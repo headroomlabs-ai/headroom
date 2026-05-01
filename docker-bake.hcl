@@ -16,8 +16,9 @@ target "runtime-gpu" {
   inherits = ["_gpu_common", "docker-metadata-action"]
   target   = "runtime"
   args = {
-    HEADROOM_EXTRAS = "proxy,code,ml,memory,image,relevance"
+    HEADROOM_EXTRAS = "proxy,code,ml,relevance"
   }
+  attest = ["type=provenance,disabled=true", "type=sbom,disabled=true"]
 }
 
 target "runtime-default" {

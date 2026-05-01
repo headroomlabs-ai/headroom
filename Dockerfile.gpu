@@ -40,7 +40,12 @@ FROM nvidia/cuda:${CUDA_VERSION}-cudnn-runtime-ubuntu${UBUNTU_VERSION} AS builde
 
 ARG PYTHON_VERSION
 ARG UV_VERSION
-ARG HEADROOM_EXTRAS="proxy,code,ml,memory,image,relevance"
+# Dropped from extras: `image` (no image compression workflows on this
+# image — saves Pillow + sentencepiece + rapidocr) and `memory` (the
+# hierarchical memory feature pulls sentence-transformers; reintroduce
+# only if Kompress memory mode is turned on). Override at build time
+# with --build-arg HEADROOM_EXTRAS=... if needed.
+ARG HEADROOM_EXTRAS="proxy,code,ml,relevance"
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -116,12 +121,15 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
         --out /tmp/wheels && \
     uv pip install --system /tmp/wheels/*.whl
 
-# Bake HF weights with retry for flaky network.
+# Bake HF weights with retry for flaky network. Only kompress-base is
+# needed — it's already a fine-tuned ModernBERT (model.safetensors +
+# tokenizer.json + config.json are all self-contained). The
+# `_name_or_path: answerdotai/ModernBERT-base` in its config is metadata
+# only and does NOT trigger a download at load time.
 RUN if echo ",${HEADROOM_EXTRAS}," | grep -q ",ml,"; then \
         for i in 1 2 3; do \
             python -c "from huggingface_hub import snapshot_download; \
-                snapshot_download('chopratejas/kompress-base'); \
-                snapshot_download('answerdotai/ModernBERT-base')" \
+                snapshot_download('chopratejas/kompress-base')" \
             && break || { echo \"hf download attempt $i failed, retrying\"; sleep 10; }; \
         done; \
         test -d /opt/hf-cache && ls /opt/hf-cache; \
@@ -170,19 +178,22 @@ RUN apt-get update && \
     rm -f /usr/lib/python${PYTHON_VERSION}/EXTERNALLY-MANAGED && \
     rm -rf /var/lib/apt/lists/*
 
-# Copy installed Python packages, headroom CLI, and baked HF cache.
-COPY --from=builder /usr/local/lib/python${PYTHON_VERSION}/dist-packages /usr/local/lib/python${PYTHON_VERSION}/dist-packages
-COPY --from=builder /usr/lib/python3/dist-packages /usr/lib/python3/dist-packages
-COPY --from=builder /usr/local/bin/headroom /usr/local/bin/headroom
-COPY --from=builder /opt/hf-cache /opt/hf-cache
-
-# Ubuntu 24.04 ships with a default `ubuntu` user at uid/gid 1000. Drop it
-# so we can claim 1000 for the headroom service account.
+# Ubuntu 24.04 ships with a default `ubuntu` user at uid/gid 1000. Drop
+# it BEFORE the COPYs so --chown lands in the same layer as the data
+# (a separate `chown -R` later would duplicate the data into a new
+# layer — that bug added 3.75 GB to the previous build).
 RUN userdel -r ubuntu 2>/dev/null || true && \
     groupadd --gid 1000 nonroot && \
     useradd --uid 1000 --gid nonroot --create-home nonroot && \
     mkdir -p /home/nonroot/.headroom /data && \
-    chown -R nonroot:nonroot /home/nonroot /data /opt/hf-cache
+    chown -R nonroot:nonroot /home/nonroot /data
+
+# Copy installed Python packages, headroom CLI, and baked HF cache.
+# HF cache is chown'd in-place to avoid the duplicate-layer bug.
+COPY --from=builder /usr/local/lib/python${PYTHON_VERSION}/dist-packages /usr/local/lib/python${PYTHON_VERSION}/dist-packages
+COPY --from=builder /usr/lib/python3/dist-packages /usr/lib/python3/dist-packages
+COPY --from=builder /usr/local/bin/headroom /usr/local/bin/headroom
+COPY --from=builder --chown=nonroot:nonroot /opt/hf-cache /opt/hf-cache
 
 USER nonroot
 WORKDIR /home/nonroot
