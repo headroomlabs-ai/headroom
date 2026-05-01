@@ -2,17 +2,41 @@
 #
 # Base: NVIDIA CUDA 12.4.1 + cuDNN 9 runtime on Ubuntu 22.04.
 # Includes the full ML extra set (torch, sentence-transformers, SigLIP,
-# fastembed, onnxruntime-gpu) so Kompress, semantic relevance, image
-# routing, and memory reranking can run on GPU.
+# fastembed, onnxruntime-gpu) plus the SmartCrusher Rust extension
+# (`headroom._core`) so JSON compression actually runs.
 #
 # Run with: docker run --gpus all -p 8787:8787 ghcr.io/orq-ai/headroom-internal:gpu
+#
+# Build prerequisites: BuildKit (DOCKER_BUILDKIT=1) — required for the
+# `--mount=type=cache` directives.
+#
+# Notes / gotchas:
+# 1. headroom-ai is the PyPI package name. We install from local checkout
+#    (./) so source is actually present.
+# 2. `headroom._core` is a PyO3/maturin extension under
+#    `crates/headroom-py/`. Not installed by `pip install`. Without it,
+#    SmartCrusher is disabled and JSON payloads pass through uncompressed.
+# 3. tree-sitter-language-pack >= 1.6.3 renamed its module to `_native`.
+#    headroom imports the old name; pin < 1.6.3.
+# 4. Rust toolchain must be `stable` (>=1.85). 1.80 fails on edition2024
+#    deps (clap_builder).
+# 5. esaxx-rs (transitive) compiles C++ -> needs g++. openssl-sys
+#    needs pkg-config + libssl-dev.
+# 6. With [ml], we bake HF weights and set TRANSFORMERS_OFFLINE so the
+#    proxy never reaches out at runtime.
+# 7. Multi-stage: builder has full toolchain (Rust, gcc, dev headers);
+#    runtime carries only Python + CUDA/cuDNN libs + installed wheels.
 
-ARG CUDA_VERSION=12.4.1
-ARG UBUNTU_VERSION=22.04
-ARG PYTHON_VERSION=3.11
+# CUDA 12.6.3 + Ubuntu 24.04 ships python3.12 in main repos — avoids the
+# deadsnakes PPA entirely (the python3.11 path on jammy hit launchpad
+# SSL/connection failures during build).
+ARG CUDA_VERSION=12.6.3
+ARG UBUNTU_VERSION=24.04
+ARG PYTHON_VERSION=3.12
 ARG UV_VERSION=0.6.17
 
-FROM nvidia/cuda:${CUDA_VERSION}-cudnn-runtime-ubuntu${UBUNTU_VERSION} AS runtime
+# ---------- Stage 1: builder ----------
+FROM nvidia/cuda:${CUDA_VERSION}-cudnn-runtime-ubuntu${UBUNTU_VERSION} AS builder
 
 ARG PYTHON_VERSION
 ARG UV_VERSION
@@ -22,61 +46,151 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
-    HEADROOM_HOST=0.0.0.0
+    HF_HOME=/opt/hf-cache
+
+# Apt retry config for flaky networks (deadsnakes / launchpad).
+RUN echo 'Acquire::Retries "3";' > /etc/apt/apt.conf.d/80-retries && \
+    echo 'Acquire::http::Timeout "30";' >> /etc/apt/apt.conf.d/80-retries && \
+    echo 'Acquire::ForceIPv4 "true";' >> /etc/apt/apt.conf.d/80-retries
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        software-properties-common \
         curl \
         ca-certificates \
         build-essential \
-        g++ && \
-    add-apt-repository -y ppa:deadsnakes/ppa && \
-    apt-get update && \
-    apt-get install -y --no-install-recommends \
+        gcc \
+        g++ \
+        libc6-dev \
+        pkg-config \
+        libssl-dev \
         python${PYTHON_VERSION} \
         python${PYTHON_VERSION}-dev \
         python${PYTHON_VERSION}-venv \
         python3-pip && \
     ln -sf /usr/bin/python${PYTHON_VERSION} /usr/local/bin/python && \
     ln -sf /usr/bin/python${PYTHON_VERSION} /usr/local/bin/python3 && \
+    rm -f /usr/lib/python${PYTHON_VERSION}/EXTERNALLY-MANAGED && \
     rm -rf /var/lib/apt/lists/*
 
-RUN python -m pip install --upgrade pip && \
-    python -m pip install uv==${UV_VERSION}
+# Rust toolchain. The repo pins via rust-toolchain.toml (1.95.0); install
+# stable here so rustup picks it up. rust-toolchain.toml will trigger
+# rustup to fetch the pinned version on first cargo invocation.
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain stable --profile minimal
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+RUN python -m pip install uv==${UV_VERSION} "maturin[patchelf]"
 
 WORKDIR /build
 
 COPY pyproject.toml uv.lock README.md ./
 RUN mkdir -p headroom && touch headroom/__init__.py
-
-# Install deps with full GPU-relevant extras.
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --system ".[${HEADROOM_EXTRAS}]"
 
-# Swap CPU onnxruntime for the CUDA build. headroom-ai pins onnxruntime in
-# [proxy]; we drop it and install the GPU variant so Kompress and any other
-# ONNX inference path uses CUDA EP when available.
+# Pin tree-sitter-language-pack below the 1.6.3 module rename.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --system "tree-sitter-language-pack>=0.10.0,<1.6.3"
+
+# Replace CPU onnxruntime with CUDA build.
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip uninstall --system onnxruntime || true && \
     uv pip install --system "onnxruntime-gpu>=1.19.0"
 
-# Real source.
 COPY headroom/ headroom/
+COPY crates/ crates/
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --system --no-deps --reinstall-package headroom-ai .
 
-RUN groupadd --gid 1000 nonroot && \
+# Build SmartCrusher PyO3 extension.
+# Workspace target dir is /build/target (Cargo.toml is at /build root via
+# the workspace inheritance). Per-crate path was wrong and reset every build.
+# CARGO_BUILD_JOBS limits parallelism to avoid OOM in Docker Desktop VM
+# during the large Rust compile (esaxx-rs, magika, fastembed all heavy).
+ENV CARGO_BUILD_JOBS=4
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/build/target \
+    maturin build --release \
+        --manifest-path crates/headroom-py/Cargo.toml \
+        --out /tmp/wheels && \
+    uv pip install --system /tmp/wheels/*.whl
+
+# Bake HF weights with retry for flaky network.
+RUN if echo ",${HEADROOM_EXTRAS}," | grep -q ",ml,"; then \
+        for i in 1 2 3; do \
+            python -c "from huggingface_hub import snapshot_download; \
+                snapshot_download('chopratejas/kompress-base'); \
+                snapshot_download('answerdotai/ModernBERT-base')" \
+            && break || { echo \"hf download attempt $i failed, retrying\"; sleep 10; }; \
+        done; \
+        test -d /opt/hf-cache && ls /opt/hf-cache; \
+    else \
+        mkdir -p /opt/hf-cache; \
+    fi
+
+# Build-time verification: fail fast on silent install issues.
+# cd to /tmp so the local /build/headroom/ source dir doesn't shadow the
+# installed package (which is the one carrying _core.so).
+RUN cd /tmp && python -c "\
+import headroom._core; \
+import torch; \
+import onnxruntime as ort; \
+import tree_sitter_language_pack as tslp; \
+assert 'CUDAExecutionProvider' in ort.get_available_providers(), 'onnxruntime-gpu missing CUDA EP'; \
+assert hasattr(tslp, 'get_language'), 'tslp API broken (1.6.3 rename?)'; \
+print('verify OK: torch', torch.__version__, '| ort providers', ort.get_available_providers()); \
+"
+
+# ---------- Stage 2: runtime ----------
+FROM nvidia/cuda:${CUDA_VERSION}-cudnn-runtime-ubuntu${UBUNTU_VERSION} AS runtime
+
+ARG PYTHON_VERSION
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    HEADROOM_HOST=0.0.0.0 \
+    HF_HOME=/opt/hf-cache \
+    TRANSFORMERS_OFFLINE=1
+
+RUN echo 'Acquire::Retries "3";' > /etc/apt/apt.conf.d/80-retries && \
+    echo 'Acquire::http::Timeout "30";' >> /etc/apt/apt.conf.d/80-retries && \
+    echo 'Acquire::ForceIPv4 "true";' >> /etc/apt/apt.conf.d/80-retries
+
+# Runtime needs only python + curl (healthcheck). Drop toolchain/dev libs.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        curl \
+        ca-certificates \
+        python${PYTHON_VERSION} \
+        python${PYTHON_VERSION}-venv && \
+    ln -sf /usr/bin/python${PYTHON_VERSION} /usr/local/bin/python && \
+    ln -sf /usr/bin/python${PYTHON_VERSION} /usr/local/bin/python3 && \
+    rm -f /usr/lib/python${PYTHON_VERSION}/EXTERNALLY-MANAGED && \
+    rm -rf /var/lib/apt/lists/*
+
+# Copy installed Python packages, headroom CLI, and baked HF cache.
+COPY --from=builder /usr/local/lib/python${PYTHON_VERSION}/dist-packages /usr/local/lib/python${PYTHON_VERSION}/dist-packages
+COPY --from=builder /usr/lib/python3/dist-packages /usr/lib/python3/dist-packages
+COPY --from=builder /usr/local/bin/headroom /usr/local/bin/headroom
+COPY --from=builder /opt/hf-cache /opt/hf-cache
+
+# Ubuntu 24.04 ships with a default `ubuntu` user at uid/gid 1000. Drop it
+# so we can claim 1000 for the headroom service account.
+RUN userdel -r ubuntu 2>/dev/null || true && \
+    groupadd --gid 1000 nonroot && \
     useradd --uid 1000 --gid nonroot --create-home nonroot && \
     mkdir -p /home/nonroot/.headroom /data && \
-    chown -R nonroot:nonroot /home/nonroot /data
+    chown -R nonroot:nonroot /home/nonroot /data /opt/hf-cache
 
 USER nonroot
 WORKDIR /home/nonroot
 
 EXPOSE 8787
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+# Cold start with [ml] takes ~25-90s (torch init).
+HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
     CMD curl --fail --silent http://127.0.0.1:8787/readyz || exit 1
 
 ENTRYPOINT ["headroom", "proxy"]
