@@ -6,6 +6,21 @@ target "_common" {
   platforms  = ["linux/amd64", "linux/arm64"]
 }
 
+target "_gpu_common" {
+  context    = "."
+  dockerfile = "Dockerfile.gpu"
+  platforms  = ["linux/amd64"]
+}
+
+target "runtime-gpu" {
+  inherits = ["_gpu_common", "docker-metadata-action"]
+  target   = "runtime"
+  args = {
+    HEADROOM_EXTRAS = "proxy,code,ml,memory,relevance"
+  }
+  attest = ["type=provenance,disabled=true", "type=sbom,disabled=true"]
+}
+
 target "runtime-default" {
   inherits = ["_common", "docker-metadata-action"]
   target   = "runtime"
