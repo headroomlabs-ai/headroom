@@ -4,7 +4,7 @@
 #
 # Usage:
 #   bash run-headroom-internal.sh                 # default settings
-#   PORT=8788 NAME=headroom-internal-test bash run-headroom-internal.sh
+#   PORT=8787 NAME=headroom-internal-test bash run-headroom-internal.sh
 #   GPUS=none bash run-headroom-internal.sh       # CPU-only (skip --gpus)
 #
 # Stops + removes any existing container with the same name first, then boots
@@ -14,7 +14,7 @@ set -euo pipefail
 
 IMAGE="${IMAGE:-headroom-internal:gpu}"
 NAME="${NAME:-headroom-internal-test}"
-PORT="${PORT:-8788}"
+PORT="${PORT:-8787}"
 DATA_VOLUME="${DATA_VOLUME:-headroom-internal-data}"
 LOG_LEVEL="${LOG_LEVEL:-INFO}"
 GPUS="${GPUS:-all}"   # set GPUS=none to disable GPU access

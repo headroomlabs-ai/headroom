@@ -9,7 +9,7 @@ The proxy runs as a Docker container on the GPU host.
 | | |
 |---|---|
 | Host | `100.77.242.54` (Tailscale) |
-| Proxy port | `8788` → container `8787` |
+| Proxy port | `8787` → container `8787` |
 | Container name | `headroom-internal-test` |
 | Data volume | `headroom-internal-data` |
 | Image | `headroom-internal:gpu` |
@@ -20,26 +20,26 @@ The container starts with `--memory`, `--code-graph`, and `--log-messages` enabl
 
 ## Using the proxy locally
 
-**Prereq: Tailscale must be connected.** The GPU host is only reachable via Tailscale (`100.77.242.54`). If you're on the same local network you can also use `10.213.31.36` directly (skip the VPN hop), but `aurl gpu` handles both via Tailscale by default.
+**Prereq: Tailscale must be connected.** The GPU host is only reachable via Tailscale (`100.77.242.54`). If you're on the same local network you can also use `10.213.31.36` directly (skip the VPN hop).
 
 ### 1. Add `aurl` to `~/.zshrc`
 
 ```bash
-# Toggle Headroom proxy: aurl [gpu|local|off]
-#   gpu   -> GPU host via Tailscale (recommended)
+# Toggle Headroom proxy: aurl [on|local|off]
+#   on    -> GPU host via Tailscale (recommended)
 #   local -> GPU host via local network IP (same network only)
 #   off   -> unset, go direct to Anthropic/OpenAI
 aurl() {
     case "$1" in
-        gpu|"")
-            export ANTHROPIC_BASE_URL=http://100.77.242.54:8788
-            export OPENAI_BASE_URL=http://100.77.242.54:8788/v1
-            export HEADROOM_PROXY_URL=http://100.77.242.54:8788
+        on|"")
+            export ANTHROPIC_BASE_URL=http://100.77.242.54:8787
+            export OPENAI_BASE_URL=http://100.77.242.54:8787/v1
+            export HEADROOM_PROXY_URL=http://100.77.242.54:8787
             ;;
         local)
-            export ANTHROPIC_BASE_URL=http://10.213.31.36:8788
-            export OPENAI_BASE_URL=http://10.213.31.36:8788/v1
-            export HEADROOM_PROXY_URL=http://10.213.31.36:8788
+            export ANTHROPIC_BASE_URL=http://10.213.31.36:8787
+            export OPENAI_BASE_URL=http://10.213.31.36:8787/v1
+            export HEADROOM_PROXY_URL=http://10.213.31.36:8787
             ;;
         off)
             unset ANTHROPIC_BASE_URL
@@ -47,7 +47,7 @@ aurl() {
             unset HEADROOM_PROXY_URL
             ;;
         *)
-            echo "usage: aurl [gpu|local|off]"
+            echo "usage: aurl [on|local|off]"
             return 1
             ;;
     esac
@@ -55,15 +55,15 @@ aurl() {
     echo "OPENAI_BASE_URL=${OPENAI_BASE_URL:-<unset>}"
     echo "HEADROOM_PROXY_URL=${HEADROOM_PROXY_URL:-<unset>}"
 }
-aurl gpu  # default to GPU host on shell startup
+aurl  # default to GPU host on shell startup
 ```
 
-Then `source ~/.zshrc`. Shell defaults to `aurl gpu` on every new session.
+Then `source ~/.zshrc`. Shell defaults to `aurl` on every new session.
 
 ### 2. Install the MCP server
 
 ```bash
-aurl gpu
+aurl
 pip install "headroom-ai[mcp]"
 headroom mcp install
 ```
@@ -81,14 +81,14 @@ Expected:
 ```
 MCP SDK:        ✓ Installed
 Claude Config:  ✓ Configured
-Proxy URL:      http://100.77.242.54:8788
-Proxy Status:   ✓ Running at http://100.77.242.54:8788
+Proxy URL:      http://100.77.242.54:8787
+Proxy Status:   ✓ Running at http://100.77.242.54:8787
 ```
 
 ### 3. Launch Claude through the proxy
 
 ```bash
-aurl gpu && claude
+aurl && claude
 ```
 
 Subagents spawned inside Claude Code inherit `ANTHROPIC_BASE_URL` automatically — no extra config needed.
@@ -104,6 +104,14 @@ On a fresh GPU host, install the NVIDIA container toolkit first (one-time):
 ```bash
 scp install-nvidia-toolkit.sh bauke@100.77.242.54:~
 ssh bauke@100.77.242.54 'bash ~/install-nvidia-toolkit.sh'
+```
+
+### First-time: stop the old upstream container
+
+If the old CPU-only upstream container is still running on port 8787, remove it first:
+
+```bash
+ssh bauke@100.77.242.54 'docker rm -f headroom'
 ```
 
 ### Build the image
@@ -127,7 +135,7 @@ bash run-headroom-internal.sh
 The script stops any existing container with the same name, starts a fresh one, and waits for `/readyz`. Environment overrides:
 
 ```bash
-PORT=8789 bash run-headroom-internal.sh          # different port
+PORT=8788 bash run-headroom-internal.sh          # different port
 GPUS=none bash run-headroom-internal.sh          # CPU-only
 LOG_LEVEL=DEBUG bash run-headroom-internal.sh    # verbose logging
 IMAGE=headroom-internal:gpu-v2 bash run-headroom-internal.sh
@@ -139,7 +147,7 @@ Container restarts automatically (`--restart=unless-stopped`) on host reboot.
 
 ## Stats and health
 
-All endpoints are on the proxy host at port `8788`.
+All endpoints are on the proxy host at port `8787`.
 
 | Endpoint | What it shows |
 |---|---|
@@ -151,8 +159,8 @@ All endpoints are on the proxy host at port `8788`.
 Quick check:
 
 ```bash
-curl http://100.77.242.54:8788/readyz
-curl http://100.77.242.54:8788/stats
+curl http://100.77.242.54:8787/readyz
+curl http://100.77.242.54:8787/stats
 ```
 
 Community dashboard (aggregated public stats): https://headroomlabs.ai/dashboard
