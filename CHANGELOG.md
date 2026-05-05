@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Dashboard "Recent Requests" / `/transformations/feed` now shows
+  traffic routed through non-Anthropic backends** (`litellm-*`, `anyllm`,
+  `openrouter`). The `/v1/chat/completions` backend-routed branches in
+  `handlers/openai.py` (non-streaming) and `handlers/streaming.py`
+  (`_stream_openai_via_backend`) called `metrics.record_request(...)` —
+  so `/stats` aggregate counters and the durable savings store were
+  correct — but did not call `self.logger.log(RequestLog(...))`. As a
+  result, the in-memory deque feeding `/stats.recent_requests` and
+  `/transformations/feed` was never populated for those backends, and
+  the dashboard's live feed stayed empty even while compression and
+  routing worked. Added the missing `RequestLog` emission in both
+  branches, mirroring the existing direct-OpenAI / Anthropic paths
+  (`handlers/streaming.py:_stream_response`).
+
 - **`Learned: error recovery` section in MEMORY.md no longer bloats with
   stale, one-shot, or contradictory entries.** The matchers paired up
   unrelated tool calls (e.g. `state.rs` and `lib.rs` in the same dir
