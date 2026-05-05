@@ -53,6 +53,12 @@ _UNKNOWN_MODEL_WARNINGS: set[str] = set()
 # Anthropic model context limits
 # All Claude 3+ models have 200K context
 ANTHROPIC_CONTEXT_LIMITS: dict[str, int] = {
+    # Claude 4.7 (Opus 4.7) - 1M context. Claude Code sends the model
+    # name with a `[1m]` suffix to select the 1M tier; both forms are
+    # registered explicitly because the lookup chain does not strip the
+    # tier suffix and LiteLLM does not key on it either.
+    "claude-opus-4-7": 1000000,
+    "claude-opus-4-7[1m]": 1000000,
     # Claude 4.6 (Opus 4.6) - 1M context
     "claude-opus-4-6": 1000000,
     # Claude 4.5 (Opus 4.5)
@@ -80,6 +86,10 @@ ANTHROPIC_CONTEXT_LIMITS: dict[str, int] = {
 # NOTE: These are ESTIMATES. Always verify against actual Anthropic billing.
 # Last updated: 2025-01-14
 ANTHROPIC_PRICING: dict[str, dict[str, float]] = {
+    # Claude 4.7 (Opus tier pricing) — registered for both the bare
+    # name and the `[1m]` tier-suffixed form Claude Code sends.
+    "claude-opus-4-7": {"input": 15.00, "output": 75.00, "cached_input": 1.50},
+    "claude-opus-4-7[1m]": {"input": 15.00, "output": 75.00, "cached_input": 1.50},
     # Claude 4.6 (Opus tier pricing)
     "claude-opus-4-6": {"input": 15.00, "output": 75.00, "cached_input": 1.50},
     # Claude 4.5 (Opus tier pricing)

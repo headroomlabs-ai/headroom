@@ -219,8 +219,23 @@ def test_wrap_copilot_prefers_existing_oauth_session(
 def test_wrap_copilot_translated_backend_still_requires_byok(
     runner: CliRunner,
     wrap_modules: tuple[types.ModuleType, click.Group],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _wrap_cli, main = wrap_modules
+    # The point of the test is that BYOK is required even with `--backend
+    # anyllm`, but the BYOK check only fires when no provider key is in
+    # the environment. The test runs against the real `os.environ`, so
+    # explicitly clear every key the CLI checks first.
+    for var in (
+        "COPILOT_PROVIDER_API_KEY",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "GEMINI_API_KEY",
+        "GROQ_API_KEY",
+        "MISTRAL_API_KEY",
+        "TOGETHER_API_KEY",
+    ):
+        monkeypatch.delenv(var, raising=False)
     with patch("headroom.cli.wrap.shutil.which", return_value="copilot"):
         with patch("headroom.cli.wrap.has_oauth_auth", return_value=True):
             result = runner.invoke(

@@ -42,6 +42,8 @@ use std::time::Instant;
 use md5::{Digest, Md5};
 use regex::Regex;
 
+use crate::ccr::CcrStore;
+
 // ─── Score-weight constants ────────────────────────────────────────────────
 //
 // These knobs tune the relevance scorer (used only when `max_hunks_per_file`
@@ -244,12 +246,37 @@ impl DiffCompressor {
     }
 
     /// Same as [`compress`] but also returns rich observability stats.
+    /// Equivalent to `compress_with_store(content, context, None).0`.
     ///
     /// [`compress`]: Self::compress
     pub fn compress_with_stats(
         &self,
         content: &str,
         context: &str,
+    ) -> (DiffCompressionResult, DiffCompressorStats) {
+        self.compress_with_store(content, context, None)
+    }
+
+    /// Compress with optional CCR persistence.
+    ///
+    /// Mirrors [`crate::transforms::log_compressor::LogCompressor::compress_with_store`]
+    /// and the search-compressor sibling: when `store` is `Some`, the
+    /// original `content` is written to it under the same `cache_key`
+    /// the wire-output marker carries. When `store` is `None`, the
+    /// `cache_key` is still emitted but the caller is responsible for
+    /// persisting (e.g. the Python shim's `_persist_to_python_ccr` path).
+    ///
+    /// **Why this exists:** prior to this method, `DiffCompressor` minted
+    /// a `cache_key` and embedded it in the output marker but never
+    /// stored — leaving Python ContentRouter with a dangling marker that
+    /// would 404 on retrieval. The `DiffOffload` orchestrator wrapper
+    /// papered over this for the new pipeline path; this method
+    /// upstreams the fix so any caller can wire in storage cleanly.
+    pub fn compress_with_store(
+        &self,
+        content: &str,
+        context: &str,
+        store: Option<&dyn CcrStore>,
     ) -> (DiffCompressionResult, DiffCompressorStats) {
         let start = Instant::now();
         let mut stats = DiffCompressorStats::default();
@@ -452,6 +479,14 @@ impl DiffCompressor {
                 "[{} lines compressed to {}. Retrieve full diff: hash={}]",
                 original_line_count, compressed_line_count, key
             ));
+            // Persist the original under the same key. When `store` is
+            // `Some`, the marker we just emitted resolves through it on
+            // the LLM's retrieval tool call. When `None`, the caller
+            // (typically the Python shim) is responsible — see the
+            // method-level docs.
+            if let Some(s) = store {
+                s.put(&key, content);
+            }
             cache_key = Some(key);
             stats.cache_key_emitted = true;
         } else if !self.config.enable_ccr {
@@ -1373,6 +1408,56 @@ mod tests {
         );
         assert!(!stats.cache_key_emitted);
         assert!(stats.ccr_skipped_reason.is_some());
+    }
+
+    #[test]
+    fn compress_with_store_persists_original_under_cache_key() {
+        // Regression: pre-fix, `DiffCompressor` minted a `cache_key` and
+        // embedded `[... hash=abc123]` in the output marker but never
+        // wrote the original anywhere — leaving Python ContentRouter
+        // with a dangling marker that 404'd on retrieval. Now any caller
+        // can pass a store and the marker resolves.
+        use crate::ccr::InMemoryCcrStore;
+        let store = InMemoryCcrStore::new();
+        let input = build_synthetic_diff(8);
+        let (r, stats) = DiffCompressor::default().compress_with_store(&input, "", Some(&store));
+        let key = r.cache_key.expect("default 0.8 should emit CCR");
+        assert!(stats.cache_key_emitted);
+        // Marker text must reference the same key.
+        assert!(r.compressed.contains(&format!("hash={key}")));
+        // Original must round-trip through the store.
+        assert_eq!(store.get(&key).as_deref(), Some(input.as_str()));
+    }
+
+    #[test]
+    fn compress_with_store_none_matches_compress_with_stats_behavior() {
+        // Passing `None` must be byte-identical to the legacy API:
+        // emits cache_key, leaves persistence to the caller. This pins
+        // the parity-preserving-default contract.
+        let input = build_synthetic_diff(8);
+        let (legacy_result, _) = DiffCompressor::default().compress_with_stats(&input, "");
+        let (new_result, _) = DiffCompressor::default().compress_with_store(&input, "", None);
+        assert_eq!(new_result.compressed, legacy_result.compressed);
+        assert_eq!(new_result.cache_key, legacy_result.cache_key);
+    }
+
+    #[test]
+    fn compress_with_store_no_op_when_ccr_skipped() {
+        // When compression doesn't clear the savings threshold, no
+        // cache_key is minted AND no store write happens.
+        use crate::ccr::InMemoryCcrStore;
+        let cfg = DiffCompressorConfig {
+            min_compression_ratio_for_ccr: 0.1, // very strict
+            ..Default::default()
+        };
+        let store = InMemoryCcrStore::new();
+        let (r, _) = DiffCompressor::new(cfg).compress_with_store(
+            &build_synthetic_diff(8),
+            "",
+            Some(&store),
+        );
+        assert!(r.cache_key.is_none());
+        assert_eq!(store.len(), 0);
     }
 
     #[test]

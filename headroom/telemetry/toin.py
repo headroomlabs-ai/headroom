@@ -1,43 +1,61 @@
-"""Tool Output Intelligence Network (TOIN) - Cross-user learning for compression.
+"""Tool Output Intelligence Network (TOIN) — observation-only contract.
 
-TOIN aggregates anonymized compression patterns across all Headroom users to
-create a network effect: every user's compression decisions improve the
-recommendations for everyone.
+# Observation-only contract (PR-B5)
 
-Key concepts:
-- ToolPattern: Aggregated intelligence about a tool type (by structure hash)
-- CompressionHint: Recommendations for how to compress a specific tool output
-- ToolIntelligenceNetwork: Central aggregator that learns from all users
+TOIN observes; it never mutates request-time compression decisions. The
+request path is deterministic: SmartCrusher and the live-zone dispatcher
+read their static configuration only. TOIN's role is to record what
+happened so an offline aggregator (`headroom.cli.toin_publish`) can emit
+a `recommendations.toml` file the deploy pipeline ships to the proxy at
+the next restart.
 
-How it works:
-1. When SmartCrusher compresses data, it records the outcome via telemetry
-2. When LLM retrieves compressed data, TOIN tracks what was needed
-3. TOIN learns: "For tools with structure X, retrieval rate is high when
-   compressing field Y - preserve it"
-4. Next time: SmartCrusher asks TOIN for hints before compressing
+Why this shape:
+- Per-request mutation tied compression bytes to TOIN's mutable state,
+  which made the same input produce different outputs across runs (P2-27,
+  P5-56). That broke prompt caching and made bugs irreproducible.
+- The request-time hint API (`get_recommendation()`) is retired. It now
+  emits a `DeprecationWarning` and returns `None`. New code must not call
+  it.
+- Recording (`record_compression`, `record_retrieval`) and storage
+  (save/load/export/import) are unchanged; the learning value is intact.
 
-Privacy:
-- No actual data values are stored
-- Tool names are structure hashes
-- Field names are SHA256[:8] hashes
-- No user identifiers
+# Aggregation key
 
-Network Effect:
-- More users → more compression events → better recommendations
-- Cross-user patterns reveal universal tool behaviors
-- Federated learning: aggregate patterns, not data
+Patterns are keyed by `(auth_mode, model_family, structure_hash)` —
+each tenant slice (PAYG vs OAuth vs subscription) and each model family
+(claude-3-5, gpt-4o, …) learns independently. Defaults `"unknown"` when
+either is not yet plumbed through (PR-F3 lights up real auth-mode
+detection).
 
-Usage:
+# Privacy
+- No actual data values are stored.
+- Tool names are structure hashes.
+- Field names are SHA256[:8] hashes.
+- No user identifiers.
+
+# Network effect (preserved)
+- More users → more compression events → better aggregated `optimal_*`
+  fields on each `ToolPattern`. The `toin publish` CLI promotes those
+  into `recommendations.toml`.
+- Cross-instance pattern import (`import_patterns`) supports federated
+  learning without sharing actual data.
+
+# Usage
     from headroom.telemetry.toin import get_toin
 
-    # Before compression, get recommendations
-    hint = get_toin().get_recommendation(tool_signature, query_context)
+    # Record a compression event (the only request-time TOIN call).
+    get_toin().record_compression(
+        tool_signature=signature,
+        original_count=len(items),
+        compressed_count=kept,
+        original_tokens=before,
+        compressed_tokens=after,
+        strategy="smart_crusher",
+    )
 
-    # Apply hint
-    if hint.skip_compression:
-        return original_data
-    config.preserve_fields = hint.preserve_fields
-    config.max_items = hint.max_items
+    # Aggregated recommendations are produced offline:
+    #   python -m headroom.cli.toin_publish --output recommendations.toml
+    # The Rust proxy loads that file at startup; no per-request hint API.
 """
 
 from __future__ import annotations
@@ -48,9 +66,10 @@ import logging
 import os
 import threading
 import time
+import warnings
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Final, Literal
 
 from .models import FieldSemantics, ToolSignature
 
@@ -62,6 +81,72 @@ TOIN_PATH_ENV_VAR = "HEADROOM_TOIN_PATH"
 # Default TOIN storage directory and file
 DEFAULT_TOIN_DIR = ".headroom"
 DEFAULT_TOIN_FILE = "toin.json"
+
+# ── Aggregation-key defaults ────────────────────────────────────────────
+# Used when callers haven't plumbed auth-mode / model-family detection
+# (PR-F3 wires the real detectors). Shipping a real `"unknown"` slice is
+# explicit — better than a magic empty string and lets the publish CLI
+# filter on it deliberately.
+DEFAULT_AUTH_MODE: Final[str] = "unknown"
+DEFAULT_MODEL_FAMILY: Final[str] = "unknown"
+
+# ── Aggregation thresholds (Final, not magic numbers) ───────────────────
+# Minimum observations a pattern must have before the `toin publish` CLI
+# emits a recommendation row for it. Below this, the recommendation
+# would be noise. The CLI exposes `--min-observations` to override per
+# environment; this is the production default the Rust proxy expects.
+DEFAULT_MIN_OBSERVATIONS_TO_PUBLISH: Final[int] = 50
+
+# Aggregation-key serialization separator. Used to encode the
+# `(auth_mode, model_family, sig_hash)` tuple as a string for JSON
+# storage (JSON object keys must be strings) and for cross-instance
+# pattern imports. Pipe is illegal in all three components by
+# construction (auth_mode ∈ {"unknown","payg","oauth","subscription"};
+# model_family is a registry name with no `|`; sig_hash is hex).
+_AGG_KEY_SEPARATOR: Final[str] = "|"
+
+
+# ── Aggregation key helpers ─────────────────────────────────────────────
+PatternKey = tuple[str, str, str]
+
+
+def _make_pattern_key(
+    auth_mode: str | None,
+    model_family: str | None,
+    sig_hash: str,
+) -> PatternKey:
+    """Build the canonical `(auth_mode, model_family, sig_hash)` key.
+
+    Defaults populate to `DEFAULT_AUTH_MODE` / `DEFAULT_MODEL_FAMILY`
+    when callers haven't supplied a value — keeps callers terse during
+    the Phase B realignment while PR-F3 wires real detectors.
+    """
+    return (
+        auth_mode or DEFAULT_AUTH_MODE,
+        model_family or DEFAULT_MODEL_FAMILY,
+        sig_hash,
+    )
+
+
+def _serialize_pattern_key(key: PatternKey) -> str:
+    """Serialize an aggregation key to a string for JSON / TOML storage."""
+    return _AGG_KEY_SEPARATOR.join(key)
+
+
+def _deserialize_pattern_key(serialized: str) -> PatternKey:
+    """Parse a serialized aggregation key back to a tuple.
+
+    Backward-compatible with pre-B5 dumps that stored keys as bare
+    structure hashes (no separator): those parse as
+    `(DEFAULT_AUTH_MODE, DEFAULT_MODEL_FAMILY, sig_hash)`. The realignment
+    plan permits wiping the on-disk store, but this fallback keeps reads
+    safe if a stale file appears in the wild.
+    """
+    parts = serialized.split(_AGG_KEY_SEPARATOR)
+    if len(parts) == 3:
+        return (parts[0], parts[1], parts[2])
+    # Legacy format: bare sig_hash. Promote to default tenant slice.
+    return (DEFAULT_AUTH_MODE, DEFAULT_MODEL_FAMILY, serialized)
 
 
 def get_default_toin_storage_path() -> str:
@@ -101,6 +186,15 @@ class ToolPattern:
     """
 
     tool_signature_hash: str
+
+    # === Aggregation Key (PR-B5) ===
+    # Per-tenant aggregation key extension. The Pattern is keyed inside
+    # the TOIN store by `(auth_mode, model_family, tool_signature_hash)` —
+    # these two fields carry the same values onto the dataclass so dumps,
+    # imports, and publish-CLI rows are self-describing without
+    # cross-referencing the dict key.
+    auth_mode: str = DEFAULT_AUTH_MODE
+    model_family: str = DEFAULT_MODEL_FAMILY
 
     # === Compression Statistics ===
     total_compressions: int = 0
@@ -153,7 +247,10 @@ class ToolPattern:
     field_semantics: dict[str, FieldSemantics] = field(default_factory=dict)
 
     # === Observation Counter ===
-    observations: int = 0  # How many times get_recommendation() was called for this pattern
+    # PR-B5: legacy counter from the retired `get_recommendation()` API.
+    # Held for serialization compatibility with v1.0 dumps; new
+    # increments only happen via record_compression / record_retrieval.
+    observations: int = 0
 
     # === Confidence ===
     sample_size: int = 0
@@ -183,6 +280,8 @@ class ToolPattern:
         """Convert to dictionary for serialization."""
         return {
             "tool_signature_hash": self.tool_signature_hash,
+            "auth_mode": self.auth_mode,
+            "model_family": self.model_family,
             "total_compressions": self.total_compressions,
             "total_items_seen": self.total_items_seen,
             "total_items_kept": self.total_items_kept,
@@ -226,6 +325,8 @@ class ToolPattern:
         # Filter to only valid fields
         valid_fields = {
             "tool_signature_hash",
+            "auth_mode",
+            "model_family",
             "total_compressions",
             "total_items_seen",
             "total_items_kept",
@@ -280,10 +381,15 @@ class ToolPattern:
 
 
 @dataclass
-class CompressionHint:
-    """Recommendation for how to compress a specific tool output.
+class _CompressionHint:
+    """Internal recommendation envelope (PR-B5: private, observation-only).
 
-    This is what TOIN returns when asked for advice before compression.
+    Pre-B5 this was the public return type of `get_recommendation()` —
+    the request-time hint API now retired. The dataclass is retained as
+    `_CompressionHint` purely for the deprecated stub's signature and
+    for the publish CLI's internal aggregation; no new code should
+    construct or consume it. Read recommendations from
+    `recommendations.toml` produced by `headroom.cli.toin_publish`.
     """
 
     # Should we compress at all?
@@ -345,14 +451,23 @@ class TOINConfig:
 
 
 class ToolIntelligenceNetwork:
-    """Aggregates tool patterns across all Headroom users.
+    """Aggregates tool patterns across all Headroom users (observation-only).
 
-    This is the brain of TOIN. It maintains a database of learned patterns
-    for different tool types and provides recommendations based on
-    cross-user intelligence.
+    This is the offline brain of TOIN. It maintains a database of learned
+    patterns for different `(auth_mode, model_family, tool_signature)`
+    slices. The `record_compression` / `record_retrieval` calls are the
+    only request-time API; aggregated recommendations are emitted by
+    `headroom.cli.toin_publish` and consumed by the Rust proxy at startup.
 
     Thread-safe for concurrent access.
     """
+
+    # ── Deprecation warning de-dupe (PR-B5) ───────────────────────────────
+    # `get_recommendation` is retired as a per-request mutator. We emit
+    # `DeprecationWarning` once per process; if every call warned, busy
+    # call sites would flood logs and obscure other warnings. Class-level
+    # so all instances share the flag.
+    _DEPRECATION_WARNED: bool = False
 
     def __init__(
         self,
@@ -380,8 +495,11 @@ class ToolIntelligenceNetwork:
         else:
             self._backend = None
 
-        # Pattern database: structure_hash -> ToolPattern
-        self._patterns: dict[str, ToolPattern] = {}
+        # Pattern database: (auth_mode, model_family, structure_hash) -> ToolPattern
+        # PR-B5 extended the key from a bare structure_hash to the per-tenant
+        # tuple. The serialized form on disk encodes the tuple as
+        # "auth|model|hash"; see `_serialize_pattern_key`.
+        self._patterns: dict[PatternKey, ToolPattern] = {}
 
         # Instance ID for user counting (anonymized)
         # IMPORTANT: Must be STABLE across restarts to avoid false user count inflation
@@ -449,11 +567,13 @@ class ToolIntelligenceNetwork:
         strategy: str,
         query_context: str | None = None,
         items: list[dict[str, Any]] | None = None,
+        auth_mode: str | None = None,
+        model_family: str | None = None,
     ) -> None:
         """Record a compression event.
 
         Called after SmartCrusher compresses data. Updates the pattern
-        for this tool type.
+        for this `(auth_mode, model_family, tool_signature)` slice.
 
         TOIN Evolution: When items are provided, we capture field statistics
         for learning semantic types (uniqueness, default values, etc.).
@@ -467,6 +587,10 @@ class ToolIntelligenceNetwork:
             strategy: Compression strategy used.
             query_context: Optional user query that triggered this tool call.
             items: Optional list of items being compressed for field-level learning.
+            auth_mode: Tenant auth slice (`payg` / `oauth` / `subscription`).
+                Defaults to `DEFAULT_AUTH_MODE` when not provided.
+            model_family: Target model family (`claude-3-5`, `gpt-4o`, …).
+                Defaults to `DEFAULT_MODEL_FAMILY` when not provided.
         """
         # HIGH FIX: Check enabled FIRST to avoid computing structure_hash if disabled
         # This saves CPU when TOIN is turned off
@@ -475,12 +599,15 @@ class ToolIntelligenceNetwork:
 
         # Computing structure_hash can be expensive for large structures
         sig_hash = tool_signature.structure_hash
+        key = _make_pattern_key(auth_mode, model_family, sig_hash)
 
         # LOW FIX #22: Emit compression metric
         self._emit_metric(
             "toin.compression",
             {
                 "signature_hash": sig_hash,
+                "auth_mode": key[0],
+                "model_family": key[1],
                 "original_count": original_count,
                 "compressed_count": compressed_count,
                 "original_tokens": original_tokens,
@@ -492,10 +619,14 @@ class ToolIntelligenceNetwork:
 
         with self._lock:
             # Get or create pattern
-            if sig_hash not in self._patterns:
-                self._patterns[sig_hash] = ToolPattern(tool_signature_hash=sig_hash)
+            if key not in self._patterns:
+                self._patterns[key] = ToolPattern(
+                    tool_signature_hash=sig_hash,
+                    auth_mode=key[0],
+                    model_family=key[1],
+                )
 
-            pattern = self._patterns[sig_hash]
+            pattern = self._patterns[key]
 
             # Update compression stats
             pattern.total_compressions += 1
@@ -691,6 +822,8 @@ class ToolIntelligenceNetwork:
         query_fields: list[str] | None = None,
         strategy: str | None = None,
         retrieved_items: list[dict[str, Any]] | None = None,
+        auth_mode: str | None = None,
+        model_family: str | None = None,
     ) -> None:
         """Record a retrieval event.
 
@@ -707,15 +840,21 @@ class ToolIntelligenceNetwork:
             query_fields: Fields mentioned in query (will be hashed).
             strategy: Compression strategy that was used (for success rate tracking).
             retrieved_items: Optional list of retrieved items for field-level learning.
+            auth_mode: Tenant auth slice. Defaults to `DEFAULT_AUTH_MODE`.
+            model_family: Target model family. Defaults to `DEFAULT_MODEL_FAMILY`.
         """
         if not self._config.enabled:
             return
+
+        key = _make_pattern_key(auth_mode, model_family, tool_signature_hash)
 
         # LOW FIX #22: Emit retrieval metric
         self._emit_metric(
             "toin.retrieval",
             {
                 "signature_hash": tool_signature_hash,
+                "auth_mode": key[0],
+                "model_family": key[1],
                 "retrieval_type": retrieval_type,
                 "has_query": query is not None,
                 "query_fields_count": len(query_fields) if query_fields else 0,
@@ -724,13 +863,15 @@ class ToolIntelligenceNetwork:
         )
 
         with self._lock:
-            if tool_signature_hash not in self._patterns:
+            if key not in self._patterns:
                 # First time seeing this tool via retrieval
-                self._patterns[tool_signature_hash] = ToolPattern(
-                    tool_signature_hash=tool_signature_hash
+                self._patterns[key] = ToolPattern(
+                    tool_signature_hash=tool_signature_hash,
+                    auth_mode=key[0],
+                    model_family=key[1],
                 )
 
-            pattern = self._patterns[tool_signature_hash]
+            pattern = self._patterns[key]
 
             # Update retrieval stats
             pattern.total_retrievals += 1
@@ -852,244 +993,36 @@ class ToolIntelligenceNetwork:
 
     def get_recommendation(
         self,
-        tool_signature: ToolSignature,
-        query_context: str | None = None,
-    ) -> CompressionHint:
-        """Get compression recommendation for a tool output.
+        tool_signature: ToolSignature,  # noqa: ARG002 — kept for source compat
+        query_context: str | None = None,  # noqa: ARG002
+    ) -> None:
+        """**Deprecated.** Returns `None`. PR-B5 retired the request-time hint API.
 
-        This is the main API for SmartCrusher to consult before compressing.
+        TOIN is observation-only; recommendations are emitted by the
+        offline `headroom.cli.toin_publish` CLI into `recommendations.toml`
+        and loaded by the Rust proxy at startup. New code must not call
+        this method. Existing call sites should migrate to reading the
+        TOML file directly.
 
-        Args:
-            tool_signature: Signature of the tool output structure.
-            query_context: User query for context-aware recommendations.
+        Emits `DeprecationWarning` once per process to keep busy call
+        sites from flooding logs.
 
         Returns:
-            CompressionHint with recommendations.
+            Always `None`. The legacy `_CompressionHint` envelope is no
+            longer constructed at request time.
         """
-        if not self._config.enabled:
-            return CompressionHint(source="default", reason="TOIN disabled")
-
-        sig_hash = tool_signature.structure_hash
-
-        with self._lock:
-            pattern = self._patterns.get(sig_hash)
-
-            if pattern is None:
-                # No data for this tool type
-                return CompressionHint(
-                    source="default",
-                    reason="No pattern data for this tool type",
-                )
-
-            # Track observation: TOIN was consulted for this pattern
-            pattern.observations += 1
-            self._dirty = True
-
-            # Not enough samples for reliable recommendation
-            if pattern.sample_size < self._config.min_samples_for_recommendation:
-                hint = CompressionHint(
-                    source="local",
-                    reason=f"Only {pattern.sample_size} samples (need {self._config.min_samples_for_recommendation})",
-                    confidence=pattern.confidence,
-                    based_on_samples=pattern.sample_size,
-                )
-                # LOW FIX #22: Emit recommendation metric
-                self._emit_metric(
-                    "toin.recommendation",
-                    {
-                        "signature_hash": sig_hash,
-                        "source": hint.source,
-                        "confidence": hint.confidence,
-                        "skip_compression": hint.skip_compression,
-                        "max_items": hint.max_items,
-                        "compression_level": hint.compression_level,
-                        "based_on_samples": hint.based_on_samples,
-                    },
-                )
-                return hint
-
-            # Build recommendation based on learned patterns
-            hint = self._build_recommendation(pattern, query_context)
-
-            # LOW FIX #22: Emit recommendation metric
-            self._emit_metric(
-                "toin.recommendation",
-                {
-                    "signature_hash": sig_hash,
-                    "source": hint.source,
-                    "confidence": hint.confidence,
-                    "skip_compression": hint.skip_compression,
-                    "max_items": hint.max_items,
-                    "compression_level": hint.compression_level,
-                    "based_on_samples": hint.based_on_samples,
-                },
+        cls = type(self)
+        if not cls._DEPRECATION_WARNED:
+            cls._DEPRECATION_WARNED = True
+            warnings.warn(
+                "ToolIntelligenceNetwork.get_recommendation() is deprecated "
+                "and now returns None. PR-B5 retired the request-time hint "
+                "API; recommendations come from recommendations.toml at "
+                "startup. See headroom/telemetry/toin.py module docstring.",
+                DeprecationWarning,
+                stacklevel=2,
             )
-            return hint
-
-    def _build_recommendation(
-        self,
-        pattern: ToolPattern,
-        query_context: str | None,
-    ) -> CompressionHint:
-        """Build a recommendation based on pattern data and query context."""
-        hint = CompressionHint(
-            source="network"
-            if pattern.user_count >= self._config.min_users_for_network_effect
-            else "local",
-            confidence=pattern.confidence,
-            based_on_samples=pattern.sample_size,
-        )
-
-        retrieval_rate = pattern.retrieval_rate
-        full_retrieval_rate = pattern.full_retrieval_rate
-
-        # High retrieval rate = compression too aggressive
-        if retrieval_rate > self._config.high_retrieval_threshold:
-            if full_retrieval_rate > 0.8:
-                # Almost all retrievals are full = don't compress
-                hint.skip_compression = True
-                hint.compression_level = "none"
-                hint.reason = f"Very high full retrieval rate ({full_retrieval_rate:.1%})"
-            else:
-                # High retrieval but mostly search = compress conservatively
-                hint.max_items = pattern.optimal_max_items
-                hint.compression_level = "conservative"
-                hint.reason = f"High retrieval rate ({retrieval_rate:.1%})"
-
-        elif retrieval_rate > self._config.medium_retrieval_threshold:
-            # Moderate retrieval = moderate compression
-            hint.max_items = max(20, pattern.optimal_max_items)
-            hint.compression_level = "moderate"
-            hint.reason = f"Moderate retrieval rate ({retrieval_rate:.1%})"
-
-        else:
-            # Low retrieval = aggressive compression works
-            hint.max_items = min(15, pattern.optimal_max_items)
-            hint.compression_level = "aggressive"
-            hint.reason = f"Low retrieval rate ({retrieval_rate:.1%})"
-
-        # Build preserve_fields list weighted by retrieval frequency
-        # Start with pattern's preserve_fields, then enhance based on query
-        preserve_fields = pattern.preserve_fields.copy()
-        query_fields_count = 0
-
-        # If we have query context, extract field names and prioritize them
-        if query_context and pattern.field_retrieval_frequency:
-            # Extract field names from query context
-            import re
-
-            query_field_names = re.findall(r"(\w+)[=:]", query_context.lower())
-
-            # Hash them and check if they're in our frequency data
-            for field_name in query_field_names:
-                field_hash = self._hash_field_name(field_name)
-                if field_hash in pattern.field_retrieval_frequency:
-                    # This field is known to be retrieved - prioritize it
-                    if field_hash in preserve_fields:
-                        # Move to front
-                        preserve_fields.remove(field_hash)
-                    preserve_fields.insert(0, field_hash)
-                    query_fields_count += 1
-
-        # Sort remaining fields by retrieval frequency (most frequent first)
-        if pattern.field_retrieval_frequency and len(preserve_fields) > 1:
-            # Separate query-mentioned fields (already at front) from others
-            if query_fields_count < len(preserve_fields):
-                rest = preserve_fields[query_fields_count:]
-                rest.sort(
-                    key=lambda f: pattern.field_retrieval_frequency.get(f, 0),
-                    reverse=True,
-                )
-                preserve_fields = preserve_fields[:query_fields_count] + rest
-
-        hint.preserve_fields = preserve_fields[:10]  # Limit to top 10
-
-        # Use optimal strategy if known AND it has good success rate
-        if pattern.optimal_strategy != "default":
-            success_rate = pattern.strategy_success_rates.get(pattern.optimal_strategy, 1.0)
-            # Only recommend strategy if success rate >= 0.5
-            # Lower success rates mean this strategy often causes retrievals
-            if success_rate >= 0.5:
-                hint.recommended_strategy = pattern.optimal_strategy
-            else:
-                # Strategy has poor success rate - reduce confidence
-                hint.confidence *= success_rate
-                hint.reason += (
-                    f" (strategy {pattern.optimal_strategy} has low success: {success_rate:.1%})"
-                )
-                # Try to find a better strategy
-                best_strategy = self._find_best_strategy(pattern)
-                if best_strategy and best_strategy != pattern.optimal_strategy:
-                    hint.recommended_strategy = best_strategy
-                    hint.reason += f", using {best_strategy} instead"
-
-        # Boost max_items if query_context matches common retrieval patterns
-        # This prevents unnecessary retrieval when we can predict what's needed
-        if query_context:
-            query_lower = query_context.lower()
-
-            # Check for exhaustive query keywords that suggest user needs all data
-            exhaustive_keywords = ["all", "every", "complete", "full", "entire", "list all"]
-            if any(kw in query_lower for kw in exhaustive_keywords):
-                # User likely needs more data - be conservative
-                hint.max_items = max(hint.max_items, 40)
-                hint.compression_level = "conservative"
-                hint.reason += " (exhaustive query detected)"
-
-            # Check against common retrieval patterns
-            if pattern.common_query_patterns:
-                query_pattern = self._anonymize_query_pattern(query_context)
-                if query_pattern:
-                    # Exact match
-                    if query_pattern in pattern.common_query_patterns:
-                        hint.max_items = max(hint.max_items, 30)
-                        hint.reason += " (query matches retrieval pattern)"
-                    else:
-                        # Partial match: check if any stored pattern is contained in query
-                        for stored_pattern in pattern.common_query_patterns:
-                            # Check if key fields match (e.g., "status:*" in both)
-                            stored_fields = {
-                                f.split(":")[0] for f in stored_pattern.split() if ":" in f
-                            }
-                            query_fields = {
-                                f.split(":")[0] for f in query_pattern.split() if ":" in f
-                            }
-                            # If query uses same fields as a problematic pattern, be conservative
-                            if stored_fields and stored_fields.issubset(query_fields):
-                                hint.max_items = max(hint.max_items, 25)
-                                hint.reason += " (query uses fields from retrieval pattern)"
-                                break
-
-        # === TOIN Evolution: Include learned field semantics ===
-        # Copy field_semantics with sufficient confidence for SmartCrusher to use
-        # Only include fields with confidence >= 0.3 to reduce noise
-        if pattern.field_semantics:
-            hint.field_semantics = {
-                field_hash: field_sem
-                for field_hash, field_sem in pattern.field_semantics.items()
-                if field_sem.confidence >= 0.3 or field_sem.retrieval_count >= 3
-            }
-
-        return hint
-
-    def _find_best_strategy(self, pattern: ToolPattern) -> str | None:
-        """Find the strategy with the best success rate.
-
-        Returns None if no strategies have been tried or all have low success.
-        """
-        if not pattern.strategy_success_rates:
-            return None
-
-        # Find strategy with highest success rate above threshold
-        best_strategy = None
-        best_rate = 0.5  # Minimum acceptable rate
-
-        for strategy, rate in pattern.strategy_success_rates.items():
-            if rate > best_rate:
-                best_rate = rate
-                best_strategy = strategy
-
-        return best_strategy
+        return None
 
     def _update_recommendations(self, pattern: ToolPattern) -> None:
         """Update learned recommendations for a pattern."""
@@ -1245,28 +1178,57 @@ class ToolIntelligenceNetwork:
                 ),
             }
 
-    def get_pattern(self, signature_hash: str) -> ToolPattern | None:
-        """Get pattern data for a specific tool signature.
+    def get_pattern(
+        self,
+        signature_hash: str,
+        auth_mode: str | None = None,
+        model_family: str | None = None,
+    ) -> ToolPattern | None:
+        """Get pattern data for a specific `(auth_mode, model_family, sig_hash)` slice.
+
+        Defaults to `(DEFAULT_AUTH_MODE, DEFAULT_MODEL_FAMILY, signature_hash)`
+        when callers haven't supplied tenant info — preserves source-compat
+        with pre-B5 callers that look up by bare hash.
 
         HIGH FIX: Returns a deep copy to prevent external mutation of internal state.
         """
         import copy
 
+        key = _make_pattern_key(auth_mode, model_family, signature_hash)
+
         with self._lock:
-            pattern = self._patterns.get(signature_hash)
+            pattern = self._patterns.get(key)
             if pattern is not None:
                 return copy.deepcopy(pattern)
             return None
 
+    def iter_patterns(self) -> list[tuple[PatternKey, ToolPattern]]:
+        """Snapshot of `(key, pattern)` pairs for offline aggregation.
+
+        Used by `headroom.cli.toin_publish` to walk every aggregated
+        slice without exposing the live `_patterns` dict to external
+        callers (deep-copies each pattern to prevent mutation).
+        """
+        import copy
+
+        with self._lock:
+            return [(k, copy.deepcopy(p)) for k, p in self._patterns.items()]
+
     def export_patterns(self) -> dict[str, Any]:
-        """Export all patterns for sharing/aggregation."""
+        """Export all patterns for sharing/aggregation.
+
+        The aggregation key tuple is encoded as a `"auth|model|hash"`
+        string for JSON storage (JSON object keys must be strings).
+        See `_serialize_pattern_key` for the canonical encoding.
+        """
         with self._lock:
             return {
-                "version": "1.0",
+                "version": "2.0",  # PR-B5: tuple aggregation key
                 "export_timestamp": time.time(),
                 "instance_id": self._instance_id,
                 "patterns": {
-                    sig_hash: pattern.to_dict() for sig_hash, pattern in self._patterns.items()
+                    _serialize_pattern_key(key): pattern.to_dict()
+                    for key, pattern in self._patterns.items()
                 },
             }
 
@@ -1275,6 +1237,11 @@ class ToolIntelligenceNetwork:
 
         Used for federated learning: aggregate patterns from multiple
         Headroom instances without sharing actual data.
+
+        Backward-compatible with v1.0 dumps that keyed patterns by bare
+        structure_hash: those are promoted to the
+        `(DEFAULT_AUTH_MODE, DEFAULT_MODEL_FAMILY, sig_hash)` slice via
+        `_deserialize_pattern_key`.
 
         Args:
             data: Exported pattern data.
@@ -1286,20 +1253,26 @@ class ToolIntelligenceNetwork:
         source_instance = data.get("instance_id", "unknown")
 
         with self._lock:
-            for sig_hash, pattern_dict in patterns_data.items():
+            for serialized_key, pattern_dict in patterns_data.items():
+                key = _deserialize_pattern_key(serialized_key)
                 imported = ToolPattern.from_dict(pattern_dict)
+                # Make sure dataclass fields agree with the dict key — pre-B5
+                # dumps don't carry auth_mode/model_family on the pattern;
+                # promote from the (possibly default) key.
+                imported.auth_mode = key[0]
+                imported.model_family = key[1]
 
-                if sig_hash in self._patterns:
+                if key in self._patterns:
                     # Merge with existing
-                    self._merge_patterns(self._patterns[sig_hash], imported)
+                    self._merge_patterns(self._patterns[key], imported)
                 else:
                     # Add new pattern - need to track source instance
-                    self._patterns[sig_hash] = imported
+                    self._patterns[key] = imported
 
                     # For NEW patterns from another instance, track the source in
                     # _seen_instance_hashes so user_count reflects cross-user data
                     if source_instance != self._instance_id:
-                        pattern = self._patterns[sig_hash]
+                        pattern = self._patterns[key]
                         if source_instance not in pattern._seen_instance_hashes:
                             # Limit storage to 100 unique instances to bound memory
                             if len(pattern._seen_instance_hashes) < 100:
@@ -1515,8 +1488,19 @@ class ToolIntelligenceNetwork:
                 self._last_save_time = time.time()
 
         except Exception as e:
-            # Log error but don't crash - TOIN should be resilient
-            logger.warning("Failed to save TOIN data: %s", e)
+            # Surface storage failures structured so log aggregators can
+            # alert on `event=toin_save_failed` without false positives
+            # from generic exception lines. Per project memory
+            # `feedback_no_silent_fallbacks.md`: never swallow.
+            logger.warning(
+                "TOIN storage save failed",
+                extra={
+                    "event": "toin_save_failed",
+                    "backend": type(self._backend).__name__,
+                    "error_type": type(e).__name__,
+                    "error": str(e),
+                },
+            )
 
     def _load_from_backend(self) -> None:
         """Load TOIN data from the storage backend."""
@@ -1529,7 +1513,15 @@ class ToolIntelligenceNetwork:
                 self.import_patterns(data)
                 self._dirty = False
         except Exception as e:
-            logger.warning("Failed to load TOIN data from backend: %s", e)
+            logger.warning(
+                "TOIN storage load failed",
+                extra={
+                    "event": "toin_load_failed",
+                    "backend": type(self._backend).__name__,
+                    "error_type": type(e).__name__,
+                    "error": str(e),
+                },
+            )
 
     def _maybe_auto_save(self) -> None:
         """Auto-save if enough time has passed.
@@ -1591,6 +1583,12 @@ def _create_default_toin_backend() -> Any:
             )
             return None
         fn = ep.load()
+        # `tenant_prefix` is retained for storage-backend namespacing
+        # (Redis key prefix, Postgres schema name, etc.) so multi-tenant
+        # SaaS deployments can carve up shared infrastructure. PR-B5 made
+        # the in-memory aggregation key per-tenant via `auth_mode` /
+        # `model_family`, so `tenant_prefix` is now functionally redundant
+        # for *learning* — it only matters for storage layout. Keep it.
         kwargs = {
             "url": os.environ.get("HEADROOM_TOIN_URL", ""),
             "tenant_prefix": os.environ.get("HEADROOM_TOIN_TENANT_PREFIX", ""),

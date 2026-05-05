@@ -11,8 +11,7 @@ These are the 4 required acceptance tests from the spec:
 import pytest
 
 from headroom import OpenAIProvider, Tokenizer
-from headroom.transforms import CacheAligner, RollingWindow
-from headroom.transforms.tool_crusher import crush_tool_output
+from headroom.transforms import CacheAligner
 
 # Create a shared provider for tests
 _provider = OpenAIProvider()
@@ -25,87 +24,49 @@ def get_tokenizer(model: str = "gpt-4o") -> Tokenizer:
 
 
 class TestDateTrap:
-    """Test that system prompt dates are relocated and prefix hash is stable."""
+    """CacheAligner is detector-only after PR-A2 (P2-23 fix).
 
-    def test_date_extraction_from_system_prompt(self):
-        """Dates should be extracted from system prompt."""
-        messages_day1 = [
-            {"role": "system", "content": "You are helpful. Current Date: 2024-01-15"},
+    The system prompt is NEVER mutated. Volatile content (dates, UUIDs,
+    JWTs, hex hashes) is only DETECTED and surfaced via warnings. The
+    spec's prior "date trap" remediation moved to live-zone routing
+    (PR-A2 P0-1) and is exercised by tests/test_proxy_system_prompt_immutable.py.
+    """
+
+    def test_system_prompt_bytes_unchanged_when_dynamic_content_present(self):
+        """The detector must not rewrite the system prompt."""
+        original = "You are helpful. Current Date: 2024-01-15"
+        messages = [
+            {"role": "system", "content": original},
             {"role": "user", "content": "Hello"},
         ]
 
         aligner = CacheAligner()
         tokenizer = get_tokenizer()
+        result = aligner.apply(messages, tokenizer)
 
-        result = aligner.apply(messages_day1, tokenizer)
+        assert result.messages[0]["content"] == original
+        assert result.transforms_applied == []
 
-        # Date should be moved out of main system content
-        system_content = result.messages[0]["content"]
-        # The date should be after the dynamic separator (---), not in the static prefix
-        # Split on the separator marker "---" to get static content
-        static_content = system_content.split("---")[0]
-        assert "Current Date: 2024-01-15" not in static_content
+    def test_warning_surfaced_for_iso_date_in_system_prompt(self):
+        """ISO 8601 dates should be surfaced as warnings, not extracted."""
+        from headroom.config import CacheAlignerConfig
 
-    def test_stable_prefix_hash_across_days(self):
-        """Prefix hash should be stable despite different dates."""
-        messages_day1 = [
-            {"role": "system", "content": "You are a helpful assistant. Current Date: 2024-01-15"},
-            {"role": "user", "content": "Hello"},
-        ]
-        messages_day2 = [
-            {"role": "system", "content": "You are a helpful assistant. Current Date: 2024-01-16"},
+        messages = [
+            {
+                "role": "system",
+                "content": "You are helpful. Time: 2024-01-15T10:30:00",
+            },
             {"role": "user", "content": "Hello"},
         ]
 
-        aligner = CacheAligner()
+        aligner = CacheAligner(CacheAlignerConfig(enabled=True))
         tokenizer = get_tokenizer()
+        result = aligner.apply(messages, tokenizer)
 
-        result1 = aligner.apply(messages_day1, tokenizer)
-        result2 = aligner.apply(messages_day2, tokenizer)
+        assert any("iso8601" in w.lower() for w in result.warnings)
 
-        # Extract hashes from markers
-        hash1 = None
-        hash2 = None
-        for marker in result1.markers_inserted:
-            if marker.startswith("stable_prefix_hash:"):
-                hash1 = marker.split(":", 1)[1]
-        for marker in result2.markers_inserted:
-            if marker.startswith("stable_prefix_hash:"):
-                hash2 = marker.split(":", 1)[1]
-
-        # Stable hash despite different dates
-        assert hash1 is not None
-        assert hash2 is not None
-        assert hash1 == hash2
-
-    def test_various_date_formats(self):
-        """Various date formats should be detected."""
-        test_cases = [
-            "Current Date: 2024-01-15",
-            "Today is Monday, January 15",
-            "Today's date: 2024-01-15",
-            "2024-01-15T10:30:00",
-        ]
-
-        aligner = CacheAligner()
-        tokenizer = get_tokenizer()
-
-        for date_str in test_cases:
-            messages = [
-                {"role": "system", "content": f"You are helpful. {date_str}. Be concise."},
-                {"role": "user", "content": "Hello"},
-            ]
-
-            result = aligner.apply(messages, tokenizer)
-
-            # Transform should be applied (date detected)
-            # Either transforms_applied has cache_align or the date is moved
-            system_content = result.messages[0]["content"]
-            # Date should be separated from main instructions
-            assert "[Context:" in system_content or "cache_align" in result.transforms_applied
-
-    def test_cache_metrics_returned(self):
-        """CachePrefixMetrics should be returned with all fields."""
+    def test_cache_metrics_populated(self):
+        """CachePrefixMetrics is populated even though no rewrite happens."""
         messages = [
             {"role": "system", "content": "You are helpful. Current Date: 2024-01-15"},
             {"role": "user", "content": "Hello"},
@@ -113,227 +74,50 @@ class TestDateTrap:
 
         aligner = CacheAligner()
         tokenizer = get_tokenizer()
-
         result = aligner.apply(messages, tokenizer)
 
-        # Cache metrics should be populated
         assert result.cache_metrics is not None
         assert result.cache_metrics.stable_prefix_bytes > 0
         assert result.cache_metrics.stable_prefix_tokens_est > 0
         assert len(result.cache_metrics.stable_prefix_hash) == 16
-        # First request: no previous hash, prefix_changed should be False
         assert result.cache_metrics.prefix_changed is False
         assert result.cache_metrics.previous_hash is None
 
-    def test_cache_metrics_tracks_changes(self):
-        """Cache metrics should track prefix changes across requests."""
+    def test_cache_metrics_tracks_changes_across_requests(self):
+        """Hash flips when bytes change. Hash is over the actual bytes now."""
         aligner = CacheAligner()
         tokenizer = get_tokenizer()
 
-        # First request with one system prompt
         messages1 = [
             {"role": "system", "content": "You are helpful. Current Date: 2024-01-15"},
             {"role": "user", "content": "Hello"},
         ]
         result1 = aligner.apply(messages1, tokenizer)
 
-        # Second request with same static content (different date)
+        # Same bytes → same hash, prefix_changed False.
         messages2 = [
-            {"role": "system", "content": "You are helpful. Current Date: 2024-01-16"},
+            {"role": "system", "content": "You are helpful. Current Date: 2024-01-15"},
             {"role": "user", "content": "Hello"},
         ]
         result2 = aligner.apply(messages2, tokenizer)
-
-        # Same static prefix → prefix_changed should be False
-        assert result2.cache_metrics is not None
         assert result2.cache_metrics.prefix_changed is False
-        assert result2.cache_metrics.previous_hash == result1.cache_metrics.stable_prefix_hash
+        assert result2.cache_metrics.stable_prefix_hash == (
+            result1.cache_metrics.stable_prefix_hash
+        )
 
-        # Third request with DIFFERENT static content
+        # Different bytes → hash flips. The detector NEVER strips dynamic
+        # content, so any byte difference is reflected in the hash. This
+        # is the correct behavior — the customer must move dynamic content
+        # to the live zone (live-zone tail per PR-A2) to get cache hits.
         messages3 = [
-            {"role": "system", "content": "You are VERY helpful. Current Date: 2024-01-17"},
+            {"role": "system", "content": "You are VERY helpful. Current Date: 2024-01-15"},
             {"role": "user", "content": "Hello"},
         ]
         result3 = aligner.apply(messages3, tokenizer)
-
-        # Different static prefix → prefix_changed should be True
-        assert result3.cache_metrics is not None
         assert result3.cache_metrics.prefix_changed is True
-        assert result3.cache_metrics.stable_prefix_hash != result2.cache_metrics.stable_prefix_hash
-
-
-class TestToolOrphan:
-    """Test that dropping tool_call also drops its tool response."""
-
-    def test_tool_unit_atomicity(self):
-        """Tool calls and their responses must be dropped together."""
-        messages = [
-            {"role": "system", "content": "You are a helpful assistant."},
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [
-                    {
-                        "id": "call_1",
-                        "type": "function",
-                        "function": {"name": "search", "arguments": '{"query": "test"}'},
-                    }
-                ],
-            },
-            {"role": "tool", "tool_call_id": "call_1", "content": '{"results": ["a", "b", "c"]}'},
-            {"role": "assistant", "content": "Based on the search, I found 3 results."},
-            {"role": "user", "content": "Thanks!"},
-        ]
-
-        window = RollingWindow()
-        tokenizer = get_tokenizer()
-
-        # Force a very small token limit to trigger dropping
-        result = window.apply(
-            messages,
-            tokenizer,
-            model_limit=200,  # Very small limit
-            output_buffer=50,
+        assert result3.cache_metrics.stable_prefix_hash != (
+            result2.cache_metrics.stable_prefix_hash
         )
-
-        # Extract tool_call IDs and tool response IDs from result
-        tool_call_ids: set[str] = set()
-        tool_response_ids: set[str] = set()
-
-        for msg in result.messages:
-            if msg.get("tool_calls"):
-                for tc in msg["tool_calls"]:
-                    tool_call_ids.add(tc.get("id", ""))
-            if msg.get("role") == "tool":
-                tool_response_ids.add(msg.get("tool_call_id", ""))
-
-        # Every tool response must have a matching tool call
-        # (no orphaned tool responses)
-        assert tool_response_ids <= tool_call_ids, (
-            f"Orphaned tool responses detected! "
-            f"Tool calls: {tool_call_ids}, Tool responses: {tool_response_ids}"
-        )
-
-    def test_multiple_tool_calls_atomicity(self):
-        """Multiple tool calls in one message are handled atomically."""
-        messages = [
-            {"role": "system", "content": "You are a helpful assistant."},
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [
-                    {
-                        "id": "call_1",
-                        "type": "function",
-                        "function": {"name": "search", "arguments": '{"q": "a"}'},
-                    },
-                    {
-                        "id": "call_2",
-                        "type": "function",
-                        "function": {"name": "search", "arguments": '{"q": "b"}'},
-                    },
-                ],
-            },
-            {"role": "tool", "tool_call_id": "call_1", "content": '{"result": "a"}'},
-            {"role": "tool", "tool_call_id": "call_2", "content": '{"result": "b"}'},
-            {"role": "assistant", "content": "Found results for both queries."},
-            {"role": "user", "content": "Great!"},
-        ]
-
-        window = RollingWindow()
-        tokenizer = get_tokenizer()
-
-        result = window.apply(
-            messages,
-            tokenizer,
-            model_limit=300,
-            output_buffer=50,
-        )
-
-        # Verify atomicity
-        tool_call_ids: set[str] = set()
-        tool_response_ids: set[str] = set()
-
-        for msg in result.messages:
-            if msg.get("tool_calls"):
-                for tc in msg["tool_calls"]:
-                    tool_call_ids.add(tc.get("id", ""))
-            if msg.get("role") == "tool":
-                tool_response_ids.add(msg.get("tool_call_id", ""))
-
-        assert tool_response_ids <= tool_call_ids
-
-    def test_many_tool_calls_all_or_nothing(self):
-        """MCP-style: one assistant message with MANY tool calls must be atomic."""
-        messages = [
-            {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": "Search everything."},
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [
-                    {
-                        "id": "call_1",
-                        "type": "function",
-                        "function": {"name": "search_web", "arguments": '{"q": "a"}'},
-                    },
-                    {
-                        "id": "call_2",
-                        "type": "function",
-                        "function": {"name": "search_files", "arguments": '{"q": "b"}'},
-                    },
-                    {
-                        "id": "call_3",
-                        "type": "function",
-                        "function": {"name": "search_db", "arguments": '{"q": "c"}'},
-                    },
-                    {
-                        "id": "call_4",
-                        "type": "function",
-                        "function": {"name": "search_api", "arguments": '{"q": "d"}'},
-                    },
-                ],
-            },
-            {"role": "tool", "tool_call_id": "call_1", "content": '{"results": ["web_result"]}'},
-            {"role": "tool", "tool_call_id": "call_2", "content": '{"results": ["file_result"]}'},
-            {"role": "tool", "tool_call_id": "call_3", "content": '{"results": ["db_result"]}'},
-            {"role": "tool", "tool_call_id": "call_4", "content": '{"results": ["api_result"]}'},
-            {"role": "assistant", "content": "I found results from all 4 sources."},
-            {"role": "user", "content": "Thanks!"},
-        ]
-
-        window = RollingWindow()
-        tokenizer = get_tokenizer()
-
-        # Force a tight limit to potentially drop the tool unit
-        result = window.apply(
-            messages,
-            tokenizer,
-            model_limit=400,  # Tight limit
-            output_buffer=50,
-        )
-
-        # Extract tool_call_ids and tool_response_ids
-        tool_call_ids: set[str] = set()
-        tool_response_ids: set[str] = set()
-
-        for msg in result.messages:
-            if msg.get("tool_calls"):
-                for tc in msg["tool_calls"]:
-                    tool_call_ids.add(tc.get("id", ""))
-            if msg.get("role") == "tool":
-                tool_response_ids.add(msg.get("tool_call_id", ""))
-
-        # KEY ASSERTION: Either ALL 4 tool responses are present, or NONE are
-        # This verifies the all-or-nothing atomicity
-        if tool_response_ids:
-            # If any are present, the assistant must have all the matching tool_calls
-            assert tool_response_ids <= tool_call_ids
-            # And the counts should match (all 4 kept together)
-            assert len(tool_response_ids) == len(tool_call_ids)
-        else:
-            # If none are present, the assistant message with tool_calls should be gone too
-            assert len(tool_call_ids) == 0
 
 
 class TestStreaming:
@@ -377,67 +161,6 @@ class TestStreaming:
         # This would require integration test with mock client
         # For unit test, we verify the wrapper generator works
         pass
-
-
-class TestSafetyMalformedJSON:
-    """Test that malformed JSON is NOT modified (safety first)."""
-
-    def test_malformed_json_unchanged(self):
-        """Malformed JSON in tool output should not be modified."""
-        malformed = '{"key": "value", invalid}'
-
-        result, modified = crush_tool_output(malformed)
-
-        assert result == malformed, "Malformed JSON should be unchanged"
-        assert modified is False, "Should report as not modified"
-
-    def test_truncated_json_unchanged(self):
-        """Truncated JSON should not be modified."""
-        truncated = '{"key": "value", "nested": {"inner": '
-
-        result, modified = crush_tool_output(truncated)
-
-        assert result == truncated
-        assert modified is False
-
-    def test_plain_text_unchanged(self):
-        """Plain text (non-JSON) should not be modified."""
-        plain_text = "This is just plain text, not JSON at all."
-
-        result, modified = crush_tool_output(plain_text)
-
-        assert result == plain_text
-        assert modified is False
-
-    def test_valid_json_can_be_modified(self):
-        """Valid JSON should be processed (but may or may not change)."""
-        valid_json = '{"key": "value"}'
-
-        result, modified = crush_tool_output(valid_json)
-
-        # Valid JSON is processed - result should still be valid JSON
-        import json
-
-        parsed = json.loads(result)
-        assert "key" in parsed
-
-    def test_large_json_is_crushed(self):
-        """Large valid JSON should be crushed."""
-        import json
-
-        # Create large JSON with long array
-        large_data = {
-            "results": [{"id": i, "name": f"Item {i}" * 50} for i in range(100)],
-            "metadata": {"total": 100},
-        }
-        large_json = json.dumps(large_data)
-
-        result, modified = crush_tool_output(large_json)
-
-        if modified:
-            parsed = json.loads(result)
-            # Should have truncated array
-            assert len(parsed["results"]) < 100
 
 
 class TestQueryAnchorExtraction:

@@ -1,21 +1,37 @@
-"""Cache alignment transform for Headroom SDK.
+"""Cache alignment detector for Headroom SDK.
 
-Phase 1 Enhancement: Integrates DynamicContentDetector for comprehensive
-dynamic content detection beyond just dates.
+PR-A2 / P2-23 fix: This module is now a **detector-only** transform.
 
-Detection capabilities include:
-- UUIDs, API keys, JWT tokens
-- Unix timestamps, request/trace IDs
-- Hex hashes (MD5, SHA1, SHA256)
-- Version numbers, structural patterns
-- High-entropy strings (random-looking IDs)
+The previous rewrite path (which strips dynamic content from the system
+prompt and re-inserts it as a context block) violated invariant I2 — the
+cache hot zone (system prompt) must never be mutated. That path has been
+removed. ``CacheAligner`` now exclusively:
+
+1. Detects volatile / dynamic content in the system prompt using
+   structural parsers (no regex):
+   - UUIDs via the stdlib ``uuid`` module
+   - ISO 8601 timestamps via ``datetime.fromisoformat``
+   - JWTs via shape-only structural checks (three dot-separated
+     base64url segments with the expected size profile)
+   - Hex hashes (MD5/SHA1/SHA256) via length + alphabet checks
+
+2. Emits a customer-visible warning log line surfacing detected
+   dynamic content so callers know their cache prefix is unstable.
+   The prompt itself is never modified.
+
+The transform's ``apply`` method is a no-op for messages — it only
+populates ``warnings`` and ``cache_metrics`` for observability.
 """
 
 from __future__ import annotations
 
+import base64
+import binascii
 import logging
-import re
-from typing import TYPE_CHECKING, Any
+import uuid as _uuid
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any
 
 from ..config import CacheAlignerConfig, CachePrefixMetrics, TransformResult
 from ..tokenizer import Tokenizer
@@ -23,85 +39,195 @@ from ..tokenizers import EstimatingTokenCounter
 from ..utils import compute_short_hash, deep_copy_messages
 from .base import Transform
 
-if TYPE_CHECKING:
-    from ..cache.dynamic_detector import DynamicContentDetector
-
 logger = logging.getLogger(__name__)
 
 
-class CacheAligner(Transform):
+# Length profile for hex hash detection. Kept as named constants — no magic
+# numbers in production code (build constraint #2). MD5 = 32 hex chars,
+# SHA1 = 40, SHA256 = 64.
+_HEX_HASH_LENGTHS = frozenset({32, 40, 64})
+
+# Canonical UUID (RFC 4122) with dashes is 36 chars. We deliberately do NOT
+# accept the 32-char dashless form since it is structurally identical to an
+# MD5 hex digest and would mis-classify a hash as a UUID.
+_UUID_CANONICAL_LEN = 36
+
+# JWT shape constraints. A JWT is exactly three base64url-encoded segments
+# joined by ``.``. We do NOT verify the signature (we don't have the key,
+# and we're only doing detection); we only check the shape.
+_JWT_SEGMENT_COUNT = 3
+_JWT_MIN_SEGMENT_BYTES = 4
+
+# Token classification labels — keep stable so log consumers can filter.
+_LABEL_UUID = "uuid"
+_LABEL_ISO8601 = "iso8601"
+_LABEL_JWT = "jwt"
+_LABEL_HEX_HASH = "hex_hash"
+
+
+@dataclass(frozen=True)
+class VolatileFinding:
+    """One detected piece of volatile content."""
+
+    label: str
+    sample: str  # Truncated, never full content
+
+
+def _is_uuid(token: str) -> bool:
+    """Return True if ``token`` parses as a canonical UUID.
+
+    Accepts only the canonical 36-char form with dashes
+    (``xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx``). The 32-char dashless form
+    is structurally indistinguishable from an MD5 hex digest and would
+    misclassify hashes; we treat that case as a hex hash instead.
+    Defers to ``uuid.UUID`` for parsing — no regex.
     """
-    Align messages for optimal cache hits.
+    if len(token) != _UUID_CANONICAL_LEN:
+        return False
+    if token.count("-") != 4:
+        return False
+    try:
+        _uuid.UUID(token)
+    except (ValueError, AttributeError):
+        return False
+    return True
 
-    This transform:
-    1. Extracts dynamic content from system prompt (dates, UUIDs, tokens, etc.)
-    2. Normalizes whitespace for consistent hashing
-    3. Computes a stable prefix hash
 
-    The goal is to make the prefix byte-identical across requests
-    so that LLM provider caching can be effective.
+def _is_iso8601(token: str) -> bool:
+    """Return True if ``token`` parses as an ISO 8601 datetime.
 
-    Phase 1 Enhancement: Now uses DynamicContentDetector for comprehensive
-    detection of 15+ dynamic content patterns including:
-    - UUIDs, API keys, JWT tokens
-    - Unix timestamps, request/trace IDs
-    - Hex hashes (MD5, SHA1, SHA256)
-    - Version numbers, structural patterns
-    - High-entropy strings
+    Uses ``datetime.fromisoformat`` (Python 3.11+ supports the full ISO
+    spec including the ``Z`` suffix; on 3.10 the parser is stricter but
+    handles the common forms we care about).
+    """
+    if len(token) < 8:
+        return False
+    if "T" not in token and "-" not in token:
+        return False
+    candidate = token[:-1] + "+00:00" if token.endswith("Z") else token
+    try:
+        datetime.fromisoformat(candidate)
+    except (ValueError, TypeError):
+        return False
+    return True
+
+
+def _is_jwt_shape(token: str) -> bool:
+    """Return True if ``token`` has the shape of a JWT.
+
+    A JWT is three base64url-encoded segments separated by ``.``. We only
+    verify shape (segment count + each segment decodes); we never verify
+    the signature.
+    """
+    if token.count(".") != _JWT_SEGMENT_COUNT - 1:
+        return False
+    segments = token.split(".")
+    if len(segments) != _JWT_SEGMENT_COUNT:
+        return False
+    for seg in segments:
+        if len(seg) < _JWT_MIN_SEGMENT_BYTES:
+            return False
+        # base64url decode requires padding to multiple of 4
+        padded = seg + "=" * (-len(seg) % 4)
+        try:
+            base64.urlsafe_b64decode(padded.encode("ascii"))
+        except (binascii.Error, ValueError, UnicodeEncodeError):
+            return False
+    return True
+
+
+def _is_hex_hash(token: str) -> bool:
+    """Return True if ``token`` looks like an MD5/SHA1/SHA256 hex digest.
+
+    Length must be one of the known fixed sizes and every character must be
+    a hex digit. We use ``str.isalnum``+``int(token, 16)`` rather than a
+    regex; the former two are O(n) C-level checks.
+    """
+    if len(token) not in _HEX_HASH_LENGTHS:
+        return False
+    try:
+        int(token, 16)
+    except ValueError:
+        return False
+    return True
+
+
+def _classify_token(token: str) -> str | None:
+    """Return a label for ``token`` if it matches a volatile pattern.
+
+    Order matters: more specific (longer / more constrained) checks first
+    so we don't mis-classify a UUID-without-dashes as a hex hash.
+    """
+    # UUID: structurally distinct (dashes or 32 hex)
+    if _is_uuid(token):
+        return _LABEL_UUID
+    # JWT: requires literal dots — cheapest discriminator
+    if "." in token and _is_jwt_shape(token):
+        return _LABEL_JWT
+    # ISO 8601: requires ``T`` or ``-`` — cheap discriminator
+    if _is_iso8601(token):
+        return _LABEL_ISO8601
+    # Hex hash: pure hex, fixed length
+    if _is_hex_hash(token):
+        return _LABEL_HEX_HASH
+    return None
+
+
+def _split_tokens(content: str) -> list[str]:
+    """Split content into whitespace-delimited tokens for inspection.
+
+    No regex. ``str.split`` (default) collapses consecutive whitespace and
+    handles all standard whitespace classes. We then strip surrounding
+    punctuation that commonly wraps an inline token (``,``, ``;``, ``)``,
+    ``"``, etc.) so ``"Date:2024-01-15."`` yields the bare ``2024-01-15``.
+    """
+    if not content:
+        return []
+    tokens: list[str] = []
+    for raw in content.split():
+        cleaned = raw.strip(".,;:!?\"'()[]{}<>")
+        if cleaned:
+            tokens.append(cleaned)
+    return tokens
+
+
+def detect_volatile_content(content: str) -> list[VolatileFinding]:
+    """Detect volatile/dynamic content in arbitrary text.
+
+    Pure detection: no regex, no mutation. Returns one finding per token
+    that matches any structural pattern. Callers can decide whether to
+    emit a warning, alert, or ignore.
+    """
+    if not content:
+        return []
+    findings: list[VolatileFinding] = []
+    for token in _split_tokens(content):
+        label = _classify_token(token)
+        if label is None:
+            continue
+        # Truncate the sample so we never log full secrets verbatim.
+        sample = token if len(token) <= 16 else token[:8] + "..." + token[-4:]
+        findings.append(VolatileFinding(label=label, sample=sample))
+    return findings
+
+
+class CacheAligner(Transform):
+    """Detect volatile content in the system prompt and warn — never rewrite.
+
+    P2-23 fix: this is now a **detector-only** transform. It NEVER mutates
+    messages, never moves content, never normalizes whitespace. Callers
+    that previously relied on the rewrite behavior must instead route
+    memory / dynamic context to the live zone (latest user turn) per
+    PR-A2.
     """
 
     name = "cache_aligner"
 
     def __init__(self, config: CacheAlignerConfig | None = None):
-        """
-        Initialize cache aligner.
-
-        Args:
-            config: Configuration for alignment behavior.
-        """
+        """Initialize the detector-only cache aligner."""
         self.config = config or CacheAlignerConfig()
-
-        # Initialize dynamic content detector if enabled
-        self._dynamic_detector: DynamicContentDetector | None = None
-        if self.config.use_dynamic_detector:
-            self._init_dynamic_detector()
-
-        # Legacy: compiled regex patterns (used when use_dynamic_detector=False)
-        self._compiled_patterns: list[re.Pattern[str]] = []
-        if not self.config.use_dynamic_detector:
-            self._compile_patterns()
-
-        # Track previous hash for cache hit detection
+        # Track previous hash for cache hit detection (observability only).
         self._previous_prefix_hash: str | None = None
-
-    def _init_dynamic_detector(self) -> None:
-        """Initialize the DynamicContentDetector with configured tiers."""
-        from ..cache.dynamic_detector import DetectorConfig, DynamicContentDetector
-
-        # Build detector config
-        detector_config = DetectorConfig(
-            tiers=list(self.config.detection_tiers),
-            entropy_threshold=self.config.entropy_threshold,
-        )
-
-        # Add extra dynamic labels if configured
-        if self.config.extra_dynamic_labels:
-            detector_config.dynamic_labels = (
-                detector_config.dynamic_labels + self.config.extra_dynamic_labels
-            )
-
-        self._dynamic_detector = DynamicContentDetector(detector_config)
-
-        # Log available tiers
-        available = self._dynamic_detector.available_tiers
-        logger.info(
-            "CacheAligner: DynamicContentDetector initialized with tiers: %s",
-            available,
-        )
-
-    def _compile_patterns(self) -> None:
-        """Compile regex patterns for efficiency (legacy mode)."""
-        self._compiled_patterns = [re.compile(pattern) for pattern in self.config.date_patterns]
 
     def should_apply(
         self,
@@ -109,32 +235,19 @@ class CacheAligner(Transform):
         tokenizer: Tokenizer,
         **kwargs: Any,
     ) -> bool:
-        """Check if alignment is needed."""
+        """Return True iff detection is enabled and a system message exists.
+
+        Detection is cheap; we run it whenever ``enabled`` is set so the
+        warning log line is emitted on every relevant turn.
+        """
         if not self.config.enabled:
             return False
-
-        # Check if system prompt contains dynamic content
         for msg in messages:
             if msg.get("role") == "system":
                 content = msg.get("content", "")
-                if isinstance(content, str):
-                    if self._has_dynamic_content(content):
-                        return True
-
-        return False
-
-    def _has_dynamic_content(self, content: str) -> bool:
-        """Check if content has any dynamic patterns."""
-        if self.config.use_dynamic_detector and self._dynamic_detector:
-            # Use DynamicContentDetector for comprehensive detection
-            result = self._dynamic_detector.detect(content)
-            return len(result.spans) > 0
-        else:
-            # Legacy: use compiled date patterns only
-            for pattern in self._compiled_patterns:
-                if pattern.search(content):
+                if isinstance(content, str) and content:
                     return True
-            return False
+        return False
 
     def apply(
         self,
@@ -142,66 +255,60 @@ class CacheAligner(Transform):
         tokenizer: Tokenizer,
         **kwargs: Any,
     ) -> TransformResult:
-        """
-        Apply cache alignment to messages.
+        """Detect volatile content; emit warnings; never mutate messages.
 
-        Args:
-            messages: List of messages.
-            tokenizer: Tokenizer for counting.
-            **kwargs: Additional arguments.
-
-        Returns:
-            TransformResult with aligned messages.
+        Invariant: ``result.messages`` is byte-equal to the input
+        ``messages`` (modulo a deep copy for downstream isolation). The
+        prompt is never rewritten.
         """
         tokens_before = tokenizer.count_messages(messages)
+        # Deep copy so callers receive a stable list they can further
+        # transform without aliasing back into the input. The COPY is
+        # not modified — invariant I2.
         result_messages = deep_copy_messages(messages)
-        transforms_applied: list[str] = []
         warnings: list[str] = []
-
-        extracted_dynamic: list[str] = []
-        detection_stats: dict[str, int] = {}  # Track what was detected
+        all_findings: list[VolatileFinding] = []
         frozen_message_count = kwargs.get("frozen_message_count", 0)
 
-        # Process system messages (skip if frozen — in provider's prefix cache)
         for i, msg in enumerate(result_messages):
             if i < frozen_message_count:
                 continue
-            if msg.get("role") == "system":
-                content = msg.get("content", "")
-                if isinstance(content, str):
-                    # Extract dynamic content (dates, UUIDs, tokens, etc.)
-                    new_content, extracted, stats = self._extract_dynamic_content(content)
+            if msg.get("role") != "system":
+                continue
+            content = msg.get("content", "")
+            if not isinstance(content, str) or not content:
+                continue
+            findings = detect_volatile_content(content)
+            if findings:
+                all_findings.extend(findings)
 
-                    if extracted:
-                        extracted_dynamic.extend(extracted)
-                        msg["content"] = new_content
-                        # Accumulate detection stats
-                        for category, count in stats.items():
-                            detection_stats[category] = detection_stats.get(category, 0) + count
+        if all_findings:
+            counts: dict[str, int] = {}
+            for f in all_findings:
+                counts[f.label] = counts.get(f.label, 0) + 1
+            counts_str = ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
+            msg_text = (
+                f"CacheAligner: detected volatile content in system prompt "
+                f"({counts_str}); cache prefix unstable. "
+                "Move dynamic values out of the system prompt to recover cache hits."
+            )
+            warnings.append(msg_text)
+            logger.warning(msg_text)
 
-        # Normalize whitespace if configured (skip frozen messages)
-        if self.config.normalize_whitespace:
-            for i, msg in enumerate(result_messages):
-                if i < frozen_message_count:
-                    continue
-                content = msg.get("content")
-                if isinstance(content, str):
-                    msg["content"] = self._normalize_whitespace(content)
-
-        # Compute stable prefix content and hash BEFORE reinserting dates
-        # This ensures the hash is based on the static content only
-        stable_prefix_content = self._get_stable_prefix_content(result_messages)
-        stable_hash = compute_short_hash(stable_prefix_content)
-
-        # Compute cache metrics
-        prefix_bytes = len(stable_prefix_content.encode("utf-8"))
-        prefix_tokens_est = tokenizer.count_text(stable_prefix_content)
+        # Compute a stable hash of all system messages for observability.
+        # This is just a hash of the (unchanged) bytes — no extraction.
+        system_text = "\n---\n".join(
+            (m.get("content") or "")
+            for m in result_messages
+            if m.get("role") == "system" and isinstance(m.get("content"), str)
+        )
+        stable_hash = compute_short_hash(system_text)
+        prefix_bytes = len(system_text.encode("utf-8"))
+        prefix_tokens_est = tokenizer.count_text(system_text)
         prefix_changed = (
             self._previous_prefix_hash is not None and self._previous_prefix_hash != stable_hash
         )
         previous_hash = self._previous_prefix_hash
-
-        # Update tracking for next request
         self._previous_prefix_hash = stable_hash
 
         cache_metrics = CachePrefixMetrics(
@@ -212,300 +319,34 @@ class CacheAligner(Transform):
             previous_hash=previous_hash,
         )
 
-        # If we extracted dynamic content, add it as dynamic context
-        if extracted_dynamic:
-            # Insert dynamic content as a context note after system messages
-            # Strategy: add as a context note after system messages
-            self._reinsert_dynamic_content(result_messages, extracted_dynamic)
-            transforms_applied.append("cache_align")
-
-            # Log what was detected
-            if detection_stats:
-                stats_str = ", ".join(
-                    f"{cat}={cnt}" for cat, cnt in sorted(detection_stats.items())
-                )
-                logger.info(
-                    "CacheAligner: extracted %d dynamic patterns (%s)",
-                    len(extracted_dynamic),
-                    stats_str,
-                )
-            else:
-                logger.debug(
-                    "CacheAligner: extracted %d dynamic patterns for cache alignment",
-                    len(extracted_dynamic),
-                )
-
-        # Log cache hit/miss
-        if prefix_changed:
-            logger.debug(
-                "CacheAligner: prefix changed (likely cache miss), hash: %s -> %s",
-                previous_hash,
-                stable_hash,
-            )
-        else:
-            logger.debug("CacheAligner: prefix stable, hash: %s", stable_hash)
-
         tokens_after = tokenizer.count_messages(result_messages)
-
         result = TransformResult(
             messages=result_messages,
             tokens_before=tokens_before,
             tokens_after=tokens_after,
-            transforms_applied=transforms_applied,
+            transforms_applied=[],  # Never applies a rewrite.
             warnings=warnings,
             cache_metrics=cache_metrics,
         )
-
-        # Store hash in flags for access by caller (backwards compatibility)
         result.markers_inserted.append(f"stable_prefix_hash:{stable_hash}")
-
         return result
 
-    def _extract_dynamic_content(self, content: str) -> tuple[str, list[str], dict[str, int]]:
-        """
-        Extract dynamic content from text.
-
-        Uses DynamicContentDetector when enabled, otherwise falls back
-        to legacy date pattern matching.
-
-        Returns:
-            Tuple of (content_without_dynamic, list_of_extracted, category_counts).
-        """
-        if self.config.use_dynamic_detector and self._dynamic_detector:
-            return self._extract_with_detector(content)
-        else:
-            # Legacy mode: extract dates only
-            result, extracted = self._extract_dates_legacy(content)
-            stats = {"date": len(extracted)} if extracted else {}
-            return result, extracted, stats
-
-    def _extract_with_detector(self, content: str) -> tuple[str, list[str], dict[str, int]]:
-        """
-        Extract dynamic content using DynamicContentDetector.
-
-        Returns:
-            Tuple of (static_content, extracted_values, category_counts).
-        """
-        if not self._dynamic_detector:
-            return content, [], {}
-
-        result = self._dynamic_detector.detect(content)
-
-        if not result.spans:
-            return content, [], {}
-
-        # Count by category
-        category_counts: dict[str, int] = {}
-        extracted: list[str] = []
-
-        for span in result.spans:
-            category = span.category.value
-            category_counts[category] = category_counts.get(category, 0) + 1
-            extracted.append(span.text)
-
-        # Use the static content from the detector
-        static_content = self._cleanup_empty_lines(result.static_content)
-
-        # Log detection details at debug level
-        logger.debug(
-            "DynamicContentDetector found %d spans in %.2fms: %s",
-            len(result.spans),
-            result.processing_time_ms,
-            category_counts,
-        )
-
-        return static_content, extracted, category_counts
-
-    def _extract_dates_legacy(self, content: str) -> tuple[str, list[str]]:
-        """
-        Extract date patterns from content (legacy mode).
-
-        Returns:
-            Tuple of (content_without_dates, list_of_extracted_dates).
-        """
-        extracted: list[str] = []
-        result = content
-
-        for pattern in self._compiled_patterns:
-            matches = pattern.findall(result)
-            extracted.extend(matches)
-            result = pattern.sub("", result)
-
-        # Clean up any resulting empty lines
-        if extracted:
-            result = self._cleanup_empty_lines(result)
-
-        return result, extracted
-
-    def _extract_dates(self, content: str) -> tuple[str, list[str]]:
-        """
-        Extract date patterns from content.
-
-        DEPRECATED: Use _extract_dynamic_content instead.
-        Kept for backward compatibility.
-
-        Returns:
-            Tuple of (content_without_dates, list_of_extracted_dates).
-        """
-        result, extracted, _ = self._extract_dynamic_content(content)
-        return result, extracted
-
-    def _normalize_whitespace(self, content: str) -> str:
-        """Normalize whitespace for consistent hashing."""
-        # Normalize line endings
-        result = content.replace("\r\n", "\n").replace("\r", "\n")
-
-        # Trim trailing whitespace from lines
-        lines = result.split("\n")
-        lines = [line.rstrip() for line in lines]
-
-        # Collapse multiple blank lines if configured
-        if self.config.collapse_blank_lines:
-            new_lines: list[str] = []
-            prev_blank = False
-            for line in lines:
-                is_blank = not line.strip()
-                if is_blank and prev_blank:
-                    continue
-                new_lines.append(line)
-                prev_blank = is_blank
-            lines = new_lines
-
-        return "\n".join(lines)
-
-    def _cleanup_empty_lines(self, content: str) -> str:
-        """Remove empty lines that result from date extraction."""
-        lines = content.split("\n")
-        # Remove lines that are now empty after pattern removal
-        lines = [line for line in lines if line.strip() or line == ""]
-
-        # Collapse multiple consecutive empty lines
-        new_lines: list[str] = []
-        prev_empty = False
-        for line in lines:
-            is_empty = not line.strip()
-            if is_empty and prev_empty:
-                continue
-            new_lines.append(line)
-            prev_empty = is_empty
-
-        return "\n".join(new_lines).strip()
-
-    def _reinsert_dynamic_content(
-        self,
-        messages: list[dict[str, Any]],
-        dynamic_values: list[str],
-    ) -> None:
-        """
-        Reinsert extracted dynamic content as dynamic context.
-
-        Strategy: Append to the end of system message with a clear separator.
-        The separator marks where static (cacheable) content ends and
-        dynamic content begins.
-
-        Note: The stable prefix hash is computed BEFORE this method is called,
-        so the hash is based on static content only.
-        """
-        if not dynamic_values:
-            return
-
-        # Format dynamic content as a note
-        # Use newlines for multiple items to improve readability
-        if len(dynamic_values) <= 3:
-            dynamic_note = ", ".join(dynamic_values)
-        else:
-            dynamic_note = "\n".join(f"- {v}" for v in dynamic_values)
-
-        separator = self.config.dynamic_tail_separator
-
-        # Find last system message and append dynamic content
-        for msg in reversed(messages):
-            if msg.get("role") == "system":
-                content = msg.get("content", "")
-                if isinstance(content, str):
-                    # Use separator to clearly mark dynamic content
-                    msg["content"] = content.strip() + separator + dynamic_note
-                break
-
-    def _reinsert_dates(
-        self,
-        messages: list[dict[str, Any]],
-        dates: list[str],
-    ) -> None:
-        """
-        Reinsert extracted dates as dynamic context.
-
-        DEPRECATED: Use _reinsert_dynamic_content instead.
-        Kept for backward compatibility.
-        """
-        self._reinsert_dynamic_content(messages, dates)
-
-    def _get_stable_prefix_content(self, messages: list[dict[str, Any]]) -> str:
-        """Get the stable prefix content (static portion of system messages).
-
-        Only includes content BEFORE the dynamic_tail_separator in each
-        system message. This ensures the content is stable across different
-        dates/dynamic content.
-        """
-        prefix_parts: list[str] = []
-        separator = self.config.dynamic_tail_separator
-
-        for msg in messages:
-            if msg.get("role") == "system":
-                content = msg.get("content", "")
-                if isinstance(content, str):
-                    # Only include content BEFORE the dynamic separator
-                    if separator in content:
-                        content = content.split(separator)[0]
-                    prefix_parts.append(content.strip())
-            else:
-                # Stop at first non-system message
-                break
-
-        return "\n---\n".join(prefix_parts)
-
-    def _compute_stable_prefix_hash(self, messages: list[dict[str, Any]]) -> str:
-        """Compute hash of the stable prefix portion.
-
-        Only includes content BEFORE the dynamic_tail_separator in each
-        system message. This ensures the hash is stable across different
-        dates/dynamic content.
-        """
-        prefix_content = self._get_stable_prefix_content(messages)
-        return compute_short_hash(prefix_content)
-
     def get_alignment_score(self, messages: list[dict[str, Any]]) -> float:
-        """
-        Compute cache alignment score (0-100).
+        """Compute cache alignment score (0-100).
 
-        Higher score means better cache alignment potential.
-        Uses DynamicContentDetector when enabled for comprehensive detection.
+        Higher score means fewer detected volatile patterns. Penalty is a
+        flat 10 points per finding, clamped to [0, 100]. This is a
+        coarse signal for dashboards — it does not change behavior.
         """
         score = 100.0
-
         for msg in messages:
-            if msg.get("role") == "system":
-                content = msg.get("content", "")
-                if isinstance(content, str):
-                    # Penalize for each dynamic pattern found
-                    if self.config.use_dynamic_detector and self._dynamic_detector:
-                        # Use comprehensive detector
-                        result = self._dynamic_detector.detect(content)
-                        score -= len(result.spans) * 10
-                    else:
-                        # Legacy: use compiled date patterns
-                        for pattern in self._compiled_patterns:
-                            matches = pattern.findall(content)
-                            score -= len(matches) * 10
-
-                    # Penalize for inconsistent whitespace
-                    if "\r" in content:
-                        score -= 5
-                    if "  " in content:  # Double spaces
-                        score -= 2
-                    if "\n\n\n" in content:  # Triple newlines
-                        score -= 2
-
+            if msg.get("role") != "system":
+                continue
+            content = msg.get("content", "")
+            if not isinstance(content, str) or not content:
+                continue
+            findings = detect_volatile_content(content)
+            score -= len(findings) * 10
         return max(0.0, min(100.0, score))
 
 
@@ -513,15 +354,10 @@ def align_for_cache(
     messages: list[dict[str, Any]],
     config: CacheAlignerConfig | None = None,
 ) -> tuple[list[dict[str, Any]], str]:
-    """
-    Convenience function to align messages for cache.
+    """Convenience wrapper that runs detection and returns the unchanged messages.
 
-    Args:
-        messages: List of messages.
-        config: Optional configuration.
-
-    Returns:
-        Tuple of (aligned_messages, stable_prefix_hash).
+    Kept as a stable public API; the second tuple element is the stable
+    prefix hash for callers that want to track cache prefix drift.
     """
     cfg = config or CacheAlignerConfig()
     aligner = CacheAligner(cfg)
@@ -529,7 +365,6 @@ def align_for_cache(
 
     result = aligner.apply(messages, tokenizer)
 
-    # Extract hash from markers
     stable_hash = ""
     for marker in result.markers_inserted:
         if marker.startswith("stable_prefix_hash:"):

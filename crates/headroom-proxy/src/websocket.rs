@@ -49,12 +49,16 @@ pub async fn ws_handler(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
+    // PR-A5: same strip policy as the HTTP path — operators flip both
+    // simultaneously via the single `Config::strip_internal_headers` knob.
+    let strip_internal_ws = state.config.strip_internal_headers.is_enabled();
     let forward_headers = build_forward_request_headers(
         req.headers(),
         client_addr.ip(),
         "http",
         forwarded_host.as_deref(),
         &request_id,
+        strip_internal_ws,
     );
     // Sec-WebSocket-Protocol must be propagated for subprotocol negotiation.
     let subprotocols: Option<String> = req

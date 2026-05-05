@@ -100,11 +100,9 @@ __all__ = [
     # Config
     "HeadroomConfig",
     "HeadroomMode",
-    "ToolCrusherConfig",
     "SmartCrusherConfig",
     "CacheAlignerConfig",
     "CacheOptimizerConfig",
-    "RollingWindowConfig",
     "RelevanceScorerConfig",
     # Data models
     "Block",
@@ -116,10 +114,8 @@ __all__ = [
     "TransformResult",
     "WasteSignals",
     # Transforms
-    "ToolCrusher",
     "SmartCrusher",
     "CacheAligner",
-    "RollingWindow",
     "TransformPipeline",
     # Cache optimizers
     "BaseCacheOptimizer",
@@ -207,11 +203,9 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     # Config
     "HeadroomConfig": ("headroom.config", "HeadroomConfig"),
     "HeadroomMode": ("headroom.config", "HeadroomMode"),
-    "ToolCrusherConfig": ("headroom.config", "ToolCrusherConfig"),
     "SmartCrusherConfig": ("headroom.config", "SmartCrusherConfig"),
     "CacheAlignerConfig": ("headroom.config", "CacheAlignerConfig"),
     "CacheOptimizerConfig": ("headroom.config", "CacheOptimizerConfig"),
-    "RollingWindowConfig": ("headroom.config", "RollingWindowConfig"),
     "RelevanceScorerConfig": ("headroom.config", "RelevanceScorerConfig"),
     # Data models
     "Block": ("headroom.config", "Block"),
@@ -223,10 +217,8 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "TransformResult": ("headroom.config", "TransformResult"),
     "WasteSignals": ("headroom.config", "WasteSignals"),
     # Transforms
-    "ToolCrusher": ("headroom.transforms", "ToolCrusher"),
     "SmartCrusher": ("headroom.transforms", "SmartCrusher"),
     "CacheAligner": ("headroom.transforms", "CacheAligner"),
-    "RollingWindow": ("headroom.transforms", "RollingWindow"),
     "TransformPipeline": ("headroom.transforms", "TransformPipeline"),
     # Cache optimizers
     "BaseCacheOptimizer": ("headroom.cache", "BaseCacheOptimizer"),

@@ -10,6 +10,7 @@ import copy
 import hashlib
 import json
 import logging
+import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -82,7 +83,30 @@ class CompressionCache:
 
     def __init__(self, max_entries: int = 10000) -> None:
         self.max_entries = max_entries
+        # Reentrant lock guarding all mutable state below. Required because
+        # the proxy is async and dispatches multiple concurrent requests per
+        # session (Claude Code background tools, parallel agents, etc.) into
+        # `asyncio.to_thread` workers — without this, two concurrent
+        # requests for the same `session_id` race on `_cache`,
+        # `_stable_hashes`, `_first_seen`, and `_total_tokens_saved`. The
+        # observable failures are (a) lost-update on `_total_tokens_saved`,
+        # (b) `OrderedDict mutated during iteration` in `apply_cached`, and
+        # (c) lost stable-hash records that drop the next-turn cache lookup.
+        # `RLock` (not `Lock`) so future code can call locked methods from
+        # inside another locked method without self-deadlock.
+        self._lock = threading.RLock()
         self._cache: OrderedDict[str, _CacheEntry] = OrderedDict()
+        # `_stable_hashes` is CONTENT-KEYED, not positional. It records "we
+        # have seen this content before and it is known not to compress
+        # further." It MUST NOT be used as a positional cache-safety gate
+        # — Anthropic's prefix cache is positional (bytes 0..K cached,
+        # anything past K fresh), and content-equality with an old message
+        # does not imply Anthropic has cached the new byte position. Issue
+        # #327 was caused by such a misuse in the Anthropic token-mode
+        # walker; the walker has been removed. Legitimate uses today:
+        # `compute_frozen_count` (bounded above by the `min` clamp at
+        # `proxy/handlers/anthropic.py`) and `update_from_result`'s
+        # "unchanged content" tracking.
         self._stable_hashes: set[str] = set()
         self._first_seen: dict[str, float] = {}
         self._hits: int = 0
@@ -91,13 +115,14 @@ class CompressionCache:
 
     def get_compressed(self, hash: str) -> str | None:
         """Retrieve compressed content by hash, refreshing LRU position on hit."""
-        entry = self._cache.get(hash)
-        if entry is None:
-            self._misses += 1
-            return None
-        self._hits += 1
-        self._cache.move_to_end(hash)
-        return entry.compressed
+        with self._lock:
+            entry = self._cache.get(hash)
+            if entry is None:
+                self._misses += 1
+                return None
+            self._hits += 1
+            self._cache.move_to_end(hash)
+            return entry.compressed
 
     def store_compressed(self, hash: str, compressed: str, tokens_saved: int) -> None:
         """Store a compressed version keyed by content hash.
@@ -106,17 +131,18 @@ class CompressionCache:
         end (most recently used). When the cache exceeds max_entries, the oldest
         entry is evicted.
         """
-        if hash in self._cache:
-            old_entry = self._cache[hash]
-            self._total_tokens_saved -= old_entry.tokens_saved
-            del self._cache[hash]
+        with self._lock:
+            if hash in self._cache:
+                old_entry = self._cache[hash]
+                self._total_tokens_saved -= old_entry.tokens_saved
+                del self._cache[hash]
 
-        self._cache[hash] = _CacheEntry(compressed=compressed, tokens_saved=tokens_saved)
-        self._total_tokens_saved += tokens_saved
+            self._cache[hash] = _CacheEntry(compressed=compressed, tokens_saved=tokens_saved)
+            self._total_tokens_saved += tokens_saved
 
-        while len(self._cache) > self.max_entries:
-            _, evicted = self._cache.popitem(last=False)
-            self._total_tokens_saved -= evicted.tokens_saved
+            while len(self._cache) > self.max_entries:
+                _, evicted = self._cache.popitem(last=False)
+                self._total_tokens_saved -= evicted.tokens_saved
 
     def mark_stable(self, content_hash: str) -> None:
         """Mark a content hash as stable (unchanged, not compressed).
@@ -125,15 +151,17 @@ class CompressionCache:
         These messages appear verbatim every turn, so they are prefix-stable
         even though no compressed version exists in the cache.
         """
-        self._stable_hashes.add(content_hash)
+        with self._lock:
+            self._stable_hashes.add(content_hash)
 
     def mark_stable_from_messages(self, messages: list[dict], up_to: int) -> None:
         """Mark all tool_result hashes in messages[:up_to] as stable."""
-        for msg in messages[:up_to]:
-            if _is_tool_result_message(msg):
-                content = _extract_tool_result_content(msg)
-                if content is not None:
-                    self._stable_hashes.add(self.content_hash(content))
+        with self._lock:
+            for msg in messages[:up_to]:
+                if _is_tool_result_message(msg):
+                    content = _extract_tool_result_content(msg)
+                    if content is not None:
+                        self._stable_hashes.add(self.content_hash(content))
 
     def should_defer_compression(
         self,
@@ -143,30 +171,42 @@ class CompressionCache:
     ) -> bool:
         """Whether to defer compressing this content to avoid mid-TTL busts.
 
-        Returns True if the content was first seen recently enough that
-        compressing it now would bust the cached prefix with no TTL benefit.
-        Returns False near the TTL boundary (within batch_window of expiry),
-        meaning we should compress now and accept one bust.
+        Returns True if we have evidence this content has been re-sent
+        within the cache TTL window — recompressing it now would bust an
+        existing prefix-cache entry without TTL-amortizing the bust over
+        future turns. Returns False otherwise:
+
+        - **First sight** of the content. Compress now: there is no
+          prefix-cache entry to preserve yet (this byte range was not in
+          a prior request), so compression carries no bust cost. Issue
+          #327: a previous version returned True here, which marked the
+          freshest tool_result on every turn as "stable" and effectively
+          disabled compression for typical Claude Code workloads where
+          each tool_result is unique-per-turn.
+        - **Near the TTL boundary**: compress now and amortize the bust
+          across future turns (batched recompression).
         """
-        now = time.time()
-        first_seen = self._first_seen.get(content_hash)
-        if first_seen is None:
-            self._first_seen[content_hash] = now
-            return True  # First time seeing this — defer
-        age = now - first_seen
-        if age >= ttl_seconds - batch_window:
-            return False  # Near TTL boundary — compress now (batch window)
-        return True  # Still within TTL — defer to preserve cache
+        with self._lock:
+            now = time.time()
+            first_seen = self._first_seen.get(content_hash)
+            if first_seen is None:
+                self._first_seen[content_hash] = now
+                return False  # First time — compress now (no cache entry to preserve)
+            age = now - first_seen
+            if age >= ttl_seconds - batch_window:
+                return False  # Near TTL boundary — compress now (batch window)
+            return True  # Seen recently within TTL — defer to preserve cache
 
     def get_stats(self) -> dict:
         """Return cache statistics."""
-        return {
-            "entries": len(self._cache),
-            "stable_hashes": len(self._stable_hashes),
-            "hits": self._hits,
-            "misses": self._misses,
-            "tokens_saved": self._total_tokens_saved,
-        }
+        with self._lock:
+            return {
+                "entries": len(self._cache),
+                "stable_hashes": len(self._stable_hashes),
+                "hits": self._hits,
+                "misses": self._misses,
+                "tokens_saved": self._total_tokens_saved,
+            }
 
     @staticmethod
     def content_hash(content: str | list) -> str:
@@ -189,21 +229,22 @@ class CompressionCache:
         content hash is already in the cache. The first unstable tool_result
         (cache miss) stops the count.
         """
-        count = 0
-        for msg in messages:
-            if _is_tool_result_message(msg):
-                content = _extract_tool_result_content(msg)
-                if content is not None:
-                    h = self.content_hash(content)
-                    if h not in self._cache and h not in self._stable_hashes:
+        with self._lock:
+            count = 0
+            for msg in messages:
+                if _is_tool_result_message(msg):
+                    content = _extract_tool_result_content(msg)
+                    if content is not None:
+                        h = self.content_hash(content)
+                        if h not in self._cache and h not in self._stable_hashes:
+                            break
+                    else:
+                        # tool_result with non-string content; treat as unstable
                         break
-                else:
-                    # tool_result with non-string content; treat as unstable
-                    break
-            # Regular user/assistant/system messages and assistant+tool_use
-            # are always stable — fall through.
-            count += 1
-        return count
+                # Regular user/assistant/system messages and assistant+tool_use
+                # are always stable — fall through.
+                count += 1
+            return count
 
     def apply_cached(self, messages: list[dict]) -> list[dict]:
         """Return a new list with cached compressions swapped into tool results.
@@ -211,18 +252,22 @@ class CompressionCache:
         Never mutates the input list or any message dict within it.
         Output always has the same length as input.
         """
-        result: list[dict] = []
-        for msg in messages:
-            if _is_tool_result_message(msg):
-                content = _extract_tool_result_content(msg)
-                if content is not None:
-                    h = self.content_hash(content)
-                    compressed = self.get_compressed(h)
-                    if compressed is not None:
-                        result.append(_swap_tool_result_content(msg, compressed))
-                        continue
-            result.append(msg)
-        return result
+        # `get_compressed` re-acquires the lock (RLock); single contiguous
+        # critical section so concurrent `store_compressed` cannot mutate
+        # `_cache` mid-iteration.
+        with self._lock:
+            result: list[dict] = []
+            for msg in messages:
+                if _is_tool_result_message(msg):
+                    content = _extract_tool_result_content(msg)
+                    if content is not None:
+                        h = self.content_hash(content)
+                        compressed = self.get_compressed(h)
+                        if compressed is not None:
+                            result.append(_swap_tool_result_content(msg, compressed))
+                            continue
+                result.append(msg)
+            return result
 
     def update_from_result(self, originals: list[dict], compressed: list[dict]) -> None:
         """Cache new compressions by comparing original and compressed messages.
@@ -238,15 +283,18 @@ class CompressionCache:
             )
             return
 
-        for orig, comp in zip(originals, compressed):
-            orig_content = _extract_tool_result_content(orig)
-            comp_content = _extract_tool_result_content(comp)
-            if orig_content is None or comp_content is None:
-                continue
-            if orig_content == comp_content:
-                # Content unchanged — mark as stable for frozen count walk
-                self._stable_hashes.add(self.content_hash(orig_content))
-                continue
-            h = self.content_hash(orig_content)
-            tokens_saved = len(orig_content) // 4 - len(comp_content) // 4
-            self.store_compressed(h, comp_content, tokens_saved=max(tokens_saved, 0))
+        # Single critical section: `store_compressed` re-acquires the lock
+        # (RLock) safely.
+        with self._lock:
+            for orig, comp in zip(originals, compressed):
+                orig_content = _extract_tool_result_content(orig)
+                comp_content = _extract_tool_result_content(comp)
+                if orig_content is None or comp_content is None:
+                    continue
+                if orig_content == comp_content:
+                    # Content unchanged — mark as stable for frozen count walk
+                    self._stable_hashes.add(self.content_hash(orig_content))
+                    continue
+                h = self.content_hash(orig_content)
+                tokens_saved = len(orig_content) // 4 - len(comp_content) // 4
+                self.store_compressed(h, comp_content, tokens_saved=max(tokens_saved, 0))

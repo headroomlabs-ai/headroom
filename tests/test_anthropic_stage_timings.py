@@ -110,7 +110,14 @@ class _DummyAnthropicHandler(AnthropicHandlerMixin):
     def _extract_tags(self, headers):
         return {}
 
-    async def _retry_request(self, method: str, url: str, headers: dict, body: dict):
+    async def _retry_request(
+        self,
+        method: str,
+        url: str,
+        headers: dict,
+        body: dict,
+        **_kwargs,
+    ):
         self.captured = (method, url, headers, body)
         return _ResponseStub()
 

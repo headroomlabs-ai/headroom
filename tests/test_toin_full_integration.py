@@ -247,6 +247,9 @@ class TestTOINPersistenceAcrossInstances:
             print("\n[PASS] TOIN persistence works correctly")
 
 
+@pytest.mark.skip(
+    reason="PR-B5: get_recommendation retired; feedback-loop covered by test_toin_observation_only.py"
+)
 class TestTOINFullFeedbackLoop:
     """Test 3: Verify TOIN feedback loop with recommendations."""
 
@@ -333,6 +336,9 @@ class TestTOINFullFeedbackLoop:
             print("\n[PASS] TOIN feedback loop works correctly")
 
 
+@pytest.mark.skip(
+    reason="PR-B5: get_recommendation retired; confidence-progression validated via record + get_pattern instead"
+)
 class TestTOINProgressiveConfidence:
     """Test 4: Verify TOIN confidence increases with sample size."""
 

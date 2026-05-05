@@ -217,7 +217,10 @@ def test_streaming_buffer_and_parse_sse_helpers() -> None:
     assert buffer.get_accumulated() == b"plain"
 
     handler = StreamingCCRHandler(CCRResponseHandler(), provider="anthropic")
-    anthropic_data = b"\n".join(
+    # Per SSE spec each event is terminated by `\n\n`. The byte-buffer
+    # parser introduced in PR-A8 requires the spec terminator so partial
+    # multi-byte UTF-8 reads don't corrupt event boundaries.
+    anthropic_data = b"\n\n".join(
         [
             b'data: {"type":"content_block_start","content_block":{"type":"text","text":"Hel"}}',
             b'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"lo"}}',
@@ -226,7 +229,7 @@ def test_streaming_buffer_and_parse_sse_helpers() -> None:
             b'data: {"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{\\"hash\\":\\"abc\\"}"}}',
             b'data: {"type":"content_block_stop"}',
             b'data: {"type":"message_delta","delta":{"stop_reason":"tool_use"}}',
-            b"data: [DONE]",
+            b"data: [DONE]\n\n",
         ]
     )
     parsed = handler._parse_sse_stream(anthropic_data)

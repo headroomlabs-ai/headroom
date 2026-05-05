@@ -141,6 +141,13 @@ class _DummyOpenAIHandler(OpenAIHandlerMixin):
         self.anthropic_backend = None
         self.cost_tracker = None
         self.memory_handler = None
+        # PR-A6 wires session-sticky `OpenAI-Beta` merging into the
+        # responses HTTP handler — it reads `compute_session_id` to key
+        # the SessionBetaTracker. The routing tests don't exercise the
+        # tracker semantics themselves, so a fixed-id stub is enough.
+        self.session_tracker_store = SimpleNamespace(
+            compute_session_id=lambda *a, **k: "sess-openai-1",
+        )
         self.captured_request: tuple[str, str, dict, dict] | None = None
         self.captured_stream_request: tuple[str, dict, dict] | None = None
 
@@ -153,6 +160,13 @@ class _DummyOpenAIHandler(OpenAIHandlerMixin):
     async def _retry_request(self, method: str, url: str, headers: dict, body: dict):
         self.captured_request = (method, url, headers, body)
         return _ResponseStub()
+
+    async def _run_compression_in_executor(self, fn, *, timeout: float):
+        # Test stub for HeadroomProxy._run_compression_in_executor.
+        # The real implementation runs `fn` on a bounded thread pool with
+        # a wall-clock timeout; tests just need the callable invoked
+        # synchronously so MagicMock call_count assertions fire.
+        return fn()
 
     async def _stream_response(
         self,
@@ -232,7 +246,10 @@ def test_handle_openai_responses_routes_chatgpt_auth_to_backend_api(monkeypatch)
     assert response.status_code == 200
 
 
-def test_handle_openai_responses_stream_keeps_compression(monkeypatch):
+def test_handle_openai_responses_stream_skips_python_compression(monkeypatch):
+    """PR-C5: Python no longer compresses /v1/responses (Rust handles it
+    natively). The streaming forward path must still fire — only the
+    Python compression dispatch is retired."""
     request = _build_request(
         {
             "model": "gpt-5.4",
@@ -250,15 +267,6 @@ def test_handle_openai_responses_stream_keeps_compression(monkeypatch):
     )
     handler = _DummyOpenAIHandler()
     handler.config.optimize = True
-    handler.openai_pipeline.apply.return_value = SimpleNamespace(
-        messages=[
-            {"role": "system", "content": "Keep it short"},
-            {"role": "user", "content": "hello"},
-        ],
-        transforms_applied=[],
-        tokens_before=2,
-        tokens_after=2,
-    )
 
     monkeypatch.setattr("headroom.tokenizers.get_tokenizer", lambda model: _DummyTokenizer())
 
@@ -266,7 +274,7 @@ def test_handle_openai_responses_stream_keeps_compression(monkeypatch):
 
     assert response.status_code == 200
     assert handler.captured_stream_request is not None
-    assert handler.openai_pipeline.apply.call_count == 1
+    assert handler.openai_pipeline.apply.call_count == 0
     assert handler.captured_stream_request[2]["stream"] is True
 
 

@@ -105,11 +105,20 @@ def restore_tags(
         protected_blocks: List from :func:`protect_tags`.
 
     Returns:
-        Text with placeholders swapped back to originals. Any
-        placeholder the compressor accidentally stripped causes the
-        corresponding original to be appended on the trailing edge of
-        the output (lossy-compression incident; same fallback the
-        Python original used).
+        Text with placeholders swapped back to originals. If the
+        compressor stripped or rewrote a placeholder, the wrap is
+        **discarded** — the compressed text is returned as-is for
+        that block, and the original tag bytes are NOT re-injected
+        anywhere. This is the Hotfix-A9 behavior change vs the
+        original "append the orphan tag at the trailing edge"
+        fallback, which produced silently malformed XML (an opening
+        tag with no closing tag and no body) on production traffic.
+
+        Each lost placeholder emits a structured ERROR-level log
+        (``event=tag_protector_placeholder_lost``) so operators can
+        alert on the corruption rather than have it disappear into
+        a WARN line. Token validation downstream is responsible for
+        catching cases where the discard regressed the final output.
     """
     return cast("str", _rust_restore_tags(text, protected_blocks))
 

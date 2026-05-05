@@ -29,7 +29,6 @@ Usage:
 Pipeline Usage:
     >>> pipeline = TransformPipeline([
     ...     ContentRouter(),   # Handles all content types
-    ...     RollingWindow(),   # Final size constraint
     ... ])
 """
 
@@ -615,7 +614,6 @@ class ContentRouter(Transform):
     Pipeline Integration:
         >>> pipeline = TransformPipeline([
         ...     ContentRouter(),   # Handles ALL content types
-        ...     RollingWindow(),   # Final size constraint
         ... ])
     """
 

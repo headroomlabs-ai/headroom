@@ -111,7 +111,7 @@ def test_openai_chat_pipeline_events_cover_proxy_lifecycle(monkeypatch) -> None:
 
         monkeypatch.setattr("headroom.tokenizers.get_tokenizer", lambda model: _DummyTokenizer())
 
-        async def _fake_retry(method, url, headers, body, stream=False):  # noqa: ANN001
+        async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
             return httpx.Response(
                 200,
                 json={
@@ -176,7 +176,7 @@ def test_anthropic_messages_pipeline_events_cover_proxy_lifecycle(monkeypatch) -
 
         monkeypatch.setattr("headroom.tokenizers.get_tokenizer", lambda model: _DummyTokenizer())
 
-        async def _fake_retry(method, url, headers, body, stream=False):  # noqa: ANN001
+        async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
             return httpx.Response(
                 200,
                 json={

@@ -42,7 +42,6 @@ except ImportError:
     BaseChatMessageHistory = object  # type: ignore[misc,assignment]
 
 from headroom import HeadroomConfig
-from headroom.config import RollingWindowConfig
 from headroom.providers import OpenAIProvider
 from headroom.transforms import TransformPipeline
 
@@ -63,8 +62,9 @@ class HeadroomChatMessageHistory(BaseChatMessageHistory):
     """Wraps any LangChain chat message history with automatic compression.
 
     When conversation history exceeds the token threshold, automatically
-    applies RollingWindow compression to keep recent turns while fitting
-    within the limit.
+    applies live-zone block compression (per-block content compression on
+    the live zone, never dropping messages — that's what the live-zone
+    refactor in PR-B1+ replaces the old RollingWindow strategy with).
 
     This works with ANY memory type because it wraps at the storage layer:
     - ConversationBufferMemory
@@ -150,7 +150,7 @@ class HeadroomChatMessageHistory(BaseChatMessageHistory):
             return list(raw_messages)
 
         # Apply compression
-        compressed = self._apply_rolling_window(raw_messages)
+        compressed = self._apply_compression(raw_messages)
         tokens_after = self._count_tokens(compressed)
 
         self._compression_count += 1
@@ -207,22 +207,25 @@ class HeadroomChatMessageHistory(BaseChatMessageHistory):
             total += token_counter.count_text(content)
         return total
 
-    def _apply_rolling_window(self, messages: list[BaseMessage]) -> list[BaseMessage]:
-        """Apply RollingWindow compression to messages.
+    def _apply_compression(self, messages: list[BaseMessage]) -> list[BaseMessage]:
+        """Apply live-zone-only compression to messages.
+
+        After PR-B1, message-dropping is no longer a strategy — only
+        per-block content compression. Result may still exceed the
+        threshold; callers should treat the threshold as advisory.
 
         Args:
             messages: Messages to compress.
 
         Returns:
-            Compressed messages fitting within threshold.
+            Messages with their live-zone content compressed where
+            applicable.
         """
         # Convert to OpenAI format for Headroom transforms
         openai_messages = self._convert_to_openai(messages)
 
         # Use TransformPipeline which handles tokenizer setup
-        config = HeadroomConfig(
-            rolling_window=RollingWindowConfig(keep_last_turns=self._keep_recent_turns),
-        )
+        config = HeadroomConfig()
         pipeline = TransformPipeline(config=config, provider=self._provider)
 
         # Apply compression via pipeline

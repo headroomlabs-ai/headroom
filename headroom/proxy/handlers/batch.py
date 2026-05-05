@@ -99,6 +99,16 @@ class BatchHandlerMixin:
         headers = dict(request.headers.items())
         headers.pop("host", None)
         headers.pop("content-length", None)
+        # PR-A5 (P5-49): strip internal x-headroom-* before forwarding upstream.
+        from headroom.proxy.helpers import _strip_internal_headers, log_outbound_headers
+
+        _pre_strip_count_gb = sum(1 for k in headers if k.lower().startswith("x-headroom-"))
+        headers = _strip_internal_headers(headers)
+        log_outbound_headers(
+            forwarder="google_batch",
+            stripped_count=_pre_strip_count_gb,
+            request_id=request_id,
+        )
 
         # Track compression stats
         total_original_tokens = 0
@@ -330,6 +340,16 @@ class BatchHandlerMixin:
         headers = dict(request.headers.items())
         headers.pop("host", None)
         headers.pop("content-length", None)
+        # PR-A5 (P5-49): strip internal x-headroom-* before forwarding upstream.
+        from headroom.proxy.helpers import _strip_internal_headers, log_outbound_headers
+
+        _pre_strip_count_gpt = sum(1 for k in headers if k.lower().startswith("x-headroom-"))
+        headers = _strip_internal_headers(headers)
+        log_outbound_headers(
+            forwarder="google_batch_passthrough",
+            stripped_count=_pre_strip_count_gpt,
+            request_id=None,
+        )
 
         url = f"{self.GEMINI_API_URL}/v1beta/models/{model}:batchGenerateContent"
 
@@ -338,10 +358,44 @@ class BatchHandlerMixin:
         if api_key:
             url = f"{url}?key={api_key}"
 
+        # Byte-faithful body bytes (PR-A3, fixes P0-2). When ``body`` is
+        # None we forward the original bytes verbatim; otherwise the dict
+        # has been synthesized by Headroom and is canonically serialized.
+        from headroom.proxy.helpers import (
+            log_outbound_request,
+            prepare_outbound_body_bytes,
+            serialize_body_canonical,
+        )
+
         if body is None:
             body_content = await request.body()
+            outbound_source = "passthrough"
+            body_mutated = False
         else:
-            body_content = json.dumps(body).encode()
+            body_content = serialize_body_canonical(body)
+            outbound_source = "canonical"
+            body_mutated = True
+        log_outbound_request(
+            forwarder="google_batch_passthrough",
+            method="POST",
+            path=url,
+            body_bytes_count=len(body_content),
+            body_mutated=body_mutated,
+            mutation_reasons=["google_batch_resynthesized"] if body_mutated else [],
+            request_id=None,
+            source=outbound_source,
+        )
+        # ``prepare_outbound_body_bytes`` is consulted only for the legacy
+        # operator opt-in path so we honor the env-var override here too.
+        from headroom.proxy.helpers import get_python_forwarder_mode
+
+        if get_python_forwarder_mode() == "legacy_json_kwarg" and body is not None:
+            outbound_bytes, _ = prepare_outbound_body_bytes(
+                body=body,
+                original_body_bytes=None,
+                body_mutated=True,
+            )
+            body_content = outbound_bytes
 
         response = await self.http_client.post(  # type: ignore[union-attr]
             url,
@@ -394,6 +448,16 @@ class BatchHandlerMixin:
 
         headers = dict(request.headers.items())
         headers.pop("host", None)
+        # PR-A5 (P5-49): strip internal x-headroom-* before forwarding upstream.
+        from headroom.proxy.helpers import _strip_internal_headers, log_outbound_headers
+
+        _pre_strip_count_gp = sum(1 for k in headers if k.lower().startswith("x-headroom-"))
+        headers = _strip_internal_headers(headers)
+        log_outbound_headers(
+            forwarder="gemini_passthrough",
+            stripped_count=_pre_strip_count_gp,
+            request_id=None,
+        )
 
         # Handle API key
         api_key = headers.pop("x-goog-api-key", None)
@@ -515,6 +579,16 @@ class BatchHandlerMixin:
 
         headers = dict(request.headers.items())
         headers.pop("host", None)
+        # PR-A5 (P5-49): strip internal x-headroom-* before forwarding upstream.
+        from headroom.proxy.helpers import _strip_internal_headers, log_outbound_headers
+
+        _pre_strip_count_gbr = sum(1 for k in headers if k.lower().startswith("x-headroom-"))
+        headers = _strip_internal_headers(headers)
+        log_outbound_headers(
+            forwarder="google_batch_results",
+            stripped_count=_pre_strip_count_gbr,
+            request_id=None,
+        )
 
         # Handle API key
         api_key = headers.pop("x-goog-api-key", None)
@@ -695,6 +769,16 @@ class BatchHandlerMixin:
         headers = dict(request.headers.items())
         headers.pop("host", None)
         headers.pop("content-length", None)
+        # PR-A5 (P5-49): strip internal x-headroom-* before forwarding upstream.
+        from headroom.proxy.helpers import _strip_internal_headers, log_outbound_headers
+
+        _pre_strip_count_oacc = sum(1 for k in headers if k.lower().startswith("x-headroom-"))
+        headers = _strip_internal_headers(headers)
+        log_outbound_headers(
+            forwarder="openai_batch_chat_completions",
+            stripped_count=_pre_strip_count_oacc,
+            request_id=request_id,
+        )
 
         try:
             # Step 1: Download the input file from OpenAI
@@ -773,7 +857,35 @@ class BatchHandlerMixin:
             }
 
             url = f"{self.OPENAI_API_URL}/v1/batches"
-            response = await self.http_client.post(url, json=batch_body, headers=headers)  # type: ignore[union-attr]
+
+            # Byte-faithful re-serialization (PR-A3, fixes P0-2).
+            # batch_body is synthesized by Headroom (compressed file_id +
+            # metadata), so it is treated as mutated and goes through the
+            # canonical serializer.
+            from headroom.proxy.helpers import (
+                log_outbound_request,
+                prepare_outbound_body_bytes,
+            )
+
+            outbound_bytes, outbound_source = prepare_outbound_body_bytes(
+                body=batch_body,
+                original_body_bytes=None,
+                body_mutated=True,
+            )
+            outbound_headers = {**headers, "content-type": "application/json"}
+            log_outbound_request(
+                forwarder="batch",
+                method="POST",
+                path=url,
+                body_bytes_count=len(outbound_bytes),
+                body_mutated=True,
+                mutation_reasons=["batch_compressed_file_substitution"],
+                request_id=request_id,
+                source=outbound_source,
+            )
+            response = await self.http_client.post(  # type: ignore[union-attr]
+                url, content=outbound_bytes, headers=outbound_headers
+            )
 
             total_latency = (time.time() - start_time) * 1000
 
@@ -977,15 +1089,62 @@ class BatchHandlerMixin:
         return compressed_lines, stats
 
     async def _batch_passthrough(self, request: Request, body: dict) -> Response:
-        """Pass through batch request to OpenAI without compression."""
+        """Pass through batch request to OpenAI without compression.
+
+        Byte-faithful (PR-A3, fixes P0-2). The original request bytes are
+        preserved verbatim when no transform mutated the body.
+        """
         from fastapi.responses import Response
+
+        from headroom.proxy.helpers import (
+            _read_request_body_bytes,
+            _strip_internal_headers,
+            log_outbound_headers,
+            log_outbound_request,
+            prepare_outbound_body_bytes,
+        )
 
         headers = dict(request.headers.items())
         headers.pop("host", None)
         headers.pop("content-length", None)
+        # PR-A5 (P5-49): strip internal x-headroom-* before forwarding upstream.
+        _pre_strip_count_obp = sum(1 for k in headers if k.lower().startswith("x-headroom-"))
+        headers = _strip_internal_headers(headers)
+        log_outbound_headers(
+            forwarder="openai_batch_passthrough",
+            stripped_count=_pre_strip_count_obp,
+            request_id=None,
+        )
 
         url = f"{self.OPENAI_API_URL}/v1/batches"
-        response = await self.http_client.post(url, json=body, headers=headers)  # type: ignore[union-attr]
+
+        # Best effort: capture the original (decompressed) bytes so the
+        # passthrough is truly byte-faithful. If the body was already
+        # consumed upstream we fall through to canonical re-serialization.
+        try:
+            original_body_bytes: bytes | None = await _read_request_body_bytes(request)
+        except Exception:
+            original_body_bytes = None
+
+        outbound_bytes, outbound_source = prepare_outbound_body_bytes(
+            body=body,
+            original_body_bytes=original_body_bytes,
+            body_mutated=False,
+        )
+        outbound_headers = {**headers, "content-type": "application/json"}
+        log_outbound_request(
+            forwarder="batch_passthrough",
+            method="POST",
+            path=url,
+            body_bytes_count=len(outbound_bytes),
+            body_mutated=False,
+            mutation_reasons=[],
+            request_id=None,
+            source=outbound_source,
+        )
+        response = await self.http_client.post(  # type: ignore[union-attr]
+            url, content=outbound_bytes, headers=outbound_headers
+        )
 
         response_headers = dict(response.headers)
         response_headers.pop("content-encoding", None)

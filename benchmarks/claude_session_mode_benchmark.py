@@ -791,7 +791,6 @@ def _make_proxy(mode: str) -> HeadroomProxy:
         smart_routing=False,
         code_aware_enabled=False,
         read_lifecycle=False,
-        intelligent_context=False,
         cache_enabled=False,
         rate_limit_enabled=False,
         cost_tracking_enabled=False,

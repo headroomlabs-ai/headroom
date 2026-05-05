@@ -53,14 +53,19 @@ class StreamingMixin:
         cache_creation_input_tokens, cache_creation_ephemeral_5m_input_tokens,
         cache_creation_ephemeral_1h_input_tokens
         Returns None if no usage found in this chunk.
+
+        PR-A8 / P1-8: Decoded via the bytes-buffer SSE splitter so multi-byte
+        characters split across TCP reads do not corrupt downstream parsing.
+        Only complete events (terminated by ``\\n\\n``) are decoded; partial
+        bytes are dropped (this method is single-chunk only — the buffered
+        path is in ``_parse_sse_usage_from_buffer``).
         """
+        from headroom.proxy.helpers import parse_sse_events_from_byte_buffer
+
         try:
-            text = chunk.decode("utf-8", errors="ignore")
-            # SSE format: "data: {...}\n\n" or "event: ...\ndata: {...}\n\n"
-            for line in text.split("\n"):
-                if not line.startswith("data: "):
-                    continue
-                data_str = line[6:].strip()
+            buf = bytearray(chunk)
+            events = parse_sse_events_from_byte_buffer(buf)
+            for _event_name, data_str in events:
                 if not data_str or data_str == "[DONE]":
                     continue
 
@@ -134,79 +139,81 @@ class StreamingMixin:
     ) -> dict[str, int] | None:
         """Parse usage from buffered SSE data, handling split chunks.
 
-        Processes complete SSE events (ending with double newline) from the buffer
-        and removes them from the buffer. Incomplete events are kept in the buffer
-        for the next chunk.
+        Processes complete SSE events (terminated by ``\\n\\n``) from the
+        bytes buffer and removes them from the buffer. Incomplete events
+        are kept in the buffer for the next chunk.
+
+        PR-A8 / P1-8: ``stream_state["sse_buffer"]`` is a ``bytearray``
+        (not ``str``); event boundaries are found in bytes so a multi-byte
+        UTF-8 character split across TCP reads is preserved intact. Each
+        complete event is decoded as UTF-8 only AFTER the boundary is
+        located. Invalid UTF-8 in a *complete* event raises (operator-
+        visible diagnostic, not silent corruption).
         """
+        from headroom.proxy.helpers import parse_sse_events_from_byte_buffer
+
         buffer = stream_state["sse_buffer"]
         usage_found: dict[str, int] = {}
 
-        # Process complete SSE events (separated by double newlines)
-        while "\n\n" in buffer:
-            event_end = buffer.index("\n\n")
-            event_text = buffer[: event_end + 2]
-            buffer = buffer[event_end + 2 :]
+        # Process complete SSE events (separated by double newlines).
+        # ``parse_sse_events_from_byte_buffer`` mutates ``buffer`` in
+        # place, leaving partial-event tail bytes for the next chunk —
+        # since ``buffer`` is the same ``bytearray`` object held by
+        # ``stream_state``, no reassignment is needed.
+        events = parse_sse_events_from_byte_buffer(buffer)
+        for _event_name, data_str in events:
+            if not data_str or data_str == "[DONE]":
+                continue
 
-            # Parse this complete event
-            for line in event_text.split("\n"):
-                if not line.startswith("data: "):
-                    continue
-                data_str = line[6:].strip()
-                if not data_str or data_str == "[DONE]":
-                    continue
+            try:
+                data = json.loads(data_str)
+            except json.JSONDecodeError:
+                continue
 
-                try:
-                    data = json.loads(data_str)
-                except json.JSONDecodeError:
-                    continue
-
-                if provider == "anthropic":
-                    event_type = data.get("type", "")
-                    if event_type == "message_start":
-                        msg = data.get("message", {})
-                        msg_usage = msg.get("usage", {})
-                        if msg_usage:
-                            usage_found["input_tokens"] = msg_usage.get("input_tokens", 0)
-                            usage_found["cache_read_input_tokens"] = msg_usage.get(
-                                "cache_read_input_tokens", 0
-                            )
-                            usage_found["cache_creation_input_tokens"] = msg_usage.get(
-                                "cache_creation_input_tokens", 0
-                            )
-                            cache_write_5m, cache_write_1h = (
-                                self._extract_anthropic_cache_ttl_metrics(msg_usage)
-                            )
-                            usage_found["cache_creation_ephemeral_5m_input_tokens"] = cache_write_5m
-                            usage_found["cache_creation_ephemeral_1h_input_tokens"] = cache_write_1h
-                            logger.debug(
-                                f"[CACHE] Anthropic usage: input={usage_found.get('input_tokens')}, "
-                                f"cache_read={usage_found.get('cache_read_input_tokens')}, "
-                                f"cache_write={usage_found.get('cache_creation_input_tokens')}"
-                            )
-                    elif event_type == "message_delta":
-                        delta_usage = data.get("usage", {})
-                        if delta_usage:
-                            usage_found["output_tokens"] = delta_usage.get("output_tokens", 0)
-
-                elif provider == "openai":
-                    chunk_usage = data.get("usage")
-                    if chunk_usage:
-                        usage_found["input_tokens"] = chunk_usage.get("prompt_tokens", 0)
-                        usage_found["output_tokens"] = chunk_usage.get("completion_tokens", 0)
-                        details = chunk_usage.get("prompt_tokens_details") or {}
-                        usage_found["cache_read_input_tokens"] = details.get("cached_tokens", 0)
-
-                elif provider == "gemini":
-                    usage_meta = data.get("usageMetadata")
-                    if usage_meta:
-                        usage_found["input_tokens"] = usage_meta.get("promptTokenCount", 0)
-                        usage_found["output_tokens"] = usage_meta.get("candidatesTokenCount", 0)
-                        usage_found["cache_read_input_tokens"] = usage_meta.get(
-                            "cachedContentTokenCount", 0
+            if provider == "anthropic":
+                event_type = data.get("type", "")
+                if event_type == "message_start":
+                    msg = data.get("message", {})
+                    msg_usage = msg.get("usage", {})
+                    if msg_usage:
+                        usage_found["input_tokens"] = msg_usage.get("input_tokens", 0)
+                        usage_found["cache_read_input_tokens"] = msg_usage.get(
+                            "cache_read_input_tokens", 0
                         )
+                        usage_found["cache_creation_input_tokens"] = msg_usage.get(
+                            "cache_creation_input_tokens", 0
+                        )
+                        cache_write_5m, cache_write_1h = self._extract_anthropic_cache_ttl_metrics(
+                            msg_usage
+                        )
+                        usage_found["cache_creation_ephemeral_5m_input_tokens"] = cache_write_5m
+                        usage_found["cache_creation_ephemeral_1h_input_tokens"] = cache_write_1h
+                        logger.debug(
+                            f"[CACHE] Anthropic usage: input={usage_found.get('input_tokens')}, "
+                            f"cache_read={usage_found.get('cache_read_input_tokens')}, "
+                            f"cache_write={usage_found.get('cache_creation_input_tokens')}"
+                        )
+                elif event_type == "message_delta":
+                    delta_usage = data.get("usage", {})
+                    if delta_usage:
+                        usage_found["output_tokens"] = delta_usage.get("output_tokens", 0)
 
-        # Update buffer with remaining incomplete data
-        stream_state["sse_buffer"] = buffer
+            elif provider == "openai":
+                chunk_usage = data.get("usage")
+                if chunk_usage:
+                    usage_found["input_tokens"] = chunk_usage.get("prompt_tokens", 0)
+                    usage_found["output_tokens"] = chunk_usage.get("completion_tokens", 0)
+                    details = chunk_usage.get("prompt_tokens_details") or {}
+                    usage_found["cache_read_input_tokens"] = details.get("cached_tokens", 0)
+
+            elif provider == "gemini":
+                usage_meta = data.get("usageMetadata")
+                if usage_meta:
+                    usage_found["input_tokens"] = usage_meta.get("promptTokenCount", 0)
+                    usage_found["output_tokens"] = usage_meta.get("candidatesTokenCount", 0)
+                    usage_found["cache_read_input_tokens"] = usage_meta.get(
+                        "cachedContentTokenCount", 0
+                    )
 
         return usage_found if usage_found else None
 
@@ -214,16 +221,28 @@ class StreamingMixin:
         """Parse SSE data to reconstruct the API response JSON.
 
         Args:
-            sse_data: Raw SSE data string.
+            sse_data: Raw SSE data string. Must already be UTF-8 decoded
+                from a complete-events bytes buffer (see
+                ``parse_sse_events_from_byte_buffer``).
             provider: Provider type for parsing.
 
         Returns:
             Reconstructed response dict or None if parsing fails.
+
+        PR-A8 / P1-9: handles all Anthropic delta types per guide §5.1:
+        ``text_delta``, ``input_json_delta``, ``thinking_delta``,
+        ``signature_delta``, ``citations_delta``. Also preserves
+        ``redacted_thinking.data`` and accumulates citations as a list.
         """
         if provider != "anthropic":
             return None  # Only implemented for Anthropic
 
         response: dict[str, Any] = {"content": [], "usage": {}}
+        # Track blocks by their `index` field so out-of-order events
+        # don't corrupt the reconstruction. The current block pointer
+        # remains for backward-compat with code that walks this dict
+        # sequentially, but the index map is the source of truth.
+        blocks_by_index: dict[int, dict[str, Any]] = {}
         current_block: dict[str, Any] | None = None
 
         for line in sse_data.split("\n"):
@@ -251,41 +270,92 @@ class StreamingMixin:
 
             elif event_type == "content_block_start":
                 block = data.get("content_block", {})
+                block_index = data.get("index", len(response["content"]))
+                btype = block.get("type")
                 current_block = {
-                    "type": block.get("type"),
-                    "index": data.get("index", len(response["content"])),
+                    "type": btype,
+                    "index": block_index,
                 }
-                if block.get("type") == "text":
+                if btype == "text":
                     current_block["text"] = block.get("text", "")
-                elif block.get("type") == "tool_use":
+                elif btype == "tool_use":
                     current_block["id"] = block.get("id")
                     current_block["name"] = block.get("name")
                     current_block["input"] = {}
+                elif btype == "thinking":
+                    # Thinking block — accumulate text via
+                    # `thinking_delta`; signature arrives via
+                    # `signature_delta` (single value, not accumulated).
+                    current_block["thinking_buffer"] = block.get("thinking", "")
+                    if "signature" in block:
+                        current_block["signature"] = block["signature"]
+                elif btype == "redacted_thinking":
+                    # Per Anthropic spec §2.7: opaque encrypted reasoning
+                    # block. The `data` field is preserved as-is and
+                    # MUST be replayed unchanged on the next turn for
+                    # signature validation to pass.
+                    if "data" in block:
+                        current_block["data"] = block["data"]
+                blocks_by_index[block_index] = current_block
 
             elif event_type == "content_block_delta":
-                if current_block:
+                # Resolve the target block by index (preferred) or fall
+                # back to current_block for legacy linear streams.
+                idx = data.get("index")
+                target = (blocks_by_index.get(idx) if idx is not None else None) or current_block
+                if target is not None:
                     delta = data.get("delta", {})
-                    if delta.get("type") == "text_delta":
-                        current_block["text"] = current_block.get("text", "") + delta.get(
-                            "text", ""
-                        )
-                    elif delta.get("type") == "input_json_delta":
-                        # Accumulate partial JSON for tool input
+                    dtype = delta.get("type")
+                    if dtype == "text_delta":
+                        target["text"] = target.get("text", "") + delta.get("text", "")
+                    elif dtype == "input_json_delta":
+                        # Accumulate partial JSON for tool input.
                         partial = delta.get("partial_json", "")
-                        current_block["_partial_json"] = (
-                            current_block.get("_partial_json", "") + partial
+                        target["_partial_json"] = target.get("_partial_json", "") + partial
+                    elif dtype == "thinking_delta":
+                        # Accumulate thinking text into the dedicated
+                        # buffer so it never collides with `text` on
+                        # text blocks (separate field per guide §2.7).
+                        target["thinking_buffer"] = target.get("thinking_buffer", "") + delta.get(
+                            "thinking", ""
                         )
+                    elif dtype == "signature_delta":
+                        # Single value, not accumulated. Last-write
+                        # wins per Anthropic spec.
+                        if "signature" in delta:
+                            target["signature"] = delta["signature"]
+                    elif dtype == "citations_delta":
+                        # Append the citation object to the citations
+                        # list so multi-citation blocks reconstruct
+                        # correctly. Per guide §2.5: each delta carries
+                        # one full citation object under `citation`.
+                        citations = target.setdefault("citations", [])
+                        citation = delta.get("citation")
+                        if citation is not None:
+                            citations.append(citation)
 
             elif event_type == "content_block_stop":
-                if current_block:
-                    # Parse accumulated JSON for tool_use blocks
-                    if current_block.get("type") == "tool_use" and "_partial_json" in current_block:
+                idx = data.get("index")
+                target = (blocks_by_index.get(idx) if idx is not None else None) or current_block
+                if target is not None:
+                    # Parse accumulated JSON for tool_use blocks.
+                    if target.get("type") == "tool_use" and "_partial_json" in target:
                         try:
-                            current_block["input"] = json.loads(current_block["_partial_json"])
+                            target["input"] = json.loads(target["_partial_json"])
                         except json.JSONDecodeError:
-                            current_block["input"] = {}
-                        del current_block["_partial_json"]
-                    response["content"].append(current_block)
+                            target["input"] = {}
+                        del target["_partial_json"]
+                    # Materialize the thinking buffer into the
+                    # canonical `thinking` field expected by the
+                    # Anthropic API.
+                    if target.get("type") == "thinking" and "thinking_buffer" in target:
+                        target["thinking"] = target.pop("thinking_buffer")
+                    # Append the block exactly once. `current_block`
+                    # may not match the indexed target if the stream
+                    # interleaved multiple blocks; index-keyed map is
+                    # authoritative.
+                    if target not in response["content"]:
+                        response["content"].append(target)
                     current_block = None
 
             elif event_type == "message_delta":
@@ -598,6 +668,10 @@ class StreamingMixin:
         pipeline_timing: dict[str, float] | None = None,
         prefix_tracker: Any | None = None,
         original_messages: list[dict] | None = None,
+        *,
+        original_body_bytes: bytes | None = None,
+        body_mutated: bool = True,
+        mutation_reasons: list[str] | None = None,
     ) -> Response | StreamingResponse:
         """Stream response with metrics tracking and memory tool handling.
 
@@ -617,6 +691,32 @@ class StreamingMixin:
         headers = await apply_copilot_api_auth(headers, url=url)
         start_time = time.time()
 
+        # Byte-faithful forwarding (PR-A3, fixes P0-2). Resolve outbound
+        # bytes once before entering the connection-retry loop. When a
+        # transform mutated the body we re-serialize canonically; otherwise
+        # we forward the original client bytes verbatim.
+        from headroom.proxy.helpers import (
+            log_outbound_request,
+            prepare_outbound_body_bytes,
+        )
+
+        outbound_bytes, outbound_source = prepare_outbound_body_bytes(
+            body=body,
+            original_body_bytes=original_body_bytes,
+            body_mutated=body_mutated,
+        )
+        outbound_headers = {**headers, "content-type": "application/json"}
+        log_outbound_request(
+            forwarder="streaming",
+            method="POST",
+            path=url,
+            body_bytes_count=len(outbound_bytes),
+            body_mutated=body_mutated,
+            mutation_reasons=list(mutation_reasons or []),
+            request_id=request_id,
+            source=outbound_source,
+        )
+
         # Mutable state for the generator to update
         stream_state: dict[str, Any] = {
             "input_tokens": None,
@@ -626,7 +726,12 @@ class StreamingMixin:
             "cache_creation_ephemeral_5m_input_tokens": 0,
             "cache_creation_ephemeral_1h_input_tokens": 0,
             "total_bytes": 0,
-            "sse_buffer": "",  # Buffer for incomplete SSE events
+            # Buffer for incomplete SSE events (bytes, per PR-A8 / P1-8).
+            # We split events on the ``\n\n`` byte sequence and decode
+            # each complete event as UTF-8 only after the boundary is
+            # found, so multi-byte characters split across TCP reads do
+            # not corrupt downstream parsing.
+            "sse_buffer": bytearray(),
             "ttfb_ms": None,  # Time to first byte from upstream
         }
 
@@ -648,7 +753,7 @@ class StreamingMixin:
             for attempt in range(retry_attempts):
                 try:
                     _upstream_req = self.http_client.build_request(
-                        "POST", url, json=body, headers=headers
+                        "POST", url, content=outbound_bytes, headers=outbound_headers
                     )
                     upstream_response = await self.http_client.send(_upstream_req, stream=True)
                     break
@@ -756,7 +861,12 @@ class StreamingMixin:
 
             # For memory mode, we buffer the response to check for tool calls
             buffered_chunks: list[bytes] = []
-            full_sse_data = ""
+            # Bytes-level mirror of the SSE stream for memory/prefix
+            # tracking. PR-A8 / P1-8: keep this as bytes too — we
+            # decode only after a complete `\n\n`-terminated event has
+            # been collected, so split UTF-8 bytes never produce
+            # corrupted strings.
+            full_sse_bytes = bytearray()
             parsed_response = None  # Set by memory block; used by CCR + prefix tracker
 
             try:
@@ -768,20 +878,23 @@ class StreamingMixin:
 
                         stream_state["total_bytes"] += len(chunk)
 
-                        # Buffer SSE data to handle chunks split across calls
-                        chunk_str = chunk.decode("utf-8", errors="ignore")
-                        stream_state["sse_buffer"] += chunk_str
+                        # PR-A8 / P1-8: append bytes verbatim. The
+                        # buffer is a ``bytearray`` and event boundaries
+                        # are located in bytes; decoding happens per
+                        # complete event in the SSE splitter helper.
+                        stream_state["sse_buffer"].extend(chunk)
 
-                        # Safety: prevent unbounded buffer growth
+                        # Safety: prevent unbounded buffer growth.
                         if len(stream_state["sse_buffer"]) > MAX_SSE_BUFFER_SIZE:
                             logger.error(
                                 "SSE buffer exceeded maximum size (%d bytes), "
                                 "truncating to prevent memory exhaustion",
                                 MAX_SSE_BUFFER_SIZE,
                             )
-                            stream_state["sse_buffer"] = stream_state["sse_buffer"][
-                                -MAX_SSE_BUFFER_SIZE // 2 :
-                            ]
+                            # Keep the most recent half so an in-flight
+                            # event is more likely to survive.
+                            tail = bytes(stream_state["sse_buffer"][-MAX_SSE_BUFFER_SIZE // 2 :])
+                            stream_state["sse_buffer"] = bytearray(tail)
 
                         # Always stream immediately — buffering breaks
                         # real-time clients (LangGraph, LangChain, etc.)
@@ -794,8 +907,8 @@ class StreamingMixin:
                         if _track_sse:
                             if memory_enabled:
                                 buffered_chunks.append(chunk)
-                            full_sse_data += chunk_str
-                            if len(full_sse_data) > MAX_SSE_BUFFER_SIZE:
+                            full_sse_bytes.extend(chunk)
+                            if len(full_sse_bytes) > MAX_SSE_BUFFER_SIZE:
                                 logger.warning(
                                     "Memory-mode SSE buffer exceeded maximum size, "
                                     "disabling memory detection for this request"
@@ -829,6 +942,14 @@ class StreamingMixin:
                 # Memory tool handling after stream completes
                 # Chunks were already yielded in real-time above, so we only
                 # do silent background processing here — no yielding.
+                #
+                # PR-A8 / P1-8: full_sse_bytes accumulated as bytes; we
+                # decode here in one shot now that the stream is
+                # complete (the entire payload is a closed sequence of
+                # complete events). Invalid UTF-8 at this point would
+                # be an upstream protocol violation — surface loudly.
+                full_sse_data: str = full_sse_bytes.decode("utf-8") if full_sse_bytes else ""
+
                 if memory_enabled and full_sse_data:
                     # Check for Claude Code credential error
                     if "only authorized for use with Claude Code" in full_sse_data:
@@ -897,6 +1018,27 @@ class StreamingMixin:
                 }
                 yield f"event: error\ndata: {json.dumps(error_event)}\n\n".encode()
             finally:
+                # PR-A8 / P1-8: best-effort decode for downstream
+                # finalization. This runs in `finally` so it must not
+                # raise — if the upstream sent invalid bytes mid-stream
+                # we surface them as `errors="strict"` would in the
+                # success path above, but here we accept the
+                # diagnostic-grade fallback so the finalization log
+                # line still emits.
+                try:
+                    _final_full_sse_data: str = (
+                        full_sse_bytes.decode("utf-8") if full_sse_bytes else ""
+                    )
+                except UnicodeDecodeError:
+                    logger.warning(
+                        f"[{request_id}] Final SSE buffer contained invalid UTF-8; "
+                        "downstream finalization will see only the well-formed prefix."
+                    )
+                    # Find the longest valid UTF-8 prefix via the
+                    # incremental decoder; the lossy decoder kwargs
+                    # are forbidden in this module per PR-A8 / P1-8.
+                    decoder = __import__("codecs").getincrementaldecoder("utf-8")()
+                    _final_full_sse_data = decoder.decode(bytes(full_sse_bytes), final=False)
                 await self._finalize_stream_response(
                     body=body,
                     provider=provider,
@@ -913,7 +1055,7 @@ class StreamingMixin:
                     pipeline_timing=pipeline_timing,
                     prefix_tracker=prefix_tracker,
                     original_messages=original_messages,
-                    full_sse_data=full_sse_data,
+                    full_sse_data=_final_full_sse_data,
                     parsed_response=parsed_response,
                 )
 

@@ -1,0 +1,34 @@
+# GitGuardian configuration — secret-detection allowlist
+#
+# Two entries below are test fixtures, NOT real credentials. They live in
+# tests that exercise our own detectors (volatile-content scanner, auth-mode
+# classifier) — by definition we have to embed plausible-looking tokens to
+# verify the detectors recognise them. The strings are syntactically valid
+# but carry no privilege against any real service.
+#
+# Anything else GitGuardian flags should be treated as a real incident: do
+# NOT extend this allowlist without verifying the secret is unauthenticated
+# fixture data, and rotate any genuine leaks before adding the row.
+
+version: 2
+
+secret:
+  ignored-matches:
+    # Canonical fake JWT used across the JS/Python ecosystem to demonstrate
+    # JWT-shaped strings. Header `{"alg":"HS256"}`, payload `{"sub":"1"}`.
+    # We use it to verify our `detect_volatile_content` recogniser flags JWTs.
+    # File: tests/test_cache_aligner_detector_only.py
+    - name: "fake JWT in volatile-content detector test"
+      match: "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+
+    # Anthropic-shaped strings whose payloads literally contain the word
+    # "fixture" — used in `test_realignment_live_multi_turn` to assert the
+    # auth-mode classifier routes PAYG / OAuth / subscription headers
+    # correctly. No live API call is ever made with these tokens.
+    # File: tests/test_realignment_live_multi_turn.py
+    - name: "Anthropic-shaped fixture token (PAYG via x-api-key)"
+      match: "sk-ant-api03-payg-fixture"
+    - name: "Anthropic-shaped fixture token (OAuth bearer)"
+      match: "sk-ant-oat01-oauth-fixture"
+    - name: "Anthropic-shaped fixture token (PAYG via bearer)"
+      match: "sk-ant-api03-payg-bearer-fixture"

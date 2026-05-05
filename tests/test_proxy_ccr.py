@@ -567,8 +567,12 @@ class TestEndToEndTOINIntegration:
         store = get_compression_store()
         store.process_pending_feedback()
 
-        # Verify TOIN learned field semantics
-        pattern = fresh_toin._patterns.get(signature.structure_hash)
+        # PR-B5: pattern key is now `(auth_mode, model_family, sig_hash)`.
+        # Callers that don't supply auth/model land on the
+        # `("unknown", "unknown", sig_hash)` slot.
+        from headroom.telemetry.toin import _make_pattern_key
+
+        pattern = fresh_toin._patterns.get(_make_pattern_key(None, None, signature.structure_hash))
         assert pattern is not None, "Pattern should exist after compression and retrieval"
 
         # CRITICAL ASSERTION: This catches the bug where compression_store
@@ -641,7 +645,12 @@ class TestEndToEndTOINIntegration:
         store.process_pending_feedback()
 
         # Step 3: Verify TOIN learned
-        pattern = fresh_toin._patterns.get(signature.structure_hash)
+        # PR-B5: pattern key is now `(auth_mode, model_family, sig_hash)`.
+        # Callers that don't supply auth/model land on the
+        # `("unknown", "unknown", sig_hash)` slot.
+        from headroom.telemetry.toin import _make_pattern_key
+
+        pattern = fresh_toin._patterns.get(_make_pattern_key(None, None, signature.structure_hash))
         assert pattern is not None, "Pattern should exist"
         assert pattern.total_compressions >= 1, "Should have compression count"
         assert pattern.total_retrievals >= 1, "Should have retrieval count"
@@ -653,6 +662,10 @@ class TestEndToEndTOINIntegration:
             "the production feedback loop is broken."
         )
 
-        # Step 5: Get recommendation (verifies learning is usable)
-        recommendation = fresh_toin.get_recommendation(signature, "find category")
-        assert recommendation.confidence >= 0, "Recommendation should have confidence"
+        # Step 5: PR-B5 retired the request-time recommendation API in favor of
+        # observation-only learning + startup-published recommendations.toml.
+        # `get_recommendation()` now returns None and emits a deprecation
+        # warning; the dispatcher consumes published advice via the Rust
+        # `RecommendationStore`. Assert the deprecation contract here so a
+        # future revival of the API doesn't slip past silently.
+        assert fresh_toin.get_recommendation(signature, "find category") is None

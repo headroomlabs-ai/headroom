@@ -91,6 +91,36 @@ curl -si http://127.0.0.1:8787/v1/models
 | `--rewrite-host` / `--no-rewrite-host` | | rewrite | rewrite Host to upstream (default) |
 | `--graceful-shutdown-timeout` | | `30s` | wait for in-flight on SIGTERM/SIGINT |
 
+### Picking the next port: invocation telemetry
+
+Before porting another Python compressor to Rust, check what's actually
+running. The Python proxy already exposes per-transform telemetry on
+`/stats` (`headroom.proxy.prometheus_metrics`):
+
+```bash
+# Top compressors by invocation count (last process lifetime)
+curl -s http://127.0.0.1:8788/stats | jq '.compressions_by_strategy'
+# {
+#   "intelligent_context": 12453,
+#   "smart_crusher": 487,
+#   "search":         312,
+#   "diff":            28,
+#   "code":             0,        # ← never fires; safe to defer porting
+#   ...
+# }
+
+# Per-transform timing (avg/max/count by transform name)
+curl -s http://127.0.0.1:8788/stats | jq '.pipeline_timing'
+
+# Token savings attributable to each strategy
+curl -s http://127.0.0.1:8788/stats | jq '.tokens_saved_by_strategy'
+```
+
+This is the data the audit-cleanup PR (2026-04-30) recommended for
+prioritizing the next Python → Rust port. Strategies with zero or
+near-zero invocations are deferral candidates; strategies on the hot
+path are porting candidates regardless of LOC count.
+
 ### Reserved paths
 
 `/healthz` and `/healthz/upstream` are intercepted by the Rust proxy and
@@ -255,3 +285,73 @@ doesn't rediscover them.
 - **`rust-toolchain.toml`** pins `channel = "stable"` rather than a specific
   version so CI picks up the same toolchain the local box uses. Tighten to a
   pinned version (e.g. `1.78`) once the port stabilizes.
+
+## Multi-worker deployment — CCR fragmentation
+
+**Status:** PR-B7 (`REALIGNMENT/04-phase-B-live-zone.md`) introduced two
+persistent CCR backends. The single-`--workers` recommendation no longer
+applies once you select a persistent backend.
+
+### Backend selection
+
+`crates/headroom-core/src/ccr/backends/` ships three implementations of
+the `CcrStore` trait:
+
+| Backend                | When to use                                 | Persistence | Multi-worker safe          |
+| ---------------------- | ------------------------------------------- | ----------- | -------------------------- |
+| `InMemoryCcrStore`     | Tests, single-worker prototyping            | No          | No                         |
+| `SqliteCcrStore` (default) | Single-instance prod / single-host fleet | Yes (file)  | Yes (sticky session)       |
+| `RedisCcrStore` (opt-in)   | Multi-host / horizontally-scaled prod     | Yes (Redis) | Yes (no stickiness needed) |
+
+`backends::from_config` picks one at startup from the operator's
+`CcrBackendConfig`. **Init failures surface to the caller**
+(`feedback_no_silent_fallbacks.md`) — a misconfigured DB path or
+unreachable Redis URL aborts startup rather than silently degrading to
+in-memory.
+
+### When does what work?
+
+- **`SqliteCcrStore`** is the default for new deploys. The DB file lives
+  on the local disk; multiple workers on the **same host** share it via
+  SQLite's WAL-mode locking, so `--workers N` works as long as a sticky
+  load balancer routes each session to the same host. Survives proxy
+  restarts: a new worker that opens the same DB file recovers every
+  in-flight `<<ccr:HASH>>` marker.
+- **`RedisCcrStore`** (cfg-gated behind the `redis` feature) is the
+  drop-in for **horizontally-scaled** deployments. Every worker on
+  every host hits the same Redis instance; no sticky session is
+  required at any layer of the LB. Enable with `--features redis` in
+  the proxy crate's Cargo build.
+- **`InMemoryCcrStore`** is fine for tests and single-worker
+  development. Production deployments using it lose every
+  `<<ccr:HASH>>` marker on restart and fragment across workers — keep
+  it confined to local boxes.
+
+### What goes wrong with the in-memory backend on `--workers N > 1`
+
+(Historical context — applies only when the operator explicitly
+chooses `CcrBackendConfig::InMemory`.) Each uvicorn worker is a
+separate Python process. Each process holds its own copies of:
+
+1. **`InMemoryCcrStore`** — sharded `DashMap` mapping
+   `hash → original_content` for content the compressor replaced with
+   `<<ccr:HASH>>` markers.
+2. **`HeadroomProxy._compression_caches`** (`headroom/proxy/server.py:367`)
+   — per-session `CompressionCache` dict.
+3. **`HeadroomProxy.session_tracker_store`** — per-session prefix-tracker
+   state derived from Anthropic's `cache_read_input_tokens` responses.
+4. **TOIN learner state** — pattern statistics used to bias the compressor.
+
+When uvicorn round-robins requests across workers, a session whose
+turn-1 landed on worker A may have turn-2 land on worker B. Worker B has
+zero knowledge of what worker A did, the `<<ccr:HASH>>` marker resolves
+to `None`, and the model sees an opaque directive it can't act on.
+Switching to `SqliteCcrStore` (default) or `RedisCcrStore` resolves the
+fragmentation directly.
+
+### Detecting it in the wild
+
+The proxy emits a `WARNING`-level log line on startup if the configured
+backend is `InMemoryCcrStore` AND `WEB_CONCURRENCY` / uvicorn
+`--workers` is > 1, pointing operators at this section. The other two
+backends never warn — they're the supported multi-worker paths.

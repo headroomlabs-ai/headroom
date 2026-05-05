@@ -24,10 +24,9 @@ Usage:
 Available Suites:
     all         - Run all benchmark suites (transforms + relevance)
     latency     - Compression overhead & cost-benefit analysis (standalone)
-    transforms  - SmartCrusher, CacheAligner, RollingWindow
+    transforms  - SmartCrusher, CacheAligner
     relevance   - BM25Scorer, HybridScorer
     crusher     - SmartCrusher only
-    window      - RollingWindow only
     pipeline    - Full transform pipeline
 """
 
@@ -59,9 +58,6 @@ BENCHMARK_SUITES = {
     ],
     "aligner": [
         "benchmarks/bench_transforms.py::TestCacheAlignerBenchmarks",
-    ],
-    "window": [
-        "benchmarks/bench_transforms.py::TestRollingWindowBenchmarks",
     ],
     "pipeline": [
         "benchmarks/bench_transforms.py::TestTransformPipelineBenchmarks",
@@ -257,8 +253,6 @@ def generate_markdown_report(
     lines.append("| SmartCrusher (1000 items) | < 10ms | Large tool output |")
     lines.append("| SmartCrusher (10000 items) | < 100ms | Stress test |")
     lines.append("| CacheAligner | < 1ms | Date extraction + hash |")
-    lines.append("| RollingWindow (50 turns) | < 5ms | Long conversation |")
-    lines.append("| RollingWindow (200 turns) | < 20ms | Stress test |")
     lines.append("| BM25Scorer (batch 100) | < 1ms | Zero dependencies |")
     lines.append("| HybridScorer (batch 100) | < 50ms | With embeddings |")
     lines.append("")

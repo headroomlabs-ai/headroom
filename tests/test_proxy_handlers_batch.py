@@ -96,7 +96,7 @@ class DummyBatchHandler(batch_module.BatchHandlerMixin):
     async def handle_passthrough(self, request, base_url):  # noqa: ANN001, ANN201
         return {"request": request, "base_url": base_url}
 
-    async def _retry_request(self, method, url, headers, body):  # noqa: ANN001, ANN201
+    async def _retry_request(self, method, url, headers, body, **kwargs):  # noqa: ANN001, ANN201
         return self._retry_response
 
     def _gemini_contents_to_messages(self, contents, system_instruction):  # noqa: ANN001, ANN201
@@ -413,7 +413,13 @@ async def test_handle_batch_create_handles_empty_upload_failure_and_success(
     assert success_headers["x-headroom-tokens-saved"] == "10"
     assert success_headers["x-headroom-savings-percent"] == "50.0"
     assert success_headers["x-openai"] == "1"
-    sent_body = handler.http_client.posts[-1]["json"]
+    # PR-A3: byte-faithful forwarder writes ``content`` (raw bytes), not
+    # ``json``. Round-trip the captured bytes back to a dict for assertion.
+    last_post = handler.http_client.posts[-1]
+    if "json" in last_post:
+        sent_body = last_post["json"]
+    else:
+        sent_body = json.loads(last_post["content"].decode("utf-8"))
     assert sent_body["metadata"]["headroom_compressed"] == "true"
     assert sent_body["metadata"]["headroom_original_file_id"] == "file-1"
     assert handler.metrics.record_calls[-1]["provider"] == "openai"
@@ -772,7 +778,7 @@ async def test_handle_google_batch_create_success_and_failure_paths(
     async def fake_store(batch_name, requests_list, model, api_key):  # noqa: ANN001
         stored.append((batch_name, requests_list, model, api_key))
 
-    async def fake_retry(method, url, headers, body):  # noqa: ANN001
+    async def fake_retry(method, url, headers, body, **kwargs):  # noqa: ANN001
         return FakeResponse(
             status_code=200,
             content=b'{"name":"batches/123"}',
@@ -815,7 +821,7 @@ async def test_handle_google_batch_create_success_and_failure_paths(
     assert stored[0][2:] == ("gemini-pro", "secret")
     assert stored[0][1][0]["metadata"] == {"key": "req-1"}
 
-    async def broken_retry(method, url, headers, body):  # noqa: ANN001
+    async def broken_retry(method, url, headers, body, **kwargs):  # noqa: ANN001
         raise RuntimeError("forward failed")
 
     monkeypatch.setattr(handler, "_retry_request", broken_retry)
@@ -884,7 +890,7 @@ async def test_handle_google_batch_create_covers_passthrough_revert_and_store_fa
 
     seen_bodies: list[dict[str, object]] = []
 
-    async def retry(method, url, headers, body):  # noqa: ANN001
+    async def retry(method, url, headers, body, **kwargs):  # noqa: ANN001
         seen_bodies.append(body)
         return FakeResponse(status_code=200, content=b"{}", json_data={"name": "batches/123"})
 

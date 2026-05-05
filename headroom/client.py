@@ -283,9 +283,9 @@ class HeadroomClient:
                 enable_cache_optimizer=True, auto-detects from provider.
             enable_cache_optimizer: Enable provider-specific cache optimization.
             enable_semantic_cache: Enable query-level semantic caching.
-            config: Optional HeadroomConfig for full control over all settings
-                including intelligent_context. When provided, takes precedence
-                over individual settings like store_url, default_mode, etc.
+            config: Optional HeadroomConfig for full control over all settings.
+                When provided, takes precedence over individual settings like
+                store_url, default_mode, etc.
         """
         self._original = original_client
         self._provider = provider
@@ -444,9 +444,7 @@ class HeadroomClient:
 
         # Apply transforms if in optimize mode
         if mode == HeadroomMode.OPTIMIZE:
-            output_buffer = (
-                headroom_output_buffer_tokens or self._config.rolling_window.output_buffer_tokens
-            )
+            output_buffer = headroom_output_buffer_tokens or self._config.output_buffer_tokens
             model_limit = self._get_context_limit(model)
 
             result = self._pipeline.apply(
@@ -774,9 +772,7 @@ class HeadroomClient:
         compute_prefix_hash(messages)
 
         # Apply transforms
-        output_buffer = (
-            headroom_output_buffer_tokens or self._config.rolling_window.output_buffer_tokens
-        )
+        output_buffer = headroom_output_buffer_tokens or self._config.output_buffer_tokens
         model_limit = self._get_context_limit(model)
 
         result = self._pipeline.simulate(
@@ -986,7 +982,6 @@ class HeadroomClient:
                 },
                 "transforms": {
                     "smart_crusher_enabled": bool,
-                    "rolling_window_enabled": bool,
                     "cache_aligner_enabled": bool,
                 },
             }
@@ -1015,7 +1010,6 @@ class HeadroomClient:
             },
             "transforms": {
                 "smart_crusher_enabled": self._config.smart_crusher.enabled,
-                "rolling_window_enabled": self._config.rolling_window.enabled,
                 "cache_aligner_enabled": self._config.cache_aligner.enabled,
             },
         }

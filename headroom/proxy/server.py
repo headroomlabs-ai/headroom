@@ -4,7 +4,7 @@ A full-featured LLM proxy with optimization, caching, rate limiting,
 and observability.
 
 Features:
-- Context optimization (SmartCrusher, CacheAligner, RollingWindow)
+- Context optimization (SmartCrusher, CacheAligner — live-zone-only after Phase B)
 - Semantic caching (save costs on repeated queries)
 - Rate limiting (token bucket)
 - Retry with exponential backoff
@@ -25,11 +25,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import concurrent.futures
 import contextlib
 import json
 import logging
 import os
 import sys
+import threading
 import time
 from dataclasses import fields, is_dataclass
 from datetime import datetime, timezone
@@ -73,9 +75,7 @@ from headroom.ccr import (
 from headroom.config import (
     CacheAlignerConfig,
     CCRConfig,
-    IntelligentContextConfig,
     ReadLifecycleConfig,
-    RollingWindowConfig,
     SmartCrusherConfig,
 )
 from headroom.dashboard import get_dashboard_html
@@ -157,10 +157,7 @@ from headroom.transforms import (
     CodeCompressorConfig,
     ContentRouter,
     ContentRouterConfig,
-    IntelligentContextManager,
-    RollingWindow,
     SmartCrusher,
-    Transform,
     TransformPipeline,
     is_tree_sitter_available,
 )
@@ -188,6 +185,93 @@ logging.basicConfig(
 logger = logging.getLogger("headroom.proxy")
 
 _MULTI_WORKER_CONFIG_ENV = "HEADROOM_PROXY_CONFIG_JSON"
+
+# Env var that opts out of the Rust core deployment smoke test (Hotfix-A0).
+# Default behavior: hard-fail at startup if `headroom._core` is unimportable
+# (Finding #2 in HEADROOM_PROXY_LOG_FINDINGS_2026_05_03.md — production
+# deployment was silently running without the Rust extension and degrading
+# every compressed request to a Python-only path or a no-op).
+#
+# Set to the literal string "false" to start the proxy in degraded
+# Python-only mode. Any other value (including unset) keeps the
+# fail-loud behavior.
+_RUST_CORE_REQUIRED_ENV = "HEADROOM_REQUIRE_RUST_CORE"
+
+# sysexits.h(3) — EX_CONFIG. Process supervisors (systemd, k8s, docker)
+# treat this as a deliberate configuration failure rather than a crash, so
+# they won't restart-loop on a broken deployment.
+_EXIT_CONFIG = 78
+
+
+def _check_rust_core() -> tuple[str, str | None]:
+    """Verify the Rust extension `headroom._core` is loadable at startup.
+
+    Returns a `(status, error)` tuple:
+      - ``("loaded", None)``     — `headroom._core.hello()` returned the
+        expected sentinel.
+      - ``("disabled", reason)`` — opt-out env var was set; proxy starts
+        in Python-only degraded mode. `reason` carries the underlying
+        import error (or ``None`` if the import actually succeeded).
+      - ``("missing", reason)``  — never returned: this branch calls
+        ``sys.exit(78)`` so the proxy refuses to start. The branch exists
+        only as a typed sentinel for callers that want to reason about
+        all three states (e.g. health endpoints).
+
+    Behavior is gated by the ``HEADROOM_REQUIRE_RUST_CORE`` env var:
+    any value other than ``"false"`` (case-insensitive) keeps the
+    fail-loud default.
+    """
+    require = os.environ.get(_RUST_CORE_REQUIRED_ENV, "true").strip().lower() != "false"
+    try:
+        from headroom._core import hello as _rust_hello
+
+        marker = _rust_hello()
+    except Exception as exc:  # ImportError, but also any init-time PyO3 failure
+        reason = f"{type(exc).__name__}: {exc}"
+        if not require:
+            logger.warning(
+                "event=rust_core_disabled reason=%r opt_out_env=%s=false mode=python_only_degraded",
+                reason,
+                _RUST_CORE_REQUIRED_ENV,
+            )
+            return ("disabled", reason)
+        # Fail loud. Print to stderr in addition to logging so operators
+        # see it even if the logging handler is mis-configured.
+        msg = (
+            f"FATAL: Rust extension `headroom._core` not loadable.\n"
+            f"    error: {reason}\n"
+            f"    fix:   `make build-wheel && pip install --force-reinstall "
+            f"target/wheels/headroom_*.whl`\n"
+            f"    opt-out: set {_RUST_CORE_REQUIRED_ENV}=false to start in "
+            f"degraded Python-only mode\n"
+        )
+        logger.error("event=rust_core_missing reason=%r action=exit_78", reason)
+        print(msg, file=sys.stderr, flush=True)
+        sys.exit(_EXIT_CONFIG)
+
+    # Import succeeded; sanity-check the marker so we catch a stale or
+    # mis-linked .so where the symbol name resolves but returns garbage.
+    if marker != "headroom-core":
+        reason = f"unexpected marker {marker!r}"
+        if not require:
+            logger.warning(
+                "event=rust_core_disabled reason=%r opt_out_env=%s=false",
+                reason,
+                _RUST_CORE_REQUIRED_ENV,
+            )
+            return ("disabled", reason)
+        msg = (
+            f"FATAL: Rust extension `headroom._core` is loaded but the "
+            f"marker function returned {marker!r}; expected 'headroom-core'.\n"
+            f"    fix:   rebuild: `make build-wheel && pip install "
+            f"--force-reinstall target/wheels/headroom_*.whl`\n"
+        )
+        logger.error("event=rust_core_marker_mismatch marker=%r action=exit_78", marker)
+        print(msg, file=sys.stderr, flush=True)
+        sys.exit(_EXIT_CONFIG)
+
+    logger.info("event=rust_core_loaded marker=%r", marker)
+    return ("loaded", None)
 
 
 # Compression pipeline timeout in seconds
@@ -253,33 +337,14 @@ class HeadroomProxy(
         )
         self.metrics = PrometheusMetrics(cost_tracker=self.cost_tracker)
 
-        # Initialize transforms based on routing mode
-        # Choose context manager: IntelligentContextManager (smart) or RollingWindow (legacy)
-        context_manager: Transform  # Can be either IntelligentContextManager or RollingWindow
-        if config.intelligent_context:
-            # Get TOIN instance for learned pattern integration
-            toin = get_toin() if config.intelligent_context_scoring else None
-            context_manager = IntelligentContextManager(
-                config=IntelligentContextConfig(
-                    enabled=True,
-                    keep_system=True,
-                    keep_last_turns=config.keep_last_turns,
-                    use_importance_scoring=config.intelligent_context_scoring,
-                    toin_integration=config.intelligent_context_scoring,
-                    compress_threshold=0.10 if config.intelligent_context_compress_first else 0.0,
-                ),
-                toin=toin,
-            )
-            self._context_manager_status = "intelligent"
-        else:
-            context_manager = RollingWindow(
-                RollingWindowConfig(
-                    enabled=True,
-                    keep_system=True,
-                    keep_last_turns=config.keep_last_turns,
-                )
-            )
-            self._context_manager_status = "rolling_window"
+        # Initialize transforms based on routing mode.
+        #
+        # Phase B PR-B1 retired the IntelligentContextManager / RollingWindow
+        # message-dropping branch. Live-zone-only compression (PR-B2..B7) does
+        # not drop messages — it operates on content blocks within messages —
+        # so the proxy no longer needs a "context manager" transform stage.
+        # Reported via metrics as `_context_manager_status = "passthrough"`.
+        self._context_manager_status = "passthrough"
 
         if config.smart_routing:
             # Smart routing: ContentRouter handles all content types intelligently
@@ -295,7 +360,6 @@ class HeadroomProxy(
             transforms = [
                 CacheAligner(CacheAlignerConfig(enabled=False)),
                 ContentRouter(router_config, observer=self.metrics),
-                context_manager,
             ]
             self._code_aware_status = "lazy" if config.code_aware_enabled else "disabled"
         else:
@@ -314,7 +378,6 @@ class HeadroomProxy(
                     ),
                     observer=self.metrics,
                 ),
-                context_manager,
             ]
             # Add CodeAware if enabled and available
             self._code_aware_status = self._setup_code_aware(config, transforms)
@@ -362,8 +425,13 @@ class HeadroomProxy(
             )
         )
 
-        # Compression cache store for token mode (session-scoped)
+        # Compression cache store for token mode (session-scoped). The dict
+        # itself is mutated under `_compression_caches_lock`; the per-session
+        # `CompressionCache` instances have their own internal lock guarding
+        # `_cache`/`_stable_hashes`/`_first_seen` against concurrent
+        # async-dispatched requests for the same session.
         self._compression_caches: dict[str, CompressionCache] = {}
+        self._compression_caches_lock = threading.RLock()
 
         self.logger = (
             RequestLogger(
@@ -419,6 +487,38 @@ class HeadroomProxy(
             )
         else:
             self.anthropic_pre_upstream_sem = None
+
+        # Dedicated compression executor — see C3 in the audit followup.
+        # Replaces ``asyncio.to_thread(...)`` for ``pipeline.apply()`` calls
+        # so that:
+        #   1. Compression work is bounded — CPU-bound Rust runs here, and
+        #      bursts cannot starve other ``asyncio.to_thread`` callers
+        #      sharing the loop's default executor (file IO, etc.).
+        #   2. Tasks that exceed ``COMPRESSION_TIMEOUT_SECONDS`` and complete
+        #      *after* the asyncio future was cancelled are counted in the
+        #      ``compression_leaked_threads`` gauge — Python cannot preempt
+        #      the worker, so this is the only signal that some pool slots
+        #      are sitting on stuck work.
+        _compression_max_cfg = config.compression_max_workers
+        if _compression_max_cfg is None:
+            _compression_max = min(32, (os.cpu_count() or 1) * 4)
+        else:
+            _compression_max = max(1, _compression_max_cfg)
+        self.compression_max_workers: int = _compression_max
+        self._compression_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=_compression_max,
+            thread_name_prefix="headroom-compress",
+        )
+        # Gauge: currently-running compression tasks. Mutated under
+        # ``_compression_metrics_lock`` from worker threads + the asyncio
+        # event loop.
+        self._compression_in_flight: int = 0
+        # High-water mark for in-flight count.
+        self._compression_in_flight_max: int = 0
+        # Counter: threads that finished AFTER their asyncio future hit the
+        # timeout. Stuck-thread leak indicator.
+        self._compression_leaked_threads: int = 0
+        self._compression_metrics_lock = threading.Lock()
 
         # Backend for Anthropic API (direct, LiteLLM, or any-llm)
         # Supports: "anthropic" (direct), "bedrock", "vertex", "litellm-<provider>", or "anyllm"
@@ -486,6 +586,19 @@ class HeadroomProxy(
                 _mem_db_path = str(_mem_dir / "memory.db")
                 logger.info(f"Memory: Project-scoped DB at {_mem_db_path}")
 
+            # PR-B6: translate the string-typed ``ProxyConfig.memory_mode``
+            # into the typed ``MemoryMode`` enum. Unknown values raise
+            # loudly per the no-silent-fallback policy.
+            from headroom.proxy.memory_handler import MemoryMode
+
+            try:
+                _memory_mode = MemoryMode(config.memory_mode)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid memory_mode={config.memory_mode!r}; "
+                    f"expected one of {[m.value for m in MemoryMode]}"
+                ) from exc
+
             memory_config = MemoryConfig(
                 enabled=True,
                 backend=config.memory_backend,
@@ -495,6 +608,7 @@ class HeadroomProxy(
                 inject_context=config.memory_inject_context,
                 top_k=config.memory_top_k,
                 min_similarity=config.memory_min_similarity,
+                mode=_memory_mode,
                 qdrant_url=config.memory_qdrant_url,
                 qdrant_host=config.memory_qdrant_host,
                 qdrant_port=config.memory_qdrant_port,
@@ -559,27 +673,101 @@ class HeadroomProxy(
             },
         )
 
+    async def _run_compression_in_executor(
+        self,
+        fn,  # noqa: ANN001 — caller-supplied no-arg sync callable
+        *,
+        timeout: float,
+    ):
+        """Run a synchronous compression callable on the bounded executor
+        with cancel-aware metrics.
+
+        Replaces ``asyncio.wait_for(asyncio.to_thread(fn), timeout=...)``.
+
+        Why a dedicated executor: the proxy's compression path is CPU-bound
+        Rust work that releases the GIL via ``py.allow_threads``. Sharing
+        the loop's default executor (used by ``asyncio.to_thread``) means
+        a burst of slow compressions can starve unrelated ``to_thread``
+        callers (file IO, etc.). The compression executor is sized
+        independently via ``config.compression_max_workers``.
+
+        Why "cancel-aware metrics": when ``asyncio.wait_for`` times out, it
+        cancels the *asyncio future*. The underlying
+        ``concurrent.futures.Future`` from ``run_in_executor`` cannot
+        actually cancel a thread that has started — Python has no way to
+        preempt running CPython bytecode or in-flight Rust calls. The
+        worker keeps running to completion, ignored. We detect this by
+        recording the start timestamp and incrementing
+        ``_compression_leaked_threads`` from the worker's ``finally``
+        block when ``elapsed > timeout``. Operators can see leaked-thread
+        rate climbing in ``/stats`` before the pool fills up.
+
+        Args:
+            fn: A no-arg sync callable that runs the compression. Must not
+                raise asyncio Cancellation; if it does, the wrapper still
+                decrements the in-flight gauge but the leaked-thread
+                counter may double-count.
+            timeout: Wall-clock timeout for the asyncio side. The
+                executor worker keeps running past this (Python limitation
+                — see above), but at least the awaiter unblocks.
+
+        Returns:
+            Whatever ``fn()`` returns.
+
+        Raises:
+            ``asyncio.TimeoutError`` if the callable doesn't return within
+            ``timeout``. Any exception raised by ``fn`` propagates
+            unchanged.
+        """
+        loop = asyncio.get_running_loop()
+        start = time.monotonic()
+        with self._compression_metrics_lock:
+            self._compression_in_flight += 1
+            if self._compression_in_flight > self._compression_in_flight_max:
+                self._compression_in_flight_max = self._compression_in_flight
+
+        def _wrapped():  # noqa: ANN202
+            try:
+                return fn()
+            finally:
+                elapsed = time.monotonic() - start
+                with self._compression_metrics_lock:
+                    self._compression_in_flight -= 1
+                    if elapsed > timeout:
+                        self._compression_leaked_threads += 1
+
+        future = loop.run_in_executor(self._compression_executor, _wrapped)
+        return await asyncio.wait_for(future, timeout=timeout)
+
     def _get_compression_cache(self, session_id: str) -> CompressionCache:
-        """Get or create a CompressionCache for a session."""
-        if session_id not in self._compression_caches:
-            from headroom.cache.compression_cache import CompressionCache
+        """Get or create a CompressionCache for a session.
 
-            # Evict oldest caches if at capacity
-            if len(self._compression_caches) >= MAX_COMPRESSION_CACHE_SESSIONS:
-                # Remove oldest quarter to amortize cleanup cost
-                oldest_keys = list(self._compression_caches.keys())[
-                    : MAX_COMPRESSION_CACHE_SESSIONS // 4
-                ]
-                for key in oldest_keys:
-                    del self._compression_caches[key]
-                logger.info(
-                    "Evicted %d compression caches (exceeded %d max sessions)",
-                    len(oldest_keys),
-                    MAX_COMPRESSION_CACHE_SESSIONS,
-                )
+        Thread-safe under `_compression_caches_lock`: a concurrent pair of
+        `_get_compression_cache(session_id)` calls (e.g. two async requests
+        for the same conversation) must return the **same** instance,
+        otherwise the per-session cache state splits and the two halves
+        diverge across requests.
+        """
+        with self._compression_caches_lock:
+            if session_id not in self._compression_caches:
+                from headroom.cache.compression_cache import CompressionCache
 
-            self._compression_caches[session_id] = CompressionCache()
-        return self._compression_caches[session_id]
+                # Evict oldest caches if at capacity
+                if len(self._compression_caches) >= MAX_COMPRESSION_CACHE_SESSIONS:
+                    # Remove oldest quarter to amortize cleanup cost
+                    oldest_keys = list(self._compression_caches.keys())[
+                        : MAX_COMPRESSION_CACHE_SESSIONS // 4
+                    ]
+                    for key in oldest_keys:
+                        del self._compression_caches[key]
+                    logger.info(
+                        "Evicted %d compression caches (exceeded %d max sessions)",
+                        len(oldest_keys),
+                        MAX_COMPRESSION_CACHE_SESSIONS,
+                    )
+
+                self._compression_caches[session_id] = CompressionCache()
+            return self._compression_caches[session_id]
 
     def _setup_code_aware(self, config: ProxyConfig, transforms: list) -> str:
         """Set up code-aware compression if enabled.
@@ -598,8 +786,10 @@ class HeadroomProxy(
                     preserve_signatures=True,
                     preserve_type_annotations=True,
                 )
-                # Insert before RollingWindow (which should be last)
-                transforms.insert(-1, CodeAwareCompressor(code_config))
+                # CodeAware runs after the content/structure transforms.
+                # Phase B PR-B1 retired the trailing context_manager so we
+                # append rather than insert(-1).
+                transforms.append(CodeAwareCompressor(code_config))
                 return "enabled"
             else:
                 logger.warning(
@@ -909,53 +1099,6 @@ class HeadroomProxy(
                 tags[tag_name] = value
         return tags
 
-    def _inject_system_context(
-        self,
-        messages: list[dict[str, Any]],
-        context: str,
-        body: dict[str, Any] | None = None,
-    ) -> list[dict[str, Any]]:
-        """Inject context into the system message/parameter.
-
-        For Anthropic API: Uses top-level 'system' parameter (not messages array).
-        For OpenAI API: Uses system role in messages array.
-
-        Args:
-            messages: The messages list.
-            context: Context to inject.
-            body: Optional request body to update system parameter (for Anthropic).
-
-        Returns:
-            Updated messages list.
-        """
-        messages = list(messages)  # Copy to avoid mutation
-
-        # For Anthropic API: use top-level 'system' parameter
-        if body is not None:
-            existing_system = body.get("system", "")
-            if isinstance(existing_system, str):
-                body["system"] = (existing_system + "\n\n" + context).strip()
-            elif isinstance(existing_system, list):
-                # system is a list of content blocks (e.g., with cache_control).
-                # Append memory context as a new text block — never overwrite.
-                body["system"] = existing_system + [{"type": "text", "text": context}]
-            else:
-                # No existing system prompt — set as string
-                body["system"] = context
-            return messages
-
-        # For OpenAI API: use system role in messages
-        for i, msg in enumerate(messages):
-            if msg.get("role") == "system":
-                content = msg.get("content", "")
-                if isinstance(content, str):
-                    messages[i] = {**msg, "content": content + "\n\n" + context}
-                return messages
-
-        # No system message found - prepend one
-        messages.insert(0, {"role": "system", "content": context})
-        return messages
-
     async def _retry_request(
         self,
         method: str,
@@ -963,17 +1106,67 @@ class HeadroomProxy(
         headers: dict,
         body: dict,
         stream: bool = False,
+        *,
+        original_body_bytes: bytes | None = None,
+        body_mutated: bool = True,
+        mutation_reasons: list[str] | None = None,
+        request_id: str | None = None,
+        forwarder_name: str = "server",
+        path_for_log: str | None = None,
     ) -> httpx.Response:
-        """Make request with retry and exponential backoff."""
+        """Make request with retry and exponential backoff.
+
+        Byte-faithful forwarding (PR-A3, fixes P0-2):
+          * If ``original_body_bytes`` is provided AND ``body_mutated`` is
+            ``False``, the original bytes are forwarded verbatim. SHA-256
+            of upstream-received bytes equals client-sent bytes.
+          * Otherwise the body dict is canonically re-serialized via
+            ``serialize_body_canonical`` (compact separators, ensure_ascii=False).
+          * ``HEADROOM_PROXY_PYTHON_FORWARDER_MODE=legacy_json_kwarg`` is an
+            explicit operator opt-in for emergency rollback to the old
+            ``httpx ... json=body`` behavior.
+
+        The default ``body_mutated=True`` preserves backward compatibility
+        for callers that still pass only ``body`` (e.g. CCR continuations
+        construct their body from scratch, so canonical serialization is
+        correct and original bytes do not exist).
+        """
+        from headroom.proxy.helpers import (
+            log_outbound_request,
+            prepare_outbound_body_bytes,
+        )
+
         last_error = None
+        reasons = list(mutation_reasons or [])
+        outbound_bytes, source = prepare_outbound_body_bytes(
+            body=body,
+            original_body_bytes=original_body_bytes,
+            body_mutated=body_mutated,
+        )
+        outbound_headers = {**headers, "content-type": "application/json"}
+
+        log_outbound_request(
+            forwarder=forwarder_name,
+            method=method,
+            path=path_for_log or url,
+            body_bytes_count=len(outbound_bytes),
+            body_mutated=body_mutated,
+            mutation_reasons=reasons,
+            request_id=request_id,
+            source=source,
+        )
 
         for attempt in range(self.config.retry_max_attempts):
             try:
                 if stream:
                     # For streaming, we return early - retry happens at higher level
-                    return await self.http_client.post(url, json=body, headers=headers)  # type: ignore[union-attr]
+                    return await self.http_client.post(  # type: ignore[union-attr]
+                        url, content=outbound_bytes, headers=outbound_headers
+                    )
                 else:
-                    response = await self.http_client.post(url, json=body, headers=headers)  # type: ignore[union-attr]
+                    response = await self.http_client.post(  # type: ignore[union-attr]
+                        url, content=outbound_bytes, headers=outbound_headers
+                    )
 
                     # Don't retry client errors (4xx)
                     if 400 <= response.status_code < 500:
@@ -1152,6 +1345,17 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
+        # Hotfix-A0: Rust core deployment smoke test. Refuse to accept
+        # traffic if the Rust extension is missing unless the operator
+        # explicitly opted out with HEADROOM_REQUIRE_RUST_CORE=false. See
+        # Finding #2 in HEADROOM_PROXY_LOG_FINDINGS_2026_05_03.md.
+        # `_check_rust_core` either returns ("loaded"|"disabled", _) or
+        # calls `sys.exit(78)` — execution past this line implies the
+        # rust_core_status is recorded.
+        _rust_core_status, _rust_core_error = _check_rust_core()
+        app.state.rust_core_status = _rust_core_status
+        app.state.rust_core_error = _rust_core_error
+
         configure_otel_metrics(OTelMetricsConfig.from_env(default_service_name="headroom-proxy"))
         configure_langfuse_tracing(
             LangfuseTracingConfig.from_env(default_service_name="headroom-proxy")
@@ -1209,6 +1413,12 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     app.state.started_at = None
     app.state.ready = False
     app.state.startup_error = None
+    # Set by the lifespan startup smoke test (`_check_rust_core`). Default
+    # "missing" means lifespan hasn't run yet — anything reading /health
+    # before startup completes (rare; lifespan runs before the first
+    # request) sees an honest "missing" rather than a stale "loaded".
+    app.state.rust_core_status = "missing"
+    app.state.rust_core_error = None
 
     def _iso_utc_now() -> str:
         return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -1281,6 +1491,12 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         ws_active_relay_tasks = (
             ws_registry.active_relay_task_count() if ws_registry is not None else 0
         )
+        # Snapshot compression executor metrics under their lock (gauges
+        # mutated by worker threads; not safe to read without).
+        with proxy._compression_metrics_lock:
+            _comp_in_flight = proxy._compression_in_flight
+            _comp_in_flight_max = proxy._compression_in_flight_max
+            _comp_leaked = proxy._compression_leaked_threads
         return {
             "anthropic_pre_upstream": {
                 "enabled": proxy.anthropic_pre_upstream_sem is not None,
@@ -1294,6 +1510,13 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     proxy.anthropic_pre_upstream_memory_context_timeout_seconds
                 ),
                 "codex_ws_gated": False,
+            },
+            "compression_executor": {
+                "max_workers": proxy.compression_max_workers,
+                "in_flight": _comp_in_flight,
+                "in_flight_max": _comp_in_flight_max,
+                "leaked_threads_total": _comp_leaked,
+                "source": ("auto" if config.compression_max_workers is None else "explicit"),
             },
             "websocket_sessions": {
                 "active_sessions": ws_active_sessions,
@@ -1313,7 +1536,13 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             "uptime_seconds": _uptime_seconds(),
             "checks": checks,
             "runtime": _runtime_payload(),
+            # Hotfix-A0: surface rust core load state so operators can alert
+            # on `rust_core != "loaded"` (Finding #2).
+            "rust_core": getattr(app.state, "rust_core_status", "missing"),
         }
+        rust_core_error = getattr(app.state, "rust_core_error", None)
+        if rust_core_error:
+            payload["rust_core_error"] = rust_core_error
         deployment_profile = os.environ.get("HEADROOM_DEPLOYMENT_PROFILE")
         if deployment_profile:
             payload["deployment"] = {
@@ -1514,14 +1743,20 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         except Exception:
             logger.warning("Failed to log /stats summary payload")
 
-        # Compression cache stats (token mode)
+        # Compression cache stats (token mode). Snapshot the cache list under
+        # the dict lock so a concurrent eviction can't mutate the dict while
+        # we iterate. Each per-session `get_stats()` is independently
+        # thread-safe via the cache's own internal lock.
         compression_cache_stats: dict = {}
         if proxy.config.mode == PROXY_MODE_TOKEN and proxy._compression_caches:
+            with proxy._compression_caches_lock:
+                _caches_snapshot = list(proxy._compression_caches.values())
+                _active_sessions = len(proxy._compression_caches)
             total_entries = 0
             total_hits = 0
             total_misses = 0
             total_tokens_saved = 0
-            for cache in proxy._compression_caches.values():
+            for cache in _caches_snapshot:
                 s = cache.get_stats()
                 total_entries += s.get("entries", 0)
                 total_hits += s.get("hits", 0)
@@ -1529,7 +1764,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 total_tokens_saved += s.get("total_tokens_saved", 0)
             compression_cache_stats = {
                 "mode": PROXY_MODE_TOKEN,
-                "active_sessions": len(proxy._compression_caches),
+                "active_sessions": _active_sessions,
                 "total_entries": total_entries,
                 "total_hits": total_hits,
                 "total_misses": total_misses,
@@ -1762,14 +1997,28 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
     @app.get("/subscription-window")
     async def subscription_window():
-        """Current Anthropic subscription window utilisation and Headroom contribution."""
+        """Current Anthropic subscription window utilisation and Headroom contribution.
+
+        Issue #281: the Anthropic OAuth usage API is polled every 5 minutes
+        (aggressive polling risks 429s / OAuth-token flagging), so the cached
+        ``utilization_pct`` lags reality by up to one poll interval. When the
+        user's 5-hour window rolls over between two polls the dashboard would
+        otherwise render the OLD window's percentage. We:
+
+        1. Optionally trigger a 60s-floored singleton poll on dashboard load
+           (bounded across users, well within Anthropic tolerance).
+        2. Render via :meth:`SubscriptionTracker.render_state`, which
+           synthesizes post-reset windows from local transcript-derived
+           token counts when ``now >= window.resets_at``.
+        """
         tracker = get_subscription_tracker()
         if tracker is None:
             return JSONResponse(
                 status_code=503,
                 content={"error": "Subscription tracking is not enabled"},
             )
-        return JSONResponse(content=tracker.state)
+        await tracker.maybe_poll_on_demand()
+        return JSONResponse(content=tracker.render_state())
 
     @app.get("/quota")
     async def quota():
@@ -2429,6 +2678,23 @@ def run_server(
     app_target: Any
     uvicorn_kwargs: dict[str, Any] = {}
     if workers > 1:
+        # CCR / compression-cache / prefix-tracker / TOIN state are all
+        # per-process. Round-robin across workers fragments these caches
+        # and produces silent retrieval failures for `Retrieve original:
+        # hash=X` markers and avoidable cache busts on the upstream
+        # provider. See the "Multi-worker deployment — CCR fragmentation"
+        # section in RUST_DEV.md for the full failure modes and the
+        # sticky-session workaround.
+        logger.warning(
+            "Headroom is running with workers=%d. The in-memory CCR store, "
+            "compression cache, prefix tracker, and TOIN state are all "
+            "per-process; multi-worker deployments produce silent retrieval "
+            "failures and avoidable cache busts when sessions land on different "
+            "workers. Run --workers 1 (or place a sticky-session load balancer "
+            "in front of multiple --workers 1 processes). See RUST_DEV.md → "
+            "'Multi-worker deployment — CCR fragmentation'.",
+            workers,
+        )
         os.environ[_MULTI_WORKER_CONFIG_ENV] = json.dumps(_proxy_config_payload(config))
         app_target = "headroom.proxy.server:create_app_from_env"
         uvicorn_kwargs["factory"] = True

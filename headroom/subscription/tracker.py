@@ -26,6 +26,8 @@ import logging
 import os
 import tempfile
 import threading
+import time
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -34,11 +36,13 @@ from headroom.subscription.base import QuotaTracker
 from headroom.subscription.client import SubscriptionClient
 from headroom.subscription.models import (
     HeadroomContribution,
+    RateLimitWindow,
     SubscriptionSnapshot,
     SubscriptionState,
     WindowDiscrepancy,
     WindowTokens,
     _utc_now,
+    synthesize_window_render,
 )
 
 logger = logging.getLogger(__name__)
@@ -48,6 +52,20 @@ _DEFAULT_ACTIVE_WINDOW_S = 60
 _PERSIST_FILE_ENV = _paths.HEADROOM_SUBSCRIPTION_STATE_PATH_ENV
 _DEFAULT_PERSIST_DIR = ".headroom"
 _DEFAULT_PERSIST_FILE = "subscription_state.json"
+
+# Singleton on-demand poll floor (seconds): the dashboard may request a fresh
+# poll if the cached snapshot is stale, but we cap how often we will actually
+# hit Anthropic to avoid 429s / OAuth-token flagging. Bounded across users.
+_DEFAULT_ON_DEMAND_POLL_FLOOR_S = 60.0
+
+# Hard timeout for the on-demand poll so a slow upstream never blocks the
+# dashboard request handler.
+_ON_DEMAND_POLL_TIMEOUT_S = 2.0
+
+# Rolling-window lengths. Single-value constants because Anthropic's API
+# defines exactly one 5-hour and one 7-day window.
+_FIVE_HOUR_WINDOW = timedelta(hours=5)
+_SEVEN_DAY_WINDOW = timedelta(days=7)
 
 # Surge pricing threshold: if actual utilization is >N% higher than expected,
 # flag it as a potential surge pricing event.
@@ -104,6 +122,11 @@ class SubscriptionTracker(QuotaTracker):
 
         self._stop_event: asyncio.Event | None = None
         self._poll_task: asyncio.Task[None] | None = None
+
+        # Unix-ts of the last on-demand poll triggered from the dashboard.
+        # Floor-gated by ``_DEFAULT_ON_DEMAND_POLL_FLOOR_S``.
+        self._last_on_demand_poll: float = 0.0
+        self._on_demand_poll_floor_s: float = _DEFAULT_ON_DEMAND_POLL_FLOOR_S
 
         self._load_persisted_state()
 
@@ -206,6 +229,132 @@ class SubscriptionTracker(QuotaTracker):
     def is_active(self) -> bool:
         with self._lock:
             return self._state.is_active(active_window_s=self._active_window_s)
+
+    # ------------------------------------------------------------------
+    # Display-time rendering (issue #281)
+    # ------------------------------------------------------------------
+
+    def render_state(self) -> dict[str, Any]:
+        """Return the dashboard-facing state dict, synthesizing post-reset.
+
+        Background poll cadence is capped at 5 minutes by Anthropic-tolerance
+        constraints; if the user's 5-hour window rolls over between two polls
+        the cached ``utilization_pct`` is stale and the dashboard would render
+        the OLD window's percentage even though Claude Code itself shows 0%
+        (issue #281). To avoid lying to the user without hammering the API,
+        we synthesize the post-reset windows here using locally-tracked
+        transcript token counts.
+
+        The returned dict preserves every key in :meth:`SubscriptionState
+        .to_dict` for backward compatibility; per-window dicts inside
+        ``latest`` gain ``synthesized: bool`` and ``resets_at_estimated:
+        bool`` keys plus an optional ``render_warning`` string when synthesis
+        falls back.
+        """
+        with self._lock:
+            base = self._state.to_dict()
+            snapshot = self._state.latest
+
+        if snapshot is None or base.get("latest") is None:
+            return base
+
+        latest_dict = base["latest"]
+        latest_dict["five_hour"] = self._render_window(
+            snapshot.five_hour,
+            window_duration=_FIVE_HOUR_WINDOW,
+            window_name="five_hour",
+        )
+        latest_dict["seven_day"] = self._render_window(
+            snapshot.seven_day,
+            window_duration=_SEVEN_DAY_WINDOW,
+            window_name="seven_day",
+        )
+        if snapshot.seven_day_opus is not None:
+            latest_dict["seven_day_opus"] = self._render_window(
+                snapshot.seven_day_opus,
+                window_duration=_SEVEN_DAY_WINDOW,
+                window_name="seven_day_opus",
+            )
+        if snapshot.seven_day_sonnet is not None:
+            latest_dict["seven_day_sonnet"] = self._render_window(
+                snapshot.seven_day_sonnet,
+                window_duration=_SEVEN_DAY_WINDOW,
+                window_name="seven_day_sonnet",
+            )
+        return base
+
+    def _render_window(
+        self,
+        window: RateLimitWindow | None,
+        *,
+        window_duration: timedelta,
+        window_name: str,
+    ) -> dict[str, Any]:
+        used_since_reset = self._compute_used_since_reset(window)
+        return synthesize_window_render(
+            window,
+            used_since_reset=used_since_reset,
+            window_duration=window_duration,
+            window_name=window_name,
+        )
+
+    def _compute_used_since_reset(self, window: RateLimitWindow | None) -> int | None:
+        """Read transcripts to count tokens spent strictly after ``window.resets_at``.
+
+        Returns ``None`` if the window has no observed reset time or if the
+        transcript scan fails (caller treats ``None`` as 0 for arithmetic
+        but propagates a render_warning when synthesis is otherwise
+        attempted).
+        """
+        if window is None or window.resets_at is None:
+            return None
+        now = _utc_now()
+        if now < window.resets_at:
+            return None
+        try:
+            from headroom.subscription import session_tracking
+
+            tokens = session_tracking.compute_window_tokens(
+                window.resets_at.timestamp(), now.timestamp()
+            )
+            return int(tokens.weighted_token_equivalent or tokens.total_raw())
+        except Exception as exc:
+            logger.warning("event=subscription_render_used_since_reset_failed error=%s", exc)
+            return None
+
+    async def maybe_poll_on_demand(self) -> None:
+        """Trigger at most one bounded poll per ``_DEFAULT_ON_DEMAND_POLL_FLOOR_S``.
+
+        Called from the ``/subscription-window`` endpoint so a dashboard
+        refresh can pull a fresh snapshot when the cache is stale, while
+        keeping fleet-wide poll rate within Anthropic tolerance. All
+        exceptions are swallowed and logged — never propagated.
+        """
+        now_ts = time.time()
+        with self._lock:
+            elapsed = now_ts - self._last_on_demand_poll
+            if elapsed < self._on_demand_poll_floor_s:
+                logger.info(
+                    "event=subscription_on_demand_poll_skipped_floor elapsed_s=%.1f floor_s=%.1f",
+                    elapsed,
+                    self._on_demand_poll_floor_s,
+                )
+                return
+            self._last_on_demand_poll = now_ts
+
+        logger.info(
+            "event=subscription_on_demand_poll_triggered floor_s=%.1f",
+            self._on_demand_poll_floor_s,
+        )
+        try:
+            await asyncio.wait_for(self._maybe_poll(), timeout=_ON_DEMAND_POLL_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "event=subscription_on_demand_poll_timeout timeout_s=%.1f",
+                _ON_DEMAND_POLL_TIMEOUT_S,
+            )
+        except Exception as exc:
+            logger.warning("event=subscription_on_demand_poll_failed error=%s", exc)
 
     # ------------------------------------------------------------------
     # Poll loop

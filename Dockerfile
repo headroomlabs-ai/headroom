@@ -12,28 +12,57 @@ FROM python:${PYTHON_VERSION}-slim@${PYTHON_DIGEST} AS builder
 
 ARG UV_VERSION
 
+# build-essential / g++ for any C extension wheels uv may need to build
+# from source. curl + ca-certificates are required by the rustup
+# bootstrap below. patchelf for maturin's wheel-link repair on linux.
+# No OpenSSL system deps required: the rustls-everywhere refactor
+# eliminated `openssl-sys` from our build tree by switching fastembed
+# to `hf-hub-rustls-tls` + `ort-download-binaries-rustls-tls`.
 RUN apt-get update && \
   apt-get install -y --no-install-recommends \
     build-essential \
     g++ \
+    curl \
+    ca-certificates \
+    patchelf \
   && rm -rf /var/lib/apt/lists/*
 
 RUN python -m pip install --no-cache-dir uv==${UV_VERSION}
 
+# Rust toolchain for the headroom._core extension. With single-wheel
+# architecture (post-#355), `pip install -e .` invokes maturin via
+# pyproject.toml's [build-system], which calls cargo. No more separate
+# headroom-core-py package.
+ENV CARGO_HOME=/usr/local/cargo \
+    RUSTUP_HOME=/usr/local/rustup \
+    PATH=/usr/local/cargo/bin:${PATH}
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+      | sh -s -- -y --no-modify-path --profile minimal -c rustfmt -c clippy --default-toolchain 1.95.0
+
 WORKDIR /build
 
-# Layer 1: install deps only (cached unless pyproject.toml/uv.lock change)
+# Copy the full set of files maturin needs to build the wheel: the root
+# pyproject.toml + Cargo workspace + Rust crates + Python source. The
+# uv install builds + installs the wheel in one shot.
 COPY pyproject.toml uv.lock README.md ./
-# Stub package so uv can resolve the local extras without full source
-RUN mkdir -p headroom && touch headroom/__init__.py
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates/ crates/
+COPY headroom/ headroom/
+
 ARG HEADROOM_EXTRAS=proxy,code
 RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/build/target \
     uv pip install --system ".[${HEADROOM_EXTRAS}]"
 
-# Layer 2: copy real source, reinstall only headroom-ai (no deps)
-COPY headroom/ headroom/
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --system --no-deps --reinstall-package headroom-ai .
+# Build-stage smoke check: verify the extension loads end-to-end inside
+# the build image before we copy site-packages into the runtime image.
+# If this fails, the runtime image would fail Phase A0's fail-loud
+# startup check on every restart. Run from /tmp so cwd doesn't shadow
+# site-packages with /build/headroom/ (which has no _core.so since
+# maturin installed the .so into site-packages).
+RUN cd /tmp && python -c "from headroom._core import DiffCompressor, SmartCrusher; \
+    print(f'build-stage rust core verify OK: {DiffCompressor.__name__}, {SmartCrusher.__name__}')"
 
 # ---- Runtime stage (python-slim): supports root/nonroot via build arg ----
 FROM python:${PYTHON_VERSION}-slim@${PYTHON_DIGEST} AS runtime-slim-base

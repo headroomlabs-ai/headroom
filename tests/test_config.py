@@ -2,7 +2,7 @@
 
 Tests all configuration dataclasses, enums, and utility classes:
 - HeadroomMode enum
-- ToolCrusherConfig, CacheAlignerConfig, RollingWindowConfig
+- CacheAlignerConfig
 - RelevanceScorerConfig, SmartCrusherConfig
 - HeadroomConfig (main config)
 - Block, WasteSignals, CachePrefixMetrics
@@ -20,9 +20,7 @@ from headroom.config import (
     HeadroomMode,
     RelevanceScorerConfig,
     RequestMetrics,
-    RollingWindowConfig,
     SmartCrusherConfig,
-    ToolCrusherConfig,
     TransformResult,
     WasteSignals,
 )
@@ -49,40 +47,6 @@ class TestHeadroomMode:
         assert HeadroomMode.SIMULATE == "simulate"
         # isinstance check confirms str inheritance
         assert isinstance(HeadroomMode.AUDIT, str)
-
-
-class TestToolCrusherConfig:
-    """Tests for ToolCrusherConfig dataclass."""
-
-    def test_default_values(self):
-        """Default values are correctly set."""
-        config = ToolCrusherConfig()
-        assert config.enabled is False
-        assert config.min_tokens_to_crush == 500
-        assert config.max_array_items == 10
-        assert config.max_string_length == 1000
-        assert config.max_depth == 5
-
-    def test_preserve_keys_default(self):
-        """Default preserve_keys contains expected keys."""
-        config = ToolCrusherConfig()
-        expected_keys = {"error", "status", "code", "id", "message", "name", "type"}
-        assert config.preserve_keys == expected_keys
-        # Verify it's a set (mutable default factory)
-        assert isinstance(config.preserve_keys, set)
-
-    def test_tool_profiles_default(self):
-        """Default tool_profiles is an empty dict."""
-        config = ToolCrusherConfig()
-        assert config.tool_profiles == {}
-        assert isinstance(config.tool_profiles, dict)
-
-    def test_preserve_keys_isolation(self):
-        """Each instance gets its own preserve_keys set."""
-        config1 = ToolCrusherConfig()
-        config2 = ToolCrusherConfig()
-        config1.preserve_keys.add("custom_key")
-        assert "custom_key" not in config2.preserve_keys
 
 
 class TestCacheAlignerConfig:
@@ -117,26 +81,6 @@ class TestCacheAlignerConfig:
         config2 = CacheAlignerConfig()
         config1.date_patterns.append(r"custom pattern")
         assert r"custom pattern" not in config2.date_patterns
-
-
-class TestRollingWindowConfig:
-    """Tests for RollingWindowConfig dataclass."""
-
-    def test_default_values(self):
-        """Default values are correctly set."""
-        config = RollingWindowConfig()
-        assert config.enabled is True
-        assert config.keep_last_turns == 2
-
-    def test_keep_system_default_true(self):
-        """keep_system defaults to True (never drop system prompt)."""
-        config = RollingWindowConfig()
-        assert config.keep_system is True
-
-    def test_output_buffer_default(self):
-        """output_buffer_tokens defaults to 4000."""
-        config = RollingWindowConfig()
-        assert config.output_buffer_tokens == 4000
 
 
 class TestRelevanceScorerConfig:
@@ -211,10 +155,8 @@ class TestHeadroomConfig:
         assert config.default_mode == HeadroomMode.AUDIT
         assert config.generate_diff_artifact is False
         # Nested configs exist
-        assert isinstance(config.tool_crusher, ToolCrusherConfig)
         assert isinstance(config.smart_crusher, SmartCrusherConfig)
         assert isinstance(config.cache_aligner, CacheAlignerConfig)
-        assert isinstance(config.rolling_window, RollingWindowConfig)
 
     def test_get_context_limit_direct_match(self):
         """get_context_limit returns limit for exact model match."""

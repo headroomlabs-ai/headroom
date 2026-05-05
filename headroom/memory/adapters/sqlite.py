@@ -14,12 +14,13 @@ import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
-
-import numpy as np
+from typing import TYPE_CHECKING, Any
 
 from ..models import Memory, ScopeLevel
 from ..ports import MemoryFilter
+
+if TYPE_CHECKING:
+    import numpy as np
 
 # Regex pattern for safe metadata keys: alphanumeric, underscores, hyphens only
 # This prevents JSON path injection attacks via malicious key names
@@ -165,6 +166,8 @@ class SQLiteMemoryStore:
         """Serialize numpy array to bytes for BLOB storage."""
         if embedding is None:
             return None
+        import numpy as np
+
         return bytes(embedding.astype(np.float32).tobytes())
 
     def _deserialize_embedding(
@@ -173,6 +176,8 @@ class SQLiteMemoryStore:
         """Deserialize bytes back to numpy array."""
         if data is None:
             return None
+        import numpy as np
+
         arr = np.frombuffer(data, dtype=np.float32)
         return arr
 

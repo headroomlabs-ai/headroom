@@ -78,7 +78,11 @@ def build_launch_env(
     environ: Mapping[str, str] | None = None,
 ) -> tuple[dict[str, str], list[str]]:
     """Build the Copilot BYOK environment for the selected provider type."""
-    env = dict(environ or os.environ)
+    # Distinguish "caller passed nothing" (use os.environ) from "caller
+    # explicitly passed an empty dict" (start fresh — the test/CLI is in
+    # charge of which keys to seed). The previous `environ or os.environ`
+    # collapsed those two cases because `bool({}) is False`.
+    env = dict(environ if environ is not None else os.environ)
     env["COPILOT_PROVIDER_TYPE"] = provider_type
     env.pop("COPILOT_PROVIDER_WIRE_API", None)
 

@@ -1,4 +1,10 @@
-"""Tests for Tool Output Intelligence Network (TOIN)."""
+"""Tests for Tool Output Intelligence Network (TOIN).
+
+PR-B5 retired the request-time hint API. Tests that exercised the old
+`get_recommendation()` / `CompressionHint` shape are skipped at module
+level — the new observation-only contract is covered by
+`tests/test_toin_observation_only.py` and `tests/test_toin_publish.py`.
+"""
 
 import os
 import tempfile
@@ -7,7 +13,6 @@ import time
 import pytest
 
 from headroom.telemetry import (
-    CompressionHint,
     TOINConfig,
     ToolIntelligenceNetwork,
     ToolPattern,
@@ -140,44 +145,22 @@ class TestToolPattern:
         assert pattern.full_retrieval_rate == 0.0
 
 
+@pytest.mark.skip(
+    reason=(
+        "PR-B5: CompressionHint is now private (_CompressionHint) and "
+        "the request-time hint API is retired. See "
+        "tests/test_toin_observation_only.py for the replacement contract."
+    )
+)
 class TestCompressionHint:
-    """Test CompressionHint data model."""
+    """Retired: CompressionHint was the public envelope for the
+    request-time hint API removed in PR-B5."""
 
     def test_default_values(self):
-        """Default values are sensible."""
-        hint = CompressionHint()
-
-        assert hint.skip_compression is False
-        assert hint.max_items == 20
-        assert hint.compression_level == "moderate"
-        assert hint.preserve_fields == []
-        assert hint.recommended_strategy == "default"
-        assert hint.source == "default"
-        assert hint.confidence == 0.0
+        pass
 
     def test_custom_values(self):
-        """Custom values are preserved."""
-        hint = CompressionHint(
-            skip_compression=True,
-            max_items=50,
-            compression_level="conservative",
-            preserve_fields=["id", "score"],
-            recommended_strategy="top_n",
-            reason="High retrieval rate",
-            confidence=0.85,
-            source="network",
-            based_on_samples=1000,
-        )
-
-        assert hint.skip_compression is True
-        assert hint.max_items == 50
-        assert hint.compression_level == "conservative"
-        assert hint.preserve_fields == ["id", "score"]
-        assert hint.recommended_strategy == "top_n"
-        assert hint.reason == "High retrieval rate"
-        assert hint.confidence == 0.85
-        assert hint.source == "network"
-        assert hint.based_on_samples == 1000
+        pass
 
 
 class TestTOINConfig:
@@ -366,145 +349,46 @@ class TestToolIntelligenceNetwork:
         # Field should be in commonly_retrieved_fields after 3+ retrievals
         assert len(pattern.commonly_retrieved_fields) > 0
 
+    # PR-B5: the following tests exercised the request-time hint API
+    # that's now retired. They're skipped wholesale; the new contract
+    # ("get_recommendation always returns None and emits a deprecation
+    # warning") is covered by tests/test_toin_observation_only.py.
+
+    @pytest.mark.skip(
+        reason="PR-B5: get_recommendation retired — see test_toin_observation_only.py"
+    )
     def test_get_recommendation_no_data(self):
-        """No recommendation with no pattern data."""
-        toin = ToolIntelligenceNetwork()
+        pass
 
-        sig = ToolSignature.from_items([{"id": "1"}])
-        hint = toin.get_recommendation(sig)
-
-        assert hint.source == "default"
-        assert hint.skip_compression is False
-        assert "No pattern data" in hint.reason
-
+    @pytest.mark.skip(
+        reason="PR-B5: get_recommendation retired — see test_toin_observation_only.py"
+    )
     def test_get_recommendation_insufficient_samples(self):
-        """Local recommendation with insufficient samples."""
-        config = TOINConfig(min_samples_for_recommendation=10)
-        toin = ToolIntelligenceNetwork(config)
+        pass
 
-        sig = ToolSignature.from_items([{"id": "1"}])
-
-        # Record only 5 compressions (less than 10)
-        for _ in range(5):
-            toin.record_compression(
-                tool_signature=sig,
-                original_count=100,
-                compressed_count=10,
-                original_tokens=1000,
-                compressed_tokens=100,
-                strategy="top_n",
-            )
-
-        hint = toin.get_recommendation(sig)
-        assert hint.source == "local"
-        assert "Only 5 samples" in hint.reason
-        assert hint.based_on_samples == 5
-
+    @pytest.mark.skip(
+        reason="PR-B5: get_recommendation retired — see test_toin_observation_only.py"
+    )
     def test_get_recommendation_aggressive_compression(self):
-        """Low retrieval rate leads to aggressive compression."""
-        config = TOINConfig(
-            min_samples_for_recommendation=5,
-            medium_retrieval_threshold=0.2,
-            high_retrieval_threshold=0.5,
-        )
-        toin = ToolIntelligenceNetwork(config)
+        pass
 
-        sig = ToolSignature.from_items([{"id": "1"}])
-
-        # Record compressions with no retrievals (low retrieval rate)
-        for _ in range(10):
-            toin.record_compression(
-                tool_signature=sig,
-                original_count=100,
-                compressed_count=10,
-                original_tokens=1000,
-                compressed_tokens=100,
-                strategy="top_n",
-            )
-
-        hint = toin.get_recommendation(sig)
-        assert hint.compression_level == "aggressive"
-        assert hint.skip_compression is False
-        assert "Low retrieval rate" in hint.reason
-
+    @pytest.mark.skip(
+        reason="PR-B5: get_recommendation retired — see test_toin_observation_only.py"
+    )
     def test_get_recommendation_conservative_compression(self):
-        """High retrieval rate leads to conservative compression."""
-        config = TOINConfig(
-            min_samples_for_recommendation=5,
-            high_retrieval_threshold=0.5,
-        )
-        toin = ToolIntelligenceNetwork(config)
+        pass
 
-        sig = ToolSignature.from_items([{"id": "1"}])
-        sig_hash = sig.structure_hash
-
-        # Record compressions
-        for _ in range(10):
-            toin.record_compression(
-                tool_signature=sig,
-                original_count=100,
-                compressed_count=10,
-                original_tokens=1000,
-                compressed_tokens=100,
-                strategy="top_n",
-            )
-
-        # Record many search retrievals (60% retrieval rate)
-        for _ in range(6):
-            toin.record_retrieval(
-                tool_signature_hash=sig_hash,
-                retrieval_type="search",
-            )
-
-        hint = toin.get_recommendation(sig)
-        assert hint.compression_level == "conservative"
-        assert hint.skip_compression is False
-        assert "High retrieval rate" in hint.reason
-
+    @pytest.mark.skip(
+        reason="PR-B5: get_recommendation retired — see test_toin_observation_only.py"
+    )
     def test_get_recommendation_skip_compression(self):
-        """Very high full retrieval rate leads to skip compression."""
-        config = TOINConfig(
-            min_samples_for_recommendation=5,
-            high_retrieval_threshold=0.5,
-        )
-        toin = ToolIntelligenceNetwork(config)
+        pass
 
-        sig = ToolSignature.from_items([{"id": "1"}])
-        sig_hash = sig.structure_hash
-
-        # Record compressions
-        for _ in range(10):
-            toin.record_compression(
-                tool_signature=sig,
-                original_count=100,
-                compressed_count=10,
-                original_tokens=1000,
-                compressed_tokens=100,
-                strategy="top_n",
-            )
-
-        # Record many FULL retrievals (60% retrieval rate, 100% full)
-        for _ in range(6):
-            toin.record_retrieval(
-                tool_signature_hash=sig_hash,
-                retrieval_type="full",
-            )
-
-        hint = toin.get_recommendation(sig)
-        assert hint.skip_compression is True
-        assert hint.compression_level == "none"
-        assert "full retrieval rate" in hint.reason.lower()
-
+    @pytest.mark.skip(
+        reason="PR-B5: get_recommendation retired — see test_toin_observation_only.py"
+    )
     def test_get_recommendation_disabled(self):
-        """Disabled TOIN returns default hint."""
-        config = TOINConfig(enabled=False)
-        toin = ToolIntelligenceNetwork(config)
-
-        sig = ToolSignature.from_items([{"id": "1"}])
-        hint = toin.get_recommendation(sig)
-
-        assert hint.source == "default"
-        assert "TOIN disabled" in hint.reason
+        pass
 
     def test_get_stats(self):
         """get_stats returns overall statistics."""
@@ -589,7 +473,9 @@ class TestTOINExportImport:
         assert "instance_id" in export
         assert "patterns" in export
         assert len(export["patterns"]) == 1
-        assert sig.structure_hash in export["patterns"]
+        # PR-B5: keys are now serialized "auth|model|hash" tuples; default
+        # auth/model produce the "unknown|unknown|<hash>" string.
+        assert f"unknown|unknown|{sig.structure_hash}" in export["patterns"]
 
     def test_import_patterns_new_pattern(self):
         """import_patterns adds new patterns."""

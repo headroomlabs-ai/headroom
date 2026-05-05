@@ -1,8 +1,9 @@
 name: Headroom e2e setup
 description: >-
   Checkout-agnostic setup shared by native e2e workflows (init, install, wrap).
-  Installs Python, installs headroom in editable mode, and (optionally) drops
-  a noop shim onto PATH so ``headroom init -g <target>`` can detect a tool
+  Installs Python + Rust toolchain, installs headroom in editable mode (which
+  builds the bundled Rust extension via maturin), and (optionally) drops a
+  noop shim onto PATH so ``headroom init -g <target>`` can detect a tool
   that isn't actually installed on the runner.
 inputs:
   python-version:
@@ -27,7 +28,18 @@ runs:
       with:
         python-version: ${{ inputs.python-version }}
 
-    - name: Install headroom (editable, with proxy extras)
+    # Single-wheel architecture: `pip install -e .` invokes maturin (declared
+    # in pyproject.toml's build-system) which calls cargo to compile the Rust
+    # extension. Toolchain has to be set up before the install step.
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@1.95.0
+
+    - name: Cache cargo registry + build
+      uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: ". -> target"
+
+    - name: Install headroom (editable, with proxy extras — builds Rust extension)
       shell: bash
       run: |
         python -m pip install --upgrade pip
@@ -35,6 +47,7 @@ runs:
         # ``cli/proxy.py``), which requires ``fastapi`` even for ``init``.
         # Install with the ``[proxy]`` extras to match the Docker e2e image.
         pip install -e ".[proxy]"
+        python -c "from headroom._core import DiffCompressor; print('headroom._core OK:', DiffCompressor)"
 
     - name: Drop shim (POSIX)
       if: ${{ inputs.shim-target != '' && runner.os != 'Windows' }}

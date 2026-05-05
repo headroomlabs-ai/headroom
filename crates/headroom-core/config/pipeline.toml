@@ -1,0 +1,151 @@
+# Compression pipeline default configuration.
+#
+# This file is embedded into the headroom-core binary via `include_str!`
+# at build time, so a stock binary needs no external file. Production
+# deployments override these defaults by loading their own TOML at
+# startup via `PipelineConfig::from_str` or `from_file`.
+#
+# All thresholds chosen CONSERVATIVELY. The pipeline is on the hot
+# path of every Claude Code / Codex / agent tool-call response — bias
+# toward "don't fire CCR unless we're sure" to avoid forcing
+# unnecessary retrieval round trips. A retrieval round trip costs
+# tokens (the marker text), latency (the tool call), and risk (the
+# LLM might not retrieve when it should).
+
+[pipeline]
+# Below this fraction of input bytes (after reformat), we consider
+# the reformat phase to have "succeeded" and skip offloads UNLESS the
+# bloat estimator demands them. 0.5 = "if reformat shrunk us to half
+# the original, that's enough for now."
+reformat_target_ratio = 0.5
+
+# Bloat threshold above which we ALWAYS run the offload, regardless
+# of reformat success. 0.5 = "if a domain-specific estimator says
+# half this content is bloat, CCR offload is worth the retrieval
+# cost." Conservative — most real-world tool outputs sit below 0.5.
+bloat_threshold = 0.5
+
+# After reformat, if (output_len / input_len) > this, we run offload
+# transforms even if their bloat estimate is below `bloat_threshold`.
+# Captures the "reformat barely helped, content might still be
+# salvageable via offload" case. 0.85 = "if reformat saved less than
+# 15% of bytes, try offload as a fallback."
+offload_fallback_ratio = 0.85
+
+# ─── Per-domain bloat estimator config ──────────────────────────────
+#
+# Each domain has its own structural-only signal for "this content
+# would benefit from CCR offload." The estimators MUST be cheap (no
+# full compression pass) so they run in parallel with the reformat
+# phase via rayon::join.
+
+[bloat.log]
+# Inputs shorter than this in lines never trigger offload; the
+# overhead of CCR retrieval would outweigh any savings. Matches
+# LogCompressorConfig::min_lines_for_ccr.
+min_lines = 50
+# How many lines to sample when scoring importance density on long
+# logs. Sampling beats full-scan because per-line keyword detection
+# costs aho-corasick + word-boundary checks per call. 100 samples
+# on a 10k-line log gives <1% error vs full scan.
+sample_size = 100
+# Lines with priority strictly above this are "high-priority" — the
+# rest count as dilution. Calibrated against the signals trait's
+# priority scale (errors return ~0.9, warnings ~0.7, info ~0.0).
+high_priority_threshold = 0.4
+# Weighted combination of two signals, summing to ≤ 1.0. The repetition
+# weight catches "log full of identical INFO heartbeats"; the priority
+# dilution weight catches "log full of unique-but-irrelevant lines
+# burying a few errors." Production tuning may shift these.
+uniqueness_weight = 0.5
+priority_dilution_weight = 0.5
+
+[bloat.diff]
+# Inputs shorter than this in lines never trigger offload.
+min_lines = 50
+# Below this context-to-change ratio, we consider the diff dense and
+# don't offload. Above, the diff is mostly context — high bloat.
+# 0.6 = "60% of relevant lines are context" is the threshold.
+normal_context_ratio = 0.6
+
+[bloat.search]
+# Inputs with fewer matches never trigger offload.
+min_matches = 10
+# Average matches per file at which we hit "fully clustered"
+# bloat = 1.0. 10 matches/file means the result set is mostly
+# repeated hits in the same files — ideal CCR candidate.
+cluster_threshold = 10.0
+
+# ─── Reformat configs ───────────────────────────────────────────────
+#
+# Reformats pack input denser without losing information. Configs here
+# tune the structural-only knobs each reformat exposes.
+
+[reformat.log_template]
+# Don't bother template-mining inputs shorter than this. The cost of
+# the bucket walk + table emission isn't worth it on small logs.
+min_lines = 20
+# Minimum consecutive lines that share a template before we collapse
+# them into a "[Template: ...] (Nx)" block + variant table. Smaller
+# values catch more — but 3 is the floor below which the dedup overhead
+# (template header + brackets) exceeds the savings.
+min_run = 3
+# Two lines are "same template" if at least this fraction of their
+# tokens match positionally (after token-count match). 0.4 = Drain's
+# published default — matches `<TS> INFO worker-<N> processing job <N>`
+# style families (where 3 of 6 tokens are constants) while rejecting
+# genuinely different shapes. Pairs with `min_constant_tokens` so a
+# template with too few anchor tokens won't be promoted regardless of
+# how high the similarity score happens to land.
+similarity_threshold = 0.4
+# Floor on the number of constant tokens a template must have. A
+# "template" of all-`<*>` tokens carries no readable signal — emit
+# verbatim instead. 2 = "must share at least 2 anchor tokens."
+min_constant_tokens = 2
+
+# ─── JSON-array offload config (SmartCrusher wrapper) ─────────────
+#
+# JsonOffload wraps SmartCrusher: a JSON array of dicts (rows) with
+# repeated schema is highly bloaty — most fields repeat their keys per
+# row. SmartCrusher dedups, drops near-duplicate rows, and emits a CCR
+# marker for retrieval. The bloat estimator below cheaply spots the
+# "array-of-dicts shape with N+ rows" signal without parsing JSON.
+
+[offload.json]
+# Don't fire below this many detected row separators (`},{` boundaries
+# scaled across the input). 5 = "less than 5 rows isn't worth it."
+min_array_rows = 5
+# At this row count, the bloat score saturates to 1.0. Tabular inputs
+# with this many rows are reliably bloat-heavy candidates for CCR.
+saturation_rows = 50
+
+# ─── Diff-noise offload config ─────────────────────────────────────
+#
+# Drop hunks for files that match these glob-like suffixes (literal
+# filename-suffix match, no globbing). Lockfiles dominate diff size in
+# JS/Python/Ruby/Go projects but carry near-zero semantic value for
+# LLM consumption — the version bump in the manifest already captures
+# what the LLM needs to know.
+
+[offload.diff_noise]
+# Inputs shorter than this never trigger noise offload.
+min_lines = 30
+# Lockfile filename suffixes (case-sensitive). Match is "path ENDS
+# WITH this suffix and the next char is `/` or start-of-path." Add
+# project-specific lock files here without code changes.
+lockfile_suffixes = [
+    "Cargo.lock",
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "poetry.lock",
+    "Pipfile.lock",
+    "Gemfile.lock",
+    "go.sum",
+    "composer.lock",
+]
+# Drop hunks where every change is whitespace-only (added/removed
+# blank lines, trailing whitespace, indentation-only changes). These
+# show up in formatter / linter commits and carry no signal the LLM
+# needs to reason about.
+drop_whitespace_only_hunks = true

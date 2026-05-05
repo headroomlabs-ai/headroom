@@ -166,11 +166,45 @@ class TestRestoreTags:
         assert "<thinking>A</thinking>" in restored
         assert "<context>B</context>" in restored
 
-    def test_lost_placeholder_appended(self):
-        """If compression removes a placeholder, the block is appended."""
+    def test_lost_placeholder_discards_wrap(self):
+        """Hotfix-A9: when compression strips a placeholder, the wrap
+        is DISCARDED — the compressed text is returned as-is and the
+        original tag bytes are NOT re-injected anywhere. The original
+        "append at the trailing edge" fallback produced silently
+        malformed XML (orphan opening tag with no closing tag) on
+        ~350 production requests over 9 days; that bug is gone."""
         protected = [("{{HEADROOM_TAG_0}}", "<tag>data</tag>")]
-        result = restore_tags("text without placeholder", protected)
-        assert "<tag>data</tag>" in result
+        compressed = "text without placeholder"
+        result = restore_tags(compressed, protected)
+        # Compressed text returned unchanged; original tag NOT injected.
+        assert result == compressed
+        assert "<tag>" not in result
+        assert "</tag>" not in result
+        assert "<tag>data</tag>" not in result
+
+    def test_lost_placeholder_idempotent_when_all_missing(self):
+        """Invariant: if every placeholder is missing from compressed,
+        restore_tags returns compressed byte-for-byte unchanged."""
+        protected = [
+            ("{{HEADROOM_TAG_0}}", "<a>1</a>"),
+            ("{{HEADROOM_TAG_1}}", "<b>2</b>"),
+            ("{{HEADROOM_TAG_2}}", "<c>3</c>"),
+        ]
+        compressed = "compressor stripped every placeholder"
+        assert restore_tags(compressed, protected) == compressed
+
+    def test_partial_loss_keeps_present_discards_lost(self):
+        """Mixed case: some placeholders survive, others are lost.
+        Surviving ones get substituted; lost ones are discarded with
+        zero orphan-tag injection."""
+        protected = [
+            ("{{HEADROOM_TAG_0}}", "<a>1</a>"),
+            ("{{HEADROOM_TAG_1}}", "<lost>x</lost>"),
+        ]
+        result = restore_tags("head {{HEADROOM_TAG_0}} tail", protected)
+        assert result == "head <a>1</a> tail"
+        assert "<lost" not in result
+        assert "</lost>" not in result
 
     def test_roundtrip_preserves_content(self):
         original = (

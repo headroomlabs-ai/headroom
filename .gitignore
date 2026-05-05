@@ -21,6 +21,9 @@ scripts/*
 !scripts/record_fixtures.py
 !scripts/build_rust_extension.sh
 !scripts/install-git-hooks.sh
+!scripts/smoke_issue_327.py
+!scripts/refresh_model_limits.sh
+!scripts/audit_wheel_glibc_symbols.py
 
 # Rust / Cargo build artifacts
 /target/

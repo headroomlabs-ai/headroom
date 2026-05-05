@@ -124,7 +124,7 @@ class TestTOINDoubleCountFix:
 
         # Get the pattern
         with toin._lock:
-            pattern = toin._patterns[sig.structure_hash]
+            pattern = toin._patterns[("unknown", "unknown", sig.structure_hash)]
             user_count_after_101 = pattern.user_count
 
         # Now call again with same instance (instance_100)
@@ -133,7 +133,7 @@ class TestTOINDoubleCountFix:
         toin.record_compression(sig, 100, 10, 1000, 100, strategy="test_strategy")
 
         with toin._lock:
-            pattern = toin._patterns[sig.structure_hash]
+            pattern = toin._patterns[("unknown", "unknown", sig.structure_hash)]
             user_count_after_102 = pattern.user_count
 
         # Restore instance_id

@@ -757,9 +757,15 @@ class HeadroomMCPServer:
                 )
             ]
 
-        # Read file from disk
+        # Read file from disk. PR-A8 / P1-8: avoid lossy decode kwargs
+        # in headroom/ccr/ — use the centralized safe-log decoder so
+        # the project-wide grep stays clean (this path is for tool
+        # output display, not SSE/wire path, so a replacement char on
+        # invalid bytes is acceptable).
         try:
-            content = path.read_text(errors="replace")
+            from headroom.proxy.helpers import safe_decode_for_logging
+
+            content = safe_decode_for_logging(path.read_bytes())
         except Exception as e:
             return [
                 TextContent(

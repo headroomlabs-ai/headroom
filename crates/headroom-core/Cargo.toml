@@ -17,7 +17,7 @@ tiktoken-rs = "0.11"
 # `tokenizers` is the HuggingFace pure-Rust tokenizer crate. Default features
 # pull in `onig` for the BPE pre-tokenizer regex; that vendors oniguruma so it
 # builds without a system dep on macOS/Linux.
-tokenizers = "0.21"
+tokenizers = "0.22"
 # `hf-hub` is the HuggingFace Hub client. We use the blocking `ureq` transport
 # with `rustls` (no system OpenSSL dep — keeps the binary static-linkable for
 # AWS deploys). `from_pretrained` is called once at startup, so blocking is
@@ -53,7 +53,19 @@ flate2 = "1"
 # int8-quantized ONNX) auto-downloads from HuggingFace Hub on first use.
 # Same library + same model = byte-equal embeddings between Python and Rust
 # (both call into ONNX Runtime over the identical ONNX file).
-fastembed = "5"
+#
+# `default-features = false` + explicit rustls features eliminates the
+# transitive `native-tls` → `openssl-sys` dependency that fastembed's
+# default features pull in (via `hf-hub-native-tls` + `ort-download-
+# binaries-native-tls`). Without this, every wheel-build surface
+# (release matrix, e2e/wrap, e2e/init, devcontainer, ci.yml) needs
+# system OpenSSL + perl modules for openssl-src vendored compile. Using
+# rustls everywhere removes the entire OpenSSL build-deps surface.
+fastembed = { version = "5", default-features = false, features = [
+    "hf-hub-rustls-tls",
+    "ort-download-binaries-rustls-tls",
+    "image-models",
+] }
 # `magika` is Google's ONNX-backed content classifier (Tier 1 of the
 # Stage-3d ContentRouter detection arch). Bundled standard-model is
 # loaded once per process via `OnceLock` and shared across calls. The
@@ -76,10 +88,57 @@ unidiff = "0.4"
 # happen as a post-filter on the byte offsets the automaton returns.
 # Default features (std, perf-literal) keep the build small.
 aho-corasick = "1"
+# `rayon` powers the pipeline orchestrator's parallel reformat-vs-bloat
+# evaluation: while a worker thread runs the structural reformat passes,
+# another set of threads run the per-offload bloat estimators in parallel.
+# Reformat completion + all bloat estimates need to be ready before the
+# orchestrator can decide which offloads to actually execute, so two-phase
+# join semantics (`rayon::join` + `par_iter`) are exactly what we need.
+rayon = "1"
+# `toml` reads the default pipeline configuration shipped at
+# `config/pipeline.toml`. The defaults embed via `include_str!` so a
+# stock binary needs no external file; production deployments override
+# by loading their own TOML at startup.
+toml = "0.8"
+# `blake3` powers `ccr::compute_key`. BLAKE3 is faster than SHA-256 on
+# every hot path the proxy hits (large diff/log/tool_result payloads)
+# and produces collision-resistant 24-char prefixes for the CCR
+# `<<ccr:HASH>>` marker. Pinning the algorithm + truncation length here
+# keeps Rust and Python in lockstep — Python parses the same 24-char
+# hex via `headroom/ccr/tool_injection.py` regex. Pure-Rust by default,
+# no system dep, no SIMD-feature-gated flag (the crate auto-detects).
+blake3 = "1"
+# `rusqlite` for the SQLite-backed CCR store (the production default).
+# `bundled` builds SQLite from source so deploys do not need a system
+# libsqlite3 — matters for Lambda / container builds where the host
+# image may lag behind. Sub-1 MB binary cost. WAL is enabled at
+# connection-open time (see `ccr/backends/sqlite.rs`); no extra feature
+# flags required.
+rusqlite = { version = "0.32", features = ["bundled"] }
+# `redis` for the optional multi-worker CCR backend. Cfg-gated behind
+# the `redis` feature so deploys that don't need it pay no compile
+# cost. Default features include the sync `Connection` API used in
+# `ccr/backends/redis.rs`; `tokio-comp` would pull `tokio` into the
+# core crate, which we do not want.
+redis = { version = "0.27", optional = true, default-features = false }
+# `http` powers the auth-mode classifier (Phase F PR-F1). The proxy
+# crate already depends on this — pulling it into core lets the
+# classifier live with the other Phase B/F policy primitives without
+# cycling through the proxy crate. Tiny crate (no I/O, just types).
+http = "1"
+
+[features]
+default = []
+# Compile in the Redis CCR backend. Enable for multi-worker deployments
+# that want a shared CCR store with no sticky-session at the LB. The
+# SQLite backend (always compiled) is the production default for
+# single-worker / single-instance setups.
+redis = ["dep:redis"]
 
 [dev-dependencies]
 proptest = "1"
 criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3"
 
 [[bench]]
 name = "tokenizer"
@@ -87,4 +146,8 @@ harness = false
 
 [[bench]]
 name = "ccr_store"
+harness = false
+
+[[bench]]
+name = "auth_mode"
 harness = false

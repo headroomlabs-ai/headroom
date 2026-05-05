@@ -1,8 +1,10 @@
-name: Publish to PyPI
+name: Publish to PyPI (manual fallback)
 
-# DEPRECATED: This workflow is superseded by release.yml.
-# Only used for manual PyPI publishing now.
-# Manual trigger only — release.yml handles automated publishing.
+# DEPRECATED: This workflow is superseded by release.yml's matrix-based
+# build-and-publish flow. It exists as a manual fallback in case release.yml
+# is broken and a hotfix needs to be pushed without going through the
+# normal tag-driven pipeline. Single-platform; produces only the linux
+# x86_64 wheel + sdist. For full cross-platform release, use release.yml.
 on:
   workflow_dispatch:
 
@@ -11,8 +13,8 @@ jobs:
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
-      id-token: write # For trusted publishing
-      contents: write # For uploading release assets
+      id-token: write  # For trusted publishing
+      contents: write  # For uploading release assets
 
     steps:
       - uses: actions/checkout@v4
@@ -22,13 +24,22 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
       - name: Install build tools
         run: |
-          python -m pip install --upgrade pip build cyclonedx-bom
+          python -m pip install --upgrade pip 'maturin>=1.5,<2.0' cyclonedx-bom
 
-      - name: Build package
+      - name: Build wheel + sdist
         run: |
-          python -m build
+          maturin sdist --out dist
+          maturin build --release --out dist
 
       - name: Generate SBOM (CycloneDX)
         run: |

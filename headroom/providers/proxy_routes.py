@@ -26,6 +26,16 @@ def _api_target(proxy: Any, provider_name: str) -> str:
 
 
 def _select_passthrough_base_url(proxy: Any, headers: dict[str, str]) -> str:
+    # Codex CLI subscription mode hits a wide surface under
+    # `/backend-api/*` (rate-limit polling, agent identity, JWT
+    # refresh, cloud tasks). Without this branch the catchall
+    # routes those to api.openai.com which 404s, and Codex
+    # interprets the failure as "session invalid" and refuses
+    # to use subscription auth at all. The check is a no-op
+    # for non-ChatGPT-authed requests.
+    _, is_chatgpt_auth = _resolve_codex_routing_headers(headers)
+    if is_chatgpt_auth:
+        return "https://chatgpt.com"
     if headers.get("x-goog-api-key"):
         return _api_target(proxy, "gemini")
     if headers.get("api-key"):

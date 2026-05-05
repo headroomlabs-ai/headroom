@@ -302,17 +302,43 @@ class CCRToolInjector:
     def inject_tool_definition(
         self,
         tools: list[dict[str, Any]] | None,
+        *,
+        session_has_done_ccr: bool = False,
     ) -> tuple[list[dict[str, Any]], bool]:
         """Inject CCR retrieval tool into tools list.
 
+        PR-B7 (`REALIGNMENT/04-phase-B-live-zone.md`): callers may pass
+        ``session_has_done_ccr=True`` so the tool is injected even when
+        THIS request has no fresh compression markers. That is the
+        sticky-on path: once a session has done CCR, the
+        ``headroom_retrieve`` tool must stay in ``body["tools"]`` for
+        every subsequent request, otherwise the tool list bytes flip
+        on/off mid-session and bust the prompt cache.
+
+        Most callers should prefer
+        :func:`headroom.proxy.helpers.apply_session_sticky_ccr_tool`
+        which threads the ``SessionCcrTracker`` directly. This method
+        is the per-request fallback used when no session_id is available
+        (e.g. Google handler, legacy code paths).
+
         Args:
             tools: Existing tools list (may be None or empty).
+            session_has_done_ccr: When True, inject regardless of
+                whether the current request contained compression
+                markers. Default False preserves legacy per-request
+                behaviour.
 
         Returns:
             Tuple of (updated_tools, was_injected).
             was_injected is False if tool was already present (e.g., from MCP).
         """
-        if not self.inject_tool or not self.has_compressed_content:
+        if not self.inject_tool:
+            return tools or [], False
+        # PR-B7: sticky-on takes precedence. If the session has
+        # previously done CCR, register the tool even when this turn
+        # has no fresh markers. Otherwise fall back to the per-request
+        # check for backwards compat.
+        if not (session_has_done_ccr or self.has_compressed_content):
             return tools or [], False
 
         tools = tools or []
@@ -390,6 +416,8 @@ class CCRToolInjector:
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
+        *,
+        session_has_done_ccr: bool = False,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]] | None, bool]:
         """Process a request, scanning for markers and injecting as needed.
 
@@ -398,9 +426,17 @@ class CCRToolInjector:
         2. Inject tool definition if enabled (skipped if already present from MCP)
         3. Inject system instructions if enabled
 
+        PR-B7: when ``session_has_done_ccr`` is True the tool gets
+        injected even when the current message stream has no fresh
+        markers. System-instruction injection still keys off
+        per-request markers (the system prompt is the cache hot zone —
+        we never mutate it without a current-turn reason).
+
         Args:
             messages: Request messages.
             tools: Request tools (may be None).
+            session_has_done_ccr: PR-B7 sticky-on flag — when True,
+                register the tool regardless of this turn's marker scan.
 
         Returns:
             Tuple of (updated_messages, updated_tools, tool_was_injected).
@@ -408,10 +444,12 @@ class CCRToolInjector:
         """
         self.scan_for_markers(messages)
 
-        if not self.has_compressed_content:
+        if not (self.has_compressed_content or session_has_done_ccr):
             return messages, tools, False
 
-        updated_tools, was_injected = self.inject_tool_definition(tools)
+        updated_tools, was_injected = self.inject_tool_definition(
+            tools, session_has_done_ccr=session_has_done_ccr
+        )
         updated_messages = self.inject_into_system_message(messages)
 
         return updated_messages, updated_tools if updated_tools else None, was_injected

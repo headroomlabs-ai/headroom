@@ -337,11 +337,12 @@ def _get_pipeline() -> Any:
 
         from headroom.transforms import TransformPipeline
 
-        # Default pipeline: CacheAligner → ContentRouter → IntelligentContext
+        # Default pipeline: CacheAligner → ContentRouter
         # CacheAligner: stabilizes prefix for provider KV cache hits
         # ContentRouter: routes to the right compressor per content type
         #   (SmartCrusher for JSON, CodeCompressor for code, Kompress for text)
-        # IntelligentContext: enforces token limits with score-based dropping
+        # Phase B PR-B1 retired the trailing context-management stage —
+        # live-zone-only compression never drops messages.
         _pipeline = TransformPipeline()
         logger.debug("Headroom compression pipeline initialized")
         return _pipeline

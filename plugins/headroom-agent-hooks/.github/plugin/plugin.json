@@ -1,6 +1,6 @@
 {
   "name": "headroom",
-  "version": "0.16.0",
+  "version": "0.20.16",
   "description": "Headroom startup hooks for Claude Code and GitHub Copilot CLI.",
   "author": {
     "name": "Headroom Contributors",

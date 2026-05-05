@@ -36,6 +36,67 @@ from .trained_router import Technique
 logger = logging.getLogger(__name__)
 
 
+# OCR backend resolution — see issue #372.
+#
+# After version 1.4.x the rapidocr ecosystem split:
+#   * rapidocr-onnxruntime — bundled-ORT, capped at Python <3.13.
+#   * rapidocr 3.x         — engine-agnostic core, supports 3.13+;
+#                            requires `onnxruntime` installed alongside
+#                            for the same ORT backend; returns a
+#                            RapidOCROutput dataclass instead of a tuple.
+#
+# We try v1 first (legacy / Python <3.13 install path), fall back to
+# v3 (Python 3.13+ install path), and cache the resolved tuple at
+# module scope. Result is intentionally None when neither package is
+# installed — OCR is an optional capability gated by `[image]` extra.
+_RESOLVED_OCR: tuple[Any | None, str | None] | None = None
+
+
+def _resolve_rapidocr() -> tuple[Any | None, str | None]:
+    """Return ``(RapidOCR class, api_version)`` cached on first call.
+
+    ``api_version`` is ``"v1"`` for ``rapidocr_onnxruntime`` (tuple
+    result shape) and ``"v3"`` for ``rapidocr`` 3.x (dataclass result
+    shape). Returns ``(None, None)`` when neither package is installed.
+
+    Detection is at runtime (not based on Python version) because a
+    user on Python 3.11 might choose to install the 3.x package, and
+    a future ABI3 ORT release may make rapidocr-onnxruntime work on
+    Python 3.13. The actual install state is the source of truth.
+    """
+    global _RESOLVED_OCR
+    if _RESOLVED_OCR is not None:
+        return _RESOLVED_OCR
+
+    try:
+        from rapidocr_onnxruntime import RapidOCR as _RapidOCRv1
+
+        _RESOLVED_OCR = (_RapidOCRv1, "v1")
+        return _RESOLVED_OCR
+    except ImportError:
+        pass
+
+    try:
+        from rapidocr import RapidOCR as _RapidOCRv3  # type: ignore[import-not-found]
+
+        _RESOLVED_OCR = (_RapidOCRv3, "v3")
+        return _RESOLVED_OCR
+    except ImportError:
+        pass
+
+    _RESOLVED_OCR = (None, None)
+    return _RESOLVED_OCR
+
+
+def _reset_resolved_ocr_for_tests() -> None:
+    """Test-only hook: clear the module-level resolver cache so each
+    test can re-monkeypatch ``sys.modules`` and exercise a fresh
+    resolution. Production code never calls this.
+    """
+    global _RESOLVED_OCR
+    _RESOLVED_OCR = None
+
+
 @dataclass
 class CompressionResult:
     """Result of image compression."""
@@ -308,44 +369,121 @@ class ImageCompressor:
     def _ocr_extract(self, image_data: bytes, min_confidence: float = 0.7) -> str | None:
         """Extract text from image using RapidOCR.
 
-        Returns extracted text if OCR is confident, None otherwise (fallback to image).
+        Adapts both API generations of the rapidocr ecosystem at runtime
+        (issue #372):
+
+        * ``rapidocr-onnxruntime`` 1.4.x (Python <3.13) — call returns
+          ``(list[(box, text, score)], elapsed)``.
+        * ``rapidocr`` 3.x (Python 3.13+) — call returns a
+          ``RapidOCROutput`` dataclass with ``.txts`` (list[str]),
+          ``.scores`` (list[float]), ``.boxes`` (list); each may be
+          ``None`` when nothing was detected.
+
+        Returns extracted text if OCR is confident, ``None`` otherwise
+        (caller falls back to image-as-image).
         """
-        try:
-            from rapidocr_onnxruntime import RapidOCR
+        ocr_cls, api_version = _resolve_rapidocr()
+        if ocr_cls is None:
+            logger.debug(
+                "OCR backend unavailable: neither rapidocr-onnxruntime nor "
+                "rapidocr installed — skipping (event=ocr_backend_missing)"
+            )
+            return None
 
-            if not hasattr(self, "_ocr_engine"):
-                self._ocr_engine = RapidOCR()
-
-            result, _ = self._ocr_engine(image_data)
-            if not result:
-                return None
-
-            # Check average confidence
-            confidences = [line[2] for line in result]
-            avg_confidence = sum(confidences) / len(confidences)
-
-            if avg_confidence < min_confidence:
-                logger.debug(
-                    f"OCR confidence too low ({avg_confidence:.0%} < {min_confidence:.0%}), "
-                    f"falling back to image"
+        if not hasattr(self, "_ocr_engine"):
+            try:
+                self._ocr_engine = ocr_cls()
+            except Exception as exc:
+                logger.warning(
+                    "OCR engine init failed (event=ocr_engine_init_failed, api=%s): %s",
+                    api_version,
+                    exc,
                 )
                 return None
 
-            # Combine lines into text
-            text = "\n".join(line[1] for line in result)
-
-            logger.info(
-                f"OCR extracted {len(result)} lines ({avg_confidence:.0%} avg confidence, "
-                f"{len(text)} chars)"
+        try:
+            raw = self._ocr_engine(image_data)
+        except Exception as exc:
+            logger.warning(
+                "OCR call failed (event=ocr_call_failed, api=%s): %s",
+                api_version,
+                exc,
             )
-            return text
+            return None
 
-        except ImportError:
-            logger.debug("rapidocr-onnxruntime not installed, skipping OCR")
+        if api_version == "v1":
+            # 1.x returns (list_of_tuples, elapsed). list may be empty
+            # or None when no text is detected.
+            try:
+                result, _elapsed = raw
+            except (TypeError, ValueError):
+                logger.warning(
+                    "OCR returned unexpected v1 shape (event=ocr_unknown_api_shape, api=v1): %r",
+                    type(raw).__name__,
+                )
+                return None
+            if not result:
+                return None
+            try:
+                texts = [line[1] for line in result]
+                confidences = [line[2] for line in result]
+            except (IndexError, TypeError):
+                logger.warning(
+                    "OCR v1 result rows missing expected (box, text, score) "
+                    "shape (event=ocr_unknown_api_shape, api=v1)"
+                )
+                return None
+
+        elif api_version == "v3":
+            # 3.x returns RapidOCROutput with txts/scores attributes.
+            # Both are None when detection found nothing — coerce to [].
+            texts_attr = getattr(raw, "txts", None)
+            scores_attr = getattr(raw, "scores", None)
+            if texts_attr is None and scores_attr is None:
+                # Probe failed to detect anything — not an error.
+                return None
+            texts = list(texts_attr or [])
+            confidences = list(scores_attr or [])
+            if not texts:
+                return None
+            if len(confidences) != len(texts):
+                logger.warning(
+                    "OCR v3 returned mismatched txts/scores lengths "
+                    "(event=ocr_unknown_api_shape, api=v3, txts=%d, scores=%d)",
+                    len(texts),
+                    len(confidences),
+                )
+                return None
+
+        else:
+            logger.warning(
+                "OCR resolver returned unknown api_version (event=ocr_unknown_api_shape, api=%r)",
+                api_version,
+            )
             return None
-        except Exception as e:
-            logger.warning(f"OCR failed: {e}")
+
+        if not confidences:
             return None
+        avg_confidence = sum(confidences) / len(confidences)
+        if avg_confidence < min_confidence:
+            logger.debug(
+                "OCR confidence too low (event=ocr_low_confidence, "
+                "avg=%.2f, min=%.2f, api=%s) — falling back to image",
+                avg_confidence,
+                min_confidence,
+                api_version,
+            )
+            return None
+
+        text = "\n".join(texts)
+        logger.info(
+            "OCR extracted %d lines (event=ocr_extracted, avg_confidence=%.2f, chars=%d, api=%s)",
+            len(texts),
+            avg_confidence,
+            len(text),
+            api_version,
+        )
+        return text
 
     def _apply_compression(
         self,

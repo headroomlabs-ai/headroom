@@ -24,30 +24,6 @@ DEFAULT_MODEL_CONTEXT_LIMITS: dict[str, int] = {}
 
 
 @dataclass
-class ToolCrusherConfig:
-    """Configuration for tool output compression (naive/fixed-rule approach).
-
-    GOTCHAS:
-    - Keeps FIRST N items only - may miss important data later in arrays
-    - A spike at index 50 will be lost if max_array_items=10
-    - String truncation cuts at fixed length, may break mid-word/mid-sentence
-    - No awareness of data patterns or importance
-
-    Consider using SmartCrusherConfig instead for statistical analysis.
-    """
-
-    enabled: bool = False  # Disabled by default, SmartCrusher is preferred
-    min_tokens_to_crush: int = 500  # Only crush if > N tokens
-    max_array_items: int = 10  # Keep first N items
-    max_string_length: int = 1000  # Truncate strings > N chars
-    max_depth: int = 5  # Preserve structure to depth N
-    preserve_keys: set[str] = field(
-        default_factory=lambda: {"error", "status", "code", "id", "message", "name", "type"}
-    )
-    tool_profiles: dict[str, dict[str, Any]] = field(default_factory=dict)
-
-
-@dataclass
 class CacheAlignerConfig:
     """Configuration for cache alignment.
 
@@ -120,130 +96,6 @@ class CacheAlignerConfig:
     # Separator used to mark where dynamic content begins in system message
     # Content before this separator is cached; content after is dynamic
     dynamic_tail_separator: str = "\n\n---\n[Dynamic Context]\n"
-
-
-@dataclass
-class RollingWindowConfig:
-    """Configuration for rolling window token cap.
-
-    GOTCHAS:
-    - Dropping old turns loses context the model may need:
-      - "As I mentioned earlier..." - what was mentioned is now gone
-      - "The user asked about X" - that turn may be dropped
-      - Implicit references to prior conversation become orphaned
-    - Tool call/result pairs are kept atomic (correct), BUT:
-      - Assistant text referencing a dropped tool result becomes confusing
-      - "Based on the search results..." when those results are gone
-    - keep_last_turns=2 may not be enough for complex multi-step reasoning
-    - No semantic analysis - drops oldest first regardless of importance
-
-    SAFER ALTERNATIVES:
-    - Increase keep_last_turns for agentic workloads
-    - Use summarization for old context (not implemented - would add latency)
-    - Set enabled=False for short conversations
-    """
-
-    enabled: bool = True
-    keep_system: bool = True  # Never drop system prompt
-    keep_last_turns: int = 2  # Never drop last N turns
-    output_buffer_tokens: int = 4000  # Reserve for output
-
-
-@dataclass
-class ScoringWeights:
-    """Weights for importance scoring factors.
-
-    All weights should sum to approximately 1.0 for normalized scoring.
-    These can be learned from TOIN retrieval patterns over time.
-
-    Design principle: NO HARDCODED PATTERNS. All importance is derived from:
-    - Computed metrics (recency, density, references)
-    - TOIN-learned patterns (field semantics, retrieval rates)
-    - Embedding similarity (semantic relevance)
-    """
-
-    recency: float = 0.20  # Exponential decay from conversation end
-    semantic_similarity: float = 0.20  # Embedding similarity to recent context
-    toin_importance: float = 0.25  # TOIN-learned field importance
-    error_indicator: float = 0.15  # TOIN-learned error field detection
-    forward_reference: float = 0.15  # Referenced by later messages
-    token_density: float = 0.05  # Information density (entropy-based)
-
-    def normalized(self) -> ScoringWeights:
-        """Return a copy with weights normalized to sum to 1.0."""
-        total = (
-            self.recency
-            + self.semantic_similarity
-            + self.toin_importance
-            + self.error_indicator
-            + self.forward_reference
-            + self.token_density
-        )
-        if total == 0:
-            return ScoringWeights()
-        return ScoringWeights(
-            recency=self.recency / total,
-            semantic_similarity=self.semantic_similarity / total,
-            toin_importance=self.toin_importance / total,
-            error_indicator=self.error_indicator / total,
-            forward_reference=self.forward_reference / total,
-            token_density=self.token_density / total,
-        )
-
-
-@dataclass
-class IntelligentContextConfig:
-    """Configuration for intelligent context management.
-
-    This extends RollingWindowConfig with semantic-aware scoring and
-    TOIN integration. All importance detection is learned, not hardcoded.
-
-    Phases:
-    - Phase 1 (current): Importance scoring + TOIN integration
-    - Phase 2 (future): Progressive summarization
-    - Phase 3 (future): Memory tiers with retrieval
-    """
-
-    # === Basic settings (backwards compatible with RollingWindowConfig) ===
-    enabled: bool = True
-    keep_system: bool = True
-    keep_last_turns: int = 2
-    output_buffer_tokens: int = 4000
-
-    # === Scoring configuration ===
-    use_importance_scoring: bool = True
-    scoring_weights: ScoringWeights = field(default_factory=ScoringWeights)
-
-    # Recency decay parameter (higher = faster decay)
-    recency_decay_rate: float = 0.1
-
-    # === TOIN integration ===
-    toin_integration: bool = True
-    toin_confidence_threshold: float = 0.3  # Min confidence to use TOIN signals
-
-    # === Strategy selection thresholds ===
-    # These determine when to try different strategies based on how much over budget
-    compress_threshold: float = 0.10  # Try deeper compression if <10% over
-
-    # === Summarization (Phase 2 - not yet implemented) ===
-    summarization_enabled: bool = False
-    summarization_model: str | None = None
-    summary_max_tokens: int = 500
-    summarize_threshold: float = 0.25  # Try summarization if <25% over
-
-    # === Memory tiers (Phase 3 - not yet implemented) ===
-    memory_tiers_enabled: bool = False
-    warm_tier_enabled: bool = False  # Summarized tier
-    cold_tier_enabled: bool = False  # Vector retrieval tier
-
-    def to_rolling_window_config(self) -> RollingWindowConfig:
-        """Convert to basic RollingWindowConfig for backwards compatibility."""
-        return RollingWindowConfig(
-            enabled=self.enabled,
-            keep_system=self.keep_system,
-            keep_last_turns=self.keep_last_turns,
-            output_buffer_tokens=self.output_buffer_tokens,
-        )
 
 
 @dataclass
@@ -471,7 +323,7 @@ class SmartCrusherConfig:
     - Set variance_threshold lower (1.5) to catch more change points
     """
 
-    enabled: bool = True  # Enabled by default (preferred over ToolCrusher)
+    enabled: bool = True  # Enabled by default — sole tool-output compressor
     min_items_to_analyze: int = 5  # Don't analyze tiny arrays
     min_tokens_to_crush: int = 200  # Only crush if > N tokens
     variance_threshold: float = 2.0  # Std devs for change point detection
@@ -610,24 +462,21 @@ class HeadroomConfig:
     model_context_limits: dict[str, int] = field(
         default_factory=lambda: DEFAULT_MODEL_CONTEXT_LIMITS.copy()
     )
-    tool_crusher: ToolCrusherConfig = field(default_factory=ToolCrusherConfig)
     smart_crusher: SmartCrusherConfig = field(default_factory=SmartCrusherConfig)
     cache_aligner: CacheAlignerConfig = field(default_factory=CacheAlignerConfig)
-    rolling_window: RollingWindowConfig = field(default_factory=RollingWindowConfig)
     cache_optimizer: CacheOptimizerConfig = field(default_factory=CacheOptimizerConfig)
     ccr: CCRConfig = field(default_factory=CCRConfig)  # Compress-Cache-Retrieve
     prefix_freeze: PrefixFreezeConfig = field(default_factory=PrefixFreezeConfig)
+
+    # Output buffer reserved for the model's response when sizing the
+    # incoming context. Previously lived on RollingWindowConfig; hoisted
+    # to the top-level config when PR-B1 retired the rolling-window stage.
+    output_buffer_tokens: int = 4000
 
     # Content Router - intelligent content-type based compression
     # Routes content to appropriate compressor (Kompress for text, SmartCrusher for JSON,
     # CodeCompressor for code, LogCompressor for logs, etc.)
     content_router_enabled: bool = True
-
-    # Intelligent context management (Phase 2.5)
-    # When enabled, replaces RollingWindow with semantic-aware context management
-    intelligent_context: IntelligentContextConfig = field(
-        default_factory=lambda: IntelligentContextConfig(enabled=False)
-    )
 
     # Tool-result interceptors (ast-grep Read outline, etc.). Opt-in for now.
     # Env var HEADROOM_INTERCEPT_ENABLED=1 also enables (for CLI `--intercept-tool-results`).

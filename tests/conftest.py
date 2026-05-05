@@ -45,6 +45,24 @@ def pytest_runtest_call(item):
             pytest.skip("Skipped due to network timeout (flaky CI)")
 
 
+@pytest.fixture(autouse=True)
+def _reset_headroom_logger_propagation():
+    """Keep `headroom.*` log records flowing to pytest's caplog handler.
+
+    `headroom.proxy.helpers._setup_file_logging` sets
+    ``logging.getLogger("headroom").propagate = False`` once any test
+    triggers a proxy startup with `--log-file`. After that, every
+    subsequent test's `caplog` fixture stops capturing `headroom.*`
+    log records (caplog attaches to root, propagation is now blocked
+    at the headroom-logger boundary). Reset before every test so the
+    capture is deterministic regardless of run order.
+    """
+    import logging as _logging
+
+    _logging.getLogger("headroom").propagate = True
+    yield
+
+
 # =============================================================================
 # Sample messages fixtures
 # =============================================================================

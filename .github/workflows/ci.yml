@@ -23,26 +23,11 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Cache pip packages
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ matrix.python-version }}-${{ hashFiles('pyproject.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-${{ matrix.python-version }}-
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[dev]"
-
-      # `headroom.transforms.diff_compressor` is now a thin pyo3 shim that
-      # delegates to `headroom._core` (built from `crates/headroom-py`). Without
-      # the wheel installed, every `DiffCompressor()` call raises
-      # `ModuleNotFoundError: No module named 'headroom._core'` and ~25 tests
-      # in `tests/test_transforms/test_diff_compressor.py` fail. The script
-      # below runs `maturin develop` and symlinks the built `.so` into the
-      # in-tree `headroom/` package so the editable install resolves it.
+      # `pip install -e .` invokes maturin (declared in `[build-system]
+      # requires`) under the hood, which calls cargo to build the Rust
+      # extension. The toolchain has to be available before the install
+      # step, otherwise build-isolation pulls maturin but `cargo` is
+      # missing.
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
 
@@ -51,33 +36,18 @@ jobs:
         with:
           workspaces: ". -> target"
 
-      - name: Install maturin
-        run: |
-          pip install 'maturin>=1.5,<2.0'
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ matrix.python-version }}-${{ hashFiles('pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-${{ matrix.python-version }}-
 
-      # `scripts/build_rust_extension.sh` uses `maturin develop` which requires
-      # a virtualenv. CI runs against bare setup-python with no venv, so build
-      # a wheel + pip-install it instead. Then symlink the `.so` into the
-      # in-tree `headroom/` package so the editable install resolves
-      # `import headroom._core` past the source dir shadowing site-packages.
-      #
-      # We locate the `.so` via filesystem (not via `import headroom._core`)
-      # because the import would fail at this point — the editable install's
-      # in-tree `headroom/` directory shadows site-packages and doesn't
-      # contain the `.so` yet. That's exactly the problem this step fixes.
-      - name: Build Rust extension (headroom._core)
+      - name: Install dependencies (builds Rust extension via maturin)
         run: |
-          set -euo pipefail
-          maturin build --release -m crates/headroom-py/Cargo.toml --out dist
-          pip install --force-reinstall --no-deps dist/headroom_core_py-*.whl
-          SITE_PACKAGES=$(python -c "import site; print(site.getsitepackages()[0])")
-          SO_FILE=$(find "$SITE_PACKAGES/headroom" -maxdepth 1 -name "_core.cpython-*.so" -print -quit 2>/dev/null)
-          if [[ -z "$SO_FILE" ]]; then
-            echo "error: could not find _core.cpython-*.so under $SITE_PACKAGES/headroom/" >&2
-            ls -la "$SITE_PACKAGES/headroom/" || true
-            exit 1
-          fi
-          ln -sf "$SO_FILE" "headroom/$(basename "$SO_FILE")"
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
           python -c "from headroom._core import DiffCompressor; print('headroom._core OK:', DiffCompressor)"
 
       - name: Run linting
@@ -117,18 +87,6 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install with relevance extras
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[dev,relevance]"
-
-      # `tests/test_relevance.py::TestSmartCrusherIntegration` constructs
-      # a `SmartCrusher`, which is a hard import of `headroom._core` since
-      # the Python implementation was retired in Stage 3c.1b. Without the
-      # extension built, those tests `ModuleNotFoundError`. Build + install
-      # the wheel and symlink the `.so` into the in-tree `headroom/` so
-      # the editable install resolves it (same pattern as the main `test`
-      # job above).
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
 
@@ -137,22 +95,10 @@ jobs:
         with:
           workspaces: ". -> target"
 
-      - name: Install maturin
-        run: pip install 'maturin>=1.5,<2.0'
-
-      - name: Build Rust extension (headroom._core)
+      - name: Install with relevance extras (builds Rust extension via maturin)
         run: |
-          set -euo pipefail
-          maturin build --release -m crates/headroom-py/Cargo.toml --out dist
-          pip install --force-reinstall --no-deps dist/headroom_core_py-*.whl
-          SITE_PACKAGES=$(python -c "import site; print(site.getsitepackages()[0])")
-          SO_FILE=$(find "$SITE_PACKAGES/headroom" -maxdepth 1 -name "_core.cpython-*.so" -print -quit 2>/dev/null)
-          if [[ -z "$SO_FILE" ]]; then
-            echo "error: could not find _core.cpython-*.so under $SITE_PACKAGES/headroom/" >&2
-            ls -la "$SITE_PACKAGES/headroom/" || true
-            exit 1
-          fi
-          ln -sf "$SO_FILE" "headroom/$(basename "$SO_FILE")"
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,relevance]"
           python -c "from headroom._core import SmartCrusher; print('headroom._core OK:', SmartCrusher)"
 
       - name: Run relevance tests
@@ -169,7 +115,15 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install with agno extras
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: Install with agno extras (builds Rust extension via maturin)
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev,agno]"
@@ -277,15 +231,29 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: "3.11"
 
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      # Single-wheel build via maturin: produces both the linux wheel and
+      # the platform-independent sdist in one shot. release.yml's matrix
+      # is what builds per-platform wheels for PyPI; this `build` job is
+      # a smoke check that the build system is wired right.
       - name: Install build tools
         run: |
-          python -m pip install --upgrade pip build twine
+          python -m pip install --upgrade pip
+          pip install 'maturin>=1.5,<2.0' twine
 
-      - name: Build package
+      - name: Build wheel + sdist
         run: |
-          python -m build
+          maturin sdist --out dist
+          maturin build --release --out dist
 
       - name: Check package
         run: |

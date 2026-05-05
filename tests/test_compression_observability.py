@@ -339,3 +339,10 @@ def test_router_with_prometheus_observer_increments_counters():
         "smart_crusher": (300 - 80) + (100 - 40),  # 280
         "code_aware": (200 - 120),  # 80
     }
+
+
+# IntelligentContextManager observability tests retired with PR-B1 —
+# the manager itself was deleted along with the message-dropping
+# strategy. Inner-router observability is now exercised solely
+# through ContentRouter, covered by
+# `test_content_router_records_observer_call_per_routing_decision`.

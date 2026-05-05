@@ -933,14 +933,11 @@ fn hash_canonical(canonical: &str) -> String {
         .collect()
 }
 
-/// Convenience: canonical-serialize `items` and hash the result. Kept
-/// for sites (e.g. tests) that don't also need the canonical bytes for
-/// storage. Production lossy path inlines `canonical_array_json` +
-/// `hash_canonical` so the bytes are reused for the store payload.
-#[cfg(test)]
-fn hash_array_for_ccr(items: &[Value]) -> String {
-    hash_canonical(&canonical_array_json(items))
-}
+// `hash_array_for_ccr` (a test-only `canonical_array_json + hash_canonical`
+// convenience) lived here previously but had no callers — clippy flagged
+// it as dead code. Reintroduce as a test fixture if a future test wants
+// the one-liner; production callsites inline both steps so the canonical
+// bytes can be reused for the store payload.
 
 // ─── PR5 walker-integration helpers (string handling) ──────────────────────
 //
@@ -1277,8 +1274,10 @@ mod tests {
         // Use low-uniqueness items so the analyzer is willing to
         // crush (unique id+name per row would trip the
         // "unique_entities_no_signal" skip gate instead).
-        let mut cfg = SmartCrusherConfig::default();
-        cfg.lossless_min_savings_ratio = 0.99;
+        let cfg = SmartCrusherConfig {
+            lossless_min_savings_ratio: 0.99,
+            ..Default::default()
+        };
         let c = SmartCrusher::new(cfg);
         let items: Vec<Value> = (0..50).map(|_| json!({"status": "ok"})).collect();
         let result = c.crush_array(&items, "", 1.0);
@@ -1305,8 +1304,10 @@ mod tests {
     #[test]
     fn ccr_hash_is_deterministic() {
         // Same input → same hash, so the runtime cache key is stable.
-        let mut cfg = SmartCrusherConfig::default();
-        cfg.lossless_min_savings_ratio = 0.99; // force lossy path
+        let cfg = SmartCrusherConfig {
+            lossless_min_savings_ratio: 0.99, // force lossy path
+            ..Default::default()
+        };
         let c = SmartCrusher::new(cfg);
         let items: Vec<Value> = (0..30).map(|i| json!({"id": i, "tag": "ok"})).collect();
         let r1 = c.crush_array(&items, "", 1.0);
@@ -1317,8 +1318,10 @@ mod tests {
 
     #[test]
     fn ccr_hash_changes_with_input() {
-        let mut cfg = SmartCrusherConfig::default();
-        cfg.lossless_min_savings_ratio = 0.99;
+        let cfg = SmartCrusherConfig {
+            lossless_min_savings_ratio: 0.99,
+            ..Default::default()
+        };
         let c = SmartCrusher::new(cfg);
         let a: Vec<Value> = (0..30).map(|i| json!({"id": i})).collect();
         let b: Vec<Value> = (100..130).map(|i| json!({"id": i})).collect();

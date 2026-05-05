@@ -104,6 +104,16 @@ class DiffCompressor:
 
     def compress(self, content: str, context: str = "") -> DiffCompressionResult:
         r = self._rust.compress(content, context)
+        cache_key: str | None = r.cache_key
+        if cache_key is not None:
+            # Mirror log_compressor.py + search_compressor.py: when the
+            # Rust path emits a CCR retrieval marker, persist the
+            # original payload to Python's CompressionStore so the
+            # marker actually resolves on the LLM's retrieval tool
+            # call. Without this, every diff CCR marker emitted in
+            # production is dangling — the regression fixed in the
+            # audit-cleanup PR.
+            self._persist_to_python_ccr(content, r.compressed, cache_key)
         return DiffCompressionResult(
             compressed=r.compressed,
             original_line_count=r.original_line_count,
@@ -113,8 +123,29 @@ class DiffCompressor:
             deletions=r.deletions,
             hunks_kept=r.hunks_kept,
             hunks_removed=r.hunks_removed,
-            cache_key=r.cache_key,
+            cache_key=cache_key,
         )
+
+    def _persist_to_python_ccr(self, original: str, compressed: str, cache_key: str) -> None:
+        """Promote a Rust-emitted cache_key into the production Python
+        CompressionStore. Failures are logged at warning level — a
+        store hiccup must not break the response, just degrade
+        retrieval. Mirrors the same helper on log_compressor.py and
+        search_compressor.py."""
+        try:
+            from ..cache.compression_store import get_compression_store
+        except ImportError as e:
+            logger.warning("CCR store import failed; cache_key %s won't persist: %s", cache_key, e)
+            return
+        try:
+            store: Any = get_compression_store()
+            store.store(original, compressed)
+        except Exception as e:
+            logger.warning(
+                "CCR store write failed; cache_key %s remains in-marker only: %s",
+                cache_key,
+                e,
+            )
 
     def compress_with_stats(
         self, content: str, context: str = ""

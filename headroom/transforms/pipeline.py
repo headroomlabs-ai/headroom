@@ -11,9 +11,6 @@ from ..config import (
     CacheAlignerConfig,
     DiffArtifact,
     HeadroomConfig,
-    IntelligentContextConfig,
-    RollingWindowConfig,
-    ToolCrusherConfig,
     TransformDiff,
     TransformResult,
     WasteSignals,
@@ -24,10 +21,7 @@ from ..utils import deep_copy_messages
 from .base import Transform
 from .cache_aligner import CacheAligner
 from .content_router import ContentRouter
-from .intelligent_context import IntelligentContextManager
-from .rolling_window import RollingWindow
 from .smart_crusher import SmartCrusher
-from .tool_crusher import ToolCrusher
 
 if TYPE_CHECKING:
     from ..providers.base import Provider
@@ -43,8 +37,12 @@ class TransformPipeline:
     1. Cache Aligner - normalize prefix for cache hits
     2. Content Router - intelligent content-aware compression (routes to appropriate
        compressor: Kompress for text, SmartCrusher for JSON, CodeCompressor for code, etc.)
-    3. SmartCrusher/ToolCrusher - fallback if ContentRouter disabled
-    4. IntelligentContextManager/RollingWindow - enforce token limits
+    3. SmartCrusher - fallback if ContentRouter disabled
+
+    Phase B PR-B1 retired the IntelligentContextManager / RollingWindow
+    "drop messages from history" stage. Live-zone-only compression is the
+    sole strategy going forward — message-list mutation no longer happens
+    in the pipeline.
     """
 
     def __init__(
@@ -122,22 +120,6 @@ class TransformPipeline:
                 include_summaries=self.config.smart_crusher.include_summaries,
             )
             transforms.append(SmartCrusher(smart_config))
-        elif self.config.tool_crusher.enabled:
-            # Fallback to fixed-rule crushing
-            transforms.append(ToolCrusher(self.config.tool_crusher))
-
-        # 3. Context Management (enforce limits last)
-        # IntelligentContextManager takes precedence over RollingWindow when enabled
-        if self.config.intelligent_context.enabled:
-            # Use semantic-aware context management with scoring
-            transforms.append(IntelligentContextManager(self.config.intelligent_context))
-            logger.info(
-                "Pipeline using IntelligentContextManager with strategies: "
-                "COMPRESS_FIRST -> SUMMARIZE -> DROP_BY_SCORE"
-            )
-        elif self.config.rolling_window.enabled:
-            # Fallback to position-based rolling window
-            transforms.append(RollingWindow(self.config.rolling_window))
 
         return transforms
 
@@ -457,34 +439,20 @@ class TransformPipeline:
 
 
 def create_pipeline(
-    tool_crusher_config: ToolCrusherConfig | None = None,
     cache_aligner_config: CacheAlignerConfig | None = None,
-    rolling_window_config: RollingWindowConfig | None = None,
-    intelligent_context_config: IntelligentContextConfig | None = None,
 ) -> TransformPipeline:
     """
     Create a pipeline with specific configurations.
 
     Args:
-        tool_crusher_config: Tool crusher configuration.
         cache_aligner_config: Cache aligner configuration.
-        rolling_window_config: Rolling window configuration.
-        intelligent_context_config: Intelligent context configuration.
-            When provided with enabled=True, replaces RollingWindow with
-            semantic-aware context management.
 
     Returns:
         Configured TransformPipeline.
     """
     config = HeadroomConfig()
 
-    if tool_crusher_config is not None:
-        config.tool_crusher = tool_crusher_config
     if cache_aligner_config is not None:
         config.cache_aligner = cache_aligner_config
-    if rolling_window_config is not None:
-        config.rolling_window = rolling_window_config
-    if intelligent_context_config is not None:
-        config.intelligent_context = intelligent_context_config
 
     return TransformPipeline(config)

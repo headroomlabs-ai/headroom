@@ -521,7 +521,13 @@ class TestAdapterLifecycle:
         assert any("get:" in op for op in backend.ops)
 
     def test_toin_save_load_preserves_patterns(self, tmp_toin_path):
-        """Patterns survive save/load via backend."""
+        """Patterns survive save/load via backend.
+
+        PR-B5 retired the request-time `get_recommendation()` API
+        (it now returns None with a deprecation warning). Stats and
+        on-disk patterns must still survive save/load — that's the
+        observation API B5 preserves.
+        """
         config = TOINConfig(storage_path=tmp_toin_path)
         toin = ToolIntelligenceNetwork(config)
 
@@ -546,6 +552,7 @@ class TestAdapterLifecycle:
         assert stats["patterns_tracked"] >= 1
         assert stats["total_compressions"] >= 15
 
-        # Recommendations should work
-        hint = toin2.get_recommendation(sig)
-        assert hint.based_on_samples >= 15
+        # PR-B5: get_recommendation is observation-only and returns None.
+        # Recommendations now flow through the publish CLI →
+        # recommendations.toml → Rust loader path.
+        assert toin2.get_recommendation(sig) is None

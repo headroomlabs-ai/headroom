@@ -41,6 +41,41 @@ humantime = "2"
 bytesize = "1"
 tokio-util = { version = "0.7" }
 headroom-core = { path = "../headroom-core" }
+# Phase D PR-D1: native Bedrock InvokeModel route. SigV4 + AWS
+# default credential chain.
+aws-sigv4 = { workspace = true }
+aws-config = { workspace = true }
+aws-credential-types = { workspace = true }
+aws-smithy-runtime-api = { workspace = true }
+# Phase D PR-D2: Bedrock binary EventStream parser. AWS frames each
+# message with a CRC32 over the prelude and over the entire message;
+# `crc32fast` is the standard IEEE 802.3 implementation already
+# transitively pulled in by `aws-smithy-*` (so this is not an
+# additional cold dep — promoting to a direct one for clarity).
+crc32fast = "1"
+# Phase D PR-D3: Prometheus metrics for Bedrock observability. The
+# `prometheus` crate's default-features pull in `protobuf`, which we
+# don't need (we serve text-format scrapes only), so we disable
+# defaults and re-enable nothing — pure registry + counter +
+# histogram + text encoder is sufficient.
+prometheus = { version = "0.13", default-features = false }
+# PR-E6: SHA-256 over canonical bytes of the cache hot zone (system,
+# tools, early messages) for cache-bust drift detection. Already in
+# the dev-dependencies (and pulled transitively by `aws-sigv4` via
+# `aws-smithy-runtime-api`); promoted here to a direct, normal-build
+# dependency so the drift detector compiles outside `cfg(test)`.
+sha2 = "0.10"
+# PR-E6: bounded session-scoped cache of structural hashes. The
+# detector evicts the oldest session at 1000 entries — we never want
+# unbounded memory growth from a flood of unique session keys. `lru`
+# is the de-facto Rust LRU crate; minimal surface, no dependencies of
+# our own beyond `hashbrown` (which we already pull transitively).
+lru = "0.12"
+# PR-D4: GCP Application Default Credentials → bearer token for
+# Vertex `:rawPredict` / `:streamRawPredict`. See workspace
+# Cargo.toml for rationale.
+gcp_auth = { workspace = true }
+async-trait = "0.1"
 
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }
@@ -53,3 +88,15 @@ hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
 http-body-util = "0.1"
 tokio-stream = "0.1"
+# PR-A1 cache-safety tests assert SHA-256 byte-equality between the
+# inbound and upstream-received bodies. The hash is the only sound
+# way to gate "the proxy did not perturb the request" because JSON
+# value-equality misses whitespace, key order, and Unicode escape
+# differences that all bust the prompt cache.
+sha2 = "0.10"
+# PR-C1: property tests for the byte-level SSE parser. The parser
+# must never panic on arbitrary input bytes (TCP can hand us anything,
+# including malformed UTF-8 split mid-codepoint or fuzz-generated
+# noise). 100K cases is the project default for "no panic" parser
+# invariants — see `feedback_realignment_build_constraints.md`.
+proptest = "1"

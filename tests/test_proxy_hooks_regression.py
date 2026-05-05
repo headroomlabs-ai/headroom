@@ -37,9 +37,18 @@ def test_anthropic_hooks_do_not_break_extract_user_query_lookup(tmp_path, monkey
         proxy = client.app.state.proxy
         large_user_content = "hello " * 200
 
+        # Mocked pipeline output. The proxy now recounts `optimized_tokens`
+        # using its own tokenizer instead of trusting `result.tokens_after`
+        # (issue #327 / Bug 3: cross-tokenizer comparison broke the
+        # inflation guard and zeroed out compression on Anthropic).
+        # The mocked content below tokenizes to a known value with the
+        # proxy's EstimatingTokenCounter; the assertion below is computed
+        # from that same tokenizer so the test stays robust to any future
+        # tokenizer recalibration.
+        compressed_messages = [{"role": "user", "content": "compressed"}]
         proxy.anthropic_pipeline.apply = MagicMock(
             return_value=SimpleNamespace(
-                messages=[{"role": "user", "content": "compressed"}],
+                messages=compressed_messages,
                 transforms_applied=["test_transform"],
                 timing={},
                 tokens_before=100,
@@ -76,6 +85,19 @@ def test_anthropic_hooks_do_not_break_extract_user_query_lookup(tmp_path, monkey
 
         assert response.status_code == 200
         assert proxy.anthropic_pipeline.apply.called
-        assert response.headers["x-headroom-tokens-after"] == "40"
-        assert int(response.headers["x-headroom-tokens-before"]) > 40
+
+        # `x-headroom-tokens-after` reflects the proxy-side recount of the
+        # pipeline's returned messages (NOT the mock's `tokens_after=40`).
+        # See issue #327 Bug 3: prior behavior trusted pipeline tokens_after
+        # which used a different tokenizer than `original_tokens`, breaking
+        # the inflation guard.
+        from headroom.tokenizers.registry import get_tokenizer
+
+        expected_after = get_tokenizer("claude-sonnet-4-6").count_messages(compressed_messages)
+        assert response.headers["x-headroom-tokens-after"] == str(expected_after)
+        tokens_before = int(response.headers["x-headroom-tokens-before"])
+        tokens_after = int(response.headers["x-headroom-tokens-after"])
+        assert tokens_before > tokens_after, (
+            f"compression should reduce tokens: before={tokens_before} after={tokens_after}"
+        )
         assert int(response.headers["x-headroom-tokens-saved"]) > 0

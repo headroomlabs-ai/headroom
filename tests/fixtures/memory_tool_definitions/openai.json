@@ -1,0 +1,206 @@
+{
+  "provider": "openai",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "memory_save",
+        "description": "Save important information to long-term memory with optional pre-extraction.\n\nIMPORTANT: For efficiency, extract facts, entities, and relationships yourself when calling this tool.\nThis avoids redundant LLM calls in the storage backend.\n\nUse this tool when you encounter information that should be remembered:\n- User preferences, personal facts, project context, decisions, relationships\n\nPRE-EXTRACTION (recommended for efficiency):\n- facts: List of discrete, self-contained fact strings\n  Example: [\"Prefers Python over JavaScript\", \"Works at Acme Corp\"]\n- extracted_entities: List of entities with types\n  Example: [{\"entity\": \"Python\", \"entity_type\": \"technology\"}]\n- extracted_relationships: List of entity relationships\n  Example: [{\"source\": \"user\", \"relationship\": \"works_at\", \"destination\": \"Acme Corp\"}]\n\nASYNC/BACKGROUND MODE (for zero latency):\n- Set background=true to return immediately while saving happens in background\n- Returns a task_id that can be used to check save status\n- Ideal for real-time conversations where response speed is critical\n\nThe importance score (0.0-1.0) helps prioritize memories:\n- 0.9-1.0: Critical facts\n- 0.7-0.8: Important preferences\n- 0.5-0.6: Useful information\n- 0.3-0.4: Background context\n\nDO NOT save: transient information, sensitive data (passwords, keys), redundant info",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "content": {
+              "type": "string",
+              "description": "The original information to remember. Used as context and fallback if no facts provided."
+            },
+            "importance": {
+              "type": "number",
+              "minimum": 0.0,
+              "maximum": 1.0,
+              "description": "Importance score from 0.0 (low) to 1.0 (critical)."
+            },
+            "facts": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Pre-extracted discrete facts. Each should be self-contained and specific. Example: ['Uses PyTorch for deep learning', 'Prefers dark mode']"
+            },
+            "entities": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "List of entity names referenced (simple format for backwards compatibility)."
+            },
+            "extracted_entities": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "entity": {
+                    "type": "string",
+                    "description": "Entity name"
+                  },
+                  "entity_type": {
+                    "type": "string",
+                    "description": "Type: person, organization, technology, location, project, concept"
+                  }
+                },
+                "required": [
+                  "entity",
+                  "entity_type"
+                ]
+              },
+              "description": "Pre-extracted entities with types for graph storage."
+            },
+            "relationships": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "source": {
+                    "type": "string"
+                  },
+                  "relation": {
+                    "type": "string"
+                  },
+                  "target": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "source",
+                  "relation",
+                  "target"
+                ]
+              },
+              "description": "Simple relationship format (backwards compatible)."
+            },
+            "extracted_relationships": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "source": {
+                    "type": "string",
+                    "description": "Source entity"
+                  },
+                  "relationship": {
+                    "type": "string",
+                    "description": "Relationship type: works_at, uses, knows, manages, depends_on, etc."
+                  },
+                  "destination": {
+                    "type": "string",
+                    "description": "Destination entity"
+                  }
+                },
+                "required": [
+                  "source",
+                  "relationship",
+                  "destination"
+                ]
+              },
+              "description": "Pre-extracted relationships for graph storage."
+            },
+            "background": {
+              "type": "boolean",
+              "description": "If true, save in background and return immediately with task_id. Use for zero-latency responses. The save will complete asynchronously. Check status via memory system's get_task_status(task_id)."
+            }
+          },
+          "required": [
+            "content",
+            "importance"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "memory_search",
+        "description": "Search stored memories to recall relevant information.\n\nUse this tool to retrieve previously saved information before responding to questions about:\n- User preferences or past decisions\n- Personal or professional context\n- Previously discussed topics or projects\n- Relationships between people, systems, or concepts\n- Historical context from past conversations\n\nSearch strategies:\n1. Semantic search (default): Use natural language queries that describe what you're looking for\n   - \"user's programming language preferences\"\n   - \"information about the current project\"\n   - \"past decisions about database choices\"\n\n2. Entity-based search: Specify entities to find memories mentioning specific people/things\n   - entities=[\"Alice\", \"Project X\"] finds memories involving Alice or Project X\n\n3. Related memories: Set include_related=true to also retrieve connected memories\n   - Finds memories linked by shared entities or explicit relationships\n\nBest practices:\n- Search BEFORE saving to avoid duplicates\n- Search when answering questions that might rely on remembered information\n- Use specific queries for better precision\n- Combine entity filters with semantic queries for targeted retrieval",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string",
+              "description": "Natural language search query describing what information you're looking for. Be specific but not too narrow."
+            },
+            "entities": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Filter to memories mentioning any of these entities. Useful for finding information about specific people, projects, or systems."
+            },
+            "include_related": {
+              "type": "boolean",
+              "description": "If true, also retrieve memories connected to the results via entity relationships. Helps build fuller context around a topic."
+            },
+            "top_k": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 50,
+              "description": "Maximum number of memories to retrieve. Default is 10. Use higher values when you need comprehensive context."
+            }
+          },
+          "required": [
+            "query"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "memory_update",
+        "description": "Update an existing memory with corrected or evolved information.\n\nUse this tool when:\n- The user provides a correction to previously stored information\n  - \"Actually, I prefer TypeScript now, not JavaScript\"\n  - \"My project is called ProjectX, not Project Y\"\n\n- Information has changed over time\n  - \"I've switched teams from Engineering to Product\"\n  - \"We migrated from MySQL to PostgreSQL\"\n\n- You need to add detail or clarification to an existing memory\n  - Original: \"Uses React\" -> Updated: \"Uses React 18 with TypeScript and Vite\"\n\n- Consolidating multiple related memories into one clearer entry\n\nDO NOT use this to:\n- Add completely new information (use memory_save instead)\n- Delete memories (use memory_delete instead)\n- Update memories with unrelated content\n\nThe update creates a new version while preserving history, allowing point-in-time queries of past states. Always provide a clear reason for the update to maintain an audit trail.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "memory_id": {
+              "type": "string",
+              "description": "The unique ID of the memory to update. Obtain this from a memory_search result."
+            },
+            "new_content": {
+              "type": "string",
+              "description": "The updated content that will replace the existing memory content. Should be complete and self-contained."
+            },
+            "reason": {
+              "type": "string",
+              "description": "Explanation for why this memory is being updated (e.g., 'user correction', 'information changed', 'adding detail'). Stored for audit trail."
+            }
+          },
+          "required": [
+            "memory_id",
+            "new_content"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "memory_delete",
+        "description": "Delete a memory that is no longer relevant or was stored in error.\n\nUse this tool when:\n- The user explicitly asks to forget something\n  - \"Please forget that I mentioned working at Acme\"\n  - \"Delete what you remember about Project X\"\n\n- Information is outdated and no longer applicable (not just changed - use update for that)\n  - A completed project that's no longer relevant\n  - A temporary context that has expired\n\n- A memory was saved in error\n  - Duplicate information\n  - Misunderstood or incorrect context\n\n- Privacy or data hygiene reasons\n  - User requests removal of personal information\n  - Cleaning up test or debug memories\n\nBefore deleting:\n1. Search to find the specific memory and confirm its ID\n2. Verify with the user if the deletion intent is ambiguous\n3. Consider if update would be more appropriate (for changed vs. obsolete info)\n\nDeletions are soft by default - the memory history is preserved but marked as deleted.\nAlways provide a reason for deletion to maintain an audit trail.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "memory_id": {
+              "type": "string",
+              "description": "The unique ID of the memory to delete. Obtain this from a memory_search result."
+            },
+            "reason": {
+              "type": "string",
+              "description": "Explanation for why this memory is being deleted (e.g., 'user request', 'outdated', 'stored in error'). Required for audit trail."
+            }
+          },
+          "required": [
+            "memory_id"
+          ]
+        }
+      }
+    }
+  ]
+}

@@ -31,7 +31,21 @@ serde = { version = "1", features = ["derive"] }
 # smart_crusher port relies on this to match Python's `str(dict)` output,
 # which preserves insertion order; otherwise BTreeMap's sorted-key default
 # would diverge from Python on every multi-key object.
-serde_json = { version = "1", features = ["preserve_order"] }
+#
+# `arbitrary_precision` keeps the literal numeric token from the source
+# JSON intact: `Value::Number` becomes a wrapper around the original
+# digit string, so `1.0` does NOT collapse to `1`, and `12345678901234567`
+# does NOT lose precision through f64. Required by Realignment invariant
+# I1 (byte-faithful passthrough on unmutated bytes; see REALIGNMENT/02-
+# architecture.md §2.2) and PR-A4 (see REALIGNMENT/03-phase-A-lockdown.md).
+#
+# `raw_value` exposes `serde_json::value::RawValue`, the unparsed JSON
+# fragment type. Phase B PR-B2 uses this to forward unmodified
+# `messages[*]` entries as exact byte copies — the parser captures the
+# original byte slice, so byte-for-byte round-trips work even with
+# whitespace, key order, or escape preferences the producer chose.
+# Enabled here in Phase A so PR-B2 can land as a pure consumer change.
+serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision", "raw_value"] }
 bytes = "1"
 thiserror = "1"
 tracing = "0.1"
@@ -42,3 +56,22 @@ axum = "0.7"
 tower = "0.5"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 pyo3 = "0.22"
+# Phase D PR-D1: AWS SigV4 signing for native Bedrock InvokeModel route.
+# `aws-sigv4` provides the canonical-request + signing-key implementation;
+# `aws-config` resolves credentials from the standard provider chain
+# (env vars, profiles, IMDS, ECS task role, etc); `aws-credential-types`
+# exposes `Credentials` so the signer accepts whatever the chain returned.
+aws-sigv4 = { version = "1", default-features = false, features = ["sign-http", "http1"] }
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rustls", "rt-tokio"] }
+aws-credential-types = { version = "1", default-features = false }
+# `Identity` lives in aws-smithy-runtime-api; the SigV4 builder
+# accepts `&Identity`. Pinning the version explicitly avoids a
+# silent semver bump from the transitive dep tree.
+aws-smithy-runtime-api = { version = "1", default-features = false, features = ["client"] }
+# PR-D4: Vertex publisher path uses GCP Application Default Credentials
+# (ADC) → bearer token for the `Authorization: Bearer <token>` header.
+# `gcp_auth` resolves the chain (gcloud user creds, GCE/GKE metadata
+# server, service-account JSON, workload-identity federation) without
+# us baking provider-specific knowledge in. The token source is wrapped
+# in a `TokenSource` trait so tests inject a static-token mock.
+gcp_auth = "0.12"

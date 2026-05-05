@@ -84,7 +84,7 @@ def test_request_id_plumbed_to_pipeline_apply() -> None:
 
         proxy.anthropic_pipeline.apply = _fake_apply
 
-        async def _fake_retry(method, url, headers, body, stream=False):  # noqa: ANN001
+        async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
             return _ok_response("msg_diag_1")
 
         proxy._retry_request = _fake_retry
@@ -124,7 +124,7 @@ def test_optimization_failure_logs_exception_type() -> None:
 
         proxy.anthropic_pipeline.apply = _raise_timeout
 
-        async def _fake_retry(method, url, headers, body, stream=False):  # noqa: ANN001
+        async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
             return _ok_response("msg_diag_2")
 
         proxy._retry_request = _fake_retry

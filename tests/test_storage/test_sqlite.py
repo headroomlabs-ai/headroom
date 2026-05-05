@@ -135,7 +135,7 @@ class TestSave:
             stable_prefix_hash="xyz789",
             cache_alignment_score=95.0,
             cached_tokens=200,
-            transforms_applied=["RollingWindow"],
+            transforms_applied=["ContentRouter"],
             tool_units_dropped=2,
             turns_dropped=1,
             messages_hash="ghi789",
@@ -175,7 +175,7 @@ class TestSave:
             stable_prefix_hash="stablehash123",
             cache_alignment_score=92.5,
             cached_tokens=750,
-            transforms_applied=["CacheAligner", "SmartCrusher", "RollingWindow"],
+            transforms_applied=["CacheAligner", "SmartCrusher", "ContentRouter"],
             tool_units_dropped=3,
             turns_dropped=2,
             messages_hash="msgshash456",
@@ -204,7 +204,7 @@ class TestSave:
         assert result.stable_prefix_hash == "stablehash123"
         assert result.cache_alignment_score == 92.5
         assert result.cached_tokens == 750
-        assert result.transforms_applied == ["CacheAligner", "SmartCrusher", "RollingWindow"]
+        assert result.transforms_applied == ["CacheAligner", "SmartCrusher", "ContentRouter"]
         assert result.tool_units_dropped == 3
         assert result.turns_dropped == 2
         assert result.messages_hash == "msgshash456"

@@ -49,29 +49,18 @@ if TYPE_CHECKING:
         HTMLExtractorConfig,
         is_html_content,
     )
-    from headroom.transforms.intelligent_context import (  # noqa: F401
-        ContextStrategy,
-        IntelligentContextManager,
-    )
     from headroom.transforms.log_compressor import (  # noqa: F401
         LogCompressionResult,
         LogCompressor,
         LogCompressorConfig,
     )
     from headroom.transforms.pipeline import TransformPipeline  # noqa: F401
-    from headroom.transforms.rolling_window import RollingWindow  # noqa: F401
-    from headroom.transforms.scoring import (  # noqa: F401
-        EmbeddingProvider,
-        MessageScore,
-        MessageScorer,
-    )
     from headroom.transforms.search_compressor import (  # noqa: F401
         SearchCompressionResult,
         SearchCompressor,
         SearchCompressorConfig,
     )
     from headroom.transforms.smart_crusher import SmartCrusher, SmartCrusherConfig  # noqa: F401
-    from headroom.transforms.tool_crusher import ToolCrusher  # noqa: F401
 
 _HTML_EXTRACTOR_AVAILABLE = importlib.util.find_spec("trafilatura") is not None
 
@@ -87,7 +76,6 @@ __all__ = [
     "calculate_information_score",
     "compute_item_hash",
     # JSON compression
-    "ToolCrusher",
     "SmartCrusher",
     "SmartCrusherConfig",
     # Text compression (coding tasks)
@@ -118,13 +106,6 @@ __all__ = [
     "CompressionStrategy",
     # Other transforms
     "CacheAligner",
-    "RollingWindow",
-    # Intelligent context management
-    "IntelligentContextManager",
-    "ContextStrategy",
-    "MessageScorer",
-    "MessageScore",
-    "EmbeddingProvider",
     # HTML extraction (optional)
     "_HTML_EXTRACTOR_AVAILABLE",
 ]
@@ -155,7 +136,6 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     ),
     "compute_item_hash": ("headroom.transforms.anchor_selector", "compute_item_hash"),
     # JSON compression
-    "ToolCrusher": ("headroom.transforms.tool_crusher", "ToolCrusher"),
     "SmartCrusher": ("headroom.transforms.smart_crusher", "SmartCrusher"),
     "SmartCrusherConfig": ("headroom.transforms.smart_crusher", "SmartCrusherConfig"),
     # Text compression (coding tasks)
@@ -204,16 +184,6 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "CompressionStrategy": ("headroom.transforms.content_router", "CompressionStrategy"),
     # Other transforms
     "CacheAligner": ("headroom.transforms.cache_aligner", "CacheAligner"),
-    "RollingWindow": ("headroom.transforms.rolling_window", "RollingWindow"),
-    # Intelligent context management
-    "IntelligentContextManager": (
-        "headroom.transforms.intelligent_context",
-        "IntelligentContextManager",
-    ),
-    "ContextStrategy": ("headroom.transforms.intelligent_context", "ContextStrategy"),
-    "MessageScorer": ("headroom.transforms.scoring", "MessageScorer"),
-    "MessageScore": ("headroom.transforms.scoring", "MessageScore"),
-    "EmbeddingProvider": ("headroom.transforms.scoring", "EmbeddingProvider"),
     # HTML extraction (optional dependency - requires trafilatura)
     "HTMLExtractor": ("headroom.transforms.html_extractor", "HTMLExtractor"),
     "HTMLExtractorConfig": ("headroom.transforms.html_extractor", "HTMLExtractorConfig"),

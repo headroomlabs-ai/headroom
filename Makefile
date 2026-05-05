@@ -7,7 +7,7 @@ MATURIN ?= maturin
 PYTHON ?= python3
 FIXTURES ?= tests/parity/fixtures
 
-.PHONY: help test test-parity bench build-proxy build-wheel fmt fmt-check lint clippy clean ci-precheck ci-precheck-rust ci-precheck-python ci-precheck-commitlint install-git-hooks
+.PHONY: help test test-parity bench build-proxy build-wheel fmt fmt-check lint clippy clean ci-precheck ci-precheck-rust ci-precheck-python ci-precheck-commitlint install-git-hooks verify-rust-core
 
 help:
 	@echo "Headroom Rust targets:"
@@ -16,6 +16,7 @@ help:
 	@echo "  make bench              - cargo bench --workspace"
 	@echo "  make build-proxy        - release build + strip headroom-proxy, print size"
 	@echo "  make build-wheel        - release wheel for headroom-py"
+	@echo "  make verify-rust-core   - build + install + import-verify headroom._core"
 	@echo "  make fmt                - cargo fmt --all"
 	@echo "  make fmt-check          - cargo fmt --all -- --check"
 	@echo "  make lint               - cargo clippy --workspace -- -D warnings"
@@ -51,6 +52,18 @@ build-proxy:
 
 build-wheel:
 	$(MATURIN) build --release -m crates/headroom-py/Cargo.toml
+
+# Hotfix-A0: maturin-develop + symlink + import-verify in one shot. Run this
+# any time you suspect the proxy is silently falling back to Python-only
+# mode (Finding #2 in HEADROOM_PROXY_LOG_FINDINGS_2026_05_03.md). The
+# proxy itself runs the same check at lifespan startup; this target
+# exposes it as a developer-facing one-liner.
+verify-rust-core:
+	@if [ -z "$$VIRTUAL_ENV" ]; then \
+		echo "error: activate a venv first (e.g. source .venv/bin/activate)"; \
+		exit 1; \
+	fi
+	bash scripts/build_rust_extension.sh
 
 fmt:
 	$(CARGO) fmt --all

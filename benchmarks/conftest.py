@@ -311,19 +311,6 @@ def cache_aligner_config():
     )
 
 
-@pytest.fixture
-def rolling_window_config():
-    """RollingWindow config for benchmarks."""
-    from headroom.config import RollingWindowConfig
-
-    return RollingWindowConfig(
-        enabled=True,
-        keep_system=True,
-        keep_last_turns=2,
-        output_buffer_tokens=4000,
-    )
-
-
 # =============================================================================
 # JSON String Fixtures (for relevance benchmarks)
 # =============================================================================

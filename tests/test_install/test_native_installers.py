@@ -242,9 +242,33 @@ def _run(
     )
 
 
+def _bash_supports_4_3() -> bool:
+    """The Docker-native installer requires bash >= 4.3. macOS ships 3.2."""
+    bash = shutil.which("bash")
+    if not bash:
+        return False
+    try:
+        out = subprocess.run(
+            [bash, "-c", 'echo "${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}"'],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return False
+    parts = out.stdout.strip().split(".")
+    if len(parts) < 2:
+        return False
+    try:
+        major, minor = int(parts[0]), int(parts[1])
+    except ValueError:
+        return False
+    return (major, minor) >= (4, 3)
+
+
 @pytest.mark.skipif(
-    os.name == "nt" or shutil.which("bash") is None,
-    reason="bash installer coverage runs on non-Windows hosts",
+    os.name == "nt" or shutil.which("bash") is None or not _bash_supports_4_3(),
+    reason="installer requires bash >= 4.3 (macOS system bash is 3.2)",
 )
 def test_bash_native_installer_supports_persistent_docker_lifecycle(tmp_path: Path) -> None:
     home = tmp_path / "home"

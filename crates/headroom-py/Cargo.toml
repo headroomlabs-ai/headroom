@@ -6,6 +6,16 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "PyO3 bindings exposing headroom-core to Python as headroom._core."
+# Issue #355: build.rs compiles a glibc-2.38-compat shim
+# (glibc_compat.c) on Linux/glibc only. Without `build = "build.rs"`
+# Cargo skips it. See the script's header comment for rationale.
+build = "build.rs"
+
+[build-dependencies]
+# Compile the C shim into a static library that links into _core.so.
+# `cc` is already transitively in our build graph (used by aws-lc-rs,
+# zstd-sys, ring, etc) so this is not a new cold dep.
+cc = "1"
 
 [lib]
 name = "_core"

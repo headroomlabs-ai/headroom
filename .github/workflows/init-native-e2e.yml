@@ -35,11 +35,18 @@ on:
 jobs:
   init-native:
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # Windows is excluded today: upstream `esaxx-rs` (transitively from
+        # `tokenizers`) and `ort-sys` (onnxruntime via `fastembed`) link
+        # with conflicting MSVC C runtime libraries (/MT vs /MD), so the
+        # Rust extension cannot build for `win_amd64` until the upstream
+        # CRT conflict is resolved. Re-add `windows-latest` once the wheel
+        # builds cleanly there. Tracked in the project plan; not a blocker
+        # for headroom-ai installs on Linux + macOS.
+        os: [ubuntu-latest, macos-latest]
         target: [claude, codex, copilot, openclaw]
         exclude:
           # openclaw delegates to ``headroom wrap openclaw`` which needs a

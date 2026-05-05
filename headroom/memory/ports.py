@@ -5,11 +5,12 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Protocol, runtime_checkable
-
-import numpy as np
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from headroom.memory.models import Memory, ScopeLevel
+
+if TYPE_CHECKING:
+    import numpy as np
 
 # =============================================================================
 # Filter Dataclasses

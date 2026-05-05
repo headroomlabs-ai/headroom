@@ -105,11 +105,13 @@ def test_anthropic_tool_sort_and_context_append_helpers() -> None:
         "ctx",
         frozen_message_count=0,
     ) == [{"role": "user", "content": "hello\n\nctx"}]
+    # PR-A2 semantics: list-content user messages get the context appended
+    # to the first text block (live-zone-tail injection).
     assert AnthropicHandlerMixin._append_context_to_latest_non_frozen_user_turn(
         [{"role": "user", "content": [{"type": "text", "text": "hello"}]}],
         "ctx",
         frozen_message_count=0,
-    ) == [{"role": "user", "content": [{"type": "text", "text": "hello"}]}]
+    ) == [{"role": "user", "content": [{"type": "text", "text": "hello\n\nctx"}]}]
 
 
 def test_anthropic_image_compression_helper_only_rewrites_latest_eligible_turn() -> None:

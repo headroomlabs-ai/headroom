@@ -363,140 +363,11 @@ And multiple blank lines."""
         benchmark(aligner.apply, messages, mock_tokenizer)
 
 
-class TestRollingWindowBenchmarks:
-    """Benchmarks for RollingWindow token budget management.
-
-    RollingWindow performs:
-    - Token counting across all messages
-    - Tool unit identification (atomic drops)
-    - Protected index calculation
-    - Strategic message removal
-
-    Expected performance:
-    - 50 turns: < 5ms
-    - 200 turns: < 20ms
-    """
-
-    @pytest.fixture
-    def window(self, rolling_window_config):
-        """Create RollingWindow instance."""
-        from headroom.transforms.rolling_window import RollingWindow
-
-        return RollingWindow(config=rolling_window_config)
-
-    def test_window_50_turns(
-        self,
-        benchmark,
-        window,
-        mock_tokenizer,
-        conversation_50_turns,
-    ):
-        """Benchmark windowing 50-turn conversation.
-
-        Target: < 5ms
-        Tests typical long conversation scenario.
-        """
-        # Set low limit to force dropping
-        result = benchmark(
-            window.apply,
-            conversation_50_turns,
-            mock_tokenizer,
-            model_limit=10000,
-            output_buffer=2000,
-        )
-
-        # Some messages should be dropped
-        assert len(result.messages) < len(conversation_50_turns)
-
-    def test_window_200_turns(
-        self,
-        benchmark,
-        window,
-        mock_tokenizer,
-        conversation_200_turns,
-    ):
-        """Benchmark windowing 200-turn conversation.
-
-        Target: < 20ms
-        Stress test for very long agentic sessions.
-        """
-        result = benchmark(
-            window.apply,
-            conversation_200_turns,
-            mock_tokenizer,
-            model_limit=20000,
-            output_buffer=4000,
-        )
-
-        assert len(result.messages) < len(conversation_200_turns)
-
-    def test_window_no_drop_needed(
-        self,
-        benchmark,
-        window,
-        mock_tokenizer,
-        conversation_10_turns,
-    ):
-        """Benchmark when no dropping needed.
-
-        Target: < 1ms
-        Tests early-exit optimization.
-        """
-        result = benchmark(
-            window.apply,
-            conversation_10_turns,
-            mock_tokenizer,
-            model_limit=1000000,  # High limit, no dropping
-            output_buffer=4000,
-        )
-
-        assert len(result.messages) == len(conversation_10_turns)
-
-    def test_window_aggressive_drop(
-        self,
-        benchmark,
-        window,
-        mock_tokenizer,
-        conversation_50_turns,
-    ):
-        """Benchmark aggressive dropping (very low limit).
-
-        Target: < 5ms
-        Tests worst-case dropping scenario.
-        """
-        result = benchmark(
-            window.apply,
-            conversation_50_turns,
-            mock_tokenizer,
-            model_limit=2000,  # Very low
-            output_buffer=500,
-        )
-
-        # Should have dropped significantly
-        assert len(result.messages) < len(conversation_50_turns) // 2
-
-    def test_window_rag_context(
-        self,
-        benchmark,
-        window,
-        mock_tokenizer,
-        rag_conversation_20k,
-    ):
-        """Benchmark windowing RAG conversation.
-
-        Target: < 5ms
-        Tests handling of large context blocks.
-        """
-        result = benchmark(
-            window.apply,
-            rag_conversation_20k,
-            mock_tokenizer,
-            model_limit=15000,
-            output_buffer=4000,
-        )
-
-        # RAG context preserved, later turns may be dropped
-        assert result.messages[0]["role"] == "system"
+# RollingWindow benchmarks were retired in PR-B1 along with the
+# RollingWindow transform itself. Live-zone-only compression
+# (PR-B2..B7) does not drop messages, so message-count-based
+# benchmarks no longer have a baseline to measure. Phase B's own
+# performance suite lives alongside the live-zone dispatcher.
 
 
 class TestTransformPipelineBenchmarks:
@@ -521,20 +392,21 @@ class TestTransformPipelineBenchmarks:
         return provider
 
     @pytest.fixture
-    def pipeline(
-        self, smart_crusher_config, cache_aligner_config, rolling_window_config, mock_provider
-    ):
-        """Create transform pipeline."""
+    def pipeline(self, smart_crusher_config, cache_aligner_config, mock_provider):
+        """Create transform pipeline.
+
+        PR-B1 retired RollingWindow; the live-zone-only architecture
+        runs CacheAligner → SmartCrusher (followed by ContentRouter
+        in production, omitted here to keep the fixture pure-stage).
+        """
         from headroom.transforms.cache_aligner import CacheAligner
         from headroom.transforms.pipeline import TransformPipeline
-        from headroom.transforms.rolling_window import RollingWindow
         from headroom.transforms.smart_crusher import SmartCrusher
 
         return TransformPipeline(
             transforms=[
                 CacheAligner(cache_aligner_config),
                 SmartCrusher(smart_crusher_config),
-                RollingWindow(rolling_window_config),
             ],
             provider=mock_provider,
         )

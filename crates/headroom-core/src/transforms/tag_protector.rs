@@ -324,6 +324,13 @@ fn parse_tag_at(bytes: &[u8], start: usize) -> TagParse {
     if is_close {
         i += 1;
     }
+    // After consuming a possible '/' we may be at end-of-input
+    // (e.g. literal `</` with nothing after). Guard the bounds
+    // before indexing into `bytes[i]` for the name-start check —
+    // proptest discovered the OOB on input `</`.
+    if i >= n {
+        return TagParse::NotTag;
+    }
     let name_start = i;
     if !is_name_start(bytes[i]) {
         return TagParse::NotTag;
@@ -638,45 +645,94 @@ fn emit_output(
 /// Restore protected tag spans after the compressor ran on the
 /// cleaned text.
 ///
+/// # Hotfix-A9 — discard-wrap semantics
+///
 /// If a placeholder went missing during compression (the compressor
-/// stripped or rewrote it) the corresponding original is appended to
-/// the output rather than dropped — same fallback semantics as the
-/// Python original. A `tracing::warn!` is emitted at compile-time-
-/// optional verbosity so prod can scrape lossy-compression incidents.
+/// stripped or rewrote it) the wrap is **discarded**: the compressed
+/// text flows downstream as-is and the original tag bytes are NOT
+/// re-injected anywhere. This is a deliberate behavior change vs the
+/// original "append the orphan tag at the trailing edge" fallback,
+/// which produced silently malformed XML (an opening tag with no
+/// closing tag and no body) on ~350 production requests over 9 days.
+///
+/// An ERROR-level `tracing` event with structured fields
+/// (`event = tag_protector_placeholder_lost`, `tag_preview`,
+/// `compressed_length`, optional `request_id`) is emitted per lost
+/// placeholder so operators can alert on the corruption rather than
+/// having it disappear into a WARN line. Token validation downstream
+/// is responsible for catching cases where the discard regressed the
+/// final output vs the original input.
+///
+/// Invariants enforced:
+/// 1. Symmetry — never emit asymmetric tag counts (the input either
+///    survives both opens and closes via successful substitution, or
+///    neither survives via discard).
+/// 2. No orphan tag injection — `restore_tags` adds bytes only as part
+///    of placeholder substitution. No appends, no prepends, no
+///    whitespace insertion outside placeholder substitutions.
+/// 3. Idempotence on missing placeholders — if every placeholder is
+///    absent from `compressed`, the function returns `compressed`
+///    byte-for-byte unchanged.
 pub fn restore_tags(text: &str, blocks: &[(String, String)]) -> String {
+    restore_tags_with_request_id(text, blocks, None)
+}
+
+/// Variant of [`restore_tags`] that threads an optional `request_id`
+/// into the structured ERROR log emitted on placeholder loss. The
+/// PyO3 binding currently calls [`restore_tags`] (no request id);
+/// this entry point exists so the proxy layer can wire request
+/// context through once it has one available end-to-end.
+pub fn restore_tags_with_request_id(
+    text: &str,
+    blocks: &[(String, String)],
+    request_id: Option<&str>,
+) -> String {
     if blocks.is_empty() {
         return text.to_string();
     }
 
     let mut result = text.to_string();
-    let mut tail_appends: Vec<&str> = Vec::new();
+    let mut lost_count: usize = 0;
+    let compressed_length = text.len();
     for (placeholder, original) in blocks {
         if result.contains(placeholder.as_str()) {
             result = result.replace(placeholder.as_str(), original);
         } else {
-            tag_lost_warn(original);
-            tail_appends.push(original.as_str());
+            lost_count += 1;
+            tag_lost_error(original, compressed_length, request_id);
         }
     }
-
-    if !tail_appends.is_empty() {
-        for original in tail_appends {
-            result.push('\n');
-            result.push_str(original);
-        }
-    }
-
+    // No tail_appends. The compressed text is returned with the
+    // wraps for the lost placeholders fully discarded — never
+    // appended back as orphan opens (Hotfix-A9).
+    let _ = lost_count; // surfaced via the per-event log; aggregate
+                        // counters live on the stats sidecar in
+                        // callers that have one.
     result
 }
 
 #[inline(never)]
-fn tag_lost_warn(original: &str) {
+fn tag_lost_error(original: &str, compressed_length: usize, request_id: Option<&str>) {
     let preview: String = original.chars().take(80).collect();
-    tracing::warn!(
-        target: "headroom::tag_protector",
-        preview = %preview,
-        "tag placeholder lost during compression, appending original"
-    );
+    match request_id {
+        Some(rid) => tracing::error!(
+            target: "headroom::tag_protector",
+            event = "tag_protector_placeholder_lost",
+            tag_preview = %preview,
+            compressed_length = compressed_length,
+            request_id = %rid,
+            action = "discarded_wrap",
+            "tag placeholder lost during compression — wrap discarded"
+        ),
+        None => tracing::error!(
+            target: "headroom::tag_protector",
+            event = "tag_protector_placeholder_lost",
+            tag_preview = %preview,
+            compressed_length = compressed_length,
+            action = "discarded_wrap",
+            "tag placeholder lost during compression — wrap discarded"
+        ),
+    }
 }
 
 // ─── Tiny byte-search helper ──────────────────────────────────────────
@@ -824,13 +880,57 @@ mod tests {
     }
 
     #[test]
-    fn restore_lost_placeholder_appended() {
+    fn restore_lost_placeholder_discards_wrap() {
+        // Hotfix-A9: when a placeholder is missing from the compressed
+        // text, the wrap is DISCARDED — the compressed text is returned
+        // as-is, with no orphan-tag append. (The original behavior of
+        // appending the tag at the trailing edge produced silently
+        // malformed XML in ~350 production requests over 9 days.)
         let blocks = vec![(
             "{{HEADROOM_TAG_0}}".to_string(),
             "<tag>data</tag>".to_string(),
         )];
-        let restored = restore_tags("text without placeholder", &blocks);
-        assert!(restored.contains("<tag>data</tag>"));
+        let compressed = "text without placeholder";
+        let restored = restore_tags(compressed, &blocks);
+        // Compressed text returned unchanged; original tag NOT injected.
+        assert_eq!(restored, compressed);
+        assert!(!restored.contains("<tag>"));
+        assert!(!restored.contains("</tag>"));
+        assert!(!restored.contains("<tag>data</tag>"));
+    }
+
+    #[test]
+    fn restore_lost_placeholder_idempotent_when_all_missing() {
+        // Invariant #3: if every placeholder is missing from the
+        // compressed text, the function returns the compressed text
+        // byte-for-byte unchanged.
+        let blocks = vec![
+            ("{{HEADROOM_TAG_0}}".to_string(), "<a>1</a>".to_string()),
+            ("{{HEADROOM_TAG_1}}".to_string(), "<b>2</b>".to_string()),
+            ("{{HEADROOM_TAG_2}}".to_string(), "<c>3</c>".to_string()),
+        ];
+        let compressed = "compressor stripped every placeholder";
+        let restored = restore_tags(compressed, &blocks);
+        assert_eq!(restored, compressed);
+    }
+
+    #[test]
+    fn restore_partial_loss_keeps_present_drops_lost() {
+        // Mixed case: some placeholders survive, others are lost. The
+        // surviving ones get substituted; the lost ones are discarded.
+        // No orphan-tag bytes appear anywhere in the output.
+        let blocks = vec![
+            ("{{HEADROOM_TAG_0}}".to_string(), "<a>1</a>".to_string()),
+            (
+                "{{HEADROOM_TAG_1}}".to_string(),
+                "<lost>x</lost>".to_string(),
+            ),
+        ];
+        let compressed = "head {{HEADROOM_TAG_0}} tail";
+        let restored = restore_tags(compressed, &blocks);
+        assert_eq!(restored, "head <a>1</a> tail");
+        assert!(!restored.contains("<lost"));
+        assert!(!restored.contains("</lost>"));
     }
 
     #[test]
@@ -945,6 +1045,19 @@ mod tests {
     }
 
     #[test]
+    fn truncated_close_marker_does_not_panic() {
+        // Hotfix-A9: proptest seed `</` would index past end-of-input
+        // in `parse_tag_at`. Pre-fix this panicked with an OOB; the
+        // bounds-check now returns NotTag and the function falls
+        // through to emitting `</` verbatim.
+        for text in ["</", "<", "<a/", "<a", "<a /", "</a"] {
+            let (cleaned, blocks, _stats) = protect_tags(text, false);
+            assert_eq!(cleaned, text);
+            assert!(blocks.is_empty());
+        }
+    }
+
+    #[test]
     fn attribute_with_gt_inside_quotes() {
         let text = r#"<context attr="a > b">payload</context>"#;
         let (cleaned, blocks, _stats) = protect_tags(text, false);
@@ -968,5 +1081,192 @@ mod tests {
         // `</div>` is HTML, not orphan.
         assert_eq!(stats.html_tags_skipped, 1);
         assert_eq!(stats.orphan_closes, 0);
+    }
+
+    // ─── Hotfix-A9 invariants ────────────────────────────────────────
+
+    /// Count `<custom>` style opening tags (excludes self-closers and
+    /// excludes the closing-tag `</…>` form). Any `<` that is followed
+    /// by an alphabetic name and ends with `>` (without an embedded
+    /// `/>`) counts. Only used by the proptest below — keeps the
+    /// invariant check independent of the parser under test.
+    fn count_open_tags(s: &str) -> usize {
+        let bytes = s.as_bytes();
+        let mut count = 0_usize;
+        let mut i = 0_usize;
+        while i < bytes.len() {
+            if bytes[i] != b'<' {
+                i += 1;
+                continue;
+            }
+            // Skip closing tags `</…>`.
+            if i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                i += 1;
+                continue;
+            }
+            // Must be followed by a name-start char to count as a tag.
+            if i + 1 >= bytes.len() || !is_name_start(bytes[i + 1]) {
+                i += 1;
+                continue;
+            }
+            // Walk to the matching `>`. If we hit `/>` first, this is
+            // self-closing and doesn't count as an unbalanced opener.
+            let mut j = i + 1;
+            let mut self_closing = false;
+            while j < bytes.len() && bytes[j] != b'>' {
+                if bytes[j] == b'/' {
+                    self_closing = true;
+                }
+                j += 1;
+            }
+            if j >= bytes.len() {
+                // No closing `>` — not a tag.
+                break;
+            }
+            if !self_closing {
+                count += 1;
+            }
+            i = j + 1;
+        }
+        count
+    }
+
+    fn count_close_tags(s: &str) -> usize {
+        let bytes = s.as_bytes();
+        let mut count = 0_usize;
+        let mut i = 0_usize;
+        while i < bytes.len() {
+            if bytes[i] != b'<' {
+                i += 1;
+                continue;
+            }
+            if i + 1 >= bytes.len() || bytes[i + 1] != b'/' {
+                i += 1;
+                continue;
+            }
+            // `</name>` — confirm name-start and find the closing `>`.
+            if i + 2 >= bytes.len() || !is_name_start(bytes[i + 2]) {
+                i += 1;
+                continue;
+            }
+            let mut j = i + 2;
+            while j < bytes.len() && bytes[j] != b'>' {
+                j += 1;
+            }
+            if j >= bytes.len() {
+                break;
+            }
+            count += 1;
+            i = j + 1;
+        }
+        count
+    }
+
+    proptest::proptest! {
+        /// Invariant: `restore_tags` never INTRODUCES tag-count
+        /// asymmetry. Concretely: restoring on a compressed text with
+        /// any subset of placeholders missing must produce the same
+        /// `opens - closes` skew as the cleaned text after stripping
+        /// the placeholders. The orphan-append bug fixed by Hotfix-A9
+        /// could turn a symmetric `<a>x</a>` into an asymmetric
+        /// `compressed-stuff <a>` whenever the placeholder was
+        /// dropped — the discard-wrap path makes that impossible
+        /// because every protected span is a balanced wrap (or a
+        /// self-closer) so dropping it changes opens and closes by
+        /// the same amount.
+        #[test]
+        fn restore_never_introduces_asymmetry(content in "[a-z<>/]{0,200}") {
+            let (cleaned, blocks, _stats) = protect_tags(&content, false);
+            // Baseline: strip every placeholder from `cleaned`. This
+            // is the "lost everything" worst case; the discard-wrap
+            // path must produce exactly this output.
+            let mut stripped = cleaned.clone();
+            for (placeholder, _original) in &blocks {
+                stripped = stripped.replace(placeholder.as_str(), "");
+            }
+            let baseline_skew = count_open_tags(&stripped) as i64
+                - count_close_tags(&stripped) as i64;
+
+            // With every placeholder lost, restore_tags must return
+            // the compressed text with placeholders dropped — which
+            // is exactly `stripped`. So asymmetry equals baseline.
+            let restored_all_lost = restore_tags(&stripped, &blocks);
+            let lost_skew = count_open_tags(&restored_all_lost) as i64
+                - count_close_tags(&restored_all_lost) as i64;
+            proptest::prop_assert_eq!(
+                lost_skew, baseline_skew,
+                "discard-wrap path introduced asymmetry: baseline={}, after_restore={}, restored={:?}",
+                baseline_skew, lost_skew, restored_all_lost
+            );
+
+            // With every placeholder PRESENT, restore_tags must round-
+            // trip exactly to the original `content`, which by
+            // construction has the same skew as `content` itself.
+            let restored_full = restore_tags(&cleaned, &blocks);
+            let full_skew = count_open_tags(&restored_full) as i64
+                - count_close_tags(&restored_full) as i64;
+            let content_skew = count_open_tags(&content) as i64
+                - count_close_tags(&content) as i64;
+            proptest::prop_assert_eq!(
+                full_skew, content_skew,
+                "full-restore path drifted from input skew: input={}, restored={}",
+                content_skew, full_skew
+            );
+        }
+
+        /// Invariant: when every placeholder is stripped before
+        /// restore, the function returns the compressed text
+        /// byte-for-byte unchanged (no orphan-tag injection, no
+        /// whitespace insertion, no prepends/appends).
+        #[test]
+        fn restore_idempotent_when_all_placeholders_lost(
+            content in "[a-z<>/]{0,200}",
+            compressed in "[ -~]{0,200}",
+        ) {
+            let (_cleaned, blocks, _stats) = protect_tags(&content, false);
+            // Drop all placeholders by feeding `restore_tags` arbitrary
+            // text the compressor "produced". If none of the
+            // placeholders happen to appear in `compressed` (the
+            // common case for arbitrary strings), the discard-wrap
+            // path runs end-to-end.
+            let any_placeholder_present = blocks
+                .iter()
+                .any(|(p, _)| compressed.contains(p.as_str()));
+            proptest::prop_assume!(!any_placeholder_present);
+            let restored = restore_tags(&compressed, &blocks);
+            proptest::prop_assert_eq!(restored, compressed);
+        }
+
+        /// Invariant: `restore_tags` never adds bytes that weren't
+        /// already in `compressed` or part of a substituted placeholder
+        /// original. Concretely: the restored length is at most
+        /// `compressed.len()` plus the sum of lengths of originals
+        /// that actually got substituted; lost-placeholder originals
+        /// contribute zero bytes.
+        #[test]
+        fn restore_no_orphan_byte_injection(
+            content in "[a-z<>/]{0,200}",
+        ) {
+            let (cleaned, blocks, _stats) = protect_tags(&content, false);
+            let restored = restore_tags(&cleaned, &blocks);
+            // Sum of the byte-lengths of the originals that were
+            // actually substituted (placeholder still present in
+            // `cleaned`). Lost placeholders contribute zero.
+            let substituted_original_bytes: usize = blocks
+                .iter()
+                .filter(|(p, _)| cleaned.contains(p.as_str()))
+                .map(|(p, original)| original.len().saturating_sub(p.len()))
+                .sum();
+            // Upper bound: cleaned.len() + delta from substitution.
+            // (Substitution replaces each placeholder of len p.len()
+            // with original of len original.len(); delta per substitution
+            // is original.len() - p.len(), summed across substitutions.)
+            let upper_bound = cleaned.len() + substituted_original_bytes;
+            proptest::prop_assert!(
+                restored.len() <= upper_bound,
+                "restored too long: restored.len={} upper_bound={} cleaned.len={}",
+                restored.len(), upper_bound, cleaned.len()
+            );
+        }
     }
 }

@@ -20,13 +20,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Install dependencies
-        run: pip install -e ".[all]"
 
-      # `compression_only.evaluate_ccr_lossless` constructs a SmartCrusher
-      # which now hard-imports `headroom._core` (Stage 3c.1b). Build the
-      # Rust extension before running the smoke test or every call raises
-      # `ModuleNotFoundError`. Mirrors the main CI `test` job pattern.
+      # `pip install -e .` invokes maturin (declared in pyproject.toml's
+      # build-system) which calls cargo to compile the Rust extension.
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
 
@@ -35,21 +31,9 @@ jobs:
         with:
           workspaces: ". -> target"
 
-      - name: Install maturin
-        run: pip install 'maturin>=1.5,<2.0'
-
-      - name: Build Rust extension (headroom._core)
+      - name: Install dependencies (builds Rust extension via maturin)
         run: |
-          set -euo pipefail
-          maturin build --release -m crates/headroom-py/Cargo.toml --out dist
-          pip install --force-reinstall --no-deps dist/headroom_core_py-*.whl
-          SITE_PACKAGES=$(python -c "import site; print(site.getsitepackages()[0])")
-          SO_FILE=$(find "$SITE_PACKAGES/headroom" -maxdepth 1 -name "_core.cpython-*.so" -print -quit 2>/dev/null)
-          if [[ -z "$SO_FILE" ]]; then
-            echo "error: could not find _core.cpython-*.so under $SITE_PACKAGES/headroom/" >&2
-            exit 1
-          fi
-          ln -sf "$SO_FILE" "headroom/$(basename "$SO_FILE")"
+          pip install -e ".[all]"
           python -c "from headroom._core import SmartCrusher; print('headroom._core OK:', SmartCrusher)"
 
       - name: Run CCR round-trip (zero cost)
@@ -77,8 +61,19 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Install dependencies
-        run: pip install -e ".[all]"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: Install dependencies (builds Rust extension via maturin)
+        run: |
+          pip install -e ".[all]"
+          python -c "from headroom._core import SmartCrusher; print('headroom._core OK')"
       - name: Run Tier 1 evaluation suite
         run: python -m headroom.evals suite --tier 1 --ci -o eval_results/
         env:

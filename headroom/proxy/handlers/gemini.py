@@ -191,11 +191,24 @@ class GeminiHandlerMixin:
         headers.pop("host", None)
         headers.pop("content-length", None)
         tags = self._extract_tags(headers)
+        # PR-A5 (P5-49): strip internal x-headroom-* from upstream-bound
+        # headers AFTER `_extract_tags` reads them. Memory user-id reads
+        # `request.headers` below.
+        from headroom.proxy.helpers import _strip_internal_headers, log_outbound_headers
 
-        # Memory: Get user ID when memory is enabled
+        _pre_strip_count_gem = sum(1 for k in headers if k.lower().startswith("x-headroom-"))
+        headers = _strip_internal_headers(headers)
+        log_outbound_headers(
+            forwarder="gemini_generate_content",
+            stripped_count=_pre_strip_count_gem,
+            request_id=request_id,
+        )
+
+        # Memory: Get user ID when memory is enabled. Reads `request.headers`
+        # directly because `headers` was stripped of `x-headroom-*` (PR-A5).
         memory_user_id: str | None = None
         if self.memory_handler:
-            memory_user_id = headers.get(
+            memory_user_id = request.headers.get(
                 "x-headroom-user-id",
                 os.environ.get("USER", os.environ.get("USERNAME", "default")),
             )
@@ -308,7 +321,14 @@ class GeminiHandlerMixin:
         tokens_saved = original_tokens - optimized_tokens
         optimization_latency = (time.time() - start_time) * 1000
 
-        # Memory: inject context for Gemini requests
+        # Memory: inject context for Gemini requests.
+        #
+        # PR-B6: memory context auto-injects to the live-zone tail (the
+        # latest user message) — never to the system / systemInstruction
+        # field. The cache hot zone is sacrosanct (invariant I2). When
+        # the memory handler is in ``MemoryMode.TOOL`` its
+        # ``search_and_format_context`` returns ``None`` so nothing flows
+        # in here.
         if self.memory_handler and memory_user_id:
             try:
                 if self.memory_handler.config.inject_context:
@@ -316,15 +336,24 @@ class GeminiHandlerMixin:
                         memory_user_id, optimized_messages
                     )
                     if memory_context:
-                        # Prepend as system message (will become systemInstruction in Gemini format)
-                        optimized_messages = [
-                            {"role": "system", "content": memory_context},
-                            *optimized_messages,
-                        ]
-                        logger.info(
-                            f"[{request_id}] Memory: Injected {len(memory_context)} chars "
-                            f"of context for user {memory_user_id} (gemini)"
+                        new_messages, bytes_appended = (
+                            self.memory_handler._append_to_latest_user_tail(
+                                optimized_messages,
+                                memory_context,
+                                provider="openai",
+                            )
                         )
+                        if bytes_appended > 0:
+                            optimized_messages = new_messages
+                            logger.info(
+                                f"[{request_id}] Memory: Injected {bytes_appended} chars "
+                                f"into latest user message tail for user {memory_user_id} (gemini)"
+                            )
+                        else:
+                            logger.debug(
+                                f"[{request_id}] Memory: no eligible user message; "
+                                "skipped tail injection (gemini)"
+                            )
             except Exception as e:
                 logger.warning(f"[{request_id}] Memory injection failed (gemini): {e}")
 
@@ -513,6 +542,17 @@ class GeminiHandlerMixin:
         headers.pop("accept-encoding", None)
         tags = self._extract_tags(headers)
         is_antigravity = self._is_cloudcode_antigravity_request(body, headers)
+        # PR-A5 (P5-49): strip internal x-headroom-* from upstream-bound headers
+        # AFTER `_extract_tags` and `is_cloudcode_antigravity` reads.
+        from headroom.proxy.helpers import _strip_internal_headers, log_outbound_headers
+
+        _pre_strip_count_cca = sum(1 for k in headers if k.lower().startswith("x-headroom-"))
+        headers = _strip_internal_headers(headers)
+        log_outbound_headers(
+            forwarder="gemini_cloudcode_assist",
+            stripped_count=_pre_strip_count_cca,
+            request_id=request_id,
+        )
 
         system_instruction = request_payload.get("systemInstruction")
         optimization_system_instruction = None if is_antigravity else system_instruction
@@ -628,6 +668,16 @@ class GeminiHandlerMixin:
         headers.pop("host", None)
         headers.pop("content-length", None)
         tags = self._extract_tags(headers)
+        # PR-A5 (P5-49): strip internal x-headroom-* before forwarding upstream.
+        from headroom.proxy.helpers import _strip_internal_headers, log_outbound_headers
+
+        _pre_strip_count_gem_stream = sum(1 for k in headers if k.lower().startswith("x-headroom-"))
+        headers = _strip_internal_headers(headers)
+        log_outbound_headers(
+            forwarder="gemini_stream_generate_content",
+            stripped_count=_pre_strip_count_gem_stream,
+            request_id=request_id,
+        )
 
         # Token counting
         tokenizer = get_tokenizer(model)
@@ -702,6 +752,16 @@ class GeminiHandlerMixin:
         headers = dict(request.headers.items())
         headers.pop("host", None)
         headers.pop("content-length", None)
+        # PR-A5 (P5-49): strip internal x-headroom-* before forwarding upstream.
+        from headroom.proxy.helpers import _strip_internal_headers, log_outbound_headers
+
+        _pre_strip_count_gem_count = sum(1 for k in headers if k.lower().startswith("x-headroom-"))
+        headers = _strip_internal_headers(headers)
+        log_outbound_headers(
+            forwarder="gemini_count_tokens",
+            stripped_count=_pre_strip_count_gem_count,
+            request_id=request_id,
+        )
 
         # Convert Gemini format to messages for optimization
         system_instruction = body.get("systemInstruction")

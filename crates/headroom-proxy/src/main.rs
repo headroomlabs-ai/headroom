@@ -31,7 +31,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "headroom-proxy starting"
     );
 
-    let state = AppState::new(config.clone())?;
+    let mut state = AppState::new(config.clone())?;
+
+    // PR-D1: resolve AWS credentials at startup via the `aws-config`
+    // default chain. Loaded once so per-request signing is cheap.
+    // Failure is NOT fatal — the proxy may run in front of a non-AWS
+    // upstream — but the Bedrock invoke handler refuses to forward
+    // unsigned requests when `bedrock_credentials` is `None`
+    // (see `bedrock::invoke::handle_invoke`).
+    if config.enable_bedrock_native {
+        match load_bedrock_credentials(&config).await {
+            Ok(creds) => {
+                state = state.with_bedrock_credentials(creds);
+                tracing::info!(
+                    event = "bedrock_credentials_loaded",
+                    region = %config.bedrock_region,
+                    profile = ?config.aws_profile,
+                    "AWS credentials resolved for Bedrock SigV4 signing"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    event = "bedrock_credentials_unavailable",
+                    region = %config.bedrock_region,
+                    profile = ?config.aws_profile,
+                    error = %e,
+                    "AWS credentials not available at startup; Bedrock invoke will 5xx until creds are configured"
+                );
+            }
+        }
+    }
+
     let app = build_app(state).into_make_service_with_connect_info::<SocketAddr>();
 
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
@@ -62,6 +92,31 @@ fn init_tracing(level: &str) {
         .with(filter)
         .with(json_layer)
         .try_init();
+}
+
+/// PR-D1: resolve AWS credentials for Bedrock SigV4 signing.
+///
+/// Uses the `aws-config` default chain (env vars → shared profile
+/// file → IMDS / ECS task role). Honours `Config::aws_profile` when
+/// set; otherwise the chain picks up `AWS_PROFILE` from the
+/// environment automatically.
+async fn load_bedrock_credentials(
+    config: &Config,
+) -> Result<aws_credential_types::Credentials, Box<dyn std::error::Error + Send + Sync>> {
+    use aws_config::BehaviorVersion;
+    use aws_credential_types::provider::ProvideCredentials;
+
+    let mut loader = aws_config::defaults(BehaviorVersion::latest())
+        .region(aws_config::Region::new(config.bedrock_region.clone()));
+    if let Some(profile) = config.aws_profile.as_deref() {
+        loader = loader.profile_name(profile);
+    }
+    let aws_config = loader.load().await;
+    let creds_provider = aws_config
+        .credentials_provider()
+        .ok_or("no credentials provider configured")?;
+    let creds = creds_provider.provide_credentials().await?;
+    Ok(creds)
 }
 
 async fn shutdown_signal() {

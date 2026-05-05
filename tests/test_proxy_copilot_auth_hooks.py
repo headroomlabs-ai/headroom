@@ -164,12 +164,13 @@ def test_streaming_response_applies_copilot_auth(monkeypatch: pytest.MonkeyPatch
                 send=self._send,
             )
 
-        def _build_request(self, method: str, url: str, json: dict, headers: dict):  # noqa: ANN003, A002
+        def _build_request(self, method: str, url: str, **kwargs):  # noqa: ANN003
+            # PR-A3: streaming forwarder is byte-faithful; it now passes
+            # ``content=<bytes>`` instead of ``json=<dict>``.
             seen["request"] = {
                 "method": method,
                 "url": url,
-                "json": json,
-                "headers": headers,
+                **kwargs,
             }
             return SimpleNamespace()
 
@@ -195,5 +196,8 @@ def test_streaming_response_applies_copilot_auth(monkeypatch: pytest.MonkeyPatch
     )
 
     assert seen["url"] == "https://api.githubcopilot.com/v1/responses"
-    assert seen["request"]["headers"] == {"Authorization": "Bearer upstream-token"}
+    # PR-A3: byte-faithful forwarder always sets ``content-type`` explicitly.
+    sent_headers = seen["request"]["headers"]
+    assert sent_headers["Authorization"] == "Bearer upstream-token"
+    assert sent_headers["content-type"] == "application/json"
     assert response.status_code == 200

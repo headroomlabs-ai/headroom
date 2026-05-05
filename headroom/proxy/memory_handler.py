@@ -25,6 +25,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import enum
 import inspect
 import json
 import logging
@@ -39,6 +40,27 @@ if TYPE_CHECKING:
     from headroom.memory.backends.local import LocalBackend
 
 logger = logging.getLogger(__name__)
+
+
+class MemoryMode(str, enum.Enum):
+    """Memory injection mode (PR-B6).
+
+    AUTO_TAIL (default): Memory retrieval runs at request entry; results are
+    appended to the latest user message tail (the live zone). The cache hot
+    zone (system prompt / instructions / frozen prefix) is never mutated —
+    invariant I2 from PR-A2.
+
+    TOOL: Auto-injection is disabled entirely. The model calls the
+    ``memory_search`` tool explicitly when it wants memory; retrieval runs in
+    the tool execution path, not the prompt-construction path. Memory becomes
+    opt-in (and visible to the model) rather than implicit.
+
+    See REALIGNMENT/04-phase-B-live-zone.md PR-B6 for the rationale.
+    """
+
+    AUTO_TAIL = "auto_tail"
+    TOOL = "tool"
+
 
 # Memory tool names for detection (Headroom's custom tools)
 MEMORY_TOOL_NAMES = {"memory_save", "memory_search", "memory_update", "memory_delete"}
@@ -75,6 +97,11 @@ class MemoryConfig:
     inject_context: bool = True
     top_k: int = 10
     min_similarity: float = 0.3
+    # PR-B6: Memory injection mode. AUTO_TAIL (default) auto-appends retrieved
+    # memory to the latest user message tail. TOOL disables auto-injection;
+    # the model must call ``memory_search`` to retrieve. Configurable per
+    # deployment via ``ProxyConfig.memory_mode``.
+    mode: MemoryMode = MemoryMode.AUTO_TAIL
     # Native memory tool (Anthropic's built-in memory_20250818)
     use_native_tool: bool = False
     native_memory_dir: str = ""  # Directory for native memory files (default: ~/.headroom/memories)
@@ -347,6 +374,51 @@ class MemoryHandler:
             self._memory_tools = get_memory_tools_optimized()
         return self._memory_tools
 
+    def compute_memory_tool_definitions(
+        self,
+        provider: str = "anthropic",
+    ) -> list[dict[str, Any]]:
+        """Return the memory tool definitions for ``provider`` (pure, no I/O).
+
+        Replaces the building half of ``inject_tools`` so the proxy
+        injection path can route through ``SessionToolTracker`` (PR-A7).
+        Honors ``self.config.use_native_tool`` for Anthropic so the
+        native ``memory_20250818`` tool flows through the same sticky
+        codepath as the custom ``memory_save`` / ``memory_search`` set.
+
+        The returned list is a fresh list of dicts. Order is stable
+        (matches ``_get_memory_tools()`` order) so the canonical bytes
+        are deterministic across calls.
+        """
+        if not self.config.inject_tools:
+            return []
+
+        if self.config.use_native_tool and provider == "anthropic":
+            return [
+                {
+                    "type": NATIVE_MEMORY_TOOL_TYPE,
+                    "name": NATIVE_MEMORY_TOOL_NAME,
+                }
+            ]
+
+        out: list[dict[str, Any]] = []
+        for memory_tool in self._get_memory_tools():
+            tool_name = memory_tool["function"]["name"]
+            if provider == "anthropic":
+                out.append(
+                    {
+                        "name": tool_name,
+                        "description": memory_tool["function"]["description"],
+                        "input_schema": memory_tool["function"]["parameters"],
+                    }
+                )
+            else:
+                # OpenAI format — return a fresh shallow copy so callers
+                # can mutate without surprise. dict() is sufficient: the
+                # nested schema is treated as immutable downstream.
+                out.append(dict(memory_tool))
+        return out
+
     def inject_tools(
         self,
         tools: list[dict[str, Any]] | None,
@@ -360,6 +432,12 @@ class MemoryHandler:
 
         Returns:
             Tuple of (updated_tools, was_injected).
+
+        NOTE (PR-A7): The proxy now wires injection through
+        ``apply_session_sticky_memory_tools`` so tool list bytes stay
+        cache-stable across turns. This method remains as the
+        non-session-aware fallback for tests / callers that don't have
+        a session_id (e.g. diagnostic shadow runs).
         """
         if not self.config.inject_tools:
             return tools or [], False
@@ -443,8 +521,25 @@ class MemoryHandler:
 
         Returns:
             Formatted context string, or None if no relevant memories.
+
+        PR-B6: When ``self.config.mode == MemoryMode.TOOL``, this method
+        returns ``None`` unconditionally so the proxy never auto-injects.
+        The model must call ``memory_search`` explicitly to retrieve. This
+        is the single chokepoint that gates auto-injection across all
+        provider handlers (Anthropic /v1/messages, OpenAI /v1/chat/completions,
+        OpenAI /v1/responses).
         """
         if not self.config.inject_context:
+            return None
+
+        # PR-B6: Tool mode disables auto-injection. The model calls
+        # ``memory_search`` to retrieve when it wants to. Log the skip
+        # decision so cache-affecting routing remains observable.
+        if self.config.mode == MemoryMode.TOOL:
+            logger.info(
+                "event=memory_mode_skip mode=tool user_id=%s reason=tool_mode_no_auto_injection",
+                user_id,
+            )
             return None
 
         await self._ensure_initialized()
@@ -508,6 +603,69 @@ Use this context to provide personalized and contextually relevant responses."""
             f"({len(context)} chars) for user {user_id}"
         )
         return context
+
+    @staticmethod
+    def _append_to_latest_user_tail(
+        messages: list[dict[str, Any]],
+        context_text: str,
+        *,
+        provider: Literal["anthropic", "openai"] = "anthropic",
+        frozen_message_count: int = 0,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Append memory context to the live-zone tail (latest user message).
+
+        PR-B6 canonical entry point for memory tail injection. Replaces the
+        retired ``_inject_to_system_or_instructions`` path (deleted in PR-A2).
+        The cache hot zone — system / instructions / frozen prefix — is never
+        mutated by this helper.
+
+        Args:
+            messages: Provider-shaped message list. For Anthropic this is the
+                Messages API ``messages`` array. For OpenAI Chat Completions
+                this is ``body["messages"]``.
+            context_text: Pre-formatted memory context block. Empty/missing
+                returns the input unchanged.
+            provider: ``"anthropic"`` or ``"openai"``. Selects the correct
+                tail-append helper for the provider's content shape.
+            frozen_message_count: For Anthropic: the cache-frozen prefix
+                length. The latest user message must lie outside this prefix
+                to be eligible for mutation. Ignored for OpenAI Chat
+                Completions (which does not have a frozen-prefix concept on
+                this path).
+
+        Returns:
+            ``(new_messages, bytes_appended)``. ``bytes_appended == 0`` means
+            no eligible user text block was found; the message list is
+            returned unchanged.
+
+        Determinism: the bytes appended are byte-identical for the same
+        ``context_text`` across runs. The caller is responsible for ensuring
+        ``context_text`` itself is deterministic (i.e. that the upstream
+        vector search produced the same results in the same order).
+        """
+        if not messages or not context_text:
+            return messages, 0
+
+        if provider == "anthropic":
+            # Late import to avoid circular: AnthropicHandlerMixin lives in
+            # headroom.proxy.handlers.anthropic which imports MemoryHandler.
+            from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
+
+            new_messages = AnthropicHandlerMixin._append_context_to_latest_non_frozen_user_turn(
+                messages,
+                context_text,
+                frozen_message_count=frozen_message_count,
+            )
+            if new_messages is messages:
+                return messages, 0
+            return new_messages, len(context_text)
+
+        if provider == "openai":
+            from headroom.proxy.helpers import append_text_to_latest_user_chat_message
+
+            return append_text_to_latest_user_chat_message(messages, context_text)
+
+        raise ValueError(f"Unknown provider {provider!r}; expected 'anthropic' or 'openai'")
 
     def _extract_user_query(self, messages: list[dict[str, Any]]) -> str:
         """Extract the user query from the last user message."""

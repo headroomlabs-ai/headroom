@@ -179,7 +179,7 @@ class TransformError(HeadroomError):
 
     This includes:
     - SmartCrusher failures
-    - RollingWindow errors
+    - ContentRouter errors
     - Pipeline errors
 
     Example:

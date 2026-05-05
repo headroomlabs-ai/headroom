@@ -252,9 +252,24 @@ class TestCompressionCacheFrozenCount:
         assert hb not in cache._stable_hashes  # msg[2] not included
 
     def test_should_defer_compression_new_content(self, cache: CompressionCache) -> None:
-        """First-time content should be deferred."""
+        """First-time content should NOT be deferred — there is no
+        prefix-cache entry to preserve, so compression carries no bust
+        cost. Issue #327: prior behavior deferred first-sight, which
+        marked every fresh tool_result as stable and disabled
+        compression for typical Claude Code workloads.
+        """
         h = CompressionCache.content_hash("brand new content")
+        assert cache.should_defer_compression(h, ttl_seconds=300, batch_window=30) is False
+        # Subsequent sightings within TTL should defer (batch window).
         assert cache.should_defer_compression(h, ttl_seconds=300, batch_window=30) is True
+
+    def test_should_defer_compression_records_first_seen(self, cache: CompressionCache) -> None:
+        """First-sight call must record the timestamp so subsequent
+        in-window calls can defer. Without this the deferral pathway
+        for genuinely-repeated content stops working."""
+        h = CompressionCache.content_hash("seen-twice content")
+        cache.should_defer_compression(h)  # first sight
+        assert h in cache._first_seen
 
     def test_should_defer_compression_near_ttl(self, cache: CompressionCache) -> None:
         """Content near TTL boundary should NOT be deferred."""
@@ -374,3 +389,204 @@ class TestCompressionCacheApplyAndUpdate:
         assert result[0]["content"] == "compressed openai"
         # Original untouched
         assert messages[0]["content"] == original_content
+
+
+# ─── C1 (audit follow-up): concurrency regression suite ────────────────────
+#
+# CompressionCache must be safe under multi-threaded mutation. The proxy is
+# async and dispatches multiple concurrent requests per `session_id` into
+# `asyncio.to_thread` workers — a single CompressionCache instance therefore
+# sees concurrent calls to `store_compressed` / `get_compressed` /
+# `mark_stable_from_messages` / `apply_cached` / `update_from_result`.
+# These tests provoke the race conditions that motivated adding `_lock`.
+
+
+class TestCompressionCacheConcurrency:
+    """Threading regression suite for the audit-followup lock."""
+
+    def test_concurrent_store_does_not_corrupt_total_tokens_saved(self) -> None:
+        """Many threads each store_compressed with tokens_saved=N; the
+        bookkeeping field must equal SUM(N) when threads finish. Pre-lock
+        this races (read-modify-write of `_total_tokens_saved`)."""
+        import threading
+
+        cache = CompressionCache(max_entries=1_000_000)
+        n_threads = 32
+        per_thread = 100
+        per_thread_tokens = 7
+
+        def worker(tid: int) -> None:
+            for i in range(per_thread):
+                h = CompressionCache.content_hash(f"thread-{tid}-item-{i}")
+                cache.store_compressed(h, f"comp-{tid}-{i}", tokens_saved=per_thread_tokens)
+
+        threads = [threading.Thread(target=worker, args=(t,)) for t in range(n_threads)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        expected = n_threads * per_thread * per_thread_tokens
+        stats = cache.get_stats()
+        assert stats["entries"] == n_threads * per_thread
+        # The expected token count is exact only because each (thread, item)
+        # produces a unique hash → no overwrite path. Pre-lock this would be
+        # < expected due to lost updates.
+        assert stats["tokens_saved"] == expected
+
+    def test_concurrent_apply_cached_with_concurrent_store_does_not_raise(self) -> None:
+        """`apply_cached` iterates `_cache` (via `get_compressed`); if a
+        concurrent `store_compressed` mutates the OrderedDict during the
+        iteration, pre-lock you'd get `RuntimeError: OrderedDict mutated
+        during iteration`. Locks make this a single critical section."""
+        import threading
+
+        cache = CompressionCache()
+
+        # Pre-populate so apply_cached has work to do.
+        for i in range(50):
+            h = CompressionCache.content_hash(f"seed-{i}")
+            cache.store_compressed(h, f"comp-{i}", tokens_saved=1)
+
+        msgs = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": f"t{i}",
+                        "content": f"seed-{i}",
+                    }
+                ],
+            }
+            for i in range(50)
+        ]
+
+        stop = threading.Event()
+        errors: list[Exception] = []
+
+        def reader() -> None:
+            try:
+                while not stop.is_set():
+                    _ = cache.apply_cached(msgs)
+            except Exception as e:  # pragma: no cover
+                errors.append(e)
+
+        def writer() -> None:
+            try:
+                for i in range(500):
+                    h = CompressionCache.content_hash(f"writer-{i}")
+                    cache.store_compressed(h, f"w-{i}", tokens_saved=1)
+            except Exception as e:  # pragma: no cover
+                errors.append(e)
+
+        readers = [threading.Thread(target=reader) for _ in range(4)]
+        writers = [threading.Thread(target=writer) for _ in range(4)]
+        for t in readers + writers:
+            t.start()
+        for t in writers:
+            t.join()
+        stop.set()
+        for t in readers:
+            t.join()
+
+        assert errors == [], f"Concurrent ops raised: {errors}"
+
+    def test_concurrent_update_from_result_no_partial_state(self) -> None:
+        """update_from_result must be all-or-nothing per call. With many
+        threads calling update_from_result in parallel on the same cache,
+        the final state must reflect every call's full effect (no partial
+        writes)."""
+        import threading
+
+        cache = CompressionCache()
+
+        n_threads = 16
+        per_thread_calls = 20
+
+        def worker(tid: int) -> None:
+            for i in range(per_thread_calls):
+                orig_text = f"orig-{tid}-{i}-" + "X" * 200
+                comp_text = f"comp-{tid}-{i}-" + "X" * 50
+                originals = [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": f"t-{tid}-{i}",
+                                "content": orig_text,
+                            }
+                        ],
+                    }
+                ]
+                compressed = [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": f"t-{tid}-{i}",
+                                "content": comp_text,
+                            }
+                        ],
+                    }
+                ]
+                cache.update_from_result(originals, compressed)
+
+        threads = [threading.Thread(target=worker, args=(t,)) for t in range(n_threads)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        stats = cache.get_stats()
+        # Each (tid, i) is a unique hash → cache entries == n_threads * per_thread_calls.
+        assert stats["entries"] == n_threads * per_thread_calls
+        assert stats["tokens_saved"] > 0
+
+
+def test_get_compression_cache_returns_same_instance_under_contention() -> None:
+    """`HeadroomProxy._get_compression_cache(session_id)` must return the
+    SAME `CompressionCache` instance for concurrent calls with the same
+    session_id. Pre-lock, two concurrent calls could both see "not in dict"
+    and each create a new instance, splitting the cache state across them.
+    """
+    import threading
+
+    pytest.importorskip("fastapi")
+    from headroom.proxy.server import ProxyConfig, create_app
+
+    config = ProxyConfig(
+        optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+        log_requests=False,
+        ccr_inject_tool=False,
+        ccr_handle_responses=False,
+        ccr_context_tracking=False,
+        image_optimize=False,
+    )
+    app = create_app(config)
+    proxy = app.state.proxy
+
+    n_threads = 32
+    results: list[CompressionCache] = []
+    results_lock = threading.Lock()
+
+    def worker() -> None:
+        c = proxy._get_compression_cache("shared-session-id")
+        with results_lock:
+            results.append(c)
+
+    threads = [threading.Thread(target=worker) for _ in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(results) == n_threads
+    first = results[0]
+    for c in results[1:]:
+        assert c is first, "Concurrent _get_compression_cache returned different instances"

@@ -123,7 +123,12 @@ class TestWsHttpFallback:
         assert "401" in event["error"]["message"]
 
     def test_fallback_sets_stream_true(self):
-        """HTTP fallback should force stream=True in request body."""
+        """HTTP fallback should force stream=True in request body.
+
+        After PR-A3 (byte-faithful Python forwarders) the fallback sends
+        the request body as raw bytes via `content=`, not via the `json=`
+        kwarg. The test extracts the posted JSON from the captured bytes.
+        """
         handler = _make_handler()
         ws = FakeWebSocket()
         captured_kwargs: dict = {}
@@ -138,7 +143,8 @@ class TestWsHttpFallback:
         body = {"model": "gpt-5.4", "input": "test", "stream": False}
         asyncio.run(handler._ws_http_fallback(ws, body, json.dumps(body), {}, "req_3"))
 
-        assert captured_kwargs["json"]["stream"] is True
+        posted = json.loads(captured_kwargs["content"])
+        assert posted["stream"] is True
 
     def test_fallback_unwraps_response_create_envelope(self):
         """HTTP fallback should unwrap WS response.create wrapper for HTTP POST."""
@@ -161,7 +167,7 @@ class TestWsHttpFallback:
         ws_msg = {"type": "response.create", "response": inner}
         asyncio.run(handler._ws_http_fallback(ws, ws_msg, json.dumps(ws_msg), {}, "req_unwrap"))
 
-        posted = captured_kwargs["json"]
+        posted = json.loads(captured_kwargs["content"])
         # Should be the inner response, not the wrapper
         assert "type" not in posted  # no "response.create" type field
         assert posted["model"] == "gpt-5.4"
@@ -184,7 +190,7 @@ class TestWsHttpFallback:
         body = {"type": "response.create", "model": "gpt-5.4", "input": "hi"}
         asyncio.run(handler._ws_http_fallback(ws, body, json.dumps(body), {}, "req_type_strip"))
 
-        posted = captured_kwargs["json"]
+        posted = json.loads(captured_kwargs["content"])
         assert posted["model"] == "gpt-5.4"
         assert posted["stream"] is True
         assert "type" not in posted

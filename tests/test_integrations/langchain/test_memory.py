@@ -146,8 +146,8 @@ class TestHeadroomChatMessageHistoryMessages:
             provider=mock_provider,
         )
 
-        # Mock _apply_rolling_window to return fewer messages
-        with patch.object(history, "_apply_rolling_window") as mock_apply:
+        # Mock _apply_compression to return fewer messages
+        with patch.object(history, "_apply_compression") as mock_apply:
             mock_apply.return_value = [
                 SystemMessage(content="Compressed"),
             ]
@@ -173,8 +173,8 @@ class TestHeadroomChatMessageHistoryMessages:
             provider=mock_provider,
         )
 
-        # Mock _apply_rolling_window to return fewer messages
-        with patch.object(history, "_apply_rolling_window") as mock_apply:
+        # Mock _apply_compression to return fewer messages
+        with patch.object(history, "_apply_compression") as mock_apply:
             mock_apply.return_value = [
                 SystemMessage(content="Short"),
             ]
@@ -435,8 +435,8 @@ class TestHeadroomChatMessageHistoryStats:
             provider=mock_provider,
         )
 
-        # Mock _apply_rolling_window
-        with patch.object(history, "_apply_rolling_window") as mock_apply:
+        # Mock _apply_compression
+        with patch.object(history, "_apply_compression") as mock_apply:
             mock_apply.return_value = [SystemMessage(content="Short")]
 
             _ = history.messages
@@ -447,11 +447,11 @@ class TestHeadroomChatMessageHistoryStats:
         assert stats["total_tokens_saved"] > 0
 
 
-class TestHeadroomChatMessageHistoryRollingWindow:
+class TestHeadroomChatMessageHistoryCompression:
     """Tests for rolling window compression."""
 
-    def test_apply_rolling_window_calls_pipeline(self, mock_base_history, mock_provider):
-        """_apply_rolling_window uses TransformPipeline."""
+    def test_apply_compression_calls_pipeline(self, mock_base_history, mock_provider):
+        """_apply_compression uses TransformPipeline."""
         from headroom.integrations.langchain.memory import HeadroomChatMessageHistory
 
         history = HeadroomChatMessageHistory(
@@ -476,7 +476,7 @@ class TestHeadroomChatMessageHistoryRollingWindow:
             mock_instance.apply.return_value = mock_result
             MockPipeline.return_value = mock_instance
 
-            result = history._apply_rolling_window(messages)
+            result = history._apply_compression(messages)
 
             MockPipeline.assert_called_once()
             mock_instance.apply.assert_called_once()
