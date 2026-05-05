@@ -19,6 +19,10 @@
 
 ---
 
+> **orq internal deployment** — if you're on the team, see **[docs/INTERNAL.md](docs/INTERNAL.md)** for the GPU proxy setup, `aurl` shell config, MCP install, and deploy instructions.
+
+---
+
 Every tool call, log line, DB read, RAG chunk, and file your agent injects into a prompt is mostly boilerplate. Headroom strips the noise and keeps the signal — **losslessly, locally, and without touching accuracy.**
 
 > **100 logs. One FATAL error buried at position 67. Both runs found it.**
