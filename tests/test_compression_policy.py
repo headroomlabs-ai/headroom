@@ -5,6 +5,11 @@ The Python module is a hand-mirror of
 pin both halves: that the per-mode values are right, and that the
 Python and Rust sides agree on the field map. F2.2 will likely retire
 the hand-mirror via PyO3 — until then, this file is the canary.
+
+F2.2 extends the F2.1 surface with three tuning fields:
+``volatile_token_threshold``, ``max_lossy_ratio``, ``toin_read_only``.
+Per-mode value tests below mirror the Rust unit tests in
+``crates/headroom-core/src/compression_policy.rs``.
 """
 
 from __future__ import annotations
@@ -20,7 +25,7 @@ from headroom.transforms.compression_policy import (
 
 
 class TestCompressionPolicyForMode:
-    """Per-mode field assertions. Mirrors the three Rust unit tests in
+    """Per-mode field assertions. Mirrors the Rust unit tests in
     `crates/headroom-core/src/compression_policy.rs`.
     """
 
@@ -29,13 +34,31 @@ class TestCompressionPolicyForMode:
         assert p.live_zone_only is False, "PAYG can touch outside live zone"
         assert p.cache_aligner_enabled is True, "PAYG runs cache aligner"
 
+    def test_payg_tuning_fields_aggressive(self):
+        # F2.2: per-mode tuning fields. Values are the conservative
+        # defaults pending bake telemetry (see PR body and module
+        # docstring).
+        p = policy_for_mode(AuthMode.PAYG)
+        assert p.volatile_token_threshold == 128, (
+            "PAYG volatile threshold is the relaxed default; F2.2-followup will tune"
+        )
+        assert p.max_lossy_ratio == pytest.approx(0.45), (
+            "PAYG max_lossy_ratio caps lossy paths at 0.45; F2.2-followup will tune"
+        )
+        assert p.toin_read_only is False, (
+            "PAYG keeps TOIN write-enabled — network effect feeds on PAYG traffic"
+        )
+
     def test_oauth_matches_payg_today(self):
-        # Canary: when F2.2 diverges OAuth from PAYG, this test fails
-        # and forces a deliberate update on BOTH sides (Rust + Python).
+        # Canary: when F2.2-followup diverges OAuth from PAYG, this test
+        # fails and forces a deliberate update on BOTH sides (Rust +
+        # Python). Covers ALL fields (F2.1 + F2.2) so a future field-
+        # level divergence trips the assertion just as loudly as a flag
+        # flip.
         oauth = policy_for_mode(AuthMode.OAUTH)
         payg = policy_for_mode(AuthMode.PAYG)
         assert oauth == payg, (
-            "F2.1 ships OAuth=PAYG; F2.2 will diverge based on telemetry. "
+            "F2.1+F2.2 ship OAuth=PAYG; F2.2-followup will diverge based on telemetry. "
             "If you are reading this assertion failure: also update "
             "crates/headroom-core/src/compression_policy.rs "
             "::oauth_matches_payg_today, otherwise the Rust + Python "
@@ -48,6 +71,32 @@ class TestCompressionPolicyForMode:
         assert p.cache_aligner_enabled is False, (
             "Subscription MUST skip cache aligner — load-bearing for issues #327 / #388"
         )
+
+    def test_subscription_tuning_fields_conservative(self):
+        # F2.2: per-mode tuning fields. Subscription is the conservative
+        # end — tighter threshold, lower lossy cap, TOIN read-only — so
+        # cache prefixes stay stable and the learning pool isn't
+        # mutated from cache-stability-sensitive traffic.
+        p = policy_for_mode(AuthMode.SUBSCRIPTION)
+        assert p.volatile_token_threshold == 32, (
+            "Subscription volatile threshold flags content earlier (cache stability)"
+        )
+        assert p.max_lossy_ratio == pytest.approx(0.25), (
+            "Subscription max_lossy_ratio caps lossy paths at 0.25 (conservative)"
+        )
+        assert p.toin_read_only is True, (
+            "Subscription MUST be TOIN read-only — load-bearing for keeping the "
+            "learning pool consistent across cache-sensitive traffic"
+        )
+
+    def test_max_lossy_ratio_in_unit_interval(self):
+        # Defensive: every per-mode `max_lossy_ratio` MUST be in
+        # ``[0.0, 1.0]`` because it expresses a fraction. A tune that
+        # drifts outside the unit interval is a bug — catch it cheaply
+        # here rather than at the eventual consumer site.
+        for mode in (AuthMode.PAYG, AuthMode.OAUTH, AuthMode.SUBSCRIPTION):
+            r = policy_for_mode(mode).max_lossy_ratio
+            assert 0.0 <= r <= 1.0, f"max_lossy_ratio for {mode!r} = {r} is outside [0.0, 1.0]"
 
 
 class TestPolicyDefaultPayg:
@@ -68,20 +117,38 @@ class TestImmutability:
             # CPython 3.10+). Catch both for compatibility.
             p.live_zone_only = True  # type: ignore[misc]
 
+    def test_f22_tuning_fields_also_frozen(self):
+        # Each F2.2 field gets its own immutability assertion — a
+        # future refactor that accidentally drops `frozen=True` on the
+        # dataclass would silently allow per-request mutation. The
+        # F2.1 test only covered ``live_zone_only``; explicit per-
+        # field coverage prevents quiet regressions.
+        p = policy_for_mode(AuthMode.PAYG)
+        for attr_name in ("volatile_token_threshold", "max_lossy_ratio", "toin_read_only"):
+            with pytest.raises((AttributeError, Exception)):
+                setattr(p, attr_name, 0)  # type: ignore[misc]
+
 
 class TestRustParityFieldMap:
     """The Python policy must have the same fields as the Rust struct.
 
     The canonical Rust struct lives at
     ``crates/headroom-core/src/compression_policy.rs``. When you add a
-    field there for F2.2, add it here AND update this test. Otherwise
-    the parity silently drifts.
+    field there for a future PR, add it here AND update this test.
+    Otherwise the parity silently drifts.
     """
 
     def test_field_set_matches_rust(self):
         # Hard-coded set — when Rust grows fields, this test fails until
-        # Python catches up.
-        expected_fields = {"live_zone_only", "cache_aligner_enabled"}
+        # Python catches up. F2.2 added three: volatile_token_threshold,
+        # max_lossy_ratio, toin_read_only.
+        expected_fields = {
+            "live_zone_only",
+            "cache_aligner_enabled",
+            "volatile_token_threshold",
+            "max_lossy_ratio",
+            "toin_read_only",
+        }
         actual_fields = {f.name for f in CompressionPolicy.__dataclass_fields__.values()}
         assert actual_fields == expected_fields, (
             f"Python CompressionPolicy fields drifted from Rust. "
