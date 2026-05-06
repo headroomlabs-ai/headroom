@@ -295,7 +295,7 @@ jobs:
           command: sdist
           args: --out dist
 
-      - name: Verify sdist includes top-level LICENSE
+      - name: Verify sdist includes top-level LICENSE + NOTICE
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: |
           python - <<'PY'
@@ -314,11 +314,14 @@ jobs:
               raise SystemExit(f"expected one sdist root directory, found {sorted(roots)}")
 
           root = roots.pop()
-          license_path = f"{root}/LICENSE"
-          if license_path not in names:
-              raise SystemExit(f"{sdists[0].name} is missing {license_path}")
+          required_paths = (f"{root}/LICENSE", f"{root}/NOTICE")
+          missing = [path for path in required_paths if path not in names]
+          if missing:
+              raise SystemExit(
+                  f"{sdists[0].name} is missing required license file(s): {', '.join(missing)}"
+              )
 
-          print(f"sdist LICENSE OK: {license_path}")
+          print(f"sdist license files OK: {', '.join(required_paths)}")
           PY
 
       # Audit each Linux wheel's dynamic symbol references against its

@@ -513,13 +513,15 @@ def test_release_workflow_verifies_versions_before_build_outputs() -> None:
     assert second_sync < second_verify < build_wheels
 
 
-def test_sdist_license_is_packaged_and_verified_before_upload() -> None:
+def test_sdist_license_files_are_packaged_and_verified_before_upload() -> None:
     pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
     release_yml = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
 
-    assert 'include = [{ path = "LICENSE", format = "sdist" }]' in pyproject
-    assert "name: Verify sdist includes top-level LICENSE" in release_yml
-    assert 'license_path = f"{root}/LICENSE"' in release_yml
+    assert '{ path = "LICENSE", format = "sdist" }' in pyproject
+    assert '{ path = "NOTICE", format = "sdist" }' in pyproject
+    assert "name: Verify sdist includes top-level LICENSE + NOTICE" in release_yml
+    assert 'f"{root}/LICENSE"' in release_yml
+    assert 'f"{root}/NOTICE"' in release_yml
 
 
 def test_pypi_publish_failure_blocks_github_release() -> None:

@@ -263,9 +263,13 @@ default = true
 # Where the Python package lives. With `python-source = "."` and the
 # package directory `headroom/` at repo root, maturin includes every file
 # under `headroom/` in the wheel — that picks up the dashboard HTML
-# templates and bundled YAML configs. `LICENSE` is listed explicitly because
-# maturin sdists do not get the package-directory treatment wheels do.
-include = [{ path = "LICENSE", format = "sdist" }]
+# templates and bundled YAML configs. `LICENSE` and `NOTICE` are listed
+# explicitly because maturin sdists do not get the package-directory
+# treatment wheels do.
+include = [
+  { path = "LICENSE", format = "sdist" },
+  { path = "NOTICE", format = "sdist" },
+]
 python-source = "."
 module-name = "headroom._core"
 # The cdylib source lives under `crates/headroom-py`. Maturin invokes
