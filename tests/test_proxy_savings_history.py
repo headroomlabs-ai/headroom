@@ -705,7 +705,7 @@ def test_dashboard_includes_history_toggle_and_endpoint(tmp_path, monkeypatch):
         html = response.text
         assert "Session" in html
         assert "Historical" in html
-        assert "fetch('/stats-history')" in html
+        assert "this.fetchJson('/stats-history')" in html
         assert "Export CSV" in html
         assert "Weekly Savings" in html
         assert "Monthly Savings" in html
