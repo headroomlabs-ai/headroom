@@ -23,7 +23,31 @@ LITELLM_AVAILABLE = importlib.util.find_spec("litellm") is not None
 litellm: Any | None = None
 
 
-def _get_litellm_module() -> Any | None:
+def _get_deepseek_pricing(model: str) -> tuple[float, float, float | None] | None:
+    """Try to get pricing from the DeepSeek pricing registry as fallback.
+
+    Returns (input_per_1m, output_per_1m, cached_input_per_1m) or None
+    if the model isn't found in the DeepSeek registry.
+    """
+    try:
+        from headroom.pricing.deepseek_prices import DEEPSEEK_PRICES
+
+        # Strip any provider prefix like "deepseek/" or "deepseek-"
+        model_name = model
+        for prefix in ("deepseek/", "deepseek-"):
+            if model_name.startswith(prefix):
+                model_name = model_name.removeprefix(prefix)
+                break
+
+        pricing = DEEPSEEK_PRICES.get(model_name)
+        if pricing is None:
+            return None
+        return (pricing.input_per_1m, pricing.output_per_1m, pricing.cached_input_per_1m)
+    except Exception:
+        return None
+
+
+def _get_litellm_module() -> Any:
     """Import LiteLLM only when pricing data is actually requested."""
     global litellm
 
@@ -511,6 +535,7 @@ class CostTracker:
             "o3-": "openai/",
             "o4-": "openai/",
             "gemini-": "google/",
+            "deepseek-": "deepseek/",
         }
         for pattern, prefix in prefixes.items():
             if model.startswith(pattern):
@@ -564,9 +589,22 @@ class CostTracker:
             total_cost = input_cost + output_cost
             return float(total_cost) if total_cost > 0 else None
 
-        except Exception as e:
-            logger.warning(f"Failed to get pricing for model {model}: {e}")
-            return None
+        except Exception:
+            pass
+
+        # Fallback: try DeepSeek pricing registry
+        try:
+            ds_pricing = _get_deepseek_pricing(model)
+            if ds_pricing:
+                input_per_1m, output_per_1m, _cached_input_per_1m = ds_pricing
+                input_cost = (input_tokens / 1_000_000) * input_per_1m
+                output_cost = (output_tokens / 1_000_000) * output_per_1m
+                total_cost = input_cost + output_cost
+                return float(total_cost) if total_cost > 0 else None
+        except Exception:
+            pass
+
+        return None
 
     def _prune_old_costs(self):
         """Remove cost entries older than retention period.
@@ -608,6 +646,12 @@ class CostTracker:
             cache_write_tokens: Cache write tokens from API response usage.
             uncached_tokens: Non-cached input tokens from API response usage.
         """
+        logger.debug(
+            "CostTracker.record_tokens: model=%s tokens_saved=%s tokens_sent=%s",
+            model,
+            tokens_saved,
+            tokens_sent,
+        )
         self._tokens_saved_by_model[model] = (
             self._tokens_saved_by_model.get(model, 0) + tokens_saved
         )
@@ -660,15 +704,27 @@ class CostTracker:
             resolved = self._resolve_litellm_model(model)
             info = litellm.model_cost.get(resolved, {})
             cost_per_token = info.get("input_cost_per_token")
-            return cost_per_token * 1_000_000 if cost_per_token else None
+            if cost_per_token:
+                return cost_per_token * 1_000_000
         except Exception:
-            return None
+            pass
+
+        # Fallback: try DeepSeek pricing registry for models not in litellm
+        try:
+            ds_pricing = _get_deepseek_pricing(model)
+            if ds_pricing:
+                return ds_pricing[0]
+        except Exception:
+            pass
+
+        return None
 
     def _get_cache_prices(self, model: str) -> tuple[float, float, float] | None:
         """Get per-token prices for cache read, cache write, and uncached input.
 
         Returns (cache_read, cache_write, uncached) per-token costs, or None
-        if pricing is unavailable. Uses LiteLLM's native cache pricing data.
+        if pricing is unavailable. Uses LiteLLM's native cache pricing data,
+        falling back to the DeepSeek pricing registry for models not in litellm.
         """
         litellm = _get_litellm_module()
         if litellm is None:
@@ -677,13 +733,27 @@ class CostTracker:
             resolved = self._resolve_litellm_model(model)
             info = litellm.model_cost.get(resolved, {})
             uncached = info.get("input_cost_per_token")
-            if not uncached:
-                return None
-            cache_read = info.get("cache_read_input_token_cost", uncached)
-            cache_write = info.get("cache_creation_input_token_cost", uncached)
-            return (cache_read, cache_write, uncached)
+            if uncached:
+                cache_read = info.get("cache_read_input_token_cost", uncached)
+                cache_write = info.get("cache_creation_input_token_cost", uncached)
+                return (cache_read, cache_write, uncached)
         except Exception:
-            return None
+            pass
+
+        # Fallback: try DeepSeek pricing registry for models not in litellm
+        try:
+            ds_pricing = _get_deepseek_pricing(model)
+            if ds_pricing:
+                input_per_1m, _output_per_1m, cached_input_per_1m = ds_pricing
+                uncached = input_per_1m / 1_000_000  # per token
+                # DeepSeek cache hit price (read); use list price for write
+                cache_read = (cached_input_per_1m / 1_000_000) if cached_input_per_1m else uncached
+                cache_write = uncached  # No separate write price for DeepSeek
+                return (cache_read, cache_write, uncached)
+        except Exception:
+            pass
+
+        return None
 
     def stats(self) -> dict:
         """Get token statistics per model."""
@@ -743,6 +813,7 @@ class CostTracker:
             if saved <= 0:
                 continue
             prices = self._get_cache_prices(model)
+            logger.debug("CostTracker.stats: model=%s saved=%s prices=%s", model, saved, prices)
             if prices:
                 _cr_price, _cw_price, uncached_price = prices
                 savings_usd += saved * uncached_price

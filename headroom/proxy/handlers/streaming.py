@@ -1432,6 +1432,13 @@ class StreamingMixin:
                     waste_signals=waste_signals,
                 )
 
+                if self.cost_tracker:
+                    self.cost_tracker.record_tokens(
+                        model,
+                        tokens_saved,
+                        optimized_tokens,
+                    )
+
                 # Mirror the Anthropic-stream path: log to RequestLogger so
                 # /stats.recent_requests and /transformations/feed see this
                 # request. Without it the OpenAI-via-backend path is invisible.

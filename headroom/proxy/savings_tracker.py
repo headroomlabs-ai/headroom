@@ -134,6 +134,7 @@ def _resolve_litellm_model(model: str) -> str:
         "o3-": "openai/",
         "o4-": "openai/",
         "gemini-": "google/",
+        "deepseek-": "deepseek/",
     }
     for pattern, prefix in prefixes.items():
         if model.startswith(pattern):
@@ -151,21 +152,56 @@ def _resolve_litellm_model(model: str) -> str:
     return model
 
 
+def _get_deepseek_pricing(model: str) -> tuple[float, float, float | None] | None:
+    """Try to get pricing from the DeepSeek pricing registry as fallback.
+
+    Returns (input_per_1m, output_per_1m, cached_input_per_1m) or None
+    if the model isn't found in the DeepSeek registry.
+    """
+    try:
+        from headroom.pricing.deepseek_prices import DEEPSEEK_PRICES
+
+        # Strip any provider prefix like "deepseek/" or "deepseek-"
+        model_name = model
+        for prefix in ("deepseek/", "deepseek-"):
+            if model_name.startswith(prefix):
+                model_name = model_name.removeprefix(prefix)
+                break
+
+        pricing = DEEPSEEK_PRICES.get(model_name)
+        if pricing is None:
+            return None
+        return (pricing.input_per_1m, pricing.output_per_1m, pricing.cached_input_per_1m)
+    except Exception:
+        return None
+
+
 def _estimate_compression_savings_usd(model: str, tokens_saved: int) -> float:
     """Estimate compression savings in USD from saved input tokens."""
     litellm = _get_litellm_module()
-    if tokens_saved <= 0 or litellm is None:
+    if tokens_saved <= 0:
         return 0.0
 
+    if litellm is not None:
+        try:
+            resolved = _resolve_litellm_model(model)
+            info = litellm.model_cost.get(resolved, {})
+            input_cost_per_token = info.get("input_cost_per_token")
+            if input_cost_per_token:
+                return float(tokens_saved) * float(input_cost_per_token)
+        except Exception:
+            pass
+
+    # Fallback: try DeepSeek pricing registry for models not in litellm
     try:
-        resolved = _resolve_litellm_model(model)
-        info = litellm.model_cost.get(resolved, {})
-        input_cost_per_token = info.get("input_cost_per_token")
-        if not input_cost_per_token:
-            return 0.0
-        return float(tokens_saved) * float(input_cost_per_token)
+        ds_pricing = _get_deepseek_pricing(model)
+        if ds_pricing:
+            input_per_1m, _output_per_1m, _cached_input_per_1m = ds_pricing
+            return float(tokens_saved) * (input_per_1m / 1_000_000)
     except Exception:
-        return 0.0
+        pass
+
+    return 0.0
 
 
 def _estimate_input_cost_usd(
@@ -183,38 +219,64 @@ def _estimate_input_cost_usd(
     """
     total_input_tokens = _coerce_int(input_tokens)
     litellm = _get_litellm_module()
-    if total_input_tokens <= 0 or litellm is None:
+    if total_input_tokens <= 0:
         return 0.0
 
     cache_read = _coerce_int(cache_read_tokens)
     cache_write = _coerce_int(cache_write_tokens)
     uncached = _coerce_int(uncached_input_tokens)
 
+    # Try litellm first
+    if litellm is not None:
+        try:
+            resolved = _resolve_litellm_model(model)
+            info = litellm.model_cost.get(resolved, {})
+            input_cost_per_token = info.get("input_cost_per_token")
+            if input_cost_per_token:
+                if cache_read + cache_write + uncached > 0:
+                    cache_read_cost = info.get(
+                        "cache_read_input_token_cost",
+                        input_cost_per_token,
+                    )
+                    cache_write_cost = info.get(
+                        "cache_creation_input_token_cost",
+                        input_cost_per_token,
+                    )
+                    return (
+                        float(cache_read) * float(cache_read_cost)
+                        + float(cache_write) * float(cache_write_cost)
+                        + float(uncached) * float(input_cost_per_token)
+                    )
+
+                return float(total_input_tokens) * float(input_cost_per_token)
+        except Exception:
+            pass
+
+    # Fallback: try DeepSeek pricing registry for models not in litellm
     try:
-        resolved = _resolve_litellm_model(model)
-        info = litellm.model_cost.get(resolved, {})
-        input_cost_per_token = info.get("input_cost_per_token")
-        if not input_cost_per_token:
-            return 0.0
+        ds_pricing = _get_deepseek_pricing(model)
+        if ds_pricing:
+            input_per_1m, _output_per_1m, cached_input_per_1m = ds_pricing
+            input_cost_per_token = input_per_1m / 1_000_000
 
-        if cache_read + cache_write + uncached > 0:
-            cache_read_cost = info.get(
-                "cache_read_input_token_cost",
-                input_cost_per_token,
-            )
-            cache_write_cost = info.get(
-                "cache_creation_input_token_cost",
-                input_cost_per_token,
-            )
-            return (
-                float(cache_read) * float(cache_read_cost)
-                + float(cache_write) * float(cache_write_cost)
-                + float(uncached) * float(input_cost_per_token)
-            )
+            if cache_read + cache_write + uncached > 0:
+                cache_read_cost = (
+                    (cached_input_per_1m / 1_000_000)
+                    if cached_input_per_1m
+                    else input_cost_per_token
+                )
+                cache_write_cost = input_cost_per_token  # No separate write price for DeepSeek
+                return (
+                    float(cache_read) * float(cache_read_cost)
+                    + float(cache_write) * float(cache_write_cost)
+                    + float(uncached) * float(input_cost_per_token)
+                )
 
-        return float(total_input_tokens) * float(input_cost_per_token)
+            return float(total_input_tokens) * float(input_cost_per_token)
     except Exception:
-        return 0.0
+        pass
+
+    return 0.0
 
 
 def _normalize_history_entry(entry: Any) -> dict[str, Any] | None:
