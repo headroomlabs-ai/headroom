@@ -207,7 +207,8 @@ class AnchorConfig:
 # Tool outputs that are reference data and must NOT be compressed.
 # Read/Glob/Grep contain exact file contents/search results the agent needs for edits.
 # Write/Edit record what changes were made — compressing them causes duplicate/conflicting edits.
-# Bash is NOT excluded — its outputs (build logs, test output) are ideal compression targets.
+# Bash IS excluded by design: RTK (Rust Token Killer) handles Bash output
+# compression upstream of headroom. Compressing here would double-compress.
 DEFAULT_EXCLUDE_TOOLS: frozenset[str] = frozenset(
     {
         "Read",

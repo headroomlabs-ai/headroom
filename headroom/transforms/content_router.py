@@ -1526,20 +1526,34 @@ class ContentRouter(Transform):
         status: dict[str, str] = {}
 
         # 1. ML text compressor: Kompress
+        # Wrapper construction alone does NOT load the ONNX session — that
+        # happens lazily inside compress(). Run a tiny dummy compress() so
+        # _load_kompress() runs AND the ONNX graph is optimized at startup,
+        # not on the first real request (was costing ~3-9s of opt_ms).
         if self.config.enable_kompress:
             compressor = self._get_kompress()
             if compressor:
-                logger.info("Kompress model pre-loaded at startup")
+                try:
+                    compressor.compress("warmup " * 16)
+                    logger.info("Kompress model pre-loaded at startup")
+                except Exception as exc:
+                    logger.warning("Kompress warmup forward pass failed: %s", exc)
                 status["kompress"] = "enabled"
             else:
                 status["kompress"] = "unavailable"
 
         # 2. Magika content detector (avoids 100-200ms on first content detection)
+        # Singleton init alone defers the model's first inference cost; run a
+        # dummy identify_bytes so the predictor is fully warm.
         try:
             from ..compression.detector import _get_magika, _magika_available
 
             if _magika_available():
-                _get_magika()  # Initializes the singleton
+                _magika_inst = _get_magika()
+                try:
+                    _magika_inst.identify_bytes(b"warmup")
+                except Exception as exc:
+                    logger.debug("Magika warmup inference failed: %s", exc)
                 logger.info("Magika content detector pre-loaded at startup")
                 status["magika"] = "enabled"
             else:
@@ -1582,6 +1596,15 @@ class ContentRouter(Transform):
                 except Exception as e:
                     logger.debug("Tree-sitter pre-load skipped: %s", e)
                     status["tree_sitter"] = "skipped"
+                # Force one parse + compress on the most common language so
+                # the AST visitor JIT paths are hot before request traffic.
+                try:
+                    code_compressor.compress(
+                        "def warmup():\n    return 1\n",
+                        language="python",
+                    )
+                except Exception as exc:
+                    logger.debug("Code-Aware warmup compress failed: %s", exc)
             else:
                 status["code_aware"] = "not installed"
 
