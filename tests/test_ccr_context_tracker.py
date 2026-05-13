@@ -521,9 +521,13 @@ class TestExpansionFormatting:
 
         formatted = tracker.format_expansions_for_context(expansions)
 
-        assert "[Proactive Context Expansion" in formatted
+        # Header must declare session-only scope and singular count for N=1.
+        assert formatted.startswith("[Proactive Context Expansion - scope: this session only,")
+        assert "scope: this session only" in formatted
+        assert "1 compressed item expanded" in formatted
         assert "Expanded from earlier" in formatted
         assert '[{"id": 1}, {"id": 2}]' in formatted
+        assert "[End Proactive Expansion]" in formatted
 
     def test_format_search_expansion(self):
         """Format search expansion for LLM context."""
@@ -542,7 +546,48 @@ class TestExpansionFormatting:
 
         formatted = tracker.format_expansions_for_context(expansions)
 
+        assert formatted.startswith("[Proactive Context Expansion - scope: this session only,")
+        assert "1 compressed item expanded" in formatted
         assert "Search results for 'authentication'" in formatted
+        assert "[End Proactive Expansion]" in formatted
+
+    def test_format_multiple_expansions_uses_plural(self):
+        """Header uses plural noun when count > 1."""
+        tracker = ContextTracker()
+
+        expansions = [
+            {
+                "hash": "abc123",
+                "type": "full",
+                "content": '[{"id": 1}]',
+                "item_count": 1,
+                "reason": "relevant to query",
+            },
+            {
+                "hash": "def456",
+                "type": "search",
+                "query": "authentication",
+                "content": [{"id": 1, "content": "auth"}],
+                "item_count": 1,
+                "reason": "matched query",
+            },
+            {
+                "hash": "ghi789",
+                "type": "full",
+                "content": '[{"id": 3}]',
+                "item_count": 1,
+                "reason": "additional context",
+            },
+        ]
+
+        formatted = tracker.format_expansions_for_context(expansions)
+
+        assert formatted.startswith("[Proactive Context Expansion - scope: this session only,")
+        assert "3 compressed items expanded" in formatted
+        # Per-item lines still render correctly for both expansion types.
+        assert "--- Expanded from earlier" in formatted
+        assert "--- Search results for 'authentication'" in formatted
+        assert "[End Proactive Expansion]" in formatted
 
     def test_format_empty_expansions(self):
         """Empty expansions return empty string."""

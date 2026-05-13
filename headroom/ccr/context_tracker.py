@@ -512,7 +512,12 @@ class ContextTracker:
         if not expansions:
             return ""
 
-        parts = ["[Proactive Context Expansion - relevant to your query]"]
+        count = len(expansions)
+        noun = "item" if count == 1 else "items"
+        parts = [
+            f"[Proactive Context Expansion - scope: this session only, "
+            f"{count} compressed {noun} expanded]"
+        ]
 
         for exp in expansions:
             if exp["type"] == "full":
