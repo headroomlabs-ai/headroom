@@ -999,8 +999,8 @@ def test_memory_tail_injection_does_not_modify_system_prompt_live(
             assert latest.get("role") == "user"
             tail_text = json.dumps(latest)
             # Memory injection in AUTO_TAIL mode appends the
-            # "Relevant Memories" preamble and at least one of the seeded
-            # phrases. We assert presence of the seed substring only.
+            # "Relevant Memories (scope:" preamble and at least one of the
+            # seeded phrases. We assert presence of the seed substring only.
             assert "tabs over spaces" in tail_text or "favorite color" in tail_text, (
                 f"memory text not found on latest user tail; latest={latest!r}"
             )

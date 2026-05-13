@@ -590,13 +590,51 @@ class MemoryHandler:
         if not memory_lines:
             return None
 
-        context = f"""## Relevant Memories for This User
+        # Compute date range from memory created_at, defensively handling missing values.
+        date_suffix = ""
+        try:
+            raw_created_ats = [getattr(r.memory, "created_at", None) for r in filtered_results]
+            # Defensively keep only datetime instances; drop strings/None/etc.
+            created_ats = [ts for ts in raw_created_ats if isinstance(ts, datetime)]
+            if created_ats:
+                # Normalize mixed tz-aware/naive datetimes by stripping tzinfo if any are
+                # tz-aware and any are naive. This avoids TypeError on min/max comparison.
+                has_aware = any(ts.tzinfo is not None for ts in created_ats)
+                has_naive = any(ts.tzinfo is None for ts in created_ats)
+                if has_aware and has_naive:
+                    created_ats = [ts.replace(tzinfo=None) for ts in created_ats]
+                oldest = min(created_ats)
+                newest = max(created_ats)
+                date_suffix = (
+                    f" from {oldest.strftime('%Y-%m-%d')} to {newest.strftime('%Y-%m-%d')}"
+                )
+        except Exception as e:
+            logger.warning("Memory: date range computation failed: %s", e)
+            date_suffix = ""
 
-The following information was previously saved about this user:
+        # Safely embed user_id into the header/provenance strings. json.dumps escapes
+        # quotes, newlines, control chars, and non-ASCII (ensure_ascii=True) and provides
+        # the surrounding quotes — so no extra quotes are needed at the call site.
+        user_id_quoted = json.dumps(user_id, ensure_ascii=True)
 
-{chr(10).join(memory_lines)}
+        count = len(filtered_results)
+        noun = "memory" if count == 1 else "memories"
+        header = (
+            f"## Relevant Memories (scope: user={user_id_quoted}, "
+            f"workspace: not detected, "
+            f"{count} {noun}{date_suffix})"
+        )
+        provenance = (
+            f"The following information was previously saved under user-id={user_id_quoted}. "
+            "These memories are not workspace-scoped — some may be from other projects. "
+            "Use them when relevant to the current request; otherwise ignore."
+        )
 
-Use this context to provide personalized and contextually relevant responses."""
+        context = f"""{header}
+
+{provenance}
+
+{chr(10).join(memory_lines)}"""
 
         logger.info(
             f"Memory: Injecting {len(memory_lines)} memories "
