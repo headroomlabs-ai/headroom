@@ -1835,16 +1835,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         payload["runtime"] = _runtime_payload()
         return JSONResponse(status_code=200, content=payload)
 
-    DASHBOARD_NO_STORE_HEADERS = {
-        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-        "Pragma": "no-cache",
-        "Expires": "0",
-    }
-
     @app.get("/dashboard", response_class=HTMLResponse)
     async def dashboard():
         """Serve the Headroom dashboard UI."""
-        return HTMLResponse(get_dashboard_html(), headers=DASHBOARD_NO_STORE_HEADERS)
+        return get_dashboard_html()
 
     DASHBOARD_STATS_CACHE_TTL_SECONDS = 5.0
     _stats_snapshot_lock = asyncio.Lock()
@@ -2302,8 +2296,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         Use ``?cached=1`` for the dashboard fast path. That returns a short-TTL
         snapshot to avoid rebuilding the full payload on every UI poll.
         """
-        payload = await _get_cached_stats_payload() if cached else await _build_stats_payload()
-        return JSONResponse(content=payload, headers=DASHBOARD_NO_STORE_HEADERS)
+        if cached:
+            return await _get_cached_stats_payload()
+        return await _build_stats_payload()
 
     @app.post("/stats/reset", dependencies=[Depends(_require_loopback)])
     async def stats_reset():
@@ -2329,16 +2324,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             return Response(
                 content=proxy.metrics.savings_tracker.export_csv(series=series),
                 media_type="text/csv; charset=utf-8",
-                headers={
-                    **DASHBOARD_NO_STORE_HEADERS,
-                    "Content-Disposition": f'attachment; filename="{filename}"',
-                },
+                headers={"Content-Disposition": f'attachment; filename="{filename}"'},
             )
 
-        return JSONResponse(
-            content=proxy.metrics.savings_tracker.history_response(history_mode=history_mode),
-            headers=DASHBOARD_NO_STORE_HEADERS,
-        )
+        return proxy.metrics.savings_tracker.history_response(history_mode=history_mode)
 
     @app.get("/transformations/feed")
     async def transformations_feed(limit: int = 20):

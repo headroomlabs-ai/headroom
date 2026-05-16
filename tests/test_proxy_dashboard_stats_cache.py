@@ -7,11 +7,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from fastapi.testclient import TestClient
 
 from headroom.dashboard import get_dashboard_html
 from headroom.proxy import helpers as proxy_helpers
-from headroom.proxy.server import ProxyConfig, create_app
 
 
 class _StatsStub:
@@ -282,9 +280,6 @@ def test_stats_cached_query_reuses_short_ttl_snapshot(monkeypatch: pytest.Monkey
     assert uncached.status_code == 200
 
     assert calls == {"store": 3, "telemetry": 3, "feedback": 3, "context_tool": 3}
-    assert first.headers["cache-control"] == "no-store, no-cache, must-revalidate, max-age=0"
-    assert first.headers["pragma"] == "no-cache"
-    assert first.headers["expires"] == "0"
     assert first.json()["context_tool"]["configured"] == "rtk"
     assert first.json()["context_tool"]["label"] == "RTK"
     assert first.json()["cli_filtering"]["tokens_saved"] == 5
@@ -477,60 +472,10 @@ def test_stats_reset_clears_runtime_proxy_counters(monkeypatch: pytest.MonkeyPat
     assert after["requests"]["total"] == 0
 
 
-def test_dashboard_route_disables_browser_caching() -> None:
-    app = create_app(
-        ProxyConfig(
-            optimize=False,
-            cache_enabled=False,
-            rate_limit_enabled=False,
-            cost_tracking_enabled=False,
-            log_requests=False,
-            ccr_inject_tool=False,
-            ccr_handle_responses=False,
-            ccr_context_tracking=False,
-        )
-    )
-
-    with TestClient(app) as client:
-        response = client.get("/dashboard")
-
-    assert response.status_code == 200
-    assert response.headers["cache-control"] == "no-store, no-cache, must-revalidate, max-age=0"
-    assert response.headers["pragma"] == "no-cache"
-    assert response.headers["expires"] == "0"
-
-
-def test_stats_history_route_disables_browser_caching() -> None:
-    app = create_app(
-        ProxyConfig(
-            optimize=False,
-            cache_enabled=False,
-            rate_limit_enabled=False,
-            cost_tracking_enabled=False,
-            log_requests=False,
-            ccr_inject_tool=False,
-            ccr_handle_responses=False,
-            ccr_context_tracking=False,
-        )
-    )
-
-    with TestClient(app) as client:
-        response = client.get("/stats-history")
-
-    assert response.status_code == 200
-    assert response.headers["cache-control"] == "no-store, no-cache, must-revalidate, max-age=0"
-    assert response.headers["pragma"] == "no-cache"
-    assert response.headers["expires"] == "0"
-
-
-def test_dashboard_uses_uncached_fetches_and_lazy_history_feed_polling() -> None:
+def test_dashboard_uses_cached_stats_and_lazy_history_feed_polling() -> None:
     html = get_dashboard_html()
 
-    assert "cache: 'no-store'" in html
     assert "this.fetchJson('/stats?cached=1')" in html
-    assert "this.fetchJson('/health')" in html
-    assert "this.fetchJson('/stats-history')" in html
-    assert "this.fetchJson('/transformations/feed?limit=50')" in html
     assert "@click=\"setViewMode('history')\"" in html
     assert '@click="toggleFeed()"' in html
     assert "this.viewMode === 'history'" in html

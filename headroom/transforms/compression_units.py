@@ -241,7 +241,7 @@ def compress_unit_with_router(
 
     if not unit.mutable:
         return _with_reason(reason="immutable")
-    if unit.role == "user":
+    if unit.role == "user" and unit.metadata.get("compress_user") != "true":
         return _with_reason(reason="protected_user_message")
     if unit.role in {"system", "developer"}:
         return _with_reason(reason="protected_system_message")
