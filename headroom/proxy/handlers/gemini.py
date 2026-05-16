@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 
 from headroom.proxy.auth_mode import classify_client
 from headroom.proxy.compression_decision import CompressionDecision
+from headroom.proxy.helpers import extract_tags
 from headroom.proxy.outcome import RequestOutcome
 
 logger = logging.getLogger("headroom.proxy")
@@ -194,7 +195,7 @@ class GeminiHandlerMixin:
         headers = dict(request.headers.items())
         headers.pop("host", None)
         headers.pop("content-length", None)
-        tags = self._extract_tags(headers)
+        tags = extract_tags(headers)
         client = classify_client(headers)
         # PR-A5 (P5-49): strip internal x-headroom-* from upstream-bound
         # headers AFTER `_extract_tags` reads them. Memory user-id reads
@@ -604,7 +605,7 @@ class GeminiHandlerMixin:
         headers.pop("host", None)
         headers.pop("content-length", None)
         headers.pop("accept-encoding", None)
-        tags = self._extract_tags(headers)
+        tags = extract_tags(headers)
         # Note: streaming handlers delegate to _stream_response, which
         # does its own classify_client. No need to compute here.
         is_antigravity = self._is_cloudcode_antigravity_request(body, headers)
@@ -743,7 +744,7 @@ class GeminiHandlerMixin:
         headers = dict(request.headers.items())
         headers.pop("host", None)
         headers.pop("content-length", None)
-        tags = self._extract_tags(headers)
+        tags = extract_tags(headers)
         # Streaming variant — delegates to _stream_response which
         # classifies the client itself from headers.
         # PR-A5 (P5-49): strip internal x-headroom-* before forwarding upstream.
@@ -831,6 +832,7 @@ class GeminiHandlerMixin:
         headers.pop("host", None)
         headers.pop("content-length", None)
         client = classify_client(headers)
+        tags = extract_tags(headers)
         # PR-A5 (P5-49): strip internal x-headroom-* before forwarding upstream.
         from headroom.proxy.helpers import _strip_internal_headers, log_outbound_headers
 
@@ -882,7 +884,7 @@ class GeminiHandlerMixin:
         # out of headers; sibling handlers do and thread them into the
         # outcome. Extract here so apply_to_tags below has a dict to
         # mutate and the outcome at end-of-call inherits the tag.
-        tags = self._extract_tags(request.headers)
+        tags = extract_tags(request.headers)
         _decision = CompressionDecision.decide(
             headers=request.headers,
             config=self.config,

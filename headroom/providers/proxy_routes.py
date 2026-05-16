@@ -46,6 +46,83 @@ def _select_passthrough_base_url(proxy: Any, headers: dict[str, str]) -> str:
     return _api_target(proxy, provider_name)
 
 
+# Codex ChatGPT-subscription auth doesn't have access to
+# `chatgpt.com/backend-api/models` — that endpoint returns 403 to OAuth
+# bearer tokens (issue #478). Codex polls `/v1/models` every few seconds
+# to populate its model-picker UI, so the 403 storm is noisy and breaks
+# refresh. The fix: when Codex hits `/v1/models` under ChatGPT auth,
+# synthesize an OpenAI-compatible response from the known-supported
+# Codex/ChatGPT model set instead of forwarding to a 403.
+#
+# The list mirrors what Codex itself ships in its built-in model
+# registry (the same models its provider config exposes); it's the
+# safe-by-construction set since these are what `/v1/responses` actually
+# accepts under ChatGPT auth.
+_CHATGPT_AUTH_CODEX_MODELS: tuple[str, ...] = (
+    "gpt-5.5",
+    "gpt-5.4",
+    "gpt-5.3",
+    "gpt-5.2",
+    "gpt-5.1",
+    "gpt-5",
+)
+
+
+def _synthetic_models_list_response() -> Response:
+    """OpenAI-compatible `/v1/models` payload for Codex ChatGPT auth."""
+    import json
+
+    payload = {
+        "object": "list",
+        "data": [
+            {
+                "id": model_id,
+                "object": "model",
+                "created": 0,
+                "owned_by": "openai",
+            }
+            for model_id in _CHATGPT_AUTH_CODEX_MODELS
+        ],
+    }
+    return Response(
+        content=json.dumps(payload),
+        status_code=200,
+        headers={"content-type": "application/json"},
+    )
+
+
+def _synthetic_model_get_response(model_id: str) -> Response:
+    """OpenAI-compatible `/v1/models/{id}` payload."""
+    import json
+
+    if model_id not in _CHATGPT_AUTH_CODEX_MODELS:
+        return Response(
+            content=json.dumps(
+                {
+                    "error": {
+                        "message": f"Model {model_id!r} not available under ChatGPT auth",
+                        "type": "invalid_request_error",
+                        "code": "model_not_found",
+                    }
+                }
+            ),
+            status_code=404,
+            headers={"content-type": "application/json"},
+        )
+    return Response(
+        content=json.dumps(
+            {
+                "id": model_id,
+                "object": "model",
+                "created": 0,
+                "owned_by": "openai",
+            }
+        ),
+        status_code=200,
+        headers={"content-type": "application/json"},
+    )
+
+
 async def _handle_chatgpt_model_metadata(
     proxy: Any,
     request: Request,
@@ -56,6 +133,15 @@ async def _handle_chatgpt_model_metadata(
     headers, is_chatgpt_auth = _resolve_codex_routing_headers(headers)
     if not is_chatgpt_auth:
         return None
+
+    # Short-circuit `/backend-api/models[/{id}]` — chatgpt.com returns
+    # 403 here for OAuth tokens; synthesize a Codex-compatible response
+    # locally so the model-picker refresh succeeds (issue #478).
+    if upstream_path == "/backend-api/models":
+        return _synthetic_models_list_response()
+    if upstream_path.startswith("/backend-api/models/"):
+        model_id = upstream_path[len("/backend-api/models/") :]
+        return _synthetic_model_get_response(model_id)
 
     url = f"https://chatgpt.com{upstream_path}"
     if request.url.query:

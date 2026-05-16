@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from fastapi.responses import Response
 
 from headroom.proxy.auth_mode import classify_client
+from headroom.proxy.helpers import extract_tags
 from headroom.proxy.outcome import RequestOutcome
 
 logger = logging.getLogger("headroom.proxy")
@@ -103,6 +104,7 @@ class BatchHandlerMixin:
         headers.pop("host", None)
         headers.pop("content-length", None)
         client = classify_client(headers)
+        tags = extract_tags(headers)
         # PR-A5 (P5-49): strip internal x-headroom-* before forwarding upstream.
         from headroom.proxy.helpers import _strip_internal_headers, log_outbound_headers
 
@@ -282,6 +284,7 @@ class BatchHandlerMixin:
                     total_latency_ms=optimization_latency,
                     overhead_ms=optimization_latency,
                     pipeline_timing=pipeline_timing,
+                    tags=tags,
                     client=client,
                 )
             )
@@ -353,6 +356,7 @@ class BatchHandlerMixin:
         headers.pop("host", None)
         headers.pop("content-length", None)
         client = classify_client(headers)
+        tags = extract_tags(headers)
         # PR-A5 (P5-49): strip internal x-headroom-* before forwarding upstream.
         from headroom.proxy.helpers import _strip_internal_headers, log_outbound_headers
 
@@ -432,6 +436,7 @@ class BatchHandlerMixin:
                 tokens_saved=0,
                 attempted_input_tokens=0,
                 total_latency_ms=latency_ms,
+                tags=tags,
                 client=client,
             )
         )
@@ -471,6 +476,7 @@ class BatchHandlerMixin:
         headers = dict(request.headers.items())
         headers.pop("host", None)
         client = classify_client(headers)
+        tags = extract_tags(headers)
         # PR-A5 (P5-49): strip internal x-headroom-* before forwarding upstream.
         from headroom.proxy.helpers import _strip_internal_headers, log_outbound_headers
 
@@ -515,6 +521,7 @@ class BatchHandlerMixin:
                 tokens_saved=0,
                 attempted_input_tokens=0,
                 total_latency_ms=latency_ms,
+                tags=tags,
                 client=client,
             )
         )
@@ -612,6 +619,7 @@ class BatchHandlerMixin:
         headers = dict(request.headers.items())
         headers.pop("host", None)
         client = classify_client(headers)
+        tags = extract_tags(headers)
         # PR-A5 (P5-49): strip internal x-headroom-* before forwarding upstream.
         from headroom.proxy.helpers import _strip_internal_headers, log_outbound_headers
 
@@ -733,6 +741,7 @@ class BatchHandlerMixin:
                 tokens_saved=0,
                 attempted_input_tokens=0,
                 total_latency_ms=latency_ms,
+                tags=tags,
                 client=client,
             )
         )
@@ -811,6 +820,7 @@ class BatchHandlerMixin:
         headers.pop("host", None)
         headers.pop("content-length", None)
         client = classify_client(headers)
+        tags = extract_tags(headers)
         # PR-A5 (P5-49): strip internal x-headroom-* before forwarding upstream.
         from headroom.proxy.helpers import _strip_internal_headers, log_outbound_headers
 
@@ -954,6 +964,7 @@ class BatchHandlerMixin:
                     attempted_input_tokens=stats["total_compressed_tokens"]
                     + stats["total_tokens_saved"],
                     total_latency_ms=total_latency,
+                    tags=tags,
                     client=client,
                 )
             )

@@ -5,14 +5,14 @@
   },
   "metadata": {
     "description": "Headroom marketplace for Claude Code and GitHub Copilot CLI plugins.",
-    "version": "0.22.0"
+    "version": "0.21.39"
   },
   "plugins": [
     {
       "name": "headroom",
       "source": "./plugins/headroom-agent-hooks",
       "description": "Headroom startup hooks for Claude Code and GitHub Copilot CLI.",
-      "version": "0.22.0",
+      "version": "0.21.39",
       "author": {
         "name": "Headroom Contributors",
         "url": "https://github.com/chopratejas/headroom"

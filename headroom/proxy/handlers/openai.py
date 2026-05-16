@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any
 from headroom.proxy.helpers import (
     COMPRESSION_TIMEOUT_SECONDS,
     _headroom_bypass_enabled,
+    extract_tags,
     jitter_delay_ms,
 )
 from headroom.proxy.stage_timer import StageTimer, emit_stage_timings_log
@@ -1226,7 +1227,7 @@ class OpenAIHandlerMixin:
         # Cloudflare Workers forward "br, zstd" which OpenAI may honor;
         # if httpx lacks brotli support the response body is undecipherable → 502.
         headers.pop("accept-encoding", None)
-        tags = self._extract_tags(headers)
+        tags = extract_tags(headers)
         client = classify_client(headers)
         # PR-A5 (P5-49): strip internal x-headroom-* from upstream-bound
         # headers AFTER `_extract_tags` reads them. Inbound bypass gating
@@ -1313,6 +1314,7 @@ class OpenAIHandlerMixin:
                         from_response_cache=True,
                         total_latency_ms=_cache_hit_latency,
                         num_messages=len(messages),
+                        tags=tags,
                         client=client,
                     )
                 )
@@ -2313,7 +2315,7 @@ class OpenAIHandlerMixin:
         # Cloudflare Workers forward "br, zstd" which OpenAI may honor;
         # if httpx lacks brotli support the response body is undecipherable → 502.
         headers.pop("accept-encoding", None)
-        tags = self._extract_tags(headers)
+        tags = extract_tags(headers)
         client = classify_client(headers)
         # PR-A5 (P5-49): strip internal x-headroom-* from upstream-bound
         # headers AFTER `_extract_tags` reads them. Memory user-id reads
@@ -4239,11 +4241,12 @@ class OpenAIHandlerMixin:
                                 # traffic was invisible to
                                 # ``headroom perf`` and the recent-
                                 # requests feed. Funnel restores all
-                                # four effects uniformly per turn.
-                                # ``ws_session_tags`` is not yet bound
-                                # at per-turn time (set at session-end
-                                # below); pass empty so the funnel
-                                # gets a real dict.
+                                # four effects uniformly per turn. Per-
+                                # turn outcomes carry ``ws_tags`` (the
+                                # `x-headroom-tag-*` headers extracted
+                                # at the WS upgrade) so dashboards can
+                                # slice WS turns by tag — same surface
+                                # as HTTP turns.
                                 await self._record_request_outcome(
                                     RequestOutcome(
                                         request_id=request_id,
@@ -4267,6 +4270,7 @@ class OpenAIHandlerMixin:
                                         )
                                         if isinstance(body, dict)
                                         else 0,
+                                        tags=ws_tags,
                                         client=client,
                                     )
                                 )
@@ -5332,6 +5336,7 @@ class OpenAIHandlerMixin:
         headers.pop("host", None)
         headers.pop("accept-encoding", None)
         client = classify_client(headers)
+        tags = extract_tags(headers)
         # PR-A5 (P5-49): strip internal x-headroom-* before forwarding upstream.
         from headroom.proxy.helpers import _strip_internal_headers, log_outbound_headers
 
@@ -5397,6 +5402,7 @@ class OpenAIHandlerMixin:
                     tokens_saved=0,
                     attempted_input_tokens=0,
                     total_latency_ms=latency_ms,
+                    tags=tags,
                     client=client,
                 )
             )

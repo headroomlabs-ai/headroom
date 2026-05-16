@@ -1174,13 +1174,14 @@ class HeadroomProxy(
             return f"hr_{int(time.time())}_{self._request_counter:06d}"
 
     def _extract_tags(self, headers: dict) -> dict[str, str]:
-        """Extract Headroom tags from headers."""
-        tags = {}
-        for key, value in headers.items():
-            if key.lower().startswith("x-headroom-"):
-                tag_name = key.lower().replace("x-headroom-", "")
-                tags[tag_name] = value
-        return tags
+        """Backwards-compat wrapper around :func:`extract_tags`.
+
+        Handlers call ``extract_tags(headers)`` directly. Kept here for
+        any external caller still using ``proxy._extract_tags(headers)``.
+        """
+        from headroom.proxy.helpers import extract_tags
+
+        return extract_tags(headers)
 
     async def _retry_request(
         self,

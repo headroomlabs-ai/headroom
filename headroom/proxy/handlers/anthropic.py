@@ -26,6 +26,7 @@ import httpx
 from headroom.pipeline import PipelineStage, summarize_routing_markers
 from headroom.proxy.auth_mode import classify_auth_mode, classify_client
 from headroom.proxy.compression_decision import CompressionDecision
+from headroom.proxy.helpers import extract_tags
 from headroom.proxy.outcome import RequestOutcome
 
 logger = logging.getLogger("headroom.proxy")
@@ -589,7 +590,7 @@ class AnthropicHandlerMixin:
             # the upstream can honor; if httpx lacks brotli support the response
             # body is undecipherable → 502.
             headers.pop("accept-encoding", None)
-            tags = self._extract_tags(headers)
+            tags = extract_tags(headers)
             # Identify the harness (codex / claude-code / aider / etc.)
             # from User-Agent or X-Client. Surfaced via the funnel into
             # PERF logs and RequestLog.tags — see RequestOutcome.client.
@@ -725,6 +726,7 @@ class AnthropicHandlerMixin:
                             total_latency_ms=optimization_latency,
                             overhead_ms=optimization_latency,
                             num_messages=len(messages),
+                            tags=tags,
                             client=client,
                         )
                     )
@@ -2349,6 +2351,7 @@ class AnthropicHandlerMixin:
         headers.pop("host", None)
         headers.pop("content-length", None)
         client = classify_client(headers)
+        tags = extract_tags(headers)
         # PR-A5 (P5-49): strip internal x-headroom-* before forwarding upstream.
         from headroom.proxy.helpers import _strip_internal_headers, log_outbound_headers
 
@@ -2516,6 +2519,7 @@ class AnthropicHandlerMixin:
                     overhead_ms=optimization_latency,
                     pipeline_timing=pipeline_timing,
                     num_messages=len(compressed_requests),
+                    tags=tags,
                     client=client,
                 )
             )
@@ -2599,6 +2603,7 @@ class AnthropicHandlerMixin:
         headers = dict(request.headers.items())
         headers.pop("host", None)
         client = classify_client(headers)
+        tags = extract_tags(headers)
         # PR-A5 (P5-49): strip internal x-headroom-* before forwarding upstream.
         from headroom.proxy.helpers import _strip_internal_headers, log_outbound_headers
 
@@ -2634,6 +2639,7 @@ class AnthropicHandlerMixin:
                 tokens_saved=0,
                 attempted_input_tokens=0,
                 total_latency_ms=latency_ms,
+                tags=tags,
                 client=client,
             )
         )
@@ -2720,6 +2726,7 @@ class AnthropicHandlerMixin:
         headers = dict(request.headers.items())
         headers.pop("host", None)
         client = classify_client(headers)
+        tags = extract_tags(headers)
         # PR-A5 (P5-49): strip internal x-headroom-* before forwarding upstream.
         from headroom.proxy.helpers import _strip_internal_headers, log_outbound_headers
 
@@ -2811,6 +2818,7 @@ class AnthropicHandlerMixin:
                 tokens_saved=0,
                 attempted_input_tokens=0,
                 total_latency_ms=latency_ms,
+                tags=tags,
                 client=client,
             )
         )

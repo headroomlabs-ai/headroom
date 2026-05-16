@@ -337,3 +337,84 @@ def test_gemini_batch_embed_contents_passthrough_uses_gemini_target(monkeypatch)
     assert calls == [
         ("/v1beta/models/demo:batchEmbedContents", "https://api.gemini.test", "batchEmbedContents")
     ]
+
+
+def test_v1_models_returns_synthetic_list_under_chatgpt_auth() -> None:
+    """Issue #478: under Codex ChatGPT-subscription OAuth, the proxy
+    must NOT forward `/v1/models` to chatgpt.com/backend-api/models
+    (which returns 403). Synthesize an OpenAI-compatible response with
+    the known-supported Codex/ChatGPT model set instead, so Codex's
+    model-picker refresh succeeds.
+    """
+    with TestClient(_app()) as client:
+        # ChatGPT auth detected via Bearer + ChatGPT account header
+        # (mirrors what Codex Desktop sends).
+        response = client.get(
+            "/v1/models",
+            headers={
+                "authorization": "Bearer eyJ-chatgpt-oauth-token",
+                "chatgpt-account-id": "test-account",
+                "originator": "Codex Desktop",
+            },
+        )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["object"] == "list"
+    assert isinstance(payload["data"], list)
+    assert len(payload["data"]) > 0
+    model_ids = {entry["id"] for entry in payload["data"]}
+    # Spot-check: the model from issue #478's repro log must be present.
+    assert "gpt-5.5" in model_ids
+    for entry in payload["data"]:
+        assert entry["object"] == "model"
+        assert entry["owned_by"] == "openai"
+
+
+def test_v1_models_get_single_synthetic_under_chatgpt_auth() -> None:
+    """The single-model variant (`/v1/models/{id}`) is also called by
+    Codex for some flows. Must return a synthetic OpenAI-compatible
+    payload for known models, 404 for unknown."""
+    with TestClient(_app()) as client:
+        ok = client.get(
+            "/v1/models/gpt-5.5",
+            headers={
+                "authorization": "Bearer eyJ-chatgpt-oauth-token",
+                "chatgpt-account-id": "test-account",
+            },
+        )
+        unknown = client.get(
+            "/v1/models/gpt-99-future",
+            headers={
+                "authorization": "Bearer eyJ-chatgpt-oauth-token",
+                "chatgpt-account-id": "test-account",
+            },
+        )
+    assert ok.status_code == 200
+    assert ok.json() == {
+        "id": "gpt-5.5",
+        "object": "model",
+        "created": 0,
+        "owned_by": "openai",
+    }
+    assert unknown.status_code == 404
+
+
+def test_v1_models_still_forwards_under_non_chatgpt_auth() -> None:
+    """Non-ChatGPT auth (regular API key, Gemini, etc.) must still
+    forward to the upstream provider — only the ChatGPT-OAuth path
+    short-circuits to the synthetic response."""
+    calls: list[tuple[str, str, str]] = []
+
+    async def fake_passthrough(self, request, base_url, sub_path="", provider_name=""):  # type: ignore[no-untyped-def]
+        calls.append((request.url.path, base_url, provider_name))
+        return JSONResponse({"base_url": base_url, "provider": provider_name})
+
+    with patch.object(HeadroomProxy, "handle_passthrough", fake_passthrough):
+        with TestClient(_app()) as client:
+            response = client.get(
+                "/v1/models",
+                headers={"authorization": "Bearer sk-real-api-key"},
+            )
+    assert response.status_code == 200
+    # Forwarded — not synthesized — because no chatgpt-account-id header.
+    assert calls, "Non-ChatGPT-auth /v1/models must forward, not synthesize"

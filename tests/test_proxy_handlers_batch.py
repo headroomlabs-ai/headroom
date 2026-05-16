@@ -101,6 +101,15 @@ class DummyBatchHandler(batch_module.BatchHandlerMixin):
 
         await emit_request_outcome(self, outcome)
 
+    def _extract_tags(self, headers: dict) -> dict[str, str]:
+        # Mirror of HeadroomProxy._extract_tags. Handlers now call this
+        # at entry to capture x-headroom-* slicing tags into the outcome.
+        return {
+            k.lower().replace("x-headroom-", ""): v
+            for k, v in headers.items()
+            if k.lower().startswith("x-headroom-")
+        }
+
     async def handle_passthrough(self, request, base_url):  # noqa: ANN001, ANN201
         return {"request": request, "base_url": base_url}
 

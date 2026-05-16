@@ -292,6 +292,26 @@ def get_python_forwarder_mode() -> PythonForwarderMode:
     )
 
 
+def extract_tags(headers: Any) -> dict[str, str]:
+    """Extract ``x-headroom-*`` tags from inbound headers.
+
+    Pure function (no I/O, no state). Used by every handler at request
+    entry to capture operator slicing tags into the per-request
+    ``RequestOutcome.tags``. Free function rather than a mixin method so
+    handler mixins instantiated in isolation (tests using
+    ``object.__new__(OpenAIHandlerMixin)``) don't need a shim
+    implementation.
+
+    Header name match is case-insensitive; the returned key has the
+    ``x-headroom-`` prefix stripped.
+    """
+    return {
+        k.lower().replace("x-headroom-", ""): v
+        for k, v in headers.items()
+        if k.lower().startswith("x-headroom-")
+    }
+
+
 def _headroom_bypass_enabled(headers: Any) -> bool:
     """Return True when inbound headers request full Headroom passthrough.
 

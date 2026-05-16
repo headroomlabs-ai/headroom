@@ -116,6 +116,16 @@ def test_openai_passthrough_applies_copilot_auth(monkeypatch: pytest.MonkeyPatch
 
             await emit_request_outcome(self, outcome)
 
+        def _extract_tags(self, headers: dict) -> dict[str, str]:
+            # Mirror of HeadroomProxy._extract_tags. The passthrough
+            # handler now extracts tags at entry as part of the
+            # outcome-tag invariant lock (PR #480).
+            return {
+                k.lower().replace("x-headroom-", ""): v
+                for k, v in headers.items()
+                if k.lower().startswith("x-headroom-")
+            }
+
         async def _request(self, **kwargs):  # noqa: ANN003
             seen["request_kwargs"] = kwargs
             return SimpleNamespace(headers={}, content=b"{}", status_code=200)
