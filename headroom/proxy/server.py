@@ -74,8 +74,8 @@ from headroom.ccr import (
     parse_tool_call,
 )
 from headroom.config import (
-    CacheAlignerConfig,
     DEFAULT_EXCLUDE_TOOLS,
+    CacheAlignerConfig,
     ReadLifecycleConfig,
 )
 from headroom.dashboard import get_dashboard_html
@@ -3148,9 +3148,7 @@ def _parse_exclude_tools(cli_excludes: str | None) -> set[str]:
     DEFAULT_EXCLUDE_TOOLS. Unset/empty -> empty set (DEFAULT_EXCLUDE_TOOLS
     used unchanged).
     """
-    raw = ",".join(
-        s for s in (cli_excludes, os.environ.get("HEADROOM_EXCLUDE_TOOLS")) if s
-    )
+    raw = ",".join(s for s in (cli_excludes, os.environ.get("HEADROOM_EXCLUDE_TOOLS")) if s)
     names: set[str] = set()
     for entry in raw.split(","):
         name = entry.strip()
