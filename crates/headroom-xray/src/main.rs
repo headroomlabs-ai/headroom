@@ -3,10 +3,6 @@
 use anyhow::Result;
 use clap::Parser;
 
-/// headroom xray — multi-CLI context-bloat diagnostics.
-///
-/// Wraps CodeBurn (https://github.com/getagentseal/codeburn, MIT) and adds
-/// a Headroom-specific compression-opportunity footer.
 #[derive(Parser, Debug)]
 #[command(name = "headroom-xray", version, about, long_about = None)]
 struct Cli {
@@ -60,7 +56,32 @@ async fn main() -> Result<()> {
             1
         });
 
-    // TODO Tasks 4-7: footer pipeline.
+    // Footer pipeline (best-effort, never breaks the main flow).
+    if !cli.no_footer && code == 0 {
+        if let Err(e) = print_footer().await {
+            if cli.xray_debug {
+                eprintln!("[xray-debug] footer suppressed: {e}");
+            }
+        }
+    }
 
     std::process::exit(code);
+}
+
+async fn print_footer() -> Result<()> {
+    use headroom_xray::footer;
+    use headroom_xray::tokenize::count_by_tool;
+    use headroom_xray::transcripts::claude_code;
+
+    let session = match claude_code::latest_session_for_cwd() {
+        Some(p) => p,
+        None => return Ok(()), // no session here — silently skip
+    };
+    let transcript = claude_code::parse(&session)?;
+    let counts = count_by_tool(&transcript)?;
+    let rendered = footer::render(&counts);
+    if !rendered.is_empty() {
+        print!("\n{rendered}");
+    }
+    Ok(())
 }
