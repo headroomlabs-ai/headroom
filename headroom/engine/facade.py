@@ -1,4 +1,4 @@
-"""HeadroomEngine — request/response hook facade (Chunks 2 + 4.2a/4.2b/4.2c + 4.3-i).
+"""HeadroomEngine — request/response hook facade (Chunks 2 + 4.2a/4.2b/4.2c + 4.3-i + 5).
 
 Composes the existing compression subsystems behind a clean hook interface.
 Does NOT reimplement compression; delegates to injected ``CompressionPipeline``
@@ -35,6 +35,15 @@ Design notes
   ``RequestContext.prefetched_memory_context`` (option (a) async-bridge:
   the async handler ``await``s the search, stores the result in
   ``RequestContext``, then calls ``engine.on_request``).
+- **Chunk 5 — OpenAI chat path**: ``openai_components`` wires the
+  ``_on_request_openai_chat`` path.  Key differences from Anthropic:
+    * tools are NOT sorted (the live handler never sorts OpenAI tools);
+    * the outbound body is ALWAYS canonically serialized (``body_mutated=True``
+      is the live handler's default — original bytes are never preserved);
+    * streaming prepends ``stream_options: {include_usage: True}`` (mirrors the
+      live handler's pre-send injection at line ~2026-2029).
+  ``(Provider.OPENAI, Flavor.RESPONSES)`` raises ``NotImplementedError`` with a
+  clear message pointing to the responses follow-up task.
 """
 
 from __future__ import annotations
@@ -82,6 +91,48 @@ class AnthropicComponents:
         semantics as ``HeadroomProxy._get_compression_cache``.
     config:
         The ``ProxyConfig`` (mode, optimize, hooks, …).
+    usage_reporter:
+        Commercial gate for ``CompressionDecision.decide``.
+    """
+
+    def __init__(
+        self,
+        *,
+        pipeline: Any,
+        provider: Any,
+        session_tracker_store: Any,
+        get_compression_cache: Callable[[str], Any],
+        config: Any,
+        usage_reporter: Any | None,
+    ) -> None:
+        self.pipeline = pipeline
+        self.provider = provider
+        self.session_tracker_store = session_tracker_store
+        self.get_compression_cache = get_compression_cache
+        self.config = config
+        self.usage_reporter = usage_reporter
+
+
+class OpenAIComponents:
+    """Real OpenAI compression components for the engine (Chunk 5).
+
+    Mirrors ``AnthropicComponents`` for the OpenAI chat path.  Injected into
+    ``HeadroomEngine`` to enable ``_on_request_openai_chat``.
+
+    Parameters
+    ----------
+    pipeline:
+        The real ``TransformPipeline`` for OpenAI (``HeadroomProxy.openai_pipeline``).
+    provider:
+        The OpenAIProvider (used for ``get_context_limit``).
+    session_tracker_store:
+        The ``SessionTrackerStore`` the engine owns (engine-private; separate
+        from the server's store so prefix-tracker state does not leak).
+    get_compression_cache:
+        Callable ``(session_id: str) -> CompressionCache`` — same semantics
+        as ``HeadroomProxy._get_compression_cache``.
+    config:
+        The ``ProxyConfig`` (mode, optimize, …).
     usage_reporter:
         Commercial gate for ``CompressionDecision.decide``.
     """
@@ -225,6 +276,18 @@ class HeadroomEngine:
     compression-core. When ``ccr_components`` is also provided, the CCR
     request-side pipeline (steps 1-4) runs after compression-core.
 
+    **Real-OpenAI-Chat mode** (Chunk 5): ``openai_components`` is set.
+    The engine orchestrates the full OpenAI chat compression-core: mode-branch,
+    frozen-count, pipeline.apply, and canonical serialization.  Key differences
+    from Anthropic (preserved to match the live handler exactly):
+      - Tools are NOT sorted (``handle_openai_chat`` never calls
+        ``_sort_tools_deterministically``).
+      - The outbound body is ALWAYS re-serialized canonically (``body_mutated=True``
+        is the live handler's effective default; it never passes
+        ``original_body_bytes`` to ``_retry_request`` / ``_stream_response``).
+      - Streaming injects ``stream_options: {include_usage: True}`` before
+        serialization (mirrors live handler lines ~2026-2029).
+
     Parameters
     ----------
     pipelines:
@@ -252,6 +315,10 @@ class HeadroomEngine:
         memory injection step between CCR compression tracking and CCR
         proactive expansion (Chunk 4.2c). When None, memory step is a no-op
         — existing tests are byte-identical to the pre-4.2c behaviour.
+    openai_components:
+        When set, the engine uses the real OpenAI orchestration path for
+        OpenAI/Chat requests (Chunk 5). When None, falls back to the
+        fake-pipeline path (Chunks 1-2 behaviour).
     """
 
     def __init__(
@@ -264,6 +331,7 @@ class HeadroomEngine:
         anthropic_components: AnthropicComponents | None = None,
         ccr_components: CCRComponents | None = None,
         memory_components: MemoryComponents | None = None,
+        openai_components: OpenAIComponents | None = None,
     ) -> None:
         self._pipelines = dict(pipelines)
         self._config = config
@@ -272,6 +340,7 @@ class HeadroomEngine:
         self._anthropic_components = anthropic_components
         self._ccr_components = ccr_components
         self._memory_components = memory_components
+        self._openai_components = openai_components
 
     # ── Request hook ──────────────────────────────────────────────────────────
 
@@ -315,6 +384,20 @@ class HeadroomEngine:
         ):
             return self._on_request_anthropic_real(
                 ctx, _session_tracker_store_override=_session_tracker_store_override
+            )
+
+        # Real OpenAI chat path (Chunk 5)
+        if ctx.provider == Provider.OPENAI and ctx.flavor == Flavor.CHAT:
+            if self._openai_components is not None:
+                return self._on_request_openai_chat(ctx)
+            # Fall through to fake-pipeline path if no openai_components.
+
+        # OpenAI Responses path — not yet wired (follow-up task).
+        if ctx.provider == Provider.OPENAI and ctx.flavor == Flavor.RESPONSES:
+            raise NotImplementedError(
+                "HeadroomEngine: (Provider.OPENAI, Flavor.RESPONSES) is not yet wired. "
+                "The /v1/responses engine path is handled in a follow-up task. "
+                "Use the live OpenAI responses handler directly for now."
             )
 
         # Legacy fake-pipeline path (Chunks 1-2)
@@ -828,6 +911,167 @@ class HeadroomEngine:
                 bytes_saved=bytes_saved,
                 compressed=compressed,
                 ccr_fired=ccr_tool_injected,
+            ),
+        )
+
+    # ── Real OpenAI chat orchestration (Chunk 5) ─────────────────────────────
+
+    def _on_request_openai_chat(self, ctx: RequestContext) -> RequestDecision:
+        """Reproduce the OpenAI /v1/chat/completions compression-core.
+
+        Mirrors ``OpenAIHandlerMixin.handle_openai_chat`` through:
+          CompressionDecision → mode-branch pipeline.apply → (streaming:
+          inject stream_options) → canonical serialization.
+
+        Intentional differences from the Anthropic path that are faithfully
+        preserved here to match the live handler byte-for-byte:
+
+        1. **No tool sort** — ``handle_openai_chat`` never calls
+           ``_sort_tools_deterministically``.  Do NOT add it.
+
+        2. **Always canonical** — the live handler always calls
+           ``_retry_request`` / ``_stream_response`` without
+           ``original_body_bytes`` or ``body_mutated=False``, so the
+           effective behaviour is always canonical serialization.
+           ``prepare_outbound_body_bytes`` is NOT called here; we use
+           ``serialize_body_canonical`` directly.
+
+        3. **stream_options injection** — when ``body["stream"]`` is truthy the
+           live handler injects ``body["stream_options"] = {"include_usage": True}``
+           (or sets the key inside an existing dict) at lines ~2026-2029,
+           BEFORE forwarding the bytes.  This produces a byte-level difference
+           vs the inbound body and is captured in the streaming golden fixtures.
+
+        Excluded from this chunk: CCR injection, memory injection, hooks,
+        pipeline_extension events, prefix-tracker.update_from_response,
+        cache, rate-limiting, image compression.  These are all controlled OFF
+        in the golden recorder's ``_DEFAULT_CONFIG_KWARGS``, so the 16 chat
+        golden fixtures do not exercise them.
+        """
+        from headroom.proxy.helpers import serialize_body_canonical
+        from headroom.proxy.modes import is_cache_mode, is_token_mode
+        from headroom.utils import extract_user_query
+
+        oc = self._openai_components
+        assert oc is not None
+
+        original_body_bytes = ctx.raw_body
+
+        # Parse body — raises loudly on malformed JSON
+        try:
+            body: dict[str, Any] = json.loads(original_body_bytes)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"on_request(openai_chat): unparseable JSON body: {exc}") from exc
+
+        messages: list[dict[str, Any]] = list(body.get("messages") or [])
+        model: str = body.get("model", "unknown")
+        original_client_messages: list[dict[str, Any]] = copy.deepcopy(messages)
+
+        # Bypass detection (same gates as the Anthropic path)
+        headers = dict(ctx.headers_view)
+        _bypass = (
+            headers.get("x-headroom-bypass", "").lower() == "true"
+            or headers.get("x-headroom-mode", "").lower() == "passthrough"
+        )
+
+        # Auth mode + per-auth-mode compression policy
+        auth_mode = classify_auth_mode(ctx.headers_view)
+        compression_policy = resolve_policy(auth_mode)
+
+        # Compression decision
+        _decision = CompressionDecision.decide(
+            headers=ctx.headers_view,
+            config=oc.config,
+            usage_reporter=oc.usage_reporter,
+            messages=messages,
+        )
+
+        optimized_messages = messages
+
+        if _decision.should_compress and not _bypass:
+            # --- Session / frozen-count derivation ---
+            session_id = oc.session_tracker_store.compute_session_id(ctx, model, messages)
+            prefix_tracker = oc.session_tracker_store.get_or_create(session_id, "openai")
+            frozen_message_count = prefix_tracker.get_frozen_message_count()
+            if is_cache_mode(oc.config.mode):
+                frozen_message_count = _strict_previous_turn_frozen_count(
+                    original_client_messages, frozen_message_count
+                )
+
+            # --- Context limit ---
+            context_limit = oc.provider.get_context_limit(model)
+
+            biases = None
+            request_id = ctx.request_id
+
+            # --- Mode branch: token / non-cache / cache-delta ---
+            if is_token_mode(oc.config.mode):
+                comp_cache = oc.get_compression_cache(session_id)
+
+                working_messages = comp_cache.apply_cached(messages)
+
+                # Re-freeze boundary (mirrors handler lines ~1469-1470)
+                frozen_message_count = comp_cache.compute_frozen_count(messages)
+                comp_cache.mark_stable_from_messages(messages, frozen_message_count)
+
+                result = oc.pipeline.apply(
+                    messages=working_messages,
+                    model=model,
+                    model_limit=context_limit,
+                    context=extract_user_query(working_messages),
+                    frozen_message_count=frozen_message_count,
+                    biases=biases,
+                    request_id=request_id,
+                    compression_policy=compression_policy,
+                )
+
+                if result.messages != working_messages:
+                    comp_cache.update_from_result(messages, result.messages)
+
+                optimized_messages = result.messages
+
+            else:
+                result = oc.pipeline.apply(
+                    messages=messages,
+                    model=model,
+                    model_limit=context_limit,
+                    context=extract_user_query(messages),
+                    frozen_message_count=frozen_message_count,
+                    biases=biases,
+                    request_id=request_id,
+                    compression_policy=compression_policy,
+                )
+
+                if result.messages != messages:
+                    optimized_messages = result.messages
+
+        # --- Reassemble body ---
+        body["messages"] = optimized_messages
+
+        # --- Streaming: inject stream_options (mirrors handler lines ~2026-2029) ---
+        # The live handler injects this BEFORE forwarding bytes, so it appears in the
+        # outbound body captured by the golden fixtures' CapturingTransport.
+        if body.get("stream"):
+            if "stream_options" not in body:
+                body["stream_options"] = {"include_usage": True}
+            elif isinstance(body.get("stream_options"), dict):
+                body["stream_options"]["include_usage"] = True
+
+        # --- Always canonical serialization ---
+        # The live handler never passes ``original_body_bytes`` or
+        # ``body_mutated=False`` to ``_retry_request`` / ``_stream_response``,
+        # so the effective behaviour is always ``serialize_body_canonical``.
+        # We replicate that directly — no passthrough path for OpenAI chat.
+        outbound_bytes = serialize_body_canonical(body)
+
+        compressed = outbound_bytes != original_body_bytes
+        bytes_saved = max(0, len(original_body_bytes) - len(outbound_bytes))
+
+        return RequestDecision(
+            body=outbound_bytes,
+            telemetry=ResponseTelemetry(
+                bytes_saved=bytes_saved,
+                compressed=compressed,
             ),
         )
 
