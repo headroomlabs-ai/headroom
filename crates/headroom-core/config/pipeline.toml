@@ -13,6 +13,14 @@
 # LLM might not retrieve when it should).
 
 [pipeline]
+# Tool names (or glob patterns with a trailing `*`) whose `tool_result`
+# blocks are forwarded byte-for-byte without compression.
+# Example: `["evolution.*"]` protects all evolution MCP tool outputs
+# while the rest of the pipeline runs normally.
+# Glob: `"foo.*"` matches any name starting with `"foo."`. Exact names
+# match without a wildcard suffix. Default: [] (no exclusions).
+excluded_tool_names = []
+
 # Below this fraction of input bytes (after reformat), we consider
 # the reformat phase to have "succeeded" and skip offloads UNLESS the
 # bloat estimator demands them. 0.5 = "if reformat shrunk us to half

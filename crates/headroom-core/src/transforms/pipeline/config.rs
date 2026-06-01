@@ -90,7 +90,7 @@ impl Default for PipelineConfig {
 }
 
 /// Orchestrator-level knobs.
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct OrchestratorConfig {
     /// After reformat, if `output_len / input_len <= this`, we treat
     /// the reformat as sufficient and skip offloads UNLESS bloat
@@ -103,6 +103,13 @@ pub struct OrchestratorConfig {
     /// offloads even when bloat is below threshold (the "reformat
     /// barely helped" fallback path).
     pub offload_fallback_ratio: f64,
+    /// Tool names (or `"prefix.*"` glob patterns) whose `tool_result`
+    /// blocks are forwarded without compression. Matched against the
+    /// `name` field of the corresponding `tool_use` block in the
+    /// assistant turn. A trailing `.*` matches any suffix after the
+    /// dot; otherwise the match is exact. Default: empty.
+    #[serde(default)]
+    pub excluded_tool_names: Vec<String>,
 }
 
 /// Per-domain bloat-estimator knobs.

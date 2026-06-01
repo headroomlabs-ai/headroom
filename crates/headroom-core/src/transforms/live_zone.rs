@@ -343,7 +343,7 @@ pub enum BlockAction {
 }
 
 /// Why a block was not eligible for compression.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum ExclusionReason {
     /// Block is in a message at index `< frozen_message_count`.
     BelowFrozenFloor,
@@ -353,6 +353,11 @@ pub enum ExclusionReason {
     /// Block type is on the cache-hot list (e.g. `tool_use`,
     /// `thinking`, `redacted_thinking`).
     HotZoneBlockType,
+    /// Tool name matched an entry in `pipeline.excluded_tool_names`.
+    ExcludedToolName {
+        /// Resolved tool name from the corresponding `tool_use` block.
+        tool_name: String,
+    },
 }
 
 /// Aggregated per-request manifest. Always populated, regardless of
@@ -676,11 +681,16 @@ pub fn compress_anthropic_live_zone_with_ccr(
         });
     };
 
+    // Build tool_use_id → tool_name map from assistant messages so the
+    // planner can check `excluded_tool_names` per tool_result block.
+    let tool_name_map = build_tool_name_map(messages);
+    let excluded = &[] as &[String]; // default: no exclusions (Phase B)
+
     // Resolve block ranges (byte offsets into `body_raw`) by walking
     // the body via `RawValue` borrowed slices. The Vec<Replacement>
     // produced here is the surgery plan; we do *not* mutate `body_raw`
     // while computing it.
-    let plan = match plan_block_replacements(body_raw, target_idx) {
+    let plan = match plan_block_replacements(body_raw, target_idx, &tool_name_map, excluded) {
         Ok(p) => p,
         Err(_) => {
             // Body shape doesn't match what we expect (e.g. content
@@ -757,6 +767,14 @@ pub fn compress_anthropic_live_zone_with_ccr(
                     ccr_store,
                 )
             }
+            SlotKind::ExcludedTool { tool_name } => BlockOutcome {
+                message_index: target_idx,
+                block_index: Some(slot.block_index),
+                block_type: "tool_result".to_string(),
+                action: BlockAction::Excluded {
+                    reason: ExclusionReason::ExcludedToolName { tool_name },
+                },
+            },
         };
         block_outcomes.push(outcome);
     }
@@ -1003,6 +1021,53 @@ enum SlotKind {
     /// Block type is on the cache-hot list — record but do not
     /// dispatch.
     HotZone(String),
+    /// Tool name matched `pipeline.excluded_tool_names` — skip
+    /// compression and forward verbatim.
+    ExcludedTool { tool_name: String },
+}
+
+/// Scan all messages and build a `tool_use_id → tool_name` lookup map.
+/// Used by the live-zone dispatcher to resolve the tool name for each
+/// `tool_result` block before checking `excluded_tool_names`.
+fn build_tool_name_map(messages: &[Value]) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    for msg in messages {
+        let role = msg.get("role").and_then(Value::as_str).unwrap_or("");
+        if role != "assistant" {
+            continue;
+        }
+        let Some(content) = msg.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+        for block in content {
+            let block_type = block.get("type").and_then(Value::as_str).unwrap_or("");
+            if block_type != "tool_use" {
+                continue;
+            }
+            if let (Some(id), Some(name)) = (
+                block.get("id").and_then(Value::as_str),
+                block.get("name").and_then(Value::as_str),
+            ) {
+                map.insert(id.to_owned(), name.to_owned());
+            }
+        }
+    }
+    map
+}
+
+/// Return true when `tool_name` matches any pattern in `excluded`.
+/// Patterns ending with `.*` are prefix-matched (e.g. `"evolution.*"`
+/// matches `"evolution.context"`, `"evolution.recall"`, etc.).
+/// All other patterns are exact matches.
+fn tool_name_is_excluded(tool_name: &str, excluded: &[String]) -> bool {
+    excluded.iter().any(|pattern| {
+        if let Some(prefix) = pattern.strip_suffix(".*") {
+            tool_name == prefix
+                || tool_name.starts_with(&format!("{prefix}."))
+        } else {
+            tool_name == pattern.as_str()
+        }
+    })
 }
 
 /// Walk the buffered body, return one `PlanSlot` per block in the
@@ -1012,6 +1077,8 @@ enum SlotKind {
 fn plan_block_replacements(
     body_raw: &[u8],
     target_msg_idx: usize,
+    tool_name_map: &std::collections::HashMap<String, String>,
+    excluded_tool_names: &[String],
 ) -> Result<Vec<PlanSlot>, PlanError> {
     // `serde_json::from_slice` requires UTF-8; we re-validate here
     // explicitly so the pointer-arithmetic helper can take a `&str`
@@ -1087,6 +1154,32 @@ fn plan_block_replacements(
         // it's a `text` field — we read that instead.
         let (inner_field_str, inner_field_offset_in_block) = match block_type.as_str() {
             "tool_result" => {
+                // Check `excluded_tool_names` before doing any work.
+                if !excluded_tool_names.is_empty() {
+                    #[derive(Deserialize)]
+                    struct ToolResultIdHeader<'a> {
+                        #[serde(borrow, default)]
+                        tool_use_id: Option<&'a str>,
+                    }
+                    if let Ok(id_header) =
+                        serde_json::from_str::<ToolResultIdHeader<'_>>(block_raw.get())
+                    {
+                        if let Some(tid) = id_header.tool_use_id {
+                            if let Some(tool_name) = tool_name_map.get(tid) {
+                                if tool_name_is_excluded(tool_name, excluded_tool_names) {
+                                    slots.push(PlanSlot {
+                                        block_index: block_idx,
+                                        kind: SlotKind::ExcludedTool {
+                                            tool_name: tool_name.clone(),
+                                        },
+                                    });
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+
                 let Some(field_raw) = header.content else {
                     // tool_result with no content — skip dispatch.
                     slots.push(PlanSlot {
@@ -2879,6 +2972,123 @@ mod openai_responses_tests {
         assert_eq!(
             summarize_openai_responses_no_change_reason(&manifest),
             "below_output_floor"
+        );
+    }
+
+    // ─── excluded_tool_names tests ────────────────────────────────────────
+
+    #[test]
+    fn tool_name_is_excluded_exact_match() {
+        assert!(tool_name_is_excluded(
+            "evolution.context",
+            &["evolution.context".to_string()]
+        ));
+        assert!(!tool_name_is_excluded(
+            "evolution.recall",
+            &["evolution.context".to_string()]
+        ));
+    }
+
+    #[test]
+    fn tool_name_is_excluded_glob_prefix() {
+        let patterns = vec!["evolution.*".to_string()];
+        assert!(tool_name_is_excluded("evolution.context", &patterns));
+        assert!(tool_name_is_excluded("evolution.recall", &patterns));
+        assert!(tool_name_is_excluded("evolution.task_open", &patterns));
+        // bare prefix without dot suffix must NOT match
+        assert!(!tool_name_is_excluded("evolutionx", &patterns));
+        // unrelated tool must NOT match
+        assert!(!tool_name_is_excluded("bash", &patterns));
+    }
+
+    #[test]
+    fn excluded_tool_result_is_not_compressed() {
+        // Build a minimal Anthropic request body: one assistant message
+        // with a tool_use, followed by a user message with a large
+        // tool_result for that tool_use_id.
+        let large_content = "x".repeat(2048);
+        let body = serde_json::json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "tu_evo_001",
+                            "name": "evolution.context",
+                            "input": {}
+                        }
+                    ]
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "tu_evo_001",
+                            "content": large_content
+                        }
+                    ]
+                }
+            ]
+        });
+        let body_bytes = serde_json::to_vec(&body).unwrap();
+
+        // Build a tool_name_map and call plan_block_replacements with
+        // evolution.* excluded.
+        let messages = body["messages"].as_array().unwrap();
+        let tool_name_map = build_tool_name_map(messages);
+        let excluded = vec!["evolution.*".to_string()];
+        let plan = plan_block_replacements(&body_bytes, 1, &tool_name_map, &excluded).unwrap();
+
+        assert_eq!(plan.len(), 1);
+        assert!(
+            matches!(&plan[0].kind, SlotKind::ExcludedTool { tool_name } if tool_name == "evolution.context"),
+            "expected ExcludedTool slot, got {:?}",
+            std::mem::discriminant(&plan[0].kind)
+        );
+    }
+
+    #[test]
+    fn non_excluded_tool_result_is_still_compressible() {
+        let large_content = "x".repeat(2048);
+        let body = serde_json::json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "tu_bash_001",
+                            "name": "bash",
+                            "input": {}
+                        }
+                    ]
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "tu_bash_001",
+                            "content": large_content
+                        }
+                    ]
+                }
+            ]
+        });
+        let body_bytes = serde_json::to_vec(&body).unwrap();
+        let messages = body["messages"].as_array().unwrap();
+        let tool_name_map = build_tool_name_map(messages);
+        let excluded = vec!["evolution.*".to_string()];
+        let plan = plan_block_replacements(&body_bytes, 1, &tool_name_map, &excluded).unwrap();
+
+        assert_eq!(plan.len(), 1);
+        assert!(
+            matches!(&plan[0].kind, SlotKind::Compressible { .. }),
+            "bash tool_result should remain Compressible"
         );
     }
 }
