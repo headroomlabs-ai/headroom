@@ -227,6 +227,41 @@ class TestCLIProxyEnvVars:
         assert result.exit_code == 0, result.output
         assert captured_config["config"].code_aware_enabled is True
 
+    def test_disable_kompress_from_env(self, runner):
+        """HEADROOM_DISABLE_KOMPRESS should be passed to ProxyConfig."""
+        captured_config = {}
+
+        def mock_run_server(config, **kwargs):
+            captured_config["config"] = config
+
+        with patch("headroom.proxy.server.run_server", mock_run_server):
+            result = runner.invoke(
+                main,
+                ["proxy"],
+                env={"HEADROOM_DISABLE_KOMPRESS": "1"},
+                catch_exceptions=False,
+            )
+
+        assert result.exit_code == 0, result.output
+        assert captured_config["config"].disable_kompress is True
+
+    def test_disable_kompress_from_cli_flag(self, runner):
+        """--disable-kompress should disable Kompress ML compression."""
+        captured_config = {}
+
+        def mock_run_server(config, **kwargs):
+            captured_config["config"] = config
+
+        with patch("headroom.proxy.server.run_server", mock_run_server):
+            result = runner.invoke(
+                main,
+                ["proxy", "--disable-kompress"],
+                catch_exceptions=False,
+            )
+
+        assert result.exit_code == 0, result.output
+        assert captured_config["config"].disable_kompress is True
+
     def test_code_aware_flag_overrides_env_var(self, runner):
         """--code-aware should win over HEADROOM_CODE_AWARE_ENABLED=false."""
         captured_config = {}
@@ -693,3 +728,12 @@ class TestArgparseBackendValidation:
         parser.add_argument("--backend", default="anthropic")
         args = parser.parse_args(["--backend", "litellm-hosted_vllm"])
         assert args.backend == "litellm-hosted_vllm"
+
+    def test_proxy_config_from_env_reads_disable_kompress(self):
+        """The direct server env path should honor HEADROOM_DISABLE_KOMPRESS."""
+        from headroom.proxy.server import _proxy_config_from_env
+
+        with patch.dict(os.environ, {"HEADROOM_DISABLE_KOMPRESS": "1"}):
+            config = _proxy_config_from_env()
+
+        assert config.disable_kompress is True

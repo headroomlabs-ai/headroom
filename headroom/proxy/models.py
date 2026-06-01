@@ -135,6 +135,11 @@ class ProxyConfig:
     # Code-aware compression (disabled by default — use code graph tools instead)
     code_aware_enabled: bool = False
 
+    # Disable Kompress ML compression while keeping structural compressors
+    # such as SmartCrusher, log/search/diff, and schema compaction enabled.
+    # CLI: --disable-kompress; env: HEADROOM_DISABLE_KOMPRESS=1.
+    disable_kompress: bool = False
+
     # Code graph live watcher (triggers incremental reindex on file changes)
     code_graph_watcher: bool = False
 

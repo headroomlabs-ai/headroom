@@ -332,6 +332,15 @@ def _selected_context_tool() -> str:
         "Default: disabled. Env: HEADROOM_CODE_AWARE_ENABLED=1 to enable."
     ),
 )
+@click.option(
+    "--disable-kompress",
+    is_flag=True,
+    envvar="HEADROOM_DISABLE_KOMPRESS",
+    help=(
+        "Disable Kompress ML compression while keeping structural compression enabled. "
+        "Env: HEADROOM_DISABLE_KOMPRESS=1."
+    ),
+)
 # Code graph: indexes project + watches files for live reindex via codebase-memory-mcp.
 # Only useful when the proxy is launched from a project root — it indexes the
 # current working directory.
@@ -597,6 +606,7 @@ def proxy(
     codex_wire_debug_dir: str | None,
     budget: float | None,
     code_aware_flag: bool | None,
+    disable_kompress: bool,
     code_graph: bool,
     no_read_lifecycle: bool,
     memory: bool,
@@ -795,6 +805,7 @@ def proxy(
             else os.environ.get("HEADROOM_CODE_AWARE_ENABLED", "").strip().lower()
             in ("true", "1", "yes", "on")
         ),
+        disable_kompress=disable_kompress,
         # Code graph: live file watcher for incremental reindexing
         code_graph_watcher=code_graph,
         # Read lifecycle: ON by default (use --no-read-lifecycle to disable)
