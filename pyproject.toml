@@ -70,6 +70,7 @@ proxy = [
     "transformers>=4.30.0",       # Tokenizer only (for Kompress)
     "watchdog>=4.0.0",            # File watcher for live code graph reindexing (--code-graph)
     "sqlite-vec>=0.1.6",          # Vector index for memory (--memory). Lightweight, no torch.
+    "gunicorn>=21.0.0",           # Optional WSGI/ASGI server for production deployment
 ]
 # AST-based code compression (tree-sitter)
 code = [
