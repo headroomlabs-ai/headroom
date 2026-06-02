@@ -24,6 +24,9 @@
 		"recharts": "^3.8.1",
 		"tailwind-merge": "^3.5.0"
 	},
+	"overrides": {
+	  "postcss": "8.5.10"
+	},
 	"devDependencies": {
 		"@ai-sdk/openai": "^3.0.51",
 		"@anthropic-ai/sdk": "^0.91.1",
@@ -34,8 +37,7 @@
 		"@types/react-dom": "^19.2.3",
 		"ai": "^6.0.149",
 		"openai": "^6.33.0",
-		"postcss": "^8.5.10",
-		"tailwindcss": "^4.2.2",
+"tailwindcss": "^4.2.2",
 		"typescript": "^5.9.3"
 	}
 }
