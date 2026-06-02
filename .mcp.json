@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "headroom": {
+      "command": "headroom",
+      "args": [
+        "mcp",
+        "serve"
+      ],
+      "cwd": ".",
+      "env": {
+        "HEADROOM_PROXY_URL": "http://127.0.0.1:8787"
+      }
+    }
+  }
+}

@@ -1,0 +1,31 @@
+{
+  "description": "Headroom Codex hooks - keep the persistent local proxy available for Codex sessions.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd /tmp && headroom init hook ensure --profile init-user --marker headroom-codex-plugin",
+            "timeout": 30,
+            "statusMessage": "Starting Headroom proxy"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd /tmp && headroom init hook ensure --profile init-user --marker headroom-codex-plugin",
+            "timeout": 30,
+            "statusMessage": "Checking Headroom proxy"
+          }
+        ]
+      }
+    ]
+  }
+}

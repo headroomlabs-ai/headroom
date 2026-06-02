@@ -86,6 +86,14 @@ _READ_ENABLED = os.environ.get("HEADROOM_MCP_READ", "off").lower().strip() in (
 DEFAULT_PROXY_URL = os.environ.get("HEADROOM_PROXY_URL", "http://127.0.0.1:8787")
 
 
+def _token_savings_percent(input_tokens: int, output_tokens: int) -> float:
+    """Return savings percent from token counts, clamped at zero for expansions."""
+    if input_tokens <= 0:
+        return 0.0
+    tokens_saved = max(0, input_tokens - output_tokens)
+    return round((tokens_saved / input_tokens) * 100, 1)
+
+
 def _format_session_summary(summary: dict[str, Any], local_stats: dict[str, Any]) -> str:
     """Format the proxy summary + local MCP stats into clean readable text."""
     lines: list[str] = []
@@ -259,9 +267,7 @@ class SessionStats:
             "type": "compress",
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
-            "savings_percent": round((1 - output_tokens / input_tokens) * 100, 1)
-            if input_tokens > 0
-            else 0,
+            "savings_percent": _token_savings_percent(input_tokens, output_tokens),
             "strategy": strategy,
             "timestamp": time.time(),
         }
@@ -387,9 +393,7 @@ class HeadroomMCPServer:
         )
         self._stats.record_compression(input_tokens, output_tokens, strategy)
 
-        savings_pct = (
-            round((1 - result.compression_ratio) * 100, 1) if result.compression_ratio < 1.0 else 0
-        )
+        savings_pct = _token_savings_percent(input_tokens, output_tokens)
 
         return {
             "compressed": compressed_content,

@@ -127,13 +127,23 @@ Reproduce: `python -m headroom.evals suite --tier 1` · [Full benchmarks & metho
 | Agent       | `headroom wrap` | Notes                            |
 |-------------|:---------------:|----------------------------------|
 | Claude Code | ●               | `--memory` · `--code-graph`      |
-| Codex       | ●               | shares memory with Claude        |
+| Codex       | ●               | CCM-compatible; proxy + MCP tools |
 | Cursor      | ●               | prints config — paste once       |
 | Aider       | ●               | starts proxy + launches          |
 | Copilot CLI | ●               | starts proxy + launches          |
 | OpenClaw    | ●               | installs as ContextEngine plugin |
 
 Any OpenAI-compatible client works via `headroom proxy`. MCP-native: `headroom mcp install`.
+
+### Codex + Cognitive Context Manager (CCM)
+
+Headroom is compatible with CCM and can run beside it in the same Codex install. A good default split is:
+
+- CCM stays the durable project-memory layer: working context, decisions, open loops, and stale-memory hygiene.
+- Headroom handles the local proxy, request compression, CCR `headroom_compress`/`headroom_retrieve`, and session stats.
+- Both expose MCP tools; use CCM when you need project state and use Headroom when a compressed marker needs expansion or when you want proxy/compression metrics.
+
+This repo includes a Codex plugin skeleton for that pairing: `.codex-plugin/plugin.json`, `.mcp.json`, `hooks/hooks.json`, and `skills/headroom/SKILL.md`. Install `headroom-ai[all]` so the `headroom` command is on `PATH`, enable the plugin in Codex, and keep CCM installed as the default project memory provider.
 
 ## When to use · When to skip
 

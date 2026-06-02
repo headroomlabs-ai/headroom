@@ -1,0 +1,42 @@
+{
+  "name": "headroom",
+  "version": "0.22.4",
+  "description": "Headroom context optimization proxy, MCP retrieval tools, and startup hooks for Codex.",
+  "author": {
+    "name": "Headroom Contributors",
+    "url": "https://github.com/chopratejas/headroom"
+  },
+  "homepage": "https://headroom-docs.vercel.app",
+  "repository": "https://github.com/chopratejas/headroom",
+  "license": "Apache-2.0",
+  "keywords": [
+    "codex",
+    "context",
+    "compression",
+    "mcp",
+    "proxy",
+    "headroom",
+    "ccm"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Headroom",
+    "shortDescription": "Context optimization proxy for Codex",
+    "longDescription": "Runs the Headroom local proxy for Codex, exposes MCP compression/retrieve/stats tools, and works alongside Cognitive Context Manager when CCM is used for durable project memory.",
+    "developerName": "Headroom Contributors",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://headroom-docs.vercel.app",
+    "defaultPrompt": [
+      "Use Headroom to inspect compression stats for this Codex session.",
+      "Use Headroom retrieval tools when compressed context markers need expansion.",
+      "Use CCM for project memory and Headroom for proxy compression when both plugins are installed."
+    ],
+    "brandColor": "#10B981"
+  }
+}
