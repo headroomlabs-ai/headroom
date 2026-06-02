@@ -26,7 +26,7 @@
 	},
 	"devDependencies": {
 		"@ai-sdk/openai": "^3.0.51",
-		"@anthropic-ai/sdk": "^0.82.0",
+		"@anthropic-ai/sdk": "^0.91.1",
 		"@tailwindcss/postcss": "^4.2.2",
 		"@types/mdx": "^2.0.13",
 		"@types/node": "^25.5.0",
