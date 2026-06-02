@@ -1062,8 +1062,7 @@ fn build_tool_name_map(messages: &[Value]) -> std::collections::HashMap<String, 
 fn tool_name_is_excluded(tool_name: &str, excluded: &[String]) -> bool {
     excluded.iter().any(|pattern| {
         if let Some(prefix) = pattern.strip_suffix(".*") {
-            tool_name == prefix
-                || tool_name.starts_with(&format!("{prefix}."))
+            tool_name == prefix || tool_name.starts_with(&format!("{prefix}."))
         } else {
             tool_name == pattern.as_str()
         }
