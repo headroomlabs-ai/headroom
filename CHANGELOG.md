@@ -6,6 +6,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [Unreleased]
+
+### Changed
+
+* **deps:** loosen over-pinned constraints and add upper bounds
+  - `litellm==1.82.3` -> `>=1.82.3,<2.0` (exact pin blocked all security patches)
+  - `transformers>=4.30.0` -> `>=4.30.0,<6.0` (add upper bound; library already crossed a major version silently)
+  - `sentence-transformers>=2.2.0` -> `>=2.2.0,<6.0` (same; applied in `memory`, `evals`, and `dev` extras)
+  - `neo4j>=5.20.0` -> `>=5.20.0,<7.0` (client had already crossed the 5.x/6.x boundary)
+  - `mem0ai>=0.1.100` -> `>=1.0.0,<2.0` (floor was pre-1.0; locked package is already 1.0.11)
+  - `langchain-core>=0.2.0` -> `>=0.2.0,<4.0`
+  - `langchain-openai>=0.1.0` -> `>=0.1.0,<2.0`
+  - `qdrant-client>=1.9.0` -> `>=1.9.0,<2.0`
+  - `uvicorn>=0.23.0` -> `>=0.23.0,<1.0` (applied in `proxy` and `dev` extras)
+  - Same `transformers` and `litellm` bounds applied consistently across `ml`, `voice`, and `dev` extras
+* **docker:** bump `neo4j` image in `docker-compose.yml` from `5.15.0` to `5.26` (latest 5.x LTS)
+* **docker:** bump `UV_VERSION` in `Dockerfile` from `0.11.16` to `0.11.18`
+
 ## [0.23.0](https://github.com/chopratejas/headroom/compare/v0.22.4...v0.23.0) (2026-06-04)
 
 ### Features
