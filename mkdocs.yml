@@ -120,6 +120,7 @@ nav:
     - SDK: sdk.md
     - Differential Network Capture: network-diff-capture.md
     - Metrics & Observability: metrics.md
+    - Telemetry Surfaces: telemetry.md
     - Error Codes: errors.md
     - Troubleshooting: troubleshooting.md
   - Deployment:

@@ -24,6 +24,9 @@ def clean_env(monkeypatch: pytest.MonkeyPatch) -> pytest.MonkeyPatch:
         paths.HEADROOM_SAVINGS_PATH_ENV,
         paths.HEADROOM_TOIN_PATH_ENV,
         paths.HEADROOM_SUBSCRIPTION_STATE_PATH_ENV,
+        paths.HEADROOM_CLUSTER_ENABLED_ENV,
+        paths.HEADROOM_CLUSTER_ID_ENV,
+        paths.HEADROOM_CLUSTER_DIR_ENV,
     ):
         monkeypatch.delenv(name, raising=False)
     return monkeypatch
@@ -138,11 +141,34 @@ def test_per_resource_getters_no_mkdir(fake_home: Path) -> None:
     paths.bin_dir()
     paths.rtk_path()
     paths.deploy_root()
+    paths.sessions_dir()
+    paths.cluster_dir()
+    paths.cluster_sessions_dir()
     paths.beacon_lock_path(8787)
     paths.models_config_path()
     paths.plugin_config_dir("example")
     paths.plugin_workspace_dir("example")
     assert not (fake_home / ".headroom").exists()
+
+
+def test_cluster_paths_default_under_workspace(fake_home: Path) -> None:
+    assert paths.cluster_enabled() is False
+    assert paths.cluster_id() == "default"
+    assert paths.cluster_dir() == fake_home / ".headroom" / "cluster"
+    assert (
+        paths.cluster_sessions_dir() == fake_home / ".headroom" / "cluster" / "default" / "sessions"
+    )
+
+
+def test_cluster_paths_env_overrides(clean_env: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    clean_env.setenv(paths.HEADROOM_CLUSTER_ENABLED_ENV, "true")
+    clean_env.setenv(paths.HEADROOM_CLUSTER_ID_ENV, "team-gamma")
+    clean_env.setenv(paths.HEADROOM_CLUSTER_DIR_ENV, str(tmp_path / "shared"))
+
+    assert paths.cluster_enabled() is True
+    assert paths.cluster_id() == "team-gamma"
+    assert paths.cluster_dir() == tmp_path / "shared"
+    assert paths.cluster_sessions_dir() == tmp_path / "shared" / "team-gamma" / "sessions"
 
 
 # ---------------------------------------------------------------------------

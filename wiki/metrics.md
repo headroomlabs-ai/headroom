@@ -2,6 +2,10 @@
 
 Headroom provides comprehensive metrics for monitoring compression performance, cost savings, and system health.
 
+For a full inventory of telemetry and observability surfaces, including which
+ones can leave the host, see [Telemetry Surfaces](telemetry.md) or run
+`headroom telemetry list --json`.
+
 ## Proxy Metrics
 
 ### Stats Endpoint
@@ -44,6 +48,15 @@ curl http://localhost:8787/stats
   "cache": {
     "entries": 10,
     "total_hits": 5
+  },
+  "active_sessions": {
+    "local_summary": {
+      "count": 1
+    }
+  },
+  "cluster": {
+    "enabled": false,
+    "cluster_id": "default"
   }
 }
 ```
@@ -56,6 +69,11 @@ proxy compression history stored by default at
 Use `HEADROOM_SAVINGS_PATH` to override the file location directly, or
 set `HEADROOM_WORKSPACE_DIR` to relocate the entire state root. See the
 [Filesystem Contract](filesystem-contract.md) for details.
+
+The `active_sessions` block summarizes local Headroom processes that are
+currently writing heartbeat manifests under `${HEADROOM_WORKSPACE_DIR}/sessions`.
+When `HEADROOM_CLUSTER_ENABLED=true`, the `cluster` block also includes sessions
+mirrored into `${HEADROOM_CLUSTER_DIR}/${HEADROOM_CLUSTER_ID}/sessions`.
 
 For Anthropic-style providers that return cache-write TTL buckets, `/stats`
 also surfaces observed cache TTL usage under `prefix_cache`:

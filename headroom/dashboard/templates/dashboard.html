@@ -120,6 +120,11 @@
                         @click="setViewMode('history')">
                     Historical
                 </button>
+                <button class="px-3 py-1.5 text-sm rounded-md transition-colors"
+                        :class="viewMode === 'active-sessions' ? 'bg-accent text-black' : 'text-gray-400 hover:text-gray-200'"
+                        @click="setViewMode('active-sessions')">
+                    Active Sessions
+                </button>
             </div>
             <template x-if="stats.anon_telemetry_shipping">
                 <div class="inline-flex items-center gap-1.5 rounded-full border border-amber-500/40 bg-amber-500/10 px-2.5 py-1"
@@ -1257,6 +1262,80 @@
             </div>
         </template>
 
+        <template x-if="viewMode === 'active-sessions'">
+            <div>
+                <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
+                    <div class="bg-surface rounded-lg p-4 border border-border">
+                        <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Local Sessions</div>
+                        <div class="text-3xl font-light tabular-nums text-accent"
+                             x-text="stats.active_sessions?.local_summary?.count || 0"></div>
+                    </div>
+                    <div class="bg-surface rounded-lg p-4 border border-border">
+                        <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Cluster Sessions</div>
+                        <div class="text-3xl font-light tabular-nums"
+                             :class="stats.cluster?.enabled ? 'text-emerald-400' : 'text-gray-500'"
+                             x-text="stats.cluster?.summary?.count || 0"></div>
+                    </div>
+                    <div class="bg-surface rounded-lg p-4 border border-border">
+                        <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Cluster ID</div>
+                        <div class="text-xl font-light tabular-nums truncate"
+                             x-text="stats.cluster?.cluster_id || 'default'"></div>
+                    </div>
+                    <div class="bg-surface rounded-lg p-4 border border-border">
+                        <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Mirroring</div>
+                        <div class="text-xl font-light"
+                             :class="stats.cluster?.enabled ? 'text-emerald-400' : 'text-gray-500'"
+                             x-text="stats.cluster?.enabled ? 'Enabled' : 'Local only'"></div>
+                    </div>
+                </div>
+
+                <div class="bg-surface rounded-lg border border-border overflow-hidden">
+                    <div class="px-4 py-3 border-b border-border flex items-center justify-between">
+                        <div>
+                            <div class="text-sm font-medium text-gray-300">All Active Sessions</div>
+                            <div class="text-xs text-gray-500">Heartbeat manifests contain aggregate counters only, never prompt content.</div>
+                        </div>
+                        <div class="text-xs text-gray-500" x-text="activeSessionRows.length + ' visible'"></div>
+                    </div>
+                    <template x-if="activeSessionRows.length > 0">
+                        <div class="overflow-x-auto">
+                            <table class="w-full text-sm">
+                                <thead class="bg-[#111] text-xs uppercase tracking-wide text-gray-500">
+                                    <tr>
+                                        <th class="text-left px-4 py-3">Scope</th>
+                                        <th class="text-left px-4 py-3">Session</th>
+                                        <th class="text-left px-4 py-3">Agent</th>
+                                        <th class="text-left px-4 py-3">Instance</th>
+                                        <th class="text-right px-4 py-3">Requests</th>
+                                        <th class="text-right px-4 py-3">Saved</th>
+                                        <th class="text-right px-4 py-3">Age</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <template x-for="session in activeSessionRows" :key="session.scope + ':' + session.session_id + ':' + session.instance_id">
+                                        <tr class="border-t border-border">
+                                            <td class="px-4 py-3 text-gray-400" x-text="session.scope"></td>
+                                            <td class="px-4 py-3 font-mono text-xs text-gray-300" x-text="shortId(session.session_id)"></td>
+                                            <td class="px-4 py-3" x-text="session.agent_type || 'unknown'"></td>
+                                            <td class="px-4 py-3 font-mono text-xs text-gray-500" x-text="shortId(session.instance_id)"></td>
+                                            <td class="px-4 py-3 text-right tabular-nums" x-text="formatNumber(session.metrics?.requests || 0)"></td>
+                                            <td class="px-4 py-3 text-right tabular-nums text-accent" x-text="formatNumber(session.metrics?.tokens_saved || 0)"></td>
+                                            <td class="px-4 py-3 text-right tabular-nums text-gray-500" x-text="formatDuration(session.age_seconds || 0)"></td>
+                                        </tr>
+                                    </template>
+                                </tbody>
+                            </table>
+                        </div>
+                    </template>
+                    <template x-if="activeSessionRows.length === 0">
+                        <div class="p-8 text-center text-gray-500">
+                            No active session manifests have been observed yet.
+                        </div>
+                    </template>
+                </div>
+            </div>
+        </template>
+
     </main>
 
     <!-- Live Feed Sidebar Drawer -->
@@ -1563,6 +1642,19 @@
                     return '0.00';
                 },
 
+                shortId(value) {
+                    const text = String(value || '');
+                    if (text.length <= 14) return text || '-';
+                    return text.substring(0, 8) + '...' + text.substring(text.length - 4);
+                },
+
+                formatDuration(seconds) {
+                    const value = Number(seconds || 0);
+                    if (value < 60) return Math.round(value) + 's';
+                    if (value < 3600) return Math.round(value / 60) + 'm';
+                    return (value / 3600).toFixed(1) + 'h';
+                },
+
                 formatResetTime(seconds) {
                     if (seconds == null || seconds <= 0) return 'now';
                     const h = Math.floor(seconds / 3600);
@@ -1721,6 +1813,22 @@
 
                 get recentHistoricalPoints() {
                     return [...(this.historyStats.history || [])].slice(-8).reverse();
+                },
+
+                get activeSessionRows() {
+                    const seen = new Set();
+                    const rows = [];
+                    const addRows = (items, scope) => {
+                        (items || []).forEach((item) => {
+                            const key = [scope, item.session_id, item.instance_id].join(':');
+                            if (seen.has(key)) return;
+                            seen.add(key);
+                            rows.push({...item, scope});
+                        });
+                    };
+                    addRows(this.stats.active_sessions?.local || [], 'local');
+                    addRows(this.stats.cluster?.active_sessions || [], 'cluster');
+                    return rows;
                 },
 
                 async downloadHistory(format = 'json', series = null) {

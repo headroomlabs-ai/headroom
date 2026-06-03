@@ -29,6 +29,7 @@ This page is the authoritative reference for the **Python Headroom CLI** exposed
 | `headroom evals ...` | Run memory evaluation workflows | **native in container** |
 | `headroom memory ...` | Inspect and manage stored memories | **native in container** |
 | `headroom mcp ...` | Install, inspect, remove, or serve MCP integration | **native in container** |
+| `headroom telemetry list` | Enumerate telemetry and observability surfaces | **native in container** |
 | `headroom wrap claude` | Start proxy and launch Claude Code | **host-bridged** |
 | `headroom wrap copilot` | Start proxy and launch GitHub Copilot CLI | **python-native only** |
 | `headroom wrap codex` | Start proxy and launch Codex CLI | **host-bridged** |

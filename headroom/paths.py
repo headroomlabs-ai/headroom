@@ -41,6 +41,9 @@ from pathlib import Path
 
 HEADROOM_CONFIG_DIR_ENV = "HEADROOM_CONFIG_DIR"
 HEADROOM_WORKSPACE_DIR_ENV = "HEADROOM_WORKSPACE_DIR"
+HEADROOM_CLUSTER_ENABLED_ENV = "HEADROOM_CLUSTER_ENABLED"
+HEADROOM_CLUSTER_ID_ENV = "HEADROOM_CLUSTER_ID"
+HEADROOM_CLUSTER_DIR_ENV = "HEADROOM_CLUSTER_DIR"
 
 # ---------------------------------------------------------------------------
 # Legacy per-resource env vars (kept for backward compatibility)
@@ -79,6 +82,8 @@ _LEAN_CTX_UNIX = "lean-ctx"
 _LEAN_CTX_WIN = "lean-ctx.exe"
 _DEPLOY_DIR = "deploy"
 _PLUGINS_DIR = "plugins"
+_SESSIONS_DIR = "sessions"
+_CLUSTER_DIR = "cluster"
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +294,45 @@ def deploy_root() -> Path:
     return workspace_dir() / _DEPLOY_DIR
 
 
+def sessions_dir() -> Path:
+    """Return the directory for per-process active session snapshots."""
+
+    return workspace_dir() / _SESSIONS_DIR
+
+
+def cluster_enabled() -> bool:
+    """Return whether filesystem-backed clustered mode is enabled."""
+
+    return _env(HEADROOM_CLUSTER_ENABLED_ENV).lower() in {"1", "true", "yes", "on"}
+
+
+def cluster_id() -> str:
+    """Return the logical cluster identifier for this instance."""
+
+    return _env(HEADROOM_CLUSTER_ID_ENV) or "default"
+
+
+def cluster_dir(explicit: str | os.PathLike[str] | None = None) -> Path:
+    """Return the base directory for cluster-shared state.
+
+    ``HEADROOM_CLUSTER_DIR`` is intentionally independent from the config
+    bucket. When unset, it falls back under ``HEADROOM_WORKSPACE_DIR`` so
+    single-host and shared-volume deployments behave consistently.
+    """
+
+    return _resolve(explicit, HEADROOM_CLUSTER_DIR_ENV, workspace_dir() / _CLUSTER_DIR)
+
+
+def cluster_sessions_dir(
+    cluster: str | None = None,
+    *,
+    explicit: str | os.PathLike[str] | None = None,
+) -> Path:
+    """Return the directory containing session snapshots for a cluster."""
+
+    return cluster_dir(explicit) / (cluster or cluster_id()) / _SESSIONS_DIR
+
+
 def beacon_lock_path(port: int) -> Path:
     """Return the per-port proxy beacon lock file path."""
 
@@ -336,6 +380,9 @@ def plugin_workspace_dir(plugin_name: str) -> Path:
 __all__ = [
     "HEADROOM_CONFIG_DIR_ENV",
     "HEADROOM_WORKSPACE_DIR_ENV",
+    "HEADROOM_CLUSTER_ENABLED_ENV",
+    "HEADROOM_CLUSTER_ID_ENV",
+    "HEADROOM_CLUSTER_DIR_ENV",
     "HEADROOM_SAVINGS_PATH_ENV",
     "HEADROOM_TOIN_PATH_ENV",
     "HEADROOM_SUBSCRIPTION_STATE_PATH_ENV",
@@ -360,6 +407,11 @@ __all__ = [
     "rtk_path",
     "lean_ctx_path",
     "deploy_root",
+    "sessions_dir",
+    "cluster_enabled",
+    "cluster_id",
+    "cluster_dir",
+    "cluster_sessions_dir",
     "beacon_lock_path",
     "models_config_path",
     "plugin_config_dir",

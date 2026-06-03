@@ -1,0 +1,41 @@
+# Telemetry Surfaces
+
+Headroom exposes several observability surfaces. Use the runtime command to see
+what is enabled in the current environment:
+
+```bash
+headroom telemetry list
+headroom telemetry list --json
+```
+
+| Surface | Default | Leaves host by default | Prompt content |
+| --- | --- | --- | --- |
+| Anonymous beacon | On | Yes | No |
+| Prometheus `/metrics` | On | No | No |
+| OTEL metrics | Off | Only when enabled | No |
+| Langfuse tracing | Off | Only when enabled | No |
+| Savings tracker | On | No | No |
+| Dashboard `/dashboard` and `/stats` | On | No | No |
+| TOIN | On | No for filesystem backend | No |
+| Proxy log | On | No | No by default |
+| Active sessions | On | No unless clustered mode is enabled | No |
+
+Disable anonymous aggregate telemetry with:
+
+```bash
+HEADROOM_TELEMETRY=off headroom proxy
+headroom proxy --no-telemetry
+```
+
+Clustered active-session mirroring is opt-in:
+
+```bash
+HEADROOM_CLUSTER_ENABLED=true
+HEADROOM_CLUSTER_ID=team-gamma
+HEADROOM_CLUSTER_DIR=/mnt/shared/headroom-cluster
+headroom proxy
+```
+
+The session manifests contain IDs, heartbeat timestamps, agent type, PID, and
+aggregate counters only. They do not include prompts, responses, tool output, or
+request payloads.
