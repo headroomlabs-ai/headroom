@@ -794,7 +794,8 @@ class CompressionFailureAction:
     reason: str
     """Short machine-readable label for telemetry. One of:
     ``timeout``, ``oversize:bytes=<n>>threshold=<m>``,
-    ``small_frame_transient``, or ``env_override:fail_open``."""
+    ``small_frame_transient``, ``client_override:codex``, or
+    ``env_override:fail_open``."""
 
     frame_bytes: int
     """Original frame size in bytes (for logging / metrics)."""
@@ -803,6 +804,8 @@ class CompressionFailureAction:
 def decide_compression_failure_action(
     exception: BaseException,
     frame_bytes: int,
+    *,
+    client: str | None = None,
 ) -> CompressionFailureAction:
     """Decide whether to refuse-and-close vs forward-original after the
     proxy's compression pipeline fails on a Realtime WebSocket frame
@@ -812,6 +815,10 @@ def decide_compression_failure_action(
 
     * env :data:`WS_COMPRESSION_FAIL_OPEN_ENV` truthy → forward (legacy
       behaviour, opt-in for debugging or strict compatibility).
+    * Codex client compression timeout → forward. Codex currently treats
+      the proxy's 1009/413 refusal path as a hard connection failure, so
+      fail-open is safer for Codex sessions even when the proxy is run
+      standalone rather than through ``headroom wrap codex``.
     * exception is :class:`asyncio.TimeoutError` → refuse (the compression
       stage hit its own timeout, which only fires on frames Headroom
       thought were big enough to need compression in the first place).
@@ -831,6 +838,15 @@ def decide_compression_failure_action(
         return CompressionFailureAction(
             refuse=False,
             reason="env_override:fail_open",
+            frame_bytes=frame_bytes,
+        )
+
+    if (client or "").strip().lower() == "codex" and isinstance(
+        exception, asyncio.TimeoutError
+    ):
+        return CompressionFailureAction(
+            refuse=False,
+            reason="client_override:codex",
             frame_bytes=frame_bytes,
         )
 
