@@ -209,7 +209,7 @@ def test_init_codex_merges_feature_flag_into_existing_table(monkeypatch, tmp_pat
     content = config_path.read_text(encoding="utf-8")
     assert 'base_url = "http://127.0.0.1:9000/v1"' in content
     assert content.count("[features]") == 1
-    assert "codex_hooks = true" in content
+    assert "hooks = true" in content
     assert 'env_key = "OPENAI_API_KEY"' not in content
     hooks = json.loads((tmp_path / ".codex" / "hooks.json").read_text(encoding="utf-8"))
     assert "--profile init-local-demo" in hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"]
@@ -482,7 +482,7 @@ def test_ensure_codex_provider_keeps_root_keys_above_existing_table(
     """
     init_cli, _ = _load_init_module(monkeypatch)
     path = tmp_path / "config.toml"
-    path.write_text("[features]\ncodex_hooks = true\n", encoding="utf-8")
+    path.write_text("[features]\nhooks = true\n", encoding="utf-8")
 
     init_cli._ensure_codex_provider(path, 8787)
 
@@ -492,7 +492,7 @@ def test_ensure_codex_provider_keeps_root_keys_above_existing_table(
     assert "model_provider" not in parsed["features"]
     assert "openai_base_url" not in parsed["features"]
     # The user's existing table is preserved.
-    assert parsed["features"]["codex_hooks"] is True
+    assert parsed["features"]["hooks"] is True
     assert parsed["model_providers"]["headroom"]["base_url"] == "http://127.0.0.1:8787/v1"
 
 
@@ -505,13 +505,13 @@ def test_ensure_codex_provider_replaces_existing_model_provider(
     """
     init_cli, _ = _load_init_module(monkeypatch)
     path = tmp_path / "config.toml"
-    path.write_text('model_provider = "openai"\n[features]\ncodex_hooks = true\n', encoding="utf-8")
+    path.write_text('model_provider = "openai"\n[features]\nhooks = true\n', encoding="utf-8")
 
     init_cli._ensure_codex_provider(path, 8787)
 
     parsed = tomllib.loads(path.read_text(encoding="utf-8"))  # raises on a duplicate key
     assert parsed["model_provider"] == "headroom"
-    assert parsed["features"]["codex_hooks"] is True
+    assert parsed["features"]["hooks"] is True
 
 
 def test_ensure_codex_feature_flag_replaces_existing_marker(monkeypatch, tmp_path: Path) -> None:
@@ -526,7 +526,8 @@ def test_ensure_codex_feature_flag_replaces_existing_marker(monkeypatch, tmp_pat
 
     content = path.read_text(encoding="utf-8")
     assert content.count(init_cli._CODEX_FEATURE_MARKER_START) == 1
-    assert "codex_hooks = true" in content
+    assert "hooks = true" in content
+    assert "codex_hooks" not in content
 
 
 def test_ensure_codex_feature_flag_skips_duplicate_existing_setting(
@@ -539,7 +540,8 @@ def test_ensure_codex_feature_flag_skips_duplicate_existing_setting(
     init_cli._ensure_codex_feature_flag(path)
 
     content = path.read_text(encoding="utf-8")
-    assert content.count("codex_hooks = true") == 1
+    assert content.count("hooks = true") == 1
+    assert "codex_hooks" not in content
     assert init_cli._CODEX_FEATURE_MARKER_START not in content
 
 
@@ -554,7 +556,7 @@ def test_ensure_codex_feature_flag_creates_features_section_when_missing(
 
     content = path.read_text(encoding="utf-8")
     assert "[features]" in content
-    assert "codex_hooks = true" in content
+    assert "hooks = true" in content
 
 
 def test_manifest_changed_detects_differences(monkeypatch) -> None:
