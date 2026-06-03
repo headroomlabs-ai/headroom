@@ -23,7 +23,7 @@ This is ideal for local development environments where you want "set and forget"
 
 ```bash
 # Install with proxy support
-pip install headroom-ai[proxy]
+pip install 'headroom-ai[proxy]'
 
 # Verify installation
 headroom proxy --help

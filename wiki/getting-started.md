@@ -11,13 +11,13 @@ This guide will help you get up and running with Headroom in under 5 minutes.
 pip install headroom
 
 # With proxy server
-pip install headroom[proxy]
+pip install 'headroom[proxy]'
 
 # With semantic relevance (for smarter compression)
-pip install headroom[relevance]
+pip install 'headroom[relevance]'
 
 # Everything
-pip install headroom[all]
+pip install 'headroom[all]'
 ```
 
 **TypeScript / Node.js:**
