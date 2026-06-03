@@ -7,6 +7,7 @@ Usage:
     headroom wrap aider                     # Start proxy + aider
     headroom wrap cursor                    # Start proxy + print Cursor config instructions
     headroom wrap openclaw                  # Install + configure OpenClaw plugin
+    headroom wrap hermes                    # Start proxy + Hermes (Nous Research) agent
     headroom wrap claude --no-context-tool  # Without CLI context-tool setup
     headroom wrap claude --port 9999        # Custom proxy port
     headroom wrap claude -- --model opus    # Pass args to claude
@@ -64,6 +65,7 @@ from headroom.providers.copilot import (
     validate_configuration as _validate_copilot_configuration,
 )
 from headroom.providers.cursor import render_setup_lines as _render_cursor_setup_lines
+from headroom.providers.hermes import build_launch_env as _build_hermes_launch_env
 from headroom.providers.openclaw import (
     build_plugin_entry as _build_openclaw_plugin_entry_impl,
 )
@@ -3374,6 +3376,104 @@ def openhands(
         learn=learn,
         memory=memory,
         agent_type="openhands",
+        code_graph=code_graph,
+        backend=backend,
+        anyllm_provider=anyllm_provider,
+        region=region,
+    )
+
+
+# =============================================================================
+# Hermes (Nous Research)
+# =============================================================================
+
+
+@wrap.command(context_settings={"ignore_unknown_options": True})
+@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--no-context-tool",
+    "--no-rtk",
+    "no_rtk",
+    is_flag=True,
+    help="Skip CLI context-tool setup",
+)
+@click.option(
+    "--code-graph",
+    is_flag=True,
+    help="Enable code graph indexing via codebase-memory-mcp (optional)",
+)
+@click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
+@click.option("--learn", is_flag=True, help="Enable live traffic learning")
+@click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
+@click.option(
+    "--backend", default=None, help="API backend: 'anthropic', 'anyllm', 'litellm-vertex', etc."
+)
+@click.option("--anyllm-provider", default=None, help="Provider for any-llm backend")
+@click.option("--region", default=None, help="Cloud region for Bedrock/Vertex")
+@click.option("--verbose", "-v", is_flag=True, help="Verbose output")
+@click.option("--prepare-only", is_flag=True, hidden=True)
+@click.argument("hermes_args", nargs=-1, type=click.UNPROCESSED)
+def hermes(
+    port: int,
+    no_rtk: bool,
+    code_graph: bool,
+    no_proxy: bool,
+    learn: bool,
+    memory: bool,
+    backend: str | None,
+    anyllm_provider: str | None,
+    region: str | None,
+    verbose: bool,
+    prepare_only: bool,
+    hermes_args: tuple,
+) -> None:
+    """Launch Hermes (Nous Research) agent through Headroom proxy.
+
+    \b
+    Sets OPENAI_BASE_URL and ANTHROPIC_BASE_URL to route Hermes' API calls
+    through Headroom. Sets up the selected CLI context tool by injecting RTK
+    guidance into CONVENTIONS.md at the project root.
+
+    \b
+    Examples:
+        headroom wrap hermes                         # Start proxy + context tool + hermes
+        headroom wrap hermes -- --model hermes-3     # Pass args to hermes
+        headroom wrap hermes --no-context-tool       # Skip CLI context-tool setup
+        headroom wrap hermes --backend litellm-vertex --region us-central1
+    """
+    if not no_rtk:
+        if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
+            click.echo("  Setting up lean-ctx for hermes...")
+            _setup_lean_ctx_agent("hermes", verbose=verbose)
+        else:
+            click.echo("  Setting up rtk for hermes...")
+            rtk_path = _ensure_rtk_binary(verbose=verbose)
+            if rtk_path:
+                conventions = Path.cwd() / "CONVENTIONS.md"
+                _inject_rtk_instructions(conventions, verbose=verbose)
+
+    if prepare_only:
+        return
+
+    hermes_bin = shutil.which("hermes")
+    if not hermes_bin:
+        click.echo("Error: 'hermes' not found in PATH.")
+        click.echo("Install Hermes: https://hermes-agent.nousresearch.com/")
+        raise SystemExit(1)
+
+    env, env_vars_display = _build_hermes_launch_env(port, os.environ)
+
+    _launch_tool(
+        binary=hermes_bin,
+        args=hermes_args,
+        env=env,
+        port=port,
+        no_proxy=no_proxy,
+        tool_label="HERMES",
+        env_vars_display=env_vars_display,
+        learn=learn,
+        memory=memory,
+        agent_type="hermes",
         code_graph=code_graph,
         backend=backend,
         anyllm_provider=anyllm_provider,
