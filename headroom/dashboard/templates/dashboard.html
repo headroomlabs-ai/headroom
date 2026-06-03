@@ -1314,15 +1314,28 @@
                     }
                 },
 
+                async fetchJson(url) {
+                    const separator = url.includes('?') ? '&' : '?';
+                    const response = await fetch(`${url}${separator}_=${Date.now()}`, {
+                        cache: 'no-store',
+                        headers: {
+                            'Cache-Control': 'no-cache'
+                        }
+                    });
+                    if (!response.ok) {
+                        throw new Error(`HTTP ${response.status} for ${url}`);
+                    }
+                    return await response.json();
+                },
+
                 async fetchStats() {
                     try {
-                        const [statsRes, healthRes] = await Promise.all([
-                            fetch('/stats?cached=1'),
-                            fetch('/health')
+                        const [stats, health] = await Promise.all([
+                            this.fetchJson('/stats?cached=1'),
+                            this.fetchJson('/health')
                         ]);
 
-                        this.stats = await statsRes.json();
-                        const health = await healthRes.json();
+                        this.stats = stats;
                         this.healthy = health.status === 'healthy';
                         this.version = health.version || '0.3.0';
                         this.log_full_messages = this.stats.log_full_messages || false;
@@ -1344,11 +1357,8 @@
 
                 async fetchHistoryStats() {
                     try {
-                        const response = await fetch('/stats-history');
-                        if (response.ok) {
-                            this.historyStats = await response.json();
-                            this.lastHistoryFetchMs = Date.now();
-                        }
+                        this.historyStats = await this.fetchJson('/stats-history');
+                        this.lastHistoryFetchMs = Date.now();
                     } catch (e) {
                         console.error('Failed to fetch history stats:', e);
                     }
@@ -1357,18 +1367,15 @@
                 async fetchTransformations() {
                     try {
                         const prevLen = this.transformations.length;
-                        const response = await fetch('/transformations/feed?limit=50');
-                        if (response.ok) {
-                            const data = await response.json();
-                            const newLen = (data.transformations || []).length;
-                            if (this.feedScrolled_ && newLen > prevLen) {
-                                this.feedNewCount = newLen - prevLen;
-                            }
-                            this.transformations = data.transformations || [];
-                            this.log_full_messages = data.log_full_messages ?? this.log_full_messages;
-                            this.lastFeedFetchMs = Date.now();
-                            this.renderTransformations();
+                        const data = await this.fetchJson('/transformations/feed?limit=50');
+                        const newLen = (data.transformations || []).length;
+                        if (this.feedScrolled_ && newLen > prevLen) {
+                            this.feedNewCount = newLen - prevLen;
                         }
+                        this.transformations = data.transformations || [];
+                        this.log_full_messages = data.log_full_messages ?? this.log_full_messages;
+                        this.lastFeedFetchMs = Date.now();
+                        this.renderTransformations();
                     } catch (e) {
                         console.error('Failed to fetch transformations:', e);
                     }

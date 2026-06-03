@@ -165,7 +165,7 @@ def _install_dashboard_routes(page: Page) -> None:
         if url.endswith("/dashboard") or url == "http://headroom.local/":
             route.fulfill(status=200, content_type="text/html", body=dashboard_html)
             return
-        if url.endswith("/stats"):
+        if "/stats?" in url or url.endswith("/stats"):
             route.fulfill(status=200, content_type="application/json", body=json.dumps(stats))
             return
         if "/stats-history" in url:
@@ -175,7 +175,7 @@ def _install_dashboard_routes(page: Page) -> None:
                 body=json.dumps(history),
             )
             return
-        if url.endswith("/health"):
+        if "/health?" in url or url.endswith("/health"):
             route.fulfill(status=200, content_type="application/json", body=json.dumps(health))
             return
         route.continue_()

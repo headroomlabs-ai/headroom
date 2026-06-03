@@ -268,7 +268,11 @@ def test_concurrent_compression_has_no_semaphore_tail() -> None:
 
     # 12 sessions × 5 frames = 60 total. Uniform 4 KB plain-text
     # payload — each frame's compute time should be identical modulo
-    # scheduler noise.
+    # scheduler noise. On some CI runners the warmed fast-path lands
+    # around ~1ms/frame, where single-millisecond timer quantization can
+    # inflate p99/p50 despite no real contention tail. The assertions
+    # below compensate with a small denominator floor plus an absolute
+    # p99 guard.
     UNIFORM_FRAME = Frame(bytes_estimate=4096, text_shape="plain_text_like")
     scenarios = [
         Scenario(
@@ -299,10 +303,14 @@ def test_concurrent_compression_has_no_semaphore_tail() -> None:
     )
 
     assert not errors, f"Got {len(errors)} errors; first: {errors[0].error}"
-    ratio = p99 / max(p50, 1)
+    assert p99 < 250.0, (
+        f"p99 latency is {p99:.1f}ms; expected < 250ms on the warmed uniform workload. "
+        f"A higher value suggests the old contention tail is back."
+    )
+    ratio = p99 / max(p50, 2.0)
     assert ratio < 4.0, (
-        f"p99/p50 ratio is {ratio:.1f}× (p50={p50:.0f}ms, p99={p99:.0f}ms). "
-        f"Expected < 4× on uniform-size workload — a higher ratio means "
-        f"the semaphore-induced contention tail is back. Pre-fix baseline "
-        f"ratio on this same workload shape was ~27× regardless of CPU speed."
+        f"p99/p50 ratio is {ratio:.1f}× (p50={p50:.0f}ms, p99={p99:.0f}ms; "
+        f"denominator floor=2ms). Expected < 4× on uniform-size workload — "
+        f"a higher ratio means the semaphore-induced contention tail is back. "
+        f"Pre-fix baseline ratio on this same workload shape was ~27× regardless of CPU speed."
     )
