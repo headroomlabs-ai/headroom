@@ -74,6 +74,80 @@ def test_version_prefers_source_tree_release_history() -> None:
     package_version.assert_not_called()
 
 
+def test_proxy_package_import_stays_lazy() -> None:
+    """Importing ``headroom.proxy`` must not pull in the fastapi-backed server.
+
+    Regression for issue #441: the eager ``from .server import ...`` in
+    ``headroom/proxy/__init__.py`` made ``headroom --help`` crash with
+    ``ModuleNotFoundError: No module named 'fastapi'`` on base installs without
+    the ``[proxy]`` extra, because loading ``headroom.cli.proxy`` imports the
+    dependency-free ``headroom.proxy.modes`` and that triggers the package
+    ``__init__``.
+    """
+    script = textwrap.dedent(
+        """
+        import json
+        import sys
+
+        import headroom.proxy
+        import headroom.proxy.modes  # what the CLI actually needs
+
+        print(json.dumps({
+            "server_loaded": "headroom.proxy.server" in sys.modules,
+            "fastapi_loaded": "fastapi" in sys.modules,
+        }))
+        """
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    data = json.loads(result.stdout.strip())
+    assert data["server_loaded"] is False
+    assert data["fastapi_loaded"] is False
+
+
+def test_proxy_package_exports_remain_accessible() -> None:
+    """The lazy ``__getattr__`` must still expose ``create_app``/``run_server``."""
+    script = textwrap.dedent(
+        """
+        import sys
+
+        import headroom.proxy
+
+        create_app = headroom.proxy.create_app
+        run_server = headroom.proxy.run_server
+        assert callable(create_app)
+        assert callable(run_server)
+        # Accessing the exports must have loaded the server module on demand.
+        assert "headroom.proxy.server" in sys.modules
+
+        # Unknown attributes still raise AttributeError.
+        try:
+            headroom.proxy.does_not_exist
+        except AttributeError:
+            pass
+        else:
+            raise AssertionError("expected AttributeError for unknown attribute")
+
+        print("ok")
+        """
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    assert result.stdout.strip() == "ok"
+
+
 def test_proxy_server_import_skips_litellm_backend() -> None:
     script = textwrap.dedent(
         """
