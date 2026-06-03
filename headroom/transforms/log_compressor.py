@@ -227,6 +227,16 @@ class LogCompressor:
         working without rebuilding through Rust on every test. Rust
         unit tests pin Rust's behavior; this implementation must
         mirror Rust's level/stack-trace/summary classification rules.
+
+        Stack-trace state machine (Phase 3e.5 parity):
+        The Rust port tracks stack-trace *language flavor* so that blank
+        lines stay inside Python tracebacks (they separate chained
+        exceptions) while still terminating JS/Rust traces immediately.
+        This Python shim replicates that behavior: when the active trace
+        was started by ``Traceback (most recent call last)`` we allow up
+        to three consecutive blank lines before closing the block; for
+        all other trace flavors we retain the pre-3e.5 terminate-on-blank
+        behavior.
         """
         import re
 
@@ -265,6 +275,14 @@ class LogCompressor:
         log_lines: list[LogLine] = []
         in_stack_trace = False
         stack_trace_lines = 0
+        # Phase 3e.5 parity: track whether the active trace is Python-flavor
+        # so we can allow blank lines within chained-exception blocks.
+        _in_python_traceback = False
+        _blank_lines_in_trace = 0
+        # Index 0 in stack_trace_patterns is the Python "Traceback (most recent
+        # call last)" pattern — the only flavor that produces blank-line
+        # separators between chained exceptions.
+        _PYTHON_TB_IDX = 0
 
         for i, line in enumerate(lines):
             log_line = LogLine(line_number=i, content=line)
@@ -274,17 +292,39 @@ class LogCompressor:
                     log_line.level = level
                     break
 
-            for pattern in stack_trace_patterns:
+            for _tb_idx, pattern in enumerate(stack_trace_patterns):
                 if pattern.search(line):
                     in_stack_trace = True
+                    _in_python_traceback = _tb_idx == _PYTHON_TB_IDX
+                    _blank_lines_in_trace = 0
                     stack_trace_lines = 0
                     break
 
             if in_stack_trace:
                 log_line.is_stack_trace = True
                 stack_trace_lines += 1
-                if stack_trace_lines > self.config.stack_trace_max_lines or not line.strip():
+                if stack_trace_lines > self.config.stack_trace_max_lines:
+                    # Hard cap: close the block regardless of flavor.
                     in_stack_trace = False
+                    _in_python_traceback = False
+                    _blank_lines_in_trace = 0
+                elif not line.strip():
+                    if _in_python_traceback and _blank_lines_in_trace < 3:
+                        # Blank lines are allowed inside Python tracebacks —
+                        # they appear between chained exceptions
+                        # ("The above exception was the direct cause of …").
+                        # Mirrors Rust's language-flavor dispatch (Phase 3e.5).
+                        _blank_lines_in_trace += 1
+                    else:
+                        # Non-Python traces (JS 'at …', Rust '-->', address
+                        # maps) terminate immediately on any blank line, as
+                        # they did before Phase 3e.5.
+                        in_stack_trace = False
+                        _in_python_traceback = False
+                        _blank_lines_in_trace = 0
+                else:
+                    # Non-blank line resets the consecutive-blank counter.
+                    _blank_lines_in_trace = 0
 
             for pattern in summary_patterns:
                 if pattern.search(line):

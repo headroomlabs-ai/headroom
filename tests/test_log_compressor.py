@@ -238,6 +238,139 @@ ZeroDivisionError: division by zero
         assert stack_trace_count > 0
 
 
+class TestChainedExceptionTracebacks:
+    """Tests for chained Python exception traceback handling (Phase 3e.5 parity).
+
+    Pre-3e.5, blank lines inside chained Python exceptions terminated the
+    stack-trace state machine, silently dropping the outer exception's traceback.
+    The Rust port fixed this by tracking language flavor; blank lines are allowed
+    inside Python tracebacks while other flavors (JS, Rust) still terminate on a
+    blank line.
+
+    The ``_parse_lines`` Python shim must mirror that fix per its own docstring
+    ("this implementation must mirror Rust's scoring").
+    """
+
+    def test_chained_exception_both_tracebacks_marked(self):
+        """Both tracebacks in a raise-from chain are fully marked is_stack_trace=True.
+
+        This is the primary regression test: before the fix the blank-line
+        separator between the two tracebacks would terminate the state machine,
+        dropping the second (outer) traceback entirely.
+        """
+        content = """\
+Traceback (most recent call last):
+  File "utils.py", line 15, in compute
+    return data / 0
+ZeroDivisionError: division by zero
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "main.py", line 42, in process
+    result = compute(data)
+RuntimeError: computation failed
+"""
+        compressor = LogCompressor()
+        log_lines = compressor._parse_lines(content.split("\n"))
+
+        stack_lines = [ll for ll in log_lines if ll.is_stack_trace]
+        # Both "Traceback (most recent call last)" headers plus at least one
+        # frame from each must be marked — 6 lines minimum.
+        assert len(stack_lines) >= 6, (
+            f"Expected ≥6 stack-trace lines, got {len(stack_lines)}. "
+            "The blank-line separator likely terminated the state machine early."
+        )
+
+    def test_blank_line_between_chains_keeps_second_header(self):
+        """The second 'Traceback' header after a blank line is tagged is_stack_trace=True."""
+        content = """\
+Traceback (most recent call last):
+  File "a.py", line 1, in f
+    raise ValueError("inner")
+ValueError: inner
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "b.py", line 2, in g
+    f()
+RuntimeError: outer
+"""
+        compressor = LogCompressor()
+        log_lines = compressor._parse_lines(content.split("\n"))
+
+        # Find the *second* occurrence of the Traceback header.
+        tb_headers = [
+            ll
+            for ll in log_lines
+            if "Traceback (most recent call last)" in ll.content
+        ]
+        assert len(tb_headers) >= 2, (
+            "Expected two 'Traceback' headers in output; "
+            f"found {len(tb_headers)}. State machine may have terminated early."
+        )
+        assert tb_headers[1].is_stack_trace, (
+            "Second 'Traceback (most recent call last)' header should be "
+            "marked is_stack_trace=True but was not."
+        )
+
+    def test_blank_line_still_terminates_javascript_trace(self):
+        """A blank line still terminates a JavaScript 'at …' stack trace immediately.
+
+        The fix must not accidentally extend this behavior to non-Python traces.
+        """
+        content = """\
+Error: Connection refused
+    at Connection.connect (src/db.js:42:15)
+    at async main (src/index.js:10:5)
+
+This line appears after a blank and must NOT be a stack trace line.
+"""
+        compressor = LogCompressor()
+        log_lines = compressor._parse_lines(content.split("\n"))
+
+        after_blank = next(
+            (ll for ll in log_lines if "must NOT be a stack trace" in ll.content),
+            None,
+        )
+        assert after_blank is not None, "Post-blank line was not parsed at all."
+        assert not after_blank.is_stack_trace, (
+            "JavaScript trace should have terminated at the blank line; "
+            "the following line must not be marked is_stack_trace=True."
+        )
+
+    def test_python_trace_terminates_after_budget_blanks(self):
+        """A Python traceback closes after 3+ consecutive blank lines (budget cap).
+
+        Even though Python tracebacks get a 3-blank budget, they must still
+        terminate eventually so unrelated content below does not get tagged.
+        """
+        tb_block = [
+            "Traceback (most recent call last):",
+            '  File "a.py", line 1, in f',
+            '    raise ValueError("err")',
+            "ValueError: err",
+        ]
+        # Four consecutive blank lines — exceeds the 3-blank budget.
+        four_blanks = ["", "", "", ""]
+        after_block = ["This unrelated line must not be tagged as a stack trace."]
+
+        content = "\n".join(tb_block + four_blanks + after_block)
+        compressor = LogCompressor()
+        log_lines = compressor._parse_lines(content.split("\n"))
+
+        after_line = next(
+            (ll for ll in log_lines if "unrelated line" in ll.content),
+            None,
+        )
+        assert after_line is not None, "Post-budget line was not parsed."
+        assert not after_line.is_stack_trace, (
+            "After 4 consecutive blank lines the Python traceback budget should be "
+            "exhausted and the following line must not be is_stack_trace=True."
+        )
+
+
 class TestLineDeduplication:
     """Tests for warning/line deduplication."""
 
