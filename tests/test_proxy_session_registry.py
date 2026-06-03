@@ -45,6 +45,31 @@ def test_active_session_registry_writes_local_and_cluster_manifests(tmp_path: Pa
     assert not registry.cluster_manifest_path.exists()
 
 
+def test_heartbeat_tolerates_unavailable_manifest_storage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail_write(path: Path, payload: dict[str, object]) -> None:
+        raise PermissionError(path)
+
+    monkeypatch.setattr(sr, "_atomic_write_json", fail_write)
+    registry = ActiveSessionRegistry(
+        session_id="sess-unwritable",
+        instance_id="inst-unwritable",
+        local_sessions_dir=tmp_path / "sessions",
+        cluster=ClusterConfig(
+            enabled=True,
+            cluster_id="team-gamma",
+            cluster_dir=tmp_path / "cluster",
+        ),
+    )
+
+    payload = registry.heartbeat({"requests": 3})
+
+    assert payload["session_id"] == "sess-unwritable"
+    assert payload["metrics"]["requests"] == 3
+    assert registry.snapshot({"requests": 4})["metrics"]["requests"] == 4
+
+
 def test_list_active_sessions_prunes_stale_manifests(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

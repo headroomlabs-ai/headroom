@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import platform
 import tempfile
@@ -16,6 +17,7 @@ from headroom import paths
 
 SESSION_SCHEMA_VERSION = 1
 DEFAULT_STALE_AFTER_SECONDS = 120
+logger = logging.getLogger(__name__)
 
 
 def _utc_now() -> datetime:
@@ -137,10 +139,24 @@ class ActiveSessionRegistry:
             "cluster": self.cluster.snapshot(),
             "metrics": metrics or {},
         }
-        _atomic_write_json(self.local_manifest_path, payload)
+        try:
+            _atomic_write_json(self.local_manifest_path, payload)
+        except OSError as exc:
+            logger.warning(
+                "event=active_session_manifest_write_failed scope=local path=%s error=%s",
+                self.local_manifest_path,
+                exc,
+            )
         cluster_path = self.cluster_manifest_path
         if cluster_path is not None:
-            _atomic_write_json(cluster_path, payload)
+            try:
+                _atomic_write_json(cluster_path, payload)
+            except OSError as exc:
+                logger.warning(
+                    "event=active_session_manifest_write_failed scope=cluster path=%s error=%s",
+                    cluster_path,
+                    exc,
+                )
         self._last_payload = payload
         return payload
 
