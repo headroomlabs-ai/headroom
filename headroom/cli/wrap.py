@@ -141,6 +141,29 @@ def _check_proxy(port: int) -> bool:
         return False
 
 
+def _port_bind_error(port: int) -> OSError | None:
+    """Return the bind error for a local proxy port, or None when it is usable."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", port))
+    except OSError as exc:
+        return exc
+    return None
+
+
+def _format_unbindable_port_error(port: int, error: OSError, agent_type: str) -> str:
+    """Build an actionable message for ports that fail before uvicorn can bind."""
+    command = "headroom proxy"
+    if agent_type != "unknown":
+        command = f"headroom wrap {agent_type}"
+    suggested_port = port + 1
+    return (
+        f"Port {port} is unavailable on 127.0.0.1 before the proxy can start: {error}. "
+        "On Windows this can happen when the port is in an excluded or reserved range. "
+        f"Rerun with a different port, for example `{command} --port {suggested_port}`."
+    )
+
+
 def _get_log_path() -> Path:
     """Get path for proxy log file."""
     from headroom import paths as _paths
@@ -1740,6 +1763,12 @@ def _ensure_proxy(
                 return None
 
         # Start (or restart) the proxy with the requested flags
+        bind_error = helpers._port_bind_error(port)
+        if bind_error is not None:
+            raise click.ClickException(
+                helpers._format_unbindable_port_error(port, bind_error, agent_type)
+            )
+
         click.echo(f"  Starting Headroom proxy on port {port}...")
         try:
             proc = cast(
