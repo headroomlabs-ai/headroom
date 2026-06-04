@@ -26,7 +26,8 @@
   <a href="#proof">Proof</a> ·
   <a href="#agent-compatibility-matrix">Agents</a> ·
   <a href="https://discord.gg/yRmaUNpsPJ">Discord</a> ·
-  <a href="llms.txt">llms.txt</a>
+  <a href="llms.txt">llms.txt</a> ·
+  <a href="ENTERPRISE.md">Enterprise</a>
 </p>
 
 <p align="center"><sub>
