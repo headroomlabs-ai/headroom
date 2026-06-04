@@ -1303,18 +1303,31 @@ def process(items):
         assert "return []" in result.compressed
 
     def test_side_effect_preferred_over_low_value_setup(self):
-        """Side-effect statements should be retained ahead of low-value setup detail."""
+        """Structural side-effect statements should be retained ahead of low-value setup detail."""
         compressor = self._make_compressor(max_body_lines=2)
         code = '''
 def persist(order):
     a = 1
     b = 2
     c = a + b
-    save_order(order)
+    emit(order)
     return c
 '''
         result = compressor.compress(code, language="python")
-        assert "save_order(order)" in result.compressed
+        assert "emit(order)" in result.compressed
+
+    def test_member_assignment_detected_as_effectful(self):
+        """Assignments to members should count as structural side effects."""
+        compressor = self._make_compressor(max_body_lines=2)
+        code = '''
+def persist(self, order):
+    a = 1
+    b = 2
+    self.last_order = order
+    return a + b
+'''
+        result = compressor.compress(code, language="python")
+        assert "self.last_order = order" in result.compressed
 
     def test_dependency_closure_keeps_assignment_for_return(self):
         """Returning a variable should pull in its nearest defining assignment."""
