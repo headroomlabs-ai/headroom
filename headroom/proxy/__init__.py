@@ -14,6 +14,24 @@ Usage:
     Set base URL in Cursor settings to http://localhost:8787
 """
 
-from .server import create_app, run_server
+from typing import Any
+from importlib import import_module
 
-__all__ = ["create_app", "run_server"]
+_LAZY_EXPORTS = {
+    "create_app": ("headroom.proxy.server", "create_app"),
+    "run_server": ("headroom.proxy.server", "run_server"),
+}
+
+
+def __getattr__(name: str) -> Any:
+    if name in _LAZY_EXPORTS:
+        module_name, attr_name = _LAZY_EXPORTS[name]
+        val = getattr(import_module(module_name), attr_name)
+        globals()[name] = val
+        return val
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(_LAZY_EXPORTS.keys()))
+
