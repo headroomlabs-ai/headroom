@@ -1,6 +1,6 @@
 {
   "name": "headroom-openclaw",
-  "version": "0.22.4",
+  "version": "0.23.0",
   "description": "Headroom context compression plugin for OpenClaw — 70-90% token savings with zero LLM calls",
   "type": "module",
   "main": "./dist/index.js",
