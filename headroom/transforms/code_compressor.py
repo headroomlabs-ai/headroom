@@ -201,8 +201,14 @@ class LangConfig:
 
     # Statement-retention node families
     terminal_nodes: frozenset[str] = frozenset()
+    raise_nodes: frozenset[str] = frozenset()
+    yield_nodes: frozenset[str] = frozenset()
     assignment_nodes: frozenset[str] = frozenset()
     call_nodes: frozenset[str] = frozenset()
+    identifier_nodes: frozenset[str] = frozenset()
+    call_target_nodes: frozenset[str] = frozenset()
+    guard_statement_nodes: frozenset[str] = frozenset()
+    else_clause_nodes: frozenset[str] = frozenset()
     member_access_nodes: frozenset[str] = frozenset()
     mutation_receiver_nodes: frozenset[str] = frozenset()
     effect_boundary_nodes: frozenset[str] = frozenset()
@@ -222,8 +228,14 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
         comment_prefix="#",
         uses_colon_after_signature=True,
         terminal_nodes=frozenset({"return_statement", "raise_statement", "yield_statement"}),
+        raise_nodes=frozenset({"raise_statement"}),
+        yield_nodes=frozenset({"yield_statement", "yield_expression"}),
         assignment_nodes=frozenset({"assignment", "augmented_assignment"}),
         call_nodes=frozenset({"call"}),
+        identifier_nodes=frozenset({"identifier", "property_identifier", "type_identifier"}),
+        call_target_nodes=frozenset({"identifier", "attribute", "property_identifier"}),
+        guard_statement_nodes=frozenset({"if_statement"}),
+        else_clause_nodes=frozenset({"else_clause"}),
         member_access_nodes=frozenset({"attribute", "subscript"}),
         mutation_receiver_nodes=frozenset({"attribute", "subscript"}),
         effect_boundary_nodes=frozenset({"raise_statement", "try_statement", "with_statement"}),
@@ -239,8 +251,14 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
         comment_prefix="//",
         uses_colon_after_signature=False,
         terminal_nodes=frozenset({"return_statement", "throw_statement"}),
+        raise_nodes=frozenset({"throw_statement"}),
+        yield_nodes=frozenset(),
         assignment_nodes=frozenset({"assignment_expression", "lexical_declaration", "variable_declaration"}),
         call_nodes=frozenset({"call_expression"}),
+        identifier_nodes=frozenset({"identifier", "property_identifier"}),
+        call_target_nodes=frozenset({"identifier", "property_identifier", "member_expression"}),
+        guard_statement_nodes=frozenset({"if_statement"}),
+        else_clause_nodes=frozenset({"else_clause"}),
         member_access_nodes=frozenset({"member_expression", "subscript_expression"}),
         mutation_receiver_nodes=frozenset({"member_expression", "subscript_expression"}),
         effect_boundary_nodes=frozenset({"throw_statement", "try_statement"}),
@@ -256,8 +274,14 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
         comment_prefix="//",
         uses_colon_after_signature=False,
         terminal_nodes=frozenset({"return_statement", "throw_statement"}),
+        raise_nodes=frozenset({"throw_statement"}),
+        yield_nodes=frozenset(),
         assignment_nodes=frozenset({"assignment_expression", "lexical_declaration", "variable_declaration"}),
         call_nodes=frozenset({"call_expression"}),
+        identifier_nodes=frozenset({"identifier", "property_identifier", "type_identifier"}),
+        call_target_nodes=frozenset({"identifier", "property_identifier", "member_expression"}),
+        guard_statement_nodes=frozenset({"if_statement"}),
+        else_clause_nodes=frozenset({"else_clause"}),
         member_access_nodes=frozenset({"member_expression", "subscript_expression"}),
         mutation_receiver_nodes=frozenset({"member_expression", "subscript_expression"}),
         effect_boundary_nodes=frozenset({"throw_statement", "try_statement"}),
@@ -274,8 +298,14 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
         uses_colon_after_signature=False,
         package_node="package_clause",
         terminal_nodes=frozenset({"return_statement"}),
+        raise_nodes=frozenset(),
+        yield_nodes=frozenset(),
         assignment_nodes=frozenset({"short_var_declaration", "assignment_statement"}),
         call_nodes=frozenset({"call_expression"}),
+        identifier_nodes=frozenset({"identifier", "field_identifier", "type_identifier"}),
+        call_target_nodes=frozenset({"identifier", "selector_expression"}),
+        guard_statement_nodes=frozenset({"if_statement"}),
+        else_clause_nodes=frozenset({"else_clause"}),
         member_access_nodes=frozenset({"selector_expression", "index_expression"}),
         mutation_receiver_nodes=frozenset({"selector_expression", "index_expression"}),
         effect_boundary_nodes=frozenset(),
@@ -291,8 +321,14 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
         comment_prefix="//",
         uses_colon_after_signature=False,
         terminal_nodes=frozenset({"return_expression"}),
+        raise_nodes=frozenset(),
+        yield_nodes=frozenset(),
         assignment_nodes=frozenset({"let_declaration", "assignment_expression"}),
         call_nodes=frozenset({"call_expression"}),
+        identifier_nodes=frozenset({"identifier", "field_identifier", "type_identifier"}),
+        call_target_nodes=frozenset({"identifier", "field_expression"}),
+        guard_statement_nodes=frozenset({"if_expression"}),
+        else_clause_nodes=frozenset(),
         member_access_nodes=frozenset({"field_expression", "index_expression"}),
         mutation_receiver_nodes=frozenset({"field_expression", "index_expression"}),
         effect_boundary_nodes=frozenset(),
@@ -309,8 +345,14 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
         uses_colon_after_signature=False,
         package_node="package_declaration",
         terminal_nodes=frozenset({"return_statement", "throw_statement"}),
+        raise_nodes=frozenset({"throw_statement"}),
+        yield_nodes=frozenset(),
         assignment_nodes=frozenset({"assignment_expression", "local_variable_declaration"}),
         call_nodes=frozenset({"method_invocation", "object_creation_expression"}),
+        identifier_nodes=frozenset({"identifier", "type_identifier"}),
+        call_target_nodes=frozenset({"identifier", "field_access"}),
+        guard_statement_nodes=frozenset({"if_statement"}),
+        else_clause_nodes=frozenset({"else_clause"}),
         member_access_nodes=frozenset({"field_access", "array_access"}),
         mutation_receiver_nodes=frozenset({"field_access", "array_access"}),
         effect_boundary_nodes=frozenset({"throw_statement", "try_statement"}),
@@ -326,8 +368,14 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
         comment_prefix="//",
         uses_colon_after_signature=False,
         terminal_nodes=frozenset({"return_statement"}),
+        raise_nodes=frozenset(),
+        yield_nodes=frozenset(),
         assignment_nodes=frozenset({"assignment_expression", "declaration"}),
         call_nodes=frozenset({"call_expression"}),
+        identifier_nodes=frozenset({"identifier", "field_identifier", "type_identifier"}),
+        call_target_nodes=frozenset({"identifier", "field_expression", "pointer_expression"}),
+        guard_statement_nodes=frozenset({"if_statement"}),
+        else_clause_nodes=frozenset({"else_clause"}),
         member_access_nodes=frozenset({"field_expression", "subscript_expression", "pointer_expression"}),
         mutation_receiver_nodes=frozenset({"field_expression", "subscript_expression", "pointer_expression"}),
         effect_boundary_nodes=frozenset(),
@@ -343,8 +391,14 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
         comment_prefix="//",
         uses_colon_after_signature=False,
         terminal_nodes=frozenset({"return_statement", "throw_statement"}),
+        raise_nodes=frozenset({"throw_statement"}),
+        yield_nodes=frozenset(),
         assignment_nodes=frozenset({"assignment_expression", "declaration"}),
         call_nodes=frozenset({"call_expression"}),
+        identifier_nodes=frozenset({"identifier", "field_identifier", "type_identifier"}),
+        call_target_nodes=frozenset({"identifier", "field_expression", "pointer_expression"}),
+        guard_statement_nodes=frozenset({"if_statement"}),
+        else_clause_nodes=frozenset({"else_clause"}),
         member_access_nodes=frozenset({"field_expression", "subscript_expression", "pointer_expression"}),
         mutation_receiver_nodes=frozenset({"field_expression", "subscript_expression", "pointer_expression"}),
         effect_boundary_nodes=frozenset({"throw_statement", "try_statement"}),
@@ -2028,18 +2082,23 @@ def _get_node_text(node: Any, code: str) -> str:
 def _classify_statement_kind(node: Any, lang_config: LangConfig) -> _StatementKind:
     """Map a tree-sitter node to a lightweight statement kind."""
     node_type = getattr(node, "type", "")
+    if node_type in lang_config.raise_nodes:
+        return _StatementKind.RAISE
+    if node_type in lang_config.yield_nodes:
+        return _StatementKind.YIELD
     if node_type in lang_config.terminal_nodes:
-        if "raise" in node_type or "throw" in node_type:
-            return _StatementKind.RAISE
-        if "yield" in node_type:
-            return _StatementKind.YIELD
         return _StatementKind.RETURN
     if node_type in lang_config.assignment_nodes:
         return _StatementKind.ASSIGN
+    if node_type in lang_config.call_nodes:
+        return _StatementKind.CALL
     return _STATEMENT_KIND_MAP.get(node_type, _StatementKind.UNKNOWN)
 
 
-def _collect_statement_symbols(node: Any) -> tuple[set[str], set[str], set[str]]:
+def _collect_statement_symbols(
+    node: Any,
+    lang_config: LangConfig,
+) -> tuple[set[str], set[str], set[str]]:
     """Collect simple def/use/call signals for a statement node."""
     defined: set[str] = set()
     referenced: set[str] = set()
@@ -2053,27 +2112,14 @@ def _collect_statement_symbols(node: Any) -> tuple[set[str], set[str], set[str]]
 
     def add_identifiers(target: set[str], subtree: Any) -> None:
         for desc in _iter_descendants(subtree):
-            if getattr(desc, "type", "") in {
-                "identifier",
-                "property_identifier",
-                "type_identifier",
-            }:
+            if getattr(desc, "type", "") in lang_config.identifier_nodes:
                 name = record_text(desc)
                 if name:
                     target.add(name)
 
-    assignment_like_types = {
-        "assignment",
-        "augmented_assignment",
-        "assignment_expression",
-        "lexical_declaration",
-        "variable_declarator",
-        "variable_declaration",
-    }
-
     # Definition heuristics: look at the left-hand side / declaration target only.
     for child in getattr(node, "children", []):
-        if child.type in assignment_like_types:
+        if child.type in lang_config.assignment_nodes:
             child_children = getattr(child, "children", [])
             if child_children:
                 add_identifiers(defined, child_children[0])
@@ -2083,22 +2129,15 @@ def _collect_statement_symbols(node: Any) -> tuple[set[str], set[str], set[str]]
     # Reference / call heuristics from descendants.
     for desc in _iter_descendants(node):
         node_type = getattr(desc, "type", "")
-        if node_type in {"identifier", "property_identifier", "type_identifier"}:
+        if node_type in lang_config.identifier_nodes:
             name = record_text(desc)
             if name:
                 referenced.add(name)
 
-        if "call" in node_type:
+        if node_type in lang_config.call_nodes:
             for call_child in getattr(desc, "children", []):
                 child_type = getattr(call_child, "type", "")
-                if child_type in {
-                    "identifier",
-                    "property_identifier",
-                    "member_expression",
-                    "attribute",
-                    "field_expression",
-                    "selector_expression",
-                }:
+                if child_type in lang_config.call_target_nodes | lang_config.identifier_nodes | lang_config.member_access_nodes:
                     name = record_text(call_child)
                     if name:
                         called.add(name.split(".")[-1])
@@ -2110,7 +2149,7 @@ def _collect_statement_symbols(node: Any) -> tuple[set[str], set[str], set[str]]
 
 def _detect_guard_clause(node: Any, lang_config: LangConfig) -> bool:
     """Detect simple early-return / early-raise guard clauses from AST structure."""
-    if getattr(node, "type", "") != "if_statement":
+    if getattr(node, "type", "") not in lang_config.guard_statement_nodes:
         return False
 
     named_children = [c for c in getattr(node, "children", []) if getattr(c, "is_named", False)]
@@ -2130,7 +2169,10 @@ def _detect_guard_clause(node: Any, lang_config: LangConfig) -> bool:
         if getattr(desc, "type", "") in lang_config.terminal_nodes:
             terminal_count += 1
 
-    has_else = any(getattr(child, "type", "") == "else_clause" for child in named_children[2:])
+    has_else = any(
+        getattr(child, "type", "") in lang_config.else_clause_nodes
+        for child in named_children[2:]
+    )
     return terminal_count > 0 and named_descendants <= 12 and not has_else
 
 
@@ -2291,7 +2333,7 @@ def _extract_statement_units(
         end_row = child.end_point[0]
         text_lines = code_lines[start_row : end_row + 1]
         kind = _classify_statement_kind(child, lang_config)
-        defined, referenced, called = _collect_statement_symbols(child)
+        defined, referenced, called = _collect_statement_symbols(child, lang_config)
         unit = _StatementUnit(
             idx=len(units),
             node=child,
