@@ -112,20 +112,19 @@ Works with structured output:
 // @noErrors
 import { withHeadroom } from 'headroom-ai/vercel-ai';
 import { openai } from '@ai-sdk/openai';
-import { generateText, Output } from 'ai';
+// Fix: Import generateObject instead of non-existent generateText/Output structures
+import { generateObject } from 'ai';
 import { z } from 'zod';
 
 const model = withHeadroom(openai('gpt-4o'));
 
-const { output } = await generateText({
-  model,
-  output: Output.object({
-    schema: z.object({
-      summary: z.string(),
-      severity: z.enum(['low', 'medium', 'high']),
-    }),
-  }),
-  messages: largeConversationHistory,
+const { object } = await generateObject({
+  model, 
+  schema: z.object({ 
+    summary: z.string(), 
+    severity: z.enum(['low', 'medium', 'high']), 
+  }), 
+  messages: largeConversationHistory, 
 });
 ```
 
