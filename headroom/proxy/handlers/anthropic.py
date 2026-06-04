@@ -26,7 +26,7 @@ import httpx
 from headroom.pipeline import PipelineStage, summarize_routing_markers
 from headroom.proxy.auth_mode import classify_auth_mode, classify_client
 from headroom.proxy.compression_decision import CompressionDecision
-from headroom.proxy.helpers import extract_tags
+from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS, extract_tags
 from headroom.proxy.memory_decision import MemoryDecision
 from headroom.proxy.memory_query import MemoryQuery
 from headroom.proxy.outcome import RequestOutcome
@@ -985,8 +985,6 @@ class AnthropicHandlerMixin:
                 )
             if _decision.should_compress:
                 try:
-                    from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS
-
                     context_limit = self.anthropic_provider.get_context_limit(model)
                     result = None
                     biases = (
@@ -1053,7 +1051,7 @@ class AnthropicHandlerMixin:
                                     request_id=request_id,
                                     compression_policy=compression_policy,
                                 ),
-                                timeout=COMPRESSION_TIMEOUT_SECONDS,
+                                timeout=getattr(self.config, "compression_timeout_seconds", COMPRESSION_TIMEOUT_SECONDS),
                             )
 
                         # Cache newly compressed messages (index-aligned diff)
@@ -1093,7 +1091,7 @@ class AnthropicHandlerMixin:
                                     request_id=request_id,
                                     compression_policy=compression_policy,
                                 ),
-                                timeout=COMPRESSION_TIMEOUT_SECONDS,
+                                timeout=getattr(self.config, "compression_timeout_seconds", COMPRESSION_TIMEOUT_SECONDS),
                             )
 
                         if result.messages != messages:
@@ -1124,7 +1122,7 @@ class AnthropicHandlerMixin:
                                         request_id=request_id,
                                         compression_policy=compression_policy,
                                     ),
-                                    timeout=COMPRESSION_TIMEOUT_SECONDS,
+                                    timeout=getattr(self.config, "compression_timeout_seconds", COMPRESSION_TIMEOUT_SECONDS),
                                 )
                                 optimized_messages = stable_forwarded_prefix + result.messages
                                 transforms_applied = result.transforms_applied

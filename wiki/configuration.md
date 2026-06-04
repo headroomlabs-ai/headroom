@@ -273,6 +273,7 @@ Some settings can be configured via environment variables:
 | `HEADROOM_SAVINGS_PATH` | Full path to the proxy savings JSON ledger. Always wins when set. | derived from `${HEADROOM_WORKSPACE_DIR}` |
 | `HEADROOM_TOIN_PATH` | Full path to the TOIN telemetry JSON file. Always wins when set. | derived from `${HEADROOM_WORKSPACE_DIR}` |
 | `HEADROOM_SUBSCRIPTION_STATE_PATH` | Full path to the subscription tracker state. Always wins when set. | derived from `${HEADROOM_WORKSPACE_DIR}` |
+| `HEADROOM_COMPRESSION_TIMEOUT_SECONDS` | Wall-clock timeout for each compression call before applying the compression-failure policy. | `30.0` |
 
 ## Filesystem Contract
 

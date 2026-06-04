@@ -753,7 +753,30 @@ def parse_sse_events_from_byte_buffer(
 MAX_MESSAGE_ARRAY_LENGTH = 10000
 
 # Compression pipeline timeout in seconds
-COMPRESSION_TIMEOUT_SECONDS = 30
+COMPRESSION_TIMEOUT_SECONDS = 30.0
+COMPRESSION_TIMEOUT_ENV = "HEADROOM_COMPRESSION_TIMEOUT_SECONDS"
+
+
+def parse_compression_timeout_seconds(raw: str | None) -> float:
+    """Parse the compression timeout env/CLI value."""
+    if raw is None or not raw.strip():
+        return COMPRESSION_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"{COMPRESSION_TIMEOUT_ENV} must be a positive number of seconds, got {raw!r}"
+        ) from exc
+    if value <= 0:
+        raise ValueError(
+            f"{COMPRESSION_TIMEOUT_ENV} must be a positive number of seconds, got {raw!r}"
+        )
+    return value
+
+
+def compression_timeout_seconds_from_env() -> float:
+    """Resolve the compression timeout from the process environment."""
+    return parse_compression_timeout_seconds(os.environ.get(COMPRESSION_TIMEOUT_ENV))
 
 # Maximum compression cache sessions (prevents unbounded memory growth)
 MAX_COMPRESSION_CACHE_SESSIONS = 500

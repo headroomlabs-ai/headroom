@@ -268,6 +268,7 @@ headroom proxy --learn --min-evidence 3
 | `HEADROOM_LIMIT_CONCURRENCY` | Maximum concurrent connections before 503 | `1000` |
 | `HEADROOM_MAX_CONNECTIONS` | Maximum upstream HTTP connections | `500` |
 | `HEADROOM_MAX_KEEPALIVE` | Maximum upstream keep-alive connections | `100` |
+| `HEADROOM_COMPRESSION_TIMEOUT_SECONDS` | Wall-clock timeout for each compression call before applying the compression-failure policy | `30.0` |
 | `HEADROOM_BUDGET` | Daily budget limit in USD | -- |
 | `HEADROOM_TELEMETRY` | Set to `off` to disable anonymous telemetry | enabled |
 | `HEADROOM_STATELESS` | Set to `true` to disable filesystem writes | `false` |

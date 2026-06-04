@@ -61,6 +61,32 @@ def test_readyz_reports_core_subsystem_checks(client):
     assert runtime["websocket_sessions"]["active_relay_tasks"] == 0
 
 
+def test_readyz_reports_configured_compression_timeout():
+    config = ProxyConfig(
+        optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+        compression_timeout_seconds=45.5,
+    )
+    app = create_app(config)
+
+    with TestClient(app) as test_client:
+        response = test_client.get("/readyz")
+
+    assert response.status_code == 200
+    runtime = response.json()["runtime"]
+    assert runtime["anthropic_pre_upstream"]["compression_timeout_seconds"] == 45.5
+
+
+def test_proxy_config_reads_compression_timeout_from_env(monkeypatch):
+    monkeypatch.setenv("HEADROOM_COMPRESSION_TIMEOUT_SECONDS", "61.25")
+
+    config = ProxyConfig()
+
+    assert config.compression_timeout_seconds == 61.25
+
+
 def test_health_preserves_backwards_compatible_config_payload(client):
     response = client.get("/health")
 

@@ -12,6 +12,7 @@ from typing import Any, Literal
 
 from headroom.memory import qdrant_env
 from headroom.providers.registry import ProviderApiOverrides
+from headroom.proxy.helpers import compression_timeout_seconds_from_env
 
 # =============================================================================
 # Data Models
@@ -289,8 +290,16 @@ class ProxyConfig:
     anthropic_pre_upstream_acquire_timeout_seconds: float = 15.0
     # Fail-open timeout for Anthropic memory-context lookup while the request
     # is still holding a pre-upstream slot. Compression already has its own
-    # COMPRESSION_TIMEOUT_SECONDS guard; this bounds the memory leg too.
+    # ``compression_timeout_seconds`` guard; this bounds the memory leg too.
     anthropic_pre_upstream_memory_context_timeout_seconds: float = 2.0
+
+    # Wall-clock timeout for a single compression call. The threadpool worker
+    # cannot be preempted once it starts running Rust/Python compression work,
+    # but the request awaiter stops waiting after this deadline and applies
+    # the compression-failure policy. Env: ``HEADROOM_COMPRESSION_TIMEOUT_SECONDS``.
+    compression_timeout_seconds: float = field(
+        default_factory=compression_timeout_seconds_from_env
+    )
 
     # Bound the dedicated compression threadpool. CPU-bound Rust work runs
     # here; the pool is separate from asyncio's default executor so other

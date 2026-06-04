@@ -61,6 +61,36 @@ echo $OPENAI_API_KEY  # or ANTHROPIC_API_KEY
 curl https://api.openai.com/v1/models -H "Authorization: Bearer $OPENAI_API_KEY"
 ```
 
+### "413 Payload Too Large with compression_refused"
+
+**Symptom**: Codex or another OpenAI Responses client receives `413 Payload Too Large`
+with `compression_refused` and a message like `compression timeout`.
+
+**Diagnosis**:
+
+```bash
+curl -fsS http://127.0.0.1:8787/health | jq '.runtime.compression_executor'
+tail -n 200 ~/.headroom/logs/proxy.log | grep -E 'compression failed|REFUSING|compression_refused'
+```
+
+**What it means**: The request was large enough that Headroom tried to compress it,
+but compression exceeded the configured timeout. Headroom refuses to forward the
+uncompressed body so the upstream model does not receive a request that may exceed
+its context window.
+
+**Solutions**:
+
+```bash
+# Reduce the request/context and retry.
+# In Codex, compact the conversation before resending the same task.
+
+# If the local compression executor is saturated, restart the local proxy.
+headroom install restart --profile init-user
+
+# If large valid requests need more time, raise the compression timeout.
+HEADROOM_COMPRESSION_TIMEOUT_SECONDS=60 headroom proxy
+```
+
 ---
 
 ## SDK Issues
