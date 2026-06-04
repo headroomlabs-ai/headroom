@@ -13,8 +13,12 @@ import hashlib
 import json
 import logging
 import os
+import threading
 import time
 import uuid
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import replace
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
@@ -45,6 +49,72 @@ from headroom.proxy.cost import _summarize_transforms
 from headroom.proxy.outcome import RequestOutcome
 
 logger = logging.getLogger("headroom.proxy")
+
+_OPENAI_RESPONSES_UNIT_CACHE_MAX_ENTRIES = 10_000
+_OPENAI_RESPONSES_UNIT_CACHE_VERSION = "openai_responses_unit_v1"
+_OPENAI_RESPONSES_UNIT_PARALLELISM_ENV = "HEADROOM_TOOL_OUTPUT_COMPRESSION_PARALLELISM"
+_OPENAI_RESPONSES_UNIT_PARALLELISM_DEFAULT = 4
+_OPENAI_RESPONSES_UNIT_PARALLELISM_MAX = 16
+_OPENAI_RESPONSES_UNIT_CACHE_INIT_LOCK = threading.RLock()
+_OPENAI_RESPONSES_UNIT_EXECUTOR_LOCK = threading.RLock()
+_OPENAI_RESPONSES_UNIT_EXECUTOR: ThreadPoolExecutor | None = None
+
+
+def _openai_responses_unit_parallelism() -> int:
+    raw = os.getenv(_OPENAI_RESPONSES_UNIT_PARALLELISM_ENV)
+    if raw is None or raw.strip() == "":
+        return _OPENAI_RESPONSES_UNIT_PARALLELISM_DEFAULT
+    try:
+        requested = int(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r; using default %d",
+            _OPENAI_RESPONSES_UNIT_PARALLELISM_ENV,
+            raw,
+            _OPENAI_RESPONSES_UNIT_PARALLELISM_DEFAULT,
+        )
+        return _OPENAI_RESPONSES_UNIT_PARALLELISM_DEFAULT
+    return max(1, min(_OPENAI_RESPONSES_UNIT_PARALLELISM_MAX, requested))
+
+
+def _openai_responses_unit_executor() -> ThreadPoolExecutor:
+    global _OPENAI_RESPONSES_UNIT_EXECUTOR
+    with _OPENAI_RESPONSES_UNIT_EXECUTOR_LOCK:
+        if _OPENAI_RESPONSES_UNIT_EXECUTOR is None:
+            _OPENAI_RESPONSES_UNIT_EXECUTOR = ThreadPoolExecutor(
+                max_workers=_OPENAI_RESPONSES_UNIT_PARALLELISM_MAX,
+                thread_name_prefix="headroom-openai-unit",
+            )
+        return _OPENAI_RESPONSES_UNIT_EXECUTOR
+
+
+def _openai_responses_unit_cache_key(unit: Any, *, model: str) -> str:
+    text_hash = hashlib.sha256(unit.text.encode("utf-8", errors="replace")).hexdigest()
+    key_payload = {
+        "version": _OPENAI_RESPONSES_UNIT_CACHE_VERSION,
+        "model": model,
+        "provider": unit.provider,
+        "endpoint": unit.endpoint,
+        "role": unit.role,
+        "item_type": unit.item_type,
+        "cache_zone": unit.cache_zone,
+        "mutable": unit.mutable,
+        "min_bytes": unit.min_bytes,
+        "context": unit.context,
+        "question": unit.question,
+        "bias": unit.bias,
+        "metadata": unit.metadata,
+        "text_sha256": text_hash,
+    }
+    serialized = json.dumps(key_payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _openai_responses_result_with_cache_hit(result: Any) -> Any:
+    router_result = getattr(result, "router_result", None)
+    if router_result is None:
+        return result
+    return replace(result, router_result=replace(router_result, cache_hit=True))
 
 
 def _codex_ws_text_shape(text: str) -> str:
@@ -365,6 +435,35 @@ class OpenAIHandlerMixin:
         "local_shell_call_output",
         "apply_patch_call_output",
     }
+
+    def _openai_responses_unit_cache(self) -> tuple[Any, OrderedDict[str, Any]]:
+        with _OPENAI_RESPONSES_UNIT_CACHE_INIT_LOCK:
+            lock = getattr(self, "_openai_responses_unit_cache_lock", None)
+            if lock is None:
+                lock = threading.RLock()
+                self._openai_responses_unit_cache_lock = lock
+            cache = getattr(self, "_openai_responses_unit_result_cache", None)
+            if cache is None:
+                cache = OrderedDict()
+                self._openai_responses_unit_result_cache = cache
+            return lock, cache
+
+    def _get_openai_responses_cached_unit(self, key: str) -> Any | None:
+        lock, cache = self._openai_responses_unit_cache()
+        with lock:
+            result = cache.get(key)
+            if result is None:
+                return None
+            cache.move_to_end(key)
+        return _openai_responses_result_with_cache_hit(result)
+
+    def _store_openai_responses_cached_unit(self, key: str, result: Any) -> None:
+        lock, cache = self._openai_responses_unit_cache()
+        with lock:
+            cache[key] = result
+            cache.move_to_end(key)
+            while len(cache) > _OPENAI_RESPONSES_UNIT_CACHE_MAX_ENTRIES:
+                cache.popitem(last=False)
 
     @staticmethod
     def _headroom_bypass_enabled(headers: Any) -> bool:
@@ -698,18 +797,65 @@ class OpenAIHandlerMixin:
             elapsed_ms = (time.perf_counter() - unit_started) * 1000.0
             return routed.slot, result, elapsed_ms
 
-        # Units run serially within the frame-level worker thread. Frame-
-        # level parallelism is already provided by
-        # ``self._compression_executor`` (32 workers, sized
-        # ``min(32, cpu*4)``), which `_run_compression_in_executor`
-        # dispatches each frame onto. The prior per-call
-        # ``ThreadPoolExecutor`` + module-global
-        # ``threading.BoundedSemaphore(10)`` caused production cascades
-        # under ≥10 concurrent Codex sessions; both are deleted.
         router_total_started = time.perf_counter()
-        routed_results = [_compress_routed_unit(routed) for routed in routed_units]
+        routed_results: list[tuple[object, Any, float] | None] = [None] * len(routed_units)
+        cache_misses: list[tuple[int, str, RoutedCompressionUnit]] = []
+        cache_miss_followers: dict[str, list[int]] = {}
+        for unit_idx, routed in enumerate(routed_units):
+            cache_key = _openai_responses_unit_cache_key(routed.unit, model=model)
+            cached = self._get_openai_responses_cached_unit(cache_key)
+            if cached is not None:
+                routed_results[unit_idx] = (routed.slot, cached, 0.0)
+                continue
+            if cache_key in cache_miss_followers:
+                cache_miss_followers[cache_key].append(unit_idx)
+                continue
+            cache_miss_followers[cache_key] = []
+            cache_misses.append((unit_idx, cache_key, routed))
 
-        for _, result, elapsed_ms in routed_results:
+        def _compress_and_store(
+            unit_idx: int,
+            cache_key: str,
+            routed: RoutedCompressionUnit,
+        ) -> tuple[int, str, tuple[object, Any, float]]:
+            slot, result, elapsed_ms = _compress_routed_unit(routed)
+            self._store_openai_responses_cached_unit(cache_key, result)
+            return unit_idx, cache_key, (slot, result, elapsed_ms)
+
+        def _record_routed_result(
+            unit_idx: int,
+            cache_key: str,
+            routed_result: tuple[object, Any, float],
+        ) -> None:
+            routed_results[unit_idx] = routed_result
+            _slot, result, _elapsed_ms = routed_result
+            for follower_idx in cache_miss_followers.get(cache_key, []):
+                routed_results[follower_idx] = (
+                    routed_units[follower_idx].slot,
+                    _openai_responses_result_with_cache_hit(result),
+                    0.0,
+                )
+
+        parallelism = _openai_responses_unit_parallelism()
+        if len(cache_misses) > 1 and parallelism > 1:
+            executor = _openai_responses_unit_executor()
+            for start in range(0, len(cache_misses), parallelism):
+                batch = cache_misses[start : start + parallelism]
+                futures = [executor.submit(_compress_and_store, *item) for item in batch]
+                for future in as_completed(futures):
+                    unit_idx, cache_key, routed_result = future.result()
+                    _record_routed_result(unit_idx, cache_key, routed_result)
+        else:
+            for unit_idx, cache_key, routed in cache_misses:
+                _record_routed_result(
+                    unit_idx,
+                    cache_key,
+                    _compress_and_store(unit_idx, cache_key, routed)[2],
+                )
+
+        ordered_routed_results = [result for result in routed_results if result is not None]
+
+        for _, result, elapsed_ms in ordered_routed_results:
             router_chain = list(result.router_result.strategy_chain) if result.router_result else []
             router_content_type = (
                 result.router_result.routing_log[0].content_type.value
@@ -766,7 +912,7 @@ class OpenAIHandlerMixin:
         _add_timing("compression_units_router_loop", router_total_started)
 
         apply_started = time.perf_counter()
-        for slot, result, _elapsed_ms in routed_results:
+        for slot, result, _elapsed_ms in ordered_routed_results:
             item_idx, slot_ref = slot
             router_chain = list(result.router_result.strategy_chain) if result.router_result else []
             for s in router_chain:

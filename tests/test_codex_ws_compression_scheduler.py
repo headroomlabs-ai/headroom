@@ -245,7 +245,9 @@ def test_concurrent_compression_has_no_semaphore_tail() -> None:
       (≈27×) or (b) OS-level scheduler noise (≈2–3×). 4× sits
       comfortably between the two — catches the bug, tolerates
       hardware. (First iteration tried 5× with mixed sizes, which
-      let size-variance push CI ratios to 7.4×.)
+      let size-variance push CI ratios to 7.4×.) The ratio is only
+      enforced once p99 clears a scheduler-noise floor — on very fast
+      runners p50 rounds to 0ms and the ratio becomes pure jitter.
 
     Marked ``slow`` so a normal ``pytest`` run can skip it via
     ``-m 'not slow'``. CI matrix runs all marks.
@@ -300,9 +302,20 @@ def test_concurrent_compression_has_no_semaphore_tail() -> None:
 
     assert not errors, f"Got {len(errors)} errors; first: {errors[0].error}"
     ratio = p99 / max(p50, 1)
-    assert ratio < 4.0, (
+    # The p99/p50 ratio only signals contention when the tail is also
+    # *absolutely* large. On a fast/quiet runner p50 rounds toward 0ms, so the
+    # ratio collapses to "p99 in ms" and a few milliseconds of ordinary
+    # scheduler jitter reads as a spurious multiple (e.g. p50=0ms, p99=5ms →
+    # ~5×) that has nothing to do with the semaphore. The deleted semaphore
+    # produced a tail of *tens* of milliseconds (and ~27×); a healthy run keeps
+    # p99 in the single-digit-ms range regardless of ratio. So only treat a high
+    # ratio as a regression once p99 clears a scheduler-noise floor.
+    SEMAPHORE_TAIL_FLOOR_MS = 25.0
+    assert ratio < 4.0 or p99 < SEMAPHORE_TAIL_FLOOR_MS, (
         f"p99/p50 ratio is {ratio:.1f}× (p50={p50:.0f}ms, p99={p99:.0f}ms). "
-        f"Expected < 4× on uniform-size workload — a higher ratio means "
-        f"the semaphore-induced contention tail is back. Pre-fix baseline "
-        f"ratio on this same workload shape was ~27× regardless of CPU speed."
+        f"Expected < 4× on uniform-size workload once p99 clears the "
+        f"{SEMAPHORE_TAIL_FLOOR_MS:.0f}ms noise floor — a high ratio with a large "
+        f"absolute tail means the semaphore-induced contention tail is back. "
+        f"Pre-fix baseline ratio on this same workload shape was ~27× regardless "
+        f"of CPU speed."
     )

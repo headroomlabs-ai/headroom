@@ -18,10 +18,14 @@ from urllib import error as urllib_error
 from urllib import request as urllib_request
 from urllib.parse import urlparse
 
+from headroom.copilot_linux_secret import read_copilot_oauth_token as read_linux_secret_token
+from headroom.copilot_macos_keychain import read_copilot_oauth_token as read_macos_keychain_token
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_API_URL = "https://api.githubcopilot.com"
 DEFAULT_TOKEN_EXCHANGE_URL = "https://api.github.com/copilot_internal/v2/token"
+DEFAULT_USER_INFO_URL = "https://api.github.com/copilot_internal/user"
 DEFAULT_GITHUB_HOST = "github.com"
 _TOKEN_EXPIRY_BUFFER_S = 60
 _DEFAULT_EDITOR_VERSION = "vscode/1.104.1"
@@ -31,11 +35,14 @@ _API_TOKEN_ENV_VARS = (
     "GITHUB_COPILOT_API_TOKEN",
     "COPILOT_PROVIDER_BEARER_TOKEN",
 )
-_OAUTH_TOKEN_ENV_VARS = (
+_COPILOT_OAUTH_TOKEN_ENV_VARS = (
     "GITHUB_COPILOT_GITHUB_TOKEN",
     "GITHUB_COPILOT_TOKEN",
-    "GITHUB_TOKEN",
     "COPILOT_GITHUB_TOKEN",
+)
+_GENERIC_GITHUB_TOKEN_ENV_VARS = (
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
 )
 _OAUTH_TOKEN_KEYS = (
     "oauth_token",
@@ -62,12 +69,26 @@ class CopilotAPIToken:
         return time.time() < (self.expires_at - _TOKEN_EXPIRY_BUFFER_S)
 
 
+@dataclass(frozen=True)
+class CopilotTokenCandidate:
+    """A discovered reusable token plus enough metadata to reason about trust."""
+
+    token: str
+    source: str
+    confidence: str
+    validate_for_subscription: bool = True
+
+
 def _github_host() -> str:
     return (os.environ.get("GITHUB_COPILOT_HOST") or DEFAULT_GITHUB_HOST).strip().lower()
 
 
 def _token_exchange_url() -> str:
     return os.environ.get("GITHUB_COPILOT_TOKEN_EXCHANGE_URL", DEFAULT_TOKEN_EXCHANGE_URL).strip()
+
+
+def _user_info_url() -> str:
+    return os.environ.get("GITHUB_COPILOT_USER_INFO_URL", DEFAULT_USER_INFO_URL).strip()
 
 
 def _should_exchange_oauth_token() -> bool:
@@ -117,6 +138,18 @@ def _read_gh_cli_oauth_token() -> str | None:
 
     token = result.stdout.strip()
     return token or None
+
+
+def _read_macos_keychain_oauth_token() -> str | None:
+    """Best-effort Copilot CLI token lookup from macOS Keychain."""
+
+    return read_macos_keychain_token(host=_github_host())
+
+
+def _read_linux_secret_oauth_token() -> str | None:
+    """Best-effort Copilot CLI token lookup from Linux Secret Service."""
+
+    return read_linux_secret_token(host=_github_host())
 
 
 def _read_windows_copilot_cli_oauth_token() -> str | None:
@@ -262,19 +295,87 @@ def _iter_file_entries(payload: Any) -> list[tuple[str, dict[str, Any]]]:
 def read_cached_oauth_token() -> str | None:
     """Return a GitHub OAuth token for Copilot, if one is available."""
 
-    for env_var in _OAUTH_TOKEN_ENV_VARS:
+    for candidate in iter_oauth_token_candidates():
+        return candidate.token
+    return None
+
+
+def iter_oauth_token_candidates() -> list[CopilotTokenCandidate]:
+    """Return reusable token candidates in safest-first discovery order."""
+
+    candidates: list[CopilotTokenCandidate] = []
+
+    for env_var in _COPILOT_OAUTH_TOKEN_ENV_VARS:
         token = os.environ.get(env_var, "").strip()
         if token:
-            return token
+            candidates.append(
+                CopilotTokenCandidate(
+                    token=token,
+                    source=f"env:{env_var}",
+                    confidence="explicit",
+                )
+            )
 
     windows_copilot_token = _read_windows_copilot_cli_oauth_token()
     if windows_copilot_token:
-        return windows_copilot_token
+        candidates.append(
+            CopilotTokenCandidate(
+                token=windows_copilot_token,
+                source="windows-credential-manager:copilot-cli",
+                confidence="high",
+            )
+        )
+
+    macos_copilot_token = _read_macos_keychain_oauth_token()
+    if macos_copilot_token:
+        candidates.append(
+            CopilotTokenCandidate(
+                token=macos_copilot_token,
+                source="macos-keychain:copilot-cli",
+                confidence="high",
+            )
+        )
+
+    linux_copilot_token = _read_linux_secret_oauth_token()
+    if linux_copilot_token:
+        candidates.append(
+            CopilotTokenCandidate(
+                token=linux_copilot_token,
+                source="linux-secret-service:copilot-cli",
+                confidence="high",
+            )
+        )
+
+    candidates.extend(_read_file_oauth_token_candidates())
+
+    for env_var in _GENERIC_GITHUB_TOKEN_ENV_VARS:
+        token = os.environ.get(env_var, "").strip()
+        if token:
+            candidates.append(
+                CopilotTokenCandidate(
+                    token=token,
+                    source=f"env:{env_var}",
+                    confidence="generic-github",
+                )
+            )
 
     gh_token = _read_gh_cli_oauth_token()
     if gh_token:
-        return gh_token
+        candidates.append(
+            CopilotTokenCandidate(
+                token=gh_token,
+                source="gh-cli",
+                confidence="generic-github",
+            )
+        )
 
+    return _dedupe_token_candidates(candidates)
+
+
+def _read_file_oauth_token_candidates() -> list[CopilotTokenCandidate]:
+    """Return token candidates from Copilot/GitHub credential files."""
+
+    candidates: list[CopilotTokenCandidate] = []
     host = _github_host()
     for path in _resolve_token_file_paths():
         try:
@@ -290,9 +391,28 @@ def read_cached_oauth_token() -> str | None:
                 continue
             cached_token = _extract_oauth_token(entry)
             if cached_token:
-                return cached_token
+                candidates.append(
+                    CopilotTokenCandidate(
+                        token=cached_token,
+                        source=f"file:{path}",
+                        confidence="medium",
+                    )
+                )
 
-    return None
+    return candidates
+
+
+def _dedupe_token_candidates(
+    candidates: list[CopilotTokenCandidate],
+) -> list[CopilotTokenCandidate]:
+    seen: set[str] = set()
+    deduped: list[CopilotTokenCandidate] = []
+    for candidate in candidates:
+        if candidate.token in seen:
+            continue
+        seen.add(candidate.token)
+        deduped.append(candidate)
+    return deduped
 
 
 def resolve_client_bearer_token() -> str | None:
@@ -303,6 +423,28 @@ def resolve_client_bearer_token() -> str | None:
         if token:
             return token
     return read_cached_oauth_token()
+
+
+def resolve_subscription_bearer_token() -> str | None:
+    """Return the first discovered token that GitHub accepts for Copilot subscription APIs."""
+
+    for env_var in _API_TOKEN_ENV_VARS:
+        token = os.environ.get(env_var, "").strip()
+        if token and _fetch_copilot_user_info(token) is not None:
+            return token
+
+    for candidate in iter_oauth_token_candidates():
+        if not candidate.validate_for_subscription:
+            continue
+        if _fetch_copilot_user_info(candidate.token) is not None:
+            logger.debug(
+                "Using Copilot subscription token from %s (%s)",
+                candidate.source,
+                candidate.confidence,
+            )
+            return candidate.token
+
+    return None
 
 
 def has_oauth_auth() -> bool:
@@ -329,6 +471,46 @@ def build_copilot_upstream_url(base_url: str, path: str) -> str:
     if is_copilot_api_url(normalized_base) and normalized_path.startswith("/v1/"):
         normalized_path = normalized_path[3:]
     return f"{normalized_base}{normalized_path}"
+
+
+def resolve_copilot_api_url(oauth_token: str | None = None) -> str:
+    """Return the Copilot API endpoint advertised for the current OAuth token."""
+
+    token = (oauth_token or read_cached_oauth_token() or "").strip()
+    if not token:
+        return os.environ.get("GITHUB_COPILOT_API_URL", DEFAULT_API_URL).strip() or DEFAULT_API_URL
+
+    payload = _fetch_copilot_user_info(token)
+    if payload is None:
+        return os.environ.get("GITHUB_COPILOT_API_URL", DEFAULT_API_URL).strip() or DEFAULT_API_URL
+
+    endpoints = payload.get("endpoints") if isinstance(payload, dict) else None
+    api_url = endpoints.get("api") if isinstance(endpoints, dict) else None
+    if isinstance(api_url, str) and api_url.strip():
+        return api_url.strip()
+    return os.environ.get("GITHUB_COPILOT_API_URL", DEFAULT_API_URL).strip() or DEFAULT_API_URL
+
+
+def _fetch_copilot_user_info(token: str) -> dict[str, Any] | None:
+    """Fetch Copilot account metadata for a reusable OAuth-style token."""
+
+    token = token.strip()
+    if not token:
+        return None
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+    }
+    request = urllib_request.Request(_user_info_url(), headers=headers, method="GET")
+    try:
+        with urllib_request.urlopen(request, timeout=10.0) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception as exc:
+        logger.debug("Unable to resolve Copilot API URL from user info: %s", exc)
+        return None
+
+    return payload if isinstance(payload, dict) else None
 
 
 class CopilotTokenProvider:
@@ -377,7 +559,7 @@ class CopilotTokenProvider:
 
     async def _exchange_token(self, oauth_token: str) -> CopilotAPIToken:
         headers = {
-            "Authorization": f"token {oauth_token}",
+            "Authorization": f"Bearer {oauth_token}",
             "Accept": "application/json",
             "Editor-Version": os.environ.get(
                 "GITHUB_COPILOT_EDITOR_VERSION", _DEFAULT_EDITOR_VERSION

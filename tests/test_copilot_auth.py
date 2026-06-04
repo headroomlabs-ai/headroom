@@ -17,6 +17,74 @@ def test_read_cached_oauth_token_prefers_env(monkeypatch: pytest.MonkeyPatch) ->
     assert copilot_auth.read_cached_oauth_token() == "gho-env"
 
 
+def test_read_cached_oauth_token_prefers_copilot_cli_before_generic_github_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("GITHUB_COPILOT_GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_COPILOT_TOKEN", raising=False)
+    monkeypatch.delenv("COPILOT_GITHUB_TOKEN", raising=False)
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp-generic")
+    monkeypatch.setattr(copilot_auth, "_read_windows_copilot_cli_oauth_token", lambda: None)
+    monkeypatch.setattr(copilot_auth, "_read_macos_keychain_oauth_token", lambda: "gho-keychain")
+    monkeypatch.setattr(copilot_auth, "_read_gh_cli_oauth_token", lambda: None)
+
+    assert copilot_auth.read_cached_oauth_token() == "gho-keychain"
+
+
+def test_iter_oauth_token_candidates_preserves_sources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("GITHUB_COPILOT_GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_COPILOT_TOKEN", raising=False)
+    monkeypatch.delenv("COPILOT_GITHUB_TOKEN", raising=False)
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp-generic")
+    monkeypatch.setattr(copilot_auth, "_read_windows_copilot_cli_oauth_token", lambda: None)
+    monkeypatch.setattr(copilot_auth, "_read_macos_keychain_oauth_token", lambda: "gho-keychain")
+    monkeypatch.setattr(copilot_auth, "_read_file_oauth_token_candidates", lambda: [])
+    monkeypatch.setattr(copilot_auth, "_read_gh_cli_oauth_token", lambda: None)
+
+    candidates = copilot_auth.iter_oauth_token_candidates()
+
+    assert [(candidate.source, candidate.token) for candidate in candidates] == [
+        ("macos-keychain:copilot-cli", "gho-keychain"),
+        ("env:GITHUB_TOKEN", "ghp-generic"),
+    ]
+
+
+def test_resolve_subscription_bearer_token_skips_invalid_generic_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("GITHUB_COPILOT_API_TOKEN", raising=False)
+    monkeypatch.delenv("COPILOT_PROVIDER_BEARER_TOKEN", raising=False)
+    monkeypatch.setattr(
+        copilot_auth,
+        "iter_oauth_token_candidates",
+        lambda: [
+            copilot_auth.CopilotTokenCandidate(
+                token="ghp-generic",
+                source="env:GITHUB_TOKEN",
+                confidence="generic-github",
+            ),
+            copilot_auth.CopilotTokenCandidate(
+                token="gho-copilot",
+                source="macos-keychain:copilot-cli",
+                confidence="high",
+            ),
+        ],
+    )
+    monkeypatch.setattr(
+        copilot_auth,
+        "_fetch_copilot_user_info",
+        lambda token: (
+            {"endpoints": {"api": "https://api.individual.githubcopilot.com"}}
+            if token == "gho-copilot"
+            else None
+        ),
+    )
+
+    assert copilot_auth.resolve_subscription_bearer_token() == "gho-copilot"
+
+
 def test_should_exchange_oauth_token_supports_truthy_values(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -59,6 +127,7 @@ def test_read_cached_oauth_token_falls_back_to_gh_cli(monkeypatch: pytest.Monkey
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     monkeypatch.delenv("COPILOT_GITHUB_TOKEN", raising=False)
     monkeypatch.setattr(copilot_auth, "_read_windows_copilot_cli_oauth_token", lambda: None)
+    monkeypatch.setattr(copilot_auth, "_read_macos_keychain_oauth_token", lambda: None)
     monkeypatch.setattr(copilot_auth, "_read_gh_cli_oauth_token", lambda: "gho-gh-cli")
 
     assert copilot_auth.read_cached_oauth_token() == "gho-gh-cli"
@@ -79,6 +148,35 @@ def test_read_cached_oauth_token_prefers_copilot_cli_windows_token(
     assert copilot_auth.read_cached_oauth_token() == "gho-copilot"
 
 
+def test_read_cached_oauth_token_prefers_macos_keychain_before_gh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("GITHUB_COPILOT_GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_COPILOT_TOKEN", raising=False)
+    monkeypatch.delenv("COPILOT_GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.setattr(copilot_auth, "_read_windows_copilot_cli_oauth_token", lambda: None)
+    monkeypatch.setattr(copilot_auth, "_read_macos_keychain_oauth_token", lambda: "gho-keychain")
+    monkeypatch.setattr(copilot_auth, "_read_gh_cli_oauth_token", lambda: "gho-gh-cli")
+
+    assert copilot_auth.read_cached_oauth_token() == "gho-keychain"
+
+
+def test_read_macos_keychain_oauth_token_uses_security(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    def fake_read(*, host: str) -> str:
+        calls.append(host)
+        return "gho-keychain"
+
+    monkeypatch.setattr(copilot_auth, "read_macos_keychain_token", fake_read)
+    assert copilot_auth._read_macos_keychain_oauth_token() == "gho-keychain"
+    assert calls == ["github.com"]
+
+
 def test_read_cached_oauth_token_reads_hosts_file(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -97,6 +195,7 @@ def test_read_cached_oauth_token_reads_hosts_file(
     monkeypatch.delenv("GITHUB_COPILOT_TOKEN", raising=False)
     monkeypatch.setenv("GITHUB_COPILOT_TOKEN_FILE", str(hosts))
     monkeypatch.setattr(copilot_auth, "_read_windows_copilot_cli_oauth_token", lambda: None)
+    monkeypatch.setattr(copilot_auth, "_read_macos_keychain_oauth_token", lambda: None)
     monkeypatch.setattr(copilot_auth, "_read_gh_cli_oauth_token", lambda: None)
 
     assert copilot_auth.read_cached_oauth_token() == "gho-file"
@@ -112,6 +211,7 @@ def test_read_cached_oauth_token_skips_expired_entries(
     )
     monkeypatch.setenv("GITHUB_COPILOT_TOKEN_FILE", str(hosts))
     monkeypatch.setattr(copilot_auth, "_read_windows_copilot_cli_oauth_token", lambda: None)
+    monkeypatch.setattr(copilot_auth, "_read_macos_keychain_oauth_token", lambda: None)
     monkeypatch.setattr(copilot_auth, "_read_gh_cli_oauth_token", lambda: None)
 
     assert copilot_auth.read_cached_oauth_token() is None

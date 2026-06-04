@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import threading
 from types import MethodType, SimpleNamespace
 
+from headroom.proxy.handlers import openai as openai_handler
 from headroom.proxy.handlers.openai import OpenAIHandlerMixin
+from headroom.transforms.compression_units import UnitCompressionResult
 from headroom.transforms.content_router import (
     CompressionStrategy,
     ContentRouter,
@@ -22,6 +25,69 @@ def _handler_with_router(router: ContentRouter) -> OpenAIHandlerMixin:
         get_token_counter=lambda _model: TokenCounter(),
     )
     return handler
+
+
+def test_openai_responses_unit_parallelism_env_defaults_and_clamps(monkeypatch):
+    monkeypatch.delenv("HEADROOM_TOOL_OUTPUT_COMPRESSION_PARALLELISM", raising=False)
+    assert openai_handler._openai_responses_unit_parallelism() == 4
+
+    monkeypatch.setenv("HEADROOM_TOOL_OUTPUT_COMPRESSION_PARALLELISM", "bad")
+    assert openai_handler._openai_responses_unit_parallelism() == 4
+
+    monkeypatch.setenv("HEADROOM_TOOL_OUTPUT_COMPRESSION_PARALLELISM", "0")
+    assert openai_handler._openai_responses_unit_parallelism() == 1
+
+    monkeypatch.setenv("HEADROOM_TOOL_OUTPUT_COMPRESSION_PARALLELISM", "999")
+    assert openai_handler._openai_responses_unit_parallelism() == 16
+
+
+def test_openai_responses_cached_unit_handles_results_without_router_result():
+    result = UnitCompressionResult(
+        original="original",
+        compressed="compressed",
+        modified=True,
+        tokens_before=2,
+        tokens_after=1,
+        tokens_saved=1,
+        transforms_applied=[],
+        strategy="none",
+        router_result=None,
+    )
+
+    assert openai_handler._openai_responses_result_with_cache_hit(result) is result
+
+
+def test_openai_responses_unit_cache_evicts_oldest_entry(monkeypatch):
+    monkeypatch.setattr(openai_handler, "_OPENAI_RESPONSES_UNIT_CACHE_MAX_ENTRIES", 1)
+    handler = OpenAIHandlerMixin()
+    first = UnitCompressionResult(
+        original="first",
+        compressed="first compressed",
+        modified=True,
+        tokens_before=2,
+        tokens_after=1,
+        tokens_saved=1,
+        transforms_applied=[],
+        strategy="none",
+        router_result=None,
+    )
+    second = UnitCompressionResult(
+        original="second",
+        compressed="second compressed",
+        modified=True,
+        tokens_before=2,
+        tokens_after=1,
+        tokens_saved=1,
+        transforms_applied=[],
+        strategy="none",
+        router_result=None,
+    )
+
+    handler._store_openai_responses_cached_unit("first", first)
+    handler._store_openai_responses_cached_unit("second", second)
+
+    assert handler._get_openai_responses_cached_unit("first") is None
+    assert handler._get_openai_responses_cached_unit("second") is second
 
 
 def test_openai_responses_adapter_compresses_only_live_text_slots():
@@ -108,6 +174,162 @@ def test_openai_responses_adapter_compresses_custom_tool_call_output():
     assert "router:openai:responses:custom_tool_call_output:kompress" in transforms
     assert units_by_category == {"applied": 1}
     assert strategy_chain == []
+
+
+def test_openai_responses_adapter_reuses_exact_tool_output_cache():
+    router = ContentRouter()
+    calls = {"count": 0}
+
+    def compress(self, content: str, **_kwargs):
+        calls["count"] += 1
+        return RouterCompressionResult(
+            compressed="cached output summary",
+            original=content,
+            strategy_used=CompressionStrategy.KOMPRESS,
+        )
+
+    router.compress = MethodType(compress, router)
+    handler = _handler_with_router(router)
+    long_text = " ".join(f"word{i}" for i in range(180))
+
+    payload_one = {
+        "model": "gpt-5",
+        "input": [
+            {"type": "local_shell_call_output", "call_id": "c1", "output": long_text},
+        ],
+    }
+    payload_two = {
+        "model": "gpt-5",
+        "input": [
+            {"type": "message", "role": "user", "content": "changed envelope"},
+            {"type": "local_shell_call_output", "call_id": "c2", "output": long_text},
+        ],
+    }
+
+    new_payload_one, modified_one, saved_one, *_ = (
+        handler._compress_openai_responses_live_text_units_with_router(
+            payload_one,
+            model="gpt-5",
+            request_id="req_cache_one",
+        )
+    )
+    new_payload_two, modified_two, saved_two, *_ = (
+        handler._compress_openai_responses_live_text_units_with_router(
+            payload_two,
+            model="gpt-5",
+            request_id="req_cache_two",
+        )
+    )
+
+    assert calls["count"] == 1
+    assert modified_one is True
+    assert modified_two is True
+    assert saved_one > 0
+    assert saved_two == saved_one
+    assert new_payload_one["input"][0]["output"] == "cached output summary"
+    assert new_payload_two["input"][1]["output"] == "cached output summary"
+
+
+def test_openai_responses_adapter_reuses_identical_tool_output_in_same_request():
+    router = ContentRouter()
+    calls = {"count": 0}
+
+    def compress(self, content: str, **_kwargs):
+        calls["count"] += 1
+        return RouterCompressionResult(
+            compressed="same request cached summary",
+            original=content,
+            strategy_used=CompressionStrategy.KOMPRESS,
+        )
+
+    router.compress = MethodType(compress, router)
+    handler = _handler_with_router(router)
+    long_text = " ".join(f"word{i}" for i in range(180))
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            {"type": "function_call_output", "call_id": "c1", "output": long_text},
+            {"type": "function_call_output", "call_id": "c2", "output": long_text},
+        ],
+    }
+
+    new_payload, modified, saved, *_ = (
+        handler._compress_openai_responses_live_text_units_with_router(
+            payload,
+            model="gpt-5",
+            request_id="req_same_request_cache",
+        )
+    )
+
+    assert calls["count"] == 1
+    assert modified is True
+    assert saved > 0
+    assert [item["output"] for item in new_payload["input"]] == [
+        "same request cached summary",
+        "same request cached summary",
+    ]
+
+
+def test_openai_responses_adapter_parallelizes_cache_misses_preserving_order(monkeypatch):
+    monkeypatch.setenv("HEADROOM_TOOL_OUTPUT_COMPRESSION_PARALLELISM", "4")
+    router = ContentRouter()
+    lock = threading.Lock()
+    release = threading.Event()
+    active = {"count": 0, "max": 0}
+
+    def compress(self, content: str, **_kwargs):
+        with lock:
+            active["count"] += 1
+            active["max"] = max(active["max"], active["count"])
+            if active["count"] >= 2:
+                release.set()
+        release.wait(0.05)
+        try:
+            marker = content.rsplit(" marker", 1)[1]
+            return RouterCompressionResult(
+                compressed=f"summary marker{marker}",
+                original=content,
+                strategy_used=CompressionStrategy.KOMPRESS,
+            )
+        finally:
+            with lock:
+                active["count"] -= 1
+
+    router.compress = MethodType(compress, router)
+    handler = _handler_with_router(router)
+
+    def long_text(index: int) -> str:
+        return " ".join(f"word{index}_{j}" for j in range(180)) + f" marker{index}"
+
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            {
+                "type": "local_shell_call_output",
+                "call_id": f"c{i}",
+                "output": long_text(i),
+            }
+            for i in range(4)
+        ],
+    }
+
+    new_payload, modified, saved, *_ = (
+        handler._compress_openai_responses_live_text_units_with_router(
+            payload,
+            model="gpt-5",
+            request_id="req_parallel",
+        )
+    )
+
+    assert active["max"] >= 2
+    assert modified is True
+    assert saved > 0
+    assert [item["output"] for item in new_payload["input"]] == [
+        "summary marker0",
+        "summary marker1",
+        "summary marker2",
+        "summary marker3",
+    ]
 
 
 def test_openai_responses_adapter_accepts_empty_input_list():
