@@ -1329,6 +1329,20 @@ def persist(self, order):
         result = compressor.compress(code, language="python")
         assert "self.last_order = order" in result.compressed
 
+    def test_javascript_member_assignment_detected_as_effectful(self):
+        """Member assignments in JS should be treated as effectful structurally."""
+        compressor = self._make_compressor(max_body_lines=2)
+        code = """
+function persist(service, payload) {
+    const a = 1;
+    const b = 2;
+    service.lastPayload = payload;
+    return a + b;
+}
+"""
+        result = compressor.compress(code, language="javascript")
+        assert "service.lastPayload = payload;" in result.compressed
+
     def test_dependency_closure_keeps_assignment_for_return(self):
         """Returning a variable should pull in its nearest defining assignment."""
         compressor = self._make_compressor(max_body_lines=2)
