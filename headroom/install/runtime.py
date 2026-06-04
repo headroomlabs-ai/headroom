@@ -149,8 +149,17 @@ def _write_pid(profile: str, pid: int) -> None:
     path.write_text(str(pid))
 
 
-def _read_pid(profile: str) -> int | None:
-    path = pid_path(profile)
+def _agent_pid_path(profile: str) -> Path:
+    return pid_path(profile).with_name("agent.pid")
+
+
+def _write_agent_pid(profile: str, pid: int) -> None:
+    path = _agent_pid_path(profile)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(str(pid))
+
+
+def _read_pid_file(path: Path) -> int | None:
     if not path.exists():
         return None
     try:
@@ -159,10 +168,39 @@ def _read_pid(profile: str) -> int | None:
         return None
 
 
+def _read_pid(profile: str) -> int | None:
+    return _read_pid_file(pid_path(profile))
+
+
+def _read_agent_pid(profile: str) -> int | None:
+    return _read_pid_file(_agent_pid_path(profile))
+
+
 def _clear_pid(profile: str) -> None:
     path = pid_path(profile)
     if path.exists():
         path.unlink()
+
+
+def _clear_agent_pid(profile: str) -> None:
+    path = _agent_pid_path(profile)
+    if path.exists():
+        path.unlink()
+
+
+def _terminate_pid(pid: int, *, process_group: bool = False) -> None:
+    try:
+        if process_group and not _is_windows():
+            os.killpg(pid, signal.SIGTERM)
+        else:
+            os.kill(pid, signal.SIGTERM)
+    except OSError:
+        if not process_group:
+            return
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            return
 
 
 def run_foreground(manifest: DeploymentManifest) -> int:
@@ -191,6 +229,7 @@ def run_foreground(manifest: DeploymentManifest) -> int:
             return proc.wait()
         finally:
             _clear_pid(manifest.profile)
+            _clear_agent_pid(manifest.profile)
 
 
 def start_detached_agent(profile: str) -> subprocess.Popen[str]:
@@ -208,7 +247,9 @@ def start_detached_agent(profile: str) -> subprocess.Popen[str]:
         )
     else:
         kwargs["start_new_session"] = True
-    return subprocess.Popen(command, **kwargs)
+    proc = subprocess.Popen(command, **kwargs)
+    _write_agent_pid(profile, proc.pid)
+    return proc
 
 
 def start_persistent_docker(manifest: DeploymentManifest) -> None:
@@ -239,14 +280,16 @@ def stop_runtime(manifest: DeploymentManifest) -> None:
         )
         return
 
+    agent_pid = _read_agent_pid(manifest.profile)
+    if agent_pid is not None:
+        _terminate_pid(agent_pid, process_group=True)
+
     pid = _read_pid(manifest.profile)
-    if pid is None:
-        return
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except OSError:
-        pass
+    if pid is not None and pid != agent_pid:
+        _terminate_pid(pid)
+
     _clear_pid(manifest.profile)
+    _clear_agent_pid(manifest.profile)
 
 
 def wait_ready(manifest: DeploymentManifest, timeout_seconds: int = 30) -> bool:
@@ -269,11 +312,12 @@ def runtime_status(manifest: DeploymentManifest) -> str:
         if manifest.container_name in result.stdout.splitlines():
             return "running"
         return "stopped"
-    pid = _read_pid(manifest.profile)
-    if pid is None:
-        return "stopped"
-    try:
-        os.kill(pid, 0)
-    except OSError:
-        return "stopped"
-    return "running"
+    for pid in (_read_agent_pid(manifest.profile), _read_pid(manifest.profile)):
+        if pid is None:
+            continue
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            continue
+        return "running"
+    return "stopped"

@@ -87,8 +87,9 @@ its context window.
 # If the local compression executor is saturated, restart the local proxy.
 headroom install restart --profile init-user
 
-# If large valid requests need more time, raise the compression timeout.
-HEADROOM_COMPRESSION_TIMEOUT_SECONDS=60 headroom proxy
+# If large valid requests need more time, raise the compression timeout
+# for the persistent proxy restart.
+HEADROOM_COMPRESSION_TIMEOUT_SECONDS=60 headroom install restart --profile init-user
 ```
 
 ---

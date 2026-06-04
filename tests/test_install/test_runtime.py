@@ -5,11 +5,14 @@ from pathlib import Path
 
 from headroom.install.models import DeploymentManifest, InstallPreset
 from headroom.install.runtime import (
+    _clear_agent_pid,
     _clear_pid,
     _deployment_env,
     _mount_source,
+    _read_agent_pid,
     _read_pid,
     _runtime_env,
+    _write_agent_pid,
     _write_pid,
     build_runtime_command,
     resolve_headroom_command,
@@ -192,18 +195,27 @@ def test_read_pid_handles_invalid_content(monkeypatch, tmp_path: Path) -> None:
     pid_file = tmp_path / ".headroom" / "deploy" / "default" / "runner.pid"
     pid_file.parent.mkdir(parents=True)
     pid_file.write_text("not-a-pid", encoding="utf-8")
+    agent_pid_file = tmp_path / ".headroom" / "deploy" / "default" / "agent.pid"
+    agent_pid_file.write_text("not-a-pid", encoding="utf-8")
 
     assert _read_pid("default") is None
+    assert _read_agent_pid("default") is None
     _clear_pid("default")
+    _clear_agent_pid("default")
     assert not pid_file.exists()
+    assert not agent_pid_file.exists()
 
 
 def test_write_read_and_clear_pid(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     _write_pid("default", 456)
+    _write_agent_pid("default", 654)
     assert _read_pid("default") == 456
+    assert _read_agent_pid("default") == 654
     _clear_pid("default")
+    _clear_agent_pid("default")
     assert _read_pid("default") is None
+    assert _read_agent_pid("default") is None
 
 
 def test_run_foreground_and_detached_helpers(monkeypatch, tmp_path: Path) -> None:
@@ -256,11 +268,13 @@ def test_run_foreground_and_detached_helpers(monkeypatch, tmp_path: Path) -> Non
         host="127.0.0.1",
         backend="anthropic",
     )
+    _write_agent_pid("default", 999)
     assert run_foreground(manifest) == 7
     assert popen_calls[0][0] == ["headroom", "proxy"]
     assert signal.SIGINT in signal_calls
     assert signal.SIGTERM in signal_calls
     assert _read_pid("default") is None
+    assert _read_agent_pid("default") is None
 
     monkeypatch.setattr("headroom.install.runtime.resolve_headroom_command", lambda: ["headroom"])
     monkeypatch.setattr("headroom.install.runtime.sys.platform", "win32")
@@ -273,6 +287,7 @@ def test_run_foreground_and_detached_helpers(monkeypatch, tmp_path: Path) -> Non
         "headroom.install.runtime.subprocess.Popen", lambda command, **kwargs: fake_proc_nt
     )
     assert start_detached_agent("demo") is fake_proc_nt
+    assert _read_agent_pid("demo") == fake_proc_nt.pid
 
     monkeypatch.setattr("headroom.install.runtime.sys.platform", "linux")
     fake_proc_posix = FakeProc()
@@ -280,6 +295,7 @@ def test_run_foreground_and_detached_helpers(monkeypatch, tmp_path: Path) -> Non
         "headroom.install.runtime.subprocess.Popen", lambda command, **kwargs: fake_proc_posix
     )
     assert start_detached_agent("demo") is fake_proc_posix
+    assert _read_agent_pid("demo") == fake_proc_posix.pid
 
 
 def test_start_stop_wait_and_runtime_status_branches(monkeypatch, tmp_path: Path) -> None:
@@ -345,14 +361,22 @@ def test_start_stop_wait_and_runtime_status_branches(monkeypatch, tmp_path: Path
         backend="anthropic",
         health_url="http://127.0.0.1:8787/health",
     )
+    _write_agent_pid("default", 122)
     _write_pid("default", 123)
+    killed_groups: list[tuple[int, int]] = []
     killed: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        "headroom.install.runtime.os.killpg",
+        lambda pid, sig: killed_groups.append((pid, sig)),
+    )
     monkeypatch.setattr(
         "headroom.install.runtime.os.kill", lambda pid, sig: killed.append((pid, sig))
     )
     stop_runtime(python_manifest)
+    assert killed_groups == [(122, signal.SIGTERM)]
     assert killed == [(123, signal.SIGTERM)]
     assert _read_pid("default") is None
+    assert _read_agent_pid("default") is None
 
     _write_pid("default", 124)
     monkeypatch.setattr(
@@ -386,6 +410,16 @@ def test_start_stop_wait_and_runtime_status_branches(monkeypatch, tmp_path: Path
     )
     assert runtime_status(manifest) == "stopped"
     assert runtime_status(python_manifest) == "stopped"
+
+    _write_agent_pid("default", 124)
+    status_checks: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        "headroom.install.runtime.os.kill",
+        lambda pid, sig: status_checks.append((pid, sig)),
+    )
+    assert runtime_status(python_manifest) == "running"
+    assert status_checks == [(124, 0)]
+    _clear_agent_pid("default")
 
     _write_pid("default", 125)
     monkeypatch.setattr(
