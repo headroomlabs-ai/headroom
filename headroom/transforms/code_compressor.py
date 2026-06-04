@@ -57,7 +57,10 @@ logger = logging.getLogger(__name__)
 
 # Lazy import for optional dependency
 _tree_sitter_available: bool | None = None
-_tree_sitter_languages: dict[str, Any] = {}
+# Per-thread parser cache: pyo3 marks _native::Parser as Unsendable, so parser
+# objects created on one thread panic if accessed from another.  threading.local()
+# ensures every thread maintains its own isolated set of parser instances.
+_tree_sitter_local = threading.local()
 _tree_sitter_lock = threading.Lock()
 
 
@@ -87,30 +90,31 @@ def _get_parser(language: str) -> Any:
         ImportError: If tree-sitter is not installed.
         ValueError: If language is not supported.
     """
-    global _tree_sitter_languages
-
     if not _check_tree_sitter_available():
         raise ImportError(
             "tree-sitter is not installed. Install with: pip install headroom-ai[code]\n"
             "This adds ~50MB for tree-sitter grammars."
         )
 
-    with _tree_sitter_lock:
-        if language not in _tree_sitter_languages:
-            try:
-                from tree_sitter_language_pack import get_parser
+    thread_parsers: dict[str, Any] | None = getattr(_tree_sitter_local, "parsers", None)
+    if thread_parsers is None:
+        thread_parsers = {}
+        _tree_sitter_local.parsers = thread_parsers
 
-                parser = get_parser(language)  # type: ignore[arg-type]
-                _tree_sitter_languages[language] = parser
-                logger.debug("Loaded tree-sitter parser for %s", language)
-            except Exception as e:
-                raise ValueError(
-                    f"Language '{language}' is not supported by tree-sitter. "
-                    f"Supported: python, javascript, typescript, go, rust, java, c, cpp. "
-                    f"Error: {e}"
-                ) from e
+    if language not in thread_parsers:
+        try:
+            from tree_sitter_language_pack import get_parser
 
-        return _tree_sitter_languages[language]
+            thread_parsers[language] = get_parser(language)  # type: ignore[arg-type]
+            logger.debug("Loaded tree-sitter parser for %s on thread %s", language, threading.current_thread().name)
+        except Exception as e:
+            raise ValueError(
+                f"Language '{language}' is not supported by tree-sitter. "
+                f"Supported: python, javascript, typescript, go, rust, java, c, cpp. "
+                f"Error: {e}"
+            ) from e
+
+    return thread_parsers[language]
 
 
 def is_tree_sitter_available() -> bool:
@@ -126,26 +130,24 @@ def is_tree_sitter_loaded() -> bool:
     """Check if any tree-sitter parsers are currently loaded.
 
     Returns:
-        True if parsers are loaded in memory.
+        True if parsers are loaded in the current thread.
     """
-    return len(_tree_sitter_languages) > 0
+    thread_parsers: dict[str, Any] | None = getattr(_tree_sitter_local, "parsers", None)
+    return bool(thread_parsers)
 
 
 def unload_tree_sitter() -> bool:
-    """Unload all tree-sitter parsers to free memory.
+    """Unload all tree-sitter parsers for the current thread to free memory.
 
     Returns:
         True if parsers were unloaded, False if none were loaded.
     """
-    global _tree_sitter_languages
-
-    with _tree_sitter_lock:
-        if _tree_sitter_languages:
-            count = len(_tree_sitter_languages)
-            _tree_sitter_languages.clear()
-            logger.info("Unloaded %d tree-sitter parsers", count)
-            return True
-
+    thread_parsers: dict[str, Any] | None = getattr(_tree_sitter_local, "parsers", None)
+    if thread_parsers:
+        count = len(thread_parsers)
+        thread_parsers.clear()
+        logger.info("Unloaded %d tree-sitter parsers from thread %s", count, threading.current_thread().name)
+        return True
     return False
 
 

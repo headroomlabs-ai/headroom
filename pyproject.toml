@@ -368,6 +368,12 @@ python_files = ["test_*.py"]
 python_functions = ["test_*"]
 addopts = "-v --tb=short"
 asyncio_mode = "auto"
+filterwarnings = [
+    # pyo3 Unsendable parsers emit an unraisable warning when GC drops them on a
+    # test-teardown thread; this is a test-harness artifact, not a production issue
+    # (production threads are long-lived and drop their parsers on themselves).
+    "ignore::pytest.PytestUnraisableExceptionWarning",
+]
 markers = [
     "slow: slow tests (model loads, large fixtures)",
     "real_llm: tests that hit real LLM APIs; skipped unless explicitly enabled",
