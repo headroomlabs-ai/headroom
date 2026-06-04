@@ -1512,6 +1512,7 @@ class CodeAwareCompressor(Transform):
         # Handle Python docstrings via AST
         docstring_text = ""
         ds_skip_lines = 0
+        ds_end_row = body_node.start_point[0] - 1
         if language == CodeLanguage.PYTHON and body_node.child_count > 0:
             first_child = body_node.children[0]
             # tree-sitter Python may represent docstrings as:
@@ -1585,6 +1586,7 @@ class CodeAwareCompressor(Transform):
                                 docstring_text = first_ds_line
                 # elif REMOVE: docstring_text stays empty
                 ds_skip_lines = ds_start_rel + ds_lines_count
+                ds_end_row = ds_node.end_point[0]
 
         # --- Statement-based body truncation (never cuts mid-expression) ---
         #
@@ -2118,13 +2120,20 @@ def _collect_statement_symbols(
                     target.add(name)
 
     # Definition heuristics: look at the left-hand side / declaration target only.
-    for child in getattr(node, "children", []):
-        if child.type in lang_config.assignment_nodes:
-            child_children = getattr(child, "children", [])
-            if child_children:
-                add_identifiers(defined, child_children[0])
-            else:
-                add_identifiers(defined, child)
+    assignment_nodes: list[Any] = []
+    if getattr(node, "type", "") in lang_config.assignment_nodes:
+        assignment_nodes.append(node)
+    assignment_nodes.extend(
+        child
+        for child in getattr(node, "children", [])
+        if getattr(child, "type", "") in lang_config.assignment_nodes
+    )
+    for assignment in assignment_nodes:
+        assignment_children = getattr(assignment, "children", [])
+        if assignment_children:
+            add_identifiers(defined, assignment_children[0])
+        else:
+            add_identifiers(defined, assignment)
 
     # Reference / call heuristics from descendants.
     for desc in _iter_descendants(node):
@@ -2186,8 +2195,13 @@ def _detect_side_effect(unit: _StatementUnit, lang_config: LangConfig) -> bool:
     }:
         return True
 
-    if node_type in lang_config.assignment_nodes:
-        lhs = getattr(unit.node, "children", [])[:1]
+    assignment_nodes = [
+        desc
+        for desc in _iter_descendants(unit.node)
+        if getattr(desc, "type", "") in lang_config.assignment_nodes
+    ]
+    for assignment in assignment_nodes:
+        lhs = getattr(assignment, "children", [])[:1]
         for child in lhs:
             if getattr(child, "type", "") in lang_config.mutation_receiver_nodes:
                 return True
@@ -2270,12 +2284,20 @@ def _select_statement_units(units: list[_StatementUnit], body_limit: int) -> lis
     if not units:
         return []
 
-    must_keep: list[_StatementUnit] = [units[0]]
+    must_keep: list[_StatementUnit] = []
     must_keep.extend(unit for unit in units if unit.is_guard_clause)
     terminal_candidates = [u for u in units if u.has_return or u.has_raise or u.has_yield]
     if terminal_candidates:
         must_keep.append(terminal_candidates[-1])
     must_keep.extend(unit for unit in units if unit.context_hit)
+
+    # Preserve likely side effects before low-value setup statements. This lets
+    # calls/member mutations compete with the first statement instead of being
+    # starved when a tiny budget is already consumed by first+terminal.
+    side_effects = [unit for unit in units if unit.has_side_effect]
+    if side_effects:
+        side_effects.sort(key=lambda u: (-u.importance_score, u.idx))
+        must_keep.append(side_effects[0])
 
     dedup: dict[int, _StatementUnit] = {u.idx: u for u in must_keep}
     selected = sorted(dedup.values(), key=lambda u: u.idx)
@@ -2286,7 +2308,17 @@ def _select_statement_units(units: list[_StatementUnit], body_limit: int) -> lis
     candidates = [u for u in units if u.idx not in selected_ids]
     candidates.sort(key=lambda u: (-u.importance_score, u.idx))
 
+    # Keep the first statement when it fits or when nothing stronger was selected,
+    # but do not let a low-value first assignment crowd out terminal/guard/effect
+    # statements under very small budgets.
+    if units[0].idx not in selected_ids and (used + units[0].line_count <= body_limit or not selected):
+        selected.append(units[0])
+        selected_ids.add(units[0].idx)
+        used += units[0].line_count
+
     for unit in candidates:
+        if unit.idx in selected_ids:
+            continue
         if used + unit.line_count <= body_limit:
             selected.append(unit)
             selected_ids.add(unit.idx)

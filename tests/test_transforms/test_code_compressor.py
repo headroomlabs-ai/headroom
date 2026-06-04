@@ -41,6 +41,15 @@ def _count_function_body_lines(compressed: str, func_name: str) -> int:
             body_count += 1
     return body_count
 
+
+def _assert_statement_selection_ran(result: CodeCompressionResult, language: CodeLanguage) -> None:
+    """Assert targeted statement-selection tests did not pass via fallback/original output."""
+    assert result.language == language
+    assert result.syntax_valid is True
+    assert result.compression_ratio < 1.0
+    assert "lines omitted" in result.compressed
+
+
 # Try to import for availability check
 try:
     import tree_sitter_language_pack  # noqa: F401
@@ -1285,6 +1294,7 @@ def sync_user(user):
     return result
 '''
         result = compressor.compress(code, language="python")
+        _assert_statement_selection_ran(result, CodeLanguage.PYTHON)
         assert "return result" in result.compressed
 
     def test_guard_clause_preserved(self):
@@ -1299,6 +1309,7 @@ def process(items):
     return logged
 '''
         result = compressor.compress(code, language="python")
+        _assert_statement_selection_ran(result, CodeLanguage.PYTHON)
         assert "if not prepared:" in result.compressed
         assert "return []" in result.compressed
 
@@ -1314,6 +1325,7 @@ def persist(order):
     return c
 '''
         result = compressor.compress(code, language="python")
+        _assert_statement_selection_ran(result, CodeLanguage.PYTHON)
         assert "emit(order)" in result.compressed
 
     def test_member_assignment_detected_as_effectful(self):
@@ -1327,6 +1339,7 @@ def persist(self, order):
     return a + b
 '''
         result = compressor.compress(code, language="python")
+        _assert_statement_selection_ran(result, CodeLanguage.PYTHON)
         assert "self.last_order = order" in result.compressed
 
     def test_javascript_member_assignment_detected_as_effectful(self):
@@ -1341,6 +1354,7 @@ function persist(service, payload) {
 }
 """
         result = compressor.compress(code, language="javascript")
+        _assert_statement_selection_ran(result, CodeLanguage.JAVASCRIPT)
         assert "service.lastPayload = payload;" in result.compressed
 
     def test_dependency_closure_keeps_assignment_for_return(self):
@@ -1353,6 +1367,7 @@ def build(user):
     return result
 '''
         result = compressor.compress(code, language="python")
+        _assert_statement_selection_ran(result, CodeLanguage.PYTHON)
         assert "return result" in result.compressed
         assert "result = create_profile(user, seed)" in result.compressed
 
@@ -1369,6 +1384,7 @@ class Service:
         return result
 '''
         result = compressor.compress(code, language="python")
+        _assert_statement_selection_ran(result, CodeLanguage.PYTHON)
         assert "if not cleaned:" in result.compressed
         assert "return result" in result.compressed
 
@@ -1382,6 +1398,7 @@ def do_work(payload):
     return result
 '''
         result = compressor.compress(code, language="python", context="investigate result path")
+        _assert_statement_selection_ran(result, CodeLanguage.PYTHON)
         assert "return result" in result.compressed
 
     def test_syntax_still_valid_with_importance(self):
