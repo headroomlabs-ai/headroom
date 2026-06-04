@@ -99,6 +99,7 @@ from headroom.providers.registry import (
     build_proxy_provider_runtime,
     create_proxy_backend,
     format_backend_status,
+    resolve_api_targets,
 )
 
 # =============================================================================
@@ -3020,6 +3021,9 @@ def run_server(
         bedrock_region=config.bedrock_region,
     )
 
+    # Resolve upstream API targets for display in the banner (#583).
+    api_targets = resolve_api_targets(config.provider_api_overrides)
+
     if print_banner:
         print(f"""
 ╔══════════════════════════════════════════════════════════════════════╗
@@ -3029,6 +3033,12 @@ def run_server(
 ║  Listening: http://{config.host}:{config.port:<5}                                      ║
 ║  Workers: {workers:<3}  Concurrency Limit: {limit_concurrency:<5}                          ║
 ║  Backend: {backend_status:<59}║
+╠══════════════════════════════════════════════════════════════════════╣
+║  UPSTREAM TARGETS:                                                   ║
+║    Anthropic:  {api_targets.anthropic:<57}║
+║    OpenAI:     {api_targets.openai:<57}║
+║    Gemini:     {api_targets.gemini:<57}║
+║    Cloud Code: {api_targets.cloudcode:<57}║
 ╠══════════════════════════════════════════════════════════════════════╣
 ║  FEATURES:                                                           ║
 ║    Optimization:    {"ENABLED " if config.optimize else "DISABLED"}                                       ║
