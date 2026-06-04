@@ -70,7 +70,14 @@ proxy = [
     "transformers>=4.30.0",       # Tokenizer only (for Kompress)
     "watchdog>=4.0.0",            # File watcher for live code graph reindexing (--code-graph)
     "sqlite-vec>=0.1.6",          # Vector index for memory (--memory). Lightweight, no torch.
-    "gunicorn>=21.0.0",           # Optional WSGI/ASGI server for production deployment
+]
+# Production ASGI/WSGI server — Unix-only (gunicorn does not support Windows).
+# Kept separate from [proxy] so that dev, CI, and Windows users are not forced
+# to install a non-functional package.  Production deployments should use:
+#   pip install headroom-ai[proxy,proxy-prod]
+proxy-prod = [
+    "headroom-ai[proxy]",
+    "gunicorn>=21.0.0; sys_platform != 'win32'",
 ]
 # AST-based code compression (tree-sitter)
 code = [
