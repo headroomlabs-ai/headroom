@@ -25,6 +25,22 @@ from headroom.transforms.code_compressor import (
     unload_tree_sitter,
 )
 
+
+def _count_function_body_lines(compressed: str, func_name: str) -> int:
+    """Count retained non-docstring body lines for a Python function in compressed output."""
+    lines = compressed.split("\n")
+    in_func = False
+    body_count = 0
+    for line in lines:
+        if line.startswith(f"def {func_name}"):
+            in_func = True
+            continue
+        if in_func and line.startswith("def "):
+            break
+        if in_func and line.strip() and not line.strip().startswith('"""'):
+            body_count += 1
+    return body_count
+
 # Try to import for availability check
 try:
     import tree_sitter_language_pack  # noqa: F401
@@ -1255,6 +1271,79 @@ function _internalDebug(msg) {
         # fetchUser is called by processUser — should score higher than _internalDebug
         if "fetchUser" in result.symbol_scores and "_internalDebug" in result.symbol_scores:
             assert result.symbol_scores["fetchUser"] > result.symbol_scores["_internalDebug"]
+
+    def test_late_return_preserved_in_long_function(self):
+        """A late terminal return should survive MVP statement selection."""
+        compressor = self._make_compressor(max_body_lines=2)
+        code = '''
+def sync_user(user):
+    payload = normalize(user)
+    if not payload:
+        return None
+    token = load_token()
+    result = call_remote_api(payload, token)
+    return result
+'''
+        result = compressor.compress(code, language="python")
+        assert "return result" in result.compressed
+
+    def test_guard_clause_preserved(self):
+        """Early guard clauses should be preserved."""
+        compressor = self._make_compressor(max_body_lines=2)
+        code = '''
+def process(items):
+    prepared = normalize(items)
+    if not prepared:
+        return []
+    logged = audit(prepared)
+    return logged
+'''
+        result = compressor.compress(code, language="python")
+        assert "if not prepared:" in result.compressed
+        assert "return []" in result.compressed
+
+    def test_side_effect_preferred_over_low_value_setup(self):
+        """Side-effect statements should be retained ahead of low-value setup detail."""
+        compressor = self._make_compressor(max_body_lines=2)
+        code = '''
+def persist(order):
+    a = 1
+    b = 2
+    c = a + b
+    save_order(order)
+    return c
+'''
+        result = compressor.compress(code, language="python")
+        assert "save_order(order)" in result.compressed
+
+    def test_dependency_closure_keeps_assignment_for_return(self):
+        """Returning a variable should pull in its nearest defining assignment."""
+        compressor = self._make_compressor(max_body_lines=2)
+        code = '''
+def build(user):
+    seed = 1
+    result = create_profile(user, seed)
+    return result
+'''
+        result = compressor.compress(code, language="python")
+        assert "return result" in result.compressed
+        assert "result = create_profile(user, seed)" in result.compressed
+
+    def test_class_method_mvp_selection_preserves_guard_and_return(self):
+        """Methods routed through class compression should use the same statement selection."""
+        compressor = self._make_compressor(max_body_lines=2)
+        code = '''
+class Service:
+    def handle(self, payload):
+        cleaned = normalize(payload)
+        if not cleaned:
+            return None
+        result = save_payload(cleaned)
+        return result
+'''
+        result = compressor.compress(code, language="python")
+        assert "if not cleaned:" in result.compressed
+        assert "return result" in result.compressed
 
     def test_syntax_still_valid_with_importance(self):
         """Compressed output with importance remains syntactically valid."""
