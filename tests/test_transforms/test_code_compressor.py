@@ -1345,6 +1345,18 @@ class Service:
         assert "if not cleaned:" in result.compressed
         assert "return result" in result.compressed
 
+    def test_identifier_based_context_hit_preserves_relevant_statement(self):
+        """Context should preserve symbol-matching statements without raw text scanning."""
+        compressor = self._make_compressor(max_body_lines=1)
+        code = '''
+def do_work(payload):
+    prepared = normalize(payload)
+    result = call_remote_api(prepared)
+    return result
+'''
+        result = compressor.compress(code, language="python", context="investigate result path")
+        assert "return result" in result.compressed
+
     def test_syntax_still_valid_with_importance(self):
         """Compressed output with importance remains syntactically valid."""
         compressor = self._make_compressor()
