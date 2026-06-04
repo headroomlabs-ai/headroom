@@ -10,6 +10,9 @@ Anthropic), not the full input price.  This prevents overstating dollar savings.
 
 from __future__ import annotations
 
+import csv
+import io
+import json
 import logging
 import re
 from dataclasses import dataclass, field
@@ -770,3 +773,140 @@ def _generate_recommendations(report: PerfReport) -> list[str]:
             break
 
     return recs
+
+
+def _record_to_dict(record: object) -> dict[str, object]:
+    """Convert a dataclass record to a plain dict for serialization."""
+    from dataclasses import fields as dc_fields
+
+    return {f.name: getattr(record, f.name) for f in dc_fields(record)}  # type: ignore[arg-type]
+
+
+def _build_summary(report: PerfReport) -> dict[str, object]:
+    """Build a summary dict with aggregated stats from the report."""
+    records = report.perf_records
+    summary: dict[str, object] = {
+        "request_count": len(records),
+        "log_files_read": report.log_files_read,
+        "total_lines_parsed": report.total_lines_parsed,
+        "requested_hours": report.requested_hours,
+        "oldest_kept_ts": report.oldest_kept_ts,
+        "newest_kept_ts": report.newest_kept_ts,
+        "records_filtered_out": report.records_filtered_out,
+    }
+
+    if records:
+        total_before = sum(r.tokens_before for r in records)
+        total_after = sum(r.tokens_after for r in records)
+        total_saved = sum(r.tokens_saved for r in records)
+        pct = (total_saved / total_before * 100) if total_before > 0 else 0
+        summary["total_tokens_before"] = total_before
+        summary["total_tokens_after"] = total_after
+        summary["total_tokens_saved"] = total_saved
+        summary["reduction_pct"] = round(pct, 1)
+
+        # Per-model breakdown
+        by_model: dict[str, dict[str, object]] = {}
+        for r in records:
+            entry = by_model.setdefault(r.model, {"requests": 0, "tokens_saved": 0, "tokens_before": 0})
+            entry["requests"] = int(str(entry["requests"])) + 1
+            entry["tokens_saved"] = int(str(entry["tokens_saved"])) + r.tokens_saved
+            entry["tokens_before"] = int(str(entry["tokens_before"])) + r.tokens_before
+        for model, stats in by_model.items():
+            m_before = int(str(stats["tokens_before"]))
+            m_saved = int(str(stats["tokens_saved"]))
+            stats["reduction_pct"] = round(m_saved / m_before * 100, 1) if m_before > 0 else 0.0
+            list_price = _get_list_price(model)
+            if list_price:
+                stats["list_price_per_mtok"] = round(list_price, 2)
+                stats["estimated_savings_usd"] = round(m_saved * list_price / 1_000_000, 4)
+        summary["per_model"] = by_model
+
+        # Cache analysis
+        cache_records = [r for r in records if (r.cache_read + r.cache_write) > 0]
+        if cache_records:
+            total_cr = sum(r.cache_read for r in cache_records)
+            total_cw = sum(r.cache_write for r in cache_records)
+            total_cache = total_cr + total_cw
+            hit_pct = (total_cr / total_cache * 100) if total_cache > 0 else 0
+            summary["cache"] = {
+                "cache_read_tokens": total_cr,
+                "cache_write_tokens": total_cw,
+                "hit_rate_pct": round(hit_pct, 1),
+            }
+
+        # Optimization latency
+        opt_times = [r.optimization_ms for r in records if r.optimization_ms > 0]
+        if opt_times:
+            summary["optimization_overhead"] = {
+                "avg_ms": round(sum(opt_times) / len(opt_times), 1),
+                "max_ms": round(max(opt_times), 1),
+                "slow_count_over_500ms": len([t for t in opt_times if t > 500]),
+            }
+
+    # Recommendations
+    recommendations = _generate_recommendations(report)
+    if recommendations:
+        summary["recommendations"] = recommendations
+
+    return summary
+
+
+def format_report_json(report: PerfReport) -> str:
+    """Format a PerfReport as a JSON string.
+
+    Args:
+        report: The PerfReport to format.
+
+    Returns:
+        A JSON string with summary, perf_records, router_records,
+        transform_records, and toin_records.
+    """
+    output = {
+        "summary": _build_summary(report),
+        "perf_records": [_record_to_dict(r) for r in report.perf_records],
+        "router_records": [_record_to_dict(r) for r in report.router_records],
+        "transform_records": [_record_to_dict(r) for r in report.transform_records],
+        "toin_records": [_record_to_dict(r) for r in report.toin_records],
+    }
+    return json.dumps(output, indent=2, ensure_ascii=False)
+
+
+def format_report_csv(report: PerfReport) -> str:
+    """Format the perf_records of a PerfReport as a CSV string.
+
+    Only exports ``perf_records`` (the richest data).  Other record types
+    (router, transform, toin) can be added in a follow-up if users request it.
+
+    Args:
+        report: The PerfReport to format.
+
+    Returns:
+        A CSV string with one row per perf record.
+    """
+    if not report.perf_records:
+        return "No performance data found"
+
+    buf = io.StringIO()
+    fieldnames = [
+        "timestamp",
+        "request_id",
+        "model",
+        "num_messages",
+        "tokens_before",
+        "tokens_after",
+        "tokens_saved",
+        "cache_read",
+        "cache_write",
+        "cache_hit_pct",
+        "optimization_ms",
+        "transforms",
+    ]
+    writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
+    writer.writeheader()
+    for r in report.perf_records:
+        row = _record_to_dict(r)
+        # Serialise transforms list as semicolon-separated string
+        row["transforms"] = ";".join(r.transforms) if r.transforms else ""
+        writer.writerow(row)
+    return buf.getvalue()

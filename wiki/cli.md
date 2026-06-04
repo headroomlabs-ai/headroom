@@ -316,12 +316,15 @@ Summarize recent proxy performance from the local proxy log.
 headroom perf
 headroom perf --hours 24
 headroom perf --raw
+headroom perf --format json    # JSON output for CI / agent consumption
+headroom perf --format csv     # CSV output for spreadsheets
 ```
 
 | Option | Default | Meaning |
 |---|---|---|
 | `--hours` | `168.0` | Time window in hours |
 | `--raw` | off | Print raw PERF records instead of the summarized report |
+| `--format` | `text` | Output format: `text`, `json`, or `csv` |
 
 The command reads `${HEADROOM_WORKSPACE_DIR}/logs/proxy.log` (defaults
 to `~/.headroom/logs/proxy.log` — see the
