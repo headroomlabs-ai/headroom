@@ -199,6 +199,14 @@ class LangConfig:
     uses_colon_after_signature: bool  # Python: True, C-family: False
     package_node: str | None = None  # e.g. "package_clause" for Go
 
+    # Statement-retention node families
+    terminal_nodes: frozenset[str] = frozenset()
+    assignment_nodes: frozenset[str] = frozenset()
+    call_nodes: frozenset[str] = frozenset()
+    member_access_nodes: frozenset[str] = frozenset()
+    mutation_receiver_nodes: frozenset[str] = frozenset()
+    effect_boundary_nodes: frozenset[str] = frozenset()
+
     # Quick pre-filter hints for language detection (substrings to check)
     detection_hints: tuple[str, ...] = ()
 
@@ -213,6 +221,12 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
         decorator_node="decorated_definition",
         comment_prefix="#",
         uses_colon_after_signature=True,
+        terminal_nodes=frozenset({"return_statement", "raise_statement", "yield_statement"}),
+        assignment_nodes=frozenset({"assignment", "augmented_assignment"}),
+        call_nodes=frozenset({"call"}),
+        member_access_nodes=frozenset({"attribute", "subscript"}),
+        mutation_receiver_nodes=frozenset({"attribute", "subscript"}),
+        effect_boundary_nodes=frozenset({"raise_statement", "try_statement", "with_statement"}),
         detection_hints=("def ", "import ", "from ", "class ", "async def"),
     ),
     CodeLanguage.JAVASCRIPT: LangConfig(
@@ -224,6 +238,12 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
         decorator_node=None,
         comment_prefix="//",
         uses_colon_after_signature=False,
+        terminal_nodes=frozenset({"return_statement", "throw_statement"}),
+        assignment_nodes=frozenset({"assignment_expression", "lexical_declaration", "variable_declaration"}),
+        call_nodes=frozenset({"call_expression"}),
+        member_access_nodes=frozenset({"member_expression", "subscript_expression"}),
+        mutation_receiver_nodes=frozenset({"member_expression", "subscript_expression"}),
+        effect_boundary_nodes=frozenset({"throw_statement", "try_statement"}),
         detection_hints=("function ", "const ", "let ", "var ", "export ", "require("),
     ),
     CodeLanguage.TYPESCRIPT: LangConfig(
@@ -235,6 +255,12 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
         decorator_node=None,
         comment_prefix="//",
         uses_colon_after_signature=False,
+        terminal_nodes=frozenset({"return_statement", "throw_statement"}),
+        assignment_nodes=frozenset({"assignment_expression", "lexical_declaration", "variable_declaration"}),
+        call_nodes=frozenset({"call_expression"}),
+        member_access_nodes=frozenset({"member_expression", "subscript_expression"}),
+        mutation_receiver_nodes=frozenset({"member_expression", "subscript_expression"}),
+        effect_boundary_nodes=frozenset({"throw_statement", "try_statement"}),
         detection_hints=("interface ", "type ", ": string", ": number", ": boolean"),
     ),
     CodeLanguage.GO: LangConfig(
@@ -247,6 +273,12 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
         comment_prefix="//",
         uses_colon_after_signature=False,
         package_node="package_clause",
+        terminal_nodes=frozenset({"return_statement"}),
+        assignment_nodes=frozenset({"short_var_declaration", "assignment_statement"}),
+        call_nodes=frozenset({"call_expression"}),
+        member_access_nodes=frozenset({"selector_expression", "index_expression"}),
+        mutation_receiver_nodes=frozenset({"selector_expression", "index_expression"}),
+        effect_boundary_nodes=frozenset(),
         detection_hints=("func ", "package ", "struct {"),
     ),
     CodeLanguage.RUST: LangConfig(
@@ -258,6 +290,12 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
         decorator_node=None,
         comment_prefix="//",
         uses_colon_after_signature=False,
+        terminal_nodes=frozenset({"return_expression"}),
+        assignment_nodes=frozenset({"let_declaration", "assignment_expression"}),
+        call_nodes=frozenset({"call_expression"}),
+        member_access_nodes=frozenset({"field_expression", "index_expression"}),
+        mutation_receiver_nodes=frozenset({"field_expression", "index_expression"}),
+        effect_boundary_nodes=frozenset(),
         detection_hints=("fn ", "struct ", "impl ", "mod ", "use "),
     ),
     CodeLanguage.JAVA: LangConfig(
@@ -270,6 +308,12 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
         comment_prefix="//",
         uses_colon_after_signature=False,
         package_node="package_declaration",
+        terminal_nodes=frozenset({"return_statement", "throw_statement"}),
+        assignment_nodes=frozenset({"assignment_expression", "local_variable_declaration"}),
+        call_nodes=frozenset({"method_invocation", "object_creation_expression"}),
+        member_access_nodes=frozenset({"field_access", "array_access"}),
+        mutation_receiver_nodes=frozenset({"field_access", "array_access"}),
+        effect_boundary_nodes=frozenset({"throw_statement", "try_statement"}),
         detection_hints=("public ", "private ", "protected ", "class ", "interface "),
     ),
     CodeLanguage.C: LangConfig(
@@ -281,6 +325,12 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
         decorator_node=None,
         comment_prefix="//",
         uses_colon_after_signature=False,
+        terminal_nodes=frozenset({"return_statement"}),
+        assignment_nodes=frozenset({"assignment_expression", "declaration"}),
+        call_nodes=frozenset({"call_expression"}),
+        member_access_nodes=frozenset({"field_expression", "subscript_expression", "pointer_expression"}),
+        mutation_receiver_nodes=frozenset({"field_expression", "subscript_expression", "pointer_expression"}),
+        effect_boundary_nodes=frozenset(),
         detection_hints=("#include", "typedef ", "int main("),
     ),
     CodeLanguage.CPP: LangConfig(
@@ -292,6 +342,12 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
         decorator_node=None,
         comment_prefix="//",
         uses_colon_after_signature=False,
+        terminal_nodes=frozenset({"return_statement", "throw_statement"}),
+        assignment_nodes=frozenset({"assignment_expression", "declaration"}),
+        call_nodes=frozenset({"call_expression"}),
+        member_access_nodes=frozenset({"field_expression", "subscript_expression", "pointer_expression"}),
+        mutation_receiver_nodes=frozenset({"field_expression", "subscript_expression", "pointer_expression"}),
+        effect_boundary_nodes=frozenset({"throw_statement", "try_statement"}),
         detection_hints=("#include", "namespace ", "class ", "::"),
     ),
 }
@@ -1495,6 +1551,7 @@ class CodeAwareCompressor(Transform):
             analysis,
             func_name,
             language,
+            lang_config,
         )
         total_body_lines_count = sum(unit.line_count for unit in statement_units)
 
@@ -1968,9 +2025,18 @@ def _get_node_text(node: Any, code: str) -> str:
     return code[node.start_byte : node.end_byte]
 
 
-def _classify_statement_kind(node: Any) -> _StatementKind:
+def _classify_statement_kind(node: Any, lang_config: LangConfig) -> _StatementKind:
     """Map a tree-sitter node to a lightweight statement kind."""
-    return _STATEMENT_KIND_MAP.get(getattr(node, "type", ""), _StatementKind.UNKNOWN)
+    node_type = getattr(node, "type", "")
+    if node_type in lang_config.terminal_nodes:
+        if "raise" in node_type or "throw" in node_type:
+            return _StatementKind.RAISE
+        if "yield" in node_type:
+            return _StatementKind.YIELD
+        return _StatementKind.RETURN
+    if node_type in lang_config.assignment_nodes:
+        return _StatementKind.ASSIGN
+    return _STATEMENT_KIND_MAP.get(node_type, _StatementKind.UNKNOWN)
 
 
 def _collect_statement_symbols(node: Any) -> tuple[set[str], set[str], set[str]]:
@@ -2042,7 +2108,7 @@ def _collect_statement_symbols(node: Any) -> tuple[set[str], set[str], set[str]]
     return defined, referenced, called
 
 
-def _detect_guard_clause(node: Any) -> bool:
+def _detect_guard_clause(node: Any, lang_config: LangConfig) -> bool:
     """Detect simple early-return / early-raise guard clauses from AST structure."""
     if getattr(node, "type", "") != "if_statement":
         return False
@@ -2055,57 +2121,44 @@ def _detect_guard_clause(node: Any) -> bool:
     if consequence is None:
         return False
 
-    terminal_nodes = {
-        "return_statement",
-        "raise_statement",
-        "yield_statement",
-        "throw_statement",
-        "break_statement",
-        "continue_statement",
-    }
-
     terminal_count = 0
     named_descendants = 0
     for desc in _iter_descendants(consequence):
         if not getattr(desc, "is_named", False):
             continue
         named_descendants += 1
-        if getattr(desc, "type", "") in terminal_nodes:
+        if getattr(desc, "type", "") in lang_config.terminal_nodes:
             terminal_count += 1
 
     has_else = any(getattr(child, "type", "") == "else_clause" for child in named_children[2:])
     return terminal_count > 0 and named_descendants <= 12 and not has_else
 
 
-def _detect_side_effect(unit: _StatementUnit) -> bool:
+def _detect_side_effect(unit: _StatementUnit, lang_config: LangConfig) -> bool:
     """Detect likely side effects from AST structure rather than source-text keywords."""
-    if unit.kind in {
+    node_type = getattr(unit.node, "type", "")
+    if node_type in lang_config.effect_boundary_nodes or unit.kind in {
         _StatementKind.RAISE,
         _StatementKind.TRY,
         _StatementKind.WITH,
     }:
         return True
 
-    node_type = getattr(unit.node, "type", "")
-    if node_type in {
-        "assignment",
-        "assignment_expression",
-        "augmented_assignment",
-    }:
+    if node_type in lang_config.assignment_nodes:
         lhs = getattr(unit.node, "children", [])[:1]
         for child in lhs:
-            if getattr(child, "type", "") in {
-                "attribute",
-                "member_expression",
-                "subscript",
-                "field_expression",
-                "selector_expression",
-            }:
+            if getattr(child, "type", "") in lang_config.mutation_receiver_nodes:
                 return True
 
-    # Bare call-style statements are the strongest structural side-effect signal.
     if unit.kind == _StatementKind.EXPR and unit.called_names:
-        return True
+        if getattr(unit.node, "type", "") == "expression_statement":
+            call_like = [
+                desc
+                for desc in _iter_descendants(unit.node)
+                if getattr(desc, "type", "") in lang_config.call_nodes
+            ]
+            if call_like:
+                return True
 
     return False
 
@@ -2221,6 +2274,7 @@ def _extract_statement_units(
     analysis: _SymbolAnalysis,
     func_name: str | None,
     language: CodeLanguage,
+    lang_config: LangConfig,
 ) -> list[_StatementUnit]:
     """Extract top-level function-body statements with lightweight semantic signals."""
     del func_name  # reserved for future use
@@ -2236,7 +2290,7 @@ def _extract_statement_units(
         start_row = child.start_point[0]
         end_row = child.end_point[0]
         text_lines = code_lines[start_row : end_row + 1]
-        kind = _classify_statement_kind(child)
+        kind = _classify_statement_kind(child, lang_config)
         defined, referenced, called = _collect_statement_symbols(child)
         unit = _StatementUnit(
             idx=len(units),
@@ -2253,8 +2307,8 @@ def _extract_statement_units(
             has_raise=kind == _StatementKind.RAISE,
             has_yield=kind == _StatementKind.YIELD,
         )
-        unit.is_guard_clause = _detect_guard_clause(child)
-        unit.has_side_effect = _detect_side_effect(unit)
+        unit.is_guard_clause = _detect_guard_clause(child, lang_config)
+        unit.has_side_effect = _detect_side_effect(unit, lang_config)
         unit.importance_score = _score_statement_unit(unit, analysis, context_terms)
         units.append(unit)
 
