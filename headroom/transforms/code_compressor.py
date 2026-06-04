@@ -1941,25 +1941,6 @@ def _iter_descendants(node: Any) -> Any:
         yield from _iter_descendants(child)
 
 
-_SIDE_EFFECT_KEYWORDS = (
-    "save",
-    "write",
-    "send",
-    "publish",
-    "update",
-    "insert",
-    "delete",
-    "commit",
-    "fetch",
-    "request",
-    "call",
-    "notify",
-    "log",
-    "error",
-    "warn",
-)
-
-
 _STATEMENT_KIND_MAP: dict[str, _StatementKind] = {
     "return_statement": _StatementKind.RETURN,
     "raise_statement": _StatementKind.RAISE,
@@ -2004,41 +1985,53 @@ def _collect_statement_symbols(node: Any) -> tuple[set[str], set[str], set[str]]
             return None
         return text.decode("utf-8") if isinstance(text, bytes) else str(text)
 
-    # Definition heuristics
-    for child in getattr(node, "children", []):
-        if child.type in {
-            "assignment",
-            "augmented_assignment",
-            "assignment_expression",
-            "lexical_declaration",
-            "variable_declarator",
-            "variable_declaration",
-        }:
-            for desc in _iter_descendants(child):
-                if getattr(desc, "type", "") in {
-                    "identifier",
-                    "property_identifier",
-                    "type_identifier",
-                }:
-                    name = record_text(desc)
-                    if name:
-                        defined.add(name)
-                    break
+    def add_identifiers(target: set[str], subtree: Any) -> None:
+        for desc in _iter_descendants(subtree):
+            if getattr(desc, "type", "") in {
+                "identifier",
+                "property_identifier",
+                "type_identifier",
+            }:
+                name = record_text(desc)
+                if name:
+                    target.add(name)
 
-    # Reference / call heuristics
+    assignment_like_types = {
+        "assignment",
+        "augmented_assignment",
+        "assignment_expression",
+        "lexical_declaration",
+        "variable_declarator",
+        "variable_declaration",
+    }
+
+    # Definition heuristics: look at the left-hand side / declaration target only.
+    for child in getattr(node, "children", []):
+        if child.type in assignment_like_types:
+            child_children = getattr(child, "children", [])
+            if child_children:
+                add_identifiers(defined, child_children[0])
+            else:
+                add_identifiers(defined, child)
+
+    # Reference / call heuristics from descendants.
     for desc in _iter_descendants(node):
         node_type = getattr(desc, "type", "")
         if node_type in {"identifier", "property_identifier", "type_identifier"}:
             name = record_text(desc)
             if name:
                 referenced.add(name)
+
         if "call" in node_type:
             for call_child in getattr(desc, "children", []):
-                if getattr(call_child, "type", "") in {
+                child_type = getattr(call_child, "type", "")
+                if child_type in {
                     "identifier",
                     "property_identifier",
                     "member_expression",
                     "attribute",
+                    "field_expression",
+                    "selector_expression",
                 }:
                     name = record_text(call_child)
                     if name:
@@ -2050,33 +2043,42 @@ def _collect_statement_symbols(node: Any) -> tuple[set[str], set[str], set[str]]
 
 
 def _detect_guard_clause(node: Any) -> bool:
-    """Detect simple early-return / early-raise guard clauses."""
+    """Detect simple early-return / early-raise guard clauses from AST structure."""
     if getattr(node, "type", "") != "if_statement":
         return False
 
-    children = getattr(node, "children", [])
-    body_blocks = [c for c in children if getattr(c, "is_named", False)]
+    named_children = [c for c in getattr(node, "children", []) if getattr(c, "is_named", False)]
+    if len(named_children) < 2:
+        return False
+
+    consequence = named_children[1]
+    if consequence is None:
+        return False
+
+    terminal_nodes = {
+        "return_statement",
+        "raise_statement",
+        "yield_statement",
+        "throw_statement",
+        "break_statement",
+        "continue_statement",
+    }
+
     terminal_count = 0
-    named_count = 0
-    for child in body_blocks:
-        for desc in _iter_descendants(child):
-            if not getattr(desc, "is_named", False):
-                continue
-            named_count += 1
-            if getattr(desc, "type", "") in {
-                "return_statement",
-                "raise_statement",
-                "yield_statement",
-                "throw_statement",
-                "break_statement",
-                "continue_statement",
-            }:
-                terminal_count += 1
-    return terminal_count > 0 and named_count <= 12
+    named_descendants = 0
+    for desc in _iter_descendants(consequence):
+        if not getattr(desc, "is_named", False):
+            continue
+        named_descendants += 1
+        if getattr(desc, "type", "") in terminal_nodes:
+            terminal_count += 1
+
+    has_else = any(getattr(child, "type", "") == "else_clause" for child in named_children[2:])
+    return terminal_count > 0 and named_descendants <= 12 and not has_else
 
 
 def _detect_side_effect(unit: _StatementUnit) -> bool:
-    """Detect likely side effects from calls or obvious mutations."""
+    """Detect likely side effects from AST structure rather than source-text keywords."""
     if unit.kind in {
         _StatementKind.RAISE,
         _StatementKind.TRY,
@@ -2084,13 +2086,27 @@ def _detect_side_effect(unit: _StatementUnit) -> bool:
     }:
         return True
 
-    lowered = "\n".join(unit.text_lines).lower()
-    if any(keyword in lowered for keyword in _SIDE_EFFECT_KEYWORDS):
+    node_type = getattr(unit.node, "type", "")
+    if node_type in {
+        "assignment",
+        "assignment_expression",
+        "augmented_assignment",
+    }:
+        lhs = getattr(unit.node, "children", [])[:1]
+        for child in lhs:
+            if getattr(child, "type", "") in {
+                "attribute",
+                "member_expression",
+                "subscript",
+                "field_expression",
+                "selector_expression",
+            }:
+                return True
+
+    # Bare call-style statements are the strongest structural side-effect signal.
+    if unit.kind == _StatementKind.EXPR and unit.called_names:
         return True
-    if any(name.lower() in _SIDE_EFFECT_KEYWORDS for name in unit.called_names):
-        return True
-    if any(token in lowered for token in ("append(", ".append(", ".push(", ".[", "self.")):
-        return True
+
     return False
 
 
@@ -2102,7 +2118,6 @@ def _score_statement_unit(
     unit: _StatementUnit,
     analysis: _SymbolAnalysis,
     context_terms: set[str],
-    language: CodeLanguage,
 ) -> float:
     """Compute a deterministic importance score for a statement."""
     score = 0.0
@@ -2127,9 +2142,10 @@ def _score_statement_unit(
                 break
 
     if context_terms:
-        haystack_terms = {name.lower() for name in (unit.defined_names | unit.referenced_names | unit.called_names)}
-        lowered = "\n".join(unit.text_lines).lower()
-        hits = sum(1 for term in context_terms if term in haystack_terms or term in lowered)
+        symbol_terms = {
+            name.lower() for name in (unit.defined_names | unit.referenced_names | unit.called_names)
+        }
+        hits = sum(1 for term in context_terms if term in symbol_terms)
         if hits:
             score += min(2.0, hits * 0.75)
             unit.context_hit = True
@@ -2239,7 +2255,7 @@ def _extract_statement_units(
         )
         unit.is_guard_clause = _detect_guard_clause(child)
         unit.has_side_effect = _detect_side_effect(unit)
-        unit.importance_score = _score_statement_unit(unit, analysis, context_terms, language)
+        unit.importance_score = _score_statement_unit(unit, analysis, context_terms)
         units.append(unit)
 
     return units
