@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+from websockets.datastructures import Headers
 
 from headroom.proxy.handlers.openai import OpenAIHandlerMixin
 from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS
@@ -235,6 +236,25 @@ def _first_frame() -> str:
     )
 
 
+@pytest.fixture(autouse=True)
+def _reset_codex_rate_limit_singleton():
+    """Isolate the process-global CodexRateLimitState across tests.
+
+    The tracker is a module singleton, so a snapshot captured by one test
+    would otherwise leak into the next (and is order-dependent under
+    pytest-randomly). Save/restore ``_latest`` around every test.
+    """
+    from headroom.subscription.codex_rate_limits import get_codex_rate_limit_state
+
+    state = get_codex_rate_limit_state()
+    saved = state._latest
+    state._latest = None
+    try:
+        yield
+    finally:
+        state._latest = saved
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -339,6 +359,93 @@ async def test_ws_session_metrics_include_response_completed_usage():
     assert recorded["cache_read_tokens"] == 75
     assert recorded["cache_write_tokens"] == 25
     assert recorded["uncached_input_tokens"] == 25
+
+
+@pytest.mark.asyncio
+async def test_ws_captures_codex_rate_limit_headers_from_handshake():
+    """Codex WS handshake response headers must refresh the rate-limit state.
+
+    Newer Codex (gpt-5.4+) speaks WebSocket, and the ``x-codex-*`` window
+    headers ride the upstream handshake response (``upstream.response.headers``).
+    Regression guard for the bug where session/weekly usage never updated on
+    the WebSocket transport because the handler only captured headers on the
+    non-streaming HTTP path.
+
+    The fixture uses a *real* ``websockets.datastructures.Headers`` multimap
+    containing a duplicated ``set-cookie`` (chatgpt.com routinely sends several).
+    ``Headers.items()`` raises ``MultipleValuesError`` on duplicate keys, so this
+    also pins the requirement that the handler iterate via ``raw_items()`` — with
+    plain ``.items()`` the whole capture would be silently skipped.
+    """
+    from headroom.subscription.codex_rate_limits import get_codex_rate_limit_state
+
+    state = get_codex_rate_limit_state()
+
+    handshake_headers = Headers()
+    handshake_headers["x-codex-primary-used-percent"] = "37.5"
+    handshake_headers["x-codex-primary-window-minutes"] = "300"
+    handshake_headers["x-codex-secondary-used-percent"] = "12.0"
+    handshake_headers["x-codex-secondary-window-minutes"] = "10080"
+    handshake_headers["x-codex-limit-name"] = "gpt-5.4-codex"
+    handshake_headers["content-type"] = "application/json"
+    # Duplicate header — would make Headers.items() raise MultipleValuesError.
+    handshake_headers["set-cookie"] = "a=1"
+    handshake_headers["set-cookie"] = "b=2"
+
+    upstream_events = [
+        json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
+        json.dumps({"type": "response.completed", "response": {"id": "r_1"}}),
+    ]
+    upstream = _FakeUpstream(upstream_events)
+    # Modern ``websockets`` exposes the handshake response via ``.response``.
+    upstream.response = SimpleNamespace(headers=handshake_headers)
+    fake_ws_mod = _make_fake_websockets_module(upstream)
+
+    client_ws = _FakeWebSocket(frames=[_first_frame()])
+    handler = _DummyOpenAIHandler()
+
+    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    snap = state.latest
+    assert snap is not None
+    assert snap.primary is not None
+    assert snap.primary.used_percent == 37.5
+    assert snap.primary.window_minutes == 300
+    assert snap.secondary is not None
+    assert snap.secondary.used_percent == 12.0
+    assert snap.secondary.window_minutes == 10080
+    assert snap.limit_name == "gpt-5.4-codex"
+
+
+@pytest.mark.asyncio
+async def test_ws_missing_handshake_response_does_not_break_session():
+    """A handshake without a ``.response`` attribute must not crash the session.
+
+    Older ``websockets`` clients (or unexpected handshake shapes) may not
+    expose ``.response``; the capture is best-effort and must never take down
+    the proxied WS session.
+    """
+    from headroom.subscription.codex_rate_limits import get_codex_rate_limit_state
+
+    state = get_codex_rate_limit_state()
+
+    upstream_events = [
+        json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
+        json.dumps({"type": "response.completed", "response": {"id": "r_1"}}),
+    ]
+    upstream = _FakeUpstream(upstream_events)  # no ``.response`` attribute
+    fake_ws_mod = _make_fake_websockets_module(upstream)
+
+    client_ws = _FakeWebSocket(frames=[_first_frame()])
+    handler = _DummyOpenAIHandler()
+
+    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    # Session completed cleanly; state simply stayed empty.
+    assert handler.ws_sessions.active_count() == 0
+    assert state.latest is None
 
 
 @pytest.mark.asyncio

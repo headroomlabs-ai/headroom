@@ -4075,6 +4075,54 @@ class OpenAIHandlerMixin:
                             )
                             _upstream_connect_recorded = True
                             _upstream_first_event_started = time.perf_counter()
+
+                        # Capture Codex rate-limit window data from the upstream
+                        # WebSocket handshake response headers. The Responses WS
+                        # transport (Codex gpt-5.4+) is the common path for newer
+                        # Codex, and these ``x-codex-*`` headers are the only place
+                        # session/weekly usage is reported — without this they
+                        # never reach ``/stats`` or the dashboard on the WS path.
+                        # Access is defensive: the handshake-response shape varies
+                        # across ``websockets`` client versions, so any failure
+                        # here must never break the proxied session.
+                        try:
+                            _ws_handshake_resp = getattr(upstream, "response", None)
+                            _ws_handshake_headers = getattr(
+                                _ws_handshake_resp, "headers", None
+                            )
+                            if _ws_handshake_headers is not None:
+                                from headroom.subscription.codex_rate_limits import (
+                                    get_codex_rate_limit_state,
+                                )
+
+                                # Prefer ``raw_items()``: the ``websockets``
+                                # ``Headers.items()`` raises ``MultipleValuesError``
+                                # if the handshake response carries any duplicate
+                                # header (chatgpt.com routinely returns multiple
+                                # ``set-cookie`` headers), which would otherwise send
+                                # the whole capture into the ``except`` below and
+                                # leave ``/stats`` stale — defeating this fix on the
+                                # WS path. ``raw_items()`` yields every (name, value)
+                                # pair without raising; ``.items()`` is the fallback
+                                # for plain-dict shapes (e.g. older clients / tests).
+                                _hs_iter = getattr(
+                                    _ws_handshake_headers, "raw_items", None
+                                )
+                                _hs_pairs = (
+                                    _hs_iter()
+                                    if callable(_hs_iter)
+                                    else _ws_handshake_headers.items()
+                                )
+                                get_codex_rate_limit_state().update_from_headers(
+                                    {str(k).lower(): str(v) for k, v in _hs_pairs}
+                                )
+                        except Exception as _ws_rl_err:  # pragma: no cover - defensive
+                            logger.debug(
+                                "[%s] WS: failed to capture Codex rate-limit headers: %r",
+                                request_id,
+                                _ws_rl_err,
+                            )
+
                         await upstream.send(first_msg_raw)
 
                         # Unit 3: flag the upstream side flips on seeing
