@@ -32,6 +32,15 @@ from headroom.providers.openclaw.install import (
 from headroom.providers.openclaw.install import (
     revert_provider_scope as _revert_openclaw_provider_scope,
 )
+from headroom.providers.opencode.install import (
+    apply_provider_scope as _apply_opencode_provider_scope,
+)
+from headroom.providers.opencode.install import (
+    build_install_env as _build_opencode_install_env,
+)
+from headroom.providers.opencode.install import (
+    revert_provider_scope as _revert_opencode_provider_scope,
+)
 
 _InstallEnvBuilder = Callable[..., dict[str, str]]
 _ProviderScopeApplier = Callable[[DeploymentManifest], ManagedMutation | None]

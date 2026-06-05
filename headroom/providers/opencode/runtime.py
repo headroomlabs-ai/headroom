@@ -57,11 +57,9 @@ def build_launch_env(
                                  primary provider)
     """
     env = dict(environ if environ is not None else os.environ)
-    effective_backend = backend or env.get("HEADROOM_BACKEND") or "github-copilot"
 
     anthropic_url = proxy_base_url(port)
     openai_url = proxy_openai_url(port)
-    copilot_url = proxy_copilot_url(port)
 
     env["ANTHROPIC_BASE_URL"] = anthropic_url
     env["OPENAI_BASE_URL"] = openai_url
