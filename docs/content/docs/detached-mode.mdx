@@ -1,0 +1,57 @@
+---
+title: Detached Mode
+description: Run Headroom in containers, CI, serverless, or read-only deployments with explicit capability degradation.
+---
+
+Detached mode is Headroom's contract for deployments where local writable state is absent or intentionally disabled.
+
+Use it for stateless containers, read-only filesystems, ephemeral CI runners, serverless processes, and load-balanced fleets where local process state should not be treated as durable.
+
+## Enable detached mode
+
+```bash
+HEADROOM_STATELESS=true headroom proxy
+```
+
+or:
+
+```bash
+headroom proxy --stateless
+```
+
+`--stateless` disables avoidable filesystem writes such as proxy file logging, local TOIN persistence, memory, learning, and telemetry beacon lock files. Request handling and compression continue to run.
+
+## Profiles
+
+Set `HEADROOM_DETACHED_PROFILE` or pass `--detached-profile`:
+
+| Profile | Behavior |
+|---|---|
+| `lenient` | Default. Start the proxy and log the capability matrix when detached. |
+| `strict` | Refuse startup when an explicitly enabled required local-state feature would degrade, such as `--memory` without available local state or a remote backend. |
+| `silent` | Start the proxy without startup degradation logs. `/capabilities`, `/stats`, `/health`, and `/metrics` still expose the matrix. |
+
+```bash
+HEADROOM_STATELESS=true \
+HEADROOM_DETACHED_PROFILE=strict \
+headroom proxy
+```
+
+## Capability endpoint
+
+```bash
+curl http://localhost:8787/capabilities
+```
+
+The response includes `detached`, `profile`, local-state availability, every feature's local-state dependency, current state, degradation mode, and strict-mode violations.
+
+## Metrics
+
+The Prometheus endpoint exposes one gauge per feature:
+
+```text
+headroom_feature_enabled{feature="compression",state="full",degradation="full",dependency="none"} 1
+headroom_feature_enabled{feature="session_aggregation",state="disabled",degradation="disabled",dependency="required"} 0
+```
+
+Use this to alert on degraded or disabled capabilities in managed deployments.

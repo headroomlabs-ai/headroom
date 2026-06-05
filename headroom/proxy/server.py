@@ -42,6 +42,7 @@ if TYPE_CHECKING:
     from ..backends.base import Backend
     from ..cache.compression_cache import CompressionCache
     from ..memory.tracker import MemoryTracker
+    from .capabilities import CapabilityReport
     from .outcome import RequestOutcome
 
 
@@ -101,6 +102,11 @@ from headroom.providers.registry import (
     create_proxy_backend,
     format_backend_status,
     resolve_api_targets,
+)
+from headroom.proxy.capabilities import (
+    build_capability_report,
+    enforce_detached_profile,
+    render_capability_matrix,
 )
 
 # =============================================================================
@@ -308,6 +314,7 @@ class HeadroomProxy(
     def __init__(self, config: ProxyConfig):
         self.config = config
         self.config.mode = normalize_proxy_mode(self.config.mode)
+        self.capabilities: CapabilityReport | None = None
         self.pipeline_extensions = PipelineExtensionManager(
             hooks=config.hooks,
             extensions=config.pipeline_extensions,
@@ -1382,14 +1389,24 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
     from contextlib import asynccontextmanager
 
+    config = config or ProxyConfig()
+    capability_report = build_capability_report(config)
+    enforce_detached_profile(capability_report)
+    if capability_report.detached and capability_report.profile != "silent":
+        logger.info(
+            "event=detached_capability_matrix\n%s", render_capability_matrix(capability_report)
+        )
+
     # Always-on file logging to ~/.headroom/logs/ for `headroom perf` analysis.
     # Installed here (not at module import) so importing headroom.proxy.server
     # in tests or library contexts does not silently attach a RotatingFileHandler
     # to the user's live proxy.log.
-    _setup_file_logging()
+    if not config.stateless:
+        _setup_file_logging()
 
-    config = config or ProxyConfig()
     proxy = HeadroomProxy(config)
+    proxy.capabilities = capability_report
+    proxy.metrics.set_feature_capabilities(capability_report.features)
 
     # Telemetry beacon (anonymous aggregate stats).
     # With uvicorn workers > 1, each worker runs the lifespan independently.
@@ -1401,11 +1418,13 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     # beacon. Other workers see the lock and skip.
     from headroom.telemetry.beacon import TelemetryBeacon
 
-    _beacon = TelemetryBeacon(
-        port=config.port if hasattr(config, "port") else 8787,
-        sdk=os.environ.get("HEADROOM_SDK", "proxy").strip() or "proxy",
-        backend=config.backend if hasattr(config, "backend") else "anthropic",
-    )
+    _beacon = None
+    if not config.stateless:
+        _beacon = TelemetryBeacon(
+            port=config.port if hasattr(config, "port") else 8787,
+            sdk=os.environ.get("HEADROOM_SDK", "proxy").strip() or "proxy",
+            backend=config.backend if hasattr(config, "backend") else "anthropic",
+        )
     from headroom import paths as _hr_paths
 
     _beacon_lock_path = _hr_paths.beacon_lock_path(config.port)
@@ -1477,18 +1496,20 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             try:
                 # Startup
                 await proxy.startup()
-                asyncio.create_task(_log_toin_stats_periodically())
+                if not proxy.config.stateless:
+                    asyncio.create_task(_log_toin_stats_periodically())
                 if proxy.usage_reporter:
                     await proxy.usage_reporter.start(proxy)
                 if proxy.traffic_learner:
                     await proxy.traffic_learner.start()
 
                 # Only start beacon if we acquire the lock (first worker wins)
-                _beacon_is_owner[0] = _try_acquire_beacon_lock()
-                if _beacon_is_owner[0]:
-                    await _beacon.start()
-                else:
-                    logger.debug("Beacon: skipping (another worker owns the lock)")
+                if _beacon is not None:
+                    _beacon_is_owner[0] = _try_acquire_beacon_lock()
+                    if _beacon_is_owner[0]:
+                        await _beacon.start()
+                    else:
+                        logger.debug("Beacon: skipping (another worker owns the lock)")
 
                 app.state.ready = True
                 yield
@@ -1498,7 +1519,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         finally:
             app.state.ready = False
             # Shutdown
-            if _beacon_is_owner[0]:
+            if _beacon is not None and _beacon_is_owner[0]:
                 await _beacon.stop()
                 _release_beacon_lock()
             if proxy.usage_reporter:
@@ -1527,6 +1548,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     # request) sees an honest "missing" rather than a stale "loaded".
     app.state.rust_core_status = "missing"
     app.state.rust_core_error = None
+    app.state.capabilities = capability_report.to_dict()
 
     def _iso_utc_now() -> str:
         return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -1659,6 +1681,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             "uptime_seconds": _uptime_seconds(),
             "checks": checks,
             "runtime": _runtime_payload(),
+            "capabilities": capability_report.to_dict(),
             # Hotfix-A0: surface rust core load state so operators can alert
             # on `rust_core != "loaded"` (Finding #2).
             "rust_core": getattr(app.state, "rust_core_status", "missing"),
@@ -1688,6 +1711,8 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "openai_api_url": config.openai_api_url,
                 "gemini_api_url": config.gemini_api_url,
                 "cloudcode_api_url": config.cloudcode_api_url,
+                "stateless": config.stateless,
+                "detached_profile": capability_report.profile,
                 "pid": os.getpid(),
             }
         return payload
@@ -1827,6 +1852,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     async def health():
         payload = _health_payload(include_config=True)
         return JSONResponse(status_code=200, content=payload)
+
+    @app.get("/capabilities")
+    async def capabilities():
+        return JSONResponse(status_code=200, content=capability_report.to_dict())
 
     # Loopback-only debug introspection (Unit 5). A remote IP gets 404 —
     # debug endpoints are invisible to external scanners.
@@ -2283,6 +2312,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             },
             "cli_filtering": cli_filtering_stats,
             "proxy_inbound": proxy.metrics.inbound_snapshot(),
+            "capabilities": capability_report.to_dict(),
             "cache": await proxy.cache.stats() if proxy.cache else None,
             "rate_limiter": await proxy.rate_limiter.stats() if proxy.rate_limiter else None,
             "recent_requests": proxy.logger.get_recent(10) if proxy.logger else [],
@@ -2985,6 +3015,11 @@ def _proxy_config_from_env() -> ProxyConfig:
         max_keepalive_connections=_get_env_int("HEADROOM_MAX_KEEPALIVE", 100),
         http2=_get_env_bool("HEADROOM_HTTP2", True),
         mode=normalize_proxy_mode(_get_env_str("HEADROOM_MODE", PROXY_MODE_TOKEN)),
+        stateless=_get_env_bool("HEADROOM_STATELESS", False),
+        detached_profile=cast(
+            Literal["strict", "lenient", "silent"],
+            _get_env_str("HEADROOM_DETACHED_PROFILE", "lenient").strip().lower(),
+        ),
     )
 
 
@@ -3078,6 +3113,7 @@ def run_server(
 ║    /livez                   Process liveness                         ║
 ║    /readyz                  Traffic readiness                        ║
 ║    /health                  Aggregate health                         ║
+║    /capabilities            Detached-mode capability matrix          ║
 ║    /stats                   Detailed statistics                      ║
 ║    /metrics                 Prometheus metrics                       ║
 ║    /cache/clear             Clear response cache                     ║
@@ -3365,6 +3401,17 @@ if __name__ == "__main__":
         action="store_true",
         help="Disable code-aware compression",
     )
+    parser.add_argument(
+        "--stateless",
+        action="store_true",
+        help="Disable filesystem writes and expose detached-mode capability degradations.",
+    )
+    parser.add_argument(
+        "--detached-profile",
+        choices=["strict", "lenient", "silent"],
+        default=None,
+        help="Detached-mode capability policy (env: HEADROOM_DETACHED_PROFILE).",
+    )
 
     args = parser.parse_args()
 
@@ -3385,6 +3432,7 @@ if __name__ == "__main__":
     optimize = env_optimize if not args.no_optimize else False
     cache_enabled = env_cache if not args.no_cache else False
     rate_limit_enabled = env_rate_limit if not args.no_rate_limit else False
+    stateless = args.stateless or _get_env_bool("HEADROOM_STATELESS", False)
 
     # Set OpenRouter API key from CLI if provided
     if hasattr(args, "openrouter_api_key") and args.openrouter_api_key:
@@ -3430,6 +3478,14 @@ if __name__ == "__main__":
         mode=normalize_proxy_mode(_get_env_str("HEADROOM_MODE", PROXY_MODE_TOKEN)),
         compress_user_messages=args.compress_user_messages
         or _get_env_bool("HEADROOM_COMPRESS_USER_MESSAGES", False),
+        stateless=stateless,
+        detached_profile=cast(
+            Literal["strict", "lenient", "silent"],
+            (
+                args.detached_profile
+                or _get_env_str("HEADROOM_DETACHED_PROFILE", "lenient").strip().lower()
+            ),
+        ),
     )
 
     # Get worker and concurrency settings

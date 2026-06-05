@@ -221,6 +221,7 @@ headroom proxy --learn --min-evidence 3
 | `HEADROOM_BUDGET` | Daily budget limit in USD | -- |
 | `HEADROOM_TELEMETRY` | Set to `off` to disable anonymous telemetry | enabled |
 | `HEADROOM_STATELESS` | Set to `true` to disable filesystem writes | `false` |
+| `HEADROOM_DETACHED_PROFILE` | Detached-mode capability policy: `strict`, `lenient`, or `silent` | `lenient` |
 | `HEADROOM_MODEL_LIMITS` | Custom model config (JSON string or file path) | -- |
 | `HEADROOM_BASE_URL` | Base URL of the Headroom proxy (TypeScript SDK) | `http://localhost:8787` |
 | `HEADROOM_API_KEY` | API key for Headroom Cloud authentication | -- |
@@ -247,6 +248,11 @@ See the **[Filesystem Contract](https://github.com/chopratejas/headroom/blob/mai
 page for the full bucket table, plugin-author guidance, and the Docker
 naming overlap note (`HEADROOM_WORKSPACE` is *not* the same as
 `HEADROOM_WORKSPACE_DIR`).
+
+For deployments where the workspace root is intentionally unavailable or
+read-only, see [Detached Mode](/docs/detached-mode). It exposes the exact
+capability matrix through `/capabilities`, `/health`, `/stats`, and
+`headroom_feature_enabled` Prometheus gauges.
 
 ## Custom Model Configuration
 

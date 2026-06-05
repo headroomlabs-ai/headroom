@@ -83,7 +83,12 @@ headroom_latency_seconds_bucket{le="0.1"} 1150
 
 # HELP headroom_cache_hits_total Cache hit counter
 headroom_cache_hits_total 456
+
+# HELP headroom_feature_enabled Feature availability after detached-mode capability resolution
+headroom_feature_enabled{feature="compression",state="full",degradation="full",dependency="none"} 1
 ```
+
+`headroom_feature_enabled` mirrors the `/capabilities` payload. Use it to alert when an expected feature is degraded or disabled in detached/stateless deployments.
 
 ### Health Check
 

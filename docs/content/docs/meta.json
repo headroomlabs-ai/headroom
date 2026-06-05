@@ -24,6 +24,7 @@
     "failure-learning",
     "---Proxy Server---",
     "proxy",
+    "detached-mode",
     "---Integrations---",
     "vercel-ai-sdk",
     "openai-sdk",

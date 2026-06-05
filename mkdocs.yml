@@ -92,6 +92,7 @@ nav:
     - Configuration: configuration.md
   - User Guide:
     - Proxy Server: proxy.md
+    - Detached Mode: detached-mode.md
     - Compression Pipeline: compression.md
     - CCR (Lossless Retrieval): ccr.md
     - Image Compression: image-compression.md

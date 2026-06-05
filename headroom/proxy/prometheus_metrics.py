@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from headroom.observability import HeadroomOtelMetrics
+    from headroom.proxy.capabilities import FeatureCapability
     from headroom.proxy.cost import CostTracker
 
 from headroom.observability import get_otel_metrics
@@ -238,6 +239,7 @@ class PrometheusMetrics:
         )
 
         self._lock = asyncio.Lock()
+        self.feature_capabilities: dict[str, dict[str, str | int]] = {}
         # Tiny synchronous critical section for stage-timing triple updates
         # (sum + count + max must move together for a consistent scrape).
         # threading.Lock is cheaper than asyncio.Lock and does NOT contend
@@ -543,6 +545,17 @@ class PrometheusMetrics:
             "by_status": dict(self.inbound_responses_by_status),
         }
 
+    def set_feature_capabilities(self, features: tuple[FeatureCapability, ...]) -> None:
+        self.feature_capabilities = {
+            feature.feature: {
+                "enabled": 1 if feature.enabled else 0,
+                "state": feature.state,
+                "degradation": feature.degradation_mode,
+                "dependency": feature.local_state_dependency,
+            }
+            for feature in features
+        }
+
     async def record_request(
         self,
         provider: str,
@@ -815,6 +828,28 @@ class PrometheusMetrics:
                 help_text="All inbound HTTP requests accepted by the proxy",
                 value=self.inbound_requests_total,
             )
+            lines.extend(
+                [
+                    "# HELP headroom_feature_enabled Feature availability after detached-mode capability resolution",
+                    "# TYPE headroom_feature_enabled gauge",
+                ]
+            )
+            if not self.feature_capabilities:
+                lines.append(
+                    'headroom_feature_enabled{feature="__init__",state="unknown",'
+                    'degradation="unknown",dependency="unknown"} 0'
+                )
+            else:
+                for feature, payload in sorted(self.feature_capabilities.items()):
+                    state = _escape_label_value(str(payload["state"]))
+                    degradation = _escape_label_value(str(payload["degradation"]))
+                    dependency = _escape_label_value(str(payload["dependency"]))
+                    lines.append(
+                        f'headroom_feature_enabled{{feature="{_escape_label_value(feature)}",'
+                        f'state="{state}",degradation="{degradation}",'
+                        f'dependency="{dependency}"}} {payload["enabled"]}'
+                    )
+            lines.append("")
             _append_metric(
                 lines,
                 name="headroom_inbound_requests_completed_total",

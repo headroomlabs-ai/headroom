@@ -265,6 +265,10 @@ class ProxyConfig:
 
     # Stateless mode — disable all filesystem writes for read-only / container deployments
     stateless: bool = False
+    # Detached-mode capability contract. ``strict`` refuses to start when an
+    # explicitly enabled local-state feature would degrade; ``lenient`` starts
+    # with visible degradations; ``silent`` starts without degradation logs.
+    detached_profile: Literal["strict", "lenient", "silent"] = "lenient"
 
     # Unit 4: Bounded pre-upstream concurrency for Anthropic replay storms.
     #

@@ -22,6 +22,12 @@ headroom proxy \
 
 Telemetry is enabled by default. Opt out with `HEADROOM_TELEMETRY=off` or `--no-telemetry`.
 
+For read-only, container, CI, serverless, or load-balanced deployments, use [Detached Mode](/docs/detached-mode) to make local-state degradation explicit:
+
+```bash
+headroom proxy --stateless --detached-profile lenient
+```
+
 ## CLI options
 
 ### Core
@@ -47,6 +53,7 @@ Telemetry is enabled by default. Opt out with `HEADROOM_TELEMETRY=off` or `--no-
 | `--backend` | `anthropic` | Backend: `anthropic`, `bedrock`, `openrouter`, `anyllm`, or `litellm-<provider>` |
 | `--no-telemetry` | `false` | Disable anonymous telemetry |
 | `--stateless` | `false` | Disable filesystem writes and keep runtime state in memory |
+| `--detached-profile` | `lenient` | Capability policy for detached/stateless deployments: `strict`, `lenient`, or `silent` |
 
 ### Context management
 
@@ -119,6 +126,14 @@ Live session statistics plus durable `persistent_savings` totals. Stored at `~/.
 
 ```bash
 curl http://localhost:8787/stats
+```
+
+### `GET /capabilities`
+
+Resolved detached-mode capability matrix for operators and deployment automation.
+
+```bash
+curl http://localhost:8787/capabilities
 ```
 
 ### `GET /stats-history`
