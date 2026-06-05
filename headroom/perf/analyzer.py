@@ -625,6 +625,127 @@ def format_report(report: PerfReport) -> str:
     return "\n".join(lines)
 
 
+def summary_dict(report: PerfReport) -> dict:
+    """Build the aggregated, machine-readable view of ``report``.
+
+    Mirrors the headline numbers shown in :func:`format_report` so CI jobs,
+    dashboards, and agent tools can consume them without parsing the text
+    output. Per-record arrays are intentionally omitted — callers who want
+    them can use ``perf --raw`` or the CSV formatter below.
+    """
+    records = report.perf_records
+    total_before = sum(r.tokens_before for r in records)
+    total_after = sum(r.tokens_after for r in records)
+    total_saved = sum(r.tokens_saved for r in records)
+    savings_pct = (total_saved / total_before * 100) if total_before > 0 else 0.0
+
+    cache_records = [r for r in records if (r.cache_read + r.cache_write) > 0]
+    total_cr = sum(r.cache_read for r in cache_records)
+    total_cw = sum(r.cache_write for r in cache_records)
+    total_cache = total_cr + total_cw
+    cache_hit_pct = (total_cr / total_cache * 100) if total_cache > 0 else 0.0
+
+    by_model: dict[str, dict] = {}
+    grouped: dict[str, list[PerfRecord]] = {}
+    for r in records:
+        grouped.setdefault(r.model, []).append(r)
+    for model, recs in grouped.items():
+        m_before = sum(r.tokens_before for r in recs)
+        m_after = sum(r.tokens_after for r in recs)
+        m_saved = sum(r.tokens_saved for r in recs)
+        by_model[model] = {
+            "requests": len(recs),
+            "tokens_before": m_before,
+            "tokens_after": m_after,
+            "tokens_saved": m_saved,
+            "savings_pct": (m_saved / m_before * 100) if m_before > 0 else 0.0,
+        }
+
+    by_transform: dict[str, dict] = {}
+    t_grouped: dict[str, list[TransformRecord]] = {}
+    for tr in report.transform_records:
+        t_grouped.setdefault(tr.name, []).append(tr)
+    for name, recs in t_grouped.items():
+        t_before = sum(r.tokens_before for r in recs)
+        t_after = sum(r.tokens_after for r in recs)
+        t_saved = sum(r.tokens_saved for r in recs)
+        by_transform[name] = {
+            "uses": len(recs),
+            "tokens_before": t_before,
+            "tokens_after": t_after,
+            "tokens_saved": t_saved,
+            "savings_pct": (t_saved / t_before * 100) if t_before > 0 else 0.0,
+        }
+
+    return {
+        "window_hours": report.requested_hours,
+        "oldest_kept_ts": report.oldest_kept_ts,
+        "newest_kept_ts": report.newest_kept_ts,
+        "total_requests": len(records),
+        "total_tokens_before": total_before,
+        "total_tokens_after": total_after,
+        "tokens_saved": total_saved,
+        "savings_pct": savings_pct,
+        "cache_read_tokens": total_cr,
+        "cache_write_tokens": total_cw,
+        "cache_hit_pct": cache_hit_pct,
+        "by_model": by_model,
+        "by_transform": by_transform,
+        "log_files_read": report.log_files_read,
+        "total_lines_parsed": report.total_lines_parsed,
+    }
+
+
+# Header order for `format_csv`. Kept explicit (rather than reading from the
+# dataclass fields) so downstream consumers can pin to a stable column layout
+# even if `PerfRecord` grows new fields later.
+_PERF_CSV_COLUMNS = (
+    "timestamp",
+    "request_id",
+    "model",
+    "num_messages",
+    "tokens_before",
+    "tokens_after",
+    "tokens_saved",
+    "cache_read",
+    "cache_write",
+    "cache_hit_pct",
+    "optimization_ms",
+)
+
+
+def format_csv(report: PerfReport) -> str:
+    """Render ``report.perf_records`` as CSV (one row per request).
+
+    Per-record granularity mirrors ``perf --raw`` so the CSV is directly
+    spreadsheet- or pandas-friendly. Aggregates are intentionally not
+    written here — they live in :func:`summary_dict` and JSON output.
+    """
+    import csv
+    import io
+
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator="\n")
+    writer.writerow(_PERF_CSV_COLUMNS)
+    for r in report.perf_records:
+        writer.writerow(
+            [
+                r.timestamp,
+                r.request_id,
+                r.model,
+                r.num_messages,
+                r.tokens_before,
+                r.tokens_after,
+                r.tokens_saved,
+                r.cache_read,
+                r.cache_write,
+                r.cache_hit_pct,
+                f"{r.optimization_ms:.0f}",
+            ]
+        )
+    return buf.getvalue()
+
+
 def _format_toin_highlights() -> list[str]:
     """Render a human-readable TOIN highlights block from the live store.
 

@@ -1,5 +1,7 @@
 """Performance analysis CLI command."""
 
+import json
+
 import click
 
 from .main import main
@@ -13,7 +15,15 @@ from .main import main
     help="Analyze logs from the last N hours (default: 168 = 7 days)",
 )
 @click.option("--raw", is_flag=True, help="Show raw PERF records instead of report")
-def perf(hours: float, raw: bool) -> None:
+@click.option(
+    "--format",
+    "fmt",
+    type=click.Choice(["text", "json", "csv"], case_sensitive=False),
+    default="text",
+    show_default=True,
+    help="Output format. `json` emits aggregated metrics, `csv` emits one row per request.",
+)
+def perf(hours: float, raw: bool, fmt: str) -> None:
     """Analyze proxy performance from logs.
 
     \b
@@ -26,13 +36,28 @@ def perf(hours: float, raw: bool) -> None:
 
     \b
     Examples:
-        headroom perf                Analyze last 7 days
-        headroom perf --hours 24     Analyze last 24 hours
-        headroom perf --raw          Show raw parsed records
+        headroom perf                       Analyze last 7 days
+        headroom perf --hours 24            Analyze last 24 hours
+        headroom perf --raw                 Show raw parsed records
+        headroom perf --format json         Emit aggregated metrics as JSON
+        headroom perf --format csv          Emit per-request rows as CSV
     """
-    from headroom.perf.analyzer import format_report, parse_log_files
+    from headroom.perf.analyzer import (
+        format_csv,
+        format_report,
+        parse_log_files,
+        summary_dict,
+    )
 
     report = parse_log_files(last_n_hours=hours)
+
+    fmt = fmt.lower()
+    if fmt == "json":
+        click.echo(json.dumps(summary_dict(report), indent=2))
+        return
+    if fmt == "csv":
+        click.echo(format_csv(report), nl=False)
+        return
 
     if raw:
         for r in report.perf_records:
