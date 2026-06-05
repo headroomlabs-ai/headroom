@@ -233,6 +233,22 @@ class EmbeddingScorer(RelevanceScorer):
 
         return results
 
+    def close(self) -> None:
+        """Release the fastembed model and its backing ONNX session.
+
+        Fastembed wraps an ``onnxruntime.InferenceSession`` plus
+        tokenizer state — together roughly 30 MB once warm. Dropping
+        the Python reference is not enough on its own: the ORT C++
+        session is kept alive until Python's GC eventually runs. Long-
+        running proxy workers that score many requests should call
+        ``close()`` between scoring bursts to reclaim that memory.
+        Calling ``close()`` on an unloaded scorer is a no-op.
+        """
+        import gc
+
+        self._model = None
+        gc.collect()
+
 
 # Convenience function for checking availability without instantiation
 def embedding_available() -> bool:

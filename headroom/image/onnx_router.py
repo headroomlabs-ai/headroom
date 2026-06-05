@@ -206,3 +206,25 @@ class OnnxTechniqueRouter:
             reason=reason,
             image_signals=image_signals,
         )
+
+    def close(self) -> None:
+        """Release ONNX session and tokenizer references.
+
+        Long-running proxy workers must call this between bursts so the
+        ~127 MB of mapped ONNX weights and tokenizer state can be
+        reclaimed. Dropping the references alone is not enough — the
+        ORT session holds C++-side memory pools (CPU arena disabled in
+        ``create_cpu_session_options`` but the weight blobs still cost
+        tens of MB per session). Calling this lets Python and ORT free
+        them; ``gc.collect()`` is invoked to break any reference cycles
+        before the C++ destructor runs.
+        """
+        import gc
+
+        self._classifier_session = None
+        self._tokenizer = None
+        self._id2label = {}
+        self._siglip_session = None
+        self._text_embeddings = {}
+        self._siglip_processor = None
+        gc.collect()
