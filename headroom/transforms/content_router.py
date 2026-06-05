@@ -59,6 +59,39 @@ def _router_debug_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
 
 
+_TREE_SITTER_PRELOAD_ENV = "HEADROOM_TREE_SITTER_PRELOAD"
+
+
+def _maybe_preload_tree_sitter_parsers() -> list[str]:
+    """Pre-load only the tree-sitter parsers explicitly requested via env.
+
+    Reading ``HEADROOM_TREE_SITTER_PRELOAD`` lets operators trade memory for
+    first-request latency. The empty/unset case (the default) returns an empty
+    list — parsers then load lazily on first use of each language, per thread.
+
+    Returns:
+        The list of languages that were successfully pre-loaded.
+    """
+    raw = os.environ.get(_TREE_SITTER_PRELOAD_ENV, "").strip()
+    if not raw:
+        return []
+
+    requested = [lang.strip().lower() for lang in raw.split(",") if lang.strip()]
+    if not requested:
+        return []
+
+    from .code_compressor import _get_parser
+
+    loaded: list[str] = []
+    for lang in requested:
+        try:
+            _get_parser(lang)
+            loaded.append(lang)
+        except (ValueError, ImportError):
+            logger.debug("Tree-sitter parser preload skipped: %s", lang)
+    return loaded
+
+
 def _log_router_debug(event: str, **payload: Any) -> None:
     if not logger.isEnabledFor(logging.DEBUG):
         return
@@ -1687,39 +1720,36 @@ class ContentRouter(Transform):
             logger.debug("Magika pre-load skipped: %s", e)
             status["magika"] = "skipped"
 
-        # 3. CodeAware compressor + common tree-sitter parsers
+        # 3. CodeAware compressor + tree-sitter parsers
         if self.config.enable_code_aware:
             code_compressor = self._get_code_compressor()
             if code_compressor:
                 status["code_aware"] = "enabled"
-                # Pre-load tree-sitter parsers for common languages
-                # Each parser is ~50ms to load; doing it here avoids 500ms+ on first code hit
+                # Tree-sitter parsers are now loaded lazily per-thread on first
+                # use. Eagerly loading all 8 languages here costs ~150-300 MB
+                # of resident memory per worker and ~400ms of startup time —
+                # and most workers only ever see Python (or no code at all).
+                #
+                # Operators that want the old behaviour can opt back in via
+                # ``HEADROOM_TREE_SITTER_PRELOAD=<lang,lang,...>``. The empty
+                # string (or unset) means "no eager preload".
                 try:
-                    from .code_compressor import _check_tree_sitter_available, _get_parser
+                    from .code_compressor import _check_tree_sitter_available
 
                     if _check_tree_sitter_available():
-                        common_languages = [
-                            "python",
-                            "javascript",
-                            "typescript",
-                            "go",
-                            "rust",
-                            "java",
-                            "c",
-                            "cpp",
-                        ]
-                        loaded = []
-                        for lang in common_languages:
-                            try:
-                                _get_parser(lang)
-                                loaded.append(lang)
-                            except (ValueError, ImportError):
-                                pass  # Language not available, skip
+                        loaded = _maybe_preload_tree_sitter_parsers()
                         if loaded:
-                            logger.info("Tree-sitter parsers pre-loaded: %s", ", ".join(loaded))
+                            logger.info(
+                                "Tree-sitter parsers pre-loaded (opt-in): %s",
+                                ", ".join(loaded),
+                            )
                             status["tree_sitter"] = f"loaded ({len(loaded)} languages)"
+                        else:
+                            status["tree_sitter"] = "lazy (load on first use)"
+                    else:
+                        status["tree_sitter"] = "not installed"
                 except Exception as e:
-                    logger.debug("Tree-sitter pre-load skipped: %s", e)
+                    logger.debug("Tree-sitter preload check failed: %s", e)
                     status["tree_sitter"] = "skipped"
             else:
                 status["code_aware"] = "not installed"

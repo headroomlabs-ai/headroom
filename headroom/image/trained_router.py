@@ -11,38 +11,75 @@ The MiniLM model is hosted on HuggingFace: headroom-ai/technique-router
 from __future__ import annotations
 
 import gc
+import importlib
+import importlib.util
 import io
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any
 
-try:
-    import torch
-    from PIL import Image
-    from transformers.modeling_outputs import BaseModelOutputWithPooling
-
-    _IMAGE_ML_AVAILABLE = True
-except ImportError:
-    _IMAGE_ML_AVAILABLE = False
-
+# NOTE: torch / transformers / PIL are imported lazily inside the helpers
+# below. Method annotations use ``Any`` (rather than ``torch.Tensor``) so the
+# module remains import-cheap — workers that never call the trained router
+# never pay the ~300-500 MB cost of loading torch.
 from headroom.models.config import ML_MODEL_DEFAULTS
 
 
-def _extract_tensor(output: torch.Tensor | BaseModelOutputWithPooling) -> torch.Tensor:
+def _image_ml_available() -> bool:
+    """Return True when torch + transformers + PIL are importable.
+
+    Uses ``importlib.util.find_spec`` so the heavy modules themselves are NOT
+    imported as a side-effect of the probe. Workers that never call into the
+    trained router (the default code path when ONNX handles image routing)
+    therefore never pay the ~300-500 MB cost of loading torch.
+    """
+    return all(
+        importlib.util.find_spec(name) is not None for name in ("torch", "transformers", "PIL")
+    )
+
+
+# Backwards-compatible boolean flag for external callers that historically
+# checked module-level state. Computed lazily so that simply *reading* the
+# attribute does not pull in torch.
+_IMAGE_ML_AVAILABLE = _image_ml_available()
+
+
+def _torch() -> Any:
+    """Import torch lazily on first call.
+
+    Keeping torch out of the import graph until it is actually used keeps a
+    cold worker's RSS small. Loading torch costs ~300-500 MB resident.
+    """
+    return importlib.import_module("torch")
+
+
+def _pil_image() -> Any:
+    """Import ``PIL.Image`` lazily on first call."""
+    return importlib.import_module("PIL.Image")
+
+
+def _base_model_output_with_pooling() -> Any:
+    """Import ``BaseModelOutputWithPooling`` lazily on first call."""
+    module = importlib.import_module("transformers.modeling_outputs")
+    return module.BaseModelOutputWithPooling
+
+
+def _extract_tensor(output: Any) -> Any:
     """Extract tensor from model output.
 
-    Some transformers versions return BaseModelOutputWithPooling instead of
-    raw tensors from get_image_features() / get_text_features(). This helper
-    handles both cases.
+    Some transformers versions return ``BaseModelOutputWithPooling`` instead
+    of raw tensors from ``get_image_features()`` / ``get_text_features()``.
+    This helper handles both cases.
 
     Args:
-        output: Either a tensor or BaseModelOutputWithPooling object.
+        output: Either a tensor or ``BaseModelOutputWithPooling`` object.
 
     Returns:
         The extracted tensor.
     """
-    if isinstance(output, BaseModelOutputWithPooling):
+    pooling_cls = _base_model_output_with_pooling()
+    if isinstance(output, pooling_cls):
         # Use pooler_output if available, otherwise last_hidden_state[:, 0]
         if output.pooler_output is not None:
             return output.pooler_output
@@ -144,7 +181,12 @@ class TrainedRouter:
         """
         self.model_path = model_path
         self.use_siglip = use_siglip
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        if device is not None:
+            self.device = device
+        else:
+            # Defer torch import until the device probe actually runs. Workers
+            # that never instantiate a TrainedRouter never pay the torch cost.
+            self.device = "cuda" if _torch().cuda.is_available() else "cpu"
 
         # Lazy-loaded models
         self._classifier: Any = None
@@ -234,6 +276,7 @@ class TrainedRouter:
         assert self._siglip_processor is not None
         assert self._siglip_model is not None
 
+        torch = _torch()
         self._text_embeddings = {}
 
         with torch.no_grad():
@@ -272,6 +315,7 @@ class TrainedRouter:
         )
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
+        torch = _torch()
         with torch.no_grad():
             outputs = self._classifier(**inputs)
             probs = torch.softmax(outputs.logits, dim=-1)
@@ -285,12 +329,13 @@ class TrainedRouter:
 
         return technique, confidence
 
-    def _get_image_embedding(self, image_data: bytes) -> torch.Tensor:
+    def _get_image_embedding(self, image_data: bytes) -> Any:
         """Get SigLIP embedding for image."""
         assert self._siglip_processor is not None
         assert self._siglip_model is not None
 
-        image = Image.open(io.BytesIO(image_data)).convert("RGB")
+        image_module = _pil_image()
+        image = image_module.open(io.BytesIO(image_data)).convert("RGB")
 
         inputs = self._siglip_processor(
             images=image,
@@ -298,14 +343,15 @@ class TrainedRouter:
         )
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
+        torch = _torch()
         with torch.no_grad():
             image_output = self._siglip_model.get_image_features(**inputs)
-            image_embeds: torch.Tensor = _extract_tensor(image_output)
+            image_embeds = _extract_tensor(image_output)
             image_embeds = image_embeds / image_embeds.norm(dim=-1, keepdim=True)
 
         return image_embeds
 
-    def _analyze_image(self, image_embedding: torch.Tensor) -> ImageSignals:
+    def _analyze_image(self, image_embedding: Any) -> ImageSignals:
         """Analyze image properties using SigLIP."""
         assert self._text_embeddings is not None
 
@@ -316,6 +362,7 @@ class TrainedRouter:
 
             return 1 / (1 + math.exp(-x * 5))
 
+        torch = _torch()
         with torch.no_grad():
             for signal_name, text_embeds in self._text_embeddings.items():
                 # Compute similarity with each description
