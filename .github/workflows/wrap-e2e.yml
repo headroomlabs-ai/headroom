@@ -3,9 +3,22 @@ name: Wrap E2E
 on:
   pull_request:
     branches: [main]
+    paths:
+      - 'headroom/**'
+      - 'crates/**'
+      - 'docker/**'
+      - 'Dockerfile'
+      - 'e2e/**'
+      - 'scripts/install*'
+      - 'pyproject.toml'
+      - '.github/workflows/wrap-e2e.yml'
   push:
     branches: [main]
   workflow_dispatch:
+
+concurrency:
+  group: wrap-e2e-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   docker-wrap-e2e:

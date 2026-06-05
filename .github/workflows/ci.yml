@@ -34,6 +34,7 @@ env:
 jobs:
   changes:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       code: ${{ steps.filter.outputs.code }}
       e2e: ${{ steps.filter.outputs.e2e }}
@@ -69,11 +70,18 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PY_VERSION }}
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-lint-${{ hashFiles('pyproject.toml') }}
+          restore-keys: ${{ runner.os }}-pip-lint-
       - run: python -m pip install --upgrade pip ruff mypy
       - name: ruff check
         run: ruff check .
@@ -86,6 +94,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -109,6 +118,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/setup-python@v5
         with:
@@ -136,6 +146,7 @@ jobs:
     needs: [changes, build-wheel, prefetch-model]
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -190,6 +201,7 @@ jobs:
     needs: [changes, build-wheel]
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       FASTEMBED_CACHE_PATH: ${{ github.workspace }}/.fastembed-cache
     steps:
@@ -244,6 +256,7 @@ jobs:
     needs: [changes, build-wheel]
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -268,11 +281,12 @@ jobs:
   commitlint:
     if: github.event_name != 'push' || !startsWith(github.event.head_commit.message, 'Merge pull request ')
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: wagoid/commitlint-github-action@v5
+      - uses: wagoid/commitlint-github-action@v6
         with:
           configFile: .commitlintrc.json
 
@@ -280,11 +294,18 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-build-${{ hashFiles('pyproject.toml') }}
+          restore-keys: ${{ runner.os }}-pip-build-
       - uses: dtolnay/rust-toolchain@1.95.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -306,13 +327,26 @@ jobs:
     needs: changes
     if: needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+      - name: Cache actionlint + act
+        id: tools-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            /usr/local/bin/actionlint
+            /usr/local/bin/act
+          key: ${{ runner.os }}-ci-tools-actionlint-act-v1
+
       - name: Install actionlint
+        if: steps.tools-cache.outputs.cache-hit != 'true'
         run: |
           curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash | bash
           sudo mv ./actionlint /usr/local/bin/actionlint
+
       - name: Install act
+        if: steps.tools-cache.outputs.cache-hit != 'true'
         run: |
           curl -fsSL https://raw.githubusercontent.com/nektos/act/master/install.sh | sudo bash
           sudo install ./bin/act /usr/local/bin/act
@@ -323,6 +357,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.e2e == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -366,6 +401,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.e2e == 'true'
     runs-on: windows-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -382,6 +418,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.e2e == 'true'
     runs-on: macos-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

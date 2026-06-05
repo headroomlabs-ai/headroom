@@ -39,6 +39,7 @@ jobs:
   test:
     name: test (ubuntu)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Install stable toolchain
@@ -63,6 +64,7 @@ jobs:
   wheels:
     name: wheels (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -105,6 +107,7 @@ jobs:
   audit:
     name: audit
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -112,9 +115,9 @@ jobs:
           toolchain: 1.95.0
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-audit + cargo-deny
-        run: |
-          cargo install --locked cargo-audit || true
-          cargo install --locked cargo-deny || true
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit,cargo-deny
       - name: cargo audit (soft-fail)
         continue-on-error: true
         run: cargo audit

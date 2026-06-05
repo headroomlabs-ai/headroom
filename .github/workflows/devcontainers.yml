@@ -62,7 +62,7 @@ jobs:
           node-version: "20"
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Install Dev Container CLI
         run: npm install -g @devcontainers/cli@0.85.0
@@ -94,7 +94,7 @@ jobs:
           node-version: "20"
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Install Dev Container CLI
         run: npm install -g @devcontainers/cli@0.85.0

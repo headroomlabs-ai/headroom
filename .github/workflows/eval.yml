@@ -15,11 +15,19 @@ jobs:
   smoke-test:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-eval-${{ hashFiles('pyproject.toml') }}
+          restore-keys: ${{ runner.os }}-pip-eval-
 
       # `pip install -e .` invokes maturin (declared in pyproject.toml's
       # build-system) which calls cargo to compile the Rust extension.
@@ -66,12 +74,19 @@ jobs:
   weekly-suite:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-eval-${{ hashFiles('pyproject.toml') }}
+          restore-keys: ${{ runner.os }}-pip-eval-
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0

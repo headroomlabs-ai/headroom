@@ -26,6 +26,13 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-docs-${{ hashFiles('mkdocs.yml') }}
+          restore-keys: ${{ runner.os }}-pip-docs-
+
       - name: Install dependencies
         run: pip install mkdocs-material
 

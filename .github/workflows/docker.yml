@@ -44,6 +44,7 @@ jobs:
   # final multi-arch tagged manifest, which is what users pull by tag.
   docker-build:
     runs-on: ${{ matrix.arch.runs_on }}
+    timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:
@@ -61,7 +62,7 @@ jobs:
           - { name: arm64, runs_on: ubuntu-24.04-arm, platform: linux/arm64 }
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
       - name: Normalize image name
         id: image-name
@@ -185,6 +186,7 @@ jobs:
   docker-manifest:
     needs: docker-build
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -351,6 +353,7 @@ jobs:
     # at the top instead of whichever variant happened to finish last.
     needs: docker-manifest
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - name: Normalize image name
         id: image-name
