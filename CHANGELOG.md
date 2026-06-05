@@ -5,8 +5,8 @@ All notable changes to Headroom will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.23.0](https://github.com/chopratejas/headroom/compare/v0.22.4...v0.23.0) (2026-06-04)
 
+## [0.23.0](https://github.com/chopratejas/headroom/compare/v0.22.4...v0.23.0) (2026-06-04)
 
 ### Features
 
@@ -70,6 +70,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 * **tests:** tomllib fallback to tomli on python 3.10 ([74843d1](https://github.com/chopratejas/headroom/commit/74843d1d626de70158a359661a540c615ef1a6c5))
 
 ## [Unreleased]
+
+### Security
+- **`/debug/memory` loopback guard.** The endpoint was missing the
+  `Depends(_require_loopback)` guard that all other `/debug/*` endpoints carry.
+  External callers can no longer reach it.
+- **`retry_max_attempts` zero guard.** When `retry_enabled=True` and
+  `retry_max_attempts=0` the retry loop exited without setting `last_error`,
+  causing `raise last_error` to raise `TypeError: exceptions must derive from
+  BaseException`. A `RuntimeError` with an actionable message is now raised
+  instead, and `ProxyConfig.__post_init__` rejects `retry_max_attempts < 1`
+  at construction time.
+- **Blocking subprocess on async event loop.** `_read_rtk_lifetime_stats` and
+  `_read_lean_ctx_lifetime_stats` called `subprocess.run` directly on the
+  asyncio thread. The `initialize_context_tool_session_baseline` function is
+  now `async` and offloads the subprocess via `asyncio.to_thread`; the stats
+  endpoint uses `await asyncio.to_thread(_get_context_tool_stats)`.
+- **Hardcoded Neo4j credential in `docker-compose.yml`.** `NEO4J_AUTH` now
+  defaults to `${NEO4J_AUTH:-neo4j/devpassword}` and is documented in
+  `.env.example` (excluded from `.gitignore` via `!.env.example`).
+- **`SemanticCache.get_memory_stats()` concurrent iteration.** The method
+  iterates `self._cache.values()` without holding the async lock. A snapshot
+  is now taken via `list(self._cache.values())` before iterating to avoid
+  `RuntimeError: dictionary changed size during iteration` under async load.
+- **Default Neo4j password in `ProxyConfig`.** `memory_neo4j_password` default
+  changed from `"password"` to `""`. The proxy startup path now emits a
+  `logger.warning` when `memory_backend == "qdrant-neo4j"` and the password
+  is empty, prompting operators to set a real credential.
 
 ### Fixed
 - **PyPI install clarity and release gating.** Documented `pipx --python python3.13`
@@ -323,7 +350,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Device selection: `--llmlingua-device` (auto/cuda/cpu/mps)
   - Custom compression rate: `--llmlingua-rate`
   - Helpful startup hints when llmlingua is available but not enabled
-  - Install with: `pip install headroom-ai[llmlingua]`
+  - ~~Install with: `pip install headroom-ai[llmlingua]`~~ (the `[llmlingua]` extra was removed in 0.9.x)
 - **Code-Aware Compression** (AST-based, syntax-preserving)
   - `CodeAwareCompressor` transform using tree-sitter for AST parsing
   - Supports Python, JavaScript, TypeScript, Go, Rust, Java, C, C++
@@ -461,12 +488,12 @@ New in 0.2.0 - run Headroom as a proxy server:
 
 ```bash
 # Start the proxy
-python -m headroom.proxy.server --port 8787
+headroom proxy --port 8787
 
 # Use with Claude Code
 ANTHROPIC_BASE_URL=http://localhost:8787 claude
 ```
 
-[Unreleased]: https://github.com/headroom-sdk/headroom/compare/v0.2.0...HEAD
-[0.2.0]: https://github.com/headroom-sdk/headroom/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/headroom-sdk/headroom/releases/tag/v0.1.0
+[Unreleased]: https://github.com/chopratejas/headroom/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/chopratejas/headroom/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/chopratejas/headroom/releases/tag/v0.1.0

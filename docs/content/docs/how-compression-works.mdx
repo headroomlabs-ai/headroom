@@ -10,18 +10,17 @@ Headroom automatically detects what kind of content you're sending and routes it
 Every request flows through three stages:
 
 ```
-┌──────────────┐     ┌────────────────┐     ┌─────────────────────┐
-│ CacheAligner │────>│ ContentRouter  │────>│ IntelligentContext   │
-│              │     │                │     │                     │
-│ Stabilize    │     │ Detect type &  │     │ Score messages &    │
-│ prefix for   │     │ route to best  │     │ fit within token    │
-│ cache hits   │     │ compressor     │     │ budget              │
-└──────────────┘     └────────────────┘     └─────────────────────┘
+┌──────────────┐     ┌────────────────┐
+│ CacheAligner │────>│ ContentRouter  │
+│              │     │                │
+│ Stabilize    │     │ Detect type &  │
+│ prefix for   │     │ route to best  │
+│ cache hits   │     │ compressor     │
+└──────────────┘     └────────────────┘
 ```
 
 1. **CacheAligner** extracts dynamic content (dates, user context) from your system prompt so the static prefix stays cacheable across requests.
 2. **ContentRouter** inspects each tool output and routes it to the optimal compressor -- SmartCrusher for JSON arrays, CodeAwareCompressor for source code, LogCompressor for build output, and so on.
-3. **IntelligentContext** scores every message by importance (recency, semantic relevance, error indicators) and drops the lowest-value messages to fit within the model's context window.
 
 ## Content Type Detection
 
@@ -30,7 +29,7 @@ The router auto-detects content type by analyzing structure and patterns. No man
 | Content Type | Detection Signal | Compressor | Typical Savings |
 |---|---|---|---|
 | JSON arrays | Valid JSON with array elements | SmartCrusher | 70-90% |
-| Source code | Syntax patterns, indentation, keywords | CodeAwareCompressor | 40-70% |
+| Source code | Syntax patterns, indentation, keywords | CodeAwareCompressor | 40-70% (opt-in; disabled by default) |
 | Search results | `file:line:content` format | SearchCompressor | 80-95% |
 | Build/test logs | Timestamps, log levels, pytest/npm markers | LogCompressor | 85-95% |
 | Diffs | Unified diff format | DiffCompressor | 60-80% |
@@ -57,7 +56,7 @@ console.log(`Compression ratio: ${result.compressionRatio}`);
 </Tab>
 <Tab value="Python">
 ```python
-from headroom.compression import compress
+from headroom import compress
 
 result = compress(content)
 print(result.compressed)
@@ -85,6 +84,7 @@ console.log(`Transforms: ${result.transformsApplied.join(", ")}`);
 </Tab>
 <Tab value="Python">
 ```python
+# Advanced / Internal API -- prefer `from headroom import compress` for typical use
 from headroom.compression import UniversalCompressor, UniversalCompressorConfig
 
 config = UniversalCompressorConfig(
@@ -130,6 +130,7 @@ Headroom doesn't blindly truncate. It identifies what matters in each content ty
 For multiple contents, batch compression is more efficient:
 
 ```python
+# Advanced / Internal API -- prefer `from headroom import compress` for typical use
 from headroom.compression import UniversalCompressor
 
 compressor = UniversalCompressor()

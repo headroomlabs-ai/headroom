@@ -164,24 +164,7 @@ response = client.chat.completions.create(
 
 ## Message-level CCR
 
-CCR is not limited to tool outputs. When IntelligentContext drops low-importance messages to fit the context budget, those messages are also stored in CCR:
-
-```
-100-message conversation (50K tokens)
-  -> IntelligentContext scores messages by importance
-  -> Drops 60 low-scoring messages
-  -> Dropped messages cached with hash=def456
-  -> Marker inserted: "60 messages dropped, retrieve: def456"
-```
-
-The marker includes the CCR reference so the LLM can recover earlier context:
-
-```
-[Earlier context compressed: 60 message(s) dropped by importance scoring.
-Full content available via ccr_retrieve tool with reference 'def456'.]
-```
-
-When users retrieve dropped messages via CCR, TOIN learns those message patterns are important and scores them higher in future sessions -- improving drop decisions across all users.
+> **Retired:** The "Message-level CCR via IntelligentContext" feature (where `IntelligentContext` would store dropped messages in CCR with a retrieval marker) was part of the `IntelligentContextConfig` API that was removed in 0.9.x. Context management is now handled automatically by the pipeline without a separate configurable IntelligentContext stage. Tool-output CCR via SmartCrusher and ContentRouter remains fully supported.
 
 ## CCR-enabled components
 
@@ -189,7 +172,6 @@ When users retrieve dropped messages via CCR, TOIN learns those message patterns
 |---|---|---|
 | **SmartCrusher** | JSON arrays (tool outputs) | Stores original array, marker includes hash |
 | **ContentRouter** | Code, logs, search results, text | Stores original content by strategy |
-| **IntelligentContext** | Messages (conversation turns) | Stores dropped messages, marker includes hash |
 
 ## Why CCR matters
 

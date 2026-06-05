@@ -64,4 +64,4 @@ The canonical, always-current documentation index lives at the docs site below. 
 
 ## Licensing
 
-Apache 2.0. Use commercially, modify, redistribute. Data stays on the user's machine when running the library, proxy, or MCP server locally. No telemetry by default.
+Apache 2.0. Use commercially, modify, redistribute. Data stays on the user's machine when running the library, proxy, or MCP server locally. Anonymous telemetry enabled by default; set `HEADROOM_TELEMETRY=off` to disable.

@@ -3,11 +3,11 @@ title: Context Management
 description: Intelligent importance-based context management that scores messages by learned patterns, with rolling window fallback and output buffer reservation.
 ---
 
-When conversations grow beyond a model's context window, Headroom decides which messages to keep and which to drop. Instead of naively removing the oldest messages, **IntelligentContext** scores every message by learned importance and drops the least valuable ones first.
+When conversations grow beyond a model's context window, Headroom decides which messages to keep and which to drop. Instead of naively removing the oldest messages, the pipeline scores every message by learned importance and drops the least valuable ones first.
 
-## IntelligentContext
+## How It Works
 
-IntelligentContext is a message-level compressor. It analyzes your conversation, assigns an importance score to each message, and removes low-scoring messages until the conversation fits within the token budget.
+The context management stage analyzes your conversation, assigns an importance score to each message, and removes low-scoring messages until the conversation fits within the token budget.
 
 Dropped messages are not lost -- they are stored in [CCR](/docs/ccr) for on-demand retrieval by the LLM.
 
@@ -74,57 +74,16 @@ The last N user/assistant turns are always preserved, ensuring the model has imm
 
 ## Configuration
 
+Context management is now automatic. Use per-request overrides to control behavior:
+
 <Tabs groupId="lang" items={['TypeScript', 'Python']}>
 <Tab value="TypeScript">
 ```ts twoslash
 import { compress } from "headroom-ai";
-import type {
-  IntelligentContextConfig,
-  ScoringWeights,
-  RollingWindowConfig,
-  HeadroomConfig,
-} from "headroom-ai";
-
-// Scoring weights (normalized automatically)
-const scoringWeights: ScoringWeights = {
-  recency: 0.20,
-  semanticSimilarity: 0.20,
-  toinImportance: 0.25,
-  errorIndicator: 0.15,
-  forwardReference: 0.15,
-  tokenDensity: 0.05,
-};
-
-// IntelligentContext configuration
-const intelligentContext: IntelligentContextConfig = {
-  enabled: true,
-  keepSystem: true,
-  keepLastTurns: 2,
-  outputBufferTokens: 4000,
-  useImportanceScoring: true,
-  scoringWeights,
-  toinIntegration: true,
-  recencyDecayRate: 0.1,
-  compressThreshold: 0.1,
-};
-
-// Rolling window fallback
-const rollingWindow: RollingWindowConfig = {
-  enabled: true,
-  keepSystem: true,
-  keepLastTurns: 3,
-  outputBufferTokens: 4000,
-};
-
-// Full configuration
-const config: HeadroomConfig = {
-  intelligentContext,
-  rollingWindow,
-};
 
 const result = await compress(messages, {
   model: "gpt-4o",
-  config,
+  tokenBudget: 32000,
 });
 
 console.log(`Compressed: ${result.tokensBefore} -> ${result.tokensAfter}`);
@@ -133,30 +92,7 @@ console.log(`Compressed: ${result.tokensBefore} -> ${result.tokensAfter}`);
 <Tab value="Python">
 ```python
 from headroom import HeadroomClient, OpenAIProvider
-from headroom.config import IntelligentContextConfig, ScoringWeights
 from openai import OpenAI
-
-# Customize scoring weights
-weights = ScoringWeights(
-    recency=0.20,
-    semantic_similarity=0.20,
-    toin_importance=0.25,
-    error_indicator=0.15,
-    forward_reference=0.15,
-    token_density=0.05,
-)
-
-context_config = IntelligentContextConfig(
-    enabled=True,
-    keep_system=True,            # Never drop system messages
-    keep_last_turns=2,           # Protect last 2 user turns
-    output_buffer_tokens=4000,   # Reserve for model output
-    use_importance_scoring=True,
-    scoring_weights=weights,
-    toin_integration=True,       # Use TOIN patterns
-    recency_decay_rate=0.1,      # Exponential decay lambda
-    compress_threshold=0.1,      # Try compression first if <10% over budget
-)
 
 client = HeadroomClient(
     original_client=OpenAI(),
@@ -174,6 +110,8 @@ response = client.chat.completions.create(
 ```
 </Tab>
 </Tabs>
+
+> **Note:** The `IntelligentContextConfig`, `ScoringWeights`, and `RollingWindowConfig` classes were removed in 0.9.x. Context management is now handled automatically inside the pipeline.
 
 ## How scoring improves over time
 

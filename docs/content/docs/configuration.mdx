@@ -132,11 +132,12 @@ config = SmartCrusherConfig(
     # Minimum tokens before applying compression
     min_tokens_to_crush=200,
 
-    # Relevance scoring tier: "bm25" (fast) or "embedding" (accurate)
-    relevance_tier="bm25",
+    # Fraction of items always kept from the start/end
+    first_fraction=0.3,
+    last_fraction=0.15,
 
-    # Always keep items with these field values
-    preserve_fields=["error", "warning", "failure"],
+    # Variance threshold for statistical analysis
+    variance_threshold=2.0,
 )
 ```
 
@@ -159,73 +160,22 @@ config = CacheAlignerConfig(
 )
 ```
 
-## RollingWindow Configuration
+## Context Window Management
 
-Control context window management when messages exceed model limits:
+Context management is now automatic. Use per-request overrides to control behavior:
 
 ```python
-from headroom.transforms import RollingWindowConfig
-
-config = RollingWindowConfig(
-    # Minimum turns to always keep
-    min_keep_turns=3,
-
-    # Reserve tokens for output
-    output_buffer_tokens=4000,
-
-    # Drop oldest tool outputs first
-    prefer_drop_tool_outputs=True,
+response = client.chat.completions.create(
+    model="gpt-4o",
+    messages=messages,
+    # Reserve tokens for model output
+    headroom_output_buffer_tokens=4000,
+    # Keep last N turns uncompressed
+    headroom_keep_turns=3,
 )
 ```
 
-## IntelligentContext Configuration
-
-Semantic-aware context management with importance scoring:
-
-```python
-from headroom.config import IntelligentContextConfig, ScoringWeights
-
-# Customize scoring weights (must sum to 1.0, or will be normalized)
-weights = ScoringWeights(
-    recency=0.20,              # Newer messages score higher
-    semantic_similarity=0.20,  # Similarity to recent context
-    toin_importance=0.25,      # TOIN-learned retrieval patterns
-    error_indicator=0.15,      # TOIN-learned error field types
-    forward_reference=0.15,    # Messages referenced by later messages
-    token_density=0.05,        # Information density
-)
-
-config = IntelligentContextConfig(
-    enabled=True,
-    keep_system=True,           # Never drop system messages
-    keep_last_turns=2,          # Protect last N user turns
-    output_buffer_tokens=4000,  # Reserve for model output
-    use_importance_scoring=True,
-    scoring_weights=weights,
-    toin_integration=True,      # Use TOIN patterns if available
-    recency_decay_rate=0.1,     # Exponential decay lambda
-    compress_threshold=0.1,     # Try compression first if <10% over budget
-)
-```
-
-### Scoring Weights
-
-<TypeTable type={{
-  recency: { type: 'float', description: 'Exponential decay from conversation end', default: '0.20' },
-  semantic_similarity: { type: 'float', description: 'Embedding cosine similarity to recent context', default: '0.20' },
-  toin_importance: { type: 'float', description: 'TOIN retrieval_rate (high retrieval = important)', default: '0.25' },
-  error_indicator: { type: 'float', description: 'TOIN field_semantics error detection', default: '0.15' },
-  forward_reference: { type: 'float', description: 'Count of later messages referencing this one', default: '0.15' },
-  token_density: { type: 'float', description: 'Unique tokens / total tokens', default: '0.05' },
-}} />
-
-Weights are automatically normalized to sum to 1.0:
-
-```python
-weights = ScoringWeights(recency=1.0, toin_importance=1.0)
-normalized = weights.normalized()
-# recency=0.5, toin_importance=0.5, others=0.0
-```
+The `RollingWindowConfig`, `IntelligentContextConfig`, and `ScoringWeights` classes were removed in 0.9.x. Context management now happens automatically inside the pipeline.
 
 ## Proxy Configuration
 

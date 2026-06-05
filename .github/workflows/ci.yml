@@ -1,5 +1,16 @@
 name: CI
 
+# Intelligent + parallel pipeline (cutover from the old 4-version matrix):
+#   changes      — paths-filter; skips heavy work for docs-only changes
+#   build-wheel  — compile the Rust ext ONCE (fast `ci` cargo profile), share via artifact
+#   lint         — ruff + mypy, once
+#   prefetch-model — download the embedding model ONCE (authenticated), warm shared cache
+#   test         — 4 parallel shards (pytest-split), each a fresh runner VM; run offline
+#   test-extras / test-agno / build / commitlint / workflow-validation / *-e2e — preserved
+#
+# Notes: CPU-only torch everywhere (no CUDA stack); test shards run HF_HUB_OFFLINE.
+# Multi-version (3.10/3.11/3.13) coverage on main is a planned follow-up.
+
 on:
   push:
     branches: [main]
@@ -7,151 +18,322 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  # Cancel superseded runs on PRs/branches, but never cancel a main build.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  PY_VERSION: "3.12"
+  # CPU-only torch — runners have no GPU; the default CUDA wheels pull ~2.5 GB.
+  PIP_EXTRA_INDEX_URL: https://download.pytorch.org/whl/cpu
+
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+      e2e: ${{ steps.filter.outputs.e2e }}
+      workflows: ${{ steps.filter.outputs.workflows }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            code:
+              - 'headroom/**'
+              - 'crates/**'
+              - '**/*.rs'
+              - 'pyproject.toml'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'tests/**'
+              - 'scripts/**'
+              - '.github/workflows/ci.yml'
+            e2e:
+              - 'headroom/**'
+              - 'crates/**'
+              - 'docker/**'
+              - 'Dockerfile'
+              - 'e2e/**'
+              - 'scripts/install*'
+              - 'pyproject.toml'
+            workflows:
+              - '.github/workflows/**'
+
+  lint:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PY_VERSION }}
+      - run: python -m pip install --upgrade pip ruff mypy
+      - name: ruff check
+        run: ruff check .
+      - name: ruff format --check
+        run: ruff format --check .
+      - name: mypy
+        run: mypy headroom --ignore-missing-imports
+
+  build-wheel:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PY_VERSION }}
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+      - name: Build wheel once (fast CI cargo profile)
+        run: |
+          python -m pip install --upgrade pip maturin
+          maturin build --profile ci --out dist --interpreter "python${PY_VERSION}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: headroom-wheel
+          path: dist/*.whl
+          retention-days: 1
+
+  prefetch-model:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PY_VERSION }}
+      - name: Cache HuggingFace model
+        id: hfcache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: ${{ runner.os }}-models-allMiniLM-v2
+      - name: Fetch all-MiniLM-L6-v2 once (authenticated, resilient)
+        if: steps.hfcache.outputs.cache-hit != 'true'
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_HUB_DISABLE_TELEMETRY: "1"
+        run: |
+          python -m pip install --upgrade pip huggingface_hub
+          for i in 1 2 3 4 5 6; do
+            if python -c "from huggingface_hub import snapshot_download; snapshot_download('sentence-transformers/all-MiniLM-L6-v2')"; then exit 0; fi
+            echo "::warning::model fetch attempt $i failed; backing off"; sleep $((i * 30))
+          done
+          echo "::error::could not fetch all-MiniLM-L6-v2 from HuggingFace"; exit 1
+
   test:
+    needs: [changes, build-wheel, prefetch-model]
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
-
+        shard: [1, 2, 3, 4]
+    env:
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: ${{ env.PY_VERSION }}
 
-      # `pip install -e .` invokes maturin (declared in `[build-system]
-      # requires`) under the hood, which calls cargo to build the Rust
-      # extension. The toolchain has to be available before the install
-      # step, otherwise build-isolation pulls maturin but `cargo` is
-      # missing.
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.95.0
-
-      - name: Cache cargo registry + build
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: ". -> target"
-
-      - name: Cache pip packages
+      - name: Cache pip
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ matrix.python-version }}-${{ hashFiles('pyproject.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-${{ matrix.python-version }}-
+          key: ${{ runner.os }}-pip-${{ env.PY_VERSION }}-${{ hashFiles('pyproject.toml') }}
+          restore-keys: ${{ runner.os }}-pip-${{ env.PY_VERSION }}-
 
-      - name: Install dependencies (builds Rust extension via maturin)
+      - name: Restore HuggingFace model cache (warmed by prefetch-model)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: ${{ runner.os }}-models-allMiniLM-v2
+
+      - name: Download prebuilt wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: headroom-wheel
+          path: dist
+
+      - name: Install (CPU torch + prebuilt wheel + dev deps, no cargo rebuild)
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev]"
-          python -c "from headroom._core import DiffCompressor; print('headroom._core OK:', DiffCompressor)"
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          WHEEL="$(ls dist/*.whl)"
+          pip install "${WHEEL}[dev]" pytest-split
+          # cwd's ./headroom source tree shadows the installed wheel; copy the
+          # compiled extension in so tests import it (no second cargo build).
+          SITE="$(python -c 'import sysconfig; print(sysconfig.get_path("platlib"))')"
+          cp "${SITE}/headroom/"_core*.so headroom/
+          python -c "from headroom._core import DiffCompressor; print('headroom._core OK')"
 
-      - name: Run linting
-        if: matrix.python-version == '3.12'
+      - name: Run test shard ${{ matrix.shard }}/4
         run: |
-          ruff check .
-          ruff format --check .
-
-      - name: Run type checking
-        if: matrix.python-version == '3.12'
-        run: |
-          mypy headroom --ignore-missing-imports
-
-      - name: Run tests
-        run: |
-          pytest -v --tb=short tests scripts/tests
-
-      - name: Run tests with coverage
-        if: matrix.python-version == '3.11'
-        run: |
-          pytest tests scripts/tests --cov=headroom --cov-report=xml --cov-report=term-missing
-
-      - name: Upload coverage to Codecov
-        if: matrix.python-version == '3.11'
-        uses: codecov/codecov-action@v4
-        with:
-          file: ./coverage.xml
-          fail_ci_if_error: false
+          pytest tests scripts/tests \
+            --splits 4 --group ${{ matrix.shard }} \
+            --tb=short -q
 
   test-extras:
+    needs: [changes, build-wheel]
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
+    env:
+      FASTEMBED_CACHE_PATH: ${{ github.workspace }}/.fastembed-cache
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.95.0
-
-      - name: Cache cargo registry + build
-        uses: Swatinem/rust-cache@v2
+          python-version: ${{ env.PY_VERSION }}
+      - name: Cache pip
+        uses: actions/cache@v4
         with:
-          workspaces: ". -> target"
-
-      - name: Install with relevance extras (builds Rust extension via maturin)
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-extras-${{ hashFiles('pyproject.toml') }}
+          restore-keys: ${{ runner.os }}-pip-extras-
+      - name: Cache fastembed model
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.fastembed-cache
+          key: ${{ runner.os }}-fastembed-bge-small-v1
+      - name: Download prebuilt wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: headroom-wheel
+          path: dist
+      - name: Install (CPU torch + wheel[dev,relevance])
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev,relevance]"
-          python -c "from headroom._core import SmartCrusher; print('headroom._core OK:', SmartCrusher)"
-
-      - name: Run relevance tests
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          WHEEL="$(ls dist/*.whl)"
+          pip install "${WHEEL}[dev,relevance]"
+          SITE="$(python -c 'import sysconfig; print(sysconfig.get_path("platlib"))')"
+          cp "${SITE}/headroom/"_core*.so headroom/
+          python -c "from headroom._core import SmartCrusher; print('headroom._core OK')"
+      - name: Pre-fetch fastembed model (authenticated, resilient)
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_HUB_DISABLE_TELEMETRY: "1"
         run: |
-          pytest tests/test_relevance.py -v
+          for i in 1 2 3 4 5; do
+            if python -c "from fastembed import TextEmbedding; TextEmbedding('BAAI/bge-small-en-v1.5')"; then exit 0; fi
+            echo "::warning::fastembed fetch attempt $i failed; backing off"; sleep $((i * 20))
+          done
+          echo "::error::could not fetch fastembed model from HuggingFace"; exit 1
+      - name: Run relevance tests
+        # Offline so fastembed reads the cache the prefetch step just warmed,
+        # without an unauthenticated cache-validation HEAD that could 429.
+        env:
+          HF_HUB_OFFLINE: "1"
+          TRANSFORMERS_OFFLINE: "1"
+        run: pytest tests/test_relevance.py -v
 
   test-agno:
+    needs: [changes, build-wheel]
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.95.0
-
-      - name: Cache cargo registry + build
-        uses: Swatinem/rust-cache@v2
+          python-version: ${{ env.PY_VERSION }}
+      - name: Download prebuilt wheel
+        uses: actions/download-artifact@v4
         with:
-          workspaces: ". -> target"
-
-      - name: Install with agno extras (builds Rust extension via maturin)
+          name: headroom-wheel
+          path: dist
+      - name: Install (CPU torch + wheel[dev,agno])
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev,agno]"
-
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          WHEEL="$(ls dist/*.whl)"
+          pip install "${WHEEL}[dev,agno]"
+          SITE="$(python -c 'import sysconfig; print(sysconfig.get_path("platlib"))')"
+          cp "${SITE}/headroom/"_core*.so headroom/
       - name: Run agno tests
-        run: |
-          pytest tests/test_integrations/agno/ -v
+        run: pytest tests/test_integrations/agno/ -v
 
-  docker-native-e2e:
+  commitlint:
+    if: github.event_name != 'push' || !startsWith(github.event.head_commit.message, 'Merge pull request ')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: wagoid/commitlint-github-action@v5
+        with:
+          configFile: .commitlintrc.json
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+  build:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
-      - name: Build local Headroom image
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+      # Smoke check that the SHIPPED build (release profile) + sdist are wired
+      # right; release.yml's matrix is what actually publishes to PyPI.
+      - name: Install build tools
         run: |
-          docker build -t headroom-native-e2e:latest .
+          python -m pip install --upgrade pip
+          pip install 'maturin>=1.5,<2.0' twine
+      - name: Build wheel + sdist
+        run: |
+          maturin sdist --out dist
+          maturin build --release --out dist
+      - name: Check package
+        run: twine check dist/*
 
+  workflow-validation:
+    needs: changes
+    if: needs.changes.outputs.workflows == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install actionlint
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash | bash
+          sudo mv ./actionlint /usr/local/bin/actionlint
+      - name: Install act
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/nektos/act/master/install.sh | sudo bash
+          sudo install ./bin/act /usr/local/bin/act
+      - name: Validate workflow files
+        run: bash scripts/validate-workflows.sh
+
+  docker-native-e2e:
+    needs: changes
+    if: needs.changes.outputs.e2e == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Build local Headroom image
+        run: docker build -t headroom-native-e2e:latest .
       - name: Run Docker-native installer e2e
         env:
           HEADROOM_DOCKER_IMAGE: headroom-native-e2e:latest
-        run: |
-          bash e2e/docker-native-install.sh
-
+        run: bash e2e/docker-native-install.sh
       - name: Run Docker-native compose smoke test
         env:
           HEADROOM_IMAGE: headroom-native-e2e:latest
@@ -171,126 +353,47 @@ jobs:
             fi
             sleep 1
           done
-
       - name: Run Docker-native wrap e2e
         run: |
           docker build -f e2e/wrap/Dockerfile -t headroom-wrap-e2e .
           docker run --rm headroom-wrap-e2e
-
       - name: Run Docker-native init e2e
         run: |
           docker build -f e2e/init/Dockerfile -t headroom-init-e2e .
           docker run --rm headroom-init-e2e
 
   windows-native-wrapper:
+    needs: changes
+    if: needs.changes.outputs.e2e == 'true'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
       - name: Install test dependencies
         run: |
           python -m pip install --upgrade pip
           pip install pytest
-
       - name: Run native installer wrapper tests
-        run: |
-          pytest tests/test_install/test_native_installers.py -q
+        run: pytest tests/test_install/test_native_installers.py -q
 
   macos-native-wrapper:
+    needs: changes
+    if: needs.changes.outputs.e2e == 'true'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
       - name: Install bash and test dependencies
         run: |
           brew install bash
           python -m pip install --upgrade pip
           python -m pip install --retries 10 --timeout 60 pytest
-
       - name: Run native installer wrapper tests
         run: |
           BASH_PREFIX="$(brew --prefix bash)"
           export PATH="$BASH_PREFIX/bin:$PATH"
           pytest tests/test_install/test_native_installers.py -q
-
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.95.0
-
-      - name: Cache cargo registry + build
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: ". -> target"
-
-      # Single-wheel build via maturin: produces both the linux wheel and
-      # the platform-independent sdist in one shot. release.yml's matrix
-      # is what builds per-platform wheels for PyPI; this `build` job is
-      # a smoke check that the build system is wired right.
-      - name: Install build tools
-        run: |
-          python -m pip install --upgrade pip
-          pip install 'maturin>=1.5,<2.0' twine
-
-      - name: Build wheel + sdist
-        run: |
-          maturin sdist --out dist
-          maturin build --release --out dist
-
-      - name: Check package
-        run: |
-          twine check dist/*
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: dist
-          path: dist/
-
-  commitlint:
-    if: github.event_name != 'push' || !startsWith(github.event.head_commit.message, 'Merge pull request ')
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: wagoid/commitlint-github-action@v5
-        with:
-          configFile: .commitlintrc.json
-
-  workflow-validation:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install actionlint
-        run: |
-          curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash | bash
-          sudo mv ./actionlint /usr/local/bin/actionlint
-
-      - name: Install act
-        run: |
-          curl -fsSL https://raw.githubusercontent.com/nektos/act/master/install.sh | sudo bash
-          sudo install ./bin/act /usr/local/bin/act
-
-      - name: Validate workflow files
-        run: |
-          bash scripts/validate-workflows.sh

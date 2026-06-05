@@ -112,7 +112,6 @@ for memory in results:
 # Add a memory manually
 client.memory.add(
     "User is a senior engineer",
-    category="fact",
     importance=0.9,
 )
 
@@ -174,10 +173,11 @@ This gives you an audit trail, the ability to debug why the LLM made certain dec
 ```python
 from headroom.memory import MemoryConfig, EmbedderBackend
 
-# Local embeddings (recommended -- fast, free, private)
+# ONNX embeddings (recommended -- fast, free, private; ~30 MB int8-quantized)
+# Note: EmbedderBackend.LOCAL requires PyTorch (~2 GB); use ONNX instead.
 config = MemoryConfig(
-    embedder_backend=EmbedderBackend.LOCAL,
-    embedder_model="all-MiniLM-L6-v2",
+    embedder_backend=EmbedderBackend.ONNX,
+    embedder_model="BAAI/bge-small-en-v1.5",
 )
 
 # OpenAI embeddings (higher quality, costs money)

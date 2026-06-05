@@ -141,6 +141,29 @@ def _check_proxy(port: int) -> bool:
         return False
 
 
+def _port_bind_error(port: int) -> OSError | None:
+    """Return the bind error for a local proxy port, or None when it is usable."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", port))
+    except OSError as exc:
+        return exc
+    return None
+
+
+def _format_unbindable_port_error(port: int, error: OSError, agent_type: str) -> str:
+    """Build an actionable message for ports that fail before uvicorn can bind."""
+    command = "headroom proxy"
+    if agent_type != "unknown":
+        command = f"headroom wrap {agent_type}"
+    suggested_port = port + 1
+    return (
+        f"Port {port} is unavailable on 127.0.0.1 before the proxy can start: {error}. "
+        "On Windows this can happen when the port is in an excluded or reserved range. "
+        f"Rerun with a different port, for example `{command} --port {suggested_port}`."
+    )
+
+
 def _get_log_path() -> Path:
     """Get path for proxy log file."""
     from headroom import paths as _paths
@@ -1740,6 +1763,12 @@ def _ensure_proxy(
                 return None
 
         # Start (or restart) the proxy with the requested flags
+        bind_error = helpers._port_bind_error(port)
+        if bind_error is not None:
+            raise click.ClickException(
+                helpers._format_unbindable_port_error(port, bind_error, agent_type)
+            )
+
         click.echo(f"  Starting Headroom proxy on port {port}...")
         try:
             proc = cast(
@@ -2439,6 +2468,13 @@ def copilot(
         headroom wrap copilot --provider-type openai --wire-api responses -- --model gpt-5.4
         headroom wrap copilot --subscription -- --model gpt-4.1
         headroom wrap copilot --no-context-tool -- --prompt "explain this file"
+
+    \b
+    Copilot hosted API (--subscription and the implicit OAuth path) routes to the
+    generic host https://api.githubcopilot.com, which serves the full model set.
+    Enterprise / data-residency accounts provisioned on a dedicated host pin it
+    explicitly with GITHUB_COPILOT_API_URL (the override flows through to upstream).
+    See TESTING-copilot-subscription.md for details.
     """
     copilot_bin = shutil.which("copilot")
     if not copilot_bin:
@@ -2534,6 +2570,15 @@ def copilot(
                 else "COPILOT_AUTH_MODE=github-oauth"
             ),
         ]
+        # Resolve the Copilot API host: an explicit GITHUB_COPILOT_API_URL wins,
+        # otherwise the generic public host (api.githubcopilot.com). This is the
+        # same policy for --subscription and the implicit OAuth path. The
+        # account-specific endpoints.api advertised by /copilot_internal/user is
+        # deliberately NOT used to route — it returns a segmented host (e.g.
+        # api.individual.githubcopilot.com) that does not serve newer models on
+        # the responses API (#610), and it is not the host the official Copilot
+        # client routes with. Accounts that require a dedicated host (enterprise /
+        # data residency) set GITHUB_COPILOT_API_URL explicitly.
         openai_api_url = resolve_copilot_api_url(client_bearer)
         env["GITHUB_COPILOT_API_URL"] = openai_api_url
         env["OPENAI_TARGET_API_URL"] = openai_api_url

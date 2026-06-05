@@ -106,3 +106,16 @@ gcp_auth = "0.12"
 strip = "symbols"
 lto = "thin"
 codegen-units = 1
+
+# Fast-to-compile profile for CI test wheels. The shipped wheel uses
+# `release` (lto + codegen-units=1) for runtime/size; CI only needs a working
+# extension, so trade runtime perf for ~parallel, lto-free compilation. Used
+# via `maturin build --profile ci`. Does NOT affect `--release` builds.
+[profile.ci]
+inherits = "release"
+lto = false
+codegen-units = 256
+opt-level = 1
+strip = "none"
+debug = false
+incremental = false

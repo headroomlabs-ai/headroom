@@ -45,7 +45,7 @@ print(f"Saved {result.tokens_saved} tokens ({result.compression_ratio:.0%})")
 | Content type | What happens | Typical savings |
 |---|---|---|
 | JSON arrays (tool outputs) | Statistical analysis keeps errors, anomalies, boundaries | 70--90% |
-| Source code | AST-aware compression preserves signatures, collapses bodies | 40--70% |
+| Source code | AST-aware compression preserves signatures, collapses bodies | 40--70% (opt-in; disabled by default) |
 | Build/test logs | Keeps failures and errors, drops passing noise | 80--95% |
 | Search results | Ranks by relevance, keeps top matches | 60--80% |
 | Plain text | ModernBERT token classification removes redundancy | 30--50% |

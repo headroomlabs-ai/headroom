@@ -89,12 +89,11 @@ from headroom import SmartCrusher, SmartCrusherConfig
 
 config = SmartCrusherConfig(
     min_tokens_to_crush=200,      # Only compress if > 200 tokens
-    max_items_after_crush=50,     # Keep at most 50 items
-    keep_first=3,                 # Always keep first 3 items
-    keep_last=2,                  # Always keep last 2 items
-    relevance_threshold=0.3,      # Keep items with relevance > 0.3
-    anomaly_std_threshold=2.0,    # Keep items > 2 std dev from mean
-    preserve_errors=True,         # Always keep error items
+    max_items_after_crush=15,     # Keep at most 15 items
+    first_fraction=0.3,           # Keep first 30% of items
+    last_fraction=0.15,           # Keep last 15% of items
+    variance_threshold=2.0,       # Statistical variance threshold
+    preserve_change_points=True,  # Keep significant transitions
 )
 
 crusher = SmartCrusher(config)
@@ -108,12 +107,16 @@ compressed = crusher.crush(tool_output, query="find payment failures")
 | Option | Default | Description |
 |---|---|---|
 | `min_tokens_to_crush` | `200` | Only compress arrays with more than this many tokens |
-| `max_items_after_crush` | `50` | Maximum items to keep after compression |
-| `keep_first` | `3` | Always keep the first N items |
-| `keep_last` | `2` | Always keep the last N items |
-| `relevance_threshold` | `0.3` | Minimum relevance score to keep an item |
-| `anomaly_std_threshold` | `2.0` | Standard deviation threshold for anomaly detection |
-| `preserve_errors` | `True` | Always keep items containing error states |
+| `min_items_to_analyze` | `5` | Minimum items before analyzing for compression |
+| `max_items_after_crush` | `15` | Maximum items to keep after compression |
+| `variance_threshold` | `2.0` | Statistical variance threshold for analysis |
+| `uniqueness_threshold` | `0.1` | Uniqueness threshold for deduplication |
+| `similarity_threshold` | `0.8` | Similarity threshold for grouping |
+| `preserve_change_points` | `True` | Preserve significant transitions in data |
+| `first_fraction` | `0.3` | Fraction of items always kept from the start |
+| `last_fraction` | `0.15` | Fraction of items always kept from the end |
+| `dedup_identical_items` | `True` | Deduplicate identical items |
+| `use_feedback_hints` | `True` | Use TOIN feedback hints for scoring |
 
 ## Example: Before and After
 

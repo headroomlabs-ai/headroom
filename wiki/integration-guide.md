@@ -208,6 +208,8 @@ headroom wrap copilot --backend anyllm --anyllm-provider groq -- --model gpt-4o
 
 By default, `headroom wrap copilot` installs `rtk` and appends token-optimized shell guidance to `.github/copilot-instructions.md` so Copilot sessions reuse the same command-saving conventions as other wrapped agent CLIs. Use `--no-rtk` to skip that step.
 
+For Copilot's **hosted** API (`--subscription` and the implicit OAuth path), Headroom routes to the generic host `https://api.githubcopilot.com`, which serves the full model set. **Enterprise / data-residency** tenants on a dedicated Copilot host pin it with `GITHUB_COPILOT_API_URL` (e.g. `export GITHUB_COPILOT_API_URL=https://api.<your-host>.githubcopilot.com`); the override flows through to the upstream request. See [`TESTING-copilot-subscription.md`](https://github.com/chopratejas/headroom/blob/main/TESTING-copilot-subscription.md).
+
 ### With Cloud Providers
 
 ```bash

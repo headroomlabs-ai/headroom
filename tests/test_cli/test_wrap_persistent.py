@@ -88,6 +88,31 @@ def test_ensure_proxy_falls_back_when_persistent_manifest_is_stale(monkeypatch) 
     assert calls == ["start"]
 
 
+def test_ensure_proxy_reports_unbindable_port_before_starting_subprocess(monkeypatch) -> None:
+    calls: list[str] = []
+
+    monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: False)
+    monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: None)
+    monkeypatch.setattr(
+        wrap_cli,
+        "_port_bind_error",
+        lambda port: PermissionError(10013, "access denied by OS port reservation"),
+    )
+    monkeypatch.setattr(wrap_cli, "_start_proxy", lambda *args, **kwargs: calls.append("start"))
+
+    try:
+        wrap_cli._ensure_proxy(8787, False, agent_type="cursor")
+    except click.ClickException as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("expected unbindable port to raise before starting proxy")
+
+    assert "Port 8787 is unavailable" in message
+    assert "Windows" in message
+    assert "headroom wrap cursor --port 8788" in message
+    assert calls == []
+
+
 def test_ensure_proxy_restarts_idle_stale_persistent_deployment(monkeypatch) -> None:
     calls: list[str] = []
     health = {

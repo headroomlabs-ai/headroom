@@ -67,7 +67,11 @@ def test_env_token_resolves_subscription_without_secret_store(
     )
 
     assert copilot_auth.resolve_subscription_bearer_token() == "gho-env-universal"
-    assert copilot_auth.resolve_copilot_api_url("gho-env-universal") == BUSINESS_API
+    # Routing is override -> generic; the account host advertised by user-info is
+    # NOT used (it regressed newer models on the responses API, #610). With no
+    # GITHUB_COPILOT_API_URL pin set, the generic public host is returned.
+    monkeypatch.delenv("GITHUB_COPILOT_API_URL", raising=False)
+    assert copilot_auth.resolve_copilot_api_url("gho-env-universal") == copilot_auth.DEFAULT_API_URL
 
 
 def test_api_url_falls_back_to_default_when_user_info_unavailable(
@@ -164,29 +168,36 @@ def test_proxy_injects_explicit_token_over_discovered_one(
 
 
 # ---------------------------------------------------------------------------
-# 4. Full wrapper→proxy chain carries one consistent token, any account host.
+# 4. Full wrapper→proxy chain carries one consistent token to a pinned host.
 # ---------------------------------------------------------------------------
 def test_end_to_end_subscription_chain(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(copilot_auth, "_provider", None)
 
-    # (a) wrapper side: resolve + validate the subscription token, then
-    #     discover the account-specific API endpoint.
+    # (a) wrapper side: resolve + validate the subscription token. The API host
+    #     comes from the GITHUB_COPILOT_API_URL pin — the supported way to target
+    #     a dedicated enterprise / data-residency host. user-info is NOT used to
+    #     route (#610), so it advertises a *different* host here to prove it is
+    #     ignored when picking the upstream.
     _stub_all_secret_stores(monkeypatch)
     _clear_token_env(monkeypatch)
     monkeypatch.setenv("GITHUB_COPILOT_TOKEN", "gho-seat-token")
+    monkeypatch.setenv("GITHUB_COPILOT_API_URL", BUSINESS_API)
     monkeypatch.setattr(
         copilot_auth,
         "_fetch_copilot_user_info",
-        lambda token: {"endpoints": {"api": BUSINESS_API}} if token == "gho-seat-token" else None,
+        lambda token: (
+            {"endpoints": {"api": "https://api.individual.githubcopilot.com"}}
+            if token == "gho-seat-token"
+            else None
+        ),
     )
     resolved_token = copilot_auth.resolve_subscription_bearer_token()
     resolved_url = copilot_auth.resolve_copilot_api_url(resolved_token)
     assert resolved_token == "gho-seat-token"
-    assert resolved_url == BUSINESS_API
+    assert resolved_url == BUSINESS_API  # the pin wins; the user-info host is ignored
 
     # (b) hand-off: the wrapper exports exactly these for the proxy.
     monkeypatch.setenv("GITHUB_COPILOT_API_TOKEN", resolved_token)
-    monkeypatch.setenv("GITHUB_COPILOT_API_URL", resolved_url)
 
     # (c) proxy side: build the upstream URL (Copilot has no /v1 prefix) and
     #     inject the same token onto the outbound request.
