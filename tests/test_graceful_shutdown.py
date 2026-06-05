@@ -6,12 +6,14 @@ Covers:
 - _SuppressCancelledErrorFilter passes through unrelated error records
 - timeout_graceful_shutdown is present in the uvicorn.run() call path
 - The lifespan shutdown branch logs the proxy_shutdown event
+- Lifespan shutdown completes even when individual steps block/raise
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -190,3 +192,100 @@ def test_lifespan_logs_shutdown_event(monkeypatch: pytest.MonkeyPatch) -> None:
 
     shutdown_records = [r for r in captured if "event=proxy_shutdown" in r.getMessage()]
     assert shutdown_records, "Expected at least one log record containing 'event=proxy_shutdown'"
+
+
+# ---------------------------------------------------------------------------
+# Lifespan shutdown: bounded await (_timed helper)
+# ---------------------------------------------------------------------------
+
+
+def test_lifespan_shutdown_completes_when_beacon_hangs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Lifespan shutdown must complete even if _beacon.stop() never returns.
+
+    Before the fix, an unbounded ``await _beacon.stop()`` would block the
+    lifespan finally-block forever, requiring a second Ctrl+C.  The fix wraps
+    every shutdown await with asyncio.wait_for so a slow step is skipped
+    after its timeout and teardown continues.
+    """
+    import asyncio
+
+    async def hanging_stop() -> None:
+        await asyncio.sleep(9999)  # simulate a blocked network call
+
+    # Prevent sys.exit(78) from the Rust-core check
+    monkeypatch.setattr(
+        "headroom.proxy.server._check_rust_core", lambda: ("disabled", "test-mock")
+    )
+
+    config = ProxyConfig(
+        optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+        log_requests=False,
+        ccr_inject_tool=False,
+        ccr_handle_responses=False,
+        ccr_context_tracking=False,
+        image_optimize=False,
+    )
+    app = create_app(config)
+
+    # Patch the beacon inside the already-created app's lifespan closure
+    # by monkeypatching TelemetryBeacon.stop globally.
+    import headroom.telemetry.beacon as beacon_mod
+
+    monkeypatch.setattr(beacon_mod.TelemetryBeacon, "stop", lambda self: hanging_stop())
+
+    from fastapi.testclient import TestClient
+
+    # If the fix is absent this would hang; with the fix it returns quickly.
+    import time
+
+    start = time.monotonic()
+    with TestClient(app, raise_server_exceptions=False):
+        pass
+    elapsed = time.monotonic() - start
+    # Teardown should complete well within 15 s even with the timeout; hanging
+    # without the fix would block until the test runner times out (~60 s).
+    assert elapsed < 15.0, f"Lifespan shutdown took too long: {elapsed:.1f}s"
+
+
+def test_lifespan_shutdown_completes_when_proxy_shutdown_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Lifespan shutdown must complete even if proxy.shutdown() raises.
+
+    The _timed wrapper catches both TimeoutError and arbitrary exceptions,
+    logs a warning, and continues so all subsequent teardown steps still run.
+    """
+    import asyncio
+
+    async def raising_shutdown() -> None:
+        raise RuntimeError("simulated shutdown failure")
+
+    monkeypatch.setattr(
+        "headroom.proxy.server._check_rust_core", lambda: ("disabled", "test-mock")
+    )
+
+    config = ProxyConfig(
+        optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+        log_requests=False,
+        ccr_inject_tool=False,
+        ccr_handle_responses=False,
+        ccr_context_tracking=False,
+        image_optimize=False,
+    )
+    app = create_app(config)
+
+    import headroom.proxy.server as server_mod
+
+    monkeypatch.setattr(server_mod.HeadroomProxy, "shutdown", lambda self: raising_shutdown())
+
+    from fastapi.testclient import TestClient
+
+    # Should not raise — the _timed helper swallows the exception with a warning
+    with TestClient(app, raise_server_exceptions=False):
+        pass

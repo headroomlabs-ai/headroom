@@ -1517,17 +1517,42 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         finally:
             app.state.ready = False
             logger.info("event=proxy_shutdown reason=signal pid=%d", os.getpid())
-            # Shutdown
+            # Shutdown — every await is bounded so the lifespan teardown
+            # completes within ~15 s on the first Ctrl+C without needing
+            # a second signal to force-exit.
+            #
+            # Background: uvicorn's lifespan.shutdown() calls
+            # ``await self.shutdown_event.wait()`` with no timeout.  That
+            # event is only set once the lifespan finally-block returns.
+            # Any unbounded await here therefore requires a second Ctrl+C
+            # (which sets force_exit=True and bypasses lifespan.shutdown()
+            # entirely).  Wrapping each step with asyncio.wait_for keeps
+            # the teardown path deterministic.
+            async def _timed(coro, *, label: str, timeout: float):  # noqa: ANN202
+                try:
+                    await asyncio.wait_for(coro, timeout=timeout)
+                except (asyncio.TimeoutError, Exception) as exc:
+                    logger.warning(
+                        "event=shutdown_step_timeout_or_error label=%s timeout=%.1fs exc=%r",
+                        label,
+                        timeout,
+                        exc,
+                    )
+
             if _beacon_is_owner[0]:
-                await _beacon.stop()
+                await _timed(_beacon.stop(), label="beacon.stop", timeout=3.0)
                 _release_beacon_lock()
             if proxy.usage_reporter:
-                await proxy.usage_reporter.stop()
+                await _timed(
+                    proxy.usage_reporter.stop(), label="usage_reporter.stop", timeout=3.0
+                )
             if proxy.traffic_learner:
-                await proxy.traffic_learner.stop()
+                await _timed(
+                    proxy.traffic_learner.stop(), label="traffic_learner.stop", timeout=3.0
+                )
             if proxy.code_graph_watcher:
                 proxy.code_graph_watcher.stop()
-            await proxy.shutdown()
+            await _timed(proxy.shutdown(), label="proxy.shutdown", timeout=5.0)
             shutdown_headroom_tracing()
             shutdown_otel_metrics()
 
