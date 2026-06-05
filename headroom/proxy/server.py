@@ -3117,8 +3117,11 @@ def run_server(
     # uvicorn's run_asgi() catches BaseException, so CancelledError raised by
     # in-flight requests at shutdown gets logged as "Exception in ASGI
     # application". This is expected behaviour during shutdown, not a bug.
-    _cancelled_filter = _SuppressCancelledErrorFilter()
-    logging.getLogger("uvicorn.error").addFilter(_cancelled_filter)
+    # Guard: install the filter at most once per process (in case run_server
+    # is somehow called more than once in the same process during tests).
+    _uvicorn_error_logger = logging.getLogger("uvicorn.error")
+    if not any(isinstance(f, _SuppressCancelledErrorFilter) for f in _uvicorn_error_logger.filters):
+        _uvicorn_error_logger.addFilter(_SuppressCancelledErrorFilter())
 
     app_target: Any
     uvicorn_kwargs: dict[str, Any] = {}
