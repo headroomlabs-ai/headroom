@@ -223,7 +223,7 @@ class HNSWVectorIndex:
     def __init__(
         self,
         dimension: int = 384,
-        max_elements: int = 100000,
+        max_elements: int = 10_000,
         ef_construction: int = 200,
         m: int = 16,
         ef_search: int = 50,
@@ -236,8 +236,10 @@ class HNSWVectorIndex:
 
         Args:
             dimension: Embedding dimension. Default 384 for MiniLM.
-            max_elements: Maximum number of elements the index can hold.
-                         Can be resized later with resize_index().
+            max_elements: Initial pre-allocated capacity of the index. Starts at
+                10_000 (was previously 100_000, which wasted ~144 MB at rest).
+                The index auto-doubles via resize_index() when this limit is hit,
+                so callers do not need to predict final size up front.
             ef_construction: HNSW construction parameter. Higher = better quality,
                            slower construction. Default: 200
             m: HNSW links per element. Higher = better recall, more memory.
@@ -249,12 +251,17 @@ class HNSWVectorIndex:
             save_path: Path for auto-save operations. Required if auto_save=True.
             max_entries: Soft limit on number of entries. When reached,
                         lowest importance entries are evicted. None = unbounded.
+                        Production deployments should always set this.
             eviction_batch_size: Number of entries to evict when limit is reached.
 
         Raises:
             ValueError: If auto_save is True but save_path is not provided.
             ImportError: If hnswlib is not installed.
         """
+        import logging
+
+        logger = logging.getLogger(__name__)
+
         if not _check_hnswlib_available():
             raise ImportError(
                 "hnswlib is required for HNSWVectorIndex. "
@@ -266,6 +273,16 @@ class HNSWVectorIndex:
 
         if auto_save and save_path is None:
             raise ValueError("save_path must be provided when auto_save is True")
+
+        # Warn operators when max_entries is unset: unbounded growth can exhaust
+        # memory in long-running production deployments.
+        if max_entries is None:
+            logger.warning(
+                "HNSWVectorIndex created without max_entries; the index will grow "
+                "without bound. Set max_entries in production to cap memory usage "
+                "(e.g. HNSWVectorIndex(max_entries=50_000) or "
+                "MemoryConfig(hnsw_max_entries=50_000))."
+            )
 
         self._dimension = dimension
         self._max_elements = max_elements
@@ -298,9 +315,6 @@ class HNSWVectorIndex:
 
         # Metadata storage for filtering
         self._metadata: dict[str, IndexedMemoryMetadata] = {}
-
-        # Embedding storage for retrieval
-        self._embeddings: dict[str, np.ndarray] = {}
 
         # Thread safety
         self._lock = Lock()
@@ -367,9 +381,8 @@ class HNSWVectorIndex:
                 self._hnsw_to_memory[hnsw_id] = memory.id
                 self._next_hnsw_id += 1
 
-                # Store metadata and embedding
+                # Store metadata
                 self._metadata[memory.id] = IndexedMemoryMetadata.from_memory(memory)
-                self._embeddings[memory.id] = embedding.copy()
 
         if self._auto_save and self._save_path:
             self.save_index(self._save_path)
@@ -412,11 +425,9 @@ class HNSWVectorIndex:
             del self._memory_to_hnsw[memory_id]
             del self._hnsw_to_memory[hnsw_id]
 
-            # Remove metadata and embedding
+            # Remove metadata
             if memory_id in self._metadata:
                 del self._metadata[memory_id]
-            if memory_id in self._embeddings:
-                del self._embeddings[memory_id]
 
             evicted += 1
 
@@ -472,16 +483,14 @@ class HNSWVectorIndex:
                 self._index.add_items(embeddings_array, ids_array)
 
                 # Update mappings and metadata
-                for memory, embedding, hnsw_id in new_memories:
+                for memory, _embedding, hnsw_id in new_memories:
                     self._memory_to_hnsw[memory.id] = hnsw_id
                     self._hnsw_to_memory[hnsw_id] = memory.id
                     self._metadata[memory.id] = IndexedMemoryMetadata.from_memory(memory)
-                    self._embeddings[memory.id] = embedding.copy()
 
             # Handle updates (hnswlib doesn't support true updates, so we track separately)
-            for memory, embedding in update_memories:
+            for memory, _embedding in update_memories:
                 self._metadata[memory.id] = IndexedMemoryMetadata.from_memory(memory)
-                self._embeddings[memory.id] = embedding.copy()
                 # Note: HNSW embedding stays unchanged unless we remove and re-add
 
         if self._auto_save and self._save_path:
@@ -514,11 +523,9 @@ class HNSWVectorIndex:
             del self._memory_to_hnsw[memory_id]
             del self._hnsw_to_memory[hnsw_id]
 
-            # Remove metadata and embedding
+            # Remove metadata
             if memory_id in self._metadata:
                 del self._metadata[memory_id]
-            if memory_id in self._embeddings:
-                del self._embeddings[memory_id]
 
         if self._auto_save and self._save_path:
             self.save_index(self._save_path)
@@ -550,11 +557,9 @@ class HNSWVectorIndex:
                 del self._memory_to_hnsw[memory_id]
                 del self._hnsw_to_memory[hnsw_id]
 
-                # Remove metadata and embedding
+                # Remove metadata
                 if memory_id in self._metadata:
                     del self._metadata[memory_id]
-                if memory_id in self._embeddings:
-                    del self._embeddings[memory_id]
 
                 removed_count += 1
 
@@ -639,8 +644,15 @@ class HNSWVectorIndex:
                 if not self._passes_filter(metadata, filter):
                     continue
 
-                # Get stored embedding
-                embedding = self._embeddings.get(memory_id)
+                # Retrieve the (L2-normalised) embedding stored in the HNSW index.
+                # hnswlib normalises vectors in cosine space before storage, so the
+                # retrieved vector differs in scale from the original but preserves
+                # direction -- sufficient for downstream cosine-similarity reuse.
+                try:
+                    stored = self._index.get_items([hnsw_id])
+                    embedding: np.ndarray | None = stored[0] if stored is not None else None
+                except Exception:
+                    embedding = None
 
                 # Create Memory from metadata
                 memory = metadata.to_memory(embedding=embedding)
@@ -732,8 +744,8 @@ class HNSWVectorIndex:
     async def update_embedding(self, memory_id: str, embedding: np.ndarray) -> bool:
         """Update the embedding for an indexed memory.
 
-        Note: hnswlib doesn't support in-place updates. This stores the new
-        embedding but the HNSW graph uses the original. For full update,
+        Note: hnswlib doesn't support in-place updates. The HNSW graph will
+        continue using the original embedding for search. For a true update,
         remove and re-index the memory.
 
         Args:
@@ -761,16 +773,14 @@ class HNSWVectorIndex:
     async def _update_embedding_internal(self, memory_id: str, embedding: np.ndarray) -> bool:
         """Internal embedding update without lock (caller must hold lock).
 
-        hnswlib doesn't support true in-place updates, so we:
-        1. Store the new embedding in our local cache
-        2. The HNSW index continues to use the old embedding for search
-
-        For a true update, the caller should remove and re-index.
+        hnswlib doesn't support true in-place updates. The HNSW graph continues
+        to use the original embedding for search. For a true update, the caller
+        should remove and re-index.
         """
         if memory_id not in self._memory_to_hnsw:
             return False
 
-        self._embeddings[memory_id] = embedding.copy()
+        # No separate embedding cache to update; the HNSW index holds the vector.
         return True
 
     def _resize_index(self, new_max_elements: int) -> None:
@@ -801,7 +811,9 @@ class HNSWVectorIndex:
             hnsw_path = path.with_suffix(".hnsw")
             self._index.save_index(str(hnsw_path))
 
-            # Save metadata, mappings, and embeddings
+            # Save metadata and mappings. Embeddings are not serialised here;
+            # they are stored inside the .hnsw binary and retrieved via
+            # get_items() on load.
             meta_path = path.with_suffix(".meta")
             meta_data = {
                 "dimension": self._dimension,
@@ -816,7 +828,6 @@ class HNSWVectorIndex:
                 "hnsw_to_memory": self._hnsw_to_memory,
                 "next_hnsw_id": self._next_hnsw_id,
                 "metadata": {mid: meta.to_dict() for mid, meta in self._metadata.items()},
-                "embeddings": {mid: emb.tolist() for mid, emb in self._embeddings.items()},
             }
 
             with open(meta_path, "w") as f:
@@ -886,11 +897,7 @@ class HNSWVectorIndex:
                 mid: IndexedMemoryMetadata.from_dict(meta_dict)
                 for mid, meta_dict in meta_data["metadata"].items()
             }
-
-            # Restore embeddings
-            self._embeddings = {
-                mid: np.array(emb, dtype=np.float32) for mid, emb in meta_data["embeddings"].items()
-            }
+            # Embeddings are stored in the .hnsw binary; no separate dict to restore.
 
     def clear(self) -> None:
         """Clear all entries from the index."""
@@ -909,7 +916,6 @@ class HNSWVectorIndex:
             self._hnsw_to_memory.clear()
             self._next_hnsw_id = 0
             self._metadata.clear()
-            self._embeddings.clear()
             self._eviction_count = 0
 
         if self._auto_save and self._save_path:
@@ -974,13 +980,6 @@ class HNSWVectorIndex:
                     size_bytes += sys.getsizeof(meta.entity_refs)
                 if meta.metadata:
                     size_bytes += sys.getsizeof(meta.metadata)
-
-            # Embeddings storage (numpy arrays)
-            size_bytes += sys.getsizeof(self._embeddings)
-            for mem_id, embedding in self._embeddings.items():
-                size_bytes += len(mem_id)
-                # numpy array size: dtype size * number of elements
-                size_bytes += embedding.nbytes
 
             # HNSW index size estimate
             # The actual index is in hnswlib C++ memory, so we estimate:
