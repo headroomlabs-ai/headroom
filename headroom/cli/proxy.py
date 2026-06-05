@@ -881,8 +881,8 @@ Memory (Multi-Provider):
 
     click.echo(f"""
 ╔═══════════════════════════════════════════════════════════════════════╗
-║                         HEADROOM PROXY                                 ║
-║           The Context Optimization Layer for LLM Applications          ║
+║                         HEADROOM PROXY                                ║
+║           The Context Optimization Layer for LLM Applications         ║
 ╚═══════════════════════════════════════════════════════════════════════╝
 
 Starting proxy server...
