@@ -25,7 +25,11 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from ..config import TransformResult
-from ..onnx_runtime import create_cpu_session_options, hf_hub_download_local_first, trim_process_heap
+from ..onnx_runtime import (
+    create_cpu_session_options,
+    hf_hub_download_local_first,
+    trim_process_heap,
+)
 from ..tokenizer import Tokenizer
 from .base import Transform
 

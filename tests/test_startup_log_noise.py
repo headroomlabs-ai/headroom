@@ -18,11 +18,11 @@ class TestAnthropicWarnParameter:
 
     def test_warn_true_emits_warning_without_client(self):
         """Default warn=True should emit UserWarning when no client is given."""
-        from headroom.providers.anthropic import AnthropicProvider, _FALLBACK_WARNING_SHOWN
+        import headroom.providers.anthropic as _mod
+        from headroom.providers.anthropic import AnthropicProvider
 
         # Only runs if the module-level dedup flag hasn't fired yet in this process;
         # we reset it to guarantee the warning fires.
-        import headroom.providers.anthropic as _mod
 
         original = _mod._FALLBACK_WARNING_SHOWN
         _mod._FALLBACK_WARNING_SHOWN = False
@@ -42,9 +42,8 @@ class TestAnthropicWarnParameter:
 
     def test_warn_false_suppresses_warning(self):
         """warn=False must produce zero UserWarnings about tiktoken fallback."""
-        from headroom.providers.anthropic import AnthropicProvider
-
         import headroom.providers.anthropic as _mod
+        from headroom.providers.anthropic import AnthropicProvider
 
         original = _mod._FALLBACK_WARNING_SHOWN
         _mod._FALLBACK_WARNING_SHOWN = False
@@ -57,9 +56,7 @@ class TestAnthropicWarnParameter:
                 except Exception:
                     pass
             tiktoken_warnings = [
-                x for x in w
-                if issubclass(x.category, UserWarning)
-                and "tiktoken" in str(x.message)
+                x for x in w if issubclass(x.category, UserWarning) and "tiktoken" in str(x.message)
             ]
             assert tiktoken_warnings == [], (
                 f"Expected no tiktoken warnings with warn=False, got: {tiktoken_warnings}"
@@ -70,6 +67,7 @@ class TestAnthropicWarnParameter:
     def test_registry_uses_warn_false(self):
         """The internal proxy provider registry must pass warn=False to AnthropicProvider."""
         import inspect
+
         from headroom.providers import registry as _registry_mod
 
         source = inspect.getsource(_registry_mod)
@@ -141,6 +139,7 @@ def pytest_importorskip_litellm():
     """Return litellm if installed, else None (for graceful skip in optional-dep tests)."""
     try:
         import litellm
+
         return litellm
     except ImportError:
         return None
@@ -167,4 +166,5 @@ def pytest_importorskip_trafilatura():
         import trafilatura  # noqa: F401
     except ImportError:
         import pytest
+
         pytest.skip("trafilatura not installed")
