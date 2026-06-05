@@ -33,6 +33,9 @@ os.environ.setdefault("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1")
 warnings.filterwarnings("ignore", category=UserWarning, module="huggingface_hub")
 # Also silence the huggingface_hub logger which emits rate-limit advisory messages.
 logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
+# sentence_transformers uses httpx to check model file manifests on every startup.
+# These HEAD/GET requests generate INFO lines per worker; suppress to WARNING.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
