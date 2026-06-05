@@ -54,11 +54,18 @@ def _enable_headroom_log_propagation() -> Iterator[None]:
     sees records that propagate all the way up. This fixture re-enables propagation
     for the duration of each test so caplog captures headroom log records correctly.
     """
-    headroom_logger = logging.getLogger("headroom")
-    original = headroom_logger.propagate
-    headroom_logger.propagate = True
+    loggers_to_restore = [
+        logging.getLogger("headroom"),
+        logging.getLogger("headroom.proxy"),
+    ]
+    saved = [(lg, lg.propagate, lg.level) for lg in loggers_to_restore]
+    for lg in loggers_to_restore:
+        lg.propagate = True
+        lg.setLevel(logging.NOTSET)
     yield
-    headroom_logger.propagate = original
+    for lg, prop, level in saved:
+        lg.propagate = prop
+        lg.setLevel(level)
 
 
 # ---------------------------------------------------------------------------

@@ -325,7 +325,7 @@ class SessionTrackerStore:
         # Enforce LRU cap: evict the oldest entry when over the limit.
         if len(self._trackers) > self._max_sessions:
             evicted_id, _ = self._trackers.popitem(last=False)
-            logger.debug(
+            logger.info(
                 "SessionTrackerStore: LRU eviction of session %s (cap=%d)",
                 evicted_id,
                 self._max_sessions,

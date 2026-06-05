@@ -27,6 +27,7 @@ import sys
 from collections import deque
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict
+from dataclasses import replace as _dc_replace
 from pathlib import Path
 from threading import Lock
 from typing import TYPE_CHECKING, Any
@@ -295,8 +296,6 @@ class RequestLogger:
         if entry.response_content is not None and isinstance(entry.response_content, str):
             truncated_content = self._truncate_body(entry.response_content, self.MAX_BODY_BYTES)
             if truncated_content is not entry.response_content:
-                from dataclasses import replace as _dc_replace
-
                 entry = _dc_replace(entry, response_content=truncated_content)
 
         self._logs.append(entry)

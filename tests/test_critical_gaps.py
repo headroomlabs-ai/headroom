@@ -71,7 +71,7 @@ class TestAllSeenInstancesUnboundedGrowth:
 
         # Verify the cap constant exists
         assert hasattr(ToolPattern, "MAX_SEEN_INSTANCES")
-        assert ToolPattern.MAX_SEEN_INSTANCES == 10000
+        assert ToolPattern.MAX_SEEN_INSTANCES == 1000
 
         # Simulate adding users via record_compression
         # (the cap is enforced there, not when directly adding to set)

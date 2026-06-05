@@ -714,9 +714,11 @@ async def test_execute_memory_tool_save_and_background_dedup(
     created_tasks: list[object] = []
 
     def fake_create_task(coro):  # noqa: ANN001
+        from unittest.mock import MagicMock
+
         created_tasks.append(coro)
         coro.close()
-        return SimpleNamespace()
+        return MagicMock()
 
     monkeypatch.setattr("headroom.proxy.memory_handler.asyncio.create_task", fake_create_task)
     backend.search_results = [

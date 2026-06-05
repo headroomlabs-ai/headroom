@@ -14,6 +14,7 @@ Or via headroom extras:
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -24,6 +25,8 @@ import numpy as np
 
 from ..models import Memory, ScopeLevel
 from ..ports import VectorFilter, VectorSearchResult
+
+logger = logging.getLogger(__name__)
 
 # hnswlib is optional - may not compile on all platforms
 # NOTE: We don't import hnswlib at module level because it can crash with SIGILL
@@ -258,10 +261,6 @@ class HNSWVectorIndex:
             ValueError: If auto_save is True but save_path is not provided.
             ImportError: If hnswlib is not installed.
         """
-        import logging
-
-        logger = logging.getLogger(__name__)
-
         if not _check_hnswlib_available():
             raise ImportError(
                 "hnswlib is required for HNSWVectorIndex. "
@@ -651,7 +650,10 @@ class HNSWVectorIndex:
                 try:
                     stored = self._index.get_items([hnsw_id])
                     embedding: np.ndarray | None = stored[0] if stored is not None else None
-                except Exception:
+                except Exception as _e:
+                    logger.debug(
+                        "HNSWVectorIndex: get_items failed for hnsw_id=%s: %s", hnsw_id, _e
+                    )
                     embedding = None
 
                 # Create Memory from metadata
@@ -742,18 +744,20 @@ class HNSWVectorIndex:
         return True
 
     async def update_embedding(self, memory_id: str, embedding: np.ndarray) -> bool:
-        """Update the embedding for an indexed memory.
+        """Attempt to update the embedding for an indexed memory.
 
-        Note: hnswlib doesn't support in-place updates. The HNSW graph will
-        continue using the original embedding for search. For a true update,
-        remove and re-index the memory.
+        Note: hnswlib does not support true in-place embedding updates.
+        The HNSW graph will continue using the *original* embedding for
+        nearest-neighbour search. For a true update, remove and re-index
+        the memory with the new embedding.
 
         Args:
             memory_id: The unique identifier of the memory.
-            embedding: The new embedding vector.
+            embedding: The new embedding vector (validated but not stored).
 
         Returns:
-            True if updated, False if memory not found in index.
+            True if the memory exists in the index (graph not changed),
+            False if memory_id is not found.
         """
         embedding = np.asarray(embedding, dtype=np.float32)
         if embedding.shape[0] != self._dimension:
