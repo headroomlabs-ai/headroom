@@ -193,7 +193,7 @@ def test_debug_rss_returns_200_with_expected_fields(loopback_client):
 
     required_fields = {
         "pid",
-        "rss_mb",
+        "peak_rss_mb",
         "python_version",
         "gc_stats",
         "top_types",
@@ -214,10 +214,10 @@ def test_debug_rss_pid_is_positive_int(loopback_client):
     assert data["pid"] > 0
 
 
-def test_debug_rss_rss_mb_is_positive_float(loopback_client):
+def test_debug_rss_peak_rss_mb_is_positive_float(loopback_client):
     data = loopback_client.get("/debug/rss").json()
-    assert isinstance(data["rss_mb"], (int, float))
-    assert data["rss_mb"] > 0, "RSS must be > 0 for a live process"
+    assert isinstance(data["peak_rss_mb"], (int, float))
+    assert data["peak_rss_mb"] > 0, "peak RSS must be > 0 for a live process"
 
 
 def test_debug_rss_gc_stats_shape(loopback_client):

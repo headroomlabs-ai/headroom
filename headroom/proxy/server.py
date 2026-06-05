@@ -2472,47 +2472,62 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         """Process-level RSS profiling endpoint.
 
         Returns a lightweight snapshot of this worker's memory footprint:
-        - Process RSS / VMS via resource.getrusage (no psutil required)
+        - Peak RSS via resource.getrusage (no psutil required)
         - GC generation stats and object type top-10
         - ML model registry summary (which models are loaded, estimated MB)
         - Key cache sizes: HNSW element count, compression cache sessions,
           TOIN pattern count, request logger deque length
         - Python interpreter version
 
+        NOTE: peak_rss_mb is the OS high-watermark (maximum RSS since process
+        start), not current RSS. It is suitable for detecting worker growth over
+        time but will not decrease after a GC cycle.
+
+        gc.collect() and gc.get_objects() are dispatched to a thread-pool
+        executor to avoid blocking the event loop while walking a large heap.
+
         Loopback-only — not reachable from outside the host.
         """
         import gc
+        import platform
         import resource
         import sys
         from collections import Counter
 
         pid = os.getpid()
+        loop = asyncio.get_event_loop()
 
         # RSS via POSIX getrusage (always available, no psutil needed).
-        # ru_maxrss is kilobytes on Linux, bytes on macOS.
+        # ru_maxrss is the PEAK (high-watermark) RSS:
+        #   - macOS: bytes
+        #   - Linux: kilobytes
         rusage = resource.getrusage(resource.RUSAGE_SELF)
         _ru_maxrss = rusage.ru_maxrss
-        import platform
-
         if platform.system() == "Darwin":
-            rss_mb = round(_ru_maxrss / (1024 * 1024), 1)
+            peak_rss_mb = round(_ru_maxrss / (1024 * 1024), 1)
         else:
-            rss_mb = round(_ru_maxrss / 1024, 1)
+            peak_rss_mb = round(_ru_maxrss / 1024, 1)
 
-        # GC stats
-        gc.collect()
-        gc_stats = [
-            {"generation": i, "collections": s["collections"], "collected": s["collected"]}
-            for i, s in enumerate(gc.get_stats())
-        ]
+        # Run gc.collect() + gc.get_objects() in a thread-pool executor so the
+        # event loop is not blocked while walking a potentially large heap.
+        # Both operations are stop-the-world for all Python threads but should
+        # not prevent the asyncio event loop from accepting new connections.
+        def _gc_snapshot() -> tuple[list[dict], list[dict]]:
+            gc.collect()
+            stats = [
+                {"generation": i, "collections": s["collections"], "collected": s["collected"]}
+                for i, s in enumerate(gc.get_stats())
+            ]
+            type_counter: Counter[str] = Counter()
+            for obj in gc.get_objects():
+                type_counter[type(obj).__name__] += 1
+            types = [
+                {"type": name, "count": cnt}
+                for name, cnt in type_counter.most_common(10)
+            ]
+            return stats, types
 
-        # Top object types by count (cheap — uses gc.get_objects())
-        type_counter: Counter[str] = Counter()
-        for obj in gc.get_objects():
-            type_counter[type(obj).__name__] += 1
-        top_types = [
-            {"type": name, "count": cnt} for name, cnt in type_counter.most_common(10)
-        ]
+        gc_stats, top_types = await loop.run_in_executor(None, _gc_snapshot)
 
         # ML model registry
         from headroom.models.ml_models import MLModelRegistry
@@ -2529,7 +2544,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         except Exception:
             pass
 
-        # Compression cache session count
+        # Compression cache session count (number of distinct sessions tracked)
         compression_cache_sessions: int | None = None
         try:
             with proxy._compression_caches_lock:
@@ -2546,17 +2561,17 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         except Exception:
             pass
 
-        # Request logger deque size
+        # Request logger: use get_memory_stats() which is the public surface
         request_log_count: int | None = None
         try:
             if proxy.logger is not None:
-                request_log_count = len(proxy.logger._logs)  # type: ignore[attr-defined]
+                request_log_count = proxy.logger.get_memory_stats().entry_count
         except Exception:
             pass
 
         return {
             "pid": pid,
-            "rss_mb": rss_mb,
+            "peak_rss_mb": peak_rss_mb,
             "python_version": sys.version,
             "gc_stats": gc_stats,
             "top_types": top_types,
