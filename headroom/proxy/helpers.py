@@ -2304,11 +2304,14 @@ def apply_session_sticky_memory_tools(
             try:
                 tool_def = json.loads(golden_bytes.decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                # Should never happen — golden bytes were produced by us.
-                # Loud failure per build constraint #4.
-                raise RuntimeError(
-                    f"corrupt golden tool bytes for session {session_id} tool {tool_name}: {exc}"
-                ) from exc
+                logger.error(
+                    "corrupt golden tool bytes for session %s tool %s: %s — skipping tool injection",
+                    session_id,
+                    tool_name,
+                    exc,
+                    exc_info=True,
+                )
+                continue
             tools_out.append(tool_def)
             existing_names.add(tool_name)
             replay_bytes += len(golden_bytes)
@@ -2584,21 +2587,24 @@ def apply_session_sticky_ccr_tool(
         if golden is not None:
             try:
                 tool_def = json.loads(golden.decode("utf-8"))
+                tools_out.append(tool_def)
+                log_tool_injection_decision(
+                    provider=provider,
+                    session_id=session_id,
+                    decision="inject_sticky_replay",
+                    tool_definition_bytes_count=len(golden),
+                    request_id=request_id,
+                )
+                return tools_out, True
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                # Should never happen — golden bytes were produced by us.
-                raise RuntimeError(
-                    f"corrupt golden CCR tool bytes for session {session_id}: {exc}"
-                ) from exc
-            tools_out.append(tool_def)
-            log_tool_injection_decision(
-                provider=provider,
-                session_id=session_id,
-                decision="inject_sticky_replay",
-                tool_definition_bytes_count=len(golden),
-                request_id=request_id,
-            )
-            return tools_out, True
-        # Tracker says "done CCR" but somehow has no golden bytes. Pin
+                logger.error(
+                    "corrupt golden CCR tool bytes for session %s: %s — regenerating fresh definition",
+                    session_id,
+                    exc,
+                    exc_info=True,
+                )
+                # Fall through to fresh creation below
+        # Tracker says "done CCR" but has no golden bytes (or they were corrupt). Pin
         # them now so future turns are stable.
         tool_def = create_ccr_tool_definition(provider)
         canonical = serialize_tool_definition_canonical(tool_def)

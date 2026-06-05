@@ -1761,7 +1761,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 proxy.metrics.record_inbound_aborted(reason=type(exc).__name__)
             except Exception:
                 logger.debug("record_inbound_aborted failed", exc_info=True)
-            logger.info(
+            logger.error(
                 "event=proxy_inbound_request_aborted id=%s method=%s path=%s reason=%s "
                 "duration_ms=%.2f",
                 inbound_id,
@@ -1769,6 +1769,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 path,
                 type(exc).__name__,
                 (time.perf_counter() - started) * 1000.0,
+                exc_info=True,
             )
             raise
         try:
