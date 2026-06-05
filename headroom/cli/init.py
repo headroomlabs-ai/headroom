@@ -20,7 +20,9 @@ from headroom.install.paths import claude_settings_path, codex_config_path, vali
 from headroom.install.planner import build_manifest
 from headroom.install.providers import _apply_unix_env_scope, _apply_windows_env_scope
 from headroom.install.runtime import (
+    acquire_runtime_start_lock,
     resolve_headroom_command,
+    runtime_status,
     start_detached_agent,
     start_persistent_docker,
     stop_runtime,
@@ -46,6 +48,7 @@ _CODEX_FEATURE_MARKER_END = "# --- end Headroom init features ---"
 _SUPPORTED_TARGETS = ("claude", "copilot", "codex", "openclaw")
 _LOCAL_TARGETS = {"claude", "codex"}
 _GLOBAL_TARGETS = {"claude", "copilot", "codex", "openclaw"}
+_STARTUP_READY_TIMEOUT_SECONDS = 15
 
 
 def _command_string(parts: list[str]) -> str:
@@ -553,13 +556,22 @@ def _ensure_profile_running(profile: str) -> None:
     if wait_ready(manifest, timeout_seconds=1):
         return
     try:
-        if manifest.preset == InstallPreset.PERSISTENT_DOCKER.value:
-            start_persistent_docker(manifest)
-        elif manifest.supervisor_kind == SupervisorKind.SERVICE.value:
-            start_supervisor(manifest)
-        else:
-            start_detached_agent(manifest.profile)
-        wait_ready(manifest, timeout_seconds=45)
+        with acquire_runtime_start_lock(manifest.profile) as acquired:
+            if not acquired:
+                return
+            if wait_ready(manifest, timeout_seconds=1):
+                return
+            if runtime_status(manifest) == "running":
+                if wait_ready(manifest, timeout_seconds=_STARTUP_READY_TIMEOUT_SECONDS):
+                    return
+                stop_runtime(manifest)
+            if manifest.preset == InstallPreset.PERSISTENT_DOCKER.value:
+                start_persistent_docker(manifest)
+            elif manifest.supervisor_kind == SupervisorKind.SERVICE.value:
+                start_supervisor(manifest)
+            else:
+                start_detached_agent(manifest.profile)
+            wait_ready(manifest, timeout_seconds=45)
     except Exception:
         return
 
