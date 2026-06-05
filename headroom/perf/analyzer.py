@@ -701,15 +701,15 @@ def build_perf_summary(report: PerfReport) -> dict:
     for tr in report.transform_records:
         by_transform_groups.setdefault(tr.name, []).append(tr)
     by_transform = []
-    for name, recs in sorted(
+    for name, t_recs in sorted(
         by_transform_groups.items(), key=lambda kv: -sum(r.tokens_saved for r in kv[1])
     ):
-        t_before = sum(r.tokens_before for r in recs)
-        t_saved = sum(r.tokens_saved for r in recs)
+        t_before = sum(r.tokens_before for r in t_recs)
+        t_saved = sum(r.tokens_saved for r in t_recs)
         by_transform.append(
             {
                 "transform": name,
-                "uses": len(recs),
+                "uses": len(t_recs),
                 "tokens_before": t_before,
                 "tokens_saved": t_saved,
                 "savings_pct": _pct(t_saved, t_before),
