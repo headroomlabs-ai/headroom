@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import warnings
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, cast
 
@@ -23,6 +24,15 @@ from headroom.onnx_runtime import create_cpu_session_options
 
 if TYPE_CHECKING:
     from sentence_transformers import SentenceTransformer
+
+# Suppress HuggingFace Hub warnings about missing tokens and rate limits.
+# These appear whenever hf_hub_download is called without HF_TOKEN set.
+# We operate in an authenticated-optional mode; warnings are not actionable.
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+os.environ.setdefault("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1")
+warnings.filterwarnings("ignore", category=UserWarning, module="huggingface_hub")
+# Also silence the huggingface_hub logger which emits rate-limit advisory messages.
+logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 
 logger = logging.getLogger(__name__)
 
@@ -306,12 +316,22 @@ class OnnxLocalEmbedder:
 
         import onnxruntime as ort
         from huggingface_hub import hf_hub_download
+        from huggingface_hub.errors import EntryNotFoundError, LocalEntryNotFoundError
         from tokenizers import Tokenizer
 
         logger.info("Loading ONNX embedding model (all-MiniLM-L6-v2, ~86MB)...")
 
-        model_path = hf_hub_download(self.ONNX_REPO, "model.onnx")
-        tok_path = hf_hub_download(self.ONNX_REPO, "tokenizer.json")
+        # Try local-cache-only first to skip the HF HEAD request (network round-trip)
+        # that every worker would otherwise make independently. Falls back to a normal
+        # download if the file isn't cached yet.
+        def _hub_download(filename: str) -> str:
+            try:
+                return hf_hub_download(self.ONNX_REPO, filename, local_files_only=True)
+            except (LocalEntryNotFoundError, EntryNotFoundError, OSError):
+                return hf_hub_download(self.ONNX_REPO, filename)
+
+        model_path = _hub_download("model.onnx")
+        tok_path = _hub_download("tokenizer.json")
 
         # Keep a small thread pool for Docker compatibility and disable ORT's
         # CPU memory arena/pattern caches so long-running proxy workers do not

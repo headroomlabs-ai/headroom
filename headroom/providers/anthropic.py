@@ -36,6 +36,9 @@ def _get_litellm_clients() -> tuple[Any | None, Any | None]:
 
     try:
         import litellm
+
+        litellm.suppress_debug_info = True
+        litellm.set_verbose = False
         from litellm import get_model_info as litellm_get_model_info
     except ImportError:
         return None, None
@@ -223,13 +226,15 @@ class AnthropicTokenCounter(TokenCounter):
     Falls back to tiktoken approximation only when no client is available.
     """
 
-    def __init__(self, model: str, client: Any = None):
+    def __init__(self, model: str, client: Any = None, warn: bool = True):
         """Initialize token counter.
 
         Args:
             model: Anthropic model name.
             client: Optional anthropic.Anthropic client for API-based counting.
                     If not provided, falls back to tiktoken approximation.
+            warn: If False, suppresses the no-client UserWarning (useful for
+                  internal proxy usage where approximation is intentional).
         """
         global _FALLBACK_WARNING_SHOWN
 
@@ -238,7 +243,7 @@ class AnthropicTokenCounter(TokenCounter):
         self._encoding: Any = None
         self._use_api = client is not None
 
-        if not self._use_api and not _FALLBACK_WARNING_SHOWN:
+        if not self._use_api and warn and not _FALLBACK_WARNING_SHOWN:
             warnings.warn(
                 "AnthropicProvider: No client provided, using tiktoken approximation. "
                 "For accurate counting, pass an Anthropic client: "
@@ -446,6 +451,7 @@ class AnthropicProvider(Provider):
         self,
         client: Any = None,
         context_limits: dict[str, int] | None = None,
+        warn: bool = True,
     ):
         """Initialize Anthropic provider.
 
@@ -453,12 +459,16 @@ class AnthropicProvider(Provider):
             client: Optional anthropic.Anthropic client for accurate token counting.
                     If not provided, uses tiktoken approximation.
             context_limits: Optional override for model context limits.
+            warn: If False, suppresses the no-client UserWarning. Set to False
+                  in contexts where tiktoken approximation is intentional (e.g.
+                  the internal proxy pipeline provider).
 
         Example:
             from anthropic import Anthropic
             provider = AnthropicProvider(client=Anthropic())
         """
         self._client = client
+        self._warn = warn
         self._token_counters: dict[str, AnthropicTokenCounter] = {}
 
         # Build context limits: defaults -> config file -> env var -> explicit
@@ -488,6 +498,7 @@ class AnthropicProvider(Provider):
             self._token_counters[model] = AnthropicTokenCounter(
                 model=model,
                 client=self._client,
+                warn=self._warn,
             )
         return self._token_counters[model]
 

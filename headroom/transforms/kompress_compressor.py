@@ -330,9 +330,17 @@ def _load_kompress_onnx(
             return _kompress_cache[model_id]
 
         from huggingface_hub import hf_hub_download
+        from huggingface_hub.errors import EntryNotFoundError, LocalEntryNotFoundError
 
         logger.info("Downloading Kompress ONNX model from %s ...", model_id)
-        onnx_path = hf_hub_download(model_id, "onnx/kompress-int8.onnx")
+
+        def _hub_download(filename: str) -> str:
+            try:
+                return hf_hub_download(model_id, filename, local_files_only=True)
+            except (LocalEntryNotFoundError, EntryNotFoundError, OSError):
+                return hf_hub_download(model_id, filename)
+
+        onnx_path = _hub_download("onnx/kompress-int8.onnx")
 
         backend = "onnx_coreml" if use_coreml else "onnx"
         providers: list[Any]
@@ -384,9 +392,17 @@ def _load_kompress_pytorch(model_id: str, device: str = "auto") -> tuple[Any, An
             return _kompress_cache[model_id]
 
         from huggingface_hub import hf_hub_download
+        from huggingface_hub.errors import EntryNotFoundError, LocalEntryNotFoundError
 
         logger.info("Downloading Kompress PyTorch model from %s ...", model_id)
-        weights_path = hf_hub_download(model_id, "model.safetensors")
+
+        def _hub_download_pt(filename: str) -> str:
+            try:
+                return hf_hub_download(model_id, filename, local_files_only=True)
+            except (LocalEntryNotFoundError, EntryNotFoundError, OSError):
+                return hf_hub_download(model_id, filename)
+
+        weights_path = _hub_download_pt("model.safetensors")
 
         HeadroomCompressorModel = _get_model_class()
         model = HeadroomCompressorModel()

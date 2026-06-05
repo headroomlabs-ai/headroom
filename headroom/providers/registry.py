@@ -126,7 +126,9 @@ def build_proxy_provider_runtime(config: Any) -> ProxyProviderRuntime:
     return ProxyProviderRuntime(
         api_targets=api_targets,
         pipeline_providers={
-            "anthropic": AnthropicProvider(),
+            # warn=False: the proxy pipeline provider intentionally uses tiktoken
+            # approximation (no Anthropic client available at this layer).
+            "anthropic": AnthropicProvider(warn=False),
             "openai": OpenAIProvider(),
         },
     )
