@@ -40,8 +40,8 @@ jobs:
       e2e: ${{ steps.filter.outputs.e2e }}
       workflows: ${{ steps.filter.outputs.workflows }}
     steps:
-      - uses: actions/checkout@v5
-      - uses: dorny/paths-filter@v3
+      - uses: actions/checkout@v6
+      - uses: dorny/paths-filter@v4
         id: filter
         with:
           filters: |
@@ -72,12 +72,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ env.PY_VERSION }}
       - name: Cache pip
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-lint-${{ hashFiles('pyproject.toml') }}
@@ -96,8 +96,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ env.PY_VERSION }}
       - uses: dtolnay/rust-toolchain@1.95.0
@@ -108,7 +108,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip maturin
           maturin build --profile ci --out dist --interpreter "python${PY_VERSION}"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: headroom-wheel
           path: dist/*.whl
@@ -120,12 +120,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ env.PY_VERSION }}
       - name: Cache HuggingFace model
         id: hfcache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cache/huggingface
           key: ${{ runner.os }}-models-allMiniLM-v2
@@ -155,26 +155,26 @@ jobs:
       HF_HUB_OFFLINE: "1"
       TRANSFORMERS_OFFLINE: "1"
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ env.PY_VERSION }}
 
       - name: Cache pip
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-${{ env.PY_VERSION }}-${{ hashFiles('pyproject.toml') }}
           restore-keys: ${{ runner.os }}-pip-${{ env.PY_VERSION }}-
 
       - name: Restore HuggingFace model cache (warmed by prefetch-model)
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cache/huggingface
           key: ${{ runner.os }}-models-allMiniLM-v2
 
       - name: Download prebuilt wheel
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: headroom-wheel
           path: dist
@@ -205,23 +205,23 @@ jobs:
     env:
       FASTEMBED_CACHE_PATH: ${{ github.workspace }}/.fastembed-cache
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ env.PY_VERSION }}
       - name: Cache pip
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-extras-${{ hashFiles('pyproject.toml') }}
           restore-keys: ${{ runner.os }}-pip-extras-
       - name: Cache fastembed model
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ${{ github.workspace }}/.fastembed-cache
           key: ${{ runner.os }}-fastembed-bge-small-v1
       - name: Download prebuilt wheel
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: headroom-wheel
           path: dist
@@ -258,12 +258,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ env.PY_VERSION }}
       - name: Download prebuilt wheel
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: headroom-wheel
           path: dist
@@ -283,7 +283,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
       - uses: wagoid/commitlint-github-action@v6
@@ -296,12 +296,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
       - name: Cache pip
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-build-${{ hashFiles('pyproject.toml') }}
@@ -329,10 +329,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - name: Cache actionlint + act
         id: tools-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             /usr/local/bin/actionlint
@@ -362,8 +362,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
       - name: Build local Headroom image
@@ -406,8 +406,8 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: Install test dependencies
@@ -423,8 +423,8 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
       - name: Install bash and test dependencies

@@ -62,7 +62,7 @@ jobs:
           - { name: arm64, runs_on: ubuntu-24.04-arm, platform: linux/arm64 }
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: Normalize image name
         id: image-name
@@ -84,7 +84,7 @@ jobs:
 
       - name: Set up Python
         if: steps.version.outputs.version != ''
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -167,7 +167,7 @@ jobs:
           touch "${RUNNER_TEMP}/digests/${digest#sha256:}"
 
       - name: Upload digest marker
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           # Variant + arch in the artifact name so the manifest job can
           # download with `pattern: digests-<variant>-*` to gather all
@@ -238,7 +238,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Download per-arch digests for this variant
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: digests-${{ matrix.variant.name || 'root' }}-*
           path: ${{ runner.temp }}/digests
@@ -317,7 +317,7 @@ jobs:
 
       - name: Install cosign
         if: steps.manifest.outputs.index_digest != ''
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@v4
 
       - name: Sign multi-arch index manifest with cosign
         if: steps.manifest.outputs.index_digest != ''
