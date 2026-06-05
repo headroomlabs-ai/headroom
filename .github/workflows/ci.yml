@@ -337,7 +337,10 @@ jobs:
           path: |
             /usr/local/bin/actionlint
             /usr/local/bin/act
-          key: ${{ runner.os }}-ci-tools-actionlint-act-v1
+          # Key off the workflow file itself: when someone updates the
+          # download URLs to a newer tool version, the hash changes and
+          # the cache busts automatically.
+          key: ${{ runner.os }}-ci-tools-${{ hashFiles('.github/workflows/ci.yml') }}
 
       - name: Install actionlint
         if: steps.tools-cache.outputs.cache-hit != 'true'
