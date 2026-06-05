@@ -181,7 +181,7 @@ def _selected_context_tool() -> str:
 )
 @click.option(
     "--subscription-poll-interval",
-    type=int,
+    type=click.IntRange(min=1, max=3600),
     default=None,
     envvar="HEADROOM_SUBSCRIPTION_POLL_INTERVAL",
     help=(
@@ -192,15 +192,23 @@ def _selected_context_tool() -> str:
 )
 @click.option(
     "--retry-max-attempts",
-    type=int,
+    type=click.IntRange(min=1, max=10),
     default=None,
-    help="Maximum upstream retry attempts for connect/read/5xx failures (default: 3)",
+    envvar="HEADROOM_RETRY_MAX_ATTEMPTS",
+    help=(
+        "Maximum upstream retry attempts for connect/read/5xx failures (1–10, default: 3). "
+        "Env: HEADROOM_RETRY_MAX_ATTEMPTS."
+    ),
 )
 @click.option(
     "--connect-timeout-seconds",
-    type=int,
+    type=click.IntRange(min=1, max=300),
     default=None,
-    help="Upstream connection timeout in seconds (default: 10)",
+    envvar="HEADROOM_CONNECT_TIMEOUT_SECONDS",
+    help=(
+        "Upstream connection timeout in seconds (1–300, default: 10). "
+        "Env: HEADROOM_CONNECT_TIMEOUT_SECONDS."
+    ),
 )
 @click.option(
     "--anthropic-pre-upstream-concurrency",
@@ -240,11 +248,26 @@ def _selected_context_tool() -> str:
         "Env: HEADROOM_ANTHROPIC_PRE_UPSTREAM_MEMORY_CONTEXT_TIMEOUT_SECONDS."
     ),
 )
-@click.option("--log-file", default=None, help="Path to JSONL log file")
+@click.option(
+    "--log-file",
+    default=None,
+    envvar="HEADROOM_LOG_FILE",
+    help=(
+        "Path to write request/response logs as JSONL. "
+        "Each line is a JSON object with fields: timestamp, request_id, model, "
+        "tokens_before, tokens_after, latency_ms, etc. "
+        "Disabled in --stateless mode. Env: HEADROOM_LOG_FILE."
+    ),
+)
 @click.option(
     "--log-messages",
     is_flag=True,
-    help="Enable full message logging (request/response content stored for live feed)",
+    envvar="HEADROOM_LOG_MESSAGES",
+    help=(
+        "Enable full message logging: request/response content is stored in the log file "
+        "and served on the live feed endpoint. WARNING: may log sensitive data. "
+        "Env: HEADROOM_LOG_MESSAGES."
+    ),
 )
 @click.option(
     "--codex-wire-debug",
@@ -261,10 +284,13 @@ def _selected_context_tool() -> str:
 )
 @click.option(
     "--budget",
-    type=float,
+    type=click.FloatRange(min=0.0),
     default=None,
     envvar="HEADROOM_BUDGET",
-    help="Daily budget limit in USD (env: HEADROOM_BUDGET)",
+    help=(
+        "Daily budget limit in USD. Requests are rejected with 429 once the limit is reached. "
+        "Resets at midnight UTC. Env: HEADROOM_BUDGET."
+    ),
 )
 # Code-aware compression (AST-based, requires `pip install headroom-ai[code]`).
 # Pair of flags so users can override the env-var default in either direction.
@@ -313,10 +339,11 @@ def _selected_context_tool() -> str:
 @click.option(
     "--memory-db-path",
     default="",
+    envvar="HEADROOM_MEMORY_DB_PATH",
     help=(
         "Path to the legacy single-file memory DB (used in --memory-storage=global, "
         "and as the seed for the project-mode storage root). "
-        "Default: {cwd}/.headroom/memory.db"
+        "Default: {cwd}/.headroom/memory.db. Env: HEADROOM_MEMORY_DB_PATH."
     ),
 )
 @click.option(
@@ -335,22 +362,41 @@ def _selected_context_tool() -> str:
 @click.option(
     "--memory-project-root",
     default="",
+    envvar="HEADROOM_MEMORY_PROJECT_ROOT",
     help=(
         "Override the project root used for --memory-storage=project. Useful when the "
         "client doesn't put a cwd in the system prompt or you want to force a specific "
         "workspace. Takes effect after the x-headroom-project-id and x-headroom-cwd "
-        "headers."
+        "headers. Env: HEADROOM_MEMORY_PROJECT_ROOT."
     ),
 )
-@click.option("--no-memory-tools", is_flag=True, help="Disable automatic memory tool injection")
 @click.option(
-    "--no-memory-context", is_flag=True, help="Disable automatic memory context injection"
+    "--no-memory-tools",
+    is_flag=True,
+    envvar="HEADROOM_NO_MEMORY_TOOLS",
+    help=(
+        "Disable automatic injection of memory_save/memory_search tools into requests. "
+        "Env: HEADROOM_NO_MEMORY_TOOLS."
+    ),
+)
+@click.option(
+    "--no-memory-context",
+    is_flag=True,
+    envvar="HEADROOM_NO_MEMORY_CONTEXT",
+    help=(
+        "Disable automatic injection of relevant past memories into the system prompt. "
+        "Env: HEADROOM_NO_MEMORY_CONTEXT."
+    ),
 )
 @click.option(
     "--memory-top-k",
-    type=int,
+    type=click.IntRange(min=1, max=100),
     default=10,
-    help="Number of memories to inject as context (default: 10)",
+    envvar="HEADROOM_MEMORY_TOP_K",
+    help=(
+        "Number of semantically-relevant memories to inject as context (1–100, default: 10). "
+        "Env: HEADROOM_MEMORY_TOP_K."
+    ),
 )
 @click.option(
     "--memory-qdrant-url",
@@ -411,15 +457,21 @@ def _selected_context_tool() -> str:
 @click.option(
     "--backend",
     default="anthropic",
+    envvar="HEADROOM_BACKEND",
     help=(
         "API backend: 'anthropic' (direct), 'bedrock' (AWS), 'openrouter' (OpenRouter), "
-        "'anyllm' (any-llm), or 'litellm-<provider>' (e.g., litellm-vertex)"
+        "'anyllm' (any-llm), or 'litellm-<provider>' (e.g., litellm-vertex). "
+        "Env: HEADROOM_BACKEND."
     ),
 )
 @click.option(
     "--anyllm-provider",
     default="openai",
-    help="Provider for any-llm backend: openai, mistral, groq, ollama, etc. (default: openai)",
+    envvar="HEADROOM_ANYLLM_PROVIDER",
+    help=(
+        "Provider for any-llm backend: openai, mistral, groq, ollama, etc. (default: openai). "
+        "Env: HEADROOM_ANYLLM_PROVIDER."
+    ),
 )
 @click.option(
     "--anthropic-api-url",
@@ -449,7 +501,8 @@ def _selected_context_tool() -> str:
 @click.option(
     "--region",
     default="us-west-2",
-    help="Cloud region for Bedrock/Vertex/etc (default: us-west-2)",
+    envvar="HEADROOM_REGION",
+    help="Cloud region for Bedrock/Vertex/etc (default: us-west-2). Env: HEADROOM_REGION.",
 )
 @click.option(
     "--bedrock-region",
@@ -567,9 +620,22 @@ def proxy(
     try:
         from headroom.proxy.server import ProxyConfig, run_server
     except ImportError as e:
-        click.echo("Error: Proxy dependencies not installed. Run: pip install headroom[proxy]")
-        click.echo(f"Details: {e}")
+        click.secho(
+            "Error: Proxy dependencies not installed. Run: pip install headroom-ai[proxy]",
+            fg="red",
+            err=True,
+        )
+        click.secho(f"Details: {e}", fg="red", err=True)
         raise SystemExit(1) from None
+
+    # Warn if --learn and --no-learn are both set (--no-learn wins, per docstring)
+    if learn and no_learn:
+        click.secho(
+            "Warning: both --learn and --no-learn were specified; --no-learn takes precedence "
+            "and traffic learning will be disabled.",
+            fg="yellow",
+            err=True,
+        )
 
     # Opt-in: turn on tool_result interceptors (ast-grep Read outline, etc.).
     # Only fetch the bundled CLI tool binaries when the feature is enabled —
@@ -973,6 +1039,7 @@ Press Ctrl+C to stop.
         run_server(config, **run_kwargs)
     except KeyboardInterrupt:
         click.echo("\nShutting down...")
+        raise SystemExit(130) from None
     finally:
         if _embed_watchdog is not None:
             import asyncio as _asyncio2
