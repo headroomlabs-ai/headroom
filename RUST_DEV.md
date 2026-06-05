@@ -331,16 +331,24 @@ in-memory.
 
 (Historical context — applies only when the operator explicitly
 chooses `CcrBackendConfig::InMemory`.) Each uvicorn worker is a
-separate Python process. Each process holds its own copies of:
+separate Python process. The following state is fragmented across workers
+in the Python proxy:
 
 1. **`InMemoryCcrStore`** — sharded `DashMap` mapping
    `hash → original_content` for content the compressor replaced with
    `<<ccr:HASH>>` markers.
-2. **`HeadroomProxy._compression_caches`** (`headroom/proxy/server.py:367`)
-   — per-session `CompressionCache` dict.
+2. **`HeadroomProxy._compression_caches`** (`headroom/proxy/server.py`)
+   — per-session `CompressionCache` dict (instance var, truly per-worker).
 3. **`HeadroomProxy.session_tracker_store`** — per-session prefix-tracker
-   state derived from Anthropic's `cache_read_input_tokens` responses.
-4. **TOIN learner state** — pattern statistics used to bias the compressor.
+   state derived from Anthropic's `cache_read_input_tokens` responses
+   (instance var, truly per-worker).
+
+Note: **CCR store** and **TOIN learner state** in the Python proxy are
+global singletons (file-backed via `CompressionStore` and
+`~/.headroom/toin.json` respectively). They are shared across all workers
+in the same process group and are NOT fragmented by multi-worker
+deployments. The startup warning covers only `CompressionCache` and
+`PrefixTracker`.
 
 When uvicorn round-robins requests across workers, a session whose
 turn-1 landed on worker A may have turn-2 land on worker B. Worker B has

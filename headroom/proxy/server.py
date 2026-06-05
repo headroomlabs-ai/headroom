@@ -3080,18 +3080,18 @@ def run_server(
     app_target: Any
     uvicorn_kwargs: dict[str, Any] = {}
     if workers > 1:
-        # CCR / compression-cache / prefix-tracker / TOIN state are all
-        # per-process. Round-robin across workers fragments these caches
-        # and produces silent retrieval failures for `Retrieve original:
-        # hash=X` markers and avoidable cache busts on the upstream
-        # provider. See the "Multi-worker deployment — CCR fragmentation"
-        # section in RUST_DEV.md for the full failure modes and the
-        # sticky-session workaround.
+        # CompressionCache and PrefixTracker are per-worker instance vars.
+        # Round-robin across workers fragments them: a session whose turn-1
+        # lands on worker A and turn-2 on worker B gets cache busts and
+        # stale prefix predictions because worker B has no knowledge of
+        # what worker A accumulated. CCR store and TOIN are global
+        # singletons (file-backed) so they are already shared — they are
+        # NOT affected by this warning. See RUST_DEV.md →
+        # "Multi-worker deployment — CCR fragmentation" for full details.
         logger.warning(
-            "Headroom is running with workers=%d. The in-memory CCR store, "
-            "compression cache, prefix tracker, and TOIN state are all "
-            "per-process; multi-worker deployments produce silent retrieval "
-            "failures and avoidable cache busts when sessions land on different "
+            "Headroom is running with workers=%d. The in-memory compression "
+            "cache and prefix tracker are per-worker; multi-worker deployments "
+            "produce avoidable cache busts when sessions land on different "
             "workers. Run --workers 1 (or place a sticky-session load balancer "
             "in front of multiple --workers 1 processes). See RUST_DEV.md → "
             "'Multi-worker deployment — CCR fragmentation'.",

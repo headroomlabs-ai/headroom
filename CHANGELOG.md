@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [Unreleased]
+
+### Fixed
+
+* **proxy:** narrow multi-worker startup warning to accurately name only `CompressionCache` and `PrefixTracker` as per-worker state; CCR store and TOIN are global singletons (file-backed) and are already shared across workers, so the previous warning was misleading. Updated `RUST_DEV.md` to match.
+
 ## [0.23.0](https://github.com/chopratejas/headroom/compare/v0.22.4...v0.23.0) (2026-06-04)
 
 ### Features
