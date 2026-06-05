@@ -11,6 +11,13 @@ on:
       - 'e2e/**'
       - 'scripts/install*'
       - 'pyproject.toml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'uv.lock'
+      - '.claude-plugin'
+      - '.github/plugin/**'
+      - 'plugins/headroom-agent-hooks/**'
       - '.github/workflows/init-e2e.yml'
   push:
     branches: [main]

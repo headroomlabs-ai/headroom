@@ -11,6 +11,12 @@ on:
       - 'e2e/**'
       - 'scripts/install*'
       - 'pyproject.toml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'uv.lock'
+      - 'sdk/typescript/**'
+      - 'plugins/openclaw/**'
       - '.github/workflows/wrap-e2e.yml'
   push:
     branches: [main]
