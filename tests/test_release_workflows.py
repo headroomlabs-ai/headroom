@@ -1011,9 +1011,7 @@ def test_release_please_workflow_exists_and_targets_main() -> None:
     )
 
     content = rp_path.read_text(encoding="utf-8")
-    assert any(
-        f"googleapis/release-please-action@v{v}" in content for v in (4, 5)
-    ), (
+    assert any(f"googleapis/release-please-action@v{v}" in content for v in (4, 5)), (
         "release-please.yml must use the v4 or v5 action — earlier versions "
         "have different manifest semantics."
     )
