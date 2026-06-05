@@ -120,6 +120,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Option E: dedicated embedding server sidecar** (`--embedding-server` flag) for shared HNSW index and reduced per-worker memory (~600 MB RSS savings across 8 workers). Includes watchdog with exponential-backoff restart. See `docs/embedding-server.md` for architecture details and usage.
+
 ### Security
 - **`/debug/memory` loopback guard.** The endpoint was missing the
   `Depends(_require_loopback)` guard that all other `/debug/*` endpoints carry.
