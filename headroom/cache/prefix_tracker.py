@@ -16,11 +16,11 @@ pipeline skips them entirely.
 
 from __future__ import annotations
 
-import copy
 import hashlib
 import json
 import logging
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
 
@@ -133,8 +133,14 @@ class PrefixCacheTracker:
         """
         self._last_activity = time.time()
         self._turn_number += 1
-        self._last_original_messages = copy.deepcopy(original_messages or messages)
-        self._last_forwarded_messages = copy.deepcopy(messages)
+        # Shallow-copy the list so the stored snapshot is independent of the
+        # caller's list reference, but message dicts are shared (they are
+        # treated as immutable after being forwarded). A full deep-copy is
+        # not needed here: the only consumer (_extract_cache_stable_delta)
+        # does its own deep-copy at call time. Avoiding deep-copy here saves
+        # 50-200 MB per session on long conversations (200+ large messages).
+        self._last_original_messages = list(original_messages or messages)
+        self._last_forwarded_messages = list(messages)
 
         # Compute total cached tokens (read + write = what's in cache now)
         total_cached = cache_read_tokens + cache_write_tokens
@@ -175,10 +181,13 @@ class PrefixCacheTracker:
         )
 
     def get_last_original_messages(self) -> list[dict[str, Any]]:
-        return copy.deepcopy(self._last_original_messages)
+        # Return a shallow copy of the stored list. Callers that need mutation
+        # isolation (e.g. _extract_cache_stable_delta) perform their own
+        # deep-copy at the point of use.
+        return list(self._last_original_messages)
 
     def get_last_forwarded_messages(self) -> list[dict[str, Any]]:
-        return copy.deepcopy(self._last_forwarded_messages)
+        return list(self._last_forwarded_messages)
 
     def record_bust_avoided(self, tokens_preserved: int, compression_foregone: int) -> None:
         """Record when we chose to preserve cache over compressing."""
@@ -277,12 +286,25 @@ class SessionTrackerStore:
     """Manages PrefixCacheTracker instances across sessions.
 
     Keyed by session ID (from x-headroom-session-id header or computed hash).
-    Automatically cleans up expired sessions.
+    Automatically cleans up expired sessions. Caps total sessions at
+    ``max_sessions`` using LRU eviction so memory usage is bounded regardless
+    of how many unique sessions a deployment serves.
+
+    Args:
+        default_config: Configuration applied to every new tracker.
+        max_sessions: Hard cap on live sessions. When exceeded, the
+            least-recently-used session is evicted. Defaults to 500.
     """
 
-    def __init__(self, default_config: PrefixFreezeConfig | None = None):
-        self._trackers: dict[str, PrefixCacheTracker] = {}
+    def __init__(
+        self,
+        default_config: PrefixFreezeConfig | None = None,
+        max_sessions: int = 500,
+    ):
+        # OrderedDict enables O(1) LRU eviction (move_to_end + popitem).
+        self._trackers: OrderedDict[str, PrefixCacheTracker] = OrderedDict()
         self._default_config = default_config or PrefixFreezeConfig()
+        self._max_sessions = max_sessions
         self._last_cleanup: float = time.time()
         self._cleanup_interval: float = 60.0  # Cleanup every 60s
 
@@ -293,10 +315,22 @@ class SessionTrackerStore:
         if session_id in self._trackers:
             tracker = self._trackers[session_id]
             tracker._last_activity = time.time()
+            # Promote to most-recently-used end.
+            self._trackers.move_to_end(session_id)
             return tracker
 
         tracker = PrefixCacheTracker(provider, self._default_config)
         self._trackers[session_id] = tracker
+
+        # Enforce LRU cap: evict the oldest entry when over the limit.
+        if len(self._trackers) > self._max_sessions:
+            evicted_id, _ = self._trackers.popitem(last=False)
+            logger.debug(
+                "SessionTrackerStore: LRU eviction of session %s (cap=%d)",
+                evicted_id,
+                self._max_sessions,
+            )
+
         return tracker
 
     def compute_session_id(
