@@ -1,0 +1,10 @@
+# CODEOWNERS — security-critical paths require review from a designated owner.
+# Format: <pattern> <owner> [<owner2> ...]
+# Docs: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# CI/CD and infrastructure changes require elevated review.
+.github/workflows/         @chopratejas
+Dockerfile                 @chopratejas
+docker-bake.hcl            @chopratejas
+pyproject.toml             @chopratejas
+scripts/install.sh         @chopratejas

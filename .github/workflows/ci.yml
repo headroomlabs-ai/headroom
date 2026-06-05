@@ -28,8 +28,10 @@ concurrency:
 
 env:
   PY_VERSION: "3.12"
-  # CPU-only torch — runners have no GPU; the default CUDA wheels pull ~2.5 GB.
-  PIP_EXTRA_INDEX_URL: https://download.pytorch.org/whl/cpu
+  # PIP_EXTRA_INDEX_URL is intentionally NOT set at workflow level.
+  # Scoping it globally means every `pip install` (ruff, mypy, pytest) also
+  # searches pytorch.org, creating a dependency-confusion vector (CWE-770).
+  # Each step that needs torch passes --index-url explicitly instead.
 
 jobs:
   changes:
@@ -89,6 +91,22 @@ jobs:
         run: ruff format --check .
       - name: mypy
         run: mypy headroom --ignore-missing-imports
+
+  pip-audit:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PY_VERSION }}
+      - name: Install dependencies + pip-audit
+        run: |
+          python -m pip install --upgrade pip pip-audit
+          pip install -e ".[proxy]"
+      - name: Audit Python dependencies for known CVEs
+        run: pip-audit --skip-editable
 
   build-wheel:
     needs: changes
@@ -344,15 +362,20 @@ jobs:
 
       - name: Install actionlint
         if: steps.tools-cache.outputs.cache-hit != 'true'
+        # Download archive to file then extract — no curl|bash, no @main float (CWE-494).
         run: |
-          curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash | bash
-          sudo mv ./actionlint /usr/local/bin/actionlint
-
+          curl -fsSL -o /tmp/actionlint.tar.gz \
+            "https://github.com/rhysd/actionlint/releases/download/v1.7.4/actionlint_1.7.4_linux_amd64.tar.gz"
+          tar -xzf /tmp/actionlint.tar.gz -C /tmp actionlint
+          sudo mv /tmp/actionlint /usr/local/bin/actionlint
       - name: Install act
         if: steps.tools-cache.outputs.cache-hit != 'true'
+        # Download archive to file then extract — no curl|bash, no @master float (CWE-494).
         run: |
-          curl -fsSL https://raw.githubusercontent.com/nektos/act/master/install.sh | sudo bash
-          sudo install ./bin/act /usr/local/bin/act
+          curl -fsSL -o /tmp/act.tar.gz \
+            "https://github.com/nektos/act/releases/download/v0.2.61/act_Linux_x86_64.tar.gz"
+          tar -xzf /tmp/act.tar.gz -C /tmp act
+          sudo mv /tmp/act /usr/local/bin/act
       - name: Validate workflow files
         run: bash scripts/validate-workflows.sh
 

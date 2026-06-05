@@ -1689,11 +1689,18 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             }
         return payload
 
-    # CORS
+    # CORS: restrict to localhost by default (this is a local proxy).
+    # Set HEADROOM_CORS_ORIGIN_REGEX to override for custom deployments.
+    # Using allow_origin_regex instead of allow_origins=["*"] because the
+    # wildcard+credentials combination is forbidden by the CORS spec (CWE-346)
+    # and would be silently rejected by browsers anyway.
+    _default_cors_regex = r"http://(localhost|127\.0\.0\.1)(:\d+)?"
+    _cors_origin_regex = os.environ.get("HEADROOM_CORS_ORIGIN_REGEX", _default_cors_regex)
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
+        allow_origins=[],
+        allow_origin_regex=_cors_origin_regex,
+        allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
     )
@@ -1820,17 +1827,18 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         payload = _health_payload(include_config=False)
         return JSONResponse(status_code=200 if payload["ready"] else 503, content=payload)
 
-    @app.get("/health")
-    async def health():
-        payload = _health_payload(include_config=True)
-        return JSONResponse(status_code=200, content=payload)
-
     # Loopback-only debug introspection (Unit 5). A remote IP gets 404 —
     # debug endpoints are invisible to external scanners.
     from headroom.proxy.debug_introspection import (
         collect_tasks as _collect_tasks,
     )
     from headroom.proxy.loopback_guard import require_loopback as _require_loopback
+
+    # /health includes internal API URLs and PID — loopback-only.
+    @app.get("/health", dependencies=[Depends(_require_loopback)])
+    async def health():
+        payload = _health_payload(include_config=True)
+        return JSONResponse(status_code=200, content=payload)
 
     @app.get("/debug/tasks", dependencies=[Depends(_require_loopback)])
     async def debug_tasks(stack: bool = False):

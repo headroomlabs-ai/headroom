@@ -118,11 +118,9 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-audit,cargo-deny
-      - name: cargo audit (soft-fail)
-        continue-on-error: true
+      - name: cargo audit
         run: cargo audit
       - name: cargo deny check licenses
-        continue-on-error: true
         run: cargo deny check licenses
 
   parity-nightly:

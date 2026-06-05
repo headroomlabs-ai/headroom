@@ -23,10 +23,11 @@ on:
 env:
   REGISTRY: ghcr.io
 
+# Minimal workflow-level permissions. Per-job overrides grant only what each
+# job needs: docker-build and docker-manifest need packages:write, only
+# docker-manifest (cosign signing) needs id-token:write (CWE-732).
 permissions:
   contents: read
-  packages: write
-  id-token: write # For cosign keyless signing via Sigstore OIDC
 
 jobs:
   # ─── Per-arch fan-out ──────────────────────────────────────────────────────
@@ -44,7 +45,9 @@ jobs:
   # final multi-arch tagged manifest, which is what users pull by tag.
   docker-build:
     runs-on: ${{ matrix.arch.runs_on }}
-    timeout-minutes: 75
+    permissions:
+      contents: read
+      packages: write
     strategy:
       fail-fast: false
       matrix:
@@ -62,7 +65,7 @@ jobs:
           - { name: arm64, runs_on: ubuntu-24.04-arm, platform: linux/arm64 }
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
       - name: Normalize image name
         id: image-name
@@ -186,7 +189,10 @@ jobs:
   docker-manifest:
     needs: docker-build
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+      id-token: write  # cosign keyless signing via Sigstore OIDC
     strategy:
       fail-fast: false
       matrix:
@@ -353,7 +359,9 @@ jobs:
     # at the top instead of whichever variant happened to finish last.
     needs: docker-manifest
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
     steps:
       - name: Normalize image name
         id: image-name

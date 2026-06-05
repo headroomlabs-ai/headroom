@@ -1179,9 +1179,13 @@ def _inject_memory_mcp_config(db_path: str, user_id: str) -> None:
     config_file = config_dir / "config.toml"
 
     # Use forward slashes in TOML paths (works on all platforms, avoids
-    # backslash escaping issues on Windows)
-    python_bin = sys.executable.replace("\\", "/")
-    db_path_toml = db_path.replace("\\", "/")
+    # backslash escaping issues on Windows). Escape any embedded double-quotes
+    # so the interpolated values cannot break the TOML string literal.
+    def _toml_escape(value: str) -> str:
+        return value.replace("\\", "/").replace('"', '\\"')
+
+    python_bin = _toml_escape(sys.executable)
+    db_path_toml = _toml_escape(db_path)
     mcp_section = (
         f"\n{_MEMORY_MCP_MARKER}\n"
         f"[mcp_servers.headroom_memory]\n"

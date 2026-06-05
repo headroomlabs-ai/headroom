@@ -66,10 +66,8 @@ FROM python:${PYTHON_VERSION}-slim AS runtime-slim-base
 ARG RUNTIME_USER=nonroot
 ARG PYTHON_SITE_PACKAGES
 
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl && \
-    rm -rf /var/lib/apt/lists/*
-
+# curl is NOT installed — it is not needed at runtime and expands the
+# attack surface of the container. Use a pure-Python healthcheck instead.
 COPY --from=builder ${PYTHON_SITE_PACKAGES} ${PYTHON_SITE_PACKAGES}
 COPY --from=builder /usr/local/bin/headroom /usr/local/bin/headroom
 
@@ -93,7 +91,7 @@ ENV HEADROOM_HOST=0.0.0.0 \
 EXPOSE 8787
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD ["curl", "--fail", "--silent", "http://127.0.0.1:8787/readyz"]
+    CMD python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/readyz', timeout=4)"
 
 ENTRYPOINT ["headroom", "proxy"]
 CMD ["--host", "0.0.0.0", "--port", "8787"]

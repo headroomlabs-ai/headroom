@@ -10,12 +10,15 @@ on:
       - '.github/workflows/docs.yml'
   workflow_dispatch:
 
+# Minimal workflow-level permissions; only the deploy step needs write access.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write  # gh-deploy pushes to gh-pages branch
     steps:
       - uses: actions/checkout@v6
         with:
@@ -34,7 +37,8 @@ jobs:
           restore-keys: ${{ runner.os }}-pip-docs-
 
       - name: Install dependencies
-        run: pip install mkdocs-material
+        # Pin version to prevent unpinned PyPI package from running with write token.
+        run: pip install "mkdocs-material==9.5.49"
 
       - name: Build and deploy
         run: mkdocs gh-deploy --force
