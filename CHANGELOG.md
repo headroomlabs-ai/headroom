@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [Unreleased]
+
+### Bug Fixes
+
+* **startup:** move HF/httpx log suppression to CLI module level so it fires before sentence_transformers worker init, eliminating ~50 noisy startup lines per proxy run
+
+
 ## [0.23.0](https://github.com/chopratejas/headroom/compare/v0.22.4...v0.23.0) (2026-06-04)
 
 ### Features
