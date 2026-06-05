@@ -64,7 +64,7 @@ EOF
 sudo mkdir -p "$project_env_root" "$cache_root/uv" "$cache_root/pip" "$cache_root/pre-commit"
 sudo chown -R "$(id -u):$(id -g)" "$project_env_root" "$cache_root"
 
-uv sync --frozen "${sync_extras[@]}" --link-mode copy
+UV_SKIP_WHEEL_FILENAME_CHECK=1 uv sync --frozen "${sync_extras[@]}" --link-mode copy
 
 if configure_worktree_git_env; then
   uv run pre-commit install
