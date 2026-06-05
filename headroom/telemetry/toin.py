@@ -67,6 +67,7 @@ import os
 import threading
 import time
 import warnings
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Final
@@ -272,9 +273,12 @@ class ToolPattern:
     # If True, we know some users were lost and should be conservative about user_count
     _tracking_truncated: bool = False
 
-    # CRITICAL FIX #1: Maximum entries in _all_seen_instances to prevent OOM
-    # This is a class constant, not a field (not serialized)
-    MAX_SEEN_INSTANCES: int = 10000
+    # Maximum entries in _all_seen_instances to prevent OOM.
+    # Reduced from 10,000 to 1,000: at ~64 bytes per 16-char hex string
+    # this caps the per-pattern set at ~64 KB instead of ~640 KB.
+    # user_count remains authoritative for counting when the cap is hit.
+    # This is a class constant, not a field (not serialized).
+    MAX_SEEN_INSTANCES: int = 1_000
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for serialization."""
@@ -404,6 +408,13 @@ class TOINConfig:
     anonymize_queries: bool = True
     max_query_patterns: int = 10
 
+    # Maximum number of patterns kept in-memory. When the cap is reached the
+    # least-recently-used pattern is evicted (LRU order).  Each ToolPattern
+    # can occupy 5–50 KB depending on how many field-semantics / instance
+    # hashes it has accumulated.  2,000 patterns × ~25 KB average = ~50 MB
+    # cap, replacing the previous unbounded growth.
+    max_patterns: int = 2_000
+
     # LOW FIX #22: Metrics/monitoring hooks
     # Callback for emitting metrics events. Signature: (event_name, event_data) -> None
     # Event names: "toin.compression", "toin.retrieval", "toin.recommendation", "toin.save"
@@ -460,7 +471,13 @@ class ToolIntelligenceNetwork:
         # PR-B5 extended the key from a bare structure_hash to the per-tenant
         # tuple. The serialized form on disk encodes the tuple as
         # "auth|model|hash"; see `_serialize_pattern_key`.
-        self._patterns: dict[PatternKey, ToolPattern] = {}
+        #
+        # OrderedDict enables O(1) LRU eviction: move_to_end() on access,
+        # popitem(last=False) to drop the LRU entry.  When the pattern count
+        # exceeds `config.max_patterns` (default 2,000) the least-recently-
+        # used entry is silently dropped.  The on-disk store is unaffected —
+        # evicted patterns are still serialised on the next save().
+        self._patterns: OrderedDict[PatternKey, ToolPattern] = OrderedDict()
 
         # Instance ID for user counting (anonymized)
         # IMPORTANT: Must be STABLE across restarts to avoid false user count inflation
@@ -501,6 +518,32 @@ class ToolIntelligenceNetwork:
                 f"{socket.gethostname()}:{os.getuid() if hasattr(os, 'getuid') else 'unknown'}"
             )
             return hashlib.sha256(machine_info.encode()).hexdigest()[:16]  # HIGH FIX: 64 bits
+
+    def _touch_pattern(self, key: PatternKey) -> None:
+        """Mark ``key`` as most-recently used in the LRU order.
+
+        Must be called while ``self._lock`` is held.
+
+        Args:
+            key: Pattern key to promote to the MRU position.
+        """
+        self._patterns.move_to_end(key)
+
+    def _evict_lru_if_needed(self) -> None:
+        """Evict the least-recently-used pattern when the cap is exceeded.
+
+        Must be called while ``self._lock`` is held.  Silently drops the
+        LRU entry when ``len(_patterns) > config.max_patterns``.  The
+        evicted pattern is not removed from the on-disk store — next
+        ``save()`` will still serialise the full in-memory snapshot.
+        """
+        while len(self._patterns) > self._config.max_patterns:
+            evicted_key, _ = self._patterns.popitem(last=False)
+            logger.debug(
+                "TOIN: evicted LRU pattern %s (cap=%d)",
+                evicted_key,
+                self._config.max_patterns,
+            )
 
     def _emit_metric(self, event_name: str, event_data: dict[str, Any]) -> None:
         """Emit a metrics event via the configured callback.
@@ -579,14 +622,17 @@ class ToolIntelligenceNetwork:
         )
 
         with self._lock:
-            # Get or create pattern
+            # Get or create pattern; evict LRU entry if the cap is exceeded.
             if key not in self._patterns:
                 self._patterns[key] = ToolPattern(
                     tool_signature_hash=sig_hash,
                     auth_mode=key[0],
                     model_family=key[1],
                 )
+                self._evict_lru_if_needed()
 
+            # Promote to MRU on every access.
+            self._touch_pattern(key)
             pattern = self._patterns[key]
 
             # Update compression stats
@@ -831,7 +877,10 @@ class ToolIntelligenceNetwork:
                     auth_mode=key[0],
                     model_family=key[1],
                 )
+                self._evict_lru_if_needed()
 
+            # Promote to MRU on every access.
+            self._touch_pattern(key)
             pattern = self._patterns[key]
 
             # Update retrieval stats
@@ -1160,6 +1209,8 @@ class ToolIntelligenceNetwork:
         with self._lock:
             pattern = self._patterns.get(key)
             if pattern is not None:
+                # Promote to MRU so reads count against eviction order.
+                self._touch_pattern(key)
                 return copy.deepcopy(pattern)
             return None
 
@@ -1224,11 +1275,13 @@ class ToolIntelligenceNetwork:
                 imported.model_family = key[1]
 
                 if key in self._patterns:
-                    # Merge with existing
+                    # Merge with existing; promote to MRU.
+                    self._touch_pattern(key)
                     self._merge_patterns(self._patterns[key], imported)
                 else:
                     # Add new pattern - need to track source instance
                     self._patterns[key] = imported
+                    self._evict_lru_if_needed()
 
                     # For NEW patterns from another instance, track the source in
                     # _seen_instance_hashes so user_count reflects cross-user data

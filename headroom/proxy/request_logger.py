@@ -184,18 +184,47 @@ def redact_image_base64(payload: Any) -> Any:
 class RequestLogger:
     """Log requests to JSONL file.
 
-    Uses a deque with max 10,000 entries to prevent unbounded memory growth.
+    Uses a deque with max ``max_entries`` entries (default 500) to cap
+    in-memory footprint. Full bodies in the deque are truncated to
+    ``MAX_BODY_BYTES`` (default 2 KB) with a ``[truncated]`` suffix;
+    the on-disk JSONL file always receives the full body.
+
     Gracefully degrades to in-memory-only if the log file cannot be written
     (read-only filesystem, permissions error, etc.).
     """
 
-    MAX_LOG_ENTRIES = 10_000
+    # Default cap: 500 entries.  At ~2 KB per stored body this is ~1 MB
+    # of retained text — a 20x reduction from the previous 10,000-entry
+    # default that could accumulate ~100 MB on a busy proxy.
+    DEFAULT_MAX_ENTRIES: int = 500
 
-    def __init__(self, log_file: str | None = None, log_full_messages: bool = False):
+    # Body strings stored in the deque are truncated at this byte length.
+    # The on-disk log file always retains the full body.
+    MAX_BODY_BYTES: int = 2048
+
+    def __init__(
+        self,
+        log_file: str | None = None,
+        log_full_messages: bool = False,
+        max_entries: int | None = None,
+    ) -> None:
+        """Initialize the request logger.
+
+        Args:
+            log_file: Path to the JSONL log file. Pass ``None`` to disable
+                on-disk logging (in-memory only).
+            log_full_messages: When True, ``request_messages`` and
+                ``response_content`` are included in log entries.
+            max_entries: Maximum number of entries retained in the in-memory
+                deque. Defaults to ``DEFAULT_MAX_ENTRIES`` (500).
+        """
         self.log_file = Path(log_file) if log_file else None
         self.log_full_messages = log_full_messages
+        self._max_entries: int = (
+            max_entries if max_entries is not None else self.DEFAULT_MAX_ENTRIES
+        )
         # Use deque with maxlen for automatic FIFO eviction
-        self._logs: deque[RequestLog] = deque(maxlen=self.MAX_LOG_ENTRIES)
+        self._logs: deque[RequestLog] = deque(maxlen=self._max_entries)
 
         if self.log_file:
             try:
@@ -208,7 +237,26 @@ class RequestLogger:
                 )
                 self.log_file = None
 
-    def log(self, entry: RequestLog):
+    @staticmethod
+    def _truncate_body(value: str, max_bytes: int) -> str:
+        """Truncate a body string to ``max_bytes`` UTF-8 bytes.
+
+        Appends a ``[truncated]`` marker when the value exceeds the limit.
+        Returns the value unchanged when it is already within bounds.
+
+        Args:
+            value: The string to truncate.
+            max_bytes: Maximum allowed UTF-8 byte length.
+
+        Returns:
+            The (possibly truncated) string.
+        """
+        encoded = value.encode("utf-8")
+        if len(encoded) <= max_bytes:
+            return value
+        return encoded[:max_bytes].decode("utf-8", errors="replace") + " [truncated]"
+
+    def log(self, entry: RequestLog) -> None:
         """Log a request. Oldest entries are automatically removed when limit reached.
 
         Phase G PR-G3 (P4-45): base64-encoded image payloads in
@@ -216,18 +264,20 @@ class RequestLogger:
         before write. Redaction also applies to the in-memory deque
         so the ``/stats/recent_requests`` endpoint never serves a
         multi-MB image either.
+
+        Bodies stored in the deque are additionally truncated to
+        ``MAX_BODY_BYTES`` (2 KB) to cap per-entry memory. The on-disk
+        JSONL file always receives the full (but still image-redacted)
+        body.
         """
-        # Redact image payloads in-place on the deque entry so memory
-        # use stays bounded. We mutate the dataclass fields rather
-        # than wrapping the entry to keep ``get_recent`` /
-        # ``get_recent_with_messages`` unchanged.
+        # Redact image payloads first (before truncation, so we measure
+        # the redacted size, not the original multi-MB payload).
         if entry.request_messages is not None:
             entry.request_messages = redact_image_base64(entry.request_messages)
         if entry.response_content is not None:
             entry.response_content = redact_image_base64(entry.response_content)
 
-        self._logs.append(entry)
-
+        # Write the full (image-redacted) body to disk before truncation.
         if self.log_file:
             try:
                 with open(self.log_file, "a") as f:
@@ -238,6 +288,18 @@ class RequestLogger:
                     f.write(json.dumps(log_dict) + "\n")
             except OSError:
                 pass  # Graceful degradation: memory-only logging continues
+
+        # Truncate bodies in the deque copy to keep per-entry memory bounded.
+        # We store a shallow copy of the entry with truncated strings rather
+        # than mutating the caller's object (callers may re-use the entry).
+        if entry.response_content is not None and isinstance(entry.response_content, str):
+            truncated_content = self._truncate_body(entry.response_content, self.MAX_BODY_BYTES)
+            if truncated_content is not entry.response_content:
+                from dataclasses import replace as _dc_replace
+
+                entry = _dc_replace(entry, response_content=truncated_content)
+
+        self._logs.append(entry)
 
     def get_recent(self, n: int = 100) -> list[dict]:
         """Get recent log entries (without request_messages and response_content)."""
