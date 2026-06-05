@@ -870,9 +870,7 @@ Memory (Multi-Provider):
             f"  (HEADROOM_STALE_READ_COMPRESS_AFTER_TURNS={_stale_turns})"
         )
     if _embed_socket:
-        _tuning_lines.append(
-            f"  Embedding sidecar:       {_embed_socket}"
-        )
+        _tuning_lines.append(f"  Embedding sidecar:       {_embed_socket}")
     if _tuning_lines:
         tuning_section = "\nPerformance Tuning:\n" + "\n".join(_tuning_lines)
     else:
