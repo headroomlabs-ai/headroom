@@ -18,6 +18,7 @@ from typing import Any
 
 import pytest
 
+from headroom.transforms.content_detector import ContentType
 from headroom.transforms.content_router import (
     CompressionStrategy,
     ContentRouter,
@@ -25,8 +26,6 @@ from headroom.transforms.content_router import (
     RouterCompressionResult,
     RoutingDecision,
 )
-from headroom.transforms.content_detector import ContentType
-
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -499,7 +498,7 @@ class TestStaleReadCompressionApply:
 
         # 3-turn conversation with Read outputs
         msgs, _ = _build_long_conversation(n_turns=3, tool_name="Read")
-        result = router.apply(msgs, tok)
+        router.apply(msgs, tok)
 
         # With stale_read=0, all Read outputs are protected (excluded_tool path)
         # compress() should NOT be called for Read outputs
@@ -625,7 +624,7 @@ class TestStaleReadCompressionApply:
                 route_counts_received.append(dict(rc))
 
         router._observer = FakeObserver()
-        result = router.apply(msgs, tok)
+        router.apply(msgs, tok)
 
         if route_counts_received:
             total_excluded = sum(rc.get("excluded_tool", 0) for rc in route_counts_received)
@@ -748,6 +747,72 @@ class TestStaleReadAnthropicFormat:
 # ---------------------------------------------------------------------------
 # Integration: Both features together
 # ---------------------------------------------------------------------------
+
+
+class TestCacheSkipNotPoisonedByConservativeMode:
+    """Conservative passthrough results must NOT poison the skip set.
+
+    Bug: if a tool message is passed through in conservative mode (stable phase)
+    and the result is added to mark_skip(), then after the stability phase ends
+    the same content stays in the skip set and is never compressed — even though
+    it could be compressed by Kompress in full mode.
+    """
+
+    def test_conservative_passthrough_not_added_to_skip_set(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Content passed through in conservative mode is NOT marked as skip."""
+        router = ContentRouter(ContentRouterConfig(compression_stable_after_turn=5))
+        tok = _fake_tokenizer()
+
+        # Monkeypatch compress to return a good compressed result (would compress in full mode)
+        full_compress_calls: list[str] = []
+        original_compress = router.compress
+
+        def mock_full_compress(content: str, **kwargs: Any) -> RouterCompressionResult:
+            full_compress_calls.append(content[:20])
+            return original_compress(content, **kwargs)
+
+        monkeypatch.setattr(router, "compress", mock_full_compress)
+
+        content = "tool output WebFetch data " * 100
+        tc_id = "tc_0"
+
+        # Turn 1 (3 turns = conservative phase, turn_count=2 <= stable_after=5)
+        msgs_early = [
+            _user_message("turn1"),
+            _assistant_with_tool_call(tc_id, "WebFetch"),
+            _tool_message(tc_id, content),
+        ]
+        router.apply(msgs_early, tok)
+
+        # In early turns, conservative mode skips Kompress-bound content
+        # (full_compress_calls may or may not be populated at this point)
+
+        # Now build a long conversation (past stability threshold) with same content
+        msgs_late = []
+        for t in range(8):
+            tc = f"tc_{t}_extra"
+            msgs_late.append(_user_message(f"turn {t}"))
+            msgs_late.append(_assistant_with_tool_call(tc, "WebFetch"))
+            msgs_late.append(_tool_message(tc, f"other content turn {t} " * 50))
+
+        # Add our original content at the end (now in full-compression territory)
+        msgs_late.append(_user_message("final"))
+        msgs_late.append(_assistant_with_tool_call("tc_final", "WebFetch"))
+        msgs_late.append(_tool_message("tc_final", content))
+
+        router.apply(msgs_late, tok)
+
+        # The skip set should NOT have been poisoned — compress() may now be called
+        # for the original content in full mode (session_turn_count > stable_after=5)
+        # This is a regression test: if mark_skip was called during conservative phase,
+        # the content would be silently skipped here.
+        # We verify by checking the skip set directly.
+        content_key = hash(content)
+        assert not router._cache.is_skipped(content_key), (
+            "Content passed through in conservative mode must not be in skip set"
+        )
 
 
 class TestBothFeaturesEnabled:

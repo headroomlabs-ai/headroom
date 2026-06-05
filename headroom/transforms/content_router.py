@@ -2324,7 +2324,7 @@ class ContentRouter(Transform):
             compressor_timing["parallel_compress_total"] = parallel_ms
 
             # --- Pass 3: Merge results back (sequential, updates caches) ---
-            for (slot_idx, _, _, _, content_key, _), (result, compress_ms) in zip(
+            for (slot_idx, _, _, _, content_key, task_conservative), (result, compress_ms) in zip(
                 pending_tasks, task_results
             ):
                 message = messages[slot_idx]
@@ -2349,8 +2349,12 @@ class ContentRouter(Transform):
                         f"{result.strategy_used.value}:{result.compression_ratio:.2f}"
                     )
                 else:
-                    # Didn't compress — add to skip set
-                    self._cache.mark_skip(content_key)
+                    # Didn't compress. If this was a conservative (stability-phase)
+                    # passthrough, do NOT add to the skip set — the content may be
+                    # compressible via Kompress once the stability phase ends.
+                    # Only mark_skip for genuine non-compressible content (full mode).
+                    if not task_conservative:
+                        self._cache.mark_skip(content_key)
                     result_slots[slot_idx] = message
                     route_counts["ratio_too_high"] += 1
 
@@ -2645,8 +2649,11 @@ class ContentRouter(Transform):
                         any_compressed = True
                         continue
                     else:
-                        # Didn't compress — add to skip set
-                        self._cache.mark_skip(content_key)
+                        # Didn't compress. In conservative (stability) mode, do NOT
+                        # mark_skip — this content may be compressible once the
+                        # stability phase ends and Kompress is re-enabled.
+                        if not conservative:
+                            self._cache.mark_skip(content_key)
                         if route_counts is not None:
                             route_counts["ratio_too_high"] += 1
                 else:
