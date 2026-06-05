@@ -14,7 +14,6 @@ Covers:
 
 from __future__ import annotations
 
-import os
 from unittest.mock import patch
 
 import pytest
@@ -48,7 +47,9 @@ def mock_run_server():
 class TestLearnNoLearnConflict:
     """--learn and --no-learn together should warn but not fail."""
 
-    def test_both_flags_warns_and_exits_zero(self, runner: CliRunner, mock_run_server: dict) -> None:
+    def test_both_flags_warns_and_exits_zero(
+        self, runner: CliRunner, mock_run_server: dict
+    ) -> None:
         result = runner.invoke(
             main,
             ["proxy", "--learn", "--no-learn"],
@@ -56,9 +57,9 @@ class TestLearnNoLearnConflict:
         )
         assert result.exit_code == 0, result.output
         # Warning must go to stderr via click.secho(err=True)
-        assert "both --learn and --no-learn" in result.output or (
-            result.output is not None
-        ), result.output
+        assert "both --learn and --no-learn" in result.output or (result.output is not None), (
+            result.output
+        )
 
     def test_no_learn_wins_over_learn(self, runner: CliRunner, mock_run_server: dict) -> None:
         """When both are set, learning must be disabled (--no-learn takes precedence)."""
@@ -78,7 +79,9 @@ class TestLearnNoLearnConflict:
         assert cfg.traffic_learning_enabled is True
         assert cfg.memory_enabled is True
 
-    def test_no_learn_alone_disables_learning(self, runner: CliRunner, mock_run_server: dict) -> None:
+    def test_no_learn_alone_disables_learning(
+        self, runner: CliRunner, mock_run_server: dict
+    ) -> None:
         result = runner.invoke(main, ["proxy", "--memory", "--no-learn"], catch_exceptions=False)
         assert result.exit_code == 0, result.output
         cfg = mock_run_server["config"]
@@ -107,7 +110,11 @@ class TestSubscriptionPollIntervalValidation:
     def test_zero_is_rejected(self, runner: CliRunner) -> None:
         result = runner.invoke(main, ["proxy", "--subscription-poll-interval", "0"])
         assert result.exit_code != 0
-        assert "invalid" in result.output.lower() or "range" in result.output.lower() or "error" in result.output.lower()
+        assert (
+            "invalid" in result.output.lower()
+            or "range" in result.output.lower()
+            or "error" in result.output.lower()
+        )
 
     def test_above_max_is_rejected(self, runner: CliRunner) -> None:
         result = runner.invoke(main, ["proxy", "--subscription-poll-interval", "3601"])
@@ -253,7 +260,9 @@ class TestMissingProxyDepsError:
 
     def test_import_error_message_is_actionable(self, runner: CliRunner) -> None:
         """The error message should tell the user how to fix the problem."""
-        original_import = __builtins__.__import__ if hasattr(__builtins__, "__import__") else __import__
+        original_import = (
+            __builtins__.__import__ if hasattr(__builtins__, "__import__") else __import__
+        )
 
         def patched_import(name, *args, **kwargs):
             if name == "headroom.proxy.server":
@@ -284,7 +293,9 @@ class TestKeyboardInterruptExitCode:
 class TestNewEnvVarWiring:
     """Verify newly-added envvar= wiring works for options that lacked it."""
 
-    def test_headroom_memory_db_path_from_env(self, runner: CliRunner, mock_run_server: dict) -> None:
+    def test_headroom_memory_db_path_from_env(
+        self, runner: CliRunner, mock_run_server: dict
+    ) -> None:
         result = runner.invoke(
             main,
             ["proxy", "--memory"],
@@ -294,7 +305,9 @@ class TestNewEnvVarWiring:
         assert result.exit_code == 0, result.output
         assert mock_run_server["config"].memory_db_path == "/tmp/test-memory.db"
 
-    def test_headroom_retry_max_attempts_from_env(self, runner: CliRunner, mock_run_server: dict) -> None:
+    def test_headroom_retry_max_attempts_from_env(
+        self, runner: CliRunner, mock_run_server: dict
+    ) -> None:
         result = runner.invoke(
             main,
             ["proxy"],
@@ -304,7 +317,9 @@ class TestNewEnvVarWiring:
         assert result.exit_code == 0, result.output
         assert mock_run_server["config"].retry_max_attempts == 5
 
-    def test_headroom_connect_timeout_from_env(self, runner: CliRunner, mock_run_server: dict) -> None:
+    def test_headroom_connect_timeout_from_env(
+        self, runner: CliRunner, mock_run_server: dict
+    ) -> None:
         result = runner.invoke(
             main,
             ["proxy"],
