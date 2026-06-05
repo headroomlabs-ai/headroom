@@ -50,6 +50,12 @@ from headroom.providers.copilot import (
     build_launch_env as _build_copilot_launch_env,
 )
 from headroom.providers.copilot import (
+    copilot_model_from_args as _copilot_model_from_args_impl,
+)
+from headroom.providers.copilot import (
+    default_wire_api_for_model as _copilot_default_wire_api_for_model_impl,
+)
+from headroom.providers.copilot import (
     detect_running_proxy_backend as _copilot_detect_running_proxy_backend,
 )
 from headroom.providers.copilot import (
@@ -1595,6 +1601,16 @@ def _copilot_model_configured(copilot_args: tuple[str, ...], env: dict[str, str]
     return _copilot_model_configured_impl(copilot_args, env)
 
 
+def _copilot_model_from_args(copilot_args: tuple[str, ...], env: dict[str, str]) -> str | None:
+    """Resolve the Copilot model from command-line args or environment."""
+    return _copilot_model_from_args_impl(copilot_args, env)
+
+
+def _copilot_default_wire_api_for_model(model: str | None) -> str:
+    """Return the default OpenAI-compatible wire API for a Copilot model."""
+    return _copilot_default_wire_api_for_model_impl(model)
+
+
 def _should_use_copilot_oauth(
     *,
     backend: str | None,
@@ -2496,11 +2512,6 @@ def copilot(
         effective_backend = running_backend or effective_backend
 
     effective_provider_type = _resolve_copilot_provider_type(effective_backend, provider_type)
-    _validate_copilot_configuration(
-        provider_type=effective_provider_type,
-        wire_api=wire_api,
-        backend=effective_backend,
-    )
     if subscription:
         if effective_backend not in (None, "", "anthropic"):
             raise click.ClickException(
@@ -2512,6 +2523,12 @@ def copilot(
                 "--subscription uses Copilot's OpenAI-compatible hosted API path; "
                 "do not combine it with --provider-type anthropic."
             )
+        effective_provider_type = "openai"
+    _validate_copilot_configuration(
+        provider_type=effective_provider_type,
+        wire_api=wire_api,
+        backend=effective_backend,
+    )
 
     if not no_rtk:
         if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
@@ -2543,7 +2560,10 @@ def copilot(
                 "GITHUB_COPILOT_TOKEN / GITHUB_COPILOT_GITHUB_TOKEN."
             )
 
-        effective_wire_api = wire_api or "completions"
+        selected_model = _copilot_model_from_args(copilot_args, env)
+        effective_wire_api = wire_api or (
+            _copilot_default_wire_api_for_model(selected_model) if subscription else "completions"
+        )
         env["COPILOT_PROVIDER_TYPE"] = "openai"
         env["COPILOT_PROVIDER_BASE_URL"] = f"http://127.0.0.1:{port}/v1"
         env["COPILOT_PROVIDER_WIRE_API"] = effective_wire_api
