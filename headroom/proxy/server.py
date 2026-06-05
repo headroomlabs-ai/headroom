@@ -1771,7 +1771,21 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 (time.perf_counter() - started) * 1000.0,
                 exc_info=True,
             )
-            raise
+            # Return a 502 instead of re-raising.  Re-raising an exception
+            # from inside BaseHTTPMiddleware after a streaming response has
+            # started leaves the client connection in an indeterminate state
+            # and prevents OpenClaw from ever receiving a response, causing
+            # the "stuck after proxy error" symptom (issue #638).
+            return JSONResponse(
+                status_code=502,
+                content={
+                    "error": {
+                        "type": "proxy_error",
+                        "message": str(exc),
+                        "error_type": type(exc).__name__,
+                    }
+                },
+            )
         try:
             proxy.metrics.record_inbound_response(status_code=response.status_code)
         except Exception:
