@@ -22,11 +22,11 @@ def telemetry_list_cmd(json_output: bool) -> None:
     from rich.console import Console
     from rich.table import Table
 
-    from headroom.telemetry.surfaces import collect_telemetry_surface_dicts
+    from headroom.telemetry.surfaces import collect_telemetry_surfaces
 
-    rows = collect_telemetry_surface_dicts()
+    rows = collect_telemetry_surfaces()
     if json_output:
-        click.echo(json.dumps(rows, indent=2))
+        click.echo(json.dumps([row.as_dict() for row in rows], indent=2))
         return
 
     table = Table(show_header=True, header_style="bold")
@@ -38,13 +38,13 @@ def telemetry_list_cmd(json_output: bool) -> None:
     table.add_column("Controls")
 
     for row in rows:
-        controls = ", ".join(str(control) for control in row["controls"])
+        controls = ", ".join(row.controls)
         table.add_row(
-            str(row["name"]),
-            str(row["status"]),
-            str(row["leaves_host"]),
-            str(row["prompt_content"]),
-            str(row["target"]),
+            row.name,
+            row.status,
+            row.leaves_host,
+            row.prompt_content,
+            row.target,
             controls,
         )
 
