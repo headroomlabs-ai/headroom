@@ -148,6 +148,7 @@ def test_ast_grep_slice_saves_tokens(repo: Path):
 
     # Extract just `process_payment` and `apply_promo` (the two functions an
     # agent would realistically need to reason about a promo-code bug).
+    # Use stdin so ast-grep does not skip pytest temp paths through ignore discovery.
     result = subprocess.run(
         [
             str(binaries.resolve("ast-grep")),
@@ -157,9 +158,11 @@ def test_ast_grep_slice_saves_tokens(repo: Path):
             "--lang",
             "python",
             "--json=stream",
-            str(repo / "payments.py"),
+            "--stdin",
         ],
+        input=full,
         capture_output=True,
+        encoding="utf-8",
         text=True,
         check=True,
     )
