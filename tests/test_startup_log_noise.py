@@ -4,6 +4,7 @@ Covers the fixes in:
 - headroom/memory/adapters/embedders.py (HF env vars, httpx logger)
 - headroom/providers/anthropic.py (warn=False suppresses tiktoken warning)
 - headroom/providers/litellm.py (suppress_debug_info, set_verbose)
+- headroom/proxy/cost.py and savings_tracker.py (LiteLLM pricing lookup noise)
 - headroom/transforms/html_extractor.py (trafilatura logger CRITICAL)
 """
 
@@ -133,6 +134,50 @@ class TestLiteLLMLogSuppression:
         assert litellm.set_verbose is False, (
             "litellm.set_verbose must be False to suppress verbose debug output"
         )
+
+    def test_proxy_cost_lookup_does_not_print_provider_list(self, capsys):
+        """Proxy cost lookups must not leak LiteLLM's provider-list banner."""
+        litellm = pytest_importorskip_litellm()
+        if litellm is None:
+            return
+
+        litellm.suppress_debug_info = False
+        litellm.set_verbose = True
+
+        import headroom.proxy.cost as cost_mod
+
+        cost_mod.litellm = None
+        cost_mod.CostTracker._resolved_model_cache.clear()
+
+        tracker = cost_mod.CostTracker()
+        assert tracker.estimate_cost("deepseek-v4-flash", 100, 10) is None
+
+        captured = capsys.readouterr()
+        assert "Provider List" not in captured.out
+        assert "Provider List" not in captured.err
+        assert litellm.suppress_debug_info is True
+        assert litellm.set_verbose is False
+
+    def test_proxy_savings_lookup_does_not_print_provider_list(self, capsys):
+        """Savings price lookups must not leak LiteLLM's provider-list banner."""
+        litellm = pytest_importorskip_litellm()
+        if litellm is None:
+            return
+
+        litellm.suppress_debug_info = False
+        litellm.set_verbose = True
+
+        import headroom.proxy.savings_tracker as savings_mod
+
+        savings_mod.litellm = None
+
+        assert savings_mod._estimate_input_cost_usd("deepseek-v4-flash", 100) == 0.0
+
+        captured = capsys.readouterr()
+        assert "Provider List" not in captured.out
+        assert "Provider List" not in captured.err
+        assert litellm.suppress_debug_info is True
+        assert litellm.set_verbose is False
 
 
 def pytest_importorskip_litellm():

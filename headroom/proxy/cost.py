@@ -14,6 +14,7 @@ from collections import deque
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
+from headroom.proxy._litellm_logging import suppress_litellm_debug_output
 from headroom.proxy.modes import PROXY_MODE_CACHE
 
 if TYPE_CHECKING:
@@ -30,6 +31,7 @@ def _get_litellm_module() -> Any | None:
     if not LITELLM_AVAILABLE:
         return None
     if litellm is not None:
+        suppress_litellm_debug_output(litellm)
         return litellm
 
     try:
@@ -37,7 +39,7 @@ def _get_litellm_module() -> Any | None:
     except ImportError:
         return None
 
-    litellm = imported_litellm
+    litellm = suppress_litellm_debug_output(imported_litellm)
     return litellm
 
 

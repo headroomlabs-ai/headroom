@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from headroom import paths as _paths
+from headroom.proxy._litellm_logging import suppress_litellm_debug_output
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,7 @@ def _get_litellm_module() -> Any | None:
     if not LITELLM_AVAILABLE:
         return None
     if litellm is not None:
+        suppress_litellm_debug_output(litellm)
         return litellm
 
     try:
@@ -50,7 +52,7 @@ def _get_litellm_module() -> Any | None:
     except ImportError:
         return None
 
-    litellm = imported_litellm
+    litellm = suppress_litellm_debug_output(imported_litellm)
     return litellm
 
 
