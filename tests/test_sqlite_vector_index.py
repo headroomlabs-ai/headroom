@@ -10,6 +10,7 @@ Tests verify:
 
 from __future__ import annotations
 
+import asyncio
 import os
 import tempfile
 
@@ -28,6 +29,11 @@ except ImportError:
     SQLITE_VEC_AVAILABLE = False
 
 
+def _close_index(index) -> None:
+    """Close async sqlite-vec index resources from sync fixtures."""
+    asyncio.run(index.close())
+
+
 @pytest.mark.skipif(not SQLITE_VEC_AVAILABLE, reason="sqlite-vec not available")
 class TestSQLiteVectorIndex:
     """Tests for SQLiteVectorIndex."""
@@ -43,6 +49,7 @@ class TestSQLiteVectorIndex:
         index = SQLiteVectorIndex(dimension=384, db_path=db_path)
         yield index
 
+        _close_index(index)
         if os.path.exists(db_path):
             os.unlink(db_path)
 
@@ -240,6 +247,8 @@ class TestSQLiteVectorIndexPersistence:
         with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
             db_path = f.name
 
+        index1 = None
+        index2 = None
         try:
             from headroom.memory.adapters.sqlite_vector import SQLiteVectorIndex
 
@@ -272,6 +281,10 @@ class TestSQLiteVectorIndexPersistence:
             assert len(results) == 1
             assert results[0].memory.id == memory_id
         finally:
+            if index2 is not None:
+                await index2.close()
+            if index1 is not None:
+                await index1.close()
             if os.path.exists(db_path):
                 os.unlink(db_path)
 
@@ -291,6 +304,7 @@ class TestSQLiteVectorIndexMemoryStats:
         index = SQLiteVectorIndex(dimension=384, db_path=db_path, page_cache_size_kb=4096)
         yield index
 
+        _close_index(index)
         if os.path.exists(db_path):
             os.unlink(db_path)
 
@@ -356,6 +370,7 @@ class TestSQLiteVectorIndexEdgeCases:
         index = SQLiteVectorIndex(dimension=384, db_path=db_path)
         yield index
 
+        _close_index(index)
         if os.path.exists(db_path):
             os.unlink(db_path)
 
