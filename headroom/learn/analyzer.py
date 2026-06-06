@@ -199,7 +199,7 @@ def _build_digest(project: ProjectInfo, sessions: list[SessionData]) -> str:
     lines: list[str] = []
 
     # Project header
-    lines.append(f"Project: {project.name} ({project.project_path})")
+    lines.append(f"Project: {project.name} ({project.project_path.as_posix()})")
     total_calls = sum(len(s.tool_calls) for s in sessions)
     total_failures = sum(s.failure_count for s in sessions)
     total_tokens_in = sum(s.total_input_tokens for s in sessions)
