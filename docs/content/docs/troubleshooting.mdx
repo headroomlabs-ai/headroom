@@ -5,6 +5,19 @@ description: Solutions for common Headroom issues including proxy startup, conne
 
 Solutions for common Headroom issues.
 
+## Sharing Diagnostics
+
+When a maintainer asks for logs or stats, generate a local support bundle:
+
+```bash
+headroom support bundle
+```
+
+The bundle includes version/platform metadata, proxy savings state, a perf
+report, and diagnostic proxy log lines. Full proxy log tails are not included
+by default because they can contain prompts or tool output. Add
+`--include-full-log-tail` only when a maintainer asks for it.
+
 ## Proxy Server Issues
 
 ### Proxy will not start
