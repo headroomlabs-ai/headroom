@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -101,10 +102,7 @@ def test_router_result_helpers_and_summary() -> None:
 
 
 def test_content_signature_and_detection_helpers(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Stage-3d (PR5) wired `_detect_content` through the Rust chain
-    (`headroom._core.detect_content_type` → magika → unidiff →
-    PlainText). The pre-PR5 Python-side `_get_magika_detector`
-    fallback path is gone.
+    """Stage-3d (PR5) wired `_detect_content` through the Rust binding.
 
     This test asserts the new contract:
     1. The detection helper delegates to the Rust binding.
@@ -131,6 +129,36 @@ def test_content_signature_and_detection_helpers(monkeypatch: pytest.MonkeyPatch
     assert result.content_type is ContentType.SOURCE_CODE
     assert result.confidence == 1.0
     assert result.metadata == {}
+
+
+def test_core_detect_content_type_uses_json_fast_path() -> None:
+    import headroom._core as _core
+
+    payload = "[" + ",".join(f'{{"id":{i},"status":"OK"}}' for i in range(50)) + "]"
+
+    result = _core.detect_content_type(payload)
+
+    assert result.content_type == "json_array"
+    assert result.confidence == 1.0
+    assert result.metadata == {"item_count": 50, "is_dict_array": True}
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows regression path")
+def test_core_detect_content_type_uses_windows_deterministic_detector() -> None:
+    import headroom._core as _core
+
+    search_output = "\n".join(
+        [
+            "src/app.py:10:def main():",
+            "src/app.py:20:print('hello')",
+            "README.md:5:usage docs",
+        ]
+    )
+
+    result = _core.detect_content_type(search_output)
+
+    assert result.content_type == "search"
+    assert result.metadata == {"matching_lines": 3, "total_lines": 3}
 
 
 def test_mixed_content_section_splitting_and_json_extraction() -> None:

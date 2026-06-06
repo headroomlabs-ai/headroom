@@ -111,14 +111,13 @@ def _detect_content(content: str) -> DetectionResult:
     """Detect content type via the Rust detection chain.
 
     Stage-3d (PR5) wired this through `headroom._core.detect_content_type`,
-    which runs the magika→unidiff→PlainText chain. The Python-side
-    Magika+regex fallback path was retired here — single detection
-    surface, no parallel paths. The Rust extension is a hard dep
-    (no Python fallback) per `feedback_no_silent_fallbacks.md`.
+    which keeps the detection surface in the Rust extension. On Linux/macOS
+    it uses the magika→unidiff→PlainText chain after cheap structural
+    shortcuts; on Windows the binding uses the deterministic Rust detector
+    to avoid first-call ONNX runtime hangs in direct/MCP compression.
 
-    The Rust binding returns the legacy `DetectionResult` shape with
-    `confidence=1.0` and an empty metadata dict. Existing callers
-    only consumed `.content_type` from it; the strategy mapping in
+    `_detect_content` keeps returning the Python `DetectionResult` type.
+    Existing callers only consume `.content_type`; the strategy mapping in
     `_strategy_from_detection` keys off that field alone.
     """
     from headroom._core import detect_content_type as _rust_detect

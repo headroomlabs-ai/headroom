@@ -18,6 +18,8 @@ use std::collections::BTreeMap;
 use headroom_core::signals::{
     ImportanceCategory, ImportanceContext, KeywordDetector, KeywordRegistry, LineImportanceDetector,
 };
+#[cfg(not(windows))]
+use headroom_core::transforms::detect as rust_detect_chain;
 use headroom_core::transforms::smart_crusher::compaction::DocumentCompactor;
 use headroom_core::transforms::smart_crusher::{
     CrushResult as RustCrushResult, SmartCrusher as RustSmartCrusher,
@@ -29,7 +31,8 @@ use headroom_core::transforms::tag_protector::{
 };
 use headroom_core::transforms::{
     compress_openai_responses_live_zone as rust_compress_openai_responses_live_zone,
-    detect as rust_detect_chain, is_json_array_of_dicts as rust_is_json_array_of_dicts,
+    detect_content_type as rust_regex_detect_content_type,
+    is_json_array_of_dicts as rust_is_json_array_of_dicts,
     summarize_openai_responses_no_change_reason as rust_summarize_openai_responses_no_change_reason,
     AuthMode as RustLiveZoneAuthMode, ContentType as RustContentType,
     DetectionResult as RustDetectionResult, DiffCompressionResult, DiffCompressor,
@@ -58,6 +61,42 @@ fn type_name(v: &serde_json::Value) -> &'static str {
         serde_json::Value::Array(_) => "array",
         serde_json::Value::Object(_) => "object",
     }
+}
+
+#[cfg(not(windows))]
+fn chain_detection_result(content: &str) -> RustDetectionResult {
+    let content_type = rust_detect_chain(content);
+    RustDetectionResult {
+        content_type,
+        confidence: 1.0,
+        metadata: serde_json::Map::new(),
+    }
+}
+
+#[cfg(not(windows))]
+fn structural_detection_fast_path(content: &str) -> Option<RustDetectionResult> {
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with('[') {
+        return None;
+    }
+
+    let detected = rust_regex_detect_content_type(content);
+    if detected.content_type == RustContentType::JsonArray {
+        Some(detected)
+    } else {
+        None
+    }
+}
+
+#[cfg(windows)]
+fn binding_detection_result(content: &str) -> RustDetectionResult {
+    // Avoid first-call ONNX/Magika hangs observed in Windows direct/MCP compression.
+    rust_regex_detect_content_type(content)
+}
+
+#[cfg(not(windows))]
+fn binding_detection_result(content: &str) -> RustDetectionResult {
+    structural_detection_fast_path(content).unwrap_or_else(|| chain_detection_result(content))
 }
 
 /// Build the dict returned by `SmartCrusher.crush_array_json`. Kept
@@ -902,29 +941,23 @@ impl PyDetectionResult {
 /// Detect the type of `content`. Returns a `DetectionResult` with the
 /// same field surface as Python's dataclass.
 ///
-/// Stage-3d (PR5) wired this through the magika→unidiff→PlainText
-/// detection chain — the regex `content_detector` is no longer on
-/// the production path. The chain returns a `ContentType` only;
-/// we synthesize the legacy `DetectionResult` shape here with
-/// `confidence = 1.0` (the chain doesn't surface a probabilistic
-/// score) and an empty metadata bag (no production caller reads
-/// metadata from this binding today — see audit notes in
-/// `headroom/transforms/content_router.py`).
+/// On non-Windows platforms, Stage-3d (PR5) still uses the
+/// magika->unidiff->PlainText detection chain after a cheap JSON-array
+/// structural fast path. The chain returns a `ContentType` only, so the
+/// binding synthesizes the legacy `DetectionResult` shape for that path.
 ///
-/// Releases the GIL while detecting — magika inference and unidiff
-/// parsing can be substantial on large bodies, and freeing the GIL
-/// lets other Python threads make progress in the meantime.
+/// On Windows, direct/MCP compression avoids the ONNX-backed Magika tier
+/// because first-call session initialization can hang inside the runtime.
+/// The binding uses the deterministic Rust detector instead, preserving
+/// JSON/search/log/diff/code routing without blocking the caller.
+///
+/// Releases the GIL while detecting so large bodies do not block other
+/// Python threads.
 #[pyfunction]
 fn detect_content_type(py: Python<'_>, content: &str) -> PyDetectionResult {
     let owned = content.to_string();
-    let content_type = py.allow_threads(move || rust_detect_chain(&owned));
-    PyDetectionResult {
-        inner: RustDetectionResult {
-            content_type,
-            confidence: 1.0,
-            metadata: serde_json::Map::new(),
-        },
-    }
+    let detected = py.allow_threads(move || binding_detection_result(&owned));
+    PyDetectionResult { inner: detected }
 }
 
 /// Quick check: is `content` a JSON array of dictionaries (the format
