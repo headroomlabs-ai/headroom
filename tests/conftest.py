@@ -7,7 +7,6 @@ import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import json
-import tempfile
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import Mock
@@ -184,19 +183,19 @@ def mock_openai_client(mock_openai_response):
 
 # Storage fixtures
 @pytest.fixture
-def temp_sqlite_db():
+def temp_sqlite_db(tmp_path: Path):
     """Temporary SQLite database path."""
-    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
-        yield f.name
-    Path(f.name).unlink(missing_ok=True)
+    db_path = tmp_path / "test.db"
+    yield str(db_path)
+    db_path.unlink(missing_ok=True)
 
 
 @pytest.fixture
-def temp_jsonl_file():
+def temp_jsonl_file(tmp_path: Path):
     """Temporary JSONL file path."""
-    with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False) as f:
-        yield f.name
-    Path(f.name).unlink(missing_ok=True)
+    file_path = tmp_path / "test.jsonl"
+    yield str(file_path)
+    file_path.unlink(missing_ok=True)
 
 
 # Provider fixtures
