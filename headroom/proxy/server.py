@@ -565,6 +565,7 @@ class HeadroomProxy(
                     enabled=True,
                     proactive_expansion=config.ccr_proactive_expansion,
                     max_proactive_expansions=config.ccr_max_proactive_expansions,
+                    max_turn_distance=config.ccr_max_turn_distance,
                 )
             )
             if config.ccr_context_tracking

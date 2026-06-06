@@ -92,6 +92,9 @@ class ContextTrackerConfig:
     # Maximum items to proactively expand per turn
     max_proactive_expansions: int = 2
 
+    # Maximum number of compressing turns before context is too stale
+    max_turn_distance: int = 10
+
 
 class ContextTracker:
     """Tracks compressed contexts across conversation turns.
@@ -235,6 +238,7 @@ class ContextTracker:
 
         recommendations: list[ExpansionRecommendation] = []
         now = time.time()
+        max_turn_distance = max(1, self.config.max_turn_distance)
 
         for hash_key, context in self._contexts.items():
             # Workspace filter — the cross-project leak gate. Skip
@@ -248,12 +252,26 @@ class ContextTracker:
             if age > self.config.max_context_age_seconds:
                 continue
 
+            if current_turn is not None and context.turn_number is not None:
+                turn_distance = max(0, current_turn - context.turn_number)
+                if turn_distance > max_turn_distance:
+                    continue
+            else:
+                turn_distance = 0
+
             # Calculate relevance
             relevance = self._calculate_relevance(query, context)
 
             # Age discount: older contexts get lower scores
             age_factor = 1.0 - (age / self.config.max_context_age_seconds) * 0.5
-            relevance *= age_factor
+            if current_turn is not None and context.turn_number is not None:
+                turn_factor = max(
+                    0.2,
+                    1.0 - (turn_distance / max_turn_distance) * 0.8,
+                )
+            else:
+                turn_factor = 1.0
+            relevance *= age_factor * turn_factor
 
             if relevance >= self.config.relevance_threshold:
                 # Determine if full expansion or search

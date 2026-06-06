@@ -17,6 +17,7 @@ from headroom.cache.compression_store import (
     get_compression_store,
     reset_compression_store,
 )
+from headroom.ccr import context_tracker as context_tracker_module
 from headroom.ccr.context_tracker import (
     CompressedContext,
     ContextTracker,
@@ -290,6 +291,141 @@ class TestQueryAnalysis:
 
         # Should not recommend aged-out context
         assert len(recommendations) == 0
+
+    def test_analyze_query_skips_context_beyond_turn_distance(self):
+        """Fresh wall-clock contexts still expire after too many compressing turns."""
+        config = ContextTrackerConfig(max_turn_distance=10)
+        tracker = ContextTracker(config)
+
+        tracker.track_compression(
+            hash_key="stale_turn_context",
+            turn_number=1,
+            tool_name="Bash",
+            original_count=100,
+            compressed_count=10,
+            query_context="investigate proactive context expansion",
+            sample_content="headroom/ccr/context_tracker.py proactive expansion context tracker",
+            workspace_key="ws-test",
+        )
+
+        recommendations = tracker.analyze_query(
+            query="proactive context expansion context_tracker",
+            current_turn=12,
+            workspace_key="ws-test",
+        )
+
+        assert recommendations == []
+
+    def test_analyze_query_keeps_recent_turn_context(self):
+        """Recent turn-distance context still expands when keyword-relevant."""
+        config = ContextTrackerConfig(max_turn_distance=10)
+        tracker = ContextTracker(config)
+
+        tracker.track_compression(
+            hash_key="recent_turn_context",
+            turn_number=9,
+            tool_name="Bash",
+            original_count=100,
+            compressed_count=10,
+            query_context="investigate proactive context expansion",
+            sample_content="headroom/ccr/context_tracker.py proactive expansion context tracker",
+            workspace_key="ws-test",
+        )
+
+        recommendations = tracker.analyze_query(
+            query="proactive context expansion context_tracker",
+            current_turn=11,
+            workspace_key="ws-test",
+        )
+
+        assert [rec.hash_key for rec in recommendations] == ["recent_turn_context"]
+
+    def test_analyze_query_turn_distance_decays_relevance(self):
+        """Turn distance reduces relevance before the hard cutoff."""
+        config = ContextTrackerConfig(relevance_threshold=0.0, max_turn_distance=10)
+        tracker = ContextTracker(config)
+        sample_content = "authentication middleware service routing auth_handler.py"
+
+        tracker.track_compression(
+            hash_key="mid_distance_context",
+            turn_number=5,
+            tool_name="Bash",
+            original_count=100,
+            compressed_count=10,
+            query_context="authentication middleware",
+            sample_content=sample_content,
+            workspace_key="ws-test",
+        )
+        tracker.track_compression(
+            hash_key="recent_context",
+            turn_number=10,
+            tool_name="Bash",
+            original_count=100,
+            compressed_count=10,
+            query_context="authentication middleware",
+            sample_content=sample_content,
+            workspace_key="ws-test",
+        )
+
+        recommendations = tracker.analyze_query(
+            query="authentication middleware",
+            current_turn=10,
+            workspace_key="ws-test",
+        )
+
+        scores = {rec.hash_key: rec.relevance_score for rec in recommendations}
+        assert scores["mid_distance_context"] < scores["recent_context"] * 0.7
+
+    def test_analyze_query_without_current_turn_uses_age_only(self):
+        """Callers without turn data keep the old age-only behavior."""
+        config = ContextTrackerConfig(max_turn_distance=1)
+        tracker = ContextTracker(config)
+
+        tracker.track_compression(
+            hash_key="turn_unknown_context",
+            turn_number=1,
+            tool_name="Bash",
+            original_count=100,
+            compressed_count=10,
+            query_context="authentication middleware",
+            sample_content="authentication middleware auth_handler.py",
+            workspace_key="ws-test",
+        )
+
+        recommendations = tracker.analyze_query(
+            query="authentication middleware",
+            current_turn=None,
+            workspace_key="ws-test",
+        )
+
+        assert [rec.hash_key for rec in recommendations] == ["turn_unknown_context"]
+
+    def test_fast_session_old_turn_is_skipped_even_when_wall_clock_fresh(self, monkeypatch):
+        """Fast sessions should not re-expand many-turn-old contexts inside 300s."""
+        now = 1_000.0
+        monkeypatch.setattr(context_tracker_module.time, "time", lambda: now)
+        config = ContextTrackerConfig(max_context_age_seconds=300.0, max_turn_distance=10)
+        tracker = ContextTracker(config)
+
+        tracker.track_compression(
+            hash_key="fast_session_stale_context",
+            turn_number=1,
+            tool_name="Bash",
+            original_count=100,
+            compressed_count=10,
+            query_context="proactive context expansion",
+            sample_content="headroom/ccr/context_tracker.py proactive expansion context tracker",
+            workspace_key="ws-test",
+        )
+
+        monkeypatch.setattr(context_tracker_module.time, "time", lambda: now + 30.0)
+        recommendations = tracker.analyze_query(
+            query="proactive context expansion context_tracker",
+            current_turn=30,
+            workspace_key="ws-test",
+        )
+
+        assert recommendations == []
 
     def test_analyze_query_max_recommendations(self):
         """Respects max proactive expansions limit."""
@@ -625,6 +761,7 @@ class TestContextTrackerConfig:
         assert config.max_context_age_seconds == 300.0
         assert config.proactive_expansion is True
         assert config.max_proactive_expansions == 2
+        assert config.max_turn_distance == 10
 
     def test_custom_config(self):
         """Custom config values."""
@@ -633,12 +770,14 @@ class TestContextTrackerConfig:
             max_tracked_contexts=50,
             relevance_threshold=0.5,
             max_proactive_expansions=5,
+            max_turn_distance=20,
         )
 
         assert config.enabled is False
         assert config.max_tracked_contexts == 50
         assert config.relevance_threshold == 0.5
         assert config.max_proactive_expansions == 5
+        assert config.max_turn_distance == 20
 
 
 class TestCompressedContextDataClass:

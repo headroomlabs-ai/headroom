@@ -126,6 +126,7 @@ class ProxyConfig:
     ccr_context_tracking: bool = True
     ccr_proactive_expansion: bool = True
     ccr_max_proactive_expansions: int = 2
+    ccr_max_turn_distance: int = 10
 
     # Code-aware compression (disabled by default — use code graph tools instead)
     code_aware_enabled: bool = False
