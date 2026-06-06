@@ -8,7 +8,7 @@ version = "0.23.0"
 description = "The Context Optimization Layer for LLM Applications - Cut costs by 50-90%"
 readme = "README.md"
 license = "Apache-2.0"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.14"
 authors = [
     { name = "Headroom Contributors" }
 ]
@@ -39,6 +39,7 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Typing :: Typed",

@@ -7,6 +7,22 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 
+def test_python_metadata_excludes_python_314_until_pyo3_supports_it() -> None:
+    """PyO3 0.22 supports Python through 3.13; pip must reject 3.14 early."""
+    try:
+        import tomllib
+    except ModuleNotFoundError:  # pragma: no cover - Python 3.10 only
+        import tomli as tomllib  # type: ignore[no-redef]
+
+    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    project = pyproject["project"]
+    classifiers = set(project["classifiers"])
+
+    assert project["requires-python"] == ">=3.10,<3.14"
+    assert "Programming Language :: Python :: 3.13" in classifiers
+    assert "Programming Language :: Python :: 3.14" not in classifiers
+
+
 def test_docker_workflow_normalizes_repository_name_for_signing() -> None:
     content = (ROOT / ".github" / "workflows" / "docker.yml").read_text(encoding="utf-8")
 
