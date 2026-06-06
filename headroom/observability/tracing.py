@@ -156,6 +156,21 @@ def configure_langfuse_tracing(
             "OpenTelemetry SDK/exporter packages are not installed. "
             "Install headroom-ai[otel] to enable Langfuse OTLP tracing."
         )
+        previous_provider = None
+        with _tracing_lock:
+            previous_provider = _owned_tracer_provider
+            _owned_tracer_provider = None
+            _owned_langfuse_config = resolved
+            _global_tracer = None
+
+        if previous_provider is not None:
+            try:
+                previous_provider.shutdown()
+            except Exception:
+                logger.debug(
+                    "Failed to shut down previous Langfuse tracer provider", exc_info=True
+                )
+
         return get_headroom_tracer()
 
     resource = Resource.create(
