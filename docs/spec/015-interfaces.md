@@ -106,6 +106,7 @@ headroom wrap [OPTIONS] -- <command> [args...]
 - `claude` — Wrap Claude Code
 - `copilot` — Wrap GitHub Copilot
 - `codex` — Wrap OpenAI Codex
+- `hermes` — Wrap Hermes Agent
 - `aider` — Wrap Aider
 - `cursor` — Wrap Cursor
 - `openclaw` — Wrap OpenClaw

@@ -48,7 +48,7 @@ Headroom compresses everything your AI agent reads — tool outputs, logs, RAG c
 
 - **Library** — `compress(messages)` in Python or TypeScript, inline in any app
 - **Proxy** — `headroom proxy --port 8787`, zero code changes, any language
-- **Agent wrap** — `headroom wrap claude|codex|cursor|aider|copilot` in one command
+- **Agent wrap** — `headroom wrap claude|codex|cursor|aider|copilot|hermes` in one command
 - **MCP server** — `headroom_compress`, `headroom_retrieve`, `headroom_stats` for any MCP client
 - **Cross-agent memory** — shared store across Claude, Codex, Gemini, auto-dedup
 - **`headroom learn`** — mines failed sessions, writes corrections to `CLAUDE.md` / `AGENTS.md`
@@ -138,9 +138,21 @@ Reproduce: `python -m headroom.evals suite --tier 1` · [Full benchmarks & metho
 | Cursor      | ✅              | prints config — paste once       |
 | Aider       | ✅              | starts proxy + launches          |
 | Copilot CLI | ✅              | starts proxy + launches          |
+| Hermes      | ✅              | OpenRouter/custom endpoint paths |
 | OpenClaw    | ✅              | installs as ContextEngine plugin |
 
 Any OpenAI-compatible client works via `headroom proxy`. MCP-native: `headroom mcp install`.
+
+### Hermes Agent
+
+Headroom can launch [Hermes Agent](https://hermes-agent.nousresearch.com/) through the local proxy:
+
+```bash
+headroom wrap hermes
+headroom wrap hermes --provider-mode custom -- --help
+```
+
+The default mode routes Hermes OpenRouter traffic by setting `OPENROUTER_BASE_URL=http://127.0.0.1:8787/v1`. Use `--provider-mode custom` for Hermes configs that should use `HERMES_INFERENCE_PROVIDER=custom` and `CUSTOM_BASE_URL` instead. Hermes registers retrieval through its native `headroom_retrieve` plugin; Headroom therefore suppresses proxy-side CCR tool injection for Hermes unless `HEADROOM_HERMES_CCR_TOOL=1` is set.
 
 ### GitHub Copilot CLI subscription mode
 

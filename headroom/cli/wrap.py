@@ -4,6 +4,7 @@ Usage:
     headroom wrap claude                    # Start proxy + context tool + claude
     headroom wrap copilot -- --model ...    # Start proxy + launch GitHub Copilot CLI
     headroom wrap codex                     # Start proxy + OpenAI Codex CLI
+    headroom wrap hermes                    # Start proxy + Hermes Agent
     headroom wrap aider                     # Start proxy + aider
     headroom wrap cursor                    # Start proxy + print Cursor config instructions
     headroom wrap openclaw                  # Install + configure OpenClaw plugin
@@ -308,6 +309,7 @@ def _start_proxy(
     openai_api_url: str | None = None,
     anthropic_api_url: str | None = None,
     copilot_api_token: str | None = None,
+    proxy_env_overrides: dict[str, str] | None = None,
 ) -> subprocess.Popen:
     """Start Headroom proxy as a background subprocess.
 
@@ -360,6 +362,8 @@ def _start_proxy(
     # Ensure proxy subprocess uses UTF-8 (Windows defaults to cp1252)
     proxy_env = os.environ.copy()
     proxy_env["PYTHONIOENCODING"] = "utf-8"
+    if proxy_env_overrides:
+        proxy_env.update(proxy_env_overrides)
 
     # Tell the proxy which agent is being wrapped (for traffic learning output)
     if agent_type != "unknown":
@@ -1833,6 +1837,7 @@ def _ensure_proxy(
     openai_api_url: str | None = None,
     anthropic_api_url: str | None = None,
     copilot_api_token: str | None = None,
+    proxy_env_overrides: dict[str, str] | None = None,
 ) -> subprocess.Popen | None:
     """Start or verify proxy. Returns process handle if we started it."""
     helpers = _live_wrap_module()
@@ -2024,6 +2029,7 @@ def _ensure_proxy(
                     openai_api_url=openai_api_url,
                     anthropic_api_url=anthropic_api_url,
                     copilot_api_token=copilot_api_token,
+                    proxy_env_overrides=proxy_env_overrides,
                 ),
             )
             click.echo(f"  Proxy ready on http://127.0.0.1:{port}")
@@ -2215,6 +2221,7 @@ def _launch_tool(
     region: str | None = None,
     openai_api_url: str | None = None,
     copilot_api_token: str | None = None,
+    proxy_env_overrides: dict[str, str] | None = None,
 ) -> None:
     """Common logic: start proxy, launch tool, clean up."""
     proxy_holder: list[subprocess.Popen | None] = [None]
@@ -2243,6 +2250,7 @@ def _launch_tool(
             region=region,
             openai_api_url=openai_api_url,
             copilot_api_token=copilot_api_token,
+            proxy_env_overrides=proxy_env_overrides,
         )
 
         if code_graph:
@@ -2467,6 +2475,7 @@ def wrap() -> None:
     Supported tools (one Click subcommand per tool):
         headroom wrap claude              # Claude Code (Anthropic)
         headroom wrap codex               # OpenAI Codex CLI
+        headroom wrap hermes              # Hermes Agent
         headroom wrap copilot -- --model claude-sonnet-4-20250514
         headroom wrap aider               # Aider
         headroom wrap cursor              # Cursor (prints config instructions)
@@ -2494,6 +2503,147 @@ def wrap() -> None:
 @main.group()
 def unwrap() -> None:
     """Undo durable Headroom wrapping for supported tools."""
+
+
+# =============================================================================
+# Hermes Agent
+# =============================================================================
+
+
+def _build_hermes_launch_env(
+    port: int,
+    base_env: dict[str, str],
+    *,
+    provider_mode: str = "openrouter",
+    debug_shape: bool = False,
+) -> tuple[dict[str, str], list[str]]:
+    """Build a Hermes launch environment without editing Hermes config.yaml.
+
+    Hermes 0.15.x resolves OpenRouter from OPENROUTER_BASE_URL, not
+    OPENAI_BASE_URL. For explicit custom routing, Hermes should be launched as
+    provider=custom so OpenRouter credentials are not reused for loopback.
+    """
+    env = dict(base_env)
+    proxy_base = f"http://127.0.0.1:{port}/v1"
+    env["HEADROOM_HERMES_MODE"] = "1"
+    if debug_shape:
+        env["HEADROOM_HERMES_DEBUG_SHAPE"] = "1"
+    display = ["HEADROOM_HERMES_MODE=1"]
+
+    if provider_mode == "custom":
+        env["HERMES_INFERENCE_PROVIDER"] = "custom"
+        env["CUSTOM_BASE_URL"] = proxy_base
+        display.extend(
+            [
+                "HERMES_INFERENCE_PROVIDER=custom",
+                f"CUSTOM_BASE_URL={proxy_base}",
+            ]
+        )
+    elif provider_mode == "openrouter":
+        env["OPENROUTER_BASE_URL"] = proxy_base
+        display.append(f"OPENROUTER_BASE_URL={proxy_base}")
+    else:
+        raise click.ClickException("--provider-mode must be 'openrouter' or 'custom'")
+
+    if debug_shape:
+        display.append("HEADROOM_HERMES_DEBUG_SHAPE=1")
+    return env, display
+
+
+@wrap.command(context_settings={"ignore_unknown_options": True})
+@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
+@click.option("--learn", is_flag=True, help="Enable live traffic learning")
+@click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
+@click.option(
+    "--provider-mode",
+    type=click.Choice(["openrouter", "custom"]),
+    default="openrouter",
+    show_default=True,
+    help="Hermes provider routing mode to use for the proxy.",
+)
+@click.option(
+    "--debug-shape",
+    is_flag=True,
+    help="Log sanitized Hermes request/response shape diagnostics.",
+)
+@click.option(
+    "--backend",
+    default=None,
+    help=(
+        "API backend for the proxy: 'anthropic', 'anyllm', 'litellm-vertex', "
+        "etc. (env: HEADROOM_BACKEND)"
+    ),
+)
+@click.option(
+    "--anyllm-provider",
+    default=None,
+    help=(
+        "Provider for any-llm backend: openai, mistral, groq, etc. "
+        "(env: HEADROOM_ANYLLM_PROVIDER)"
+    ),
+)
+@click.option("--region", default=None, help="Cloud region for Bedrock/Vertex")
+@click.option("--prepare-only", is_flag=True, hidden=True)
+@click.argument("hermes_args", nargs=-1, type=click.UNPROCESSED)
+def hermes(
+    port: int,
+    no_proxy: bool,
+    learn: bool,
+    memory: bool,
+    provider_mode: str,
+    debug_shape: bool,
+    backend: str | None,
+    anyllm_provider: str | None,
+    region: str | None,
+    prepare_only: bool,
+    hermes_args: tuple,
+) -> None:
+    """Launch Hermes Agent through Headroom proxy.
+
+    \b
+    Default mode matches Hermes configs that use provider=openrouter by setting
+    OPENROUTER_BASE_URL to Headroom. Use --provider-mode custom to launch Hermes
+    with HERMES_INFERENCE_PROVIDER=custom and CUSTOM_BASE_URL instead.
+    """
+    env, env_vars_display = _build_hermes_launch_env(
+        port,
+        os.environ,
+        provider_mode=provider_mode,
+        debug_shape=debug_shape,
+    )
+    proxy_env_overrides = {"HEADROOM_HERMES_MODE": "1"}
+    if debug_shape:
+        proxy_env_overrides["HEADROOM_HERMES_DEBUG_SHAPE"] = "1"
+    effective_backend = backend or os.environ.get("HEADROOM_BACKEND") or "openrouter"
+    if not backend and not os.environ.get("HEADROOM_BACKEND"):
+        env_vars_display.append("HEADROOM_BACKEND=openrouter")
+    if prepare_only:
+        for line in env_vars_display:
+            click.echo(line)
+        return
+
+    hermes_bin = shutil.which("hermes")
+    if not hermes_bin:
+        click.echo("Error: 'hermes' not found in PATH.")
+        raise SystemExit(1)
+
+    _launch_tool(
+        binary=hermes_bin,
+        args=hermes_args,
+        env=env,
+        port=port,
+        no_proxy=no_proxy,
+        tool_label="HERMES",
+        env_vars_display=env_vars_display,
+        learn=learn,
+        memory=memory,
+        agent_type="hermes",
+        backend=effective_backend,
+        anyllm_provider=anyllm_provider,
+        region=region,
+        proxy_env_overrides=proxy_env_overrides,
+    )
 
 
 # =============================================================================

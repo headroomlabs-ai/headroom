@@ -30,11 +30,16 @@ ANTHROPIC_BASE_URL=http://localhost:8787 claude
 # GitHub Copilot CLI
 headroom wrap copilot -- --model claude-sonnet-4-20250514
 
+# Hermes Agent
+headroom wrap hermes
+
 # OpenAI-compatible clients
 OPENAI_BASE_URL=http://localhost:8787/v1 your-app
 ```
 
 `headroom wrap copilot` uses Copilot CLI's BYOK provider settings under the hood. In `provider-type=auto`, it chooses Headroom's Anthropic route for the default proxy backend and the OpenAI-compatible `/v1` route for translated backends such as `anyllm` and LiteLLM.
+
+`headroom wrap hermes` defaults to Hermes' OpenRouter route by setting `OPENROUTER_BASE_URL` to the local Headroom `/v1` endpoint. Use `--provider-mode custom` to launch Hermes with `HERMES_INFERENCE_PROVIDER=custom` and `CUSTOM_BASE_URL` instead. Hermes-side retrieval is provided by the native plugin under `plugins/hermes/headroom_retrieve`.
 
 Anonymous aggregate telemetry is enabled by default. Opt out with `HEADROOM_TELEMETRY=off` or `headroom proxy --no-telemetry`. Downstream apps can set `HEADROOM_SDK=headroom-app` to override the anonymous telemetry `sdk` label; the default remains `proxy`.
 
@@ -311,6 +316,18 @@ headroom proxy --port 8787
 # In another terminal
 ANTHROPIC_BASE_URL=http://localhost:8787 claude
 ```
+
+## Using with Hermes Agent
+
+```bash
+# Default OpenRouter-compatible Hermes path
+headroom wrap hermes
+
+# Explicit custom endpoint mode
+headroom wrap hermes --provider-mode custom
+```
+
+Hermes registers tools through its own plugin system. Install or enable the Hermes `headroom_retrieve` plugin when you want compressed markers to be reversible from inside Hermes sessions.
 
 ## Using with Cursor
 

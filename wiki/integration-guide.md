@@ -196,6 +196,9 @@ ANTHROPIC_BASE_URL=http://localhost:8787 claude
 # GitHub Copilot CLI
 headroom wrap copilot -- --model claude-sonnet-4-20250514
 
+# Hermes Agent
+headroom wrap hermes
+
 # Cursor / Any OpenAI client
 OPENAI_BASE_URL=http://localhost:8787/v1 cursor
 ```
@@ -209,6 +212,8 @@ headroom wrap copilot --backend anyllm --anyllm-provider groq -- --model gpt-4o
 By default, `headroom wrap copilot` installs `rtk` and appends token-optimized shell guidance to `.github/copilot-instructions.md` so Copilot sessions reuse the same command-saving conventions as other wrapped agent CLIs. Use `--no-rtk` to skip that step.
 
 For Copilot's **hosted** API (`--subscription` and the implicit OAuth path), Headroom routes to the generic host `https://api.githubcopilot.com`, which serves the full model set. **Enterprise / data-residency** tenants on a dedicated Copilot host pin it with `GITHUB_COPILOT_API_URL` (e.g. `export GITHUB_COPILOT_API_URL=https://api.<your-host>.githubcopilot.com`); the override flows through to the upstream request. See [`TESTING-copilot-subscription.md`](https://github.com/chopratejas/headroom/blob/main/TESTING-copilot-subscription.md).
+
+For Hermes, `headroom wrap hermes` sets `OPENROUTER_BASE_URL` to Headroom's local `/v1` endpoint by default. Use `headroom wrap hermes --provider-mode custom` when Hermes should use `HERMES_INFERENCE_PROVIDER=custom` and `CUSTOM_BASE_URL`. Retrieval for compressed markers is handled by Hermes' native `headroom_retrieve` plugin in `plugins/hermes`, so the proxy does not inject the generic CCR tool for Hermes unless explicitly opted in.
 
 ### With Cloud Providers
 

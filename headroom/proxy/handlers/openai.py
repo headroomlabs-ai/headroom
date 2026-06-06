@@ -309,6 +309,175 @@ def _compact_openai_responses_tools(
     return updated, True, before, after
 
 
+def _truthy_env(name: str) -> bool:
+    raw = os.getenv(name, "")
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _is_hermes_request(headers: dict[str, str]) -> bool:
+    if os.getenv("HEADROOM_AGENT_TYPE", "").strip().lower() == "hermes":
+        return True
+    if _truthy_env("HEADROOM_HERMES_MODE"):
+        return True
+    normalized_headers = {str(k).lower(): str(v) for k, v in headers.items()}
+    agent = normalized_headers.get("x-headroom-agent", "") or normalized_headers.get(
+        "x-hermes-agent",
+        "",
+    )
+    user_agent = normalized_headers.get("user-agent", "")
+    return "hermes" in f"{agent} {user_agent}".lower()
+
+
+def _should_inject_ccr_tool_for_request(
+    *,
+    config_enabled: bool,
+    hermes_request: bool,
+) -> bool:
+    """Return whether to advertise Headroom's CCR retrieval tool upstream.
+
+    Hermes executes tool calls through its own registry. Advertising
+    ``headroom_retrieve`` before Hermes has registered that tool causes the
+    model to call a function Hermes cannot execute. Keep transparent
+    compression enabled for Hermes, and allow CCR tool injection only when a
+    user explicitly opts in after wiring the tool/MCP side.
+    """
+    if not config_enabled:
+        return False
+    if hermes_request and not _truthy_env("HEADROOM_HERMES_CCR_TOOL"):
+        return False
+    return True
+
+
+def _count_tool_schema_tokens(tokenizer: Any, tools: Any) -> int:
+    if not tools:
+        return 0
+    serialized = _json_debug_dumps(tools)
+    if hasattr(tokenizer, "count_text"):
+        return tokenizer.count_text(serialized)
+    return tokenizer.count_messages([{"role": "system", "content": serialized}])
+
+
+def _compact_openai_chat_tools_for_hermes(
+    body: dict[str, Any],
+) -> tuple[dict[str, Any], bool, int, int]:
+    """Compact OpenAI chat tool schemas using the existing schema compactor."""
+    if not isinstance(body.get("tools"), list):
+        return body, False, 0, 0
+    compacted, changed, before, after = _compact_openai_responses_tools(
+        {"tools": body.get("tools")}
+    )
+    if not changed:
+        return body, False, before, after
+    updated = copy.deepcopy(body)
+    updated["tools"] = compacted["tools"]
+    return updated, True, before, after
+
+
+def _looks_like_hermes_packed_tool_history(content: str) -> bool:
+    if len(content) < 800:
+        return False
+    lowered = content[:20_000].lower()
+    markers = (
+        '"role": "tool"',
+        '"role":"tool"',
+        "tool_call_id",
+        "tool_result",
+        "terminal output",
+        "exit_code",
+        "stderr",
+        "stdout",
+        "command:",
+        "search results",
+    )
+    return sum(1 for marker in markers if marker in lowered) >= 2
+
+
+def _prepare_hermes_packed_history_messages(
+    messages: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[int]]:
+    """Temporarily expose old tool-like user history to ContentRouter.
+
+    Hermes can pack previous terminal/log/tool history into user-role text.
+    ContentRouter correctly protects user messages, so these old high-volume
+    blobs otherwise never compress. We only retag non-latest, clearly tool-like
+    strings for the compression pass, then restore their original user role
+    before forwarding the request upstream.
+    """
+    if len(messages) < 3:
+        return messages, []
+    prepared = copy.deepcopy(messages)
+    retagged: list[int] = []
+    latest_user_idx = max(
+        (idx for idx, msg in enumerate(messages) if msg.get("role") == "user"),
+        default=-1,
+    )
+    for idx, msg in enumerate(prepared):
+        if idx == latest_user_idx or msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str) and _looks_like_hermes_packed_tool_history(content):
+            msg["_headroom_original_role"] = "user"
+            msg["role"] = "tool"
+            msg.setdefault("tool_call_id", f"headroom_hermes_history_{idx}")
+            retagged.append(idx)
+    return prepared, retagged
+
+
+def _restore_hermes_packed_history_roles(
+    messages: list[dict[str, Any]],
+    retagged_indices: list[int],
+) -> list[dict[str, Any]]:
+    if not retagged_indices:
+        return messages
+    restored = copy.deepcopy(messages)
+    for idx in retagged_indices:
+        if idx >= len(restored):
+            continue
+        msg = restored[idx]
+        if msg.pop("_headroom_original_role", None) == "user":
+            msg["role"] = "user"
+            if str(msg.get("tool_call_id", "")).startswith("headroom_hermes_history_"):
+                msg.pop("tool_call_id", None)
+    return restored
+
+
+def _openai_chat_response_shape(response_json: Any) -> dict[str, Any]:
+    if not isinstance(response_json, dict):
+        return {"json": False, "type": type(response_json).__name__}
+    choices = response_json.get("choices")
+    first_choice = choices[0] if isinstance(choices, list) and choices else {}
+    message = first_choice.get("message") if isinstance(first_choice, dict) else None
+    if not isinstance(message, dict):
+        message = {}
+    content = message.get("content")
+    tool_calls = message.get("tool_calls")
+    return {
+        "json": True,
+        "choices_count": len(choices) if isinstance(choices, list) else 0,
+        "finish_reason": first_choice.get("finish_reason")
+        if isinstance(first_choice, dict)
+        else None,
+        "has_message": bool(message),
+        "message_role": message.get("role"),
+        "has_content": isinstance(content, str) and bool(content),
+        "content_chars": len(content) if isinstance(content, str) else 0,
+        "has_tool_calls": isinstance(tool_calls, list) and bool(tool_calls),
+        "tool_calls_count": len(tool_calls) if isinstance(tool_calls, list) else 0,
+        "usage_keys": sorted((response_json.get("usage") or {}).keys())
+        if isinstance(response_json.get("usage"), dict)
+        else [],
+    }
+
+
+def _log_hermes_debug_shape(event: str, **payload: Any) -> None:
+    if not _truthy_env("HEADROOM_HERMES_DEBUG_SHAPE"):
+        return
+    logger.info(
+        "event=hermes_debug_shape %s",
+        _json_debug_dumps({"event": event, **payload}),
+    )
+
+
 def _responses_input_item_text_bytes(item: Any) -> int:
     if not isinstance(item, dict):
         return _json_byte_len(item)
@@ -1488,6 +1657,19 @@ class OpenAIHandlerMixin:
             stripped_count=_pre_strip_count_chat,
             request_id=request_id,
         )
+        hermes_request = _is_hermes_request(dict(request.headers.items()))
+        if hermes_request:
+            tags["agent"] = "hermes"
+            _log_hermes_debug_shape(
+                "request_received",
+                request_id=request_id,
+                provider="openai_chat_completions",
+                model=model,
+                message_count=len(messages),
+                roles=[m.get("role") for m in messages if isinstance(m, dict)],
+                tool_count=len(body.get("tools") or []),
+                stream=bool(stream),
+            )
 
         # Memory: Get user ID when memory is enabled. Reads `request.headers`
         # directly because `headers` was stripped of `x-headroom-*` for the
@@ -1589,7 +1771,9 @@ class OpenAIHandlerMixin:
 
         # Token counting
         tokenizer = get_tokenizer(model)
-        original_tokens = tokenizer.count_messages(messages)
+        original_message_tokens = tokenizer.count_messages(messages)
+        original_tool_tokens = _count_tool_schema_tokens(tokenizer, body.get("tools"))
+        original_tokens = original_message_tokens + original_tool_tokens
 
         # Hook: pre_compress
         _hook_biases = None
@@ -1693,10 +1877,18 @@ class OpenAIHandlerMixin:
                     comp_cache = self._get_compression_cache(openai_session_id)
 
                     # Zone 1: Swap cached compressed versions
-                    working_messages = comp_cache.apply_cached(messages)
+                    compression_input_messages = messages
+                    hermes_retagged_indices: list[int] = []
+                    if hermes_request:
+                        compression_input_messages, hermes_retagged_indices = (
+                            _prepare_hermes_packed_history_messages(messages)
+                        )
+                    working_messages = comp_cache.apply_cached(compression_input_messages)
 
                     # Re-freeze boundary
-                    openai_frozen_count = comp_cache.compute_frozen_count(messages)
+                    openai_frozen_count = comp_cache.compute_frozen_count(
+                        compression_input_messages
+                    )
 
                     result = await self._run_compression_in_executor(
                         lambda: self.openai_pipeline.apply(
@@ -1712,22 +1904,41 @@ class OpenAIHandlerMixin:
                     )
 
                     if result.messages != working_messages:
-                        comp_cache.update_from_result(messages, result.messages)
+                        comp_cache.update_from_result(
+                            compression_input_messages,
+                            result.messages,
+                        )
 
                     # Always use pipeline result in token mode
-                    optimized_messages = result.messages
+                    optimized_messages = _restore_hermes_packed_history_roles(
+                        result.messages,
+                        hermes_retagged_indices,
+                    )
                     transforms_applied = result.transforms_applied
+                    if hermes_retagged_indices:
+                        transforms_applied = [
+                            *transforms_applied,
+                            f"hermes:packed_user_history:{len(hermes_retagged_indices)}",
+                        ]
                     pipeline_timing = result.timing
                     # Keep original_tokens as the REAL original (pre-Zone-1-swap)
                     # so tokens_saved captures both Zone 1 + Zone 2 savings.
-                    optimized_tokens = result.tokens_after
+                    optimized_tokens = (
+                        tokenizer.count_messages(optimized_messages) + original_tool_tokens
+                    )
                 else:
+                    compression_input_messages = messages
+                    hermes_retagged_indices = []
+                    if hermes_request:
+                        compression_input_messages, hermes_retagged_indices = (
+                            _prepare_hermes_packed_history_messages(messages)
+                        )
                     result = await self._run_compression_in_executor(
                         lambda: self.openai_pipeline.apply(
-                            messages=messages,
+                            messages=compression_input_messages,
                             model=model,
                             model_limit=context_limit,
-                            context=extract_user_query(messages),
+                            context=extract_user_query(compression_input_messages),
                             frozen_message_count=openai_frozen_count,
                             biases=_hook_biases,
                             compression_policy=compression_policy,
@@ -1735,12 +1946,22 @@ class OpenAIHandlerMixin:
                         timeout=COMPRESSION_TIMEOUT_SECONDS,
                     )
 
-                    if result.messages != messages:
-                        optimized_messages = result.messages
+                    restored_result_messages = _restore_hermes_packed_history_roles(
+                        result.messages,
+                        hermes_retagged_indices,
+                    )
+                    if restored_result_messages != messages:
+                        optimized_messages = restored_result_messages
                         transforms_applied = result.transforms_applied
+                        if hermes_retagged_indices:
+                            transforms_applied = [
+                                *transforms_applied,
+                                f"hermes:packed_user_history:{len(hermes_retagged_indices)}",
+                            ]
                         pipeline_timing = result.timing
-                        original_tokens = result.tokens_before
-                        optimized_tokens = result.tokens_after
+                        optimized_tokens = (
+                            tokenizer.count_messages(optimized_messages) + original_tool_tokens
+                        )
 
                 if result.waste_signals:
                     waste_signals_dict = result.waste_signals.to_dict()
@@ -1778,7 +1999,9 @@ class OpenAIHandlerMixin:
             )
             if routed_event.messages is not None:
                 optimized_messages = routed_event.messages
-                optimized_tokens = tokenizer.count_messages(optimized_messages)
+                optimized_tokens = (
+                    tokenizer.count_messages(optimized_messages) + original_tool_tokens
+                )
                 tokens_saved = original_tokens - optimized_tokens
 
         compressed_event = self.pipeline_extensions.emit(
@@ -1799,7 +2022,9 @@ class OpenAIHandlerMixin:
         )
         if compressed_event.messages is not None:
             optimized_messages = compressed_event.messages
-            optimized_tokens = tokenizer.count_messages(optimized_messages)
+            optimized_tokens = (
+                tokenizer.count_messages(optimized_messages) + original_tool_tokens
+            )
             tokens_saved = original_tokens - optimized_tokens
 
         # Hook: post_compress
@@ -1832,8 +2057,12 @@ class OpenAIHandlerMixin:
         # anchored on the previous turn's tool list never busts.
         tools = body.get("tools")
         _original_tools = tools  # Preserve for diagnostic / future retry
+        ccr_inject_tool_for_request = _should_inject_ccr_tool_for_request(
+            config_enabled=self.config.ccr_inject_tool,
+            hermes_request=hermes_request,
+        )
         if (
-            self.config.ccr_inject_tool or self.config.ccr_inject_system_instructions
+            ccr_inject_tool_for_request or self.config.ccr_inject_system_instructions
         ) and not _bypass:
             injector = CCRToolInjector(
                 provider="openai",
@@ -1844,7 +2073,7 @@ class OpenAIHandlerMixin:
             if self.config.ccr_inject_system_instructions and injector.has_compressed_content:
                 optimized_messages = injector.inject_into_system_message(optimized_messages)
 
-            if self.config.ccr_inject_tool:
+            if ccr_inject_tool_for_request:
                 from headroom.proxy.helpers import apply_session_sticky_ccr_tool
 
                 tools, ccr_tool_injected = apply_session_sticky_ccr_tool(
@@ -1988,6 +2217,26 @@ class OpenAIHandlerMixin:
         if tools or _original_tools is not None:
             body["tools"] = tools
 
+        if hermes_request and not _bypass:
+            compacted_body, tools_compacted, tool_bytes_before, tool_bytes_after = (
+                _compact_openai_chat_tools_for_hermes(body)
+            )
+            if tools_compacted:
+                body = compacted_body
+                tools = body.get("tools")
+                transforms_applied = [
+                    *transforms_applied,
+                    f"hermes:compact_tools:{tool_bytes_before}->{tool_bytes_after}",
+                ]
+                _log_hermes_debug_shape(
+                    "tools_compacted",
+                    request_id=request_id,
+                    model=model,
+                    tool_count=len(tools or []),
+                    bytes_before=tool_bytes_before,
+                    bytes_after=tool_bytes_after,
+                )
+
         presend_event = self.pipeline_extensions.emit(
             PipelineStage.PRE_SEND,
             operation="proxy.request",
@@ -2007,8 +2256,27 @@ class OpenAIHandlerMixin:
             body["tools"] = tools
         if presend_event.headers is not None:
             headers = presend_event.headers
-        optimized_tokens = tokenizer.count_messages(body["messages"])
+        optimized_tokens = tokenizer.count_messages(body["messages"]) + _count_tool_schema_tokens(
+            tokenizer,
+            body.get("tools"),
+        )
         tokens_saved = original_tokens - optimized_tokens
+        if hermes_request:
+            _log_hermes_debug_shape(
+                "request_presend",
+                request_id=request_id,
+                model=model,
+                message_count=len(body.get("messages", [])),
+                roles=[
+                    m.get("role")
+                    for m in body.get("messages", [])
+                    if isinstance(m, dict)
+                ],
+                tool_count=len(body.get("tools") or []),
+                input_tokens_original=original_tokens,
+                input_tokens_optimized=optimized_tokens,
+                transforms_applied=transforms_applied,
+            )
 
         # Route through LiteLLM/any-llm backend if configured
         if self.anthropic_backend is not None:
@@ -2080,6 +2348,15 @@ class OpenAIHandlerMixin:
                         return JSONResponse(
                             status_code=backend_response.status_code,
                             content=backend_response.body,
+                        )
+                    if hermes_request:
+                        _log_hermes_debug_shape(
+                            "upstream_response",
+                            request_id=request_id,
+                            model=model,
+                            backend=getattr(self.anthropic_backend, "name", "backend"),
+                            status_code=backend_response.status_code,
+                            shape=_openai_chat_response_shape(backend_response.body),
                         )
 
                     # CCR Response Handling: intercept headroom_retrieve
@@ -2404,6 +2681,15 @@ class OpenAIHandlerMixin:
                 resp_json = None
                 try:
                     resp_json = response.json()
+                    if hermes_request:
+                        _log_hermes_debug_shape(
+                            "upstream_response",
+                            request_id=request_id,
+                            model=model,
+                            backend="direct",
+                            status_code=response.status_code,
+                            shape=_openai_chat_response_shape(resp_json),
+                        )
                     usage = resp_json.get("usage", {})
                     total_input_tokens = usage.get("prompt_tokens", optimized_tokens)
                     output_tokens = usage.get("completion_tokens", 0)

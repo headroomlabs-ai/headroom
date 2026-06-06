@@ -226,6 +226,12 @@ class AnchorConfig:
 - Code completion optimization
 - Batch request support
 
+### Hermes
+
+- OpenRouter-compatible routing through `OPENROUTER_BASE_URL`
+- Custom endpoint routing through `HERMES_INFERENCE_PROVIDER=custom` and `CUSTOM_BASE_URL`
+- Hermes-aware CCR behavior that relies on native plugin registration for retrieval
+
 ### Gemini
 
 - Multi-modal inputs

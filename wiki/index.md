@@ -99,6 +99,7 @@ Headroom works as a **transparent proxy** (zero code changes), a **Python functi
     headroom wrap claude       # Claude Code
     headroom wrap copilot -- --model claude-sonnet-4-20250514
     headroom wrap codex        # OpenAI Codex CLI
+    headroom wrap hermes       # Hermes Agent
     headroom wrap aider        # Aider
     headroom wrap cursor       # Cursor
     headroom wrap openclaw     # OpenClaw plugin bootstrap
@@ -225,6 +226,21 @@ headroom wrap openclaw
 ```
 
 [OpenClaw Plugin &rarr;](https://github.com/chopratejas/headroom/tree/main/plugins/openclaw)
+
+</div>
+
+<div class="grid-item" markdown>
+
+### Hermes
+
+Launch Hermes Agent through Headroom for OpenRouter-compatible or custom OpenAI-compatible provider paths.
+
+```bash
+headroom wrap hermes
+headroom wrap hermes --provider-mode custom
+```
+
+Hermes retrieval uses the native `headroom_retrieve` plugin in `plugins/hermes`, so the proxy does not inject the generic CCR retrieval tool unless explicitly opted in.
 
 </div>
 

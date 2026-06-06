@@ -739,6 +739,29 @@ headroom wrap codex --backend anyllm --anyllm-provider groq
 
 Requires the `codex` binary on the host.
 
+### `headroom wrap hermes`
+
+```bash
+headroom wrap hermes
+headroom wrap hermes --provider-mode custom
+headroom wrap hermes --debug-shape -- --help
+```
+
+| Option / arg | Default | Meaning |
+|---|---|---|
+| `--port`, `-p` | `8787` | Proxy port |
+| `--no-proxy` | off | Reuse an existing proxy |
+| `--learn` | off | Enable live traffic learning |
+| `--memory` | off | Enable persistent cross-session memory |
+| `--provider-mode` | `openrouter` | Route with `OPENROUTER_BASE_URL`; use `custom` for `HERMES_INFERENCE_PROVIDER=custom` and `CUSTOM_BASE_URL` |
+| `--debug-shape` | off | Log sanitized Hermes request/response shape diagnostics |
+| `--backend` | unset | Proxy backend override; defaults to `openrouter` when unset for Hermes |
+| `--anyllm-provider` | unset | `anyllm` provider override |
+| `--region` | unset | Cloud region override |
+| `hermes_args...` | passthrough | Additional Hermes Agent arguments |
+
+Requires the `hermes` binary on the host. Hermes registers retrieval through its native `headroom_retrieve` plugin, so Headroom suppresses normal proxy-side CCR tool injection in Hermes mode unless `HEADROOM_HERMES_CCR_TOOL=1` is set.
+
 ### `headroom wrap copilot`
 
 ```bash
