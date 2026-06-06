@@ -74,15 +74,15 @@ _RTK_WIRING_ALLOWED = ("enabled", "disabled")
 # os.replace, but the in-memory counters diverge per worker — and any
 # dashboard hitting a non-owner worker would see drifted values.
 #
-# The owner-election strategy mirrors the beacon's file-lock pattern in
-# ``headroom/proxy/server.py``: a non-blocking ``fcntl.flock`` on
-# ``HEADROOM_RTK_POLL_LOCK`` (default under the workspace dir). Only the
-# lock holder polls; non-owners return 0 from ``_poll_rtk_delta`` and
-# delegate to whatever the owner writes to the shared state file.
+# The owner-election strategy uses a non-blocking file lock on
+# ``HEADROOM_RTK_POLL_LOCK`` (default under the workspace dir). Unix uses
+# ``fcntl.flock``; Windows uses ``msvcrt.locking``. Only the lock holder
+# polls; non-owners return 0 from ``_poll_rtk_delta`` and delegate to
+# whatever the owner writes to the shared state file.
 #
-# Loud / no silent fallback: when ``fcntl`` is unavailable (Windows), every
-# worker polls — but the explicit ``WindowsNoLockMode`` log line surfaces
-# the choice so operators see it in startup logs.
+# Loud / no silent fallback: on platforms without either lock backend, every
+# worker polls, but the explicit log line surfaces the choice so operators
+# see it in startup logs.
 _RTK_POLL_LOCK_ENV = "HEADROOM_RTK_POLL_LOCK"
 
 
@@ -204,6 +204,7 @@ class SubscriptionTracker(QuotaTracker):
         # worker owns the lock and we skip polling.
         self._rtk_poll_owner: bool | None = None
         self._rtk_poll_lock_fd: Any = None
+        self._rtk_poll_lock_backend: str | None = None
 
         self._stop_event: asyncio.Event | None = None
         self._poll_task: asyncio.Task[None] | None = None
@@ -466,34 +467,71 @@ class SubscriptionTracker(QuotaTracker):
         lock is released in :meth:`_release_rtk_poll_lock`, called from
         :meth:`stop`.
 
-        Mirrors the beacon's ``_try_acquire_beacon_lock`` pattern in
-        ``headroom/proxy/server.py`` (fcntl.flock, LOCK_EX | LOCK_NB).
+        Uses ``fcntl.flock`` on Unix and ``msvcrt.locking`` on Windows.
         """
         if self._rtk_poll_owner is not None:
             return self._rtk_poll_owner
 
+        fcntl_module: Any = None
         try:
-            import fcntl
+            import fcntl as _fcntl
+
+            fcntl_module = _fcntl
         except ImportError:
-            # Platform without fcntl (Windows). Every worker polls; log
-            # loudly so the operator knows the multi-worker invariant is
-            # weaker on this platform.
-            logger.warning("event=subscription_rtk_poll_lock_unavailable platform=no-fcntl")
-            self._rtk_poll_owner = True
-            return True
+            pass
 
         lock_path = self._rtk_poll_lock_path()
         fd = None
+        if fcntl_module is None:
+            try:
+                import msvcrt as _msvcrt
+
+                msvcrt_module: Any = _msvcrt
+            except ImportError:
+                logger.warning("event=subscription_rtk_poll_lock_unavailable platform=no-file-lock")
+                self._rtk_poll_owner = True
+                return True
+
+            try:
+                lock_path.parent.mkdir(parents=True, exist_ok=True)
+                fd = open(lock_path, "a+")  # noqa: SIM115
+                fd.seek(0)
+                msvcrt_module.locking(fd.fileno(), msvcrt_module.LK_NBLCK, 1)
+                fd.seek(0)
+                fd.truncate()
+                fd.write(str(os.getpid()))
+                fd.flush()
+                self._rtk_poll_lock_fd = fd
+                self._rtk_poll_lock_backend = "msvcrt"
+                self._rtk_poll_owner = True
+                logger.info(
+                    "event=subscription_rtk_poll_lock_acquired pid=%d path=%s backend=msvcrt",
+                    os.getpid(),
+                    lock_path,
+                )
+                return True
+            except OSError:
+                if fd is not None:
+                    fd.close()
+                self._rtk_poll_owner = False
+                logger.info(
+                    "event=subscription_rtk_poll_lock_skipped pid=%d path=%s backend=msvcrt",
+                    os.getpid(),
+                    lock_path,
+                )
+                return False
+
         try:
             lock_path.parent.mkdir(parents=True, exist_ok=True)
             fd = open(lock_path, "w")  # noqa: SIM115
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl_module.flock(fd, fcntl_module.LOCK_EX | fcntl_module.LOCK_NB)
             fd.write(str(os.getpid()))
             fd.flush()
             self._rtk_poll_lock_fd = fd
+            self._rtk_poll_lock_backend = "fcntl"
             self._rtk_poll_owner = True
             logger.info(
-                "event=subscription_rtk_poll_lock_acquired pid=%d path=%s",
+                "event=subscription_rtk_poll_lock_acquired pid=%d path=%s backend=fcntl",
                 os.getpid(),
                 lock_path,
             )
@@ -503,7 +541,7 @@ class SubscriptionTracker(QuotaTracker):
                 fd.close()
             self._rtk_poll_owner = False
             logger.info(
-                "event=subscription_rtk_poll_lock_skipped pid=%d path=%s",
+                "event=subscription_rtk_poll_lock_skipped pid=%d path=%s backend=fcntl",
                 os.getpid(),
                 lock_path,
             )
@@ -515,9 +553,17 @@ class SubscriptionTracker(QuotaTracker):
         if fd is None:
             return
         try:
-            import fcntl
+            if self._rtk_poll_lock_backend == "fcntl":
+                import fcntl as _fcntl
 
-            fcntl.flock(fd, fcntl.LOCK_UN)
+                fcntl_module: Any = _fcntl
+                fcntl_module.flock(fd, fcntl_module.LOCK_UN)
+            elif self._rtk_poll_lock_backend == "msvcrt":
+                import msvcrt as _msvcrt
+
+                msvcrt_module: Any = _msvcrt
+                fd.seek(0)
+                msvcrt_module.locking(fd.fileno(), msvcrt_module.LK_UNLCK, 1)
         except Exception:
             pass
         try:
@@ -525,6 +571,7 @@ class SubscriptionTracker(QuotaTracker):
         except Exception:
             pass
         self._rtk_poll_lock_fd = None
+        self._rtk_poll_lock_backend = None
         try:
             self._rtk_poll_lock_path().unlink(missing_ok=True)
         except Exception:
