@@ -187,8 +187,9 @@ def mock_openai_client(mock_openai_response):
 def temp_sqlite_db():
     """Temporary SQLite database path."""
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
-        yield f.name
-    Path(f.name).unlink(missing_ok=True)
+        db_path = f.name
+    yield db_path
+    Path(db_path).unlink(missing_ok=True)
 
 
 @pytest.fixture
