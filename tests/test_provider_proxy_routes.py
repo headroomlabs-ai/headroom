@@ -88,6 +88,55 @@ def test_provider_passthrough_routes_forward_expected_targets(monkeypatch) -> No
     assert len(calls) >= 16
 
 
+def test_mcp_endpoint_is_handled_locally_instead_of_passthrough() -> None:
+    calls: list[tuple[str, str]] = []
+
+    async def fake_passthrough(self, request, base_url, sub_path="", provider_name=""):  # type: ignore[no-untyped-def]
+        calls.append((request.url.path, base_url))
+        return JSONResponse({"base_url": base_url, "path": request.url.path})
+
+    initialize_payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "test-client", "version": "1.0"},
+        },
+    }
+    tools_payload = {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
+
+    with patch.object(HeadroomProxy, "handle_passthrough", fake_passthrough):
+        with TestClient(_app()) as client:
+            response = client.post(
+                "/mcp",
+                json=initialize_payload,
+                headers={"accept": "application/json"},
+            )
+            tools_response = client.post(
+                "/mcp",
+                json=tools_payload,
+                headers={"accept": "application/json"},
+            )
+
+    assert calls == []
+
+    if response.status_code == 501:
+        payload = response.json()
+        assert payload["error"] == "Headroom MCP HTTP endpoint is unavailable"
+        assert "headroom-ai[mcp]" in payload["detail"]
+        assert tools_response.status_code == 501
+        return
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/json")
+    assert response.json()["result"]["serverInfo"]["name"] == "headroom"
+    assert tools_response.status_code == 200
+    tool_names = {tool["name"] for tool in tools_response.json()["result"]["tools"]}
+    assert {"headroom_compress", "headroom_retrieve", "headroom_stats"} <= tool_names
+
+
 def test_proxy_route_helpers_prefer_legacy_targets_and_gemini_passthrough() -> None:
     proxy_routes = importlib.import_module("headroom.providers.proxy_routes")
     proxy = type(

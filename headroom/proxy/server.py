@@ -1368,12 +1368,68 @@ def _register_memory_components(proxy: HeadroomProxy, tracker: MemoryTracker) ->
     # registered when the memory system is initialized with specific backends.
 
 
+class _MCPStreamableHTTPApp:
+    def __init__(self, session_manager: Any) -> None:
+        self._session_manager = session_manager
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope.get("type") != "http":
+            response = PlainTextResponse("Not found", status_code=404)
+            await response(scope, receive, send)
+            return
+        await self._session_manager.handle_request(scope, receive, send)
+
+
+class _MCPUnavailableApp:
+    def __init__(self, reason: str) -> None:
+        self._reason = reason
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope.get("type") != "http":
+            response = PlainTextResponse("Not found", status_code=404)
+            await response(scope, receive, send)
+            return
+        response = JSONResponse(
+            status_code=501,
+            content={
+                "error": "Headroom MCP HTTP endpoint is unavailable",
+                "detail": "Install the MCP extra with: pip install 'headroom-ai[mcp]'",
+                "reason": self._reason,
+            },
+        )
+        await response(scope, receive, send)
+
+
+def _build_mcp_streamable_http_app(
+    config: ProxyConfig,
+) -> tuple[Any, Any | None, Any | None, str | None]:
+    proxy_url = f"http://127.0.0.1:{config.port}"
+    try:
+        from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+
+        from headroom.ccr.mcp_server import create_ccr_mcp_server
+
+        mcp_server = create_ccr_mcp_server(proxy_url=proxy_url)
+        session_manager = StreamableHTTPSessionManager(
+            mcp_server.server,
+            json_response=True,
+            stateless=True,
+        )
+        return _MCPStreamableHTTPApp(session_manager), session_manager, mcp_server, None
+    except Exception as exc:
+        reason = f"{type(exc).__name__}: {exc}"
+        logger.warning("event=mcp_http_unavailable reason=%r", reason)
+        return _MCPUnavailableApp(reason), None, None, reason
+
+
 def create_app(config: ProxyConfig | None = None) -> FastAPI:
     """Create FastAPI application."""
     if not FASTAPI_AVAILABLE:
         raise ImportError("FastAPI required. Install: pip install fastapi uvicorn httpx")
 
     from contextlib import asynccontextmanager
+
+    from starlette.routing import Route
 
     # Always-on file logging to ~/.headroom/logs/ for `headroom perf` analysis.
     # Installed here (not at module import) so importing headroom.proxy.server
@@ -1383,6 +1439,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
     config = config or ProxyConfig()
     proxy = HeadroomProxy(config)
+    mcp_http_app, mcp_http_session_manager, mcp_http_server, mcp_http_error = (
+        _build_mcp_streamable_http_app(config)
+    )
 
     # Telemetry beacon (anonymous aggregate stats).
     # With uvicorn workers > 1, each worker runs the lifespan independently.
@@ -1467,6 +1526,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         await initialize_context_tool_session_baseline()
 
         try:
+            stack = contextlib.AsyncExitStack()
+            if mcp_http_session_manager is not None:
+                await stack.enter_async_context(mcp_http_session_manager.run())
             try:
                 # Startup
                 await proxy.startup()
@@ -1490,6 +1552,8 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 raise
         finally:
             app.state.ready = False
+            if "stack" in locals():
+                await stack.aclose()
             # Shutdown
             if _beacon_is_owner[0]:
                 await _beacon.stop()
@@ -1501,6 +1565,8 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             if proxy.code_graph_watcher:
                 proxy.code_graph_watcher.stop()
             await proxy.shutdown()
+            if mcp_http_server is not None:
+                await mcp_http_server.cleanup()
             shutdown_headroom_tracing()
             shutdown_otel_metrics()
 
@@ -1520,6 +1586,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     # request) sees an honest "missing" rather than a stale "loaded".
     app.state.rust_core_status = "missing"
     app.state.rust_core_error = None
+    app.state.mcp_http_error = mcp_http_error
 
     def _iso_utc_now() -> str:
         return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -2926,6 +2993,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     @app.post("/v1/compress")
     async def compress_messages(request: Request):
         return await proxy.handle_compress(request)
+
+    app.router.routes.append(Route("/mcp", mcp_http_app, methods=["GET", "POST", "DELETE"]))
+    app.mount("/mcp", mcp_http_app)
 
     register_provider_routes(app, proxy)
 

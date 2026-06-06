@@ -119,6 +119,29 @@ headroom mcp serve --debug
 
 ## MCP host configuration
 
+### Proxy Streamable HTTP endpoint
+
+When the proxy is running, it also serves a local MCP Streamable HTTP endpoint at
+`http://127.0.0.1:<port>/mcp`. Use it only with MCP hosts that support
+Streamable HTTP. Hosts that expect a local stdio server should still use
+`headroom mcp serve`.
+
+If the MCP SDK is missing in a custom install, the proxy returns a local `501`
+with an install hint instead of forwarding `/mcp` to the upstream LLM provider.
+
+```json
+{
+  "mcpServers": {
+    "headroom": {
+      "type": "http",
+      "url": "http://127.0.0.1:8787/mcp"
+    }
+  }
+}
+```
+
+### Stdio server
+
 For MCP hosts that let you configure a local stdio server, point them at `headroom mcp serve`. If you also run the proxy, pass the proxy URL explicitly so retrieval and stats come from the intended proxy instance.
 
 ```json
@@ -152,7 +175,7 @@ For multiple proxy instances, register one stdio MCP server per proxy URL:
 }
 ```
 
-Do not assume that a running proxy exposes an HTTP MCP endpoint at `/mcp`. If `http://127.0.0.1:<port>/mcp` returns `404`, use the stdio configuration above.
+For desktop MCP hosts without Streamable HTTP support, use the stdio configuration above.
 
 ## Cross-tool compatibility
 
@@ -161,7 +184,7 @@ Do not assume that a running proxy exposes an HTTP MCP endpoint at `/mcp`. If `h
 | Claude Code | Native | `headroom mcp install` |
 | Cursor | Supported | Add to Cursor MCP settings |
 | Codex | If supported | Configure MCP server |
-| Any MCP host | Yes | Point to `headroom mcp serve` |
+| Any MCP host | Yes | Use stdio (`headroom mcp serve`) or Streamable HTTP (`/mcp`) |
 
 ## Architecture
 
