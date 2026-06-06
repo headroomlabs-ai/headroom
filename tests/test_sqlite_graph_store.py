@@ -14,16 +14,46 @@ Tests verify:
 from __future__ import annotations
 
 import os
+import sqlite3
 import tempfile
 
 import pytest
 
+import headroom.memory.adapters.sqlite_graph as sqlite_graph_adapter
 from headroom.memory.adapters.graph_models import (
     Entity,
     Relationship,
     RelationshipDirection,
 )
 from headroom.memory.adapters.sqlite_graph import SQLiteGraphStore
+
+
+def test_connection_context_closes_sqlite_connection(tmp_path, monkeypatch):
+    """The per-operation connection context must release the database file."""
+    closed_connections = []
+    real_connect = sqlite3.connect
+
+    class TrackingConnection(sqlite3.Connection):
+        def close(self):
+            closed_connections.append(self)
+            super().close()
+
+    def tracking_connect(*args, **kwargs):
+        kwargs["factory"] = TrackingConnection
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(sqlite_graph_adapter.sqlite3, "connect", tracking_connect)
+
+    store = SQLiteGraphStore(db_path=tmp_path / "graph.db")
+    assert closed_connections
+    closed_connections.clear()
+
+    with store._get_conn() as conn:
+        conn.execute("SELECT 1").fetchone()
+
+    assert closed_connections == [conn]
+    with pytest.raises(sqlite3.ProgrammingError):
+        conn.execute("SELECT 1")
 
 
 class TestSQLiteGraphStoreEntityOperations:
