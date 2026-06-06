@@ -12,6 +12,7 @@ pytest.importorskip("fastapi")
 
 from fastapi.testclient import TestClient
 
+from headroom.ccr.context_tracker import ContextTracker
 from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
 from headroom.proxy.server import ProxyConfig, create_app
 
@@ -288,6 +289,46 @@ def test_append_context_does_not_touch_previous_turns_if_last_message_not_user()
         frozen_message_count=0,
     )
     assert result[0]["content"] == "previous user turn"
+
+
+def test_proactive_expansion_append_keeps_peer_turn_attribution_separable() -> None:
+    tracker = ContextTracker()
+    expansion_text = tracker.format_expansions_for_context(
+        [
+            {
+                "hash": "ctx-1",
+                "type": "full",
+                "content": "expanded context that Headroom injected",
+                "item_count": 1,
+                "reason": "matched query",
+            }
+        ]
+    )
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": '<peer_turn from="AgentX">actual peer content</peer_turn>',
+                }
+            ],
+        }
+    ]
+
+    result = AnthropicHandlerMixin._append_context_to_latest_non_frozen_user_turn(
+        messages,
+        expansion_text,
+        frozen_message_count=0,
+    )
+
+    text = result[0]["content"][0]["text"]
+    assert '<peer_turn from="AgentX">actual peer content</peer_turn>' in text
+    assert "\n\n<headroom_proactive_expansion>" in text
+    peer_text, expansion = text.split("\n\n<headroom_proactive_expansion>", 1)
+    assert peer_text == '<peer_turn from="AgentX">actual peer content</peer_turn>'
+    assert "expanded context that Headroom injected" in expansion
+    assert expansion.rstrip().endswith("</headroom_proactive_expansion>")
 
 
 def test_token_mode_freeze_is_capped_by_prefix_tracker() -> None:

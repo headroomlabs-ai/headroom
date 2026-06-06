@@ -31,6 +31,10 @@ from ..cache.compression_store import get_compression_store
 
 logger = logging.getLogger(__name__)
 
+PROACTIVE_EXPANSION_TAG = "headroom_proactive_expansion"
+PROACTIVE_EXPANSION_OPEN_TAG = f"<{PROACTIVE_EXPANSION_TAG}>"
+PROACTIVE_EXPANSION_CLOSE_TAG = f"</{PROACTIVE_EXPANSION_TAG}>"
+
 
 @dataclass
 class CompressedContext:
@@ -574,7 +578,7 @@ class ContextTracker:
         if workspace_label:
             header += f" | workspace: {workspace_label}"
         header += "]"
-        parts = [header]
+        parts = [PROACTIVE_EXPANSION_OPEN_TAG, header]
 
         for exp in expansions:
             if exp["type"] == "full":
@@ -588,6 +592,7 @@ class ContextTracker:
                     parts.append(str(exp["content"]))
 
         parts.append("\n[End Proactive Expansion]")
+        parts.append(PROACTIVE_EXPANSION_CLOSE_TAG)
 
         return "\n".join(parts)
 

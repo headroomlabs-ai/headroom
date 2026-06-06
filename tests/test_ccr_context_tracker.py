@@ -547,6 +547,26 @@ class TestExpansionFormatting:
         assert "Expanded from earlier" in formatted
         assert '[{"id": 1}, {"id": 2}]' in formatted
 
+    def test_format_full_expansion_wraps_provenance_tag(self):
+        """Wrap proactive expansions so downstream consumers can strip them."""
+        tracker = ContextTracker()
+
+        expansions = [
+            {
+                "hash": "abc123",
+                "type": "full",
+                "content": "expanded content",
+                "item_count": 1,
+                "reason": "relevant to query",
+            }
+        ]
+
+        formatted = tracker.format_expansions_for_context(expansions)
+
+        assert formatted.startswith("<headroom_proactive_expansion>\n[Proactive Context Expansion")
+        assert formatted.endswith("\n</headroom_proactive_expansion>")
+        assert "[End Proactive Expansion]" in formatted
+
     def test_format_search_expansion(self):
         """Format search expansion for LLM context."""
         tracker = ContextTracker()
