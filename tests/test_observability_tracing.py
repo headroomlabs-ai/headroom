@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
-from opentelemetry.sdk.resources import Resource
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import SimpleSpanProcessor
-from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from headroom.observability import (
     HeadroomTracer,
@@ -16,6 +14,31 @@ from headroom.observability import (
     set_headroom_tracer,
 )
 from headroom.transforms.pipeline import TransformPipeline
+
+
+def _otel_trace_sdk() -> tuple[Any, Any, Any, Any]:
+    resources = pytest.importorskip(
+        "opentelemetry.sdk.resources",
+        reason="headroom-ai[otel] extra is not installed",
+    )
+    trace_sdk = pytest.importorskip(
+        "opentelemetry.sdk.trace",
+        reason="headroom-ai[otel] extra is not installed",
+    )
+    trace_export = pytest.importorskip(
+        "opentelemetry.sdk.trace.export",
+        reason="headroom-ai[otel] extra is not installed",
+    )
+    in_memory_export = pytest.importorskip(
+        "opentelemetry.sdk.trace.export.in_memory_span_exporter",
+        reason="headroom-ai[otel] extra is not installed",
+    )
+    return (
+        resources.Resource,
+        trace_sdk.TracerProvider,
+        trace_export.SimpleSpanProcessor,
+        in_memory_export.InMemorySpanExporter,
+    )
 
 
 def test_langfuse_tracing_config_builds_trace_endpoint() -> None:
@@ -34,6 +57,7 @@ def test_langfuse_tracing_config_builds_trace_endpoint() -> None:
 
 
 def test_transform_pipeline_emits_trace_spans() -> None:
+    Resource, TracerProvider, SimpleSpanProcessor, InMemorySpanExporter = _otel_trace_sdk()
     exporter = InMemorySpanExporter()
     provider = TracerProvider(resource=Resource.create({"service.name": "headroom-test"}))
     provider.add_span_processor(SimpleSpanProcessor(exporter))

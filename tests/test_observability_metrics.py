@@ -6,15 +6,25 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import pytest
-from opentelemetry.sdk.metrics import MeterProvider
-from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 
 from headroom.observability import HeadroomOtelMetrics, reset_otel_metrics, set_otel_metrics
 from headroom.proxy.prometheus_metrics import PrometheusMetrics
 from headroom.transforms.pipeline import TransformPipeline
 
 
-def _collect_metrics(reader: InMemoryMetricReader) -> dict[str, Any]:
+def _otel_metrics_sdk() -> tuple[Any, Any]:
+    metrics_sdk = pytest.importorskip(
+        "opentelemetry.sdk.metrics",
+        reason="headroom-ai[otel] extra is not installed",
+    )
+    metrics_export = pytest.importorskip(
+        "opentelemetry.sdk.metrics.export",
+        reason="headroom-ai[otel] extra is not installed",
+    )
+    return metrics_sdk.MeterProvider, metrics_export.InMemoryMetricReader
+
+
+def _collect_metrics(reader: Any) -> dict[str, Any]:
     data = reader.get_metrics_data()
     collected: dict[str, Any] = {}
 
@@ -34,6 +44,7 @@ def _find_point(metric: Any, **expected_attributes: Any) -> Any:
 
 
 def test_headroom_otel_metrics_records_proxy_and_pipeline_metrics() -> None:
+    MeterProvider, InMemoryMetricReader = _otel_metrics_sdk()
     reader = InMemoryMetricReader()
     provider = MeterProvider(metric_readers=[reader])
     otel_metrics = HeadroomOtelMetrics(meter_provider=provider)
@@ -164,6 +175,7 @@ def test_transform_pipeline_simulate_skips_metric_recording() -> None:
 
 
 def test_proxy_failure_and_rate_limit_metrics_include_provider_labels() -> None:
+    MeterProvider, InMemoryMetricReader = _otel_metrics_sdk()
     reader = InMemoryMetricReader()
     provider = MeterProvider(metric_readers=[reader])
     otel_metrics = HeadroomOtelMetrics(meter_provider=provider)
