@@ -72,6 +72,33 @@ class StreamingMixin:
             int(cache_creation.get("ephemeral_1h_input_tokens", 0) or 0),
         )
 
+    @staticmethod
+    def _fill_missing_anthropic_message_start_input_tokens(
+        event_data: dict[str, Any], input_tokens: int
+    ) -> bool:
+        """Fill zero message_start input usage with the proxy-side token count."""
+        if input_tokens <= 0 or event_data.get("type") != "message_start":
+            return False
+
+        message = event_data.get("message")
+        if not isinstance(message, dict):
+            return False
+
+        usage = message.get("usage")
+        if not isinstance(usage, dict):
+            usage = {}
+            message["usage"] = usage
+
+        try:
+            current_input_tokens = int(usage.get("input_tokens", 0) or 0)
+        except (TypeError, ValueError):
+            current_input_tokens = 0
+        if current_input_tokens > 0:
+            return False
+
+        usage["input_tokens"] = input_tokens
+        return True
+
     def _parse_sse_usage(self, chunk: bytes, provider: str) -> dict[str, int] | None:
         """Parse usage information from SSE chunk.
 
@@ -1357,9 +1384,17 @@ class StreamingMixin:
                     if stream_state["ttfb_ms"] is None:
                         stream_state["ttfb_ms"] = (time.time() - start_time) * 1000
 
+                    raw_sse = event.raw_sse
+                    if event.event_type == "message_start":
+                        filled_usage = self._fill_missing_anthropic_message_start_input_tokens(
+                            event.data, optimized_tokens
+                        )
+                        if filled_usage:
+                            raw_sse = None
+
                     # Format as SSE
-                    if event.raw_sse:
-                        yield event.raw_sse.encode()
+                    if raw_sse:
+                        yield raw_sse.encode()
                     else:
                         sse_line = f"event: {event.event_type}\ndata: {json.dumps(event.data)}\n\n"
                         yield sse_line.encode()

@@ -241,6 +241,16 @@ def _sse_data(event_type: str, data: dict[str, Any]) -> str:
     return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
 
 
+def _sse_event_data(body: str, event_type: str) -> dict[str, Any]:
+    for block in body.split("\n\n"):
+        lines = block.splitlines()
+        if not lines or lines[0] != f"event: {event_type}":
+            continue
+        data_line = next(line for line in lines if line.startswith("data: "))
+        return json.loads(data_line.removeprefix("data: "))
+    raise AssertionError(f"missing SSE event {event_type!r} in response:\n{body[:500]}")
+
+
 def test_bedrock_streaming_emits_perf_with_message_start_cache_usage() -> None:
     """Bedrock streaming must surface cache_read + cache_write from message_start.
 
@@ -336,6 +346,77 @@ def test_bedrock_streaming_emits_perf_with_message_start_cache_usage() -> None:
     assert cw == 200, f"expected cache_write=200, got {cw}"
     # round(500 / (500 + 200) * 100) = round(71.43) = 71
     assert chp == 71, f"expected cache_hit_pct=71, got {chp}"
+
+
+def test_bedrock_streaming_fills_zero_message_start_input_usage() -> None:
+    """Claude Code context tracking consumes input usage from message_start.
+
+    Backend-routed Anthropic providers can stream ``input_tokens: 0`` in the
+    initial event even though Headroom already counted the proxied request. In
+    that case the client sees a zero-sized context window while ``/stats`` is
+    non-zero, so the SSE event needs the proxy-side input-token fallback.
+    """
+    config = ProxyConfig(
+        optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        backend="anyllm",
+        anyllm_provider="anthropic",
+    )
+
+    message_start = {
+        "type": "message_start",
+        "message": {
+            "id": "msg_1",
+            "model": "claude-3-5-sonnet-20241022",
+            "role": "assistant",
+            "type": "message",
+            "content": [],
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+        },
+    }
+    message_delta = {
+        "type": "message_delta",
+        "delta": {"stop_reason": "end_turn"},
+        "usage": {"output_tokens": 59},
+    }
+    message_stop = {"type": "message_stop"}
+
+    events = [
+        StreamEvent(
+            event_type=e["type"],
+            data=e,
+            raw_sse=_sse_data(e["type"], e),
+        )
+        for e in [message_start, message_delta, message_stop]
+    ]
+    backend = _make_bedrock_backend(events)
+
+    with patch("headroom.proxy.server.AnyLLMBackend", return_value=backend):
+        app = create_app(config)
+        with TestClient(app) as client:
+            resp = client.post(
+                "/v1/messages",
+                json={
+                    "model": "claude-3-5-sonnet-20241022",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": "Please answer this short question.",
+                        }
+                    ],
+                    "max_tokens": 64,
+                    "stream": True,
+                },
+                headers={
+                    "x-api-key": "sk-ant-test",
+                    "anthropic-version": "2023-06-01",
+                },
+            )
+
+    assert resp.status_code == 200, resp.text[:200]
+    streamed_start = _sse_event_data(resp.text, "message_start")
+    assert streamed_start["message"]["usage"]["input_tokens"] > 0
 
 
 # =============================================================================
