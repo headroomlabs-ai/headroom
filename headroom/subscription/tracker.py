@@ -110,6 +110,14 @@ def _validate_rtk_env_at_startup() -> None:
     _rtk_wiring_mode()
 
 
+def _import_fcntl() -> Any | None:
+    try:
+        import fcntl
+    except ImportError:
+        return None
+    return fcntl
+
+
 # Singleton on-demand poll floor (seconds): the dashboard may request a fresh
 # poll if the cached snapshot is stale, but we cap how often we will actually
 # hit Anthropic to avoid 429s / OAuth-token flagging. Bounded across users.
@@ -472,9 +480,8 @@ class SubscriptionTracker(QuotaTracker):
         if self._rtk_poll_owner is not None:
             return self._rtk_poll_owner
 
-        try:
-            import fcntl
-        except ImportError:
+        fcntl = _import_fcntl()
+        if fcntl is None:
             # Platform without fcntl (Windows). Every worker polls; log
             # loudly so the operator knows the multi-worker invariant is
             # weaker on this platform.
@@ -515,9 +522,9 @@ class SubscriptionTracker(QuotaTracker):
         if fd is None:
             return
         try:
-            import fcntl
-
-            fcntl.flock(fd, fcntl.LOCK_UN)
+            fcntl = _import_fcntl()
+            if fcntl is not None:
+                fcntl.flock(fd, fcntl.LOCK_UN)
         except Exception:
             pass
         try:

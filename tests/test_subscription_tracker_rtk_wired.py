@@ -603,6 +603,9 @@ def test_multi_worker_only_one_polls(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     own ``c.tokens_saved_rtk``, inflating dashboard savings by N× workers.
     """
 
+    if tracker_module._import_fcntl() is None:
+        pytest.skip("POSIX file-lock owner election requires fcntl")
+
     monkeypatch.delenv(tracker_module._RTK_WIRING_ENV, raising=False)
 
     # Both trackers share a state directory so they share the lock file.
@@ -635,3 +638,23 @@ def test_multi_worker_only_one_polls(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     # Cleanup so subsequent tests don't see a stale lock.
     tracker_a._release_rtk_poll_lock()
     tracker_b._release_rtk_poll_lock()
+
+
+def test_poll_lock_falls_back_when_fcntl_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Platforms without fcntl should poll and log the weaker invariant."""
+
+    monkeypatch.setattr(tracker_module, "_import_fcntl", lambda: None)
+    caplog.set_level(logging.WARNING, logger="headroom.subscription.tracker")
+
+    tracker = SubscriptionTracker(persist_path=tmp_path / "state.json", enabled=True)
+
+    assert tracker._try_acquire_rtk_poll_lock() is True
+    assert tracker._rtk_poll_owner is True
+    assert tracker._rtk_poll_lock_fd is None
+    assert any(
+        "event=subscription_rtk_poll_lock_unavailable" in rec.getMessage() for rec in caplog.records
+    )
