@@ -227,6 +227,72 @@ ANTHROPIC_BASE_URL=http://localhost:8787 claude
 OPENAI_BASE_URL=http://localhost:8787/v1 cursor
 ```
 
+## Proxy chaining
+
+Headroom can also sit between a client and another local or remote provider proxy.
+Use the upstream flag that matches the wire API your next hop exposes.
+
+### Claude Code to Ollama
+
+Ollama exposes an Anthropic-compatible `/v1/messages` API for Claude Code. Start
+Headroom with Ollama as the Anthropic upstream, then point Claude Code at
+Headroom instead of directly at Ollama:
+
+```bash
+ollama pull qwen3-coder
+
+headroom proxy \
+  --port 8787 \
+  --anthropic-api-url http://localhost:11434
+
+ANTHROPIC_AUTH_TOKEN=ollama \
+ANTHROPIC_BASE_URL=http://localhost:8787 \
+claude --model qwen3-coder
+```
+
+`ANTHROPIC_AUTH_TOKEN` is required by Anthropic-compatible clients but is ignored
+by Ollama. Headroom forwards the compressed Anthropic-format request to Ollama.
+
+### OpenAI-compatible local providers
+
+For OpenAI-compatible clients or provider proxies, chain through Headroom's
+OpenAI upstream instead:
+
+```bash
+headroom proxy \
+  --port 8787 \
+  --openai-api-url http://localhost:11434/v1
+
+OPENAI_API_KEY=ollama \
+OPENAI_BASE_URL=http://localhost:8787/v1 \
+cursor
+```
+
+Use the same shape for LiteLLM, VibeProxy, DroidProxy, or another local gateway:
+point the client at Headroom, and point Headroom at the gateway.
+
+### Provider translation with any-llm
+
+If the upstream does not expose the same wire API as the client, use the
+translated backend instead:
+
+```bash
+pip install "headroom-ai[proxy,anyllm]" "any-llm-sdk[ollama]"
+
+headroom proxy \
+  --port 8787 \
+  --backend anyllm \
+  --anyllm-provider ollama
+
+ANTHROPIC_AUTH_TOKEN=ollama \
+ANTHROPIC_BASE_URL=http://localhost:8787 \
+claude --model qwen3-coder
+```
+
+Prefer direct proxy chaining when the provider already exposes the same API
+surface. Use `--backend anyllm` when you need any-llm to translate between the
+client request format and the target provider.
+
 ## Cloud providers
 
 ```bash
