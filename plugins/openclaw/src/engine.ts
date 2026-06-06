@@ -293,9 +293,10 @@ export class HeadroomContextEngine {
         this.logger.info(`Headroom proxy ready at ${proxyUrl}`);
         return proxyUrl;
       })
-      .catch((error) => {
+      .catch((error): string => {
         this.logger.warn(`Headroom proxy unavailable: ${error}`);
-        throw error;
+        // Do not re-throw — graceful degradation, compression simply skipped
+        return "";
       })
       .finally(() => {
         this.proxyStartupPromise = null;
