@@ -685,6 +685,8 @@ def _find_sse_event_terminator(buf: bytearray) -> tuple[int, int] | None:
     if not matches:
         return None
     return min(matches, key=lambda match: match[0])
+
+
 _SSE_EVENT_LINE_PREFIX = b"event:"
 _SSE_DATA_LINE_PREFIX = b"data:"
 
