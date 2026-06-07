@@ -62,7 +62,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from headroom._version import __version__
 from headroom.cache.compression_feedback import get_compression_feedback
-from headroom.cache.compression_store import get_compression_store
+from headroom.cache.compression_store import format_retrieval_miss_detail, get_compression_store
 from headroom.ccr import (
     CCR_TOOL_NAME,
     # Batch processing
@@ -2506,11 +2506,14 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
         store = get_compression_store()
 
+        entry_status = store.get_entry_status(hash_key, clean_expired=True)
+        if entry_status["status"] != "available":
+            raise HTTPException(
+                status_code=404,
+                detail=format_retrieval_miss_detail(entry_status),
+            )
+
         if query:
-            if not store.exists(hash_key, clean_expired=True):
-                raise HTTPException(
-                    status_code=404, detail="Entry not found or expired (TTL: 5 minutes)"
-                )
             # Search within cached content
             results = store.search(hash_key, query)
             return {
@@ -2533,7 +2536,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     "retrieval_count": entry.retrieval_count,
                 }
             raise HTTPException(
-                status_code=404, detail="Entry not found or expired (TTL: 5 minutes)"
+                status_code=404,
+                detail=format_retrieval_miss_detail(
+                    store.get_entry_status(hash_key, clean_expired=True)
+                ),
             )
 
     @app.get("/v1/retrieve/stats")
@@ -2819,10 +2825,15 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     async def ccr_retrieve_get(hash_key: str, query: str | None = None):
         """GET version of CCR retrieve for easier testing."""
         store = get_compression_store()
+        entry_status = store.get_entry_status(hash_key, clean_expired=True)
+
+        if entry_status["status"] != "available":
+            raise HTTPException(
+                status_code=404,
+                detail=format_retrieval_miss_detail(entry_status),
+            )
 
         if query:
-            if not store.exists(hash_key, clean_expired=True):
-                raise HTTPException(status_code=404, detail="Entry not found or expired")
             results = store.search(hash_key, query)
             return {
                 "hash": hash_key,
@@ -2842,7 +2853,12 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     "tool_name": entry.tool_name,
                     "retrieval_count": entry.retrieval_count,
                 }
-            raise HTTPException(status_code=404, detail="Entry not found or expired")
+            raise HTTPException(
+                status_code=404,
+                detail=format_retrieval_miss_detail(
+                    store.get_entry_status(hash_key, clean_expired=True)
+                ),
+            )
 
     # CCR Tool Call Handler - for agent frameworks to call when LLM uses headroom_retrieve
     @app.post("/v1/retrieve/tool_call")
@@ -2896,8 +2912,16 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
         # Perform retrieval
         store = get_compression_store()
+        entry_status = store.get_entry_status(hash_key, clean_expired=True)
 
-        if query:
+        if entry_status["status"] != "available":
+            retrieval_data = {
+                "error": format_retrieval_miss_detail(entry_status),
+                "hash": hash_key,
+                "status": entry_status["status"],
+                "ttl_seconds": entry_status.get("ttl_seconds", entry_status["default_ttl_seconds"]),
+            }
+        elif query:
             results = store.search(hash_key, query)
             retrieval_data = {
                 "hash": hash_key,
@@ -2915,9 +2939,14 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     "compressed_item_count": entry.compressed_item_count,
                 }
             else:
+                miss_status = store.get_entry_status(hash_key, clean_expired=True)
                 retrieval_data = {
-                    "error": "Entry not found or expired (TTL: 5 minutes)",
+                    "error": format_retrieval_miss_detail(miss_status),
                     "hash": hash_key,
+                    "status": miss_status["status"],
+                    "ttl_seconds": miss_status.get(
+                        "ttl_seconds", miss_status["default_ttl_seconds"]
+                    ),
                 }
 
         # Format tool result for provider

@@ -27,6 +27,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from headroom.cache.compression_store import (
+    CCR_TTL_SECONDS_ENV,
+    DEFAULT_CCR_TTL_SECONDS,
     CompressionEntry,
     CompressionStore,
     RetrievalEvent,
@@ -126,6 +128,58 @@ def test_search_logs_retrieved_payload_preview():
     assert events[0]["payload_preview"] == json.dumps(results, ensure_ascii=False)
     assert events[0]["payload_preview_chars"] == len(json.dumps(results, ensure_ascii=False))
     assert events[0]["payload_truncated"] is False
+
+
+def test_global_store_uses_env_default_ttl(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv(CCR_TTL_SECONDS_ENV, "7200")
+
+    store = get_compression_store()
+    hash_key = store.store(original="long-running agent payload", compressed="payload")
+    entry = store.retrieve(hash_key)
+
+    assert entry is not None
+    assert entry.ttl == 7200
+    assert store.get_stats()["default_ttl_seconds"] == 7200
+
+
+def test_global_store_invalid_env_ttl_falls_back(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv(CCR_TTL_SECONDS_ENV, "0")
+
+    store = get_compression_store()
+    hash_key = store.store(original="payload", compressed="payload")
+    entry = store.retrieve(hash_key)
+
+    assert entry is not None
+    assert entry.ttl == DEFAULT_CCR_TTL_SECONDS
+    assert store.get_stats()["default_ttl_seconds"] == DEFAULT_CCR_TTL_SECONDS
+
+
+def test_explicit_global_store_ttl_overrides_env(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv(CCR_TTL_SECONDS_ENV, "7200")
+
+    store = get_compression_store(default_ttl=60)
+    hash_key = store.store(original="payload", compressed="payload")
+    entry = store.retrieve(hash_key)
+
+    assert entry is not None
+    assert entry.ttl == 60
+    assert store.get_stats()["default_ttl_seconds"] == 60
+
+
+def test_entry_status_reports_expiration_metadata():
+    store = CompressionStore(default_ttl=1)
+
+    with patch("headroom.cache.compression_store.time.time", return_value=1000.0):
+        hash_key = store.store(original="payload", compressed="payload")
+
+    with patch("headroom.cache.compression_store.time.time", return_value=1002.0):
+        status = store.get_entry_status(hash_key, clean_expired=True)
+
+    assert status["status"] == "expired"
+    assert status["ttl_seconds"] == 1
+    assert status["age_seconds"] == 2
+    assert status["expires_at"] == 1001.0
+    assert store.exists(hash_key) is False
 
 
 # =============================================================================

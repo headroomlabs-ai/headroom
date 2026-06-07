@@ -407,14 +407,14 @@ class CCRConfig:
     - Network effect: retrieval patterns improve compression for all users
 
     GOTCHAS:
-    - Cache has TTL (default 5 min) - retrieval fails after expiration
+    - Cache has TTL (default 300 seconds) - retrieval fails after expiration
     - Memory usage: ~1KB per cached entry
     - Only works with array compression (not string truncation)
     """
 
     enabled: bool = True  # Enable CCR (cache + retrieval markers)
     store_max_entries: int = 1000  # Max entries in compression store
-    store_ttl_seconds: int = 300  # Cache TTL (5 minutes)
+    store_ttl_seconds: int = 300  # Cache TTL in seconds
     inject_retrieval_marker: bool = True  # Add retrieval hint to compressed output
     feedback_enabled: bool = True  # Track retrieval events for learning
     min_items_to_cache: int = 20  # Only cache if original had >= N items

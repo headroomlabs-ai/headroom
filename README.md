@@ -52,7 +52,7 @@ Headroom compresses everything your AI agent reads — tool outputs, logs, RAG c
 - **MCP server** — `headroom_compress`, `headroom_retrieve`, `headroom_stats` for any MCP client
 - **Cross-agent memory** — shared store across Claude, Codex, Gemini, auto-dedup
 - **`headroom learn`** — mines failed sessions, writes corrections to `CLAUDE.md` / `AGENTS.md`
-- **Reversible (CCR)** — originals never deleted; LLM retrieves on demand
+- **Reversible (CCR)** — originals are cached for retrieval on demand
 
 ## How it works (30 seconds)
 
@@ -159,7 +159,7 @@ Platform support note: macOS auth reuse via Copilot CLI Keychain storage has bee
 **Great fit if you…**
 - run AI coding agents daily and want savings without changing your code
 - work across multiple agents and want shared memory
-- need reversible compression — originals always retrievable via CCR
+- need reversible compression — originals are retrievable via CCR within the configured TTL
 
 **Skip it if you…**
 - only use a single provider's native compaction and don't need cross-agent memory
