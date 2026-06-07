@@ -77,9 +77,7 @@ def test_detect_true_when_codex_home_exists(
     assert CodexRegistrar().detect() is True
 
 
-def test_register_uses_codex_home_env(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_register_uses_codex_home_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     codex_home = tmp_path / "custom-codex-home"
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
 
