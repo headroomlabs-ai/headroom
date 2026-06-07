@@ -552,7 +552,29 @@ class CompressionStore:
         return [{"type": "json_scalar", "value": parsed}]
 
     def _json_object_search_items(self, value: dict[str, Any]) -> list[dict[str, Any]]:
-        """Return searchable leaf records for a JSON object."""
+        """Return searchable records for a JSON object.
+
+        Prefer row-shaped arrays inside objects (for common API shapes such as
+        ``{"results": [...]}``) so a query for one field can return the full
+        row with sibling fields still available. Preserve leaf records too so
+        scalar object metadata remains searchable.
+        """
+
+        row_items: list[dict[str, Any]] = []
+
+        def collect_rows(node: Any) -> None:
+            if isinstance(node, dict):
+                for child in node.values():
+                    collect_rows(child)
+                return
+            if isinstance(node, list):
+                for child in node:
+                    if isinstance(child, dict):
+                        row_items.append(child)
+                    elif isinstance(child, list):
+                        collect_rows(child)
+
+        collect_rows(value)
 
         items: list[dict[str, Any]] = []
 
@@ -571,6 +593,8 @@ class CompressionStore:
             items.append({"type": "json_leaf", "path": path, "value": node})
 
         walk(value, "")
+        if row_items:
+            return row_items + items
         if items:
             return items
         return [{"type": "json_object", "value": value}]

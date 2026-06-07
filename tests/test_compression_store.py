@@ -931,6 +931,33 @@ class TestCompressionStoreSearch:
         assert results[0]["path"] == "module.function"
         assert results[0]["value"] == "_compress_openai_responses_payload"
 
+    def test_search_json_object_returns_matching_array_row(self, store: CompressionStore):
+        """search() returns full rows from common object-wrapped arrays."""
+        original = json.dumps(
+            {
+                "results": [
+                    {
+                        "request_id": "REQ-00000",
+                        "service": "worker",
+                        "status": "ok",
+                    },
+                    {
+                        "request_id": "REQ-IMPORTANT-042",
+                        "service": "fastapi",
+                        "status": "needs-review",
+                    },
+                ]
+            }
+        )
+        hash_key = store.store(original=original, compressed="{}")
+
+        results = store.search(hash_key, "REQ-IMPORTANT-042 needs-review fastapi")
+
+        assert len(results) >= 1
+        assert results[0]["request_id"] == "REQ-IMPORTANT-042"
+        assert results[0]["service"] == "fastapi"
+        assert results[0]["status"] == "needs-review"
+
     def test_search_non_array_returns_empty(self, store: CompressionStore):
         """search() returns empty for JSON objects without matching leaves."""
         hash_key = store.store(original=json.dumps({"key": "value"}), compressed="{}")

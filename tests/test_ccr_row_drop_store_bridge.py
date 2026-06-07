@@ -417,6 +417,10 @@ def test_v1_compress_then_v1_retrieve_resolves_marker_hash() -> None:
                 end += 1
             ccr_hash = messages_blob[start:end]
             assert ccr_hash, "couldn't extract hash from marker"
+            assert ccr_hash in body["ccr_hashes"], (
+                f"/v1/compress should expose marker hash {ccr_hash!r} "
+                f"in ccr_hashes; got {body['ccr_hashes']!r}"
+            )
 
             # The retrieve stats endpoint should now show ≥ 1 entry.
             stats_resp = client.get("/v1/retrieve/stats")
