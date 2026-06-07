@@ -16,6 +16,7 @@ from headroom.providers.codex.install import apply_provider_scope as apply_codex
 from headroom.providers.codex.install import build_install_env as build_codex_install_env
 from headroom.providers.codex.install import revert_provider_scope as revert_codex_provider_scope
 from headroom.providers.copilot.install import build_install_env as build_copilot_install_env
+from headroom.providers.grok.install import build_install_env as build_grok_install_env
 
 
 def _manifest(tmp_path: Path) -> DeploymentManifest:
@@ -84,6 +85,12 @@ def test_codex_build_install_env_returns_proxy_base_url() -> None:
     env = build_codex_install_env(port=5566, backend="ignored")
 
     assert env == {"OPENAI_BASE_URL": "http://127.0.0.1:5566/v1"}
+
+
+def test_grok_build_install_env_returns_proxy_base_url() -> None:
+    env = build_grok_install_env(port=5566, backend="ignored")
+
+    assert env == {"GROK_CLI_CHAT_PROXY_BASE_URL": "http://127.0.0.1:5566/v1"}
 
 
 def test_apply_codex_provider_scope_skips_non_provider_scope(monkeypatch, tmp_path: Path) -> None:
