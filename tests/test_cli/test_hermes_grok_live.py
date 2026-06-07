@@ -1,37 +1,20 @@
 """Optional live Hermes + Headroom integration tests (OpenAI chat path).
 
-Grok Build's ``wrap grok`` routes ``/v1/sessions/*`` traffic — mostly passthrough.
-Hermes on spot-tech-ci exposes ``/v1/chat/completions``, which is the compressible
-path Headroom optimizes when messages include large ``role: tool`` outputs.
-
 Run on a host where Hermes llm-proxy is up (default ``:38765``):
 
     HEADROOM_LIVE_HERMES=1 pytest tests/test_cli/test_hermes_grok_live.py -v
 
-spot-tech-ci (minimal venv — full ``--extra dev`` needs a C++ toolchain)::
+spot-tech-ci minimal venv::
 
-    export PATH="$HOME/.local/bin:$PATH"
-    cd ~/headroom-wrap-grok-clean
     uv venv .venv-live && source .venv-live/bin/activate
     uv pip install httpx pytest
     HEADROOM_LIVE_HERMES=1 pytest tests/test_cli/test_hermes_grok_live.py -v
     python scripts/bench_hermes_headroom.py
-
-Captured agent-tool benchmark (2026-06-07, grok backend):
-
-| Path | ``prompt_tokens`` | Headroom ``tokens.saved`` |
-|------|-------------------|---------------------------|
-| Plain Hermes | 9,763 | — |
-| Headroom → Hermes | 7,964 | 562 (smart_crusher: 1,799) |
 """
 
 from __future__ import annotations
 
 import os
-import shutil
-import socket
-import subprocess
-import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -39,51 +22,23 @@ from typing import Any
 import httpx
 import pytest
 
+from tests.test_cli.hermes_support import (
+    assert_compression_delta,
+    hermes_health_url,
+    hermes_reachable,
+    pick_free_port,
+    start_headroom_proxy,
+    stop_process,
+    wait_proxy_ready,
+)
 from tests.test_cli.hermes_workloads import agent_tool_messages
 
 _LIVE = os.environ.get("HEADROOM_LIVE_HERMES") == "1"
 HERMES_BASE = os.environ.get("HEADROOM_HERMES_BASE_URL", "http://127.0.0.1:38765/v1").rstrip("/")
 HERMES_MODEL = os.environ.get("HEADROOM_HERMES_MODEL", "grok-4.3")
 REPLY_TOKEN = os.environ.get("HEADROOM_HERMES_REPLY_TOKEN", "HERMES_OK")
-HERMES_HEALTH_URL = HERMES_BASE.replace("/v1", "") + "/health"
 
 pytestmark = pytest.mark.skipif(not _LIVE, reason="set HEADROOM_LIVE_HERMES=1 to run live Hermes tests")
-
-
-def _hermes_reachable() -> bool:
-    try:
-        with httpx.Client(timeout=3.0) as client:
-            resp = client.get(HERMES_HEALTH_URL)
-            return resp.status_code == 200
-    except Exception:
-        return False
-
-
-def _pick_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
-
-def _headroom_argv(repo_root: Path) -> list[str]:
-    if shutil.which("headroom"):
-        return ["headroom"]
-    return ["uv", "run", "headroom"]
-
-
-def _wait_proxy_ready(port: int, timeout: float = 180.0) -> None:
-    deadline = time.time() + timeout
-    with httpx.Client(timeout=3.0) as client:
-        while time.time() < deadline:
-            for path in ("/readyz", "/health", "/livez"):
-                try:
-                    resp = client.get(f"http://127.0.0.1:{port}{path}")
-                    if resp.status_code == 200:
-                        return
-                except Exception:
-                    continue
-            time.sleep(1.0)
-    raise RuntimeError(f"headroom proxy on {port} did not become ready")
 
 
 def _chat(
@@ -113,53 +68,37 @@ def repo_root() -> Path:
 
 
 @pytest.fixture(scope="module")
-def hermes_client() -> Iterator[httpx.Client]:
-    if not _hermes_reachable():
-        pytest.skip(f"Hermes not reachable at {HERMES_HEALTH_URL}")
+def hermes_available() -> None:
+    if not hermes_reachable(HERMES_BASE):
+        pytest.skip(f"Hermes not reachable at {hermes_health_url(HERMES_BASE)}")
+
+
+@pytest.fixture(scope="module")
+def hermes_client(hermes_available: None) -> Iterator[httpx.Client]:  # noqa: ARG001
     with httpx.Client() as client:
         yield client
 
 
 @pytest.fixture
-def headroom_proxy(repo_root: Path) -> Iterator[int]:
-    port = _pick_free_port()
-    env = os.environ.copy()
-    env["HEADROOM_TELEMETRY"] = "off"
-    proc = subprocess.Popen(
-        [
-            *_headroom_argv(repo_root),
-            "proxy",
-            "--port",
-            str(port),
-            "--openai-api-url",
-            HERMES_BASE,
-            "--no-telemetry",
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        cwd=repo_root,
-        env=env,
-    )
+def headroom_proxy(repo_root: Path, hermes_available: None) -> Iterator[int]:  # noqa: ARG001
+    port = pick_free_port()
+    proc = start_headroom_proxy(port=port, hermes_base=HERMES_BASE, repo_root=repo_root)
     try:
-        _wait_proxy_ready(port)
+        wait_proxy_ready(port)
         yield port
     finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=15)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+        stop_process(proc)
 
 
-@pytest.mark.skipif(not _hermes_reachable(), reason="Hermes llm-proxy not reachable")
-def test_live_hermes_health(hermes_client: httpx.Client) -> None:
-    resp = hermes_client.get(HERMES_HEALTH_URL)
+def test_live_hermes_health(hermes_client: httpx.Client, hermes_available: None) -> None:  # noqa: ARG001
+    resp = hermes_client.get(hermes_health_url(HERMES_BASE))
     assert resp.status_code == 200
     assert resp.text.strip().lower() in {"ok", '"ok"'}
 
 
-@pytest.mark.skipif(not _hermes_reachable(), reason="Hermes llm-proxy not reachable")
-def test_live_plain_hermes_chat_completion(hermes_client: httpx.Client) -> None:
+def test_live_plain_hermes_chat_completion(
+    hermes_client: httpx.Client, hermes_available: None
+) -> None:  # noqa: ARG001
     body = _chat(
         hermes_client,
         HERMES_BASE,
@@ -171,11 +110,11 @@ def test_live_plain_hermes_chat_completion(hermes_client: httpx.Client) -> None:
     assert int(usage.get("prompt_tokens") or 0) > 0
 
 
-@pytest.mark.skipif(not _hermes_reachable(), reason="Hermes llm-proxy not reachable")
 def test_live_headroom_proxy_routes_to_hermes(
     hermes_client: httpx.Client,
     headroom_proxy: int,
-) -> None:
+    hermes_available: None,
+) -> None:  # noqa: ARG001
     body = _chat(
         hermes_client,
         f"http://127.0.0.1:{headroom_proxy}/v1",
@@ -191,11 +130,11 @@ def test_live_headroom_proxy_routes_to_hermes(
     assert requests_total >= 1
 
 
-@pytest.mark.skipif(not _hermes_reachable(), reason="Hermes llm-proxy not reachable")
 def test_live_headroom_openai_upstream_points_at_hermes(
     hermes_client: httpx.Client,
     headroom_proxy: int,
-) -> None:
+    hermes_available: None,
+) -> None:  # noqa: ARG001
     health_resp = hermes_client.get(f"http://127.0.0.1:{headroom_proxy}/health", timeout=30.0)
     health_resp.raise_for_status()
     health = health_resp.json()
@@ -203,17 +142,18 @@ def test_live_headroom_openai_upstream_points_at_hermes(
     assert config.get("openai_api_url") == HERMES_BASE
 
 
-@pytest.mark.skipif(not _hermes_reachable(), reason="Hermes llm-proxy not reachable")
 def test_live_headroom_compresses_agent_tool_output(
     hermes_client: httpx.Client,
     headroom_proxy: int,
-) -> None:
+    hermes_available: None,
+) -> None:  # noqa: ARG001
     messages = agent_tool_messages()
     plain = _chat(hermes_client, HERMES_BASE, messages)
     wrapped = _chat(hermes_client, f"http://127.0.0.1:{headroom_proxy}/v1", messages)
 
     plain_tokens = int((plain.get("usage") or {}).get("prompt_tokens") or 0)
     wrapped_tokens = int((wrapped.get("usage") or {}).get("prompt_tokens") or 0)
+    content = wrapped["choices"][0]["message"]["content"]
 
     stats_resp = hermes_client.get(f"http://127.0.0.1:{headroom_proxy}/stats", timeout=30.0)
     stats_resp.raise_for_status()
@@ -221,7 +161,10 @@ def test_live_headroom_compresses_agent_tool_output(
     saved = int((stats.get("tokens") or {}).get("saved") or 0)
     strategy_saved = int((stats.get("tokens_saved_by_strategy") or {}).get("smart_crusher") or 0)
 
-    assert plain_tokens > 5000, "tool workload should be large enough to compress"
-    assert wrapped_tokens < plain_tokens or saved > 0 or strategy_saved > 0, (
-        f"expected compression: plain={plain_tokens} wrapped={wrapped_tokens} saved={saved}"
+    assert_compression_delta(
+        plain_prompt_tokens=plain_tokens,
+        wrapped_prompt_tokens=wrapped_tokens,
+        tokens_saved=saved,
+        smart_crusher_saved=strategy_saved,
+        content=content,
     )

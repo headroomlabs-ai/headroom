@@ -771,9 +771,11 @@ GET  https://cli-chat-proxy.grok.com/v1/settings → HTTP/2 200 OK
 POST https://cli-chat-proxy.grok.com/v1/sessions/register → HTTP/2 200 OK
 ```
 
-**Token savings** — Grok Build headless ``-p`` uses ``/v1/sessions/*`` and
-``/v1/traces`` (passthrough today). For measurable compression on
-``/v1/chat/completions``, route through Hermes instead:
+**Routing vs compression** — ``wrap grok`` routes Grok Build ``/v1/sessions/*``
+traffic (passthrough on headless ``-p`` today). For measurable compression use
+``wrap hermes`` (OpenAI ``/v1/chat/completions`` → Hermes llm-proxy).
+
+**Token savings** — large ``role: tool`` outputs compress via SmartCrusher:
 
 ```bash
 # Plain — bots already use this shape (grok-hermes → :38765/v1)
@@ -781,8 +783,9 @@ curl -s http://127.0.0.1:38765/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"grok-4.3","messages":[{"role":"user","content":"Say OK"}],"max_tokens":8}'
 
-# Headroom → Hermes → Grok OAuth
-headroom proxy --openai-api-url http://127.0.0.1:38765/v1 --no-telemetry
+# Headroom → Hermes → Grok OAuth (preferred)
+headroom wrap hermes
+# or: headroom proxy --openai-api-url http://127.0.0.1:38765/v1 --no-telemetry
 OPENAI_BASE_URL=http://127.0.0.1:8787/v1 your-openai-client
 curl -s http://127.0.0.1:8787/stats | jq '.tokens.saved'
 ```
@@ -795,11 +798,15 @@ systemctl --user status llm-proxy hermes-xai-proxy       # both active
 export PATH="$HOME/.local/bin:$PATH"
 uv tool install 'headroom-ai[proxy]'                      # once if needed
 
-# Live pytest (opt-in)
-HEADROOM_LIVE_HERMES=1 uv run --extra dev \
-  pytest tests/test_cli/test_hermes_grok_live.py -v
+# Persistent canary (optional)
+cp scripts/spot-tech-ci-headroom-hermes.service.example \
+  ~/.config/systemd/user/headroom-hermes.service
+systemctl --user enable --now headroom-hermes.service
 
-# Token bench script
+# Live pytest (opt-in; minimal venv on CI host)
+HEADROOM_LIVE_HERMES=1 pytest tests/test_cli/test_hermes_grok_live.py -v
+
+# Token bench (exits non-zero if savings below regression floor)
 python scripts/bench_hermes_headroom.py
 python scripts/bench_hermes_headroom.py --multi-turn
 ```
