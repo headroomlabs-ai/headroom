@@ -9,6 +9,7 @@ unchanged.
 from __future__ import annotations
 
 import os
+import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
@@ -16,12 +17,24 @@ import pytest
 from click.testing import CliRunner
 
 from headroom.cli.main import main
-from headroom.providers.grok.runtime import GROK_PROXY_ENV
+from headroom.providers.grok.runtime import DEFAULT_API_URL, GROK_PROXY_ENV
 
 
 @pytest.fixture
 def runner() -> CliRunner:
     return CliRunner()
+
+
+def _write_grok_env_stub(tmp_path: Path) -> Path:
+    """Stub `grok` that prints the proxy env var Grok Build reads at launch."""
+    stub = tmp_path / "grok"
+    stub.write_text(
+        "#!/bin/sh\n"
+        'printf "proxy=%s\\n" "${GROK_CLI_CHAT_PROXY_BASE_URL:-<unset>}"\n'
+        "exit 0\n"
+    )
+    stub.chmod(0o755)
+    return stub
 
 
 # Real Grok CLI shapes lifted from `grok --help` (2026-06).
@@ -214,18 +227,55 @@ def test_wrap_grok_missing_binary(
     assert "grok" in result.output.lower()
 
 
-def test_wrap_grok_stub_binary_receives_proxy_env(
-    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """End-to-end: a real subprocess child must see GROK_CLI_CHAT_PROXY_BASE_URL."""
-    stub = tmp_path / "grok"
-    stub.write_text('#!/bin/sh\nprintf "%s\\n" "$GROK_CLI_CHAT_PROXY_BASE_URL"\nexit 0\n')
-    stub.chmod(0o755)
-    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}")
+class TestGrokHeadroomVsPlain:
+    """Grok without Headroom uses Grok's hosted proxy; wrap routes through localhost."""
 
-    with patch("headroom.cli.wrap._ensure_proxy", return_value=None):
-        result = runner.invoke(main, ["wrap", "grok", "--no-proxy"])
+    def test_plain_grok_leaves_proxy_env_unset(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        stub = _write_grok_env_stub(tmp_path)
+        monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}")
+        monkeypatch.delenv(GROK_PROXY_ENV, raising=False)
 
-    assert result.exit_code == 0, result.output
-    assert "http://127.0.0.1:8787/v1" in result.output
-    assert "HEADROOM WRAP: GROK" in result.output
+        result = subprocess.run([str(stub)], capture_output=True, text=True, check=True)
+
+        assert result.stdout.strip() == "proxy=<unset>"
+
+    def test_plain_grok_with_manual_export_still_hits_remote_default(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        stub = _write_grok_env_stub(tmp_path)
+        monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}")
+        monkeypatch.setenv(GROK_PROXY_ENV, DEFAULT_API_URL)
+
+        result = subprocess.run([str(stub)], capture_output=True, text=True, check=True)
+
+        assert result.stdout.strip() == f"proxy={DEFAULT_API_URL}"
+
+    def test_headroom_wrap_points_grok_at_local_proxy(
+        self, runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _write_grok_env_stub(tmp_path)
+        monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}")
+        monkeypatch.setenv(GROK_PROXY_ENV, DEFAULT_API_URL)
+
+        with patch("headroom.cli.wrap._ensure_proxy", return_value=None):
+            result = runner.invoke(main, ["wrap", "grok", "--no-proxy", "-p", "ship it"])
+
+        assert result.exit_code == 0, result.output
+        assert f"{GROK_PROXY_ENV}=http://127.0.0.1:8787/v1" in result.output
+        assert DEFAULT_API_URL not in result.output
+        assert "HEADROOM WRAP: GROK" in result.output
+
+    def test_headroom_wrap_custom_port_overrides_remote_default(
+        self, runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _write_grok_env_stub(tmp_path)
+        monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}")
+
+        with patch("headroom.cli.wrap._ensure_proxy", return_value=None):
+            result = runner.invoke(main, ["wrap", "grok", "--no-proxy", "--port", "4242"])
+
+        assert result.exit_code == 0, result.output
+        assert f"{GROK_PROXY_ENV}=http://127.0.0.1:4242/v1" in result.output
+        assert DEFAULT_API_URL not in result.output

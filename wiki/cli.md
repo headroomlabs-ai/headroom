@@ -742,11 +742,28 @@ Requires the `codex` binary on the host.
 
 ### `headroom wrap grok`
 
+**Without Headroom** — Grok Build talks directly to Grok's hosted cli-chat-proxy (no local compression):
+
+```bash
+grok -p "fix the bug"
+# GROK_CLI_CHAT_PROXY_BASE_URL unset → https://cli-chat-proxy.grok.com/v1
+```
+
+**With Headroom** — the same command routes cli-chat-proxy traffic through the local proxy:
+
+```bash
+headroom wrap grok -p "fix the bug"
+# GROK_CLI_CHAT_PROXY_BASE_URL=http://127.0.0.1:8787/v1
+```
+
+More examples:
+
 ```bash
 headroom wrap grok
 headroom wrap grok -p "fix the bug"
 headroom wrap grok -- -p "fix the bug"
 headroom wrap grok --backend anyllm --anyllm-provider groq
+headroom install apply --providers manual --target grok
 ```
 
 | Option / arg | Default | Meaning |
@@ -760,7 +777,7 @@ headroom wrap grok --backend anyllm --anyllm-provider groq
 | `--region` | unset | Cloud region override |
 | `grok_args...` | passthrough | Additional Grok Build CLI arguments |
 
-Sets `GROK_CLI_CHAT_PROXY_BASE_URL` so Grok routes cli-chat-proxy traffic through Headroom. Requires the `grok` binary on the host.
+Sets `GROK_CLI_CHAT_PROXY_BASE_URL` so Grok routes cli-chat-proxy traffic through Headroom. Requires the `grok` binary on the host. Like `wrap aider`, this is launch-time env injection only — no on-disk Grok config is modified.
 
 Use `--` before Grok arguments when a Grok flag could collide with a Headroom option. Grok's `-p` prompt flag also works directly because `headroom wrap grok` preserves unknown options for passthrough.
 
@@ -893,6 +910,7 @@ Legend:
 | `headroom wrap claude` | native | host-bridged | partial |
 | `headroom wrap copilot` | native | not implemented in Docker-native wrapper | none |
 | `headroom wrap codex` | native | host-bridged | partial |
+| `headroom wrap grok` | native | host-bridged | partial |
 | `headroom wrap aider` | native | host-bridged | partial |
 | `headroom wrap cursor` | native | host-bridged | partial |
 | `headroom wrap openclaw` | native | host-bridged | partial |
