@@ -107,6 +107,47 @@ class TestBM25Scorer:
         """BM25Scorer is always available."""
         assert BM25Scorer.is_available()
 
+    def test_compute_idf_follows_standard_formula(self):
+        """IDF rewards rare terms and decays toward zero for common terms."""
+        scorer = BM25Scorer()
+
+        # Absent term contributes nothing.
+        assert scorer._compute_idf("x", doc_count=10, doc_freq=0) == 0.0
+
+        # A term in 1/10 docs is more discriminative than one in 9/10 docs.
+        rare = scorer._compute_idf("x", doc_count=10, doc_freq=1)
+        common = scorer._compute_idf("x", doc_count=10, doc_freq=9)
+        assert rare > common > 0
+
+    def test_batch_idf_downweights_common_terms(self):
+        """A discriminative term outranks one shared across the whole corpus.
+
+        ``shared`` appears in every item, so its corpus IDF approaches zero,
+        while ``zeta`` appears in a single item and stays discriminative. An
+        item matched only on the rare term must therefore outrank an item
+        matched only on the ubiquitous term.
+        """
+        scorer = BM25Scorer()
+        items = [
+            "shared zeta",  # matches both query terms, one of them rare
+            "shared alpha",  # matches only the ubiquitous term
+            "shared beta",
+            "shared gamma",
+        ]
+        context = "shared zeta"
+
+        scores = scorer.score_batch(items, context)
+        assert scores[0].score > scores[1].score
+        assert scores[0].score > scores[2].score
+
+    def test_batch_idf_does_not_change_matched_terms(self):
+        """Corpus IDF affects ranking only, not which terms are reported."""
+        scorer = BM25Scorer()
+        items = ["alpha", "alpha beta"]
+        scores = scorer.score_batch(items, "alpha beta")
+        assert scores[0].matched_terms == ["alpha"]
+        assert sorted(scores[1].matched_terms) == ["alpha", "beta"]
+
 
 class TestEmbeddingScorer:
     """Tests for embedding-based semantic scorer."""

@@ -55,7 +55,7 @@ jobs:
           - target: openclaw
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Setup (shim=${{ matrix.target }})
         uses: ./.github/actions/headroom-e2e-setup

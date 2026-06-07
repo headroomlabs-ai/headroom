@@ -23,6 +23,11 @@ from typing import Any
 import trafilatura
 from trafilatura.settings import use_config
 
+# Suppress trafilatura's internal parse-error noise (e.g. "parsed tree length: 0")
+# which appears at WARNING level on every document that fails to extract content.
+# These are expected failures for non-article pages; log them only at CRITICAL.
+logging.getLogger("trafilatura").setLevel(logging.CRITICAL)
+
 logger = logging.getLogger(__name__)
 
 

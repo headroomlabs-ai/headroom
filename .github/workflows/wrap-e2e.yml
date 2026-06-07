@@ -3,9 +3,28 @@ name: Wrap E2E
 on:
   pull_request:
     branches: [main]
+    paths:
+      - 'headroom/**'
+      - 'crates/**'
+      - 'docker/**'
+      - 'Dockerfile'
+      - 'e2e/**'
+      - 'scripts/install*'
+      - 'pyproject.toml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'uv.lock'
+      - 'sdk/typescript/**'
+      - 'plugins/openclaw/**'
+      - '.github/workflows/wrap-e2e.yml'
   push:
     branches: [main]
   workflow_dispatch:
+
+concurrency:
+  group: wrap-e2e-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   docker-wrap-e2e:
@@ -13,7 +32,7 @@ jobs:
     timeout-minutes: 45
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Build wrap e2e image
         run: docker build -f e2e/wrap/Dockerfile -t headroom-wrap-e2e .

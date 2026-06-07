@@ -13,16 +13,29 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import warnings
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 
 from headroom.models.config import ML_MODEL_DEFAULTS
-from headroom.onnx_runtime import create_cpu_session_options
+from headroom.onnx_runtime import create_cpu_session_options, hf_hub_download_local_first
 
 if TYPE_CHECKING:
     from sentence_transformers import SentenceTransformer
+
+# Suppress HuggingFace Hub warnings about missing tokens and rate limits.
+# These appear whenever hf_hub_download is called without HF_TOKEN set.
+# We operate in an authenticated-optional mode; warnings are not actionable.
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+os.environ.setdefault("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1")
+warnings.filterwarnings("ignore", category=UserWarning, module="huggingface_hub")
+# Also silence the huggingface_hub logger which emits rate-limit advisory messages.
+logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
+# sentence_transformers uses httpx to check model file manifests on every startup.
+# These HEAD/GET requests generate INFO lines per worker; suppress to WARNING.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
@@ -305,13 +318,13 @@ class OnnxLocalEmbedder:
             return
 
         import onnxruntime as ort
-        from huggingface_hub import hf_hub_download
         from tokenizers import Tokenizer
 
         logger.info("Loading ONNX embedding model (all-MiniLM-L6-v2, ~86MB)...")
 
-        model_path = hf_hub_download(self.ONNX_REPO, "model.onnx")
-        tok_path = hf_hub_download(self.ONNX_REPO, "tokenizer.json")
+        # Prefer local cache to avoid a redundant network HEAD on warm starts.
+        model_path = hf_hub_download_local_first(self.ONNX_REPO, "model.onnx")
+        tok_path = hf_hub_download_local_first(self.ONNX_REPO, "tokenizer.json")
 
         # Keep a small thread pool for Docker compatibility and disable ORT's
         # CPU memory arena/pattern caches so long-running proxy workers do not

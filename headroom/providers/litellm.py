@@ -33,6 +33,12 @@ logger = logging.getLogger(__name__)
 # Check if litellm is available
 try:
     import litellm
+
+    # Suppress litellm's startup banner ("Provider List: https://...") and
+    # verbose debug output that spams stdout on every worker import.
+    litellm.suppress_debug_info = True
+    litellm.set_verbose = False
+
     from litellm import get_model_info as litellm_get_model_info
     from litellm import model_cost as litellm_model_cost
     from litellm import token_counter as litellm_token_counter

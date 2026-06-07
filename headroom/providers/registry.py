@@ -126,7 +126,9 @@ def build_proxy_provider_runtime(config: Any) -> ProxyProviderRuntime:
     return ProxyProviderRuntime(
         api_targets=api_targets,
         pipeline_providers={
-            "anthropic": AnthropicProvider(),
+            # warn=False: the proxy pipeline provider intentionally uses tiktoken
+            # approximation (no Anthropic client available at this layer).
+            "anthropic": AnthropicProvider(warn=False),
             "openai": OpenAIProvider(),
         },
     )
@@ -312,8 +314,16 @@ _CLIENT_TRANSPORTS: dict[str, _ClientTransport] = {
 
 def _is_anthropic_auth(headers: Mapping[str, str]) -> bool:
     authorization = headers.get("authorization") or headers.get("Authorization") or ""
+    user_agent = headers.get("user-agent") or headers.get("User-Agent") or ""
     return bool(
         headers.get("x-api-key")
         or headers.get("anthropic-version")
         or authorization.startswith("Bearer sk-ant-")
+        or _is_claude_code_client(user_agent)
     )
+
+
+def _is_claude_code_client(user_agent: str) -> bool:
+    """Return True for Claude Code/Claude CLI requests using Anthropic gateway auth."""
+    normalized = user_agent.lower()
+    return "claude-code/" in normalized or "claude-cli/" in normalized
