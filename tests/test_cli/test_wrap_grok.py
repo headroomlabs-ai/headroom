@@ -38,7 +38,9 @@ def test_wrap_grok_sets_proxy_env(
     assert captured["args"] == ("-p", "fix the bug")
 
 
-def test_wrap_grok_missing_binary(runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_wrap_grok_missing_binary(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.chdir(tmp_path)
 
     with patch("headroom.cli.wrap.shutil.which", return_value=None):

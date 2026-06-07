@@ -22,11 +22,11 @@ from headroom.providers.codex.install import build_install_env as _build_codex_i
 from headroom.providers.codex.install import (
     revert_provider_scope as _revert_codex_provider_scope,
 )
-from headroom.providers.grok.install import build_install_env as _build_grok_install_env
 from headroom.providers.copilot.install import (
     build_install_env as _build_copilot_install_env,
 )
 from headroom.providers.cursor.install import build_install_env as _build_cursor_install_env
+from headroom.providers.grok.install import build_install_env as _build_grok_install_env
 from headroom.providers.openclaw.install import (
     apply_provider_scope as _apply_openclaw_provider_scope,
 )

@@ -591,7 +591,7 @@ Options:
                                   [default: user]
   --providers [auto|all|manual]   Target selection mode for direct tool
                                   configuration.  [default: auto]
-  --target [claude|copilot|codex|aider|cursor|openclaw]
+  --target [claude|copilot|codex|grok|aider|cursor|openclaw]
                                   Tool target to configure when --providers
                                   manual is used.
   --profile TEXT                  Deployment profile name.  [default: default]

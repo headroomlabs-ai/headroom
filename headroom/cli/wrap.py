@@ -47,7 +47,6 @@ from headroom.copilot_auth import (
 from headroom.providers.aider import build_launch_env as _build_aider_launch_env
 from headroom.providers.claude import proxy_base_url as _claude_proxy_base_url
 from headroom.providers.codex import build_launch_env as _build_codex_launch_env
-from headroom.providers.grok import build_launch_env as _build_grok_launch_env
 from headroom.providers.copilot import (
     build_launch_env as _build_copilot_launch_env,
 )
@@ -70,6 +69,7 @@ from headroom.providers.copilot import (
     validate_configuration as _validate_copilot_configuration,
 )
 from headroom.providers.cursor import render_setup_lines as _render_cursor_setup_lines
+from headroom.providers.grok import build_launch_env as _build_grok_launch_env
 from headroom.providers.openclaw import (
     build_plugin_entry as _build_openclaw_plugin_entry_impl,
 )
