@@ -26,6 +26,7 @@ from headroom.providers.copilot.install import (
     build_install_env as _build_copilot_install_env,
 )
 from headroom.providers.cursor.install import build_install_env as _build_cursor_install_env
+from headroom.providers.grok.install import build_install_env as _build_grok_install_env
 from headroom.providers.openclaw.install import (
     apply_provider_scope as _apply_openclaw_provider_scope,
 )
@@ -41,6 +42,7 @@ _ENV_BUILDERS: dict[str, _InstallEnvBuilder] = {
     "claude": _build_claude_install_env,
     "copilot": _build_copilot_install_env,
     "codex": _build_codex_install_env,
+    "grok": _build_grok_install_env,
     "aider": _build_aider_install_env,
     "cursor": _build_cursor_install_env,
 }

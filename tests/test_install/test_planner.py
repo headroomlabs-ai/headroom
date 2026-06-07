@@ -16,6 +16,17 @@ def test_resolve_targets_auto_falls_back_when_detection_empty(monkeypatch) -> No
     ]
 
 
+def test_resolve_targets_auto_detects_grok_binary(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "headroom.install.planner.shutil.which",
+        lambda binary: f"/usr/bin/{binary}" if binary == "grok" else None,
+    )
+
+    targets = resolve_targets(ProviderSelectionMode.AUTO.value, [])
+
+    assert targets == [ToolTarget.GROK.value]
+
+
 def test_build_manifest_for_persistent_docker_sets_expected_defaults() -> None:
     manifest = build_manifest(
         profile="default",
@@ -51,7 +62,7 @@ def test_build_manifest_uses_provider_slice_env_builders_for_all_supported_targe
         runtime_kind="python",
         scope="user",
         provider_mode="manual",
-        targets=["claude", "copilot", "codex", "aider", "cursor"],
+        targets=["claude", "copilot", "codex", "grok", "aider", "cursor"],
         port=9999,
         backend="anyllm",
         anyllm_provider="groq",
@@ -64,6 +75,7 @@ def test_build_manifest_uses_provider_slice_env_builders_for_all_supported_targe
 
     assert manifest.tool_envs["claude"]["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:9999"
     assert manifest.tool_envs["codex"]["OPENAI_BASE_URL"] == "http://127.0.0.1:9999/v1"
+    assert manifest.tool_envs["grok"]["GROK_CLI_CHAT_PROXY_BASE_URL"] == "http://127.0.0.1:9999/v1"
     assert manifest.tool_envs["aider"] == {
         "OPENAI_API_BASE": "http://127.0.0.1:9999/v1",
         "ANTHROPIC_BASE_URL": "http://127.0.0.1:9999",

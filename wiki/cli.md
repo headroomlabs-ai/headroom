@@ -32,6 +32,7 @@ This page is the authoritative reference for the **Python Headroom CLI** exposed
 | `headroom wrap claude` | Start proxy and launch Claude Code | **host-bridged** |
 | `headroom wrap copilot` | Start proxy and launch GitHub Copilot CLI | **python-native only** |
 | `headroom wrap codex` | Start proxy and launch Codex CLI | **host-bridged** |
+| `headroom wrap grok` | Start proxy and launch Grok Build CLI | **host-bridged** |
 | `headroom wrap aider` | Start proxy and launch Aider | **host-bridged** |
 | `headroom wrap cursor` | Start proxy and print Cursor config guidance | **host-bridged** |
 | `headroom wrap openclaw` | Install and configure the OpenClaw plugin | **host-bridged** |
@@ -590,7 +591,7 @@ Options:
                                   [default: user]
   --providers [auto|all|manual]   Target selection mode for direct tool
                                   configuration.  [default: auto]
-  --target [claude|copilot|codex|aider|cursor|openclaw]
+  --target [claude|copilot|codex|grok|aider|cursor|openclaw]
                                   Tool target to configure when --providers
                                   manual is used.
   --profile TEXT                  Deployment profile name.  [default: default]
@@ -738,6 +739,30 @@ headroom wrap codex --backend anyllm --anyllm-provider groq
 | `codex_args...` | passthrough | Additional Codex CLI arguments |
 
 Requires the `codex` binary on the host.
+
+### `headroom wrap grok`
+
+```bash
+headroom wrap grok
+headroom wrap grok -p "fix the bug"
+headroom wrap grok -- -p "fix the bug"
+headroom wrap grok --backend anyllm --anyllm-provider groq
+```
+
+| Option / arg | Default | Meaning |
+|---|---|---|
+| `--port` | `8787` | Proxy port |
+| `--no-proxy` | off | Skip proxy startup and assume an existing proxy is running |
+| `--learn` | off | Enable live traffic learning |
+| `--memory` | off | Enable persistent cross-session memory |
+| `--backend` | unset | Proxy backend override |
+| `--anyllm-provider` | unset | `anyllm` provider override |
+| `--region` | unset | Cloud region override |
+| `grok_args...` | passthrough | Additional Grok Build CLI arguments |
+
+Sets `GROK_CLI_CHAT_PROXY_BASE_URL` so Grok routes cli-chat-proxy traffic through Headroom. Requires the `grok` binary on the host.
+
+Use `--` before Grok arguments when a Grok flag could collide with a Headroom option. Grok's `-p` prompt flag also works directly because `headroom wrap grok` preserves unknown options for passthrough.
 
 ### `headroom wrap copilot`
 
