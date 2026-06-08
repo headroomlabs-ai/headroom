@@ -137,10 +137,7 @@ class TestCompressEndpointBasic:
         messages = [
             {
                 "role": "tool",
-                "content": (
-                    "[100 rows compressed. "
-                    "Retrieve more: hash=abc123def4567890abc123de]"
-                ),
+                "content": ("[100 rows compressed. Retrieve more: hash=abc123def4567890abc123de]"),
             },
             {
                 "role": "assistant",
