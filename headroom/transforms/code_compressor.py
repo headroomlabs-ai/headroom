@@ -276,7 +276,9 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
         terminal_nodes=frozenset({"return_statement", "throw_statement"}),
         raise_nodes=frozenset({"throw_statement"}),
         yield_nodes=frozenset(),
-        assignment_nodes=frozenset({"assignment_expression", "lexical_declaration", "variable_declaration"}),
+        assignment_nodes=frozenset(
+            {"assignment_expression", "lexical_declaration", "variable_declaration"}
+        ),
         call_nodes=frozenset({"call_expression"}),
         identifier_nodes=frozenset({"identifier", "property_identifier"}),
         call_target_nodes=frozenset({"identifier", "property_identifier", "member_expression"}),
@@ -299,7 +301,9 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
         terminal_nodes=frozenset({"return_statement", "throw_statement"}),
         raise_nodes=frozenset({"throw_statement"}),
         yield_nodes=frozenset(),
-        assignment_nodes=frozenset({"assignment_expression", "lexical_declaration", "variable_declaration"}),
+        assignment_nodes=frozenset(
+            {"assignment_expression", "lexical_declaration", "variable_declaration"}
+        ),
         call_nodes=frozenset({"call_expression"}),
         identifier_nodes=frozenset({"identifier", "property_identifier", "type_identifier"}),
         call_target_nodes=frozenset({"identifier", "property_identifier", "member_expression"}),
@@ -399,8 +403,12 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
         call_target_nodes=frozenset({"identifier", "field_expression", "pointer_expression"}),
         guard_statement_nodes=frozenset({"if_statement"}),
         else_clause_nodes=frozenset({"else_clause"}),
-        member_access_nodes=frozenset({"field_expression", "subscript_expression", "pointer_expression"}),
-        mutation_receiver_nodes=frozenset({"field_expression", "subscript_expression", "pointer_expression"}),
+        member_access_nodes=frozenset(
+            {"field_expression", "subscript_expression", "pointer_expression"}
+        ),
+        mutation_receiver_nodes=frozenset(
+            {"field_expression", "subscript_expression", "pointer_expression"}
+        ),
         effect_boundary_nodes=frozenset(),
         detection_hints=("#include", "typedef ", "int main("),
     ),
@@ -422,8 +430,12 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
         call_target_nodes=frozenset({"identifier", "field_expression", "pointer_expression"}),
         guard_statement_nodes=frozenset({"if_statement"}),
         else_clause_nodes=frozenset({"else_clause"}),
-        member_access_nodes=frozenset({"field_expression", "subscript_expression", "pointer_expression"}),
-        mutation_receiver_nodes=frozenset({"field_expression", "subscript_expression", "pointer_expression"}),
+        member_access_nodes=frozenset(
+            {"field_expression", "subscript_expression", "pointer_expression"}
+        ),
+        mutation_receiver_nodes=frozenset(
+            {"field_expression", "subscript_expression", "pointer_expression"}
+        ),
         effect_boundary_nodes=frozenset({"throw_statement", "try_statement"}),
         detection_hints=("#include", "namespace ", "class ", "::"),
     ),
@@ -1534,7 +1546,6 @@ class CodeAwareCompressor(Transform):
 
         # Handle Python docstrings via AST
         docstring_text = ""
-        ds_skip_lines = 0
         ds_end_row = body_node.start_point[0] - 1
         if language == CodeLanguage.PYTHON and body_node.child_count > 0:
             first_child = body_node.children[0]
@@ -1608,7 +1619,6 @@ class CodeAwareCompressor(Transform):
                             else:
                                 docstring_text = first_ds_line
                 # elif REMOVE: docstring_text stays empty
-                ds_skip_lines = ds_start_rel + ds_lines_count
                 ds_end_row = ds_node.end_point[0]
 
         # --- Statement-based body truncation (never cuts mid-expression) ---
@@ -2169,7 +2179,12 @@ def _collect_statement_symbols(
         if node_type in lang_config.call_nodes:
             for call_child in getattr(desc, "children", []):
                 child_type = getattr(call_child, "type", "")
-                if child_type in lang_config.call_target_nodes | lang_config.identifier_nodes | lang_config.member_access_nodes:
+                if (
+                    child_type
+                    in lang_config.call_target_nodes
+                    | lang_config.identifier_nodes
+                    | lang_config.member_access_nodes
+                ):
                     name = record_text(call_child)
                     if name:
                         called.add(name.split(".")[-1])
@@ -2202,8 +2217,7 @@ def _detect_guard_clause(node: Any, lang_config: LangConfig) -> bool:
             terminal_count += 1
 
     has_else = any(
-        getattr(child, "type", "") in lang_config.else_clause_nodes
-        for child in named_children[2:]
+        getattr(child, "type", "") in lang_config.else_clause_nodes for child in named_children[2:]
     )
     return terminal_count > 0 and named_descendants <= 12 and not has_else
 
@@ -2264,7 +2278,12 @@ def _score_statement_unit(
         score += 2.5
     if unit.has_side_effect:
         score += 1.8
-    if unit.kind in {_StatementKind.IF, _StatementKind.FOR, _StatementKind.WHILE, _StatementKind.TRY}:
+    if unit.kind in {
+        _StatementKind.IF,
+        _StatementKind.FOR,
+        _StatementKind.WHILE,
+        _StatementKind.TRY,
+    }:
         score += 0.8
 
     for called in unit.called_names:
@@ -2275,7 +2294,8 @@ def _score_statement_unit(
 
     if context_terms:
         symbol_terms = {
-            name.lower() for name in (unit.defined_names | unit.referenced_names | unit.called_names)
+            name.lower()
+            for name in (unit.defined_names | unit.referenced_names | unit.called_names)
         }
         hits = sum(1 for term in context_terms if term in symbol_terms)
         if hits:
@@ -2286,7 +2306,9 @@ def _score_statement_unit(
     return round(score, 3)
 
 
-def _nearest_definitions(selected: list[_StatementUnit], units: list[_StatementUnit]) -> list[_StatementUnit]:
+def _nearest_definitions(
+    selected: list[_StatementUnit], units: list[_StatementUnit]
+) -> list[_StatementUnit]:
     """Add one backward definition layer for referenced local names."""
     selected_ids = {unit.idx for unit in selected}
     ordered = sorted(selected, key=lambda u: u.idx)
@@ -2334,7 +2356,9 @@ def _select_statement_units(units: list[_StatementUnit], body_limit: int) -> lis
     # Keep the first statement when it fits or when nothing stronger was selected,
     # but do not let a low-value first assignment crowd out terminal/guard/effect
     # statements under very small budgets.
-    if units[0].idx not in selected_ids and (used + units[0].line_count <= body_limit or not selected):
+    if units[0].idx not in selected_ids and (
+        used + units[0].line_count <= body_limit or not selected
+    ):
         selected.append(units[0])
         selected_ids.add(units[0].idx)
         used += units[0].line_count
