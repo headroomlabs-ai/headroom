@@ -1,21 +1,21 @@
-"""Unit tests for headroom.proxy.ssl_context.build_ssl_context.
+"""Unit tests for headroom.proxy.ssl_context.find_ca_bundle.
 
 Covers:
 - Returns None when no env var is set
-- Returns an SSLContext when SSL_CERT_FILE points to a valid PEM file
-- Returns an SSLContext when REQUESTS_CA_BUNDLE points to a valid PEM file
-- Returns an SSLContext when NODE_EXTRA_CA_CERTS points to a valid PEM file
+- Returns a path string when SSL_CERT_FILE points to a valid PEM file
+- Returns a path string when REQUESTS_CA_BUNDLE points to a valid PEM file
+- Returns a path string when NODE_EXTRA_CA_CERTS points to a valid PEM file
 - Priority order: SSL_CERT_FILE beats REQUESTS_CA_BUNDLE beats NODE_EXTRA_CA_CERTS
 - Nonexistent paths are skipped (returns None if all paths are missing)
 """
 
 from __future__ import annotations
 
-import ssl
+import os
 
 import pytest
 
-from headroom.proxy.ssl_context import build_ssl_context
+from headroom.proxy.ssl_context import find_ca_bundle
 
 # Minimal self-signed CA certificate (PEM) used only to verify that
 # load_verify_locations accepts the file.  Generated offline; never used
@@ -57,33 +57,36 @@ def _clean_env(monkeypatch):
         monkeypatch.delenv(var, raising=False)
 
 
-class TestBuildSslContextNoEnvVars:
+class TestFindCaBundleNoEnvVars:
     def test_returns_none_when_no_env_var_set(self, monkeypatch):
         _clean_env(monkeypatch)
-        assert build_ssl_context() is None
+        assert find_ca_bundle() is None
 
 
-class TestBuildSslContextWithValidPem:
-    def test_ssl_cert_file_returns_ssl_context(self, monkeypatch, ca_pem_file):
+class TestFindCaBundleWithValidPem:
+    def test_ssl_cert_file_returns_path(self, monkeypatch, ca_pem_file):
         _clean_env(monkeypatch)
         monkeypatch.setenv("SSL_CERT_FILE", ca_pem_file)
-        ctx = build_ssl_context()
-        assert isinstance(ctx, ssl.SSLContext)
+        ctx = find_ca_bundle()
+        assert isinstance(ctx, str)
+        assert os.path.isfile(ctx)
 
-    def test_requests_ca_bundle_returns_ssl_context(self, monkeypatch, ca_pem_file):
+    def test_requests_ca_bundle_returns_path(self, monkeypatch, ca_pem_file):
         _clean_env(monkeypatch)
         monkeypatch.setenv("REQUESTS_CA_BUNDLE", ca_pem_file)
-        ctx = build_ssl_context()
-        assert isinstance(ctx, ssl.SSLContext)
+        ctx = find_ca_bundle()
+        assert isinstance(ctx, str)
+        assert os.path.isfile(ctx)
 
-    def test_node_extra_ca_certs_returns_ssl_context(self, monkeypatch, ca_pem_file):
+    def test_node_extra_ca_certs_returns_path(self, monkeypatch, ca_pem_file):
         _clean_env(monkeypatch)
         monkeypatch.setenv("NODE_EXTRA_CA_CERTS", ca_pem_file)
-        ctx = build_ssl_context()
-        assert isinstance(ctx, ssl.SSLContext)
+        ctx = find_ca_bundle()
+        assert isinstance(ctx, str)
+        assert os.path.isfile(ctx)
 
 
-class TestBuildSslContextPriority:
+class TestFindCaBundlePriority:
     def test_ssl_cert_file_beats_requests_ca_bundle(self, monkeypatch, tmp_path):
         """SSL_CERT_FILE is used first even when REQUESTS_CA_BUNDLE is also set."""
         _clean_env(monkeypatch)
@@ -97,13 +100,14 @@ class TestBuildSslContextPriority:
         monkeypatch.setenv("REQUESTS_CA_BUNDLE", str(pem2))
 
         # Both files are valid; we cannot easily inspect which CA was loaded
-        # into the context, but we can verify the function returns a context
+        # into the context, but we can verify the function returns a path
         # (not None) and that it is tied to SSL_CERT_FILE by temporarily
         # making REQUESTS_CA_BUNDLE point to a nonexistent path.
         monkeypatch.setenv("REQUESTS_CA_BUNDLE", "/nonexistent/path.pem")
-        ctx = build_ssl_context()
-        # SSL_CERT_FILE still valid → should return a context
-        assert isinstance(ctx, ssl.SSLContext)
+        ctx = find_ca_bundle()
+        # SSL_CERT_FILE still valid → should return a path
+        assert isinstance(ctx, str)
+        assert os.path.isfile(ctx)
 
     def test_ssl_cert_file_beats_node_extra_ca_certs(self, monkeypatch, tmp_path):
         """SSL_CERT_FILE takes precedence over NODE_EXTRA_CA_CERTS."""
@@ -114,8 +118,9 @@ class TestBuildSslContextPriority:
         monkeypatch.setenv("SSL_CERT_FILE", str(pem))
         monkeypatch.setenv("NODE_EXTRA_CA_CERTS", "/nonexistent/node.pem")
 
-        ctx = build_ssl_context()
-        assert isinstance(ctx, ssl.SSLContext)
+        ctx = find_ca_bundle()
+        assert isinstance(ctx, str)
+        assert os.path.isfile(ctx)
 
     def test_requests_ca_bundle_beats_node_extra_ca_certs(self, monkeypatch, tmp_path):
         """REQUESTS_CA_BUNDLE is used before NODE_EXTRA_CA_CERTS."""
@@ -127,22 +132,23 @@ class TestBuildSslContextPriority:
         monkeypatch.setenv("REQUESTS_CA_BUNDLE", str(pem))
         monkeypatch.setenv("NODE_EXTRA_CA_CERTS", "/nonexistent/node.pem")
 
-        ctx = build_ssl_context()
-        assert isinstance(ctx, ssl.SSLContext)
+        ctx = find_ca_bundle()
+        assert isinstance(ctx, str)
+        assert os.path.isfile(ctx)
 
 
-class TestBuildSslContextNonexistentPaths:
+class TestFindCaBundleNonexistentPaths:
     def test_nonexistent_path_is_skipped(self, monkeypatch):
         _clean_env(monkeypatch)
         monkeypatch.setenv("SSL_CERT_FILE", "/nonexistent/path/ca.pem")
-        assert build_ssl_context() is None
+        assert find_ca_bundle() is None
 
     def test_all_nonexistent_returns_none(self, monkeypatch):
         _clean_env(monkeypatch)
         monkeypatch.setenv("SSL_CERT_FILE", "/no/such/file1.pem")
         monkeypatch.setenv("REQUESTS_CA_BUNDLE", "/no/such/file2.pem")
         monkeypatch.setenv("NODE_EXTRA_CA_CERTS", "/no/such/file3.pem")
-        assert build_ssl_context() is None
+        assert find_ca_bundle() is None
 
     def test_first_nonexistent_falls_through_to_valid(self, monkeypatch, ca_pem_file):
         """When the first env var path is missing, the next valid one is used."""
@@ -150,5 +156,5 @@ class TestBuildSslContextNonexistentPaths:
         monkeypatch.setenv("SSL_CERT_FILE", "/nonexistent/ssl.pem")
         monkeypatch.setenv("REQUESTS_CA_BUNDLE", ca_pem_file)
 
-        ctx = build_ssl_context()
-        assert isinstance(ctx, ssl.SSLContext)
+        ctx = find_ca_bundle()
+        assert ctx == ca_pem_file
