@@ -3,11 +3,22 @@ title: Installation
 description: Install Headroom via pip, npm, or Docker. Includes all Python extras, TypeScript setup, Docker image tags, and environment variables.
 ---
 
+---
+
+## Install options
+
+**pip** - you're writing Python, or you need the CLI (`headroom proxy`, `wrap`, `mcp`, `learn`, `perf`), regardless of what language your app is in.
+
+**npm** - you're writing TypeScript/Node and want inline `compress()`, SDK wrapping (`withHeadroom`), or Vercel AI SDK middleware.
+
 ## Python
 
 Headroom requires **Python 3.10+** and is published as `headroom-ai` on PyPI.
-Current release wheels are built for Python **3.10 through 3.13**. If your
-installer is using a newer Python, force a supported interpreter.
+Current release wheels are built for Python **3.10 through 3.13** on Linux
+(manylinux_2_28 x86_64 / aarch64) and macOS (Apple Silicon). Other targets —
+**Windows** and **Intel macOS** — fall back to building the Rust extension
+from the sdist and need a working native toolchain. If your installer is
+using a newer Python, force a supported interpreter.
 
 ### Core package
 
@@ -47,6 +58,40 @@ You can combine extras:
 ```bash
 pip install "headroom-ai[proxy,langchain,ml]"
 ```
+
+### Windows
+
+There are no prebuilt Windows wheels yet, so `pip install headroom-ai`
+(and `uv tool install`, `pipx install`, …) will fall back to building the
+Rust extension from the sdist. The build needs the MSVC toolchain on
+`PATH`. Without it you'll see:
+
+```text
+error: linker `link.exe` not found
+note: please ensure that Visual Studio 2017 or later, or Build Tools for
+Visual Studio were installed with the Visual C++ option
+```
+
+To install the prerequisites:
+
+1. **MSVC toolchain** — install **[Build Tools for Visual Studio](https://visualstudio.microsoft.com/visual-cpp-build-tools/)**
+   and select the *"Desktop development with C++"* workload (this gives
+   you `link.exe`). VS Code on its own is not enough.
+2. **Rust** — install via [rustup](https://rustup.rs/). Choose the
+   `stable-x86_64-pc-windows-msvc` toolchain so Cargo uses the MSVC
+   linker you just installed.
+3. **Open a fresh PowerShell** so the installer's PATH updates take
+   effect, then run the install:
+
+   ```powershell
+   uv tool install --python 3.13 "headroom-ai[all]"
+   # or
+   pip install "headroom-ai[all]"
+   ```
+
+If you'd rather avoid the native toolchain entirely, run Headroom
+through Docker — see the [Docker](#docker) section below. Native
+Windows wheels are tracked in [#636](https://github.com/chopratejas/headroom/issues/636).
 
 ### pipx
 
@@ -189,6 +234,40 @@ These variables configure Headroom at runtime. Set them in your shell, `.env` fi
 |---|---|---|
 | `HEADROOM_BASE_URL` | `http://localhost:8787` | Proxy URL for the TypeScript SDK |
 | `HEADROOM_API_KEY` | _(none)_ | API key if the proxy requires auth |
+
+## Troubleshooting
+
+These are common issues faced during initial setup and how to resolve them.
+
+### Python version error
+
+This project requires **Python 3.10+**.
+
+Check your version:
+
+```bash
+python3 --version
+```
+
+If needed (Mac with Homebrew):
+
+```bash
+brew install python@3.11
+```
+
+### Editable install fails (`pip install -e`)
+
+Upgrade pip to the latest version:
+
+```bash
+python3 -m pip install --upgrade pip
+```
+
+### Missing `cargo` (Rust error)
+
+Some tests require Rust tooling.
+
+The recommended way to install rust is using `rustup`. You can find the official installation instructions [here](https://rust-lang.org/tools/install/).
 
 ## Next steps
 

@@ -49,8 +49,8 @@ def _env(**overrides: str | None) -> Iterator[None]:
                 os.environ[key] = prior
 
 
-def test_timeout_always_refuses_regardless_of_frame_size() -> None:
-    """asyncio.TimeoutError → refuse, even for a tiny frame.
+def test_timeout_refuses_without_client_override_regardless_of_frame_size() -> None:
+    """asyncio.TimeoutError → refuse, even for a tiny non-Codex frame.
 
     Compression timeout fires after ``COMPRESSION_TIMEOUT_SECONDS``, which
     means the pipeline already started work on the frame. A small frame
@@ -62,6 +62,31 @@ def test_timeout_always_refuses_regardless_of_frame_size() -> None:
     assert action.refuse is True
     assert action.reason == "timeout"
     assert action.frame_bytes == 128
+
+
+def test_codex_client_timeout_fails_open_without_env_override() -> None:
+    """Codex direct-proxy traffic should keep flowing on compression timeout."""
+    with _env(**{WS_COMPRESSION_FAIL_OPEN_ENV: None, WS_COMPRESSION_OVERSIZE_BYTES_ENV: None}):
+        action = decide_compression_failure_action(
+            asyncio.TimeoutError(),
+            frame_bytes=128,
+            client="codex",
+        )
+    assert action.refuse is False
+    assert action.reason == "client_override:codex"
+    assert action.frame_bytes == 128
+
+
+def test_non_codex_timeout_still_refuses_without_env_override() -> None:
+    """The Codex override must not restore global fail-open behavior."""
+    with _env(**{WS_COMPRESSION_FAIL_OPEN_ENV: None, WS_COMPRESSION_OVERSIZE_BYTES_ENV: None}):
+        action = decide_compression_failure_action(
+            asyncio.TimeoutError(),
+            frame_bytes=128,
+            client="claude-code",
+        )
+    assert action.refuse is True
+    assert action.reason == "timeout"
 
 
 def test_small_transient_error_falls_through_to_passthrough() -> None:

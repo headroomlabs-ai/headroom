@@ -2957,7 +2957,11 @@ class OpenAIHandlerMixin:
                     decide_compression_failure_action,
                 )
 
-                _http_action = decide_compression_failure_action(_e, _http_body_bytes)
+                _http_action = decide_compression_failure_action(
+                    _e,
+                    _http_body_bytes,
+                    client=client,
+                )
                 if _http_action.refuse:
                     logger.error(
                         "[%s] /v1/responses REFUSING to forward request "
@@ -4125,7 +4129,11 @@ class OpenAIHandlerMixin:
                         decide_compression_failure_action,
                     )
 
-                    _ws_action = decide_compression_failure_action(_ce, _ws_frame_bytes)
+                    _ws_action = decide_compression_failure_action(
+                        _ce,
+                        _ws_frame_bytes,
+                        client=client,
+                    )
                     if _ws_action.refuse:
                         logger.error(
                             "[%s] WS /v1/responses REFUSING to forward "

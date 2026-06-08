@@ -10,7 +10,7 @@ Key Features:
 - Compresses function bodies while maintaining structure
 - Multi-language support via tree-sitter
 - Data-driven language config (no per-language method duplication)
-- Thread-safe (no mutable instance state during compression)
+- Thread-safe (thread-local tree-sitter parsers, no shared mutable state)
 
 Supported Languages (Tier 1):
 - Python, JavaScript, TypeScript
@@ -57,8 +57,7 @@ logger = logging.getLogger(__name__)
 
 # Lazy import for optional dependency
 _tree_sitter_available: bool | None = None
-_tree_sitter_languages: dict[str, Any] = {}
-_tree_sitter_lock = threading.Lock()
+_thread_local = threading.local()
 
 
 def _check_tree_sitter_available() -> bool:
@@ -77,40 +76,64 @@ def _check_tree_sitter_available() -> bool:
 def _get_parser(language: str) -> Any:
     """Get a tree-sitter parser for the given language.
 
+    Returns a **thread-local** ``tree_sitter.Parser`` instance.
+
+    tree-sitter ≥ 0.23 wraps the C ``TSParser`` in a PyO3
+    ``#[pyclass(unsendable)]`` which hard-panics if the object is accessed
+    from any thread other than its creator.  Because Headroom runs
+    compression inside a ``ThreadPoolExecutor``, a single shared parser
+    would be touched from arbitrary pool threads → instant crash.
+
+    We use the stock ``tree_sitter.Parser`` (which returns standard
+    ``tree_sitter.Node`` / ``tree_sitter.Tree`` with property access) and
+    set its language via ``tree_sitter_language_pack.get_language()``.
+    Storing one parser per (thread, language) satisfies the ``unsendable``
+    contract with negligible extra memory.
+
     Args:
         language: Language name (e.g., 'python', 'javascript').
 
     Returns:
-        Configured tree-sitter parser.
+        Configured ``tree_sitter.Parser`` bound to the current thread.
 
     Raises:
         ImportError: If tree-sitter is not installed.
         ValueError: If language is not supported.
     """
-    global _tree_sitter_languages
-
     if not _check_tree_sitter_available():
         raise ImportError(
             "tree-sitter is not installed. Install with: pip install headroom-ai[code]\n"
             "This adds ~50MB for tree-sitter grammars."
         )
 
-    with _tree_sitter_lock:
-        if language not in _tree_sitter_languages:
-            try:
-                from tree_sitter_language_pack import get_parser
+    parsers: dict[str, Any] | None = getattr(_thread_local, "parsers", None)
+    if parsers is None:
+        parsers = {}
+        _thread_local.parsers = parsers
 
-                parser = get_parser(language)  # type: ignore[arg-type]
-                _tree_sitter_languages[language] = parser
-                logger.debug("Loaded tree-sitter parser for %s", language)
-            except Exception as e:
-                raise ValueError(
-                    f"Language '{language}' is not supported by tree-sitter. "
-                    f"Supported: python, javascript, typescript, go, rust, java, c, cpp. "
-                    f"Error: {e}"
-                ) from e
+    if language not in parsers:
+        try:
+            from tree_sitter import Parser
+            from tree_sitter_language_pack import get_language
 
-        return _tree_sitter_languages[language]
+            parser = Parser()
+            # `language` is a validated runtime str; get_language types its arg
+            # as a Literal of supported names, which a dynamic str can't satisfy.
+            parser.language = get_language(language)  # type: ignore[arg-type]
+            parsers[language] = parser
+            logger.debug(
+                "Loaded tree-sitter parser for %s (thread %s)",
+                language,
+                threading.current_thread().name,
+            )
+        except Exception as e:
+            raise ValueError(
+                f"Language '{language}' is not supported by tree-sitter. "
+                f"Supported: python, javascript, typescript, go, rust, java, c, cpp. "
+                f"Error: {e}"
+            ) from e
+
+    return parsers[language]
 
 
 def is_tree_sitter_available() -> bool:
@@ -123,29 +146,29 @@ def is_tree_sitter_available() -> bool:
 
 
 def is_tree_sitter_loaded() -> bool:
-    """Check if any tree-sitter parsers are currently loaded.
+    """Check if any tree-sitter parsers are loaded on the current thread.
 
     Returns:
-        True if parsers are loaded in memory.
+        True if parsers are loaded in this thread's local storage.
     """
-    return len(_tree_sitter_languages) > 0
+    parsers: dict[str, Any] | None = getattr(_thread_local, "parsers", None)
+    return bool(parsers)
 
 
 def unload_tree_sitter() -> bool:
-    """Unload all tree-sitter parsers to free memory.
+    """Unload tree-sitter parsers on the current thread to free memory.
 
     Returns:
         True if parsers were unloaded, False if none were loaded.
     """
-    global _tree_sitter_languages
-
-    with _tree_sitter_lock:
-        if _tree_sitter_languages:
-            count = len(_tree_sitter_languages)
-            _tree_sitter_languages.clear()
-            logger.info("Unloaded %d tree-sitter parsers", count)
-            return True
-
+    parsers: dict[str, Any] | None = getattr(_thread_local, "parsers", None)
+    if parsers:
+        count = len(parsers)
+        parsers.clear()
+        logger.info(
+            "Unloaded %d tree-sitter parsers (thread %s)", count, threading.current_thread().name
+        )
+        return True
     return False
 
 
@@ -617,7 +640,7 @@ class CodeAwareCompressor(Transform):
     - Better compression ratios for code (5-8x vs 3-5x)
     - Lower latency (~20-50ms vs 50-200ms for token-level compressors)
     - Smaller memory footprint (~50MB vs ~1GB)
-    - Thread-safe (no mutable instance state during compression)
+    - Thread-safe (thread-local tree-sitter parsers, no shared mutable state)
 
     Example:
         >>> compressor = CodeAwareCompressor()

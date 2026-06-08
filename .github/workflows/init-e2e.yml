@@ -3,9 +3,29 @@ name: Init E2E
 on:
   pull_request:
     branches: [main]
+    paths:
+      - 'headroom/**'
+      - 'crates/**'
+      - 'docker/**'
+      - 'Dockerfile'
+      - 'e2e/**'
+      - 'scripts/install*'
+      - 'pyproject.toml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'uv.lock'
+      - '.claude-plugin'
+      - '.github/plugin/**'
+      - 'plugins/headroom-agent-hooks/**'
+      - '.github/workflows/init-e2e.yml'
   push:
     branches: [main]
   workflow_dispatch:
+
+concurrency:
+  group: init-e2e-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   docker-init-e2e:
@@ -13,7 +33,7 @@ jobs:
     timeout-minutes: 45
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Build init e2e image
         run: docker build -f e2e/init/Dockerfile -t headroom-init-e2e .

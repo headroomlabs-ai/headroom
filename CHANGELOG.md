@@ -5,6 +5,15 @@ All notable changes to Headroom will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+
+## [Unreleased]
+
+### Bug Fixes
+
+* **deps:** move `gunicorn` to `[proxy-prod]` extra with `sys_platform != 'win32'` guard; removed from `[proxy]` to avoid forcing a Unix-only package on dev, CI, and Windows users ([#537](https://github.com/chopratejas/headroom/pull/537))
+* **startup:** suppress proxy startup log noise — litellm banner, trafilatura parse errors, HuggingFace Hub unauthenticated warnings, tiktoken fallback warning, and httpx INFO lines from sentence_transformers HEAD checks. Affected files: `headroom/providers/litellm.py`, `headroom/transforms/html_extractor.py`, `headroom/memory/adapters/embedders.py`, `headroom/providers/anthropic.py`, `headroom/providers/registry.py`, `headroom/image/onnx_router.py`, `headroom/transforms/kompress_compressor.py`.
+
+
 ## [0.23.0](https://github.com/chopratejas/headroom/compare/v0.22.4...v0.23.0) (2026-06-04)
 
 ### Features
@@ -14,7 +23,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
-<<<<<<< HEAD
 * **ccr:** scope proactive expansion by workspace (cross-project leak) ([197601b](https://github.com/chopratejas/headroom/commit/197601bc64ee72e786bf6b94cd90efcac4269bcf))
 * **ccr:** scope proactive expansion by workspace (cross-project leak) ([1bc163f](https://github.com/chopratejas/headroom/commit/1bc163f5bc1a8422f9ad659061e1fdd8cfeb077b))
 * **codex:** keep init model_provider at config root ([#260](https://github.com/chopratejas/headroom/issues/260)) ([304dcc7](https://github.com/chopratejas/headroom/commit/304dcc78047bc744fc2f7656b484ec54dc271354))
@@ -41,7 +49,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 * Update Next.js to 16.2.4 in docs/bun.lock to address GHSA-gx5p-jg67-6x7h (CVE-2026-44580) ([0b9f11a](https://github.com/chopratejas/headroom/commit/0b9f11a223bb6e6a6c1660ff1dfc1df6d67dfa84))
 * Update Next.js to 16.2.6 in docs/package.json and package-lock.json to address GHSA-h64f-5h5j-jqjh (CVE-2026-44577) ([db5d15f](https://github.com/chopratejas/headroom/commit/db5d15f99e71b69a369eb9c161e04dbffb9b5d4a))
 * Upgrade litellm to 1.86.2 to remediate CVE-2026-42271 ([07581b9](https://github.com/chopratejas/headroom/commit/07581b9e8075b833a6b543149008547260fe9dc0))
-* **deps:** move `gunicorn` to `[proxy-prod]` extra with `sys_platform != 'win32'` guard; removed from `[proxy]` to avoid forcing a Unix-only package on dev, CI, and Windows users ([#537](https://github.com/chopratejas/headroom/pull/537))
 
 
 ### Code Refactoring
@@ -71,6 +78,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 * **tests:** tomllib fallback to tomli on python 3.10 ([74843d1](https://github.com/chopratejas/headroom/commit/74843d1d626de70158a359661a540c615ef1a6c5))
 
 ## [Unreleased]
+
+### Security
+- **`/debug/memory` loopback guard.** The endpoint was missing the
+  `Depends(_require_loopback)` guard that all other `/debug/*` endpoints carry.
+  External callers can no longer reach it.
+- **`retry_max_attempts` zero guard.** When `retry_enabled=True` and
+  `retry_max_attempts=0` the retry loop exited without setting `last_error`,
+  causing `raise last_error` to raise `TypeError: exceptions must derive from
+  BaseException`. A `RuntimeError` with an actionable message is now raised
+  instead, and `ProxyConfig.__post_init__` rejects `retry_max_attempts < 1`
+  at construction time.
+- **Blocking subprocess on async event loop.** `_read_rtk_lifetime_stats` and
+  `_read_lean_ctx_lifetime_stats` called `subprocess.run` directly on the
+  asyncio thread. The `initialize_context_tool_session_baseline` function is
+  now `async` and offloads the subprocess via `asyncio.to_thread`; the stats
+  endpoint uses `await asyncio.to_thread(_get_context_tool_stats)`.
+- **Hardcoded Neo4j credential in `docker-compose.yml`.** `NEO4J_AUTH` now
+  defaults to `${NEO4J_AUTH:-neo4j/devpassword}` and is documented in
+  `.env.example` (excluded from `.gitignore` via `!.env.example`).
+- **`SemanticCache.get_memory_stats()` concurrent iteration.** The method
+  iterates `self._cache.values()` without holding the async lock. A snapshot
+  is now taken via `list(self._cache.values())` before iterating to avoid
+  `RuntimeError: dictionary changed size during iteration` under async load.
+- **Default Neo4j password in `ProxyConfig`.** `memory_neo4j_password` default
+  changed from `"password"` to `""`. The proxy startup path now emits a
+  `logger.warning` when `memory_backend == "qdrant-neo4j"` and the password
+  is empty, prompting operators to set a real credential.
 
 ### Fixed
 - **PyPI install clarity and release gating.** Documented `pipx --python python3.13`

@@ -1,4 +1,4 @@
-```
+<div align="center"><pre>
   ██╗  ██╗███████╗ █████╗ ██████╗ ██████╗  ██████╗  ██████╗ ███╗   ███╗
   ██║  ██║██╔════╝██╔══██╗██╔══██╗██╔══██╗██╔═══██╗██╔═══██╗████╗ ████║
   ███████║█████╗  ███████║██║  ██║██████╔╝██║   ██║██║   ██║██╔████╔██║
@@ -6,7 +6,7 @@
   ██║  ██║███████╗██║  ██║██████╔╝██║  ██║╚██████╔╝╚██████╔╝██║ ╚═╝ ██║
   ╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝╚═════╝ ╚═╝  ╚═╝ ╚═════╝  ╚═════╝ ╚═╝     ╚═╝
                   The context compression layer for AI agents
-```
+</pre></div>
 
 <p align="center"><strong>60–95% fewer tokens · library · proxy · MCP · 6 algorithms · local-first · reversible</strong></p>
 
@@ -26,7 +26,8 @@
   <a href="#proof">Proof</a> ·
   <a href="#agent-compatibility-matrix">Agents</a> ·
   <a href="https://discord.gg/yRmaUNpsPJ">Discord</a> ·
-  <a href="llms.txt">llms.txt</a>
+  <a href="llms.txt">llms.txt</a> ·
+  <a href="ENTERPRISE.md">Enterprise</a>
 </p>
 
 <p align="center"><sub>
@@ -34,9 +35,9 @@
 </sub></p>
 
 ---
-<a href="https://trendshift.io/repositories/20881" target="_blank"><img src="https://trendshift.io/api/badge/repositories/20881" alt="chopratejas%2Fheadroom | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
+<p align="center"><a href="https://trendshift.io/repositories/20881" target="_blank"><img src="https://trendshift.io/api/badge/repositories/20881" alt="chopratejas%2Fheadroom | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a></p>
 
-> Headroom compresses everything your AI agent reads — tool outputs, logs, RAG chunks, files, and conversation history — before it reaches the LLM. Same answers, fraction of the tokens.
+Headroom compresses everything your AI agent reads — tool outputs, logs, RAG chunks, files, and conversation history — before it reaches the LLM. Same answers, fraction of the tokens.
 
 <p align="center">
   <img src="HeadroomDemo-Fast.gif" alt="Headroom in action" width="820">
@@ -122,16 +123,22 @@ Granular extras: `[proxy]`, `[mcp]`, `[ml]`, `[code]`, `[memory]`, `[relevance]`
 
 Reproduce: `python -m headroom.evals suite --tier 1` · [Full benchmarks & methodology](https://headroom-docs.vercel.app/docs/benchmarks)
 
+<a href="https://www.star-history.com/?repos=chopratejas%2Fheadroom&type=date&legend=top-left">
+ <picture>
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=chopratejas/headroom&type=date&legend=top-left" />
+ </picture>
+</a>
+
 ## Agent compatibility matrix
 
 | Agent       | `headroom wrap` | Notes                            |
 |-------------|:---------------:|----------------------------------|
-| Claude Code | ●               | `--memory` · `--code-graph`      |
-| Codex       | ●               | shares memory with Claude        |
-| Cursor      | ●               | prints config — paste once       |
-| Aider       | ●               | starts proxy + launches          |
-| Copilot CLI | ●               | starts proxy + launches          |
-| OpenClaw    | ●               | installs as ContextEngine plugin |
+| Claude Code | ✅              | `--memory` · `--code-graph`      |
+| Codex       | ✅              | shares memory with Claude        |
+| Cursor      | ✅              | prints config — paste once       |
+| Aider       | ✅              | starts proxy + launches          |
+| Copilot CLI | ✅              | starts proxy + launches          |
+| OpenClaw    | ✅              | installs as ContextEngine plugin |
 
 Any OpenAI-compatible client works via `headroom proxy`. MCP-native: `headroom mcp install`.
 

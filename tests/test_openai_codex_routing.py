@@ -340,6 +340,40 @@ def test_handle_openai_responses_memory_timeout_fails_open(monkeypatch):
     assert body.get("instructions") is None
 
 
+def test_codex_responses_timeout_fails_open_in_standalone_proxy(monkeypatch):
+    """Codex users running only the proxy still get fail-open on timeout."""
+    request = _build_request(
+        {
+            "model": "gpt-5.4",
+            "input": [
+                {
+                    "type": "function_call_output",
+                    "call_id": "call-1",
+                    "output": "large tool output",
+                }
+            ],
+        },
+        {"Authorization": "Bearer sk-test", "x-client": "codex"},
+    )
+    handler = _DummyOpenAIHandler()
+    handler.config.optimize = True
+
+    monkeypatch.setattr("headroom.tokenizers.get_tokenizer", lambda model: _DummyTokenizer())
+    monkeypatch.setattr(
+        handler,
+        "_compress_openai_responses_payload",
+        lambda *args, **kwargs: (_ for _ in ()).throw(TimeoutError()),
+    )
+
+    response = anyio.run(handler.handle_openai_responses, request)
+
+    assert response.status_code == 200
+    assert handler.captured_request is not None
+    _, url, _, body = handler.captured_request
+    assert url == "https://api.openai.com/v1/responses"
+    assert body["input"][0]["output"] == "large tool output"
+
+
 class _DummyWebSocket:
     def __init__(self, headers: dict[str, str]):
         self.headers = headers

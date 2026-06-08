@@ -521,3 +521,47 @@ def test_v1_models_still_forwards_under_non_chatgpt_auth() -> None:
     assert response.status_code == 200
     # Forwarded — not synthesized — because no chatgpt-account-id header.
     assert calls, "Non-ChatGPT-auth /v1/models must forward, not synthesize"
+
+
+def test_v1_models_routes_claude_code_gateway_discovery_to_anthropic() -> None:
+    """Claude Code gateway/OAuth model discovery can use a Bearer token that
+    does not look like an Anthropic API key. Route those `/v1/models` requests
+    to Anthropic so Claude's gateway model cache is not populated from OpenAI.
+    """
+    calls: list[tuple[str, str, str]] = []
+
+    async def fake_passthrough(self, request, base_url, sub_path="", provider_name=""):  # type: ignore[no-untyped-def]
+        calls.append((request.url.path, base_url, provider_name))
+        return JSONResponse({"base_url": base_url, "provider": provider_name})
+
+    with patch.object(HeadroomProxy, "handle_passthrough", fake_passthrough):
+        with TestClient(_app()) as client:
+            list_response = client.get(
+                "/v1/models",
+                headers={
+                    "authorization": "Bearer claude-gateway-oauth-token",
+                    "user-agent": "claude-code/1.5.0 (darwin; arm64)",
+                },
+            )
+            get_response = client.get(
+                "/v1/models/claude-opus-4-8",
+                headers={
+                    "authorization": "Bearer claude-gateway-oauth-token",
+                    "user-agent": "claude-code/1.5.0 (darwin; arm64)",
+                },
+            )
+
+    assert list_response.status_code == 200
+    assert get_response.status_code == 200
+    assert list_response.json() == {
+        "base_url": "https://api.anthropic.test",
+        "provider": "anthropic",
+    }
+    assert get_response.json() == {
+        "base_url": "https://api.anthropic.test",
+        "provider": "anthropic",
+    }
+    assert calls == [
+        ("/v1/models", "https://api.anthropic.test", "anthropic"),
+        ("/v1/models/claude-opus-4-8", "https://api.anthropic.test", "anthropic"),
+    ]

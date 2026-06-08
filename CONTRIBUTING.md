@@ -1,227 +1,119 @@
 # Contributing to Headroom
 
-Thank you for your interest in contributing to Headroom! This document provides guidelines and instructions for contributing.
+Thanks for contributing! Please skim this before opening a PR : the policies exist because we've been burned skipping them, not because we love paperwork.
 
-## Code of Conduct
+By participating, you agree to our [Code of Conduct](CODE_OF_CONDUCT.md).
 
-By participating in this project, you agree to abide by our [Code of Conduct](CODE_OF_CONDUCT.md).
+## Where does my contribution go?
 
-## How to Contribute
+| Type | What to do |
+| --- | --- |
+| 🐛 Bug or small fix | **Open a PR** (with repro + test) |
+| ✨ New feature / architectural change | **Open an issue or ask in Discord first.** |
+| 🧹 Refactor-only | **Don't.** Only if a maintainer asked, as part of a concrete fix. |
+| 🧪 Test/CI-only PR chasing a known `main` failure | **Don't.** We're tracking it. |
+| 📦 New dep or version bump | **PR with written justification.** |
+| ❓ Question | **Discord `#help` |
 
-### Reporting Bugs
+**Open PR cap: 10 per author.** Get existing ones merged before opening more.
 
-Before creating a bug report, please check existing issues to avoid duplicates. When creating a bug report, include:
+## Guiding principles
 
-- **Clear title** describing the issue
-- **Steps to reproduce** the behavior
-- **Expected behavior** vs what actually happened
-- **Environment details** (Python version, OS, Headroom version)
-- **Code samples** or minimal reproduction if possible
+- **Verification is the author's job, not the reviewer's.**
+- **Supply chain is a real threat.** Dependency changes get human review, every time.
 
-### Suggesting Features
+## Bug fixes
 
-Feature requests are welcome! Please:
+Every bug-fix PR must include:
 
-- Check existing issues/discussions first
-- Clearly describe the use case and motivation
-- Explain how it fits with Headroom's goals (context optimization, safety, determinism)
+1. **A reproduction** — minimal code, failing test, or steps.
+2. **A test that fails before your fix and passes after** (unit, integration, or e2e).
 
-### Pull Requests
+If you genuinely can't write a test, say so explicitly and explain how you verified.
 
-1. **Fork the repository** and create your branch from `main`
-2. **Install development dependencies**:
-   ```bash
-   pip install -e ".[dev]"
-   ```
-3. **Make your changes** following our coding standards
-4. **Add tests** for new functionality
-5. **Run the test suite**:
-   ```bash
-   pytest
-   ```
-6. **Run linting**:
-   ```bash
-   ruff check .
-   ruff format .
-   ```
-7. **Update documentation** if needed
-8. **Submit your PR** with a clear description
+## "Real behavior proof" — required on every external PR
 
-## Development Setup
+We can't merge what we can't verify. Include a **`Real behavior proof`** section in the PR body covering:
+
+- **Setup you tested on** (OS, Python, config, provider/model)
+- **Exact command or steps you ran after the patch**
+- **After-fix evidence** + **observed result**
+- **What you did *not* test**
+
+✅ Counts: screenshots, recordings, terminal output, copied live output, linked artifacts, redacted runtime logs.
+❌ Does **not** count alone: unit tests, mocks, snapshots, lint, typechecks, green CI. Have them too — but they prove the test passes, not that the feature works.
+
+**PRs missing this may be autoclosed.**
+
+## New features
+
+Before writing code:
+
+1. **Open a feature-request issue** (or raise in Discord).
+2. **Get a 👍 from a core maintainer** before implementing.
+3. **Include a short spec** covering:
+   - **API surface** (public functions, config, CLI flags)
+   - **Changes to existing behavior**
+   - **User stories** — Given / When / Then, golden path + one edge case
+   - **Failure modes**
+   - **Recovery / resilience**
+   - **Security considerations**
+
+Short and concrete beats long.
+
+## Dependencies & supply chain
+
+A human maintainer reviews every dep change. PRs that add or bump a package must justify:
+
+- **Why this package** (vs. doing it ourselves / using existing deps)
+- **Who maintains it** (activity, release cadence, security history)
+- **Install surface** (transitive deps, native code, install/runtime network)
+- **Why this version** — permitted reasons: **bug fix**, **security patch**, **required new functionality**. Cosmetic bumps will be closed.
+
+## PR workflow
+
+1. Fork, branch from `main`.
+2. `pip install -e ".[dev]"`
+3. One logical change per PR.
+4. Add tests.
+5. `pytest` · `ruff check .` · `ruff format .`
+6. Update `CHANGELOG.md` for user-facing changes.
+7. Open the PR with a clear description + `Real behavior proof` + any spec/justification required.
+
+**Title format** (conventional commits): `feat:`, `fix:`, `docs:`, `test:`, `refactor:`.
+
+**Review:** CI green, one maintainer review, coverage held/improved.
+
+## Development setup
 
 ```bash
-# Clone the repository
 git clone https://github.com/chopratejas/headroom.git
 cd headroom
-
-# Create a virtual environment
-python -m venv .venv
-source .venv/bin/activate  # or `.venv\Scripts\activate` on Windows
-
-# Install in development mode with all dependencies
+python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev,relevance,proxy]"
-
-# Run tests
 pytest
-
-# Run tests with coverage
-pytest --cov=headroom --cov-report=html
 ```
 
 ### Dev Containers
 
-If you use VS Code or GitHub Codespaces, Headroom ships two Dev Container configs:
+Two configs ship for VS Code / Codespaces:
 
-- **`.devcontainer/devcontainer.json`** - default contributor environment with Python 3.12, `uv`, Node.js, and GitHub CLI
-- **`.devcontainer/memory-stack/devcontainer.json`** - the same environment plus Qdrant and Neo4j sidecars, with the locked `memory-stack` extra installed for `qdrant-neo4j` backend work
+- **`.devcontainer/devcontainer.json`** — Python 3.12, `uv`, Node.js, `gh`.
+- **`.devcontainer/memory-stack/devcontainer.json`** — adds Qdrant + Neo4j sidecars (use `qdrant:6333`, `neo4j://neo4j:7687`).
 
-Inside the memory-stack container, use the sidecar service names instead of `localhost`:
+Inside, use: `uv run ruff check .`, `uv run pytest`, etc.
 
-```bash
-qdrant:6333
-neo4j://neo4j:7687
-```
+## Coding standards
 
-The default container runs `uv sync --frozen --extra dev` on creation, so the usual repo commands become:
+- [Ruff](https://github.com/astral-sh/ruff) for lint + format, line length 100, PEP 8.
+- Type hints on public functions; Google-style docstrings.
+- Cover new behavior + edge cases; aim >80% coverage on new code.
+- Python 3.10+. Optional features go behind extras.
 
-```bash
-uv run ruff check .
-uv run ruff format --check .
-uv run mypy headroom --ignore-missing-imports
-uv run pytest -v --tb=short
-```
+## Architecture principles
 
-## Coding Standards
+**Safety first:** never drop user/assistant content, never break tool call/response pairing, malformed content passes through unchanged, prefer false negatives.
 
-### Style
+**Performance:** transforms <50ms at P99, lazy-load optional deps, profile before optimizing.
 
-- We use [Ruff](https://github.com/astral-sh/ruff) for linting and formatting
-- Line length: 100 characters
-- Use type hints for all public functions
-- Follow PEP 8 naming conventions
-
-### Code Organization
-
-```
-headroom/
-├── __init__.py          # Public API exports
-├── client.py            # HeadroomClient wrapper
-├── config.py            # Configuration dataclasses
-├── transforms/          # Context transforms
-│   ├── smart_crusher.py # Statistical compression
-│   ├── cache_aligner.py # Cache optimization
-│   └── rolling_window.py# Context windowing
-├── relevance/           # Relevance scoring
-├── providers/           # LLM provider adapters
-├── proxy/               # Proxy server
-└── storage/             # Metrics storage
-```
-
-### Testing
-
-- Write tests for all new functionality
-- Use pytest fixtures for common setup
-- Test edge cases and error conditions
-- Aim for >80% coverage on new code
-
-Example test structure:
-```python
-class TestSmartCrusher:
-    """Tests for SmartCrusher transform."""
-
-    def test_compresses_large_arrays(self):
-        """Should compress arrays above token threshold."""
-        ...
-
-    def test_preserves_errors(self):
-        """Should never drop items containing errors."""
-        ...
-```
-
-### Documentation
-
-- Add docstrings to all public classes and functions
-- Use Google-style docstrings
-- Update README.md for user-facing changes
-- Add examples for new features
-
-```python
-def compress_tool_output(
-    content: str,
-    max_items: int = 50,
-) -> str:
-    """Compress tool output while preserving important items.
-
-    Args:
-        content: The tool output content (usually JSON).
-        max_items: Maximum items to keep in arrays.
-
-    Returns:
-        Compressed content string.
-
-    Raises:
-        ValueError: If content is not valid JSON.
-
-    Example:
-        >>> compress_tool_output('[{"id": 1}, {"id": 2}]', max_items=1)
-        '[{"id": 1}]'
-    """
-```
-
-## Pull Request Guidelines
-
-### PR Title Format
-
-Use conventional commit style:
-- `feat: Add semantic caching to proxy`
-- `fix: Handle empty tool outputs correctly`
-- `docs: Update proxy documentation`
-- `test: Add tests for CacheAligner`
-- `refactor: Simplify rolling window logic`
-
-### PR Description
-
-Include:
-- **What** changes were made
-- **Why** the changes were needed
-- **How** to test the changes
-- **Breaking changes** if any
-
-### Review Process
-
-1. All PRs require at least one review
-2. CI must pass (tests, linting, type checking)
-3. Maintain or improve test coverage
-4. Update CHANGELOG.md for notable changes
-
-## Architecture Decisions
-
-### Safety First
-
-Headroom's core principle is **safety**. When in doubt:
-- Never drop user/assistant content
-- Never break tool call/response pairing
-- Malformed content passes through unchanged
-- Prefer false negatives over false positives
-
-### Performance
-
-- Transforms should add <50ms latency at P99
-- Use lazy loading for optional dependencies
-- Profile before optimizing
-
-### Compatibility
-
-- Support Python 3.10+
-- Core functionality has minimal dependencies
-- Optional features use extras (e.g., `pip install headroom[relevance]`)
-
-
-## Recognition
-
-Contributors are recognized in:
-- The CHANGELOG for their contributions
-- The GitHub contributors page
-- Release notes for significant features
-
-Thank you for contributing to Headroom!
+Contributors are credited in `CHANGELOG`, the GitHub contributors page, and release notes. Thanks again. 💚

@@ -22,7 +22,38 @@ Mechanically: the Copilot CLI's only interposition hook is its provider-override
 subscription token** and points back at **GitHub's own Copilot API**. So the CLI
 may print "BYOK" and require an explicit `--model`, but you are **not** paying a
 third party — it's your subscription, just compressed. (Proof it's working: the
-proxy forwards to `https://api.*.githubcopilot.com` with your token.)
+proxy forwards to GitHub's Copilot API — `https://api.githubcopilot.com` by
+default — with your token.)
+
+## API host & Enterprise / data-residency
+
+Headroom routes wrapped Copilot traffic to GitHub's **generic public host**,
+`https://api.githubcopilot.com`, for both `--subscription` and the implicit
+OAuth path. That host serves the full model set (including newer models on the
+responses API) and matches the routing that worked before 0.23.
+
+Headroom deliberately does **not** auto-select a per-account host from
+`/copilot_internal/user`. That endpoint advertises a segmented host (e.g.
+`api.individual.githubcopilot.com`) that does **not** serve newer models on the
+responses API and is not the host the official Copilot client routes with — using
+it regressed `headroom wrap copilot` after 0.22.4
+([#610](https://github.com/chopratejas/headroom/issues/610)).
+
+**Enterprise / data-residency:** if your organization is provisioned on a
+dedicated Copilot API host (GitHub Enterprise Cloud with data residency, or an
+egress proxy), pin it explicitly — the override flows through both
+`--subscription` and OAuth, and onward through the proxy to the upstream request:
+
+```bash
+export GITHUB_COPILOT_API_URL=https://api.<your-host>.githubcopilot.com
+headroom wrap copilot --subscription -- --model gpt-5.4
+```
+
+If you operate such an environment and would like Headroom to **auto-detect** the
+correct host instead of pinning it, please [open an issue](https://github.com/chopratejas/headroom/issues/new) —
+the intended path is to resolve it from GitHub's token-exchange endpoint (the
+source the official Copilot client uses), and we'd want to validate it against a
+real enterprise tenant.
 
 ## Status
 

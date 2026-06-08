@@ -118,12 +118,17 @@ class SemanticCache:
         """
         from ..memory.tracker import ComponentStats
 
-        # Calculate size - this is sync but we access _cache directly
-        # Note: This is a rough estimate, not perfectly accurate under async load
+        # Take a snapshot of cache values under the lock to avoid iterating
+        # over a dict that may be mutated concurrently by async coroutines.
+        # The lock is an asyncio.Lock and cannot be acquired in a sync method,
+        # so we do a single atomic copy of the values view instead.
+        snapshot = list(self._cache.values())
+        entry_count = len(snapshot)
+
         size_bytes = sys.getsizeof(self._cache)
         total_hits = 0
 
-        for entry in self._cache.values():
+        for entry in snapshot:
             size_bytes += sys.getsizeof(entry)
             size_bytes += len(entry.response_body)
             size_bytes += sys.getsizeof(entry.response_headers)
@@ -133,7 +138,7 @@ class SemanticCache:
 
         return ComponentStats(
             name="semantic_cache",
-            entry_count=len(self._cache),
+            entry_count=entry_count,
             size_bytes=size_bytes,
             budget_bytes=None,
             hits=total_hits,

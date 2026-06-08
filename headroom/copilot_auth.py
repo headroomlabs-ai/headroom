@@ -474,21 +474,27 @@ def build_copilot_upstream_url(base_url: str, path: str) -> str:
 
 
 def resolve_copilot_api_url(oauth_token: str | None = None) -> str:
-    """Return the Copilot API endpoint advertised for the current OAuth token."""
+    """Return the Copilot API host to route wrapped requests through.
 
-    token = (oauth_token or read_cached_oauth_token() or "").strip()
-    if not token:
-        return os.environ.get("GITHUB_COPILOT_API_URL", DEFAULT_API_URL).strip() or DEFAULT_API_URL
+    Resolution order:
 
-    payload = _fetch_copilot_user_info(token)
-    if payload is None:
-        return os.environ.get("GITHUB_COPILOT_API_URL", DEFAULT_API_URL).strip() or DEFAULT_API_URL
+    1. An explicit ``GITHUB_COPILOT_API_URL`` — the operator's escape hatch
+       (corporate proxy, enterprise / data-residency host, tests).
+    2. The generic public host ``https://api.githubcopilot.com``.
 
-    endpoints = payload.get("endpoints") if isinstance(payload, dict) else None
-    api_url = endpoints.get("api") if isinstance(endpoints, dict) else None
-    if isinstance(api_url, str) and api_url.strip():
-        return api_url.strip()
-    return os.environ.get("GITHUB_COPILOT_API_URL", DEFAULT_API_URL).strip() or DEFAULT_API_URL
+    The account-specific ``endpoints.api`` advertised by ``/copilot_internal/user``
+    is intentionally NOT used to route. It returns a segmented host (e.g.
+    ``api.individual.githubcopilot.com``) that does not serve newer models on the
+    responses API — wrapping such a request regressed after 0.22.4 (#610) — and it
+    is not the host the official Copilot client routes with (that comes from the
+    token-exchange endpoint, not user info). Accounts that genuinely require a
+    dedicated host set ``GITHUB_COPILOT_API_URL`` explicitly. ``oauth_token`` is
+    accepted for call-site compatibility but no longer triggers a network lookup.
+    """
+
+    del oauth_token  # reserved; routing no longer depends on a user-info lookup
+    override = os.environ.get("GITHUB_COPILOT_API_URL", "").strip()
+    return override or DEFAULT_API_URL
 
 
 def _fetch_copilot_user_info(token: str) -> dict[str, Any] | None:

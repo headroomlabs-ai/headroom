@@ -794,7 +794,8 @@ class CompressionFailureAction:
     reason: str
     """Short machine-readable label for telemetry. One of:
     ``timeout``, ``oversize:bytes=<n>>threshold=<m>``,
-    ``small_frame_transient``, or ``env_override:fail_open``."""
+    ``small_frame_transient``, ``client_override:codex``, or
+    ``env_override:fail_open``."""
 
     frame_bytes: int
     """Original frame size in bytes (for logging / metrics)."""
@@ -803,6 +804,8 @@ class CompressionFailureAction:
 def decide_compression_failure_action(
     exception: BaseException,
     frame_bytes: int,
+    *,
+    client: str | None = None,
 ) -> CompressionFailureAction:
     """Decide whether to refuse-and-close vs forward-original after the
     proxy's compression pipeline fails on a Realtime WebSocket frame
@@ -812,6 +815,10 @@ def decide_compression_failure_action(
 
     * env :data:`WS_COMPRESSION_FAIL_OPEN_ENV` truthy → forward (legacy
       behaviour, opt-in for debugging or strict compatibility).
+    * Codex client compression timeout → forward. Codex currently treats
+      the proxy's 1009/413 refusal path as a hard connection failure, so
+      fail-open is safer for Codex sessions even when the proxy is run
+      standalone rather than through ``headroom wrap codex``.
     * exception is :class:`asyncio.TimeoutError` → refuse (the compression
       stage hit its own timeout, which only fires on frames Headroom
       thought were big enough to need compression in the first place).
@@ -831,6 +838,13 @@ def decide_compression_failure_action(
         return CompressionFailureAction(
             refuse=False,
             reason="env_override:fail_open",
+            frame_bytes=frame_bytes,
+        )
+
+    if (client or "").strip().lower() == "codex" and isinstance(exception, asyncio.TimeoutError):
+        return CompressionFailureAction(
+            refuse=False,
+            reason="client_override:codex",
             frame_bytes=frame_bytes,
         )
 
@@ -1233,11 +1247,11 @@ def _read_context_tool_lifetime_stats(tool: str) -> dict[str, Any] | None:
     return _read_rtk_lifetime_stats()
 
 
-def initialize_context_tool_session_baseline() -> None:
+async def initialize_context_tool_session_baseline() -> None:
     """Pin the current context-tool counters as the proxy-session baseline."""
 
     tool = _selected_context_tool()
-    payload = _read_context_tool_lifetime_stats(tool)
+    payload = await asyncio.to_thread(_read_context_tool_lifetime_stats, tool)
     with _context_tool_stats_cache_lock:
         _context_tool_session_baseline.update(
             {
@@ -1261,10 +1275,10 @@ def initialize_context_tool_session_baseline() -> None:
         )
 
 
-def initialize_rtk_session_baseline() -> None:
-    """Pin the current context-tool counters as the proxy-session baseline."""
+async def initialize_rtk_session_baseline() -> None:
+    """Backward-compatible alias for initialize_context_tool_session_baseline."""
 
-    initialize_context_tool_session_baseline()
+    await initialize_context_tool_session_baseline()
 
 
 def _get_context_tool_stats() -> dict[str, Any] | None:
@@ -2290,11 +2304,14 @@ def apply_session_sticky_memory_tools(
             try:
                 tool_def = json.loads(golden_bytes.decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                # Should never happen — golden bytes were produced by us.
-                # Loud failure per build constraint #4.
-                raise RuntimeError(
-                    f"corrupt golden tool bytes for session {session_id} tool {tool_name}: {exc}"
-                ) from exc
+                logger.error(
+                    "corrupt golden tool bytes for session %s tool %s: %s — skipping tool injection",
+                    session_id,
+                    tool_name,
+                    exc,
+                    exc_info=True,
+                )
+                continue
             tools_out.append(tool_def)
             existing_names.add(tool_name)
             replay_bytes += len(golden_bytes)
@@ -2570,21 +2587,24 @@ def apply_session_sticky_ccr_tool(
         if golden is not None:
             try:
                 tool_def = json.loads(golden.decode("utf-8"))
+                tools_out.append(tool_def)
+                log_tool_injection_decision(
+                    provider=provider,
+                    session_id=session_id,
+                    decision="inject_sticky_replay",
+                    tool_definition_bytes_count=len(golden),
+                    request_id=request_id,
+                )
+                return tools_out, True
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                # Should never happen — golden bytes were produced by us.
-                raise RuntimeError(
-                    f"corrupt golden CCR tool bytes for session {session_id}: {exc}"
-                ) from exc
-            tools_out.append(tool_def)
-            log_tool_injection_decision(
-                provider=provider,
-                session_id=session_id,
-                decision="inject_sticky_replay",
-                tool_definition_bytes_count=len(golden),
-                request_id=request_id,
-            )
-            return tools_out, True
-        # Tracker says "done CCR" but somehow has no golden bytes. Pin
+                logger.error(
+                    "corrupt golden CCR tool bytes for session %s: %s — regenerating fresh definition",
+                    session_id,
+                    exc,
+                    exc_info=True,
+                )
+                # Fall through to fresh creation below
+        # Tracker says "done CCR" but has no golden bytes (or they were corrupt). Pin
         # them now so future turns are stable.
         tool_def = create_ccr_tool_definition(provider)
         canonical = serialize_tool_definition_canonical(tool_def)

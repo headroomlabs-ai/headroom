@@ -486,3 +486,223 @@ def test_wrap_copilot_fails_when_binary_missing(
     assert result.exit_code == 1
     assert "'copilot' not found in PATH" in result.output
     assert "Install GitHub Copilot CLI" in result.output
+
+
+# ---------------------------------------------------------------------------
+# Regression suite for #610 — GitHub Copilot endpoint routing per auth mode.
+#
+# 0.23.0 (commit f4dff9b) re-pointed the *shared* OAuth branch away from the
+# generic https://api.githubcopilot.com to the account-specific endpoints.api
+# host returned by /copilot_internal/user, and made resolve_copilot_api_url()
+# ignore the GITHUB_COPILOT_API_URL override whenever a token resolves. For
+# individual-plan users that broke newer models (gpt-5.4) on the responses API
+# that had worked on 0.22.4. The pre-existing oauth test passed only because it
+# left _fetch_copilot_user_info unmocked — the network call fails in CI, so
+# resolve_copilot_api_url() fell back to the generic host and the real-world
+# success path was never exercised. These tests mock a *successful* user-info
+# response (the real world) so the routing for every auth mode is locked.
+# ---------------------------------------------------------------------------
+
+_ACCOUNT_USER_INFO = {"endpoints": {"api": "https://api.individual.githubcopilot.com"}}
+
+
+def _clear_copilot_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for var in (
+        "COPILOT_PROVIDER_API_KEY",
+        "COPILOT_PROVIDER_BEARER_TOKEN",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "GITHUB_COPILOT_API_URL",
+        "GITHUB_COPILOT_TOKEN",
+        "GITHUB_COPILOT_GITHUB_TOKEN",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+
+def test_wrap_copilot_oauth_keeps_generic_endpoint_when_account_advertised(
+    runner: CliRunner,
+    wrap_modules: tuple[types.ModuleType, click.Group],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#610: non-subscription OAuth must route to the generic Copilot endpoint
+    even when /copilot_internal/user advertises an account-specific host. The
+    account host (api.individual.githubcopilot.com) does not serve newer models
+    such as gpt-5.4 on the responses API — exactly what regressed after 0.22.4.
+    """
+    _wrap_cli, main = wrap_modules
+    _clear_copilot_env(monkeypatch)
+    captured: dict[str, object] = {}
+
+    def fake_launch_tool(**kwargs):  # noqa: ANN003
+        captured.update(kwargs)
+
+    with (
+        patch("headroom.cli.wrap.shutil.which", return_value="copilot"),
+        patch("headroom.cli.wrap.resolve_client_bearer_token", return_value="gho-oauth"),
+        patch("headroom.cli.wrap.has_oauth_auth", return_value=True),
+        patch("headroom.copilot_auth._fetch_copilot_user_info", return_value=_ACCOUNT_USER_INFO),
+        patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch_tool),
+    ):
+        result = runner.invoke(main, ["wrap", "copilot", "--no-rtk", "--", "--model", "gpt-5.4"])
+
+    assert result.exit_code == 0, result.output
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert env["COPILOT_PROVIDER_BEARER_TOKEN"] == "gho-oauth"
+    assert captured["openai_api_url"] == DEFAULT_API_URL
+    assert env["OPENAI_TARGET_API_URL"] == DEFAULT_API_URL
+    assert env["GITHUB_COPILOT_API_URL"] == DEFAULT_API_URL
+
+
+def test_wrap_copilot_oauth_honors_api_url_override(
+    runner: CliRunner,
+    wrap_modules: tuple[types.ModuleType, click.Group],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The GITHUB_COPILOT_API_URL escape hatch must be honored even when a token
+    resolves and user-info advertises a different host (it was silently lost)."""
+    _wrap_cli, main = wrap_modules
+    _clear_copilot_env(monkeypatch)
+    monkeypatch.setenv("GITHUB_COPILOT_API_URL", "https://proxy.internal.example.com")
+    captured: dict[str, object] = {}
+
+    def fake_launch_tool(**kwargs):  # noqa: ANN003
+        captured.update(kwargs)
+
+    with (
+        patch("headroom.cli.wrap.shutil.which", return_value="copilot"),
+        patch("headroom.cli.wrap.resolve_client_bearer_token", return_value="gho-oauth"),
+        patch("headroom.cli.wrap.has_oauth_auth", return_value=True),
+        patch("headroom.copilot_auth._fetch_copilot_user_info", return_value=_ACCOUNT_USER_INFO),
+        patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch_tool),
+    ):
+        result = runner.invoke(main, ["wrap", "copilot", "--no-rtk", "--", "--model", "gpt-5.4"])
+
+    assert result.exit_code == 0, result.output
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert captured["openai_api_url"] == "https://proxy.internal.example.com"
+    assert env["OPENAI_TARGET_API_URL"] == "https://proxy.internal.example.com"
+
+
+def test_wrap_copilot_byok_never_resolves_copilot_endpoint(
+    runner: CliRunner,
+    wrap_modules: tuple[types.ModuleType, click.Group],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BYOK (provider key, no OAuth) routes to the model provider through the
+    proxy and must never resolve the Copilot hosted endpoint. It was unaffected
+    by #610 — this pins that independence so a future change can't entangle it.
+    """
+    _wrap_cli, main = wrap_modules
+    _clear_copilot_env(monkeypatch)
+    monkeypatch.setenv("COPILOT_PROVIDER_API_KEY", "sk-test-dummy")
+    captured: dict[str, object] = {}
+
+    def fake_launch_tool(**kwargs):  # noqa: ANN003
+        captured.update(kwargs)
+
+    def tripwire(*_args, **_kwargs):  # noqa: ANN002,ANN003
+        raise AssertionError("BYOK must not resolve the Copilot hosted endpoint")
+
+    with (
+        patch("headroom.cli.wrap.shutil.which", return_value="copilot"),
+        patch("headroom.cli.wrap.has_oauth_auth", return_value=False),
+        patch("headroom.cli.wrap.resolve_copilot_api_url", side_effect=tripwire),
+        patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch_tool),
+    ):
+        result = runner.invoke(
+            main,
+            ["wrap", "copilot", "--no-rtk", "--provider-type", "openai", "--", "--model", "gpt-4o"],
+        )
+
+    assert result.exit_code == 0, result.output
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert captured["openai_api_url"] is None
+    assert env["COPILOT_PROVIDER_TYPE"] == "openai"
+
+
+def test_wrap_copilot_subscription_uses_generic_endpoint_not_account(
+    runner: CliRunner,
+    wrap_modules: tuple[types.ModuleType, click.Group],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#610 (subscription has the same latent bug): --subscription must route to
+    the generic host too, even when /copilot_internal/user advertises an
+    account-specific host. The segmented host does not serve newer models on the
+    responses API, and it is not the host the official Copilot client uses."""
+    _wrap_cli, main = wrap_modules
+    _clear_copilot_env(monkeypatch)
+    captured: dict[str, object] = {}
+
+    def fake_launch_tool(**kwargs):  # noqa: ANN003
+        captured.update(kwargs)
+
+    with (
+        patch("headroom.cli.wrap.shutil.which", return_value="copilot"),
+        patch("headroom.cli.wrap.resolve_subscription_bearer_token", return_value="gho-sub"),
+        patch("headroom.cli.wrap.has_oauth_auth", return_value=True),
+        patch("headroom.copilot_auth._fetch_copilot_user_info", return_value=_ACCOUNT_USER_INFO),
+        patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch_tool),
+    ):
+        result = runner.invoke(
+            main,
+            ["wrap", "copilot", "--subscription", "--no-rtk", "--", "--model", "gpt-5.4"],
+        )
+
+    assert result.exit_code == 0, result.output
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert captured["openai_api_url"] == DEFAULT_API_URL
+    assert env["OPENAI_TARGET_API_URL"] == DEFAULT_API_URL
+    assert env["COPILOT_PROVIDER_BEARER_TOKEN"] == "gho-sub"
+
+
+def test_wrap_copilot_subscription_honors_api_url_override(
+    runner: CliRunner,
+    wrap_modules: tuple[types.ModuleType, click.Group],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Enterprise / data-residency accounts that require a dedicated host pin it
+    via GITHUB_COPILOT_API_URL — the override must flow through --subscription."""
+    _wrap_cli, main = wrap_modules
+    _clear_copilot_env(monkeypatch)
+    monkeypatch.setenv("GITHUB_COPILOT_API_URL", "https://api.enterprise.example.com")
+    captured: dict[str, object] = {}
+
+    def fake_launch_tool(**kwargs):  # noqa: ANN003
+        captured.update(kwargs)
+
+    with (
+        patch("headroom.cli.wrap.shutil.which", return_value="copilot"),
+        patch("headroom.cli.wrap.resolve_subscription_bearer_token", return_value="gho-sub"),
+        patch("headroom.cli.wrap.has_oauth_auth", return_value=True),
+        patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch_tool),
+    ):
+        result = runner.invoke(
+            main,
+            ["wrap", "copilot", "--subscription", "--no-rtk", "--", "--model", "gpt-5.4"],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert captured["openai_api_url"] == "https://api.enterprise.example.com"
+
+
+def test_resolve_copilot_api_url_ignores_user_info_and_never_calls_network(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unit lock for #610: routing is override -> generic and must NOT depend on a
+    user-info lookup. Even with a token in hand and user-info advertising an
+    account host, the generic host is returned and no network call is made."""
+    from headroom import copilot_auth
+
+    monkeypatch.delenv("GITHUB_COPILOT_API_URL", raising=False)
+    with patch.object(copilot_auth, "_fetch_copilot_user_info") as fetch:
+        assert copilot_auth.resolve_copilot_api_url("gho-real") == copilot_auth.DEFAULT_API_URL
+    fetch.assert_not_called()
+
+    monkeypatch.setenv("GITHUB_COPILOT_API_URL", "https://pin.example.com")
+    with patch.object(copilot_auth, "_fetch_copilot_user_info") as fetch:
+        assert copilot_auth.resolve_copilot_api_url("gho-real") == "https://pin.example.com"
+    fetch.assert_not_called()
