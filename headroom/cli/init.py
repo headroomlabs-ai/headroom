@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 import json
 import logging
 import os
@@ -546,22 +548,45 @@ def _install_copilot_marketplace() -> None:
     )
 
 
+@contextmanager
+def _suppress_hook_output() -> Iterator[None]:
+    """Keep best-effort hook recovery from emitting invalid hook output."""
+    stdout_fd = os.dup(1)
+    stderr_fd = os.dup(2)
+    try:
+        with open(os.devnull, "w", encoding="utf-8") as devnull:
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os.dup2(devnull.fileno(), 1)
+            os.dup2(devnull.fileno(), 2)
+            with redirect_stdout(devnull), redirect_stderr(devnull):
+                yield
+    finally:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os.dup2(stdout_fd, 1)
+        os.dup2(stderr_fd, 2)
+        os.close(stdout_fd)
+        os.close(stderr_fd)
+
+
 def _ensure_profile_running(profile: str) -> None:
     manifest = load_manifest(profile)
     if manifest is None:
         return
-    if wait_ready(manifest, timeout_seconds=1):
-        return
-    try:
-        if manifest.preset == InstallPreset.PERSISTENT_DOCKER.value:
-            start_persistent_docker(manifest)
-        elif manifest.supervisor_kind == SupervisorKind.SERVICE.value:
-            start_supervisor(manifest)
-        else:
-            start_detached_agent(manifest.profile)
-        wait_ready(manifest, timeout_seconds=45)
-    except Exception:
-        return
+    with _suppress_hook_output():
+        if wait_ready(manifest, timeout_seconds=1):
+            return
+        try:
+            if manifest.preset == InstallPreset.PERSISTENT_DOCKER.value:
+                start_persistent_docker(manifest)
+            elif manifest.supervisor_kind == SupervisorKind.SERVICE.value:
+                start_supervisor(manifest)
+            else:
+                start_detached_agent(manifest.profile)
+            wait_ready(manifest, timeout_seconds=45)
+        except Exception:
+            return
 
 
 def _probe_init_targets(global_scope: bool) -> list[tuple[str, str | None]]:
