@@ -1185,14 +1185,16 @@ def _inject_memory_mcp_config(db_path: str, user_id: str) -> None:
         # Convert backslashes to forward slashes for cross-platform TOML paths,
         # then escape characters that would break TOML basic-string literals.
         import re as _re
+
         value = value.replace("\\", "/")
         value = value.replace('"', '\\"')
         value = value.replace("\n", "\\n")
         value = value.replace("\r", "\\r")
         value = value.replace("\t", "\\t")
         # Escape remaining ASCII control characters as \uXXXX.
-        value = _re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]",
-                        lambda m: f"\\u{ord(m.group()):04x}", value)
+        value = _re.sub(
+            r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", lambda m: f"\\u{ord(m.group()):04x}", value
+        )
         return value
 
     python_bin = _toml_escape(sys.executable)

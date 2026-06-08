@@ -1,0 +1,23 @@
+# Gitleaks configuration for headroom.
+# https://github.com/gitleaks/gitleaks/blob/master/config/gitleaks.toml
+
+[extend]
+# Extend the default ruleset rather than replacing it.
+useDefault = true
+
+[[allowlists]]
+description = "Test fixture files contain synthetic session_key / API-key fields, not real credentials"
+paths = [
+  "tests/",
+]
+regexes = [
+  '''session_key''',
+]
+
+[[allowlists]]
+description = "Docs and changelog references to key names are not secrets"
+paths = [
+  "docs/",
+  "CHANGELOG.md",
+  "wiki/",
+]

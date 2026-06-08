@@ -416,14 +416,13 @@ jobs:
       - name: Install headroom + CycloneDX tooling
         run: |
           pip install --upgrade pip
-          pip install "cyclonedx-bom==4.6.1"
-          pip install -e ".[proxy]" --no-deps
+          pip install -e ".[proxy]"
+          pip install "cyclonedx-py==5.3.0"
       - name: Generate CycloneDX JSON SBOM
         run: |
-          python -m cyclonedx_py.cmd pip \
-            --requirements-file <(pip list --format=freeze) \
-            --output-format json \
-            --outfile "sbom-${{ needs.detect-version.outputs.version }}.cyclonedx.json"
+          cyclonedx-py environment \
+            --output-format JSON \
+            -o "sbom-${{ needs.detect-version.outputs.version }}.cyclonedx.json"
       - name: Upload SBOM artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:

@@ -1,0 +1,9 @@
+# actionlint configuration for headroom CI validation.
+# https://rhysd.github.io/actionlint/config.html
+
+self-hosted-runner:
+  # ubuntu-24.04-arm is a GitHub-hosted native arm64 runner (GA Jan 2025).
+  # actionlint's bundled runner list predates this label; we declare it here
+  # so workflow-validation does not fail on valid runner references.
+  labels:
+    - ubuntu-24.04-arm
