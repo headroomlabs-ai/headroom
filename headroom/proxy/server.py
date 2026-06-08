@@ -1585,6 +1585,12 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 native_tool=bool(memory_status.get("native_tool", False)),
                 bridge_enabled=bool(memory_status.get("bridge_enabled", False)),
             ),
+            "upstream": _component_health(
+                enabled=os.environ.get("HEADROOM_SKIP_UPSTREAM_CHECK", "").strip() != "1",
+                ready=bool(_upstream_check_cache["ok"]),
+                url=_upstream_check_cache["url"],
+                error=_upstream_check_cache["error"],
+            ),
         }
 
     def _runtime_payload() -> dict[str, Any]:
@@ -1685,6 +1691,65 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "pid": os.getpid(),
             }
         return payload
+
+    # ---------------------------------------------------------------------------
+    # Upstream connectivity check — cached to avoid hammering the upstream on
+    # every /readyz poll.  Set HEADROOM_SKIP_UPSTREAM_CHECK=1 to opt out (e.g.
+    # in air-gapped or test environments where the upstream isn't reachable at
+    # startup time).
+    # ---------------------------------------------------------------------------
+
+    _UPSTREAM_CHECK_TTL = 30.0  # seconds
+    _upstream_check_cache: dict[str, Any] = {
+        "expires_at": 0.0,
+        "ok": True,
+        "error": None,
+        "url": None,
+    }
+    _upstream_check_lock = asyncio.Lock()
+
+    def _upstream_target_url() -> str:
+        """Return the primary upstream base URL to probe."""
+        # Use the resolved API target from the provider runtime so we respect
+        # any overrides set by ProxyConfig.anthropic_api_url / env vars.
+        return proxy.provider_runtime.api_targets.anthropic
+
+    async def _check_upstream() -> None:
+        """Probe the upstream API endpoint and update the cached result.
+
+        Uses a HEAD request with a 5-second timeout — just enough to verify
+        TLS + TCP reachability without triggering an inference call.
+        """
+        if os.environ.get("HEADROOM_SKIP_UPSTREAM_CHECK", "").strip() == "1":
+            # Opt-out: treat upstream as always reachable.
+            _upstream_check_cache["ok"] = True
+            _upstream_check_cache["error"] = None
+            _upstream_check_cache["expires_at"] = time.monotonic() + _UPSTREAM_CHECK_TTL
+            return
+
+        now = time.monotonic()
+        # Fast-path: return if the cached result is still fresh (no lock needed
+        # for a simple float comparison — worst case we re-check twice).
+        if now < _upstream_check_cache["expires_at"]:
+            return
+
+        async with _upstream_check_lock:
+            # Re-check inside the lock to handle concurrent waiters.
+            if time.monotonic() < _upstream_check_cache["expires_at"]:
+                return
+            url = _upstream_target_url()
+            _upstream_check_cache["url"] = url
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as probe_client:
+                    resp = await probe_client.head(url)
+                    # Any HTTP response (even 4xx/5xx) means TLS+TCP worked.
+                    _ = resp.status_code
+                _upstream_check_cache["ok"] = True
+                _upstream_check_cache["error"] = None
+            except Exception as exc:  # noqa: BLE001
+                _upstream_check_cache["ok"] = False
+                _upstream_check_cache["error"] = str(exc)
+            _upstream_check_cache["expires_at"] = time.monotonic() + _UPSTREAM_CHECK_TTL
 
     # CORS
     app.add_middleware(
@@ -1814,11 +1879,13 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
     @app.get("/readyz")
     async def readyz():
+        await _check_upstream()
         payload = _health_payload(include_config=False)
         return JSONResponse(status_code=200 if payload["ready"] else 503, content=payload)
 
     @app.get("/health")
     async def health():
+        await _check_upstream()
         payload = _health_payload(include_config=True)
         return JSONResponse(status_code=200, content=payload)
 

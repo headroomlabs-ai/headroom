@@ -12,7 +12,10 @@ from headroom.proxy.server import ProxyConfig, create_app
 
 
 @pytest.fixture
-def client():
+def client(monkeypatch):
+    # Skip the live upstream connectivity probe in unit tests — tests verify
+    # the check logic separately (see test_readyz_upstream_check_* below).
+    monkeypatch.setenv("HEADROOM_SKIP_UPSTREAM_CHECK", "1")
     config = ProxyConfig(
         optimize=False,
         cache_enabled=False,
@@ -80,6 +83,7 @@ def test_health_preserves_backwards_compatible_config_payload(client):
 
 
 def test_health_includes_deployment_metadata_when_present(monkeypatch):
+    monkeypatch.setenv("HEADROOM_SKIP_UPSTREAM_CHECK", "1")
     monkeypatch.setenv("HEADROOM_DEPLOYMENT_PROFILE", "default")
     monkeypatch.setenv("HEADROOM_DEPLOYMENT_PRESET", "persistent-service")
     monkeypatch.setenv("HEADROOM_DEPLOYMENT_RUNTIME", "python")
@@ -116,7 +120,8 @@ def test_health_remains_200_when_proxy_is_not_ready(client):
     assert response.json()["ready"] is False
 
 
-def test_readyz_reports_memory_backend_when_enabled(tmp_path):
+def test_readyz_reports_memory_backend_when_enabled(tmp_path, monkeypatch):
+    monkeypatch.setenv("HEADROOM_SKIP_UPSTREAM_CHECK", "1")
     config = ProxyConfig(
         optimize=False,
         cache_enabled=False,
@@ -141,6 +146,7 @@ def test_readyz_reports_memory_backend_when_enabled(tmp_path):
 
 
 def test_readyz_initializes_qdrant_memory_backend(monkeypatch):
+    monkeypatch.setenv("HEADROOM_SKIP_UPSTREAM_CHECK", "1")
     from headroom.memory.backends import direct_mem0
 
     init_calls: list[str] = []
@@ -175,7 +181,8 @@ def test_readyz_initializes_qdrant_memory_backend(monkeypatch):
     assert data["checks"]["memory"]["initialized"] is True
 
 
-def test_shutdown_tolerates_stubbed_memory_handler():
+def test_shutdown_tolerates_stubbed_memory_handler(monkeypatch):
+    monkeypatch.setenv("HEADROOM_SKIP_UPSTREAM_CHECK", "1")
     config = ProxyConfig(
         optimize=False,
         cache_enabled=False,
@@ -197,3 +204,88 @@ def test_shutdown_tolerates_stubbed_memory_handler():
         response = client.get("/health")
 
     assert response.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Upstream connectivity check tests
+# ---------------------------------------------------------------------------
+
+
+def test_readyz_upstream_check_disabled_by_env_var(monkeypatch):
+    """HEADROOM_SKIP_UPSTREAM_CHECK=1 suppresses the probe and reports ready."""
+    monkeypatch.setenv("HEADROOM_SKIP_UPSTREAM_CHECK", "1")
+    config = ProxyConfig(
+        optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+    )
+    app = create_app(config)
+
+    with TestClient(app) as test_client:
+        response = test_client.get("/readyz")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["ready"] is True
+    # When the check is skipped the component is reported as "disabled"
+    assert data["checks"]["upstream"]["enabled"] is False
+    assert data["checks"]["upstream"]["ready"] is True
+
+
+def test_readyz_upstream_check_failure_returns_503(monkeypatch):
+    """A failed upstream probe makes /readyz return HTTP 503."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    import httpx
+
+    monkeypatch.delenv("HEADROOM_SKIP_UPSTREAM_CHECK", raising=False)
+
+    config = ProxyConfig(
+        optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+    )
+    app = create_app(config)
+
+    # Build the fake context-manager client once the app is already running so
+    # the startup httpx.AsyncClient (for the proxy's main http_client) is not
+    # affected — only the probe client created inside _check_upstream() is.
+    fake_probe = MagicMock()
+    fake_probe.__aenter__ = AsyncMock(return_value=fake_probe)
+    fake_probe.__aexit__ = AsyncMock(return_value=False)
+    fake_probe.head = AsyncMock(side_effect=httpx.ConnectError("connection refused (test)"))
+
+    with TestClient(app) as test_client:
+        with patch("headroom.proxy.server.httpx.AsyncClient", return_value=fake_probe):
+            response = test_client.get("/readyz")
+
+    assert response.status_code == 503
+    data = response.json()
+    assert data["ready"] is False
+    assert data["checks"]["upstream"]["ready"] is False
+    assert "connection refused" in data["checks"]["upstream"]["error"]
+
+
+def test_health_includes_upstream_check_result(monkeypatch):
+    """/health always returns 200 but exposes the upstream check result."""
+    monkeypatch.setenv("HEADROOM_SKIP_UPSTREAM_CHECK", "1")
+    config = ProxyConfig(
+        optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+    )
+    app = create_app(config)
+
+    with TestClient(app) as test_client:
+        response = test_client.get("/health")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert "upstream" in data["checks"]
+    upstream = data["checks"]["upstream"]
+    assert "enabled" in upstream
+    assert "ready" in upstream
+    assert "status" in upstream
