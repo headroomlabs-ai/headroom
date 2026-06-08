@@ -13,6 +13,7 @@ pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
 
 from headroom.cache.compression_store import get_compression_store, reset_compression_store
+from headroom.proxy.loopback_guard import require_loopback
 from headroom.proxy.server import ProxyConfig, create_app
 
 
@@ -27,6 +28,7 @@ def client():
         cost_tracking_enabled=False,
     )
     app = create_app(config)
+    app.dependency_overrides[require_loopback] = lambda: None
     with TestClient(app) as client:
         yield client
     reset_compression_store()

@@ -110,6 +110,7 @@ def test_proxy_starts_in_degraded_mode_when_opt_out_set(
     """
     from fastapi.testclient import TestClient
 
+    from headroom.proxy.loopback_guard import require_loopback
     from headroom.proxy.server import ProxyConfig, create_app
 
     monkeypatch.setenv("HEADROOM_REQUIRE_RUST_CORE", "false")
@@ -135,6 +136,7 @@ def test_proxy_starts_in_degraded_mode_when_opt_out_set(
         ccr_context_tracking=False,
     )
     app = create_app(config)
+    app.dependency_overrides[require_loopback] = lambda: None
 
     try:
         with TestClient(app) as client:

@@ -34,6 +34,7 @@ import pytest
 pytest.importorskip("fastapi")
 
 from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS  # noqa: F401
+from headroom.proxy.loopback_guard import require_loopback
 from headroom.proxy.server import ProxyConfig, create_app
 
 
@@ -275,6 +276,7 @@ def test_compression_executor_metrics_appear_in_runtime_payload() -> None:
         compression_max_workers=5,
     )
     app = create_app(config)
+    app.dependency_overrides[require_loopback] = lambda: None
 
     with TestClient(app) as client:
         # The compression_executor metrics are published from the runtime
@@ -312,6 +314,7 @@ def test_explicit_None_resolves_to_auto_source() -> None:
         image_optimize=False,
     )
     app = create_app(config)
+    app.dependency_overrides[require_loopback] = lambda: None
     with TestClient(app) as client:
         r = client.get("/health")
         assert r.json()["runtime"]["compression_executor"]["source"] == "auto"

@@ -41,8 +41,10 @@ RUN set -eux; \
     DPKG_ARCH="$(dpkg --print-architecture)"; \
     case "$DPKG_ARCH" in \
       amd64) RUSTUP_ARCH="x86_64-unknown-linux-musl"; \
+             RUST_HOST="x86_64-unknown-linux-gnu"; \
              RUSTUP_SHA256="1455d1df3825c5f24ba06d9dd1c7052908272a2cae9aa749ea49d67acbe22b47" ;; \
       arm64) RUSTUP_ARCH="aarch64-unknown-linux-musl"; \
+             RUST_HOST="aarch64-unknown-linux-gnu"; \
              RUSTUP_SHA256="7087ada906cd27a00c8e0323401a46804a03a742bd07811da6dead016617cc64" ;; \
       *) echo "Unsupported architecture: $DPKG_ARCH" >&2; exit 1 ;; \
     esac; \
@@ -51,6 +53,7 @@ RUN set -eux; \
     echo "${RUSTUP_SHA256}  /tmp/rustup-init" | sha256sum -c -; \
     chmod +x /tmp/rustup-init; \
     /tmp/rustup-init -y --no-modify-path --profile minimal \
+      --default-host "${RUST_HOST}" \
       -c rustfmt -c clippy --default-toolchain 1.95.0; \
     rm /tmp/rustup-init
 

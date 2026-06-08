@@ -5,7 +5,8 @@ from __future__ import annotations
 import unicodedata
 
 import pytest
-from hypothesis import given, settings, strategies as st
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 from headroom.proxy.helpers import _sanitize_log_token
 

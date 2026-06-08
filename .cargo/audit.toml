@@ -12,6 +12,21 @@
 # Docs: https://docs.rs/cargo-audit/latest/cargo_audit/config/
 
 [advisories]
-# No suppressions yet. If CI hard-fails due to a transitive dep advisory,
-# add a suppression entry above with justification.
-ignore = []
+ignore = [
+  # RUSTSEC-2025-0119: `number_prefix` crate is unmaintained. It is a
+  # transitive dependency of `indicatif` (via `console`) with no known
+  # vulnerability — only a maintenance status advisory. No fix or
+  # replacement is available at this time.
+  { id = "RUSTSEC-2025-0119", reason = "number_prefix is unmaintained but has no known vuln; transitive via indicatif/console, no upgrade path" },
+
+  # RUSTSEC-2026-0002: `lru` crate has an unsoundness advisory. It is a
+  # transitive dependency pulled by several crates in our graph. The
+  # advisory does not affect our usage pattern (no concurrent mutable
+  # access across thread boundaries in the affected code path).
+  { id = "RUSTSEC-2026-0002", reason = "lru unsoundness does not affect our usage pattern; transitive dep, no upgrade available" },
+
+  # RUSTSEC-2024-0436: `paste` crate is unmaintained. It is a transitive
+  # dependency with no known vulnerability — only a maintenance advisory.
+  # The macro-only crate is stable and widely used; no replacement exists.
+  { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained but has no known vuln; transitive dep, macro-only crate, stable" },
+]

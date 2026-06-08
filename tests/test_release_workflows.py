@@ -52,7 +52,7 @@ def test_create_release_requires_successful_build_and_pypi_publish() -> None:
     # success in the `if:` block (otherwise `always()` would let the
     # release proceed even when the smoke gate failed).
     assert (
-        "needs: [detect-version, build, build-wheels, collect-dist, smoke-import-wheels, publish-pypi, publish-npm, publish-github-packages, publish-docker]"
+        "needs: [detect-version, build, build-wheels, collect-dist, generate-sbom, smoke-import-wheels, publish-pypi, publish-npm, publish-github-packages, publish-docker]"
         in content
     )
     assert "always()" in content
@@ -585,7 +585,8 @@ def test_pypi_publish_failure_blocks_github_release() -> None:
     npm_job_start = content.index("publish-npm:", pypi_job_start)
     pypi_job = content[pypi_job_start:npm_job_start]
 
-    assert "uses: pypa/gh-action-pypi-publish@release/v1" in pypi_job
+    assert "uses: pypa/gh-action-pypi-publish@" in pypi_job
+    assert "# release/v1" in pypi_job
     assert "continue-on-error: true" not in pypi_job
     assert "(vars.PYPI_SKIP == 'true' || needs.publish-pypi.result == 'success')" in content
 
@@ -1011,9 +1012,12 @@ def test_release_please_workflow_exists_and_targets_main() -> None:
     )
 
     content = rp_path.read_text(encoding="utf-8")
-    assert any(f"googleapis/release-please-action@v{v}" in content for v in (4, 5)), (
-        "release-please.yml must use the v4 or v5 action — earlier versions "
+    assert "googleapis/release-please-action@" in content, (
+        "release-please.yml must use the release-please-action — earlier versions "
         "have different manifest semantics."
+    )
+    assert "# v4" in content, (
+        "release-please action must be pinned to a v4 SHA (comment '# v4' expected)"
     )
     assert "branches: [main]" in content, (
         "release-please.yml must watch main; that's where the bot reads "

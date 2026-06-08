@@ -21,3 +21,20 @@ paths = [
   "CHANGELOG.md",
   "wiki/",
 ]
+
+[[allowlists]]
+description = "Benchmark scripts contain synthetic refresh tokens and dummy API keys, not real credentials"
+paths = [
+  "benchmarks/",
+]
+
+[[allowlists]]
+description = "Source comments and CLI help text reference example/dummy key patterns, not real credentials"
+paths = [
+  "headroom/config.py",
+  "headroom/cli/proxy.py",
+]
+regexes = [
+  '''sk-ant-dummy''',
+  '''(?i)example[_-]?jwt|jwt[_-]?example|bearer[_-]?token[_-]?example|dummy[_-]?token''',
+]

@@ -417,7 +417,7 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install -e ".[proxy]"
-          pip install "cyclonedx-py==5.3.0"
+          pip install "cyclonedx-bom==7.3.0"
       - name: Generate CycloneDX JSON SBOM
         run: |
           cyclonedx-py environment \

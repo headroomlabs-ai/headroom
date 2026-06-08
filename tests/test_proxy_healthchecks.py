@@ -8,6 +8,7 @@ pytest.importorskip("httpx")
 
 from fastapi.testclient import TestClient
 
+from headroom.proxy.loopback_guard import require_loopback
 from headroom.proxy.server import ProxyConfig, create_app
 
 
@@ -20,6 +21,7 @@ def client():
         cost_tracking_enabled=False,
     )
     app = create_app(config)
+    app.dependency_overrides[require_loopback] = lambda: None
     with TestClient(app) as test_client:
         yield test_client
 
@@ -93,6 +95,7 @@ def test_health_includes_deployment_metadata_when_present(monkeypatch):
         cost_tracking_enabled=False,
     )
     app = create_app(config)
+    app.dependency_overrides[require_loopback] = lambda: None
 
     with TestClient(app) as client:
         response = client.get("/health")
@@ -183,6 +186,7 @@ def test_shutdown_tolerates_stubbed_memory_handler():
         cost_tracking_enabled=False,
     )
     app = create_app(config)
+    app.dependency_overrides[require_loopback] = lambda: None
 
     with TestClient(app) as client:
         client.app.state.proxy.memory_handler = SimpleNamespace(
