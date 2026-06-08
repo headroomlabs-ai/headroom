@@ -39,8 +39,9 @@ jobs:
   test:
     name: test (ubuntu)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install stable toolchain
         # Pin action code to @stable (latest fixes), toolchain version
         # via input. The @1.95.0 ref shipped action code that errors on
@@ -63,6 +64,7 @@ jobs:
   wheels:
     name: wheels (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -82,8 +84,8 @@ jobs:
         # locally (the toolchain works; only prebuilt distribution skips
         # this target).
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.11'
       - name: "Build wheel (single-wheel architecture builds headroom-ai)"
@@ -97,7 +99,7 @@ jobs:
           args: --release --out dist
           target: ${{ matrix.maturin-target }}
       - name: Upload wheel artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wheels-${{ matrix.target }}
           path: dist/*.whl
@@ -105,16 +107,17 @@ jobs:
   audit:
     name: audit
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.95.0
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-audit + cargo-deny
-        run: |
-          cargo install --locked cargo-audit || true
-          cargo install --locked cargo-deny || true
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit,cargo-deny
       - name: cargo audit (soft-fail)
         continue-on-error: true
         run: cargo audit
@@ -128,11 +131,11 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.95.0
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.11'
       - uses: Swatinem/rust-cache@v2

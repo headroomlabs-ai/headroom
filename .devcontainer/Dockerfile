@@ -21,4 +21,4 @@ FROM mcr.microsoft.com/devcontainers/python:1-${VARIANT}
 # doesn't need yarn.
 RUN rm -f /etc/apt/sources.list.d/yarn.list
 
-RUN python -m pip install --no-cache-dir uv==0.6.17 'maturin>=1.5,<2.0'
+RUN python -m pip install --no-cache-dir 'uv>=0.7.0' 'maturin>=1.5,<2.0'

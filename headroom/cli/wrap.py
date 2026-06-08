@@ -184,6 +184,7 @@ def _start_proxy(
     anyllm_provider: str | None = None,
     region: str | None = None,
     openai_api_url: str | None = None,
+    anthropic_api_url: str | None = None,
     copilot_api_token: str | None = None,
 ) -> subprocess.Popen:
     """Start Headroom proxy as a background subprocess.
@@ -227,6 +228,9 @@ def _start_proxy(
     if openai_api_url:
         cmd.extend(["--openai-api-url", openai_api_url])
 
+    if anthropic_api_url:
+        cmd.extend(["--anthropic-api-url", anthropic_api_url])
+
     log_path = _get_log_path()
     log_file = open(log_path, "a")  # noqa: SIM115
 
@@ -240,6 +244,8 @@ def _start_proxy(
         proxy_env.setdefault("HEADROOM_STACK", f"wrap_{agent_type}")
     if openai_api_url:
         proxy_env["OPENAI_TARGET_API_URL"] = openai_api_url
+    if anthropic_api_url:
+        proxy_env["ANTHROPIC_TARGET_API_URL"] = anthropic_api_url
     # Pin the wrapper-validated Copilot token for this proxy instance only.
     # Injected into the subprocess env here (not the parent's os.environ) so it
     # never leaks into shared state. The proxy's CopilotTokenProvider honours
@@ -1629,6 +1635,7 @@ def _ensure_proxy(
     anyllm_provider: str | None = None,
     region: str | None = None,
     openai_api_url: str | None = None,
+    anthropic_api_url: str | None = None,
     copilot_api_token: str | None = None,
 ) -> subprocess.Popen | None:
     """Start or verify proxy. Returns process handle if we started it."""
@@ -1783,6 +1790,7 @@ def _ensure_proxy(
                     anyllm_provider=anyllm_provider,
                     region=region,
                     openai_api_url=openai_api_url,
+                    anthropic_api_url=anthropic_api_url,
                     copilot_api_token=copilot_api_token,
                 ),
             )
@@ -2272,8 +2280,20 @@ def claude(
         click.echo("  ╚═══════════════════════════════════════════════╝")
         click.echo()
 
+        # Detect Foundry mode: Claude Code uses ANTHROPIC_FOUNDRY_BASE_URL instead of
+        # ANTHROPIC_BASE_URL when CLAUDE_CODE_USE_FOUNDRY=1 is set.
+        foundry_upstream = None
+        if os.environ.get("CLAUDE_CODE_USE_FOUNDRY"):
+            foundry_upstream = os.environ.get("ANTHROPIC_FOUNDRY_BASE_URL")
+
         proxy_holder[0] = _ensure_proxy(
-            port, no_proxy, learn=learn, memory=memory, agent_type="claude", code_graph=code_graph
+            port,
+            no_proxy,
+            learn=learn,
+            memory=memory,
+            agent_type="claude",
+            code_graph=code_graph,
+            anthropic_api_url=foundry_upstream,
         )
 
         if not no_rtk:
@@ -2303,16 +2323,25 @@ def claude(
         if code_graph:
             _setup_code_graph(verbose=verbose)
 
+        proxy_url = _claude_proxy_base_url(port)
         click.echo()
         click.echo("  Launching Claude Code (API routed through Headroom)...")
-        click.echo(f"  ANTHROPIC_BASE_URL={_claude_proxy_base_url(port)}")
+        if foundry_upstream:
+            click.echo(
+                f"  Foundry mode: ANTHROPIC_FOUNDRY_BASE_URL={proxy_url} → upstream {foundry_upstream}"
+            )
+        else:
+            click.echo(f"  ANTHROPIC_BASE_URL={proxy_url}")
         if claude_args:
             click.echo(f"  Extra args: {' '.join(claude_args)}")
         _print_telemetry_notice()
         click.echo()
 
         env = os.environ.copy()
-        env["ANTHROPIC_BASE_URL"] = _claude_proxy_base_url(port)
+        if foundry_upstream:
+            env["ANTHROPIC_FOUNDRY_BASE_URL"] = proxy_url
+        else:
+            env["ANTHROPIC_BASE_URL"] = proxy_url
 
         result = subprocess.run([claude_bin, *claude_args], env=env)
         raise SystemExit(result.returncode)

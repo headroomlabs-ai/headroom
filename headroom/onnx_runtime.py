@@ -7,6 +7,32 @@ import sys
 from typing import Any
 
 
+def hf_hub_download_local_first(repo_id: str, filename: str) -> str:
+    """Download a file from HuggingFace Hub, preferring the local cache.
+
+    Tries ``local_files_only=True`` first to avoid a network HEAD request when
+    the model is already cached.  Falls back to a normal (network-allowed)
+    download on the first cold start.
+
+    Args:
+        repo_id: HuggingFace Hub repository identifier (e.g. ``"org/model"``).
+        filename: Filename within the repository.
+
+    Returns:
+        Absolute path to the local cached file.
+
+    Raises:
+        Any exception raised by ``hf_hub_download`` on a genuine download failure.
+    """
+    from huggingface_hub import hf_hub_download
+    from huggingface_hub.errors import EntryNotFoundError, LocalEntryNotFoundError
+
+    try:
+        return str(hf_hub_download(repo_id, filename, local_files_only=True))
+    except (LocalEntryNotFoundError, EntryNotFoundError, OSError):
+        return str(hf_hub_download(repo_id, filename))
+
+
 def create_cpu_session_options(
     ort: Any,
     *,

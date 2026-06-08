@@ -20,7 +20,7 @@ from typing import Any
 import numpy as np
 
 from headroom.image.trained_router import ImageSignals, RouteDecision, Technique
-from headroom.onnx_runtime import create_cpu_session_options
+from headroom.onnx_runtime import create_cpu_session_options, hf_hub_download_local_first
 
 logger = logging.getLogger(__name__)
 
@@ -57,19 +57,18 @@ class OnnxTechniqueRouter:
             return
 
         import onnxruntime as ort
-        from huggingface_hub import hf_hub_download
         from tokenizers import Tokenizer
 
         logger.info("Loading technique-router ONNX INT8...")
 
-        model_path = hf_hub_download(_TECHNIQUE_ROUTER_REPO, "model_quantized.onnx")
+        model_path = hf_hub_download_local_first(_TECHNIQUE_ROUTER_REPO, "model_quantized.onnx")
         self._classifier_session = ort.InferenceSession(
             model_path,
             create_cpu_session_options(ort),
             providers=["CPUExecutionProvider"],
         )
 
-        tokenizer_path = hf_hub_download(_TECHNIQUE_ROUTER_REPO, "tokenizer.json")
+        tokenizer_path = hf_hub_download_local_first(_TECHNIQUE_ROUTER_REPO, "tokenizer.json")
         self._tokenizer = Tokenizer.from_file(tokenizer_path)
         self._tokenizer.enable_truncation(max_length=64)
         self._tokenizer.enable_padding(length=64)
@@ -77,7 +76,7 @@ class OnnxTechniqueRouter:
         # Load label mapping
         import json
 
-        config_path = hf_hub_download(_TECHNIQUE_ROUTER_REPO, "config.json")
+        config_path = hf_hub_download_local_first(_TECHNIQUE_ROUTER_REPO, "config.json")
         with open(config_path) as f:
             config = json.load(f)
         self._id2label = {int(k): v for k, v in config.get("id2label", {}).items()}
@@ -93,18 +92,17 @@ class OnnxTechniqueRouter:
             return
 
         import onnxruntime as ort
-        from huggingface_hub import hf_hub_download
 
         logger.info("Loading SigLIP ONNX INT8 image encoder...")
 
-        model_path = hf_hub_download(_SIGLIP_ENCODER_REPO, "image_encoder_int8.onnx")
+        model_path = hf_hub_download_local_first(_SIGLIP_ENCODER_REPO, "image_encoder_int8.onnx")
         self._siglip_session = ort.InferenceSession(
             model_path,
             create_cpu_session_options(ort),
             providers=["CPUExecutionProvider"],
         )
 
-        embeddings_path = hf_hub_download(_SIGLIP_ENCODER_REPO, "text_embeddings.npz")
+        embeddings_path = hf_hub_download_local_first(_SIGLIP_ENCODER_REPO, "text_embeddings.npz")
         loaded = np.load(embeddings_path)
         self._text_embeddings = {k: loaded[k] for k in loaded.files}
 
