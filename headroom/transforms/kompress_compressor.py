@@ -25,7 +25,11 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from ..config import TransformResult
-from ..onnx_runtime import create_cpu_session_options, trim_process_heap
+from ..onnx_runtime import (
+    create_cpu_session_options,
+    hf_hub_download_local_first,
+    trim_process_heap,
+)
 from ..tokenizer import Tokenizer
 from .base import Transform
 
@@ -329,10 +333,9 @@ def _load_kompress_onnx(
         if model_id in _kompress_cache:
             return _kompress_cache[model_id]
 
-        from huggingface_hub import hf_hub_download
-
         logger.info("Downloading Kompress ONNX model from %s ...", model_id)
-        onnx_path = hf_hub_download(model_id, "onnx/kompress-int8.onnx")
+
+        onnx_path = hf_hub_download_local_first(model_id, "onnx/kompress-int8.onnx")
 
         backend = "onnx_coreml" if use_coreml else "onnx"
         providers: list[Any]
@@ -383,10 +386,9 @@ def _load_kompress_pytorch(model_id: str, device: str = "auto") -> tuple[Any, An
         if model_id in _kompress_cache:
             return _kompress_cache[model_id]
 
-        from huggingface_hub import hf_hub_download
-
         logger.info("Downloading Kompress PyTorch model from %s ...", model_id)
-        weights_path = hf_hub_download(model_id, "model.safetensors")
+
+        weights_path = hf_hub_download_local_first(model_id, "model.safetensors")
 
         HeadroomCompressorModel = _get_model_class()
         model = HeadroomCompressorModel()

@@ -103,22 +103,26 @@ class BM25Scorer(RelevanceScorer):
         Uses the standard BM25 IDF formula:
             IDF = log((N - n + 0.5) / (n + 0.5) + 1)
 
-        Where N = total docs, n = docs containing term.
+        Where N = total docs (``doc_count``) and n = docs containing the
+        term (``doc_freq``). The ``+ 1`` keeps the result non-negative even
+        when a term appears in more than half the corpus, which is the
+        floored variant of BM25 used by Lucene/Elasticsearch.
 
-        For single-document scoring, we use a simplified version.
+        A term that occurs in few documents (low ``doc_freq``) is more
+        discriminative and earns a higher IDF; a term that occurs in nearly
+        every document earns an IDF approaching ``log(1) = 0``.
         """
-        if doc_freq == 0:
+        if doc_freq <= 0:
             return 0.0
 
-        # Simplified IDF for single-document case
-        # Term present = higher IDF, term absent = 0
-        return math.log(2.0)  # Constant since we have single document
+        return math.log((doc_count - doc_freq + 0.5) / (doc_freq + 0.5) + 1.0)
 
     def _bm25_score(
         self,
         doc_tokens: list[str],
         query_tokens: list[str],
         avg_doc_len: float | None = None,
+        idf_map: dict[str, float] | None = None,
     ) -> tuple[float, list[str]]:
         """Compute BM25 score between document and query.
 
@@ -126,6 +130,13 @@ class BM25Scorer(RelevanceScorer):
             doc_tokens: Tokenized document.
             query_tokens: Tokenized query.
             avg_doc_len: Average document length (optional).
+            idf_map: Pre-computed corpus IDF per term. When supplied (batch
+                scoring, where a real corpus exists) each term is weighted by
+                its inverse document frequency, so a discriminative term such
+                as a UUID outranks a term that is common across the corpus.
+                When ``None`` (single-document scoring, where there is no
+                corpus to estimate IDF from) every term falls back to the
+                neutral ``log(2.0)`` weight, preserving the original behaviour.
 
         Returns:
             Tuple of (score, matched_terms).
@@ -149,8 +160,9 @@ class BM25Scorer(RelevanceScorer):
             f = doc_freq[term]
             matched_terms.append(term)
 
-            # BM25 term score
-            idf = math.log(2.0)  # Simplified for single doc
+            # BM25 term score. Use the corpus IDF when available; otherwise
+            # fall back to the neutral single-document weight.
+            idf = idf_map.get(term, math.log(2.0)) if idf_map is not None else math.log(2.0)
             numerator = f * (self.k1 + 1)
             denominator = f + self.k1 * (1 - self.b + self.b * doc_len / avgdl)
 
@@ -223,9 +235,26 @@ class BM25Scorer(RelevanceScorer):
         all_tokens = [self._tokenize(item) for item in items]
         avg_len = sum(len(t) for t in all_tokens) / max(len(items), 1)
 
+        # Compute corpus IDF per query term. Unlike single-item scoring,
+        # a batch is a real corpus, so document frequency is meaningful:
+        # terms that appear in many items are down-weighted while rare,
+        # discriminative terms (IDs, UUIDs) are boosted. This is what makes
+        # the ranking BM25 rather than plain term-frequency weighting.
+        n_docs = len(all_tokens)
+        doc_freq_across: Counter[str] = Counter()
+        for tokens in all_tokens:
+            doc_freq_across.update(set(tokens))
+        idf_map = {
+            term: self._compute_idf(term, n_docs, doc_freq_across[term])
+            for term in set(context_tokens)
+            if term in doc_freq_across
+        }
+
         results = []
         for item_tokens in all_tokens:
-            raw_score, matched = self._bm25_score(item_tokens, context_tokens, avg_doc_len=avg_len)
+            raw_score, matched = self._bm25_score(
+                item_tokens, context_tokens, avg_doc_len=avg_len, idf_map=idf_map
+            )
 
             # Normalize
             if self.normalize_score:

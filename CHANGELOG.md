@@ -8,9 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
+### Bug Fixes
 
 * **proxy:** narrow multi-worker startup warning to accurately name only `CompressionCache` and `PrefixTracker` as per-worker state; CCR store and TOIN are global singletons (file-backed) and are already shared across workers, so the previous warning was misleading. Updated `RUST_DEV.md` to match.
+* **startup:** suppress proxy startup log noise — litellm banner, trafilatura parse errors, HuggingFace Hub unauthenticated warnings, tiktoken fallback warning, and httpx INFO lines from sentence_transformers HEAD checks. Affected files: `headroom/providers/litellm.py`, `headroom/transforms/html_extractor.py`, `headroom/memory/adapters/embedders.py`, `headroom/providers/anthropic.py`, `headroom/providers/registry.py`, `headroom/image/onnx_router.py`, `headroom/transforms/kompress_compressor.py`.
 
 ## [0.23.0](https://github.com/chopratejas/headroom/compare/v0.22.4...v0.23.0) (2026-06-04)
 
