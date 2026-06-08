@@ -297,61 +297,57 @@ def _ensure_codex_provider(path: Path, port: int) -> None:
     path.write_text(content, encoding="utf-8")
 
 
+def _codex_feature_block() -> str:
+    return f"{_CODEX_FEATURE_MARKER_START}\nhooks = true\n{_CODEX_FEATURE_MARKER_END}"
+
+
 def _ensure_codex_feature_flag(path: Path) -> None:
+    """Ensure Codex's ``[features].hooks`` flag is enabled in config.toml.
+
+    ``hooks`` is the canonical key. ``codex_hooks`` was the original key name and
+    still resolves as a deprecated alias, but Codex >= 0.129 emits a deprecation
+    warning for it (renamed in openai/codex#20522). Any such legacy line is
+    removed wherever it appears (any value, inside or outside our marker block) so
+    a migrated config drops the deprecated key and never collides with a duplicate
+    ``hooks`` key. A user-managed ``hooks`` value outside our marker block is left
+    untouched.
+    """
     content = path.read_text(encoding="utf-8") if path.exists() else ""
+    # Drop the deprecated alias key anywhere it appears. Mirrors the top-level
+    # key cleanup in _ensure_codex_provider (#260) so re-running init migrates a
+    # legacy config rather than producing a duplicate `hooks` key.
+    content = re.sub(r"(?m)^[ \t]*codex_hooks[ \t]*=.*\r?\n", "", content)
+
     if _CODEX_FEATURE_MARKER_START in content and _CODEX_FEATURE_MARKER_END in content:
-        block = f"{_CODEX_FEATURE_MARKER_START}\nhooks = true\n{_CODEX_FEATURE_MARKER_END}"
+        # init owns its marker block: always assert hooks = true inside it.
         content = _replace_marker_block(
             content,
             _CODEX_FEATURE_MARKER_START,
             _CODEX_FEATURE_MARKER_END,
-            block,
+            _codex_feature_block(),
         )
-    elif "[features]" in content:
-        lines = content.splitlines()
-        inserted = False
-        for index, line in enumerate(lines):
-            if line.strip() != "[features]":
-                continue
-            section_end = index + 1
-            while section_end < len(lines) and not (
-                lines[section_end].startswith("[") and lines[section_end].endswith("]")
-            ):
-                if re.match(r"^[ \t]*codex_hooks[ \t]*=", lines[section_end]):
-                    lines[section_end] = "hooks = true"
-                if re.match(r"^[ \t]*hooks[ \t]*=", lines[section_end]):
-                    inserted = True
-                    break
-                section_end += 1
-            if not inserted:
-                lines[index + 1 : index + 1] = [
-                    _CODEX_FEATURE_MARKER_START,
-                    "hooks = true",
-                    _CODEX_FEATURE_MARKER_END,
-                ]
-                inserted = True
-            break
-        content = "\n".join(lines).rstrip() + "\n"
-        if not inserted:
-            content = (
-                content.rstrip()
-                + "\n\n[features]\n"
-                + _CODEX_FEATURE_MARKER_START
-                + "\n"
-                + "hooks = true\n"
-                + _CODEX_FEATURE_MARKER_END
-                + "\n"
-            )
+    elif re.search(r"(?m)^[ \t]*hooks[ \t]*=", content):
+        # A user-managed `hooks` key already exists outside our marker block;
+        # respect their value. Clearing the legacy key above was the only work.
+        pass
     else:
-        content = (
-            content.rstrip()
-            + "\n\n[features]\n"
-            + _CODEX_FEATURE_MARKER_START
-            + "\n"
-            + "hooks = true\n"
-            + _CODEX_FEATURE_MARKER_END
-            + "\n"
-        ).lstrip()
+        lines = content.splitlines()
+        features_index = next(
+            (index for index, line in enumerate(lines) if line.strip() == "[features]"),
+            None,
+        )
+        if features_index is not None:
+            # Leading blank line matches the normalisation _replace_marker_block
+            # applies on later runs, so re-running init is byte-idempotent.
+            lines[features_index + 1 : features_index + 1] = [
+                "",
+                *_codex_feature_block().splitlines(),
+            ]
+            content = "\n".join(lines).rstrip() + "\n"
+        else:
+            content = (
+                content.rstrip() + "\n\n[features]\n\n" + _codex_feature_block() + "\n"
+            ).lstrip()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
 
