@@ -6,9 +6,12 @@ import json
 import subprocess
 import sys
 import textwrap
+import types
 from importlib.metadata import PackageNotFoundError
 from pathlib import Path
 from unittest.mock import patch
+
+import pytest
 
 import headroom._version as version_module
 
@@ -146,6 +149,33 @@ def test_proxy_package_exports_remain_accessible() -> None:
     )
 
     assert result.stdout.strip() == "ok"
+
+
+def test_proxy_lazy_getattr_uses_server_module(monkeypatch: pytest.MonkeyPatch) -> None:
+    import headroom.proxy as proxy
+
+    fake_server = types.ModuleType("headroom.proxy.server")
+
+    def create_app() -> object:
+        return object()
+
+    def run_server() -> None:
+        return None
+
+    fake_server.create_app = create_app  # type: ignore[attr-defined]
+    fake_server.run_server = run_server  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "headroom.proxy.server", fake_server)
+    monkeypatch.delattr(proxy, "server", raising=False)
+
+    assert proxy.__getattr__("create_app") is create_app
+    assert proxy.__getattr__("run_server") is run_server
+
+
+def test_proxy_lazy_getattr_rejects_unknown_attribute() -> None:
+    import headroom.proxy as proxy
+
+    with pytest.raises(AttributeError, match="does_not_exist"):
+        proxy.__getattr__("does_not_exist")
 
 
 def test_proxy_server_import_skips_litellm_backend() -> None:
