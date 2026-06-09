@@ -215,23 +215,27 @@ def _json_byte_len(value: Any) -> int:
 
 def _compact_openai_tool_schema_value(
     value: Any,
+    _parent_key: str | None = None,
 ) -> Any:
     if isinstance(value, list):
-        return [_compact_openai_tool_schema_value(item) for item in value]
+        return [_compact_openai_tool_schema_value(item, _parent_key) for item in value]
 
     if not isinstance(value, dict):
         return value
 
     compacted: dict[str, Any] = {}
     for key, child in value.items():
-        if key in _OPENAI_TOOL_SCHEMA_DROP_KEYS:
+        # Don't drop keys that are property *names* inside a JSON Schema
+        # `properties` object — only drop them when they are schema annotations.
+        # e.g. a tool with a field literally named "title" must not be stripped.
+        if _parent_key != "properties" and key in _OPENAI_TOOL_SCHEMA_DROP_KEYS:
             continue
 
         if key == "description" and isinstance(child, str):
             compacted[key] = " ".join(child.split())
             continue
 
-        compacted[key] = _compact_openai_tool_schema_value(child)
+        compacted[key] = _compact_openai_tool_schema_value(child, key)
 
     return compacted
 
