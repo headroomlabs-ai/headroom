@@ -1,0 +1,60 @@
+name: Stale Triage
+
+on:
+  schedule:
+    # Daily weekday pass during US morning hours.
+    - cron: '17 15 * * 1-5'
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: stale-triage
+  cancel-in-progress: false
+
+jobs:
+  stale:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Ensure stale label exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh label create "status: stale" \
+            --repo "${{ github.repository }}" \
+            --color "ededed" \
+            --description "No recent activity; may be closed if it stays inactive" \
+            --force
+
+      - uses: actions/stale@v9
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          operations-per-run: 200
+          remove-stale-when-updated: true
+          exempt-all-milestones: true
+          exempt-issue-labels: pinned,security,good first issue,help wanted,needs reproduction
+          exempt-pr-labels: pinned,security,dependencies,release,do not merge
+
+          stale-issue-label: "status: stale"
+          days-before-issue-stale: 60
+          days-before-issue-close: 14
+          stale-issue-message: >
+            This issue has had no recent activity and is being marked stale.
+            Please comment with new context if it is still relevant.
+          close-issue-message: >
+            Closing this issue due to continued inactivity. It can be reopened
+            if there is new information or a clear next step.
+
+          stale-pr-label: "status: stale"
+          days-before-pr-stale: 30
+          days-before-pr-close: 14
+          stale-pr-message: >
+            This pull request has had no recent activity and is being marked
+            stale. Please rebase, resolve conflicts, or comment if it is still
+            actively being worked.
+          close-pr-message: >
+            Closing this pull request due to continued inactivity. It can be
+            reopened when it is ready for review again.
