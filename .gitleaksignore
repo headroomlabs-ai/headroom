@@ -1,0 +1,6 @@
+# Gitleaks allowlist — test fixtures and example tokens only.
+# Each entry is a fingerprint: file:rule:line
+
+# jwt.io example token used as a test fixture in the auth_mode benchmark.
+# This is the canonical public example JWT from jwt.io — not a real credential.
+crates/headroom-core/benches/auth_mode.rs:jwt:48

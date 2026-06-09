@@ -1350,6 +1350,18 @@ wheels = [
 ]
 
 [[package]]
+name = "gunicorn"
+version = "26.0.0"
+source = { registry = "https://pypi.org/simple/" }
+dependencies = [
+    { name = "packaging", marker = "python_full_version < '3.11' or sys_platform != 'win32'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/6d/b7/a4a3f632f823e432ce6bc65f62961b7980c898c77f075a2f7118cb3846fe/gunicorn-26.0.0.tar.gz", hash = "sha256:ca9346f85e3a4aeeb64d491045c16b9a35647abd37ea15efe53080eb8b090baf", size = 727286, upload-time = "2026-05-05T06:38:25.529Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e6/40/9c2384fc2be4ad25dd4a49decd5ad9ea5a3639814c11bd40ab77cb9f0a14/gunicorn-26.0.0-py3-none-any.whl", hash = "sha256:40233d26a5f0d1872916188c276e21641155111c2853f0c2cd55260aec0d24fc", size = 212009, upload-time = "2026-05-05T06:38:23.007Z" },
+]
+
+[[package]]
 name = "h11"
 version = "0.16.0"
 source = { registry = "https://pypi.org/simple/" }
@@ -1373,7 +1385,7 @@ wheels = [
 
 [[package]]
 name = "headroom-ai"
-version = "0.23.0"
+version = "0.24.0"
 source = { editable = "." }
 dependencies = [
     { name = "ast-grep-cli" },
@@ -1525,6 +1537,21 @@ proxy = [
     { name = "websockets" },
     { name = "zstandard" },
 ]
+proxy-prod = [
+    { name = "fastapi" },
+    { name = "gunicorn", marker = "sys_platform != 'win32'" },
+    { name = "httpx", extra = ["http2"] },
+    { name = "magika" },
+    { name = "mcp" },
+    { name = "onnxruntime" },
+    { name = "openai" },
+    { name = "sqlite-vec" },
+    { name = "transformers" },
+    { name = "uvicorn" },
+    { name = "watchdog" },
+    { name = "websockets" },
+    { name = "zstandard" },
+]
 relevance = [
     { name = "fastembed" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple/" }, marker = "python_full_version < '3.11'" },
@@ -1570,6 +1597,8 @@ requires-dist = [
     { name = "fastapi", marker = "extra == 'dev'", specifier = ">=0.100.0" },
     { name = "fastapi", marker = "extra == 'proxy'", specifier = ">=0.100.0" },
     { name = "fastembed", marker = "extra == 'relevance'", specifier = ">=0.4.0" },
+    { name = "gunicorn", marker = "sys_platform != 'win32' and extra == 'proxy-prod'", specifier = ">=21.0.0" },
+    { name = "headroom-ai", extras = ["proxy"], marker = "extra == 'proxy-prod'" },
     { name = "headroom-ai", extras = ["proxy", "code", "ml", "memory", "relevance", "image", "reports", "otel", "evals", "voice", "html", "benchmark", "mcp"], marker = "extra == 'all'" },
     { name = "headroom-ai", extras = ["voice"], marker = "extra == 'voice-train'" },
     { name = "hnswlib", marker = "extra == 'dev'", specifier = ">=0.8.0" },
@@ -1644,7 +1673,7 @@ requires-dist = [
     { name = "websockets", marker = "extra == 'proxy'", specifier = ">=13.0" },
     { name = "zstandard", marker = "extra == 'proxy'", specifier = ">=0.20.0" },
 ]
-provides-extras = ["proxy", "code", "ml", "memory", "memory-stack", "relevance", "image", "reports", "otel", "anyllm", "langchain", "agno", "strands", "mcp", "voice", "voice-train", "evals", "bedrock", "html", "benchmark", "dev", "all"]
+provides-extras = ["proxy", "proxy-prod", "code", "ml", "memory", "memory-stack", "relevance", "image", "reports", "otel", "anyllm", "langchain", "agno", "strands", "mcp", "voice", "voice-train", "evals", "bedrock", "html", "benchmark", "dev", "all"]
 
 [package.metadata.requires-dev]
 dev = [{ name = "ruff", specifier = ">=0.14.14" }]

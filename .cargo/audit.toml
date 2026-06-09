@@ -11,22 +11,11 @@
 # Run: cargo audit --deny warnings
 # Docs: https://docs.rs/cargo-audit/latest/cargo_audit/config/
 
+# cargo-audit expects ignore entries as plain strings (advisory IDs only).
+# Reasons are documented in the comments above each entry.
+
 [advisories]
-ignore = [
-  # RUSTSEC-2025-0119: `number_prefix` crate is unmaintained. It is a
-  # transitive dependency of `indicatif` (via `console`) with no known
-  # vulnerability — only a maintenance status advisory. No fix or
-  # replacement is available at this time.
-  { id = "RUSTSEC-2025-0119", reason = "number_prefix is unmaintained but has no known vuln; transitive via indicatif/console, no upgrade path" },
-
-  # RUSTSEC-2026-0002: `lru` crate has an unsoundness advisory. It is a
-  # transitive dependency pulled by several crates in our graph. The
-  # advisory does not affect our usage pattern (no concurrent mutable
-  # access across thread boundaries in the affected code path).
-  { id = "RUSTSEC-2026-0002", reason = "lru unsoundness does not affect our usage pattern; transitive dep, no upgrade available" },
-
-  # RUSTSEC-2024-0436: `paste` crate is unmaintained. It is a transitive
-  # dependency with no known vulnerability — only a maintenance advisory.
-  # The macro-only crate is stable and widely used; no replacement exists.
-  { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained but has no known vuln; transitive dep, macro-only crate, stable" },
-]
+# RUSTSEC-2025-0119: `number_prefix` is unmaintained; transitive via indicatif/console, no known vuln, no upgrade path.
+# RUSTSEC-2026-0002: `lru` unsoundness; transitive dep, does not affect our usage pattern, no upgrade available.
+# RUSTSEC-2024-0436: `paste` is unmaintained; transitive dep, macro-only crate, no known vuln, no replacement.
+ignore = ["RUSTSEC-2025-0119", "RUSTSEC-2026-0002", "RUSTSEC-2024-0436"]
