@@ -317,7 +317,7 @@ jobs:
 
       - name: Install cosign
         if: steps.manifest.outputs.index_digest != ''
-        uses: sigstore/cosign-installer@v4
+        uses: sigstore/cosign-installer@v3
 
       - name: Sign multi-arch index manifest with cosign
         if: steps.manifest.outputs.index_digest != ''
