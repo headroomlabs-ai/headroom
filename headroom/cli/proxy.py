@@ -473,21 +473,6 @@ def _selected_context_tool() -> str:
     "For containerized / read-only / load-balanced deployments. "
     "(env: HEADROOM_STATELESS=true)",
 )
-@click.option(
-    "--embedding-server/--no-embedding-server",
-    default=False,
-    help="Run a dedicated embedding server sidecar (Option E). "
-    "Shares a single ONNX embedder + HNSW index across all worker processes, "
-    "saving ~600 MB RSS. Default: disabled (opt-in for testing). "
-    "(env: HEADROOM_EMBEDDING_SERVER=true)",
-)
-@click.option(
-    "--embedding-server-socket",
-    default=None,
-    help="Unix socket path for the embedding server sidecar. "
-    "Default: /tmp/headroom-embed-{port}.sock. "
-    "(env: HEADROOM_EMBEDDING_SERVER_SOCKET)",
-)
 @click.pass_context
 def proxy(
     ctx: click.Context,
@@ -544,8 +529,6 @@ def proxy(
     bedrock_profile: str | None,
     no_telemetry: bool,
     stateless: bool,
-    embedding_server: bool,
-    embedding_server_socket: str | None,
 ) -> None:
     """Start the optimization proxy server.
 
@@ -855,9 +838,6 @@ Memory (Multi-Provider):
     # Performance tuning section — only shown when at least one tuning var is active.
     _stable_turn = int(os.environ.get("HEADROOM_COMPRESSION_STABLE_AFTER_TURN", "0"))
     _stale_turns = int(os.environ.get("HEADROOM_STALE_READ_COMPRESS_AFTER_TURNS", "0"))
-    _embed_socket = os.environ.get("HEADROOM_EMBEDDING_SERVER_SOCKET") or (
-        embedding_server and (embedding_server_socket or f"/tmp/headroom-embed-{port}.sock")
-    )
     _tuning_lines: list[str] = []
     if _stable_turn:
         _tuning_lines.append(
@@ -869,8 +849,6 @@ Memory (Multi-Provider):
             f"  Stale read compression:  reads older than {_stale_turns} turns eligible"
             f"  (HEADROOM_STALE_READ_COMPRESS_AFTER_TURNS={_stale_turns})"
         )
-    if _embed_socket:
-        _tuning_lines.append(f"  Embedding sidecar:       {_embed_socket}")
     if _tuning_lines:
         tuning_section = "\nPerformance Tuning:\n" + "\n".join(_tuning_lines)
     else:
@@ -923,44 +901,6 @@ Endpoints:
 Press Ctrl+C to stop.
 """)
 
-    # -----------------------------------------------------------------------
-    # Option E: start embedding server sidecar if requested
-    # -----------------------------------------------------------------------
-    _embed_watchdog = None
-    if embedding_server:
-        _embed_socket = embedding_server_socket or f"/tmp/headroom-embed-{config.port}.sock"
-        # Pass socket path to all worker processes via environment variable
-        os.environ["HEADROOM_EMBEDDING_SERVER_SOCKET"] = _embed_socket
-        click.echo(f"  Embedding server: starting sidecar on {_embed_socket}...")
-
-        import asyncio as _asyncio
-
-        from headroom.memory.adapters.watchdog import EmbeddingServerWatchdog
-
-        async def _start_embed_watchdog() -> Any:
-            wd = EmbeddingServerWatchdog(socket_path=_embed_socket)
-            await wd.start()
-            ok = await wd.wait_until_healthy(timeout=30.0)
-            if not ok:
-                click.echo(
-                    "  WARNING: Embedding server did not become healthy within 30s. "
-                    "Memory features may be unavailable.",
-                    err=True,
-                )
-            else:
-                click.echo("  Embedding server: ready.")
-            return wd
-
-        try:
-            _embed_watchdog = _asyncio.run(_start_embed_watchdog())
-        except Exception as _exc:
-            click.echo(
-                f"  WARNING: Failed to start embedding server sidecar: {_exc}. "
-                "Falling back to per-worker embedder.",
-                err=True,
-            )
-            os.environ.pop("HEADROOM_EMBEDDING_SERVER_SOCKET", None)
-
     try:
         run_kwargs: dict[str, Any] = {}
         if workers != 1:
@@ -974,8 +914,3 @@ Press Ctrl+C to stop.
         run_server(config, **run_kwargs)
     except KeyboardInterrupt:
         click.echo("\nShutting down...")
-    finally:
-        if _embed_watchdog is not None:
-            import asyncio as _asyncio2
-
-            _asyncio2.run(_embed_watchdog.stop())
