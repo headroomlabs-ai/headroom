@@ -226,6 +226,7 @@ def test_stats_cached_query_reuses_short_ttl_snapshot(monkeypatch: pytest.Monkey
     monkeypatch.setattr(server.time, "monotonic", lambda: now["value"])
     # Treat TestClient as loopback so the cache path is exercised.
     import headroom.proxy.loopback_guard as _lg
+
     monkeypatch.setattr(_lg, "is_loopback_host", lambda host: True)
     monkeypatch.setattr(
         server,

@@ -30,3 +30,21 @@ wildcards = "allow"
 [sources]
 unknown-registry = "warn"
 unknown-git = "warn"
+
+[advisories]
+version = 2
+# Advisories suppressed here must also be suppressed in .cargo/audit.toml.
+# Add an entry when a transitive dependency has an advisory that cannot be
+# resolved immediately; include a justification and a tracking note.
+ignore = [
+    # pyo3 0.22.6 buffer overflow in PyString::from_object. Fix requires >=0.24.1
+    # which is a breaking API change. Tracked for a follow-up upgrade; our code
+    # does not call PyString::from_object directly.
+    { id = "RUSTSEC-2025-0020", reason = "pyo3 0.22.6 buffer overflow; fix requires >=0.24.1 breaking change, tracked for upgrade" },
+    # number_prefix is unmaintained; transitive via indicatif/console, no known vuln, no upgrade path.
+    { id = "RUSTSEC-2025-0119", reason = "number_prefix is unmaintained but has no known vuln; transitive via indicatif/console, no upgrade path" },
+    # lru unsoundness; transitive dep, does not affect our usage pattern, no upgrade available.
+    { id = "RUSTSEC-2026-0002", reason = "lru unsoundness does not affect our usage pattern; transitive dep, no upgrade available" },
+    # paste is unmaintained; transitive dep, macro-only crate, no known vuln, no replacement.
+    { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained but has no known vuln; transitive dep, macro-only crate, stable" },
+]
