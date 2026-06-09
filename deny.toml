@@ -19,6 +19,10 @@ allow = [
     "Zlib",
     "0BSD",
     "MPL-2.0",
+    # NCSA: libfuzzer-sys (transitive via rav1e -> ravif -> image -> fastembed); OSI/FSF approved
+    "NCSA",
+    # CDLA-Permissive-2.0: webpki-roots (transitive via tokio-tungstenite/ureq); permissive data license
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.8
 exceptions = []

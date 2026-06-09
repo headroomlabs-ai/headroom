@@ -42,8 +42,10 @@ WRAPPER="${HOME}/.local/bin/headroom"
 status_output="$("${WRAPPER}" install status --profile "${PROFILE}")"
 printf '%s\n' "${status_output}"
 grep -Fq "Status:     running" <<<"${status_output}"
-curl --fail --silent "http://127.0.0.1:${PORT}/readyz" >/dev/null
-health_output="$(curl --fail --silent "http://127.0.0.1:${PORT}/health")"
+# /health is loopback-only (Docker port-forwarding traffic arrives with the
+# bridge gateway IP, not 127.0.0.1). Use /readyz which is public and returns
+# the same deployment fields this script asserts on.
+health_output="$(curl --fail --silent "http://127.0.0.1:${PORT}/readyz")"
 
 python3 - <<'PY' "${HOME}" "${PROFILE}" "${PORT}" "${health_output}"
 import json

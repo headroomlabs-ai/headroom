@@ -1609,18 +1609,18 @@ requires-dist = [
     { name = "huggingface-hub", marker = "extra == 'ml'", specifier = ">=1.5.0,<2.0" },
     { name = "hypothesis", marker = "extra == 'dev'", specifier = ">=6.0.0" },
     { name = "jinja2", marker = "extra == 'reports'", specifier = ">=3.0.0" },
-    { name = "langchain-core", marker = "extra == 'langchain'", specifier = ">=0.2.0" },
+    { name = "langchain-core", marker = "extra == 'langchain'", specifier = ">=1.3.3,<4.0" },
     { name = "langchain-ollama", marker = "extra == 'dev'", specifier = ">=0.2.0" },
-    { name = "langchain-openai", marker = "extra == 'langchain'", specifier = ">=0.1.0" },
-    { name = "litellm", specifier = ">=1.83.10" },
-    { name = "litellm", marker = "extra == 'dev'", specifier = ">=1.83.10" },
+    { name = "langchain-openai", marker = "extra == 'langchain'", specifier = ">=1.1.14,<2.0" },
+    { name = "litellm", specifier = ">=1.86.2,<2.0" },
+    { name = "litellm", marker = "extra == 'dev'", specifier = ">=1.86.2,<2.0" },
     { name = "lm-eval", extras = ["api"], marker = "extra == 'benchmark'", specifier = ">=0.4.0" },
     { name = "magika", marker = "extra == 'proxy'", specifier = ">=0.6.0" },
     { name = "mcp", marker = "extra == 'mcp'", specifier = ">=1.0.0" },
     { name = "mcp", marker = "extra == 'proxy'", specifier = ">=1.0.0" },
-    { name = "mem0ai", marker = "extra == 'memory-stack'", specifier = ">=0.1.100" },
+    { name = "mem0ai", marker = "extra == 'memory-stack'", specifier = ">=1.0.0,<2.0" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.0.0" },
-    { name = "neo4j", marker = "extra == 'memory-stack'", specifier = ">=5.20.0" },
+    { name = "neo4j", marker = "extra == 'memory-stack'", specifier = ">=5.20.0,<7.0" },
     { name = "numpy", marker = "extra == 'dev'", specifier = ">=1.24.0" },
     { name = "numpy", marker = "extra == 'evals'", specifier = ">=1.24.0" },
     { name = "numpy", marker = "extra == 'relevance'", specifier = ">=1.24.0" },
@@ -1643,15 +1643,15 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.21.0" },
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=4.0.0" },
-    { name = "qdrant-client", marker = "extra == 'memory-stack'", specifier = ">=1.9.0" },
+    { name = "qdrant-client", marker = "extra == 'memory-stack'", specifier = ">=1.9.0,<2.0" },
     { name = "rapidocr", marker = "python_full_version >= '3.13' and extra == 'image'", specifier = ">=3.0,<4" },
     { name = "rapidocr-onnxruntime", marker = "python_full_version < '3.13' and extra == 'image'", specifier = ">=1.4.0,<2" },
     { name = "rich", specifier = ">=13.0.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.1.0" },
     { name = "scikit-learn", marker = "extra == 'evals'", specifier = ">=1.3.0" },
-    { name = "sentence-transformers", marker = "extra == 'dev'", specifier = ">=2.2.0" },
-    { name = "sentence-transformers", marker = "extra == 'evals'", specifier = ">=2.2.0" },
-    { name = "sentence-transformers", marker = "extra == 'memory'", specifier = ">=2.2.0" },
+    { name = "sentence-transformers", marker = "extra == 'dev'", specifier = ">=2.2.0,<6.0" },
+    { name = "sentence-transformers", marker = "extra == 'evals'", specifier = ">=2.2.0,<6.0" },
+    { name = "sentence-transformers", marker = "extra == 'memory'", specifier = ">=2.2.0,<6.0" },
     { name = "sentencepiece", marker = "extra == 'image'", specifier = ">=0.1.99" },
     { name = "sqlite-vec", marker = "extra == 'dev'", specifier = ">=0.1.6" },
     { name = "sqlite-vec", marker = "extra == 'memory'", specifier = ">=0.1.6" },
@@ -1662,12 +1662,12 @@ requires-dist = [
     { name = "torch", marker = "extra == 'ml'", specifier = ">=2.0.0" },
     { name = "torch", marker = "extra == 'voice'", specifier = ">=2.0.0" },
     { name = "trafilatura", marker = "extra == 'html'", specifier = ">=1.6.0" },
-    { name = "transformers", marker = "extra == 'ml'", specifier = ">=4.30.0" },
-    { name = "transformers", marker = "extra == 'proxy'", specifier = ">=4.30.0" },
-    { name = "transformers", marker = "extra == 'voice'", specifier = ">=4.30.0" },
+    { name = "transformers", marker = "extra == 'ml'", specifier = ">=4.30.0,<6.0" },
+    { name = "transformers", marker = "extra == 'proxy'", specifier = ">=4.30.0,<6.0" },
+    { name = "transformers", marker = "extra == 'voice'", specifier = ">=4.30.0,<6.0" },
     { name = "tree-sitter-language-pack", marker = "extra == 'code'", specifier = ">=0.10.0" },
-    { name = "uvicorn", marker = "extra == 'dev'", specifier = ">=0.23.0" },
-    { name = "uvicorn", marker = "extra == 'proxy'", specifier = ">=0.23.0" },
+    { name = "uvicorn", marker = "extra == 'dev'", specifier = ">=0.23.0,<1.0" },
+    { name = "uvicorn", marker = "extra == 'proxy'", specifier = ">=0.23.0,<1.0" },
     { name = "watchdog", marker = "extra == 'proxy'", specifier = ">=4.0.0" },
     { name = "websockets", marker = "extra == 'dev'", specifier = ">=13.0" },
     { name = "websockets", marker = "extra == 'proxy'", specifier = ">=13.0" },
@@ -2081,10 +2081,11 @@ wheels = [
 
 [[package]]
 name = "langchain-core"
-version = "1.2.26"
+version = "1.4.2"
 source = { registry = "https://pypi.org/simple/" }
 dependencies = [
     { name = "jsonpatch" },
+    { name = "langchain-protocol" },
     { name = "langsmith" },
     { name = "packaging" },
     { name = "pydantic" },
@@ -2093,9 +2094,9 @@ dependencies = [
     { name = "typing-extensions" },
     { name = "uuid-utils" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/8c/b0/30ed29e5820580bc13d70b1f8a212b4fe0609a9737164ed1a90167941ca2/langchain_core-1.2.26.tar.gz", hash = "sha256:ba025ec70e19b56467f46b9109de19d30d169d328a174986b353cb23fd0ff0fe", size = 844795, upload-time = "2026-04-03T23:30:32.567Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/de/13/446580dc9f26e4e524d57f727a9007b4c2484decd2c00269b7fd4f51326d/langchain_core-1.4.2.tar.gz", hash = "sha256:242abe763db71de05fe0d7ecff03f9cc6022fbceba8be15902fb89e35b7292f9", size = 935103, upload-time = "2026-06-08T18:19:41.611Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/e5/8b/c184205a52b37a4a3166b3567323495701929b1dbfd528e5ba1df62bd404/langchain_core-1.2.26-py3-none-any.whl", hash = "sha256:3d0a3913dff77a930b017a05afe979e4959d27bec0c77ee51f9a100754510509", size = 508298, upload-time = "2026-04-03T23:30:30.253Z" },
+    { url = "https://files.pythonhosted.org/packages/d0/2c/92a6a6f5af07f1c347021d81aea307d405ed9d34a4f8ea6b78cfa3c3b189/langchain_core-1.4.2-py3-none-any.whl", hash = "sha256:a2906d339514e02a46d6c0888021dd2651ed5acc661a1f546fe33e1453adfcb9", size = 550103, upload-time = "2026-06-08T18:19:40.197Z" },
 ]
 
 [[package]]
@@ -2113,16 +2114,28 @@ wheels = [
 
 [[package]]
 name = "langchain-openai"
-version = "1.1.9"
+version = "1.2.2"
 source = { registry = "https://pypi.org/simple/" }
 dependencies = [
     { name = "langchain-core" },
     { name = "openai" },
     { name = "tiktoken" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/49/ae/1dbeb49ab8f098f78ec52e21627e705e5d7c684dc8826c2c34cc2746233a/langchain_openai-1.1.9.tar.gz", hash = "sha256:fdee25dcf4b0685d8e2f59856f4d5405431ef9e04ab53afe19e2e8360fed8234", size = 1004828, upload-time = "2026-02-10T21:03:21.615Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/f7/1b/c506c7f41156d3a6b4582b4c487f480001b8741deecc6e2d4931fdf4cf2c/langchain_openai-1.2.2.tar.gz", hash = "sha256:8698ffcee9a086e91ab6d207f0026181a03effcbf86bf9aee1808ee35af69dcc", size = 1147539, upload-time = "2026-05-21T22:08:31.123Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/52/a1/8a20d19f69d022c10d34afa42d972cc50f971b880d0eb4a828cf3dd824a8/langchain_openai-1.1.9-py3-none-any.whl", hash = "sha256:ca2482b136c45fb67c0db84a9817de675e0eb8fb2203a33914c1b7a96f273940", size = 85769, upload-time = "2026-02-10T21:03:20.333Z" },
+    { url = "https://files.pythonhosted.org/packages/a6/8e/7406c99afacafc8c2ce0fa4152f9f8b9598c93ceb291959821abd053b982/langchain_openai-1.2.2-py3-none-any.whl", hash = "sha256:7da39a3c70cbafa93853456199e39a264dc70651be79b12ac49b4f6a448bce2d", size = 99631, upload-time = "2026-05-21T22:08:29.527Z" },
+]
+
+[[package]]
+name = "langchain-protocol"
+version = "0.0.16"
+source = { registry = "https://pypi.org/simple/" }
+dependencies = [
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/36/e7/8300ba22d968653051fd06e3117d783872dddf3dcebdd6b1d386836eb43c/langchain_protocol-0.0.16.tar.gz", hash = "sha256:806c7cdd951b1c4f692fa40fce60821ff0f221d4360e27673ddf2c2b99c2b7ff", size = 5969, upload-time = "2026-05-28T23:05:11.121Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/1f/9c/06dfcc88d02a6364e8d864c421ddd3736305cb0a6c853f75c302c80fe17c/langchain_protocol-0.0.16-py3-none-any.whl", hash = "sha256:3658c142c5d0fb3a023a4be442ce4c15c6d626aab6135eb79a76dc64ad19c3c3", size = 7037, upload-time = "2026-05-28T23:05:10.163Z" },
 ]
 
 [[package]]
