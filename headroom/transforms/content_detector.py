@@ -30,6 +30,8 @@ class ContentType(Enum):
     BUILD_OUTPUT = "build"  # Compiler, test, lint logs
     GIT_DIFF = "diff"  # Unified diff format
     HTML = "html"  # Web pages (needs content extraction, not compression)
+    BOOLEAN_LOGIC = "boolean_logic"      # Boolean expressions and truth tables
+    NL_BOOLEAN_LOGIC = "nl_boolean_logic"  # Natural-language logic descriptions
     PLAIN_TEXT = "text"  # Fallback
 
 
@@ -164,7 +166,17 @@ def detect_content_type(content: str) -> DetectionResult:
     if code_result and code_result.confidence >= 0.5:
         return code_result
 
-    # 7. Fallback to plain text
+    # 7. Check for boolean logic (truth tables and boolean expressions)
+    bool_result = _try_detect_boolean(content)
+    if bool_result and bool_result.confidence >= 0.7:
+        return bool_result
+
+    # 8. Check for natural-language logic descriptions
+    nl_bool_result = _try_detect_nl_boolean(content)
+    if nl_bool_result and nl_bool_result.confidence >= 0.7:
+        return nl_bool_result
+
+    # 9. Fallback to plain text
     return DetectionResult(ContentType.PLAIN_TEXT, 0.5, {})
 
 
@@ -433,3 +445,138 @@ def is_json_array_of_dicts(content: str) -> bool:
     return result.content_type == ContentType.JSON_ARRAY and result.metadata.get(
         "is_dict_array", False
     )
+
+
+# ── Boolean logic detection ───────────────────────────────────────────────────
+
+_BOOL_ENGLISH_OPS = re.compile(
+    r"\b(AND|OR|NOT|XOR|NAND|NOR|XNOR)\b", re.I
+)
+_BOOL_SYMBOLIC_OPS = re.compile(
+    r"(?<![a-zA-Z0-9_])[A-Z](?:\s*[.+^|&]\s*!?[A-Z])+",
+)
+_BOOL_VARIABLE = re.compile(r"^[A-Z]$")
+_BOOL_TABLE_HEADER = re.compile(
+    r"^[\|]?\s*([A-Za-z_]\w*\s*[\|]?\s*){2,}$"
+)
+_BOOL_TABLE_ROW = re.compile(
+    r"^[\s|]*([01][\s|]+)+[01][\s|]*$"
+)
+
+
+def _try_detect_boolean(content: str) -> "DetectionResult | None":
+    """Detect boolean logic content: truth tables and boolean expressions.
+
+    Returns a DetectionResult with ContentType.BOOLEAN_LOGIC when confident
+    the content represents boolean algebra. Does not fire for source code
+    that happens to use boolean operators — detection requires single-letter
+    uppercase variables or an explicit truth table structure.
+    """
+    stripped = content.strip()
+    lines    = [l.strip() for l in stripped.splitlines() if l.strip()]
+
+    if not lines:
+        return None
+
+    # ── Truth table detection ─────────────────────────────────────────────
+    # Require: 1 header row of variable names + N binary data rows
+    header_found    = False
+    binary_rows     = 0
+    header_var_count = 0
+
+    for line in lines:
+        clean = re.sub(r"[|\-:+]", " ", line).strip()
+        words = clean.split()
+        if not words:
+            continue
+        if not header_found:
+            # Header: all tokens look like identifiers, none are "0" or "1"
+            if all(re.match(r"^[A-Za-z_]\w*$", w) for w in words) and len(words) >= 2:
+                header_found     = True
+                header_var_count = len(words)
+                continue
+        if header_found:
+            # Skip separator rows
+            if re.match(r"^[-\s|:]+$", line):
+                continue
+            if all(v in ("0", "1") for v in words) and len(words) == header_var_count:
+                binary_rows += 1
+
+    if header_found and binary_rows >= 2:
+        confidence = min(0.95, 0.7 + 0.05 * binary_rows)
+        return DetectionResult(
+            ContentType.BOOLEAN_LOGIC,
+            confidence,
+            {"form": "truth_table", "variable_count": header_var_count - 1},
+        )
+
+    # ── Boolean expression detection ──────────────────────────────────────
+    # Require single-letter uppercase variables + recognised operators
+    # Reject if content has lowercase identifiers (likely prose or code)
+    text = " ".join(lines)
+
+    has_english_ops  = bool(_BOOL_ENGLISH_OPS.search(text))
+    has_symbolic_ops = bool(_BOOL_SYMBOLIC_OPS.search(text))
+
+    # Check uppercase-only variable pattern: single capital letters used as variables
+    single_cap_vars = re.findall(r"\b([A-Z])\b", text)
+    has_single_caps = len(set(single_cap_vars)) >= 2
+
+    # Reject if there's prose (lowercase words longer than 2 chars not in operators)
+    prose_words = re.findall(r"\b[a-z]{3,}\b", text)
+    known_ops   = {"and", "or", "not", "xor", "nand", "nor", "xnor"}
+    prose_noise = [w for w in prose_words if w not in known_ops]
+    if len(prose_noise) > 2:
+        return None
+
+    if has_single_caps and (has_english_ops or has_symbolic_ops):
+        confidence = 0.85 if has_english_ops else 0.75
+        return DetectionResult(
+            ContentType.BOOLEAN_LOGIC,
+            confidence,
+            {"form": "expression", "variable_count": len(set(single_cap_vars))},
+        )
+
+    return None
+
+
+_NL_LOGIC_SIGNALS = [
+    re.compile(r"\b(output|signal|result|flag|state)\s+(is\s+)?(high|low|true|false|on|off)\s+(when|if)\b", re.I),
+    re.compile(r"\b(true|on|active|high|enabled)\s+(only\s+)?(if|when|iff)\b", re.I),
+    re.compile(r"\b(lights?|motor|alarm|gate|relay|switch)\s+(turns?\s+)?(on|off)\s+(when|if)\b", re.I),
+]
+_NL_OP_WORDS = re.compile(r"\b(and|or|not|xor|nor|nand|both|neither|either|unless|but not)\b", re.I)
+
+
+def _try_detect_nl_boolean(content: str) -> "DetectionResult | None":
+    """Detect natural-language descriptions of boolean/digital logic.
+
+    Only fires when the prose clearly describes a logic function, not generic
+    prose that happens to use 'and'/'or'. Requires at least one structural
+    signal phrase plus multiple operator words.
+    """
+    stripped = content.strip()
+    # Reject multi-paragraph content — NL logic descriptions are short
+    if stripped.count("\n\n") > 1 or len(stripped.split()) > 100:
+        return None
+    # Must not already look like structured boolean (caught by _try_detect_boolean)
+    if re.search(r"[A-Z]\.[A-Z]|[A-Z]\+[A-Z]", stripped):
+        return None
+
+    signal_hit = any(pat.search(stripped) for pat in _NL_LOGIC_SIGNALS)
+    op_count   = len(_NL_OP_WORDS.findall(stripped))
+
+    if signal_hit and op_count >= 1:
+        return DetectionResult(
+            ContentType.NL_BOOLEAN_LOGIC,
+            0.80,
+            {"form": "nl_description", "op_count": op_count},
+        )
+    if op_count >= 3 and len(stripped.split()) < 50:
+        return DetectionResult(
+            ContentType.NL_BOOLEAN_LOGIC,
+            0.70,
+            {"form": "nl_description", "op_count": op_count},
+        )
+
+    return None
