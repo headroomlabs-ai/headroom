@@ -331,6 +331,35 @@ RESPONSES_CONTEXT_SEARCH_TIMEOUT_SECONDS = 2.0
 WS_FIRST_FRAME_TIMEOUT_SECONDS = 60.0
 
 
+def _extract_codex_handshake_headers(upstream: Any) -> list[tuple[str, str]]:
+    """Return the ``x-codex-*`` headers from an upstream WS handshake response.
+
+    OpenAI delivers the Codex subscription/rate-limit window only on the
+    WebSocket handshake response headers (not in data frames). We forward
+    that subset onto the client-facing 101 so Codex, ``/stats``, and the
+    headroom-desktop gauge can all read the live window. Filtered strictly
+    to ``x-codex-*`` -- never ``set-cookie``/``authorization``/etc.
+    """
+    resp = getattr(upstream, "response", None)
+    headers = getattr(resp, "headers", None)
+    if headers is None:
+        return []
+    raw_items = getattr(headers, "raw_items", None)
+    try:
+        items = list(raw_items()) if callable(raw_items) else list(headers.items())
+    except Exception:
+        return []
+    out: list[tuple[str, str]] = []
+    for name, value in items:
+        name_str = name.decode("latin-1") if isinstance(name, (bytes, bytearray)) else str(name)
+        if name_str.lower().startswith("x-codex-"):
+            value_str = (
+                value.decode("latin-1") if isinstance(value, (bytes, bytearray)) else str(value)
+            )
+            out.append((name_str, value_str))
+    return out
+
+
 def _infer_openai_cache_write_tokens(input_tokens: int, cache_read_tokens: int) -> int:
     """Infer OpenAI automatic prompt-cache writes from uncached input tokens.
 
@@ -3346,38 +3375,6 @@ class OpenAIHandlerMixin:
         if raw_protocol:
             client_subprotocols = [p.strip() for p in raw_protocol.split(",") if p.strip()]
 
-        # Accept client connection with the requested subprotocol
-        async with stage_timer.measure("accept"):
-            if client_subprotocols:
-                await websocket.accept(subprotocol=client_subprotocols[0])
-            else:
-                await websocket.accept()
-
-        # --- Unit 3: register the session as soon as accept succeeds ---
-        client_addr: str | None = None
-        client_info = getattr(websocket, "client", None)
-        if client_info is not None:
-            host = getattr(client_info, "host", None)
-            port = getattr(client_info, "port", None)
-            if host is not None and port is not None:
-                client_addr = f"{host}:{port}"
-            elif host is not None:
-                client_addr = str(host)
-        if ws_sessions is not None:
-            session_handle = WSSessionHandle(
-                session_id=session_id,
-                request_id=request_id,
-                client_addr=client_addr,
-                upstream_url=None,  # set below once upstream_url is computed
-            )
-            ws_sessions.register(session_handle)
-            metrics = getattr(self, "metrics", None)
-            if metrics is not None and hasattr(metrics, "inc_active_ws_sessions"):
-                try:
-                    metrics.inc_active_ws_sessions()
-                except Exception:  # pragma: no cover - defensive
-                    pass
-
         # Forward all client headers except hop-by-hop / per-connection headers.
         # These are WebSocket handshake mechanics that the `websockets` library
         # generates fresh for the upstream connection — forwarding them would conflict.
@@ -3450,10 +3447,6 @@ class OpenAIHandlerMixin:
                 "subprotocols": client_subprotocols,
             },
         )
-
-        # Unit 3: attach the resolved upstream URL to the session handle.
-        if session_handle is not None:
-            session_handle.upstream_url = upstream_url
 
         logger.info(
             "[%s] WS /v1/responses accepted (route=%s, auth_mode=%s, subprotocols=%s)",
@@ -3554,6 +3547,118 @@ class OpenAIHandlerMixin:
         )
 
         try:
+            # --- Connect to upstream OpenAI WebSocket ---
+            # NOTE: we connect *before* accepting the client. OpenAI delivers the
+            # Codex subscription/rate-limit window only on the upstream WS
+            # handshake response headers, so we must read them here and attach
+            # the x-codex-* subset to the client-facing 101 (below). Once accept()
+            # sends the 101 the headers can no longer be added.
+            logger.info(f"[{request_id}] WS /v1/responses connecting to {upstream_url}")
+
+            # Use ssl=True to let the websockets library handle SSL natively.
+            # Manual ssl.create_default_context() + certifi doesn't load the
+            # Windows system cert store, causing HTTP 500 on wss:// connections.
+            use_ssl: bool | None = True if upstream_url.startswith("wss://") else None
+
+            ws_connected = False
+            ws_connect_attempts = max(1, getattr(self.config, "retry_max_attempts", 3))
+            ws_last_err: Exception | None = None
+            _upstream_connect_started = time.perf_counter()
+            _upstream_connect_recorded = False
+            _upstream_first_event_started: float | None = None
+            upstream: Any = None
+
+            for ws_attempt in range(ws_connect_attempts):
+                try:
+                    upstream = await websockets.connect(
+                        upstream_url,
+                        additional_headers=upstream_headers,
+                        subprotocols=(
+                            [websockets.Subprotocol(p) for p in client_subprotocols]
+                            if client_subprotocols and hasattr(websockets, "Subprotocol")
+                            else client_subprotocols or None
+                        ),
+                        ssl=use_ssl,
+                        open_timeout=max(30, self.config.connect_timeout_seconds * 3),
+                        close_timeout=10,
+                        ping_interval=20,
+                        ping_timeout=20,
+                    )
+                    ws_connected = True
+                    if not _upstream_connect_recorded:
+                        stage_timer.record(
+                            "upstream_connect",
+                            (time.perf_counter() - _upstream_connect_started) * 1000.0,
+                        )
+                        _upstream_connect_recorded = True
+                        _upstream_first_event_started = time.perf_counter()
+                    break
+                except Exception as ws_err:
+                    ws_last_err = ws_err
+                    if ws_attempt >= ws_connect_attempts - 1:
+                        break
+                    delay_with_jitter = jitter_delay_ms(
+                        self.config.retry_base_delay_ms,
+                        self.config.retry_max_delay_ms,
+                        ws_attempt,
+                    )
+                    logger.warning(
+                        f"[{request_id}] WS upstream connect failed "
+                        f"(attempt {ws_attempt + 1}/{ws_connect_attempts}): {ws_err}; "
+                        f"retrying in {delay_with_jitter:.0f}ms"
+                    )
+                    await asyncio.sleep(delay_with_jitter / 1000)
+
+            # Accept the client WS, forwarding OpenAI's x-codex-* subscription
+            # window from the upstream handshake onto the client-facing 101 so
+            # Codex, /stats, and the headroom-desktop gauge can read the live
+            # window. In API-key mode the handshake carries no x-codex-* headers,
+            # so accept_headers stays empty and this behaves exactly as before.
+            accept_headers: list[tuple[bytes, bytes]] = []
+            if ws_connected:
+                _codex_handshake = _extract_codex_handshake_headers(upstream)
+                if _codex_handshake:
+                    accept_headers = [
+                        (name.encode("latin-1"), value.encode("latin-1"))
+                        for name, value in _codex_handshake
+                    ]
+                    # Parity with the HTTP path: also refresh Python /stats state.
+                    from headroom.subscription.codex_rate_limits import (
+                        get_codex_rate_limit_state,
+                    )
+
+                    with contextlib.suppress(Exception):
+                        get_codex_rate_limit_state().update_from_headers(dict(_codex_handshake))
+            async with stage_timer.measure("accept"):
+                await websocket.accept(
+                    subprotocol=client_subprotocols[0] if client_subprotocols else None,
+                    headers=accept_headers or None,
+                )
+
+            # --- Unit 3: register the session as soon as accept succeeds ---
+            client_addr: str | None = None
+            client_info = getattr(websocket, "client", None)
+            if client_info is not None:
+                host = getattr(client_info, "host", None)
+                port = getattr(client_info, "port", None)
+                if host is not None and port is not None:
+                    client_addr = f"{host}:{port}"
+                elif host is not None:
+                    client_addr = str(host)
+            if ws_sessions is not None:
+                session_handle = WSSessionHandle(
+                    session_id=session_id,
+                    request_id=request_id,
+                    client_addr=client_addr,
+                    upstream_url=upstream_url,
+                )
+                ws_sessions.register(session_handle)
+                metrics = getattr(self, "metrics", None)
+                if metrics is not None and hasattr(metrics, "inc_active_ws_sessions"):
+                    try:
+                        metrics.inc_active_ws_sessions()
+                    except Exception:  # pragma: no cover - defensive
+                        pass
             # Receive the first message from client (the response.create request).
             # Bound the wait with WS_FIRST_FRAME_TIMEOUT_SECONDS so a zombie
             # client that opens the WS but never sends a frame cannot hold a
@@ -4190,171 +4295,152 @@ class OpenAIHandlerMixin:
                 },
             )
 
-            # --- Connect to upstream OpenAI WebSocket ---
-            logger.info(f"[{request_id}] WS /v1/responses connecting to {upstream_url}")
+            if ws_connected:
+                async with upstream:
+                    await upstream.send(first_msg_raw)
 
-            # Use ssl=True to let the websockets library handle SSL natively.
-            # Manual ssl.create_default_context() + certifi doesn't load the
-            # Windows system cert store, causing HTTP 500 on wss:// connections.
-            use_ssl: bool | None = True if upstream_url.startswith("wss://") else None
+                    # Unit 3: flag the upstream side flips on seeing
+                    # ``response.completed`` so the outer cause
+                    # classifier can prefer it over the raw
+                    # "upstream iterator ended" default.
+                    response_completed_seen = False
+                    # Captures the first exception surfaced by the
+                    # inner relay ``except`` blocks so the outer
+                    # classifier can still tell ``upstream_error``
+                    # from ``upstream_disconnect`` / ``response_completed``
+                    # even though the halves swallow and log.
+                    upstream_relay_error: BaseException | None = None
+                    client_relay_error: BaseException | None = None
 
-            ws_connected = False
-            ws_connect_attempts = max(1, getattr(self.config, "retry_max_attempts", 3))
-            ws_last_err: Exception | None = None
-            _upstream_connect_started = time.perf_counter()
-            _upstream_connect_recorded = False
-            _upstream_first_event_started: float | None = None
-
-            for ws_attempt in range(ws_connect_attempts):
-                try:
-                    async with websockets.connect(
-                        upstream_url,
-                        additional_headers=upstream_headers,
-                        subprotocols=(
-                            [websockets.Subprotocol(p) for p in client_subprotocols]
-                            if client_subprotocols and hasattr(websockets, "Subprotocol")
-                            else client_subprotocols or None
-                        ),
-                        ssl=use_ssl,
-                        open_timeout=max(30, self.config.connect_timeout_seconds * 3),
-                        close_timeout=10,
-                        ping_interval=20,
-                        ping_timeout=20,
-                    ) as upstream:
-                        ws_connected = True
-                        if not _upstream_connect_recorded:
-                            stage_timer.record(
-                                "upstream_connect",
-                                (time.perf_counter() - _upstream_connect_started) * 1000.0,
+                    async def _maybe_compress_response_create_frame(
+                        raw_msg: str,
+                        *,
+                        frame_index: int,
+                    ) -> tuple[str, bool, str | None]:
+                        """Compress a single client→upstream frame
+                        when its `type` is `response.create`. Other
+                        event types (response.cancel, session.update,
+                        etc.) pass through unchanged. Errors are
+                        warned and the original frame is returned —
+                        fail loud in logs, fail safe on the wire.
+                        Updates outer-scope ``tokens_saved``,
+                        ``transforms_applied``, and
+                        ``ws_frames_compressed`` so the session-end
+                        log reports cumulative savings across all
+                        frames in the WS session.
+                        """
+                        nonlocal tokens_saved, transforms_applied, attempted_input_tokens_total
+                        nonlocal ws_frames_compressed
+                        if _ws_bypass:
+                            _log_ws_passthrough(
+                                "bypass_header",
+                                frame_index=frame_index,
+                                raw_bytes=len(raw_msg.encode("utf-8", errors="replace")),
                             )
-                            _upstream_connect_recorded = True
-                            _upstream_first_event_started = time.perf_counter()
-                        await upstream.send(first_msg_raw)
-
-                        # Unit 3: flag the upstream side flips on seeing
-                        # ``response.completed`` so the outer cause
-                        # classifier can prefer it over the raw
-                        # "upstream iterator ended" default.
-                        response_completed_seen = False
-                        # Captures the first exception surfaced by the
-                        # inner relay ``except`` blocks so the outer
-                        # classifier can still tell ``upstream_error``
-                        # from ``upstream_disconnect`` / ``response_completed``
-                        # even though the halves swallow and log.
-                        upstream_relay_error: BaseException | None = None
-                        client_relay_error: BaseException | None = None
-
-                        async def _maybe_compress_response_create_frame(
-                            raw_msg: str,
-                            *,
-                            frame_index: int,
-                        ) -> tuple[str, bool, str | None]:
-                            """Compress a single client→upstream frame
-                            when its `type` is `response.create`. Other
-                            event types (response.cancel, session.update,
-                            etc.) pass through unchanged. Errors are
-                            warned and the original frame is returned —
-                            fail loud in logs, fail safe on the wire.
-                            Updates outer-scope ``tokens_saved``,
-                            ``transforms_applied``, and
-                            ``ws_frames_compressed`` so the session-end
-                            log reports cumulative savings across all
-                            frames in the WS session.
-                            """
-                            nonlocal tokens_saved, transforms_applied, attempted_input_tokens_total
-                            nonlocal ws_frames_compressed
-                            if _ws_bypass:
-                                _log_ws_passthrough(
-                                    "bypass_header",
-                                    frame_index=frame_index,
-                                    raw_bytes=len(raw_msg.encode("utf-8", errors="replace")),
-                                )
-                                return raw_msg, False, "bypass_header"
-                            if not self.config.optimize:
-                                _log_ws_passthrough(
-                                    "optimize_disabled",
-                                    frame_index=frame_index,
-                                    raw_bytes=len(raw_msg.encode("utf-8", errors="replace")),
-                                )
-                                return raw_msg, False, "optimize_disabled"
-                            _preflight_started = time.perf_counter()
+                            return raw_msg, False, "bypass_header"
+                        if not self.config.optimize:
+                            _log_ws_passthrough(
+                                "optimize_disabled",
+                                frame_index=frame_index,
+                                raw_bytes=len(raw_msg.encode("utf-8", errors="replace")),
+                            )
+                            return raw_msg, False, "optimize_disabled"
+                        _preflight_started = time.perf_counter()
+                        try:
+                            parsed_frame = json.loads(raw_msg)
+                        except json.JSONDecodeError:
+                            _log_ws_passthrough(
+                                "non_json",
+                                frame_index=frame_index,
+                                raw_bytes=len(raw_msg.encode("utf-8", errors="replace")),
+                            )
+                            return raw_msg, False, "non_json"
+                        if (
+                            not isinstance(parsed_frame, dict)
+                            or parsed_frame.get("type") != "response.create"
+                        ):
+                            _log_ws_passthrough(
+                                "not_response_create",
+                                frame_index=frame_index,
+                                raw_bytes=len(raw_msg.encode("utf-8", errors="replace")),
+                                frame_type=(
+                                    parsed_frame.get("type")
+                                    if isinstance(parsed_frame, dict)
+                                    else type(parsed_frame).__name__
+                                ),
+                            )
+                            return raw_msg, False, "not_response_create"
+                        wrapped_frame = isinstance(parsed_frame.get("response"), dict)
+                        inner_payload = parsed_frame["response"] if wrapped_frame else parsed_frame
+                        if not isinstance(inner_payload, dict):
+                            _log_ws_passthrough(
+                                "invalid_inner_payload",
+                                frame_index=frame_index,
+                                raw_bytes=len(raw_msg.encode("utf-8", errors="replace")),
+                                frame_type="response.create",
+                            )
+                            return raw_msg, False, "invalid_inner_payload"
+                        frame_compression_elapsed_ms = 0.0
+                        try:
+                            model_for_frame = inner_payload.get("model") or ""
+                            _frame_auth_mode = classify_auth_mode(ws_headers)
+                            _preflight_ms = (time.perf_counter() - _preflight_started) * 1000.0
+                            _record_ws_compression_timing(
+                                "compression_preflight_serialization",
+                                _preflight_ms,
+                            )
+                            _record_ws_compression_overhead(_preflight_ms)
+                            _compression_started = time.perf_counter()
                             try:
-                                parsed_frame = json.loads(raw_msg)
-                            except json.JSONDecodeError:
-                                _log_ws_passthrough(
-                                    "non_json",
-                                    frame_index=frame_index,
-                                    raw_bytes=len(raw_msg.encode("utf-8", errors="replace")),
+                                (
+                                    new_inner,
+                                    modified,
+                                    frame_saved,
+                                    frame_transforms,
+                                    frame_reason,
+                                    bytes_before,
+                                    bytes_after,
+                                    frame_attempted_tokens,
+                                    frame_compression_timing,
+                                ) = await self._compress_openai_responses_payload_in_executor(
+                                    inner_payload,
+                                    model=model_for_frame,
+                                    request_id=request_id,
                                 )
-                                return raw_msg, False, "non_json"
-                            if (
-                                not isinstance(parsed_frame, dict)
-                                or parsed_frame.get("type") != "response.create"
-                            ):
-                                _log_ws_passthrough(
-                                    "not_response_create",
-                                    frame_index=frame_index,
-                                    raw_bytes=len(raw_msg.encode("utf-8", errors="replace")),
-                                    frame_type=(
-                                        parsed_frame.get("type")
-                                        if isinstance(parsed_frame, dict)
-                                        else type(parsed_frame).__name__
+                                for (
+                                    _timing_name,
+                                    _timing_ms,
+                                ) in frame_compression_timing.items():
+                                    _record_ws_compression_timing(_timing_name, _timing_ms)
+                            finally:
+                                frame_compression_elapsed_ms = (
+                                    time.perf_counter() - _compression_started
+                                ) * 1000.0
+                                _record_ws_compression_timing(
+                                    "compression_executor_wait_run",
+                                    frame_compression_elapsed_ms,
+                                )
+                                _record_ws_compression_overhead(frame_compression_elapsed_ms)
+                            record_frame = getattr(
+                                getattr(self, "metrics", None),
+                                "record_codex_ws_frame",
+                                None,
+                            )
+                            if record_frame is not None:
+                                record_frame(
+                                    elapsed_ms=frame_compression_elapsed_ms,
+                                    bytes_before=bytes_before,
+                                    bytes_after=bytes_after,
+                                    attempted_tokens=frame_attempted_tokens,
+                                    tokens_saved=frame_saved,
+                                    modified=modified,
+                                    strategy_chain=_codex_ws_strategy_chain(frame_transforms),
+                                    final_strategies=_codex_ws_final_strategies(
+                                        frame_compression_timing
                                     ),
                                 )
-                                return raw_msg, False, "not_response_create"
-                            wrapped_frame = isinstance(parsed_frame.get("response"), dict)
-                            inner_payload = (
-                                parsed_frame["response"] if wrapped_frame else parsed_frame
-                            )
-                            if not isinstance(inner_payload, dict):
-                                _log_ws_passthrough(
-                                    "invalid_inner_payload",
-                                    frame_index=frame_index,
-                                    raw_bytes=len(raw_msg.encode("utf-8", errors="replace")),
-                                    frame_type="response.create",
-                                )
-                                return raw_msg, False, "invalid_inner_payload"
-                            frame_compression_elapsed_ms = 0.0
-                            try:
-                                model_for_frame = inner_payload.get("model") or ""
-                                _frame_auth_mode = classify_auth_mode(ws_headers)
-                                _preflight_ms = (time.perf_counter() - _preflight_started) * 1000.0
-                                _record_ws_compression_timing(
-                                    "compression_preflight_serialization",
-                                    _preflight_ms,
-                                )
-                                _record_ws_compression_overhead(_preflight_ms)
-                                _compression_started = time.perf_counter()
-                                try:
-                                    (
-                                        new_inner,
-                                        modified,
-                                        frame_saved,
-                                        frame_transforms,
-                                        frame_reason,
-                                        bytes_before,
-                                        bytes_after,
-                                        frame_attempted_tokens,
-                                        frame_compression_timing,
-                                    ) = await self._compress_openai_responses_payload_in_executor(
-                                        inner_payload,
-                                        model=model_for_frame,
-                                        request_id=request_id,
-                                    )
-                                    for (
-                                        _timing_name,
-                                        _timing_ms,
-                                    ) in frame_compression_timing.items():
-                                        _record_ws_compression_timing(_timing_name, _timing_ms)
-                                finally:
-                                    frame_compression_elapsed_ms = (
-                                        time.perf_counter() - _compression_started
-                                    ) * 1000.0
-                                    _record_ws_compression_timing(
-                                        "compression_executor_wait_run",
-                                        frame_compression_elapsed_ms,
-                                    )
-                                    _record_ws_compression_overhead(frame_compression_elapsed_ms)
+                        except Exception as _frame_err:
+                            if frame_compression_elapsed_ms > 0:
                                 record_frame = getattr(
                                     getattr(self, "metrics", None),
                                     "record_codex_ws_frame",
@@ -4363,807 +4449,749 @@ class OpenAIHandlerMixin:
                                 if record_frame is not None:
                                     record_frame(
                                         elapsed_ms=frame_compression_elapsed_ms,
-                                        bytes_before=bytes_before,
-                                        bytes_after=bytes_after,
-                                        attempted_tokens=frame_attempted_tokens,
-                                        tokens_saved=frame_saved,
-                                        modified=modified,
-                                        strategy_chain=_codex_ws_strategy_chain(frame_transforms),
-                                        final_strategies=_codex_ws_final_strategies(
-                                            frame_compression_timing
-                                        ),
+                                        bytes_before=len(raw_msg.encode("utf-8", errors="replace")),
+                                        failed=True,
                                     )
-                            except Exception as _frame_err:
-                                if frame_compression_elapsed_ms > 0:
-                                    record_frame = getattr(
-                                        getattr(self, "metrics", None),
-                                        "record_codex_ws_frame",
-                                        None,
-                                    )
-                                    if record_frame is not None:
-                                        record_frame(
-                                            elapsed_ms=frame_compression_elapsed_ms,
-                                            bytes_before=len(
-                                                raw_msg.encode("utf-8", errors="replace")
-                                            ),
-                                            failed=True,
-                                        )
-                                logger.warning(
-                                    "[%s] WS /v1/responses frame compression "
-                                    "failed; forwarding original: %s: %s",
-                                    request_id,
-                                    type(_frame_err).__name__,
-                                    _frame_err,
-                                )
-                                _log_ws_passthrough(
-                                    "compression_exception",
-                                    frame_index=frame_index,
-                                    raw_bytes=len(raw_msg.encode("utf-8", errors="replace")),
-                                    frame_type="response.create",
-                                    model=str(inner_payload.get("model") or "unknown"),
-                                )
-                                return raw_msg, False, "compression_exception"
-                            if not modified:
-                                reason = frame_reason or "no_compression"
-                                _log_ws_passthrough(
-                                    reason,
-                                    frame_index=frame_index,
-                                    raw_bytes=bytes_before,
-                                    frame_type="response.create",
-                                    model=str(inner_payload.get("model") or "unknown"),
-                                )
-                                return raw_msg, False, reason
-                            if not isinstance(new_inner, dict):
-                                _log_ws_passthrough(
-                                    "compressed_payload_not_dict",
-                                    frame_index=frame_index,
-                                    raw_bytes=len(raw_msg.encode("utf-8", errors="replace")),
-                                    frame_type="response.create",
-                                    model=str(inner_payload.get("model") or "unknown"),
-                                )
-                                return raw_msg, False, "compressed_payload_not_dict"
-                            if wrapped_frame:
-                                _rewrite_started = time.perf_counter()
-                                parsed_frame["response"] = new_inner
-                                rewritten = json.dumps(parsed_frame)
-                            else:
-                                _rewrite_started = time.perf_counter()
-                                rewritten = json.dumps(new_inner)
-                            _rewrite_ms = (time.perf_counter() - _rewrite_started) * 1000.0
-                            _record_ws_compression_timing(
-                                "compression_payload_rewrite_json_dump",
-                                _rewrite_ms,
-                            )
-                            _record_ws_compression_overhead(_rewrite_ms)
-                            tokens_saved += int(frame_saved)
-                            attempted_input_tokens_total += int(frame_attempted_tokens)
-                            for t in frame_transforms:
-                                if t not in transforms_applied:
-                                    transforms_applied.append(t)
-                            ws_frames_compressed += 1
-                            logger.info(
-                                "[%s] WS /v1/responses frame compressed "
-                                "%d→%d bytes (%d tokens saved, "
-                                "auth_mode=%s, frame=%d)",
+                            logger.warning(
+                                "[%s] WS /v1/responses frame compression "
+                                "failed; forwarding original: %s: %s",
                                 request_id,
-                                bytes_before,
-                                bytes_after,
-                                int(frame_saved),
-                                _frame_auth_mode.value,
-                                ws_frames_compressed,
+                                type(_frame_err).__name__,
+                                _frame_err,
                             )
-                            return rewritten, True, frame_reason or "compressed"
+                            _log_ws_passthrough(
+                                "compression_exception",
+                                frame_index=frame_index,
+                                raw_bytes=len(raw_msg.encode("utf-8", errors="replace")),
+                                frame_type="response.create",
+                                model=str(inner_payload.get("model") or "unknown"),
+                            )
+                            return raw_msg, False, "compression_exception"
+                        if not modified:
+                            reason = frame_reason or "no_compression"
+                            _log_ws_passthrough(
+                                reason,
+                                frame_index=frame_index,
+                                raw_bytes=bytes_before,
+                                frame_type="response.create",
+                                model=str(inner_payload.get("model") or "unknown"),
+                            )
+                            return raw_msg, False, reason
+                        if not isinstance(new_inner, dict):
+                            _log_ws_passthrough(
+                                "compressed_payload_not_dict",
+                                frame_index=frame_index,
+                                raw_bytes=len(raw_msg.encode("utf-8", errors="replace")),
+                                frame_type="response.create",
+                                model=str(inner_payload.get("model") or "unknown"),
+                            )
+                            return raw_msg, False, "compressed_payload_not_dict"
+                        if wrapped_frame:
+                            _rewrite_started = time.perf_counter()
+                            parsed_frame["response"] = new_inner
+                            rewritten = json.dumps(parsed_frame)
+                        else:
+                            _rewrite_started = time.perf_counter()
+                            rewritten = json.dumps(new_inner)
+                        _rewrite_ms = (time.perf_counter() - _rewrite_started) * 1000.0
+                        _record_ws_compression_timing(
+                            "compression_payload_rewrite_json_dump",
+                            _rewrite_ms,
+                        )
+                        _record_ws_compression_overhead(_rewrite_ms)
+                        tokens_saved += int(frame_saved)
+                        attempted_input_tokens_total += int(frame_attempted_tokens)
+                        for t in frame_transforms:
+                            if t not in transforms_applied:
+                                transforms_applied.append(t)
+                        ws_frames_compressed += 1
+                        logger.info(
+                            "[%s] WS /v1/responses frame compressed "
+                            "%d→%d bytes (%d tokens saved, "
+                            "auth_mode=%s, frame=%d)",
+                            request_id,
+                            bytes_before,
+                            bytes_after,
+                            int(frame_saved),
+                            _frame_auth_mode.value,
+                            ws_frames_compressed,
+                        )
+                        return rewritten, True, frame_reason or "compressed"
 
-                        async def _client_to_upstream() -> None:
-                            nonlocal client_relay_error, ws_response_create_frames
-                            nonlocal ws_client_frames_total, ws_cancel_frames
-                            nonlocal ws_last_client_frame_type, ws_client_disconnect_seen
-                            client_frame_index = 1
-                            try:
-                                while True:
-                                    msg = await websocket.receive_text()
-                                    client_frame_index += 1
-                                    ws_client_frames_total += 1
-                                    if session_handle is not None:
-                                        session_handle.mark_activity()
-                                    _inbound_frame_body: Any = None
-                                    try:
-                                        _inbound_frame_body = json.loads(msg)
-                                    except json.JSONDecodeError:
-                                        _inbound_frame_body = None
-                                    ws_last_client_frame_type = (
-                                        str(_inbound_frame_body.get("type") or "unknown")
-                                        if isinstance(_inbound_frame_body, dict)
-                                        else "non_json"
-                                    )
-                                    if ws_last_client_frame_type == "response.cancel":
-                                        ws_cancel_frames += 1
-                                        logger.info(
-                                            "[%s] WS client sent response.cancel "
-                                            "session_id=%s frame=%d cancels=%d",
-                                            request_id,
-                                            session_id,
-                                            client_frame_index,
-                                            ws_cancel_frames,
-                                        )
-                                    else:
-                                        logger.debug(
-                                            "[%s] WS client frame session_id=%s frame=%d type=%s",
-                                            request_id,
-                                            session_id,
-                                            client_frame_index,
-                                            ws_last_client_frame_type,
-                                        )
-                                    capture_codex_wire_debug(
-                                        "ws_inbound_client_frame",
-                                        request_id=request_id,
-                                        session_id=session_id,
-                                        transport="websocket",
-                                        direction="client_to_headroom",
-                                        url=_ws_url,
-                                        body=_inbound_frame_body,
-                                        raw_text=None if _inbound_frame_body is not None else msg,
-                                        metadata={"frame": client_frame_index},
-                                    )
-                                    if (
-                                        isinstance(_inbound_frame_body, dict)
-                                        and _inbound_frame_body.get("type") == "response.create"
-                                    ):
-                                        ws_response_create_frames += 1
-                                    (
-                                        msg,
-                                        _frame_modified,
-                                        _frame_reason,
-                                    ) = await _maybe_compress_response_create_frame(
-                                        msg,
-                                        frame_index=client_frame_index,
-                                    )
-                                    _outbound_frame_body: Any = None
-                                    try:
-                                        _outbound_frame_body = json.loads(msg)
-                                    except json.JSONDecodeError:
-                                        _outbound_frame_body = None
-                                    capture_codex_wire_debug(
-                                        "ws_upstream_client_frame",
-                                        request_id=request_id,
-                                        session_id=session_id,
-                                        transport="websocket",
-                                        direction="headroom_to_upstream",
-                                        url=upstream_url,
-                                        body=_outbound_frame_body,
-                                        raw_text=None if _outbound_frame_body is not None else msg,
-                                        metadata={
-                                            "frame": client_frame_index,
-                                            "tokens_saved_total": tokens_saved,
-                                            "transforms_applied": transforms_applied,
-                                        },
-                                    )
-                                    await upstream.send(msg)
-                            except asyncio.CancelledError:
-                                # Explicit cancel from the outer
-                                # orchestrator — re-raise so
-                                # ``t.cancelled()`` and ``t.exception()``
-                                # behave correctly in the caller.
-                                raise
-                            except Exception as relay_err:
-                                # Surface real errors to the classifier
-                                # without re-raising (existing fork
-                                # behavior: log and return so the
-                                # partner task can be cancelled
-                                # deterministically).
-                                if "WebSocketDisconnect" not in type(relay_err).__name__:
-                                    client_relay_error = relay_err
-                                    logger.debug(
-                                        f"[{request_id}] WS client→upstream relay ended: {relay_err}"
-                                    )
-                                else:
-                                    ws_client_disconnect_seen = True
+                    async def _client_to_upstream() -> None:
+                        nonlocal client_relay_error, ws_response_create_frames
+                        nonlocal ws_client_frames_total, ws_cancel_frames
+                        nonlocal ws_last_client_frame_type, ws_client_disconnect_seen
+                        client_frame_index = 1
+                        try:
+                            while True:
+                                msg = await websocket.receive_text()
+                                client_frame_index += 1
+                                ws_client_frames_total += 1
+                                if session_handle is not None:
+                                    session_handle.mark_activity()
+                                _inbound_frame_body: Any = None
+                                try:
+                                    _inbound_frame_body = json.loads(msg)
+                                except json.JSONDecodeError:
+                                    _inbound_frame_body = None
+                                ws_last_client_frame_type = (
+                                    str(_inbound_frame_body.get("type") or "unknown")
+                                    if isinstance(_inbound_frame_body, dict)
+                                    else "non_json"
+                                )
+                                if ws_last_client_frame_type == "response.cancel":
+                                    ws_cancel_frames += 1
                                     logger.info(
-                                        "[%s] WS client disconnected session_id=%s "
-                                        "frames=%d cancels=%d last_type=%s",
+                                        "[%s] WS client sent response.cancel "
+                                        "session_id=%s frame=%d cancels=%d",
                                         request_id,
                                         session_id,
-                                        ws_client_frames_total,
+                                        client_frame_index,
                                         ws_cancel_frames,
+                                    )
+                                else:
+                                    logger.debug(
+                                        "[%s] WS client frame session_id=%s frame=%d type=%s",
+                                        request_id,
+                                        session_id,
+                                        client_frame_index,
                                         ws_last_client_frame_type,
                                     )
-                                with contextlib.suppress(Exception):
-                                    await upstream.close()
+                                capture_codex_wire_debug(
+                                    "ws_inbound_client_frame",
+                                    request_id=request_id,
+                                    session_id=session_id,
+                                    transport="websocket",
+                                    direction="client_to_headroom",
+                                    url=_ws_url,
+                                    body=_inbound_frame_body,
+                                    raw_text=None if _inbound_frame_body is not None else msg,
+                                    metadata={"frame": client_frame_index},
+                                )
+                                if (
+                                    isinstance(_inbound_frame_body, dict)
+                                    and _inbound_frame_body.get("type") == "response.create"
+                                ):
+                                    ws_response_create_frames += 1
+                                (
+                                    msg,
+                                    _frame_modified,
+                                    _frame_reason,
+                                ) = await _maybe_compress_response_create_frame(
+                                    msg,
+                                    frame_index=client_frame_index,
+                                )
+                                _outbound_frame_body: Any = None
+                                try:
+                                    _outbound_frame_body = json.loads(msg)
+                                except json.JSONDecodeError:
+                                    _outbound_frame_body = None
+                                capture_codex_wire_debug(
+                                    "ws_upstream_client_frame",
+                                    request_id=request_id,
+                                    session_id=session_id,
+                                    transport="websocket",
+                                    direction="headroom_to_upstream",
+                                    url=upstream_url,
+                                    body=_outbound_frame_body,
+                                    raw_text=None if _outbound_frame_body is not None else msg,
+                                    metadata={
+                                        "frame": client_frame_index,
+                                        "tokens_saved_total": tokens_saved,
+                                        "transforms_applied": transforms_applied,
+                                    },
+                                )
+                                await upstream.send(msg)
+                        except asyncio.CancelledError:
+                            # Explicit cancel from the outer
+                            # orchestrator — re-raise so
+                            # ``t.cancelled()`` and ``t.exception()``
+                            # behave correctly in the caller.
+                            raise
+                        except Exception as relay_err:
+                            # Surface real errors to the classifier
+                            # without re-raising (existing fork
+                            # behavior: log and return so the
+                            # partner task can be cancelled
+                            # deterministically).
+                            if "WebSocketDisconnect" not in type(relay_err).__name__:
+                                client_relay_error = relay_err
+                                logger.debug(
+                                    f"[{request_id}] WS client→upstream relay ended: {relay_err}"
+                                )
+                            else:
+                                ws_client_disconnect_seen = True
+                                logger.info(
+                                    "[%s] WS client disconnected session_id=%s "
+                                    "frames=%d cancels=%d last_type=%s",
+                                    request_id,
+                                    session_id,
+                                    ws_client_frames_total,
+                                    ws_cancel_frames,
+                                    ws_last_client_frame_type,
+                                )
+                            with contextlib.suppress(Exception):
+                                await upstream.close()
 
-                        async def _upstream_to_client() -> None:
-                            """Relay upstream→client with transparent memory tool handling.
+                    async def _upstream_to_client() -> None:
+                        """Relay upstream→client with transparent memory tool handling.
 
-                            Uses a buffer-then-decide approach:
-                            1. Buffer events until first output item arrives
-                            2. If first output is a memory tool → suppress entire response,
-                               execute tools silently, send continuation upstream
-                            3. If first output is non-memory → flush buffer, stream normally
-                            4. Continuation response events are relayed to Codex seamlessly
+                        Uses a buffer-then-decide approach:
+                        1. Buffer events until first output item arrives
+                        2. If first output is a memory tool → suppress entire response,
+                           execute tools silently, send continuation upstream
+                        3. If first output is non-memory → flush buffer, stream normally
+                        4. Continuation response events are relayed to Codex seamlessly
 
-                            This prevents orphaned response.created events from confusing Codex.
-                            """
-                            from headroom.proxy.memory_handler import MEMORY_TOOL_NAMES
+                        This prevents orphaned response.created events from confusing Codex.
+                        """
+                        from headroom.proxy.memory_handler import MEMORY_TOOL_NAMES
 
-                            # Unit 3: surface response.completed observation
-                            # to the outer scope so the termination-cause
-                            # classifier can prefer ``response_completed``
-                            # over ``upstream_disconnect``.
-                            nonlocal response_completed_seen
-                            nonlocal upstream_relay_error
-                            nonlocal ws_input_tokens_total, ws_output_tokens_total
-                            nonlocal ws_cache_read_tokens_total, ws_cache_write_tokens_total
-                            nonlocal ws_uncached_input_tokens_total
+                        # Unit 3: surface response.completed observation
+                        # to the outer scope so the termination-cause
+                        # classifier can prefer ``response_completed``
+                        # over ``upstream_disconnect``.
+                        nonlocal response_completed_seen
+                        nonlocal upstream_relay_error
+                        nonlocal ws_input_tokens_total, ws_output_tokens_total
+                        nonlocal ws_cache_read_tokens_total, ws_cache_write_tokens_total
+                        nonlocal ws_uncached_input_tokens_total
+                        nonlocal ws_recorded_input_tokens_total
+                        nonlocal ws_recorded_output_tokens_total
+                        nonlocal ws_recorded_cache_read_tokens_total
+                        nonlocal ws_recorded_cache_write_tokens_total
+                        nonlocal ws_recorded_uncached_input_tokens_total
+                        nonlocal ws_recorded_tokens_saved_total
+                        nonlocal ws_recorded_overhead_ms_total, ws_recorded_ttfb_ms
+                        nonlocal ws_upstream_frames_total, ws_last_upstream_frame_type
+                        nonlocal ws_ttfb_ms
+
+                        memory_enabled = bool(self.memory_handler and memory_user_id)
+
+                        # Per-response state (reset after each response.completed)
+                        event_buffer: list[str] = []
+                        decided = False
+                        suppress_response = False
+                        pending_fcs: list[dict[str, Any]] = []
+                        resp_id: str | None = None
+
+                        def _reset() -> None:
+                            nonlocal decided, suppress_response, resp_id
+                            event_buffer.clear()
+                            decided = False
+                            suppress_response = False
+                            pending_fcs.clear()
+                            resp_id = None
+
+                        response_started_ms: float | None = None
+
+                        async def _record_ws_response_metrics() -> None:
+                            """Record one completed Responses turn on long-lived WS sessions."""
                             nonlocal ws_recorded_input_tokens_total
                             nonlocal ws_recorded_output_tokens_total
                             nonlocal ws_recorded_cache_read_tokens_total
                             nonlocal ws_recorded_cache_write_tokens_total
                             nonlocal ws_recorded_uncached_input_tokens_total
                             nonlocal ws_recorded_tokens_saved_total
+                            nonlocal ws_recorded_attempted_input_tokens_total
                             nonlocal ws_recorded_overhead_ms_total, ws_recorded_ttfb_ms
-                            nonlocal ws_upstream_frames_total, ws_last_upstream_frame_type
-                            nonlocal ws_ttfb_ms
 
-                            memory_enabled = bool(self.memory_handler and memory_user_id)
+                            input_delta = ws_input_tokens_total - ws_recorded_input_tokens_total
+                            output_delta = ws_output_tokens_total - ws_recorded_output_tokens_total
+                            cache_read_delta = (
+                                ws_cache_read_tokens_total - ws_recorded_cache_read_tokens_total
+                            )
+                            cache_write_delta = (
+                                ws_cache_write_tokens_total - ws_recorded_cache_write_tokens_total
+                            )
+                            uncached_delta = (
+                                ws_uncached_input_tokens_total
+                                - ws_recorded_uncached_input_tokens_total
+                            )
+                            saved_delta = tokens_saved - ws_recorded_tokens_saved_total
+                            attempted_delta = (
+                                attempted_input_tokens_total
+                                - ws_recorded_attempted_input_tokens_total
+                            )
+                            (
+                                overhead_delta_ms,
+                                ttfb_for_record_ms,
+                                dashboard_pipeline_timing,
+                            ) = _prepare_ws_performance_metrics()
+                            if (
+                                input_delta <= 0
+                                and output_delta <= 0
+                                and cache_read_delta <= 0
+                                and cache_write_delta <= 0
+                                and uncached_delta <= 0
+                                and saved_delta <= 0
+                                and attempted_delta <= 0
+                                and overhead_delta_ms <= 0
+                                and ttfb_for_record_ms <= 0
+                            ):
+                                return
 
-                            # Per-response state (reset after each response.completed)
-                            event_buffer: list[str] = []
-                            decided = False
-                            suppress_response = False
-                            pending_fcs: list[dict[str, Any]] = []
-                            resp_id: str | None = None
-
-                            def _reset() -> None:
-                                nonlocal decided, suppress_response, resp_id
-                                event_buffer.clear()
-                                decided = False
-                                suppress_response = False
-                                pending_fcs.clear()
-                                resp_id = None
-
-                            response_started_ms: float | None = None
-
-                            async def _record_ws_response_metrics() -> None:
-                                """Record one completed Responses turn on long-lived WS sessions."""
-                                nonlocal ws_recorded_input_tokens_total
-                                nonlocal ws_recorded_output_tokens_total
-                                nonlocal ws_recorded_cache_read_tokens_total
-                                nonlocal ws_recorded_cache_write_tokens_total
-                                nonlocal ws_recorded_uncached_input_tokens_total
-                                nonlocal ws_recorded_tokens_saved_total
-                                nonlocal ws_recorded_attempted_input_tokens_total
-                                nonlocal ws_recorded_overhead_ms_total, ws_recorded_ttfb_ms
-
-                                input_delta = ws_input_tokens_total - ws_recorded_input_tokens_total
-                                output_delta = (
-                                    ws_output_tokens_total - ws_recorded_output_tokens_total
-                                )
-                                cache_read_delta = (
-                                    ws_cache_read_tokens_total - ws_recorded_cache_read_tokens_total
-                                )
-                                cache_write_delta = (
-                                    ws_cache_write_tokens_total
-                                    - ws_recorded_cache_write_tokens_total
-                                )
-                                uncached_delta = (
-                                    ws_uncached_input_tokens_total
-                                    - ws_recorded_uncached_input_tokens_total
-                                )
-                                saved_delta = tokens_saved - ws_recorded_tokens_saved_total
-                                attempted_delta = (
-                                    attempted_input_tokens_total
-                                    - ws_recorded_attempted_input_tokens_total
-                                )
-                                (
-                                    overhead_delta_ms,
-                                    ttfb_for_record_ms,
-                                    dashboard_pipeline_timing,
-                                ) = _prepare_ws_performance_metrics()
-                                if (
-                                    input_delta <= 0
-                                    and output_delta <= 0
-                                    and cache_read_delta <= 0
-                                    and cache_write_delta <= 0
-                                    and uncached_delta <= 0
-                                    and saved_delta <= 0
-                                    and attempted_delta <= 0
-                                    and overhead_delta_ms <= 0
-                                    and ttfb_for_record_ms <= 0
-                                ):
-                                    return
-
-                                model_for_metrics = str(body.get("model") or "unknown")
-                                latency_ms = (
-                                    (time.perf_counter() * 1000.0 - response_started_ms)
-                                    if response_started_ms is not None
-                                    else 0.0
-                                )
-                                # Per-turn record: delta values capture
-                                # this turn's contribution since the
-                                # Codex WS handler accumulates session
-                                # totals. Pre-refactor this site
-                                # emitted only metrics + cost_tracker
-                                # — no RequestLog, no PERF — so Codex
-                                # traffic was invisible to
-                                # ``headroom perf`` and the recent-
-                                # requests feed. Funnel restores all
-                                # four effects uniformly per turn. Per-
-                                # turn outcomes carry ``ws_tags`` (the
-                                # `x-headroom-tag-*` headers extracted
-                                # at the WS upgrade) so dashboards can
-                                # slice WS turns by tag — same surface
-                                # as HTTP turns.
-                                await self._record_request_outcome(
-                                    RequestOutcome(
-                                        request_id=request_id,
-                                        provider="openai",
-                                        model=model_for_metrics,
-                                        original_tokens=max(0, input_delta) + max(0, saved_delta),
-                                        optimized_tokens=max(0, input_delta),
-                                        output_tokens=max(0, output_delta),
-                                        tokens_saved=max(0, saved_delta),
-                                        attempted_input_tokens=max(0, attempted_delta),
-                                        cache_read_tokens=max(0, cache_read_delta),
-                                        cache_write_tokens=max(0, cache_write_delta),
-                                        uncached_input_tokens=max(0, uncached_delta),
-                                        total_latency_ms=latency_ms,
-                                        overhead_ms=overhead_delta_ms,
-                                        ttfb_ms=ttfb_for_record_ms,
-                                        pipeline_timing=dashboard_pipeline_timing,
-                                        transforms_applied=tuple(transforms_applied),
-                                        num_messages=len(
-                                            body.get("messages") or body.get("input") or []
-                                        )
-                                        if isinstance(body, dict)
-                                        else 0,
-                                        tags=ws_tags,
-                                        client=client,
+                            model_for_metrics = str(body.get("model") or "unknown")
+                            latency_ms = (
+                                (time.perf_counter() * 1000.0 - response_started_ms)
+                                if response_started_ms is not None
+                                else 0.0
+                            )
+                            # Per-turn record: delta values capture
+                            # this turn's contribution since the
+                            # Codex WS handler accumulates session
+                            # totals. Pre-refactor this site
+                            # emitted only metrics + cost_tracker
+                            # — no RequestLog, no PERF — so Codex
+                            # traffic was invisible to
+                            # ``headroom perf`` and the recent-
+                            # requests feed. Funnel restores all
+                            # four effects uniformly per turn. Per-
+                            # turn outcomes carry ``ws_tags`` (the
+                            # `x-headroom-tag-*` headers extracted
+                            # at the WS upgrade) so dashboards can
+                            # slice WS turns by tag — same surface
+                            # as HTTP turns.
+                            await self._record_request_outcome(
+                                RequestOutcome(
+                                    request_id=request_id,
+                                    provider="openai",
+                                    model=model_for_metrics,
+                                    original_tokens=max(0, input_delta) + max(0, saved_delta),
+                                    optimized_tokens=max(0, input_delta),
+                                    output_tokens=max(0, output_delta),
+                                    tokens_saved=max(0, saved_delta),
+                                    attempted_input_tokens=max(0, attempted_delta),
+                                    cache_read_tokens=max(0, cache_read_delta),
+                                    cache_write_tokens=max(0, cache_write_delta),
+                                    uncached_input_tokens=max(0, uncached_delta),
+                                    total_latency_ms=latency_ms,
+                                    overhead_ms=overhead_delta_ms,
+                                    ttfb_ms=ttfb_for_record_ms,
+                                    pipeline_timing=dashboard_pipeline_timing,
+                                    transforms_applied=tuple(transforms_applied),
+                                    num_messages=len(
+                                        body.get("messages") or body.get("input") or []
                                     )
-                                )
-
-                                # Structured PERF log line so ``headroom perf``
-                                # counts this Codex turn. Pre-P2 this emit was
-                                # missing, which is why Codex traffic showed up
-                                # as ``Requests: 0`` in the perf report even
-                                # under heavy load — the same visibility bug
-                                # class as #327's "Cache write: 0" report.
-                                _perf_input_tokens = max(0, input_delta)
-                                _perf_cache_read = max(0, cache_read_delta)
-                                _perf_cache_write = max(0, cache_write_delta)
-                                _perf_cache_hit_pct = (
-                                    round(
-                                        _perf_cache_read
-                                        / (_perf_cache_read + _perf_cache_write)
-                                        * 100
-                                    )
-                                    if (_perf_cache_read + _perf_cache_write) > 0
-                                    else 0
-                                )
-                                _perf_tok_before = _perf_input_tokens + max(0, saved_delta)
-                                _perf_num_msgs = (
-                                    len(body.get("messages") or body.get("input") or [])
                                     if isinstance(body, dict)
-                                    else 0
+                                    else 0,
+                                    tags=ws_tags,
+                                    client=client,
                                 )
-                                logger.info(
-                                    f"[{request_id}] PERF "
-                                    f"model={model_for_metrics} msgs={_perf_num_msgs} "
-                                    f"tok_before={_perf_tok_before} "
-                                    f"tok_after={_perf_input_tokens} "
-                                    f"tok_saved={max(0, saved_delta)} "
-                                    f"cache_read={_perf_cache_read} "
-                                    f"cache_write={_perf_cache_write} "
-                                    f"cache_hit_pct={_perf_cache_hit_pct} "
-                                    f"opt_ms={overhead_delta_ms:.0f} "
-                                    f"transforms={_summarize_transforms(transforms_applied)}"
-                                )
+                            )
 
-                                ws_recorded_input_tokens_total = ws_input_tokens_total
-                                ws_recorded_output_tokens_total = ws_output_tokens_total
-                                ws_recorded_cache_read_tokens_total = ws_cache_read_tokens_total
-                                ws_recorded_cache_write_tokens_total = ws_cache_write_tokens_total
-                                ws_recorded_uncached_input_tokens_total = (
-                                    ws_uncached_input_tokens_total
+                            # Structured PERF log line so ``headroom perf``
+                            # counts this Codex turn. Pre-P2 this emit was
+                            # missing, which is why Codex traffic showed up
+                            # as ``Requests: 0`` in the perf report even
+                            # under heavy load — the same visibility bug
+                            # class as #327's "Cache write: 0" report.
+                            _perf_input_tokens = max(0, input_delta)
+                            _perf_cache_read = max(0, cache_read_delta)
+                            _perf_cache_write = max(0, cache_write_delta)
+                            _perf_cache_hit_pct = (
+                                round(
+                                    _perf_cache_read / (_perf_cache_read + _perf_cache_write) * 100
                                 )
-                                ws_recorded_tokens_saved_total = tokens_saved
-                                ws_recorded_attempted_input_tokens_total = (
-                                    attempted_input_tokens_total
-                                )
-                                ws_recorded_overhead_ms_total = _current_ws_overhead_ms()
-                                ws_recorded_compression_timing_totals.update(
-                                    ws_compression_timing_totals
-                                )
-                                if ttfb_for_record_ms > 0:
-                                    ws_recorded_ttfb_ms = True
+                                if (_perf_cache_read + _perf_cache_write) > 0
+                                else 0
+                            )
+                            _perf_tok_before = _perf_input_tokens + max(0, saved_delta)
+                            _perf_num_msgs = (
+                                len(body.get("messages") or body.get("input") or [])
+                                if isinstance(body, dict)
+                                else 0
+                            )
+                            logger.info(
+                                f"[{request_id}] PERF "
+                                f"model={model_for_metrics} msgs={_perf_num_msgs} "
+                                f"tok_before={_perf_tok_before} "
+                                f"tok_after={_perf_input_tokens} "
+                                f"tok_saved={max(0, saved_delta)} "
+                                f"cache_read={_perf_cache_read} "
+                                f"cache_write={_perf_cache_write} "
+                                f"cache_hit_pct={_perf_cache_hit_pct} "
+                                f"opt_ms={overhead_delta_ms:.0f} "
+                                f"transforms={_summarize_transforms(transforms_applied)}"
+                            )
 
-                            # The retry-loop variable is safe to close over here:
-                            # ``_upstream_to_client`` is defined and awaited within
-                            # a single iteration and never escapes.
-                            _first_event_started_at = _upstream_first_event_started  # noqa: B023
+                            ws_recorded_input_tokens_total = ws_input_tokens_total
+                            ws_recorded_output_tokens_total = ws_output_tokens_total
+                            ws_recorded_cache_read_tokens_total = ws_cache_read_tokens_total
+                            ws_recorded_cache_write_tokens_total = ws_cache_write_tokens_total
+                            ws_recorded_uncached_input_tokens_total = ws_uncached_input_tokens_total
+                            ws_recorded_tokens_saved_total = tokens_saved
+                            ws_recorded_attempted_input_tokens_total = attempted_input_tokens_total
+                            ws_recorded_overhead_ms_total = _current_ws_overhead_ms()
+                            ws_recorded_compression_timing_totals.update(
+                                ws_compression_timing_totals
+                            )
+                            if ttfb_for_record_ms > 0:
+                                ws_recorded_ttfb_ms = True
 
-                            try:
-                                upstream_frame_index = 0
-                                async for msg in upstream:
-                                    upstream_frame_index += 1
-                                    ws_upstream_frames_total += 1
-                                    if session_handle is not None:
-                                        session_handle.mark_activity()
-                                    if (
-                                        _first_event_started_at is not None
-                                        and "upstream_first_event" not in stage_timer
-                                    ):
-                                        if ws_ttfb_ms is None:
-                                            ws_ttfb_ms = (
-                                                time.perf_counter() - session_started_at
-                                            ) * 1000.0
-                                        stage_timer.record(
-                                            "upstream_first_event",
-                                            (time.perf_counter() - _first_event_started_at)
-                                            * 1000.0,
-                                        )
-                                    if isinstance(msg, bytes):
-                                        ws_last_upstream_frame_type = "binary"
-                                        capture_codex_wire_debug(
-                                            "ws_upstream_binary_frame",
-                                            request_id=request_id,
-                                            session_id=session_id,
-                                            transport="websocket",
-                                            direction="upstream_to_headroom",
-                                            url=upstream_url,
-                                            metadata={
-                                                "frame": upstream_frame_index,
-                                                "byte_count": len(msg),
-                                            },
-                                        )
-                                        await websocket.send_bytes(msg)
-                                        continue
-                                    msg_str = msg if isinstance(msg, str) else str(msg)
-                                    _upstream_frame_body: Any = None
-                                    try:
-                                        _upstream_frame_body = json.loads(msg_str)
-                                    except json.JSONDecodeError:
-                                        _upstream_frame_body = None
+                        # The retry-loop variable is safe to close over here:
+                        # ``_upstream_to_client`` is defined and awaited within
+                        # a single iteration and never escapes.
+                        _first_event_started_at = _upstream_first_event_started  # noqa: B023
+
+                        try:
+                            upstream_frame_index = 0
+                            async for msg in upstream:
+                                upstream_frame_index += 1
+                                ws_upstream_frames_total += 1
+                                if session_handle is not None:
+                                    session_handle.mark_activity()
+                                if (
+                                    _first_event_started_at is not None
+                                    and "upstream_first_event" not in stage_timer
+                                ):
+                                    if ws_ttfb_ms is None:
+                                        ws_ttfb_ms = (
+                                            time.perf_counter() - session_started_at
+                                        ) * 1000.0
+                                    stage_timer.record(
+                                        "upstream_first_event",
+                                        (time.perf_counter() - _first_event_started_at) * 1000.0,
+                                    )
+                                if isinstance(msg, bytes):
+                                    ws_last_upstream_frame_type = "binary"
                                     capture_codex_wire_debug(
-                                        "ws_upstream_text_frame",
+                                        "ws_upstream_binary_frame",
                                         request_id=request_id,
                                         session_id=session_id,
                                         transport="websocket",
                                         direction="upstream_to_headroom",
                                         url=upstream_url,
-                                        body=_upstream_frame_body,
-                                        raw_text=None
-                                        if _upstream_frame_body is not None
-                                        else msg_str,
-                                        metadata={"frame": upstream_frame_index},
+                                        metadata={
+                                            "frame": upstream_frame_index,
+                                            "byte_count": len(msg),
+                                        },
                                     )
+                                    await websocket.send_bytes(msg)
+                                    continue
+                                msg_str = msg if isinstance(msg, str) else str(msg)
+                                _upstream_frame_body: Any = None
+                                try:
+                                    _upstream_frame_body = json.loads(msg_str)
+                                except json.JSONDecodeError:
+                                    _upstream_frame_body = None
+                                capture_codex_wire_debug(
+                                    "ws_upstream_text_frame",
+                                    request_id=request_id,
+                                    session_id=session_id,
+                                    transport="websocket",
+                                    direction="upstream_to_headroom",
+                                    url=upstream_url,
+                                    body=_upstream_frame_body,
+                                    raw_text=None if _upstream_frame_body is not None else msg_str,
+                                    metadata={"frame": upstream_frame_index},
+                                )
 
-                                    # Parse event
-                                    try:
-                                        event = json.loads(msg_str)
-                                    except (json.JSONDecodeError, TypeError):
-                                        ws_last_upstream_frame_type = "non_json"
-                                        await websocket.send_text(msg_str)
-                                        continue
-
-                                    event_type = event.get("type", "")
-                                    ws_last_upstream_frame_type = str(event_type or "unknown")
-                                    logger.debug(
-                                        "[%s] WS upstream frame session_id=%s frame=%d type=%s",
-                                        request_id,
-                                        session_id,
-                                        upstream_frame_index,
-                                        ws_last_upstream_frame_type,
-                                    )
-                                    if event_type == "response.created":
-                                        response_started_ms = time.perf_counter() * 1000.0
-                                    (
-                                        usage_input_tokens,
-                                        usage_output_tokens,
-                                        usage_cache_read_tokens,
-                                        usage_cache_write_tokens,
-                                        usage_uncached_tokens,
-                                    ) = _extract_responses_usage(event)
-                                    if usage_input_tokens or usage_output_tokens:
-                                        ws_input_tokens_total += usage_input_tokens
-                                        ws_output_tokens_total += usage_output_tokens
-                                        ws_cache_read_tokens_total += usage_cache_read_tokens
-                                        ws_cache_write_tokens_total += usage_cache_write_tokens
-                                        ws_uncached_input_tokens_total += usage_uncached_tokens
-
-                                    if not memory_enabled:
-                                        if event_type == "response.completed":
-                                            response_completed_seen = True
-                                            await _record_ws_response_metrics()
-                                        await websocket.send_text(msg_str)
-                                        continue
-
-                                    # --- Phase 1: Buffer until first output item ---
-                                    if not decided:
-                                        event_buffer.append(msg_str)
-
-                                        if event_type == "response.output_item.added":
-                                            item = event.get("item", {})
-                                            if (
-                                                item.get("type") == "function_call"
-                                                and item.get("name") in MEMORY_TOOL_NAMES
-                                            ):
-                                                # Memory tool first → suppress entire response
-                                                suppress_response = True
-                                                decided = True
-                                                event_buffer.clear()
-                                                logger.info(
-                                                    f"[{request_id}] WS Memory: Detected "
-                                                    f"{item.get('name')} — suppressing response"
-                                                )
-                                            else:
-                                                # Non-memory first → flush buffer, pass through
-                                                decided = True
-                                                for buf in event_buffer:
-                                                    await websocket.send_text(buf)
-                                                event_buffer.clear()
-
-                                        elif event_type == "response.completed":
-                                            # No output items at all — flush
-                                            decided = True
-                                    for buf in event_buffer:
-                                        await websocket.send_text(buf)
-                                    event_buffer.clear()
-                                    await _record_ws_response_metrics()
-                                    _reset()
-                                    response_completed_seen = True
-
+                                # Parse event
+                                try:
+                                    event = json.loads(msg_str)
+                                except (json.JSONDecodeError, TypeError):
+                                    ws_last_upstream_frame_type = "non_json"
+                                    await websocket.send_text(msg_str)
                                     continue
 
-                                    # --- Phase 2a: Suppress mode (memory response) ---
-                                    if suppress_response:
-                                        if event_type == "response.output_item.done":
-                                            item = event.get("item", {})
-                                            if (
-                                                item.get("type") == "function_call"
-                                                and item.get("name") in MEMORY_TOOL_NAMES
-                                            ):
-                                                pending_fcs.append(item)
+                                event_type = event.get("type", "")
+                                ws_last_upstream_frame_type = str(event_type or "unknown")
+                                logger.debug(
+                                    "[%s] WS upstream frame session_id=%s frame=%d type=%s",
+                                    request_id,
+                                    session_id,
+                                    upstream_frame_index,
+                                    ws_last_upstream_frame_type,
+                                )
+                                if event_type == "response.created":
+                                    response_started_ms = time.perf_counter() * 1000.0
+                                (
+                                    usage_input_tokens,
+                                    usage_output_tokens,
+                                    usage_cache_read_tokens,
+                                    usage_cache_write_tokens,
+                                    usage_uncached_tokens,
+                                ) = _extract_responses_usage(event)
+                                if usage_input_tokens or usage_output_tokens:
+                                    ws_input_tokens_total += usage_input_tokens
+                                    ws_output_tokens_total += usage_output_tokens
+                                    ws_cache_read_tokens_total += usage_cache_read_tokens
+                                    ws_cache_write_tokens_total += usage_cache_write_tokens
+                                    ws_uncached_input_tokens_total += usage_uncached_tokens
 
-                                        elif event_type == "response.completed":
-                                            response_completed_seen = True
-                                            await _record_ws_response_metrics()
-                                            resp = event.get("response", {})
-                                            resp_id = resp.get("id")
-
-                                            if pending_fcs:
-                                                logger.info(
-                                                    f"[{request_id}] WS Memory: Executing "
-                                                    f"{len(pending_fcs)} tool(s) transparently"
-                                                )
-
-                                                # Execute memory tool calls
-                                                tool_outputs: list[dict[str, Any]] = []
-                                                for fc in pending_fcs:
-                                                    call_id = fc.get("call_id", fc.get("id", ""))
-                                                    fc_name = fc.get("name", "")
-                                                    args_str = fc.get("arguments", "{}")
-                                                    try:
-                                                        fc_args = json.loads(args_str)
-                                                    except json.JSONDecodeError:
-                                                        fc_args = {}
-
-                                                    await self.memory_handler._ensure_initialized()
-                                                    if self.memory_handler._backend:
-                                                        result = await self.memory_handler._execute_memory_tool(
-                                                            fc_name,
-                                                            fc_args,
-                                                            memory_user_id,
-                                                            "openai",
-                                                        )
-                                                    else:
-                                                        result = json.dumps(
-                                                            {"error": "backend not ready"}
-                                                        )
-
-                                                    tool_outputs.append(
-                                                        {
-                                                            "type": "function_call_output",
-                                                            "call_id": call_id,
-                                                            "output": result,
-                                                        }
-                                                    )
-                                                    logger.info(
-                                                        f"[{request_id}] WS Memory: Executed "
-                                                        f"{fc_name} for user {memory_user_id}"
-                                                    )
-
-                                                # Send continuation upstream
-                                                cont: dict[str, Any] = {
-                                                    "type": "response.create",
-                                                    "response": {"input": tool_outputs},
-                                                }
-                                                if resp_id:
-                                                    cont["response"]["previous_response_id"] = (
-                                                        resp_id
-                                                    )
-                                                await upstream.send(json.dumps(cont))
-                                                logger.info(
-                                                    f"[{request_id}] WS Memory: Sent continuation "
-                                                    f"with {len(tool_outputs)} result(s)"
-                                                )
-
-                                            _reset()
-                                        # All events suppressed in this mode
-                                        continue
-
-                                    # --- Phase 2b: Pass-through mode ---
+                                if not memory_enabled:
+                                    if event_type == "response.completed":
+                                        response_completed_seen = True
+                                        await _record_ws_response_metrics()
                                     await websocket.send_text(msg_str)
+                                    continue
 
-                            except asyncio.CancelledError:
-                                raise
-                            except Exception as relay_err:
-                                if "WebSocketDisconnect" not in type(relay_err).__name__:
-                                    # Capture for the outer classifier
-                                    # so ``upstream_error`` can be
-                                    # distinguished from a clean
-                                    # upstream disconnect.
-                                    upstream_relay_error = relay_err
-                                    logger.debug(
-                                        f"[{request_id}] WS upstream→client relay ended: {relay_err}"
-                                    )
-                            finally:
-                                with contextlib.suppress(Exception):
-                                    await websocket.close()
+                                # --- Phase 1: Buffer until first output item ---
+                                if not decided:
+                                    event_buffer.append(msg_str)
 
-                        # --- Unit 3: deterministic relay-task cancellation ---
-                        # Spawn each half as a named task so we can:
-                        #   (a) attach them to the session registry for
-                        #       ``/debug/ws-sessions``,
-                        #   (b) cancel the survivor explicitly when the
-                        #       first one exits, and
-                        #   (c) classify the termination cause for the
-                        #       duration histogram.
-                        client_task = asyncio.create_task(
-                            _client_to_upstream(),
-                            name=f"codex-ws-c2u-{session_id}",
-                        )
-                        upstream_task = asyncio.create_task(
-                            _upstream_to_client(),
-                            name=f"codex-ws-u2c-{session_id}",
-                        )
-                        relay_tasks = [client_task, upstream_task]
-                        if ws_sessions is not None:
-                            ws_sessions.attach_tasks(session_id, relay_tasks)
-                            metrics_for_tasks = getattr(self, "metrics", None)
-                            if metrics_for_tasks is not None and hasattr(
-                                metrics_for_tasks, "inc_active_relay_tasks"
-                            ):
-                                try:
-                                    metrics_for_tasks.inc_active_relay_tasks(len(relay_tasks))
-                                except Exception:  # pragma: no cover - defensive
-                                    pass
-
-                        try:
-                            done, pending = await asyncio.wait(
-                                {client_task, upstream_task},
-                                return_when=asyncio.FIRST_COMPLETED,
-                            )
-                            # Cancel the survivor so we don't leak the
-                            # partner task. Suppress the CancelledError
-                            # we just raised ourselves — any *other*
-                            # exception from the cancelled task is
-                            # already logged inside its own try/except.
-                            for t in pending:
-                                t.cancel()
-                            if pending:
-                                with contextlib.suppress(asyncio.CancelledError):
-                                    await asyncio.gather(*pending, return_exceptions=True)
-
-                            # Classify termination cause from whichever
-                            # task completed first. ``CancelledError``
-                            # can show up on the "done" side if the
-                            # handler itself was cancelled from outside
-                            # (e.g. server shutdown).
-                            for t in done:
-                                exc = None
-                                # Cancelled tasks raise CancelledError from
-                                # .exception(); surface it explicitly so the
-                                # downstream ``isinstance(exc, CancelledError)``
-                                # branches actually run. For any other
-                                # unexpected state (``InvalidStateError`` if
-                                # the task somehow isn't done — shouldn't
-                                # happen post-gather but defensive), we
-                                # suppress and leave ``exc`` as ``None``.
-                                if t.cancelled():
-                                    exc = asyncio.CancelledError()
-                                else:
-                                    with contextlib.suppress(asyncio.InvalidStateError):
-                                        exc = t.exception()
-                                task_name = t.get_name() or ""
-                                if t is client_task:
-                                    if client_relay_error is not None:
-                                        termination_cause = "client_error"
-                                    elif exc is None:
-                                        termination_cause = "client_disconnect"
-                                    elif isinstance(exc, asyncio.CancelledError):
-                                        termination_cause = "client_disconnect"
-                                    else:
-                                        # Distinguish legitimate client
-                                        # disconnect exceptions from
-                                        # real errors: WebSocketDisconnect
-                                        # is a normal client exit.
-                                        if "WebSocketDisconnect" in type(exc).__name__:
-                                            termination_cause = "client_disconnect"
+                                    if event_type == "response.output_item.added":
+                                        item = event.get("item", {})
+                                        if (
+                                            item.get("type") == "function_call"
+                                            and item.get("name") in MEMORY_TOOL_NAMES
+                                        ):
+                                            # Memory tool first → suppress entire response
+                                            suppress_response = True
+                                            decided = True
+                                            event_buffer.clear()
+                                            logger.info(
+                                                f"[{request_id}] WS Memory: Detected "
+                                                f"{item.get('name')} — suppressing response"
+                                            )
                                         else:
-                                            termination_cause = "client_error"
-                                elif t is upstream_task:
-                                    if upstream_relay_error is not None:
-                                        termination_cause = "upstream_error"
-                                        logger.debug(
-                                            f"[{request_id}] WS relay {task_name} "
-                                            f"raised: {upstream_relay_error!r}"
-                                        )
-                                    elif exc is None:
-                                        termination_cause = (
-                                            "response_completed"
-                                            if response_completed_seen
-                                            else "upstream_disconnect"
-                                        )
-                                    elif isinstance(exc, asyncio.CancelledError):
-                                        termination_cause = "upstream_disconnect"
-                                    else:
-                                        termination_cause = "upstream_error"
-                                        logger.debug(
-                                            f"[{request_id}] WS relay {task_name} raised: {exc!r}"
-                                        )
-                            if (
-                                ws_cancel_frames > 0
-                                and not response_completed_seen
-                                and termination_cause
-                                in {"upstream_disconnect", "client_disconnect", "unknown"}
-                            ):
-                                termination_cause = "client_cancel"
+                                            # Non-memory first → flush buffer, pass through
+                                            decided = True
+                                            for buf in event_buffer:
+                                                await websocket.send_text(buf)
+                                            event_buffer.clear()
+
+                                    elif event_type == "response.completed":
+                                        # No output items at all — flush
+                                        decided = True
+                                for buf in event_buffer:
+                                    await websocket.send_text(buf)
+                                event_buffer.clear()
+                                await _record_ws_response_metrics()
+                                _reset()
+                                response_completed_seen = True
+
+                                continue
+
+                                # --- Phase 2a: Suppress mode (memory response) ---
+                                if suppress_response:
+                                    if event_type == "response.output_item.done":
+                                        item = event.get("item", {})
+                                        if (
+                                            item.get("type") == "function_call"
+                                            and item.get("name") in MEMORY_TOOL_NAMES
+                                        ):
+                                            pending_fcs.append(item)
+
+                                    elif event_type == "response.completed":
+                                        response_completed_seen = True
+                                        await _record_ws_response_metrics()
+                                        resp = event.get("response", {})
+                                        resp_id = resp.get("id")
+
+                                        if pending_fcs:
+                                            logger.info(
+                                                f"[{request_id}] WS Memory: Executing "
+                                                f"{len(pending_fcs)} tool(s) transparently"
+                                            )
+
+                                            # Execute memory tool calls
+                                            tool_outputs: list[dict[str, Any]] = []
+                                            for fc in pending_fcs:
+                                                call_id = fc.get("call_id", fc.get("id", ""))
+                                                fc_name = fc.get("name", "")
+                                                args_str = fc.get("arguments", "{}")
+                                                try:
+                                                    fc_args = json.loads(args_str)
+                                                except json.JSONDecodeError:
+                                                    fc_args = {}
+
+                                                await self.memory_handler._ensure_initialized()
+                                                if self.memory_handler._backend:
+                                                    result = await self.memory_handler._execute_memory_tool(
+                                                        fc_name,
+                                                        fc_args,
+                                                        memory_user_id,
+                                                        "openai",
+                                                    )
+                                                else:
+                                                    result = json.dumps(
+                                                        {"error": "backend not ready"}
+                                                    )
+
+                                                tool_outputs.append(
+                                                    {
+                                                        "type": "function_call_output",
+                                                        "call_id": call_id,
+                                                        "output": result,
+                                                    }
+                                                )
+                                                logger.info(
+                                                    f"[{request_id}] WS Memory: Executed "
+                                                    f"{fc_name} for user {memory_user_id}"
+                                                )
+
+                                            # Send continuation upstream
+                                            cont: dict[str, Any] = {
+                                                "type": "response.create",
+                                                "response": {"input": tool_outputs},
+                                            }
+                                            if resp_id:
+                                                cont["response"]["previous_response_id"] = resp_id
+                                            await upstream.send(json.dumps(cont))
+                                            logger.info(
+                                                f"[{request_id}] WS Memory: Sent continuation "
+                                                f"with {len(tool_outputs)} result(s)"
+                                            )
+
+                                        _reset()
+                                    # All events suppressed in this mode
+                                    continue
+
+                                # --- Phase 2b: Pass-through mode ---
+                                await websocket.send_text(msg_str)
+
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as relay_err:
+                            if "WebSocketDisconnect" not in type(relay_err).__name__:
+                                # Capture for the outer classifier
+                                # so ``upstream_error`` can be
+                                # distinguished from a clean
+                                # upstream disconnect.
+                                upstream_relay_error = relay_err
+                                logger.debug(
+                                    f"[{request_id}] WS upstream→client relay ended: {relay_err}"
+                                )
                         finally:
-                            # In case anything above raised before the
-                            # cancel-and-await loop ran.
-                            for t in relay_tasks:
-                                if not t.done():
-                                    t.cancel()
-                            with contextlib.suppress(asyncio.CancelledError):
-                                await asyncio.gather(*relay_tasks, return_exceptions=True)
+                            with contextlib.suppress(Exception):
+                                await websocket.close()
 
-                        logger.info(
-                            "[%s] WS /v1/responses completed "
-                            "(tokens_saved=%d, cause=%s, client_frames=%d, upstream_frames=%d, "
-                            "cancel_frames=%d, client_disconnect=%s, last_client_type=%s, "
-                            "last_upstream_type=%s)",
-                            request_id,
-                            tokens_saved,
-                            termination_cause,
-                            ws_client_frames_total,
-                            ws_upstream_frames_total,
-                            ws_cancel_frames,
-                            ws_client_disconnect_seen,
-                            ws_last_client_frame_type,
-                            ws_last_upstream_frame_type,
+                    # --- Unit 3: deterministic relay-task cancellation ---
+                    # Spawn each half as a named task so we can:
+                    #   (a) attach them to the session registry for
+                    #       ``/debug/ws-sessions``,
+                    #   (b) cancel the survivor explicitly when the
+                    #       first one exits, and
+                    #   (c) classify the termination cause for the
+                    #       duration histogram.
+                    client_task = asyncio.create_task(
+                        _client_to_upstream(),
+                        name=f"codex-ws-c2u-{session_id}",
+                    )
+                    upstream_task = asyncio.create_task(
+                        _upstream_to_client(),
+                        name=f"codex-ws-u2c-{session_id}",
+                    )
+                    relay_tasks = [client_task, upstream_task]
+                    if ws_sessions is not None:
+                        ws_sessions.attach_tasks(session_id, relay_tasks)
+                        metrics_for_tasks = getattr(self, "metrics", None)
+                        if metrics_for_tasks is not None and hasattr(
+                            metrics_for_tasks, "inc_active_relay_tasks"
+                        ):
+                            try:
+                                metrics_for_tasks.inc_active_relay_tasks(len(relay_tasks))
+                            except Exception:  # pragma: no cover - defensive
+                                pass
+
+                    try:
+                        done, pending = await asyncio.wait(
+                            {client_task, upstream_task},
+                            return_when=asyncio.FIRST_COMPLETED,
                         )
-                    break
-                except Exception as ws_err:
-                    if ws_connected:
-                        # WS was established but broke mid-stream — re-raise
-                        raise
+                        # Cancel the survivor so we don't leak the
+                        # partner task. Suppress the CancelledError
+                        # we just raised ourselves — any *other*
+                        # exception from the cancelled task is
+                        # already logged inside its own try/except.
+                        for t in pending:
+                            t.cancel()
+                        if pending:
+                            with contextlib.suppress(asyncio.CancelledError):
+                                await asyncio.gather(*pending, return_exceptions=True)
 
-                    ws_last_err = ws_err
-                    if ws_attempt >= ws_connect_attempts - 1:
-                        break
+                        # Classify termination cause from whichever
+                        # task completed first. ``CancelledError``
+                        # can show up on the "done" side if the
+                        # handler itself was cancelled from outside
+                        # (e.g. server shutdown).
+                        for t in done:
+                            exc = None
+                            # Cancelled tasks raise CancelledError from
+                            # .exception(); surface it explicitly so the
+                            # downstream ``isinstance(exc, CancelledError)``
+                            # branches actually run. For any other
+                            # unexpected state (``InvalidStateError`` if
+                            # the task somehow isn't done — shouldn't
+                            # happen post-gather but defensive), we
+                            # suppress and leave ``exc`` as ``None``.
+                            if t.cancelled():
+                                exc = asyncio.CancelledError()
+                            else:
+                                with contextlib.suppress(asyncio.InvalidStateError):
+                                    exc = t.exception()
+                            task_name = t.get_name() or ""
+                            if t is client_task:
+                                if client_relay_error is not None:
+                                    termination_cause = "client_error"
+                                elif exc is None:
+                                    termination_cause = "client_disconnect"
+                                elif isinstance(exc, asyncio.CancelledError):
+                                    termination_cause = "client_disconnect"
+                                else:
+                                    # Distinguish legitimate client
+                                    # disconnect exceptions from
+                                    # real errors: WebSocketDisconnect
+                                    # is a normal client exit.
+                                    if "WebSocketDisconnect" in type(exc).__name__:
+                                        termination_cause = "client_disconnect"
+                                    else:
+                                        termination_cause = "client_error"
+                            elif t is upstream_task:
+                                if upstream_relay_error is not None:
+                                    termination_cause = "upstream_error"
+                                    logger.debug(
+                                        f"[{request_id}] WS relay {task_name} "
+                                        f"raised: {upstream_relay_error!r}"
+                                    )
+                                elif exc is None:
+                                    termination_cause = (
+                                        "response_completed"
+                                        if response_completed_seen
+                                        else "upstream_disconnect"
+                                    )
+                                elif isinstance(exc, asyncio.CancelledError):
+                                    termination_cause = "upstream_disconnect"
+                                else:
+                                    termination_cause = "upstream_error"
+                                    logger.debug(
+                                        f"[{request_id}] WS relay {task_name} raised: {exc!r}"
+                                    )
+                        if (
+                            ws_cancel_frames > 0
+                            and not response_completed_seen
+                            and termination_cause
+                            in {"upstream_disconnect", "client_disconnect", "unknown"}
+                        ):
+                            termination_cause = "client_cancel"
+                    finally:
+                        # In case anything above raised before the
+                        # cancel-and-await loop ran.
+                        for t in relay_tasks:
+                            if not t.done():
+                                t.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await asyncio.gather(*relay_tasks, return_exceptions=True)
 
-                    delay_with_jitter = jitter_delay_ms(
-                        self.config.retry_base_delay_ms,
-                        self.config.retry_max_delay_ms,
-                        ws_attempt,
+                    logger.info(
+                        "[%s] WS /v1/responses completed "
+                        "(tokens_saved=%d, cause=%s, client_frames=%d, upstream_frames=%d, "
+                        "cancel_frames=%d, client_disconnect=%s, last_client_type=%s, "
+                        "last_upstream_type=%s)",
+                        request_id,
+                        tokens_saved,
+                        termination_cause,
+                        ws_client_frames_total,
+                        ws_upstream_frames_total,
+                        ws_cancel_frames,
+                        ws_client_disconnect_seen,
+                        ws_last_client_frame_type,
+                        ws_last_upstream_frame_type,
                     )
-                    logger.warning(
-                        f"[{request_id}] WS upstream connect failed "
-                        f"(attempt {ws_attempt + 1}/{ws_connect_attempts}): {ws_err}; "
-                        f"retrying in {delay_with_jitter:.0f}ms"
-                    )
-                    await asyncio.sleep(delay_with_jitter / 1000)
-
-            if not ws_connected:
+            else:
                 # WS upgrade failed (HTTP 500 from OpenAI is common).
                 # Fall back to HTTP POST streaming and relay SSE events
                 # back over the client WebSocket transparently.
@@ -5371,6 +5399,12 @@ class OpenAIHandlerMixin:
                 "total_session",
                 (time.perf_counter() - session_started_at) * 1000.0,
             )
+            # Close the upstream WS on early-return paths (e.g. first-frame
+            # timeout after we connected). The relay path closes it via
+            # `async with upstream`; this idempotent backstop covers the rest.
+            with contextlib.suppress(Exception):
+                if upstream is not None:
+                    await upstream.close()
             # Unit 3: deregister the session before (or independently
             # of) the stage-timings log so a failure there cannot leak
             # the registry entry. ``deregister`` is idempotent, so a
@@ -5547,6 +5581,17 @@ class OpenAIHandlerMixin:
                             }
                             await websocket.send_text(json.dumps(error_event))
                             return
+
+                        # Refresh Codex /stats from the fallback response
+                        # headers. We can't forward them onto the client 101
+                        # (already accepted headerless on this arm), but /stats
+                        # parity is still worth keeping on a WS->HTTP fallback.
+                        with contextlib.suppress(Exception):
+                            from headroom.subscription.codex_rate_limits import (
+                                get_codex_rate_limit_state,
+                            )
+
+                            get_codex_rate_limit_state().update_from_headers(dict(response.headers))
 
                         # Relay SSE events as WS text messages
                         buffer = ""
