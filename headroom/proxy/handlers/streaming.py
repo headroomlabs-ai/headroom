@@ -967,6 +967,22 @@ class StreamingMixin:
 
             return StreamingResponse(_error_gen(), media_type="text/event-stream")
 
+        # Capture Codex rate-limit window data from the upstream response
+        # headers, for *every* status. Codex (gpt-5.x) almost always streams, so
+        # without this the session/weekly windows surfaced in ``/stats`` and the
+        # dashboard would only refresh on the rare non-streaming reply. We do this
+        # *before* the error early-return below so a streaming 429/5xx — the moment
+        # usage is most relevant — still refreshes the windows, matching the
+        # non-streaming HTTP handlers which capture on all statuses.
+        # ``update_from_headers`` is a no-op when the response carries no
+        # ``x-codex-*`` headers (e.g. the Anthropic streaming path), so this is
+        # safe to call unconditionally.
+        from headroom.subscription.codex_rate_limits import (
+            get_codex_rate_limit_state,
+        )
+
+        get_codex_rate_limit_state().update_from_headers(dict(upstream_response.headers))
+
         if upstream_response.status_code >= 400:
             logger.warning(
                 "[%s] Forwarding upstream streaming error status=%s url=%s",
@@ -1050,9 +1066,15 @@ class StreamingMixin:
                 headers=response_headers,
             )
 
-        # Forward upstream ratelimit headers to the client
+        # Forward upstream rate-limit headers to the client. We pass both the
+        # generic ``*ratelimit*`` headers (Anthropic) and Codex's ``x-codex-*``
+        # window/credit headers — the latter do not contain the ``ratelimit``
+        # substring, so without the second clause the Codex CLI's own
+        # session/weekly display would stop updating on the streaming path.
         forwarded_headers = {
-            k: v for k, v in upstream_response.headers.items() if "ratelimit" in k.lower()
+            k: v
+            for k, v in upstream_response.headers.items()
+            if "ratelimit" in k.lower() or k.lower().startswith("x-codex")
         }
 
         async def generate():
