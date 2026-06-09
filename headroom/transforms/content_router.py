@@ -947,6 +947,24 @@ class ContentRouter(Transform):
             else:
                 result = self._compress_pure(content, strategy, context, question, bias=bias)
 
+        # Empty-output guard: compression must NEVER blank out non-empty input.
+        # An empty user-message content makes Anthropic reject the whole request
+        # with 400 ("messages.N: user messages must have non-empty content").
+        # If any transform yields empty/whitespace from non-empty input, fall
+        # back to the original content (passthrough) instead of emitting empty.
+        if (
+            content
+            and content.strip()
+            and (result.compressed is None or not str(result.compressed).strip())
+        ):
+            logger.warning(
+                "content_router: compression produced EMPTY output from non-empty "
+                "input (%d chars, strategy=%s); falling back to original to avoid 400.",
+                len(content),
+                getattr(result.strategy_used, "value", result.strategy_used),
+            )
+            result.compressed = content
+
         # One observer call per routing decision; the observer is the
         # forcing function for catching strategy-level regressions.
         # Empty routing_log (passthrough fast path) → no calls.
