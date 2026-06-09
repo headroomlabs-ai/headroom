@@ -50,6 +50,9 @@ _GLOBAL_TARGETS = {"claude", "copilot", "codex", "openclaw"}
 
 def _command_string(parts: list[str]) -> str:
     if os.name == "nt":
+        # Normalize backslash paths to forward slashes so hook commands
+        # work when Claude Code executes them via Git Bash (#724).
+        parts = [p.replace("\\", "/") for p in parts]
         return subprocess.list2cmdline(parts)
     return shlex.join(parts)
 
