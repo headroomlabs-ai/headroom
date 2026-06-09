@@ -107,6 +107,12 @@ memory-stack = [
     "qdrant-client>=1.9.0",
     "neo4j>=5.20.0",
 ]
+# Apple-Silicon GPU (MPS) offload for the memory embedder. Opt in at runtime with
+# HEADROOM_EMBEDDER_RUNTIME=pytorch_mps. macOS-only; intentionally excluded from [all].
+pytorch-mps = [
+    "torch>=2.0.0; sys_platform == 'darwin'",
+    "sentence-transformers>=2.2.0; sys_platform == 'darwin'",
+]
 # Semantic relevance scoring with embeddings.
 # Uses `fastembed` (BAAI/bge-small-en-v1.5 by default — 33M params,
 # 384 dims, ~30 MB int8-quantized ONNX). Same library + model used by
