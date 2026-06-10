@@ -347,6 +347,18 @@ def test_command_string_normalizes_backslashes_on_windows(monkeypatch) -> None:
     assert "C:/Users/user/.local/bin/headroom.exe" in result
 
 
+def test_command_string_quotes_spaces_after_normalization(monkeypatch) -> None:
+    """Paths with spaces must stay properly quoted after backslash normalization (#724)."""
+    init_cli, _ = _load_init_module(monkeypatch)
+    monkeypatch.setattr(init_cli, "os", SimpleNamespace(name="nt"))
+
+    result = init_cli._command_string(
+        ["C:\\Program Files\\headroom\\headroom.exe", "init", "hook", "ensure"]
+    )
+    assert "\\" not in result
+    assert '"C:/Program Files/headroom/headroom.exe"' in result
+
+
 def test_json_file_handles_missing_empty_and_non_mapping(monkeypatch, tmp_path: Path) -> None:
     init_cli, _ = _load_init_module(monkeypatch)
     missing = tmp_path / "missing.json"
