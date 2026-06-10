@@ -35,6 +35,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+* **kompress:** warn when `HEADROOM_KOMPRESS_BACKEND` is set to an unrecognized
+  value instead of silently falling back to `auto`, and document the backend
+  selection env var (`auto` / `onnx` / `onnx_cpu` / `onnx_coreml` / `pytorch` /
+  `pytorch_mps` plus shorthand aliases) in `wiki/configuration.md` (issue
+  [#202](https://github.com/chopratejas/headroom/issues/202), PR
+  [#204](https://github.com/chopratejas/headroom/pull/204)).
 * **proxy:** per-provider attribution in the savings history rollups. Each `/stats-history` bucket (hourly/daily/weekly/monthly) now carries a `by_provider` map breaking down `tokens_saved`, `compression_savings_usd_delta`, `total_input_tokens_delta`, and `total_input_cost_usd_delta` per provider, so consumers can show how savings and spend are distributed across providers within a time period. Providers only appear in a bucket where they moved a counter; legacy history checkpoints with no provider collapse into `"unknown"`. Affected files: `headroom/proxy/savings_tracker.py`, `headroom/proxy/prometheus_metrics.py`.
 
 ### Changed
