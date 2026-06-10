@@ -73,6 +73,40 @@ class GeminiHandlerMixin:
                 return True
         return False
 
+    def _rebuild_gemini_contents(
+        self,
+        original_contents: list[dict],
+        preserved_indices: set[int],
+        preserved_contents: dict[int, dict],
+        optimized_contents: list[dict],
+    ) -> list[dict]:
+        """Interleave preserved (non-text) entries back into optimized_contents at their
+        original positions.
+
+        preserved_indices uses original contents[] indices, but optimized_contents uses
+        a different (shorter) index space because entries with no text parts were excluded
+        from the messages[] sent for compression.  Using orig_idx directly to overwrite
+        optimized_contents[orig_idx] corrupts or silently drops entries.
+
+        This method walks original_contents in order, placing each position with either
+        the preserved original (for non-text entries) or the next optimized text entry.
+        """
+        opt_iter = iter(optimized_contents)
+        result: list[dict] = []
+        for idx, content in enumerate(original_contents):
+            had_text = any("text" in p for p in content.get("parts", []))
+            if idx in preserved_indices:
+                result.append(preserved_contents[idx])
+                if had_text:
+                    # Entry also produced a message; consume but discard the optimized version
+                    next(opt_iter, None)
+            else:
+                opt_entry = next(opt_iter, None)
+                if opt_entry is not None:
+                    result.append(opt_entry)
+                # else: dropped by compression — omit
+        return result
+
     def _gemini_contents_to_messages(
         self, contents: list[dict], system_instruction: dict | None = None
     ) -> tuple[list[dict], set[int]]:
@@ -501,12 +535,9 @@ class GeminiHandlerMixin:
             optimized_contents, optimized_system = self._messages_to_gemini_contents(
                 optimized_messages
             )
-
-            # Restore preserved content entries that had non-text parts
-            for orig_idx, original_content in preserved_contents.items():
-                if orig_idx < len(optimized_contents):
-                    optimized_contents[orig_idx] = original_content
-
+            optimized_contents = self._rebuild_gemini_contents(
+                contents, preserved_indices, preserved_contents, optimized_contents
+            )
             body["contents"] = optimized_contents
             if optimized_system:
                 body["systemInstruction"] = optimized_system
@@ -784,9 +815,12 @@ class GeminiHandlerMixin:
             optimized_contents, optimized_system = self._messages_to_gemini_contents(
                 optimized_messages
             )
-            for orig_idx, original_content in preserved_contents.items():
-                if orig_idx < len(optimized_contents):
-                    optimized_contents[orig_idx] = original_content
+            optimized_contents = self._rebuild_gemini_contents(
+                contents if isinstance(contents, list) else [],
+                preserved_indices,
+                preserved_contents,
+                optimized_contents,
+            )
             request_payload["contents"] = optimized_contents
             if not is_antigravity:
                 if optimized_system:
@@ -1028,12 +1062,9 @@ class GeminiHandlerMixin:
             optimized_contents, optimized_system = self._messages_to_gemini_contents(
                 optimized_messages
             )
-
-            # Restore preserved content entries that had non-text parts
-            for orig_idx, original_content in preserved_contents.items():
-                if orig_idx < len(optimized_contents):
-                    optimized_contents[orig_idx] = original_content
-
+            optimized_contents = self._rebuild_gemini_contents(
+                contents, preserved_indices, preserved_contents, optimized_contents
+            )
             body["contents"] = optimized_contents
             if optimized_system:
                 body["systemInstruction"] = optimized_system
