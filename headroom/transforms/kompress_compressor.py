@@ -90,7 +90,16 @@ def _selected_backend() -> KompressBackend:
         "pytorch_mps": "pytorch_mps",
         "auto": "auto",
     }
-    return aliases.get(raw, "auto")  # type: ignore[return-value]
+    backend = aliases.get(raw)
+    if backend is None:
+        logger.warning(
+            "%s has unrecognized value %r; falling back to 'auto'. Valid values: %s",
+            KOMPRESS_BACKEND_ENV,
+            os.environ.get(KOMPRESS_BACKEND_ENV, ""),
+            ", ".join(sorted(set(aliases.values()))),
+        )
+        return "auto"
+    return backend  # type: ignore[return-value]
 
 
 def _env_int(name: str) -> int | None:
