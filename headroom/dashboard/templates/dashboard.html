@@ -1201,7 +1201,7 @@
                                 <div class="flex items-center justify-between mb-4">
                                     <span class="text-sm font-medium text-gray-300">Per-Model Breakdown</span>
                                     <span class="text-xs text-gray-500 font-mono"
-                                          x-text="historySelectedSeriesLabel + ' buckets'"></span>
+                                          x-text="historyModelSourceSeriesLabel + ' buckets'"></span>
                                 </div>
                                 <template x-if="historyModelBreakdown.length === 0">
                                     <div class="text-sm text-gray-500 italic">
@@ -1803,6 +1803,18 @@
                         .sort((a, b) => b[1] - a[1])
                         .slice(0, 5)
                         .map(([model]) => model);
+                    // A breakdown-row selection outside the top 5 takes the
+                    // last chart slot so the filter works for every row (the
+                    // template renders a fixed set of line slots).
+                    const selected = this.historySelectedModel;
+                    if (
+                        selected &&
+                        (totals[selected] || 0) > 0 &&
+                        topModels.length > 0 &&
+                        !topModels.includes(selected)
+                    ) {
+                        topModels[topModels.length - 1] = selected;
+                    }
                     return topModels.map(model => {
                         let running = 0;
                         return {
@@ -1923,6 +1935,14 @@
                         monthly: 'Monthly',
                     };
                     return labels[this.historySelectedSeriesKey] || 'History';
+                },
+
+                get historyModelSourceSeriesLabel() {
+                    // historyModelSourceSeries substitutes the daily rollup
+                    // at raw checkpoint granularity; label what is shown.
+                    return this.historySelectedSeriesKey === 'history'
+                        ? 'Daily'
+                        : this.historySelectedSeriesLabel;
                 },
 
                 get historySelectedPointCount() {
