@@ -402,6 +402,92 @@ print(f"CCR Key: {result.ccr_key}")             # For retrieval
 
 ---
 
+---
+
+## Boolean Compression
+
+Headroom includes a **lossless** boolean algebra compressor that reduces truth tables and boolean expressions to their minimal sum-of-products (SOP) form using the Quine-McCluskey algorithm via [boolean-algebra-engine](https://github.com/Shrivastava-Aditya/bool-LLM-ngn). Unlike Kompress, this path never approximates — the output is proven logically equivalent to the input.
+
+### Content types handled
+
+| Input | Example | Savings |
+|-------|---------|---------|
+| Markdown truth table | 8-row `\| A \| B \| C \| Out \|` table | ~91% |
+| English-operator expression | `A AND B OR NOT C` | ~71% |
+| Natural-language logic (NL path) | "alarm on when door open and motion detected" | ~87% |
+
+### Installation
+
+```bash
+# Algorithmic path only (no API key needed)
+pip install "headroom-ai[boolean]"
+
+# With natural-language extraction (Anthropic)
+pip install "headroom-ai[boolean,nl-anthropic]"
+export ANTHROPIC_API_KEY=sk-...
+
+# With natural-language extraction (OpenAI)
+pip install "headroom-ai[boolean,nl-openai]"
+export OPENAI_API_KEY=sk-...
+```
+
+If `boolean-algebra-engine` is not installed, both compressors are silently unavailable and headroom falls back to Kompress. No import error is raised at startup.
+
+### How detection works
+
+The router detects boolean content before routing:
+
+- **Truth tables**: A header row of variable names followed by rows of `0`/`1` values (markdown `|` pipes supported).
+- **Symbolic expressions**: Single uppercase-letter variables (`A`, `B`, `C`) combined with `AND`/`OR`/`NOT`, `&&`/`||`/`!`, `.`/`+`/`~`, or Unicode `¬`.
+- **Natural-language logic** (NL path, optional): Short prose describing a logic function using signal phrases like *"output is high when … and …"* or *"alarm turns on if … but not …"*.
+
+Source code and general prose that happen to use `and`/`or` are **not** detected — the detector requires single-letter uppercase variables or an explicit truth table structure to avoid false positives.
+
+### Telemetry and opt-out
+
+This path fires two anonymous events to the **boolean-algebra-engine** PostHog project:
+
+**`headroom_boolean_engine_loaded`** — fired once per headroom session the first time a boolean compression succeeds. Used to distinguish headroom-sourced engine usage from direct CLI installs.
+
+| Field | Value |
+|-------|-------|
+| `source` | `"headroom"` |
+
+**`headroom_boolean_compress`** — fired on each compression. Reports:
+
+| Field | Description |
+|-------|-------------|
+| `tokens_before` | Token count before compression |
+| `tokens_after` | Token count after compression |
+| `tokens_saved` | Tokens saved |
+| `savings_pct` | Savings as a percentage |
+| `variable_count` | Number of boolean variables |
+| `strategy` | `"truth_table"`, `"expression"`, or `"nl_expression"` |
+| `source` | Always `"headroom"` |
+
+No prompt content, file paths, or personally identifiable information is sent. The `distinct_id` reuses the `boolean-algebra-engine` install ID (stored in `~/.config/boolcalc/telemetry.json`) so headroom usage can be correlated with direct CLI usage under one anonymous profile.
+
+**To opt out**, set the environment variable before starting headroom:
+
+```bash
+export BOOLCALC_NO_TELEMETRY=1
+```
+
+Or add it to your headroom environment permanently:
+
+```bash
+# docker-compose.yml
+environment:
+  - BOOLCALC_NO_TELEMETRY=1
+
+# .env / shell profile
+BOOLCALC_NO_TELEMETRY=1
+```
+
+When the variable is set, no network request is made and no thread is spawned.
+
+---
+
 ## See Also
 
 - [Transforms Reference](transforms.md) - Other compression transforms

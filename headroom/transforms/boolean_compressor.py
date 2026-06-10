@@ -24,6 +24,7 @@ Telemetry: fires an anonymous PostHog event to the boolean-algebra-engine projec
 each time a compression occurs, reporting tokens_before, tokens_after, variable_count,
 and strategy. Respects BOOLCALC_NO_TELEMETRY=1.
 """
+
 from __future__ import annotations
 
 import logging
@@ -43,19 +44,19 @@ if TYPE_CHECKING:
 
 # Order matters: longer patterns before shorter ones
 _NORMALISE_RULES: list[tuple[re.Pattern[str], str]] = [
-    (re.compile(r"\bXNOR\b",  re.I), "^"),   # XNOR → ^ (not standard, but handle)
-    (re.compile(r"\bXOR\b",   re.I), "^"),
-    (re.compile(r"\bNAND\b",  re.I), "!."),  # approximate
-    (re.compile(r"\bNOR\b",   re.I), "!+"),  # approximate
-    (re.compile(r"\bNOT\s+",  re.I), "!"),
-    (re.compile(r"\bAND\b",   re.I), "."),
-    (re.compile(r"\bOR\b",    re.I), "+"),
-    (re.compile(r"\|\|"),           "+"),
-    (re.compile(r"&&"),             "."),
-    (re.compile(r"[~¬]"),           "!"),
-    (re.compile(r"\|(?!\|)"),       "+"),
-    (re.compile(r"&(?!&)"),         "."),
-    (re.compile(r"\s+"),            ""),      # strip all whitespace last
+    (re.compile(r"\bXNOR\b", re.I), "^"),  # XNOR → ^ (not standard, but handle)
+    (re.compile(r"\bXOR\b", re.I), "^"),
+    (re.compile(r"\bNAND\b", re.I), "!."),  # approximate
+    (re.compile(r"\bNOR\b", re.I), "!+"),  # approximate
+    (re.compile(r"\bNOT\s+", re.I), "!"),
+    (re.compile(r"\bAND\b", re.I), "."),
+    (re.compile(r"\bOR\b", re.I), "+"),
+    (re.compile(r"\|\|"), "+"),
+    (re.compile(r"&&"), "."),
+    (re.compile(r"[~¬]"), "!"),
+    (re.compile(r"\|(?!\|)"), "+"),
+    (re.compile(r"&(?!&)"), "."),
+    (re.compile(r"\s+"), ""),  # strip all whitespace last
 ]
 
 
@@ -68,15 +69,15 @@ def _normalise(expr: str) -> str:
 
 # ── Truth table parsing ───────────────────────────────────────────────────────
 
-_BINARY_ROW  = re.compile(r"^[\s|]*([01][\s|]+)+[01][\s|]*$")
-_MD_HEADER   = re.compile(r"^\|?\s*([A-Za-z_]\w*\s*\|?\s*)+$")
+_BINARY_ROW = re.compile(r"^[\s|]*([01][\s|]+)+[01][\s|]*$")
+_MD_HEADER = re.compile(r"^\|?\s*([A-Za-z_]\w*\s*\|?\s*)+$")
 _VAR_EXTRACT = re.compile(r"[A-Za-z_]\w*")
 
 
 @dataclass
 class _ParsedTable:
     variables: list[str]
-    minterms:  list[int]
+    minterms: list[int]
 
 
 def _try_parse_truth_table(content: str) -> _ParsedTable | None:
@@ -91,13 +92,13 @@ def _try_parse_truth_table(content: str) -> _ParsedTable | None:
 
     # Find header line (contains variable names, no binary data)
     header_line = None
-    data_start   = 0
+    data_start = 0
     for i, line in enumerate(lines):
         clean = re.sub(r"[|\-:+]", " ", line).strip()
         words = clean.split()
         if words and all(re.match(r"^[A-Za-z_]\w*$", w) for w in words):
             header_line = words
-            data_start  = i + 1
+            data_start = i + 1
             # Skip markdown separator row (---|---...)
             if data_start < len(lines) and re.match(r"^[\s|:\-]+$", lines[data_start]):
                 data_start += 1
@@ -106,7 +107,7 @@ def _try_parse_truth_table(content: str) -> _ParsedTable | None:
     if header_line is None or len(header_line) < 2:
         return None
 
-    variables = header_line[:-1]   # all but last column
+    variables = header_line[:-1]  # all but last column
     # output_col = header_line[-1]  # not used — last column is output
 
     if not (1 <= len(variables) <= 8):
@@ -116,7 +117,7 @@ def _try_parse_truth_table(content: str) -> _ParsedTable | None:
     minterms: list[int] = []
     row_index = 0
     for line in lines[data_start:]:
-        clean  = re.sub(r"[|\s]+", " ", line).strip()
+        clean = re.sub(r"[|\s]+", " ", line).strip()
         values = clean.split()
         if not values:
             continue
@@ -137,14 +138,15 @@ def _try_parse_truth_table(content: str) -> _ParsedTable | None:
 
 # ── Compression result ────────────────────────────────────────────────────────
 
+
 @dataclass
 class BooleanCompressionResult:
-    compressed:        str
-    original:          str
-    original_tokens:   int
+    compressed: str
+    original: str
+    original_tokens: int
     compressed_tokens: int
-    variable_count:    int
-    strategy:          str   # "expression" | "truth_table"
+    variable_count: int
+    strategy: str  # "expression" | "truth_table"
 
     @property
     def tokens_saved(self) -> int:
@@ -159,6 +161,7 @@ class BooleanCompressionResult:
 
 # ── Core compressor ───────────────────────────────────────────────────────────
 
+
 class BooleanCompressor:
     """Lossless boolean algebra compressor.
 
@@ -172,6 +175,8 @@ class BooleanCompressor:
             result = self._compress_truth_table(content)
             if result is None:
                 result = self._compress_expression(content)
+            if result is not None:
+                _fire_engine_loaded()
             return result
         except Exception as exc:
             logger.debug("BooleanCompressor: compression failed: %s", exc)
@@ -194,7 +199,7 @@ class BooleanCompressor:
 
                 rows: list[TruthTableRow] = []
                 n = len(parsed.variables)
-                for i in range(2 ** n):
+                for i in range(2**n):
                     bits = [(i >> (n - 1 - j)) & 1 for j in range(n)]
                     inputs = dict(zip(parsed.variables, bits))
                     output = 1 if i in parsed.minterms else 0
@@ -210,29 +215,29 @@ class BooleanCompressor:
                 logger.debug("BooleanCompressor: synthesize failed: %s", exc)
                 return None
 
-        original_tokens   = len(content.split())
+        original_tokens = len(content.split())
         compressed_tokens = len(minimal.split())
         if compressed_tokens >= original_tokens:
             return None  # no savings
 
-        header = (
-            f"[boolean-simplified: {', '.join(parsed.variables)} → {minimal}]\n"
-        )
+        header = f"[boolean-simplified: {', '.join(parsed.variables)} → {minimal}]\n"
         compressed = header + minimal
 
         return BooleanCompressionResult(
-            compressed        = compressed,
-            original          = content,
-            original_tokens   = original_tokens,
-            compressed_tokens = len(compressed.split()),
-            variable_count    = len(parsed.variables),
-            strategy          = "truth_table",
+            compressed=compressed,
+            original=content,
+            original_tokens=original_tokens,
+            compressed_tokens=len(compressed.split()),
+            variable_count=len(parsed.variables),
+            strategy="truth_table",
         )
 
     def _compress_expression(self, content: str) -> BooleanCompressionResult | None:
         content_stripped = content.strip()
         # Only compress if it looks like a single expression (not prose)
-        if "\n" in content_stripped and not re.search(r"\b(AND|OR|NOT|XOR)\b", content_stripped, re.I):
+        if "\n" in content_stripped and not re.search(
+            r"\b(AND|OR|NOT|XOR)\b", content_stripped, re.I
+        ):
             return None
         # Collapse multi-line expressions (each line is one expression or one term)
         lines = [ln.strip() for ln in content_stripped.splitlines() if ln.strip()]
@@ -250,39 +255,91 @@ class BooleanCompressor:
         try:
             from boolean_algebra_engine import evaluate, synthesize
 
-            table, _  = evaluate(normalised)
+            table, _ = evaluate(normalised)
             minimal, m = synthesize(table)
         except Exception as exc:
             logger.debug("BooleanCompressor: expression evaluate/synthesize failed: %s", exc)
             return None
 
-        original_tokens   = len(content.split())
+        original_tokens = len(content.split())
         compressed_tokens = len(minimal.split())
         if compressed_tokens >= original_tokens:
             return None
 
-        var_count  = len(table.variables)
+        var_count = len(table.variables)
         compressed = f"[boolean-simplified: {normalised} → {minimal}]\n{minimal}"
 
         return BooleanCompressionResult(
-            compressed        = compressed,
-            original          = content,
-            original_tokens   = original_tokens,
-            compressed_tokens = len(compressed.split()),
-            variable_count    = var_count,
-            strategy          = "expression",
+            compressed=compressed,
+            original=content,
+            original_tokens=original_tokens,
+            compressed_tokens=len(compressed.split()),
+            variable_count=var_count,
+            strategy="expression",
         )
 
 
 # ── Anonymous telemetry ───────────────────────────────────────────────────────
 
-_PH_KEY      = "phc_Am4NNyVXotVffz6rcBy8xZVUZeaJCCbbHMu63pWMz3M8"
+_PH_KEY = "phc_Am4NNyVXotVffz6rcBy8xZVUZeaJCCbbHMu63pWMz3M8"
 _PH_ENDPOINT = "https://us.i.posthog.com/capture/"
 _CONFIG_FILE = (
     __import__("pathlib").Path(
-        __import__("os").environ.get("XDG_CONFIG_HOME", __import__("pathlib").Path.home() / ".config")
-    ) / "boolcalc" / "telemetry.json"
+        __import__("os").environ.get(
+            "XDG_CONFIG_HOME", __import__("pathlib").Path.home() / ".config"
+        )
+    )
+    / "boolcalc"
+    / "telemetry.json"
 )
+
+_engine_loaded_fired = False
+
+
+def _fire_engine_loaded() -> None:
+    """Fire a one-time event the first time BooleanCompressor compresses successfully.
+
+    Distinguishes headroom-sourced engine usage from direct CLI installs in PostHog.
+    Respects BOOLCALC_NO_TELEMETRY=1.
+    """
+    global _engine_loaded_fired
+    if _engine_loaded_fired or os.environ.get("BOOLCALC_NO_TELEMETRY"):
+        return
+    _engine_loaded_fired = True
+
+    def _send() -> None:
+        try:
+            import json
+            import urllib.request
+
+            install_id = "headroom-anonymous"
+            try:
+                if _CONFIG_FILE.exists():
+                    state = json.loads(_CONFIG_FILE.read_text())
+                    install_id = state.get("install_id", install_id)
+            except Exception:
+                pass
+
+            payload = json.dumps(
+                {
+                    "api_key": _PH_KEY,
+                    "event": "headroom_boolean_engine_loaded",
+                    "distinct_id": install_id,
+                    "properties": {"source": "headroom"},
+                }
+            ).encode()
+
+            req = urllib.request.Request(
+                _PH_ENDPOINT,
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            urllib.request.urlopen(req, timeout=3)
+        except Exception:
+            pass
+
+    threading.Thread(target=_send, daemon=True).start()
 
 
 def _fire_telemetry(result: BooleanCompressionResult) -> None:
@@ -304,31 +361,33 @@ def _fire_telemetry(result: BooleanCompressionResult) -> None:
             install_id = "headroom-anonymous"
             try:
                 if _CONFIG_FILE.exists():
-                    state      = json.loads(_CONFIG_FILE.read_text())
+                    state = json.loads(_CONFIG_FILE.read_text())
                     install_id = state.get("install_id", install_id)
             except Exception:
                 pass
 
-            payload = json.dumps({
-                "api_key":     _PH_KEY,
-                "event":       "headroom_boolean_compress",
-                "distinct_id": install_id,
-                "properties": {
-                    "tokens_before":  result.original_tokens,
-                    "tokens_after":   result.compressed_tokens,
-                    "tokens_saved":   result.tokens_saved,
-                    "savings_pct":    round(result.savings_pct, 1),
-                    "variable_count": result.variable_count,
-                    "strategy":       result.strategy,
-                    "source":         "headroom",
-                },
-            }).encode()
+            payload = json.dumps(
+                {
+                    "api_key": _PH_KEY,
+                    "event": "headroom_boolean_compress",
+                    "distinct_id": install_id,
+                    "properties": {
+                        "tokens_before": result.original_tokens,
+                        "tokens_after": result.compressed_tokens,
+                        "tokens_saved": result.tokens_saved,
+                        "savings_pct": round(result.savings_pct, 1),
+                        "variable_count": result.variable_count,
+                        "strategy": result.strategy,
+                        "source": "headroom",
+                    },
+                }
+            ).encode()
 
             req = urllib.request.Request(
                 _PH_ENDPOINT,
-                data    = payload,
-                headers = {"Content-Type": "application/json"},
-                method  = "POST",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
             )
             urllib.request.urlopen(req, timeout=3)
         except Exception:
@@ -341,10 +400,15 @@ def _fire_telemetry(result: BooleanCompressionResult) -> None:
 
 # Natural-language logic description markers
 _NL_LOGIC_PATTERNS = [
-    re.compile(r"\b(output|signal|result|flag|value|state)\s+(is\s+)?(high|low|true|false|1|0|on|off)\s+(when|if|whenever)\b", re.I),
+    re.compile(
+        r"\b(output|signal|result|flag|value|state)\s+(is\s+)?(high|low|true|false|1|0|on|off)\s+(when|if|whenever)\b",
+        re.I,
+    ),
     re.compile(r"\b(true|on|active|high|enabled)\s+(only\s+)?(if|when|whenever|iff)\b", re.I),
     re.compile(r"\b(if|when)\s+\w+\s+(and|or|not|xor|nor|nand)\s+\w+\b", re.I),
-    re.compile(r"\b(lights?|motor|alarm|gate|switch|relay)\s+(turns?\s+)?(on|off)\s+(when|if)\b", re.I),
+    re.compile(
+        r"\b(lights?|motor|alarm|gate|switch|relay)\s+(turns?\s+)?(on|off)\s+(when|if)\b", re.I
+    ),
 ]
 
 _NL_OPERATOR_WORDS = re.compile(
@@ -366,6 +430,7 @@ def _detect_provider():
     """Return an NL provider if a supported API key is set, else None."""
     try:
         from boolean_algebra_engine.nl.nl import AnthropicProvider, OpenAIProvider
+
         if os.environ.get("ANTHROPIC_API_KEY"):
             return AnthropicProvider()
         if os.environ.get("OPENAI_API_KEY"):
@@ -396,6 +461,7 @@ class NLBooleanCompressor:
             return None
         try:
             from boolean_algebra_engine.nl.nl import ask
+
             result = ask(content.strip(), provider=provider)
         except Exception as exc:
             logger.debug("NLBooleanCompressor: ask() failed: %s", exc)
@@ -408,16 +474,16 @@ class NLBooleanCompressor:
         var_map = "  ".join(f"{k}={v}" for k, v in result.variables.items())
         compressed = f"[nl-boolean: {var_map}]\n{minimal}"
 
-        original_tokens   = len(content.split())
+        original_tokens = len(content.split())
         compressed_tokens = len(compressed.split())
         if compressed_tokens >= original_tokens:
             return None
 
         return BooleanCompressionResult(
-            compressed        = compressed,
-            original          = content,
-            original_tokens   = original_tokens,
-            compressed_tokens = compressed_tokens,
-            variable_count    = len(result.variables),
-            strategy          = "nl_expression",
+            compressed=compressed,
+            original=content,
+            original_tokens=original_tokens,
+            compressed_tokens=compressed_tokens,
+            variable_count=len(result.variables),
+            strategy="nl_expression",
         )

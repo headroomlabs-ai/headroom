@@ -10,6 +10,7 @@ Covers the checklist from PR #779:
 - Prose with and/or → not detected as boolean logic
 - BOOLCALC_NO_TELEMETRY=1 → no PostHog event fired
 """
+
 from __future__ import annotations
 
 import sys
@@ -34,6 +35,7 @@ from headroom.transforms.content_detector import (
 )
 
 # ── Notation normaliser ───────────────────────────────────────────────────────
+
 
 def test_normalise_english_operators() -> None:
     assert _normalise("A AND B OR NOT C") == "A.B+!C"
@@ -86,6 +88,7 @@ def test_parse_truth_table_rejects_plain_text() -> None:
 
 # ── Boolean content detector ──────────────────────────────────────────────────
 
+
 def test_detect_boolean_truth_table() -> None:
     result = _try_detect_boolean(_MAJORITY_TABLE)
     assert result is not None
@@ -124,6 +127,7 @@ def test_detect_boolean_requires_two_distinct_variables() -> None:
 
 # ── NL boolean content detector ──────────────────────────────────────────────
 
+
 def test_detect_nl_boolean_signal_phrase() -> None:
     content = "The alarm turns on when motion is detected and door is open."
     result = _try_detect_nl_boolean(content)
@@ -152,18 +156,20 @@ def test_detect_nl_boolean_rejects_generic_prose() -> None:
 
 # ── BooleanCompressor (with mocked boolean_algebra_engine) ───────────────────
 
+
 def _make_fake_engine(minimal: str = "B.C+A.C+A.B") -> ModuleType:
     """Build a minimal fake of the boolean_algebra_engine module."""
+
     def fake_row(inputs: Any, output: Any) -> Any:
         return SimpleNamespace(inputs=inputs, output=output)
 
     engine = ModuleType("boolean_algebra_engine")
     engine.synthesize = lambda table: (minimal, None)
-    engine.evaluate   = lambda expr: (SimpleNamespace(variables=["A", "B", "C"]), None)
+    engine.evaluate = lambda expr: (SimpleNamespace(variables=["A", "B", "C"]), None)
 
     core = ModuleType("boolean_algebra_engine.core")
     models = ModuleType("boolean_algebra_engine.core.models")
-    models.TruthTable    = lambda **kw: SimpleNamespace(**kw)
+    models.TruthTable = lambda **kw: SimpleNamespace(**kw)
     models.TruthTableRow = fake_row
     core.models = models
 
@@ -220,6 +226,7 @@ def test_boolean_compressor_engine_exception_returns_none(monkeypatch: pytest.Mo
 
 # ── NLBooleanCompressor ───────────────────────────────────────────────────────
 
+
 def _fake_nl_result() -> Any:
     return SimpleNamespace(
         minimal="A^B",
@@ -234,10 +241,12 @@ def test_nl_compressor_fires_with_api_key(monkeypatch: pytest.MonkeyPatch) -> No
     fake_provider = object()
     nl_mod = ModuleType("boolean_algebra_engine.nl.nl")
     nl_mod.AnthropicProvider = lambda: fake_provider  # type: ignore[attr-defined]
-    nl_mod.OpenAIProvider    = lambda: None            # type: ignore[attr-defined]
-    nl_mod.ask               = lambda content, provider: _fake_nl_result()  # type: ignore[attr-defined]
+    nl_mod.OpenAIProvider = lambda: None  # type: ignore[attr-defined]
+    nl_mod.ask = lambda content, provider: _fake_nl_result()  # type: ignore[attr-defined]
 
-    monkeypatch.setitem(sys.modules, "boolean_algebra_engine.nl", ModuleType("boolean_algebra_engine.nl"))
+    monkeypatch.setitem(
+        sys.modules, "boolean_algebra_engine.nl", ModuleType("boolean_algebra_engine.nl")
+    )
     monkeypatch.setitem(sys.modules, "boolean_algebra_engine.nl.nl", nl_mod)
 
     content = "The alarm turns on when motion is detected and the door is open."
@@ -265,18 +274,21 @@ def test_nl_compressor_skips_non_logic_content(monkeypatch: pytest.MonkeyPatch) 
 
 # ── Telemetry opt-out ─────────────────────────────────────────────────────────
 
+
 def test_telemetry_suppressed_by_env_var(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("BOOLCALC_NO_TELEMETRY", "1")
 
     with patch("threading.Thread") as mock_thread:
-        _fire_telemetry(BooleanCompressionResult(
-            compressed="A.B",
-            original="A AND B",
-            original_tokens=3,
-            compressed_tokens=1,
-            variable_count=2,
-            strategy="expression",
-        ))
+        _fire_telemetry(
+            BooleanCompressionResult(
+                compressed="A.B",
+                original="A AND B",
+                original_tokens=3,
+                compressed_tokens=1,
+                variable_count=2,
+                strategy="expression",
+            )
+        )
         mock_thread.assert_not_called()
 
 
@@ -292,20 +304,23 @@ def test_telemetry_fires_thread_without_opt_out(monkeypatch: pytest.MonkeyPatch)
         return t
 
     with patch("threading.Thread", side_effect=capturing_thread):
-        _fire_telemetry(BooleanCompressionResult(
-            compressed="A.B",
-            original="A AND B",
-            original_tokens=3,
-            compressed_tokens=1,
-            variable_count=2,
-            strategy="expression",
-        ))
+        _fire_telemetry(
+            BooleanCompressionResult(
+                compressed="A.B",
+                original="A AND B",
+                original_tokens=3,
+                compressed_tokens=1,
+                variable_count=2,
+                strategy="expression",
+            )
+        )
 
     assert len(threads_started) == 1
     assert threads_started[0].daemon is True
 
 
 # ── Content router integration ────────────────────────────────────────────────
+
 
 def test_router_boolean_strategy_mapped(monkeypatch: pytest.MonkeyPatch) -> None:
     """BOOLEAN and NL_BOOLEAN strategies are wired in ContentRouter without import error."""
@@ -315,5 +330,11 @@ def test_router_boolean_strategy_mapped(monkeypatch: pytest.MonkeyPatch) -> None
     assert hasattr(CompressionStrategy, "NL_BOOLEAN")
 
     router = ContentRouter()
-    assert router._strategy_from_detection_type(ContentType.BOOLEAN_LOGIC) is CompressionStrategy.BOOLEAN
-    assert router._strategy_from_detection_type(ContentType.NL_BOOLEAN_LOGIC) is CompressionStrategy.NL_BOOLEAN
+    assert (
+        router._strategy_from_detection_type(ContentType.BOOLEAN_LOGIC)
+        is CompressionStrategy.BOOLEAN
+    )
+    assert (
+        router._strategy_from_detection_type(ContentType.NL_BOOLEAN_LOGIC)
+        is CompressionStrategy.NL_BOOLEAN
+    )

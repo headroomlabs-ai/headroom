@@ -1500,17 +1500,18 @@ class ContentRouter(Transform):
                     compressor_name = type(compressor).__name__
                     bool_result = compressor.compress(content)
                     if bool_result is not None:
-                        compressed        = bool_result.compressed
+                        compressed = bool_result.compressed
                         compressed_tokens = bool_result.compressed_tokens
-                        decision_reason   = f"boolean_{bool_result.strategy}"
+                        decision_reason = f"boolean_{bool_result.strategy}"
                         from .boolean_compressor import _fire_telemetry
+
                         _fire_telemetry(bool_result)
                 if compressed is None:
                     # Fallback to Kompress when boolean-algebra-engine unavailable
                     compressed, compressed_tokens = self._try_ml_compressor(
                         content, context, question
                     )
-                    strategy        = CompressionStrategy.KOMPRESS
+                    strategy = CompressionStrategy.KOMPRESS
                     actual_strategy = strategy
                     compressor_name = "KompressCompressor"
                     decision_reason = "boolean_unavailable_fallback_kompress"
@@ -1522,16 +1523,17 @@ class ContentRouter(Transform):
                     compressor_name = type(compressor).__name__
                     bool_result = compressor.compress(content)
                     if bool_result is not None:
-                        compressed        = bool_result.compressed
+                        compressed = bool_result.compressed
                         compressed_tokens = bool_result.compressed_tokens
-                        decision_reason   = "nl_boolean"
+                        decision_reason = "nl_boolean"
                         from .boolean_compressor import _fire_telemetry
+
                         _fire_telemetry(bool_result)
                 if compressed is None:
                     compressed, compressed_tokens = self._try_ml_compressor(
                         content, context, question
                     )
-                    strategy        = CompressionStrategy.KOMPRESS
+                    strategy = CompressionStrategy.KOMPRESS
                     actual_strategy = strategy
                     compressor_name = "KompressCompressor"
                     decision_reason = "nl_boolean_unavailable_fallback_kompress"
@@ -1843,9 +1845,12 @@ class ContentRouter(Transform):
         if self._boolean_compressor is None:
             try:
                 from .boolean_compressor import BooleanCompressor
+
                 self._boolean_compressor = BooleanCompressor()
             except ImportError:
-                logger.debug("BooleanCompressor not available — install boolean-algebra-engine[cli]")
+                logger.debug(
+                    "BooleanCompressor not available — install boolean-algebra-engine[cli]"
+                )
         return self._boolean_compressor
 
     def _get_nl_boolean_compressor(self) -> Any:
@@ -1853,9 +1858,12 @@ class ContentRouter(Transform):
         if self._nl_boolean_compressor is None:
             try:
                 from .boolean_compressor import NLBooleanCompressor
+
                 self._nl_boolean_compressor = NLBooleanCompressor()
             except ImportError:
-                logger.debug("NLBooleanCompressor not available — install boolean-algebra-engine[nl-anthropic]")
+                logger.debug(
+                    "NLBooleanCompressor not available — install boolean-algebra-engine[nl-anthropic]"
+                )
         return self._nl_boolean_compressor
 
     def _get_diff_compressor(self) -> Any:
