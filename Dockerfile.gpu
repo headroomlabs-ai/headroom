@@ -122,14 +122,21 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
         --out /tmp/wheels && \
     uv pip install --system /tmp/wheels/*.whl
 
-# Bake HF weights with retry for flaky network. kompress-v2-base is the
-# current Kompress default (weight-only int8 ONNX, self-contained:
-# model.onnx + tokenizer.json + config.json). It loads via onnxruntime,
-# not transformers, so TRANSFORMERS_OFFLINE does not block it.
+# Bake HF weights with retry for flaky network. Two repos are required:
+#   1. chopratejas/kompress-v2-base — the Kompress default (int8 ONNX weights).
+#   2. answerdotai/ModernBERT-base  — its tokenizer. The Kompress loader calls
+#      AutoTokenizer.from_pretrained("answerdotai/ModernBERT-base") explicitly
+#      (see headroom/transforms/kompress_compressor.py). With TRANSFORMERS_OFFLINE=1
+#      and this repo absent, the tokenizer fetch fails, the whole model load fails,
+#      and Kompress SILENTLY degrades to a no-op (returns input unchanged). Bake
+#      it so offline text compression actually runs. Tokenizer files only — the
+#      ModernBERT weights are not needed.
 RUN if echo ",${HEADROOM_EXTRAS}," | grep -q ",ml,"; then \
         for i in 1 2 3; do \
             python -c "from huggingface_hub import snapshot_download; \
-                snapshot_download('chopratejas/kompress-v2-base')" \
+                snapshot_download('chopratejas/kompress-v2-base'); \
+                snapshot_download('answerdotai/ModernBERT-base', \
+                    allow_patterns=['tokenizer*', '*.json', 'special_tokens*'])" \
             && break || { echo \"hf download attempt $i failed, retrying\"; sleep 10; }; \
         done; \
         test -d /opt/hf-cache && ls /opt/hf-cache; \
