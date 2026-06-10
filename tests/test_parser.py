@@ -786,7 +786,85 @@ class TestAnthropicToolResultBlocks:
 
         blocks = parse_message_to_blocks(message, 0, mock_tokenizer)
 
+        # Nothing extractable: keep the container block so every message
+        # still yields at least one block.
         assert [b.kind for b in blocks] == ["user"]
+
+    def test_tool_result_only_message_skips_container_block(self, mock_tokenizer, big_json_payload):
+        message = {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_08", "content": big_json_payload}
+            ],
+        }
+
+        blocks = parse_message_to_blocks(message, 0, mock_tokenizer)
+
+        assert [b.kind for b in blocks] == ["tool_result"]
+
+    def test_tool_result_dict_content_serialized_as_json(self, mock_tokenizer):
+        rows = {"rows": [{"id": i, "padding": "x" * 30} for i in range(120)]}
+        message = {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "toolu_09", "content": rows}],
+        }
+
+        blocks = parse_message_to_blocks(message, 0, mock_tokenizer)
+
+        tool_blocks = [b for b in blocks if b.kind == "tool_result"]
+        assert len(tool_blocks) == 1
+        assert tool_blocks[0].text.startswith('{"rows":')
+        assert tool_blocks[0].flags["waste_signals"]["json_bloat"] > 0
+
+    def test_missing_tool_use_id_yields_none_flag(self, mock_tokenizer, big_json_payload):
+        message = {
+            "role": "user",
+            "content": [{"type": "tool_result", "content": big_json_payload}],
+        }
+
+        blocks = parse_message_to_blocks(message, 0, mock_tokenizer)
+
+        assert blocks[0].kind == "tool_result"
+        assert blocks[0].flags["tool_call_id"] is None
+
+
+class TestStrandsToolResultBlocks:
+    """Strands/Bedrock converse format: toolResult content parts."""
+
+    def test_strands_text_content(self, mock_tokenizer, big_json_payload):
+        message = {
+            "role": "user",
+            "content": [
+                {
+                    "toolResult": {
+                        "toolUseId": "strands_01",
+                        "content": [{"text": big_json_payload}],
+                        "status": "success",
+                    }
+                }
+            ],
+        }
+
+        blocks = parse_message_to_blocks(message, 0, mock_tokenizer)
+
+        assert [b.kind for b in blocks] == ["tool_result"]
+        assert blocks[0].text == big_json_payload
+        assert blocks[0].flags["tool_call_id"] == "strands_01"
+        assert blocks[0].flags["waste_signals"]["json_bloat"] > 0
+
+    def test_strands_json_content(self, mock_tokenizer):
+        rows = {"rows": [{"id": i, "padding": "x" * 30} for i in range(120)]}
+        message = {
+            "role": "user",
+            "content": [
+                {"toolResult": {"toolUseId": "strands_02", "content": [{"json": rows}]}}
+            ],
+        }
+
+        blocks = parse_message_to_blocks(message, 0, mock_tokenizer)
+
+        assert [b.kind for b in blocks] == ["tool_result"]
+        assert blocks[0].flags["waste_signals"]["json_bloat"] > 0
 
     def test_non_text_inner_blocks_skipped(self, mock_tokenizer):
         message = {
