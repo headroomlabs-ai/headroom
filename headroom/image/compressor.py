@@ -138,8 +138,16 @@ class ImageCompressor:
         self.use_siglip = use_siglip
         self.device = device
 
-        # Lazy-loaded router
+        # Lazy-loaded routers. The ONNX router holds ~127 MB of mapped
+        # weights once warm, so we cache it on the instance and release
+        # it explicitly in ``close()``. Previously each call to
+        # ``_compress_message_list`` constructed a fresh
+        # ``OnnxTechniqueRouter`` (and dropped the reference at function
+        # exit), which left the ORT C++ session alive until Python's GC
+        # eventually ran a full cycle — frequently several requests
+        # later, after the next router had already been built.
         self._router: TrainedRouter | None = None
+        self._onnx_router: Any = None
 
         # Last compression result (for metrics)
         self.last_result: CompressionResult | None = None
@@ -163,13 +171,42 @@ class ImageCompressor:
             )
         return self._router
 
+    def _get_onnx_router(self) -> Any:
+        """Lazy-load and cache the ONNX technique router.
+
+        Returns:
+            The cached ``OnnxTechniqueRouter`` instance.
+        """
+        if self._onnx_router is None:
+            from .onnx_router import OnnxTechniqueRouter
+
+            self._onnx_router = OnnxTechniqueRouter(use_siglip=self.use_siglip)
+        return self._onnx_router
+
     def close(self, unload_models: bool = True) -> None:
-        """Release any router-held model state."""
+        """Release any router-held model state.
+
+        Releases both the PyTorch ``TrainedRouter`` (if loaded) and the
+        ONNX ``OnnxTechniqueRouter`` (if loaded). Each holds tens-to-
+        hundreds of MB once warm; closing the compressor between
+        request bursts is the supported way to reclaim that memory in
+        long-running proxy workers.
+
+        Args:
+            unload_models: If True, also evict the underlying PyTorch
+                models from the shared ``MLModelRegistry`` cache.
+        """
         if self._router is not None:
             # Only loaded routers hold heavyweight image models; plain has_images()
             # checks remain cheap and have nothing to release.
             self._router.release_models(unload_registry=unload_models)
             self._router = None
+
+        if self._onnx_router is not None:
+            close_fn = getattr(self._onnx_router, "close", None)
+            if callable(close_fn):
+                close_fn()
+            self._onnx_router = None
 
     def has_images(self, messages: list[dict[str, Any]]) -> bool:
         """Check if messages contain images."""
@@ -675,9 +712,10 @@ class ImageCompressor:
                 confidence = 0.0
         else:
             try:
-                from .onnx_router import OnnxTechniqueRouter
-
-                onnx_router = OnnxTechniqueRouter(use_siglip=self.use_siglip)
+                # Re-use the cached ONNX router so the ~127 MB of mapped
+                # weights are loaded once per compressor lifetime, not
+                # once per request.
+                onnx_router = self._get_onnx_router()
                 decision = onnx_router.classify(image_data, query)
                 technique = decision.technique
                 confidence = decision.confidence

@@ -33,6 +33,7 @@ import os
 import sys
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import fields, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -422,12 +423,19 @@ class HeadroomProxy(
             )
         )
 
-        # Compression cache store for token mode (session-scoped). The dict
-        # itself is mutated under `_compression_caches_lock`; the per-session
-        # `CompressionCache` instances have their own internal lock guarding
-        # `_cache`/`_stable_hashes`/`_first_seen` against concurrent
-        # async-dispatched requests for the same session.
-        self._compression_caches: dict[str, CompressionCache] = {}
+        # Compression cache store for token mode (session-scoped). The
+        # dict itself is mutated under `_compression_caches_lock`; the
+        # per-session `CompressionCache` instances have their own
+        # internal lock guarding `_cache`/`_stable_hashes`/`_first_seen`
+        # against concurrent async-dispatched requests for the same
+        # session.
+        #
+        # Backed by ``OrderedDict`` so we can run a true LRU policy: on
+        # every access we ``move_to_end`` the hit session, and on
+        # capacity overflow we evict from the front (true cold sessions)
+        # rather than from insertion order (which would evict the oldest
+        # *created* session even if it had just been used).
+        self._compression_caches: OrderedDict[str, CompressionCache] = OrderedDict()
         self._compression_caches_lock = threading.RLock()
 
         self.logger = (
@@ -815,25 +823,31 @@ class HeadroomProxy(
         diverge across requests.
         """
         with self._compression_caches_lock:
-            if session_id not in self._compression_caches:
-                from headroom.cache.compression_cache import CompressionCache
+            existing = self._compression_caches.get(session_id)
+            if existing is not None:
+                # True LRU: refresh recency on every access so the
+                # front of the OrderedDict tracks genuinely cold
+                # sessions rather than the oldest *created* ones.
+                self._compression_caches.move_to_end(session_id)
+                return existing
 
-                # Evict oldest caches if at capacity
-                if len(self._compression_caches) >= MAX_COMPRESSION_CACHE_SESSIONS:
-                    # Remove oldest quarter to amortize cleanup cost
-                    oldest_keys = list(self._compression_caches.keys())[
-                        : MAX_COMPRESSION_CACHE_SESSIONS // 4
-                    ]
-                    for key in oldest_keys:
-                        del self._compression_caches[key]
-                    logger.info(
-                        "Evicted %d compression caches (exceeded %d max sessions)",
-                        len(oldest_keys),
-                        MAX_COMPRESSION_CACHE_SESSIONS,
-                    )
+            from headroom.cache.compression_cache import CompressionCache
 
-                self._compression_caches[session_id] = CompressionCache()
-            return self._compression_caches[session_id]
+            # Evict oldest caches if at capacity. With LRU ordering the
+            # first quarter of the OrderedDict is the coldest quarter.
+            if len(self._compression_caches) >= MAX_COMPRESSION_CACHE_SESSIONS:
+                evict_count = MAX_COMPRESSION_CACHE_SESSIONS // 4
+                for _ in range(evict_count):
+                    self._compression_caches.popitem(last=False)
+                logger.info(
+                    "Evicted %d compression caches (exceeded %d max sessions)",
+                    evict_count,
+                    MAX_COMPRESSION_CACHE_SESSIONS,
+                )
+
+            new_cache = CompressionCache()
+            self._compression_caches[session_id] = new_cache
+            return new_cache
 
     def _setup_code_aware(self, config: ProxyConfig, transforms: list) -> str:
         """Set up code-aware compression if enabled.
@@ -1477,7 +1491,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             try:
                 # Startup
                 await proxy.startup()
-                asyncio.create_task(_log_toin_stats_periodically())
+                app.state.toin_stats_task = asyncio.create_task(_log_toin_stats_periodically())
                 if proxy.usage_reporter:
                     await proxy.usage_reporter.start(proxy)
                 if proxy.traffic_learner:

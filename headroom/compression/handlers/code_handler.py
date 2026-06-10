@@ -30,8 +30,10 @@ logger = logging.getLogger(__name__)
 
 # Lazy-loaded tree-sitter
 _tree_sitter_available: bool | None = None
-_tree_sitter_parsers: dict[str, Any] = {}
-_tree_sitter_lock = threading.Lock()
+# Per-thread parser cache: pyo3 marks Parser as Unsendable, so parser objects created on
+# one thread panic if accessed from another. threading.local() ensures every thread
+# maintains its own isolated set of parser instances.
+_tree_sitter_local = threading.local()
 
 
 def _check_tree_sitter() -> bool:
@@ -48,19 +50,21 @@ def _check_tree_sitter() -> bool:
 
 
 def _get_parser(language: str) -> Any:
-    """Get tree-sitter parser for language."""
-    global _tree_sitter_parsers
-
+    """Get tree-sitter parser for language (per-thread cache)."""
     if not _check_tree_sitter():
         raise ImportError("tree-sitter-language-pack not installed")
 
-    with _tree_sitter_lock:
-        if language not in _tree_sitter_parsers:
-            from tree_sitter_language_pack import get_parser
+    thread_parsers: dict[str, Any] | None = getattr(_tree_sitter_local, "parsers", None)
+    if thread_parsers is None:
+        thread_parsers = {}
+        _tree_sitter_local.parsers = thread_parsers
 
-            _tree_sitter_parsers[language] = get_parser(language)  # type: ignore[arg-type]
+    if language not in thread_parsers:
+        from tree_sitter_language_pack import get_parser
 
-        return _tree_sitter_parsers[language]
+        thread_parsers[language] = get_parser(language)  # type: ignore[arg-type]
+
+    return thread_parsers[language]
 
 
 class CodeLanguage(Enum):

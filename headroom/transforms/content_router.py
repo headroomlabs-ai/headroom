@@ -40,6 +40,7 @@ import logging
 import os
 import re
 import time
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
@@ -56,6 +57,39 @@ logger = logging.getLogger(__name__)
 
 def _router_debug_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
+
+
+_TREE_SITTER_PRELOAD_ENV = "HEADROOM_TREE_SITTER_PRELOAD"
+
+
+def _maybe_preload_tree_sitter_parsers() -> list[str]:
+    """Pre-load only the tree-sitter parsers explicitly requested via env.
+
+    Reading ``HEADROOM_TREE_SITTER_PRELOAD`` lets operators trade memory for
+    first-request latency. The empty/unset case (the default) returns an empty
+    list — parsers then load lazily on first use of each language, per thread.
+
+    Returns:
+        The list of languages that were successfully pre-loaded.
+    """
+    raw = os.environ.get(_TREE_SITTER_PRELOAD_ENV, "").strip()
+    if not raw:
+        return []
+
+    requested = [lang.strip().lower() for lang in raw.split(",") if lang.strip()]
+    if not requested:
+        return []
+
+    from .code_compressor import _get_parser
+
+    loaded: list[str] = []
+    for lang in requested:
+        try:
+            _get_parser(lang)
+            loaded.append(lang)
+        except (ValueError, ImportError):
+            logger.debug("Tree-sitter parser preload skipped: %s", lang)
+    return loaded
 
 
 def _log_router_debug(event: str, **payload: Any) -> None:
@@ -189,28 +223,45 @@ def _create_content_signature(
 
 
 class CompressionCache:
-    """Two-tier compression cache with TTL.
+    """Two-tier compression cache with TTL and max-entries LRU cap.
 
     Tier 1 (skip set): content hashes that won't compress — instant skip,
-    near-zero memory (just ints in a set).
+    near-zero memory (just ints in an OrderedDict).
 
     Tier 2 (result cache): compressed results for content that DID compress —
     reuse the compressed text on subsequent requests.
 
-    Entries expire after TTL (default 30min). No max-entries cap — TTL is the
-    natural bound. Memory grows proportional to compressible content × TTL,
-    which is bounded by session duration.
+    Entries expire after TTL (default 30min). Both tiers are capped at
+    ``max_results`` and ``max_skip`` entries respectively, using LRU eviction
+    via ``OrderedDict.move_to_end`` on access and ``popitem(last=False)`` on
+    overflow. This bounds peak memory even in sessions with many unique
+    tool outputs and prevents the 30-100 MB unbounded growth observed in
+    busy deployments.
 
-    Uses in-process dict for ultra-fast lookups (~100ns). Could be backed
+    Uses in-process OrderedDict for LRU + O(1) lookup. Could be backed
     by memcached/Redis for multi-process deployments.
+
+    Args:
+        ttl_seconds: TTL for cache entries in seconds. Defaults to 30 min.
+        max_results: Maximum number of compressed-result entries (Tier 2).
+            Defaults to 5000.
+        max_skip: Maximum number of skip-set entries (Tier 1).
+            Defaults to 5000.
     """
 
-    def __init__(self, ttl_seconds: int = 1800):
+    def __init__(
+        self,
+        ttl_seconds: int = 1800,
+        max_results: int = 5000,
+        max_skip: int = 5000,
+    ):
         # Tier 2: compressed results {hash: (text, ratio, strategy, timestamp)}
-        self._results: dict[int, tuple[str, float, str, float]] = {}
+        self._results: OrderedDict[int, tuple[str, float, str, float]] = OrderedDict()
         # Tier 1: hashes of content that won't compress {hash: timestamp}
-        self._skip: dict[int, float] = {}
+        self._skip: OrderedDict[int, float] = OrderedDict()
         self._ttl_seconds = ttl_seconds
+        self._max_results = max_results
+        self._max_skip = max_skip
         # Metrics
         self._hits = 0
         self._misses = 0
@@ -222,8 +273,12 @@ class CompressionCache:
     def get(self, key: int) -> tuple[str, float, str] | None:
         """Get cached compression result.
 
-        Returns (compressed_text, ratio, strategy) or None if not found/expired.
-        Use is_skipped() first to check if content is known non-compressible.
+        Promotes the accessed entry to most-recently-used on hit.
+
+        Returns:
+            ``(compressed_text, ratio, strategy)`` or ``None`` if not
+            found/expired.  Call ``is_skipped()`` first to check the
+            Tier-1 skip set.
         """
         t0 = time.perf_counter_ns()
         entry = self._results.get(key)
@@ -233,6 +288,8 @@ class CompressionCache:
                 self._hits += 1
                 self._total_lookup_ns += time.perf_counter_ns() - t0
                 self._lookup_count += 1
+                # Promote to MRU position.
+                self._results.move_to_end(key)
                 return (compressed, ratio, strategy)
             else:
                 del self._results[key]
@@ -248,6 +305,8 @@ class CompressionCache:
         if ts is not None:
             if (time.time() - ts) < self._ttl_seconds:
                 self._skip_hits += 1
+                # Promote to MRU position.
+                self._skip.move_to_end(key)
                 return True
             else:
                 del self._skip[key]
@@ -255,17 +314,31 @@ class CompressionCache:
         return False
 
     def put(self, key: int, compressed: str, ratio: float, strategy: str) -> None:
-        """Store a compressed result (Tier 2)."""
+        """Store a compressed result (Tier 2).
+
+        Evicts the least-recently-used entry when the cap is exceeded.
+        """
         self._results[key] = (compressed, ratio, strategy, time.time())
+        self._results.move_to_end(key)
+        if len(self._results) > self._max_results:
+            self._results.popitem(last=False)
+            self._evictions += 1
 
     def mark_skip(self, key: int) -> None:
-        """Mark content as non-compressible (Tier 1)."""
+        """Mark content as non-compressible (Tier 1).
+
+        Evicts the least-recently-used skip entry when the cap is exceeded.
+        """
         self._skip[key] = time.time()
+        self._skip.move_to_end(key)
+        if len(self._skip) > self._max_skip:
+            self._skip.popitem(last=False)
+            self._evictions += 1
 
     def move_to_skip(self, key: int) -> None:
         """Move a result to skip set (threshold tightened, no longer qualifies)."""
         self._results.pop(key, None)
-        self._skip[key] = time.time()
+        self.mark_skip(key)
 
     @property
     def size(self) -> int:
@@ -1647,39 +1720,36 @@ class ContentRouter(Transform):
             logger.debug("Magika pre-load skipped: %s", e)
             status["magika"] = "skipped"
 
-        # 3. CodeAware compressor + common tree-sitter parsers
+        # 3. CodeAware compressor + tree-sitter parsers
         if self.config.enable_code_aware:
             code_compressor = self._get_code_compressor()
             if code_compressor:
                 status["code_aware"] = "enabled"
-                # Pre-load tree-sitter parsers for common languages
-                # Each parser is ~50ms to load; doing it here avoids 500ms+ on first code hit
+                # Tree-sitter parsers are now loaded lazily per-thread on first
+                # use. Eagerly loading all 8 languages here costs ~150-300 MB
+                # of resident memory per worker and ~400ms of startup time —
+                # and most workers only ever see Python (or no code at all).
+                #
+                # Operators that want the old behaviour can opt back in via
+                # ``HEADROOM_TREE_SITTER_PRELOAD=<lang,lang,...>``. The empty
+                # string (or unset) means "no eager preload".
                 try:
-                    from .code_compressor import _check_tree_sitter_available, _get_parser
+                    from .code_compressor import _check_tree_sitter_available
 
                     if _check_tree_sitter_available():
-                        common_languages = [
-                            "python",
-                            "javascript",
-                            "typescript",
-                            "go",
-                            "rust",
-                            "java",
-                            "c",
-                            "cpp",
-                        ]
-                        loaded = []
-                        for lang in common_languages:
-                            try:
-                                _get_parser(lang)
-                                loaded.append(lang)
-                            except (ValueError, ImportError):
-                                pass  # Language not available, skip
+                        loaded = _maybe_preload_tree_sitter_parsers()
                         if loaded:
-                            logger.info("Tree-sitter parsers pre-loaded: %s", ", ".join(loaded))
+                            logger.info(
+                                "Tree-sitter parsers pre-loaded (opt-in): %s",
+                                ", ".join(loaded),
+                            )
                             status["tree_sitter"] = f"loaded ({len(loaded)} languages)"
+                        else:
+                            status["tree_sitter"] = "lazy (load on first use)"
+                    else:
+                        status["tree_sitter"] = "not installed"
                 except Exception as e:
-                    logger.debug("Tree-sitter pre-load skipped: %s", e)
+                    logger.debug("Tree-sitter preload check failed: %s", e)
                     status["tree_sitter"] = "skipped"
             else:
                 status["code_aware"] = "not installed"

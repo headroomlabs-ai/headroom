@@ -10,6 +10,7 @@ Anthropic), not the full input price.  This prevents overstating dollar savings.
 
 from __future__ import annotations
 
+import functools
 import logging
 import re
 from dataclasses import asdict, dataclass, field
@@ -62,6 +63,29 @@ try:
     _LITELLM_AVAILABLE = True
 except ImportError:
     _LITELLM_AVAILABLE = False
+
+
+@functools.lru_cache(maxsize=256)
+def _resolve_model(model: str) -> str:
+    """Resolve to a model name LiteLLM recognises, adding provider prefix if needed.
+
+    TODO: Duplicated with CostTracker._resolve_litellm_model in proxy/server.py.
+    Extract to shared utility.
+    """
+    if not _LITELLM_AVAILABLE:
+        return model
+
+    # Try as-is
+    if model in _litellm.model_cost:
+        return model
+
+    # Try provider prefixes
+    for prefix in ("anthropic/", "openai/", "google/", "mistral/", "deepseek/"):
+        prefixed = f"{prefix}{model}"
+        if prefixed in _litellm.model_cost:
+            return prefixed
+
+    return model
 
 
 def _litellm_cost(

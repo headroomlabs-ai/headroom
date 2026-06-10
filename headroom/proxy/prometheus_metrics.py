@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import threading
 from collections import defaultdict
 from datetime import datetime
@@ -24,6 +25,42 @@ from headroom.observability import get_otel_metrics
 from headroom.proxy.savings_tracker import SavingsTracker
 
 logger = logging.getLogger("headroom.proxy")
+
+
+_UUID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE
+)
+_NUMERIC_SEGMENT_RE = re.compile(r"^\d+$")
+
+
+def _normalize_path(path: str) -> str:
+    """Strip query strings and replace dynamic path segments with {id}.
+
+    Keeps at most the first 3 path segments to bound cardinality.
+    """
+    # Strip query string and fragment
+    path = path.split("?", 1)[0].split("#", 1)[0]
+
+    # Replace UUIDs first (they contain hyphens so numeric RE won't catch them)
+    path = _UUID_RE.sub("{id}", path)
+
+    # Split and normalise each segment
+    parts = path.split("/")
+    normalised: list[str] = []
+    for part in parts:
+        if not part:
+            normalised.append(part)
+        elif _NUMERIC_SEGMENT_RE.match(part):
+            normalised.append("{id}")
+        else:
+            normalised.append(part)
+
+    # Cap depth: keep scheme-less prefix up to 3 non-empty segments
+    non_empty = [p for p in normalised if p]
+    if len(non_empty) > 3:
+        normalised = [""] + non_empty[:3] + ["{...}"]
+
+    return "/".join(normalised)
 
 
 def _escape_label_value(value: str) -> str:
@@ -521,7 +558,7 @@ class PrometheusMetrics:
         self.inbound_requests_total += 1
         self.inbound_requests_active += 1
         self.inbound_requests_by_method[method.upper()] += 1
-        self.inbound_requests_by_path[path] += 1
+        self.inbound_requests_by_path[_normalize_path(path)] += 1
 
     def record_inbound_response(self, *, status_code: int | str) -> None:
         self.inbound_requests_completed += 1

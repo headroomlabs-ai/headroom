@@ -203,6 +203,8 @@ class MemoryHandler:
             self._init_native_memory_dir()
         # Memory Bridge
         self._bridge: Any = None  # MemoryBridge, lazy imported
+        # Strong references for fire-and-forget background tasks (prevents GC cancellation)
+        self._background_tasks: set[asyncio.Task[Any]] = set()
 
     def _get_init_lock(self) -> asyncio.Lock:
         """Lazily create the init lock bound to the running event loop.
@@ -1224,9 +1226,11 @@ your responses, not to drive new actions."""
 
         # Async background dedup: auto-supersede obvious duplicates
         if similar_memories:
-            asyncio.create_task(
+            _dedup_task = asyncio.create_task(
                 self._background_dedup(memory.id, similar_memories, effective_user_id, backend)
             )
+            self._background_tasks.add(_dedup_task)
+            _dedup_task.add_done_callback(self._background_tasks.discard)
 
         logger.info(
             "event=memory_save user=%s scope=%s agent=%s provider=%s similar=%d",

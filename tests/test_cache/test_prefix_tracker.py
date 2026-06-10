@@ -466,3 +466,113 @@ class TestMultiTurnScenario:
 
         # After a bust with 0 total, freeze should reset
         assert tracker.get_frozen_message_count() == 0
+
+
+# =============================================================================
+# Shallow-copy tests (Problem 1 fix): no deep-copy of large message lists
+# =============================================================================
+
+
+class TestPrefixTrackerShallowCopy:
+    """PrefixCacheTracker stores shallow list snapshots, not deep copies."""
+
+    def _make_tracker_with_messages(
+        self,
+    ) -> tuple[PrefixCacheTracker, list[dict]]:
+        """Return a tracker that has processed one turn with 3 messages."""
+        tracker = PrefixCacheTracker("anthropic")
+        messages = [
+            {"role": "system", "content": "System " * 200},
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi"},
+        ]
+        tracker.update_from_response(
+            cache_read_tokens=0,
+            cache_write_tokens=2000,
+            messages=messages,
+            message_token_counts=[1500, 50, 50],
+        )
+        return tracker, messages
+
+    def test_stored_list_is_not_identical_to_original(self) -> None:
+        """Stored list is a separate list object (shallow copy), not the same ref."""
+        tracker, messages = self._make_tracker_with_messages()
+        stored = tracker.get_last_original_messages()
+        # Should be equal in value but distinct list objects.
+        assert stored == messages
+        assert stored is not messages
+
+    def test_stored_list_shares_dict_references(self) -> None:
+        """Message dicts inside the stored list are the same objects (shallow copy)."""
+        tracker, messages = self._make_tracker_with_messages()
+        stored = tracker.get_last_original_messages()
+        # Shallow copy means each dict is the same object as the original.
+        for original_msg, stored_msg in zip(messages, stored):
+            assert stored_msg is original_msg
+
+    def test_large_message_list_does_not_deep_copy(self) -> None:
+        """Storing 200 large messages does not allocate 200 independent copies."""
+        large_msg = {"role": "user", "content": "x" * 50_000}
+        messages = [large_msg] * 200  # 200 refs to the same large dict
+        tracker = PrefixCacheTracker("anthropic")
+        tracker.update_from_response(
+            cache_read_tokens=0,
+            cache_write_tokens=5000,
+            messages=messages,
+            message_token_counts=[100] * 200,
+        )
+        stored = tracker.get_last_original_messages()
+        # Every dict in the stored list must be the exact same object as the
+        # original (i.e. no deep-copy happened — identity, not equality).
+        assert all(m is large_msg for m in stored)
+        # The stored list itself should be a fresh list (not the original).
+        assert stored is not messages
+
+    def test_accessor_returns_fresh_list_each_call(self) -> None:
+        """Each call to get_last_*_messages returns a new list instance."""
+        tracker, _ = self._make_tracker_with_messages()
+        a = tracker.get_last_original_messages()
+        b = tracker.get_last_original_messages()
+        assert a is not b
+        assert a == b
+
+
+# =============================================================================
+# LRU cap tests for SessionTrackerStore (Problem 1 fix)
+# =============================================================================
+
+
+class TestSessionTrackerStoreLRU:
+    """SessionTrackerStore enforces a max-sessions cap with LRU eviction."""
+
+    def test_sessions_below_cap_are_retained(self) -> None:
+        store = SessionTrackerStore(max_sessions=5)
+        for i in range(5):
+            store.get_or_create(f"session-{i}", "anthropic")
+        assert store.active_sessions == 5
+
+    def test_session_at_cap_plus_one_evicts_oldest(self) -> None:
+        store = SessionTrackerStore(max_sessions=3)
+        t1 = store.get_or_create("s1", "anthropic")
+        store.get_or_create("s2", "anthropic")
+        store.get_or_create("s3", "anthropic")
+        # Access s1 to promote it to MRU.
+        store.get_or_create("s1", "anthropic")
+        # Adding s4 should evict s2 (now LRU after s1's promotion).
+        store.get_or_create("s4", "anthropic")
+        assert store.active_sessions == 3
+        # s1 must still be alive (was promoted).
+        assert store.get_or_create("s1", "anthropic") is t1
+
+    def test_cap_is_enforced_with_many_sessions(self) -> None:
+        cap = 10
+        store = SessionTrackerStore(max_sessions=cap)
+        for i in range(50):
+            store.get_or_create(f"session-{i}", "anthropic")
+        assert store.active_sessions == cap
+
+    def test_existing_session_is_returned_unchanged(self) -> None:
+        store = SessionTrackerStore(max_sessions=10)
+        t1 = store.get_or_create("s1", "anthropic")
+        t1_again = store.get_or_create("s1", "anthropic")
+        assert t1 is t1_again

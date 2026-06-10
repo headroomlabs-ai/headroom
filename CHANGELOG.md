@@ -31,7 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 * **startup:** suppress proxy startup log noise ([#619](https://github.com/chopratejas/headroom/issues/619)) ([4555901](https://github.com/chopratejas/headroom/commit/45559011b16a2e084dda22c675c819a4789f961d))
 * **wrap:** report unbindable proxy ports ([#602](https://github.com/chopratejas/headroom/issues/602)) ([6dfcaa8](https://github.com/chopratejas/headroom/commit/6dfcaa839f1175518e378963c79cc7bd3ceb7946))
 
-## [Unreleased]
+## [Unreleased] - Memory Optimization (~1 GB RSS reduction per worker)
 
 ### Added
 
@@ -55,9 +55,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
-
 * **deps:** move `gunicorn` to `[proxy-prod]` extra with `sys_platform != 'win32'` guard; removed from `[proxy]` to avoid forcing a Unix-only package on dev, CI, and Windows users ([#537](https://github.com/chopratejas/headroom/pull/537))
+* **memory:** release ONNX router and fastembed model on close - prevents sawtooth RSS growth
+* **memory:** cap HNSW default max_elements from 100k to 10k (-130 MB cold start) and remove redundant _embeddings dict (-144 MB)
+* **memory:** cap ContentRouter CompressionCache at 5000-entry LRU to bound per-worker heap
+* **memory:** reduce PrefixCacheTracker copy depth from deepcopy to shallow copy (-50-200 MB per session)
+* **memory:** cap SessionTrackerStore at 500-entry LRU to bound session state memory
+* **memory:** cap RequestLogger in-memory retention at 500 entries with 2 KB body truncation (-100 MB in-memory logs)
+* **memory:** cap TOIN pattern store at 2000-entry OrderedDict LRU and MAX_SEEN_INSTANCES from 10k to 1k (-50-300 MB TOIN state)
+* **memory:** defer torch/PIL/transformers imports in trained_router to reduce cold-start RSS (-300-500 MB per worker when ONNX path used)
+* **memory:** use thread-local tree-sitter parsers in code_handler to prevent pyo3 Unsendable panics
+* **memory:** normalize Prometheus path labels to prevent cardinality explosion
+* **memory:** apply lru_cache on model resolver in perf/analyzer to avoid redundant re-resolution
+* **memory:** retain strong references to background async tasks in memory_handler to prevent premature GC
+* **proxy:** use true LRU for per-session compression caches in server.py
 * **startup:** suppress proxy startup log noise — litellm banner, trafilatura parse errors, HuggingFace Hub unauthenticated warnings, tiktoken fallback warning, and httpx INFO lines from sentence_transformers HEAD checks. Affected files: `headroom/providers/litellm.py`, `headroom/transforms/html_extractor.py`, `headroom/memory/adapters/embedders.py`, `headroom/providers/anthropic.py`, `headroom/providers/registry.py`, `headroom/image/onnx_router.py`, `headroom/transforms/kompress_compressor.py`.
+
+### Tests
+
+* **memory:** add test_memory_usage_optimization.py covering ONNX close, fastembed release, and LRU eviction
+* **memory:** add tests/test_memory/test_hnsw_memory_fix.py covering HNSW max_elements cap and _embeddings removal
+* **memory:** add tests/test_memory_cap_fixes.py covering RequestLogger cap/truncation and TOIN eviction
+* **memory:** add tests/test_lazy_imports.py covering deferred torch and tree-sitter imports
+* **memory:** add tests/test_cache/test_prefix_tracker.py covering shallow copy and SessionTrackerStore LRU
+* **memory:** add tests/test_transforms_content_router.py covering CompressionCache LRU eviction
+
 
 ## [0.23.0](https://github.com/chopratejas/headroom/compare/v0.22.4...v0.23.0) (2026-06-04)
 

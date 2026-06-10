@@ -645,3 +645,66 @@ def test_pinning_skips_already_compressed(monkeypatch: pytest.MonkeyPatch) -> No
     )
     # Already-compressed marker keeps proxy idempotent across turns
     assert result["content"][0]["text"] == pinned
+
+
+# =============================================================================
+# LRU cap tests for CompressionCache (Problem 2 fix)
+# =============================================================================
+
+
+def test_compression_cache_lru_evicts_oldest_result_entry() -> None:
+    """Result cache evicts the LRU entry once max_results is exceeded."""
+    cache = CompressionCache(max_results=3, max_skip=10)
+    cache.put(1, "c1", 0.5, "text")
+    cache.put(2, "c2", 0.5, "text")
+    cache.put(3, "c3", 0.5, "text")
+
+    # Promote key=1 to MRU by accessing it.
+    cache.get(1)
+
+    # Insert a 4th entry — should evict key=2 (LRU after promotion of 1).
+    cache.put(4, "c4", 0.5, "text")
+
+    assert cache.size == 3
+    assert cache.get(1) is not None  # was promoted, must still be present
+    assert cache.get(2) is None  # was LRU, must be evicted
+    assert cache.get(3) is not None
+    assert cache.get(4) is not None
+
+
+def test_compression_cache_lru_evicts_oldest_skip_entry() -> None:
+    """Skip set evicts the LRU entry once max_skip is exceeded."""
+    cache = CompressionCache(max_results=10, max_skip=3)
+    cache.mark_skip(10)
+    cache.mark_skip(20)
+    cache.mark_skip(30)
+
+    # Promote key=10 to MRU.
+    cache.is_skipped(10)
+
+    # Insert a 4th skip entry — should evict key=20 (LRU after promotion of 10).
+    cache.mark_skip(40)
+
+    assert cache.skip_size == 3
+    assert cache.is_skipped(10) is True
+    assert cache.is_skipped(20) is False  # evicted
+    assert cache.is_skipped(30) is True
+    assert cache.is_skipped(40) is True
+
+
+def test_compression_cache_max_results_default_is_5000() -> None:
+    """Default cap is 5000 results; inserting 5001 entries evicts one."""
+    cache = CompressionCache()
+    for i in range(5001):
+        cache.put(i, f"c{i}", 0.5, "text")
+    assert cache.size == 5000
+
+
+def test_compression_cache_eviction_counter_increments() -> None:
+    """Eviction counter in stats reflects LRU evictions."""
+    cache = CompressionCache(max_results=2, max_skip=2)
+    cache.put(1, "a", 0.5, "text")
+    cache.put(2, "b", 0.5, "text")
+    before = cache.stats["cache_evictions"]
+    cache.put(3, "c", 0.5, "text")  # should evict key=1
+    assert cache.stats["cache_evictions"] == before + 1
