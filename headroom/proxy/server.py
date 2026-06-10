@@ -130,7 +130,6 @@ from headroom.proxy.helpers import (
     jitter_delay_ms,
 )
 from headroom.proxy.memory_handler import MemoryConfig, MemoryHandler
-from headroom.proxy.project_context import classify_project, set_current_project
 
 # Data models (extracted to headroom/proxy/models.py for maintainability)
 from headroom.proxy.models import CacheEntry, ProxyConfig, RateLimitState, RequestLog  # noqa: F401
@@ -140,6 +139,7 @@ from headroom.proxy.modes import (
     is_token_mode,
     normalize_proxy_mode,
 )
+from headroom.proxy.project_context import classify_project, set_current_project
 from headroom.proxy.prometheus_metrics import PrometheusMetrics  # noqa: F401
 from headroom.proxy.rate_limiter import TokenBucketRateLimiter  # noqa: F401
 from headroom.proxy.request_logger import RequestLogger  # noqa: F401

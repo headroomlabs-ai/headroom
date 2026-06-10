@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## Unreleased
+
+### Features
+
+* **proxy:** per-project savings breakdown on the dashboard, for Claude Code and Codex ([#802](https://github.com/chopratejas/headroom/issues/802)). `headroom wrap claude`/`headroom wrap codex` tag requests with an `X-Headroom-Project` header (launch-directory name); the proxy aggregates savings per project (persisted, schema v3 with transparent v2 migration), exposes them as `savings.per_project` in `/stats` and `projects` in `/stats-history`, and the dashboard shows a Per-Project Savings table.
+
+
 ## [0.24.0](https://github.com/chopratejas/headroom/compare/v0.23.0...v0.24.0) (2026-06-08)
 
 

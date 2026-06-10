@@ -878,6 +878,45 @@ def _prepare_wrap_rtk(verbose: bool = False, *, label: str | None = None) -> Pat
     return _ensure_rtk_binary(verbose=verbose)
 
 
+# Canonical casing for the proxy's per-project savings header (matched
+# case-insensitively by headroom.proxy.project_context.PROJECT_HEADER).
+_PROJECT_HEADER_NAME = "X-Headroom-Project"
+
+
+def _project_name_from_cwd() -> str | None:
+    """Project label for X-Headroom-Project: basename of the launch directory.
+
+    The proxy sanitizes and caps the value server-side
+    (headroom.proxy.savings_tracker.sanitize_project_name), so the raw
+    directory name is safe to send as-is.
+    """
+    name = Path.cwd().name.strip()
+    return name or None
+
+
+def _apply_project_header_env(env: dict[str, str]) -> None:
+    """Inject X-Headroom-Project into ``ANTHROPIC_CUSTOM_HEADERS``.
+
+    Claude Code reads ``ANTHROPIC_CUSTOM_HEADERS`` as newline-separated
+    ``Name: value`` lines and attaches them to every API request; the
+    Headroom proxy uses the X-Headroom-Project header for per-project
+    savings attribution.  An existing user-supplied x-headroom-project
+    header (any casing) always wins — we never duplicate or overwrite it,
+    and any other user headers are preserved by appending.
+    """
+    project = _project_name_from_cwd()
+    if not project:
+        return
+    header_line = f"{_PROJECT_HEADER_NAME}: {project}"
+    existing = env.get("ANTHROPIC_CUSTOM_HEADERS")
+    if existing:
+        if _PROJECT_HEADER_NAME.lower() in existing.lower():
+            return  # user override wins
+        env["ANTHROPIC_CUSTOM_HEADERS"] = f"{existing}\n{header_line}"
+    else:
+        env["ANTHROPIC_CUSTOM_HEADERS"] = header_line
+
+
 def _inject_codex_provider_config(port: int) -> None:
     """Inject a Headroom model provider into Codex's config.toml.
 
@@ -919,6 +958,11 @@ def _inject_codex_provider_config(port: int) -> None:
         'name = "OpenAI via Headroom proxy"\n'
         f'base_url = "http://127.0.0.1:{port}/v1"\n'
         f"supports_websockets = true\n"
+        # Per-project savings: Codex sends the header only when the mapped
+        # env var (HEADROOM_PROJECT, set by `headroom wrap codex`) exists at
+        # Codex runtime.  Inline table keeps the key inside this section so
+        # _strip_codex_headroom_blocks removes it with the rest of the block.
+        f'env_http_headers = {{ "{_PROJECT_HEADER_NAME}" = "HEADROOM_PROJECT" }}\n'
         f"{_CODEX_END_MARKER}\n"
     )
 
@@ -2418,6 +2462,10 @@ def claude(
         else:
             env["ANTHROPIC_BASE_URL"] = proxy_url
 
+        # Per-project savings attribution: tag every request with the launch
+        # directory's name via X-Headroom-Project (user override wins).
+        _apply_project_header_env(env)
+
         # Issue #746: keep Claude Code's on-demand tool loading on through the
         # proxy so tool schemas are not eagerly materialized into local context.
         _tool_search_value = _configure_tool_search_env(env, tool_search)
@@ -2927,6 +2975,13 @@ def codex(
         raise SystemExit(1)
 
     env, env_vars_display = _build_codex_launch_env(port, os.environ)
+
+    # Per-project savings attribution: the injected provider config maps the
+    # X-Headroom-Project header to HEADROOM_PROJECT via env_http_headers, so
+    # Codex sends it only when this var is set.  A user-set value wins.
+    _codex_project = _project_name_from_cwd()
+    if _codex_project and "HEADROOM_PROJECT" not in env:
+        env["HEADROOM_PROJECT"] = _codex_project
 
     # Inject Headroom provider into Codex config so WebSocket traffic also
     # routes through the proxy.  Codex ignores OPENAI_BASE_URL for its WS

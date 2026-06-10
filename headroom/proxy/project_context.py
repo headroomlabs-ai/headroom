@@ -15,8 +15,9 @@ that request, matching pre-feature behavior.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from contextvars import ContextVar
-from typing import Any, Mapping
+from typing import Any
 
 from headroom.proxy.savings_tracker import sanitize_project_name
 
