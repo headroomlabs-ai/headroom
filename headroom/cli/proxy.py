@@ -160,6 +160,31 @@ def _selected_context_tool() -> str:
 @click.option("--no-cache", is_flag=True, help="Disable semantic caching")
 @click.option("--no-rate-limit", is_flag=True, help="Disable rate limiting")
 @click.option(
+    "--no-ccr-inject-tool",
+    is_flag=True,
+    envvar="HEADROOM_NO_CCR_INJECT_TOOL",
+    help=(
+        "Don't inject the CCR headroom_retrieve tool. Run compression-only — "
+        "for streaming / non-MCP clients that can't resolve the retrieve tool "
+        "and would otherwise error on it. Env: HEADROOM_NO_CCR_INJECT_TOOL."
+    ),
+)
+@click.option(
+    "--no-ccr-marker",
+    is_flag=True,
+    envvar="HEADROOM_NO_CCR_MARKER",
+    help=("Don't add CCR retrieval markers to compressed content. Env: HEADROOM_NO_CCR_MARKER."),
+)
+@click.option(
+    "--no-ccr-proactive-expansion",
+    is_flag=True,
+    envvar="HEADROOM_NO_CCR_PROACTIVE_EXPANSION",
+    help=(
+        "Disable proactive expansion of previously compressed content. "
+        "Env: HEADROOM_NO_CCR_PROACTIVE_EXPANSION."
+    ),
+)
+@click.option(
     "--proxy-extension",
     "proxy_extension",
     multiple=True,
@@ -482,6 +507,9 @@ def proxy(
     no_optimize: bool,
     no_cache: bool,
     no_rate_limit: bool,
+    no_ccr_inject_tool: bool,
+    no_ccr_marker: bool,
+    no_ccr_proactive_expansion: bool,
     proxy_extension: tuple[str, ...],
     no_subscription_tracking: bool,
     subscription_poll_interval: int | None,
@@ -638,6 +666,12 @@ def proxy(
         optimize=not no_optimize,
         cache_enabled=not no_cache,
         rate_limit_enabled=not no_rate_limit,
+        # CCR opt-outs for compression-only deployments (streaming / non-MCP
+        # clients that can't resolve the injected retrieve tool). Defaults keep
+        # CCR fully on; each flag flips one dataclass default to False.
+        ccr_inject_tool=not no_ccr_inject_tool,
+        ccr_inject_marker=not no_ccr_marker,
+        ccr_proactive_expansion=not no_ccr_proactive_expansion,
         # Flatten repeat-flag tuple AND any comma-separated values inside it.
         # `--proxy-extension a,b --proxy-extension c` and `HEADROOM_PROXY_EXTENSIONS=a,b,c`
         # both yield ["a", "b", "c"]. None when nothing was supplied.

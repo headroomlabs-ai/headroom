@@ -462,6 +462,90 @@ class TestCLIAnyllmProviderEnv:
         assert captured_config["config"].anyllm_provider == "groq"
 
 
+class TestCLICompressionOnlyFlags:
+    """The CCR opt-out flags must flip the corresponding ProxyConfig fields.
+
+    These enable a compression-only deployment for streaming / non-MCP clients
+    that can't resolve the injected headroom_retrieve tool (issue #645).
+    """
+
+    def test_ccr_defaults_on(self, runner):
+        """Without flags, all three CCR toggles stay enabled (no behavior change)."""
+        captured_config = {}
+
+        def mock_run_server(config, **kwargs):
+            captured_config["config"] = config
+
+        with patch("headroom.proxy.server.run_server", mock_run_server):
+            result = runner.invoke(main, ["proxy"], catch_exceptions=False)
+
+        assert result.exit_code == 0, result.output
+        cfg = captured_config["config"]
+        assert cfg.ccr_inject_tool is True
+        assert cfg.ccr_inject_marker is True
+        assert cfg.ccr_proactive_expansion is True
+
+    def test_no_ccr_inject_tool_flag(self, runner):
+        """--no-ccr-inject-tool disables retrieve-tool injection only."""
+        captured_config = {}
+
+        def mock_run_server(config, **kwargs):
+            captured_config["config"] = config
+
+        with patch("headroom.proxy.server.run_server", mock_run_server):
+            result = runner.invoke(main, ["proxy", "--no-ccr-inject-tool"], catch_exceptions=False)
+
+        assert result.exit_code == 0, result.output
+        cfg = captured_config["config"]
+        assert cfg.ccr_inject_tool is False
+        # Untouched flags remain on.
+        assert cfg.ccr_inject_marker is True
+        assert cfg.ccr_proactive_expansion is True
+
+    def test_compression_only_all_flags(self, runner):
+        """All three flags together yield a compression-only config."""
+        captured_config = {}
+
+        def mock_run_server(config, **kwargs):
+            captured_config["config"] = config
+
+        with patch("headroom.proxy.server.run_server", mock_run_server):
+            result = runner.invoke(
+                main,
+                [
+                    "proxy",
+                    "--no-ccr-inject-tool",
+                    "--no-ccr-marker",
+                    "--no-ccr-proactive-expansion",
+                ],
+                catch_exceptions=False,
+            )
+
+        assert result.exit_code == 0, result.output
+        cfg = captured_config["config"]
+        assert cfg.ccr_inject_tool is False
+        assert cfg.ccr_inject_marker is False
+        assert cfg.ccr_proactive_expansion is False
+
+    def test_no_ccr_marker_from_env(self, runner):
+        """HEADROOM_NO_CCR_MARKER env var disables marker injection."""
+        captured_config = {}
+
+        def mock_run_server(config, **kwargs):
+            captured_config["config"] = config
+
+        with patch("headroom.proxy.server.run_server", mock_run_server):
+            result = runner.invoke(
+                main,
+                ["proxy"],
+                env={"HEADROOM_NO_CCR_MARKER": "1"},
+                catch_exceptions=False,
+            )
+
+        assert result.exit_code == 0, result.output
+        assert captured_config["config"].ccr_inject_marker is False
+
+
 class TestArgparseBackendValidation:
     """Test that the argparse path (python -m headroom.proxy.server) accepts litellm-* backends."""
 
