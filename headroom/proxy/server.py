@@ -61,6 +61,7 @@ except ImportError:
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from headroom._version import __version__
+from headroom.agent_savings import proxy_pipeline_kwargs
 from headroom.cache.compression_feedback import get_compression_feedback
 from headroom.cache.compression_store import format_retrieval_miss_detail, get_compression_store
 from headroom.ccr import (
@@ -361,11 +362,20 @@ class HeadroomProxy(
         # ContentRouter is the single proxy routing surface. Provider handlers
         # normalize their request shapes into messages or CompressionUnits, and
         # the router chooses SmartCrusher, log/search/diff/code, or Kompress.
+        profile_kwargs = proxy_pipeline_kwargs(config)
         router_config = ContentRouterConfig(
             enable_code_aware=config.code_aware_enabled,
             tool_profiles=config.tool_profiles,
             read_lifecycle=ReadLifecycleConfig(enabled=config.read_lifecycle),
             ccr_inject_marker=config.ccr_inject_marker,
+            smart_crusher_max_items_after_crush=cast(
+                int | None,
+                profile_kwargs.get("max_items_after_crush"),
+            ),
+            smart_crusher_with_compaction=cast(
+                bool,
+                profile_kwargs.get("smart_crusher_with_compaction", True),
+            ),
         )
         if config.disable_kompress:
             router_config.enable_kompress = False
@@ -381,7 +391,7 @@ class HeadroomProxy(
         # Off by default for prefix-cache safety; enabled for workloads where
         # user-message content dominates input (OpenAI/Azure chat with pasted
         # code/RAG context — see issue #454).
-        if config.compress_user_messages:
+        if profile_kwargs.get("compress_user_messages"):
             router_config.skip_user_messages = False
         transforms = [
             CacheAligner(CacheAlignerConfig(enabled=False)),
@@ -1686,6 +1696,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "scope": os.environ.get("HEADROOM_DEPLOYMENT_SCOPE"),
             }
         if include_config:
+            profile_kwargs = proxy_pipeline_kwargs(config)
+            effective_target_ratio = cast(
+                float | None,
+                profile_kwargs.get("target_ratio", config.target_ratio),
+            )
             payload["config"] = {
                 "backend": config.backend,
                 "optimize": config.optimize,
@@ -1699,6 +1714,44 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "openai_api_url": config.openai_api_url,
                 "gemini_api_url": config.gemini_api_url,
                 "cloudcode_api_url": config.cloudcode_api_url,
+                "savings_profile": config.savings_profile,
+                "target_ratio": effective_target_ratio,
+                "target_savings_percent": (
+                    round(max(0.0, min(1.0, 1.0 - float(effective_target_ratio))) * 100, 1)
+                    if effective_target_ratio is not None
+                    else None
+                ),
+                "compress_user_messages": bool(
+                    profile_kwargs.get("compress_user_messages", config.compress_user_messages)
+                ),
+                "compress_system_messages": bool(
+                    profile_kwargs.get(
+                        "compress_system_messages",
+                        config.compress_system_messages,
+                    )
+                ),
+                "protect_recent": profile_kwargs.get(
+                    "read_protection_window",
+                    config.protect_recent,
+                ),
+                "protect_analysis_context": profile_kwargs.get(
+                    "protect_analysis_context",
+                    config.protect_analysis_context,
+                ),
+                "min_tokens_to_crush": profile_kwargs.get(
+                    "min_tokens_to_compress",
+                    config.min_tokens_to_crush,
+                ),
+                "max_items_after_crush": profile_kwargs.get(
+                    "max_items_after_crush",
+                    config.max_items_after_crush,
+                ),
+                "smart_crusher_with_compaction": profile_kwargs.get(
+                    "smart_crusher_with_compaction",
+                    config.smart_crusher_with_compaction,
+                ),
+                "force_kompress": bool(profile_kwargs.get("force_kompress", False)),
+                "accuracy_guard": config.accuracy_guard,
                 "pid": os.getpid(),
             }
         return payload

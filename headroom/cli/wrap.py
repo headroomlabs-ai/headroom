@@ -109,6 +109,8 @@ _WRAP_PROXY_TIMEOUT_ML_MODULES = ("torch", "sentence_transformers", "spacy")
 # Code, so the agent loop is unaffected).
 _TOOL_SEARCH_ENV = "ENABLE_TOOL_SEARCH"
 _TOOL_SEARCH_DEFAULT = "true"
+_AGENT_SAVINGS_WRAP_AGENTS = {"claude", "codex", "cursor"}
+_DEFAULT_AGENT_SAVINGS_PROFILE = "agent-90"
 
 
 def _normalize_tool_search_mode(value: str) -> str:
@@ -196,6 +198,14 @@ def _ml_wrap_extras_detected() -> bool:
     """Detect slow optional ML stacks without triggering their import cost."""
 
     return any(_module_available(module_name) for module_name in _WRAP_PROXY_TIMEOUT_ML_MODULES)
+
+
+def _wrap_agent_savings_profile(agent_type: str) -> str | None:
+    """Return the savings profile required for agent wrappers, if any."""
+
+    if agent_type not in _AGENT_SAVINGS_WRAP_AGENTS:
+        return None
+    return os.environ.get("HEADROOM_SAVINGS_PROFILE") or _DEFAULT_AGENT_SAVINGS_PROFILE
 
 
 def _default_wrap_proxy_timeout_seconds() -> int:
@@ -355,6 +365,11 @@ def _start_proxy(
     if agent_type != "unknown":
         proxy_env["HEADROOM_AGENT_TYPE"] = agent_type
         proxy_env.setdefault("HEADROOM_STACK", f"wrap_{agent_type}")
+    savings_profile = _wrap_agent_savings_profile(agent_type)
+    if savings_profile is not None:
+        from headroom.agent_savings import apply_agent_savings_env_defaults
+
+        apply_agent_savings_env_defaults(proxy_env, savings_profile)
     if openai_api_url:
         proxy_env["OPENAI_TARGET_API_URL"] = openai_api_url
     if anthropic_api_url:
@@ -1906,6 +1921,12 @@ def _ensure_proxy(
                     missing.append("learn")
                 if code_graph and not running_config.get("code_graph"):
                     missing.append("code_graph")
+                expected_savings_profile = helpers._wrap_agent_savings_profile(agent_type)
+                if (
+                    expected_savings_profile is not None
+                    and running_config.get("savings_profile") != expected_savings_profile
+                ):
+                    missing.append("savings-profile")
                 if openai_api_url:
                     running_openai_url = _normalize_proxy_api_url(
                         running_config.get("openai_api_url")

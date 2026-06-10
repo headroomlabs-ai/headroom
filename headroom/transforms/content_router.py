@@ -495,6 +495,8 @@ class ContentRouterConfig:
     # CCR (Compress-Cache-Retrieve) settings for SmartCrusher
     ccr_enabled: bool = True  # Enable CCR marker injection for reversible compression
     ccr_inject_marker: bool = True  # Add retrieval markers to compressed content
+    smart_crusher_max_items_after_crush: int | None = None
+    smart_crusher_with_compaction: bool = True
 
     # Tag protection: preserve custom/workflow XML tags from text compression.
     # When False (default), entire <custom-tag>content</custom-tag> blocks are
@@ -931,7 +933,12 @@ class ContentRouter(Transform):
             # Determine strategy from content analysis
             mixed = is_mixed_content(content)
             detection = _detect_content(content)
-            strategy = self._determine_strategy(content)
+            force_kompress = bool(getattr(self, "_runtime_force_kompress", False))
+            strategy = (
+                CompressionStrategy.KOMPRESS
+                if force_kompress
+                else self._determine_strategy(content)
+            )
             if debug_enabled:
                 _log_router_debug(
                     "content_router_input",
@@ -939,7 +946,13 @@ class ContentRouter(Transform):
                     detected_content_type=detection.content_type.value,
                     detection_confidence=detection.confidence,
                     selected_strategy=strategy.value,
-                    selection_reason="mixed_content" if mixed else "content_detection",
+                    selection_reason=(
+                        "runtime_force_kompress"
+                        if force_kompress
+                        else "mixed_content"
+                        if mixed
+                        else "content_detection"
+                    ),
                 )
 
             if strategy == CompressionStrategy.MIXED:
@@ -1556,14 +1569,23 @@ class ContentRouter(Transform):
         if self._smart_crusher is None:
             try:
                 from ..config import CCRConfig
-                from .smart_crusher import SmartCrusher
+                from .smart_crusher import SmartCrusher, SmartCrusherConfig
 
                 # Pass CCR config for marker injection
                 ccr_config = CCRConfig(
                     enabled=self.config.ccr_enabled,
                     inject_retrieval_marker=self.config.ccr_inject_marker,
                 )
-                self._smart_crusher = SmartCrusher(ccr_config=ccr_config)
+                crusher_config = SmartCrusherConfig()
+                if self.config.smart_crusher_max_items_after_crush is not None:
+                    crusher_config.max_items_after_crush = (
+                        self.config.smart_crusher_max_items_after_crush
+                    )
+                self._smart_crusher = SmartCrusher(
+                    config=crusher_config,
+                    ccr_config=ccr_config,
+                    with_compaction=self.config.smart_crusher_with_compaction,
+                )
             except ImportError:
                 logger.debug("SmartCrusher not available")
         return self._smart_crusher
@@ -1899,6 +1921,7 @@ class ContentRouter(Transform):
         )
         # Store runtime options on self for access by _route_and_compress_block
         self._runtime_target_ratio: float | None = kwargs.get("target_ratio")
+        self._runtime_force_kompress: bool = bool(kwargs.get("force_kompress", False))
         self._runtime_kompress_model: str | None = kwargs.get("kompress_model")
         # F2.2: capture the per-request CompressionPolicy so
         # ``_record_to_toin`` can gate TOIN writes on
@@ -1938,6 +1961,9 @@ class ContentRouter(Transform):
             )
         else:
             read_protection_window = num_messages  # 0.0 = protect all (old behavior)
+        runtime_read_protection_window = kwargs.get("read_protection_window")
+        if runtime_read_protection_window is not None:
+            read_protection_window = max(0, int(runtime_read_protection_window))
 
         # Adaptive compression ratio: scale with context pressure
         if model_limit > 0:

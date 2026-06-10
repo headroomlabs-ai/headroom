@@ -8,6 +8,8 @@ Comprehensive tests covering:
 - Transform interface: apply(), should_apply() methods
 """
 
+from types import SimpleNamespace
+
 import pytest
 
 from headroom.transforms.content_detector import ContentType
@@ -140,6 +142,53 @@ python main.py --verbose
 
 That's all!
 """
+
+
+def test_force_kompress_routes_anthropic_tool_result_to_targeted_kompress(
+    router, tokenizer, monkeypatch
+):
+    captured: dict[str, object] = {}
+
+    class FakeKompress:
+        def compress(self, content, **kwargs):
+            captured.update(kwargs)
+            compressed = " ".join(content.split()[:20])
+            return SimpleNamespace(
+                compressed=compressed,
+                compressed_tokens=len(compressed.split()),
+            )
+
+    monkeypatch.setattr(router, "_get_kompress", lambda: FakeKompress())
+    tool_content = " ".join(
+        f'{{"file":"src/module_{i}.py","line":{i},"text":"repeated search payload"}}'
+        for i in range(160)
+    )
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_search_1",
+                    "content": tool_content,
+                }
+            ],
+        }
+    ]
+
+    result = router.apply(
+        messages,
+        tokenizer,
+        force_kompress=True,
+        target_ratio=0.10,
+        compress_user_messages=True,
+        min_tokens_to_compress=10,
+        read_protection_window=0,
+    )
+
+    assert result.messages[0]["content"][0]["content"] != tool_content
+    assert result.transforms_applied == ["router:tool_result:kompress"]
+    assert captured["target_ratio"] == 0.10
 
 
 # =============================================================================
@@ -738,6 +787,47 @@ class TestExcludeTools:
         assert tool_result_block["content"] == messages[1]["content"][0]["content"]
         # Verify exclusion was tracked (consistent with OpenAI format)
         assert "router:excluded:tool" in result.transforms_applied
+
+    def test_anthropic_tool_result_runtime_window_allows_old_excluded_tools(self, tokenizer):
+        """Agent profiles can shrink the protected window for Claude tool results."""
+        config = ContentRouterConfig(
+            min_section_tokens=10,
+            min_chars_for_block_compression=10,
+            exclude_tools={"Glob"},
+        )
+        router = ContentRouter(config)
+
+        old_tool_content = generate_search_results(80)
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_glob_old",
+                        "name": "Glob",
+                        "input": {"pattern": "*.py"},
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_glob_old",
+                        "content": old_tool_content,
+                    }
+                ],
+            },
+            {"role": "assistant", "content": "ack"},
+            {"role": "user", "content": "continue"},
+            {"role": "assistant", "content": "ack"},
+        ]
+
+        result = router.apply(messages, tokenizer, read_protection_window=2)
+
+        assert "router:excluded:tool" not in result.transforms_applied
 
     def test_mixed_excluded_and_non_excluded_tools(self, tokenizer):
         """Multiple tools in same conversation - only excluded ones pass through."""

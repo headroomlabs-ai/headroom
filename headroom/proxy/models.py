@@ -113,6 +113,7 @@ class ProxyConfig:
     image_optimize: bool = True
     min_tokens_to_crush: int = 500
     max_items_after_crush: int = 50
+    smart_crusher_with_compaction: bool | None = None
     keep_last_turns: int = 4
 
     # CCR Tool Injection
@@ -153,6 +154,14 @@ class ProxyConfig:
     # router would otherwise have nothing eligible to compress.
     # CLI: --compress-user-messages; env: HEADROOM_COMPRESS_USER_MESSAGES=1.
     compress_user_messages: bool = False
+    # Named savings policy shared across Claude/Codex/Cursor proxy handlers.
+    # CLI/env: HEADROOM_SAVINGS_PROFILE=agent-90.
+    savings_profile: str | None = None
+    target_ratio: float | None = None
+    compress_system_messages: bool | None = None
+    protect_recent: int | None = None
+    protect_analysis_context: bool | None = None
+    accuracy_guard: str | None = None
 
     # Extra tool names whose outputs are never compressed, merged with the
     # built-in DEFAULT_EXCLUDE_TOOLS. None means built-in defaults only.
