@@ -856,9 +856,7 @@ class TestStrandsToolResultBlocks:
         rows = {"rows": [{"id": i, "padding": "x" * 30} for i in range(120)]}
         message = {
             "role": "user",
-            "content": [
-                {"toolResult": {"toolUseId": "strands_02", "content": [{"json": rows}]}}
-            ],
+            "content": [{"toolResult": {"toolUseId": "strands_02", "content": [{"json": rows}]}}],
         }
 
         blocks = parse_message_to_blocks(message, 0, mock_tokenizer)
