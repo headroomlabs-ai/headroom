@@ -25,6 +25,8 @@ scripts/*
 !scripts/refresh_model_limits.sh
 !scripts/audit_wheel_glibc_symbols.py
 !scripts/replay_codex_ws_load.py
+!scripts/bench_hermes_headroom.py
+!scripts/spot-tech-ci-headroom-hermes.service.example
 
 # Rust / Cargo build artifacts
 /target/

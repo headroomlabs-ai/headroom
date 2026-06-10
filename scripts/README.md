@@ -3,6 +3,24 @@
 Utility scripts bundled with the Headroom repo. Most are one-off operator
 tools; a few are runnable as part of development workflows.
 
+## Hermes token benchmark (spot-tech-ci)
+
+`bench_hermes_headroom.py` compares plain Hermes ``/v1/chat/completions`` traffic
+against Headroom→Hermes on a host where Hermes llm-proxy is running (default
+``:38765``). Designed for spot-tech-ci; also works locally when Hermes is up.
+
+```bash
+python scripts/bench_hermes_headroom.py
+python scripts/bench_hermes_headroom.py --multi-turn
+python scripts/bench_hermes_headroom.py --canary-port 18787   # persistent systemd canary
+HEADROOM_LIVE_HERMES=1 uv run --extra dev pytest tests/test_cli/test_hermes_grok_live.py -v
+HEADROOM_LIVE_HERMES=1 HEADROOM_LIVE_CANARY=1 \
+  uv run --extra dev pytest tests/test_cli/test_hermes_canary_live.py -v
+```
+
+See ``wiki/cli.md`` (``headroom wrap grok`` → spot-tech-ci runbook) for the full
+operator steps.
+
 ## Reproducing the reconnect storm
 
 `repro_codex_replay.py` reproduces the multi-agent Codex reconnect/retry storm

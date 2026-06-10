@@ -53,6 +53,8 @@ class ToolTarget(str, Enum):
     CLAUDE = "claude"
     COPILOT = "copilot"
     CODEX = "codex"
+    GROK = "grok"
+    HERMES = "hermes"
     AIDER = "aider"
     CURSOR = "cursor"
     OPENCLAW = "openclaw"

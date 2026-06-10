@@ -32,6 +32,7 @@ This page is the authoritative reference for the **Python Headroom CLI** exposed
 | `headroom wrap claude` | Start proxy and launch Claude Code | **host-bridged** |
 | `headroom wrap copilot` | Start proxy and launch GitHub Copilot CLI | **python-native only** |
 | `headroom wrap codex` | Start proxy and launch Codex CLI | **host-bridged** |
+| `headroom wrap grok` | Start proxy and launch Grok Build CLI | **host-bridged** |
 | `headroom wrap aider` | Start proxy and launch Aider | **host-bridged** |
 | `headroom wrap cursor` | Start proxy and print Cursor config guidance | **host-bridged** |
 | `headroom wrap openclaw` | Install and configure the OpenClaw plugin | **host-bridged** |
@@ -590,7 +591,7 @@ Options:
                                   [default: user]
   --providers [auto|all|manual]   Target selection mode for direct tool
                                   configuration.  [default: auto]
-  --target [claude|copilot|codex|aider|cursor|openclaw]
+  --target [claude|copilot|codex|grok|aider|cursor|openclaw]
                                   Tool target to configure when --providers
                                   manual is used.
   --profile TEXT                  Deployment profile name.  [default: default]
@@ -739,6 +740,129 @@ headroom wrap codex --backend anyllm --anyllm-provider groq
 
 Requires the `codex` binary on the host.
 
+### `headroom wrap grok`
+
+**Without Headroom** — Grok Build talks directly to Grok's hosted cli-chat-proxy (no local compression):
+
+```bash
+grok -p "fix the bug"
+# GROK_CLI_CHAT_PROXY_BASE_URL unset → https://cli-chat-proxy.grok.com/v1
+```
+
+**With Headroom** — the same command routes cli-chat-proxy traffic through the local proxy:
+
+```bash
+headroom wrap grok -p "fix the bug"
+# GROK_CLI_CHAT_PROXY_BASE_URL=http://127.0.0.1:8787/v1
+# Proxy upstream: https://cli-chat-proxy.grok.com/v1
+```
+
+**Live verification** (grok 0.2.32, authenticated host, 2026-06-07):
+
+| Mode | Command | Response | Upstream |
+|---|---|---|---|
+| Plain | `grok -p "…PLAIN_OK" --output-format plain --no-plan --always-approve` | `PLAIN_OK` | `cli-chat-proxy.grok.com` (direct) |
+| Wrapped | `headroom wrap grok -p "…HEADROOM_OK" …` | `HEADROOM_OK` | `127.0.0.1:8791/v1` → `cli-chat-proxy.grok.com` |
+
+Proxy log excerpt after a wrapped run:
+
+```text
+GET  https://cli-chat-proxy.grok.com/v1/settings → HTTP/2 200 OK
+POST https://cli-chat-proxy.grok.com/v1/sessions/register → HTTP/2 200 OK
+```
+
+**Routing vs compression** — ``wrap grok`` routes Grok Build ``/v1/sessions/*``
+traffic (passthrough on headless ``-p`` today). For measurable compression use
+``wrap hermes`` (OpenAI ``/v1/chat/completions`` → Hermes llm-proxy).
+
+**Token savings** — large ``role: tool`` outputs compress via SmartCrusher:
+
+```bash
+# Plain — bots already use this shape (grok-hermes → :38765/v1)
+curl -s http://127.0.0.1:38765/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"grok-4.3","messages":[{"role":"user","content":"Say OK"}],"max_tokens":8}'
+
+# Headroom → Hermes → Grok OAuth (preferred)
+headroom wrap hermes
+# or: headroom proxy --openai-api-url http://127.0.0.1:38765/v1 --no-telemetry
+OPENAI_BASE_URL=http://127.0.0.1:8787/v1 your-openai-client
+curl -s http://127.0.0.1:8787/stats | jq '.tokens.saved'
+```
+
+**spot-tech-ci runbook** (``falk@80.241.217.210``, Hermes always-on):
+
+```bash
+curl -s http://127.0.0.1:38765/health                    # => ok
+systemctl --user status llm-proxy hermes-xai-proxy       # both active
+export PATH="$HOME/.local/bin:$PATH"
+uv tool install 'headroom-ai[proxy]'                      # once if needed
+
+# Persistent canary (optional; uses :18787 — falkbot-ops docker owns :8787)
+# Binds 0.0.0.0 so Docker bots can use http://172.18.0.1:18787/v1
+cp scripts/spot-tech-ci-headroom-hermes.service.example \
+  ~/.config/systemd/user/headroom-hermes.service
+systemctl --user daemon-reload
+systemctl --user enable --now headroom-hermes.service
+curl -s http://127.0.0.1:18787/stats | jq '.tokens.saved'
+python scripts/bench_hermes_headroom.py --canary-port 18787
+
+# UFW (Docker bridges cannot reach :18787 until allowed):
+sudo ufw allow from 172.18.0.0/16 to any port 18787 proto tcp
+sudo ufw allow from 172.20.0.0/16 to any port 18787 proto tcp
+sudo ufw allow from 172.17.0.0/16 to any port 18787 proto tcp
+
+# Route one bot (e.g. wsb-digest) through the canary in spot-tech compose:
+# FALKBOT_PROVIDER_BACKENDS baseUrl -> http://172.18.0.1:18787/v1
+# Keep IMAGE_GROK_BASE_URL on :38765 (non-chat paths).
+
+# Live pytest (opt-in; minimal venv on CI host)
+HEADROOM_LIVE_HERMES=1 pytest tests/test_cli/test_hermes_grok_live.py -v
+HEADROOM_LIVE_HERMES=1 HEADROOM_LIVE_CANARY=1 \\
+  pytest tests/test_cli/test_hermes_canary_live.py -v
+
+# Token bench (exits non-zero if savings below regression floor)
+python scripts/bench_hermes_headroom.py
+python scripts/bench_hermes_headroom.py --multi-turn
+```
+
+Captured on spot-tech-ci (2026-06-07, **agent-tool workload** — large
+``role: tool`` JSON output):
+
+| Path | ``prompt_tokens`` | ``tokens.saved`` |
+|------|-------------------|------------------|
+| Plain Hermes | 9,763 | — |
+| Headroom → Hermes | 7,964 | 562 (`smart_crusher`: 1,799) |
+
+Plain user/system log filler does **not** compress — use tool-output-shaped
+messages (what WSB/anime bots send). See ``tests/test_cli/hermes_workloads.py``
+and ``scripts/bench_hermes_headroom.py``.
+
+More examples:
+
+```bash
+headroom wrap grok
+headroom wrap grok -p "fix the bug"
+headroom wrap grok -- -p "fix the bug"
+headroom wrap grok --backend anyllm --anyllm-provider groq
+headroom install apply --providers manual --target grok
+```
+
+| Option / arg | Default | Meaning |
+|---|---|---|
+| `--port` | `8787` | Proxy port |
+| `--no-proxy` | off | Skip proxy startup and assume an existing proxy is running |
+| `--learn` | off | Enable live traffic learning |
+| `--memory` | off | Enable persistent cross-session memory |
+| `--backend` | unset | Proxy backend override |
+| `--anyllm-provider` | unset | `anyllm` provider override |
+| `--region` | unset | Cloud region override |
+| `grok_args...` | passthrough | Additional Grok Build CLI arguments |
+
+Sets `GROK_CLI_CHAT_PROXY_BASE_URL` so Grok routes cli-chat-proxy traffic through Headroom. Requires the `grok` binary on the host. Like `wrap aider`, this is launch-time env injection only — no on-disk Grok config is modified.
+
+Use `--` before Grok arguments when a Grok flag could collide with a Headroom option. Grok's `-p` prompt flag also works directly because `headroom wrap grok` preserves unknown options for passthrough.
+
 ### `headroom wrap copilot`
 
 ```bash
@@ -868,6 +992,7 @@ Legend:
 | `headroom wrap claude` | native | host-bridged | partial |
 | `headroom wrap copilot` | native | not implemented in Docker-native wrapper | none |
 | `headroom wrap codex` | native | host-bridged | partial |
+| `headroom wrap grok` | native | host-bridged | partial |
 | `headroom wrap aider` | native | host-bridged | partial |
 | `headroom wrap cursor` | native | host-bridged | partial |
 | `headroom wrap openclaw` | native | host-bridged | partial |

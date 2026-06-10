@@ -4,6 +4,8 @@ Usage:
     headroom wrap claude                    # Start proxy + context tool + claude
     headroom wrap copilot -- --model ...    # Start proxy + launch GitHub Copilot CLI
     headroom wrap codex                     # Start proxy + OpenAI Codex CLI
+    headroom wrap grok                      # Start proxy + Grok Build CLI (sessions routing)
+    headroom wrap hermes                    # Start proxy upstream of Hermes llm-proxy
     headroom wrap aider                     # Start proxy + aider
     headroom wrap cursor                    # Start proxy + print Cursor config instructions
     headroom wrap openclaw                  # Install + configure OpenClaw plugin
@@ -68,6 +70,10 @@ from headroom.providers.copilot import (
     validate_configuration as _validate_copilot_configuration,
 )
 from headroom.providers.cursor import render_setup_lines as _render_cursor_setup_lines
+from headroom.providers.grok import DEFAULT_API_URL as _GROK_DEFAULT_API_URL
+from headroom.providers.grok import build_launch_env as _build_grok_launch_env
+from headroom.providers.hermes import DEFAULT_HERMES_API_URL as _HERMES_DEFAULT_API_URL
+from headroom.providers.hermes import build_launch_env as _build_hermes_launch_env
 from headroom.providers.openclaw import (
     build_plugin_entry as _build_openclaw_plugin_entry_impl,
 )
@@ -1099,6 +1105,7 @@ def _run_proxy_only_watcher(
     memory: bool,
     agent_type: str,
     print_setup_lines: Callable[[], None],
+    openai_api_url: str | None = None,
 ) -> None:
     """Shared scaffolding for proxy-only wrap subcommands (no child binary launch).
 
@@ -1119,7 +1126,12 @@ def _run_proxy_only_watcher(
     try:
         _print_wrap_banner(agent_label)
         proxy_holder[0] = _ensure_proxy(
-            port, no_proxy, learn=learn, memory=memory, agent_type=agent_type
+            port,
+            no_proxy,
+            learn=learn,
+            memory=memory,
+            agent_type=agent_type,
+            openai_api_url=openai_api_url,
         )
         click.echo()
         print_setup_lines()
@@ -2176,6 +2188,8 @@ def wrap() -> None:
     Supported tools (one Click subcommand per tool):
         headroom wrap claude              # Claude Code (Anthropic)
         headroom wrap codex               # OpenAI Codex CLI
+        headroom wrap grok                # Grok Build CLI (sessions routing)
+        headroom wrap hermes              # Hermes llm-proxy compression path
         headroom wrap copilot -- --model claude-sonnet-4-20250514
         headroom wrap aider               # Aider
         headroom wrap cursor              # Cursor (prints config instructions)
@@ -3056,6 +3070,169 @@ def aider(
         backend=backend,
         anyllm_provider=anyllm_provider,
         region=region,
+    )
+
+
+# =============================================================================
+# Grok Build
+# =============================================================================
+
+
+@wrap.command(context_settings={"ignore_unknown_options": True})
+@click.option("--port", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
+@click.option(
+    "--learn", is_flag=True, help="Enable live traffic learning (patterns saved to MEMORY.md)"
+)
+@click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
+@click.option(
+    "--backend", default=None, help="API backend: 'anthropic', 'anyllm', 'litellm-vertex', etc."
+)
+@click.option("--anyllm-provider", default=None, help="Provider for any-llm backend")
+@click.option("--region", default=None, help="Cloud region for Bedrock/Vertex")
+@click.argument("grok_args", nargs=-1, type=click.UNPROCESSED)
+def grok(
+    port: int,
+    no_proxy: bool,
+    learn: bool,
+    memory: bool,
+    backend: str | None,
+    anyllm_provider: str | None,
+    region: str | None,
+    grok_args: tuple[str, ...],
+) -> None:
+    """Launch Grok Build through Headroom proxy (sessions API routing).
+
+    \b
+    Sets GROK_CLI_CHAT_PROXY_BASE_URL so Grok routes cli-chat-proxy traffic
+    through Headroom. Grok Build headless ``-p`` uses ``/v1/sessions/*`` and
+    is mostly passthrough today — for token compression use ``wrap hermes``.
+
+    \b
+    Examples:
+        headroom wrap grok                         # Start proxy + grok TUI
+        headroom wrap grok -p "fix the bug"        # Headless prompt
+        headroom wrap grok --port 9999             # Custom proxy port
+        headroom wrap hermes                       # Compressible chat path
+    """
+    grok_bin = shutil.which("grok")
+    if not grok_bin:
+        raise click.ClickException(
+            "'grok' not found in PATH. Install Grok Build: https://grok.com/build"
+        )
+
+    env, env_vars_display = _build_grok_launch_env(port, os.environ)
+
+    _launch_tool(
+        binary=grok_bin,
+        args=grok_args,
+        env=env,
+        port=port,
+        no_proxy=no_proxy,
+        tool_label="GROK",
+        env_vars_display=env_vars_display,
+        learn=learn,
+        memory=memory,
+        agent_type="grok",
+        backend=backend,
+        anyllm_provider=anyllm_provider,
+        region=region,
+        openai_api_url=_GROK_DEFAULT_API_URL,
+    )
+
+
+# =============================================================================
+# Hermes llm-proxy
+# =============================================================================
+
+
+@wrap.command("hermes", context_settings={"ignore_unknown_options": True})
+@click.option("--port", default=8787, type=int, help="Headroom proxy port (default: 8787)")
+@click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
+@click.option("--learn", is_flag=True, help="Enable live traffic learning")
+@click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
+@click.option(
+    "--hermes-url",
+    default=None,
+    envvar="HEADROOM_HERMES_BASE_URL",
+    help="Hermes OpenAI base URL (default: http://127.0.0.1:38765/v1)",
+)
+@click.option(
+    "--backend", default=None, help="API backend: 'anthropic', 'anyllm', 'litellm-vertex', etc."
+)
+@click.option("--anyllm-provider", default=None, help="Provider for any-llm backend")
+@click.option("--region", default=None, help="Cloud region for Bedrock/Vertex")
+@click.argument("command_args", nargs=-1, type=click.UNPROCESSED)
+def hermes(
+    port: int,
+    no_proxy: bool,
+    learn: bool,
+    memory: bool,
+    hermes_url: str | None,
+    backend: str | None,
+    anyllm_provider: str | None,
+    region: str | None,
+    command_args: tuple[str, ...],
+) -> None:
+    """Start Headroom upstream of Hermes llm-proxy (compressible chat path).
+
+    \b
+    Routes ``/v1/chat/completions`` through Headroom into Hermes (default
+    ``:38765``), where SmartCrusher compresses large ``role: tool`` outputs.
+    Use this for grok-hermes bots and OpenAI-compatible clients — not for
+    Grok Build CLI sessions (see ``wrap grok``).
+
+    \b
+    Examples:
+        headroom wrap hermes
+        headroom wrap hermes --hermes-url http://127.0.0.1:38765/v1
+        headroom wrap hermes -- python scripts/bench_hermes_headroom.py
+        headroom install apply --providers manual --target hermes
+    """
+    upstream = (hermes_url or _HERMES_DEFAULT_API_URL).rstrip("/")
+
+    if command_args:
+        env, env_vars_display = _build_hermes_launch_env(port, os.environ)
+        _launch_tool(
+            binary=command_args[0],
+            args=command_args[1:],
+            env=env,
+            port=port,
+            no_proxy=no_proxy,
+            tool_label="HERMES",
+            env_vars_display=[*env_vars_display, f"Hermes upstream={upstream}"],
+            learn=learn,
+            memory=memory,
+            agent_type="hermes",
+            backend=backend,
+            anyllm_provider=anyllm_provider,
+            region=region,
+            openai_api_url=upstream,
+        )
+        return
+
+    openai_base = _build_hermes_launch_env(port, {})[0]["OPENAI_BASE_URL"]
+
+    def _print_hermes_setup() -> None:
+        click.echo("  Configure OpenAI-compatible clients:")
+        click.echo(f"    OPENAI_BASE_URL={openai_base}")
+        click.echo(f"    Hermes upstream (proxy): {upstream}")
+        click.echo()
+        click.echo("  spot-tech-ci bots: point grok-hermes at this Headroom port")
+        click.echo("  instead of http://172.18.0.1:38765/v1 for compression.")
+        click.echo()
+        click.echo("  Run a one-off command through the proxy:")
+        click.echo("    headroom wrap hermes -- python scripts/bench_hermes_headroom.py")
+
+    _run_proxy_only_watcher(
+        agent_label="hermes",
+        port=port,
+        no_proxy=no_proxy,
+        learn=learn,
+        memory=memory,
+        agent_type="hermes",
+        openai_api_url=upstream,
+        print_setup_lines=_print_hermes_setup,
     )
 
 

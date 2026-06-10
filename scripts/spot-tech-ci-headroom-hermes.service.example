@@ -1,0 +1,32 @@
+# Example systemd user unit for spot-tech-ci canary.
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp scripts/spot-tech-ci-headroom-hermes.service.example \
+#      ~/.config/systemd/user/headroom-hermes.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now headroom-hermes.service
+#
+# Docker bots (UFW on spot-tech-ci — allow bridge → :18787):
+#   sudo ufw allow from 172.18.0.0/16 to any port 18787 proto tcp
+#   sudo ufw allow from 172.20.0.0/16 to any port 18787 proto tcp
+#   sudo ufw allow from 172.17.0.0/16 to any port 18787 proto tcp
+#
+# spot-tech-ci: docker falkbot-ops already binds :8787 — use :18787 here.
+# Point one bot at http://127.0.0.1:18787/v1 instead of :38765 for canary.
+
+[Unit]
+Description=Headroom proxy upstream of Hermes llm-proxy (compression canary)
+After=network-online.target llm-proxy.service
+Wants=network-online.target llm-proxy.service
+
+[Service]
+Type=simple
+Environment=HEADROOM_TELEMETRY=off
+Environment=HEADROOM_HOST=0.0.0.0
+Environment=HEADROOM_HERMES_BASE_URL=http://127.0.0.1:38765/v1
+ExecStart=%h/.local/bin/headroom proxy --host 0.0.0.0 --port 18787 --openai-api-url http://127.0.0.1:38765/v1 --no-telemetry
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
