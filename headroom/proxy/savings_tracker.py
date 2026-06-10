@@ -133,6 +133,22 @@ def _normalize_provider(value: Any) -> str:
     return cleaned or PROVIDER_UNKNOWN
 
 
+MODEL_UNKNOWN = "unknown"
+
+
+def _normalize_model(value: Any) -> str:
+    """Normalize a model label, falling back to a stable sentinel.
+
+    History checkpoints persisted before per-model attribution existed have
+    no model field, so they collapse into ``MODEL_UNKNOWN`` rather than
+    silently dropping their savings from the per-model breakdown.
+    """
+    if not isinstance(value, str):
+        return MODEL_UNKNOWN
+    cleaned = value.strip()
+    return cleaned or MODEL_UNKNOWN
+
+
 def _resolve_litellm_model(model: str) -> str:
     """Resolve model name to one LiteLLM recognizes."""
     litellm = _get_litellm_module()
@@ -243,6 +259,7 @@ def _normalize_history_entry(entry: Any) -> dict[str, Any] | None:
     total_input_tokens = 0
     total_input_cost_usd = 0.0
     provider = PROVIDER_UNKNOWN
+    model = MODEL_UNKNOWN
 
     if isinstance(entry, dict):
         timestamp = _parse_timestamp(entry.get("timestamp"))
@@ -251,6 +268,7 @@ def _normalize_history_entry(entry: Any) -> dict[str, Any] | None:
         total_input_tokens = _coerce_int(entry.get("total_input_tokens"))
         total_input_cost_usd = _coerce_float(entry.get("total_input_cost_usd"))
         provider = _normalize_provider(entry.get("provider"))
+        model = _normalize_model(entry.get("model"))
     elif isinstance(entry, list | tuple) and len(entry) >= 2:
         timestamp = _parse_timestamp(entry[0])
         total_tokens_saved = _coerce_int(entry[1])
@@ -269,6 +287,7 @@ def _normalize_history_entry(entry: Any) -> dict[str, Any] | None:
     return {
         "timestamp": _to_utc_iso(timestamp),
         "provider": provider,
+        "model": model,
         "total_tokens_saved": total_tokens_saved,
         "compression_savings_usd": round(compression_savings_usd, 6),
         "total_input_tokens": total_input_tokens,
@@ -470,6 +489,7 @@ class SavingsTracker:
                 {
                     "timestamp": _to_utc_iso(timestamp_dt),
                     "provider": _normalize_provider(provider),
+                    "model": _normalize_model(model),
                     "total_tokens_saved": lifetime["tokens_saved"],
                     "compression_savings_usd": lifetime["compression_savings_usd"],
                     "total_input_tokens": lifetime["total_input_tokens"],
@@ -602,6 +622,7 @@ class SavingsTracker:
                     {
                         "timestamp": _to_utc_iso(timestamp_dt),
                         "provider": _normalize_provider(provider),
+                        "model": _normalize_model(model),
                         "total_tokens_saved": lifetime["tokens_saved"],
                         "compression_savings_usd": lifetime["compression_savings_usd"],
                         "total_input_tokens": lifetime["total_input_tokens"],
@@ -1077,6 +1098,7 @@ class SavingsTracker:
                     "total_input_cost_usd_delta": 0.0,
                     "total_input_cost_usd": total_input_cost_usd,
                     "by_provider": {},
+                    "by_model": {},
                 },
             )
             entry["tokens_saved"] += delta_tokens
@@ -1117,6 +1139,27 @@ class SavingsTracker:
                 prov["total_input_tokens_delta"] += delta_input_tokens
                 prov["total_input_cost_usd_delta"] = round(
                     prov["total_input_cost_usd_delta"] + delta_input_cost_usd,
+                    6,
+                )
+
+                model = _normalize_model(point.get("model"))
+                mod = entry["by_model"].setdefault(
+                    model,
+                    {
+                        "tokens_saved": 0,
+                        "compression_savings_usd_delta": 0.0,
+                        "total_input_tokens_delta": 0,
+                        "total_input_cost_usd_delta": 0.0,
+                    },
+                )
+                mod["tokens_saved"] += delta_tokens
+                mod["compression_savings_usd_delta"] = round(
+                    mod["compression_savings_usd_delta"] + delta_usd,
+                    6,
+                )
+                mod["total_input_tokens_delta"] += delta_input_tokens
+                mod["total_input_cost_usd_delta"] = round(
+                    mod["total_input_cost_usd_delta"] + delta_input_cost_usd,
                     6,
                 )
 
