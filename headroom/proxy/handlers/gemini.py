@@ -278,7 +278,7 @@ class GeminiHandlerMixin:
             rate_key = headers.get("x-goog-api-key", "default")[:20]
             allowed, wait_seconds = await self.rate_limiter.check_request(rate_key)
             if not allowed:
-                await self.metrics.record_rate_limited(provider="gemini")
+                await self.metrics.record_rate_limited(provider=provider_name)
                 raise HTTPException(
                     status_code=429,
                     detail=f"Rate limited. Retry after {wait_seconds:.1f}s",
@@ -337,6 +337,7 @@ class GeminiHandlerMixin:
                     [],
                     tags,
                     0,
+                    outcome_provider=provider_name,
                 )
             else:
                 response = await self._retry_request("POST", url, headers, body)
@@ -510,7 +511,7 @@ class GeminiHandlerMixin:
                     stream_url = (
                         f"{self.GEMINI_API_URL}/v1beta/models/{model}:streamGenerateContent?alt=sse"
                     )
-                if "key" in query_params:
+                if "key" in query_params and not upstream_base_url:
                     stream_url = f"{self.GEMINI_API_URL}/v1beta/models/{model}:streamGenerateContent?key={query_params['key']}&alt=sse"
 
                 return await self._stream_response(
@@ -526,6 +527,7 @@ class GeminiHandlerMixin:
                     transforms_applied,
                     tags,
                     optimization_latency,
+                    outcome_provider=provider_name,
                 )
             else:
                 response = await self._retry_request("POST", url, headers, body)
@@ -615,7 +617,7 @@ class GeminiHandlerMixin:
                     headers=response_headers,
                 )
         except Exception as e:
-            await self.metrics.record_failed(provider="gemini")
+            await self.metrics.record_failed(provider=provider_name)
             logger.error(f"[{request_id}] Gemini request failed: {type(e).__name__}: {e}")
             return JSONResponse(
                 status_code=502,
@@ -1075,7 +1077,7 @@ class GeminiHandlerMixin:
                 headers=response_headers,
             )
         except Exception as e:
-            await self.metrics.record_failed(provider="gemini")
+            await self.metrics.record_failed(provider=provider_name)
             logger.error(f"[{request_id}] Gemini countTokens failed: {type(e).__name__}: {e}")
             return JSONResponse(
                 status_code=502,

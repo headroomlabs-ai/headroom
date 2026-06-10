@@ -646,6 +646,7 @@ class StreamingMixin:
         *,
         body: dict,
         provider: str,
+        outcome_provider: str | None = None,
         model: str,
         request_id: str,
         original_tokens: int,
@@ -665,6 +666,7 @@ class StreamingMixin:
     ) -> None:
         from headroom.proxy.outcome import RequestOutcome
 
+        outcome_provider = outcome_provider or provider
         total_latency = (time.time() - start_time) * 1000
 
         # Per-chunk SSE parsing only flushes events terminated by ``\n\n``.
@@ -763,7 +765,7 @@ class StreamingMixin:
         # happening (issue #455).
         outcome = RequestOutcome.from_stream(
             body=body,
-            provider=provider,
+            provider=outcome_provider,
             model=model,
             request_id=request_id,
             original_tokens=effective_original_tokens,
@@ -809,6 +811,7 @@ class StreamingMixin:
         body_mutated: bool = True,
         mutation_reasons: list[str] | None = None,
         memory_request_ctx: Any | None = None,
+        outcome_provider: str | None = None,
     ) -> Response | StreamingResponse:
         """Stream response with metrics tracking and memory tool handling.
 
@@ -1029,6 +1032,7 @@ class StreamingMixin:
             await self._finalize_stream_response(
                 body=body,
                 provider=provider,
+                outcome_provider=outcome_provider,
                 model=model,
                 request_id=request_id,
                 original_tokens=original_tokens,
@@ -1284,6 +1288,7 @@ class StreamingMixin:
                 await self._finalize_stream_response(
                     body=body,
                     provider=provider,
+                    outcome_provider=outcome_provider,
                     model=model,
                     request_id=request_id,
                     original_tokens=original_tokens,

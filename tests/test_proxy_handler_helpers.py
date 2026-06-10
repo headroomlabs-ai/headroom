@@ -313,6 +313,54 @@ def test_vertex_stream_passthrough_preserves_chunks_and_records_usage() -> None:
     assert outcome.cache_read_tokens == 2
 
 
+def test_stream_finalizer_records_vertex_provider_for_dashboard() -> None:
+    handler = object.__new__(HeadroomProxy)
+    handler.config = SimpleNamespace(log_full_messages=False)
+    outcomes = []
+
+    async def record(outcome):  # noqa: ANN001, ANN202
+        outcomes.append(outcome)
+
+    handler._record_request_outcome = record
+
+    asyncio.run(
+        handler._finalize_stream_response(
+            body={"contents": [{"role": "user", "parts": [{"text": "hello"}]}]},
+            provider="gemini",
+            outcome_provider="vertex:google",
+            model="gemini-2.0-flash",
+            request_id="req_vertex_stream_final",
+            original_tokens=20,
+            optimized_tokens=12,
+            tokens_saved=8,
+            transforms_applied=["test-transform"],
+            optimization_latency=3.0,
+            stream_state={
+                "input_tokens": 12,
+                "output_tokens": 5,
+                "cache_read_input_tokens": 2,
+                "cache_creation_input_tokens": 0,
+                "cache_creation_ephemeral_5m_input_tokens": 0,
+                "cache_creation_ephemeral_1h_input_tokens": 0,
+                "total_bytes": 100,
+                "sse_buffer": bytearray(),
+                "ttfb_ms": 4.0,
+            },
+            start_time=0.0,
+            tags={"route": "vertex"},
+        )
+    )
+
+    assert len(outcomes) == 1
+    outcome = outcomes[0]
+    assert outcome.provider == "vertex:google"
+    assert outcome.model == "gemini-2.0-flash"
+    assert outcome.optimized_tokens == 12
+    assert outcome.output_tokens == 5
+    assert outcome.tokens_saved == 8
+    assert outcome.cache_read_tokens == 2
+
+
 def test_retry_request_retries_connect_timeout() -> None:
     proxy = object.__new__(HeadroomProxy)
     proxy.http_client = _RetryThenSuccessClient()

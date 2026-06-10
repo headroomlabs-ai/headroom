@@ -706,7 +706,7 @@ class AnthropicHandlerMixin:
                 rate_key = f"{api_key[:16]}:{client_ip}" if api_key else client_ip
                 allowed, wait_seconds = await self.rate_limiter.check_request(rate_key)
                 if not allowed:
-                    await self.metrics.record_rate_limited(provider="anthropic")
+                    await self.metrics.record_rate_limited(provider=provider_name)
                     # Unit 4: release the pre-upstream semaphore before we
                     # bail out of the handler via HTTPException — FastAPI's
                     # exception handler will NOT run our ``finally``.
@@ -1897,6 +1897,7 @@ class AnthropicHandlerMixin:
                         body_mutated=body_mutation_tracker.mutated,
                         mutation_reasons=body_mutation_tracker.reasons,
                         memory_request_ctx=memory_request_ctx,
+                        outcome_provider=provider_name,
                     )
                 else:
                     async with stage_timer.measure("upstream_connect"):
@@ -2407,7 +2408,7 @@ class AnthropicHandlerMixin:
                 # Retry-After header. The outer finally still runs.
                 raise
             except Exception as e:
-                await self.metrics.record_failed(provider="anthropic")
+                await self.metrics.record_failed(provider=provider_name)
                 # Log full error details internally for debugging
                 logger.error(f"[{request_id}] Request failed: {type(e).__name__}: {e}")
 
