@@ -193,6 +193,72 @@ def test_funnel_attributes_savings_from_context_and_stats_exposes_them(tmp_path,
         assert history["projects"]["ctx-project"]["requests"] == 1
 
 
+# ---------------------------------------------------------------------------
+# Regression: pre-feature behavior must be unchanged
+# ---------------------------------------------------------------------------
+
+
+def test_record_request_without_project_matches_legacy_totals(tmp_path):
+    """No-header traffic produces exactly the pre-v3 aggregates."""
+    path = tmp_path / "savings.json"
+    tracker = SavingsTracker(path=str(path))
+    tracker.record_request(model="gpt-4o", input_tokens=100, tokens_saved=40)
+    tracker.record_request(model="gpt-4o", input_tokens=200, tokens_saved=60)
+
+    preview = tracker.stats_preview()
+    assert preview["projects"] == {}
+    assert preview["lifetime"]["requests"] == 2
+    assert preview["lifetime"]["tokens_saved"] == 100
+    assert preview["display_session"]["tokens_saved"] == 100
+
+    persisted = json.loads(path.read_text())
+    # Every legacy top-level key survives alongside the new projects map.
+    assert set(persisted) >= {"schema_version", "lifetime", "display_session", "history"}
+    assert persisted["projects"] == {}
+
+
+def test_stats_payload_keeps_legacy_shape(tmp_path, monkeypatch):
+    """Dashboard consumers of the old /stats keys must not break."""
+    monkeypatch.setenv("HEADROOM_SAVINGS_PATH", str(tmp_path / "savings.json"))
+    config = ProxyConfig(cache_enabled=False, rate_limit_enabled=False, log_requests=False)
+
+    with TestClient(create_app(config)) as client:
+        proxy = client.app.state.proxy
+        _emit_outcome(proxy)  # unattributed: no header, no context, no field
+
+        stats = client.get("/stats").json()
+        assert stats["savings"]["per_project"] == {}
+        for legacy_key in ("requests", "savings", "persistent_savings", "cost"):
+            assert legacy_key in stats, f"legacy /stats key {legacy_key!r} disappeared"
+        assert stats["persistent_savings"]["lifetime"]["requests"] == 1
+
+        history = client.get("/stats-history").json()
+        for legacy_key in ("schema_version", "lifetime", "display_session", "retention"):
+            assert legacy_key in history, f"legacy /stats-history key {legacy_key!r} disappeared"
+
+
+def test_metrics_record_request_works_without_project_kwarg(tmp_path, monkeypatch):
+    """Existing callers that never pass ``project=`` keep working."""
+    monkeypatch.setenv("HEADROOM_SAVINGS_PATH", str(tmp_path / "savings.json"))
+    config = ProxyConfig(cache_enabled=False, rate_limit_enabled=False, log_requests=False)
+
+    with TestClient(create_app(config)) as client:
+        proxy = client.app.state.proxy
+        asyncio.run(
+            proxy.metrics.record_request(
+                provider="openai",
+                model="gpt-4o",
+                input_tokens=120,
+                output_tokens=24,
+                tokens_saved=30,
+                latency_ms=15.0,
+            )
+        )
+        preview = proxy.metrics.savings_tracker.stats_preview()
+        assert preview["lifetime"]["tokens_saved"] == 30
+        assert preview["projects"] == {}
+
+
 def test_middleware_binds_project_header_to_context(tmp_path, monkeypatch):
     monkeypatch.setenv("HEADROOM_SAVINGS_PATH", str(tmp_path / "savings.json"))
     config = ProxyConfig(cache_enabled=False, rate_limit_enabled=False, log_requests=False)
