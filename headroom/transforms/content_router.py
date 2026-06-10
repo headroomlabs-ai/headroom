@@ -2613,9 +2613,7 @@ class ContentRouter(Transform):
                 result.compression_ratio,
                 result.strategy_used.value,
             )
-            transforms_applied.append(
-                f"router:{strategy_label}:{result.strategy_used.value}"
-            )
+            transforms_applied.append(f"router:{strategy_label}:{result.strategy_used.value}")
             if compressed_details is not None:
                 compressed_details.append(
                     f"{details_prefix}:{result.strategy_used.value}:{result.compression_ratio:.2f}"
