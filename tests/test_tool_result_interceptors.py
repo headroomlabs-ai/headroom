@@ -213,6 +213,83 @@ def test_astgrep_outlines_large_python_read(tokenizer):
     assert "total += item.price * item.qty" not in new_content
 
 
+def test_astgrep_outlines_block_list_tool_result(tokenizer):
+    # Claude Code (and the Anthropic Messages API generally) sends tool_result
+    # content as a list of text blocks, not a plain string.
+    messages = [
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "abc",
+                    "name": "Read",
+                    "input": {"file_path": "/repo/payments.py"},
+                }
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "abc",
+                    "content": [{"type": "text", "text": _PY_FIXTURE}],
+                }
+            ],
+        },
+    ]
+    result = apply_to_messages(messages, tokenizer)
+    assert len(result.spans) == 1
+    assert result.spans[0].tool == "ast-grep"
+    new_inner = result.messages[1]["content"][0]["content"]
+    # The block-list shape is preserved on writeback.
+    assert isinstance(new_inner, list)
+    assert new_inner[0]["type"] == "text"
+    assert "outlined by ast-grep" in new_inner[0]["text"]
+    assert "total += item.price * item.qty" not in new_inner[0]["text"]
+
+
+def test_block_list_with_non_text_block_passes_through(tokenizer):
+    # Mixed block lists (e.g. text + image) are not safe to flatten.
+    messages = [
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "abc",
+                    "name": "Read",
+                    "input": {"file_path": "/repo/payments.py"},
+                }
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "abc",
+                    "content": [
+                        {"type": "text", "text": _PY_FIXTURE},
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": "",
+                            },
+                        },
+                    ],
+                }
+            ],
+        },
+    ]
+    result = apply_to_messages(messages, tokenizer)
+    assert len(result.spans) == 0
+    assert result.messages[1]["content"][0]["content"][1]["type"] == "image"
+
+
 def test_astgrep_skips_small_files(tokenizer):
     small = "def foo(): return 1\n"
     messages = [
