@@ -122,24 +122,35 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
         --out /tmp/wheels && \
     uv pip install --system /tmp/wheels/*.whl
 
-# Bake HF weights with retry for flaky network. Two repos are required:
-#   1. chopratejas/kompress-v2-base — the Kompress default (int8 ONNX weights).
-#   2. answerdotai/ModernBERT-base  — its tokenizer. The Kompress loader calls
-#      AutoTokenizer.from_pretrained("answerdotai/ModernBERT-base") explicitly
-#      (see headroom/transforms/kompress_compressor.py). With TRANSFORMERS_OFFLINE=1
-#      and this repo absent, the tokenizer fetch fails, the whole model load fails,
-#      and Kompress SILENTLY degrades to a no-op (returns input unchanged). Bake
-#      it so offline text compression actually runs. Tokenizer files only — the
-#      ModernBERT weights are not needed.
+# Bake the Kompress model + tokenizer into /opt/hf-cache (HF_HOME) for offline
+# runtime. Drive the download through the library's OWN loader
+# (KompressCompressor.preload) instead of hardcoding repo ids here: preload()
+# resolves HF_MODEL_ID and the transitive tokenizer (answerdotai/ModernBERT-base)
+# straight from source, so a future upstream model bump can't leave this
+# Dockerfile baking a stale model — the exact silent no-op this guards against.
+# It also pulls only the first loadable ONNX artifact (int8-wo, ~261MB), not
+# every variant. Pin the ONNX backend so the baked set (onnx weights + tokenizer)
+# is provably sufficient and the PyTorch fallback — which would need un-baked
+# ModernBERT weights — can never fire offline. cd /tmp so the /build/headroom/
+# source tree doesn't shadow the installed package carrying _core.so.
+# Fails the build (exit 1) if weights can't be fetched after 3 attempts, rather
+# than shipping an image that silently no-ops at runtime.
 RUN if echo ",${HEADROOM_EXTRAS}," | grep -q ",ml,"; then \
+        ok=0; \
         for i in 1 2 3; do \
-            python -c "from huggingface_hub import snapshot_download; \
-                snapshot_download('chopratejas/kompress-v2-base'); \
-                snapshot_download('answerdotai/ModernBERT-base', \
-                    allow_patterns=['tokenizer*', '*.json', 'special_tokens*'])" \
-            && break || { echo \"hf download attempt $i failed, retrying\"; sleep 10; }; \
+            if ( cd /tmp && HEADROOM_KOMPRESS_BACKEND=onnx python -c "\
+from headroom.transforms.kompress_compressor import KompressCompressor; \
+print('Kompress baked, backend=', KompressCompressor().preload())" ); then \
+                ok=1; \
+                break; \
+            fi; \
+            echo "kompress preload attempt $i failed, retrying"; \
+            sleep 10; \
         done; \
-        test -d /opt/hf-cache && ls /opt/hf-cache; \
+        if [ "$ok" != 1 ]; then \
+            echo 'FATAL: Kompress weights failed to bake after 3 attempts'; \
+            exit 1; \
+        fi; \
     else \
         mkdir -p /opt/hf-cache; \
     fi
@@ -157,6 +168,22 @@ assert hasattr(tslp, 'get_language'), 'tslp API broken (1.6.3 rename?)'; \
 print('verify OK: torch', torch.__version__, '| ort providers', ort.get_available_providers()); \
 "
 
+# Verify Kompress actually COMPRESSES under the exact offline env the runtime
+# uses. The historical failure was silent — a missing model/tokenizer made
+# compress() return its input unchanged. This turns that into a hard build
+# failure instead of a latent prod no-op.
+RUN if echo ",${HEADROOM_EXTRAS}," | grep -q ",ml,"; then \
+        cd /tmp && TRANSFORMERS_OFFLINE=1 HF_HUB_OFFLINE=1 \
+        HEADROOM_KOMPRESS_BACKEND=onnx HF_HOME=/opt/hf-cache python -c "\
+from headroom.transforms.kompress_compressor import KompressCompressor; \
+src='The quick brown fox jumps over the lazy dog. ' * 40; \
+out=KompressCompressor().compress(src); \
+assert out.compressed != src and len(out.compressed) < len(src), \
+    'Kompress no-op offline: weights/tokenizer not baked correctly'; \
+print('Kompress offline OK:', len(src), '->', len(out.compressed)); \
+"; \
+    fi
+
 # ---------- Stage 2: runtime ----------
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-runtime-ubuntu${UBUNTU_VERSION} AS runtime
 
@@ -167,7 +194,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
     HEADROOM_HOST=0.0.0.0 \
     HF_HOME=/opt/hf-cache \
-    TRANSFORMERS_OFFLINE=1
+    TRANSFORMERS_OFFLINE=1 \
+    HEADROOM_KOMPRESS_BACKEND=onnx
 
 RUN echo 'Acquire::Retries "3";' > /etc/apt/apt.conf.d/80-retries && \
     echo 'Acquire::http::Timeout "30";' >> /etc/apt/apt.conf.d/80-retries && \
