@@ -487,7 +487,14 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         publisher: str,
         model: str,
     ):
-        del api_version, project, location, model
+        del api_version, project, location
+        if publisher == "google":
+            return await proxy.handle_gemini_generate_content(
+                request,
+                model,
+                _api_target(proxy, "vertex"),
+                "vertex:google",
+            )
         return await vertex_publisher_passthrough(request, publisher, "generateContent")
 
     @app.post(
@@ -501,7 +508,14 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         publisher: str,
         model: str,
     ):
-        del api_version, project, location, model
+        del api_version, project, location
+        if publisher == "google":
+            return await proxy.handle_gemini_generate_content(
+                request,
+                model,
+                _api_target(proxy, "vertex"),
+                "vertex:google",
+            )
         return await vertex_publisher_passthrough(request, publisher, "streamGenerateContent")
 
     @app.post(
@@ -515,7 +529,14 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         publisher: str,
         model: str,
     ):
-        del api_version, project, location, model
+        del api_version, project, location
+        if publisher == "google":
+            return await proxy.handle_gemini_count_tokens(
+                request,
+                model,
+                _api_target(proxy, "vertex"),
+                "vertex:google",
+            )
         return await vertex_publisher_passthrough(request, publisher, "countTokens")
 
     @app.post(
@@ -529,7 +550,14 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         publisher: str,
         model: str,
     ):
-        del api_version, project, location, model
+        del api_version, project, location
+        if publisher == "anthropic":
+            return await proxy.handle_anthropic_messages(
+                request,
+                _api_target(proxy, "vertex"),
+                "vertex:anthropic",
+                model,
+            )
         return await vertex_publisher_passthrough(request, publisher, "rawPredict")
 
     @app.post(
@@ -543,7 +571,15 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         publisher: str,
         model: str,
     ):
-        del api_version, project, location, model
+        del api_version, project, location
+        if publisher == "anthropic":
+            return await proxy.handle_anthropic_messages(
+                request,
+                _api_target(proxy, "vertex"),
+                "vertex:anthropic",
+                model,
+                True,
+            )
         return await vertex_publisher_passthrough(request, publisher, "streamRawPredict")
 
     @app.get("/v1/models")

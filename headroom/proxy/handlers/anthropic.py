@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 
 import httpx
 
+from headroom.copilot_auth import build_copilot_upstream_url
 from headroom.pipeline import PipelineStage, summarize_routing_markers
 from headroom.proxy.auth_mode import classify_auth_mode, classify_client
 from headroom.proxy.compression_decision import CompressionDecision
@@ -404,6 +405,10 @@ class AnthropicHandlerMixin:
     async def handle_anthropic_messages(
         self,
         request: Request,
+        upstream_base_url: str | None = None,
+        provider_name: str = "anthropic",
+        model_override: str | None = None,
+        force_stream: bool = False,
     ) -> Response | StreamingResponse:
         """Handle Anthropic /v1/messages endpoint."""
         if not hasattr(self, "pipeline_extensions"):
@@ -590,7 +595,7 @@ class AnthropicHandlerMixin:
                         },
                     },
                 )
-            model = body.get("model", "unknown")
+            model = body.get("model") or model_override or "unknown"
             messages = body.get("messages", [])
             with stage_timer.measure("deep_copy"):
                 original_client_messages = copy.deepcopy(messages)
@@ -626,7 +631,7 @@ class AnthropicHandlerMixin:
                     },
                 )
 
-            stream = body.get("stream", False)
+            stream = bool(body.get("stream", False) or force_stream)
 
             # Bypass: skip ALL compression, TOIN learning, and CCR injection
             # when the caller explicitly opts out via header.
@@ -1848,8 +1853,15 @@ class AnthropicHandlerMixin:
                         },
                     )
 
-            # Direct Anthropic API
-            url = f"{self.ANTHROPIC_API_URL}/v1/messages"
+            # Direct Anthropic API, or a provider-compatible Anthropic
+            # Messages endpoint such as Vertex AI publisher rawPredict.
+            url = (
+                build_copilot_upstream_url(upstream_base_url, request.url.path)
+                if upstream_base_url
+                else f"{self.ANTHROPIC_API_URL}/v1/messages"
+            )
+            if upstream_base_url and request.url.query:
+                url = f"{url}?{request.url.query}"
 
             try:
                 if stream:
@@ -2316,7 +2328,7 @@ class AnthropicHandlerMixin:
                     await self._record_request_outcome(
                         RequestOutcome(
                             request_id=request_id,
-                            provider="anthropic",
+                            provider=provider_name,
                             model=model,
                             original_tokens=original_tokens,
                             optimized_tokens=optimized_tokens,
