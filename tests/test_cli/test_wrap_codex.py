@@ -23,6 +23,7 @@ def _set_test_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     home = str(tmp_path)
     monkeypatch.setenv("HOME", home)
     monkeypatch.setenv("USERPROFILE", home)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
 
 
 @pytest.fixture
@@ -175,6 +176,23 @@ class TestInjectAndRestoreRoundTrip:
         assert status == "removed"
         assert not config_file.exists()
         assert not (tmp_path / ".codex" / "config.toml.headroom-backup").exists()
+
+    def test_wrap_unwrap_respects_codex_home(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        _set_test_home(monkeypatch, tmp_path)
+        codex_home = tmp_path / "custom-codex-home"
+        monkeypatch.setenv("CODEX_HOME", str(codex_home))
+        config_file = codex_home / "config.toml"
+
+        wrap_mod._inject_codex_provider_config(8787)
+        assert config_file.exists()
+        assert 'model_provider = "headroom"' in config_file.read_text()
+        assert not (tmp_path / ".codex" / "config.toml").exists()
+
+        status, _ = wrap_mod._restore_codex_provider_config()
+        assert status == "removed"
+        assert not config_file.exists()
 
     def test_wrap_unwrap_restores_prior_model_provider(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -411,6 +429,68 @@ def test_wrap_codex_prepare_only_creates_backup_and_config(
     assert backup.read_text() == original
 
 
+def test_wrap_codex_prepare_only_respects_codex_home(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_test_home(monkeypatch, tmp_path)
+    codex_home = tmp_path / "custom-codex-home"
+    codex_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    with patch("headroom.cli.wrap._ensure_rtk_binary", return_value=None):
+        result = runner.invoke(
+            main,
+            ["wrap", "codex", "--prepare-only", "--no-serena", "--port", "8787"],
+        )
+
+    assert result.exit_code == 0, result.output
+    config_file = codex_home / "config.toml"
+    assert config_file.exists()
+    content = config_file.read_text()
+    assert 'model_provider = "headroom"' in content
+    assert "[mcp_servers.headroom]" in content
+    assert not (tmp_path / ".codex" / "config.toml").exists()
+
+
+def test_unwrap_codex_without_codex_home_warns_on_ambiguous_noop(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_test_home(monkeypatch, tmp_path)
+    codex_home = tmp_path / "custom-codex-home"
+    codex_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    with patch("headroom.cli.wrap._ensure_rtk_binary", return_value=None):
+        wrap_result = runner.invoke(
+            main,
+            [
+                "wrap",
+                "codex",
+                "--prepare-only",
+                "--no-mcp",
+                "--no-serena",
+                "--port",
+                "8787",
+            ],
+        )
+
+    assert wrap_result.exit_code == 0, wrap_result.output
+    config_file = codex_home / "config.toml"
+    assert 'openai_base_url = "http://127.0.0.1:8787/v1"' in config_file.read_text()
+
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    unwrap_result = runner.invoke(main, ["unwrap", "codex", "--no-stop-proxy"])
+
+    assert unwrap_result.exit_code == 0, unwrap_result.output
+    assert "Warning: found no Headroom wrap markers in the default Codex config" in (
+        unwrap_result.output
+    )
+    assert "If you wrapped Codex with CODEX_HOME" in unwrap_result.output
+    assert "CODEX_HOME=/path/to/codex-home headroom unwrap codex" in unwrap_result.output
+    assert "Nothing to undo" in unwrap_result.output
+    assert 'openai_base_url = "http://127.0.0.1:8787/v1"' in config_file.read_text()
+
+
 def test_start_proxy_uses_separate_session_for_signal_isolation(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -576,6 +656,7 @@ def test_unwrap_codex_no_stop_proxy_leaves_proxy_alone(
     runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _set_test_home(monkeypatch, tmp_path)
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "explicit-codex-home"))
 
     with patch("headroom.cli.wrap._stop_local_proxy_for_unwrap") as stop_proxy:
         result = runner.invoke(main, ["unwrap", "codex", "--no-stop-proxy"])
@@ -613,14 +694,16 @@ def test_stop_local_proxy_for_unwrap_refuses_unidentified_listener(
     kill_proxy.assert_not_called()
 
 
-def test_unwrap_codex_is_safe_noop_with_no_prior_wrap(
+def test_unwrap_codex_is_safe_noop_with_explicit_codex_home(
     runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _set_test_home(monkeypatch, tmp_path)
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "explicit-codex-home"))
 
     result = runner.invoke(main, ["unwrap", "codex"])
     assert result.exit_code == 0, result.output
     assert "Nothing to undo" in result.output
+    assert "Warning:" not in result.output
     assert not (tmp_path / ".codex" / "config.toml").exists()
 
 

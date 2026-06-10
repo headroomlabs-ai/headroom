@@ -8,13 +8,24 @@
     <script src="https://unpkg.com/htmx.org@1.9.10"></script>
     <script src="https://unpkg.com/alpinejs@3.13.3/dist/cdn.min.js" defer></script>
     <script>
+        (function() {
+            const saved = localStorage.getItem('headroom-theme');
+            const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+            if (saved === 'light' || (!saved && !prefersDark)) {
+                document.documentElement.classList.remove('dark');
+            } else {
+                document.documentElement.classList.add('dark');
+            }
+        })();
+    </script>
+    <script>
         tailwind.config = {
             darkMode: 'class',
             theme: {
                 extend: {
                     colors: {
-                        surface: '#1a1a1a',
-                        border: '#2a2a2a',
+                        surface: 'var(--color-surface)',
+                        border: 'var(--color-border)',
                         accent: '#22d3ee',
                     }
                 }
@@ -22,7 +33,29 @@
         }
     </script>
     <style>
-        body { background: #0f0f0f; }
+        :root {
+            --bg: #f9fafb;
+            --color-surface: #ffffff;
+            --color-border: #e5e7eb;
+            --card-alt-bg: #f3f4f6;
+            --diff-before-header: #fff5f5;
+            --diff-before-body: #fef2f2;
+            --diff-after-header: #f0fdf4;
+            --diff-after-body: #f0fdf4;
+            --ttl-card-bg: linear-gradient(180deg, rgba(34,211,238,0.10), rgba(224,249,253,0.90));
+        }
+        html.dark {
+            --bg: #0f0f0f;
+            --color-surface: #1a1a1a;
+            --color-border: #2a2a2a;
+            --card-alt-bg: #141414;
+            --diff-before-header: #1a0808;
+            --diff-before-body: #120606;
+            --diff-after-header: #081a08;
+            --diff-after-body: #0a120a;
+            --ttl-card-bg: linear-gradient(180deg, rgba(34,211,238,0.10), rgba(12,16,22,0.88));
+        }
+        body { background: var(--bg); }
         .sparkline { stroke: #22d3ee; stroke-width: 1.5; fill: none; }
         .sparkline-area { fill: url(#sparkline-gradient); }
         .trend-line { stroke: #22d3ee; stroke-width: 2; fill: none; }
@@ -36,12 +69,36 @@
         #feed-virtual-list {
             position: relative;
         }
-        .transformation-card {
-            background: #141414;
-        }
-        .transformation-card:hover {
-            background: #1a1a1a;
-        }
+        .transformation-card { background: var(--card-alt-bg); }
+        .transformation-card:hover { background: var(--color-surface); }
+        .diff-before-header { background: var(--diff-before-header); }
+        .diff-before { background: var(--diff-before-body); }
+        .diff-after-header { background: var(--diff-after-header); }
+        .diff-after { background: var(--diff-after-body); }
+        .ttl-bucket-gradient-card { background: var(--ttl-card-bg); }
+
+        /* Light mode: invert the gray text scale (dark bg grays → light bg grays) */
+        html:not(.dark) body { color: #1f2937; }
+        html:not(.dark) .text-gray-200 { color: #1f2937; }
+        html:not(.dark) .text-gray-300 { color: #374151; }
+        html:not(.dark) .text-gray-400 { color: #6b7280; }
+        html:not(.dark) .text-gray-500 { color: #9ca3af; }
+        html:not(.dark) .text-gray-600 { color: #6b7280; }
+        html:not(.dark) .hover\:text-gray-200:hover { color: #111827; }
+        html:not(.dark) .hover\:text-white:hover { color: #111827; }
+        /* Light mode overrides for dark-specific utility classes */
+        html:not(.dark) .bg-black\/20 { background-color: rgba(0,0,0,0.04); }
+        html:not(.dark) .bg-black\/30 { background-color: rgba(0,0,0,0.06); }
+        html:not(.dark) .border-white\/8 { border-color: rgba(0,0,0,0.10); }
+        html:not(.dark) .ring-white\/5 { --tw-ring-color: rgba(0,0,0,0.08); }
+        html:not(.dark) .border-red-900\/30 { border-color: rgba(239,68,68,0.25); }
+        html:not(.dark) .border-emerald-900\/30 { border-color: rgba(16,185,129,0.25); }
+        /* Light mode: TTL card color adjustments */
+        html:not(.dark) .text-cyan-50 { color: #164e63; }
+        html:not(.dark) .text-violet-50 { color: #4c1d95; }
+        html:not(.dark) .text-cyan-200\/80 { color: #0e7490; }
+        html:not(.dark) .text-cyan-300\/75 { color: #0891b2; }
+        html:not(.dark) .text-violet-300\/75 { color: #7c3aed; }
     </style>
 </head>
 <body class="text-gray-200 min-h-screen" x-data="dashboard()" x-init="init()">
@@ -87,6 +144,16 @@
             <div class="text-xs text-gray-500">
                 Updated <span x-text="lastUpdate"></span>
             </div>
+            <button onclick="toggleTheme()" id="theme-toggle"
+                    class="px-3 py-1.5 text-sm rounded-md border border-border bg-surface text-gray-400 hover:text-gray-200 transition-colors"
+                    title="Toggle light/dark mode">
+                <svg class="w-4 h-4 dark:hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z"/>
+                </svg>
+                <svg class="w-4 h-4 hidden dark:block" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z"/>
+                </svg>
+            </button>
             <button x-show="log_full_messages" id="feed-toggle"
                     class="px-3 py-1.5 text-sm rounded-md border border-border bg-surface text-gray-300 hover:text-white transition-colors"
                     @click="toggleFeed()"
@@ -555,7 +622,7 @@
                             <div class="text-xs text-gray-500 font-mono" x-text="observedTtlWindowLabel"></div>
                         </div>
                         <div class="grid grid-cols-1 xl:grid-cols-[1.3fr_0.9fr] gap-4">
-                            <div class="rounded-2xl border border-cyan-500/20 bg-[linear-gradient(180deg,rgba(34,211,238,0.10),rgba(12,16,22,0.88))] p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]">
+                            <div class="ttl-bucket-gradient-card rounded-2xl border border-cyan-500/20 p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]">
                         <div class="flex items-start justify-between gap-3">
                             <div>
                                 <div class="text-[11px] uppercase tracking-[0.22em] text-cyan-300/75">Bucket Mix</div>
@@ -861,7 +928,7 @@
                                     </div>
                                     <!-- Expanded detail row -->
                                     <template x-if="expandedRows[req.request_id]">
-                                        <div class="px-8 py-4 bg-[#151515] border-t border-border">
+                                        <div class="px-8 py-4 border-t border-border" style="background: var(--card-alt-bg);">
                                             <div class="grid grid-cols-2 lg:grid-cols-4 gap-4 text-xs">
                                                 <div>
                                                     <div class="text-gray-500 uppercase tracking-wide mb-1">Original Tokens</div>
@@ -1005,7 +1072,7 @@
                                         <span class="text-sm font-medium text-gray-300">Historical Savings Trend</span>
                                         <span class="text-xs text-gray-500 font-mono" x-text="historyTrendLabel"></span>
                                     </div>
-                                    <div class="inline-flex rounded-lg border border-border bg-[#141414] p-1 self-start lg:self-auto">
+                                    <div class="inline-flex rounded-lg border border-border p-1 self-start lg:self-auto" style="background: var(--card-alt-bg);">
                                         <template x-for="[label, key] in historyGranularityOptions" :key="key">
                                             <button class="px-3 py-1.5 text-sm rounded-md transition-colors"
                                                     :class="historyGranularity === key ? 'bg-accent text-black' : 'text-gray-400 hover:text-gray-200'"
@@ -1449,17 +1516,17 @@
                             </div>
                             <div class="grid grid-cols-2 gap-2" style="height: 115px;">
                                 <div class="rounded border border-red-900/30 overflow-hidden flex flex-col">
-                                    <div class="bg-[#1a0808] px-2 py-1 border-b border-red-900/30 shrink-0">
+                                    <div class="diff-before-header px-2 py-1 border-b border-red-900/30 shrink-0">
                                         <span class="text-[10px] text-red-400 uppercase tracking-wide font-semibold">Before</span>
                                     </div>
-                                    <div class="diff-before bg-[#120606] p-2 font-mono text-[11px] text-gray-300 overflow-auto flex-1"
+                                    <div class="diff-before p-2 font-mono text-[11px] text-gray-300 overflow-auto flex-1"
                                          >${beforeContent}</div>
                                 </div>
                                 <div class="rounded border border-emerald-900/30 overflow-hidden flex flex-col">
-                                    <div class="bg-[#081a08] px-2 py-1 border-b border-emerald-900/30 shrink-0">
+                                    <div class="diff-after-header px-2 py-1 border-b border-emerald-900/30 shrink-0">
                                         <span class="text-[10px] text-emerald-400 uppercase tracking-wide font-semibold">After</span>
                                     </div>
-                                    <div class="diff-after bg-[#0a120a] p-2 font-mono text-[11px] text-gray-300 overflow-auto flex-1"
+                                    <div class="diff-after p-2 font-mono text-[11px] text-gray-300 overflow-auto flex-1"
                                          >${afterContent}</div>
                                 </div>
                             </div>
@@ -1900,6 +1967,11 @@
                     return line + ` L200,64 L0,64 Z`;
                 },
             };
+        }
+
+        function toggleTheme() {
+            const isDark = document.documentElement.classList.toggle('dark');
+            localStorage.setItem('headroom-theme', isDark ? 'dark' : 'light');
         }
     </script>
 </body>
