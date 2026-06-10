@@ -79,12 +79,12 @@ class _ParsedTable:
     minterms:  list[int]
 
 
-def _try_parse_truth_table(content: str) -> "_ParsedTable | None":
+def _try_parse_truth_table(content: str) -> _ParsedTable | None:
     """Parse a markdown or space-separated truth table.
 
     Returns _ParsedTable if confident, None otherwise.
     """
-    lines = [l.strip() for l in content.strip().splitlines() if l.strip()]
+    lines = [ln.strip() for ln in content.strip().splitlines() if ln.strip()]
     # Need at least a header + one data row
     if len(lines) < 2:
         return None
@@ -166,7 +166,7 @@ class BooleanCompressor:
     Optional dependency — fails gracefully if not installed.
     """
 
-    def compress(self, content: str) -> "BooleanCompressionResult | None":
+    def compress(self, content: str) -> BooleanCompressionResult | None:
         """Compress boolean content. Returns None on failure (caller should passthrough)."""
         try:
             result = self._compress_truth_table(content)
@@ -177,7 +177,7 @@ class BooleanCompressor:
             logger.debug("BooleanCompressor: compression failed: %s", exc)
             return None
 
-    def _compress_truth_table(self, content: str) -> "BooleanCompressionResult | None":
+    def _compress_truth_table(self, content: str) -> BooleanCompressionResult | None:
         parsed = _try_parse_truth_table(content)
         if parsed is None:
             return None
@@ -189,8 +189,8 @@ class BooleanCompressor:
             minimal = "1"
         else:
             try:
-                from boolean_algebra_engine.core.models import TruthTable, TruthTableRow
                 from boolean_algebra_engine import synthesize
+                from boolean_algebra_engine.core.models import TruthTable, TruthTableRow
 
                 rows: list[TruthTableRow] = []
                 n = len(parsed.variables)
@@ -229,13 +229,13 @@ class BooleanCompressor:
             strategy          = "truth_table",
         )
 
-    def _compress_expression(self, content: str) -> "BooleanCompressionResult | None":
+    def _compress_expression(self, content: str) -> BooleanCompressionResult | None:
         content_stripped = content.strip()
         # Only compress if it looks like a single expression (not prose)
         if "\n" in content_stripped and not re.search(r"\b(AND|OR|NOT|XOR)\b", content_stripped, re.I):
             return None
         # Collapse multi-line expressions (each line is one expression or one term)
-        lines = [l.strip() for l in content_stripped.splitlines() if l.strip()]
+        lines = [ln.strip() for ln in content_stripped.splitlines() if ln.strip()]
         expr_line = " ".join(lines) if len(lines) > 1 else content_stripped
 
         normalised = _normalise(expr_line)
@@ -387,7 +387,7 @@ class NLBooleanCompressor:
     deterministic and lossless.
     """
 
-    def compress(self, content: str) -> "BooleanCompressionResult | None":
+    def compress(self, content: str) -> BooleanCompressionResult | None:
         if not _looks_like_nl_logic(content):
             return None
         provider = _detect_provider()

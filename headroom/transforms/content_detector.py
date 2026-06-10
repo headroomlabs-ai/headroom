@@ -464,7 +464,7 @@ _BOOL_TABLE_ROW = re.compile(
 )
 
 
-def _try_detect_boolean(content: str) -> "DetectionResult | None":
+def _try_detect_boolean(content: str) -> DetectionResult | None:
     """Detect boolean logic content: truth tables and boolean expressions.
 
     Returns a DetectionResult with ContentType.BOOLEAN_LOGIC when confident
@@ -473,7 +473,7 @@ def _try_detect_boolean(content: str) -> "DetectionResult | None":
     uppercase variables or an explicit truth table structure.
     """
     stripped = content.strip()
-    lines    = [l.strip() for l in stripped.splitlines() if l.strip()]
+    lines = [ln.strip() for ln in stripped.splitlines() if ln.strip()]
 
     if not lines:
         return None
@@ -548,7 +548,7 @@ _NL_LOGIC_SIGNALS = [
 _NL_OP_WORDS = re.compile(r"\b(and|or|not|xor|nor|nand|both|neither|either|unless|but not)\b", re.I)
 
 
-def _try_detect_nl_boolean(content: str) -> "DetectionResult | None":
+def _try_detect_nl_boolean(content: str) -> DetectionResult | None:
     """Detect natural-language descriptions of boolean/digital logic.
 
     Only fires when the prose clearly describes a logic function, not generic
