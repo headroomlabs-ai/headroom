@@ -1,8 +1,20 @@
 from __future__ import annotations
 
 import click
+import pytest
 
 import headroom.cli.wrap as wrap_cli
+
+
+@pytest.fixture(autouse=True)
+def _no_attached_wrappers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Default: no other wrap clients attached, so restart paths are hermetic.
+
+    The ephemeral restart guards (#804) consult ``_live_proxy_clients``; without
+    this, a real ``headroom wrap`` session on the dev's machine could make these
+    tests flaky. Individual tests override this to simulate attached wrappers.
+    """
+    monkeypatch.setattr(wrap_cli, "_live_proxy_clients", lambda *a, **kw: [])
 
 
 class _Manifest:
@@ -299,3 +311,104 @@ def test_ensure_proxy_leaves_active_stale_ephemeral_proxy_running(monkeypatch) -
     result = wrap_cli._ensure_proxy(8787, False)
 
     assert result is None
+
+
+def test_ensure_proxy_defers_version_restart_when_http_wrapper_attached(monkeypatch) -> None:
+    """#804: a stale-version proxy is NOT restarted while a marker-tracked HTTP
+    wrapper is attached, even though the WebSocket session count is zero."""
+    health = {
+        "version": "0.0.1",  # stale → version restart wanted
+        # No WebSocket relay sessions — the gap that let the old code kill it.
+        "runtime": {"websocket_sessions": {"active_sessions": 0, "active_relay_tasks": 0}},
+        "config": {"pid": "12345", "memory": False, "learn": False, "code_graph": False},
+    }
+
+    monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: None)
+    monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: True)
+    monkeypatch.setattr(wrap_cli, "_query_proxy_health", lambda port: health)
+    # Another HTTP wrapper (PID 999) is attached per the marker registry.
+    monkeypatch.setattr(wrap_cli, "_live_proxy_clients", lambda *a, **kw: [999])
+    monkeypatch.setattr(
+        wrap_cli,
+        "_kill_proxy_by_pid",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("attached proxy must not be killed for a version restart")
+        ),
+    )
+    monkeypatch.setattr(
+        wrap_cli,
+        "_start_proxy",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("replacement proxy must not start")
+        ),
+    )
+
+    result = wrap_cli._ensure_proxy(8787, False)
+
+    assert result is None
+
+
+def test_ensure_proxy_defers_flag_restart_when_other_wrapper_attached(monkeypatch) -> None:
+    """#804: requesting --memory must not restart the proxy out from under
+    another attached wrapper; reuse the running proxy as-is instead."""
+    health = {
+        "version": wrap_cli._HEADROOM_VERSION,  # same version → no version restart
+        "runtime": {"websocket_sessions": {"active_sessions": 0, "active_relay_tasks": 0}},
+        # Running proxy lacks `memory`; this session asks for it.
+        "config": {"pid": "12345", "memory": False, "learn": False, "code_graph": False},
+    }
+
+    monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: None)
+    monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: True)
+    monkeypatch.setattr(wrap_cli, "_query_proxy_health", lambda port: health)
+    monkeypatch.setattr(wrap_cli, "_live_proxy_clients", lambda *a, **kw: [999])
+    monkeypatch.setattr(
+        wrap_cli,
+        "_kill_proxy_by_pid",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("attached proxy must not be killed to add flags")
+        ),
+    )
+    monkeypatch.setattr(
+        wrap_cli,
+        "_start_proxy",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("replacement proxy must not start")
+        ),
+    )
+
+    result = wrap_cli._ensure_proxy(8787, False, memory=True)
+
+    assert result is None
+
+
+def test_ensure_proxy_restarts_for_flags_when_no_other_wrapper(monkeypatch) -> None:
+    """Control: with no other wrapper attached, a missing-flag restart still
+    happens — the guard must not block the single-client upgrade path."""
+    calls: list[object] = []
+    health = {
+        "version": wrap_cli._HEADROOM_VERSION,
+        "runtime": {"websocket_sessions": {"active_sessions": 0, "active_relay_tasks": 0}},
+        "config": {"pid": "12345", "memory": False, "learn": False, "code_graph": False},
+    }
+
+    monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: None)
+    monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: len(calls) == 0)
+    monkeypatch.setattr(wrap_cli, "_query_proxy_health", lambda port: health)
+    monkeypatch.setattr(wrap_cli, "_live_proxy_clients", lambda *a, **kw: [])
+    monkeypatch.setattr(
+        wrap_cli,
+        "_kill_proxy_by_pid",
+        lambda pid, port: calls.append(("kill", pid, port)) or True,
+    )
+    monkeypatch.setattr(
+        wrap_cli,
+        "_start_proxy",
+        lambda *args, **kwargs: calls.append(("start", args, kwargs)),
+    )
+
+    result = wrap_cli._ensure_proxy(8787, False, memory=True)
+
+    assert result is None
+    assert calls[0] == ("kill", 12345, 8787)
+    assert calls[1][0] == "start"
