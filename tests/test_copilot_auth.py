@@ -611,3 +611,51 @@ def test_read_windows_copilot_cli_oauth_token_returns_none_without_windll(
     monkeypatch.delattr(copilot_auth.ctypes, "WinDLL", raising=False)
 
     assert copilot_auth._read_windows_copilot_cli_oauth_token() is None
+
+
+def test_is_copilot_api_token_returns_false_for_empty_string() -> None:
+    assert copilot_auth._is_copilot_api_token("") is False
+    assert copilot_auth._is_copilot_api_token("   ") is False
+
+
+def test_token_kind_returns_known_prefixes() -> None:
+    assert copilot_auth._token_kind("tid_abc123") == "tid_***"
+    assert copilot_auth._token_kind("gho_abc123") == "gho_***"
+    assert copilot_auth._token_kind("ghs_abc123") == "ghs_***"
+    assert copilot_auth._token_kind("ghp_abc123") == "ghp_***"
+    assert copilot_auth._token_kind("github_pat_abc123") == "github_pat_***"
+
+
+def test_token_kind_returns_unknown_for_unrecognised_token() -> None:
+    assert copilot_auth._token_kind("some_random_token") == "unknown"
+
+
+def test_token_kind_returns_empty_for_blank_token() -> None:
+    assert copilot_auth._token_kind("") == "empty"
+    assert copilot_auth._token_kind("   ") == "empty"
+
+
+def test_exchange_token_sync_returns_payload_on_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = {"token": "copilot-api", "expires_at": int(time.time()) + 3600}
+
+    class FakeResponse:
+        def read(self) -> bytes:
+            return json.dumps(payload).encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+    monkeypatch.setattr(
+        copilot_auth.urllib_request,
+        "urlopen",
+        lambda *args, **kwargs: FakeResponse(),
+    )
+
+    result = copilot_auth.CopilotTokenProvider._exchange_token_sync(
+        {"Authorization": "Bearer gho_test"}
+    )
+
+    assert result == payload
