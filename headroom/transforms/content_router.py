@@ -1355,10 +1355,21 @@ class ContentRouter(Transform):
             }
             fallback_no_savings = compressed == content or compressed_tokens >= original_tokens
             if fallback_eligible_strategy and fallback_no_savings:
-                strategy_chain.append(CompressionStrategy.KOMPRESS.value)
-                fallback_compressed, fallback_tokens = self._try_ml_compressor(
-                    content, context, question
+                # Skip if Kompress was already tried by an inline fallback
+                # (e.g. CODE_AWARE's code-compressor-unavailable path at
+                # line 1249).  Prevents a duplicate strategy_chain entry
+                # and a wasted second _try_ml_compressor call.
+                already_tried_kompress = (
+                    CompressionStrategy.KOMPRESS.value in strategy_chain
                 )
+                if not already_tried_kompress:
+                    strategy_chain.append(CompressionStrategy.KOMPRESS.value)
+                    fallback_compressed, fallback_tokens = self._try_ml_compressor(
+                        content, context, question
+                    )
+                else:
+                    fallback_compressed = compressed
+                    fallback_tokens = compressed_tokens
                 if fallback_tokens < compressed_tokens:
                     compressed = fallback_compressed
                     compressed_tokens = fallback_tokens
