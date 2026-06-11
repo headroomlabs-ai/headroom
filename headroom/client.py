@@ -7,8 +7,6 @@ from collections.abc import Iterator
 from datetime import datetime, timezone
 from typing import Any
 
-logger = logging.getLogger(__name__)
-
 from .cache import (
     BaseCacheOptimizer,
     CacheConfig,
@@ -36,6 +34,8 @@ from .utils import (
     format_cost,
     generate_request_id,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class ChatCompletions:
