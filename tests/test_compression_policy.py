@@ -157,3 +157,62 @@ class TestRustParityFieldMap:
             f"and `crates/headroom-core/src/compression_policy.rs` in "
             f"the same commit."
         )
+
+
+class TestNetCostFormula:
+    """Net-cost mutation formula (#856) — Rust parity.
+
+    Scenario values are golden: the Rust unit tests in
+    ``crates/headroom-core/src/compression_policy.rs`` assert the
+    identical numbers, so a drift in either side trips the parity pair
+    loudly.
+    """
+
+    def test_small_shave_deep_suffix_is_loss(self):
+        # 2000*(1.25 + 0.1*9) - 1.0*1.15*50000 = 4300 - 57500 = -53200.
+        p = policy_for_mode(AuthMode.PAYG)
+        gain = p.net_mutation_gain(2_000, 50_000, 10.0, 1.0)
+        assert abs(gain - (-53_200.0)) < 1.0
+        assert not p.should_mutate_deep(2_000, 50_000, 10.0, 1.0)
+
+    def test_big_shave_shallow_suffix_is_win(self):
+        # 50000*(1.25 + 0.1*2) - 1.0*1.15*10000 = 72500 - 11500 = 61000.
+        p = policy_for_mode(AuthMode.PAYG)
+        gain = p.net_mutation_gain(50_000, 10_000, 3.0, 1.0)
+        assert abs(gain - 61_000.0) < 1.0
+        assert p.should_mutate_deep(50_000, 10_000, 3.0, 1.0)
+
+    def test_live_zone_edit_always_profitable(self):
+        # S = 0 derives the existing Subscription live-zone policy as a
+        # special case of the formula.
+        p = policy_for_mode(AuthMode.SUBSCRIPTION)
+        assert p.should_mutate_deep(1, 0, 0.0, 1.0)
+        assert p.should_mutate_deep(2_000, 0, 0.0, 1.0)
+
+    def test_cold_cache_ignores_suffix(self):
+        # P_alive = 0 (TTL lapsed): the idle-timer compaction window.
+        p = policy_for_mode(AuthMode.PAYG)
+        assert p.should_mutate_deep(2_000, 50_000, 0.0, 0.0)
+
+    def test_clamps_out_of_range_inputs(self):
+        p = policy_for_mode(AuthMode.PAYG)
+        clamped = p.net_mutation_gain(2_000, 50_000, -5.0, 7.0)
+        reference = p.net_mutation_gain(2_000, 50_000, 0.0, 1.0)
+        assert abs(clamped - reference) < 1e-6
+
+    def test_break_even_reads_matches_research_anchor(self):
+        # R = 11.5*(S/dT - 1): 2K/50K -> 276; 50K/10K -> negative
+        # (profitable from the first read); dT=0 -> 0.
+        p = policy_for_mode(AuthMode.PAYG)
+        assert abs(p.break_even_reads(2_000, 50_000) - 276.0) < 0.5
+        assert p.break_even_reads(50_000, 10_000) < 0.0
+        assert p.break_even_reads(0, 10_000) == 0.0
+
+    def test_constants_match_rust(self):
+        from headroom.transforms.compression_policy import (
+            CACHE_READ_MULTIPLIER,
+            CACHE_WRITE_MULTIPLIER,
+        )
+
+        assert CACHE_WRITE_MULTIPLIER == 1.25
+        assert CACHE_READ_MULTIPLIER == 0.1

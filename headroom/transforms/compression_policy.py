@@ -54,6 +54,16 @@ _MAX_LOSSY_RATIO_PAYG: float = 0.45
 #: Subscription: conservative cap at 25%. Cache stability over savings.
 _MAX_LOSSY_RATIO_SUBSCRIPTION: float = 0.25
 
+#: Anthropic prompt-cache write multiplier: a ``cache_creation`` token
+#: costs 1.25x a plain input token (5-minute TTL tier). Input to the
+#: net-cost mutation formula (#856). Mirrors the Rust ``pub const``.
+CACHE_WRITE_MULTIPLIER: float = 1.25
+
+#: Anthropic prompt-cache read multiplier: a ``cache_read`` token costs
+#: 0.1x a plain input token. Input to the net-cost mutation formula
+#: (#856). Mirrors the Rust ``pub const``.
+CACHE_READ_MULTIPLIER: float = 0.1
+
 
 @dataclass(frozen=True, slots=True)
 class CompressionPolicy:
@@ -111,6 +121,57 @@ class CompressionPolicy:
     (network effect keeps growing). The gate is read by
     ``smart_crusher.py`` and ``content_router.py`` at the
     ``record_compression`` call sites."""
+
+    def net_mutation_gain(
+        self,
+        delta_t: int,
+        suffix_tokens: int,
+        expected_reads: float,
+        p_alive: float,
+    ) -> float:
+        """Net gain (in plain-input-token cost units) of a mutation that
+        removes ``delta_t`` tokens from a message whose cached suffix is
+        ``suffix_tokens`` long (#856).
+
+        Mirrors ``CompressionPolicy::net_mutation_gain`` in the Rust
+        crate (source of truth — see its docstring for the derivation)::
+
+            gain = dT * (w + r*(R - 1)) - P_alive * (w - r) * S
+
+        Inputs are clamped: ``expected_reads`` to ``>= 0``, ``p_alive``
+        to ``[0, 1]``.
+        """
+        w = CACHE_WRITE_MULTIPLIER
+        r = CACHE_READ_MULTIPLIER
+        reads = max(expected_reads, 0.0)
+        alive = min(max(p_alive, 0.0), 1.0)
+        return float(delta_t) * (w + r * (reads - 1.0)) - alive * (w - r) * float(suffix_tokens)
+
+    def should_mutate_deep(
+        self,
+        delta_t: int,
+        suffix_tokens: int,
+        expected_reads: float,
+        p_alive: float,
+    ) -> bool:
+        """Decision form of :meth:`net_mutation_gain`: mutate iff the
+        gain is strictly positive."""
+        return self.net_mutation_gain(delta_t, suffix_tokens, expected_reads, p_alive) > 0.0
+
+    def break_even_reads(self, delta_t: int, suffix_tokens: int) -> float:
+        """Remaining-read count at which a warm-cache (``p_alive=1``)
+        mutation breaks even::
+
+            R = ((w - r) / r) * (S/dT - 1)   ~= 11.5 * S/dT  for S >> dT
+
+        Returns 0 when ``delta_t`` is 0 (no savings — callers gate on
+        ``delta_t > 0``). Mirrors the Rust method.
+        """
+        if delta_t == 0:
+            return 0.0
+        w = CACHE_WRITE_MULTIPLIER
+        r = CACHE_READ_MULTIPLIER
+        return ((w - r) / r) * (float(suffix_tokens) / float(delta_t) - 1.0)
 
 
 def policy_for_mode(mode: AuthMode) -> CompressionPolicy:
