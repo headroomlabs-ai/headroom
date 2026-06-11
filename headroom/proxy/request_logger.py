@@ -212,9 +212,9 @@ class RequestLogger:
         """Log a request. Oldest entries are automatically removed when limit reached.
 
         Phase G PR-G3 (P4-45): base64-encoded image payloads in
-        ``request_messages`` / ``response_content`` are redacted
-        before write. Redaction also applies to the in-memory deque
-        so the ``/stats/recent_requests`` endpoint never serves a
+        ``request_messages`` / ``compressed_messages`` / ``response_content``
+        are redacted before write. Redaction also applies to the in-memory
+        deque so the ``/stats/recent_requests`` endpoint never serves a
         multi-MB image either.
         """
         # Redact image payloads in-place on the deque entry so memory

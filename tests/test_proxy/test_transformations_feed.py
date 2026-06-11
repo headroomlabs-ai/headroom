@@ -42,9 +42,12 @@ async def test_transformations_feed_returns_messages(app):
     data = response.json()
     transformations = data["transformations"]
     for t in transformations:
-        assert "request_messages" in t or t.get("request_messages") is None
-        assert "compressed_messages" in t or t.get("compressed_messages") is None
-        assert "response_content" in t or t.get("response_content") is None
+        assert "request_messages" in t
+        assert t["request_messages"] is None or isinstance(t["request_messages"], list)
+        assert "compressed_messages" in t
+        assert t["compressed_messages"] is None or isinstance(t["compressed_messages"], list)
+        assert "response_content" in t
+        assert t["response_content"] is None or isinstance(t["response_content"], str)
 
 
 @pytest.mark.asyncio

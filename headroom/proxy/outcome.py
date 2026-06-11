@@ -253,8 +253,9 @@ class RequestOutcome:
         if system is None:
             system = body.get("systemInstruction")
 
-        # ``request_items`` is ``body["messages"]`` — the post-compression
-        # list the caller already mutated in place before finalize. When a
+        # ``request_items`` is ``body["messages"]`` (or ``body["contents"]``
+        # for Gemini, falling back to ``[]``) — the post-compression list the
+        # caller already mutated in place before finalize. When a
         # caller threads in ``original_messages`` (the pre-compression
         # snapshot), log it as ``request_messages`` and the sent body as
         # ``compressed_messages`` so the two sides stay diffable. Callers that
