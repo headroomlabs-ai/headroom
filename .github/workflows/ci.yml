@@ -279,7 +279,7 @@ jobs:
         run: pytest tests/test_integrations/agno/ -v
 
   commitlint:
-    if: github.event_name != 'push' || !startsWith(github.event.head_commit.message, 'Merge pull request ')
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
