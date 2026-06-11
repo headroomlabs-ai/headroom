@@ -1874,9 +1874,9 @@ def _ensure_proxy(
                 other_wrappers = helpers._live_proxy_clients(port, exclude_self=True)
                 if active_sessions > 0 or other_wrappers:
                     # active_sessions only counts Codex WebSocket relay; the
-                    # marker list also covers HTTP wrap clients (#804). Either
-                    # means a live session is attached, so don't restart the
-                    # shared proxy out from under it — defer until idle.
+                    # marker list also covers HTTP wrap clients. Either means a
+                    # live session is attached, so don't restart the shared
+                    # proxy out from under it — defer until idle.
                     detail = (
                         f"{active_sessions} active session(s)"
                         if active_sessions > 0
@@ -1932,8 +1932,8 @@ def _ensure_proxy(
                     other_wrappers = helpers._live_proxy_clients(port, exclude_self=True)
                     if other_wrappers:
                         # Another wrapper is attached to this proxy; restarting it
-                        # to add flags would drop their in-flight requests (#804).
-                        # Reuse the running proxy as-is rather than disrupt them.
+                        # to add flags would drop their in-flight requests. Reuse
+                        # the running proxy as-is rather than disrupt them.
                         click.echo(
                             f"  Proxy on port {port} is missing: {flags_str}, but "
                             f"{len(other_wrappers)} other wrapper(s) are attached."
@@ -2036,10 +2036,9 @@ def _proc_identity(pid: int) -> tuple[str, float] | None:
         return ("psutil", float(psutil.Process(pid).create_time()))
     except Exception:
         pass
-    # Linux fallback (the platform this bug was reported on): field 22 of
-    # /proc/<pid>/stat is starttime in clock ticks since boot — a stable
-    # per-process value. `comm` (field 2) may contain spaces/parens, so split
-    # after the final ')'.
+    # Linux fallback: field 22 of /proc/<pid>/stat is starttime in clock ticks
+    # since boot — a stable per-process value. `comm` (field 2) may contain
+    # spaces/parens, so split after the final ')'.
     try:
         with open(f"/proc/{pid}/stat", "rb") as fh:
             fields = fh.read().rpartition(b")")[2].split()

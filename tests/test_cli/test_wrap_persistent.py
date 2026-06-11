@@ -10,9 +10,9 @@ import headroom.cli.wrap as wrap_cli
 def _no_attached_wrappers(monkeypatch: pytest.MonkeyPatch) -> None:
     """Default: no other wrap clients attached, so restart paths are hermetic.
 
-    The ephemeral restart guards (#804) consult ``_live_proxy_clients``; without
-    this, a real ``headroom wrap`` session on the dev's machine could make these
-    tests flaky. Individual tests override this to simulate attached wrappers.
+    The ephemeral restart guards consult ``_live_proxy_clients``; without this, a
+    real ``headroom wrap`` session on the dev's machine could make these tests
+    flaky. Individual tests override this to simulate attached wrappers.
     """
     monkeypatch.setattr(wrap_cli, "_live_proxy_clients", lambda *a, **kw: [])
 
@@ -314,7 +314,7 @@ def test_ensure_proxy_leaves_active_stale_ephemeral_proxy_running(monkeypatch) -
 
 
 def test_ensure_proxy_defers_version_restart_when_http_wrapper_attached(monkeypatch) -> None:
-    """#804: a stale-version proxy is NOT restarted while a marker-tracked HTTP
+    """A stale-version proxy is NOT restarted while a marker-tracked HTTP
     wrapper is attached, even though the WebSocket session count is zero."""
     health = {
         "version": "0.0.1",  # stale → version restart wanted
@@ -349,8 +349,8 @@ def test_ensure_proxy_defers_version_restart_when_http_wrapper_attached(monkeypa
 
 
 def test_ensure_proxy_defers_flag_restart_when_other_wrapper_attached(monkeypatch) -> None:
-    """#804: requesting --memory must not restart the proxy out from under
-    another attached wrapper; reuse the running proxy as-is instead."""
+    """Requesting --memory must not restart the proxy out from under another
+    attached wrapper; reuse the running proxy as-is instead."""
     health = {
         "version": wrap_cli._HEADROOM_VERSION,  # same version → no version restart
         "runtime": {"websocket_sessions": {"active_sessions": 0, "active_relay_tasks": 0}},

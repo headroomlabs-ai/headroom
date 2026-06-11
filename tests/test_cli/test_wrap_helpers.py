@@ -556,7 +556,7 @@ class _FakeProxyProc:
 
 
 class TestProxyClientRefCounting:
-    """#804: proxy lifecycle is reference-counted via marker files, not pgrep."""
+    """Proxy lifecycle is reference-counted via marker files, not pgrep."""
 
     PORT = 8787
 
