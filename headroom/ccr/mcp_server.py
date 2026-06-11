@@ -342,14 +342,17 @@ class HeadroomMCPServer:
         self._setup_handlers()
 
     def _get_local_store(self) -> Any:
-        """Get or create the local compression store (lazy init)."""
-        if self._local_store is None:
-            from headroom.cache.compression_store import CompressionStore
+        """Get the shared compression store singleton (lazy init).
 
-            self._local_store = CompressionStore(
-                max_entries=500,
-                default_ttl=MCP_SESSION_TTL,
-            )
+        Returns the same instance the proxy and response_handler use so
+        retrieval can see content either side compressed in-process.
+        Called with no args to keep one shared config; the compress path
+        passes its own per-entry ``ttl`` at store time.
+        """
+        if self._local_store is None:
+            from headroom.cache.compression_store import get_compression_store
+
+            self._local_store = get_compression_store()
         return self._local_store
 
     def _compress_content(self, content: str) -> dict[str, Any]:
