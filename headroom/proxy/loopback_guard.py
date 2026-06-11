@@ -72,14 +72,16 @@ def is_loopback_host(host: str | None) -> bool:
     ``request.client``.
 
     ``"localhost"`` is special-cased as a string since it is not a
-    valid IP literal. Every other host is parsed with
+    valid IP literal. The comparison is case-insensitive because
+    hostnames are (RFC 4343), so a ``Host: LOCALHOST`` from a local
+    tool is still accepted. Every other host is parsed with
     :func:`ipaddress.ip_address`; this accepts IPv6-mapped IPv4
     (``::ffff:127.0.0.1``) which Linux dual-stack sockets emit by
     default. Malformed input returns ``False``.
     """
     if host is None:
         return True
-    if host == "localhost":
+    if host.lower() == "localhost":
         return True
     try:
         address = ipaddress.ip_address(host)

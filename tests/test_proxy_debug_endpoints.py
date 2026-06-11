@@ -192,6 +192,8 @@ def test_is_loopback_host_header_accepts_canonical_values():
         "127.0.0.1:8787",
         "localhost",
         "localhost:8787",
+        "LOCALHOST",
+        "Localhost:8787",
         "[::1]",
         "[::1]:8787",
     ):
