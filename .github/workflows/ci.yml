@@ -100,7 +100,7 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: ${{ env.PY_VERSION }}
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.100.0
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
@@ -306,7 +306,7 @@ jobs:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-build-${{ hashFiles('pyproject.toml') }}
           restore-keys: ${{ runner.os }}-pip-build-
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.100.0
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
