@@ -13,6 +13,7 @@ from headroom.providers.codex import DEFAULT_API_URL as DEFAULT_OPENAI_API_URL
 from headroom.providers.gemini import DEFAULT_API_URL as DEFAULT_GEMINI_API_URL
 
 DEFAULT_CLOUDCODE_API_URL = "https://cloudcode-pa.googleapis.com"
+DEFAULT_VERTEX_API_URL = "https://us-central1-aiplatform.googleapis.com"
 
 if TYPE_CHECKING:
     from headroom.backends.base import Backend
@@ -30,6 +31,7 @@ class ProviderApiOverrides:
     openai: str | None = None
     gemini: str | None = None
     cloudcode: str | None = None
+    vertex: str | None = None
 
 
 @dataclass(frozen=True)
@@ -40,6 +42,7 @@ class ProviderApiTargets:
     openai: str = DEFAULT_OPENAI_API_URL
     gemini: str = DEFAULT_GEMINI_API_URL
     cloudcode: str = DEFAULT_CLOUDCODE_API_URL
+    vertex: str = DEFAULT_VERTEX_API_URL
 
 
 @dataclass(frozen=True)
@@ -56,6 +59,7 @@ class ProxyProviderRuntime:
             "openai": self.api_targets.openai,
             "gemini": self.api_targets.gemini,
             "cloudcode": self.api_targets.cloudcode,
+            "vertex": self.api_targets.vertex,
         }[provider_name]
 
     def pipeline_provider(self, provider_name: str) -> Provider:
@@ -95,15 +99,19 @@ def resolve_api_overrides(
     openai_api_url: str | None,
     gemini_api_url: str | None,
     cloudcode_api_url: str | None,
+    vertex_api_url: str | None = None,
     environ: Mapping[str, str] | None = None,
 ) -> ProviderApiOverrides:
     """Resolve provider API URL overrides from CLI/config inputs and environment."""
     env = environ or os.environ
     return ProviderApiOverrides(
-        anthropic=anthropic_api_url or env.get("ANTHROPIC_TARGET_API_URL"),
+        anthropic=anthropic_api_url
+        or env.get("ANTHROPIC_TARGET_API_URL")
+        or env.get("ANTHROPIC_FOUNDRY_BASE_URL"),
         openai=openai_api_url or env.get("OPENAI_TARGET_API_URL"),
         gemini=gemini_api_url or env.get("GEMINI_TARGET_API_URL"),
         cloudcode=cloudcode_api_url or env.get("CLOUDCODE_TARGET_API_URL"),
+        vertex=vertex_api_url or env.get("VERTEX_TARGET_API_URL"),
     )
 
 
@@ -114,6 +122,7 @@ def resolve_api_targets(overrides: ProviderApiOverrides) -> ProviderApiTargets:
         openai=_normalize_api_url(overrides.openai, default=DEFAULT_OPENAI_API_URL),
         gemini=_normalize_api_url(overrides.gemini, default=DEFAULT_GEMINI_API_URL),
         cloudcode=_normalize_api_url(overrides.cloudcode, default=DEFAULT_CLOUDCODE_API_URL),
+        vertex=_normalize_api_url(overrides.vertex, default=DEFAULT_VERTEX_API_URL),
     )
 
 

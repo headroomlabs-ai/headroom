@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import types
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -334,6 +335,30 @@ def test_command_string_and_matcher_on_windows(monkeypatch) -> None:
 
     assert init_cli._command_string(["headroom", "init"]) == "joined-command"
     assert init_cli._powershell_matcher() == "Bash|PowerShell"
+
+
+def test_command_string_normalizes_backslashes_on_windows(monkeypatch) -> None:
+    """Backslash paths must become forward slashes so Git Bash hooks work (#724)."""
+    init_cli, _ = _load_init_module(monkeypatch)
+    monkeypatch.setattr(init_cli, "os", SimpleNamespace(name="nt"))
+
+    result = init_cli._command_string(
+        ["C:\\Users\\user\\.local\\bin\\headroom.exe", "init", "hook", "ensure"]
+    )
+    assert "\\" not in result
+    assert "C:/Users/user/.local/bin/headroom.exe" in result
+
+
+def test_command_string_quotes_spaces_after_normalization(monkeypatch) -> None:
+    """Paths with spaces must stay properly quoted after backslash normalization (#724)."""
+    init_cli, _ = _load_init_module(monkeypatch)
+    monkeypatch.setattr(init_cli, "os", SimpleNamespace(name="nt"))
+
+    result = init_cli._command_string(
+        ["C:\\Program Files\\headroom\\headroom.exe", "init", "hook", "ensure"]
+    )
+    assert "\\" not in result
+    assert '"C:/Program Files/headroom/headroom.exe"' in result
 
 
 def test_json_file_handles_missing_empty_and_non_mapping(monkeypatch, tmp_path: Path) -> None:
@@ -781,6 +806,13 @@ def test_ensure_profile_running_covers_runtime_modes(monkeypatch) -> None:
     wait_calls: list[tuple[str, int]] = []
 
     monkeypatch.setattr(init_cli, "load_manifest", lambda profile: manifests.get(profile))
+    monkeypatch.setattr(init_cli, "runtime_status", lambda manifest: "stopped")
+
+    @contextmanager
+    def fake_start_lock(profile: str):
+        yield True
+
+    monkeypatch.setattr(init_cli, "acquire_runtime_start_lock", fake_start_lock)
 
     def fake_wait_ready(manifest, timeout_seconds: int) -> bool:
         wait_calls.append((manifest.profile, timeout_seconds))
@@ -857,6 +889,12 @@ def test_ensure_profile_running_returns_when_ready_or_on_exception(monkeypatch) 
     init_cli._ensure_profile_running("task-profile")
     assert detached_calls == []
 
+    @contextmanager
+    def fake_start_lock(profile: str):
+        yield True
+
+    monkeypatch.setattr(init_cli, "acquire_runtime_start_lock", fake_start_lock)
+    monkeypatch.setattr(init_cli, "runtime_status", lambda manifest: "stopped")
     monkeypatch.setattr(init_cli, "wait_ready", lambda manifest, timeout_seconds: False)
     monkeypatch.setattr(
         init_cli,
@@ -864,6 +902,75 @@ def test_ensure_profile_running_returns_when_ready_or_on_exception(monkeypatch) 
         lambda profile: (_ for _ in ()).throw(RuntimeError("boom")),
     )
     init_cli._ensure_profile_running("task-profile")
+
+
+def test_ensure_profile_running_skips_spawn_when_start_lock_is_held(monkeypatch) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    manifest = SimpleNamespace(
+        preset=init_cli.InstallPreset.PERSISTENT_TASK.value,
+        supervisor_kind=init_cli.SupervisorKind.NONE.value,
+        profile="task-profile",
+    )
+    detached_calls: list[str] = []
+
+    @contextmanager
+    def fake_start_lock(profile: str):
+        yield False
+
+    monkeypatch.setattr(init_cli, "load_manifest", lambda profile: manifest)
+    monkeypatch.setattr(init_cli, "wait_ready", lambda manifest, timeout_seconds: False)
+    monkeypatch.setattr(init_cli, "acquire_runtime_start_lock", fake_start_lock)
+    monkeypatch.setattr(
+        init_cli,
+        "start_detached_agent",
+        lambda profile: detached_calls.append(profile),
+    )
+
+    init_cli._ensure_profile_running("task-profile")
+
+    assert detached_calls == []
+
+
+def test_ensure_profile_running_does_not_spawn_again_during_slow_startup(monkeypatch) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    manifest = SimpleNamespace(
+        preset=init_cli.InstallPreset.PERSISTENT_TASK.value,
+        supervisor_kind=init_cli.SupervisorKind.NONE.value,
+        profile="task-profile",
+    )
+    detached_calls: list[str] = []
+    wait_calls: list[int] = []
+    stop_calls: list[object] = []
+
+    @contextmanager
+    def fake_start_lock(profile: str):
+        yield True
+
+    def fake_wait_ready(manifest, timeout_seconds: int) -> bool:
+        wait_calls.append(timeout_seconds)
+        return bool(detached_calls and timeout_seconds == init_cli._STARTUP_READY_TIMEOUT_SECONDS)
+
+    monkeypatch.setattr(init_cli, "load_manifest", lambda profile: manifest)
+    monkeypatch.setattr(init_cli, "wait_ready", fake_wait_ready)
+    monkeypatch.setattr(init_cli, "acquire_runtime_start_lock", fake_start_lock)
+    monkeypatch.setattr(
+        init_cli,
+        "runtime_status",
+        lambda manifest: "running" if detached_calls else "stopped",
+    )
+    monkeypatch.setattr(
+        init_cli,
+        "start_detached_agent",
+        lambda profile: detached_calls.append(profile),
+    )
+    monkeypatch.setattr(init_cli, "stop_runtime", lambda manifest: stop_calls.append(manifest))
+
+    init_cli._ensure_profile_running("task-profile")
+    init_cli._ensure_profile_running("task-profile")
+
+    assert detached_calls == ["task-profile"]
+    assert init_cli._STARTUP_READY_TIMEOUT_SECONDS in wait_calls
+    assert stop_calls == []
 
 
 def test_init_codex_windows_warns_about_upstream_hook_limitation(monkeypatch) -> None:

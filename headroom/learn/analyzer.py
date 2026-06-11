@@ -17,8 +17,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+import queue
 import shutil
 import subprocess
+import threading
+import time
+import typing
 
 from .models import (
     AnalysisResult,
@@ -43,9 +47,11 @@ _MODEL_DEFAULTS: list[tuple[str, str]] = [
 _MAX_DIGEST_TOKENS = 80_000  # Budget for the digest (leave room for prompt + output)
 
 # CLI tools to try when no API key is set (checked in order).
-# Each entry: (binary_name, model_identifier, command_prefix)
+# Each entry: (binary_name, model_identifier, command_prefix). The claude-cli
+# command uses stream-json output so the analyzer can detect progress and
+# enforce an idle (rather than wall-clock-only) timeout — see _call_cli_llm.
 _CLI_BACKENDS: list[tuple[str, str, list[str]]] = [
-    ("claude", "claude-cli", ["claude", "-p"]),
+    ("claude", "claude-cli", ["claude", "-p", "--output-format", "stream-json", "--verbose"]),
     ("gemini", "gemini-cli", ["gemini", "-p"]),
     ("codex", "codex-cli", ["codex", "exec"]),
 ]
@@ -55,7 +61,35 @@ _CLI_MODEL_IDS: set[str] = {model for _, model, _ in _CLI_BACKENDS}
 
 _USER_PROMPT_PREFIX = "Analyze these coding agent sessions and return JSON recommendations:\n\n"  # Shared by _call_cli_llm and _call_llm
 _MAX_SNIPPET_LEN = 2000  # Max chars of CLI output (stdout/stderr) in error messages
-_CLI_TIMEOUT = 120  # Subprocess timeout for CLI backends, in seconds
+# Hard wall-clock cap for CLI backends (seconds). Override with
+# HEADROOM_LEARN_CLI_TIMEOUT_SECS for slow networks or large digests.
+_CLI_TIMEOUT = 300
+# Idle cap (seconds) for streaming claude-cli: kill if no output arrives for
+# this long. Lets us catch genuine hangs quickly while letting long-but-active
+# analyses run to completion. Override with HEADROOM_LEARN_CLI_IDLE_TIMEOUT_SECS.
+_CLI_IDLE_TIMEOUT = 60
+
+
+def _resolve_timeout_secs(env_var: str, default: int) -> int:
+    """Resolve a positive-integer timeout from *env_var* or fall back to *default*.
+
+    Invalid or non-positive values are logged and ignored so a typo in env
+    config can't accidentally disable the timeout.
+    """
+    raw = os.environ.get(env_var)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r — using default %ds", env_var, raw, default)
+        return default
+    if value <= 0:
+        logger.warning(
+            "Invalid %s=%r (must be positive) — using default %ds", env_var, raw, default
+        )
+        return default
+    return value
 
 
 def _detect_default_model() -> str:
@@ -413,9 +447,12 @@ def _call_cli_llm(digest: str, model: str) -> dict:
     OS ``ARG_MAX`` limits and argument-injection risks.
 
     CLI invocations:
-      claude-cli → echo <prompt> | claude -p
-      gemini-cli → echo <prompt> | gemini -p
-      codex-cli  → echo <prompt> | codex exec
+      claude-cli → claude -p --output-format stream-json --verbose (idle-timeout)
+      gemini-cli → gemini -p (wall-clock timeout)
+      codex-cli  → codex exec (wall-clock timeout)
+
+    The claude-cli path streams JSON events, letting the analyzer kill genuine
+    hangs while letting long-but-active analyses run to completion.
 
     Args:
         digest: Token-efficient session digest to analyze.
@@ -437,6 +474,11 @@ def _call_cli_llm(digest: str, model: str) -> dict:
         raise ValueError(f"Unknown CLI model: {model}")
 
     prompt = _SYSTEM_PROMPT + "\n\n" + _USER_PROMPT_PREFIX + digest
+    hard_cap = _resolve_timeout_secs("HEADROOM_LEARN_CLI_TIMEOUT_SECS", _CLI_TIMEOUT)
+
+    if model == "claude-cli":
+        idle_cap = _resolve_timeout_secs("HEADROOM_LEARN_CLI_IDLE_TIMEOUT_SECS", _CLI_IDLE_TIMEOUT)
+        return _call_claude_cli_streaming(cmd, prompt, hard_cap=hard_cap, idle_cap=idle_cap)
 
     try:
         result = subprocess.run(
@@ -444,7 +486,7 @@ def _call_cli_llm(digest: str, model: str) -> dict:
             input=prompt,
             capture_output=True,
             text=True,
-            timeout=_CLI_TIMEOUT,
+            timeout=hard_cap,
         )
     except FileNotFoundError:
         raise RuntimeError(
@@ -453,9 +495,9 @@ def _call_cli_llm(digest: str, model: str) -> dict:
         ) from None
     except subprocess.TimeoutExpired:
         raise RuntimeError(
-            f"`{' '.join(cmd)}` did not respond within {_CLI_TIMEOUT}s. "
-            "Check network connectivity or try a different backend with "
-            "--model <litellm-model-name>."
+            f"`{' '.join(cmd)}` did not respond within {hard_cap}s. "
+            "Check network connectivity, raise HEADROOM_LEARN_CLI_TIMEOUT_SECS, "
+            "or try a different backend with --model <litellm-model-name>."
         ) from None
 
     if result.returncode != 0:
@@ -476,6 +518,155 @@ def _call_cli_llm(digest: str, model: str) -> dict:
             f"`{' '.join(cmd)}` returned unparseable output. "
             f"First {_MAX_SNIPPET_LEN} chars:\n{stdout_snippet}"
         ) from exc
+
+
+def _call_claude_cli_streaming(
+    cmd: list[str], prompt: str, *, hard_cap: int, idle_cap: int
+) -> dict:
+    """Run claude-cli with stream-json output and an idle-timeout watchdog.
+
+    Each line of stdout is one JSON event from claude (system/assistant/user/
+    result). Any line resets the idle deadline. The process is killed if no
+    output arrives for *idle_cap* seconds, or if total elapsed exceeds
+    *hard_cap* seconds. The final ``type:"result"`` event carries the assistant
+    response, which is then parsed as JSON.
+
+    Threads (rather than ``select``) drain stdout/stderr so the watchdog works
+    on Windows too, where ``select`` does not support pipe handles.
+    """
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,  # line-buffered
+        )
+    except FileNotFoundError:
+        raise RuntimeError(
+            f"`{cmd[0]}` not found in PATH. Install it or use a different backend "
+            "with --model <litellm-model-name>."
+        ) from None
+
+    assert proc.stdin is not None and proc.stdout is not None and proc.stderr is not None
+    try:
+        proc.stdin.write(prompt)
+    finally:
+        try:
+            proc.stdin.close()
+        except BrokenPipeError:  # pragma: no cover — defensive, claude exits before stdin drain
+            pass
+
+    events: queue.Queue[tuple[str, str | None]] = queue.Queue()
+
+    def _pump(stream: typing.IO[str], tag: str) -> None:
+        try:
+            for line in stream:
+                events.put((tag, line))
+        except Exception as exc:  # pragma: no cover — defensive
+            logger.debug("stream pump (%s) errored: %s", tag, exc)
+        finally:
+            events.put((tag, None))  # EOF marker
+
+    threading.Thread(target=_pump, args=(proc.stdout, "stdout"), daemon=True).start()
+    threading.Thread(target=_pump, args=(proc.stderr, "stderr"), daemon=True).start()
+
+    start = time.monotonic()
+    last_activity = start
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+    final_result: str | None = None
+    eofs = 0
+
+    def _kill(reason: str) -> None:
+        proc.kill()
+        try:
+            proc.wait(timeout=5)
+        except (
+            subprocess.TimeoutExpired
+        ):  # pragma: no cover — defensive, kill normally returns fast
+            pass
+        logger.debug("claude-cli killed: %s", reason)
+
+    while eofs < 2:
+        elapsed = time.monotonic() - start
+        if elapsed > hard_cap:
+            _kill(f"hard cap {hard_cap}s exceeded")
+            raise RuntimeError(
+                f"`{' '.join(cmd)}` exceeded the {hard_cap}s hard cap. "
+                "Raise HEADROOM_LEARN_CLI_TIMEOUT_SECS for slower networks or "
+                "larger digests, or try a different backend with "
+                "--model <litellm-model-name>."
+            )
+        idle_elapsed = time.monotonic() - last_activity
+        if idle_elapsed > idle_cap:
+            _kill(f"idle cap {idle_cap}s exceeded")
+            raise RuntimeError(
+                f"`{' '.join(cmd)}` produced no output for {idle_cap}s. "
+                "Check network connectivity, raise "
+                "HEADROOM_LEARN_CLI_IDLE_TIMEOUT_SECS, or try a different "
+                "backend with --model <litellm-model-name>."
+            )
+
+        # Block up to 1s waiting for the next event, then re-check deadlines.
+        try:
+            tag, line = events.get(timeout=1.0)
+        except queue.Empty:
+            continue
+
+        if line is None:
+            eofs += 1
+            continue
+        last_activity = time.monotonic()
+        if tag == "stdout":
+            stdout_lines.append(line)
+            event = _parse_stream_event(line)
+            if event is not None and event.get("type") == "result":
+                # Last result event wins if multiple are emitted.
+                result_text = event.get("result")
+                if isinstance(result_text, str):
+                    final_result = result_text
+        else:
+            stderr_lines.append(line)
+
+    proc.wait()
+
+    if proc.returncode != 0:
+        stderr_blob = "".join(stderr_lines)[:_MAX_SNIPPET_LEN]
+        raise RuntimeError(f"`{' '.join(cmd)}` failed (exit {proc.returncode}):\n{stderr_blob}")
+
+    stderr_blob = "".join(stderr_lines)
+    if stderr_blob.strip():
+        logger.debug("CLI stderr (exit 0): %s", stderr_blob[:_MAX_SNIPPET_LEN])
+
+    if final_result is None:
+        stdout_snippet = "".join(stdout_lines)[:_MAX_SNIPPET_LEN]
+        raise RuntimeError(
+            f"`{' '.join(cmd)}` did not emit a final `result` event. "
+            f"First {_MAX_SNIPPET_LEN} chars of stdout:\n{stdout_snippet}"
+        )
+
+    try:
+        return _strip_fenced_json(final_result)
+    except json.JSONDecodeError as exc:
+        snippet = final_result[:_MAX_SNIPPET_LEN]
+        raise RuntimeError(
+            f"`{' '.join(cmd)}` returned unparseable output. "
+            f"First {_MAX_SNIPPET_LEN} chars:\n{snippet}"
+        ) from exc
+
+
+def _parse_stream_event(line: str) -> dict | None:
+    """Parse one line of claude-cli stream-json output, returning None on junk."""
+    line = line.strip()
+    if not line:
+        return None
+    try:
+        parsed = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 def _call_llm(digest: str, model: str) -> dict:

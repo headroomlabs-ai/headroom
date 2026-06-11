@@ -15,7 +15,7 @@
   <a href="https://app.codecov.io/gh/chopratejas/headroom"><img src="https://codecov.io/gh/chopratejas/headroom/graph/badge.svg" alt="codecov"></a>
   <a href="https://pypi.org/project/headroom-ai/"><img src="https://img.shields.io/pypi/v/headroom-ai.svg" alt="PyPI"></a>
   <a href="https://www.npmjs.com/package/headroom-ai"><img src="https://img.shields.io/npm/v/headroom-ai.svg" alt="npm"></a>
-  <a href="https://huggingface.co/chopratejas/kompress-base"><img src="https://img.shields.io/badge/model-Kompress--base-yellow.svg" alt="Model: Kompress-base"></a>
+  <a href="https://huggingface.co/chopratejas/kompress-v2-base"><img src="https://img.shields.io/badge/model-Kompress--v2--base-yellow.svg" alt="Model: Kompress-v2-base"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License: Apache 2.0"></a>
   <a href="https://headroom-docs.vercel.app/docs"><img src="https://img.shields.io/badge/docs-online-blue.svg" alt="Docs"></a>
 </p>
@@ -52,7 +52,7 @@ Headroom compresses everything your AI agent reads — tool outputs, logs, RAG c
 - **MCP server** — `headroom_compress`, `headroom_retrieve`, `headroom_stats` for any MCP client
 - **Cross-agent memory** — shared store across Claude, Codex, Gemini, auto-dedup
 - **`headroom learn`** — mines failed sessions, writes corrections to `CLAUDE.md` / `AGENTS.md`
-- **Reversible (CCR)** — originals never deleted; LLM retrieves on demand
+- **Reversible (CCR)** — originals are cached for retrieval on demand
 
 ## How it works (30 seconds)
 
@@ -81,7 +81,7 @@ Headroom compresses everything your AI agent reads — tool outputs, logs, RAG c
 - **CacheAligner** — stabilizes prefixes so provider KV caches actually hit
 - **CCR** — stores originals locally; LLM calls `headroom_retrieve` if it needs them
 
-→ [Architecture](https://headroom-docs.vercel.app/docs/architecture) · [CCR reversible compression](https://headroom-docs.vercel.app/docs/ccr) · [Kompress-base model card](https://huggingface.co/chopratejas/kompress-base)
+→ [Architecture](https://headroom-docs.vercel.app/docs/architecture) · [CCR reversible compression](https://headroom-docs.vercel.app/docs/ccr) · [Kompress-v2-base model card](https://huggingface.co/chopratejas/kompress-v2-base)
 
 ## Get started (60 seconds)
 
@@ -159,7 +159,7 @@ Platform support note: macOS auth reuse via Copilot CLI Keychain storage has bee
 **Great fit if you…**
 - run AI coding agents daily and want savings without changing your code
 - work across multiple agents and want shared memory
-- need reversible compression — originals always retrievable via CCR
+- need reversible compression — originals are retrievable via CCR within the configured TTL
 
 **Skip it if you…**
 - only use a single provider's native compaction and don't need cross-agent memory
@@ -238,6 +238,33 @@ pipx install --python python3.13 "headroom-ai[all]"
 
 → [Installation guide](https://headroom-docs.vercel.app/docs/installation) — Docker tags, persistent service, PowerShell, devcontainers.
 
+### Corporate / SSL-inspection environments
+
+If `pip install "headroom-ai[all]"` fails with `CERTIFICATE_VERIFY_FAILED`
+(`unable to get local issuer certificate`), your network uses **SSL inspection** — a MITM
+proxy presenting a company-issued CA. The build backend (`maturin`) downloads `rustup` over a
+connection your TLS stack doesn't trust. **Install Rust first** so the build doesn't fetch it:
+
+```bash
+# macOS / Linux
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh && rustup default stable
+# Windows
+winget install Rustlang.Rustup && rustup default stable
+```
+
+Restart your shell, then `pip install "headroom-ai[all]"`. A prebuilt wheel avoids the Rust
+build entirely where available: `pip install --only-binary headroom-ai headroom-ai`.
+
+Two runtime assets are fetched over TLS; if they are blocked, trust your corporate CA via
+`REQUESTS_CA_BUNDLE` / `SSL_CERT_FILE` / `CURL_CA_BUNDLE`:
+
+- **`cdn.pyke.io`** — the ONNX Runtime for the Rust core. Alternatively pre-provide it with
+  `ORT_STRATEGY=system` and `ORT_LIB_LOCATION=/path/to/onnxruntime`.
+- **`huggingface.co`** — the `kompress-base` compression model. Pre-download it and run with
+  `HF_HUB_OFFLINE=1`, or set `HF_ENDPOINT` to a trusted mirror.
+
+Running with compression disabled (pure gateway) requires neither asset.
+
 ## headroom learn
 
 <p align="center">
@@ -283,7 +310,7 @@ Devcontainers in `.devcontainer/` (default + `memory-stack` with Qdrant & Neo4j)
 ## Community
 
 - **[Discord](https://discord.gg/yRmaUNpsPJ)** — questions, feedback, war stories.
-- **[Kompress-base on HuggingFace](https://huggingface.co/chopratejas/kompress-base)** — the model behind our text compression.
+- **[Kompress-v2-base on HuggingFace](https://huggingface.co/chopratejas/kompress-v2-base)** — the model behind our text compression.
 
 ## License
 

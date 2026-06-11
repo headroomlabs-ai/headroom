@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
 import signal
+import subprocess
+import sys
 from pathlib import Path
 
 from headroom.install.models import DeploymentManifest, InstallPreset
@@ -11,6 +14,7 @@ from headroom.install.runtime import (
     _read_pid,
     _runtime_env,
     _write_pid,
+    acquire_runtime_start_lock,
     build_runtime_command,
     resolve_headroom_command,
     run_foreground,
@@ -204,6 +208,40 @@ def test_write_read_and_clear_pid(monkeypatch, tmp_path: Path) -> None:
     assert _read_pid("default") == 456
     _clear_pid("default")
     assert _read_pid("default") is None
+
+
+def test_runtime_start_lock_is_nonblocking(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    with acquire_runtime_start_lock("default") as first_acquired:
+        assert first_acquired is True
+        with acquire_runtime_start_lock("default") as second_acquired:
+            assert second_acquired is False
+
+    with acquire_runtime_start_lock("default") as acquired_after_release:
+        assert acquired_after_release is True
+
+
+def test_runtime_start_lock_blocks_another_process(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    script = (
+        "from headroom.install.runtime import acquire_runtime_start_lock\n"
+        "with acquire_runtime_start_lock('default') as acquired:\n"
+        "    print(acquired)\n"
+    )
+    env = {**os.environ, "HOME": str(tmp_path), "PYTHONPATH": str(Path.cwd())}
+
+    with acquire_runtime_start_lock("default") as acquired:
+        assert acquired is True
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            check=True,
+            env=env,
+            text=True,
+        )
+
+    assert result.stdout.strip() == "False"
 
 
 def test_run_foreground_and_detached_helpers(monkeypatch, tmp_path: Path) -> None:

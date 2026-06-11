@@ -947,6 +947,24 @@ class ContentRouter(Transform):
             else:
                 result = self._compress_pure(content, strategy, context, question, bias=bias)
 
+        # Empty-output guard: compression must NEVER blank out non-empty input.
+        # An empty user-message content makes Anthropic reject the whole request
+        # with 400 ("messages.N: user messages must have non-empty content").
+        # If any transform yields empty/whitespace from non-empty input, fall
+        # back to the original content (passthrough) instead of emitting empty.
+        if (
+            content
+            and content.strip()
+            and (result.compressed is None or not str(result.compressed).strip())
+        ):
+            logger.warning(
+                "content_router: compression produced EMPTY output from non-empty "
+                "input (%d chars, strategy=%s); falling back to original to avoid 400.",
+                len(content),
+                getattr(result.strategy_used, "value", result.strategy_used),
+            )
+            result.compressed = content
+
         # One observer call per routing decision; the observer is the
         # forcing function for catching strategy-level regressions.
         # Empty routing_log (passthrough fast path) → no calls.
@@ -1463,7 +1481,7 @@ class ContentRouter(Transform):
         compressed: str | None = None
         compressed_tokens: int | None = None
 
-        # Primary: Kompress — downloads from chopratejas/kompress-base on first use
+        # Primary: Kompress — downloads from chopratejas/kompress-v2-base on first use
         if self.config.enable_kompress:
             compressor = self._get_kompress()
             if compressor:
@@ -1677,7 +1695,7 @@ class ContentRouter(Transform):
         """Get KompressCompressor (lazy load). Downloads from HuggingFace on first use.
 
         Respects runtime kompress_model kwarg:
-        - None: use default (chopratejas/kompress-base) — cached on self
+        - None: use default (chopratejas/kompress-v2-base) — cached on self
         - "disabled": return None (skip ML compression entirely)
         - any model ID string: create compressor with that model
           (model weights are cached at module level in kompress_compressor.py,

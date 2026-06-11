@@ -69,11 +69,10 @@ def test_macos_native_wrapper_dependency_install_retries_pypi_downloads() -> Non
     assert "python -m pip install --retries 10 --timeout 60 pytest" in content
 
 
-def test_ci_commitlint_skips_default_github_merge_commits() -> None:
+def test_ci_commitlint_runs_only_for_pull_requests() -> None:
     content = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
 
-    assert "github.event_name != 'push'" in content
-    assert "!startsWith(github.event.head_commit.message, 'Merge pull request ')" in content
+    assert "github.event_name == 'pull_request'" in content
 
 
 def test_no_openssl_sys_in_wheel_build_tree() -> None:

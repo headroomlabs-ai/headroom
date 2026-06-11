@@ -646,6 +646,7 @@ class StreamingMixin:
         *,
         body: dict,
         provider: str,
+        outcome_provider: str | None = None,
         model: str,
         request_id: str,
         original_tokens: int,
@@ -665,6 +666,7 @@ class StreamingMixin:
     ) -> None:
         from headroom.proxy.outcome import RequestOutcome
 
+        outcome_provider = outcome_provider or provider
         total_latency = (time.time() - start_time) * 1000
 
         # Per-chunk SSE parsing only flushes events terminated by ``\n\n``.
@@ -710,7 +712,7 @@ class StreamingMixin:
         effective_optimized_tokens = optimized_tokens
         effective_original_tokens = original_tokens
         if (
-            provider == "openai"
+            provider in {"openai", "gemini"}
             and isinstance(provider_input_tokens, int)
             and provider_input_tokens > 0
         ):
@@ -763,7 +765,7 @@ class StreamingMixin:
         # happening (issue #455).
         outcome = RequestOutcome.from_stream(
             body=body,
-            provider=provider,
+            provider=outcome_provider,
             model=model,
             request_id=request_id,
             original_tokens=effective_original_tokens,
@@ -809,6 +811,7 @@ class StreamingMixin:
         body_mutated: bool = True,
         mutation_reasons: list[str] | None = None,
         memory_request_ctx: Any | None = None,
+        outcome_provider: str | None = None,
     ) -> Response | StreamingResponse:
         """Stream response with metrics tracking and memory tool handling.
 
@@ -967,6 +970,22 @@ class StreamingMixin:
 
             return StreamingResponse(_error_gen(), media_type="text/event-stream")
 
+        # Capture Codex rate-limit window data from the upstream response
+        # headers, for *every* status. Codex (gpt-5.x) almost always streams, so
+        # without this the session/weekly windows surfaced in ``/stats`` and the
+        # dashboard would only refresh on the rare non-streaming reply. We do this
+        # *before* the error early-return below so a streaming 429/5xx — the moment
+        # usage is most relevant — still refreshes the windows, matching the
+        # non-streaming HTTP handlers which capture on all statuses.
+        # ``update_from_headers`` is a no-op when the response carries no
+        # ``x-codex-*`` headers (e.g. the Anthropic streaming path), so this is
+        # safe to call unconditionally.
+        from headroom.subscription.codex_rate_limits import (
+            get_codex_rate_limit_state,
+        )
+
+        get_codex_rate_limit_state().update_from_headers(dict(upstream_response.headers))
+
         if upstream_response.status_code >= 400:
             logger.warning(
                 "[%s] Forwarding upstream streaming error status=%s url=%s",
@@ -1029,6 +1048,7 @@ class StreamingMixin:
             await self._finalize_stream_response(
                 body=body,
                 provider=provider,
+                outcome_provider=outcome_provider,
                 model=model,
                 request_id=request_id,
                 original_tokens=original_tokens,
@@ -1050,9 +1070,15 @@ class StreamingMixin:
                 headers=response_headers,
             )
 
-        # Forward upstream ratelimit headers to the client
+        # Forward upstream rate-limit headers to the client. We pass both the
+        # generic ``*ratelimit*`` headers (Anthropic) and Codex's ``x-codex-*``
+        # window/credit headers — the latter do not contain the ``ratelimit``
+        # substring, so without the second clause the Codex CLI's own
+        # session/weekly display would stop updating on the streaming path.
         forwarded_headers = {
-            k: v for k, v in upstream_response.headers.items() if "ratelimit" in k.lower()
+            k: v
+            for k, v in upstream_response.headers.items()
+            if "ratelimit" in k.lower() or k.lower().startswith("x-codex")
         }
 
         async def generate():
@@ -1284,6 +1310,7 @@ class StreamingMixin:
                 await self._finalize_stream_response(
                     body=body,
                     provider=provider,
+                    outcome_provider=outcome_provider,
                     model=model,
                     request_id=request_id,
                     original_tokens=original_tokens,

@@ -449,7 +449,7 @@ class HeadroomMCPServer:
             "error": "Content not found. It may have expired or the hash may be incorrect.",
             "hash": hash_key,
             "hint": "Content compressed via headroom_compress is stored for the session. "
-            "Content compressed by the proxy has a shorter TTL (5 minutes).",
+            "Content compressed by the proxy uses the configured CCR TTL.",
         }
 
     async def _retrieve_via_proxy(

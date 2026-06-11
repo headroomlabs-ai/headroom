@@ -3,7 +3,7 @@ repos:
     hooks:
       - id: sync-plugin-versions
         name: Sync plugin versions
-        entry: python scripts/sync-plugin-versions.py
+        entry: python3 scripts/sync-plugin-versions.py
         language: system
         pass_filenames: false
         always_run: true

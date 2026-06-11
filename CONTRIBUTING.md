@@ -73,7 +73,7 @@ A human maintainer reviews every dep change. PRs that add or bump a package must
 ## PR workflow
 
 1. Fork, branch from `main`.
-2. `pip install -e ".[dev]"`
+2. `pip install -e ".[dev]"` then `make install-git-hooks` — installs repo pre-commit checks on every commit and ci-precheck on every push.
 3. One logical change per PR.
 4. Add tests.
 5. `pytest` · `ruff check .` · `ruff format .`

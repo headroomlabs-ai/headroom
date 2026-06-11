@@ -1,0 +1,91 @@
+name: PR Health
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review]
+  schedule:
+    # Keep labels fresh even when base branches move or checks finish later.
+    - cron: '23 14 * * 1-5'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+  checks: read
+  statuses: read
+
+concurrency:
+  group: pr-health-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Ensure maintenance labels exist
+        run: |
+          set -euo pipefail
+
+          gh label create "status: needs rebase" \
+            --repo "$REPO" \
+            --color "fbca04" \
+            --description "Pull request branch is behind the base branch" \
+            --force
+          gh label create "status: has conflicts" \
+            --repo "$REPO" \
+            --color "d73a4a" \
+            --description "Pull request has merge conflicts with the base branch" \
+            --force
+          gh label create "status: ci failing" \
+            --repo "$REPO" \
+            --color "d73a4a" \
+            --description "Required or reported CI checks are failing" \
+            --force
+
+      - name: Label open pull requests
+        run: |
+          set -euo pipefail
+
+          if jq -e '.pull_request.number' "$GITHUB_EVENT_PATH" >/dev/null; then
+            pr_numbers="$(jq -r '.pull_request.number' "$GITHUB_EVENT_PATH")"
+          else
+            pr_numbers="$(gh pr list --repo "$REPO" --state open --limit 100 --json number --jq '.[].number')"
+          fi
+
+          for pr in $pr_numbers; do
+            data="$(gh pr view "$pr" --repo "$REPO" \
+              --json mergeStateStatus,statusCheckRollup)"
+
+            merge_state="$(jq -r '.mergeStateStatus // "UNKNOWN"' <<<"$data")"
+            check_state="$(jq -r '
+              [
+                .statusCheckRollup[]
+                | select((.conclusion // .state // "") as $s
+                  | ["FAILURE", "TIMED_OUT", "ACTION_REQUIRED", "CANCELLED", "ERROR"] | index($s))
+              ]
+              | if length > 0 then "failing" else "passing" end
+            ' <<<"$data")"
+
+            if [[ "$merge_state" == "BEHIND" ]]; then
+              gh pr edit "$pr" --repo "$REPO" --add-label "status: needs rebase"
+            else
+              gh pr edit "$pr" --repo "$REPO" --remove-label "status: needs rebase" || true
+            fi
+
+            if [[ "$merge_state" == "DIRTY" ]]; then
+              gh pr edit "$pr" --repo "$REPO" --add-label "status: has conflicts"
+            else
+              gh pr edit "$pr" --repo "$REPO" --remove-label "status: has conflicts" || true
+            fi
+
+            if [[ "$check_state" == "failing" ]]; then
+              gh pr edit "$pr" --repo "$REPO" --add-label "status: ci failing"
+            else
+              gh pr edit "$pr" --repo "$REPO" --remove-label "status: ci failing" || true
+            fi
+          done

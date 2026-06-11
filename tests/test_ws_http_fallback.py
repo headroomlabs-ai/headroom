@@ -31,9 +31,15 @@ class FakeWebSocket:
 class FakeStreamResponse:
     """Mock httpx streaming response."""
 
-    def __init__(self, status_code: int = 200, sse_events: list[str] | None = None):
+    def __init__(
+        self,
+        status_code: int = 200,
+        sse_events: list[str] | None = None,
+        headers: dict[str, str] | None = None,
+    ):
         self.status_code = status_code
         self._events = sse_events or []
+        self.headers = headers or {}
 
     async def aiter_text(self):
         for event in self._events:
@@ -279,3 +285,37 @@ class TestWsHttpFallback:
         asyncio.run(handler._ws_http_fallback(ws, body, json.dumps(body), headers, "req_6"))
 
         assert "api.openai.com" in captured_url["url"]
+
+    def test_fallback_refreshes_codex_rate_limit_state(self, monkeypatch):
+        """A successful fallback refreshes Codex /stats from response headers.
+
+        The fallback can't forward headers onto the (already-accepted) client
+        101, but it should still keep Python /stats in sync so the gauge does
+        not go stale when the WS upgrade fails and we drop to HTTP.
+        """
+        handler = _make_handler()
+        ws = FakeWebSocket()
+        captured: dict[str, dict[str, str]] = {}
+
+        class _FakeState:
+            def update_from_headers(self, hdrs):
+                captured["headers"] = dict(hdrs)
+
+        import headroom.subscription.codex_rate_limits as crl
+
+        monkeypatch.setattr(crl, "get_codex_rate_limit_state", lambda: _FakeState())
+
+        response = FakeStreamResponse(
+            200,
+            ['data: {"type":"response.completed"}\n\n', "data: [DONE]\n\n"],
+            headers={
+                "x-codex-primary-used-percent": "42",
+                "content-type": "text/event-stream",
+            },
+        )
+        handler.http_client = FakeHttpClient(response)
+
+        body = {"model": "gpt-5.4", "input": "hi"}
+        asyncio.run(handler._ws_http_fallback(ws, body, json.dumps(body), {}, "req_capture"))
+
+        assert captured["headers"]["x-codex-primary-used-percent"] == "42"

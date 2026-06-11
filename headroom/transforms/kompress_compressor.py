@@ -1,6 +1,6 @@
 """Kompress: ModernBERT token compressor for structured tool outputs.
 
-Auto-downloads the model from HuggingFace (chopratejas/kompress-base)
+Auto-downloads the model from HuggingFace (chopratejas/kompress-v2-base)
 on first use.
 
 Requires the [ml] extra: pip install headroom-ai[ml]
@@ -36,8 +36,28 @@ from .base import Transform
 logger = logging.getLogger(__name__)
 
 # Default HuggingFace model ID
-HF_MODEL_ID = "chopratejas/kompress-base"
+HF_MODEL_ID = "chopratejas/kompress-v2-base"
 KOMPRESS_BACKEND_ENV = "HEADROOM_KOMPRESS_BACKEND"
+KOMPRESS_ONNX_FILENAME_ENV = "HEADROOM_KOMPRESS_ONNX_FILENAME"
+
+# ONNX artifacts are resolved against the model repo in this order, falling
+# through on download miss OR session-load failure:
+#
+# - kompress-int8-wo.onnx: weight-only int8 (MatMulNBits), 261MB. Evaluated on
+#   the labeled dataset_v2 test split (n=500): f1=0.9130 vs fp32's 0.9128,
+#   must_keep_recall 0.9765 vs 0.9770, keep_rate 0.8097 vs 0.8100, 99.6%
+#   keep-decision agreement — fp32-equivalent at 2.2x less memory. Uses the
+#   com.microsoft MatMulNBits contrib op; older onnxruntime builds without the
+#   8-bit kernel fail at session load and fall through to fp32.
+# - kompress-fp32.onnx: lossless reference, 601MB.
+# - kompress-int8.onnx: v1-era dynamic int8 (kept for custom domain repos).
+#
+# An operator can pin an exact file via HEADROOM_KOMPRESS_ONNX_FILENAME.
+_DEFAULT_ONNX_FILENAMES = (
+    "onnx/kompress-int8-wo.onnx",
+    "onnx/kompress-fp32.onnx",
+    "onnx/kompress-int8.onnx",
+)
 KOMPRESS_ONNX_INTRA_THREADS_ENV = "HEADROOM_KOMPRESS_ONNX_INTRA_THREADS"
 KOMPRESS_ONNX_INTER_THREADS_ENV = "HEADROOM_KOMPRESS_ONNX_INTER_THREADS"
 KOMPRESS_COREML_CACHE_DIR_ENV = "HEADROOM_KOMPRESS_COREML_CACHE_DIR"
@@ -70,7 +90,16 @@ def _selected_backend() -> KompressBackend:
         "pytorch_mps": "pytorch_mps",
         "auto": "auto",
     }
-    return aliases.get(raw, "auto")  # type: ignore[return-value]
+    backend = aliases.get(raw)
+    if backend is None:
+        logger.warning(
+            "%s has unrecognized value %r; falling back to 'auto'. Valid values: %s",
+            KOMPRESS_BACKEND_ENV,
+            os.environ.get(KOMPRESS_BACKEND_ENV, ""),
+            ", ".join(sorted(set(aliases.values()))),
+        )
+        return "auto"
+    return backend  # type: ignore[return-value]
 
 
 def _env_int(name: str) -> int | None:
@@ -320,12 +349,56 @@ class _OnnxModel:
         return (np.array(scores) > 0.5).tolist()
 
 
+def _onnx_filename_candidates() -> tuple[str, ...]:
+    """ONNX repo paths to try, honoring an optional exact-file override."""
+    override = os.environ.get(KOMPRESS_ONNX_FILENAME_ENV, "").strip()
+    if override:
+        # Put the override first but keep the defaults as a safety net.
+        return (override, *(f for f in _DEFAULT_ONNX_FILENAMES if f != override))
+    return _DEFAULT_ONNX_FILENAMES
+
+
+def _create_onnx_session(model_id: str, ort: Any, providers: list[Any]) -> Any:
+    """Resolve and load the model's ONNX artifact, trying candidates in order.
+
+    A candidate is skipped on download miss (file not in the repo) or on
+    session-load failure (e.g. the weight-only int8 artifact uses the
+    MatMulNBits contrib op, which old onnxruntime builds can't run — those
+    installs fall through to the fp32 artifact instead of losing Kompress).
+    """
+    last_err: Exception | None = None
+    for filename in _onnx_filename_candidates():
+        try:
+            onnx_path = hf_hub_download_local_first(model_id, filename)
+        except Exception as exc:
+            last_err = exc
+            logger.debug("ONNX artifact %r not in %s: %s", filename, model_id, exc)
+            continue
+        try:
+            return ort.InferenceSession(
+                onnx_path,
+                _onnx_session_options(ort),
+                providers=providers,
+            )
+        except Exception as exc:
+            last_err = exc
+            logger.warning(
+                "ONNX artifact %r from %s failed to load (%s); trying next candidate",
+                filename,
+                model_id,
+                exc,
+            )
+    raise FileNotFoundError(
+        f"No loadable ONNX artifact in {model_id}; tried {_onnx_filename_candidates()}"
+    ) from last_err
+
+
 def _load_kompress_onnx(
     model_id: str,
     *,
     use_coreml: bool = False,
 ) -> tuple[Any, Any, str]:
-    """Download ONNX INT8 model from HuggingFace and load with onnxruntime."""
+    """Download the ONNX model from HuggingFace and load with onnxruntime."""
     import onnxruntime as ort
     from transformers import AutoTokenizer
 
@@ -334,8 +407,6 @@ def _load_kompress_onnx(
             return _kompress_cache[model_id]
 
         logger.info("Downloading Kompress ONNX model from %s ...", model_id)
-
-        onnx_path = hf_hub_download_local_first(model_id, "onnx/kompress-int8.onnx")
 
         backend = "onnx_coreml" if use_coreml else "onnx"
         providers: list[Any]
@@ -364,16 +435,12 @@ def _load_kompress_onnx(
         else:
             providers = ["CPUExecutionProvider"]
 
-        session = ort.InferenceSession(
-            onnx_path,
-            _onnx_session_options(ort),
-            providers=providers,
-        )
+        session = _create_onnx_session(model_id, ort, providers)
         model = _OnnxModel(session)
         tokenizer = AutoTokenizer.from_pretrained("answerdotai/ModernBERT-base")
 
         _kompress_cache[model_id] = (model, tokenizer, backend)
-        logger.info("Kompress ONNX INT8 loaded: %s backend=%s", model_id, backend)
+        logger.info("Kompress ONNX loaded: %s backend=%s", model_id, backend)
         return model, tokenizer, backend
 
 
@@ -533,7 +600,7 @@ class KompressConfig:
 
     The model_id, chunk_words, and score_threshold are coupled: a model
     trained on 50-word chunks needs chunk_words=50 at inference. The
-    defaults match kompress-base. For domain-specific models, set all three.
+    defaults match kompress-v2-base. For domain-specific models, set all three.
 
     Example — financial documents::
 

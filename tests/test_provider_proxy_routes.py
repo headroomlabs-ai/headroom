@@ -21,12 +21,16 @@ def _app() -> Any:
             openai_api_url="https://api.openai.test",
             gemini_api_url="https://api.gemini.test",
             cloudcode_api_url="https://cloudcode.test",
+            vertex_api_url="https://vertex.test",
         )
     )
 
 
 def test_provider_passthrough_routes_forward_expected_targets(monkeypatch) -> None:
     calls: list[tuple[str, str, str, str]] = []
+    gemini_calls: list[tuple[str, str, str, str]] = []
+    gemini_count_calls: list[tuple[str, str, str, str]] = []
+    anthropic_calls: list[tuple[str, str, str, str, bool]] = []
 
     async def fake_passthrough(self, request, base_url, sub_path="", provider_name=""):  # type: ignore[no-untyped-def]
         calls.append((request.method, request.url.path, base_url, provider_name))
@@ -40,7 +44,68 @@ def test_provider_passthrough_routes_forward_expected_targets(monkeypatch) -> No
             }
         )
 
+    async def fake_gemini_generate(
+        self,
+        request,
+        model,
+        upstream_base_url=None,
+        provider_name="gemini",
+    ):  # type: ignore[no-untyped-def]
+        gemini_calls.append((request.url.path, model, upstream_base_url, provider_name))
+        return JSONResponse(
+            {
+                "handler": "handle_gemini_generate_content",
+                "path": request.url.path,
+                "model": model,
+                "upstream_base_url": upstream_base_url,
+                "provider": provider_name,
+            }
+        )
+
+    async def fake_anthropic_messages(
+        self,
+        request,
+        upstream_base_url=None,
+        provider_name="anthropic",
+        model_override=None,
+        force_stream=False,
+    ):  # type: ignore[no-untyped-def]
+        anthropic_calls.append(
+            (request.url.path, upstream_base_url, provider_name, model_override, force_stream)
+        )
+        return JSONResponse(
+            {
+                "handler": "handle_anthropic_messages",
+                "path": request.url.path,
+                "upstream_base_url": upstream_base_url,
+                "provider": provider_name,
+                "model": model_override,
+                "force_stream": force_stream,
+            }
+        )
+
+    async def fake_gemini_count(
+        self,
+        request,
+        model,
+        upstream_base_url=None,
+        provider_name="gemini",
+    ):  # type: ignore[no-untyped-def]
+        gemini_count_calls.append((request.url.path, model, upstream_base_url, provider_name))
+        return JSONResponse(
+            {
+                "handler": "handle_gemini_count_tokens",
+                "path": request.url.path,
+                "model": model,
+                "upstream_base_url": upstream_base_url,
+                "provider": provider_name,
+            }
+        )
+
     monkeypatch.setattr(HeadroomProxy, "handle_passthrough", fake_passthrough)
+    monkeypatch.setattr(HeadroomProxy, "handle_gemini_generate_content", fake_gemini_generate)
+    monkeypatch.setattr(HeadroomProxy, "handle_gemini_count_tokens", fake_gemini_count)
+    monkeypatch.setattr(HeadroomProxy, "handle_anthropic_messages", fake_anthropic_messages)
 
     with TestClient(_app()) as client:
         assert client.post("/v1/messages/count_tokens").json()["base_url"] == (
@@ -68,6 +133,34 @@ def test_provider_passthrough_routes_forward_expected_targets(monkeypatch) -> No
         assert client.get("/v1beta/models").json()["provider"] == "gemini"
         assert client.get("/v1beta/models/demo").json()["sub_path"] == "models"
         assert client.post("/v1beta/models/demo:embedContent").json()["sub_path"] == "embedContent"
+        assert client.post(
+            "/v1/projects/p/locations/us-central1/publishers/google/models/gemini-2.0-flash:generateContent"
+        ).json() == {
+            "handler": "handle_gemini_generate_content",
+            "path": "/v1/projects/p/locations/us-central1/publishers/google/models/gemini-2.0-flash:generateContent",
+            "model": "gemini-2.0-flash",
+            "upstream_base_url": "https://vertex.test",
+            "provider": "vertex:google",
+        }
+        assert client.post(
+            "/v1/projects/p/locations/us-central1/publishers/google/models/gemini-2.0-flash:countTokens"
+        ).json() == {
+            "handler": "handle_gemini_count_tokens",
+            "path": "/v1/projects/p/locations/us-central1/publishers/google/models/gemini-2.0-flash:countTokens",
+            "model": "gemini-2.0-flash",
+            "upstream_base_url": "https://vertex.test",
+            "provider": "vertex:google",
+        }
+        assert client.post(
+            "/v1beta1/projects/p/locations/us-central1/publishers/anthropic/models/claude-3-5-sonnet@20240620:rawPredict"
+        ).json() == {
+            "handler": "handle_anthropic_messages",
+            "path": "/v1beta1/projects/p/locations/us-central1/publishers/anthropic/models/claude-3-5-sonnet@20240620:rawPredict",
+            "upstream_base_url": "https://vertex.test",
+            "provider": "vertex:anthropic",
+            "model": "claude-3-5-sonnet@20240620",
+            "force_stream": False,
+        }
         assert client.post("/v1beta/cachedContents").json()["sub_path"] == "cachedContents"
         assert client.get("/v1beta/cachedContents").json()["sub_path"] == "cachedContents"
         assert client.get("/v1beta/cachedContents/cache-1").json()["sub_path"] == "cachedContents"
@@ -86,6 +179,9 @@ def test_provider_passthrough_routes_forward_expected_targets(monkeypatch) -> No
         ] == ("https://api.gemini.test")
 
     assert len(calls) >= 16
+    assert len(gemini_calls) >= 1
+    assert len(gemini_count_calls) >= 1
+    assert len(anthropic_calls) >= 1
 
 
 def test_proxy_route_helpers_prefer_legacy_targets_and_gemini_passthrough() -> None:
@@ -97,6 +193,7 @@ def test_proxy_route_helpers_prefer_legacy_targets_and_gemini_passthrough() -> N
             "ANTHROPIC_API_URL": "https://legacy.anthropic.test",
             "OPENAI_API_URL": "https://legacy.openai.test",
             "GEMINI_API_URL": "https://legacy.gemini.test",
+            "VERTEX_API_URL": "https://legacy.vertex.test",
             "provider_runtime": type(
                 "Runtime",
                 (),
@@ -109,6 +206,7 @@ def test_proxy_route_helpers_prefer_legacy_targets_and_gemini_passthrough() -> N
     )()
 
     assert proxy_routes._api_target(proxy, "anthropic") == "https://legacy.anthropic.test"
+    assert proxy_routes._api_target(proxy, "vertex") == "https://legacy.vertex.test"
     assert proxy_routes._select_passthrough_base_url(proxy, {"x-goog-api-key": "test"}) == (
         "https://legacy.gemini.test"
     )
@@ -152,6 +250,7 @@ def test_provider_specific_routes_delegate_to_expected_proxy_handlers(monkeypatc
         "handle_google_batch_create",
         "handle_google_batch_results",
         "handle_google_batch_passthrough",
+        "handle_passthrough",
     ):
         install(handler_name)
 
@@ -190,6 +289,36 @@ def test_provider_specific_routes_delegate_to_expected_proxy_handlers(monkeypatc
         assert client.post("/v1beta/models/demo:countTokens").json()["handler"] == (
             "handle_gemini_count_tokens"
         )
+        assert client.post(
+            "/v1/projects/p/locations/us-central1/publishers/google/models/gemini-2.0-flash:streamGenerateContent"
+        ).json() == {
+            "handler": "handle_gemini_generate_content",
+            "path": "/v1/projects/p/locations/us-central1/publishers/google/models/gemini-2.0-flash:streamGenerateContent",
+            "args": [
+                "gemini-2.0-flash",
+                "https://vertex.test",
+                "vertex:google",
+            ],
+        }
+        assert client.post(
+            "/v1/projects/p/locations/us-central1/publishers/google/models/gemini-2.0-flash:countTokens"
+        ).json() == {
+            "handler": "handle_gemini_count_tokens",
+            "path": "/v1/projects/p/locations/us-central1/publishers/google/models/gemini-2.0-flash:countTokens",
+            "args": [
+                "gemini-2.0-flash",
+                "https://vertex.test",
+                "vertex:google",
+            ],
+        }
+        assert client.post(
+            "/v1beta1/projects/p/locations/us-central1/publishers/anthropic/models/claude-3-5-sonnet@20240620:streamRawPredict"
+        ).json()["args"] == [
+            "https://vertex.test",
+            "vertex:anthropic",
+            "claude-3-5-sonnet@20240620",
+            True,
+        ]
         assert client.post("/v1internal:streamGenerateContent").json()["handler"] == (
             "handle_google_cloudcode_stream"
         )

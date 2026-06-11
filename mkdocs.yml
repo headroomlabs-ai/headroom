@@ -100,6 +100,7 @@ nav:
     - Failure Learning: learn.md
   - Integrations:
     - Overview: integration-guide.md
+    - Vertex AI: vertex.md
     - LangChain: langchain.md
     - Agno: agno.md
     - Strands: strands.md
@@ -117,6 +118,7 @@ nav:
     - CLI: cli.md
     - API: api.md
     - SDK: sdk.md
+    - Differential Network Capture: network-diff-capture.md
     - Metrics & Observability: metrics.md
     - Error Codes: errors.md
     - Troubleshooting: troubleshooting.md

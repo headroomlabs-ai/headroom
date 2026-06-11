@@ -129,6 +129,7 @@ class RequestOutcome:
     request_messages: list[dict[str, Any]] | None = None
     tags: dict[str, str] = field(default_factory=dict)
     client: str | None = None
+    project: str | None = None
 
     # ── Derived (computed once, no caching needed — properties are cheap) ─
 
@@ -222,6 +223,29 @@ class RequestOutcome:
         """
         from headroom.proxy.helpers import compute_turn_id
 
+        request_items = body.get("messages")
+        turn_messages = request_items
+        if request_items is None:
+            request_items = body.get("contents", [])
+            if isinstance(request_items, list):
+                turn_messages = []
+                for item in request_items:
+                    if not isinstance(item, dict):
+                        continue
+                    parts = item.get("parts")
+                    text = ""
+                    if isinstance(parts, list):
+                        text = "\n".join(
+                            str(part.get("text"))
+                            for part in parts
+                            if isinstance(part, dict) and part.get("text")
+                        )
+                    role = "assistant" if item.get("role") == "model" else "user"
+                    turn_messages.append({"role": role, "content": text})
+        system = body.get("system")
+        if system is None:
+            system = body.get("systemInstruction")
+
         return cls(
             request_id=request_id,
             provider=provider,
@@ -243,11 +267,11 @@ class RequestOutcome:
             pipeline_timing=pipeline_timing,
             transforms_applied=tuple(transforms_applied),
             waste_signals=waste_signals,
-            num_messages=len(body.get("messages", [])),
-            turn_id=compute_turn_id(model, body.get("system"), body.get("messages")),
+            num_messages=len(request_items) if isinstance(request_items, list) else 0,
+            turn_id=compute_turn_id(model, system, turn_messages),
             tags=tags or {},
             client=client,
-            request_messages=body.get("messages") if log_full_messages else None,
+            request_messages=request_items if log_full_messages else None,
         )
 
 
@@ -280,6 +304,11 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     """
     from headroom.proxy.cost import _summarize_transforms
     from headroom.proxy.models import RequestLog
+    from headroom.proxy.project_context import get_current_project
+
+    # Project attribution: explicit outcome field wins, else the value the
+    # HTTP middleware / WS accept captured from ``X-Headroom-Project``.
+    project = outcome.project or get_current_project()
 
     # 1. Prometheus / SavingsTracker.
     await handler.metrics.record_request(
@@ -300,6 +329,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         cache_write_1h_tokens=outcome.cache_write_1h_tokens,
         uncached_input_tokens=outcome.uncached_input_tokens,
         attempted_input_tokens=outcome.attempted_input_tokens,
+        project=project,
     )
 
     # 2. Cost tracker (optional).
@@ -326,6 +356,8 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         log_tags = dict(outcome.tags)
         if outcome.client:
             log_tags["client"] = outcome.client
+        if project:
+            log_tags["project"] = project
         request_logger.log(
             RequestLog(
                 request_id=outcome.request_id,

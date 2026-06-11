@@ -96,6 +96,7 @@ class ProxyConfig:
     openai_api_url: str | None = None  # Custom OpenAI API URL override
     gemini_api_url: str | None = None  # Custom Gemini API URL override
     cloudcode_api_url: str | None = None  # Custom Cloud Code Assist API URL override
+    vertex_api_url: str | None = None  # Custom Vertex AI regional API URL override
 
     # Backend: "anthropic" (direct API), "litellm-*" (via LiteLLM), or "anyllm" (via any-llm)
     backend: str = "anthropic"
@@ -117,6 +118,10 @@ class ProxyConfig:
     # CCR Tool Injection
     ccr_inject_tool: bool = True
     ccr_inject_system_instructions: bool = False
+    # Proxy-level mirror of ContentRouterConfig.ccr_inject_marker, so retrieval
+    # markers can be toggled from the CLI (--no-ccr-marker). Threaded into the
+    # router in server.py; default preserves current behavior.
+    ccr_inject_marker: bool = True
 
     # CCR Response Handling
     ccr_handle_responses: bool = True
@@ -129,6 +134,11 @@ class ProxyConfig:
 
     # Code-aware compression (disabled by default — use code graph tools instead)
     code_aware_enabled: bool = False
+
+    # Disable Kompress ML compression while keeping structural compressors
+    # such as SmartCrusher, log/search/diff, and schema compaction enabled.
+    # CLI: --disable-kompress; env: HEADROOM_DISABLE_KOMPRESS=1.
+    disable_kompress: bool = False
 
     # Code graph live watcher (triggers incremental reindex on file changes)
     code_graph_watcher: bool = False
@@ -323,4 +333,5 @@ class ProxyConfig:
             openai=self.openai_api_url,
             gemini=self.gemini_api_url,
             cloudcode=self.cloudcode_api_url,
+            vertex=self.vertex_api_url,
         )

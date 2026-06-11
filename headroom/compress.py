@@ -128,7 +128,7 @@ class CompressConfig:
 
     # Model variant
     kompress_model: str | None = None
-    """Kompress model ID. None = default (chopratejas/kompress-base).
+    """Kompress model ID. None = default (chopratejas/kompress-v2-base).
     Set to a HuggingFace model ID for domain-specific compression.
     Set to 'disabled' to skip ML compression entirely
     (only SmartCrusher + CacheAligner will run)."""

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from typing import TYPE_CHECKING, Any
 
@@ -34,6 +35,38 @@ RAG_PATTERN = re.compile("|".join(RAG_MARKERS), re.IGNORECASE)
 def compute_hash(text: str) -> str:
     """Compute hash of text, truncated to 16 chars."""
     return hashlib.md5(text.encode()).hexdigest()[:16]  # nosec B324
+
+
+def _extract_tool_result_text(payload: dict[str, Any]) -> str:
+    """Extract text from a tool result payload.
+
+    Handles the Anthropic ``tool_result`` block (``payload["content"]``
+    is a plain string or a list of ``{"type": "text", ...}`` blocks) and
+    the Strands/Bedrock ``toolResult`` payload (content items keyed as
+    ``{"text": ...}`` or ``{"json": ...}`` without a ``type`` field).
+    Non-text inner blocks (e.g. images) are skipped.
+    """
+    inner = payload.get("content")
+    if inner is None:
+        return ""
+    if isinstance(inner, str):
+        return inner
+    if isinstance(inner, list):
+        pieces = []
+        for item in inner:
+            if isinstance(item, dict):
+                if item.get("type") == "text":
+                    pieces.append(item.get("text", ""))
+                elif "type" not in item and isinstance(item.get("text"), str):
+                    pieces.append(item["text"])
+                elif "type" not in item and "json" in item:
+                    pieces.append(json.dumps(item["json"], default=str))
+            elif isinstance(item, str):
+                pieces.append(item)
+        return "\n".join(pieces)
+    if isinstance(inner, dict):
+        return json.dumps(inner, default=str)
+    return str(inner)
 
 
 def detect_waste_signals(text: str, tokenizer: Tokenizer) -> WasteSignals:
@@ -112,6 +145,7 @@ def parse_message_to_blocks(
     # Handle content
     content = message.get("content")
     if content:
+        tool_result_parts: list[dict[str, Any]] = []
         if isinstance(content, str):
             text = content
         elif isinstance(content, list):
@@ -120,6 +154,13 @@ def parse_message_to_blocks(
             for part in content:
                 if isinstance(part, dict) and part.get("type") == "text":
                     text_parts.append(part.get("text", ""))
+                elif isinstance(part, dict) and part.get("type") == "tool_result":
+                    # Anthropic Messages format nests tool output one level
+                    # deeper; collect for dedicated tool_result blocks below.
+                    tool_result_parts.append(part)
+                elif isinstance(part, dict) and "toolResult" in part:
+                    # Strands/Bedrock converse format; same treatment.
+                    tool_result_parts.append(part)
                 elif isinstance(part, str):
                     text_parts.append(part)
             text = "\n".join(text_parts)
@@ -149,16 +190,46 @@ def parse_message_to_blocks(
         if waste.total() > 0:
             flags["waste_signals"] = waste.to_dict()
 
-        blocks.append(
-            Block(
-                kind=kind,  # type: ignore[arg-type]
-                text=text,
-                tokens_est=tokenizer.count_text(text) + 4,  # Add message overhead
-                content_hash=compute_hash(text),
-                source_index=index,
-                flags=flags,
+        tr_blocks: list[Block] = []
+        for part in tool_result_parts:
+            payload = part["toolResult"] if "toolResult" in part else part
+            if not isinstance(payload, dict):
+                continue
+            tr_text = _extract_tool_result_text(payload)
+            if not tr_text:
+                continue
+
+            tr_id = payload.get("toolUseId") if "toolResult" in part else part.get("tool_use_id")
+            tr_flags: dict[str, Any] = {"tool_call_id": tr_id}
+            tr_waste = detect_waste_signals(tr_text, tokenizer)
+            if tr_waste.total() > 0:
+                tr_flags["waste_signals"] = tr_waste.to_dict()
+
+            tr_blocks.append(
+                Block(
+                    kind="tool_result",
+                    text=tr_text,
+                    tokens_est=tokenizer.count_text(tr_text) + 4,  # Add message overhead
+                    content_hash=compute_hash(tr_text),
+                    source_index=index,
+                    flags=tr_flags,
+                )
             )
-        )
+
+        # Tool-result-only messages are fully represented by their dedicated
+        # blocks; skip the empty container block in that case.
+        if text or not tr_blocks:
+            blocks.append(
+                Block(
+                    kind=kind,  # type: ignore[arg-type]
+                    text=text,
+                    tokens_est=tokenizer.count_text(text) + 4,  # Add message overhead
+                    content_hash=compute_hash(text),
+                    source_index=index,
+                    flags=flags,
+                )
+            )
+        blocks.extend(tr_blocks)
 
     # Handle tool calls (assistant messages with tool_calls)
     tool_calls = message.get("tool_calls")

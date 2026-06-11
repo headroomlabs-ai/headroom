@@ -1,15 +1,19 @@
 #!/usr/bin/env bash
-# Install a pre-push git hook that runs `make ci-precheck` before every push.
+# Install git hooks for the Headroom repo:
+#   1. pre-commit  — repo pre-commit checks (ruff, mypy, sync-plugin-versions)
+#   2. pre-push    — full ci-precheck (cargo fmt/clippy/test + python suite)
 #
-# Why: the 2026-04-27 push hit five CI failures that could all have been
-# caught locally — cargo fmt drift, an x86_64-apple-darwin wheel that the
-# project doesn't actually need, missing Rust extension in two CI lanes,
-# and a commitlint warning treated as an error. The fixes are committed;
-# this hook ensures we don't repeat the same dance.
+# Why pre-push was added: the 2026-04-27 push hit five CI failures that could
+# all have been caught locally — cargo fmt drift, an x86_64-apple-darwin wheel
+# that the project doesn't actually need, missing Rust extension in two CI
+# lanes, and a commitlint warning treated as an error.
 #
-# Idempotent. Re-running is safe — it overwrites the hook file with the
-# current desired contents. Skips installation if `.git/hooks/` is missing
-# (e.g. running outside a git checkout).
+# Why pre-commit was added: PR #772 merged with inline-comment spacing and
+# import-order violations because the ruff pre-commit hook in
+# .pre-commit-config.yaml was never installed for contributors.
+#
+# Idempotent. Re-running is safe. Skips installation if `.git/hooks/` is
+# missing (e.g. running outside a git checkout).
 
 set -euo pipefail
 
@@ -70,3 +74,23 @@ chmod +x "$HOOK_PATH"
 echo "✅ installed: $HOOK_PATH"
 echo "   Runs 'make ci-precheck' before every git push."
 echo "   Bypass (use sparingly): git push --no-verify"
+
+# Install pre-commit hooks (repo checks on every commit).
+# Prefer the project venv over a global install so contributors always run the
+# pinned version. Resolution order: active $VIRTUAL_ENV → .venv → global PATH.
+PRE_COMMIT_BIN=""
+if [[ -n "${VIRTUAL_ENV:-}" && -x "${VIRTUAL_ENV}/bin/pre-commit" ]]; then
+    PRE_COMMIT_BIN="${VIRTUAL_ENV}/bin/pre-commit"
+elif [[ -x .venv/bin/pre-commit ]]; then
+    PRE_COMMIT_BIN=".venv/bin/pre-commit"
+elif command -v pre-commit &>/dev/null; then
+    PRE_COMMIT_BIN="pre-commit"
+fi
+
+if [[ -n "$PRE_COMMIT_BIN" ]]; then
+    "$PRE_COMMIT_BIN" install
+    echo "✅ installed: .git/hooks/pre-commit (repo pre-commit checks via pre-commit)"
+else
+    echo "error: pre-commit not found — run 'pip install -e .[dev]' first, then re-run this script." >&2
+    exit 1
+fi
