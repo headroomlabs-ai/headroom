@@ -140,7 +140,7 @@ def _read_gh_cli_oauth_token() -> str | None:
     token = result.stdout.strip()
     return token or None
 
-  
+
 def _read_macos_keychain_oauth_token() -> str | None:
     """Best-effort Copilot CLI token lookup from macOS Keychain."""
 
