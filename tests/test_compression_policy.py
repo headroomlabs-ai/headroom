@@ -200,6 +200,25 @@ class TestNetCostFormula:
         reference = p.net_mutation_gain(2_000, 50_000, 0.0, 1.0)
         assert abs(clamped - reference) < 1e-6
 
+    def test_nan_inputs_guarded(self):
+        # NaN reads -> 0, NaN p_alive -> 1 (same as Rust): the gain stays
+        # finite instead of poisoning the mutate decision.
+        import math
+
+        p = policy_for_mode(AuthMode.PAYG)
+        guarded = p.net_mutation_gain(2_000, 50_000, float("nan"), float("nan"))
+        assert math.isfinite(guarded)
+        reference = p.net_mutation_gain(2_000, 50_000, 0.0, 1.0)
+        assert abs(guarded - reference) < 1e-6
+
+    def test_negative_int_inputs_clamped(self):
+        # Rust takes u32 — negative Python ints must not flip the sign of
+        # the result; they clamp to 0.
+        p = policy_for_mode(AuthMode.PAYG)
+        assert p.net_mutation_gain(-2_000, -50_000, 5.0, 1.0) == p.net_mutation_gain(0, 0, 5.0, 1.0)
+        assert p.break_even_reads(-5, 10_000) == 0.0
+        assert p.net_mutation_gain(2_000, -1, 5.0, 1.0) == p.net_mutation_gain(2_000, 0, 5.0, 1.0)
+
     def test_break_even_reads_matches_research_anchor(self):
         # R = 11.5*(S/dT - 1): 2K/50K -> 276; 50K/10K -> negative
         # (profitable from the first read); dT=0 -> 0.

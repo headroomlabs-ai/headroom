@@ -18,6 +18,7 @@ docstring (per-mode rationale, why-a-struct, etc.).
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 
@@ -138,14 +139,20 @@ class CompressionPolicy:
 
             gain = dT * (w + r*(R - 1)) - P_alive * (w - r) * S
 
-        Inputs are clamped: ``expected_reads`` to ``>= 0``, ``p_alive``
-        to ``[0, 1]``.
+        Inputs are clamped: ``delta_t``/``suffix_tokens`` to ``>= 0``
+        (the Rust signature takes ``u32``), ``expected_reads`` to
+        ``>= 0`` (NaN → 0), ``p_alive`` to ``[0, 1]`` (NaN → 1, the
+        conservative full-penalty assumption — same as Rust).
         """
         w = CACHE_WRITE_MULTIPLIER
         r = CACHE_READ_MULTIPLIER
-        reads = max(expected_reads, 0.0)
-        alive = min(max(p_alive, 0.0), 1.0)
-        return float(delta_t) * (w + r * (reads - 1.0)) - alive * (w - r) * float(suffix_tokens)
+        dt = max(0, delta_t)
+        suffix = max(0, suffix_tokens)
+        # Python max()/min() propagate NaN from the first argument, unlike
+        # f32::max in the Rust source of truth — guard explicitly.
+        reads = 0.0 if math.isnan(expected_reads) else max(expected_reads, 0.0)
+        alive = 1.0 if math.isnan(p_alive) else min(max(p_alive, 0.0), 1.0)
+        return float(dt) * (w + r * (reads - 1.0)) - alive * (w - r) * float(suffix)
 
     def should_mutate_deep(
         self,
@@ -164,14 +171,15 @@ class CompressionPolicy:
 
             R = ((w - r) / r) * (S/dT - 1)   ~= 11.5 * S/dT  for S >> dT
 
-        Returns 0 when ``delta_t`` is 0 (no savings — callers gate on
-        ``delta_t > 0``). Mirrors the Rust method.
+        Returns 0 when ``delta_t`` is ``<= 0`` (no savings — callers
+        gate on ``delta_t > 0``; the Rust signature takes ``u32``).
+        Mirrors the Rust method.
         """
-        if delta_t == 0:
+        if delta_t <= 0:
             return 0.0
         w = CACHE_WRITE_MULTIPLIER
         r = CACHE_READ_MULTIPLIER
-        return ((w - r) / r) * (float(suffix_tokens) / float(delta_t) - 1.0)
+        return ((w - r) / r) * (float(max(0, suffix_tokens)) / float(delta_t) - 1.0)
 
 
 def policy_for_mode(mode: AuthMode) -> CompressionPolicy:

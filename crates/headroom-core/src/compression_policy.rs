@@ -248,15 +248,17 @@ impl CompressionPolicy {
     ///
     ///   gain = ΔT · (w + r·(R − 1))  −  P_alive · (w − r) · S
     ///
-    /// Sanity anchors (Anthropic w=1.25, r=0.1): a 2K shave under a
-    /// 50K warm suffix needs ~290 remaining reads (never profitable);
-    /// a 50K shave under a 10K suffix breaks even at ~2.3 reads
-    /// (almost always profitable); a live-zone edit (S = 0) is always
-    /// profitable.
+    /// Sanity anchors (Anthropic w=1.25, r=0.1), matching the unit
+    /// tests below: a 2K shave under a 50K warm suffix needs ~276
+    /// remaining reads to pay off (rarely profitable); a 50K shave
+    /// under a 10K suffix is profitable from the first write (its
+    /// break-even read count is negative); a live-zone edit (S = 0)
+    /// is always profitable.
     ///
     /// Takes `&self` so a follow-up can apply per-mode margins; today
     /// the arithmetic is mode-independent. Inputs are clamped:
-    /// `expected_reads` to `>= 0`, `p_alive` to `[0, 1]`.
+    /// `expected_reads` to `>= 0` (NaN → 0), `p_alive` to `[0, 1]`
+    /// (NaN → 1, the conservative full-penalty assumption).
     pub fn net_mutation_gain(
         &self,
         delta_t: u32,
@@ -266,8 +268,14 @@ impl CompressionPolicy {
     ) -> f32 {
         let w = CACHE_WRITE_MULTIPLIER;
         let r = CACHE_READ_MULTIPLIER;
+        // f32::max ignores NaN (returns the other operand), so NaN reads
+        // land on 0.0; clamp would propagate NaN, so guard alive explicitly.
         let reads = expected_reads.max(0.0);
-        let alive = p_alive.clamp(0.0, 1.0);
+        let alive = if p_alive.is_nan() {
+            1.0
+        } else {
+            p_alive.clamp(0.0, 1.0)
+        };
         (delta_t as f32) * (w + r * (reads - 1.0)) - alive * (w - r) * (suffix_tokens as f32)
     }
 
@@ -452,9 +460,20 @@ mod tests {
     }
 
     #[test]
+    fn net_gain_guards_nan_inputs() {
+        // NaN reads → 0, NaN p_alive → 1: gain stays finite and matches
+        // the conservative reference instead of poisoning the decision.
+        let p = CompressionPolicy::for_mode(AuthMode::Payg);
+        let guarded = p.net_mutation_gain(2_000, 50_000, f32::NAN, f32::NAN);
+        assert!(guarded.is_finite());
+        let reference = p.net_mutation_gain(2_000, 50_000, 0.0, 1.0);
+        assert!((guarded - reference).abs() < f32::EPSILON);
+    }
+
+    #[test]
     fn break_even_reads_matches_research_anchor() {
         // R = 11.5·(S/ΔT − 1): 2K shave / 50K suffix → 11.5·24 = 276
-        // (the "~290 turns: never" anchor); 50K shave / 10K suffix →
+        // (rarely profitable); 50K shave / 10K suffix →
         // 11.5·(0.2 − 1) < 0 → profitable from the first read.
         let p = CompressionPolicy::for_mode(AuthMode::Payg);
         let r = p.break_even_reads(2_000, 50_000);
