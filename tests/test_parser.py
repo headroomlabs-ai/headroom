@@ -419,13 +419,21 @@ class TestRereadDetection:
         """Mirror mock_tokenizer + message overhead used for tool_result blocks."""
         return len(text) // 4 + 1 + 4
 
-    def test_reread_detected_openai_tool_messages(self, mock_tokenizer):
-        """Identical large tool outputs at different positions count as re-read."""
-        messages = [
-            {"role": "tool", "tool_call_id": "c1", "content": self.LARGE_CONTENT},
-            {"role": "assistant", "content": "Working on it."},
-            {"role": "tool", "tool_call_id": "c2", "content": self.LARGE_CONTENT},
+    @staticmethod
+    def _filler(n):
+        """Interleaved turns that push a repeat beyond the polling gap."""
+        return [
+            {"role": "assistant" if i % 2 == 0 else "user", "content": f"step {i} of the task"}
+            for i in range(n)
         ]
+
+    def test_reread_detected_openai_tool_messages(self, mock_tokenizer):
+        """Identical large tool outputs far apart count as re-read."""
+        messages = (
+            [{"role": "tool", "tool_call_id": "c1", "content": self.LARGE_CONTENT}]
+            + self._filler(4)
+            + [{"role": "tool", "tool_call_id": "c2", "content": self.LARGE_CONTENT}]
+        )
         _, _, waste = parse_messages(messages, mock_tokenizer)
         assert waste.reread_tokens == self._expected_tokens(self.LARGE_CONTENT)
 
@@ -433,17 +441,19 @@ class TestRereadDetection:
         """Anthropic-format tool_result parts are matched by content, not id."""
         part = {"type": "tool_result", "tool_use_id": "t1", "content": self.LARGE_CONTENT}
         part2 = {"type": "tool_result", "tool_use_id": "t2", "content": self.LARGE_CONTENT}
-        messages = [
-            {"role": "user", "content": [part]},
-            {"role": "user", "content": [part2]},
-        ]
+        messages = (
+            [{"role": "user", "content": [part]}]
+            + self._filler(4)
+            + [{"role": "user", "content": [part2]}]
+        )
         _, _, waste = parse_messages(messages, mock_tokenizer)
         assert waste.reread_tokens == self._expected_tokens(self.LARGE_CONTENT)
 
     def test_three_occurrences_count_repeats_only(self, mock_tokenizer):
-        """First serve is free; every repeat is counted."""
+        """First serve is free; every distant repeat is counted."""
         msg = {"role": "tool", "tool_call_id": "c", "content": self.LARGE_CONTENT}
-        _, _, waste = parse_messages([dict(msg), dict(msg), dict(msg)], mock_tokenizer)
+        messages = [dict(msg)] + self._filler(4) + [dict(msg)] + self._filler(4) + [dict(msg)]
+        _, _, waste = parse_messages(messages, mock_tokenizer)
         assert waste.reread_tokens == 2 * self._expected_tokens(self.LARGE_CONTENT)
 
     def test_single_occurrence_no_signal(self, mock_tokenizer):
@@ -476,11 +486,40 @@ class TestRereadDetection:
         part = {"type": "tool_result", "tool_use_id": "t1", "content": self.LARGE_CONTENT}
         part2 = {"type": "tool_result", "tool_use_id": "t2", "content": self.LARGE_CONTENT}
         part3 = {"type": "tool_result", "tool_use_id": "t3", "content": self.LARGE_CONTENT}
+        messages = (
+            [{"role": "user", "content": [part, part2]}]
+            + self._filler(4)
+            + [{"role": "user", "content": [part3]}]
+        )
+        _, _, waste = parse_messages(messages, mock_tokenizer)
+        assert waste.reread_tokens == self._expected_tokens(self.LARGE_CONTENT)
+
+    def test_adjacent_polling_repeats_ignored(self, mock_tokenizer):
+        """Back-to-back identical results (poll loop) are not re-reads."""
         messages = [
-            {"role": "user", "content": [part, part2]},
-            {"role": "assistant", "content": "Looking again."},
-            {"role": "user", "content": [part3]},
+            {"role": "tool", "tool_call_id": "c1", "content": self.LARGE_CONTENT},
+            {"role": "assistant", "content": "Still pending, checking again."},
+            {"role": "tool", "tool_call_id": "c2", "content": self.LARGE_CONTENT},
         ]
+        _, _, waste = parse_messages(messages, mock_tokenizer)
+        assert waste.reread_tokens == 0
+
+    def test_polling_chain_never_accumulates(self, mock_tokenizer):
+        """Each poll advances the baseline — long chains stay at zero."""
+        msg = {"role": "tool", "tool_call_id": "c", "content": self.LARGE_CONTENT}
+        nudge = {"role": "assistant", "content": "polling"}
+        messages = [dict(msg), dict(nudge), dict(msg), dict(nudge), dict(msg), dict(nudge)]
+        _, _, waste = parse_messages(messages, mock_tokenizer)
+        assert waste.reread_tokens == 0
+
+    def test_distant_repeat_after_polling_chain_counts(self, mock_tokenizer):
+        """A far repeat counts even when earlier repeats were polling."""
+        msg = {"role": "tool", "tool_call_id": "c", "content": self.LARGE_CONTENT}
+        messages = (
+            [dict(msg), {"role": "assistant", "content": "polling"}, dict(msg)]
+            + self._filler(4)
+            + [dict(msg)]
+        )
         _, _, waste = parse_messages(messages, mock_tokenizer)
         assert waste.reread_tokens == self._expected_tokens(self.LARGE_CONTENT)
 
