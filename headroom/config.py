@@ -358,6 +358,11 @@ class SmartCrusherConfig:
     first_fraction: float = 0.3  # 30% of K from start of array
     last_fraction: float = 0.15  # 15% of K from end of array
 
+    # Lossless compaction only replaces the original when it saves at
+    # least this byte fraction vs the (minified) input. Mirrors the
+    # Rust default.
+    lossless_min_savings_ratio: float = 0.30
+
 
 @dataclass
 class CacheOptimizerConfig:

@@ -691,8 +691,8 @@ impl PySmartCrusher {
         match RustSmartCrusher::with_compaction_format(cfg, format_name) {
             Some(inner) => Ok(Self { inner }),
             None => Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "unknown compaction format {format_name:?}; \
-                 expected one of: csv-schema, json, markdown-kv"
+                "unknown compaction format {format_name:?}; expected one of: {}",
+                headroom_core::transforms::smart_crusher::compaction::CompactionStage::SUPPORTED_FORMAT_NAMES.join(", ")
             ))),
         }
     }

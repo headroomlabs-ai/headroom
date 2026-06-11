@@ -24,6 +24,7 @@ import pytest
 from headroom._core import SmartCrusher as RustSmartCrusher
 from headroom._core import SmartCrusherConfig as RustSmartCrusherConfig
 from headroom.transforms.smart_crusher import SmartCrusher
+from headroom.transforms.smart_crusher import SmartCrusherConfig as PySmartCrusherConfig
 
 
 def _tabular_json(n: int = 50) -> str:
@@ -109,6 +110,26 @@ def test_unknown_format_kwarg_raises() -> None:
 def test_without_compaction_ignores_format() -> None:
     crusher = SmartCrusher(with_compaction=False, compaction_format="markdown-kv")
     assert crusher._compaction_format is None
+
+
+def test_without_compaction_still_validates_format() -> None:
+    # An explicit bogus format is a misconfiguration even when the knob
+    # is ignored on this path — fail loudly, don't silently accept.
+    with pytest.raises(ValueError, match="bogus"):
+        SmartCrusher(with_compaction=False, compaction_format="bogus")
+
+
+def test_end_to_end_crush_emits_markdown_kv() -> None:
+    # Through the high-level Python SmartCrusher, not the Rust bridge:
+    # proves the kwarg changes crush() output, not just the stored
+    # attribute. Same lowered gate as the bridge test — KV's savings on
+    # minified JSON sit below the 30% default.
+    config = PySmartCrusherConfig(lossless_min_savings_ratio=0.01)
+    crusher = SmartCrusher(config=config, compaction_format="markdown-kv")
+    result = crusher.crush(_tabular_json())
+    assert result.was_modified
+    assert "- email: user_0@example.com" in result.compressed
+    assert "[50]{" in result.compressed
 
 
 def test_default_output_unchanged_by_feature() -> None:

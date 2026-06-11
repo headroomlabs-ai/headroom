@@ -1,4 +1,4 @@
-//! Formatter trait + two built-in implementations.
+//! Formatter trait + the built-in implementations.
 //!
 //! [`Formatter`] walks a [`Compaction`] tree and renders bytes. It's the
 //! pluggable seam where users (or Enterprise plugins) choose how the
@@ -14,10 +14,14 @@
 //!   TOON's most useful idea (the `[N]{cols}` declaration) without
 //!   adopting TOON's bespoke escaping rules — every model has seen
 //!   millions of CSV examples in training.
+//! - [`MarkdownKvFormatter`] — the same `[N]{cols}` declaration +
+//!   one Markdown list item per row with `key: value` lines.
+//!   Token-heavier than CSV (field names repeat per row) but
+//!   format-comprehension benchmarks favor KV for read-back accuracy.
 //!
 //! # Nested cells
 //!
-//! Both formatters handle [`CellValue::Nested`] by recursively
+//! The formatters handle [`CellValue::Nested`] by recursively
 //! formatting the sub-compaction and embedding the result. The CSV
 //! formatter wraps nested output in CSV-quoted form; the JSON
 //! formatter embeds it as a structured JSON object.
@@ -26,7 +30,7 @@
 //!
 //! [`CellValue::OpaqueRef`] renders as a structured marker the model
 //! can recognize: `<<ccr:HASH,KIND,SIZE>>`. This format is fixed across
-//! both built-in formatters so downstream consumers can pattern-match
+//! all built-in formatters so downstream consumers can pattern-match
 //! markers regardless of which formatter produced them.
 
 use serde_json::{json, Value};
@@ -468,6 +472,9 @@ fn write_kv_table(
 ) {
     // Same declaration line as the CSV formatter: keeps row count and
     // typed shape up front where the model (and telemetry) expect it.
+    // Unlike CSV (pre-existing exposure, kept byte-identical), KV quotes
+    // pathological field names here so the declaration parses the same
+    // way as the row lines below.
     out.push('[');
     out.push_str(&rows.len().to_string());
     out.push_str("]{");
@@ -475,10 +482,11 @@ fn write_kv_table(
         .fields
         .iter()
         .map(|f| {
+            let name = kv_field_name(&f.name);
             if f.nullable {
-                format!("{}:{}?", f.name, f.type_tag)
+                format!("{}:{}?", name, f.type_tag)
             } else {
-                format!("{}:{}", f.name, f.type_tag)
+                format!("{}:{}", name, f.type_tag)
             }
         })
         .collect();
@@ -490,6 +498,9 @@ fn write_kv_table(
     out.push('\n');
 
     for row in rows {
+        // Compactor invariant: one cell per schema field. zip() would
+        // silently drop extras — fail loudly in debug builds instead.
+        debug_assert_eq!(row.0.len(), schema.fields.len());
         let mut wrote_first = false;
         for (field, cell) in schema.fields.iter().zip(row.0.iter()) {
             let rendered = match cell {
@@ -503,7 +514,7 @@ fn write_kv_table(
                 } => format_ccr_marker(ccr_hash, *byte_size, kind),
             };
             out.push_str(if wrote_first { "  " } else { "- " });
-            out.push_str(&field.name);
+            out.push_str(&kv_field_name(&field.name));
             out.push_str(": ");
             out.push_str(&rendered);
             out.push('\n');
@@ -541,6 +552,18 @@ fn needs_kv_quote(s: &str) -> bool {
         || s.contains('\r')
         || s.starts_with(char::is_whitespace)
         || s.ends_with(char::is_whitespace)
+}
+
+/// Field names are normally bare identifiers, but nothing upstream
+/// enforces that. Quote the pathological ones the same way as values:
+/// an embedded newline would inject fake row lines, and `": "` inside
+/// a key would split the line at the wrong colon on read-back.
+fn kv_field_name(name: &str) -> String {
+    if needs_kv_quote(name) || name.contains(": ") {
+        serde_json::to_string(name).unwrap_or_default()
+    } else {
+        name.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -808,6 +831,24 @@ mod tests {
             "multiline must be JSON-quoted, got: {out}"
         );
         assert!(out.contains("msg: plain\n"), "got: {out}");
+    }
+
+    #[test]
+    fn markdown_kv_quotes_pathological_field_names() {
+        // A newline in a key would inject fake row lines; ": " in a key
+        // would split read-back at the wrong colon. Both get JSON-quoted
+        // in the declaration and in every row line.
+        let items = vec![
+            json!({"bad\nkey": 1, "note: extra": "x"}),
+            json!({"bad\nkey": 2, "note: extra": "y"}),
+        ];
+        let c = compact(&items, &cfg());
+        let out = MarkdownKvFormatter::new().format(&c);
+        assert!(!out.contains("bad\nkey"), "raw newline key leaked: {out}");
+        assert!(out.contains(r#""bad\nkey""#), "got: {out}");
+        assert!(out.contains(r#""note: extra": x"#), "got: {out}");
+        let decl = out.lines().next().unwrap();
+        assert!(decl.contains(r#""bad\nkey":int"#), "got decl: {decl}");
     }
 
     #[test]

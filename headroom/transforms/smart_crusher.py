@@ -57,6 +57,12 @@ from .base import Transform
 logger = logging.getLogger(__name__)
 
 
+# Lossless-compaction renderers known to the Rust core — mirrors
+# `CompactionStage::SUPPORTED_FORMAT_NAMES` in
+# `crates/headroom-core/.../compaction/mod.rs`.
+_SUPPORTED_COMPACTION_FORMATS = ("csv-schema", "json", "markdown-kv")
+
+
 # ─── CCR sentinel ─────────────────────────────────────────────────────────
 #
 # When SmartCrusher's lossy path drops rows, it appends a sentinel object
@@ -132,6 +138,11 @@ class SmartCrusherConfig:
     dedup_identical_items: bool = True
     first_fraction: float = 0.3
     last_fraction: float = 0.15
+    # Lossless compaction only replaces the original when it saves at
+    # least this byte fraction vs the (minified) input. Mirrors the Rust
+    # default; mainly lowered in tests and KV experiments — KV repeats
+    # field names per row, so it clears the gate less often than CSV.
+    lossless_min_savings_ratio: float = 0.30
 
 
 # ─── Rust-backed SmartCrusher ─────────────────────────────────────────────
@@ -264,6 +275,7 @@ class SmartCrusher(Transform):
             dedup_identical_items=cfg.dedup_identical_items,
             first_fraction=cfg.first_fraction,
             last_fraction=cfg.last_fraction,
+            lossless_min_savings_ratio=cfg.lossless_min_savings_ratio,
             relevance_threshold=0.3,
             enable_ccr_marker=(
                 self._ccr_config.enabled and self._ccr_config.inject_retrieval_marker
@@ -284,6 +296,15 @@ class SmartCrusher(Transform):
         resolved_format = compaction_format or os.environ.get(
             "HEADROOM_COMPACTION_FORMAT", "csv-schema"
         )
+        # Validate even when with_compaction=False: an explicit bogus
+        # format (kwarg or env var) is a misconfiguration that should be
+        # visible, not silently accepted because the knob happens to be
+        # ignored on this path.
+        if resolved_format not in _SUPPORTED_COMPACTION_FORMATS:
+            raise ValueError(
+                f"unknown compaction format {resolved_format!r}; "
+                f"expected one of: {', '.join(_SUPPORTED_COMPACTION_FORMATS)}"
+            )
         self._compaction_format = resolved_format if with_compaction else None
         if not with_compaction:
             self._rust = _RustSmartCrusher.without_compaction(rust_cfg)

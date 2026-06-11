@@ -79,9 +79,15 @@ impl CompactionStage {
         }
     }
 
-    /// Look up a preset by its formatter name (`"csv-schema"`,
-    /// `"json"`, `"markdown-kv"`). `None` for unknown names — callers
-    /// own the fallback/error policy.
+    /// Formatter names accepted by [`Self::from_format_name`]. The
+    /// single source of truth for caller error messages (the PyO3
+    /// bridge renders this list) — keep in sync with the match below.
+    pub const SUPPORTED_FORMAT_NAMES: &'static [&'static str] =
+        &["csv-schema", "json", "markdown-kv"];
+
+    /// Look up a preset by its formatter name (see
+    /// [`Self::SUPPORTED_FORMAT_NAMES`]). `None` for unknown names —
+    /// callers own the fallback/error policy.
     pub fn from_format_name(name: &str) -> Option<Self> {
         match name {
             "csv-schema" => Some(Self::default_csv_schema()),
