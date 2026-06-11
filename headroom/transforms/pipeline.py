@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import threading
 import time
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any
@@ -64,6 +66,18 @@ class TransformPipeline:
             self.transforms = transforms
         else:
             self.transforms = self._build_default_transforms()
+
+        # Circuit breaker (issue #847): after N consecutive pipeline
+        # failures, pass messages through untouched for a cooldown window
+        # instead of re-running (and re-failing) transforms on every
+        # request. Threshold <= 0 disables the breaker.
+        self._breaker_threshold = int(os.environ.get("HEADROOM_PIPELINE_BREAKER_THRESHOLD", "3"))
+        self._breaker_cooldown_s = float(
+            os.environ.get("HEADROOM_PIPELINE_BREAKER_COOLDOWN_S", "60")
+        )
+        self._breaker_lock = threading.Lock()
+        self._breaker_failures = 0
+        self._breaker_open_until = 0.0
 
     def _build_default_transforms(self) -> list[Transform]:
         """Build default transform pipeline from config."""
@@ -134,6 +148,36 @@ class TransformPipeline:
 
         return self._provider.__class__.__name__.removesuffix("Provider").lower()
 
+    def _breaker_is_open(self) -> bool:
+        """True while the circuit breaker cooldown window is active."""
+        if self._breaker_threshold <= 0:
+            return False
+        with self._breaker_lock:
+            return time.monotonic() < self._breaker_open_until
+
+    def _breaker_record_failure(self) -> None:
+        """Count a pipeline failure; open the breaker at the threshold."""
+        if self._breaker_threshold <= 0:
+            return
+        with self._breaker_lock:
+            self._breaker_failures += 1
+            if self._breaker_failures >= self._breaker_threshold:
+                self._breaker_open_until = time.monotonic() + self._breaker_cooldown_s
+                self._breaker_failures = 0
+                logger.warning(
+                    "Pipeline circuit breaker OPEN after %d consecutive failures; "
+                    "passing messages through for %.0fs",
+                    self._breaker_threshold,
+                    self._breaker_cooldown_s,
+                )
+
+    def _breaker_record_success(self) -> None:
+        """Reset the consecutive-failure count after a clean run."""
+        if self._breaker_threshold <= 0:
+            return
+        with self._breaker_lock:
+            self._breaker_failures = 0
+
     def apply(
         self,
         messages: list[dict[str, Any]],
@@ -168,6 +212,16 @@ class TransformPipeline:
             )
 
         # Start with original tokens
+        # Circuit breaker open — pass through untouched (issue #847).
+        if self._breaker_is_open():
+            passthrough_tokens = tokenizer.count_messages(messages)
+            return TransformResult(
+                messages=messages,
+                tokens_before=passthrough_tokens,
+                tokens_after=passthrough_tokens,
+                transforms_applied=["pipeline:circuit_open"],
+            )
+
         t_count = time.perf_counter()
         tokens_before = tokenizer.count_messages(messages)
         count_ms = (time.perf_counter() - t_count) * 1000
@@ -248,7 +302,11 @@ class TransformPipeline:
                 with transform_span_context as transform_span:
                     # Time the transform
                     t0 = time.perf_counter()
-                    result = transform.apply(current_messages, tokenizer, **kwargs)
+                    try:
+                        result = transform.apply(current_messages, tokenizer, **kwargs)
+                    except Exception:
+                        self._breaker_record_failure()
+                        raise
                     duration_ms = (time.perf_counter() - t0) * 1000
 
                     # Update messages for next transform
@@ -315,6 +373,9 @@ class TransformPipeline:
                                 duration_ms=duration_ms,
                             )
                         )
+
+            # All transforms ran without raising — reset the breaker.
+            self._breaker_record_success()
 
             # Single final token count — the only full recount in the pipeline.
             # Earlier per-transform counts come from each transform's own result.
