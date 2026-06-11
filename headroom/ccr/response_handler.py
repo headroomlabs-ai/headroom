@@ -432,6 +432,19 @@ class CCRResponseHandler:
                 # No CCR tool calls, we're done
                 break
 
+            # If the model called CCR alongside non-CCR tools, we cannot build
+            # a valid continuation — every tool_use in the assistant message
+            # requires a matching tool_result, but we only have CCR results.
+            # Skip CCR handling and let the client resolve all tool calls.
+            if other_calls:
+                logger.warning(
+                    "CCR: Skipping CCR handling — model called %d non-CCR tool(s) "
+                    "alongside headroom_retrieve. Cannot create a valid continuation "
+                    "without results for the other tools. Client must handle all tool calls.",
+                    len(other_calls),
+                )
+                break
+
             rounds += 1
             with self._retrieval_count_lock:
                 self._retrieval_count += len(ccr_calls)
