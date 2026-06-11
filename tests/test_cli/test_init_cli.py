@@ -545,6 +545,29 @@ def test_ensure_codex_feature_flag_replaces_existing_marker(monkeypatch, tmp_pat
     assert "codex_hooks" not in content
 
 
+def test_ensure_codex_feature_flag_replaces_marker_inside_features_scope(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    path = tmp_path / "config.toml"
+    path.write_text(
+        "[features]\n"
+        f"{init_cli._CODEX_FEATURE_MARKER_START}\n"
+        "hooks = true\n"
+        f"{init_cli._CODEX_FEATURE_MARKER_END}\n"
+        "\n[tools]\nhooks = false\n",
+        encoding="utf-8",
+    )
+
+    init_cli._ensure_codex_feature_flag(path)
+
+    content = path.read_text(encoding="utf-8")
+    parsed = tomllib.loads(content)
+    assert parsed["features"]["hooks"] is True
+    assert parsed["tools"]["hooks"] is False
+    assert content.count(init_cli._CODEX_FEATURE_MARKER_START) == 1
+
+
 def test_ensure_codex_feature_flag_migrates_legacy_codex_hooks_key(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -561,6 +584,23 @@ def test_ensure_codex_feature_flag_migrates_legacy_codex_hooks_key(
     assert "codex_hooks" not in parsed["features"]
     assert content.count("hooks = true") == 1
     assert content.count(init_cli._CODEX_FEATURE_MARKER_START) == 1
+
+
+def test_ensure_codex_feature_flag_migrates_dotted_legacy_codex_hooks_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    path = tmp_path / "config.toml"
+    path.write_text("features.codex_hooks = true\nfeatures.shell_tool = true\n", encoding="utf-8")
+
+    init_cli._ensure_codex_feature_flag(path)
+
+    content = path.read_text(encoding="utf-8")
+    parsed = tomllib.loads(content)
+    assert parsed["features"]["hooks"] is True
+    assert parsed["features"]["shell_tool"] is True
+    assert "codex_hooks" not in parsed["features"]
+    assert "features.hooks = true" in content
 
 
 def test_ensure_codex_feature_flag_migrates_when_both_keys_present(
@@ -594,6 +634,102 @@ def test_ensure_codex_feature_flag_migrates_when_keys_reversed(
     parsed = tomllib.loads(content)
     assert "codex_hooks" not in parsed["features"]
     assert parsed["features"]["hooks"] is False
+
+
+def test_ensure_codex_feature_flag_ignores_hooks_outside_features(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    path = tmp_path / "config.toml"
+    path.write_text(
+        "[features]\nshell_tool = true\n\n[some_other_table]\nhooks = true\n",
+        encoding="utf-8",
+    )
+
+    init_cli._ensure_codex_feature_flag(path)
+
+    content = path.read_text(encoding="utf-8")
+    parsed = tomllib.loads(content)
+    assert parsed["features"]["hooks"] is True
+    assert parsed["features"]["shell_tool"] is True
+    assert parsed["some_other_table"]["hooks"] is True
+    assert content.count(init_cli._CODEX_FEATURE_MARKER_START) == 1
+
+
+def test_ensure_codex_feature_flag_ignores_hooks_after_commented_table_header(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    path = tmp_path / "config.toml"
+    path.write_text(
+        "[features]\nshell_tool = true\n\n[some_other_table] # comment\nhooks = true\n",
+        encoding="utf-8",
+    )
+
+    init_cli._ensure_codex_feature_flag(path)
+
+    parsed = tomllib.loads(path.read_text(encoding="utf-8"))
+    assert parsed["features"]["hooks"] is True
+    assert parsed["features"]["shell_tool"] is True
+    assert parsed["some_other_table"]["hooks"] is True
+
+
+def test_ensure_codex_feature_flag_respects_commented_features_header_and_quoted_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    path = tmp_path / "config.toml"
+    path.write_text('[features] # comment\n"hooks" = false\n', encoding="utf-8")
+
+    init_cli._ensure_codex_feature_flag(path)
+
+    content = path.read_text(encoding="utf-8")
+    parsed = tomllib.loads(content)
+    assert parsed["features"]["hooks"] is False
+    assert init_cli._CODEX_FEATURE_MARKER_START not in content
+
+
+def test_ensure_codex_feature_flag_migrates_quoted_legacy_codex_hooks_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    path = tmp_path / "config.toml"
+    path.write_text('[features]\n"codex_hooks" = true\n', encoding="utf-8")
+
+    init_cli._ensure_codex_feature_flag(path)
+
+    parsed = tomllib.loads(path.read_text(encoding="utf-8"))
+    assert parsed["features"]["hooks"] is True
+    assert "codex_hooks" not in parsed["features"]
+
+
+def test_ensure_codex_feature_flag_respects_root_dotted_feature_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    path = tmp_path / "config.toml"
+    path.write_text("features.hooks = false\n", encoding="utf-8")
+
+    init_cli._ensure_codex_feature_flag(path)
+
+    content = path.read_text(encoding="utf-8")
+    parsed = tomllib.loads(content)
+    assert parsed["features"]["hooks"] is False
+    assert init_cli._CODEX_FEATURE_MARKER_START not in content
+
+
+def test_ensure_codex_feature_flag_preserves_legacy_key_outside_features(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    path = tmp_path / "config.toml"
+    path.write_text("[some_other_table]\ncodex_hooks = true\n", encoding="utf-8")
+
+    init_cli._ensure_codex_feature_flag(path)
+
+    parsed = tomllib.loads(path.read_text(encoding="utf-8"))
+    assert parsed["features"]["hooks"] is True
+    assert parsed["some_other_table"]["codex_hooks"] is True
 
 
 def test_ensure_codex_feature_flag_drops_legacy_key_outside_marker(
