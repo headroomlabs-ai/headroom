@@ -506,6 +506,80 @@ class TestTransformTracking:
         stale_transforms = [t for t in result.transforms_applied if "stale" in t]
         assert len(stale_transforms) == 2  # Both reads are stale
 
+    def test_transform_tag_includes_file_path_openai(self):
+        """OpenAI-format tag shape is ``read_lifecycle:<state>:<file_path>``."""
+        config = ReadLifecycleConfig(enabled=True)
+        mgr = ReadLifecycleManager(config)
+        messages = [
+            make_openai_read("r1", "/src/app.py"),
+            make_openai_tool_result("r1", LARGE_CONTENT),
+            make_openai_edit("e1", "/src/app.py"),
+            make_openai_tool_result("e1", "done"),
+        ]
+
+        result = mgr.apply(messages)
+        assert "read_lifecycle:stale:/src/app.py" in result.transforms_applied
+
+    def test_transform_tag_includes_file_path_anthropic(self):
+        """Anthropic-format tag shape matches OpenAI tag shape."""
+        config = ReadLifecycleConfig(enabled=True)
+        mgr = ReadLifecycleManager(config)
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "r1",
+                        "name": "Read",
+                        "input": {"file_path": "/src/notes.md"},
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "r1", "content": LARGE_CONTENT}],
+            },
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "e1",
+                        "name": "Edit",
+                        "input": {
+                            "file_path": "/src/notes.md",
+                            "old_string": "old",
+                            "new_string": "new",
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "e1", "content": "done"}],
+            },
+        ]
+
+        result = mgr.apply(messages)
+        assert "read_lifecycle:stale:/src/notes.md" in result.transforms_applied
+
+    def test_transform_tag_preserves_colons_in_path(self):
+        """Paths containing ``:`` survive — consumers must bound their split."""
+        config = ReadLifecycleConfig(enabled=True)
+        mgr = ReadLifecycleManager(config)
+        weird_path = "/tmp/has:colon/file.py"
+        messages = [
+            make_openai_read("r1", weird_path),
+            make_openai_tool_result("r1", LARGE_CONTENT),
+            make_openai_edit("e1", weird_path),
+            make_openai_tool_result("e1", "done"),
+        ]
+
+        result = mgr.apply(messages)
+        tag = next(t for t in result.transforms_applied if t.startswith("read_lifecycle:stale"))
+        assert tag.split(":", 2) == ["read_lifecycle", "stale", weird_path]
+
 
 class TestNoFilePathHandling:
     """Reads without parseable file_path should be left alone."""

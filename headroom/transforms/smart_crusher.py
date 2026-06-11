@@ -89,6 +89,47 @@ def strip_ccr_sentinels(items: Any) -> Any:
     return [x for x in items if not is_ccr_sentinel(x)]
 
 
+# ─── Tool-name attribution ────────────────────────────────────────────────
+
+
+def _build_tool_name_index(messages: list[dict[str, Any]]) -> dict[str, str]:
+    """Map tool_call_id/tool_use_id → tool name across OpenAI + Anthropic formats.
+
+    Skips entries where id or name is missing; those calls still crush, but
+    won't contribute a tool-name to the ``smart_crush`` tag.
+    """
+    index: dict[str, str] = {}
+    for msg in messages:
+        if msg.get("role") != "assistant":
+            continue
+        for tc in msg.get("tool_calls") or []:
+            tc_id = tc.get("id")
+            name = (tc.get("function") or {}).get("name")
+            if tc_id and name:
+                index[tc_id] = name
+        content = msg.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_use":
+                    continue
+                bid = block.get("id")
+                name = block.get("name")
+                if bid and name:
+                    index[bid] = name
+    return index
+
+
+def _format_smart_crush_transform(count: int, tool_names: list[str]) -> str:
+    """Format ``smart_crush:<count>[:<name1,name2,...>]``.
+
+    Names are included when known so consumers can show what was crushed. Empty
+    names fall back to the count-only form for backwards compatibility.
+    """
+    if tool_names:
+        return f"smart_crush:{count}:{','.join(tool_names)}"
+    return f"smart_crush:{count}"
+
+
 # ─── Public dataclasses ───────────────────────────────────────────────────
 
 
@@ -827,6 +868,16 @@ class SmartCrusher(Transform):
         crushed_count = 0
         frozen_message_count = kwargs.get("frozen_message_count", 0)
 
+        crushed_tool_names: list[str] = []
+        seen_tool_names: set[str] = set()
+        tool_names_by_id = _build_tool_name_index(result_messages)
+
+        def _record(tool_id: str | None) -> None:
+            name = tool_names_by_id.get(tool_id or "")
+            if name and name not in seen_tool_names:
+                seen_tool_names.add(name)
+                crushed_tool_names.append(name)
+
         for msg_idx, msg in enumerate(result_messages):
             if msg_idx < frozen_message_count:
                 continue
@@ -844,6 +895,7 @@ class SmartCrusher(Transform):
                             marker = create_tool_digest_marker(compute_short_hash(content))
                             msg["content"] = crushed + "\n" + marker
                             crushed_count += 1
+                            _record(msg.get("tool_call_id"))
                             markers_inserted.append(marker)
                             if info:
                                 transforms_applied.append(f"smart:{info}")
@@ -870,13 +922,16 @@ class SmartCrusher(Transform):
                         marker = create_tool_digest_marker(compute_short_hash(tool_content))
                         content[i]["content"] = crushed + "\n" + marker
                         crushed_count += 1
+                        _record(block.get("tool_use_id"))
                         markers_inserted.append(marker)
                         if info:
                             transforms_applied.append(f"smart:{info}")
                         self._notify_observer(tokens, tokenizer.count_text(crushed))
 
         if crushed_count > 0:
-            transforms_applied.insert(0, f"smart_crush:{crushed_count}")
+            transforms_applied.insert(
+                0, _format_smart_crush_transform(crushed_count, crushed_tool_names)
+            )
 
         tokens_after = tokenizer.count_messages(result_messages)
 
