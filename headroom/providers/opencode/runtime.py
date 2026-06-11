@@ -7,6 +7,12 @@ headroom proxy already understands (see :mod:`headroom.proxy.auth_mode`).
 For users who configure Anthropic or OpenAI directly, the proxy is reached
 via the standard ``ANTHROPIC_BASE_URL`` / ``OPENAI_BASE_URL`` env vars that
 OpenCode passes straight through to the AI SDK.
+
+The github-copilot provider in OpenCode reads its base URL from
+``opencode.json`` (patched by :func:`headroom.providers.opencode.install.apply_provider_scope`),
+not from an environment variable.  Do NOT set ``GITHUB_COPILOT_HOST`` here;
+that env var controls GitHub Enterprise host resolution in
+:mod:`headroom.copilot_auth` and would break credential discovery.
 """
 
 from __future__ import annotations
@@ -29,16 +35,6 @@ def proxy_openai_url(port: int) -> str:
     return f"http://127.0.0.1:{port}/v1"
 
 
-def proxy_copilot_url(port: int) -> str:
-    """Return the GitHub Copilot backend proxy URL for OpenCode.
-
-    The headroom proxy routes requests prefixed with ``github-copilot/``
-    to ``api.githubcopilot.com``.  Setting ``HEADROOM_COPILOT_BASE_URL``
-    tells headroom to use its own proxy as the upstream for Copilot calls.
-    """
-    return f"http://127.0.0.1:{port}/github-copilot"
-
-
 def build_launch_env(
     port: int,
     environ: Mapping[str, str] | None = None,
@@ -47,14 +43,13 @@ def build_launch_env(
 ) -> tuple[dict[str, str], list[str]]:
     """Build environment variables to route OpenCode through the headroom proxy.
 
-    OpenCode reads standard AI SDK env vars.  We set all three so it works
-    regardless of which provider the user has configured:
+    OpenCode reads standard AI SDK env vars.  We set:
 
     * ``ANTHROPIC_BASE_URL``  — for ``anthropic/*`` models
     * ``OPENAI_BASE_URL``     — for ``openai/*`` models
-    * ``GITHUB_COPILOT_HOST`` — headroom's copilot backend prefix for
-                                 ``github-copilot/*`` models (e.g. the user's
-                                 primary provider)
+
+    The ``github-copilot`` provider gets its base URL from ``opencode.json``
+    (see :func:`~headroom.providers.opencode.install.apply_provider_scope`).
     """
     env = dict(environ if environ is not None else os.environ)
 
@@ -63,12 +58,9 @@ def build_launch_env(
 
     env["ANTHROPIC_BASE_URL"] = anthropic_url
     env["OPENAI_BASE_URL"] = openai_url
-    # headroom.copilot_auth reads GITHUB_COPILOT_HOST to override the upstream
-    env["GITHUB_COPILOT_HOST"] = f"127.0.0.1:{port}"
 
     display = [
         f"ANTHROPIC_BASE_URL={anthropic_url}",
         f"OPENAI_BASE_URL={openai_url}",
-        f"GITHUB_COPILOT_HOST=127.0.0.1:{port}",
     ]
     return env, display

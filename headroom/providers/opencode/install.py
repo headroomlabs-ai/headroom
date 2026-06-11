@@ -103,3 +103,32 @@ def revert_provider_scope(mutation: ManagedMutation, manifest: DeploymentManifes
             del provider_section[prov_id]
 
     path.write_text(json.dumps(payload, indent=2) + "\n")
+
+
+def _patch_copilot_base_url(port: int) -> None:
+    """Ensure the github-copilot provider in opencode.json points to the proxy.
+
+    Called by ``headroom wrap opencode`` so the github-copilot backend routes
+    through headroom even without a full ``headroom mcp install``.
+    """
+    path = opencode_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    payload: dict = {}
+    if path.exists():
+        try:
+            payload = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError):
+            # Don't overwrite a broken config silently.
+            return
+
+    base = proxy_base_url(port)
+    opts = (
+        payload.setdefault("provider", {})
+        .setdefault("github-copilot", {})
+        .setdefault("options", {})
+    )
+    if opts.get("baseURL") == base:
+        return  # already patched
+    opts["baseURL"] = base
+    path.write_text(json.dumps(payload, indent=2) + "\n")

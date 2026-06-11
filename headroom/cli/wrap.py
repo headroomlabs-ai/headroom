@@ -4163,6 +4163,14 @@ def opencode(
             err=True,
         )
 
+    # Patch opencode.json so the github-copilot provider routes through the
+    # proxy.  This is needed because OpenCode's github-copilot provider reads
+    # its base URL from the config file, not from env vars.
+    if backend == "github-copilot":
+        from headroom.providers.opencode.install import _patch_copilot_base_url
+
+        _patch_copilot_base_url(port)
+
     if not no_rtk:
         if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
             click.echo("  Setting up lean-ctx for opencode...")

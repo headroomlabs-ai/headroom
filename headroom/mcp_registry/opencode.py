@@ -45,7 +45,10 @@ class OpenCodeRegistrar(MCPRegistrar):
         return bool(shutil.which("opencode")) or self._config_path.exists()
 
     def get_server(self, server_name: str) -> ServerSpec | None:
-        config = _read_json(self._config_path)
+        try:
+            config = _read_json(self._config_path)
+        except MalformedConfigError:
+            return None
         entry = config.get("mcp", {}).get(server_name)
         if not isinstance(entry, dict):
             return None
@@ -66,6 +69,11 @@ class OpenCodeRegistrar(MCPRegistrar):
             mcp_section = config.setdefault("mcp", {})
             mcp_section[spec.name] = _spec_to_entry(spec)
             _write_json(self._config_path, config)
+        except MalformedConfigError as exc:
+            return RegisterResult(
+                RegisterStatus.FAILED,
+                f"refusing to overwrite malformed config at {exc.path}: {exc.cause}",
+            )
         except OSError as exc:
             return RegisterResult(
                 RegisterStatus.FAILED, f"could not write {self._config_path}: {exc}"
@@ -77,7 +85,7 @@ class OpenCodeRegistrar(MCPRegistrar):
             return False
         try:
             config = _read_json(self._config_path)
-        except OSError:
+        except (OSError, MalformedConfigError):
             return False
         mcp = config.get("mcp", {})
         if server_name not in mcp:
@@ -95,15 +103,28 @@ class OpenCodeRegistrar(MCPRegistrar):
 # ------------------------------------------------------------------
 
 
+class MalformedConfigError(Exception):
+    """Raised when the OpenCode config file exists but cannot be parsed."""
+
+    def __init__(self, path: Path, cause: Exception) -> None:
+        self.path = path
+        self.cause = cause
+        super().__init__(f"Cannot parse {path}: {cause}")
+
+
 def _read_json(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
     try:
         with open(path) as fh:
             data = json.load(fh)
-    except (OSError, json.JSONDecodeError):
-        return {}
-    return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError) as exc:
+        raise MalformedConfigError(path, exc) from exc
+    if not isinstance(data, dict):
+        raise MalformedConfigError(
+            path, ValueError(f"Expected top-level object, got {type(data).__name__}")
+        )
+    return data
 
 
 def _write_json(path: Path, data: dict[str, Any]) -> None:
