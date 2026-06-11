@@ -619,11 +619,11 @@ def test_is_copilot_api_token_returns_false_for_empty_string() -> None:
 
 
 def test_token_kind_returns_known_prefixes() -> None:
-    assert copilot_auth._token_kind("tid_abc123") == "tid_***"
-    assert copilot_auth._token_kind("gho_abc123") == "gho_***"
-    assert copilot_auth._token_kind("ghs_abc123") == "ghs_***"
-    assert copilot_auth._token_kind("ghp_abc123") == "ghp_***"
-    assert copilot_auth._token_kind("github_pat_abc123") == "github_pat_***"
+    assert copilot_auth._token_kind("tid_x") == "tid_***"
+    assert copilot_auth._token_kind("gho_x") == "gho_***"
+    assert copilot_auth._token_kind("ghs_x") == "ghs_***"
+    assert copilot_auth._token_kind("ghp_x") == "ghp_***"
+    assert copilot_auth._token_kind("github_pat_x") == "github_pat_***"
 
 
 def test_token_kind_returns_unknown_for_unrecognised_token() -> None:
