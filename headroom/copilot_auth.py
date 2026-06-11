@@ -646,6 +646,15 @@ def _is_copilot_api_token(token: str) -> bool:
     return normalized.startswith("tid_")
 
 
+def _token_kind(token: str) -> str:
+    """Return a non-sensitive label for the token type, safe to log."""
+    t = token.strip()
+    for prefix in ("tid_", "gho_", "ghs_", "ghp_", "github_pat_"):
+        if t.startswith(prefix):
+            return prefix + "***"
+    return "unknown" if t else "empty"
+
+
 async def apply_copilot_api_auth(headers: dict[str, str], *, url: str) -> dict[str, str]:
     """Apply Copilot auth headers for GitHub Copilot API requests."""
     resolved = dict(headers)
@@ -667,13 +676,13 @@ async def apply_copilot_api_auth(headers: dict[str, str], *, url: str) -> dict[s
         scheme, _, raw_token = incoming_auth.partition(" ")
         if scheme.lower() == "bearer" and raw_token and _is_copilot_api_token(raw_token):
             logger.info(
-                "apply_copilot_api_auth: passing through client token prefix=%s",
-                raw_token[:12],
+                "apply_copilot_api_auth: passing through client token kind=%s",
+                _token_kind(raw_token),
             )
             return resolved
         logger.info(
-            "apply_copilot_api_auth: incoming token not suitable (prefix=%s), will replace",
-            raw_token[:12] if raw_token else "none",
+            "apply_copilot_api_auth: incoming token not suitable (kind=%s), will replace",
+            _token_kind(raw_token) if raw_token else "none",
         )
 
     token = await get_copilot_token_provider().get_api_token()
