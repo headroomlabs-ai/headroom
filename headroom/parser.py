@@ -313,9 +313,13 @@ def parse_messages(
         if block.kind == "tool_result" and block.tokens_est >= REREAD_MIN_TOKENS:
             reread_groups.setdefault(block.content_hash, []).append(block)
     for group in reread_groups.values():
-        if len({b.source_index for b in group}) < 2:
-            continue
-        total_waste.reread_tokens += sum(b.tokens_est for b in group[1:])
+        # The message that first served the content is the original; only
+        # copies appearing in *later* messages are re-reads. This also
+        # excludes duplicates within the original message itself.
+        first_index = group[0].source_index
+        total_waste.reread_tokens += sum(
+            b.tokens_est for b in group if b.source_index != first_index
+        )
 
     # Compute block breakdown
     breakdown: dict[str, int] = {}

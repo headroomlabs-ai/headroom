@@ -470,6 +470,20 @@ class TestRereadDetection:
         _, _, waste = parse_messages(messages, mock_tokenizer)
         assert waste.reread_tokens == 0
 
+    def test_mixed_same_message_duplicate_not_counted(self, mock_tokenizer):
+        """A duplicate inside the original message stays excluded even when
+        a later message also re-serves the content."""
+        part = {"type": "tool_result", "tool_use_id": "t1", "content": self.LARGE_CONTENT}
+        part2 = {"type": "tool_result", "tool_use_id": "t2", "content": self.LARGE_CONTENT}
+        part3 = {"type": "tool_result", "tool_use_id": "t3", "content": self.LARGE_CONTENT}
+        messages = [
+            {"role": "user", "content": [part, part2]},
+            {"role": "assistant", "content": "Looking again."},
+            {"role": "user", "content": [part3]},
+        ]
+        _, _, waste = parse_messages(messages, mock_tokenizer)
+        assert waste.reread_tokens == self._expected_tokens(self.LARGE_CONTENT)
+
     def test_reread_in_total_and_dict(self):
         """reread_tokens participates in total() and to_dict()."""
         from headroom.config import WasteSignals
