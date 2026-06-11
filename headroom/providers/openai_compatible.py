@@ -20,6 +20,7 @@ so supporting this format gives near-universal coverage.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -463,6 +464,53 @@ def create_fireworks_provider(
         base_url="https://api.fireworks.ai/inference/v1",
         api_key=api_key,
     )
+
+
+def create_atlascloud_provider(
+    api_key: str | None = None,
+) -> OpenAICompatibleProvider:
+    """Create provider for Atlas Cloud.
+
+    Atlas Cloud exposes an OpenAI-compatible LLM endpoint and aggregates
+    models from multiple upstream vendors behind a single API key.
+
+    Args:
+        api_key: Atlas Cloud API key. If not provided, falls back to the
+            ``ATLASCLOUD_API_KEY`` environment variable (with
+            ``ATLAS_CLOUD_API_KEY`` accepted as an alias).
+
+    Returns:
+        Configured provider.
+    """
+    resolved_api_key = (
+        api_key
+        or os.environ.get("ATLASCLOUD_API_KEY", "").strip()
+        or os.environ.get("ATLAS_CLOUD_API_KEY", "").strip()
+        or None
+    )
+
+    provider = OpenAICompatibleProvider(
+        name="atlascloud",
+        base_url="https://api.atlascloud.ai/v1",
+        api_key=resolved_api_key,
+        default_model="qwen/qwen3-32b",
+    )
+
+    provider.register_model(
+        "qwen/qwen3-32b",
+        context_window=131072,
+        supports_tools=True,
+        supports_streaming=True,
+    )
+
+    provider.register_model(
+        "moonshotai/Kimi-K2-Instruct",
+        context_window=131072,
+        supports_tools=True,
+        supports_streaming=True,
+    )
+
+    return provider
 
 
 def create_anyscale_provider(

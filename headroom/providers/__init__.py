@@ -9,7 +9,7 @@ Supported Providers:
 - GoogleProvider: Google Gemini models
 - CohereProvider: Cohere Command models
 - OpenAICompatibleProvider: Universal provider for any OpenAI-compatible API
-  (Ollama, vLLM, Together, Groq, Fireworks, LM Studio, etc.)
+  (Ollama, vLLM, Together, Groq, Fireworks, Atlas Cloud, LM Studio, etc.)
 - LiteLLMProvider: Universal provider via LiteLLM (100+ providers)
 """
 
@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from headroom.providers.openai_compatible import (
         ModelCapabilities,
         OpenAICompatibleProvider,
+        create_atlascloud_provider,
         create_anyscale_provider,
         create_fireworks_provider,
         create_groq_provider,
@@ -61,6 +62,7 @@ __all__ = [
     "create_together_provider",
     "create_groq_provider",
     "create_fireworks_provider",
+    "create_atlascloud_provider",
     "create_anyscale_provider",
     "create_vllm_provider",
     "create_lmstudio_provider",
@@ -94,6 +96,10 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "create_fireworks_provider": (
         "headroom.providers.openai_compatible",
         "create_fireworks_provider",
+    ),
+    "create_atlascloud_provider": (
+        "headroom.providers.openai_compatible",
+        "create_atlascloud_provider",
     ),
     "create_anyscale_provider": (
         "headroom.providers.openai_compatible",

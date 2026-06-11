@@ -334,6 +334,30 @@ provider = GoogleProvider(
 </Tab>
 </Tabs>
 
+### Atlas Cloud
+
+Atlas Cloud exposes an OpenAI-compatible LLM endpoint, so you can either point the proxy at Atlas Cloud or instantiate the provider factory directly.
+
+```python
+import os
+
+from headroom.providers import create_atlascloud_provider
+
+provider = create_atlascloud_provider(
+    api_key=os.environ["ATLASCLOUD_API_KEY"],
+)
+```
+
+```bash
+export ATLASCLOUD_API_KEY=your-atlas-key
+export ATLASCLOUD_MODEL=qwen/qwen3-32b
+export OPENAI_TARGET_API_URL=https://api.atlascloud.ai/v1
+export OPENAI_API_KEY=$ATLASCLOUD_API_KEY
+headroom proxy
+```
+
+Set `ATLASCLOUD_MODEL` to any model ID from the [Atlas Cloud model list](https://www.atlascloud.ai/models).
+
 ## Tool Profiles
 
 Skip or customize compression for specific tools:
