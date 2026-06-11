@@ -20,6 +20,10 @@ BASE64_PATTERN = re.compile(r"[A-Za-z0-9+/]{50,}={0,2}")
 WHITESPACE_PATTERN = re.compile(r"[ \t]{4,}|\n{3,}")
 JSON_BLOCK_PATTERN = re.compile(r"\{[\s\S]{500,}\}")
 
+# Tool results below this size legitimately repeat ("ok", empty diffs,
+# exit codes) and are not evidence of a re-read.
+REREAD_MIN_TOKENS = 50
+
 # Patterns for RAG detection (best effort)
 RAG_MARKERS = [
     r"\[Document\s*\d+\]",
@@ -299,6 +303,19 @@ def parse_messages(
                 total_waste.whitespace_tokens += ws.get("whitespace", 0)
                 total_waste.dynamic_date_tokens += ws.get("dynamic_date", 0)
                 total_waste.repetition_tokens += ws.get("repetition", 0)
+
+    # Cross-message re-read detection: identical tool_result content served
+    # at more than one position means the agent re-fetched something already
+    # in context — an over-compression signal (#853). The first serve is
+    # free; every repeat is counted as waste.
+    reread_groups: dict[str, list[Block]] = {}
+    for block in all_blocks:
+        if block.kind == "tool_result" and block.tokens_est >= REREAD_MIN_TOKENS:
+            reread_groups.setdefault(block.content_hash, []).append(block)
+    for group in reread_groups.values():
+        if len({b.source_index for b in group}) < 2:
+            continue
+        total_waste.reread_tokens += sum(b.tokens_est for b in group[1:])
 
     # Compute block breakdown
     breakdown: dict[str, int] = {}

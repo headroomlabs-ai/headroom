@@ -407,6 +407,78 @@ class TestParseMessages:
         assert len(tool_result_blocks) >= 1
 
 
+# --- TestRereadDetection ---
+
+
+class TestRereadDetection:
+    """Tests for cross-message re-read detection in parse_messages."""
+
+    LARGE_CONTENT = "def handler(event):\n    return process(event)\n" * 10  # > 200 chars
+
+    def _expected_tokens(self, text):
+        """Mirror mock_tokenizer + message overhead used for tool_result blocks."""
+        return len(text) // 4 + 1 + 4
+
+    def test_reread_detected_openai_tool_messages(self, mock_tokenizer):
+        """Identical large tool outputs at different positions count as re-read."""
+        messages = [
+            {"role": "tool", "tool_call_id": "c1", "content": self.LARGE_CONTENT},
+            {"role": "assistant", "content": "Working on it."},
+            {"role": "tool", "tool_call_id": "c2", "content": self.LARGE_CONTENT},
+        ]
+        _, _, waste = parse_messages(messages, mock_tokenizer)
+        assert waste.reread_tokens == self._expected_tokens(self.LARGE_CONTENT)
+
+    def test_reread_detected_anthropic_tool_result_blocks(self, mock_tokenizer):
+        """Anthropic-format tool_result parts are matched by content, not id."""
+        part = {"type": "tool_result", "tool_use_id": "t1", "content": self.LARGE_CONTENT}
+        part2 = {"type": "tool_result", "tool_use_id": "t2", "content": self.LARGE_CONTENT}
+        messages = [
+            {"role": "user", "content": [part]},
+            {"role": "user", "content": [part2]},
+        ]
+        _, _, waste = parse_messages(messages, mock_tokenizer)
+        assert waste.reread_tokens == self._expected_tokens(self.LARGE_CONTENT)
+
+    def test_three_occurrences_count_repeats_only(self, mock_tokenizer):
+        """First serve is free; every repeat is counted."""
+        msg = {"role": "tool", "tool_call_id": "c", "content": self.LARGE_CONTENT}
+        _, _, waste = parse_messages([dict(msg), dict(msg), dict(msg)], mock_tokenizer)
+        assert waste.reread_tokens == 2 * self._expected_tokens(self.LARGE_CONTENT)
+
+    def test_single_occurrence_no_signal(self, mock_tokenizer):
+        """One large tool result is not a re-read."""
+        messages = [{"role": "tool", "tool_call_id": "c1", "content": self.LARGE_CONTENT}]
+        _, _, waste = parse_messages(messages, mock_tokenizer)
+        assert waste.reread_tokens == 0
+
+    def test_short_duplicates_ignored(self, mock_tokenizer):
+        """Trivially short outputs (\"ok\") legitimately repeat and are skipped."""
+        messages = [
+            {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+            {"role": "tool", "tool_call_id": "c2", "content": "ok"},
+            {"role": "tool", "tool_call_id": "c3", "content": "ok"},
+        ]
+        _, _, waste = parse_messages(messages, mock_tokenizer)
+        assert waste.reread_tokens == 0
+
+    def test_same_message_duplicates_ignored(self, mock_tokenizer):
+        """Duplicates within a single message are not a re-read."""
+        part = {"type": "tool_result", "tool_use_id": "t1", "content": self.LARGE_CONTENT}
+        part2 = {"type": "tool_result", "tool_use_id": "t2", "content": self.LARGE_CONTENT}
+        messages = [{"role": "user", "content": [part, part2]}]
+        _, _, waste = parse_messages(messages, mock_tokenizer)
+        assert waste.reread_tokens == 0
+
+    def test_reread_in_total_and_dict(self):
+        """reread_tokens participates in total() and to_dict()."""
+        from headroom.config import WasteSignals
+
+        ws = WasteSignals(reread_tokens=42)
+        assert ws.total() == 42
+        assert ws.to_dict()["reread"] == 42
+
+
 # --- TestFindToolUnits ---
 
 
