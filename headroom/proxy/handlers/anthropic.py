@@ -1733,6 +1733,7 @@ class AnthropicHandlerMixin:
                             tags,
                             optimization_latency,
                             pipeline_timing=pipeline_timing,
+                            original_messages=original_client_messages,
                         )
                     else:
                         async with stage_timer.measure("upstream_connect"):
@@ -1834,7 +1835,15 @@ class AnthropicHandlerMixin:
                                 turn_id=compute_turn_id(
                                     model, body.get("system"), body.get("messages")
                                 ),
-                                request_messages=body.get("messages")
+                                # `original_client_messages` is the deep-copied
+                                # pre-compression snapshot; `body["messages"]`
+                                # is the compressed list sent upstream. Both
+                                # share the `log_full_messages` gate so the two
+                                # sides stay symmetric.
+                                request_messages=original_client_messages
+                                if self.config.log_full_messages
+                                else None,
+                                compressed_messages=body.get("messages")
                                 if self.config.log_full_messages
                                 else None,
                             )
@@ -2355,7 +2364,16 @@ class AnthropicHandlerMixin:
                             turn_id=compute_turn_id(
                                 model, body.get("system"), body.get("messages")
                             ),
-                            request_messages=messages if self.config.log_full_messages else None,
+                            # `original_client_messages` is the deep-copied
+                            # pre-compression snapshot; `body["messages"]` is the
+                            # compressed list sent upstream. Both gated by
+                            # `log_full_messages`.
+                            request_messages=original_client_messages
+                            if self.config.log_full_messages
+                            else None,
+                            compressed_messages=body.get("messages")
+                            if self.config.log_full_messages
+                            else None,
                         )
                     )
 
