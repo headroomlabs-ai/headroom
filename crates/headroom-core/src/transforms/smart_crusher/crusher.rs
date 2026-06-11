@@ -179,6 +179,21 @@ impl SmartCrusher {
             .build()
     }
 
+    /// Construct like [`SmartCrusher::new`] but with the compaction
+    /// stage's formatter chosen by name (`"csv-schema"`, `"json"`,
+    /// `"markdown-kv"`). `None` for unknown names — callers own the
+    /// fallback/error policy. `"csv-schema"` is equivalent to `new`.
+    pub fn with_compaction_format(config: SmartCrusherConfig, format_name: &str) -> Option<Self> {
+        let stage = CompactionStage::from_format_name(format_name)?;
+        Some(
+            SmartCrusherBuilder::new(config)
+                .with_default_oss_setup()
+                .with_compaction(stage)
+                .with_default_ccr_store()
+                .build(),
+        )
+    }
+
     /// Begin a builder chain for custom composition. The Enterprise
     /// entry point: swap the scorer, add business-rule constraints,
     /// attach an audit observer.
