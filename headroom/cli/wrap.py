@@ -5,6 +5,7 @@ Usage:
     headroom wrap copilot -- --model ...    # Start proxy + launch GitHub Copilot CLI
     headroom wrap codex                     # Start proxy + OpenAI Codex CLI
     headroom wrap aider                     # Start proxy + aider
+    headroom wrap vibe                      # Start proxy + Mistral Vibe
     headroom wrap cursor                    # Start proxy + print Cursor config instructions
     headroom wrap openclaw                  # Install + configure OpenClaw plugin
     headroom wrap claude --no-context-tool  # Without CLI context-tool setup
@@ -75,6 +76,7 @@ from headroom.providers.copilot import (
     validate_configuration as _validate_copilot_configuration,
 )
 from headroom.providers.cursor import render_setup_lines as _render_cursor_setup_lines
+from headroom.providers.mistral_vibe import build_launch_env as _build_mistral_vibe_launch_env
 from headroom.providers.openclaw import (
     build_plugin_entry as _build_openclaw_plugin_entry_impl,
 )
@@ -2301,6 +2303,7 @@ def wrap() -> None:
         headroom wrap codex               # OpenAI Codex CLI
         headroom wrap copilot -- --model claude-sonnet-4-20250514
         headroom wrap aider               # Aider
+        headroom wrap vibe                # Mistral Vibe
         headroom wrap cursor              # Cursor (prints config instructions)
         headroom wrap cline               # Cline (VS Code; prints config instructions)
         headroom wrap continue            # Continue (VS Code/JetBrains; injects systemMessage)
@@ -3201,6 +3204,75 @@ def aider(
         backend=backend,
         anyllm_provider=anyllm_provider,
         region=region,
+    )
+
+
+
+# =============================================================================
+# Mistral Vibe
+# =============================================================================
+
+
+@wrap.command(context_settings={"ignore_unknown_options": True})
+@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--code-graph",
+    is_flag=True,
+    help="Enable code graph indexing via codebase-memory-mcp (optional)",
+)
+@click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
+@click.option("--learn", is_flag=True, help="Enable live traffic learning")
+@click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
+@click.option("--verbose", "-v", is_flag=True, help="Verbose output")
+@click.option("--prepare-only", is_flag=True, hidden=True)
+@click.argument("vibe_args", nargs=-1, type=click.UNPROCESSED)
+def vibe(
+    port: int,
+    code_graph: bool,
+    no_proxy: bool,
+    learn: bool,
+    memory: bool,
+    verbose: bool,
+    prepare_only: bool,
+    vibe_args: tuple,
+) -> None:
+    """Launch Mistral Vibe through Headroom proxy.
+
+    \b
+    Sets VIBE_PROVIDERS to route all Mistral API calls through Headroom.
+
+    \b
+    Examples:
+        headroom wrap vibe                         # Start proxy + vibe
+        headroom wrap vibe -- "fix the bug"        # Pass prompt to vibe
+        headroom wrap vibe --port 9999             # Custom proxy port
+    """
+    if prepare_only:
+        return
+
+    vibe_bin = shutil.which("vibe")
+    if not vibe_bin:
+        click.echo("Error: 'vibe' not found in PATH.")
+        click.echo("Install Mistral Vibe: https://github.com/mistralai/mistral-vibe")
+        raise SystemExit(1)
+
+    env, env_vars_display = _build_mistral_vibe_launch_env(
+        port, os.environ, project=_project_name_from_cwd()
+    )
+
+    _launch_tool(
+        binary=vibe_bin,
+        args=vibe_args,
+        env=env,
+        port=port,
+        no_proxy=no_proxy,
+        tool_label="VIBE",
+        env_vars_display=env_vars_display,
+        learn=learn,
+        memory=memory,
+        agent_type="vibe",
+        code_graph=code_graph,
+        openai_api_url="https://api.mistral.ai",
     )
 
 
