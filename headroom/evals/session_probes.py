@@ -17,6 +17,12 @@ messages as:
 Dimensions follow production session-replay findings: exact numerics are the
 leakiest under compression, artifact trails (paths, hashes, URLs) the weakest,
 and error evidence the most critical to keep.
+
+Known limitation: marker recoverability is event-scoped, not block-scoped — a
+retrieval marker anywhere in the compressed messages marks every missing
+target as recoverable, which can overcount when the marker belongs to a
+different block than the loss. The metric is comparative (across ratios,
+transforms, and versions), not absolute.
 """
 
 from __future__ import annotations
@@ -43,14 +49,18 @@ _CCR_MARKER_RE = re.compile(r"Retrieve more: hash=|Retrieve original: hash=|<<cc
 _NUMERIC_RE = re.compile(r"[A-Za-z_][\w.-]{0,24}\"?[ =:]{1,3}\d+(?:\.\d+)?")
 _URL_RE = re.compile(r"https?://[^\s\"'<>)\]]+")
 _PATH_RE = re.compile(r"(?:~/|\.{1,2}/|/)?(?:[\w.-]+/){2,}[\w.@-]+")
-_HEX_RE = re.compile(r"\b[0-9a-f]{7,64}\b")
+# Requires at least one a-f so bare decimal runs (timestamps, row counts) are
+# not mistaken for content hashes.
+_HEX_RE = re.compile(r"\b(?=[0-9a-f]*[a-f])[0-9a-f]{7,64}\b")
 _UUID_RE = re.compile(
     r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"
 )
 
 _MIN_TARGET_LEN = 4
 _ERROR_LINE_PREFIX_LEN = 160
-_RATIO_BUCKETS = ((0.0, 0.25), (0.25, 0.5), (0.5, 0.75), (0.75, 1.01))
+# Final bucket catches inflation events (tokens_after > tokens_before), which
+# the recorder captures because compression changed the token count.
+_RATIO_BUCKETS = ((0.0, 0.25), (0.25, 0.5), (0.5, 0.75), (0.75, 1.01), (1.01, float("inf")))
 
 # Collapse punctuation that format conversions (JSON -> table/KV/CSV) rewrite,
 # keeping path/url/hash-significant characters.
@@ -119,7 +129,9 @@ class ProbeReport:
     def by_ratio_bucket(self) -> dict[str, dict[str, DimensionTally]]:
         buckets: dict[str, dict[str, DimensionTally]] = {}
         for low, high in _RATIO_BUCKETS:
-            label = f"{low:.2f}-{min(high, 1.0):.2f}"
+            label = (
+                "1.00+ (inflated)" if high == float("inf") else f"{low:.2f}-{min(high, 1.0):.2f}"
+            )
             buckets[label] = {name: DimensionTally() for name in DIMENSIONS}
             for event in self.events:
                 if low <= event.ratio < high:
@@ -287,20 +299,21 @@ def run_probes(recordings_dir: Path) -> ProbeReport:
 
     report = ProbeReport()
     for path in sorted(recordings_dir.glob("*.jsonl")):
-        for line in path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                report.skipped_lines += 1
-                continue
-            result = probe_event(record) if isinstance(record, dict) else None
-            if result is None:
-                report.skipped_lines += 1
-                continue
-            report.events.append(result)
+        with path.open(encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    report.skipped_lines += 1
+                    continue
+                result = probe_event(record) if isinstance(record, dict) else None
+                if result is None:
+                    report.skipped_lines += 1
+                    continue
+                report.events.append(result)
     return report
 
 

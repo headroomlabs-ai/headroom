@@ -67,6 +67,12 @@ class TestExtractProbeTargets:
         assert "d293b77ab12" in targets["artifacts"]
         assert "123e4567-e89b-42d3-a456-426614174000" in targets["artifacts"]
 
+    def test_bare_decimal_runs_are_not_artifacts(self):
+        targets = extract_probe_targets("run id 27344471690 at ts 1765449600")
+
+        assert "27344471690" not in targets["artifacts"]
+        assert "1765449600" not in targets["artifacts"]
+
     def test_extracts_error_lines(self):
         targets = extract_probe_targets("all good\nModuleNotFoundError: No module named 'x'\n")
 
@@ -228,6 +234,21 @@ class TestRunProbesAndReport:
         assert buckets["0.00-0.25"]["numerics"].total > 0
         assert buckets["0.75-1.00"]["numerics"].total == 0
         assert "smart_crusher" in report.by_transform()
+
+    def test_inflated_events_land_in_inflation_bucket(self, tmp_path):
+        record = _record("gone", tokens_before=100, tokens_after=130)
+        path = tmp_path / "compression-events-1.jsonl"
+        path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+        report = run_probes(tmp_path)
+
+        buckets = report.by_ratio_bucket()
+        assert buckets["1.00+ (inflated)"]["numerics"].total > 0
+        assert all(
+            dims["numerics"].total == 0
+            for label, dims in buckets.items()
+            if label != "1.00+ (inflated)"
+        )
 
     def test_transform_grouping_dedupes_repeated_markers(self, tmp_path):
         record = _record("gone", transforms=["smart_crusher", "smart_crusher"])

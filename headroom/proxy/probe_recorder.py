@@ -5,6 +5,9 @@ Records (original, compressed) message pairs at ``INPUT_COMPRESSED`` so that
 proxied sessions. Activated only when ``HEADROOM_PROBE_RECORD_DIR`` is set;
 recordings contain full conversation content in plaintext, are written with
 directory mode 0700, and never leave the machine.
+
+Writes happen synchronously on the request path, so this is a diagnostic
+tool for bounded recording sessions, not an always-on production setting.
 """
 
 from __future__ import annotations
