@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
-from contextlib import contextmanager, redirect_stderr, redirect_stdout
 import json
 import logging
 import os
@@ -11,6 +9,8 @@ import shlex
 import shutil
 import subprocess
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from hashlib import sha1
 from pathlib import Path
 from typing import Any
