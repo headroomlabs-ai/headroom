@@ -177,6 +177,7 @@ class BooleanCompressor:
                 result = self._compress_expression(content)
             if result is not None:
                 _fire_engine_loaded()
+                _fire_telemetry(result)
             return result
         except Exception as exc:
             logger.debug("BooleanCompressor: compression failed: %s", exc)
