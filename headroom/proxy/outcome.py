@@ -129,6 +129,7 @@ class RequestOutcome:
     request_messages: list[dict[str, Any]] | None = None
     tags: dict[str, str] = field(default_factory=dict)
     client: str | None = None
+    project: str | None = None
 
     # ── Derived (computed once, no caching needed — properties are cheap) ─
 
@@ -303,6 +304,11 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     """
     from headroom.proxy.cost import _summarize_transforms
     from headroom.proxy.models import RequestLog
+    from headroom.proxy.project_context import get_current_project
+
+    # Project attribution: explicit outcome field wins, else the value the
+    # HTTP middleware / WS accept captured from ``X-Headroom-Project``.
+    project = outcome.project or get_current_project()
 
     # 1. Prometheus / SavingsTracker.
     await handler.metrics.record_request(
@@ -323,6 +329,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         cache_write_1h_tokens=outcome.cache_write_1h_tokens,
         uncached_input_tokens=outcome.uncached_input_tokens,
         attempted_input_tokens=outcome.attempted_input_tokens,
+        project=project,
     )
 
     # 2. Cost tracker (optional).
@@ -349,6 +356,8 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         log_tags = dict(outcome.tags)
         if outcome.client:
             log_tags["client"] = outcome.client
+        if project:
+            log_tags["project"] = project
         request_logger.log(
             RequestLog(
                 request_id=outcome.request_id,

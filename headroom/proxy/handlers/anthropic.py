@@ -2170,11 +2170,11 @@ class AnthropicHandlerMixin:
                         except Exception as e:
                             import traceback
 
-                            logger.warning(
+                            logger.error(
                                 f"[{request_id}] CCR: Response handling failed: {e}\n"
                                 f"Traceback: {traceback.format_exc()}"
                             )
-                            # Continue with original response
+                            raise
 
                     # Memory: Handle memory tool calls in response
                     if (

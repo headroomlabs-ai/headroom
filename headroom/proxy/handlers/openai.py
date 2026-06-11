@@ -47,6 +47,7 @@ from headroom.proxy.auth_mode import classify_auth_mode, classify_client
 from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.cost import _summarize_transforms
 from headroom.proxy.outcome import RequestOutcome
+from headroom.proxy.project_context import classify_project, set_current_project
 
 logger = logging.getLogger("headroom.proxy")
 
@@ -3381,6 +3382,9 @@ class OpenAIHandlerMixin:
         # Identify the WS harness before downstream auth/header rewrites.
         # Captured in closure so per-turn RequestOutcome can stamp it.
         client = classify_client(ws_headers)
+        # WS sessions bypass the HTTP middleware, so bind the project here;
+        # per-turn outcome emission inside this task inherits the context.
+        set_current_project(classify_project(ws_headers))
         _ws_url_obj = getattr(websocket, "url", None)
         _ws_url = str(_ws_url_obj) if _ws_url_obj is not None else ""
         _ws_path = getattr(_ws_url_obj, "path", "") if _ws_url_obj is not None else ""

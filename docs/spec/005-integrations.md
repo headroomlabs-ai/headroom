@@ -207,46 +207,41 @@ app.add_middleware(
 
 ---
 
-### MCP Server (`headroom/integrations/mcp/server.py`)
+### MCP integration helpers (`headroom/integrations/mcp/server.py`)
 
-Model Context Protocol server for Claude Desktop integration.
+Helpers for MCP-aware host applications and custom wrappers. This module does
+not currently ship a standalone `HeadroomMCPProxy` server implementation.
 
 **`HeadroomMCPCompressor` class:**
 ```python
 class HeadroomMCPCompressor:
     def __init__(
         self,
-        headroom_url: str = "http://localhost:8787",
-        api_key: str | None = None,
+        config: HeadroomConfig | None = None,
+        profiles: list[MCPToolProfile] | None = None,
+        token_counter: Callable[[str], int] | None = None,
     ) -> None:
-        self.headroom_url = headroom_url
-        self.api_key = api_key
+        ...
     
-    async def compress(self, messages: list[dict]) -> CompressResult:
-        """MCP tool: compress"""
-        pass
-    
-    async def get_savings(self) -> SavingsStats:
-        """MCP tool: get_savings"""
-        pass
-    
-    async def get_stats(self) -> Stats:
-        """MCP tool: get_stats"""
+    def compress(
+        self,
+        content: str,
+        tool_name: str,
+        tool_args: dict[str, Any] | None = None,
+        user_query: str = "",
+    ) -> MCPCompressionResult:
+        """Compress an MCP tool result."""
         pass
 ```
 
-**MCP Tools:**
-- `compress` — Compress messages
-- `get_savings` — Get savings statistics
-- `get_stats` — Get compression statistics
+**Companion helpers:**
+- `compress_tool_result(...)` — standalone helper for host applications
+- `HeadroomMCPClientWrapper` — wraps an MCP client and compresses tool results
+- `create_headroom_mcp_proxy(...)` — returns config for a custom wrapper/proxy
 
-**MCP Resources:**
-- `session://headroom/sessions` — List of sessions
-- `savings://headroom/history` — Savings history
-
-**Configuration:**
+**Ready-to-run MCP tools server:**
 ```bash
-headroom mcp --port 8766
+headroom mcp serve
 ```
 
 ---

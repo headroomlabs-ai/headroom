@@ -886,6 +886,44 @@
             </div>
         </template>
 
+        <!-- Per-Project Savings Breakdown -->
+        <template x-if="Object.keys(stats.savings?.per_project || {}).length > 0">
+            <div class="bg-surface rounded-lg border border-border overflow-hidden mb-6">
+                <div class="px-4 py-3 border-b border-border flex justify-between items-center">
+                    <span class="text-sm font-medium text-gray-300">Per-Project Savings</span>
+                    <span class="text-xs text-gray-500">Lifetime totals &mdash; all time</span>
+                </div>
+                <div class="overflow-x-auto">
+                    <table class="w-full text-sm">
+                        <thead>
+                            <tr class="text-left text-xs text-gray-500 uppercase tracking-wide">
+                                <th class="px-4 py-3 font-medium">Project</th>
+                                <th class="px-4 py-3 font-medium text-right">Requests</th>
+                                <th class="px-4 py-3 font-medium text-right">Tokens Saved</th>
+                                <th class="px-4 py-3 font-medium text-right">Saved $</th>
+                                <th class="px-4 py-3 font-medium text-right">Savings %</th>
+                            </tr>
+                        </thead>
+                        <tbody class="divide-y divide-border">
+                            <template x-for="[project, info] in Object.entries(stats.savings?.per_project || {})" :key="project">
+                                <tr class="hover:bg-border/30 transition-colors">
+                                    <td class="px-4 py-3">
+                                        <span class="px-2 py-0.5 bg-border rounded text-xs" x-text="project"></span>
+                                    </td>
+                                    <td class="px-4 py-3 text-right font-mono" x-text="info.requests"></td>
+                                    <td class="px-4 py-3 text-right font-mono text-accent" x-text="formatNumber(info.tokens_saved)"></td>
+                                    <td class="px-4 py-3 text-right font-mono text-emerald-400" x-text="'$' + formatCurrency(info.compression_savings_usd || 0)"></td>
+                                    <td class="px-4 py-3 text-right">
+                                        <span class="text-accent font-mono" x-text="(info.savings_percent || 0).toFixed(1) + '%'"></span>
+                                    </td>
+                                </tr>
+                            </template>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </template>
+
         <!-- Recent Requests Table (with expandable rows) -->
         <div class="bg-surface rounded-lg border border-border overflow-hidden">
             <div class="px-4 py-3 border-b border-border flex justify-between items-center">

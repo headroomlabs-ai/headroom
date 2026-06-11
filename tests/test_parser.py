@@ -703,3 +703,226 @@ def sample_messages_with_tools():
         },
         {"role": "assistant", "content": "I found user Alice with ID 12345."},
     ]
+
+
+# --- Anthropic tool_result content blocks (chopratejas/headroom#813) ---
+
+
+@pytest.fixture
+def big_json_payload():
+    """JSON blob large enough to trip the json_bloat detector (>500 tokens)."""
+    return "{" + ",".join(f'"key_{i}": "value padding text {i}"' for i in range(200)) + "}"
+
+
+class TestAnthropicToolResultBlocks:
+    """Anthropic Messages format nests tool output in tool_result content blocks."""
+
+    def test_tool_result_with_nested_text_list(self, mock_tokenizer, big_json_payload):
+        message = {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_01",
+                    "content": [{"type": "text", "text": big_json_payload}],
+                }
+            ],
+        }
+
+        blocks = parse_message_to_blocks(message, 0, mock_tokenizer)
+
+        tool_blocks = [b for b in blocks if b.kind == "tool_result"]
+        assert len(tool_blocks) == 1
+        assert tool_blocks[0].text == big_json_payload
+        assert tool_blocks[0].flags["tool_call_id"] == "toolu_01"
+        assert tool_blocks[0].flags["waste_signals"]["json_bloat"] > 0
+
+    def test_tool_result_with_string_content(self, mock_tokenizer, big_json_payload):
+        message = {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_02",
+                    "content": big_json_payload,
+                }
+            ],
+        }
+
+        blocks = parse_message_to_blocks(message, 0, mock_tokenizer)
+
+        tool_blocks = [b for b in blocks if b.kind == "tool_result"]
+        assert len(tool_blocks) == 1
+        assert tool_blocks[0].text == big_json_payload
+        assert tool_blocks[0].flags["waste_signals"]["json_bloat"] > 0
+
+    def test_mixed_text_and_tool_result(self, mock_tokenizer, big_json_payload):
+        message = {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Here is the output:"},
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_03",
+                    "content": [{"type": "text", "text": big_json_payload}],
+                },
+            ],
+        }
+
+        blocks = parse_message_to_blocks(message, 0, mock_tokenizer)
+
+        assert [b.kind for b in blocks] == ["user", "tool_result"]
+        assert blocks[0].text == "Here is the output:"
+        assert blocks[1].text == big_json_payload
+
+    def test_empty_tool_result_content_emits_no_block(self, mock_tokenizer):
+        message = {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_04", "content": []},
+                {"type": "tool_result", "tool_use_id": "toolu_05"},
+            ],
+        }
+
+        blocks = parse_message_to_blocks(message, 0, mock_tokenizer)
+
+        # Nothing extractable: keep the container block so every message
+        # still yields at least one block.
+        assert [b.kind for b in blocks] == ["user"]
+
+    def test_tool_result_only_message_skips_container_block(self, mock_tokenizer, big_json_payload):
+        message = {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_08", "content": big_json_payload}
+            ],
+        }
+
+        blocks = parse_message_to_blocks(message, 0, mock_tokenizer)
+
+        assert [b.kind for b in blocks] == ["tool_result"]
+
+    def test_tool_result_dict_content_serialized_as_json(self, mock_tokenizer):
+        rows = {"rows": [{"id": i, "padding": "x" * 30} for i in range(120)]}
+        message = {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "toolu_09", "content": rows}],
+        }
+
+        blocks = parse_message_to_blocks(message, 0, mock_tokenizer)
+
+        tool_blocks = [b for b in blocks if b.kind == "tool_result"]
+        assert len(tool_blocks) == 1
+        assert tool_blocks[0].text.startswith('{"rows":')
+        assert tool_blocks[0].flags["waste_signals"]["json_bloat"] > 0
+
+    def test_missing_tool_use_id_yields_none_flag(self, mock_tokenizer, big_json_payload):
+        message = {
+            "role": "user",
+            "content": [{"type": "tool_result", "content": big_json_payload}],
+        }
+
+        blocks = parse_message_to_blocks(message, 0, mock_tokenizer)
+
+        assert blocks[0].kind == "tool_result"
+        assert blocks[0].flags["tool_call_id"] is None
+
+
+class TestStrandsToolResultBlocks:
+    """Strands/Bedrock converse format: toolResult content parts."""
+
+    def test_strands_text_content(self, mock_tokenizer, big_json_payload):
+        message = {
+            "role": "user",
+            "content": [
+                {
+                    "toolResult": {
+                        "toolUseId": "strands_01",
+                        "content": [{"text": big_json_payload}],
+                        "status": "success",
+                    }
+                }
+            ],
+        }
+
+        blocks = parse_message_to_blocks(message, 0, mock_tokenizer)
+
+        assert [b.kind for b in blocks] == ["tool_result"]
+        assert blocks[0].text == big_json_payload
+        assert blocks[0].flags["tool_call_id"] == "strands_01"
+        assert blocks[0].flags["waste_signals"]["json_bloat"] > 0
+
+    def test_strands_json_content(self, mock_tokenizer):
+        rows = {"rows": [{"id": i, "padding": "x" * 30} for i in range(120)]}
+        message = {
+            "role": "user",
+            "content": [{"toolResult": {"toolUseId": "strands_02", "content": [{"json": rows}]}}],
+        }
+
+        blocks = parse_message_to_blocks(message, 0, mock_tokenizer)
+
+        assert [b.kind for b in blocks] == ["tool_result"]
+        assert blocks[0].flags["waste_signals"]["json_bloat"] > 0
+
+    def test_non_text_inner_blocks_skipped(self, mock_tokenizer):
+        message = {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_06",
+                    "content": [
+                        {"type": "image", "source": {"type": "base64", "data": "abc"}},
+                        {"type": "text", "text": "small result"},
+                        "raw string piece",
+                    ],
+                }
+            ],
+        }
+
+        blocks = parse_message_to_blocks(message, 0, mock_tokenizer)
+
+        tool_blocks = [b for b in blocks if b.kind == "tool_result"]
+        assert len(tool_blocks) == 1
+        assert tool_blocks[0].text == "small result\nraw string piece"
+
+    def test_parse_messages_aggregates_tool_result_waste(self, mock_tokenizer, big_json_payload):
+        messages = [
+            {"role": "user", "content": "Run the tool"},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_07",
+                        "content": [{"type": "text", "text": big_json_payload}],
+                    }
+                ],
+            },
+        ]
+
+        _, breakdown, waste = parse_messages(messages, mock_tokenizer)
+
+        assert waste.json_bloat_tokens > 0
+        assert breakdown["tool_result"] > 0
+
+    def test_waste_parity_with_openai_tool_role(self, mock_tokenizer, big_json_payload):
+        anthropic_messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "t1",
+                        "content": [{"type": "text", "text": big_json_payload}],
+                    }
+                ],
+            }
+        ]
+        openai_messages = [{"role": "tool", "tool_call_id": "t1", "content": big_json_payload}]
+
+        _, _, anthropic_waste = parse_messages(anthropic_messages, mock_tokenizer)
+        _, _, openai_waste = parse_messages(openai_messages, mock_tokenizer)
+
+        assert anthropic_waste.total() > 0
+        assert anthropic_waste.total() == openai_waste.total()

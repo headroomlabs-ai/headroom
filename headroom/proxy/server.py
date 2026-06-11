@@ -139,6 +139,11 @@ from headroom.proxy.modes import (
     is_token_mode,
     normalize_proxy_mode,
 )
+from headroom.proxy.project_context import (
+    classify_project,
+    set_current_project,
+    strip_project_path_prefix,
+)
 from headroom.proxy.prometheus_metrics import PrometheusMetrics  # noqa: F401
 from headroom.proxy.rate_limiter import TokenBucketRateLimiter  # noqa: F401
 from headroom.proxy.request_logger import RequestLogger  # noqa: F401
@@ -359,6 +364,7 @@ class HeadroomProxy(
             enable_code_aware=config.code_aware_enabled,
             tool_profiles=config.tool_profiles,
             read_lifecycle=ReadLifecycleConfig(enabled=config.read_lifecycle),
+            ccr_inject_marker=config.ccr_inject_marker,
         )
         # A non-None exclude_tools replaces DEFAULT_EXCLUDE_TOOLS in
         # ContentRouter, so merge rather than assign.
@@ -1709,10 +1715,17 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     async def _record_headroom_stack(request, call_next):
         started = time.perf_counter()
         inbound_id = f"inbound-{time.time_ns()}"
+        # Project attribution: an explicit X-Headroom-Project header wins
+        # (claude/codex wraps); otherwise a /p/<name> base-URL prefix (aider,
+        # Copilot BYOK, Cursor — clients that cannot send custom headers).
+        # The prefix strip mutates the scope, so it must happen before
+        # request.url is first accessed (Starlette caches the URL).
+        prefix_project = strip_project_path_prefix(request.scope)
         path = request.url.path
         method = request.method
         query = request.url.query
         headers = dict(request.headers.items())
+        set_current_project(classify_project(headers) or prefix_project)
         client = getattr(request, "client", None)
         client_addr = ""
         if client is not None:
@@ -2024,6 +2037,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             "summary": summary,
             "savings": {
                 "total_tokens": total_tokens_all_layers,
+                "per_project": persistent_savings.get("projects", {}),
                 "by_layer": {
                     "cli_filtering": {
                         "tool": cli_filtering_tool,

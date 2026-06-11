@@ -405,3 +405,114 @@ def test_run_proxy_only_watcher_calls_cleanup_on_finally(
     inv = runner.invoke(_cmd)
     assert inv.exit_code == 1
     assert cleanup_calls["n"] >= 1, "cleanup must run via the finally block"
+
+
+# ---------------------------------------------------------------------------
+# _project_name_from_cwd / _apply_project_header_env — per-project savings
+# header injection for `headroom wrap claude` (issue: per-project savings).
+# ---------------------------------------------------------------------------
+
+
+class TestApplyProjectHeaderEnv:
+    """X-Headroom-Project injection into ANTHROPIC_CUSTOM_HEADERS."""
+
+    def test_sets_header_from_cwd_basename(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        project_dir = tmp_path / "my-project"
+        project_dir.mkdir()
+        monkeypatch.chdir(project_dir)
+
+        env: dict[str, str] = {}
+        wrap_mod._apply_project_header_env(env)
+
+        assert env["ANTHROPIC_CUSTOM_HEADERS"] == "X-Headroom-Project: my-project"
+
+    def test_appends_to_existing_custom_headers(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        project_dir = tmp_path / "proj"
+        project_dir.mkdir()
+        monkeypatch.chdir(project_dir)
+
+        env = {"ANTHROPIC_CUSTOM_HEADERS": "X-Custom-Trace: abc123"}
+        wrap_mod._apply_project_header_env(env)
+
+        # User header preserved verbatim, ours appended on a new line.
+        assert env["ANTHROPIC_CUSTOM_HEADERS"] == (
+            "X-Custom-Trace: abc123\nX-Headroom-Project: proj"
+        )
+
+    @pytest.mark.parametrize(
+        "user_value",
+        [
+            "X-Headroom-Project: their-name",
+            "x-headroom-project: their-name",
+            "X-HEADROOM-PROJECT: their-name",
+            "X-Other: 1\nx-Headroom-Project: their-name",
+        ],
+    )
+    def test_existing_project_header_wins_case_insensitive(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        user_value: str,
+    ) -> None:
+        project_dir = tmp_path / "proj"
+        project_dir.mkdir()
+        monkeypatch.chdir(project_dir)
+
+        env = {"ANTHROPIC_CUSTOM_HEADERS": user_value}
+        wrap_mod._apply_project_header_env(env)
+
+        # Untouched: no duplicate header, user override wins.
+        assert env["ANTHROPIC_CUSTOM_HEADERS"] == user_value
+
+    @pytest.mark.parametrize(
+        "user_value",
+        [
+            "X-Headroom-Project-Id: other",
+            "X-Trace: mentions x-headroom-project in the value",
+        ],
+    )
+    def test_similar_header_names_do_not_suppress_injection(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        user_value: str,
+    ) -> None:
+        project_dir = tmp_path / "proj"
+        project_dir.mkdir()
+        monkeypatch.chdir(project_dir)
+
+        env = {"ANTHROPIC_CUSTOM_HEADERS": user_value}
+        wrap_mod._apply_project_header_env(env)
+
+        # Only an exact header-name match counts as a user override.
+        assert env["ANTHROPIC_CUSTOM_HEADERS"] == (f"{user_value}\nX-Headroom-Project: proj")
+
+    def test_empty_cwd_name_sets_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A degenerate cwd (e.g. filesystem root → empty basename) is a no-op."""
+        monkeypatch.setattr(wrap_mod.Path, "cwd", classmethod(lambda cls: Path("/")))
+
+        env: dict[str, str] = {}
+        wrap_mod._apply_project_header_env(env)
+
+        assert "ANTHROPIC_CUSTOM_HEADERS" not in env
+
+    def test_whitespace_only_cwd_name_sets_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(wrap_mod.Path, "cwd", classmethod(lambda cls: Path("/tmp/   ")))
+
+        env: dict[str, str] = {}
+        wrap_mod._apply_project_header_env(env)
+
+        assert "ANTHROPIC_CUSTOM_HEADERS" not in env
+
+    def test_project_name_from_cwd_returns_basename(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        project_dir = tmp_path / "vibe-headroom"
+        project_dir.mkdir()
+        monkeypatch.chdir(project_dir)
+
+        assert wrap_mod._project_name_from_cwd() == "vibe-headroom"

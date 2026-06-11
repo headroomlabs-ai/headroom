@@ -26,8 +26,10 @@ logger = logging.getLogger(__name__)
 HEADROOM_SAVINGS_PATH_ENV_VAR = _paths.HEADROOM_SAVINGS_PATH_ENV
 DEFAULT_SAVINGS_DIR = ".headroom"
 DEFAULT_SAVINGS_FILE = "proxy_savings.json"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 DEFAULT_MAX_HISTORY_POINTS = 5000
+DEFAULT_MAX_PROJECTS = 50
+PROJECT_NAME_MAX_LENGTH = 128
 DEFAULT_MAX_HISTORY_AGE_DAYS = 365
 DEFAULT_MAX_RESPONSE_HISTORY_POINTS = 500
 DEFAULT_DISPLAY_SESSION_INACTIVITY_MINUTES = 60
@@ -287,6 +289,64 @@ def _empty_display_session() -> dict[str, Any]:
     }
 
 
+def sanitize_project_name(value: Any) -> str | None:
+    """Normalize a client-supplied project name; ``None`` when unusable.
+
+    Strips control characters, trims whitespace, and caps length so a
+    misbehaving client cannot bloat the persisted state or the dashboard.
+    """
+    if not isinstance(value, str):
+        return None
+    cleaned = "".join(ch for ch in value if ch.isprintable()).strip()
+    if not cleaned:
+        return None
+    return cleaned[:PROJECT_NAME_MAX_LENGTH]
+
+
+def _empty_project_entry() -> dict[str, Any]:
+    return {
+        "requests": 0,
+        "tokens_saved": 0,
+        "compression_savings_usd": 0.0,
+        "total_input_tokens": 0,
+        "total_input_cost_usd": 0.0,
+        "last_activity_at": None,
+    }
+
+
+def _normalize_projects(raw: Any) -> dict[str, dict[str, Any]]:
+    if not isinstance(raw, dict):
+        return {}
+    projects: dict[str, dict[str, Any]] = {}
+    for name, entry in raw.items():
+        cleaned_name = sanitize_project_name(name)
+        if cleaned_name is None or not isinstance(entry, dict):
+            continue
+        normalized = _empty_project_entry()
+        normalized["requests"] = _coerce_int(entry.get("requests"))
+        normalized["tokens_saved"] = _coerce_int(entry.get("tokens_saved"))
+        normalized["compression_savings_usd"] = round(
+            _coerce_float(entry.get("compression_savings_usd")), 6
+        )
+        normalized["total_input_tokens"] = _coerce_int(entry.get("total_input_tokens"))
+        normalized["total_input_cost_usd"] = round(
+            _coerce_float(entry.get("total_input_cost_usd")), 6
+        )
+        last_activity = _parse_timestamp(entry.get("last_activity_at"))
+        normalized["last_activity_at"] = _to_utc_iso(last_activity) if last_activity else None
+        projects[cleaned_name] = normalized
+    if len(projects) > DEFAULT_MAX_PROJECTS:
+        # Oversized persisted maps (hand-edited or future versions) would
+        # otherwise shrink only one entry per recorded request.
+        kept = sorted(
+            projects.items(),
+            key=lambda item: (item[1]["tokens_saved"], item[1]["last_activity_at"] or ""),
+            reverse=True,
+        )[:DEFAULT_MAX_PROJECTS]
+        projects = dict(kept)
+    return projects
+
+
 def _normalize_display_session(entry: Any) -> dict[str, Any]:
     if not isinstance(entry, dict):
         return _empty_display_session()
@@ -427,6 +487,7 @@ class SavingsTracker:
         input_tokens: int,
         tokens_saved: int,
         provider: str | None = None,
+        project: str | None = None,
         cache_read_tokens: int = 0,
         cache_write_tokens: int = 0,
         uncached_input_tokens: int = 0,
@@ -526,6 +587,16 @@ class SavingsTracker:
             if session.get("started_at") is None:
                 session["started_at"] = session["last_activity_at"]
 
+            self._record_project_locked(
+                project,
+                timestamp_dt=timestamp_dt,
+                requests_delta=1,
+                tokens_saved_delta=delta_tokens_saved,
+                savings_usd_delta=delta_savings_usd,
+                input_tokens_delta=delta_input_tokens,
+                input_cost_usd_delta=delta_input_cost_usd,
+            )
+
             if delta_tokens_saved > 0:
                 self._state["history"].append(
                     {
@@ -542,6 +613,67 @@ class SavingsTracker:
             self._save_locked()
             return True
 
+    def _record_project_locked(
+        self,
+        project: str | None,
+        *,
+        timestamp_dt: datetime,
+        requests_delta: int = 0,
+        tokens_saved_delta: int = 0,
+        savings_usd_delta: float = 0.0,
+        input_tokens_delta: int = 0,
+        input_cost_usd_delta: float = 0.0,
+    ) -> None:
+        """Accumulate per-project savings. Caller must hold ``self._lock``.
+
+        Unattributed traffic (``project`` missing or unusable) is skipped so
+        existing aggregate behavior is unchanged. The map is capped at
+        ``DEFAULT_MAX_PROJECTS`` entries, evicting the smallest/oldest bucket.
+        """
+        name = sanitize_project_name(project)
+        if name is None:
+            return
+        projects: dict[str, dict[str, Any]] = self._state.setdefault("projects", {})
+        entry = projects.setdefault(name, _empty_project_entry())
+        entry["requests"] += max(requests_delta, 0)
+        entry["tokens_saved"] += max(tokens_saved_delta, 0)
+        entry["compression_savings_usd"] = round(
+            entry["compression_savings_usd"] + max(savings_usd_delta, 0.0), 6
+        )
+        entry["total_input_tokens"] += max(input_tokens_delta, 0)
+        entry["total_input_cost_usd"] = round(
+            entry["total_input_cost_usd"] + max(input_cost_usd_delta, 0.0), 6
+        )
+        entry["last_activity_at"] = _to_utc_iso(timestamp_dt)
+        if len(projects) > DEFAULT_MAX_PROJECTS:
+            evict = min(
+                (key for key in projects if key != name),
+                key=lambda key: (
+                    projects[key]["tokens_saved"],
+                    projects[key]["last_activity_at"] or "",
+                ),
+            )
+            del projects[evict]
+
+    def _projects_snapshot_locked(self) -> dict[str, dict[str, Any]]:
+        """Per-project stats with a derived ``savings_percent``, sorted by savings."""
+        projects = self._state.get("projects", {})
+        ranked = sorted(
+            projects.items(),
+            key=lambda item: item[1]["tokens_saved"],
+            reverse=True,
+        )
+        result: dict[str, dict[str, Any]] = {}
+        for name, entry in ranked:
+            view = dict(entry)
+            total_before = entry["tokens_saved"] + entry["total_input_tokens"]
+            view["savings_percent"] = round(
+                (entry["tokens_saved"] / total_before * 100) if total_before > 0 else 0.0,
+                2,
+            )
+            result[name] = view
+        return result
+
     def stats_preview(self, recent_points: int = 20) -> dict[str, Any]:
         """Return a compact preview for `/stats`."""
         snapshot = self.snapshot()
@@ -554,6 +686,8 @@ class SavingsTracker:
             "history_points": len(snapshot["history"]),
             "recent_history": snapshot["history"][-recent_points:],
             "retention": snapshot["retention"],
+            "projects": snapshot["projects"],
+            "projects_limit": DEFAULT_MAX_PROJECTS,
         }
 
     def history_response(self, history_mode: str = "compact") -> dict[str, Any]:
@@ -582,6 +716,7 @@ class SavingsTracker:
                 "available_series": ["history", *series.keys()],
             },
             "retention": snapshot["retention"],
+            "projects": snapshot["projects"],
             "history_summary": {
                 "mode": history_mode,
                 "stored_points": len(raw_history),
@@ -645,6 +780,7 @@ class SavingsTracker:
                     "max_history_age_days": self._max_history_age_days,
                     "max_response_history_points": self._max_response_history_points,
                 },
+                "projects": self._projects_snapshot_locked(),
             }
 
     def _default_state(self) -> dict[str, Any]:
@@ -659,6 +795,7 @@ class SavingsTracker:
             },
             "display_session": _empty_display_session(),
             "history": [],
+            "projects": {},
         }
 
     def _load_state(self) -> dict[str, Any]:
@@ -731,6 +868,7 @@ class SavingsTracker:
             },
             "display_session": _normalize_display_session(raw.get("display_session")),
             "history": normalized_history,
+            "projects": _normalize_projects(raw.get("projects")),
         }
 
         if normalized_history:
@@ -822,6 +960,7 @@ class SavingsTracker:
                 "lifetime": self._state["lifetime"],
                 "display_session": self._state["display_session"],
                 "history": self._state["history"],
+                "projects": self._state.get("projects", {}),
             }
             json_data = json.dumps(payload, indent=2)
 
