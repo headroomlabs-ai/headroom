@@ -1739,11 +1739,16 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 return
             url = _upstream_target_url()
             _upstream_check_cache["url"] = url
+            client = proxy.http_client
+            if client is None:
+                _upstream_check_cache["ok"] = False
+                _upstream_check_cache["error"] = "proxy client not initialised"
+                _upstream_check_cache["expires_at"] = time.monotonic() + _UPSTREAM_CHECK_TTL
+                return
             try:
-                async with httpx.AsyncClient(timeout=5.0) as probe_client:
-                    resp = await probe_client.head(url)
-                    # Any HTTP response (even 4xx/5xx) means TLS+TCP worked.
-                    _ = resp.status_code
+                resp = await client.head(url, timeout=5.0)
+                # Any HTTP response (even 4xx/5xx) means TLS+TCP worked.
+                _ = resp.status_code
                 _upstream_check_cache["ok"] = True
                 _upstream_check_cache["error"] = None
             except Exception as exc:  # noqa: BLE001

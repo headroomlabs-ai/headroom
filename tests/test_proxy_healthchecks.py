@@ -235,7 +235,7 @@ def test_readyz_upstream_check_disabled_by_env_var(monkeypatch):
 
 def test_readyz_upstream_check_failure_returns_503(monkeypatch):
     """A failed upstream probe makes /readyz return HTTP 503."""
-    from unittest.mock import AsyncMock, MagicMock, patch
+    from unittest.mock import AsyncMock, patch
 
     import httpx
 
@@ -249,16 +249,14 @@ def test_readyz_upstream_check_failure_returns_503(monkeypatch):
     )
     app = create_app(config)
 
-    # Build the fake context-manager client once the app is already running so
-    # the startup httpx.AsyncClient (for the proxy's main http_client) is not
-    # affected — only the probe client created inside _check_upstream() is.
-    fake_probe = MagicMock()
-    fake_probe.__aenter__ = AsyncMock(return_value=fake_probe)
-    fake_probe.__aexit__ = AsyncMock(return_value=False)
-    fake_probe.head = AsyncMock(side_effect=httpx.ConnectError("connection refused (test)"))
-
+    # Patch the proxy's shared http_client.head so the probe uses the same
+    # client as real traffic (which also means TLS/CA config is consistent).
     with TestClient(app) as test_client:
-        with patch("headroom.proxy.server.httpx.AsyncClient", return_value=fake_probe):
+        with patch.object(
+            test_client.app.state.proxy.http_client,
+            "head",
+            new=AsyncMock(side_effect=httpx.ConnectError("connection refused (test)")),
+        ):
             response = test_client.get("/readyz")
 
     assert response.status_code == 503
