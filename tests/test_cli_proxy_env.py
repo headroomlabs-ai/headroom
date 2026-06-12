@@ -454,6 +454,51 @@ class TestCLIProxyEnvVars:
         assert captured_config["config"].openai_api_url == "http://my-vllm:4000"
         assert captured_config["config"].gemini_api_url == "http://my-gemini:5000"
 
+    @pytest.mark.parametrize("timeout", [-1, 0, 1, 10000])
+    def test_request_timeout_cli_flags(self, runner, timeout):
+        """Fast-fail CLI flags should map into ProxyConfig."""
+        captured_config = {}
+
+        def mock_run_server(config, **kwargs):
+            captured_config["config"] = config
+
+        with patch("headroom.proxy.server.run_server", mock_run_server):
+            result = runner.invoke(
+                main,
+                ["proxy", "--request-timeout-seconds", f"{timeout}"],
+                catch_exceptions=False,
+            )
+
+        assert result.exit_code == 0, result.output
+        assert (
+            captured_config["config"].request_timeout_seconds == timeout
+            if timeout and timeout > 0
+            else 300
+        )
+
+    @pytest.mark.parametrize("timeout", [-1, 0, 1, 10000])
+    def test_request_timeout_from_env(self, runner, timeout):
+        """HEADROOM_REQUEST_TIMEOUT env var should be passed to ProxyConfig."""
+        captured_config = {}
+
+        def mock_run_server(config, **kwargs):
+            captured_config["config"] = config
+
+        with patch("headroom.proxy.server.run_server", mock_run_server):
+            result = runner.invoke(
+                main,
+                ["proxy"],
+                env={"HEADROOM_REQUEST_TIMEOUT": f"{timeout}"},
+                catch_exceptions=False,
+            )
+
+        assert result.exit_code == 0, result.output
+        assert (
+            captured_config["config"].request_timeout_seconds == timeout
+            if timeout and timeout > 0
+            else 300
+        )
+
     def test_retry_and_connect_timeout_cli_flags(self, runner):
         """Fast-fail CLI flags should map into ProxyConfig."""
         captured_config = {}

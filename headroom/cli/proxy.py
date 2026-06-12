@@ -242,6 +242,17 @@ def _selected_context_tool() -> str:
     ),
 )
 @click.option(
+    "--request-timeout-seconds",
+    type=int,
+    default=None,
+    envvar="HEADROOM_REQUEST_TIMEOUT",
+    help=(
+        "Request timeout in seconds (default: 300). "
+        "Useful for slow providers (eg local). "
+        "Env: HEADROOM_REQUEST_TIMEOUT."
+    ),
+)
+@click.option(
     "--connect-timeout-seconds",
     type=click.IntRange(min=1, max=300),
     default=None,
@@ -612,6 +623,7 @@ def proxy(
     no_subscription_tracking: bool,
     subscription_poll_interval: int | None,
     retry_max_attempts: int | None,
+    request_timeout_seconds: int | None,
     connect_timeout_seconds: int | None,
     anthropic_pre_upstream_concurrency: int | None,
     anthropic_pre_upstream_acquire_timeout_seconds: float | None,
@@ -811,6 +823,9 @@ def proxy(
             subscription_poll_interval if subscription_poll_interval is not None else 300
         ),
         retry_max_attempts=retry_max_attempts if retry_max_attempts is not None else 3,
+        request_timeout_seconds=request_timeout_seconds
+        if request_timeout_seconds is not None and request_timeout_seconds > 0
+        else 300,
         connect_timeout_seconds=connect_timeout_seconds
         if connect_timeout_seconds is not None
         else 10,
