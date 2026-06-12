@@ -19,7 +19,11 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from headroom.providers.ccr import get_ccr_adapter
+from headroom.providers.ccr import (
+    ANTHROPIC_CCR_ADAPTER,
+    OPENAI_CCR_ADAPTER,
+    get_ccr_adapter,
+)
 
 from ..cache.compression_store import format_retrieval_miss_detail, get_compression_store
 from .tool_injection import CCR_TOOL_NAME, parse_tool_call
@@ -635,14 +639,14 @@ class StreamingCCRHandler:
         events: list[dict[str, Any]],
     ) -> dict[str, Any]:
         """Reconstruct Anthropic response from stream events."""
-        return get_ccr_adapter("anthropic").reconstruct_stream_response(events)
+        return ANTHROPIC_CCR_ADAPTER.reconstruct_stream_response(events)
 
     def _reconstruct_openai_response(
         self,
         events: list[dict[str, Any]],
     ) -> dict[str, Any]:
         """Reconstruct OpenAI response from stream events."""
-        return get_ccr_adapter("openai").reconstruct_stream_response(events)
+        return OPENAI_CCR_ADAPTER.reconstruct_stream_response(events)
 
     async def _response_to_sse(
         self,

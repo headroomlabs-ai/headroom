@@ -26,7 +26,7 @@ from typing import Any, Protocol
 
 import httpx
 
-from headroom.providers.ccr import get_ccr_adapter
+from headroom.providers.ccr import CCR_API_URLS, GOOGLE_CCR_ADAPTER, get_ccr_adapter
 
 from .batch_store import BatchContext, BatchRequestContext, get_batch_context_store
 from .response_handler import CCRResponseHandler, ResponseHandlerConfig
@@ -109,12 +109,7 @@ class BatchResultProcessor:
             )
         )
 
-        # API base URLs
-        self.api_urls = {
-            "anthropic": "https://api.anthropic.com",
-            "openai": "https://api.openai.com",
-            "google": "https://generativelanguage.googleapis.com",
-        }
+        self.api_urls = CCR_API_URLS
 
     async def process_results(
         self,
@@ -355,9 +350,7 @@ class BatchResultProcessor:
         messages: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
         """Convert standard messages to Google contents format."""
-        adapter = get_ccr_adapter("google")
-        messages_to_contents = adapter.messages_to_contents
-        return messages_to_contents(messages)
+        return GOOGLE_CCR_ADAPTER.messages_to_contents(messages)
 
     def _update_result(
         self,
