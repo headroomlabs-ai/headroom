@@ -21,12 +21,17 @@ Usage:
 
 from __future__ import annotations
 
-import base64
 import io
 import logging
-import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
+
+from headroom.providers.image import (
+    decode_image_block,
+    estimate_low_detail_tokens,
+    low_detail_resize_dimension,
+    rewrite_low_detail_image_block,
+)
 
 if TYPE_CHECKING:
     from .trained_router import TrainedRouter
@@ -227,24 +232,9 @@ class ImageCompressor:
                 if not isinstance(item, dict):
                     continue
 
-                # OpenAI format: {"type": "image_url", "image_url": {"url": "data:..."}}
-                if item.get("type") == "image_url":
-                    url = item.get("image_url", {}).get("url", "")
-                    if url.startswith("data:"):
-                        # Extract base64 data
-                        match = re.match(r"data:image/[^;]+;base64,(.+)", url)
-                        if match:
-                            return base64.b64decode(match.group(1))
-
-                # Anthropic format: {"type": "image", "source": {"data": "..."}}
-                if item.get("type") == "image":
-                    source = item.get("source", {})
-                    if source.get("type") == "base64":
-                        return base64.b64decode(source.get("data", ""))
-
-                # Google format: {"inlineData": {"data": "..."}}
-                if "inlineData" in item:
-                    return base64.b64decode(item["inlineData"].get("data", ""))
+                image_block = decode_image_block(item)
+                if image_block is not None:
+                    return image_block.image_bytes
 
         return None
 
@@ -338,31 +328,14 @@ class ImageCompressor:
                     total += max(1, len(text) // 4)  # ~4 chars per token
                     continue
 
-                # OpenAI: check if detail was set to "low"
-                if item.get("type") == "image_url":
-                    detail = item.get("image_url", {}).get("detail", "high")
-                    if detail == "low":
-                        total += 85  # OpenAI's documented low-detail cost
-                    else:
-                        # Re-estimate from the (possibly resized) image
-                        url = item.get("image_url", {}).get("url", "")
-                        if url.startswith("data:"):
-                            match = re.match(r"data:image/[^;]+;base64,(.+)", url)
-                            if match:
-                                data = base64.b64decode(match.group(1))
-                                total += self._estimate_tokens(data, "high")
+                low_detail_tokens = estimate_low_detail_tokens(item)
+                if low_detail_tokens is not None:
+                    total += low_detail_tokens
+                    continue
 
-                # Anthropic: re-estimate from the (possibly resized) image
-                elif item.get("type") == "image":
-                    source = item.get("source", {})
-                    if source.get("type") == "base64":
-                        data = base64.b64decode(source.get("data", ""))
-                        total += self._estimate_tokens(data, "high")
-
-                # Google: re-estimate
-                elif "inlineData" in item:
-                    data = base64.b64decode(item.get("inlineData", {}).get("data", ""))
-                    total += self._estimate_tokens(data, "high")
+                image_block = decode_image_block(item)
+                if image_block is not None:
+                    total += self._estimate_tokens(image_block.image_bytes, "high")
 
         return total if total > 0 else self._estimate_tokens(original_image_data, "high")
 
@@ -509,31 +482,11 @@ class ImageCompressor:
                     new_content.append(item)
                     continue
 
-                # Extract image bytes for OCR (transcode) across all formats
-                image_bytes_for_ocr: bytes | None = None
-                is_image_block = False
-
-                if item.get("type") == "image_url":
-                    is_image_block = True
-                    url = item.get("image_url", {}).get("url", "")
-                    if url.startswith("data:"):
-                        match = re.match(r"data:image/[^;]+;base64,(.+)", url)
-                        if match:
-                            image_bytes_for_ocr = base64.b64decode(match.group(1))
-                elif item.get("type") == "image":
-                    is_image_block = True
-                    source = item.get("source", {})
-                    if source.get("type") == "base64":
-                        image_bytes_for_ocr = base64.b64decode(source.get("data", ""))
-                elif "inlineData" in item:
-                    is_image_block = True
-                    image_bytes_for_ocr = base64.b64decode(
-                        item.get("inlineData", {}).get("data", "")
-                    )
-
-                if not is_image_block:
+                image_block = decode_image_block(item, provider)
+                if image_block is None:
                     new_content.append(item)
                     continue
+                image_bytes_for_ocr = image_block.image_bytes
 
                 # --- TRANSCODE: OCR the image and replace with text ---
                 if technique.value == "transcode" and image_bytes_for_ocr:
@@ -549,57 +502,25 @@ class ImageCompressor:
 
                 # --- FULL_LOW / CROP: reduce quality ---
                 if technique.value in ("full_low", "crop", "transcode"):
-                    if item.get("type") == "image_url" and provider == "openai":
-                        new_content.append(
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    **item.get("image_url", {}),
-                                    "detail": "low",
-                                },
-                            }
+                    max_dimension = low_detail_resize_dimension(provider)
+                    if max_dimension is None:
+                        new_content.append(rewrite_low_detail_image_block(item, provider))
+                        continue
+                    try:
+                        resized_data, media_type = self._resize_image(
+                            image_bytes_for_ocr,
+                            max_dimension=max_dimension,
                         )
-                    elif item.get("type") == "image" and provider == "anthropic":
-                        if image_bytes_for_ocr:
-                            try:
-                                resized_data, media_type = self._resize_image(
-                                    image_bytes_for_ocr, max_dimension=512
-                                )
-                                new_content.append(
-                                    {
-                                        "type": "image",
-                                        "source": {
-                                            "type": "base64",
-                                            "media_type": media_type,
-                                            "data": base64.b64encode(resized_data).decode(),
-                                        },
-                                    }
-                                )
-                            except Exception as e:
-                                logger.warning(f"Failed to resize image: {e}")
-                                new_content.append(item)
-                        else:
-                            new_content.append(item)
-                    elif "inlineData" in item and provider == "google":
-                        if image_bytes_for_ocr:
-                            try:
-                                resized_data, media_type = self._resize_image(
-                                    image_bytes_for_ocr, max_dimension=768
-                                )
-                                new_content.append(
-                                    {
-                                        "inlineData": {
-                                            "mimeType": media_type,
-                                            "data": base64.b64encode(resized_data).decode(),
-                                        }
-                                    }
-                                )
-                            except Exception as e:
-                                logger.warning(f"Failed to resize image: {e}")
-                                new_content.append(item)
-                        else:
-                            new_content.append(item)
-                    else:
+                        new_content.append(
+                            rewrite_low_detail_image_block(
+                                item,
+                                provider,
+                                resized_data=resized_data,
+                                media_type=media_type,
+                            )
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to resize image: {e}")
                         new_content.append(item)
                 else:
                     # PRESERVE or unknown — keep original
