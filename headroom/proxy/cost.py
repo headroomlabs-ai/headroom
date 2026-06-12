@@ -84,6 +84,31 @@ def _summarize_transforms(transforms: list[str]) -> str:
     return " ".join(parts)
 
 
+def header_safe_transforms(transforms: list[str]) -> list[str]:
+    """Strip enriched detail so each tag is safe in the comma-joined header.
+
+    ``x-headroom-transforms`` is built as ``",".join(transforms_applied)``, so a
+    tag must not itself contain a comma or the header can't be split back into
+    tags. The enriched ``read_lifecycle:<state>:<path>`` and
+    ``smart_crush:<n>:<names>`` tags carry comma-bearing detail (file paths may
+    contain commas; tool-name lists are comma-separated), so collapse them back
+    to their legacy counter shape for the header. Full detail stays in the
+    structured ``transforms_applied`` list (dashboards, request logs, the
+    desktop activity feed) — only the opaque header is normalized.
+    """
+    safe: list[str] = []
+    for t in transforms:
+        if t.startswith("smart_crush:"):
+            parts = t.split(":")
+            safe.append(f"smart_crush:{parts[1]}" if len(parts) >= 2 else t)
+        elif t.startswith("read_lifecycle:"):
+            parts = t.split(":")
+            safe.append(f"read_lifecycle:{parts[1]}" if len(parts) >= 2 else t)
+        else:
+            safe.append(t)
+    return safe
+
+
 def build_prefix_cache_stats(
     metrics: PrometheusMetrics,
     cost_tracker: CostTracker | None,

@@ -741,3 +741,64 @@ def test_unwrap_codex_preserves_unrelated_sections(
     assert result.exit_code == 0, result.output
     restored = config_file.read_text()
     assert restored == original
+
+
+# ---------------------------------------------------------------------------
+# Per-project savings: env_http_headers in the injected provider block
+# ---------------------------------------------------------------------------
+
+
+class TestCodexProjectHeaderConfig:
+    """The injected provider maps X-Headroom-Project to HEADROOM_PROJECT.
+
+    Codex's ``env_http_headers`` sends a header only when the mapped env var
+    is set at Codex runtime, so `headroom wrap codex` exports
+    ``HEADROOM_PROJECT`` and the proxy attributes savings per project.
+    """
+
+    def test_inject_writes_env_http_headers_mapping(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        _set_test_home(monkeypatch, tmp_path)
+
+        wrap_mod._inject_codex_provider_config(8787)
+
+        content = (tmp_path / ".codex" / "config.toml").read_text()
+        assert 'env_http_headers = { "X-Headroom-Project" = "HEADROOM_PROJECT" }' in content
+
+    def test_env_http_headers_inside_provider_section(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The mapping must live inside [model_providers.headroom], before
+        the closing marker, so it applies to the Headroom provider."""
+        _set_test_home(monkeypatch, tmp_path)
+
+        wrap_mod._inject_codex_provider_config(8787)
+
+        content = (tmp_path / ".codex" / "config.toml").read_text()
+        section_start = content.index("[model_providers.headroom]")
+        mapping_pos = content.index("env_http_headers")
+        end_marker_pos = content.index(wrap_mod._CODEX_END_MARKER, section_start)
+        assert section_start < mapping_pos < end_marker_pos
+
+    def test_strip_removes_block_with_env_http_headers(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """_strip_codex_headroom_blocks removes the whole injected block,
+        including the new env_http_headers line, leaving user content."""
+        _set_test_home(monkeypatch, tmp_path)
+        config_dir = tmp_path / ".codex"
+        config_dir.mkdir()
+        config_file = config_dir / "config.toml"
+        original = '[profiles.default]\nmodel = "gpt-4o"\n'
+        config_file.write_text(original)
+
+        wrap_mod._inject_codex_provider_config(8787)
+        wrapped = config_file.read_text()
+        assert "env_http_headers" in wrapped
+
+        cleaned = wrap_mod._strip_codex_headroom_blocks(wrapped)
+        assert "env_http_headers" not in cleaned
+        assert "X-Headroom-Project" not in cleaned
+        assert "[model_providers.headroom]" not in cleaned
+        assert 'model = "gpt-4o"' in cleaned

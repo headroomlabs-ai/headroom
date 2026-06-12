@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "headroom-ai"
-version = "0.24.0"
+version = "0.25.0"
 description = "The Context Optimization Layer for LLM Applications - Cut costs by 50-90%"
 readme = "README.md"
 license = "Apache-2.0"
@@ -108,6 +108,12 @@ memory-stack = [
     "mem0ai>=1.0.0,<2.0",
     "qdrant-client>=1.9.0,<2.0",
     "neo4j>=5.20.0,<7.0",
+]
+# Apple-Silicon GPU (MPS) offload for the memory embedder. Opt in at runtime with
+# HEADROOM_EMBEDDER_RUNTIME=pytorch_mps. macOS-only; intentionally excluded from [all].
+pytorch-mps = [
+    "torch>=2.0.0; sys_platform == 'darwin'",
+    "sentence-transformers>=2.2.0; sys_platform == 'darwin'",
 ]
 # Semantic relevance scoring with embeddings.
 # Uses `fastembed` (BAAI/bge-small-en-v1.5 by default — 33M params,

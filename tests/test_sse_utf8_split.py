@@ -85,6 +85,16 @@ def test_cjk_split_across_chunks_preserved() -> None:
     assert parsed["text"] == "日本語テスト"
 
 
+def test_crlf_terminated_event_is_parsed() -> None:
+    """SSE permits CRLF event terminators as well as LF terminators."""
+    buf = bytearray(b'event: message\r\ndata: {"ok": true}\r\n\r\n')
+
+    events = parse_sse_events_from_byte_buffer(buf)
+
+    assert events == [("message", '{"ok": true}')]
+    assert buf == bytearray()
+
+
 def test_complete_event_with_invalid_utf8_raises_loud() -> None:
     """Invalid UTF-8 in a *complete* event surfaces loudly (not silent corruption)."""
     # Build a complete event whose data field has invalid UTF-8 bytes

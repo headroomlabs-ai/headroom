@@ -358,6 +358,11 @@ class SmartCrusherConfig:
     first_fraction: float = 0.3  # 30% of K from start of array
     last_fraction: float = 0.15  # 15% of K from end of array
 
+    # Lossless compaction only replaces the original when it saves at
+    # least this byte fraction vs the (minified) input. Mirrors the
+    # Rust default.
+    lossless_min_savings_ratio: float = 0.30
+
 
 @dataclass
 class CacheOptimizerConfig:
@@ -407,14 +412,14 @@ class CCRConfig:
     - Network effect: retrieval patterns improve compression for all users
 
     GOTCHAS:
-    - Cache has TTL (default 5 min) - retrieval fails after expiration
+    - Cache has TTL (default 300 seconds) - retrieval fails after expiration
     - Memory usage: ~1KB per cached entry
     - Only works with array compression (not string truncation)
     """
 
     enabled: bool = True  # Enable CCR (cache + retrieval markers)
     store_max_entries: int = 1000  # Max entries in compression store
-    store_ttl_seconds: int = 300  # Cache TTL (5 minutes)
+    store_ttl_seconds: int = 300  # Cache TTL in seconds
     inject_retrieval_marker: bool = True  # Add retrieval hint to compressed output
     feedback_enabled: bool = True  # Track retrieval events for learning
     min_items_to_cache: int = 20  # Only cache if original had >= N items
@@ -531,6 +536,7 @@ class WasteSignals:
     whitespace_tokens: int = 0  # Repeated whitespace
     dynamic_date_tokens: int = 0  # Dynamic dates in system prompt
     repetition_tokens: int = 0  # Repeated content
+    reread_tokens: int = 0  # Tool results re-served after already appearing earlier
 
     def total(self) -> int:
         """Total waste tokens detected."""
@@ -541,6 +547,7 @@ class WasteSignals:
             + self.whitespace_tokens
             + self.dynamic_date_tokens
             + self.repetition_tokens
+            + self.reread_tokens
         )
 
     def to_dict(self) -> dict[str, int]:
@@ -552,6 +559,7 @@ class WasteSignals:
             "whitespace": self.whitespace_tokens,
             "dynamic_date": self.dynamic_date_tokens,
             "repetition": self.repetition_tokens,
+            "reread": self.reread_tokens,
         }
 
 

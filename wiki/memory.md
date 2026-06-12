@@ -446,6 +446,38 @@ config = MemoryConfig(
 )
 ```
 
+### Embedding Runtime / GPU Offload (Apple Silicon)
+
+By default the proxy's memory embedder runs on the **ONNX CPU** backend. This
+is fast and dependency-light, but it is CPU-only — under sustained load the
+embedding step can saturate the CPU and make the proxy less responsive.
+
+On Apple Silicon you can opt in to running the embedder on the **Apple GPU
+(MPS)** instead, which offloads that work off the CPU and keeps the proxy
+responsive. This is especially useful on fanless Macs (e.g. the M5 Air) that
+are prone to CPU-saturation timeouts.
+
+Enable it by installing the extra and setting the env var:
+
+```bash
+pip install 'headroom-ai[pytorch-mps]'   # also works as [pytorch_mps]
+export HEADROOM_EMBEDDER_RUNTIME=pytorch_mps
+```
+
+When set, the embedder runs via the torch sentence-transformers backend on the
+Apple GPU instead of the default ONNX CPU embedder. Notes:
+
+- **Strictly opt-in.** `pytorch_mps` is the only accepted value; anything else
+  (or unset) keeps the default ONNX CPU embedder. Default behavior is unchanged.
+- **Auto-fallback.** It only activates when Apple MPS is actually available
+  (Apple Silicon + torch). If MPS is unavailable or torch/sentence-transformers
+  is not installed, it logs a warning and uses the existing default embedder
+  selection path: ONNX when available, then the pre-existing local
+  sentence-transformers fallback.
+- **MPS serialization.** torch-MPS is not thread-safe, so the embedder
+  serializes MPS encode calls internally via a single-worker executor. This is
+  automatic — there is nothing to configure.
+
 ### Storage Configuration
 
 ```python

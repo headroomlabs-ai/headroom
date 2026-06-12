@@ -111,7 +111,14 @@ def _parse_kv(kv_str: str) -> dict[str, str]:
     # Handle transforms= specially since its value contains spaces
     if "transforms=" in kv_str:
         before, transforms_val = kv_str.split("transforms=", 1)
-        result["transforms"] = transforms_val.strip()
+        transform_parts: list[str] = []
+        for part in transforms_val.split():
+            if "=" in part:
+                k, v = part.split("=", 1)
+                result[k] = v
+            else:
+                transform_parts.append(part)
+        result["transforms"] = " ".join(transform_parts).strip()
         kv_str = before
     for part in kv_str.split():
         if "=" in part:
@@ -136,6 +143,7 @@ class PerfRecord:
     cache_hit_pct: int = 0
     optimization_ms: float = 0
     transforms: list[str] = field(default_factory=list)
+    client: str = ""
 
 
 @dataclass
@@ -226,7 +234,8 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
     report = PerfReport()
     report.requested_hours = last_n_hours
 
-    if not LOG_DIR.exists():
+    log_dir = _paths.log_dir()
+    if not log_dir.exists():
         return report
 
     cutoff = datetime.now() - timedelta(hours=last_n_hours) if last_n_hours > 0 else None
@@ -250,7 +259,7 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
             report.newest_kept_ts = ts_str
 
     # Collect log files: proxy.log, proxy.log.1, proxy.log.2, ...
-    log_files = sorted(LOG_DIR.glob("proxy.log*"), key=lambda p: p.stat().st_mtime)
+    log_files = sorted(log_dir.glob("proxy.log*"), key=lambda p: p.stat().st_mtime)
 
     for log_file in log_files:
         report.log_files_read += 1
@@ -299,6 +308,7 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
                                 cache_hit_pct=int(kv.get("cache_hit_pct", 0)),
                                 optimization_ms=float(kv.get("opt_ms", 0)),
                                 transforms=transforms,
+                                client=kv.get("client", ""),
                             )
                         )
                         continue
@@ -589,7 +599,7 @@ def format_report(report: PerfReport) -> str:
     lines.append(
         f"Log files: {report.log_files_read} | Lines parsed: {report.total_lines_parsed:,}"
     )
-    lines.append(f"Log dir: {LOG_DIR}")
+    lines.append(f"Log dir: {_paths.log_dir()}")
 
     return "\n".join(lines)
 
@@ -611,6 +621,7 @@ PERF_RECORD_FIELDS = [
     "timestamp",
     "request_id",
     "model",
+    "client",
     "num_messages",
     "tokens_before",
     "tokens_after",

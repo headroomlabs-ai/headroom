@@ -52,7 +52,7 @@ Headroom compresses everything your AI agent reads — tool outputs, logs, RAG c
 - **MCP server** — `headroom_compress`, `headroom_retrieve`, `headroom_stats` for any MCP client
 - **Cross-agent memory** — shared store across Claude, Codex, Gemini, auto-dedup
 - **`headroom learn`** — mines failed sessions, writes corrections to `CLAUDE.md` / `AGENTS.md`
-- **Reversible (CCR)** — originals never deleted; LLM retrieves on demand
+- **Reversible (CCR)** — originals are cached for retrieval on demand
 
 ## How it works (30 seconds)
 
@@ -99,7 +99,7 @@ headroom proxy --port 8787              # drop-in proxy, zero code changes
 headroom perf
 ```
 
-Granular extras: `[proxy]`, `[mcp]`, `[ml]`, `[code]`, `[memory]`, `[relevance]`, `[image]`, `[agno]`, `[langchain]`, `[evals]`. Requires **Python 3.10+**.
+Granular extras: `[proxy]`, `[mcp]`, `[ml]`, `[code]`, `[memory]`, `[relevance]`, `[image]`, `[agno]`, `[langchain]`, `[evals]`, `[pytorch-mps]` (Apple-GPU memory-embedder offload — set `HEADROOM_EMBEDDER_RUNTIME=pytorch_mps`). Requires **Python 3.10+**.
 
 ## Proof
 
@@ -159,7 +159,7 @@ Platform support note: macOS auth reuse via Copilot CLI Keychain storage has bee
 **Great fit if you…**
 - run AI coding agents daily and want savings without changing your code
 - work across multiple agents and want shared memory
-- need reversible compression — originals always retrievable via CCR
+- need reversible compression — originals are retrievable via CCR within the configured TTL
 
 **Skip it if you…**
 - only use a single provider's native compaction and don't need cross-agent memory
@@ -228,7 +228,7 @@ npm install headroom-ai                 # TypeScript / Node
 docker pull ghcr.io/chopratejas/headroom:latest
 ```
 
-Granular extras: `[proxy]`, `[mcp]`, `[ml]` (Kompress-base), `[code]`, `[memory]`, `[relevance]`, `[image]`, `[agno]`, `[langchain]`, `[evals]`. Requires **Python 3.10+**.
+Granular extras: `[proxy]`, `[mcp]`, `[ml]` (Kompress-base), `[code]`, `[memory]`, `[relevance]`, `[image]`, `[agno]`, `[langchain]`, `[evals]`, `[pytorch-mps]` (Apple-GPU memory-embedder offload — set `HEADROOM_EMBEDDER_RUNTIME=pytorch_mps`). Requires **Python 3.10+**.
 
 Using `pipx`? Choose a supported interpreter explicitly:
 
@@ -237,6 +237,33 @@ pipx install --python python3.13 "headroom-ai[all]"
 ```
 
 → [Installation guide](https://headroom-docs.vercel.app/docs/installation) — Docker tags, persistent service, PowerShell, devcontainers.
+
+### Corporate / SSL-inspection environments
+
+If `pip install "headroom-ai[all]"` fails with `CERTIFICATE_VERIFY_FAILED`
+(`unable to get local issuer certificate`), your network uses **SSL inspection** — a MITM
+proxy presenting a company-issued CA. The build backend (`maturin`) downloads `rustup` over a
+connection your TLS stack doesn't trust. **Install Rust first** so the build doesn't fetch it:
+
+```bash
+# macOS / Linux
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh && rustup default stable
+# Windows
+winget install Rustlang.Rustup && rustup default stable
+```
+
+Restart your shell, then `pip install "headroom-ai[all]"`. A prebuilt wheel avoids the Rust
+build entirely where available: `pip install --only-binary headroom-ai headroom-ai`.
+
+Two runtime assets are fetched over TLS; if they are blocked, trust your corporate CA via
+`REQUESTS_CA_BUNDLE` / `SSL_CERT_FILE` / `CURL_CA_BUNDLE`:
+
+- **`cdn.pyke.io`** — the ONNX Runtime for the Rust core. Alternatively pre-provide it with
+  `ORT_STRATEGY=system` and `ORT_LIB_LOCATION=/path/to/onnxruntime`.
+- **`huggingface.co`** — the `kompress-base` compression model. Pre-download it and run with
+  `HF_HUB_OFFLINE=1`, or set `HF_ENDPOINT` to a trusted mirror.
+
+Running with compression disabled (pure gateway) requires neither asset.
 
 ## headroom learn
 

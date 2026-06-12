@@ -8,12 +8,14 @@ import signal
 import subprocess
 import sys
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from .health import probe_ready
 from .models import DeploymentManifest, InstallPreset, RuntimeKind
-from .paths import log_path, pid_path
+from .paths import log_path, pid_path, profile_root
 
 PASSTHROUGH_ENV_PREFIXES = (
     "HEADROOM_",
@@ -163,6 +165,57 @@ def _clear_pid(profile: str) -> None:
     path = pid_path(profile)
     if path.exists():
         path.unlink()
+
+
+@contextmanager
+def acquire_runtime_start_lock(profile: str) -> Iterator[bool]:
+    """Try to hold the profile-local runtime start lock."""
+
+    path = profile_root(profile) / "runner.start.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a+", encoding="utf-8", errors="replace") as lock_file:
+        acquired = False
+        if _is_windows():
+            import msvcrt
+
+            lock_file.seek(0)
+            msvcrt_any = cast(Any, msvcrt)
+            try:
+                msvcrt_any.locking(lock_file.fileno(), msvcrt_any.LK_NBLCK, 1)
+                acquired = True
+            except OSError:
+                yield False
+                return
+        else:
+            import fcntl
+
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+            except BlockingIOError:
+                yield False
+                return
+        try:
+            lock_file.seek(0)
+            lock_file.truncate()
+            lock_file.write(str(os.getpid()))
+            lock_file.flush()
+            yield True
+        finally:
+            if acquired:
+                if _is_windows():
+                    import msvcrt
+
+                    lock_file.seek(0)
+                    msvcrt_any = cast(Any, msvcrt)
+                    try:
+                        msvcrt_any.locking(lock_file.fileno(), msvcrt_any.LK_UNLCK, 1)
+                    except OSError:
+                        pass
+                else:
+                    import fcntl
+
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def run_foreground(manifest: DeploymentManifest) -> int:

@@ -11,6 +11,8 @@ from typing import Any
 
 import click
 
+from headroom.proxy.project_context import with_project_prefix
+
 
 def resolve_provider_type(
     backend: str | None, provider_type: str, environ: Mapping[str, str] | None = None
@@ -65,6 +67,43 @@ def validate_configuration(
         )
 
 
+def _normalized_model_name(model: str | None) -> str:
+    """Return a lowercase model name without provider/path prefixes."""
+    if not model:
+        return ""
+    value = model.strip().lower()
+    for separator in ("/", ":"):
+        if separator in value:
+            value = value.rsplit(separator, 1)[-1]
+    return value
+
+
+def model_prefers_responses_api(model: str | None) -> bool:
+    """Return True for OpenAI reasoning models served via /responses."""
+    value = _normalized_model_name(model)
+    return value.startswith(("gpt-5", "o1", "o3"))
+
+
+def copilot_model_from_args(
+    copilot_args: tuple[str, ...],
+    env: Mapping[str, str] | None = None,
+) -> str | None:
+    """Resolve the Copilot model from CLI args or environment variables."""
+    for idx, arg in enumerate(copilot_args):
+        if arg == "--model" and idx + 1 < len(copilot_args):
+            return copilot_args[idx + 1]
+        if arg.startswith("--model="):
+            return arg.split("=", 1)[1]
+
+    source = env or os.environ
+    return source.get("COPILOT_MODEL") or source.get("COPILOT_PROVIDER_MODEL_ID")
+
+
+def default_wire_api_for_model(model: str | None) -> str:
+    """Choose the Copilot OpenAI-compatible wire API for a model."""
+    return "responses" if model_prefers_responses_api(model) else "completions"
+
+
 def provider_key_source(provider_type: str) -> str:
     """Return the preferred provider key variable for the selected provider type."""
     return "ANTHROPIC_API_KEY" if provider_type == "anthropic" else "OPENAI_API_KEY"
@@ -76,8 +115,14 @@ def build_launch_env(
     provider_type: str,
     wire_api: str | None,
     environ: Mapping[str, str] | None = None,
+    project: str | None = None,
 ) -> tuple[dict[str, str], list[str]]:
-    """Build the Copilot BYOK environment for the selected provider type."""
+    """Build the Copilot BYOK environment for the selected provider type.
+
+    ``project`` (the wrap launch directory) is encoded as a ``/p/<name>``
+    base-URL prefix because the Copilot CLI cannot send custom headers; the
+    proxy strips it and attributes savings per project.
+    """
     # Distinguish "caller passed nothing" (use os.environ) from "caller
     # explicitly passed an empty dict" (start fresh — the test/CLI is in
     # charge of which keys to seed). The previous `environ or os.environ`
@@ -92,7 +137,7 @@ def build_launch_env(
             env["COPILOT_PROVIDER_API_KEY"] = key
 
     if provider_type == "anthropic":
-        base_url = f"http://127.0.0.1:{port}"
+        base_url = with_project_prefix(f"http://127.0.0.1:{port}", project)
         env["COPILOT_PROVIDER_BASE_URL"] = base_url
         return env, [
             "COPILOT_PROVIDER_TYPE=anthropic",
@@ -100,7 +145,7 @@ def build_launch_env(
         ]
 
     effective_wire_api = wire_api or "completions"
-    base_url = f"http://127.0.0.1:{port}/v1"
+    base_url = with_project_prefix(f"http://127.0.0.1:{port}/v1", project)
     env["COPILOT_PROVIDER_BASE_URL"] = base_url
     env["COPILOT_PROVIDER_WIRE_API"] = effective_wire_api
     return env, [
