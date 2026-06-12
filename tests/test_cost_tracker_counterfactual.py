@@ -108,3 +108,47 @@ def test_no_cost_without_headroom_field():
     stats = ct.stats()
 
     assert "cost_without_headroom_usd" not in stats
+
+
+def test_budget_enforced_after_recording_costs():
+    """record_tokens must populate cost history so check_budget enforces the limit.
+
+    Regression test: _costs was never written, so check_budget always
+    returned (True, budget_limit) and budgets were silently unenforced.
+    """
+    from headroom.proxy.server import CostTracker
+
+    ct = CostTracker(budget_limit_usd=0.0001, budget_period="daily")
+    allowed, remaining = ct.check_budget()
+    assert allowed  # nothing spent yet
+
+    # ~$1.50+ of Sonnet input at list price — far over the budget
+    ct.record_tokens(
+        "claude-sonnet-4-20250514",
+        tokens_saved=0,
+        tokens_sent=500_000,
+        uncached_tokens=500_000,
+        output_tokens=10_000,
+    )
+
+    assert ct.get_period_cost() > 0
+    allowed, remaining = ct.check_budget()
+    assert not allowed
+    assert remaining == 0
+
+
+def test_budget_input_cost_counted_without_usage_breakdown():
+    """When the call site has no API usage breakdown (cache/uncached all 0),
+    tokens_sent must be used as the input count — input cost must not be
+    silently dropped from the budget."""
+    from headroom.proxy.server import CostTracker
+
+    ct = CostTracker(budget_limit_usd=100.0)
+    ct.record_tokens(
+        "claude-sonnet-4-20250514",
+        tokens_saved=0,
+        tokens_sent=500_000,
+    )
+
+    # 500k input tokens at Sonnet list price is ~$1.50 — must be > output-only
+    assert ct.get_period_cost() > 0.5
