@@ -103,3 +103,46 @@ def test_provider_image_formula_helpers_are_authoritative() -> None:
     assert estimate_anthropic_tokens(1024, 768) == 1048
     assert find_optimal_openai_dimensions(512, 512) == (512, 512)
     assert find_optimal_anthropic_dimensions(800, 600) == (800, 600)
+
+
+def test_provider_image_openai_formula_scales_large_images() -> None:
+    # Max-dimension and short-side scaling should match the public OpenAI tile formula.
+    assert estimate_openai_tokens(4000, 3000) == 765
+    assert estimate_openai_tokens(768, 768) == 765
+
+    opt_w, opt_h = find_optimal_openai_dimensions(770, 770)
+
+    assert (opt_w, opt_h) == (512, 512)
+    assert estimate_openai_tokens(opt_w, opt_h) < estimate_openai_tokens(770, 770)
+
+
+def test_provider_image_anthropic_formula_scales_to_limits() -> None:
+    assert find_optimal_anthropic_dimensions(3000, 2000) == (1313, 875)
+
+    opt_w, opt_h = find_optimal_anthropic_dimensions(1568, 1568)
+
+    assert opt_w * opt_h <= 1_150_000
+    assert estimate_anthropic_tokens(3000, 2000) == max(1, (1313 * 875) // 750)
+
+
+def test_tile_plan_handles_anthropic_and_unsupported_blocks() -> None:
+    anthropic = tile_optimization_plan(
+        block_provider="anthropic",
+        requested_provider="openai",
+        width=3000,
+        height=2000,
+    )
+    unsupported = tile_optimization_plan(
+        block_provider="google",
+        requested_provider="google",
+        width=3000,
+        height=2000,
+    )
+
+    assert anthropic is not None
+    assert anthropic.result_provider == "anthropic"
+    assert anthropic.tokens_after == estimate_anthropic_tokens(
+        anthropic.optimized_width,
+        anthropic.optimized_height,
+    )
+    assert unsupported is None
