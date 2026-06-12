@@ -59,6 +59,20 @@ def test_codex_uses_chatgpt_auth_false_for_missing_or_malformed(tmp_path: Path) 
     assert codex_uses_chatgpt_auth(bad) is False
 
 
+def test_codex_uses_chatgpt_auth_false_for_non_dict_json(tmp_path: Path) -> None:
+    auth = tmp_path / "auth.json"
+    auth.write_text("[]", encoding="utf-8")
+
+    assert codex_uses_chatgpt_auth(auth) is False
+
+
+def test_codex_uses_chatgpt_auth_false_for_empty_object(tmp_path: Path) -> None:
+    auth = tmp_path / "auth.json"
+    auth.write_text("{}", encoding="utf-8")
+
+    assert codex_uses_chatgpt_auth(auth) is False
+
+
 def test_codex_provider_section_supports_custom_markers() -> None:
     section = build_provider_section(
         port=9100,

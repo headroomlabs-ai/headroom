@@ -350,6 +350,30 @@ class TestSubscriptionRouting:
         content = (tmp_path / ".codex" / "config.toml").read_text()
         assert 'openai_base_url = "http://127.0.0.1:8787/v1"' in content
 
+    def test_inject_emits_requires_openai_auth_for_chatgpt(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        _set_test_home(monkeypatch, tmp_path)
+        config_dir = tmp_path / ".codex"
+        config_dir.mkdir()
+        (config_dir / "auth.json").write_text('{"auth_mode": "chatgpt"}', encoding="utf-8")
+
+        wrap_mod._inject_codex_provider_config(8787)
+
+        assert "requires_openai_auth = true" in (config_dir / "config.toml").read_text()
+
+    def test_inject_omits_requires_openai_auth_for_api_key(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        _set_test_home(monkeypatch, tmp_path)
+        config_dir = tmp_path / ".codex"
+        config_dir.mkdir()
+        (config_dir / "auth.json").write_text('{"auth_mode": "apikey"}', encoding="utf-8")
+
+        wrap_mod._inject_codex_provider_config(8787)
+
+        assert "requires_openai_auth" not in (config_dir / "config.toml").read_text()
+
     def test_openai_base_url_port_updates_on_rewrap(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:

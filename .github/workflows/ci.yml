@@ -195,7 +195,16 @@ jobs:
         run: |
           pytest tests scripts/tests \
             --splits 4 --group ${{ matrix.shard }} \
+            --cov=headroom --cov-report=xml:coverage-unit-${{ matrix.shard }}.xml \
             --tb=short -q
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          file: ./coverage-unit-${{ matrix.shard }}.xml
+          flags: unit
+          name: unit-shard-${{ matrix.shard }}
+          fail_ci_if_error: false
 
   test-extras:
     needs: [changes, build-wheel]
