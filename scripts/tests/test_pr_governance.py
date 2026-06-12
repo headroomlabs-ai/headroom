@@ -89,7 +89,9 @@ def test_validate_pull_request_marks_ready_pr_valid() -> None:
 
 def test_validate_pull_request_allows_draft_without_ready_checkboxes() -> None:
     module = _load_module()
-    body = VALID_BODY.replace("- [x] I have performed a self-review", "- [ ] I have performed a self-review")
+    body = VALID_BODY.replace(
+        "- [x] I have performed a self-review", "- [ ] I have performed a self-review"
+    )
     body = body.replace(
         "- [x] This PR is ready for human review",
         "- [ ] This PR is ready for human review",

@@ -169,7 +169,9 @@ def validate_pull_request(event: dict[str, Any]) -> GovernanceReport:
 
     changes_made = sections.get("Changes Made", "")
     if changes_made and not has_non_placeholder_bullets(changes_made):
-        problems.append("Replace the placeholder bullets in `Changes Made` with the actual changes.")
+        problems.append(
+            "Replace the placeholder bullets in `Changes Made` with the actual changes."
+        )
 
     type_of_change_checked = checked_items(sections.get("Type of Change", ""))
     if sections.get("Type of Change") and not type_of_change_checked:
@@ -193,7 +195,9 @@ def validate_pull_request(event: dict[str, Any]) -> GovernanceReport:
     has_ready_checkbox = "this pr is ready for human review" in readiness_checked
     if not is_draft:
         if not has_self_review:
-            problems.append("Check `I have performed a self-review` before requesting human review.")
+            problems.append(
+                "Check `I have performed a self-review` before requesting human review."
+            )
         if not has_ready_checkbox:
             problems.append(
                 "Check `This PR is ready for human review` or convert the PR back to draft."
@@ -274,7 +278,9 @@ def emit_outputs(report: GovernanceReport) -> None:
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--event", type=Path, required=True, help="Path to the GitHub event payload JSON.")
+    parser.add_argument(
+        "--event", type=Path, required=True, help="Path to the GitHub event payload JSON."
+    )
     parser.add_argument("--report", type=Path, required=True, help="Path to write the JSON report.")
     return parser.parse_args(argv)
 
