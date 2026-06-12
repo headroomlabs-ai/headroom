@@ -666,6 +666,40 @@
                         </div>
                     </div>
                 </template>
+                <!-- Compression vs cache: net impact of prefix-mutating layers -->
+                <template x-if="hasCompressionVsCache">
+                    <div class="mt-5 border-t border-border pt-4">
+                        <div class="flex items-center justify-between mb-3">
+                            <div>
+                                <div class="text-xs text-gray-500 uppercase tracking-wide">Compression vs Cache</div>
+                                <div class="text-[11px] text-gray-600 mt-0.5">Tokens saved by compression against cached-prefix tokens its mutations invalidated</div>
+                            </div>
+                            <div data-testid="cvc-net-headline" class="rounded-full border bg-black/20 px-3 py-1 text-[11px] uppercase tracking-[0.18em]" :class="compressionVsCacheNet >= 0 ? 'border-emerald-400/20 text-emerald-300/90' : 'border-red-400/25 text-red-300/90'" x-text="compressionVsCacheNet >= 0 ? 'Net positive' : 'Net negative'"></div>
+                        </div>
+                        <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+                            <div class="rounded-2xl border border-white/8 bg-black/20 p-4">
+                                <div class="text-[11px] uppercase tracking-[0.18em] text-emerald-300/75">Saved by Compression</div>
+                                <div data-testid="cvc-saved-value" class="mt-2 text-3xl font-light text-emerald-50" x-text="formatNumber(stats.prefix_cache?.compression_vs_cache?.tokens_saved_by_compression || 0)"></div>
+                                <div class="mt-1 text-xs text-gray-500">tokens removed before send</div>
+                            </div>
+                            <div class="rounded-2xl border border-white/8 bg-black/20 p-4">
+                                <div class="text-[11px] uppercase tracking-[0.18em] text-red-300/75">Lost to Cache Busts</div>
+                                <div data-testid="cvc-bust-value" class="mt-2 text-3xl font-light text-red-50" x-text="formatNumber(stats.prefix_cache?.compression_vs_cache?.tokens_lost_to_cache_bust || 0)"></div>
+                                <div class="mt-1 text-xs text-gray-500" x-text="formatNumber(stats.prefix_cache?.compression_vs_cache?.cache_bust_count || 0) + ' busts observed'"></div>
+                            </div>
+                            <div class="rounded-2xl border border-white/8 bg-black/20 p-4">
+                                <div class="text-[11px] uppercase tracking-[0.18em] text-gray-400">Net</div>
+                                <div data-testid="cvc-net-value" class="mt-2 text-3xl font-light" :class="compressionVsCacheNet >= 0 ? 'text-emerald-400' : 'text-red-400'" x-text="(compressionVsCacheNet >= 0 ? '+' : '-') + formatNumber(Math.abs(compressionVsCacheNet))"></div>
+                                <div class="mt-1 text-xs text-gray-500">saved minus bust losses</div>
+                            </div>
+                            <div class="rounded-2xl border border-white/8 bg-black/20 p-4">
+                                <div class="text-[11px] uppercase tracking-[0.18em] text-cyan-300/75">Prefix Freeze Net</div>
+                                <div data-testid="freeze-net-value" class="mt-2 text-3xl font-light" :class="prefixFreezeNet >= 0 ? 'text-cyan-50' : 'text-red-400'" x-text="(prefixFreezeNet >= 0 ? '+' : '-') + formatNumber(Math.abs(prefixFreezeNet))"></div>
+                                <div class="mt-1 text-xs text-gray-500" x-text="formatNumber(stats.prefix_cache?.prefix_freeze?.busts_avoided || 0) + ' busts avoided, ' + formatNumber(stats.prefix_cache?.prefix_freeze?.compression_foregone_tokens || 0) + ' foregone'"></div>
+                            </div>
+                        </div>
+                    </div>
+                </template>
                 <!-- Per-provider breakdown -->
                 <template x-if="Object.keys(stats.prefix_cache?.by_provider || {}).length > 0">
                     <div class="mt-4 border-t border-border pt-3">
@@ -2069,6 +2103,25 @@
                     const active = mix.active_buckets || [];
                     if (!active.length) return 'No TTL bucket data';
                     return active.length === 1 ? active[0] + ' only' : active.join(' / ');
+                },
+
+                get compressionVsCacheNet() {
+                    const cvc = this.stats.prefix_cache?.compression_vs_cache || {};
+                    return cvc.net_tokens ?? ((cvc.tokens_saved_by_compression || 0) - (cvc.tokens_lost_to_cache_bust || 0));
+                },
+
+                get prefixFreezeNet() {
+                    const pf = this.stats.prefix_cache?.prefix_freeze || {};
+                    return pf.net_benefit_tokens ?? ((pf.tokens_preserved || 0) - (pf.compression_foregone_tokens || 0));
+                },
+
+                get hasCompressionVsCache() {
+                    const cvc = this.stats.prefix_cache?.compression_vs_cache || {};
+                    const pf = this.stats.prefix_cache?.prefix_freeze || {};
+                    return (cvc.tokens_saved_by_compression || 0) > 0
+                        || (cvc.tokens_lost_to_cache_bust || 0) > 0
+                        || (pf.tokens_preserved || 0) > 0
+                        || (pf.compression_foregone_tokens || 0) > 0;
                 },
 
                 // --- Waste Signals ---
