@@ -156,6 +156,24 @@ class TestCLIProxyEnvVars:
         assert result.exit_code == 0, result.output
         assert captured_config["config"].port == 9797
 
+    def test_headroom_min_tokens_from_env(self, runner):
+        """HEADROOM_MIN_TOKENS env var should be passed to ProxyConfig."""
+        captured_config = {}
+
+        def mock_run_server(config, **kwargs):
+            captured_config["config"] = config
+
+        with patch("headroom.proxy.server.run_server", mock_run_server):
+            result = runner.invoke(
+                main,
+                ["proxy"],
+                env={"HEADROOM_MIN_TOKENS": "120"},
+                catch_exceptions=False,
+            )
+
+        assert result.exit_code == 0, result.output
+        assert captured_config["config"].min_tokens_to_crush == 120
+
     def test_headroom_budget_from_env(self, runner):
         """HEADROOM_BUDGET env var should be passed to ProxyConfig."""
         captured_config = {}

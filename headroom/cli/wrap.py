@@ -38,6 +38,9 @@ if sys.platform == "win32" and hasattr(sys.stdout, "buffer"):
 import click
 
 from headroom._version import __version__ as _HEADROOM_VERSION
+from headroom.agent_savings import (
+    apply_agent_savings_env_defaults,
+)
 from headroom.copilot_auth import (
     has_oauth_auth,
     resolve_client_bearer_token,
@@ -95,6 +98,7 @@ _CONTEXT_TOOL_ENV = "HEADROOM_CONTEXT_TOOL"
 _CONTEXT_TOOL_RTK = "rtk"
 _CONTEXT_TOOL_LEAN_CTX = "lean-ctx"
 _VALID_CONTEXT_TOOLS = {_CONTEXT_TOOL_RTK, _CONTEXT_TOOL_LEAN_CTX}
+_AGENT_SAVINGS_TARGET_AGENTS = {"claude", "codex", "cursor"}
 _WRAP_PROXY_TIMEOUT_ENV = "HEADROOM_WRAP_PROXY_TIMEOUT"
 _WRAP_PROXY_TIMEOUT_DEFAULT_SECONDS = 45
 _WRAP_PROXY_TIMEOUT_ML_DEFAULT_SECONDS = 90
@@ -360,6 +364,8 @@ def _start_proxy(
     # Ensure proxy subprocess uses UTF-8 (Windows defaults to cp1252)
     proxy_env = os.environ.copy()
     proxy_env["PYTHONIOENCODING"] = "utf-8"
+    if agent_type in {"claude", "codex", "cursor"}:
+        apply_agent_savings_env_defaults(proxy_env)
 
     # Tell the proxy which agent is being wrapped (for traffic learning output)
     if agent_type != "unknown":
@@ -367,8 +373,6 @@ def _start_proxy(
         proxy_env.setdefault("HEADROOM_STACK", f"wrap_{agent_type}")
     savings_profile = _wrap_agent_savings_profile(agent_type)
     if savings_profile is not None:
-        from headroom.agent_savings import apply_agent_savings_env_defaults
-
         apply_agent_savings_env_defaults(proxy_env, savings_profile)
     if openai_api_url:
         proxy_env["OPENAI_TARGET_API_URL"] = openai_api_url
@@ -1551,6 +1555,77 @@ def _proxy_health_config(payload: dict[str, Any] | None) -> dict[str, Any] | Non
         return None
     config = payload.get("config")
     return config if isinstance(config, dict) else None
+
+
+def _env_bool_value(value: str) -> bool:
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _agent_savings_config_mismatches(
+    running_config: dict[str, Any],
+    agent_type: str,
+) -> list[str]:
+    """Return restart reasons when a running proxy lacks target agent savings."""
+
+    if agent_type not in _AGENT_SAVINGS_TARGET_AGENTS:
+        return []
+
+    desired_env = os.environ.copy()
+    apply_agent_savings_env_defaults(desired_env)
+    checks: tuple[tuple[str, str, str, str], ...] = (
+        ("HEADROOM_SAVINGS_PROFILE", "savings_profile", "savings-profile", "str"),
+        ("HEADROOM_TARGET_RATIO", "target_ratio", "target-ratio", "float"),
+        (
+            "HEADROOM_COMPRESS_USER_MESSAGES",
+            "compress_user_messages",
+            "compress-user-messages",
+            "bool",
+        ),
+        (
+            "HEADROOM_COMPRESS_SYSTEM_MESSAGES",
+            "compress_system_messages",
+            "compress-system-messages",
+            "bool",
+        ),
+        ("HEADROOM_PROTECT_RECENT", "protect_recent", "protect-recent", "int"),
+        (
+            "HEADROOM_PROTECT_ANALYSIS_CONTEXT",
+            "protect_analysis_context",
+            "protect-analysis-context",
+            "bool",
+        ),
+        ("HEADROOM_MIN_TOKENS", "min_tokens_to_crush", "min-tokens", "int"),
+        ("HEADROOM_MAX_ITEMS", "max_items_after_crush", "max-items", "int"),
+        (
+            "HEADROOM_SMART_CRUSHER_COMPACTION",
+            "smart_crusher_with_compaction",
+            "smart-crusher-compaction",
+            "bool",
+        ),
+        ("HEADROOM_ACCURACY_GUARD", "accuracy_guard", "accuracy-guard", "str"),
+    )
+
+    mismatches: list[str] = []
+    for env_key, config_key, label, value_type in checks:
+        expected = desired_env.get(env_key)
+        if expected is None:
+            continue
+        actual = running_config.get(config_key)
+        try:
+            if value_type == "float":
+                matches = actual is not None and abs(float(actual) - float(expected)) < 1e-9
+            elif value_type == "int":
+                matches = actual is not None and int(actual) == int(expected)
+            elif value_type == "bool":
+                matches = actual is not None and bool(actual) is _env_bool_value(expected)
+            else:
+                matches = str(actual or "").strip().lower() == expected.strip().lower()
+        except (TypeError, ValueError):
+            matches = False
+        if not matches:
+            mismatches.append(label)
+
+    return mismatches
 
 
 def _proxy_active_session_count(payload: dict[str, Any] | None) -> int:

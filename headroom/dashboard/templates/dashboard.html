@@ -133,6 +133,18 @@
                     <span class="text-xs text-amber-400 font-medium">Anon Telemetry</span>
                 </div>
             </template>
+            <template x-if="stats.config && stats.config.savings_profile">
+                <div class="inline-flex items-center gap-1.5 rounded-full border border-cyan-500/40 bg-cyan-500/10 px-2.5 py-1"
+                     :title="'Current proxy profile: ' + stats.config.savings_profile">
+                    <span class="w-1.5 h-1.5 rounded-full bg-cyan-400"></span>
+                    <span class="text-xs text-cyan-100">
+                        <span x-text="stats.config.savings_profile"></span>
+                        <template x-if="stats.config.target_savings_percent !== null">
+                            <span x-text="' · target ' + stats.config.target_savings_percent + '%'"></span>
+                        </template>
+                    </span>
+                </div>
+            </template>
             <div class="flex items-center gap-2">
                 <span class="text-xs text-gray-500">Status</span>
                 <span class="flex items-center gap-1.5">
@@ -226,6 +238,106 @@
                 <div class="mt-2 text-xs text-gray-500">
                     TTFB <span x-text="((stats.ttfb?.average_ms || 0) / 1000).toFixed(2)"></span>s avg
                 </div>
+            </div>
+        </div>
+
+        <!-- Agent Usage -->
+        <div class="bg-surface rounded-lg border border-border overflow-hidden mb-6">
+            <div class="px-4 py-3 border-b border-border flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
+                <div>
+                    <div class="text-sm font-medium text-gray-300">Agent Usage</div>
+                    <div class="text-xs text-gray-500">Before and after token usage by detected client</div>
+                </div>
+                <div class="flex flex-wrap items-center gap-3 text-xs">
+                    <span class="text-gray-500" x-text="'Coverage: ' + agentCoverageLabel"></span>
+                    <span class="px-2 py-0.5 rounded border border-border bg-[#141414] font-mono text-gray-400"
+                          x-text="formatNumber(stats.agent_usage?.totals?.requests || 0) + ' requests'"></span>
+                </div>
+            </div>
+
+            <div class="p-4">
+                <div class="grid grid-cols-1 md:grid-cols-4 gap-3 mb-5">
+                    <div class="rounded-lg border border-border bg-[#141414] p-3">
+                        <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Before</div>
+                        <div class="text-2xl font-light tabular-nums" x-text="formatNumber(stats.agent_usage?.totals?.before_tokens || 0)"></div>
+                    </div>
+                    <div class="rounded-lg border border-border bg-[#141414] p-3">
+                        <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">After</div>
+                        <div class="text-2xl font-light tabular-nums text-gray-200" x-text="formatNumber(stats.agent_usage?.totals?.after_tokens || 0)"></div>
+                    </div>
+                    <div class="rounded-lg border border-border bg-[#141414] p-3">
+                        <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Saved</div>
+                        <div class="text-2xl font-light tabular-nums text-accent" x-text="formatNumber(stats.agent_usage?.totals?.tokens_saved || 0)"></div>
+                    </div>
+                    <div class="rounded-lg border border-border bg-[#141414] p-3">
+                        <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Savings</div>
+                        <div class="text-2xl font-light tabular-nums text-emerald-400" x-text="(stats.agent_usage?.totals?.savings_percent || 0).toFixed(1) + '%'"></div>
+                    </div>
+                </div>
+
+                <template x-if="agentRows.length > 0">
+                    <div class="space-y-3">
+                        <template x-for="agent in agentRows" :key="agent.agent">
+                            <div class="rounded-lg border border-border bg-[#141414] p-3">
+                                <div class="grid grid-cols-1 gap-3 lg:grid-cols-[minmax(160px,0.9fr)_minmax(260px,1.5fr)_minmax(260px,1.2fr)] lg:items-center">
+                                    <div class="min-w-0">
+                                        <div class="flex items-center gap-2">
+                                            <span class="h-2.5 w-2.5 rounded-full" :class="agentDotClass(agent.agent)"></span>
+                                            <span class="text-sm font-medium text-gray-200 truncate" x-text="agent.label"></span>
+                                        </div>
+                                        <div class="mt-1 text-xs text-gray-500">
+                                            <span x-text="formatNumber(agent.requests || 0) + ' requests'"></span>
+                                            <span class="mx-1 text-gray-700">/</span>
+                                            <span x-text="agent.source"></span>
+                                        </div>
+                                    </div>
+
+                                    <div>
+                                        <div class="flex items-center justify-between text-xs mb-1">
+                                            <span class="text-gray-500">Token flow</span>
+                                            <span class="font-mono text-emerald-400" x-text="(agent.savings_percent || 0).toFixed(1) + '% saved'"></span>
+                                        </div>
+                                        <div class="h-3 w-full rounded-full bg-border overflow-hidden flex">
+                                            <div class="h-full bg-emerald-500 transition-all duration-500"
+                                                 :style="'width:' + agentSavedWidth(agent) + '%'"></div>
+                                            <div class="h-full bg-accent/60 transition-all duration-500"
+                                                 :style="'width:' + agentAfterWidth(agent) + '%'"></div>
+                                        </div>
+                                        <div class="mt-1 flex flex-wrap gap-3 text-xs text-gray-500">
+                                            <span class="inline-flex items-center gap-1"><span class="h-2 w-2 rounded-full bg-emerald-500"></span>Saved</span>
+                                            <span class="inline-flex items-center gap-1"><span class="h-2 w-2 rounded-full bg-accent/60"></span>Sent</span>
+                                        </div>
+                                    </div>
+
+                                    <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 text-right">
+                                        <div>
+                                            <div class="text-[11px] uppercase tracking-wide text-gray-500">Before</div>
+                                            <div class="font-mono text-sm" x-text="formatNumber(agent.before_tokens || 0)"></div>
+                                        </div>
+                                        <div>
+                                            <div class="text-[11px] uppercase tracking-wide text-gray-500">After</div>
+                                            <div class="font-mono text-sm" x-text="formatNumber(agent.after_tokens || 0)"></div>
+                                        </div>
+                                        <div>
+                                            <div class="text-[11px] uppercase tracking-wide text-gray-500">Saved</div>
+                                            <div class="font-mono text-sm text-accent" x-text="formatNumber(agent.tokens_saved || 0)"></div>
+                                        </div>
+                                        <div>
+                                            <div class="text-[11px] uppercase tracking-wide text-gray-500">Share</div>
+                                            <div class="font-mono text-sm text-gray-300" x-text="(agent.share_of_saved_percent || 0).toFixed(1) + '%'"></div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </template>
+                    </div>
+                </template>
+
+                <template x-if="agentRows.length === 0">
+                    <div class="rounded-lg border border-dashed border-border p-6 text-center text-sm text-gray-500">
+                        Agent usage appears after Cursor, Claude, Codex, or another client sends traffic through this proxy.
+                    </div>
+                </template>
             </div>
         </div>
 
@@ -1761,6 +1873,48 @@
                     return model.replace(/^(anthropic\.|openai\.|bedrock\/)/, '')
                                .replace(/-\d{8}$/, '')
                                .substring(0, 20);
+                },
+
+                // --- Agent Usage ---
+
+                get agentRows() {
+                    return this.stats.agent_usage?.agents || [];
+                },
+
+                get agentCoverageLabel() {
+                    const coverage = this.stats.agent_usage?.coverage || {};
+                    if (coverage.mode === 'request_logs') {
+                        return this.formatNumber(coverage.logged_requests || 0) + ' logged requests';
+                    }
+                    return 'aggregate fallback';
+                },
+
+                agentSavedWidth(agent) {
+                    const before = agent.before_tokens || 0;
+                    if (before <= 0) return 0;
+                    return Math.min(100, Math.max(0, (agent.tokens_saved || 0) / before * 100)).toFixed(1);
+                },
+
+                agentAfterWidth(agent) {
+                    const before = agent.before_tokens || 0;
+                    if (before <= 0) return 0;
+                    return Math.min(100, Math.max(0, (agent.after_tokens || 0) / before * 100)).toFixed(1);
+                },
+
+                agentDotClass(agent) {
+                    const colors = {
+                        'claude-code': 'bg-orange-400',
+                        claude: 'bg-orange-400',
+                        codex: 'bg-emerald-400',
+                        cursor: 'bg-cyan-400',
+                        copilot: 'bg-violet-400',
+                        openai: 'bg-sky-400',
+                        anthropic: 'bg-orange-400',
+                        gemini: 'bg-rose-400',
+                        aider: 'bg-amber-400',
+                        unknown: 'bg-gray-500',
+                    };
+                    return colors[agent] || 'bg-gray-400';
                 },
 
                 // --- Historical View ---

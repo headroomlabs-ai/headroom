@@ -41,6 +41,7 @@ if TYPE_CHECKING:
 
 import httpx
 
+from headroom.agent_savings import proxy_pipeline_kwargs
 from headroom.copilot_auth import apply_copilot_api_auth, build_copilot_upstream_url
 from headroom.pipeline import PipelineStage, summarize_routing_markers
 from headroom.proxy.auth_mode import classify_auth_mode, classify_client
@@ -139,7 +140,12 @@ def _openai_responses_unit_executor() -> ThreadPoolExecutor:
         return _OPENAI_RESPONSES_UNIT_EXECUTOR
 
 
-def _openai_responses_unit_cache_key(unit: Any, *, model: str) -> str:
+def _openai_responses_unit_cache_key(
+    unit: Any,
+    *,
+    model: str,
+    target_ratio: float | None = None,
+) -> str:
     text_hash = hashlib.sha256(unit.text.encode("utf-8", errors="replace")).hexdigest()
     key_payload = {
         "version": _OPENAI_RESPONSES_UNIT_CACHE_VERSION,
@@ -155,6 +161,7 @@ def _openai_responses_unit_cache_key(unit: Any, *, model: str) -> str:
         "question": unit.question,
         "bias": unit.bias,
         "metadata": unit.metadata,
+        "target_ratio": target_ratio,
         "text_sha256": text_hash,
     }
     serialized = json.dumps(key_payload, sort_keys=True, separators=(",", ":"), default=str)
@@ -646,6 +653,10 @@ class OpenAIHandlerMixin:
         if router is None:
             logger.debug("[%s] OpenAI Responses ContentRouter unavailable", request_id)
             return payload, False, 0, [], {}, [], 0
+        profile_kwargs = proxy_pipeline_kwargs(getattr(self, "config", None))
+        unit_target_ratio = profile_kwargs.get("target_ratio")
+        if unit_target_ratio is not None:
+            unit_target_ratio = float(unit_target_ratio)
 
         try:
             tokenizer = self.openai_provider.get_token_counter(model)
@@ -877,7 +888,12 @@ class OpenAIHandlerMixin:
             # `elapsed_ms=60000+` in production logs even though they did
             # no work. With the semaphore deleted, this timer is honest.
             unit_started = time.perf_counter()
-            result = compress_unit_with_router(routed.unit, router=router, tokenizer=tokenizer)
+            result = compress_unit_with_router(
+                routed.unit,
+                router=router,
+                tokenizer=tokenizer,
+                target_ratio=unit_target_ratio,
+            )
             elapsed_ms = (time.perf_counter() - unit_started) * 1000.0
             return routed.slot, result, elapsed_ms
 
@@ -886,7 +902,11 @@ class OpenAIHandlerMixin:
         cache_misses: list[tuple[int, str, RoutedCompressionUnit]] = []
         cache_miss_followers: dict[str, list[int]] = {}
         for unit_idx, routed in enumerate(routed_units):
-            cache_key = _openai_responses_unit_cache_key(routed.unit, model=model)
+            cache_key = _openai_responses_unit_cache_key(
+                routed.unit,
+                model=model,
+                target_ratio=unit_target_ratio,
+            )
             cached = self._get_openai_responses_cached_unit(cache_key)
             if cached is not None:
                 routed_results[unit_idx] = (routed.slot, cached, 0.0)
@@ -2975,6 +2995,8 @@ class OpenAIHandlerMixin:
             )
 
         headers, is_chatgpt_auth = _resolve_codex_routing_headers(headers)
+        if is_chatgpt_auth:
+            client = "codex"
 
         # Route to correct endpoint based on auth mode.
         # ChatGPT session auth (codex login) uses chatgpt.com, not api.openai.com.
@@ -4876,7 +4898,8 @@ class OpenAIHandlerMixin:
                                 f"cache_write={_perf_cache_write} "
                                 f"cache_hit_pct={_perf_cache_hit_pct} "
                                 f"opt_ms={overhead_delta_ms:.0f} "
-                                f"transforms={_summarize_transforms(transforms_applied)}"
+                                f"transforms={_summarize_transforms(transforms_applied)} "
+                                f"client={client or ''}"
                             )
 
                             ws_recorded_input_tokens_total = ws_input_tokens_total
@@ -5816,7 +5839,10 @@ class OpenAIHandlerMixin:
             protect_recent = compress_config.get("protect_recent")
             protect_analysis_context = compress_config.get("protect_analysis_context")
 
-            pipeline_kwargs: dict = {"model_limit": context_limit}
+            pipeline_kwargs: dict = {
+                "model_limit": context_limit,
+                **proxy_pipeline_kwargs(self.config),
+            }
             if compress_user_messages:
                 pipeline_kwargs["compress_user_messages"] = True
             if target_ratio is not None:

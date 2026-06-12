@@ -156,6 +156,35 @@ def test_perf_json_raw_is_array(runner, monkeypatch):
     assert data[0]["request_id"] == "hr_1"
 
 
+def test_perf_json_raw_preserves_client_field(runner, monkeypatch):
+    report = _sample_report()
+    report.perf_records[0].client = "codex"
+    _patch_report(monkeypatch, report)
+
+    result = runner.invoke(main, ["perf", "--format", "json", "--raw"])
+
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.output)
+    assert data[0]["client"] == "codex"
+
+
+def test_parse_perf_line_preserves_client_field(monkeypatch, tmp_path):
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    (log_dir / "proxy.log").write_text(
+        "2026-06-10 10:00:00,000 - headroom.proxy - INFO - "
+        "[hr_codex] PERF model=gpt-5 msgs=3 tok_before=1000 "
+        "tok_after=90 tok_saved=910 cache_read=0 cache_write=0 "
+        "cache_hit_pct=0 opt_ms=12 transforms=content_router client=codex\n"
+    )
+    monkeypatch.setattr(analyzer, "LOG_DIR", log_dir)
+
+    report = analyzer.parse_log_files(last_n_hours=0)
+
+    assert len(report.perf_records) == 1
+    assert report.perf_records[0].client == "codex"
+
+
 def test_perf_csv_by_model(runner, monkeypatch):
     _patch_report(monkeypatch, _sample_report())
     result = runner.invoke(main, ["perf", "--format", "csv"])
@@ -191,3 +220,22 @@ def test_perf_rejects_unknown_format(runner, monkeypatch):
     _patch_report(monkeypatch, _sample_report())
     result = runner.invoke(main, ["perf", "--format", "xml"])
     assert result.exit_code != 0
+
+
+def test_parse_perf_line_preserves_blank_client_field(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+    monkeypatch.setattr(analyzer, "LOG_DIR", logs_dir)
+    (logs_dir / "proxy.log").write_text(
+        "2026-06-10 10:00:00,000 - headroom.proxy - INFO - [req-blank] PERF "
+        "model=gpt-5 msgs=1 tok_before=100 tok_after=50 tok_saved=50 "
+        "cache_read=0 cache_write=0 cache_hit_pct=0 opt_ms=1 transforms=test client=\n",
+        encoding="utf-8",
+    )
+
+    report = analyzer.parse_log_files(last_n_hours=0)
+
+    assert len(report.perf_records) == 1
+    assert report.perf_records[0].client == ""

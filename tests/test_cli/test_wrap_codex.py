@@ -517,6 +517,67 @@ def test_start_proxy_uses_separate_session_for_signal_isolation(
     assert popen_kwargs["start_new_session"] == (wrap_mod.os.name == "posix")
 
 
+@pytest.mark.parametrize("agent_type", ["claude", "codex", "cursor"])
+def test_start_proxy_applies_agent_90_defaults(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, agent_type: str
+) -> None:
+    """Wrapped coding agents should start the proxy with high-savings defaults."""
+    popen_kwargs: dict[str, object] = {}
+
+    class FakeProc:
+        returncode = None
+
+        def poll(self) -> None:
+            return None
+
+    def fake_popen(*args: object, **kwargs: object) -> FakeProc:
+        popen_kwargs.update(kwargs)
+        return FakeProc()
+
+    monkeypatch.setattr(wrap_mod, "_get_log_path", lambda: tmp_path / "proxy.log")
+    monkeypatch.setattr(wrap_mod, "_check_proxy", lambda port: True)
+    monkeypatch.setattr(wrap_mod.subprocess, "Popen", fake_popen)
+
+    wrap_mod._start_proxy(8787, agent_type=agent_type)
+
+    env = popen_kwargs["env"]
+    assert isinstance(env, dict)
+    assert env["HEADROOM_SAVINGS_PROFILE"] == "agent-90"
+    assert env["HEADROOM_TARGET_RATIO"] == "0.10"
+    assert env["HEADROOM_MAX_ITEMS"] == "8"
+    assert env["HEADROOM_SMART_CRUSHER_COMPACTION"] == "0"
+
+
+def test_start_proxy_preserves_explicit_savings_overrides(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """User-provided savings env vars should override wrapper defaults."""
+    popen_kwargs: dict[str, object] = {}
+
+    class FakeProc:
+        returncode = None
+
+        def poll(self) -> None:
+            return None
+
+    def fake_popen(*args: object, **kwargs: object) -> FakeProc:
+        popen_kwargs.update(kwargs)
+        return FakeProc()
+
+    monkeypatch.setenv("HEADROOM_TARGET_RATIO", "0.20")
+    monkeypatch.setenv("HEADROOM_MAX_ITEMS", "12")
+    monkeypatch.setattr(wrap_mod, "_get_log_path", lambda: tmp_path / "proxy.log")
+    monkeypatch.setattr(wrap_mod, "_check_proxy", lambda port: True)
+    monkeypatch.setattr(wrap_mod.subprocess, "Popen", fake_popen)
+
+    wrap_mod._start_proxy(8787, agent_type="codex")
+
+    env = popen_kwargs["env"]
+    assert isinstance(env, dict)
+    assert env["HEADROOM_TARGET_RATIO"] == "0.20"
+    assert env["HEADROOM_MAX_ITEMS"] == "12"
+
+
 def test_launch_tool_ignores_sigint_in_wrapper(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

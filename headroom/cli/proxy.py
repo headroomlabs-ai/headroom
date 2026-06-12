@@ -783,12 +783,6 @@ def proxy(
         optimize=not no_optimize,
         cache_enabled=not no_cache,
         rate_limit_enabled=not no_rate_limit,
-        # CCR opt-outs for compression-only deployments (streaming / non-MCP
-        # clients that can't resolve the injected retrieve tool). Defaults keep
-        # CCR fully on; each flag flips one dataclass default to False.
-        ccr_inject_tool=not no_ccr_inject_tool,
-        ccr_inject_marker=not no_ccr_marker,
-        ccr_proactive_expansion=not no_ccr_proactive_expansion,
         compress_user_messages=_get_env_bool("HEADROOM_COMPRESS_USER_MESSAGES", False),
         min_tokens_to_crush=_get_env_int_optional("HEADROOM_MIN_TOKENS") or 500,
         max_items_after_crush=_get_env_int_optional("HEADROOM_MAX_ITEMS") or 50,
@@ -799,6 +793,12 @@ def proxy(
         protect_recent=_get_env_int_optional("HEADROOM_PROTECT_RECENT"),
         protect_analysis_context=_get_env_bool_optional("HEADROOM_PROTECT_ANALYSIS_CONTEXT"),
         accuracy_guard=os.environ.get("HEADROOM_ACCURACY_GUARD") or None,
+        # CCR opt-outs for compression-only deployments (streaming / non-MCP
+        # clients that can't resolve the injected retrieve tool). Defaults keep
+        # CCR fully on; each flag flips one dataclass default to False.
+        ccr_inject_tool=not no_ccr_inject_tool,
+        ccr_inject_marker=not no_ccr_marker,
+        ccr_proactive_expansion=not no_ccr_proactive_expansion,
         # Flatten repeat-flag tuple AND any comma-separated values inside it.
         # `--proxy-extension a,b --proxy-extension c` and `HEADROOM_PROXY_EXTENSIONS=a,b,c`
         # both yield ["a", "b", "c"]. None when nothing was supplied.
