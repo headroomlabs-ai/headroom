@@ -138,6 +138,10 @@ def _copilot_subdomain_enterprise_host(enterprise_url: str) -> str | None:
     """
 
     host = _enterprise_hostname(enterprise_url)
+    for prefix in ("copilot-api.", "api."):
+        if host.startswith(prefix):
+            host = host[len(prefix) :]
+            break
     if not host or host in {"github.com", "www.github.com", "api.github.com"}:
         return None
     return host
@@ -848,6 +852,22 @@ def resolve_subscription_bearer_token_details() -> CopilotSubscriptionTokenResol
     for candidate in iter_oauth_token_candidates():
         if not candidate.validate_for_subscription:
             continue
+        if _is_copilot_api_token(candidate.token):
+            payload = _fetch_copilot_user_info(candidate.token)
+            if payload is not None:
+                logger.debug(
+                    "Using Copilot API subscription token from %s (%s)",
+                    candidate.source,
+                    candidate.confidence,
+                )
+                return _subscription_resolution(
+                    token=candidate.token,
+                    source=candidate.source,
+                    confidence=candidate.confidence,
+                    api_url=_subscription_api_url_from_user_info_payload(payload),
+                )
+            continue
+
         exchanged = _subscription_resolution_from_token_exchange(candidate)
         if exchanged is not None:
             logger.debug(
@@ -856,20 +876,6 @@ def resolve_subscription_bearer_token_details() -> CopilotSubscriptionTokenResol
                 candidate.confidence,
             )
             return exchanged
-
-        payload = _fetch_copilot_user_info(candidate.token)
-        if payload is not None:
-            logger.debug(
-                "Using Copilot subscription token from %s (%s)",
-                candidate.source,
-                candidate.confidence,
-            )
-            return _subscription_resolution(
-                token=candidate.token,
-                source=candidate.source,
-                confidence=candidate.confidence,
-                api_url=_subscription_api_url_from_user_info_payload(payload),
-            )
 
     return None
 
@@ -1111,6 +1117,9 @@ async def apply_copilot_api_auth(headers: dict[str, str], *, url: str) -> dict[s
                 "apply_copilot_api_auth: passing through client token kind=%s",
                 _token_kind(raw_token),
             )
+            for key in list(resolved):
+                if key.lower() == "x-api-key":
+                    resolved.pop(key)
             return resolved
         logger.info(
             "apply_copilot_api_auth: incoming token not suitable (kind=%s), will replace",

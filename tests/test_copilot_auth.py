@@ -107,6 +107,38 @@ def test_resolve_subscription_bearer_token_skips_invalid_generic_token(
                 confidence="generic-github",
             ),
             copilot_auth.CopilotTokenCandidate(
+                token="tid_copilot",
+                source="macos-keychain:copilot-cli",
+                confidence="high",
+            ),
+        ],
+    )
+    monkeypatch.setattr(
+        copilot_auth,
+        "_fetch_copilot_user_info",
+        lambda token: (
+            {"endpoints": {"api": "https://api.individual.githubcopilot.com"}}
+            if token == "tid_copilot"
+            else None
+        ),
+    )
+
+    assert copilot_auth.resolve_subscription_bearer_token() == "tid_copilot"
+
+
+def test_resolve_subscription_bearer_token_does_not_fallback_to_unexchanged_oauth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("GITHUB_COPILOT_API_TOKEN", raising=False)
+    monkeypatch.delenv("COPILOT_PROVIDER_BEARER_TOKEN", raising=False)
+    monkeypatch.setattr(
+        copilot_auth, "_subscription_resolution_from_token_exchange", lambda _: None
+    )
+    monkeypatch.setattr(
+        copilot_auth,
+        "iter_oauth_token_candidates",
+        lambda: [
+            copilot_auth.CopilotTokenCandidate(
                 token="gho-copilot",
                 source="macos-keychain:copilot-cli",
                 confidence="high",
@@ -123,7 +155,7 @@ def test_resolve_subscription_bearer_token_skips_invalid_generic_token(
         ),
     )
 
-    assert copilot_auth.resolve_subscription_bearer_token() == "gho-copilot"
+    assert copilot_auth.resolve_subscription_bearer_token() is None
 
 
 def test_resolve_subscription_bearer_token_details_exchanges_oauth_candidate(
@@ -248,6 +280,14 @@ def test_user_info_url_override_wins_over_enterprise_domain(
 def test_copilot_api_url_from_enterprise_url_supports_enterprise_server_domain() -> None:
     assert (
         copilot_auth.copilot_api_url_from_enterprise_url("https://ghe.example.com/")
+        == "https://copilot-api.ghe.example.com"
+    )
+    assert (
+        copilot_auth.copilot_api_url_from_enterprise_url("https://api.ghe.example.com/")
+        == "https://copilot-api.ghe.example.com"
+    )
+    assert (
+        copilot_auth.copilot_api_url_from_enterprise_url("https://copilot-api.ghe.example.com/")
         == "https://copilot-api.ghe.example.com"
     )
 
@@ -574,12 +614,16 @@ def test_apply_copilot_api_auth_passes_through_existing_api_token(
 
     headers = asyncio.run(
         copilot_auth.apply_copilot_api_auth(
-            {"authorization": "Bearer tid_existing_copilot_token"},
+            {
+                "authorization": "Bearer tid_existing_copilot_token",
+                "x-api-key": "sk-downstream",
+            },
             url="https://api.githubcopilot.com/v1/chat/completions",
         )
     )
 
     assert headers["authorization"] == "Bearer tid_existing_copilot_token"
+    assert "x-api-key" not in headers
 
 
 def test_apply_copilot_api_auth_replaces_github_oauth_bearer(
