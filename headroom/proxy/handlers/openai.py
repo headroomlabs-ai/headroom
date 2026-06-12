@@ -21,6 +21,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlparse
 
 from headroom.proxy.helpers import (
     COMPRESSION_TIMEOUT_SECONDS,
@@ -507,6 +508,16 @@ def _resolve_codex_routing_headers(headers: dict[str, str]) -> tuple[dict[str, s
         return resolved, True
 
     return resolved, False
+
+
+def _prefers_http1_passthrough(base_url: str) -> bool:
+    """Whether passthrough to this host must use HTTP/1.1.
+
+    ChatGPT's Cloudflare edge issues a managed challenge to our HTTP/2
+    fingerprint on sensitive account endpoints; HTTP/1.1 is accepted.
+    """
+    host = (urlparse(base_url).hostname or "").lower()
+    return host == "chatgpt.com" or host.endswith(".chatgpt.com")
 
 
 class OpenAIHandlerMixin:
@@ -5923,8 +5934,17 @@ class OpenAIHandlerMixin:
         body = await request.body()
 
         headers = await apply_copilot_api_auth(headers, url=url)
+        # Cloudflare bot-management challenges our HTTP/2 fingerprint on
+        # ChatGPT's sensitive account endpoints (/backend-api/me,
+        # /backend-api/accounts/check), returning a 403 challenge page instead
+        # of JSON and collapsing the Codex account menu to just "Settings".
+        # Those endpoints answer fine over HTTP/1.1, so forward ChatGPT
+        # passthrough on the HTTP/1.1 client. Other hosts keep HTTP/2.
+        passthrough_client = self.http_client
+        if _prefers_http1_passthrough(base_url):
+            passthrough_client = self.http_client_h1 or self.http_client
         try:
-            response = await self.http_client.request(  # type: ignore[union-attr]
+            response = await passthrough_client.request(  # type: ignore[union-attr]
                 method=request.method,
                 url=url,
                 headers=headers,

@@ -469,6 +469,9 @@ class HeadroomProxy(
 
         # HTTP client
         self.http_client: httpx.AsyncClient | None = None
+        # HTTP/1.1-only client for ChatGPT passthrough (Cloudflare challenges
+        # our HTTP/2 fingerprint on its sensitive account endpoints).
+        self.http_client_h1: httpx.AsyncClient | None = None
 
         # Shared cold-start warmup registry (populated by startup()).
         # Holds typed slots with loaded / loading / null / error status for
@@ -901,19 +904,26 @@ class HeadroomProxy(
             metadata={"port": self.config.port, "host": self.config.host},
         )
         _ca_bundle = find_ca_bundle()
-        self.http_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(
+        _client_kwargs: dict[str, Any] = {
+            "timeout": httpx.Timeout(
                 connect=self.config.connect_timeout_seconds,
                 read=self.config.request_timeout_seconds,
                 write=self.config.request_timeout_seconds,
                 pool=self.config.connect_timeout_seconds,
             ),
-            limits=httpx.Limits(
+            "limits": httpx.Limits(
                 max_connections=self.config.max_connections,
                 max_keepalive_connections=self.config.max_keepalive_connections,
             ),
-            http2=self.config.http2,
-            verify=_ca_bundle if _ca_bundle is not None else True,
+            "verify": _ca_bundle if _ca_bundle is not None else True,
+        }
+        self.http_client = httpx.AsyncClient(http2=self.config.http2, **_client_kwargs)
+        # Reuse the primary client when HTTP/2 is already off; otherwise keep a
+        # dedicated HTTP/1.1 client for ChatGPT passthrough.
+        self.http_client_h1 = (
+            self.http_client
+            if not self.config.http2
+            else httpx.AsyncClient(http2=False, **_client_kwargs)
         )
         logger.info("Headroom Proxy started")
         logger.info(f"Optimization: {'ENABLED' if self.config.optimize else 'DISABLED'}")
@@ -1135,6 +1145,9 @@ class HeadroomProxy(
 
     async def shutdown(self):
         """Cleanup async resources."""
+        if self.http_client_h1 and self.http_client_h1 is not self.http_client:
+            await self.http_client_h1.aclose()
+        self.http_client_h1 = None
         if self.http_client:
             await self.http_client.aclose()
             self.http_client = None
