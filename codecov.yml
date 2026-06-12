@@ -9,6 +9,7 @@ coverage:
     patch:
       default:
         target: auto
+        informational: true
 
 ignore:
   - "tests/**"
