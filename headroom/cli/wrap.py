@@ -47,6 +47,7 @@ from headroom.copilot_auth import (
 from headroom.providers.aider import build_launch_env as _build_aider_launch_env
 from headroom.providers.claude import proxy_base_url as _claude_proxy_base_url
 from headroom.providers.codex import build_launch_env as _build_codex_launch_env
+from headroom.providers.codex.install import codex_uses_chatgpt_auth
 from headroom.providers.copilot import (
     build_launch_env as _build_copilot_launch_env,
 )
@@ -1036,12 +1037,19 @@ def _inject_codex_provider_config(port: int) -> None:
         f'openai_base_url = "http://127.0.0.1:{port}/v1"\n'
         f"{_CODEX_END_MARKER}\n"
     )
+    # Emit requires_openai_auth only for ChatGPT-OAuth users (restores the
+    # account menu); omitting it for API-key users avoids forcing an OAuth
+    # login (#406).
+    requires_openai_auth = (
+        "requires_openai_auth = true\n" if codex_uses_chatgpt_auth(config_dir / "auth.json") else ""
+    )
     provider_section = (
         f"{_CODEX_TOP_LEVEL_MARKER}\n"
         "[model_providers.headroom]\n"
         'name = "OpenAI via Headroom proxy"\n'
         f'base_url = "http://127.0.0.1:{port}/v1"\n'
         f"supports_websockets = true\n"
+        f"{requires_openai_auth}"
         # Per-project savings: Codex sends the header only when the mapped
         # env var (HEADROOM_PROJECT, set by `headroom wrap codex`) exists at
         # Codex runtime.  Inline table keeps the key inside this section so

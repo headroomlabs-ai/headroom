@@ -80,6 +80,19 @@ def test_apply_and_revert_codex_provider_scope(monkeypatch, tmp_path: Path) -> N
     assert reverted.strip() == 'model = "gpt-4o"'
 
 
+def test_apply_codex_provider_scope_emits_flag_for_chatgpt_auth(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config_path = tmp_path / "config.toml"
+    (tmp_path / "auth.json").write_text('{"auth_mode": "chatgpt"}')
+    monkeypatch.setattr("headroom.providers.codex.install.codex_config_path", lambda: config_path)
+    manifest = _manifest(tmp_path)
+
+    apply_codex_provider_scope(manifest)
+
+    assert "requires_openai_auth = true" in config_path.read_text()
+
+
 def test_codex_build_install_env_returns_proxy_base_url() -> None:
     env = build_codex_install_env(port=5566, backend="ignored")
 
