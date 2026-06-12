@@ -1019,19 +1019,19 @@ mod tests {
                 "test".to_string(),
             )),
         };
-        let uri: Uri = "/model/eu.anthropic.claude-haiku-4-5-20251001-v1:0/invoke-with-response-stream"
+        let uri: Uri = "/model/anthropic.claude-3-haiku-20240307-v1:0/invoke-with-response-stream"
             .parse()
             .unwrap();
         let url = build_bedrock_streaming_upstream(
             &state,
-            "eu.anthropic.claude-haiku-4-5-20251001-v1:0",
+            "anthropic.claude-3-haiku-20240307-v1:0",
             &uri,
             STREAMING_ACTION,
         )
         .unwrap();
         assert_eq!(
             url.as_str(),
-            "https://bedrock-runtime.eu-west-1.amazonaws.com/model/eu.anthropic.claude-haiku-4-5-20251001-v1:0/invoke-with-response-stream"
+            "https://bedrock-runtime.eu-west-1.amazonaws.com/model/anthropic.claude-3-haiku-20240307-v1:0/invoke-with-response-stream"
         );
     }
 
@@ -1058,19 +1058,19 @@ mod tests {
                 "test".to_string(),
             )),
         };
-        let uri: Uri = "/model/eu.anthropic.claude-haiku-4-5-20251001-v1:0/converse-stream"
+        let uri: Uri = "/model/anthropic.claude-3-haiku-20240307-v1:0/converse-stream"
             .parse()
             .unwrap();
         let url = build_bedrock_streaming_upstream(
             &state,
-            "eu.anthropic.claude-haiku-4-5-20251001-v1:0",
+            "anthropic.claude-3-haiku-20240307-v1:0",
             &uri,
             CONVERSE_STREAM_ACTION,
         )
         .unwrap();
         assert_eq!(
             url.as_str(),
-            "https://bedrock-runtime.eu-west-1.amazonaws.com/model/eu.anthropic.claude-haiku-4-5-20251001-v1:0/converse-stream"
+            "https://bedrock-runtime.eu-west-1.amazonaws.com/model/anthropic.claude-3-haiku-20240307-v1:0/converse-stream"
         );
     }
 
@@ -1078,18 +1078,18 @@ mod tests {
     fn extract_streaming_action_supports_both_bedrock_paths() {
         assert_eq!(
             extract_streaming_action(
-                "/model/eu.anthropic.claude-haiku-4-5-20251001-v1:0/invoke-with-response-stream"
+                "/model/anthropic.claude-3-haiku-20240307-v1:0/invoke-with-response-stream"
             ),
             Some(STREAMING_ACTION)
         );
         assert_eq!(
             extract_streaming_action(
-                "/model/eu.anthropic.claude-haiku-4-5-20251001-v1:0/converse-stream"
+                "/model/anthropic.claude-3-haiku-20240307-v1:0/converse-stream"
             ),
             Some(CONVERSE_STREAM_ACTION)
         );
         assert_eq!(
-            extract_streaming_action("/model/eu.anthropic.claude-haiku-4-5-20251001-v1:0/invoke"),
+            extract_streaming_action("/model/anthropic.claude-3-haiku-20240307-v1:0/invoke"),
             None
         );
     }
