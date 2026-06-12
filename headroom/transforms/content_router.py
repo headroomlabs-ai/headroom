@@ -1894,6 +1894,68 @@ class ContentRouter(Transform):
 
         return mapping
 
+    def _net_cost_allows(
+        self,
+        *,
+        slot_idx: int,
+        original_tokens: int,
+        compressed_tokens: int,
+        suffix_tokens: list[int],
+        route_counts: dict[str, int],
+        transforms_applied: list[str],
+    ) -> bool:
+        """Break-even gate for one candidate mutation (#856 P2, flag-gated).
+
+        Consumes ``CompressionPolicy.net_mutation_gain`` with the issue's v1
+        estimators: ΔT is the candidate's exact token saving (the compressed
+        form is already computed when this runs), S is the token total after
+        the slot, and R / P_alive are env-tunable constants
+        (``HEADROOM_NET_COST_EXPECTED_READS``, default 10;
+        ``HEADROOM_NET_COST_P_ALIVE``, default 1.0 — the conservative
+        full-penalty assumption). Every decision is logged with its inputs
+        and counted in ``route_counts`` so the flag can be validated from
+        telemetry before any default-on.
+        """
+        delta_t = max(0, original_tokens - compressed_tokens)
+        suffix = suffix_tokens[slot_idx + 1]
+        policy = self._runtime_compression_policy
+        if policy is None:
+            from .compression_policy import policy_default_payg
+
+            policy = policy_default_payg()
+        # Malformed env values fall back to defaults with a warning rather
+        # than crashing the request path (same posture as the #851 breaker
+        # env guard).
+        reads, p_alive = 10.0, 1.0
+        try:
+            reads = float(os.environ.get("HEADROOM_NET_COST_EXPECTED_READS", "") or 10.0)
+        except ValueError:
+            logger.warning("HEADROOM_NET_COST_EXPECTED_READS malformed; using 10")
+        try:
+            p_alive = float(os.environ.get("HEADROOM_NET_COST_P_ALIVE", "") or 1.0)
+        except ValueError:
+            logger.warning("HEADROOM_NET_COST_P_ALIVE malformed; using 1.0")
+        gain = policy.net_mutation_gain(delta_t, suffix, reads, p_alive)
+        allowed = gain > 0.0
+        logger.info(
+            "NetCostPolicy slot=%d delta_t=%d suffix=%d reads=%.1f p_alive=%.2f gain=%.0f -> %s",
+            slot_idx,
+            delta_t,
+            suffix,
+            reads,
+            p_alive,
+            gain,
+            "mutate" if allowed else "skip",
+        )
+        if allowed:
+            route_counts.setdefault("netcost_allowed", 0)
+            route_counts["netcost_allowed"] += 1
+        else:
+            route_counts.setdefault("netcost_skipped", 0)
+            route_counts["netcost_skipped"] += 1
+            transforms_applied.append(f"netcost:skip:{gain:.0f}")
+        return allowed
+
     def apply(
         self,
         messages: list[dict[str, Any]],
@@ -2066,6 +2128,19 @@ class ContentRouter(Transform):
         # Pre-allocate result slots — None means "pending compression".
         result_slots: list[dict[str, Any] | None] = [None] * num_messages
 
+        # #856 P2 (flag-gated, default off): net-cost mutation gate. Suffix
+        # token sums are precomputed once (reverse cumulative) so each
+        # candidate's S lookup is O(1). v1 estimator per the issue: S is the
+        # token total of every message after the candidate.
+        netcost_enabled = os.environ.get("HEADROOM_NET_COST_POLICY") == "1"
+        netcost_suffix_tokens: list[int] = []
+        if netcost_enabled:
+            netcost_suffix_tokens = [0] * (num_messages + 1)
+            for j in range(num_messages - 1, -1, -1):
+                netcost_suffix_tokens[j] = netcost_suffix_tokens[j + 1] + tokenizer.count_text(
+                    str(messages[j].get("content", ""))
+                )
+
         # Tasks: list of (slot_index, content, context, bias, content_key)
         _PendingTask = tuple[int, str, str, float, int]
         pending_tasks: list[_PendingTask] = []
@@ -2227,9 +2302,21 @@ class ContentRouter(Transform):
                 cached_compressed, cached_ratio, cached_strategy = cached
                 # Re-check ratio against current min_ratio (shifts with context pressure)
                 if cached_ratio < min_ratio:
-                    result_slots[i] = {**message, "content": cached_compressed}
-                    transforms_applied.append(f"router:{cached_strategy}:{cached_ratio:.2f}")
-                    compressed_details.append(f"{cached_strategy}:{cached_ratio:.2f}")
+                    if netcost_enabled and not self._net_cost_allows(
+                        slot_idx=i,
+                        original_tokens=tokenizer.count_text(content),
+                        compressed_tokens=tokenizer.count_text(cached_compressed),
+                        suffix_tokens=netcost_suffix_tokens,
+                        route_counts=route_counts,
+                        transforms_applied=transforms_applied,
+                    ):
+                        # Net-cost gate: mutation would cost more in cache
+                        # invalidation than it saves — leave untouched.
+                        result_slots[i] = message
+                    else:
+                        result_slots[i] = {**message, "content": cached_compressed}
+                        transforms_applied.append(f"router:{cached_strategy}:{cached_ratio:.2f}")
+                        compressed_details.append(f"{cached_strategy}:{cached_ratio:.2f}")
                 else:
                     # Threshold tightened — no longer qualifies. Move to skip.
                     self._cache.move_to_skip(content_key)
@@ -2272,7 +2359,7 @@ class ContentRouter(Transform):
             compressor_timing["parallel_compress_total"] = parallel_ms
 
             # --- Pass 3: Merge results back (sequential, updates caches) ---
-            for (slot_idx, _, _, _, content_key), (result, compress_ms) in zip(
+            for (slot_idx, task_content, _, _, content_key), (result, compress_ms) in zip(
                 pending_tasks, task_results
             ):
                 message = messages[slot_idx]
@@ -2282,13 +2369,26 @@ class ContentRouter(Transform):
                 )
 
                 if result.compression_ratio < min_ratio:
-                    # Compressed — store in result cache
+                    # Compressed — store in result cache. The cache is still
+                    # warmed when the net-cost gate blocks the slot: the
+                    # gate's verdict is contextual (suffix size), the
+                    # compression result is not.
                     self._cache.put(
                         content_key,
                         result.compressed,
                         result.compression_ratio,
                         result.strategy_used.value,
                     )
+                    if netcost_enabled and not self._net_cost_allows(
+                        slot_idx=slot_idx,
+                        original_tokens=tokenizer.count_text(task_content),
+                        compressed_tokens=tokenizer.count_text(result.compressed),
+                        suffix_tokens=netcost_suffix_tokens,
+                        route_counts=route_counts,
+                        transforms_applied=transforms_applied,
+                    ):
+                        result_slots[slot_idx] = message
+                        continue
                     result_slots[slot_idx] = {**message, "content": result.compressed}
                     transforms_applied.append(
                         f"router:{result.strategy_used.value}:{result.compression_ratio:.2f}"
