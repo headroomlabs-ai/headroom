@@ -15,6 +15,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from headroom.providers.evals import call_eval_llm, create_eval_client
+
 if TYPE_CHECKING:
     from headroom.transforms.html_extractor import HTMLExtractor
 
@@ -255,85 +257,25 @@ class HTMLExtractionEvaluator:
 
     def _create_judge(self) -> Callable[[str, str, str], tuple[float, str]]:
         """Create the LLM judge function."""
-        if self.provider == "openai":
-            try:
-                from openai import OpenAI
+        client = create_eval_client(self.provider)
 
-                client = OpenAI()
+        def judge(question: str, ground_truth: str, prediction: str) -> tuple[float, str]:
+            prompt = HTML_JUDGE_PROMPT.format(
+                question=question,
+                ground_truth=ground_truth,
+                prediction=prediction,
+            )
+            text = call_eval_llm(
+                self.provider,
+                client,
+                self.judge_model,
+                [{"role": "user", "content": prompt}],
+                max_tokens=200,
+                temperature=0.0,
+            )
+            return self._parse_judge_response(text)
 
-                def judge(question: str, ground_truth: str, prediction: str) -> tuple[float, str]:
-                    prompt = HTML_JUDGE_PROMPT.format(
-                        question=question,
-                        ground_truth=ground_truth,
-                        prediction=prediction,
-                    )
-                    response = client.chat.completions.create(
-                        model=self.judge_model,
-                        messages=[{"role": "user", "content": prompt}],
-                        temperature=0.0,
-                        max_tokens=200,
-                    )
-                    return self._parse_judge_response(response.choices[0].message.content or "")
-
-                return judge
-            except ImportError:
-                raise ImportError(
-                    "OpenAI package required. Install with: pip install openai"
-                ) from None
-
-        elif self.provider == "anthropic":
-            try:
-                import anthropic
-
-                anthropic_client = anthropic.Anthropic()
-
-                def judge(question: str, ground_truth: str, prediction: str) -> tuple[float, str]:
-                    prompt = HTML_JUDGE_PROMPT.format(
-                        question=question,
-                        ground_truth=ground_truth,
-                        prediction=prediction,
-                    )
-                    anthropic_response = anthropic_client.messages.create(
-                        model=self.judge_model,
-                        max_tokens=200,
-                        messages=[{"role": "user", "content": prompt}],
-                    )
-                    text = (
-                        getattr(anthropic_response.content[0], "text", "")
-                        if anthropic_response.content
-                        else ""
-                    )
-                    return self._parse_judge_response(text)
-
-                return judge
-            except ImportError:
-                raise ImportError(
-                    "Anthropic package required. Install with: pip install anthropic"
-                ) from None
-
-        else:
-            try:
-                import litellm
-
-                def judge(question: str, ground_truth: str, prediction: str) -> tuple[float, str]:
-                    prompt = HTML_JUDGE_PROMPT.format(
-                        question=question,
-                        ground_truth=ground_truth,
-                        prediction=prediction,
-                    )
-                    response = litellm.completion(
-                        model=self.judge_model,
-                        messages=[{"role": "user", "content": prompt}],
-                        temperature=0.0,
-                        max_tokens=200,
-                    )
-                    return self._parse_judge_response(response.choices[0].message.content or "")
-
-                return judge
-            except ImportError:
-                raise ImportError(
-                    "LiteLLM package required. Install with: pip install litellm"
-                ) from None
+        return judge
 
     def _parse_judge_response(self, text: str) -> tuple[float, str]:
         """Parse judge response to extract score and reasoning."""
@@ -364,43 +306,14 @@ Question: {question}
 
 Answer concisely and factually based only on the content provided."""
 
-        if self.provider == "openai":
-            from openai import OpenAI
-
-            openai_client = OpenAI()
-            openai_response = openai_client.chat.completions.create(
-                model=self.answer_model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.0,
-                max_tokens=500,
-            )
-            return openai_response.choices[0].message.content or ""
-
-        elif self.provider == "anthropic":
-            import anthropic
-
-            anthropic_client = anthropic.Anthropic()
-            anthropic_response = anthropic_client.messages.create(
-                model=self.answer_model,
-                max_tokens=500,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            return (
-                getattr(anthropic_response.content[0], "text", "")
-                if anthropic_response.content
-                else ""
-            )
-
-        else:
-            import litellm
-
-            litellm_response = litellm.completion(
-                model=self.answer_model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.0,
-                max_tokens=500,
-            )
-            return litellm_response.choices[0].message.content or ""
+        return call_eval_llm(
+            self.provider,
+            create_eval_client(self.provider),
+            self.answer_model,
+            [{"role": "user", "content": prompt}],
+            max_tokens=500,
+            temperature=0.0,
+        )
 
     def evaluate_case(self, case: HTMLEvalCase) -> HTMLEvalResult:
         """Evaluate a single HTML extraction case.
