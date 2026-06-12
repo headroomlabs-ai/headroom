@@ -130,6 +130,37 @@ class TestCompressEndpointBasic:
         assert data["tokens_saved"] >= 0
         assert data["compression_ratio"] > 0
 
+    def test_response_ccr_hashes_extracts_embedded_marker_hashes(self):
+        """ccr_hashes includes hashes embedded in compressed message markers."""
+        from headroom.proxy.handlers.openai import _response_ccr_hashes
+
+        messages = [
+            {
+                "role": "tool",
+                "content": ("[100 rows compressed. Retrieve more: hash=abc123def4567890abc123de]"),
+            },
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "<<ccr:feedface0011223344556677 10_rows_offloaded>>",
+                    }
+                ],
+            },
+        ]
+
+        hashes = _response_ccr_hashes(
+            messages,
+            ["deadbeef0000000000000000", "ABC123DEF4567890ABC123DE"],
+        )
+
+        assert hashes == [
+            "deadbeef0000000000000000",
+            "abc123def4567890abc123de",
+            "feedface0011223344556677",
+        ]
+
     def test_bypass_header_returns_uncompressed(self, client):
         """X-Headroom-Bypass header should skip compression."""
         messages = [

@@ -59,6 +59,7 @@ _OPENAI_RESPONSES_UNIT_PARALLELISM_MAX = 16
 _OPENAI_RESPONSES_UNIT_CACHE_INIT_LOCK = threading.RLock()
 _OPENAI_RESPONSES_UNIT_EXECUTOR_LOCK = threading.RLock()
 _OPENAI_RESPONSES_UNIT_EXECUTOR: ThreadPoolExecutor | None = None
+_CCR_HASH_CHARS = frozenset("0123456789abcdefABCDEF")
 
 
 def _usage_int(value: Any) -> int:
@@ -137,6 +138,62 @@ def _openai_responses_unit_executor() -> ThreadPoolExecutor:
                 thread_name_prefix="headroom-openai-unit",
             )
         return _OPENAI_RESPONSES_UNIT_EXECUTOR
+
+
+def _collect_ccr_hashes_from_text(text: str, sink: set[str]) -> None:
+    """Collect CCR hashes from compression markers embedded in text."""
+    prefixes = ("<<ccr:", "Retrieve more: hash=", "Retrieve original: hash=")
+    n = len(text)
+    for prefix in prefixes:
+        idx = 0
+        while True:
+            start = text.find(prefix, idx)
+            if start == -1:
+                break
+            cursor = start + len(prefix)
+            end = cursor
+            while end < n and text[end] in _CCR_HASH_CHARS:
+                end += 1
+            if end > cursor:
+                sink.add(text[cursor:end].lower())
+            idx = max(end, cursor + 1)
+
+
+def _collect_ccr_hashes_from_value(value: Any, sink: set[str]) -> None:
+    """Walk a message value and collect CCR hashes from string leaves."""
+    if isinstance(value, str):
+        _collect_ccr_hashes_from_text(value, sink)
+        return
+    if isinstance(value, dict):
+        for child in value.values():
+            _collect_ccr_hashes_from_value(child, sink)
+        return
+    if isinstance(value, list):
+        for child in value:
+            _collect_ccr_hashes_from_value(child, sink)
+
+
+def _response_ccr_hashes(messages: list[dict[str, Any]], markers: list[str]) -> list[str]:
+    """Return stable CCR hashes reported by transforms or embedded markers."""
+    hashes: set[str] = set()
+    ordered: list[str] = []
+
+    def add(hash_key: str) -> None:
+        normalized = hash_key.lower()
+        if normalized and normalized not in hashes:
+            hashes.add(normalized)
+            ordered.append(normalized)
+
+    for marker in markers:
+        if isinstance(marker, str):
+            add(marker)
+
+    embedded: set[str] = set()
+    _collect_ccr_hashes_from_value(messages, embedded)
+    for marker in sorted(embedded):
+        add(marker)
+
+    return ordered
 
 
 def _openai_responses_unit_cache_key(unit: Any, *, model: str) -> str:
@@ -5831,6 +5888,7 @@ class OpenAIHandlerMixin:
                 model=model,
                 **pipeline_kwargs,
             )
+            ccr_hashes = _response_ccr_hashes(result.messages, result.markers_inserted)
 
             return JSONResponse(
                 {
@@ -5845,7 +5903,7 @@ class OpenAIHandlerMixin:
                     ),
                     "transforms_applied": result.transforms_applied,
                     "transforms_summary": result.transforms_summary,
-                    "ccr_hashes": result.markers_inserted,
+                    "ccr_hashes": ccr_hashes,
                 }
             )
         except Exception as e:
