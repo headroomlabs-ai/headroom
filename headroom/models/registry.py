@@ -9,6 +9,7 @@ Pricing is fetched dynamically from LiteLLM's community-maintained database.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -49,6 +50,11 @@ class ModelInfo:
     tokenizer_backend: str | None = None
     aliases: tuple[str, ...] = ()
     notes: str = ""
+
+
+def _model_provider(info: ModelInfo) -> str:
+    """Return the provider label for a model registry entry."""
+    return info.provider
 
 
 # Built-in model database
@@ -588,17 +594,18 @@ class ModelRegistry:
         Returns:
             List of matching ModelInfo.
         """
+        selected_providers = frozenset(value for value in [provider] if value)
+        predicates: list[Callable[[ModelInfo], bool]] = [
+            lambda info: not selected_providers or _model_provider(info) in selected_providers,
+            lambda info: supports_tools is None or info.supports_tools == supports_tools,
+            lambda info: supports_vision is None or info.supports_vision == supports_vision,
+            lambda info: not min_context or info.context_window >= min_context,
+        ]
+
         results = []
         for info in _MODELS.values():
-            if provider and info.provider != provider:
-                continue
-            if supports_tools is not None and info.supports_tools != supports_tools:
-                continue
-            if supports_vision is not None and info.supports_vision != supports_vision:
-                continue
-            if min_context and info.context_window < min_context:
-                continue
-            results.append(info)
+            if all(predicate(info) for predicate in predicates):
+                results.append(info)
         return results
 
     @classmethod

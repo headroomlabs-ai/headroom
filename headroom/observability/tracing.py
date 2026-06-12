@@ -210,16 +210,16 @@ def shutdown_headroom_tracing() -> None:
     global _owned_tracer_provider
     global _owned_langfuse_config
 
-    provider = None
+    tracer_backend = None
     with _tracing_lock:
-        provider = _owned_tracer_provider
+        tracer_backend = _owned_tracer_provider
         _owned_tracer_provider = None
         _owned_langfuse_config = None
         _global_tracer = None
 
-    if provider is not None:
+    if tracer_backend:
         try:
-            provider.shutdown()
+            tracer_backend.shutdown()
         except Exception:
             logger.debug("Failed to shut down Langfuse tracer provider", exc_info=True)
 
