@@ -42,7 +42,7 @@ except ImportError:
     BaseChatMessageHistory = object  # type: ignore[misc,assignment]
 
 from headroom import HeadroomConfig
-from headroom.providers import OpenAIProvider
+from headroom.providers.defaults import create_default_provider
 from headroom.transforms import TransformPipeline
 
 logger = logging.getLogger(__name__)
@@ -117,7 +117,7 @@ class HeadroomChatMessageHistory(BaseChatMessageHistory):
                 to always preserve during compression. Default 5.
             model: Model name for token counting. Default "gpt-4o".
             provider: Headroom provider for token counting. Auto-uses
-                OpenAIProvider if not specified.
+                the provider-owned default if not specified.
         """
         _check_langchain_available()
 
@@ -125,7 +125,7 @@ class HeadroomChatMessageHistory(BaseChatMessageHistory):
         self._threshold = compress_threshold_tokens
         self._keep_recent_turns = keep_recent_turns
         self._model = model
-        self._provider: Provider = provider or OpenAIProvider()
+        self._provider: Provider = provider or create_default_provider()
 
         # Track compression stats
         self._compression_count = 0

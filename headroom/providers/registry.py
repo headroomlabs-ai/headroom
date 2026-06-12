@@ -233,6 +233,33 @@ def format_backend_status(*, backend: str, anyllm_provider: str, bedrock_region:
     return f"{provider_config.display_name} via LiteLLM"
 
 
+def format_backend_usage_section(*, backend: str, host: str, port: int) -> str:
+    """Build provider-specific setup guidance shown by the proxy CLI."""
+    if backend == "anthropic":
+        return ""
+
+    if backend == "anyllm" or backend.startswith("anyllm-"):
+        return """
+  Set credentials for your provider (e.g., OPENAI_API_KEY, MISTRAL_API_KEY)
+  Providers: https://mozilla-ai.github.io/any-llm/providers/
+"""
+
+    from headroom.backends.litellm import get_provider_config
+
+    provider = backend.replace("litellm-", "")
+    provider_config = get_provider_config(provider)
+    env_vars_str = ", ".join(provider_config.env_vars) if provider_config.env_vars else "See docs"
+    section = f"""
+IMPORTANT for {provider_config.display_name} users:
+  1. Set credentials: {env_vars_str}
+  2. Set a dummy Anthropic key: ANTHROPIC_API_KEY="sk-ant-dummy"
+     (Headroom ignores this - it uses your {provider_config.display_name} credentials)
+  3. Set base URL: ANTHROPIC_BASE_URL=http://{host}:{port}"""
+    if provider_config.model_format_hint:
+        section += f"\n  4. Use model names: {provider_config.model_format_hint}"
+    return f"{section}\n"
+
+
 def call_client_transport(
     api_style: str,
     client: Any,

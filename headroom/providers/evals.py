@@ -150,6 +150,37 @@ _EVAL_PROVIDER_ADAPTERS: dict[str, EvalProviderAdapter] = {
     ),
 }
 
+EVAL_JUDGE_PROVIDER_CHOICES = ("openai", "anthropic", "litellm", "simple")
+
+
+def create_eval_judge(provider: str, model: str) -> Callable[[str, str, str], tuple[float, str]]:
+    """Create an eval judge function from provider-owned selection policy."""
+    from headroom.evals.memory import (
+        create_anthropic_judge,
+        create_litellm_judge,
+        create_openai_judge,
+        simple_judge,
+    )
+
+    judge_factories: dict[str, Callable[[str], Callable[[str, str, str], tuple[float, str]]]] = {
+        "anthropic": create_anthropic_judge,
+        "litellm": create_litellm_judge,
+        "openai": create_openai_judge,
+        "simple": lambda _model: simple_judge,
+    }
+
+    try:
+        return judge_factories[provider](model)
+    except KeyError as exc:
+        raise ValueError(f"Unknown judge provider: {provider}") from exc
+
+
+def describe_eval_judge(provider: str, model: str) -> str:
+    """Return display text for an eval judge provider/model pair."""
+    if provider == "simple":
+        return "ENABLED (rule-based F1)"
+    return f"ENABLED ({provider}: {model})"
+
 
 def get_eval_provider_adapter(provider: str) -> EvalProviderAdapter:
     """Return evaluation provider behavior for a provider name."""

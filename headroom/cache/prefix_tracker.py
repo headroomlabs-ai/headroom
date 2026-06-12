@@ -24,22 +24,9 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+from headroom.providers.cache_economics import cache_economics_for_provider
+
 logger = logging.getLogger(__name__)
-
-# Provider cache economics for cost comparisons
-_PROVIDER_READ_DISCOUNT = {
-    "anthropic": 0.9,  # 90% discount on reads
-    "openai": 0.5,  # 50% discount on reads
-    "gemini": 0.9,
-    "bedrock": 0.9,
-}
-
-_PROVIDER_WRITE_PENALTY = {
-    "anthropic": 0.25,  # 25% surcharge on writes
-    "openai": 0.0,  # No write penalty
-    "gemini": 0.0,
-    "bedrock": 0.25,
-}
 
 
 @dataclass
@@ -207,7 +194,7 @@ class PrefixCacheTracker:
         savings_fraction = (message_tokens - estimated_compressed_tokens) / message_tokens
 
         # Would compression savings exceed the cache read discount?
-        read_discount = _PROVIDER_READ_DISCOUNT.get(self.provider, 0.5)
+        read_discount = cache_economics_for_provider(self.provider).read_discount
         return savings_fraction > read_discount
 
     @property

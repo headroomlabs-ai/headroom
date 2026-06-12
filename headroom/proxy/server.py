@@ -108,7 +108,6 @@ from headroom.providers.registry import (
 # Extracted modules (re-exported for backward compatibility)
 # =============================================================================
 from headroom.proxy.cost import (
-    _CACHE_ECONOMICS,  # noqa: F401
     CostTracker,  # noqa: F401
     _summarize_transforms,  # noqa: F401
     build_prefix_cache_stats,  # noqa: F401

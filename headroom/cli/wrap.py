@@ -72,6 +72,12 @@ from headroom.providers.copilot import (
     resolve_provider_type as _copilot_resolve_provider_type,
 )
 from headroom.providers.copilot import (
+    resolve_subscription_provider_type as _copilot_resolve_subscription_provider_type,
+)
+from headroom.providers.copilot import (
+    should_use_oauth as _copilot_should_use_oauth,
+)
+from headroom.providers.copilot import (
     validate_configuration as _validate_copilot_configuration,
 )
 from headroom.providers.cursor import render_setup_lines as _render_cursor_setup_lines
@@ -1789,18 +1795,14 @@ def _should_use_copilot_oauth(
     force_subscription: bool = False,
 ) -> bool:
     """Prefer a reusable Copilot OAuth session when the requested routing supports it."""
-    if force_subscription:
-        return True
-    if env.get("COPILOT_PROVIDER_API_KEY") or env.get("COPILOT_PROVIDER_BEARER_TOKEN"):
-        return False
-    if provider_type == "anthropic":
-        return False
-
     effective_backend = backend or os.environ.get("HEADROOM_BACKEND")
-    if effective_backend not in (None, "", "anthropic"):
-        return False
-
-    return has_oauth_auth()
+    return _copilot_should_use_oauth(
+        backend=effective_backend,
+        provider_type=provider_type,
+        env=env,
+        has_oauth_auth=has_oauth_auth(),
+        force_subscription=force_subscription,
+    )
 
 
 def _ensure_proxy(
@@ -2742,17 +2744,13 @@ def copilot(
 
     effective_provider_type = _resolve_copilot_provider_type(effective_backend, provider_type)
     if subscription:
-        if effective_backend not in (None, "", "anthropic"):
-            raise click.ClickException(
-                "--subscription routes to GitHub Copilot's hosted API and cannot be combined "
-                "with translated backends such as anyllm or litellm-*."
-            )
-        if provider_type == "anthropic":
-            raise click.ClickException(
-                "--subscription uses Copilot's OpenAI-compatible hosted API path; "
-                "do not combine it with --provider-type anthropic."
-            )
-        effective_provider_type = "openai"
+        subscription_resolution = _copilot_resolve_subscription_provider_type(
+            backend=effective_backend,
+            provider_type=provider_type,
+        )
+        if subscription_resolution.error:
+            raise click.ClickException(subscription_resolution.error)
+        effective_provider_type = subscription_resolution.provider_type
     _validate_copilot_configuration(
         provider_type=effective_provider_type,
         wire_api=wire_api,

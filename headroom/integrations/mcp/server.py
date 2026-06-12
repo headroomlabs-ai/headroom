@@ -55,7 +55,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from headroom.config import HeadroomConfig, SmartCrusherConfig
-from headroom.providers.openai import OpenAIProvider
+from headroom.providers.defaults import DEFAULT_TOKEN_MODEL, create_default_provider
 from headroom.transforms.smart_crusher import SmartCrusher
 
 
@@ -164,8 +164,8 @@ class HeadroomMCPCompressor:
         if token_counter:
             self._count_tokens = token_counter
         else:
-            provider = OpenAIProvider()
-            counter = provider.get_token_counter("gpt-4o")
+            provider = create_default_provider()
+            counter = provider.get_token_counter(DEFAULT_TOKEN_MODEL)
             self._count_tokens = counter.count_text
 
     def get_profile(self, tool_name: str) -> MCPToolProfile:

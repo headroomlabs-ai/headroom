@@ -30,6 +30,12 @@ from headroom.install.runtime import (
 )
 from headroom.install.state import load_manifest, save_manifest
 from headroom.install.supervisors import start_supervisor
+from headroom.providers.copilot import (
+    build_launch_env as _build_copilot_launch_env,
+)
+from headroom.providers.copilot import (
+    resolve_provider_type as _resolve_copilot_provider_type,
+)
 
 from .main import main
 
@@ -474,16 +480,14 @@ def _apply_user_env(values: dict[str, str]) -> None:
 
 
 def _resolve_copilot_env(port: int, backend: str) -> dict[str, str]:
-    if backend == "anthropic":
-        return {
-            "COPILOT_PROVIDER_TYPE": "anthropic",
-            "COPILOT_PROVIDER_BASE_URL": f"http://127.0.0.1:{port}",
-        }
-    return {
-        "COPILOT_PROVIDER_TYPE": "openai",
-        "COPILOT_PROVIDER_BASE_URL": f"http://127.0.0.1:{port}/v1",
-        "COPILOT_PROVIDER_WIRE_API": "completions",
-    }
+    provider_type = _resolve_copilot_provider_type(backend, "auto", environ={})
+    env, _display = _build_copilot_launch_env(
+        port=port,
+        provider_type=provider_type,
+        wire_api=None,
+        environ={},
+    )
+    return env
 
 
 def _marketplace_source() -> str:
