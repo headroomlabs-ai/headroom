@@ -332,6 +332,69 @@ def _responses_input_item_text_bytes(item: Any) -> int:
     return _json_byte_len(item)
 
 
+_RESPONSES_OUTPUT_ITEM_TYPES = frozenset(
+    {
+        "custom_tool_call_output",
+        "function_call_output",
+        "local_shell_call_output",
+        "apply_patch_call_output",
+    }
+)
+
+
+def _responses_part_text(value: Any) -> str:
+    """Best-effort text from a Responses item field (string or part list)."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        texts = []
+        for part in value:
+            if isinstance(part, str):
+                texts.append(part)
+            elif isinstance(part, dict) and isinstance(part.get("text"), str):
+                texts.append(part["text"])
+        return "\n".join(t for t in texts if t)
+    return ""
+
+
+def _responses_input_to_waste_messages(instructions: Any, input_data: Any) -> list[dict[str, Any]]:
+    """Convert a Responses payload to OpenAI-style messages for waste parsing (#820).
+
+    Telemetry-only — never used as a compression input. Tool output items
+    become ``role="tool"`` messages so tool results (where most waste lives)
+    reach ``parse_messages``; ``message`` items keep their role and joined
+    part text.
+    """
+    messages: list[dict[str, Any]] = []
+    if isinstance(instructions, str) and instructions:
+        messages.append({"role": "system", "content": instructions})
+    if isinstance(input_data, str):
+        if input_data:
+            messages.append({"role": "user", "content": input_data})
+        return messages
+    if not isinstance(input_data, list):
+        return messages
+    for item in input_data:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") in _RESPONSES_OUTPUT_ITEM_TYPES:
+            text = _responses_part_text(item.get("output"))
+            if text:
+                message: dict[str, Any] = {"role": "tool", "content": text}
+                call_id = item.get("call_id")
+                if isinstance(call_id, str) and call_id:
+                    message["tool_call_id"] = call_id
+                messages.append(message)
+            continue
+        text = _responses_part_text(item.get("content"))
+        if text:
+            role = item.get("role")
+            messages.append(
+                {"role": role if isinstance(role, str) and role else "user", "content": text}
+            )
+    return messages
+
+
 def _openai_responses_context_budget(payload: dict[str, Any]) -> dict[str, Any]:
     payload_bytes = _json_byte_len(payload)
     buckets: dict[str, int] = {}
@@ -513,12 +576,7 @@ class OpenAIHandlerMixin:
     """Mixin providing OpenAI API handler methods for HeadroomProxy."""
 
     OPENAI_RESPONSES_ROUTER_MIN_BYTES = 512
-    OPENAI_RESPONSES_OUTPUT_TYPES = {
-        "custom_tool_call_output",
-        "function_call_output",
-        "local_shell_call_output",
-        "apply_patch_call_output",
-    }
+    OPENAI_RESPONSES_OUTPUT_TYPES = _RESPONSES_OUTPUT_ITEM_TYPES
 
     def _openai_responses_unit_cache(self) -> tuple[Any, OrderedDict[str, Any]]:
         with _OPENAI_RESPONSES_UNIT_CACHE_INIT_LOCK:
@@ -3097,6 +3155,24 @@ class OpenAIHandlerMixin:
             },
         )
 
+        # Waste-signal detection for the Responses path (#820). The transform
+        # pipeline never runs here (compression goes through CompressionUnits),
+        # so parse a telemetry-only message conversion directly, behind the
+        # same >100 saved-token gate as TransformPipeline.apply.
+        waste_signals_dict: dict[str, int] | None = None
+        if tokens_saved > 100:
+            try:
+                from headroom.parser import parse_messages
+
+                _, _, _waste = parse_messages(
+                    _responses_input_to_waste_messages(instructions, input_data),
+                    tokenizer,
+                )
+                if _waste.total() > 0:
+                    waste_signals_dict = _waste.to_dict()
+            except Exception:
+                pass
+
         try:
             if stream:
                 # Streaming for Responses API uses semantic events
@@ -3115,6 +3191,7 @@ class OpenAIHandlerMixin:
                     optimization_latency,
                     memory_user_id=memory_user_id,
                     memory_request_ctx=memory_request_ctx,
+                    waste_signals=waste_signals_dict,
                 )
             else:
                 headers = await apply_copilot_api_auth(headers, url=url)
@@ -3302,6 +3379,7 @@ class OpenAIHandlerMixin:
                         total_latency_ms=total_latency,
                         overhead_ms=optimization_latency,
                         transforms_applied=tuple(transforms_applied),
+                        waste_signals=waste_signals_dict,
                         num_messages=len(messages) if isinstance(messages, list) else 0,
                         tags=_resp_log_tags,
                         turn_id=compute_turn_id(model, body.get("instructions"), messages),
