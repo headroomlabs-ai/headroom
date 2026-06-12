@@ -669,10 +669,24 @@ def get_body_too_large_status() -> int:
     return value
 
 
-# Sentinel used by the SSE byte-buffer helper to mark events that have no
-# `event:` line. Per the SSE spec the default event name is "message"; we
-# return ``None`` so callers can decide whether to apply that default.
-_SSE_EVENT_TERMINATOR = b"\n\n"
+# SSE byte-buffer helper supports LF and CRLF event separators. Per the SSE
+# spec the default event name is "message"; we return ``None`` so callers can
+# decide whether to apply that default.
+_SSE_EVENT_TERMINATORS = (b"\n\n", b"\r\n\r\n")
+
+
+def _find_sse_event_terminator(buf: bytearray) -> tuple[int, int] | None:
+    """Return the earliest complete SSE event terminator in ``buf``."""
+    matches = [
+        (idx, len(terminator))
+        for terminator in _SSE_EVENT_TERMINATORS
+        if (idx := buf.find(terminator)) != -1
+    ]
+    if not matches:
+        return None
+    return min(matches, key=lambda match: match[0])
+
+
 _SSE_EVENT_LINE_PREFIX = b"event:"
 _SSE_DATA_LINE_PREFIX = b"data:"
 
@@ -718,20 +732,20 @@ def parse_sse_events_from_byte_buffer(
     multi-byte characters split across TCP reads will corrupt content.
     """
     events: list[tuple[str | None, str]] = []
-    terminator = _SSE_EVENT_TERMINATOR
     while True:
-        idx = buf.find(terminator)
-        if idx == -1:
+        terminator_match = _find_sse_event_terminator(buf)
+        if terminator_match is None:
             break
+        idx, terminator_len = terminator_match
         event_bytes = bytes(buf[:idx])
         # Drain the event + the trailing terminator from the buffer.
-        del buf[: idx + len(terminator)]
+        del buf[: idx + terminator_len]
         # Decoding the COMPLETE event must succeed. If it doesn't, the
         # upstream emitted invalid UTF-8 mid-stream — surface loudly.
         event_text = event_bytes.decode("utf-8")
         event_name: str | None = None
         data_lines: list[str] = []
-        for line in event_text.split("\n"):
+        for line in event_text.splitlines():
             if not line:
                 continue
             # SSE comment line — ignored per spec.

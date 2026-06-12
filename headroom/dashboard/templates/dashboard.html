@@ -886,6 +886,44 @@
             </div>
         </template>
 
+        <!-- Per-Project Savings Breakdown -->
+        <template x-if="Object.keys(stats.savings?.per_project || {}).length > 0">
+            <div class="bg-surface rounded-lg border border-border overflow-hidden mb-6">
+                <div class="px-4 py-3 border-b border-border flex justify-between items-center">
+                    <span class="text-sm font-medium text-gray-300">Per-Project Savings</span>
+                    <span class="text-xs text-gray-500">Lifetime totals &mdash; all time</span>
+                </div>
+                <div class="overflow-x-auto">
+                    <table class="w-full text-sm">
+                        <thead>
+                            <tr class="text-left text-xs text-gray-500 uppercase tracking-wide">
+                                <th class="px-4 py-3 font-medium">Project</th>
+                                <th class="px-4 py-3 font-medium text-right">Requests</th>
+                                <th class="px-4 py-3 font-medium text-right">Tokens Saved</th>
+                                <th class="px-4 py-3 font-medium text-right">Saved $</th>
+                                <th class="px-4 py-3 font-medium text-right">Savings %</th>
+                            </tr>
+                        </thead>
+                        <tbody class="divide-y divide-border">
+                            <template x-for="[project, info] in Object.entries(stats.savings?.per_project || {})" :key="project">
+                                <tr class="hover:bg-border/30 transition-colors">
+                                    <td class="px-4 py-3">
+                                        <span class="px-2 py-0.5 bg-border rounded text-xs" x-text="project"></span>
+                                    </td>
+                                    <td class="px-4 py-3 text-right font-mono" x-text="info.requests"></td>
+                                    <td class="px-4 py-3 text-right font-mono text-accent" x-text="formatNumber(info.tokens_saved)"></td>
+                                    <td class="px-4 py-3 text-right font-mono text-emerald-400" x-text="'$' + formatCurrency(info.compression_savings_usd || 0)"></td>
+                                    <td class="px-4 py-3 text-right">
+                                        <span class="text-accent font-mono" x-text="(info.savings_percent || 0).toFixed(1) + '%'"></span>
+                                    </td>
+                                </tr>
+                            </template>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </template>
+
         <!-- Recent Requests Table (with expandable rows) -->
         <div class="bg-surface rounded-lg border border-border overflow-hidden">
             <div class="px-4 py-3 border-b border-border flex justify-between items-center">
@@ -1072,13 +1110,23 @@
                                         <span class="text-sm font-medium text-gray-300">Historical Savings Trend</span>
                                         <span class="text-xs text-gray-500 font-mono" x-text="historyTrendLabel"></span>
                                     </div>
-                                    <div class="inline-flex rounded-lg border border-border p-1 self-start lg:self-auto" style="background: var(--card-alt-bg);">
-                                        <template x-for="[label, key] in historyGranularityOptions" :key="key">
-                                            <button class="px-3 py-1.5 text-sm rounded-md transition-colors"
-                                                    :class="historyGranularity === key ? 'bg-accent text-black' : 'text-gray-400 hover:text-gray-200'"
-                                                    @click="historyGranularity = key"
-                                                    x-text="label"></button>
-                                        </template>
+                                    <div class="flex flex-wrap gap-2 self-start lg:self-auto">
+                                        <div class="inline-flex rounded-lg border border-border p-1" style="background: var(--card-alt-bg);">
+                                            <template x-for="[label, key] in historyGranularityOptions" :key="key">
+                                                <button class="px-3 py-1.5 text-sm rounded-md transition-colors"
+                                                        :class="historyGranularity === key ? 'bg-accent text-black' : 'text-gray-400 hover:text-gray-200'"
+                                                        @click="historyGranularity = key"
+                                                x-text="label"></button>
+                                            </template>
+                                        </div>
+                                        <div class="inline-flex rounded-lg border border-border p-1" style="background: var(--card-alt-bg);">
+                                            <template x-for="[label, key] in historyChartModeOptions" :key="key">
+                                                <button class="px-3 py-1.5 text-sm rounded-md transition-colors"
+                                                        :class="historyChartMode === key ? 'bg-accent text-black' : 'text-gray-400 hover:text-gray-200'"
+                                                        @click="historyChartMode = key"
+                                                x-text="label"></button>
+                                            </template>
+                                        </div>
                                     </div>
                                 </div>
                                 <div class="text-xs text-gray-500 mb-4"
@@ -1092,16 +1140,105 @@
                                                     <stop offset="100%" style="stop-color:#22d3ee;stop-opacity:0"/>
                                                 </linearGradient>
                                             </defs>
-                                            <path :d="getObjectTrendArea(historicalTrend, 'total_tokens_saved')"
+                                            <path :d="historyChartMode === 'tokens' && !historyActiveModel ? getObjectTrendArea(historicalTrend, 'total_tokens_saved') : ''"
                                                   fill="url(#history-trend-gradient)"></path>
                                             <path class="trend-line"
-                                                  :d="getObjectTrendLine(historicalTrend, 'total_tokens_saved')"></path>
+                                                  :d="historyChartMode === 'tokens' && !historyActiveModel ? getObjectTrendLine(historicalTrend, 'total_tokens_saved') : ''"></path>
+                                            <path fill="none" stroke-width="1"
+                                                  :stroke="historyModelColor(0)" :d="historyModelLine(0)"></path>
+                                            <path fill="none" stroke-width="1"
+                                                  :stroke="historyModelColor(1)" :d="historyModelLine(1)"></path>
+                                            <path fill="none" stroke-width="1"
+                                                  :stroke="historyModelColor(2)" :d="historyModelLine(2)"></path>
+                                            <path fill="none" stroke-width="1"
+                                                  :stroke="historyModelColor(3)" :d="historyModelLine(3)"></path>
+                                            <path fill="none" stroke-width="1"
+                                                  :stroke="historyModelColor(4)" :d="historyModelLine(4)"></path>
+                                            <path fill="none" stroke="#22d3ee" stroke-width="1.5"
+                                                  :d="historyCostLine('actual')"></path>
+                                            <path fill="none" stroke="#fbbf24" stroke-width="1.5" stroke-dasharray="3 2"
+                                                  :d="historyCostLine('expected')"></path>
                                         </svg>
                                     </div>
                                 </template>
                                 <template x-if="historicalTrend.length < 2">
                                     <div class="h-48 flex items-center justify-center text-sm text-gray-500 italic">
                                         Historical trend data will appear after more saved checkpoints in this granularity.
+                                    </div>
+                                </template>
+                                <div class="flex flex-wrap gap-3 mt-3"
+                                     x-show="historyChartMode === 'tokens' && historyGranularity !== 'history' && historyModelChartSeries.length > 0">
+                                    <template x-for="(series, index) in historyModelChartSeries" :key="series.model">
+                                        <button class="flex items-center gap-1.5 text-xs transition-opacity cursor-pointer"
+                                                :class="historyActiveModel && historyActiveModel !== series.model
+                                                    ? 'text-gray-600 opacity-50'
+                                                    : 'text-gray-400 hover:text-gray-200'"
+                                                @click="toggleHistoryModel(series.model)"
+                                                :title="historySelectedModel === series.model
+                                                    ? 'Show all models'
+                                                    : 'Show only this model'">
+                                            <span class="inline-block w-2 h-2 rounded-full"
+                                                  :style="'background:' + historyModelColor(index)"></span>
+                                            <span :class="historySelectedModel === series.model ? 'underline' : ''"
+                                                  x-text="truncateModel(series.model)"></span>
+                                        </button>
+                                    </template>
+                                </div>
+                                <div class="flex flex-wrap gap-4 mt-3" x-show="historyChartMode === 'cost'">
+                                    <span class="flex items-center gap-1.5 text-xs text-gray-400">
+                                        <span class="inline-block w-3 h-0.5" style="background:#22d3ee"></span>
+                                        Actual cost (with Headroom)
+                                    </span>
+                                    <span class="flex items-center gap-1.5 text-xs text-gray-400">
+                                        <span class="inline-block w-3 h-0.5"
+                                              style="background:repeating-linear-gradient(90deg,#fbbf24 0 4px,transparent 4px 7px)"></span>
+                                        Expected cost (without Headroom)
+                                    </span>
+                                </div>
+                            </div>
+
+                            <div class="bg-surface rounded-lg p-4 border border-border">
+                                <div class="flex items-center justify-between mb-4">
+                                    <span class="text-sm font-medium text-gray-300">Per-Model Breakdown</span>
+                                    <span class="text-xs text-gray-500 font-mono"
+                                          x-text="historyModelSourceSeriesLabel + ' buckets'"></span>
+                                </div>
+                                <template x-if="historyModelBreakdown.length === 0">
+                                    <div class="text-sm text-gray-500 italic">
+                                        Per-model attribution appears for checkpoints recorded after upgrading.
+                                    </div>
+                                </template>
+                                <template x-if="historyModelBreakdown.length > 0">
+                                    <div class="overflow-x-auto">
+                                        <table class="w-full text-sm">
+                                            <thead>
+                                                <tr class="text-xs text-gray-500 text-left">
+                                                    <th class="py-2 pr-4 font-medium">Model</th>
+                                                    <th class="py-2 pr-4 font-medium text-right">Tokens saved</th>
+                                                    <th class="py-2 pr-4 font-medium text-right">Cost with Headroom</th>
+                                                    <th class="py-2 pr-4 font-medium text-right">Expected cost without Headroom</th>
+                                                    <th class="py-2 font-medium text-right">Saved</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody>
+                                                <template x-for="row in historyModelBreakdown" :key="row.model">
+                                                    <tr class="border-t border-border text-gray-300 cursor-pointer transition-colors"
+                                                        :class="historySelectedModel === row.model ? 'bg-[#1c1c1c]' : 'hover:bg-[#181818]'"
+                                                        @click="toggleHistoryModel(row.model)"
+                                                        :title="historySelectedModel === row.model
+                                                            ? 'Show all models'
+                                                            : 'Show only this model in the chart'">
+                                                        <td class="py-2 pr-4 font-mono text-xs"
+                                                            :class="historySelectedModel === row.model ? 'underline' : ''"
+                                                            x-text="truncateModel(row.model)"></td>
+                                                        <td class="py-2 pr-4 text-right tabular-nums" x-text="formatNumber(row.tokens_saved)"></td>
+                                                        <td class="py-2 pr-4 text-right tabular-nums" x-text="'$' + formatCurrency(row.input_cost_usd)"></td>
+                                                        <td class="py-2 pr-4 text-right tabular-nums" x-text="'$' + formatCurrency(row.expected_cost_usd)"></td>
+                                                        <td class="py-2 text-right tabular-nums text-accent" x-text="'$' + formatCurrency(row.savings_usd)"></td>
+                                                    </tr>
+                                                </template>
+                                            </tbody>
+                                        </table>
                                     </div>
                                 </template>
                             </div>
@@ -1320,6 +1457,8 @@
                 lastUpdate: 'never',
                 viewMode: 'session',
                 historyGranularity: 'daily',
+                historyChartMode: 'tokens',
+                historySelectedModel: null,
                 requestHistory: [],
                 savingsHistory: [],
                 expandedRows: {},
@@ -1635,6 +1774,151 @@
                     ];
                 },
 
+                get historyChartModeOptions() {
+                    return [
+                        ['Tokens', 'tokens'],
+                        ['Cost', 'cost'],
+                    ];
+                },
+
+                get historyModelSourceSeries() {
+                    // Rollup buckets carrying by_model attribution. Raw checkpoints
+                    // have no by_model, so the checkpoint view falls back to daily.
+                    const key = this.historySelectedSeriesKey === 'history'
+                        ? 'daily'
+                        : this.historySelectedSeriesKey;
+                    return this.historyStats.series?.[key] || [];
+                },
+
+                get historyModelChartSeries() {
+                    const buckets = this.historyModelSourceSeries;
+                    const totals = {};
+                    for (const bucket of buckets) {
+                        for (const [model, entry] of Object.entries(bucket.by_model || {})) {
+                            totals[model] = (totals[model] || 0) + (entry.tokens_saved || 0);
+                        }
+                    }
+                    const topModels = Object.entries(totals)
+                        .filter(([, saved]) => saved > 0)
+                        .sort((a, b) => b[1] - a[1])
+                        .slice(0, 5)
+                        .map(([model]) => model);
+                    // A breakdown-row selection outside the top 5 takes the
+                    // last chart slot so the filter works for every row (the
+                    // template renders a fixed set of line slots).
+                    const selected = this.historySelectedModel;
+                    if (
+                        selected &&
+                        (totals[selected] || 0) > 0 &&
+                        topModels.length > 0 &&
+                        !topModels.includes(selected)
+                    ) {
+                        topModels[topModels.length - 1] = selected;
+                    }
+                    return topModels.map(model => {
+                        let running = 0;
+                        return {
+                            model,
+                            values: buckets.map(bucket => {
+                                running += bucket.by_model?.[model]?.tokens_saved || 0;
+                                return running;
+                            }),
+                        };
+                    });
+                },
+
+                get historyModelBreakdown() {
+                    const totals = {};
+                    for (const bucket of this.historyModelSourceSeries) {
+                        for (const [model, entry] of Object.entries(bucket.by_model || {})) {
+                            const row = totals[model] || (totals[model] = {
+                                model,
+                                tokens_saved: 0,
+                                savings_usd: 0,
+                                input_cost_usd: 0,
+                            });
+                            row.tokens_saved += entry.tokens_saved || 0;
+                            row.savings_usd += entry.compression_savings_usd_delta || 0;
+                            row.input_cost_usd += entry.total_input_cost_usd_delta || 0;
+                        }
+                    }
+                    return Object.values(totals)
+                        .map(row => ({
+                            ...row,
+                            expected_cost_usd: row.input_cost_usd + row.savings_usd,
+                        }))
+                        .sort((a, b) => b.tokens_saved - a.tokens_saved);
+                },
+
+                get historyActiveModel() {
+                    // A model filter only applies while that model is present in
+                    // the charted series; otherwise fall back to showing all.
+                    // Raw checkpoint view plots no per-model lines (they are
+                    // derived from rollup buckets), so the filter must not
+                    // suppress the aggregate line there.
+                    if (this.historySelectedSeriesKey === 'history') return null;
+                    const model = this.historySelectedModel;
+                    if (!model) return null;
+                    return this.historyModelChartSeries.some(series => series.model === model)
+                        ? model
+                        : null;
+                },
+
+                toggleHistoryModel(model) {
+                    this.historySelectedModel = this.historySelectedModel === model ? null : model;
+                },
+
+                get historyCostTrend() {
+                    return this.historicalTrend.map(point => {
+                        const actual = point?.total_input_cost_usd || 0;
+                        const saved = point?.compression_savings_usd || 0;
+                        return { actual, expected: actual + saved };
+                    });
+                },
+
+                historyModelColor(index) {
+                    const palette = ['#a78bfa', '#34d399', '#fbbf24', '#f87171', '#60a5fa'];
+                    return palette[index % palette.length];
+                },
+
+                historyModelLine(index) {
+                    if (this.historyChartMode !== 'tokens') return '';
+                    // Checkpoint view plots raw checkpoints; daily-derived model
+                    // lines would not share its x-axis.
+                    if (this.historySelectedSeriesKey === 'history') return '';
+                    const allSeries = this.historyModelChartSeries;
+                    const series = allSeries[index];
+                    if (!series || series.values.length < 2) return '';
+                    const activeModel = this.historyActiveModel;
+                    if (activeModel && series.model !== activeModel) return '';
+                    // A single filtered model gets its own scale; the full set
+                    // shares one so the lines stay comparable.
+                    const scaleSeries = activeModel ? [series] : allSeries;
+                    const max = Math.max(...scaleSeries.flatMap(s => s.values), 1);
+                    return this.buildTrendPath(series.values, 0, max);
+                },
+
+                historyCostLine(kind) {
+                    if (this.historyChartMode !== 'cost') return '';
+                    const trend = this.historyCostTrend;
+                    if (trend.length < 2) return '';
+                    const all = trend.flatMap(point => [point.actual, point.expected]);
+                    const min = Math.min(...all);
+                    const max = Math.max(...all);
+                    return this.buildTrendPath(trend.map(point => point[kind]), min, max);
+                },
+
+                buildTrendPath(values, min, max) {
+                    if (!values || values.length < 2) return '';
+                    const range = max - min || 1;
+                    const points = values.map((value, index) => {
+                        const x = (index / (values.length - 1)) * 200;
+                        const y = 60 - ((value - min) / range) * 56;
+                        return `${x},${y}`;
+                    });
+                    return 'M' + points.join(' L');
+                },
+
                 get hasHistoricalData() {
                     return (this.historyStats.history || []).length > 0;
                 },
@@ -1651,6 +1935,14 @@
                         monthly: 'Monthly',
                     };
                     return labels[this.historySelectedSeriesKey] || 'History';
+                },
+
+                get historyModelSourceSeriesLabel() {
+                    // historyModelSourceSeries substitutes the daily rollup
+                    // at raw checkpoint granularity; label what is shown.
+                    return this.historySelectedSeriesKey === 'history'
+                        ? 'Daily'
+                        : this.historySelectedSeriesLabel;
                 },
 
                 get historySelectedPointCount() {
@@ -1789,6 +2081,7 @@
                         whitespace: 'Whitespace',
                         dynamic_date: 'Dynamic Dates',
                         repetition: 'Repetition',
+                        reread: 'Re-read Tool Results',
                     };
                     return labels[signal] || signal;
                 },
@@ -1801,6 +2094,7 @@
                         whitespace: 'bg-blue-500',
                         dynamic_date: 'bg-purple-500',
                         repetition: 'bg-pink-500',
+                        reread: 'bg-teal-500',
                     };
                     return colors[signal] || 'bg-gray-500';
                 },
@@ -1813,6 +2107,7 @@
                         whitespace: 'bg-blue-500/20 text-blue-400',
                         dynamic_date: 'bg-purple-500/20 text-purple-400',
                         repetition: 'bg-pink-500/20 text-pink-400',
+                        reread: 'bg-teal-500/20 text-teal-400',
                     };
                     return colors[signal] || 'bg-gray-500/20 text-gray-400';
                 },

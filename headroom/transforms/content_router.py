@@ -50,6 +50,7 @@ from ..tokenizer import Tokenizer
 from .base import Transform
 from .content_detector import ContentType, DetectionResult
 from .content_detector import detect_content_type as _regex_detect_content_type
+from .error_detection import content_has_strong_error_indicators
 
 logger = logging.getLogger(__name__)
 
@@ -457,6 +458,14 @@ class ContentRouterConfig:
     protect_recent_code: int = 4  # Don't compress CODE in last N messages (0 = disabled)
     protect_analysis_context: bool = True  # Detect "analyze/review" intent, protect code
 
+    # Protection: failed tool calls / error outputs stay verbatim (issue #847).
+    # The model needs exact tracebacks and error text to recover; compressing
+    # them measurably hurts agent recovery. Outputs above the size cap still
+    # compress — LogCompressor preserves error lines in big logs, so the two
+    # features stay complementary.
+    protect_error_outputs: bool = True
+    error_protection_max_chars: int = 8000  # ~2K tokens; larger errors compress
+
     # Cache safety: assistant text-block compression.
     # Default OFF. Assistant content is echoed back by the client in
     # subsequent turns and becomes part of the upstream provider's
@@ -495,6 +504,8 @@ class ContentRouterConfig:
     # CCR (Compress-Cache-Retrieve) settings for SmartCrusher
     ccr_enabled: bool = True  # Enable CCR marker injection for reversible compression
     ccr_inject_marker: bool = True  # Add retrieval markers to compressed content
+    smart_crusher_max_items_after_crush: int | None = None
+    smart_crusher_with_compaction: bool = True
 
     # Tag protection: preserve custom/workflow XML tags from text compression.
     # When False (default), entire <custom-tag>content</custom-tag> blocks are
@@ -931,7 +942,12 @@ class ContentRouter(Transform):
             # Determine strategy from content analysis
             mixed = is_mixed_content(content)
             detection = _detect_content(content)
-            strategy = self._determine_strategy(content)
+            force_kompress = bool(getattr(self, "_runtime_force_kompress", False))
+            strategy = (
+                CompressionStrategy.KOMPRESS
+                if force_kompress
+                else self._determine_strategy(content)
+            )
             if debug_enabled:
                 _log_router_debug(
                     "content_router_input",
@@ -939,7 +955,13 @@ class ContentRouter(Transform):
                     detected_content_type=detection.content_type.value,
                     detection_confidence=detection.confidence,
                     selected_strategy=strategy.value,
-                    selection_reason="mixed_content" if mixed else "content_detection",
+                    selection_reason=(
+                        "runtime_force_kompress"
+                        if force_kompress
+                        else "mixed_content"
+                        if mixed
+                        else "content_detection"
+                    ),
                 )
 
             if strategy == CompressionStrategy.MIXED:
@@ -1556,14 +1578,23 @@ class ContentRouter(Transform):
         if self._smart_crusher is None:
             try:
                 from ..config import CCRConfig
-                from .smart_crusher import SmartCrusher
+                from .smart_crusher import SmartCrusher, SmartCrusherConfig
 
                 # Pass CCR config for marker injection
                 ccr_config = CCRConfig(
                     enabled=self.config.ccr_enabled,
                     inject_retrieval_marker=self.config.ccr_inject_marker,
                 )
-                self._smart_crusher = SmartCrusher(ccr_config=ccr_config)
+                crusher_config = SmartCrusherConfig()
+                if self.config.smart_crusher_max_items_after_crush is not None:
+                    crusher_config.max_items_after_crush = (
+                        self.config.smart_crusher_max_items_after_crush
+                    )
+                self._smart_crusher = SmartCrusher(
+                    config=crusher_config,
+                    ccr_config=ccr_config,
+                    with_compaction=self.config.smart_crusher_with_compaction,
+                )
             except ImportError:
                 logger.debug("SmartCrusher not available")
         return self._smart_crusher
@@ -1622,14 +1653,36 @@ class ContentRouter(Transform):
         """
         status: dict[str, str] = {}
 
-        # 1. ML text compressor: Kompress
+        # 1. ML text compressor: Kompress.
+        #
+        # Eager preload is cache-only (allow_download=False): on a cold cache we
+        # must NOT trigger a network download here, because this runs on the
+        # blocking startup/lifespan path before the proxy binds its port. A slow
+        # download stalls the bind, and a hard crash in the native download/ML
+        # stack (uncatchable SIGABRT) kills the interpreter before it ever
+        # listens — the proxy then "never opens its port" and the supervisor
+        # gives up. When the model isn't cached we defer to first use instead.
         if self.config.enable_kompress:
+            from .kompress_compressor import KompressModelNotCached
+
             compressor = self._get_kompress()
             if compressor:
-                backend = compressor.preload() if hasattr(compressor, "preload") else "unknown"
-                logger.info("Kompress model pre-loaded at startup backend=%s", backend)
-                status["kompress"] = "enabled"
-                status["kompress_backend"] = str(backend)
+                if not hasattr(compressor, "preload"):
+                    status["kompress"] = "enabled"
+                    status["kompress_backend"] = "unknown"
+                else:
+                    try:
+                        backend = compressor.preload(allow_download=False)
+                    except KompressModelNotCached:
+                        logger.info(
+                            "Kompress model not cached; deferring download to "
+                            "first use to keep startup non-blocking"
+                        )
+                        status["kompress"] = "deferred"
+                    else:
+                        logger.info("Kompress model pre-loaded at startup backend=%s", backend)
+                        status["kompress"] = "enabled"
+                        status["kompress_backend"] = str(backend)
             else:
                 status["kompress"] = "unavailable"
 
@@ -1899,6 +1952,7 @@ class ContentRouter(Transform):
         )
         # Store runtime options on self for access by _route_and_compress_block
         self._runtime_target_ratio: float | None = kwargs.get("target_ratio")
+        self._runtime_force_kompress: bool = bool(kwargs.get("force_kompress", False))
         self._runtime_kompress_model: str | None = kwargs.get("kompress_model")
         # F2.2: capture the per-request CompressionPolicy so
         # ``_record_to_toin`` can gate TOIN writes on
@@ -1938,6 +1992,9 @@ class ContentRouter(Transform):
             )
         else:
             read_protection_window = num_messages  # 0.0 = protect all (old behavior)
+        runtime_read_protection_window = kwargs.get("read_protection_window")
+        if runtime_read_protection_window is not None:
+            read_protection_window = max(0, int(runtime_read_protection_window))
 
         # Adaptive compression ratio: scale with context pressure
         if model_limit > 0:
@@ -2098,6 +2155,24 @@ class ContentRouter(Transform):
                 route_counts["small"] += 1
                 continue
 
+            # Protection: failed tool calls / error outputs stay verbatim
+            # (issue #847). The model needs exact tracebacks to recover.
+            # Strong (>=2 distinct indicators) match only — a single
+            # keyword false-positives on benign outputs that mention
+            # errors. Above the size cap, fall through — LogCompressor
+            # preserves error lines in big logs.
+            if (
+                self.config.protect_error_outputs
+                and role == "tool"
+                and len(content) <= self.config.error_protection_max_chars
+                and content_has_strong_error_indicators(content)
+            ):
+                result_slots[i] = message
+                transforms_applied.append("router:protected:error_output")
+                route_counts.setdefault("error_protected", 0)
+                route_counts["error_protected"] += 1
+                continue
+
             # Detect content type for protection decisions
             detection = _detect_content(content)
             is_code = detection.content_type == ContentType.SOURCE_CODE
@@ -2250,6 +2325,8 @@ class ContentRouter(Transform):
             parts.append(f"{route_counts['analysis_ctx']} protected (analysis ctx)")
         if route_counts.get("already_compressed"):
             parts.append(f"{route_counts['already_compressed']} pinned (already compressed)")
+        if route_counts.get("error_protected"):
+            parts.append(f"{route_counts['error_protected']} protected (error output)")
         if route_counts["ratio_too_high"]:
             parts.append(f"{route_counts['ratio_too_high']} unchanged (ratio>={min_ratio:.2f})")
         if route_counts["content_blocks"]:
@@ -2432,6 +2509,29 @@ class ContentRouter(Transform):
                 bias = self._get_tool_bias(tool_name) if tool_name else 1.0
 
                 tool_content = block.get("content", "")
+
+                # Protection: failed tool calls / error outputs stay verbatim
+                # (issue #847). `is_error` is Anthropic's explicit failure
+                # flag and suffices alone; the indicator scan catches error
+                # text without the flag but requires >=2 distinct keywords
+                # so benign outputs mentioning errors don't skip compression.
+                # Above the size cap, fall through — LogCompressor preserves
+                # error lines in big logs.
+                if (
+                    self.config.protect_error_outputs
+                    and isinstance(tool_content, str)
+                    and len(tool_content) <= self.config.error_protection_max_chars
+                    and (
+                        block.get("is_error") is True
+                        or content_has_strong_error_indicators(tool_content)
+                    )
+                ):
+                    new_blocks.append(block)
+                    transforms_applied.append("router:protected:error_output")
+                    if route_counts is not None:
+                        route_counts.setdefault("error_protected", 0)
+                        route_counts["error_protected"] += 1
+                    continue
 
                 # Only process string content
                 if isinstance(tool_content, str) and len(tool_content) > min_chars:

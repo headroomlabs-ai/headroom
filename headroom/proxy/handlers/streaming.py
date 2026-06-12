@@ -785,6 +785,7 @@ class StreamingMixin:
             uncached_input_tokens=uncached_input_tokens,
             ttfb_ms=stream_state["ttfb_ms"] or total_latency,
             pipeline_timing=pipeline_timing,
+            original_messages=original_messages,
         )
         await self._record_request_outcome(outcome)
 
@@ -1349,6 +1350,7 @@ class StreamingMixin:
         tags: dict[str, str],
         optimization_latency: float,
         pipeline_timing: dict[str, float] | None = None,
+        original_messages: list[dict] | None = None,
     ) -> StreamingResponse:
         """Stream response from Bedrock backend with metrics tracking.
 
@@ -1455,6 +1457,7 @@ class StreamingMixin:
                     cache_write_1h_tokens=stream_state["cache_creation_ephemeral_1h_input_tokens"],
                     ttfb_ms=stream_state["ttfb_ms"] or 0,
                     pipeline_timing=pipeline_timing,
+                    original_messages=original_messages,
                 )
                 await self._record_request_outcome(outcome)
 

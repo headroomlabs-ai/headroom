@@ -53,6 +53,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_CCR_TTL_SECONDS = 300
+CCR_TTL_SECONDS_ENV = "HEADROOM_CCR_TTL_SECONDS"
+
 _RETRIEVAL_LOG_PREVIEW_CHARS = 4096
 _SECRET_KEY_VALUE_RE = re.compile(
     r"(?i)\b([A-Z0-9_-]*(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTH)[A-Z0-9_-]*)"
@@ -60,6 +63,48 @@ _SECRET_KEY_VALUE_RE = re.compile(
 )
 _AUTH_VALUE_RE = re.compile(r"(?i)\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{12,}")
 _API_KEY_VALUE_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b")
+
+
+def _get_env_default_ttl_seconds() -> int:
+    raw_value = os.environ.get(CCR_TTL_SECONDS_ENV)
+    if raw_value is None or not raw_value.strip():
+        return DEFAULT_CCR_TTL_SECONDS
+
+    try:
+        ttl_seconds = int(raw_value)
+    except ValueError:
+        logger.warning(
+            "%s must be a positive integer number of seconds, got %r; using %s",
+            CCR_TTL_SECONDS_ENV,
+            raw_value,
+            DEFAULT_CCR_TTL_SECONDS,
+        )
+        return DEFAULT_CCR_TTL_SECONDS
+
+    if ttl_seconds <= 0:
+        logger.warning(
+            "%s must be greater than 0, got %s; using %s",
+            CCR_TTL_SECONDS_ENV,
+            ttl_seconds,
+            DEFAULT_CCR_TTL_SECONDS,
+        )
+        return DEFAULT_CCR_TTL_SECONDS
+
+    return ttl_seconds
+
+
+def format_retrieval_miss_detail(status: dict[str, Any]) -> str:
+    """Return an operator-facing miss reason for CCR retrieval failures."""
+    default_ttl = status.get("default_ttl_seconds", DEFAULT_CCR_TTL_SECONDS)
+    ttl_seconds = status.get("ttl_seconds", default_ttl)
+
+    if status.get("status") == "expired":
+        age_seconds = status.get("age_seconds")
+        if isinstance(age_seconds, (int, float)):
+            return f"Entry expired (CCR TTL: {ttl_seconds} seconds; age: {age_seconds:.0f} seconds)"
+        return f"Entry expired (CCR TTL: {ttl_seconds} seconds)"
+
+    return f"Entry not found (CCR TTL: {default_ttl} seconds)"
 
 
 def _redact_retrieval_log_payload(payload: str) -> str:
@@ -95,7 +140,7 @@ class CompressionEntry:
     tool_call_id: str | None
     query_context: str | None
     created_at: float
-    ttl: int = 300  # 5 minutes default
+    ttl: int = DEFAULT_CCR_TTL_SECONDS
 
     # TOIN integration: Store the tool signature hash for retrieval correlation
     # This MUST match the hash used by SmartCrusher when recording compression
@@ -146,7 +191,7 @@ class CompressionStore:
     Design principles:
     - Zero external dependencies (pure Python)
     - Thread-safe for concurrent access
-    - TTL-based expiration (default 5 minutes)
+    - TTL-based expiration (default 300 seconds, env-configurable)
     - LRU-style eviction when capacity is reached
     - Built-in BM25 search for filtering
     """
@@ -154,7 +199,7 @@ class CompressionStore:
     def __init__(
         self,
         max_entries: int = 1000,
-        default_ttl: int = 300,
+        default_ttl: int = DEFAULT_CCR_TTL_SECONDS,
         enable_feedback: bool = True,
         backend: CompressionStoreBackend | None = None,
     ):
@@ -162,7 +207,7 @@ class CompressionStore:
 
         Args:
             max_entries: Maximum number of entries to store.
-            default_ttl: Default TTL in seconds (5 minutes).
+            default_ttl: Default TTL in seconds.
             enable_feedback: Whether to track retrieval events.
             backend: Storage backend to use. Defaults to InMemoryBackend.
                      Custom backends can be passed for persistence (MongoDB, Redis).
@@ -191,6 +236,11 @@ class CompressionStore:
 
         # BM25 scorer for search
         self._scorer = BM25Scorer()
+
+    @property
+    def default_ttl_seconds(self) -> int:
+        """Default TTL applied to new entries when callers do not override it."""
+        return self._default_ttl
 
     def store(
         self,
@@ -730,6 +780,42 @@ class CompressionStore:
                 return False
             return True
 
+    def get_entry_status(
+        self,
+        hash_key: str,
+        *,
+        clean_expired: bool = False,
+    ) -> dict[str, Any]:
+        """Return availability and TTL metadata for a stored entry."""
+        now = time.time()
+        with self._lock:
+            entry = self._backend.get(hash_key)
+            if entry is None:
+                return {
+                    "hash": hash_key,
+                    "status": "missing",
+                    "default_ttl_seconds": self._default_ttl,
+                }
+
+            age_seconds = now - entry.created_at
+            expires_at = entry.created_at + entry.ttl
+            expired = age_seconds > entry.ttl
+            status = {
+                "hash": hash_key,
+                "status": "expired" if expired else "available",
+                "ttl_seconds": entry.ttl,
+                "default_ttl_seconds": self._default_ttl,
+                "created_at": entry.created_at,
+                "expires_at": expires_at,
+                "age_seconds": age_seconds,
+            }
+
+            if expired and clean_expired:
+                self._backend.delete(hash_key)
+                self._stale_heap_entries += 1
+
+            return status
+
     def get_stats(self) -> dict[str, Any]:
         """Get store statistics for monitoring."""
         with self._lock:
@@ -748,6 +834,7 @@ class CompressionStore:
             return {
                 "entry_count": self._backend.count(),
                 "max_entries": self._max_entries,
+                "default_ttl_seconds": self._default_ttl,
                 "total_original_tokens": total_original_tokens,
                 "total_compressed_tokens": total_compressed_tokens,
                 "total_retrievals": total_retrievals,
@@ -1134,7 +1221,7 @@ def _create_default_ccr_backend() -> CompressionStoreBackend | None:
 
 def get_compression_store(
     max_entries: int = 1000,
-    default_ttl: int = 300,
+    default_ttl: int | None = None,
     backend: CompressionStoreBackend | None = None,
 ) -> CompressionStore:
     """Get the compression store instance.
@@ -1146,6 +1233,7 @@ def get_compression_store(
     Args:
         max_entries: Maximum entries (only used on first call for global store).
         default_ttl: Default TTL (only used on first call for global store).
+            When omitted, HEADROOM_CCR_TTL_SECONDS overrides the 300-second default.
         backend: Custom storage backend (only used on first call for global store).
                  Defaults to InMemoryBackend if not provided; env backend used if backend is None.
 
@@ -1162,9 +1250,12 @@ def get_compression_store(
             if _compression_store is None:
                 if backend is None:
                     backend = _create_default_ccr_backend()
+                effective_default_ttl = (
+                    default_ttl if default_ttl is not None else _get_env_default_ttl_seconds()
+                )
                 _compression_store = CompressionStore(
                     max_entries=max_entries,
-                    default_ttl=default_ttl,
+                    default_ttl=effective_default_ttl,
                     backend=backend,
                 )
     return _compression_store

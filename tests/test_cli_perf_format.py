@@ -167,12 +167,15 @@ def test_perf_csv_by_model(runner, monkeypatch):
 
 
 def test_perf_csv_raw_per_record(runner, monkeypatch):
-    _patch_report(monkeypatch, _sample_report())
+    report = _sample_report()
+    report.perf_records[0].client = "codex"
+    _patch_report(monkeypatch, report)
     result = runner.invoke(main, ["perf", "--format", "csv", "--raw"])
     assert result.exit_code == 0, result.output
     rows = list(csv.DictReader(io.StringIO(result.output)))
     assert len(rows) == 2
     assert rows[0]["request_id"] == "hr_1"
+    assert rows[0]["client"] == "codex"
     # transforms flattened to a string cell
     assert rows[0]["transforms"] == "content_router"
 
