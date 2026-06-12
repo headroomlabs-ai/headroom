@@ -191,11 +191,25 @@ jobs:
           cp "${SITE}/headroom/"_core*.so headroom/
           python -c "from headroom._core import DiffCompressor; print('headroom._core OK')"
 
+      # Coverage upload: without this, codecov only receives reports from
+      # the two native-e2e workflows (3 CLI test files total), so head
+      # coverage reads ~6% and codecov/patch fails for ANY diff not
+      # exercised by those files — a false negative on every PR. The main
+      # suite runs here; its coverage must be what codecov sees.
       - name: Run test shard ${{ matrix.shard }}/4
         run: |
           pytest tests scripts/tests \
             --splits 4 --group ${{ matrix.shard }} \
+            --cov=headroom --cov-report=xml:coverage-shard-${{ matrix.shard }}.xml \
             --tb=short -q
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          file: ./coverage-shard-${{ matrix.shard }}.xml
+          flags: unit
+          name: test-shard-${{ matrix.shard }}
+          fail_ci_if_error: false
 
   test-extras:
     needs: [changes, build-wheel]
