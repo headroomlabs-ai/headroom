@@ -95,6 +95,7 @@ def test_canonical_only_user_workspace_bucket_relocates(
     assert paths.proxy_log_path() == alt_ws / "logs" / "proxy.log"
     assert paths.debug_400_dir() == alt_ws / "logs" / "debug_400"
     assert paths.bin_dir() == alt_ws / "bin"
+    assert paths.proxy_clients_dir(8787) == alt_ws / "clients" / "8787"
     assert paths.deploy_root() == alt_ws / "deploy"
     assert paths.beacon_lock_path(8787) == alt_ws / ".beacon_lock_8787"
     # Config bucket follows the derived config dir.

@@ -672,7 +672,11 @@ class GeminiHandlerMixin:
                 response_headers["x-headroom-tokens-saved"] = str(tokens_saved)
                 response_headers["x-headroom-model"] = model
                 if transforms_applied:
-                    response_headers["x-headroom-transforms"] = ",".join(transforms_applied)
+                    from headroom.proxy.cost import header_safe_transforms
+
+                    response_headers["x-headroom-transforms"] = ",".join(
+                        header_safe_transforms(transforms_applied)
+                    )
                 if cache_read_tokens > 0:
                     response_headers["x-headroom-cached"] = "true"
                 if _compression_failed:

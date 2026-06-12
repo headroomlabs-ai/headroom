@@ -358,6 +358,11 @@ class SmartCrusherConfig:
     first_fraction: float = 0.3  # 30% of K from start of array
     last_fraction: float = 0.15  # 15% of K from end of array
 
+    # Lossless compaction only replaces the original when it saves at
+    # least this byte fraction vs the (minified) input. Mirrors the
+    # Rust default.
+    lossless_min_savings_ratio: float = 0.30
+
 
 @dataclass
 class CacheOptimizerConfig:
@@ -531,6 +536,7 @@ class WasteSignals:
     whitespace_tokens: int = 0  # Repeated whitespace
     dynamic_date_tokens: int = 0  # Dynamic dates in system prompt
     repetition_tokens: int = 0  # Repeated content
+    reread_tokens: int = 0  # Tool results re-served after already appearing earlier
 
     def total(self) -> int:
         """Total waste tokens detected."""
@@ -541,6 +547,7 @@ class WasteSignals:
             + self.whitespace_tokens
             + self.dynamic_date_tokens
             + self.repetition_tokens
+            + self.reread_tokens
         )
 
     def to_dict(self) -> dict[str, int]:
@@ -552,6 +559,7 @@ class WasteSignals:
             "whitespace": self.whitespace_tokens,
             "dynamic_date": self.dynamic_date_tokens,
             "repetition": self.repetition_tokens,
+            "reread": self.reread_tokens,
         }
 
 

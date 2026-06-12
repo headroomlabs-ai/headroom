@@ -12,6 +12,10 @@ once with confusing diffs.
 
 from __future__ import annotations
 
+import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +23,7 @@ import click
 import pytest
 from click.testing import CliRunner
 
+from headroom import paths as paths_mod
 from headroom.cli import wrap as wrap_mod
 
 # ---------------------------------------------------------------------------
@@ -516,3 +521,189 @@ class TestApplyProjectHeaderEnv:
         monkeypatch.chdir(project_dir)
 
         assert wrap_mod._project_name_from_cwd() == "vibe-headroom"
+
+
+# ---------------------------------------------------------------------------
+# Proxy-client reference counting
+#
+# The shared proxy must only be torn down by its owner once *no* other live
+# wrap clients remain. Clients carry the proxy URL in ANTHROPIC_BASE_URL /
+# OPENAI_BASE_URL (env, not argv), so the old `pgrep -f "127.0.0.1:<port>"`
+# guard could neither see real clients nor reject unrelated processes that
+# merely had the address in their command line. These tests pin the new
+# marker-file contract: a per-PID file under paths.proxy_clients_dir(port).
+# ---------------------------------------------------------------------------
+
+
+class _FakeProxyProc:
+    """Minimal stand-in for the proxy ``subprocess.Popen`` handle."""
+
+    def __init__(self) -> None:
+        self.terminated = False
+        self.killed = False
+
+    def poll(self) -> int | None:
+        return None  # alive
+
+    def terminate(self) -> None:
+        self.terminated = True
+
+    def wait(self, timeout: float | None = None) -> int:
+        return 0
+
+    def kill(self) -> None:
+        self.killed = True
+
+
+class TestProxyClientRefCounting:
+    """Proxy lifecycle is reference-counted via marker files, not pgrep."""
+
+    PORT = 8787
+
+    @pytest.fixture
+    def clients_dir(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        """Redirect ``paths.proxy_clients_dir`` into a throwaway tmp tree."""
+        base = tmp_path / "clients"
+        monkeypatch.setattr(paths_mod, "proxy_clients_dir", lambda port: base / str(port))
+        return base
+
+    def _write_marker(
+        self,
+        clients_dir: Path,
+        pid: int,
+        *,
+        identity: tuple[str, float] | None = None,
+    ) -> Path:
+        marker = clients_dir / str(self.PORT) / f"{pid}.json"
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        rec: dict[str, Any] = {"pid": pid, "started_at": 0}
+        if identity is not None:
+            rec["start_src"], rec["start_time"] = identity
+        marker.write_text(json.dumps(rec))
+        return marker
+
+    def test_cleanup_terminates_proxy_when_only_self_registered(self, clients_dir: Path) -> None:
+        """The owner alone → no other clients → proxy is terminated on exit."""
+        wrap_mod._register_proxy_client(self.PORT)
+        proc = _FakeProxyProc()
+        cleanup = wrap_mod._make_cleanup([proc], self.PORT)
+
+        cleanup()
+
+        assert proc.terminated is True
+        # Our own marker is removed before we count.
+        assert wrap_mod._live_proxy_clients(self.PORT, exclude_self=False) == []
+
+    def test_cleanup_leaves_proxy_running_when_other_client_alive(self, clients_dir: Path) -> None:
+        """A second live client (here: the test's parent) keeps the proxy up."""
+        wrap_mod._register_proxy_client(self.PORT)
+        other_pid = os.getppid()  # alive for the duration of the test run
+        assert other_pid != os.getpid()
+        self._write_marker(clients_dir, other_pid)
+
+        proc = _FakeProxyProc()
+        cleanup = wrap_mod._make_cleanup([proc], self.PORT)
+        cleanup()
+
+        assert proc.terminated is False
+
+    def test_dead_client_marker_is_pruned_and_not_counted(self, clients_dir: Path) -> None:
+        """A marker for a dead PID is pruned from disk and never counted."""
+        # Spawn and reap a child so its PID is reliably dead (not a zombie).
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        child.wait()
+        dead_pid = child.pid
+        marker = self._write_marker(clients_dir, dead_pid)
+
+        live = wrap_mod._live_proxy_clients(self.PORT, exclude_self=True)
+
+        assert dead_pid not in live
+        assert not marker.exists()
+
+    def test_reused_pid_with_mismatched_identity_is_pruned(
+        self, clients_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A *live* PID that the original client no longer owns is pruned.
+
+        Models the PID-reuse orphan path: a wrapper crashed, the OS later
+        recycled its PID for an unrelated long-lived process. `os.kill(pid, 0)`
+        succeeds, but the recorded start time no longer matches.
+        """
+        live_pid = os.getppid()  # alive, but not the process that "registered"
+        marker = self._write_marker(clients_dir, live_pid, identity=("psutil", 1000.0))
+        # The process currently holding that PID started much later → reuse.
+        monkeypatch.setattr(wrap_mod, "_proc_identity", lambda p: ("psutil", 9000.0))
+
+        live = wrap_mod._live_proxy_clients(self.PORT, exclude_self=True)
+
+        assert live_pid not in live
+        assert not marker.exists()
+
+    def test_matching_identity_within_tolerance_is_kept(
+        self, clients_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Same process (start time within tolerance) is a real client — kept."""
+        live_pid = os.getppid()
+        marker = self._write_marker(clients_dir, live_pid, identity=("psutil", 1000.0))
+        monkeypatch.setattr(wrap_mod, "_proc_identity", lambda p: ("psutil", 1000.4))
+
+        live = wrap_mod._live_proxy_clients(self.PORT, exclude_self=True)
+
+        assert live_pid in live
+        assert marker.exists()
+
+    def test_identity_check_skipped_when_source_unavailable(
+        self, clients_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No reuse protection (e.g. macOS w/o psutil) → fall back to existence."""
+        live_pid = os.getppid()
+        self._write_marker(clients_dir, live_pid, identity=("psutil", 1000.0))
+        # Start time unknowable for the live PID → must not prune a real client.
+        monkeypatch.setattr(wrap_mod, "_proc_identity", lambda p: None)
+
+        live = wrap_mod._live_proxy_clients(self.PORT, exclude_self=True)
+
+        assert live_pid in live
+
+    def test_non_marker_files_are_ignored(self, clients_dir: Path) -> None:
+        """Stray non-numeric / non-json files don't crash or count as clients."""
+        d = clients_dir / str(self.PORT)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "not-a-pid.json").write_text("{}")
+        (d / "README.txt").write_text("ignore me")
+
+        assert wrap_mod._live_proxy_clients(self.PORT, exclude_self=True) == []
+
+    def test_cleanup_does_not_shell_out_to_pgrep(
+        self, clients_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression: liveness is never inferred from an argv scan.
+
+        An unrelated process whose command line contains ``127.0.0.1:8787``
+        used to be a false positive (orphaning the proxy). The new path never
+        calls ``subprocess.run`` at all, so it can't be fooled by argv.
+        """
+        wrap_mod._register_proxy_client(self.PORT)
+
+        def _no_subprocess(*args: Any, **kwargs: Any) -> None:
+            raise AssertionError("cleanup must not invoke subprocess.run (no pgrep)")
+
+        monkeypatch.setattr(wrap_mod.subprocess, "run", _no_subprocess)
+
+        proc = _FakeProxyProc()
+        cleanup = wrap_mod._make_cleanup([proc], self.PORT)
+        cleanup()  # must not raise
+
+        assert proc.terminated is True
+
+    def test_register_then_unregister_is_idempotent(self, clients_dir: Path) -> None:
+        """Register adds exactly our marker; unregister removes it; re-call is safe."""
+        wrap_mod._register_proxy_client(self.PORT)
+        all_clients = wrap_mod._live_proxy_clients(self.PORT, exclude_self=False)
+        assert all_clients == [os.getpid()]
+
+        wrap_mod._unregister_proxy_client(self.PORT)
+        assert wrap_mod._live_proxy_clients(self.PORT, exclude_self=False) == []
+
+        # Second unregister is a no-op, not an error.
+        wrap_mod._unregister_proxy_client(self.PORT)

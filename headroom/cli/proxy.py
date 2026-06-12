@@ -61,6 +61,22 @@ def _get_env_bool(name: str, default: bool) -> bool:
     return val.lower() in ("true", "1", "yes", "on")
 
 
+def _get_env_bool_optional(name: str) -> bool | None:
+    if name not in os.environ:
+        return None
+    return _get_env_bool(name, False)
+
+
+def _get_env_int_optional(name: str) -> int | None:
+    val = os.environ.get(name)
+    return int(val) if val is not None and val != "" else None
+
+
+def _get_env_float_optional(name: str) -> float | None:
+    val = os.environ.get(name)
+    return float(val) if val is not None and val != "" else None
+
+
 def _selected_context_tool() -> str:
     raw = os.environ.get(_CONTEXT_TOOL_ENV, "").strip().lower().replace("_", "-")
     if not raw:
@@ -773,6 +789,16 @@ def proxy(
         ccr_inject_tool=not no_ccr_inject_tool,
         ccr_inject_marker=not no_ccr_marker,
         ccr_proactive_expansion=not no_ccr_proactive_expansion,
+        compress_user_messages=_get_env_bool("HEADROOM_COMPRESS_USER_MESSAGES", False),
+        min_tokens_to_crush=_get_env_int_optional("HEADROOM_MIN_TOKENS") or 500,
+        max_items_after_crush=_get_env_int_optional("HEADROOM_MAX_ITEMS") or 50,
+        smart_crusher_with_compaction=_get_env_bool_optional("HEADROOM_SMART_CRUSHER_COMPACTION"),
+        savings_profile=os.environ.get("HEADROOM_SAVINGS_PROFILE") or None,
+        target_ratio=_get_env_float_optional("HEADROOM_TARGET_RATIO"),
+        compress_system_messages=_get_env_bool_optional("HEADROOM_COMPRESS_SYSTEM_MESSAGES"),
+        protect_recent=_get_env_int_optional("HEADROOM_PROTECT_RECENT"),
+        protect_analysis_context=_get_env_bool_optional("HEADROOM_PROTECT_ANALYSIS_CONTEXT"),
+        accuracy_guard=os.environ.get("HEADROOM_ACCURACY_GUARD") or None,
         # Flatten repeat-flag tuple AND any comma-separated values inside it.
         # `--proxy-extension a,b --proxy-extension c` and `HEADROOM_PROXY_EXTENSIONS=a,b,c`
         # both yield ["a", "b", "c"]. None when nothing was supplied.

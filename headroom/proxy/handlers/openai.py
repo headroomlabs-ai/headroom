@@ -45,7 +45,7 @@ from headroom.copilot_auth import apply_copilot_api_auth, build_copilot_upstream
 from headroom.pipeline import PipelineStage, summarize_routing_markers
 from headroom.proxy.auth_mode import classify_auth_mode, classify_client
 from headroom.proxy.compression_decision import CompressionDecision
-from headroom.proxy.cost import _summarize_transforms
+from headroom.proxy.cost import _summarize_transforms, header_safe_transforms
 from headroom.proxy.outcome import RequestOutcome
 from headroom.proxy.project_context import classify_project, set_current_project
 
@@ -1795,6 +1795,9 @@ class OpenAIHandlerMixin:
                 "tokens_before": original_tokens,
                 "tokens_after": optimized_tokens,
                 "transforms_applied": transforms_applied,
+                # Read-only reference for recording extensions (probe
+                # recorder); extensions must not mutate it.
+                "original_messages": original_messages,
             },
         )
         if compressed_event.messages is not None:
@@ -2560,7 +2563,9 @@ class OpenAIHandlerMixin:
                 response_headers["x-headroom-tokens-saved"] = str(tokens_saved)
                 response_headers["x-headroom-model"] = model
                 if transforms_applied:
-                    response_headers["x-headroom-transforms"] = ",".join(transforms_applied)
+                    response_headers["x-headroom-transforms"] = ",".join(
+                        header_safe_transforms(transforms_applied)
+                    )
                 if cache_read_tokens > 0:
                     response_headers["x-headroom-cached"] = "true"
                 if _compression_failed:

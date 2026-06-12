@@ -28,6 +28,7 @@ DEFAULT_TOKEN_EXCHANGE_URL = "https://api.github.com/copilot_internal/v2/token"
 DEFAULT_USER_INFO_URL = "https://api.github.com/copilot_internal/user"
 DEFAULT_GITHUB_HOST = "github.com"
 _TOKEN_EXPIRY_BUFFER_S = 60
+_DEFAULT_INTEGRATION_ID = "vscode-chat"
 _DEFAULT_EDITOR_VERSION = "vscode/1.104.1"
 _DEFAULT_USER_AGENT = "GitHubCopilotChat/0.1"
 
@@ -203,25 +204,37 @@ def _read_windows_copilot_cli_oauth_token() -> str | None:
         return None
 
     host = _github_host().lower()
-    service_prefixes = [f"copilot-cli/{host}:"]
+    bare_host = host.removeprefix("https://").removeprefix("http://")
+
+    gh_prefix = f"gh:{bare_host}:"
+    copilot_prefixes = [f"copilot-cli/{host}:"]
     if "://" not in host:
-        service_prefixes.append(f"copilot-cli/https://{host}:")
+        copilot_prefixes.append(f"copilot-cli/https://{host}:")
+        copilot_prefixes.append(f"copilot-cli/https://{host}/")
+
+    gh_tokens: list[str] = []
+    copilot_tokens: list[str] = []
 
     try:
         for idx in range(count.value):
             credential = credentials[idx].contents
             target = (credential.TargetName or "").strip().lower()
-            if not any(target.startswith(prefix) for prefix in service_prefixes):
-                continue
             if credential.CredentialBlobSize <= 0 or not credential.CredentialBlob:
                 continue
             blob = ctypes.string_at(credential.CredentialBlob, credential.CredentialBlobSize)
             token = blob.decode("utf-8", errors="replace").strip()
-            if token:
-                return token
+            if not token:
+                continue
+            if target.startswith(gh_prefix):
+                gh_tokens.append(token)
+            elif any(target.startswith(p) for p in copilot_prefixes):
+                copilot_tokens.append(token)
     finally:
         if credentials:
             advapi32.CredFree(credentials)
+
+    for token in gh_tokens + copilot_tokens:
+        return token
 
     return None
 
@@ -617,12 +630,66 @@ def get_copilot_token_provider() -> CopilotTokenProvider:
     return _provider
 
 
-async def apply_copilot_api_auth(headers: dict[str, str], *, url: str) -> dict[str, str]:
-    """Replace Authorization with a fresh Copilot API token when targeting Copilot."""
+def _is_copilot_api_token(token: str) -> bool:
+    """Return True when the token looks like a short-lived Copilot API token.
 
+    Copilot API tokens currently use the "tid_" prefix.
+    GitHub OAuth tokens (for example "gho_", "ghs_", "ghp_", "github_pat_")
+    should be exchanged and must not be forwarded directly.
+    """
+    normalized = token.strip()
+    if not normalized:
+        return False
+
+    if (
+        normalized.startswith("gho_")
+        or normalized.startswith("ghs_")
+        or normalized.startswith("ghp_")
+        or normalized.startswith("github_pat_")
+    ):
+        return False
+
+    return normalized.startswith("tid_")
+
+
+def _token_kind(token: str) -> str:
+    """Return a non-sensitive label for the token type, safe to log."""
+    t = token.strip()
+    for prefix in ("tid_", "gho_", "ghs_", "ghp_", "github_pat_"):
+        if t.startswith(prefix):
+            return prefix + "***"
+    return "unknown" if t else "empty"
+
+
+async def apply_copilot_api_auth(headers: dict[str, str], *, url: str) -> dict[str, str]:
+    """Apply Copilot auth headers for GitHub Copilot API requests."""
     resolved = dict(headers)
     if not is_copilot_api_url(url):
         return resolved
+
+    lower_keys = {k.lower() for k in resolved}
+    if "copilot-integration-id" not in lower_keys:
+        resolved["Copilot-Integration-Id"] = os.environ.get(
+            "GITHUB_COPILOT_INTEGRATION_ID", _DEFAULT_INTEGRATION_ID
+        )
+    if "editor-version" not in lower_keys:
+        resolved["editor-version"] = os.environ.get(
+            "GITHUB_COPILOT_EDITOR_VERSION", _DEFAULT_EDITOR_VERSION
+        )
+
+    incoming_auth = next((v for k, v in resolved.items() if k.lower() == "authorization"), None)
+    if incoming_auth:
+        scheme, _, raw_token = incoming_auth.partition(" ")
+        if scheme.lower() == "bearer" and raw_token and _is_copilot_api_token(raw_token):
+            logger.info(
+                "apply_copilot_api_auth: passing through client token kind=%s",
+                _token_kind(raw_token),
+            )
+            return resolved
+        logger.info(
+            "apply_copilot_api_auth: incoming token not suitable (kind=%s), will replace",
+            _token_kind(raw_token) if raw_token else "none",
+        )
 
     token = await get_copilot_token_provider().get_api_token()
     for key in list(resolved):

@@ -127,6 +127,12 @@ class RequestOutcome:
     num_messages: int = 0
     turn_id: str | None = None
     request_messages: list[dict[str, Any]] | None = None
+    # Post-compression messages actually sent upstream, paired with
+    # ``request_messages`` (pre-compression) so consumers can diff the two.
+    # Only populated when a caller threads in the pre-compression snapshot
+    # (``original_messages``); otherwise ``request_messages`` carries the sent
+    # body for backward compatibility and this stays ``None``.
+    compressed_messages: list[dict[str, Any]] | None = None
     tags: dict[str, str] = field(default_factory=dict)
     client: str | None = None
     project: str | None = None
@@ -201,6 +207,7 @@ class RequestOutcome:
         ttfb_ms: float = 0.0,
         pipeline_timing: dict[str, float] | None = None,
         waste_signals: dict[str, int] | None = None,
+        original_messages: list[dict] | None = None,
     ) -> RequestOutcome:
         """Construct an outcome from the locals available at streaming
         finalize. Three streaming finalizers
@@ -246,6 +253,25 @@ class RequestOutcome:
         if system is None:
             system = body.get("systemInstruction")
 
+        # ``request_items`` is ``body["messages"]`` (or ``body["contents"]``
+        # for Gemini, falling back to ``[]``) — the post-compression list the
+        # caller already mutated in place before finalize. When a
+        # caller threads in ``original_messages`` (the pre-compression
+        # snapshot), log it as ``request_messages`` and the sent body as
+        # ``compressed_messages`` so the two sides stay diffable. Callers that
+        # don't thread it in (gemini ``contents``, OpenAI-via-backend) keep the
+        # prior behaviour: sent body under ``request_messages``, no compressed
+        # side. Both sides share the ``log_full_messages`` gate.
+        if not log_full_messages:
+            log_request_messages = None
+            log_compressed_messages = None
+        elif original_messages is not None:
+            log_request_messages = original_messages
+            log_compressed_messages = request_items
+        else:
+            log_request_messages = request_items
+            log_compressed_messages = None
+
         return cls(
             request_id=request_id,
             provider=provider,
@@ -271,7 +297,8 @@ class RequestOutcome:
             turn_id=compute_turn_id(model, system, turn_messages),
             tags=tags or {},
             client=client,
-            request_messages=request_items if log_full_messages else None,
+            request_messages=log_request_messages,
+            compressed_messages=log_compressed_messages,
         )
 
 
@@ -376,6 +403,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
                 transforms_applied=list(outcome.transforms_applied),
                 waste_signals=outcome.waste_signals,
                 request_messages=outcome.request_messages,
+                compressed_messages=outcome.compressed_messages,
                 turn_id=outcome.turn_id,
             )
         )

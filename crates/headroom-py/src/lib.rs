@@ -677,6 +677,26 @@ impl PySmartCrusher {
         }
     }
 
+    /// Construct with the lossless-first compaction stage's formatter
+    /// chosen by name: `"csv-schema"` (the `new()` default), `"json"`,
+    /// or `"markdown-kv"`. Raises `ValueError` on unknown names so a
+    /// misconfigured knob is visible instead of silently falling back.
+    #[staticmethod]
+    #[pyo3(signature = (config = None, format_name = "csv-schema"))]
+    fn with_compaction_format(
+        config: Option<&PySmartCrusherConfig>,
+        format_name: &str,
+    ) -> PyResult<Self> {
+        let cfg = config.map(|c| c.inner.clone()).unwrap_or_default();
+        match RustSmartCrusher::with_compaction_format(cfg, format_name) {
+            Some(inner) => Ok(Self { inner }),
+            None => Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "unknown compaction format {format_name:?}; expected one of: {}",
+                headroom_core::transforms::smart_crusher::compaction::CompactionStage::SUPPORTED_FORMAT_NAMES.join(", ")
+            ))),
+        }
+    }
+
     /// `crush(content, query="", bias=1.0) -> CrushResult`. Argument
     /// order and keyword names mirror the Python implementation.
     ///

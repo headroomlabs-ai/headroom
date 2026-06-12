@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "headroom-oauth2"
+version = "0.1.0"
+description = "Generic OAuth2 client-credentials upstream-auth extension for the Headroom proxy"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Khalid Shaikh", email = "43288811+mkhalid-s@users.noreply.github.com" }]
+keywords = ["headroom", "oauth2", "client-credentials", "proxy", "llm-gateway"]
+dependencies = []
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Internet :: Proxy Servers",
+    "Topic :: Security",
+]
+
+[project.optional-dependencies]
+# Only needed if you set HEADROOM_OAUTH2_HEADERS (static upstream headers via litellm.headers).
+# The token-minting + injection path is standard-library only and needs none of this.
+litellm = ["litellm>=1.40"]
+dev = ["pytest>=7", "ruff"]
+test = ["pytest>=7"]
+
+[project.urls]
+Homepage = "https://github.com/chopratejas/headroom"
+Repository = "https://github.com/chopratejas/headroom"
+Issues = "https://github.com/chopratejas/headroom/issues"
+
+# Registers with Headroom's opt-in proxy-extension seam (headroom/proxy/extensions.py).
+# Enable at runtime with `--proxy-extension oauth2` or HEADROOM_PROXY_EXTENSIONS=oauth2.
+[project.entry-points."headroom.proxy_extension"]
+oauth2 = "headroom_oauth2:install"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100

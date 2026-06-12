@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 import sys
 import types
 from contextlib import contextmanager
@@ -840,6 +841,33 @@ def test_ensure_profile_running_covers_runtime_modes(monkeypatch) -> None:
     assert detached_calls == ["task-profile"]
     assert ("docker-profile", 1) in wait_calls
     assert ("docker-profile", 45) in wait_calls
+
+
+def test_ensure_profile_running_suppresses_hook_recovery_output(monkeypatch, capfd) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    manifest = SimpleNamespace(
+        preset=init_cli.InstallPreset.PERSISTENT_TASK.value,
+        supervisor_kind=init_cli.SupervisorKind.SERVICE.value,
+        profile="service-profile",
+    )
+
+    monkeypatch.setattr(init_cli, "load_manifest", lambda profile: manifest)
+    monkeypatch.setattr(init_cli, "wait_ready", lambda manifest, timeout_seconds: False)
+
+    def noisy_start_supervisor(manifest) -> None:
+        print("python stdout")
+        print("python stderr", file=sys.stderr)
+        os.write(1, b"fd stdout\n")
+        os.write(2, b"fd stderr\n")
+        raise RuntimeError("not permitted")
+
+    monkeypatch.setattr(init_cli, "start_supervisor", noisy_start_supervisor)
+
+    init_cli._ensure_profile_running("service-profile")
+
+    captured = capfd.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
 
 
 def test_ensure_profile_running_returns_when_ready_or_on_exception(monkeypatch) -> None:

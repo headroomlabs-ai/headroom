@@ -109,6 +109,8 @@ _WRAP_PROXY_TIMEOUT_ML_MODULES = ("torch", "sentence_transformers", "spacy")
 # Code, so the agent loop is unaffected).
 _TOOL_SEARCH_ENV = "ENABLE_TOOL_SEARCH"
 _TOOL_SEARCH_DEFAULT = "true"
+_AGENT_SAVINGS_WRAP_AGENTS = {"claude", "codex", "cursor"}
+_DEFAULT_AGENT_SAVINGS_PROFILE = "agent-90"
 
 
 def _normalize_tool_search_mode(value: str) -> str:
@@ -196,6 +198,14 @@ def _ml_wrap_extras_detected() -> bool:
     """Detect slow optional ML stacks without triggering their import cost."""
 
     return any(_module_available(module_name) for module_name in _WRAP_PROXY_TIMEOUT_ML_MODULES)
+
+
+def _wrap_agent_savings_profile(agent_type: str) -> str | None:
+    """Return the savings profile required for agent wrappers, if any."""
+
+    if agent_type not in _AGENT_SAVINGS_WRAP_AGENTS:
+        return None
+    return os.environ.get("HEADROOM_SAVINGS_PROFILE") or _DEFAULT_AGENT_SAVINGS_PROFILE
 
 
 def _default_wrap_proxy_timeout_seconds() -> int:
@@ -355,6 +365,11 @@ def _start_proxy(
     if agent_type != "unknown":
         proxy_env["HEADROOM_AGENT_TYPE"] = agent_type
         proxy_env.setdefault("HEADROOM_STACK", f"wrap_{agent_type}")
+    savings_profile = _wrap_agent_savings_profile(agent_type)
+    if savings_profile is not None:
+        from headroom.agent_savings import apply_agent_savings_env_defaults
+
+        apply_agent_savings_env_defaults(proxy_env, savings_profile)
     if openai_api_url:
         proxy_env["OPENAI_TARGET_API_URL"] = openai_api_url
     if anthropic_api_url:
@@ -1226,6 +1241,7 @@ def _run_proxy_only_watcher(
     """
     proxy_holder: list[subprocess.Popen | None] = [None]
     cleanup = _make_cleanup(proxy_holder, port)
+    _register_proxy_client(port)
     signal.signal(signal.SIGINT, cleanup)
     signal.signal(signal.SIGTERM, cleanup)
 
@@ -1830,13 +1846,19 @@ def _ensure_proxy(
                 if helpers._proxy_needs_version_restart(health_payload):
                     running_version = helpers._proxy_version(health_payload) or "unknown"
                     active_sessions = helpers._proxy_active_session_count(health_payload)
-                    if active_sessions > 0:
+                    other_wrappers = helpers._live_proxy_clients(port, exclude_self=True)
+                    if active_sessions > 0 or other_wrappers:
+                        detail = (
+                            f"{active_sessions} active session(s)"
+                            if active_sessions > 0
+                            else f"{len(other_wrappers)} attached wrapper(s)"
+                        )
                         click.echo(
                             f"  Proxy on port {port} is running Headroom {running_version}; "
                             f"current CLI is {_HEADROOM_VERSION}."
                         )
                         click.echo(
-                            f"  Leaving it running because {active_sessions} active session(s) "
+                            f"  Leaving it running because {detail} "
                             "are still attached; it will be restarted when idle."
                         )
                         return None
@@ -1870,13 +1892,23 @@ def _ensure_proxy(
             if helpers._proxy_needs_version_restart(health_payload):
                 running_version = helpers._proxy_version(health_payload) or "unknown"
                 active_sessions = helpers._proxy_active_session_count(health_payload)
-                if active_sessions > 0:
+                other_wrappers = helpers._live_proxy_clients(port, exclude_self=True)
+                if active_sessions > 0 or other_wrappers:
+                    # active_sessions only counts Codex WebSocket relay; the
+                    # marker list also covers HTTP wrap clients. Either means a
+                    # live session is attached, so don't restart the shared
+                    # proxy out from under it — defer until idle.
+                    detail = (
+                        f"{active_sessions} active session(s)"
+                        if active_sessions > 0
+                        else f"{len(other_wrappers)} attached wrapper(s)"
+                    )
                     click.echo(
                         f"  Proxy on port {port} is running Headroom {running_version}; "
                         f"current CLI is {_HEADROOM_VERSION}."
                     )
                     click.echo(
-                        f"  Leaving it running because {active_sessions} active session(s) "
+                        f"  Leaving it running because {detail} "
                         "are still attached; it will be restarted when idle."
                     )
                     return None
@@ -1906,6 +1938,12 @@ def _ensure_proxy(
                     missing.append("learn")
                 if code_graph and not running_config.get("code_graph"):
                     missing.append("code_graph")
+                expected_savings_profile = helpers._wrap_agent_savings_profile(agent_type)
+                if (
+                    expected_savings_profile is not None
+                    and running_config.get("savings_profile") != expected_savings_profile
+                ):
+                    missing.append("savings-profile")
                 if openai_api_url:
                     running_openai_url = _normalize_proxy_api_url(
                         running_config.get("openai_api_url")
@@ -1915,35 +1953,49 @@ def _ensure_proxy(
                         missing.append("openai-api-url")
 
                 if missing:
-                    needs_restart = True
                     flags_str = ", ".join(
                         f if f.startswith("--") else f"--{f.replace('_', '-')}" for f in missing
                     )
-                    click.echo(f"  Proxy on port {port} is missing: {flags_str}")
-                    click.echo("  Restarting proxy with upgraded configuration...")
-
-                    # Merge: keep features the running proxy already has
-                    memory = memory or bool(running_config.get("memory"))
-                    learn = learn or bool(running_config.get("learn"))
-                    code_graph = code_graph or bool(running_config.get("code_graph"))
-
-                    proxy_pid = running_config.get("pid")
-                    if proxy_pid is not None:
-                        if not helpers._kill_proxy_by_pid(int(proxy_pid), port):
-                            raise click.ClickException(
-                                f"Failed to stop existing proxy (PID {proxy_pid}) on port {port}. "
-                                "Stop it manually and retry."
-                            )
+                    other_wrappers = helpers._live_proxy_clients(port, exclude_self=True)
+                    if other_wrappers:
+                        # Another wrapper is attached to this proxy; restarting it
+                        # to add flags would drop their in-flight requests. Reuse
+                        # the running proxy as-is rather than disrupt them.
+                        click.echo(
+                            f"  Proxy on port {port} is missing: {flags_str}, but "
+                            f"{len(other_wrappers)} other wrapper(s) are attached."
+                        )
+                        click.echo(
+                            "  Leaving it running to avoid disrupting them; this "
+                            "session will use the existing proxy as-is."
+                        )
                     else:
-                        click.echo(
-                            "  Warning: Running proxy does not expose PID. "
-                            "Cannot restart automatically."
-                        )
-                        click.echo(
-                            f"  Please stop the proxy on port {port} manually "
-                            f"and rerun with {flags_str}."
-                        )
-                        return None
+                        needs_restart = True
+                        click.echo(f"  Proxy on port {port} is missing: {flags_str}")
+                        click.echo("  Restarting proxy with upgraded configuration...")
+
+                        # Merge: keep features the running proxy already has
+                        memory = memory or bool(running_config.get("memory"))
+                        learn = learn or bool(running_config.get("learn"))
+                        code_graph = code_graph or bool(running_config.get("code_graph"))
+
+                        proxy_pid = running_config.get("pid")
+                        if proxy_pid is not None:
+                            if not helpers._kill_proxy_by_pid(int(proxy_pid), port):
+                                raise click.ClickException(
+                                    f"Failed to stop existing proxy (PID {proxy_pid}) on port {port}. "
+                                    "Stop it manually and retry."
+                                )
+                        else:
+                            click.echo(
+                                "  Warning: Running proxy does not expose PID. "
+                                "Cannot restart automatically."
+                            )
+                            click.echo(
+                                f"  Please stop the proxy on port {port} manually "
+                                f"and rerun with {flags_str}."
+                            )
+                            return None
 
             if not needs_restart:
                 click.echo(f"  Proxy already running on port {port}")
@@ -1985,35 +2037,150 @@ def _ensure_proxy(
         return None
 
 
+def _client_marker_path(port: int) -> Path:
+    """Path to this process's wrap-client marker for ``port``."""
+    from headroom import paths as _paths
+
+    d = _paths.proxy_clients_dir(port)
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"{os.getpid()}.json"
+
+
+def _proc_identity(pid: int) -> tuple[str, float] | None:
+    """Best-effort ``(source, start_time)`` identity for a PID.
+
+    Used to defeat PID reuse: a marker is only trusted while the live PID is
+    *the same process* that wrote it. Returns ``None`` when start time can't be
+    determined (e.g. macOS without psutil), in which case callers fall back to
+    existence-only liveness — no regression, just no reuse protection there.
+
+    The ``source`` tag ("psutil" vs "proc") guards against comparing values in
+    different units; we only compare like-for-like.
+    """
+    try:
+        import psutil  # optional dependency; portable when present
+
+        return ("psutil", float(psutil.Process(pid).create_time()))
+    except Exception:
+        pass
+    # Linux fallback: field 22 of /proc/<pid>/stat is starttime in clock ticks
+    # since boot — a stable per-process value. `comm` (field 2) may contain
+    # spaces/parens, so split after the final ')'.
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as fh:
+            fields = fh.read().rpartition(b")")[2].split()
+        return ("proc", float(fields[19]))
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def _register_proxy_client(port: int) -> None:
+    """Register this wrap process as a live client of the shared proxy.
+
+    Best-effort: a failed write just means our marker is missing, and the
+    liveness pruning in :func:`_live_proxy_clients` is the real safety net.
+    """
+    try:
+        payload: dict[str, Any] = {"pid": os.getpid(), "started_at": time.time()}
+        ident = _proc_identity(os.getpid())
+        if ident is not None:
+            payload["start_src"], payload["start_time"] = ident
+        _client_marker_path(port).write_text(json.dumps(payload))
+    except OSError:
+        pass
+
+
+def _unregister_proxy_client(port: int) -> None:
+    """Remove this process's client marker (idempotent)."""
+    try:
+        _client_marker_path(port).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _pid_alive(pid: int) -> bool:
+    """Return True if ``pid`` names a live process."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists but owned by another user
+    except OSError:
+        return False
+    return True
+
+
+def _marker_pid_reused(marker: Path, pid: int) -> bool:
+    """True only if the live ``pid`` is *provably* a different process than the
+    one that wrote ``marker`` (i.e. the PID was recycled after a crash).
+
+    Conservative by design: any uncertainty (legacy marker, unknown start time,
+    mismatched source) returns ``False`` so a real client is never pruned.
+    """
+    try:
+        rec = json.loads(marker.read_text())
+    except (OSError, ValueError):
+        return False
+    src = rec.get("start_src")
+    recorded = rec.get("start_time")
+    if not isinstance(src, str) or not isinstance(recorded, (int, float)):
+        return False  # legacy / identity-less marker — can't tell
+    ident = _proc_identity(pid)
+    if ident is None or ident[0] != src:
+        return False  # can't compare like-for-like — don't prune
+    # Start times are stable per process; >1s apart means a different process.
+    return abs(ident[1] - float(recorded)) > 1.0
+
+
+def _live_proxy_clients(port: int, *, exclude_self: bool = True) -> list[int]:
+    """Live wrap-client PIDs for ``port``, pruning stale markers as we go."""
+    from headroom import paths as _paths
+
+    d = _paths.proxy_clients_dir(port)
+    if not d.exists():
+        return []
+    me = os.getpid()
+    live: list[int] = []
+    for marker in d.glob("*.json"):
+        try:
+            pid = int(marker.stem)
+        except ValueError:
+            continue
+        # Stale if the PID is gone, or recycled by an unrelated process.
+        if not _pid_alive(pid) or _marker_pid_reused(marker, pid):
+            try:
+                marker.unlink(missing_ok=True)
+            except OSError:
+                pass
+            continue
+        if not (exclude_self and pid == me):
+            live.append(pid)
+    return live
+
+
 def _make_cleanup(proxy_proc_holder: list, port: int = 8787) -> Any:
     """Create a cleanup function that terminates the proxy on exit.
 
-    Only kills the proxy if no other headroom-wrapped clients are using it.
-    Checks by looking for other processes with ANTHROPIC_BASE_URL or
-    OPENAI_BASE_URL pointing at our port.
+    Only kills the proxy when no other live headroom-wrapped clients remain,
+    tracked via per-PID marker files in ``paths.proxy_clients_dir(port)``.
     """
 
     def _other_clients_exist() -> bool:
-        """Check if other processes are using this proxy."""
-        try:
-            # Count headroom wrap processes (excluding ourselves)
-            result = subprocess.run(
-                ["pgrep", "-f", f"127.0.0.1:{port}"],
-                capture_output=True,
-                text=True,
-            )
-            pids = [p.strip() for p in result.stdout.strip().split("\n") if p.strip()]
-            my_pid = str(os.getpid())
-            other_pids = [p for p in pids if p != my_pid]
-            return len(other_pids) > 0
-        except Exception:
-            return False  # If we can't check, assume no others
+        # Reference-count from marker files, not argv scans. Wrapped clients
+        # carry the proxy URL in ANTHROPIC_BASE_URL/OPENAI_BASE_URL (env, not
+        # argv), so `pgrep -f` could never see them — and it matched unrelated
+        # processes by substring. Markers are exact and OS-portable.
+        return len(_live_proxy_clients(port, exclude_self=True)) > 0
 
     def cleanup(signum: int | None = None, frame: Any = None) -> None:
+        # Drop our own marker first so the count reflects the post-exit state;
+        # also covers the signal path, where the `finally` block may not run.
+        _unregister_proxy_client(port)
         proc = proxy_proc_holder[0] if proxy_proc_holder else None
         if proc and proc.poll() is None:
             if _other_clients_exist():
-                # Other clients still using the proxy — leave it running
+                # Other clients still using the proxy — leave it running.
                 return
             proc.terminate()
             try:
@@ -2052,6 +2219,7 @@ def _launch_tool(
     """Common logic: start proxy, launch tool, clean up."""
     proxy_holder: list[subprocess.Popen | None] = [None]
     cleanup = _make_cleanup(proxy_holder, port)
+    _register_proxy_client(port)
     signal.signal(signal.SIGINT, _ignore_child_sigint)
     signal.signal(signal.SIGTERM, cleanup)
 
@@ -2426,6 +2594,7 @@ def claude(
     # Setup rtk before launching (Claude-specific)
     proxy_holder: list[subprocess.Popen | None] = [None]
     cleanup = _make_cleanup(proxy_holder, port)
+    _register_proxy_client(port)
     signal.signal(signal.SIGINT, _ignore_child_sigint)
     signal.signal(signal.SIGTERM, cleanup)
 
