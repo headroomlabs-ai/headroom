@@ -439,6 +439,13 @@ def test_is_copilot_api_url_matches_expected_hosts() -> None:
     assert not copilot_auth.is_copilot_api_url("https://api.openai.com/v1/chat/completions")
 
 
+def test_is_copilot_api_url_matches_ghe_copilot_hosts() -> None:
+    assert copilot_auth.is_copilot_api_url("https://copilot-api.acme.ghe.com/v1/responses")
+    assert copilot_auth.is_copilot_api_url("https://copilot-api.ghe.com/v1/chat/completions")
+    assert not copilot_auth.is_copilot_api_url("https://api.acme.ghe.com/v1/responses")
+    assert not copilot_auth.is_copilot_api_url("https://not-copilot-api.acme.ghe.com/v1/responses")
+
+
 def test_is_copilot_api_url_trusts_configured_enterprise_api_url(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -462,6 +469,23 @@ def test_build_copilot_upstream_url_strips_v1_only_for_copilot_hosts() -> None:
             "/v1/chat/completions",
         )
         == "https://api.openai.com/v1/chat/completions"
+    )
+
+
+def test_build_copilot_upstream_url_strips_v1_for_ghe_copilot_hosts() -> None:
+    assert (
+        copilot_auth.build_copilot_upstream_url(
+            "https://copilot-api.acme.ghe.com",
+            "/v1/responses",
+        )
+        == "https://copilot-api.acme.ghe.com/responses"
+    )
+    assert (
+        copilot_auth.build_copilot_upstream_url(
+            "https://api.acme.ghe.com",
+            "/v1/responses",
+        )
+        == "https://api.acme.ghe.com/v1/responses"
     )
 
 
@@ -621,7 +645,8 @@ def test_apply_copilot_api_auth_injects_required_headers(
 
     assert headers["Authorization"] == "Bearer copilot-session"
     assert headers["Copilot-Integration-Id"] == "vscode-chat"
-    assert headers["editor-version"] == "vscode/1.104.1"
+    assert headers["Editor-Version"] == "vscode/1.107.0"
+    assert headers["Editor-Plugin-Version"] == "copilot-chat/0.35.0"
 
 
 def test_apply_copilot_api_auth_preserves_existing_copilot_headers(

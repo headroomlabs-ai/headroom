@@ -880,7 +880,27 @@ def is_copilot_api_url(url: str | None) -> bool:
     configured_host = urlparse(_configured_api_url()).netloc.lower()
     if configured_host and host == configured_host:
         return True
-    return "githubcopilot.com" in host
+    hostname = (parsed.hostname or host.split("/", 1)[0]).lower()
+    return _is_public_copilot_api_host(hostname) or _is_ghe_copilot_api_host(hostname)
+
+
+def _is_public_copilot_api_host(host: str) -> bool:
+    """Return True for GitHub-hosted Copilot API domains."""
+
+    return host == "githubcopilot.com" or host.endswith(".githubcopilot.com")
+
+
+def _is_ghe_copilot_api_host(host: str) -> bool:
+    """Return True for GitHub Enterprise Copilot API hosts.
+
+    GHE Copilot deployments use hosts like ``copilot-api.<tenant>.ghe.com``.
+    Restrict this to the Copilot API subdomain so unrelated GHE hosts do not
+    receive Copilot auth headers or Copilot-specific path normalization.
+    """
+
+    return host == "copilot-api.ghe.com" or (
+        host.startswith("copilot-api.") and host.endswith(".ghe.com")
+    )
 
 
 def build_copilot_upstream_url(base_url: str, path: str) -> str:

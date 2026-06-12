@@ -76,6 +76,36 @@ class TestCLIWrapProxyTimeout:
         assert sleeps == [1]
         assert fake_proc.killed is False
 
+    def test_start_proxy_passes_resolved_copilot_api_url_to_proxy(self, monkeypatch, tmp_path):
+        fake_proc = _FakeProxyProcess()
+        captured: dict[str, object] = {}
+
+        monkeypatch.delenv(wrap_mod._WRAP_PROXY_TIMEOUT_ENV, raising=False)
+        monkeypatch.setattr(wrap_mod, "_ml_wrap_extras_detected", lambda: False)
+        monkeypatch.setattr(wrap_mod, "_get_log_path", lambda: tmp_path / "proxy.log")
+        monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: True)
+        monkeypatch.setattr(wrap_mod.time, "sleep", lambda _seconds: None)
+
+        def fake_popen(*args, **kwargs):  # noqa: ANN002, ANN003
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            return fake_proc
+
+        monkeypatch.setattr(wrap_mod.subprocess, "Popen", fake_popen)
+
+        proc = wrap_mod._start_proxy(
+            8787,
+            agent_type="copilot",
+            openai_api_url="https://copilot-api.acme.ghe.com",
+            copilot_api_token="copilot-api-token",
+        )
+
+        assert proc is fake_proc
+        env = captured["kwargs"]["env"]
+        assert env["OPENAI_TARGET_API_URL"] == "https://copilot-api.acme.ghe.com"
+        assert env["GITHUB_COPILOT_API_URL"] == "https://copilot-api.acme.ghe.com"
+        assert env["GITHUB_COPILOT_API_TOKEN"] == "copilot-api-token"
+
     def test_env_timeout_allows_slow_start_proxy_to_succeed(self, monkeypatch, tmp_path):
         fake_proc = _FakeProxyProcess()
         sleeps = []

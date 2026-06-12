@@ -385,6 +385,8 @@ def _start_proxy(
     # GITHUB_COPILOT_API_TOKEN directly, making upstream auth deterministic.
     if copilot_api_token:
         proxy_env["GITHUB_COPILOT_API_TOKEN"] = copilot_api_token
+        if openai_api_url:
+            proxy_env["GITHUB_COPILOT_API_URL"] = openai_api_url
 
     proc = subprocess.Popen(
         cmd,

@@ -303,7 +303,10 @@ def test_wrap_copilot_subscription_defaults_to_responses_for_reasoning_model(
 
     with (
         patch("headroom.cli.wrap.shutil.which", return_value="copilot"),
-        patch("headroom.cli.wrap.resolve_subscription_bearer_token", return_value="gho-existing"),
+        patch(
+            "headroom.cli.wrap.resolve_subscription_bearer_token_details",
+            return_value=_subscription_resolution("gho-existing"),
+        ),
         patch("headroom.cli.wrap.has_oauth_auth", return_value=False),
         patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch_tool),
     ):
@@ -340,7 +343,10 @@ def test_wrap_copilot_subscription_keeps_gpt4_on_completions(
 
     with (
         patch("headroom.cli.wrap.shutil.which", return_value="copilot"),
-        patch("headroom.cli.wrap.resolve_subscription_bearer_token", return_value="gho-existing"),
+        patch(
+            "headroom.cli.wrap.resolve_subscription_bearer_token_details",
+            return_value=_subscription_resolution("gho-existing"),
+        ),
         patch("headroom.cli.wrap.has_oauth_auth", return_value=False),
         patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch_tool),
     ):
@@ -370,7 +376,10 @@ def test_wrap_copilot_subscription_allows_explicit_responses_wire_api(
 
     with (
         patch("headroom.cli.wrap.shutil.which", return_value="copilot"),
-        patch("headroom.cli.wrap.resolve_subscription_bearer_token", return_value="gho-existing"),
+        patch(
+            "headroom.cli.wrap.resolve_subscription_bearer_token_details",
+            return_value=_subscription_resolution("gho-existing"),
+        ),
         patch("headroom.cli.wrap.has_oauth_auth", return_value=False),
         patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch_tool),
     ):

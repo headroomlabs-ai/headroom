@@ -320,7 +320,7 @@ Headroom runs **locally**, covers **every** content type, works with every major
 
 ```bash
 git clone https://github.com/chopratejas/headroom.git && cd headroom
-pip install -e ".[dev]" && pytest
+uv sync --extra dev && uv run pytest
 ```
 
 Devcontainers in `.devcontainer/` (default + `memory-stack` with Qdrant & Neo4j). See [CONTRIBUTING.md](CONTRIBUTING.md).
