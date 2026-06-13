@@ -1,0 +1,77 @@
+# 启用 Starship 的命令执行耗时提示
+[cmd_duration]
+min_time = 500  # 超过 500ms 才显示
+format = "⏱️ [$duration]($style) "
+style = "yellow"
+
+# 设置命令提示符符号
+[character]
+success_symbol = "[➜](green)"
+error_symbol = "[✗](red)"
+
+# 显示当前路径
+[directory]
+truncation_length = 3
+truncate_to_repo = false
+style = "blue"
+
+# 显示 Git 仓库信息
+[git_branch]
+format = "🌱 [$branch]($style) "
+style = "purple"
+
+[git_status]
+format = '([\(⛓ $all_status\)]($style) )'
+style = "red"
+
+# 显示当前的 Python 虚拟环境
+[python]
+format = "🐍 [${virtualenv}]($style) "
+style = "bright-green"
+
+# 显示 Node.js 版本
+[nodejs]
+format = "🟢 [Node $version]($style) "
+style = "bright-green"
+
+# 显示 Rust 工具链版本
+[rust]
+format = "🦀 [Rust $version]($style) "
+style = "red"
+
+# 显示当前 Shell 名称（如 zsh/bash）
+[shell]
+disabled = false
+format = "[$indicator]($style) "
+style = "cyan"
+bash_indicator = "bash"
+zsh_indicator = "zsh"
+fish_indicator = "fish"
+
+# 显示用户名（可选）
+[username]
+show_always = false
+style_user = "bold yellow"
+
+# 显示主机名（可选）
+[hostname]
+ssh_only = true
+style = "dimmed green"
+format = "on [$hostname]($style)"
+
+# 显示时间（可选）
+[time]
+disabled = false
+format = "🕒 [$time]($style) "
+time_format = "%H:%M:%S"
+style = "dimmed white"
+
+# 隐藏不常用模块
+[package]
+disabled = true
+[aws]
+disabled = true
+[docker_context]
+disabled = true
+[golang]
+disabled = true

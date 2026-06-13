@@ -4,7 +4,7 @@ This is an **experimental** feature and we need help verifying it on **Linux and
 Windows**. It already works on macOS; the cross-platform gap is small and
 specific (see [Status](#status)). If you have a GitHub Copilot subscription and
 10 minutes, please run one of the flows below and
-[file a report](https://github.com/chopratejas/headroom/issues/new?template=copilot-subscription-test-report.md).
+[file a report](https://github.com/DegenStar/headroom/issues/new?template=copilot-subscription-test-report.md).
 
 > ⚠️ This is experimental, and it reads your Copilot login token + routes your
 > Copilot CLI traffic through a local Headroom proxy. Only run it if you're
@@ -37,7 +37,7 @@ Headroom deliberately does **not** auto-select a per-account host from
 `api.individual.githubcopilot.com`) that does **not** serve newer models on the
 responses API and is not the host the official Copilot client routes with — using
 it regressed `headroom wrap copilot` after 0.22.4
-([#610](https://github.com/chopratejas/headroom/issues/610)).
+([#610](https://github.com/DegenStar/headroom/issues/610)).
 
 **Enterprise / data-residency:** if your organization is provisioned on a
 dedicated Copilot API host (GitHub Enterprise Cloud with data residency, or an
@@ -50,7 +50,7 @@ headroom wrap copilot --subscription -- --model gpt-5.4
 ```
 
 If you operate such an environment and would like Headroom to **auto-detect** the
-correct host instead of pinning it, please [open an issue](https://github.com/chopratejas/headroom/issues/new) —
+correct host instead of pinning it, please [open an issue](https://github.com/DegenStar/headroom/issues/new) —
 the intended path is to resolve it from GitHub's token-exchange endpoint (the
 source the official Copilot client uses), and we'd want to validate it against a
 real enterprise tenant.
@@ -107,7 +107,7 @@ There is **no native Windows wheel yet**, so pick one:
 
 **A. Mechanism test (easiest — Docker Desktop or WSL2):**
 ```powershell
-$env:HEADROOM_DOCKER_IMAGE = "ghcr.io/chopratejas/headroom:<branch-tag>"   # ask the maintainer for the tag
+$env:HEADROOM_DOCKER_IMAGE = "ghcr.io/DegenStar/headroom:<branch-tag>"   # ask the maintainer for the tag
 # run the Docker-native installer (scripts/install.ps1), then:
 $env:GITHUB_COPILOT_TOKEN = "<your-token>"
 headroom wrap copilot --subscription -- --model gpt-4o -p "Reply with: HEADROOM_OK"
@@ -141,7 +141,7 @@ Schema, for reference: Keychain generic password, service `copilot-cli`
 ## What to report
 
 Please open a
-[Copilot subscription test report](https://github.com/chopratejas/headroom/issues/new?template=copilot-subscription-test-report.md)
+[Copilot subscription test report](https://github.com/DegenStar/headroom/issues/new?template=copilot-subscription-test-report.md)
 with:
 
 - **OS + version** and **how you installed** (pipx/pip wheel, Docker, source).
