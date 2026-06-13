@@ -1,0 +1,142 @@
+name: headroom-network-diff
+
+services:
+  mitm-direct:
+    image: mitmproxy/mitmproxy:12
+    command:
+      - mitmdump
+      - --mode
+      - regular
+      - --listen-host
+      - 0.0.0.0
+      - --listen-port
+      - "8080"
+      - --set
+      - confdir=/mitmproxy
+      - -s
+      - /capture/mitm_capture.py
+    environment:
+      CAPTURE_LANE: direct
+      CAPTURE_OUTPUT: /captures/direct.jsonl
+      CAPTURE_INCLUDE_HOSTS: ${CAPTURE_INCLUDE_HOSTS:-api.anthropic.com}
+      CAPTURE_BODY_BYTES: ${CAPTURE_BODY_BYTES:-262144}
+    volumes:
+      - ./mitm_capture.py:/capture/mitm_capture.py:ro
+      - ./captures:/captures
+      - mitm_direct_ca:/mitmproxy
+    ports:
+      - "${DIRECT_MITM_PORT:-18080}:8080"
+
+  mitm-headroom-client:
+    image: mitmproxy/mitmproxy:12
+    command:
+      - mitmdump
+      - --mode
+      - reverse:http://headroom-proxy:8787
+      - --listen-host
+      - 0.0.0.0
+      - --listen-port
+      - "8080"
+      - -s
+      - /capture/mitm_capture.py
+    environment:
+      CAPTURE_LANE: headroom-client
+      CAPTURE_OUTPUT: /captures/headroom-client.jsonl
+      CAPTURE_INCLUDE_HOSTS: ${CAPTURE_CLIENT_INCLUDE_HOSTS:-mitm-headroom-client,headroom-proxy,api.anthropic.com}
+      CAPTURE_BODY_BYTES: ${CAPTURE_BODY_BYTES:-262144}
+    volumes:
+      - ./mitm_capture.py:/capture/mitm_capture.py:ro
+      - ./captures:/captures
+    ports:
+      - "${HEADROOM_CLIENT_MITM_PORT:-18082}:8080"
+    depends_on:
+      - headroom-proxy
+
+  mitm-headroom-upstream:
+    image: mitmproxy/mitmproxy:12
+    command:
+      - mitmdump
+      - --mode
+      - regular
+      - --listen-host
+      - 0.0.0.0
+      - --listen-port
+      - "8080"
+      - --set
+      - confdir=/mitmproxy
+      - -s
+      - /capture/mitm_capture.py
+    environment:
+      CAPTURE_LANE: headroom-upstream
+      CAPTURE_OUTPUT: /captures/headroom-upstream.jsonl
+      CAPTURE_INCLUDE_HOSTS: ${CAPTURE_INCLUDE_HOSTS:-api.anthropic.com}
+      CAPTURE_BODY_BYTES: ${CAPTURE_BODY_BYTES:-262144}
+    volumes:
+      - ./mitm_capture.py:/capture/mitm_capture.py:ro
+      - ./captures:/captures
+      - mitm_headroom_ca:/mitmproxy
+    ports:
+      - "${HEADROOM_MITM_PORT:-18081}:8080"
+
+  headroom-proxy:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    command: ["--host", "0.0.0.0", "--port", "8787", "--backend", "anthropic"]
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:?Set ANTHROPIC_API_KEY}
+      ANTHROPIC_TARGET_API_URL: ${ANTHROPIC_TARGET_API_URL:-https://api.anthropic.com}
+      HTTPS_PROXY: http://mitm-headroom-upstream:8080
+      HTTP_PROXY: http://mitm-headroom-upstream:8080
+      NO_PROXY: 127.0.0.1,localhost,headroom-proxy
+      REQUESTS_CA_BUNDLE: /mitmproxy/mitmproxy-ca-cert.pem
+      SSL_CERT_FILE: /mitmproxy/mitmproxy-ca-cert.pem
+    volumes:
+      - mitm_headroom_ca:/mitmproxy:ro
+    depends_on:
+      - mitm-headroom-upstream
+
+  claude-direct:
+    build:
+      context: .
+      dockerfile: Dockerfile.runner
+      args:
+        CLAUDE_CODE_PACKAGE: ${CLAUDE_CODE_PACKAGE:-@anthropic-ai/claude-code}
+    profiles: ["run"]
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:?Set ANTHROPIC_API_KEY}
+      HTTPS_PROXY: http://mitm-direct:8080
+      HTTP_PROXY: http://mitm-direct:8080
+      NO_PROXY: 127.0.0.1,localhost
+      NODE_EXTRA_CA_CERTS: /mitmproxy/mitmproxy-ca-cert.pem
+      SSL_CERT_FILE: /mitmproxy/mitmproxy-ca-cert.pem
+      CLAUDE_LANE: direct
+      CLAUDE_PROMPT: ${CLAUDE_PROMPT:-Summarize this repository in one sentence.}
+      CLAUDE_ARGS: ${CLAUDE_DIRECT_ARGS:-}
+    volumes:
+      - ../..:/workspace:ro
+      - mitm_direct_ca:/mitmproxy:ro
+    depends_on:
+      - mitm-direct
+
+  claude-headroom:
+    build:
+      context: .
+      dockerfile: Dockerfile.runner
+      args:
+        CLAUDE_CODE_PACKAGE: ${CLAUDE_CODE_PACKAGE:-@anthropic-ai/claude-code}
+    profiles: ["run"]
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:?Set ANTHROPIC_API_KEY}
+      ANTHROPIC_BASE_URL: http://mitm-headroom-client:8080
+      CLAUDE_LANE: headroom
+      CLAUDE_PROMPT: ${CLAUDE_PROMPT:-Summarize this repository in one sentence.}
+      CLAUDE_ARGS: ${CLAUDE_HEADROOM_ARGS:-}
+    volumes:
+      - ../..:/workspace:ro
+    depends_on:
+      - mitm-headroom-client
+
+volumes:
+  mitm_direct_ca:
+  mitm_headroom_ca:

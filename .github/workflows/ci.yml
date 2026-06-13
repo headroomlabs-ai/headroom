@@ -100,7 +100,7 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: ${{ env.PY_VERSION }}
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.96.0
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
@@ -195,7 +195,18 @@ jobs:
         run: |
           pytest tests scripts/tests \
             --splits 4 --group ${{ matrix.shard }} \
+            --cov=headroom --cov-branch \
+            --cov-report=xml:coverage-${{ matrix.shard }}.xml \
+            --cov-report= \
             --tb=short -q
+
+      - name: Upload coverage shard ${{ matrix.shard }} to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: coverage-${{ matrix.shard }}.xml
+          flags: python
+          name: python-shard-${{ matrix.shard }}
+          fail_ci_if_error: true
 
   test-extras:
     needs: [changes, build-wheel]
@@ -278,8 +289,50 @@ jobs:
       - name: Run agno tests
         run: pytest tests/test_integrations/agno/ -v
 
+  test-dashboard-ui:
+    needs: [changes, build-wheel]
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PY_VERSION }}
+      - name: Download prebuilt wheel
+        uses: actions/download-artifact@v8
+        with:
+          name: headroom-wheel
+          path: dist
+      - name: Install (CPU torch + wheel[dev] + playwright)
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          WHEEL="$(ls dist/*.whl)"
+          pip install "${WHEEL}[dev]" playwright
+          SITE="$(python -c 'import sysconfig; print(sysconfig.get_path("platlib"))')"
+          cp "${SITE}/headroom/"_core*.so headroom/
+      - name: Install chromium
+        run: playwright install --with-deps chromium
+      - name: Run dashboard playwright tests
+        # Stub-based dashboard tests only (routes fully mocked, no network).
+        # tests/test_dashboard/test_live_feed.py needs a live proxy on
+        # localhost:8787 and stays excluded; the main shards keep skipping
+        # these via importorskip since playwright is not installed there.
+        env:
+          HEADROOM_PLAYWRIGHT_ARTIFACT_DIR: ${{ runner.temp }}/playwright-artifacts
+        run: pytest tests/test_dashboard_*_playwright.py -v
+      - name: Upload dashboard screenshots
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: dashboard-playwright-artifacts
+          path: ${{ runner.temp }}/playwright-artifacts
+          if-no-files-found: ignore
+          retention-days: 7
+
   commitlint:
-    if: github.event_name != 'push' || !startsWith(github.event.head_commit.message, 'Merge pull request ')
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -306,7 +359,7 @@ jobs:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-build-${{ hashFiles('pyproject.toml') }}
           restore-keys: ${{ runner.os }}-pip-build-
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.96.0
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"

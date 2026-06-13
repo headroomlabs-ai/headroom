@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "headroom-ai"
-version = "0.23.0"
+version = "0.25.0"
 description = "The Context Optimization Layer for LLM Applications - Cut costs by 50-90%"
 readme = "README.md"
 license = "Apache-2.0"
@@ -39,6 +39,8 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Typing :: Typed",
@@ -47,7 +49,7 @@ dependencies = [
     # Core: lightweight compression (SmartCrusher, ContentRouter, CCR, TOIN)
     "tiktoken>=0.5.0",            # Tokenizer for all compressors
     "pydantic>=2.0.0",            # Config and data models
-    "litellm==1.82.3",            # Model registry, pricing, and provider support
+    "litellm>=1.86.2,<2.0",        # Model registry, pricing, and provider support
     "click>=8.1.0",               # CLI framework
     "rich>=13.0.0",               # Rich terminal output
     "opentelemetry-api>=1.24.0",  # Safe no-op OTEL API for instrumentation
@@ -59,7 +61,7 @@ dependencies = [
 # Proxy server (most common install: pip install headroom-ai[proxy])
 proxy = [
     "fastapi>=0.100.0",
-    "uvicorn>=0.23.0",
+    "uvicorn>=0.23.0,<1.0",
     "httpx[http2]>=0.24.0",
     "openai>=2.14.0",             # OpenAI API format support
     "mcp>=1.0.0",                 # MCP server (headroom_compress, retrieve, stats)
@@ -67,9 +69,17 @@ proxy = [
     "zstandard>=0.20.0",          # Decompress zstd request bodies (Codex, etc.)
     "websockets>=13.0",           # WebSocket proxy for /v1/responses (Codex gpt-5.4+)
     "onnxruntime>=1.16.0",        # Kompress ONNX INT8 text compression (no torch needed)
-    "transformers>=4.30.0",       # Tokenizer only (for Kompress)
+    "transformers>=4.30.0,<6.0",  # Tokenizer only (for Kompress)
     "watchdog>=4.0.0",            # File watcher for live code graph reindexing (--code-graph)
     "sqlite-vec>=0.1.6",          # Vector index for memory (--memory). Lightweight, no torch.
+]
+# Production ASGI/WSGI server — Unix-only (gunicorn does not support Windows).
+# Kept separate from [proxy] so that dev, CI, and Windows users are not forced
+# to install a non-functional package.  Production deployments should use:
+#   pip install headroom-ai[proxy,proxy-prod]
+proxy-prod = [
+    "headroom-ai[proxy]",
+    "gunicorn>=21.0.0; sys_platform != 'win32'",
 ]
 # AST-based code compression (tree-sitter)
 code = [
@@ -80,7 +90,7 @@ code = [
 # Use [ml] for the supported ML compression dependencies.)
 ml = [
     "torch>=2.0.0",
-    "transformers>=4.30.0",
+    "transformers>=4.30.0,<6.0",
     # transformers >= 5.x requires huggingface-hub >= 1.5.0,<2.0; pinning
     # the floor here prevents Kompress from silently falling back to
     # "unavailable" when a sibling install (e.g. `pip install
@@ -91,13 +101,19 @@ ml = [
 memory = [
     "hnswlib>=0.8.0",
     "sqlite-vec>=0.1.6",
-    "sentence-transformers>=2.2.0",
+    "sentence-transformers>=2.2.0,<6.0",
 ]
 # Qdrant + Neo4j memory backend helpers
 memory-stack = [
-    "mem0ai>=0.1.100",
-    "qdrant-client>=1.9.0",
-    "neo4j>=5.20.0",
+    "mem0ai>=1.0.0,<2.0",
+    "qdrant-client>=1.9.0,<2.0",
+    "neo4j>=5.20.0,<7.0",
+]
+# Apple-Silicon GPU (MPS) offload for the memory embedder. Opt in at runtime with
+# HEADROOM_EMBEDDER_RUNTIME=pytorch_mps. macOS-only; intentionally excluded from [all].
+pytorch-mps = [
+    "torch>=2.0.0; sys_platform == 'darwin'",
+    "sentence-transformers>=2.2.0; sys_platform == 'darwin'",
 ]
 # Semantic relevance scoring with embeddings.
 # Uses `fastembed` (BAAI/bge-small-en-v1.5 by default — 33M params,
@@ -151,8 +167,8 @@ anyllm = [
 ]
 # LangChain integration
 langchain = [
-    "langchain-core>=0.2.0",
-    "langchain-openai>=0.1.0",
+    "langchain-core>=1.3.3,<4.0",
+    "langchain-openai>=1.1.14,<2.0",
 ]
 # Agno agent framework integration
 agno = [
@@ -170,7 +186,7 @@ mcp = [
 # Voice filler detection
 voice = [
     "onnxruntime>=1.16.0",
-    "transformers>=4.30.0",
+    "transformers>=4.30.0,<6.0",
     "torch>=2.0.0",
 ]
 # Voice training (includes voice deps + training extras)
@@ -182,7 +198,7 @@ voice-train = [
 # Evaluation framework
 evals = [
     "datasets>=2.14.0",
-    "sentence-transformers>=2.2.0",
+    "sentence-transformers>=2.2.0,<6.0",
     "numpy>=1.24.0",
     "scikit-learn>=1.3.0",
     "anthropic>=0.18.0",
@@ -212,9 +228,9 @@ dev = [
     "pre-commit>=3.0.0",
     "openai>=1.0.0",
     "anthropic>=0.18.0",
-    "litellm==1.82.3",
+    "litellm>=1.86.2,<2.0",
     "fastapi>=0.100.0",
-    "uvicorn>=0.23.0",
+    "uvicorn>=0.23.0,<1.0",
     "httpx[http2]>=0.24.0",
     "websockets>=13.0",
     "opentelemetry-sdk>=1.24.0",
@@ -223,7 +239,7 @@ dev = [
     "langchain-ollama>=0.2.0",
     "hnswlib>=0.8.0",
     "sqlite-vec>=0.1.6",
-    "sentence-transformers>=2.2.0",
+    "sentence-transformers>=2.2.0,<6.0",
     "numpy>=1.24.0",
 ]
 # All optional dependencies (everything you need)
@@ -368,6 +384,12 @@ python_files = ["test_*.py"]
 python_functions = ["test_*"]
 addopts = "-v --tb=short"
 asyncio_mode = "auto"
+filterwarnings = [
+    # pyo3 Unsendable parsers emit an unraisable warning when GC drops them on a
+    # test-teardown thread; this is a test-harness artifact, not a production issue
+    # (production threads are long-lived and drop their parsers on themselves).
+    "ignore::pytest.PytestUnraisableExceptionWarning",
+]
 markers = [
     "slow: slow tests (model loads, large fixtures)",
     "real_llm: tests that hit real LLM APIs; skipped unless explicitly enabled",

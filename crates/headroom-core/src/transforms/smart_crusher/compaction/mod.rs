@@ -31,7 +31,7 @@ pub mod walker;
 
 pub use classifier::{classify_cell, CellClass, ClassifyConfig};
 pub use compactor::{compact, CompactConfig};
-pub use formatter::{CsvSchemaFormatter, Formatter, JsonFormatter};
+pub use formatter::{CsvSchemaFormatter, Formatter, JsonFormatter, MarkdownKvFormatter};
 pub use ir::{Bucket, CellValue, Compaction, FieldSpec, OpaqueKind, Row, Schema};
 pub use walker::{
     compact_document, emit_opaque_ccr_marker, try_parse_json_container, DocumentCompactor,
@@ -66,6 +66,34 @@ impl CompactionStage {
         Self {
             config: CompactConfig::default(),
             formatter: Box::new(JsonFormatter::new()),
+        }
+    }
+
+    /// Markdown-KV formatter, default config — opt-in trade of tokens
+    /// for model read accuracy (field names repeat per row, but
+    /// format-comprehension benchmarks favor KV over CSV).
+    pub fn default_markdown_kv() -> Self {
+        Self {
+            config: CompactConfig::default(),
+            formatter: Box::new(MarkdownKvFormatter::new()),
+        }
+    }
+
+    /// Formatter names accepted by [`Self::from_format_name`]. The
+    /// single source of truth for caller error messages (the PyO3
+    /// bridge renders this list) — keep in sync with the match below.
+    pub const SUPPORTED_FORMAT_NAMES: &'static [&'static str] =
+        &["csv-schema", "json", "markdown-kv"];
+
+    /// Look up a preset by its formatter name (see
+    /// [`Self::SUPPORTED_FORMAT_NAMES`]). `None` for unknown names —
+    /// callers own the fallback/error policy.
+    pub fn from_format_name(name: &str) -> Option<Self> {
+        match name {
+            "csv-schema" => Some(Self::default_csv_schema()),
+            "json" => Some(Self::default_json()),
+            "markdown-kv" => Some(Self::default_markdown_kv()),
+            _ => None,
         }
     }
 

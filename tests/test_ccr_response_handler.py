@@ -478,6 +478,52 @@ class TestCCRResponseHandling:
 
         assert result == response
 
+    @pytest.mark.asyncio
+    async def test_handle_response_mixed_tools_skips_ccr(self):
+        """When CCR and non-CCR tools are called together, skip CCR.
+
+        Building a valid continuation is impossible without results for the
+        non-CCR tools (Anthropic requires every tool_use to have a
+        tool_result). Skipping CCR avoids a wasted 400 API call and returns
+        the original response immediately so the client can resolve all
+        tool calls itself.
+        """
+        store = get_compression_store()
+        hash_key = store.store(original="[1,2,3]", compressed="[]")
+
+        handler = CCRResponseHandler()
+
+        mixed_response = {
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "ccr_call",
+                    "name": CCR_TOOL_NAME,
+                    "input": {"hash": hash_key},
+                },
+                {
+                    "type": "tool_use",
+                    "id": "user_call",
+                    "name": "read_file",
+                    "input": {"path": "/etc/config"},
+                },
+            ]
+        }
+
+        api_call_count = 0
+
+        async def mock_api_call(messages, tools):
+            nonlocal api_call_count
+            api_call_count += 1
+            return {"content": [{"type": "text", "text": "continuation"}]}
+
+        result = await handler.handle_response(mixed_response, [], None, mock_api_call, "anthropic")
+
+        # CCR skipped — no continuation call made (avoids the 400 API round-trip)
+        assert api_call_count == 0, "should not attempt continuation with mixed tools"
+        # Original response returned unchanged so client can handle all tool calls
+        assert result is mixed_response
+
 
 class TestCCRResponseHandlerStats:
     """Test handler statistics."""

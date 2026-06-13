@@ -13,6 +13,8 @@ survives that kind of sys.modules mutation.
 """
 
 from . import (  # noqa: F401
+    capture,
+    copilot_auth,
     evals,
     init,
     install,

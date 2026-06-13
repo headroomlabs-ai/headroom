@@ -3,10 +3,15 @@ repos:
     hooks:
       - id: sync-plugin-versions
         name: Sync plugin versions
-        entry: python scripts/sync-plugin-versions.py
+        entry: python3 scripts/sync-plugin-versions.py
         language: system
         pass_filenames: false
         always_run: true
+      - id: commitlint
+        name: Commitlint
+        entry: bash -lc 'npx --yes --package=@commitlint/cli --package=@commitlint/config-conventional -- commitlint --edit "$1" --config .commitlintrc.json' --
+        language: system
+        stages: [commit-msg]
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.9.4
     hooks:

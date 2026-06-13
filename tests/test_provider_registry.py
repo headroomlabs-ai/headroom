@@ -16,12 +16,14 @@ from headroom.proxy.models import ProxyConfig
 def test_resolve_api_overrides_prefers_explicit_values_over_environment(monkeypatch) -> None:
     monkeypatch.setenv("ANTHROPIC_TARGET_API_URL", "https://env.anthropic.example/v1")
     monkeypatch.setenv("OPENAI_TARGET_API_URL", "https://env.openai.example/v1")
+    monkeypatch.setenv("VERTEX_TARGET_API_URL", "https://env-vertex-aiplatform.example/v1")
 
     overrides = resolve_api_overrides(
         anthropic_api_url="https://cli.anthropic.example/v1",
         openai_api_url=None,
         gemini_api_url=None,
         cloudcode_api_url=None,
+        vertex_api_url="https://cli-vertex-aiplatform.example/v1",
     )
 
     assert overrides == ProviderApiOverrides(
@@ -29,6 +31,7 @@ def test_resolve_api_overrides_prefers_explicit_values_over_environment(monkeypa
         openai="https://env.openai.example/v1",
         gemini=None,
         cloudcode=None,
+        vertex="https://cli-vertex-aiplatform.example/v1",
     )
 
 
@@ -39,6 +42,7 @@ def test_resolve_api_targets_normalizes_trailing_v1() -> None:
             openai="https://openai.example/v1",
             gemini="https://gemini.example/v1",
             cloudcode="https://cloudcode.example/v1/",
+            vertex="https://vertex.example/v1/",
         )
     )
 
@@ -46,6 +50,7 @@ def test_resolve_api_targets_normalizes_trailing_v1() -> None:
     assert targets.openai == "https://openai.example"
     assert targets.gemini == "https://gemini.example"
     assert targets.cloudcode == "https://cloudcode.example"
+    assert targets.vertex == "https://vertex.example"
 
 
 def test_proxy_config_exposes_provider_api_overrides() -> None:
@@ -54,6 +59,7 @@ def test_proxy_config_exposes_provider_api_overrides() -> None:
         openai_api_url="https://openai.example",
         gemini_api_url=None,
         cloudcode_api_url="https://cloudcode.example",
+        vertex_api_url="https://vertex.example",
     )
 
     assert config.provider_api_overrides == ProviderApiOverrides(
@@ -61,6 +67,7 @@ def test_proxy_config_exposes_provider_api_overrides() -> None:
         openai="https://openai.example",
         gemini=None,
         cloudcode="https://cloudcode.example",
+        vertex="https://vertex.example",
     )
 
 

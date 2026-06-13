@@ -8,9 +8,15 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import httpx
+from fastapi.responses import StreamingResponse
 
 from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
-from headroom.proxy.handlers.openai import OpenAIHandlerMixin, _decode_openai_bearer_payload
+from headroom.proxy.handlers.openai import (
+    OpenAIHandlerMixin,
+    _decode_openai_bearer_payload,
+    _passthrough_usage_from_json,
+    _prefers_http1_passthrough,
+)
 from headroom.proxy.helpers import _headroom_bypass_enabled
 from headroom.proxy.server import HeadroomProxy
 
@@ -46,6 +52,31 @@ class _TimeoutHttpClient:
         raise httpx.ConnectTimeout("connect timed out")
 
 
+class _RecordingHttpClient:
+    def __init__(self, label: str) -> None:
+        self.label = label
+        self.calls = 0
+
+    async def request(self, **kwargs):  # noqa: ANN001, ANN201
+        self.calls += 1
+        request = httpx.Request(kwargs["method"], kwargs["url"])
+        return httpx.Response(
+            200,
+            request=request,
+            headers={"content-type": "application/json"},
+            json={"client": self.label},
+        )
+
+
+class _ChatGPTAccountRequest:
+    method = "GET"
+    headers = {}
+    url = SimpleNamespace(path="/backend-api/me", query="")
+
+    async def body(self) -> bytes:
+        return b""
+
+
 class _PassthroughRequest:
     method = "GET"
     headers = {}
@@ -53,6 +84,110 @@ class _PassthroughRequest:
 
     async def body(self) -> bytes:
         return b""
+
+
+class _VertexPassthroughRequest:
+    method = "POST"
+    headers = {}
+    url = SimpleNamespace(
+        path="/v1/projects/p/locations/us-central1/publishers/google/models/gemini-2.0-flash:generateContent",
+        query="",
+    )
+
+    async def body(self) -> bytes:
+        return b'{"contents":[]}'
+
+
+class _VertexStreamPassthroughRequest:
+    method = "POST"
+    headers = {}
+    url = SimpleNamespace(
+        path="/v1/projects/p/locations/us-central1/publishers/google/models/gemini-2.0-flash:streamGenerateContent",
+        query="alt=sse",
+    )
+
+    async def body(self) -> bytes:
+        return b'{"contents":[]}'
+
+
+class _VertexGeminiImageRequest:
+    method = "POST"
+    headers = {}
+    query_params = {}
+    url = SimpleNamespace(
+        path="/v1/projects/p/locations/us-central1/publishers/google/models/gemini-2.0-flash:generateContent",
+        query="",
+    )
+
+    async def body(self) -> bytes:
+        return json.dumps(
+            {
+                "contents": [
+                    {
+                        "role": "user",
+                        "parts": [
+                            {
+                                "inlineData": {
+                                    "mimeType": "image/png",
+                                    "data": "aW1hZ2U=",
+                                }
+                            }
+                        ],
+                    }
+                ]
+            }
+        ).encode("utf-8")
+
+
+class _VertexUsageClient:
+    async def request(self, **kwargs):  # noqa: ANN001, ANN201
+        request = httpx.Request(kwargs["method"], kwargs["url"], content=kwargs["content"])
+        return httpx.Response(
+            200,
+            request=request,
+            headers={"content-type": "application/json"},
+            json={
+                "candidates": [{"content": {"parts": [{"text": "ok"}]}}],
+                "usageMetadata": {
+                    "promptTokenCount": 11,
+                    "candidatesTokenCount": 7,
+                    "cachedContentTokenCount": 3,
+                },
+            },
+        )
+
+
+class _AsyncChunks(httpx.AsyncByteStream):
+    def __init__(self, chunks: list[bytes]) -> None:
+        self._chunks = chunks
+
+    async def __aiter__(self):  # noqa: ANN204
+        for chunk in self._chunks:
+            yield chunk
+
+
+class _VertexStreamClient:
+    def __init__(self) -> None:
+        self.sent_url = ""
+
+    def build_request(self, method, url, headers, content):  # noqa: ANN001, ANN201
+        self.sent_url = str(url)
+        return httpx.Request(method, url, headers=headers, content=content)
+
+    async def send(self, request, stream=False):  # noqa: ANN001, ANN201
+        assert stream is True
+        return httpx.Response(
+            200,
+            request=request,
+            headers={"content-type": "text/event-stream"},
+            stream=_AsyncChunks(
+                [
+                    b'data: {"candidates":[{"content":{"parts":[{"text":"hello"}]}}]}\n\n',
+                    b'data: {"usageMetadata":{"promptTokenCount":13,'
+                    b'"candidatesTokenCount":5,"cachedContentTokenCount":2}}\n\n',
+                ]
+            ),
+        )
 
 
 class _RetryThenSuccessClient:
@@ -138,6 +273,262 @@ def test_openai_passthrough_connect_timeout_returns_502() -> None:
     payload = json.loads(response.body)
     assert payload["error"]["type"] == "connection_error"
     assert "Failed to connect to upstream API" in payload["error"]["message"]
+
+
+def test_prefers_http1_passthrough_matches_chatgpt_hosts_only() -> None:
+    assert _prefers_http1_passthrough("https://chatgpt.com") is True
+    assert _prefers_http1_passthrough("https://chatgpt.com/backend-api/me") is True
+    assert _prefers_http1_passthrough("https://api.chatgpt.com") is True
+    assert _prefers_http1_passthrough("https://CHATGPT.COM/backend-api/me") is True
+    assert _prefers_http1_passthrough("https://api.openai.com") is False
+    assert _prefers_http1_passthrough("https://notchatgpt.com") is False
+    assert _prefers_http1_passthrough("https://chatgpt.com.evil.com") is False
+    assert _prefers_http1_passthrough("") is False
+
+
+def test_chatgpt_passthrough_uses_http1_client() -> None:
+    handler = object.__new__(OpenAIHandlerMixin)
+    handler.http_client = _RecordingHttpClient("h2")
+    handler.http_client_h1 = _RecordingHttpClient("h1")
+
+    response = asyncio.run(
+        handler.handle_passthrough(_ChatGPTAccountRequest(), "https://chatgpt.com")
+    )
+
+    assert response.status_code == 200
+    assert json.loads(response.body)["client"] == "h1"
+    assert handler.http_client.calls == 0
+    assert handler.http_client_h1.calls == 1
+
+
+def test_non_chatgpt_passthrough_uses_default_client() -> None:
+    handler = object.__new__(OpenAIHandlerMixin)
+    handler.http_client = _RecordingHttpClient("h2")
+    handler.http_client_h1 = _RecordingHttpClient("h1")
+
+    response = asyncio.run(
+        handler.handle_passthrough(_PassthroughRequest(), "https://api.openai.com")
+    )
+
+    assert response.status_code == 200
+    assert json.loads(response.body)["client"] == "h2"
+    assert handler.http_client.calls == 1
+    assert handler.http_client_h1.calls == 0
+
+
+def test_chatgpt_passthrough_falls_back_when_h1_client_missing() -> None:
+    handler = object.__new__(OpenAIHandlerMixin)
+    handler.http_client = _RecordingHttpClient("h2")
+    handler.http_client_h1 = None
+
+    response = asyncio.run(
+        handler.handle_passthrough(_ChatGPTAccountRequest(), "https://chatgpt.com")
+    )
+
+    assert response.status_code == 200
+    assert json.loads(response.body)["client"] == "h2"
+    assert handler.http_client.calls == 1
+
+
+def test_passthrough_usage_normalizes_vertex_usage_metadata() -> None:
+    usage = _passthrough_usage_from_json(
+        {
+            "usageMetadata": {
+                "promptTokenCount": 11,
+                "candidatesTokenCount": 7,
+                "cachedContentTokenCount": 3,
+            }
+        }
+    )
+
+    assert usage == {
+        "input_tokens": 11,
+        "output_tokens": 7,
+        "cache_read_input_tokens": 3,
+    }
+
+
+def test_vertex_passthrough_records_usage_metadata_for_dashboard() -> None:
+    handler = object.__new__(HeadroomProxy)
+    handler.http_client = _VertexUsageClient()
+    outcomes = []
+
+    async def next_request_id():  # noqa: ANN202
+        return "req_vertex"
+
+    async def record(outcome):  # noqa: ANN001, ANN202
+        outcomes.append(outcome)
+
+    handler._next_request_id = next_request_id
+    handler._record_request_outcome = record
+
+    response = asyncio.run(
+        handler.handle_passthrough(
+            _VertexPassthroughRequest(),
+            "https://vertex.test",
+            "generateContent",
+            "vertex:google",
+        )
+    )
+
+    assert response.status_code == 200
+    assert len(outcomes) == 1
+    outcome = outcomes[0]
+    assert outcome.provider == "vertex:google"
+    assert outcome.model == "gemini-2.0-flash"
+    assert outcome.optimized_tokens == 11
+    assert outcome.output_tokens == 7
+    assert outcome.cache_read_tokens == 3
+
+
+def test_vertex_stream_passthrough_preserves_chunks_and_records_usage() -> None:
+    handler = object.__new__(HeadroomProxy)
+    handler.http_client = _VertexStreamClient()
+    outcomes = []
+
+    async def next_request_id():  # noqa: ANN202
+        return "req_vertex_stream"
+
+    async def record(outcome):  # noqa: ANN001, ANN202
+        outcomes.append(outcome)
+
+    handler._next_request_id = next_request_id
+    handler._record_request_outcome = record
+
+    response = asyncio.run(
+        handler.handle_passthrough(
+            _VertexStreamPassthroughRequest(),
+            "https://vertex.test",
+            "streamGenerateContent",
+            "vertex:google",
+        )
+    )
+
+    assert isinstance(response, StreamingResponse)
+
+    async def collect():  # noqa: ANN202
+        return [chunk async for chunk in response.body_iterator]
+
+    chunks = asyncio.run(collect())
+
+    assert len(chunks) == 2
+    assert chunks[0].startswith(b'data: {"candidates"')
+    assert b'"usageMetadata"' in chunks[1]
+    assert len(outcomes) == 1
+    outcome = outcomes[0]
+    assert outcome.provider == "vertex:google"
+    assert outcome.model == "gemini-2.0-flash"
+    assert outcome.optimized_tokens == 13
+    assert outcome.output_tokens == 5
+    assert outcome.cache_read_tokens == 2
+
+
+def test_stream_finalizer_records_vertex_provider_for_dashboard() -> None:
+    handler = object.__new__(HeadroomProxy)
+    handler.config = SimpleNamespace(log_full_messages=False)
+    outcomes = []
+
+    async def record(outcome):  # noqa: ANN001, ANN202
+        outcomes.append(outcome)
+
+    handler._record_request_outcome = record
+
+    asyncio.run(
+        handler._finalize_stream_response(
+            body={"contents": [{"role": "user", "parts": [{"text": "hello"}]}]},
+            provider="gemini",
+            outcome_provider="vertex:google",
+            model="gemini-2.0-flash",
+            request_id="req_vertex_stream_final",
+            original_tokens=20,
+            optimized_tokens=12,
+            tokens_saved=8,
+            transforms_applied=["test-transform"],
+            optimization_latency=3.0,
+            stream_state={
+                "input_tokens": 12,
+                "output_tokens": 5,
+                "cache_read_input_tokens": 2,
+                "cache_creation_input_tokens": 0,
+                "cache_creation_ephemeral_5m_input_tokens": 0,
+                "cache_creation_ephemeral_1h_input_tokens": 0,
+                "total_bytes": 100,
+                "sse_buffer": bytearray(),
+                "ttfb_ms": 4.0,
+            },
+            start_time=0.0,
+            tags={"route": "vertex"},
+        )
+    )
+
+    assert len(outcomes) == 1
+    outcome = outcomes[0]
+    assert outcome.provider == "vertex:google"
+    assert outcome.model == "gemini-2.0-flash"
+    assert outcome.optimized_tokens == 12
+    assert outcome.output_tokens == 5
+    assert outcome.tokens_saved == 8
+    assert outcome.cache_read_tokens == 2
+
+
+def test_vertex_gemini_non_text_generate_records_dashboard_outcome() -> None:
+    handler = object.__new__(HeadroomProxy)
+    handler.memory_handler = None
+    handler.rate_limiter = None
+    outcomes = []
+    upstream_urls = []
+
+    async def next_request_id():  # noqa: ANN202
+        return "req_vertex_image"
+
+    async def record(outcome):  # noqa: ANN001, ANN202
+        outcomes.append(outcome)
+
+    async def retry_request(method, url, headers, body):  # noqa: ANN001, ANN202
+        upstream_urls.append(url)
+        request = httpx.Request(method, url, headers=headers)
+        return httpx.Response(
+            200,
+            request=request,
+            headers={"content-type": "application/json"},
+            json={
+                "usageMetadata": {
+                    "promptTokenCount": 31,
+                    "candidatesTokenCount": 4,
+                    "cachedContentTokenCount": 6,
+                }
+            },
+        )
+
+    handler._next_request_id = next_request_id
+    handler._record_request_outcome = record
+    handler._retry_request = retry_request
+
+    response = asyncio.run(
+        handler.handle_gemini_generate_content(
+            _VertexGeminiImageRequest(),
+            "gemini-2.0-flash",
+            "https://vertex.test",
+            "vertex:google",
+        )
+    )
+
+    assert response.status_code == 200
+    assert upstream_urls == [
+        "https://vertex.test/v1/projects/p/locations/us-central1/publishers/google/models/gemini-2.0-flash:generateContent"
+    ]
+    assert response.headers["x-headroom-tokens-before"] == "31"
+    assert response.headers["x-headroom-tokens-after"] == "31"
+    assert response.headers["x-headroom-tokens-saved"] == "0"
+    assert len(outcomes) == 1
+    outcome = outcomes[0]
+    assert outcome.provider == "vertex:google"
+    assert outcome.model == "gemini-2.0-flash"
+    assert outcome.original_tokens == 31
+    assert outcome.optimized_tokens == 31
+    assert outcome.output_tokens == 4
+    assert outcome.cache_read_tokens == 6
+    assert outcome.num_messages == 1
 
 
 def test_retry_request_retries_connect_timeout() -> None:

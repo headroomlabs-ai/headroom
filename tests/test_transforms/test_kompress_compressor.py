@@ -8,6 +8,7 @@ Covers:
 - Transform interface: apply() method
 """
 
+import logging
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -83,6 +84,30 @@ class TestKompressBackendSelection:
         monkeypatch.setenv("HEADROOM_KOMPRESS_BACKEND", "unknown")
         assert kmod._selected_backend() == "auto"
 
+    def test_unrecognized_backend_warns_and_falls_back_to_auto(self, monkeypatch, caplog) -> None:
+        import headroom.transforms.kompress_compressor as kmod
+
+        monkeypatch.setenv("HEADROOM_KOMPRESS_BACKEND", "tpu")
+        with caplog.at_level(logging.WARNING, logger=kmod.logger.name):
+            assert kmod._selected_backend() == "auto"
+
+        assert any(
+            "unrecognized" in record.getMessage() and "tpu" in record.getMessage()
+            for record in caplog.records
+        )
+
+    def test_valid_backend_values_do_not_warn(self, monkeypatch, caplog) -> None:
+        import headroom.transforms.kompress_compressor as kmod
+
+        with caplog.at_level(logging.WARNING, logger=kmod.logger.name):
+            for value in ("auto", "onnx", "cpu", "coreml", "mps", "torch", "ONNX-CPU"):
+                monkeypatch.setenv("HEADROOM_KOMPRESS_BACKEND", value)
+                kmod._selected_backend()
+            monkeypatch.delenv("HEADROOM_KOMPRESS_BACKEND", raising=False)
+            kmod._selected_backend()
+
+        assert not caplog.records
+
     def test_forced_pytorch_mps_backend_uses_mps_device(self, monkeypatch) -> None:
         import headroom.transforms.kompress_compressor as kmod
 
@@ -92,7 +117,7 @@ class TestKompressBackendSelection:
         monkeypatch.setattr(
             kmod,
             "_load_kompress_pytorch",
-            lambda model_id, device: (
+            lambda model_id, device, *, allow_download=True: (
                 calls.append((model_id, device)) or ("model", "tokenizer", "pytorch")
             ),
         )
@@ -109,7 +134,7 @@ class TestKompressBackendSelection:
         monkeypatch.setattr(
             kmod,
             "_load_kompress_onnx",
-            lambda model_id, *, use_coreml=False: (
+            lambda model_id, *, use_coreml=False, allow_download=True: (
                 calls.append((model_id, use_coreml)) or ("model", "tokenizer", "onnx_coreml")
             ),
         )
@@ -128,14 +153,16 @@ class TestKompressBackendSelection:
         monkeypatch.setattr(
             kmod,
             "_load_kompress_onnx",
-            lambda model_id, *, use_coreml=False: (
+            lambda model_id, *, use_coreml=False, allow_download=True: (
                 calls.append("onnx") or ("model", "tokenizer", "onnx")
             ),
         )
         monkeypatch.setattr(
             kmod,
             "_load_kompress_pytorch",
-            lambda model_id, device: calls.append("pytorch") or ("model", "tokenizer", "pytorch"),
+            lambda model_id, device, *, allow_download=True: (
+                calls.append("pytorch") or ("model", "tokenizer", "pytorch")
+            ),
         )
 
         assert kmod._load_kompress("model-c") == ("model", "tokenizer", "onnx")

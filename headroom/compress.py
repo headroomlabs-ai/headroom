@@ -58,9 +58,10 @@ from __future__ import annotations
 
 import logging
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
+from .agent_savings import apply_agent_savings_profile
 from .observability import get_otel_metrics
 from .pipeline import PipelineExtensionManager, PipelineStage, summarize_routing_markers
 from .utils import extract_user_query as _extract_user_query
@@ -128,10 +129,13 @@ class CompressConfig:
 
     # Model variant
     kompress_model: str | None = None
-    """Kompress model ID. None = default (chopratejas/kompress-base).
+    """Kompress model ID. None = default (chopratejas/kompress-v2-base).
     Set to a HuggingFace model ID for domain-specific compression.
     Set to 'disabled' to skip ML compression entirely
     (only SmartCrusher + CacheAligner will run)."""
+
+    savings_profile: str | None = None
+    """Named high-savings profile, e.g. 'agent-90' for Codex/Claude/Cursor."""
 
 
 @dataclass
@@ -204,6 +208,9 @@ def compress(
     for key, value in kwargs.items():
         if key in config_fields:
             setattr(cfg, key, value)
+    if cfg.savings_profile:
+        cfg = replace(cfg)
+        apply_agent_savings_profile(cfg, cfg.savings_profile)
 
     pipeline = _get_pipeline()
     pipeline_extensions = PipelineExtensionManager(hooks=hooks, discover=False)
@@ -251,6 +258,24 @@ def compress(
         tokens_before = result.tokens_before
         tokens_after = result.tokens_after
         compressed_messages = result.messages
+
+        # Guard: if "optimization" inflated tokens, revert to originals.
+        # Mirrors the inflation guards in the proxy handlers
+        # (anthropic/openai/gemini/batch) — the library path had none.
+        if tokens_after > tokens_before:
+            logger.warning(
+                "Optimization inflated tokens (%d -> %d); reverting to original messages",
+                tokens_before,
+                tokens_after,
+            )
+            return CompressResult(
+                messages=messages,
+                tokens_before=tokens_before,
+                tokens_after=tokens_before,
+                tokens_saved=0,
+                compression_ratio=0.0,
+                transforms_applied=["inflation_guard:reverted"],
+            )
 
         routing_markers = summarize_routing_markers(result.transforms_applied)
         if routing_markers:

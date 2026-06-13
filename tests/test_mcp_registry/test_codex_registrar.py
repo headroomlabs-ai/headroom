@@ -49,6 +49,10 @@ def _config_path(tmp_path: Path) -> Path:
     return tmp_path / ".codex" / "config.toml"
 
 
+def _codex_home_config_path(codex_home: Path) -> Path:
+    return codex_home / "config.toml"
+
+
 # ----------------------------------------------------------------------
 # detect()
 # ----------------------------------------------------------------------
@@ -61,6 +65,29 @@ def test_detect_true_when_codex_dir_exists(tmp_path: Path) -> None:
 
 def test_detect_false_when_codex_dir_missing(tmp_path: Path) -> None:
     assert _make_registrar(tmp_path).detect() is False
+
+
+def test_detect_true_when_codex_home_exists(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    codex_home = tmp_path / "custom-codex-home"
+    codex_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    assert CodexRegistrar().detect() is True
+
+
+def test_register_uses_codex_home_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    codex_home = tmp_path / "custom-codex-home"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    result = CodexRegistrar().register_server(_spec())
+
+    assert result.status == RegisterStatus.REGISTERED
+    assert _codex_home_config_path(codex_home).exists()
+    assert not _config_path(tmp_path).exists()
+    text = _codex_home_config_path(codex_home).read_text()
+    assert "[mcp_servers.headroom]" in text
 
 
 # ----------------------------------------------------------------------

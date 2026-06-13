@@ -32,7 +32,7 @@ jobs:
       # `pip install -e .` invokes maturin (declared in pyproject.toml's
       # build-system) which calls cargo to compile the Rust extension.
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.95.0
+        uses: dtolnay/rust-toolchain@1.96.0
 
       - name: Cache cargo registry + build
         uses: Swatinem/rust-cache@v2
@@ -54,6 +54,17 @@ jobs:
           print(f'CCR Round-trip: {result.passed_cases}/{result.total_cases} passed')
           assert result.passed, f'CCR failures: {result.errors}'
           "
+
+      - name: Run tool schema compaction integrity eval (zero cost)
+        run: |
+          python -c "
+          from headroom.evals.runners.compression_only import CompressionOnlyRunner
+          runner = CompressionOnlyRunner()
+          result = runner.evaluate_tool_schema_compaction()
+          print(f'Tool schema compaction: {result.passed_cases}/{result.total_cases} passed, {result.total_tokens_saved} annotation tokens stripped')
+          assert result.passed, f'Schema compaction failures: {result.errors}'
+          "
+
       # OPENAI_API_KEY is intentionally not set in the public OSS repo
       # (the secret list is empty). The CCR round-trip step above is the
       # mandatory gate; this step only runs when an operator has wired
@@ -89,7 +100,7 @@ jobs:
           restore-keys: ${{ runner.os }}-pip-eval-
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.95.0
+        uses: dtolnay/rust-toolchain@1.96.0
 
       - name: Cache cargo registry + build
         uses: Swatinem/rust-cache@v2

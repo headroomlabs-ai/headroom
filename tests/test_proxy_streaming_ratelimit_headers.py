@@ -18,6 +18,24 @@ import headroom.proxy.handlers.streaming as streaming_module
 from headroom.proxy.server import HeadroomProxy
 
 
+@pytest.fixture(autouse=True)
+def _reset_codex_rate_limit_singleton():
+    """Isolate the process-global CodexRateLimitState across tests.
+
+    The tracker is a module singleton; save/restore ``_latest`` around every
+    test so a captured snapshot never leaks into (or depends on) another test.
+    """
+    from headroom.subscription.codex_rate_limits import get_codex_rate_limit_state
+
+    state = get_codex_rate_limit_state()
+    saved = state._latest
+    state._latest = None
+    try:
+        yield
+    finally:
+        state._latest = saved
+
+
 class TestStreamingRatelimitHeaderForwarding:
     """Test that upstream ratelimit headers are forwarded in streaming responses."""
 
@@ -397,3 +415,153 @@ class TestStreamingRatelimitHeaderForwarding:
 
         assert attempts["count"] == 2
         assert chunks
+
+    @pytest.mark.asyncio
+    async def test_codex_rate_limit_headers_captured_and_forwarded_in_streaming(self):
+        """Codex x-codex-* headers must refresh /stats state AND reach the client.
+
+        Regression guard for the bug where Codex session/weekly usage never
+        updated on the streaming SSE transport: the proxy neither captured the
+        ``x-codex-*`` headers into ``CodexRateLimitState`` nor forwarded them to
+        the client (the old ``"ratelimit" in k`` filter dropped them, so the
+        Codex CLI's own usage display also went stale).
+        """
+        from headroom.subscription.codex_rate_limits import get_codex_rate_limit_state
+
+        state = get_codex_rate_limit_state()
+
+        proxy = self._create_mock_proxy()
+        mock_response = self._create_mock_upstream_response(
+            extra_headers={
+                "x-codex-primary-used-percent": "42.0",
+                "x-codex-primary-window-minutes": "300",
+                "x-codex-secondary-used-percent": "8.0",
+                "x-codex-secondary-window-minutes": "10080",
+                "x-codex-limit-name": "gpt-5.4-codex",
+            }
+        )
+
+        mock_request = MagicMock()
+        proxy.http_client.build_request = MagicMock(return_value=mock_request)
+        proxy.http_client.send = AsyncMock(return_value=mock_response)
+
+        result = await proxy._stream_response(
+            url="https://chatgpt.com/backend-api/codex/responses",
+            headers={"authorization": "Bearer sk-test"},
+            body={"model": "gpt-5.4", "stream": True, "input": "hi"},
+            provider="openai",
+            model="gpt-5.4",
+            request_id="test-codex-sse",
+            original_tokens=10,
+            optimized_tokens=10,
+            tokens_saved=0,
+            transforms_applied=[],
+            tags={},
+            optimization_latency=0.0,
+        )
+
+        # 1. Rate-limit state refreshed from the *streaming* response.
+        snap = state.latest
+        assert snap is not None
+        assert snap.primary is not None
+        assert snap.primary.used_percent == 42.0
+        assert snap.primary.window_minutes == 300
+        assert snap.secondary is not None
+        assert snap.secondary.used_percent == 8.0
+        assert snap.secondary.window_minutes == 10080
+        assert snap.limit_name == "gpt-5.4-codex"
+
+        # 2. x-codex headers forwarded so the Codex CLI's native usage display
+        #    keeps working through the proxy on the streaming path.
+        assert result.headers.get("x-codex-primary-used-percent") == "42.0"
+        assert result.headers.get("x-codex-limit-name") == "gpt-5.4-codex"
+        # 3. Generic ratelimit headers still forwarded; unrelated headers dropped.
+        assert result.headers.get("anthropic-ratelimit-tokens-limit") == "80000"
+        assert result.headers.get("x-request-id") is None
+
+    @pytest.mark.asyncio
+    async def test_codex_rate_limit_captured_on_streaming_429(self):
+        """A streaming 429 carrying x-codex-* must still refresh /stats.
+
+        The capture runs *before* the >=400 early-return, matching the
+        non-streaming HTTP handlers (which capture on all statuses). A 429 is
+        exactly when the session/weekly windows are most worth surfacing, so the
+        previous success-only placement left the most important update missing.
+        """
+        from headroom.subscription.codex_rate_limits import get_codex_rate_limit_state
+
+        state = get_codex_rate_limit_state()
+
+        proxy = self._create_mock_proxy()
+        mock_response = self._create_mock_upstream_response()
+        mock_response.status_code = 429
+        mock_response.headers = httpx.Headers(
+            {
+                "content-type": "application/json",
+                "x-codex-primary-used-percent": "99.5",
+                "x-codex-primary-window-minutes": "300",
+            }
+        )
+        mock_response.aread = AsyncMock(return_value=b'{"error":{"message":"rate limited"}}')
+        mock_response.aclose = AsyncMock()
+
+        mock_request = MagicMock()
+        proxy.http_client.build_request = MagicMock(return_value=mock_request)
+        proxy.http_client.send = AsyncMock(return_value=mock_response)
+
+        result = await proxy._stream_response(
+            url="https://chatgpt.com/backend-api/codex/responses",
+            headers={"authorization": "Bearer sk-test"},
+            body={"model": "gpt-5.4", "stream": True, "input": "hi"},
+            provider="openai",
+            model="gpt-5.4",
+            request_id="test-codex-429",
+            original_tokens=10,
+            optimized_tokens=10,
+            tokens_saved=0,
+            transforms_applied=[],
+            tags={},
+            optimization_latency=0.0,
+        )
+
+        assert result.status_code == 429
+        snap = state.latest
+        assert snap is not None
+        assert snap.primary is not None
+        assert snap.primary.used_percent == 99.5
+
+    @pytest.mark.asyncio
+    async def test_anthropic_stream_leaves_codex_state_untouched(self):
+        """The now-unconditional capture must be a no-op for non-Codex streams."""
+        from headroom.subscription.codex_rate_limits import get_codex_rate_limit_state
+
+        state = get_codex_rate_limit_state()
+
+        proxy = self._create_mock_proxy()
+        mock_response = self._create_mock_upstream_response()  # anthropic-ratelimit-* only
+
+        mock_request = MagicMock()
+        proxy.http_client.build_request = MagicMock(return_value=mock_request)
+        proxy.http_client.send = AsyncMock(return_value=mock_response)
+
+        await proxy._stream_response(
+            url="https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": "sk-test"},
+            body={
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 100,
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+            provider="anthropic",
+            model="claude-sonnet-4-20250514",
+            request_id="test-anthropic-noop",
+            original_tokens=10,
+            optimized_tokens=10,
+            tokens_saved=0,
+            transforms_applied=[],
+            tags={},
+            optimization_latency=0.0,
+        )
+
+        assert state.latest is None

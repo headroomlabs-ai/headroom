@@ -59,11 +59,13 @@ class _FakeWebSocket:
         self.sent_text: list[str] = []
         self.sent_bytes: list[bytes] = []
         self.accepted_subprotocol = None
+        self.accepted_headers: list[tuple[bytes, bytes]] | None = None
         self.closed = False
         self.close_code: int | None = None
 
-    async def accept(self, subprotocol=None) -> None:
+    async def accept(self, subprotocol=None, headers=None) -> None:
         self.accepted_subprotocol = subprotocol
+        self.accepted_headers = list(headers) if headers is not None else None
 
     async def receive_text(self) -> str:
         if not self._frames:
@@ -112,7 +114,13 @@ class _FakeUpstream:
 
 def _make_fake_websockets_module(upstream: _FakeUpstream):
     module = MagicMock()
-    module.connect = MagicMock(return_value=upstream)
+
+    # Production now does ``upstream = await websockets.connect(...)`` then
+    # ``async with upstream`` — so connect must return an awaitable.
+    async def _connect(*args, **kwargs):
+        return upstream
+
+    module.connect = _connect
     module.Subprotocol = str  # the handler wraps client subprotocols if present
     return module
 
@@ -221,15 +229,12 @@ def test_codex_ws_upstream_connect_failure_still_logs_timings(stage_log_capture)
     """A session that never connects upstream still logs a timing line
     with ``upstream_first_event`` absent (null)."""
 
-    class _BoomUpstream:
-        async def __aenter__(self):
-            raise RuntimeError("upstream refused")
-
-        async def __aexit__(self, exc_type, exc, tb):
-            return None
-
     fake_ws_mod = MagicMock()
-    fake_ws_mod.connect = MagicMock(return_value=_BoomUpstream())
+
+    async def _boom_connect(*args, **kwargs):
+        raise RuntimeError("upstream refused")
+
+    fake_ws_mod.connect = _boom_connect
     fake_ws_mod.Subprotocol = str
 
     first_frame = json.dumps(
@@ -251,12 +256,14 @@ def test_codex_ws_upstream_connect_failure_still_logs_timings(stage_log_capture)
     payload = _parse_stage_log(stage_log_capture)
     stages = payload["stages"]
 
-    # upstream_first_event never fired because connect failed on entry.
+    # upstream_first_event never fired because connect failed.
     assert stages.get("upstream_first_event") is None
-    # upstream_connect is also None because we record it only after the
-    # context manager successfully enters.
+    # upstream_connect is also None because we record it only after a
+    # successful ``await websockets.connect(...)``.
     assert stages.get("upstream_connect") is None
-    # But the envelope is still complete.
+    # But the envelope is still complete: the client is accepted and its
+    # first frame is read before falling back to HTTP, even on connect
+    # failure.
     assert stages["accept"] is not None
     assert stages["first_client_frame"] is not None
     assert stages["total_session"] > 0.0

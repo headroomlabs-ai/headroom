@@ -22,6 +22,7 @@ def _api_target(proxy: Any, provider_name: str) -> str:
         "openai": "OPENAI_API_URL",
         "gemini": "GEMINI_API_URL",
         "cloudcode": "CLOUDCODE_API_URL",
+        "vertex": "VERTEX_API_URL",
     }
     legacy_attr = legacy_attrs[provider_name]
     return cast(str, getattr(proxy, legacy_attr, proxy.provider_runtime.api_target(provider_name)))
@@ -315,6 +316,14 @@ async def _handle_chatgpt_model_metadata(
 def register_provider_routes(app: FastAPI, proxy: Any) -> None:
     """Register provider-specific proxy endpoints."""
 
+    async def vertex_publisher_passthrough(request: Request, publisher: str, action: str):
+        return await proxy.handle_passthrough(
+            request,
+            _api_target(proxy, "vertex"),
+            action,
+            f"vertex:{publisher}",
+        )
+
     @app.post("/v1/messages")
     async def anthropic_messages(request: Request):
         return await proxy.handle_anthropic_messages(request)
@@ -466,6 +475,112 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
     @app.post("/v1/v1internal:streamGenerateContent")
     async def google_cloudcode_stream_generate_content_v1(request: Request):
         return await proxy.handle_google_cloudcode_stream(request)
+
+    @app.post(
+        "/{api_version}/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:generateContent"
+    )
+    async def vertex_generate_content(
+        request: Request,
+        api_version: str,
+        project: str,
+        location: str,
+        publisher: str,
+        model: str,
+    ):
+        del api_version, project, location
+        if publisher == "google":
+            return await proxy.handle_gemini_generate_content(
+                request,
+                model,
+                _api_target(proxy, "vertex"),
+                "vertex:google",
+            )
+        return await vertex_publisher_passthrough(request, publisher, "generateContent")
+
+    @app.post(
+        "/{api_version}/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:streamGenerateContent"
+    )
+    async def vertex_stream_generate_content(
+        request: Request,
+        api_version: str,
+        project: str,
+        location: str,
+        publisher: str,
+        model: str,
+    ):
+        del api_version, project, location
+        if publisher == "google":
+            return await proxy.handle_gemini_generate_content(
+                request,
+                model,
+                _api_target(proxy, "vertex"),
+                "vertex:google",
+            )
+        return await vertex_publisher_passthrough(request, publisher, "streamGenerateContent")
+
+    @app.post(
+        "/{api_version}/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:countTokens"
+    )
+    async def vertex_count_tokens(
+        request: Request,
+        api_version: str,
+        project: str,
+        location: str,
+        publisher: str,
+        model: str,
+    ):
+        del api_version, project, location
+        if publisher == "google":
+            return await proxy.handle_gemini_count_tokens(
+                request,
+                model,
+                _api_target(proxy, "vertex"),
+                "vertex:google",
+            )
+        return await vertex_publisher_passthrough(request, publisher, "countTokens")
+
+    @app.post(
+        "/{api_version}/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:rawPredict"
+    )
+    async def vertex_raw_predict(
+        request: Request,
+        api_version: str,
+        project: str,
+        location: str,
+        publisher: str,
+        model: str,
+    ):
+        del api_version, project, location
+        if publisher == "anthropic":
+            return await proxy.handle_anthropic_messages(
+                request,
+                _api_target(proxy, "vertex"),
+                "vertex:anthropic",
+                model,
+            )
+        return await vertex_publisher_passthrough(request, publisher, "rawPredict")
+
+    @app.post(
+        "/{api_version}/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:streamRawPredict"
+    )
+    async def vertex_stream_raw_predict(
+        request: Request,
+        api_version: str,
+        project: str,
+        location: str,
+        publisher: str,
+        model: str,
+    ):
+        del api_version, project, location
+        if publisher == "anthropic":
+            return await proxy.handle_anthropic_messages(
+                request,
+                _api_target(proxy, "vertex"),
+                "vertex:anthropic",
+                model,
+                True,
+            )
+        return await vertex_publisher_passthrough(request, publisher, "streamRawPredict")
 
     @app.get("/v1/models")
     async def list_models(request: Request):

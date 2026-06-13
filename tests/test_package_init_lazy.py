@@ -74,6 +74,31 @@ def test_version_prefers_source_tree_release_history() -> None:
     package_version.assert_not_called()
 
 
+def test_proxy_package_import_does_not_eagerly_load_server() -> None:
+    script = textwrap.dedent(
+        """
+        import json
+        import sys
+
+        import headroom.proxy
+
+        print(json.dumps({
+            "server_loaded": "headroom.proxy.server" in sys.modules,
+        }))
+        """
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    data = json.loads(result.stdout.strip())
+    assert data["server_loaded"] is False
+
+
 def test_proxy_server_import_skips_litellm_backend() -> None:
     script = textwrap.dedent(
         """

@@ -162,6 +162,18 @@ response = client.chat.completions.create(
 </Tab>
 </Tabs>
 
+## Retention
+
+Proxy CCR originals are kept for 300 seconds by default. For longer autonomous
+agent runs, set `HEADROOM_CCR_TTL_SECONDS` before starting the proxy:
+
+```bash
+HEADROOM_CCR_TTL_SECONDS=7200 headroom proxy
+```
+
+Check the effective setting at `/v1/retrieve/stats` under
+`store.default_ttl_seconds`.
+
 ## Message-level CCR
 
 > **Retired:** The "Message-level CCR via IntelligentContext" feature (where `IntelligentContext` would store dropped messages in CCR with a retrieval marker) was part of the `IntelligentContextConfig` API that was removed in 0.9.x. Context management is now handled automatically by the pipeline without a separate configurable IntelligentContext stage. Tool-output CCR via SmartCrusher and ContentRouter remains fully supported.
