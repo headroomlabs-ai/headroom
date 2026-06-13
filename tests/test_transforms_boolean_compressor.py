@@ -499,7 +499,9 @@ def test_detect_provider_import_error_returns_none(monkeypatch: pytest.MonkeyPat
 
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
     monkeypatch.setitem(
-        sys.modules, "boolean_algebra_engine.nl.nl", None  # type: ignore[arg-type]
+        sys.modules,
+        "boolean_algebra_engine.nl.nl",
+        None,  # type: ignore[arg-type]
     )
     assert _detect_provider() is None
 

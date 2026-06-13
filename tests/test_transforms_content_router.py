@@ -778,6 +778,7 @@ def test_boolean_strategy_compresses_when_compressor_available(
 
     monkeypatch.setattr(router, "_get_boolean_compressor", lambda: FakeBoolean())
     import headroom.transforms.boolean_compressor as bc_mod
+
     monkeypatch.setattr(bc_mod, "_fire_telemetry", lambda result: None)
 
     compressed, tokens, chain = router._apply_strategy_to_content(
@@ -857,6 +858,7 @@ def test_nl_boolean_strategy_compresses_when_compressor_available(
 
     monkeypatch.setattr(router, "_get_nl_boolean_compressor", lambda: FakeNLBoolean())
     import headroom.transforms.boolean_compressor as bc_mod
+
     monkeypatch.setattr(bc_mod, "_fire_telemetry", lambda result: None)
 
     compressed, tokens, chain = router._apply_strategy_to_content(
