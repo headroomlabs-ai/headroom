@@ -24,6 +24,11 @@ JSON_BLOCK_PATTERN = re.compile(r"\{[\s\S]{500,}\}")
 # exit codes) and are not evidence of a re-read.
 REREAD_MIN_TOKENS = 50
 
+# Canonical CCR retrieval-marker shapes. Mirrors the alternation in
+# transforms/compression_units._CCR_MARKER_RE; kept local because the parser
+# is a base module and importing from transforms would create a cycle.
+CCR_RETRIEVAL_MARKER_RE = re.compile(r"Retrieve more: hash=|Retrieve original: hash=|<<ccr:[^>]+>>")
+
 # Repeats this close (in message positions) to the previous serve are
 # polling, not re-reads. Consecutive tool turns sit 2 apart (the
 # assistant tool_use message lies between results); 3 also absorbs a
@@ -46,6 +51,22 @@ RAG_PATTERN = re.compile("|".join(RAG_MARKERS), re.IGNORECASE)
 def compute_hash(text: str) -> str:
     """Compute hash of text, truncated to 16 chars."""
     return hashlib.md5(text.encode()).hexdigest()[:16]  # nosec B324
+
+
+def _canonical_call_key(name: str, arguments: Any) -> str:
+    """Canonical identity for a tool invocation: name + arguments with JSON
+    key order normalized, so semantically identical calls hash equal even
+    when the provider serializes arguments differently."""
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except (ValueError, TypeError):
+            pass
+    if isinstance(arguments, (dict, list)):
+        canon = json.dumps(arguments, sort_keys=True, separators=(",", ":"), default=str)
+    else:
+        canon = str(arguments)
+    return compute_hash(f"{name}\x00{canon}")
 
 
 def _extract_tool_result_text(payload: dict[str, Any]) -> str:
@@ -157,6 +178,7 @@ def parse_message_to_blocks(
     content = message.get("content")
     if content:
         tool_result_parts: list[dict[str, Any]] = []
+        tool_use_parts: list[dict[str, Any]] = []
         if isinstance(content, str):
             text = content
         elif isinstance(content, list):
@@ -172,6 +194,13 @@ def parse_message_to_blocks(
                 elif isinstance(part, dict) and "toolResult" in part:
                     # Strands/Bedrock converse format; same treatment.
                     tool_result_parts.append(part)
+                elif isinstance(part, dict) and part.get("type") == "tool_use":
+                    # Anthropic Messages format: call side of the tool unit;
+                    # collect for dedicated tool_call blocks below.
+                    tool_use_parts.append(part)
+                elif isinstance(part, dict) and "toolUse" in part:
+                    # Strands/Bedrock converse format; same treatment.
+                    tool_use_parts.append(part)
                 elif isinstance(part, str):
                     text_parts.append(part)
             text = "\n".join(text_parts)
@@ -242,6 +271,33 @@ def parse_message_to_blocks(
             )
         blocks.extend(tr_blocks)
 
+        for part in tool_use_parts:
+            payload = part["toolUse"] if "toolUse" in part else part
+            if not isinstance(payload, dict):
+                continue
+            tu_name = payload.get("name") or "unknown"
+            tu_args = payload.get("input", {})
+            tu_id = payload.get("toolUseId") if "toolUse" in part else payload.get("id")
+            try:
+                tu_args_text = json.dumps(tu_args, sort_keys=True, default=str)
+            except (TypeError, ValueError):
+                tu_args_text = str(tu_args)
+            tu_text = f"{tu_name}({tu_args_text})"
+            blocks.append(
+                Block(
+                    kind="tool_call",
+                    text=tu_text,
+                    tokens_est=tokenizer.count_text(tu_text) + 10,
+                    content_hash=compute_hash(tu_text),
+                    source_index=index,
+                    flags={
+                        "tool_call_id": tu_id,
+                        "function_name": tu_name,
+                        "call_key": _canonical_call_key(tu_name, tu_args),
+                    },
+                )
+            )
+
     # Handle tool calls (assistant messages with tool_calls)
     tool_calls = message.get("tool_calls")
     if tool_calls:
@@ -259,6 +315,9 @@ def parse_message_to_blocks(
                     flags={
                         "tool_call_id": tc.get("id"),
                         "function_name": func.get("name"),
+                        "call_key": _canonical_call_key(
+                            func.get("name") or "unknown", func.get("arguments", "")
+                        ),
                     },
                 )
             )
@@ -282,6 +341,7 @@ def parse_message_to_blocks(
 def parse_messages(
     messages: list[dict[str, Any]],
     tokenizer: Tokenizer,
+    compressed_messages: list[dict[str, Any]] | None = None,
 ) -> tuple[list[Block], dict[str, int], WasteSignals]:
     """
     Parse all messages into blocks with analysis.
@@ -289,6 +349,11 @@ def parse_messages(
     Args:
         messages: List of message dicts.
         tokenizer: Tokenizer instance for token counting.
+        compressed_messages: Optional post-transform copy of the same
+            messages. When provided (and the message count matches), reread
+            waste is additionally attributed: repeats whose first serve was
+            replaced by a CCR retrieval marker count into
+            ``reread_compressed_tokens`` (#899).
 
     Returns:
         Tuple of (blocks, block_breakdown, total_waste_signals)
@@ -315,10 +380,12 @@ def parse_messages(
     # at more than one position means the agent re-fetched something already
     # in context — an over-compression signal (#853). The first serve is
     # free; every repeat is counted as waste.
+    counted_results: set[int] = set()
     reread_groups: dict[str, list[Block]] = {}
     for block in all_blocks:
         if block.kind == "tool_result" and block.tokens_est >= REREAD_MIN_TOKENS:
             reread_groups.setdefault(block.content_hash, []).append(block)
+    attribute = compressed_messages is not None and len(compressed_messages) == len(messages)
     for group in reread_groups.values():
         # The message that first served the content is the original; only
         # copies appearing in *later* messages are re-reads. Duplicates
@@ -330,13 +397,71 @@ def parse_messages(
         # repeats advance the baseline without counting, so a long polling
         # chain never accumulates waste.
         prev_index = group[0].source_index
+        counted_tokens = 0
         for block in group:
             if block.source_index == prev_index:
                 continue
             is_polling = block.source_index - prev_index <= REREAD_ADJACENT_GAP
             prev_index = block.source_index
             if not is_polling:
-                total_waste.reread_tokens += block.tokens_est
+                counted_tokens += block.tokens_est
+                counted_results.add(id(block))
+        if not counted_tokens:
+            continue
+        total_waste.reread_tokens += counted_tokens
+        # Over-compression attribution (#899): if the transformed copy of the
+        # first serve carries a CCR retrieval marker and its original text is
+        # gone, the model never saw the full first serve — the repeats are
+        # attributable to compression. Lossless reshaping (no marker) is
+        # deliberately not attributed: the model saw all the data, so the
+        # re-read is agent behavior.
+        if attribute and compressed_messages is not None:
+            first = group[0]
+            transformed_blocks = parse_message_to_blocks(
+                compressed_messages[first.source_index], first.source_index, tokenizer
+            )
+            transformed_text = "\n".join(b.text for b in transformed_blocks)
+            if CCR_RETRIEVAL_MARKER_RE.search(transformed_text) and (
+                first.text not in transformed_text
+            ):
+                total_waste.reread_compressed_tokens += counted_tokens
+
+    # Re-issued-call detection: the agent invoking the same tool with the
+    # same arguments again is a re-fetch even when the result bytes differ
+    # (timestamps, mtimes, ordering defeat the content-hash pass above).
+    # Same polling guard and size floor as above, applied to the repeat
+    # invocation's result; results the content-hash pass already counted
+    # are skipped so identical-content repeats are never counted twice.
+    results_by_call_id: dict[str, Block] = {}
+    for block in all_blocks:
+        if block.kind == "tool_result":
+            tc_id = block.flags.get("tool_call_id")
+            if tc_id and tc_id not in results_by_call_id:
+                results_by_call_id[tc_id] = block
+
+    call_groups: dict[str, list[Block]] = {}
+    for block in all_blocks:
+        if block.kind == "tool_call":
+            call_key = block.flags.get("call_key")
+            if call_key:
+                call_groups.setdefault(call_key, []).append(block)
+
+    for group in call_groups.values():
+        prev_index = group[0].source_index
+        for block in group:
+            if block.source_index == prev_index:
+                continue
+            is_polling = block.source_index - prev_index <= REREAD_ADJACENT_GAP
+            prev_index = block.source_index
+            if is_polling:
+                continue
+            result = results_by_call_id.get(block.flags.get("tool_call_id") or "")
+            if result is None or result.tokens_est < REREAD_MIN_TOKENS:
+                continue
+            if id(result) in counted_results:
+                continue
+            total_waste.reread_tokens += result.tokens_est
+            counted_results.add(id(result))
 
     # Compute block breakdown
     breakdown: dict[str, int] = {}

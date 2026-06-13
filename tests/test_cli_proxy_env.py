@@ -76,6 +76,36 @@ class TestCLIWrapProxyTimeout:
         assert sleeps == [1]
         assert fake_proc.killed is False
 
+    def test_start_proxy_passes_resolved_copilot_api_url_to_proxy(self, monkeypatch, tmp_path):
+        fake_proc = _FakeProxyProcess()
+        captured: dict[str, object] = {}
+
+        monkeypatch.delenv(wrap_mod._WRAP_PROXY_TIMEOUT_ENV, raising=False)
+        monkeypatch.setattr(wrap_mod, "_ml_wrap_extras_detected", lambda: False)
+        monkeypatch.setattr(wrap_mod, "_get_log_path", lambda: tmp_path / "proxy.log")
+        monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: True)
+        monkeypatch.setattr(wrap_mod.time, "sleep", lambda _seconds: None)
+
+        def fake_popen(*args, **kwargs):  # noqa: ANN002, ANN003
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            return fake_proc
+
+        monkeypatch.setattr(wrap_mod.subprocess, "Popen", fake_popen)
+
+        proc = wrap_mod._start_proxy(
+            8787,
+            agent_type="copilot",
+            openai_api_url="https://copilot-api.acme.ghe.com",
+            copilot_api_token="copilot-api-token",
+        )
+
+        assert proc is fake_proc
+        env = captured["kwargs"]["env"]
+        assert env["OPENAI_TARGET_API_URL"] == "https://copilot-api.acme.ghe.com"
+        assert env["GITHUB_COPILOT_API_URL"] == "https://copilot-api.acme.ghe.com"
+        assert env["GITHUB_COPILOT_API_TOKEN"] == "copilot-api-token"
+
     def test_env_timeout_allows_slow_start_proxy_to_succeed(self, monkeypatch, tmp_path):
         fake_proc = _FakeProxyProcess()
         sleeps = []
@@ -155,6 +185,24 @@ class TestCLIProxyEnvVars:
 
         assert result.exit_code == 0, result.output
         assert captured_config["config"].port == 9797
+
+    def test_headroom_min_tokens_from_env(self, runner):
+        """HEADROOM_MIN_TOKENS env var should be passed to ProxyConfig."""
+        captured_config = {}
+
+        def mock_run_server(config, **kwargs):
+            captured_config["config"] = config
+
+        with patch("headroom.proxy.server.run_server", mock_run_server):
+            result = runner.invoke(
+                main,
+                ["proxy"],
+                env={"HEADROOM_MIN_TOKENS": "120"},
+                catch_exceptions=False,
+            )
+
+        assert result.exit_code == 0, result.output
+        assert captured_config["config"].min_tokens_to_crush == 120
 
     def test_headroom_budget_from_env(self, runner):
         """HEADROOM_BUDGET env var should be passed to ProxyConfig."""
@@ -737,3 +785,120 @@ class TestArgparseBackendValidation:
             config = _proxy_config_from_env()
 
         assert config.disable_kompress is True
+
+
+class TestCLIProxyExcludeToolsEnvVar:
+    """HEADROOM_EXCLUDE_TOOLS and HEADROOM_TOOL_PROFILES must reach ProxyConfig via the Click path.
+
+    Regression coverage for issue #825: the Click entrypoint (headroom/cli/proxy.py)
+    previously built ProxyConfig without calling _parse_exclude_tools or
+    _parse_tool_profiles, so those env vars were silently ignored for all
+    shared/deployed services that launch via `headroom proxy`.
+    """
+
+    def test_exclude_tools_single_name_from_env(self, runner):
+        """HEADROOM_EXCLUDE_TOOLS=WebSearch propagates to ProxyConfig.exclude_tools."""
+        captured_config = {}
+
+        def mock_run_server(config, **kwargs):
+            captured_config["config"] = config
+
+        with patch("headroom.proxy.server.run_server", mock_run_server):
+            result = runner.invoke(
+                main,
+                ["proxy"],
+                env={"HEADROOM_EXCLUDE_TOOLS": "WebSearch"},
+                catch_exceptions=False,
+            )
+
+        assert result.exit_code == 0, result.output
+        cfg = captured_config["config"]
+        assert cfg.exclude_tools is not None
+        assert "WebSearch" in cfg.exclude_tools
+
+    def test_exclude_tools_multi_name_from_env(self, runner):
+        """HEADROOM_EXCLUDE_TOOLS=WebSearch,WebFetch yields both names (and lowercased) in result."""
+        captured_config = {}
+
+        def mock_run_server(config, **kwargs):
+            captured_config["config"] = config
+
+        with patch("headroom.proxy.server.run_server", mock_run_server):
+            result = runner.invoke(
+                main,
+                ["proxy"],
+                env={"HEADROOM_EXCLUDE_TOOLS": "WebSearch,WebFetch"},
+                catch_exceptions=False,
+            )
+
+        assert result.exit_code == 0, result.output
+        cfg = captured_config["config"]
+        assert cfg.exclude_tools is not None
+        assert "WebSearch" in cfg.exclude_tools
+        assert "WebFetch" in cfg.exclude_tools
+        assert "websearch" in cfg.exclude_tools
+        assert "webfetch" in cfg.exclude_tools
+
+    def test_exclude_tools_unset_leaves_none(self, runner):
+        """Without HEADROOM_EXCLUDE_TOOLS, exclude_tools stays None (DEFAULT_EXCLUDE_TOOLS used)."""
+        captured_config = {}
+
+        def mock_run_server(config, **kwargs):
+            captured_config["config"] = config
+
+        env = {k: v for k, v in os.environ.items() if k != "HEADROOM_EXCLUDE_TOOLS"}
+
+        with (
+            patch("headroom.proxy.server.run_server", mock_run_server),
+            patch.dict(os.environ, env, clear=True),
+        ):
+            result = runner.invoke(
+                main,
+                ["proxy"],
+                catch_exceptions=False,
+            )
+
+        assert result.exit_code == 0, result.output
+        assert captured_config["config"].exclude_tools is None
+
+    def test_tool_profiles_from_env(self, runner):
+        """HEADROOM_TOOL_PROFILES=Grep:conservative propagates to ProxyConfig.tool_profiles."""
+        captured_config = {}
+
+        def mock_run_server(config, **kwargs):
+            captured_config["config"] = config
+
+        with patch("headroom.proxy.server.run_server", mock_run_server):
+            result = runner.invoke(
+                main,
+                ["proxy"],
+                env={"HEADROOM_TOOL_PROFILES": "Grep:conservative"},
+                catch_exceptions=False,
+            )
+
+        assert result.exit_code == 0, result.output
+        cfg = captured_config["config"]
+        assert cfg.tool_profiles is not None
+        assert "Grep" in cfg.tool_profiles
+
+    def test_tool_profiles_unset_leaves_none(self, runner):
+        """Without HEADROOM_TOOL_PROFILES, tool_profiles stays None."""
+        captured_config = {}
+
+        def mock_run_server(config, **kwargs):
+            captured_config["config"] = config
+
+        env = {k: v for k, v in os.environ.items() if k != "HEADROOM_TOOL_PROFILES"}
+
+        with (
+            patch("headroom.proxy.server.run_server", mock_run_server),
+            patch.dict(os.environ, env, clear=True),
+        ):
+            result = runner.invoke(
+                main,
+                ["proxy"],
+                catch_exceptions=False,
+            )
+
+        assert result.exit_code == 0, result.output
+        assert captured_config["config"].tool_profiles is None

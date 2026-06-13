@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Install git hooks for the Headroom repo:
 #   1. pre-commit  — repo pre-commit checks (ruff, mypy, sync-plugin-versions)
-#   2. pre-push    — full ci-precheck (cargo fmt/clippy/test + python suite)
+#   2. commit-msg  — conventional-commit enforcement via commitlint
+#   3. pre-push    — full ci-precheck (cargo fmt/clippy/test + python suite)
 #
 # Why pre-push was added: the 2026-04-27 push hit five CI failures that could
 # all have been caught locally — cargo fmt drift, an x86_64-apple-darwin wheel
@@ -21,6 +22,11 @@ cd "$(dirname "$0")/.."
 
 if [[ ! -d .git/hooks ]]; then
     echo "error: .git/hooks/ not found — run from a git checkout root" >&2
+    exit 1
+fi
+
+if ! command -v npx &>/dev/null; then
+    echo "error: npx not found — install Node 18+ before installing Headroom's git hooks." >&2
     exit 1
 fi
 
@@ -89,7 +95,9 @@ fi
 
 if [[ -n "$PRE_COMMIT_BIN" ]]; then
     "$PRE_COMMIT_BIN" install
+    "$PRE_COMMIT_BIN" install --hook-type commit-msg
     echo "✅ installed: .git/hooks/pre-commit (repo pre-commit checks via pre-commit)"
+    echo "✅ installed: .git/hooks/commit-msg (conventional commit enforcement via commitlint)"
 else
     echo "error: pre-commit not found — run 'pip install -e .[dev]' first, then re-run this script." >&2
     exit 1

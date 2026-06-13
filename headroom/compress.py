@@ -58,9 +58,10 @@ from __future__ import annotations
 
 import logging
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
+from .agent_savings import apply_agent_savings_profile
 from .observability import get_otel_metrics
 from .pipeline import PipelineExtensionManager, PipelineStage, summarize_routing_markers
 from .utils import extract_user_query as _extract_user_query
@@ -133,6 +134,9 @@ class CompressConfig:
     Set to 'disabled' to skip ML compression entirely
     (only SmartCrusher + CacheAligner will run)."""
 
+    savings_profile: str | None = None
+    """Named high-savings profile, e.g. 'agent-90' for Codex/Claude/Cursor."""
+
 
 @dataclass
 class CompressResult:
@@ -204,6 +208,9 @@ def compress(
     for key, value in kwargs.items():
         if key in config_fields:
             setattr(cfg, key, value)
+    if cfg.savings_profile:
+        cfg = replace(cfg)
+        apply_agent_savings_profile(cfg, cfg.savings_profile)
 
     pipeline = _get_pipeline()
     pipeline_extensions = PipelineExtensionManager(hooks=hooks, discover=False)

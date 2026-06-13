@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 from typing import Any
 from unittest.mock import patch
 
@@ -694,3 +695,107 @@ def test_v1_models_routes_claude_code_gateway_discovery_to_anthropic() -> None:
         ("/v1/models", "https://api.anthropic.test", "anthropic"),
         ("/v1/models/claude-opus-4-8", "https://api.anthropic.test", "anthropic"),
     ]
+
+
+def test_anthropic_model_metadata_strips_ansi_model_ids() -> None:
+    class FakeAsyncClient:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str]] = []
+
+        async def request(self, method, url, **kwargs):  # type: ignore[no-untyped-def]
+            self.calls.append((method, url))
+            return httpx.Response(
+                200,
+                json={
+                    "object": "list",
+                    "data": [
+                        {"id": "claude-opus-4-8\x1b[1m", "object": "model"},
+                        {"id": "claude-sonnet-4-5[1m]", "object": "model"},
+                    ],
+                },
+            )
+
+        async def aclose(self) -> None:
+            return None
+
+    with TestClient(_app()) as client:
+        fake_http_client = FakeAsyncClient()
+        client.app.state.proxy.http_client = fake_http_client
+        response = client.get("/v1/models", headers={"x-api-key": "sk-ant-test"})
+
+    assert response.status_code == 200
+    assert response.json()["data"] == [
+        {"id": "claude-opus-4-8", "object": "model"},
+        {"id": "claude-sonnet-4-5", "object": "model"},
+    ]
+    assert fake_http_client.calls == [("GET", "https://api.anthropic.test/v1/models")]
+
+
+def test_anthropic_model_detail_path_strips_ansi_model_id() -> None:
+    class FakeAsyncClient:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str]] = []
+
+        async def request(self, method, url, **kwargs):  # type: ignore[no-untyped-def]
+            self.calls.append((method, url))
+            return httpx.Response(
+                200,
+                json={"id": "claude-opus-4-8\x1b[1m", "object": "model"},
+            )
+
+        async def aclose(self) -> None:
+            return None
+
+    with TestClient(_app()) as client:
+        fake_http_client = FakeAsyncClient()
+        client.app.state.proxy.http_client = fake_http_client
+        response = client.get(
+            "/v1/models/claude-opus-4-8%1B%5B1m",
+            headers={"x-api-key": "sk-ant-test"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["id"] == "claude-opus-4-8"
+    assert fake_http_client.calls == [
+        ("GET", "https://api.anthropic.test/v1/models/claude-opus-4-8")
+    ]
+
+
+def test_anthropic_messages_strips_ansi_model_id_before_upstream() -> None:
+    class FakeAsyncClient:
+        def __init__(self) -> None:
+            self.bodies: list[dict[str, Any]] = []
+
+        async def post(self, url, **kwargs):  # type: ignore[no-untyped-def]
+            self.bodies.append(json.loads(kwargs["content"]))
+            return httpx.Response(
+                200,
+                json={
+                    "id": "msg_1",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "claude-opus-4-8",
+                    "content": [],
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                },
+            )
+
+        async def aclose(self) -> None:
+            return None
+
+    with TestClient(_app()) as client:
+        fake_http_client = FakeAsyncClient()
+        client.app.state.proxy.http_client = fake_http_client
+        response = client.post(
+            "/v1/messages",
+            headers={"x-api-key": "sk-ant-test"},
+            json={
+                "model": "claude-opus-4-8\x1b[1m",
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+
+    assert response.status_code == 200
+    assert fake_http_client.bodies[0]["model"] == "claude-opus-4-8"
