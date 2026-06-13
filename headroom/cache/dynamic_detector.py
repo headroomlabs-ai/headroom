@@ -772,15 +772,17 @@ class SemanticDetector:
         # Encode all sentences
         if not sentences:
             return [], None
+        if self._model is None or self._exemplar_embeddings is None:
+            return [], self._load_error or "semantic detector is not initialized"
 
         sentence_texts = [s[0] for s in sentences]
-        sentence_embeddings = self._model.encode(  # type: ignore[union-attr]
+        sentence_embeddings = self._model.encode(
             sentence_texts,
             convert_to_numpy=True,
         )
 
         # Compute similarities
-        similarities = np.dot(sentence_embeddings, self._exemplar_embeddings.T)  # type: ignore[union-attr]
+        similarities = np.dot(sentence_embeddings, self._exemplar_embeddings.T)
 
         for i, (text, start, end) in enumerate(sentences):
             # Get max similarity to any exemplar
