@@ -770,8 +770,6 @@ class SemanticDetector:
         # Encode all sentences
         if not sentences:
             return [], None
-        if self._model is None or self._exemplar_embeddings is None:
-            return [], self._load_error or "semantic detector is not initialized"
 
         try:
             import numpy as np
@@ -779,6 +777,9 @@ class SemanticDetector:
             return [], "numpy not installed. Install with: pip install numpy"
 
         sentence_texts = [s[0] for s in sentences]
+        if self._model is None or self._exemplar_embeddings is None:
+            return [], self._load_error or "semantic detector is not initialized"
+
         sentence_embeddings = self._model.encode(
             sentence_texts,
             convert_to_numpy=True,

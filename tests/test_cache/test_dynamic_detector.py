@@ -473,6 +473,21 @@ class TestSemanticDetector:
         # Should detect this as volatile/realtime
         # Depends on similarity threshold
 
+    def test_missing_exemplar_embeddings_returns_warning(self):
+        """Semantic detector reports unavailable state when embeddings are missing."""
+        from headroom.cache.dynamic_detector import SemanticDetector
+
+        detector = object.__new__(SemanticDetector)
+        detector.config = DetectorConfig(tiers=["semantic"])
+        detector._model = object()
+        detector._exemplar_embeddings = None
+        detector._load_error = None
+
+        spans, warning = detector.detect("The current stock price changes every minute.")
+
+        assert spans == []
+        assert warning == "semantic detector is not initialized"
+
 
 class TestIntegrationWithAllTiers:
     """Integration tests using all available tiers."""
