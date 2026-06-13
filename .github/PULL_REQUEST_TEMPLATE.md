@@ -1,8 +1,8 @@
 ## Description
 
-Brief description of changes and motivation.
+<!-- Briefly explain the change and why it is needed. -->
 
-Fixes #(issue number)
+Closes #
 
 ## Type of Change
 
@@ -15,13 +15,11 @@ Fixes #(issue number)
 
 ## Changes Made
 
-- Change 1
-- Change 2
-- Change 3
+- 
 
 ## Testing
 
-Describe the tests you ran to verify your changes:
+<!-- Check what you actually ran, then paste the real command output below. -->
 
 - [ ] Unit tests pass (`pytest`)
 - [ ] Linting passes (`ruff check .`)
@@ -29,12 +27,23 @@ Describe the tests you ran to verify your changes:
 - [ ] New tests added for new functionality
 - [ ] Manual testing performed
 
-## Test Output
+### Test Output
 
+```text
+# Paste relevant command output or artifact links here
 ```
-# Paste relevant test output here
-pytest -v tests/test_your_feature.py
-```
+
+## Real Behavior Proof
+
+- Environment:
+- Exact command / steps:
+- Observed result:
+- Not tested:
+
+## Review Readiness
+
+- [ ] I have performed a self-review
+- [ ] This PR is ready for human review
 
 ## Checklist
 
@@ -53,4 +62,4 @@ Add screenshots to help explain your changes.
 
 ## Additional Notes
 
-Any additional information that reviewers should know.
+<!-- Mention any N/A checklist items, tradeoffs, follow-ups, or maintainer context. -->

@@ -14,15 +14,34 @@ from headroom.proxy.server import ProxyConfig, create_app
 class _RecordingExtension:
     def __init__(self) -> None:
         self.stages: list[PipelineStage] = []
+        self.events: list = []
 
     def on_pipeline_event(self, event):
         self.stages.append(event.stage)
+        self.events.append(event)
         return None
 
 
 class _DummyTokenizer:
     def count_messages(self, messages):
         return len(messages)
+
+
+def _assert_compressed_event_carries_originals(events: list) -> None:
+    """INPUT_COMPRESSED must expose the pre-compression messages to extensions.
+
+    The probe recorder (headroom.proxy.probe_recorder) depends on this
+    metadata contract; dropping it silently disables session recording.
+    """
+    compressed = [event for event in events if event.stage is PipelineStage.INPUT_COMPRESSED]
+    assert compressed
+    original = compressed[0].metadata.get("original_messages")
+    assert isinstance(original, list)
+    assert any(
+        message.get("role") == "user" and "hello" in str(message.get("content"))
+        for message in original
+        if isinstance(message, dict)
+    )
 
 
 def _assert_stage_order(stages: list[PipelineStage]) -> None:
@@ -136,6 +155,7 @@ def test_openai_chat_pipeline_events_cover_proxy_lifecycle(monkeypatch) -> None:
 
     assert response.status_code == 200
     _assert_stage_order(recorder.stages)
+    _assert_compressed_event_carries_originals(recorder.events)
 
 
 def test_anthropic_messages_pipeline_events_cover_proxy_lifecycle(monkeypatch) -> None:
@@ -214,3 +234,4 @@ def test_anthropic_messages_pipeline_events_cover_proxy_lifecycle(monkeypatch) -
 
     assert response.status_code == 200
     _assert_stage_order(recorder.stages)
+    _assert_compressed_event_carries_originals(recorder.events)

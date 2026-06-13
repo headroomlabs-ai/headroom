@@ -6,13 +6,13 @@ from headroom import utils
 
 
 class FakeProvider:
-    def __init__(self, result):
+    def __init__(self, result: str | None) -> None:
         self.result = result
         self.calls: list[tuple[int, int, str, int]] = []
 
     def estimate_cost(
         self, input_tokens: int, output_tokens: int, model: str, cached_tokens: int = 0
-    ):
+    ) -> str | None:
         self.calls.append((input_tokens, output_tokens, model, cached_tokens))
         return self.result
 

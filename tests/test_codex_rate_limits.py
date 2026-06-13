@@ -2,13 +2,47 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 
+import headroom.subscription.codex_rate_limits as crl
 from headroom.subscription.codex_rate_limits import (
     CodexRateLimitState,
     CodexRateLimitWindow,
+    _build_usage_headers,
+    maybe_schedule_usage_poll,
     parse_codex_rate_limits,
+    parse_codex_usage_payload,
 )
+
+# A faithful GET /wham/usage body (shape captured from a live Plus account).
+USAGE_PAYLOAD = {
+    "plan_type": "plus",
+    "rate_limit": {
+        "allowed": True,
+        "limit_reached": False,
+        "primary_window": {
+            "used_percent": 23,
+            "limit_window_seconds": 18000,
+            "reset_after_seconds": 12266,
+            "reset_at": 1781276043,
+        },
+        "secondary_window": {
+            "used_percent": 6,
+            "limit_window_seconds": 604800,
+            "reset_after_seconds": 359170,
+            "reset_at": 1781622947,
+        },
+    },
+    "additional_rate_limits": None,
+    "credits": {
+        "has_credits": False,
+        "unlimited": False,
+        "balance": "0",
+    },
+    "rate_limit_reached_type": None,
+    "promo": None,
+}
 
 # ---------------------------------------------------------------------------
 # CodexRateLimitWindow helpers
@@ -225,3 +259,163 @@ class TestCodexRateLimitState:
         assert snap is not None
         assert snap.primary is not None
         assert snap.primary.used_percent == 90.0
+
+
+# ---------------------------------------------------------------------------
+# parse_codex_usage_payload (GET /wham/usage)
+# ---------------------------------------------------------------------------
+
+
+class TestParseCodexUsagePayload:
+    def test_parses_full_payload(self):
+        snap = parse_codex_usage_payload(USAGE_PAYLOAD)
+        assert snap is not None
+        assert snap.primary is not None
+        assert snap.primary.used_percent == 23.0
+        assert snap.primary.window_minutes == 300  # 18000s rounded up
+        assert snap.primary.resets_at == 1781276043
+        assert snap.secondary is not None
+        assert snap.secondary.used_percent == 6.0
+        assert snap.secondary.window_minutes == 10080  # 604800s
+
+    def test_window_minutes_rounds_up(self):
+        snap = parse_codex_usage_payload(
+            {"rate_limit": {"primary_window": {"used_percent": 1, "limit_window_seconds": 61}}}
+        )
+        assert snap is not None
+        assert snap.primary is not None
+        assert snap.primary.window_minutes == 2
+
+    def test_no_credits_balance_suppressed(self):
+        # has_credits False -> balance must not surface as "0".
+        snap = parse_codex_usage_payload(USAGE_PAYLOAD)
+        assert snap is not None
+        assert snap.credits is not None
+        assert snap.credits.has_credits is False
+        assert snap.credits.balance is None
+
+    def test_credits_balance_kept_when_has_credits(self):
+        payload = {
+            "rate_limit": {"primary_window": {"used_percent": 5}},
+            "credits": {"has_credits": True, "unlimited": False, "balance": "$5.00"},
+        }
+        snap = parse_codex_usage_payload(payload)
+        assert snap is not None
+        assert snap.credits is not None
+        assert snap.credits.balance == "$5.00"
+
+    def test_promo_object_message(self):
+        payload = {
+            "rate_limit": {"primary_window": {"used_percent": 5}},
+            "promo": {"message": "Hello"},
+        }
+        snap = parse_codex_usage_payload(payload)
+        assert snap is not None
+        assert snap.promo_message == "Hello"
+
+    def test_returns_none_for_empty(self):
+        assert parse_codex_usage_payload({}) is None
+        assert parse_codex_usage_payload(None) is None
+        assert parse_codex_usage_payload({"rate_limit": {}}) is None
+
+    def test_missing_used_percent_window_skipped(self):
+        snap = parse_codex_usage_payload(
+            {"rate_limit": {"primary_window": {"limit_window_seconds": 60}}}
+        )
+        assert snap is None
+
+    def test_update_from_usage_payload_stores(self):
+        state = CodexRateLimitState()
+        assert state.update_from_usage_payload(USAGE_PAYLOAD) is True
+        snap = state.latest
+        assert snap is not None
+        assert snap.primary is not None
+        assert snap.primary.used_percent == 23.0
+
+    def test_update_from_usage_payload_noop_returns_false(self):
+        state = CodexRateLimitState()
+        assert state.update_from_usage_payload({}) is False
+        assert state.latest is None
+
+
+# ---------------------------------------------------------------------------
+# Usage poll: header gating + throttle
+# ---------------------------------------------------------------------------
+
+
+class TestUsagePollGating:
+    def test_build_headers_requires_account_id(self):
+        assert _build_usage_headers({"authorization": "Bearer abc.def.ghi"}) is None
+
+    def test_build_headers_requires_bearer(self):
+        assert _build_usage_headers({"chatgpt-account-id": "acct"}) is None
+        assert (
+            _build_usage_headers({"authorization": "sk-live", "chatgpt-account-id": "acct"}) is None
+        )
+
+    def test_build_headers_happy_path(self):
+        headers = _build_usage_headers(
+            {
+                "Authorization": "Bearer abc.def.ghi",
+                "ChatGPT-Account-Id": "acct-1",
+                "User-Agent": "codex_exec/0.139.0",
+                "originator": "codex_exec",
+            }
+        )
+        assert headers is not None
+        assert headers["Authorization"] == "Bearer abc.def.ghi"
+        assert headers["ChatGPT-Account-Id"] == "acct-1"
+        assert headers["User-Agent"] == "codex_exec/0.139.0"
+        assert headers["originator"] == "codex_exec"
+
+    def test_try_begin_poll_throttles(self):
+        state = CodexRateLimitState()
+        assert state._try_begin_poll(60.0) is True
+        # Second immediate attempt is throttled (within interval).
+        assert state._try_begin_poll(60.0) is False
+        state._end_poll()
+        # Still throttled by time even after the in-flight flag clears.
+        assert state._try_begin_poll(60.0) is False
+        # A zero interval always allows once the in-flight flag is clear.
+        assert state._try_begin_poll(0.0) is True
+
+    def test_maybe_schedule_returns_false_without_loop(self):
+        # No running event loop -> cannot schedule.
+        assert (
+            maybe_schedule_usage_poll(
+                {"authorization": "Bearer a.b.c", "chatgpt-account-id": "acct"}
+            )
+            is False
+        )
+
+    def test_maybe_schedule_skips_non_codex(self):
+        async def run():
+            return maybe_schedule_usage_poll({"authorization": "Bearer a.b.c"})
+
+        assert asyncio.run(run()) is False
+
+    def test_maybe_schedule_creates_task_and_throttles(self, monkeypatch):
+        # Replace the network fetch with a fast no-op coroutine.
+        calls: list[str] = []
+
+        async def fake_fetch(url, headers):  # noqa: ANN001
+            calls.append(url)
+            crl.get_codex_rate_limit_state()._end_poll()
+
+        monkeypatch.setattr(crl, "_fetch_and_store_usage", fake_fetch)
+        # Reset the singleton's throttle so this test is deterministic.
+        monkeypatch.setattr(crl, "_state", None)
+        monkeypatch.setattr(crl, "_state_lock", crl.Lock())
+
+        async def run():
+            req = {"authorization": "Bearer a.b.c", "chatgpt-account-id": "acct"}
+            first = maybe_schedule_usage_poll(req, min_interval_s=60.0)
+            second = maybe_schedule_usage_poll(req, min_interval_s=60.0)
+            # Let the scheduled task run.
+            await asyncio.sleep(0)
+            return first, second
+
+        first, second = asyncio.run(run())
+        assert first is True
+        assert second is False  # throttled
+        assert calls == [crl.CODEX_USAGE_URL]

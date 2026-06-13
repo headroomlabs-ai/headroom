@@ -4,6 +4,7 @@ These tests verify the /v1/retrieve endpoints work correctly.
 """
 
 import json
+from unittest.mock import patch
 
 import pytest
 
@@ -65,7 +66,23 @@ class TestCCRRetrieveEndpoint:
         """Request with nonexistent hash should return 404."""
         response = client.post("/v1/retrieve", json={"hash": "nonexistent123"})
         assert response.status_code == 404
-        assert "not found or expired" in response.json()["detail"]
+        assert "Entry not found" in response.json()["detail"]
+        assert "CCR TTL: 300 seconds" in response.json()["detail"]
+
+    def test_retrieve_expired_hash_reports_expiration_detail(self, client):
+        """Expired entries report expiration separately from missing hashes."""
+        store = get_compression_store(default_ttl=1)
+        with patch("headroom.cache.compression_store.time.time", return_value=1000.0):
+            hash_key = store.store(original="payload", compressed="payload")
+
+        with patch("headroom.cache.compression_store.time.time", return_value=1002.0):
+            response = client.post("/v1/retrieve", json={"hash": hash_key})
+
+        assert response.status_code == 404
+        detail = response.json()["detail"]
+        assert "Entry expired" in detail
+        assert "CCR TTL: 1 seconds" in detail
+        assert "age: 2 seconds" in detail
 
     def test_retrieve_full_content(self, client):
         """Full retrieval returns original content."""
@@ -246,7 +263,18 @@ class TestCCRStatsEndpoint:
         data = response.json()
         assert "store" in data
         assert data["store"]["entry_count"] == 0
+        assert data["store"]["default_ttl_seconds"] == 300
         assert "recent_retrievals" in data
+
+    def test_stats_exposes_env_configured_ttl(self, client, monkeypatch):
+        """Stats expose the effective CCR TTL configured through env."""
+        reset_compression_store()
+        monkeypatch.setenv("HEADROOM_CCR_TTL_SECONDS", "7200")
+
+        response = client.get("/v1/retrieve/stats")
+
+        assert response.status_code == 200
+        assert response.json()["store"]["default_ttl_seconds"] == 7200
 
     def test_stats_with_entries(self, client):
         """Stats reflect store contents."""

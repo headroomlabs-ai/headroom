@@ -19,7 +19,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from ..cache.compression_store import get_compression_store
+from ..cache.compression_store import format_retrieval_miss_detail, get_compression_store
 from .tool_injection import CCR_TOOL_NAME, parse_tool_call
 
 logger = logging.getLogger(__name__)
@@ -202,6 +202,28 @@ class CCRResponseHandler:
         store = get_compression_store()
 
         try:
+            get_status = getattr(store, "get_entry_status", None)
+            entry_status = (
+                get_status(ccr_call.hash_key, clean_expired=True) if callable(get_status) else None
+            )
+            if entry_status is not None and entry_status["status"] != "available":
+                content = json.dumps(
+                    {
+                        "error": format_retrieval_miss_detail(entry_status),
+                        "hash": ccr_call.hash_key,
+                        "status": entry_status["status"],
+                        "ttl_seconds": entry_status.get(
+                            "ttl_seconds", entry_status["default_ttl_seconds"]
+                        ),
+                    },
+                    indent=2,
+                )
+                return CCRToolResult(
+                    tool_call_id=ccr_call.tool_call_id,
+                    content=content,
+                    success=False,
+                )
+
             if ccr_call.query:
                 # Search within compressed content
                 results = store.search(ccr_call.hash_key, ccr_call.query)
@@ -241,10 +263,17 @@ class CCRResponseHandler:
                         was_search=False,
                     )
                 else:
+                    miss_status = (
+                        get_status(ccr_call.hash_key, clean_expired=True)
+                        if callable(get_status)
+                        else {"hash": ccr_call.hash_key, "status": "missing"}
+                    )
                     content = json.dumps(
                         {
-                            "error": "Entry not found or expired (TTL: 5 minutes)",
+                            "error": format_retrieval_miss_detail(miss_status),
                             "hash": ccr_call.hash_key,
+                            "status": miss_status["status"],
+                            "ttl_seconds": miss_status.get("ttl_seconds"),
                         },
                         indent=2,
                     )
@@ -430,6 +459,19 @@ class CCRResponseHandler:
 
             if not ccr_calls:
                 # No CCR tool calls, we're done
+                break
+
+            # If the model called CCR alongside non-CCR tools, we cannot build
+            # a valid continuation — every tool_use in the assistant message
+            # requires a matching tool_result, but we only have CCR results.
+            # Skip CCR handling and let the client resolve all tool calls.
+            if other_calls:
+                logger.warning(
+                    "CCR: Skipping CCR handling — model called %d non-CCR tool(s) "
+                    "alongside headroom_retrieve. Cannot create a valid continuation "
+                    "without results for the other tools. Client must handle all tool calls.",
+                    len(other_calls),
+                )
                 break
 
             rounds += 1

@@ -329,29 +329,33 @@ in-memory.
 
 ### What goes wrong with the in-memory backend on `--workers N > 1`
 
-(Historical context — applies only when the operator explicitly
-chooses `CcrBackendConfig::InMemory`.) Each uvicorn worker is a
-separate Python process. Each process holds its own copies of:
+Each uvicorn worker is a separate Python process. The following state is
+fragmented across workers:
 
-1. **`InMemoryCcrStore`** — sharded `DashMap` mapping
-   `hash → original_content` for content the compressor replaced with
-   `<<ccr:HASH>>` markers.
-2. **`HeadroomProxy._compression_caches`** (`headroom/proxy/server.py:367`)
-   — per-session `CompressionCache` dict.
+1. **Python `CompressionStore`** — defaults to `InMemoryBackend` (per-process)
+   when `HEADROOM_CCR_BACKEND` is unset. Each worker has its own singleton; CCR
+   markers written on worker A are invisible to worker B. Set
+   `HEADROOM_CCR_BACKEND=sqlite` to use a shared cross-worker store.
+2. **`HeadroomProxy._compression_caches`** (`headroom/proxy/server.py`)
+   — per-session `CompressionCache` dict (instance var, always per-worker).
 3. **`HeadroomProxy.session_tracker_store`** — per-session prefix-tracker
-   state derived from Anthropic's `cache_read_input_tokens` responses.
-4. **TOIN learner state** — pattern statistics used to bias the compressor.
+   state derived from Anthropic's `cache_read_input_tokens` responses
+   (instance var, always per-worker).
+4. **TOIN learner state** — writes snapshots to `~/.headroom/toin.json` but
+   keeps per-process in-memory state; pattern statistics on one worker are not
+   visible to others until the next disk flush.
 
 When uvicorn round-robins requests across workers, a session whose
 turn-1 landed on worker A may have turn-2 land on worker B. Worker B has
 zero knowledge of what worker A did, the `<<ccr:HASH>>` marker resolves
 to `None`, and the model sees an opaque directive it can't act on.
 Switching to `SqliteCcrStore` (default) or `RedisCcrStore` resolves the
-fragmentation directly.
+CCR fragmentation; a sticky-session load balancer resolves all of them.
 
 ### Detecting it in the wild
 
-The proxy emits a `WARNING`-level log line on startup if the configured
-backend is `InMemoryCcrStore` AND `WEB_CONCURRENCY` / uvicorn
-`--workers` is > 1, pointing operators at this section. The other two
-backends never warn — they're the supported multi-worker paths.
+The proxy emits a `WARNING`-level log line on startup when `--workers N > 1`.
+When `HEADROOM_CCR_BACKEND` is unset (default InMemoryBackend), the warning
+includes CCR retrieval failures and suggests setting `HEADROOM_CCR_BACKEND=sqlite`.
+When a cross-worker backend is already configured, the warning covers only the
+remaining per-worker stores (compression cache, prefix tracker, TOIN, CostTracker).

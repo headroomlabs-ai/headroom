@@ -116,6 +116,33 @@ def test_client_field_round_trips() -> None:
     assert o.client == "codex"
 
 
+def test_stream_outcome_derives_gemini_contents_metadata() -> None:
+    outcome = RequestOutcome.from_stream(
+        body={
+            "systemInstruction": {"parts": [{"text": "sys"}]},
+            "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+        },
+        provider="vertex:google",
+        model="gemini-2.0-flash",
+        request_id="req-gemini-stream",
+        original_tokens=12,
+        optimized_tokens=10,
+        output_tokens=3,
+        tokens_saved=2,
+        transforms_applied=["compress"],
+        total_latency_ms=25.0,
+        overhead_ms=4.0,
+        tags={"route": "vertex"},
+        client="codex",
+        log_full_messages=True,
+    )
+
+    assert outcome.provider == "vertex:google"
+    assert outcome.num_messages == 1
+    assert outcome.request_messages == [{"role": "user", "parts": [{"text": "hello"}]}]
+    assert outcome.turn_id is not None
+
+
 # ── classify_client — the harness ID source ─────────────────────────
 
 

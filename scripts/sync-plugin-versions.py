@@ -25,14 +25,18 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from headroom.release_version import (  # noqa: E402
-    compute_release_version,
-    determine_bump_level,
-    find_latest_release_tag,
-    get_canonical_version,
-    list_release_commits,
-    list_release_tags,
-)
+try:
+    from headroom.release_version import (  # noqa: E402
+        compute_release_version,
+        determine_bump_level,
+        find_latest_release_tag,
+        get_canonical_version,
+        list_release_commits,
+        list_release_tags,
+    )
+except ImportError:
+    print("skip: headroom deps not installed (run from a dev venv to enable)")
+    sys.exit(0)
 
 
 def compute_repo_semver(root: Path) -> str:

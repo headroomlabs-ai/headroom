@@ -104,20 +104,22 @@ def test_search_compressor_persist_to_python_ccr(monkeypatch: pytest.MonkeyPatch
     logged (not silently swallowed) — this pins both paths."""
     compressor = SearchCompressor()
 
-    seen: dict[str, tuple[str, str]] = {}
+    seen: dict[str, tuple[str, str, str | None]] = {}
     monkeypatch.setitem(
         __import__("sys").modules,
         "headroom.cache.compression_store",
         SimpleNamespace(
             get_compression_store=lambda: SimpleNamespace(
-                store=lambda original, compressed, original_item_count=0: (
-                    seen.setdefault("call", (original, compressed)) or "stored-key"
+                store=lambda original, compressed, original_item_count=0, explicit_hash=None: (
+                    seen.setdefault("call", (original, compressed, explicit_hash)) or "stored-key"
                 )
             )
         ),
     )
     compressor._persist_to_python_ccr("orig", "comp", "abc123")
-    assert seen["call"] == ("orig", "comp")
+    # explicit_hash carries the Rust marker key so retrieval of the
+    # marker hash finds the entry (issue #816).
+    assert seen["call"] == ("orig", "comp", "abc123")
 
     # Loud failure: the store raises, but persist swallows + logs (no
     # exception propagates to the compress callsite).

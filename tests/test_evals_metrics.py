@@ -130,3 +130,24 @@ def test_information_recall_reports_preserved_and_missing_facts() -> None:
     empty_original = metrics.compute_information_recall("No facts here", "Still none", ["Alice"])
     assert empty_original["facts_in_original"] == 0
     assert empty_original["recall"] == 1.0
+
+
+def test_tool_schema_compaction_integrity() -> None:
+    """Property names that collide with DROP_KEYS must survive schema compaction.
+
+    Runs the full CompressionOnlyRunner.evaluate_tool_schema_compaction() path
+    against the built-in cases and asserts zero failures.  This is zero-cost
+    (no API calls) and safe for CI smoke runs.
+    """
+    from headroom.evals.runners.compression_only import CompressionOnlyRunner
+
+    runner = CompressionOnlyRunner()
+    result = runner.evaluate_tool_schema_compaction()
+
+    assert result.passed, (
+        f"Tool schema compaction integrity failures "
+        f"({result.failed_cases}/{result.total_cases}):\n" + "\n".join(result.errors)
+    )
+    assert result.total_cases == 4, f"Expected 4 built-in cases, got {result.total_cases}"
+    # Annotations were stripped so byte count must have shrunk.
+    assert result.total_tokens_saved > 0, "Expected at least some annotation tokens to be stripped"

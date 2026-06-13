@@ -157,3 +157,85 @@ class TestRustParityFieldMap:
             f"and `crates/headroom-core/src/compression_policy.rs` in "
             f"the same commit."
         )
+
+
+class TestNetCostFormula:
+    """Net-cost mutation formula (#856) — Rust parity.
+
+    Scenario values are golden: the Rust unit tests in
+    ``crates/headroom-core/src/compression_policy.rs`` assert the
+    identical numbers, so a drift in either side trips the parity pair
+    loudly.
+    """
+
+    def test_small_shave_deep_suffix_is_loss(self):
+        # 2000*(1.25 + 0.1*9) - 1.0*1.15*52000 = 4300 - 59800 = -55500.
+        p = policy_for_mode(AuthMode.PAYG)
+        gain = p.net_mutation_gain(2_000, 50_000, 10.0, 1.0)
+        assert abs(gain - (-55_500.0)) < 1.0
+        assert not p.should_mutate_deep(2_000, 50_000, 10.0, 1.0)
+
+    def test_big_shave_shallow_suffix_is_win(self):
+        # 50000*(1.25 + 0.1*2) - 1.0*1.15*60000 = 72500 - 69000 = 3500.
+        # Tight but positive — consistent with the 2.3-read break-even.
+        p = policy_for_mode(AuthMode.PAYG)
+        gain = p.net_mutation_gain(50_000, 10_000, 3.0, 1.0)
+        assert abs(gain - 3_500.0) < 1.0
+        assert p.should_mutate_deep(50_000, 10_000, 3.0, 1.0)
+
+    def test_no_suffix_edit_profitable_with_reads_remaining(self):
+        # S = 0: warm-case saving is the avoided rereads, dT*r*R —
+        # positive whenever at least one read remains. At R=0 with a
+        # warm cache the gain is exactly 0 (already written, never read
+        # again): pointless rather than harmful.
+        p = policy_for_mode(AuthMode.SUBSCRIPTION)
+        assert p.should_mutate_deep(1, 0, 1.0, 1.0)
+        assert p.should_mutate_deep(2_000, 0, 1.0, 1.0)
+        assert abs(p.net_mutation_gain(2_000, 0, 0.0, 1.0)) < 1e-6
+
+    def test_cold_cache_ignores_suffix(self):
+        # P_alive = 0 (TTL lapsed): the idle-timer compaction window.
+        p = policy_for_mode(AuthMode.PAYG)
+        assert p.should_mutate_deep(2_000, 50_000, 0.0, 0.0)
+
+    def test_clamps_out_of_range_inputs(self):
+        p = policy_for_mode(AuthMode.PAYG)
+        clamped = p.net_mutation_gain(2_000, 50_000, -5.0, 7.0)
+        reference = p.net_mutation_gain(2_000, 50_000, 0.0, 1.0)
+        assert abs(clamped - reference) < 1e-6
+
+    def test_nan_inputs_guarded(self):
+        # NaN reads -> 0, NaN p_alive -> 1 (same as Rust): the gain stays
+        # finite instead of poisoning the mutate decision.
+        import math
+
+        p = policy_for_mode(AuthMode.PAYG)
+        guarded = p.net_mutation_gain(2_000, 50_000, float("nan"), float("nan"))
+        assert math.isfinite(guarded)
+        reference = p.net_mutation_gain(2_000, 50_000, 0.0, 1.0)
+        assert abs(guarded - reference) < 1e-6
+
+    def test_negative_int_inputs_clamped(self):
+        # Rust takes u32 — negative Python ints must not flip the sign of
+        # the result; they clamp to 0.
+        p = policy_for_mode(AuthMode.PAYG)
+        assert p.net_mutation_gain(-2_000, -50_000, 5.0, 1.0) == p.net_mutation_gain(0, 0, 5.0, 1.0)
+        assert p.break_even_reads(-5, 10_000) == 0.0
+        assert p.net_mutation_gain(2_000, -1, 5.0, 1.0) == p.net_mutation_gain(2_000, 0, 5.0, 1.0)
+
+    def test_break_even_reads_matches_research_anchor(self):
+        # R = 11.5*S/dT, the #856 anchors exactly: 2K/50K -> 287.5;
+        # 50K/10K -> 2.3; dT=0 -> 0.
+        p = policy_for_mode(AuthMode.PAYG)
+        assert abs(p.break_even_reads(2_000, 50_000) - 287.5) < 0.5
+        assert abs(p.break_even_reads(50_000, 10_000) - 2.3) < 0.05
+        assert p.break_even_reads(0, 10_000) == 0.0
+
+    def test_constants_match_rust(self):
+        from headroom.transforms.compression_policy import (
+            CACHE_READ_MULTIPLIER,
+            CACHE_WRITE_MULTIPLIER,
+        )
+
+        assert CACHE_WRITE_MULTIPLIER == 1.25
+        assert CACHE_READ_MULTIPLIER == 0.1

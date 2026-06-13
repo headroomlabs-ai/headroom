@@ -65,6 +65,8 @@ def test_savings_tracker_helpers_normalize_inputs_and_paths(tmp_path, monkeypatc
         ["2026-03-27T09:00:00Z", "12", "0.5"]
     ) == {
         "timestamp": "2026-03-27T09:00:00Z",
+        "provider": "unknown",
+        "model": "unknown",
         "total_tokens_saved": 12,
         "compression_savings_usd": 0.5,
         "total_input_tokens": 0,
@@ -110,7 +112,7 @@ def test_savings_tracker_sanitizes_legacy_state_and_applies_retention(tmp_path):
     )
     snapshot = tracker.snapshot()
 
-    assert snapshot["schema_version"] == 2
+    assert snapshot["schema_version"] == 3
     assert snapshot["lifetime"] == {
         "requests": 0,
         "tokens_saved": 30,
@@ -122,6 +124,8 @@ def test_savings_tracker_sanitizes_legacy_state_and_applies_retention(tmp_path):
     assert snapshot["history"] == [
         {
             "timestamp": "2026-03-27T09:00:00Z",
+            "provider": "unknown",
+            "model": "unknown",
             "total_tokens_saved": 30,
             "compression_savings_usd": 0.03,
             "total_input_tokens": 0,
@@ -190,6 +194,8 @@ def test_record_compression_savings_skips_empty_updates_and_normalizes_timestamp
     assert snapshot["history"] == [
         {
             "timestamp": "2026-03-27T08:00:00Z",
+            "provider": "unknown",
+            "model": "gpt-4o",
             "total_tokens_saved": 10,
             "compression_savings_usd": 0.01,
             "total_input_tokens": 120,
@@ -197,6 +203,8 @@ def test_record_compression_savings_skips_empty_updates_and_normalizes_timestamp
         },
         {
             "timestamp": "2026-03-27T12:34:00Z",
+            "provider": "unknown",
+            "model": "gpt-4o",
             "total_tokens_saved": 15,
             "compression_savings_usd": 0.015,
             "total_input_tokens": 180,
@@ -209,6 +217,42 @@ def test_record_compression_savings_skips_empty_updates_and_normalizes_timestamp
     assert persisted["lifetime"]["total_input_tokens"] == 180
     assert persisted["lifetime"]["total_input_cost_usd"] == pytest.approx(0.36)
     assert persisted["history"][-1]["timestamp"] == "2026-03-27T12:34:00Z"
+
+
+def test_savings_tracker_save_does_not_flock_target_inode_before_replace(tmp_path, monkeypatch):
+    path = tmp_path / "proxy_savings.json"
+    tracker = SavingsTracker(path=str(path))
+
+    tracker.record_request(
+        model="gpt-4o",
+        input_tokens=120,
+        tokens_saved=10,
+        timestamp="2026-03-27T09:00:00Z",
+    )
+    assert path.exists()
+
+    flock_calls: list[int] = []
+
+    class _FcntlSpy:
+        LOCK_EX = 1
+        LOCK_UN = 2
+
+        def flock(self, _fh, operation: int) -> None:
+            flock_calls.append(operation)
+
+    monkeypatch.setattr(savings_tracker_module, "_HAS_FCNTL", True, raising=False)
+    monkeypatch.setattr(savings_tracker_module, "_fcntl", _FcntlSpy(), raising=False)
+
+    tracker.record_request(
+        model="gpt-4o",
+        input_tokens=80,
+        tokens_saved=5,
+        timestamp="2026-03-27T09:10:00Z",
+    )
+
+    assert flock_calls == []
+    persisted = json.loads(path.read_text(encoding="utf-8"))
+    assert persisted["lifetime"]["tokens_saved"] == 15
 
 
 def test_litellm_resolution_and_savings_estimation_fallbacks(monkeypatch):
@@ -486,6 +530,196 @@ def test_savings_tracker_rollups_preserve_spend_and_input_history(tmp_path, monk
     ]
 
 
+def test_savings_tracker_rollup_attributes_savings_per_provider(tmp_path, monkeypatch):
+    path = tmp_path / "proxy_savings.json"
+    tracker = SavingsTracker(
+        path=str(path),
+        max_history_points=100,
+        max_history_age_days=30,
+    )
+    monkeypatch.setattr(
+        "headroom.proxy.savings_tracker._estimate_compression_savings_usd",
+        lambda model, tokens_saved: tokens_saved / 1000.0,
+    )
+
+    # Two providers active in the same hour bucket.
+    tracker.record_compression_savings(
+        model="claude-3-5-sonnet",
+        tokens_saved=100,
+        provider="anthropic",
+        total_input_tokens=120,
+        total_input_cost_usd=0.24,
+        timestamp="2026-03-27T09:10:00Z",
+    )
+    tracker.record_compression_savings(
+        model="gpt-4o",
+        tokens_saved=40,
+        provider="openai",
+        total_input_tokens=200,
+        total_input_cost_usd=0.40,
+        timestamp="2026-03-27T09:40:00Z",
+    )
+    # Only anthropic active in the next hour bucket.
+    tracker.record_compression_savings(
+        model="claude-3-5-sonnet",
+        tokens_saved=25,
+        provider="anthropic",
+        total_input_tokens=260,
+        total_input_cost_usd=0.52,
+        timestamp="2026-03-27T10:05:00Z",
+    )
+    # A legacy-style record with no provider collapses into "unknown".
+    tracker.record_compression_savings(
+        model="gpt-4o",
+        tokens_saved=15,
+        total_input_tokens=320,
+        total_input_cost_usd=0.64,
+        timestamp="2026-03-27T11:00:00Z",
+    )
+
+    hourly = tracker.history_response()["series"]["hourly"]
+
+    first = hourly[0]
+    assert first["tokens_saved"] == 140
+    assert set(first["by_provider"]) == {"anthropic", "openai"}
+    assert first["by_provider"]["anthropic"]["tokens_saved"] == 100
+    assert first["by_provider"]["anthropic"]["total_input_tokens_delta"] == 120
+    assert first["by_provider"]["anthropic"]["compression_savings_usd_delta"] == pytest.approx(0.1)
+    assert first["by_provider"]["anthropic"]["total_input_cost_usd_delta"] == pytest.approx(0.24)
+    assert first["by_provider"]["openai"]["tokens_saved"] == 40
+    assert first["by_provider"]["openai"]["total_input_tokens_delta"] == 80
+    assert first["by_provider"]["openai"]["compression_savings_usd_delta"] == pytest.approx(0.04)
+    assert first["by_provider"]["openai"]["total_input_cost_usd_delta"] == pytest.approx(0.16)
+    # Per-provider deltas sum back to the bucket total.
+    assert (
+        first["by_provider"]["anthropic"]["tokens_saved"]
+        + first["by_provider"]["openai"]["tokens_saved"]
+        == first["tokens_saved"]
+    )
+
+    second = hourly[1]
+    assert set(second["by_provider"]) == {"anthropic"}
+    assert second["by_provider"]["anthropic"]["tokens_saved"] == 25
+    assert second["by_provider"]["anthropic"]["total_input_tokens_delta"] == 60
+
+    third = hourly[2]
+    assert set(third["by_provider"]) == {"unknown"}
+    assert third["by_provider"]["unknown"]["tokens_saved"] == 15
+
+
+def test_savings_tracker_rollup_attributes_savings_per_model(tmp_path, monkeypatch):
+    path = tmp_path / "proxy_savings.json"
+    tracker = SavingsTracker(
+        path=str(path),
+        max_history_points=100,
+        max_history_age_days=30,
+    )
+
+    monkeypatch.setattr(
+        "headroom.proxy.savings_tracker._estimate_compression_savings_usd",
+        lambda model, tokens_saved: tokens_saved / 1000.0,
+    )
+
+    # Two models from the same provider land in the same bucket.
+    tracker.record_compression_savings(
+        model="claude-sonnet-4-6",
+        tokens_saved=100,
+        provider="anthropic",
+        total_input_tokens=120,
+        total_input_cost_usd=0.24,
+        timestamp="2026-03-27T09:10:00Z",
+    )
+    tracker.record_compression_savings(
+        model="claude-opus-4-8",
+        tokens_saved=40,
+        provider="anthropic",
+        total_input_tokens=200,
+        total_input_cost_usd=0.40,
+        timestamp="2026-03-27T09:40:00Z",
+    )
+    tracker.record_compression_savings(
+        model="claude-sonnet-4-6",
+        tokens_saved=25,
+        provider="anthropic",
+        total_input_tokens=260,
+        total_input_cost_usd=0.52,
+        timestamp="2026-03-27T10:05:00Z",
+    )
+
+    response = tracker.history_response()
+
+    # Checkpoints persist the model alongside the provider.
+    assert [point["model"] for point in response["history"]] == [
+        "claude-sonnet-4-6",
+        "claude-opus-4-8",
+        "claude-sonnet-4-6",
+    ]
+
+    hourly = response["series"]["hourly"]
+
+    first = hourly[0]
+    assert set(first["by_model"]) == {"claude-sonnet-4-6", "claude-opus-4-8"}
+    assert first["by_model"]["claude-sonnet-4-6"]["tokens_saved"] == 100
+    assert first["by_model"]["claude-sonnet-4-6"]["total_input_tokens_delta"] == 120
+    assert first["by_model"]["claude-sonnet-4-6"]["compression_savings_usd_delta"] == pytest.approx(
+        0.1
+    )
+    assert first["by_model"]["claude-sonnet-4-6"]["total_input_cost_usd_delta"] == pytest.approx(
+        0.24
+    )
+    assert first["by_model"]["claude-opus-4-8"]["tokens_saved"] == 40
+    # Per-model deltas sum back to the bucket total.
+    assert (
+        first["by_model"]["claude-sonnet-4-6"]["tokens_saved"]
+        + first["by_model"]["claude-opus-4-8"]["tokens_saved"]
+        == first["tokens_saved"]
+    )
+
+    second = hourly[1]
+    assert set(second["by_model"]) == {"claude-sonnet-4-6"}
+    assert second["by_model"]["claude-sonnet-4-6"]["tokens_saved"] == 25
+
+    # The expected no-headroom cost is derivable per bucket: actual input cost
+    # delta plus the compression savings delta.
+    sonnet = first["by_model"]["claude-sonnet-4-6"]
+    assert sonnet["total_input_cost_usd_delta"] + sonnet["compression_savings_usd_delta"] == (
+        pytest.approx(0.34)
+    )
+
+
+def test_legacy_checkpoints_without_model_collapse_into_unknown(tmp_path):
+    path = tmp_path / "proxy_savings.json"
+    legacy_state = {
+        "schema_version": 2,
+        "lifetime": {
+            "requests": 1,
+            "tokens_saved": 50,
+            "compression_savings_usd": 0.05,
+            "total_input_tokens": 100,
+            "total_input_cost_usd": 0.2,
+        },
+        "history": [
+            {
+                "timestamp": "2026-03-27T09:10:00Z",
+                "provider": "anthropic",
+                "total_tokens_saved": 50,
+                "compression_savings_usd": 0.05,
+                "total_input_tokens": 100,
+                "total_input_cost_usd": 0.2,
+            }
+        ],
+    }
+    path.write_text(json.dumps(legacy_state), encoding="utf-8")
+
+    tracker = SavingsTracker(path=str(path))
+    response = tracker.history_response()
+
+    assert response["history"][0]["model"] == "unknown"
+    hourly = response["series"]["hourly"]
+    assert set(hourly[0]["by_model"]) == {"unknown"}
+    assert hourly[0]["by_model"]["unknown"]["tokens_saved"] == 50
+
+
 def test_stats_history_defaults_to_compact_history_but_can_return_full_history(
     tmp_path, monkeypatch
 ):
@@ -569,7 +803,7 @@ def test_stats_history_persists_across_restarts_and_stats_stays_compatible(tmp_p
         history = client.get("/stats-history")
         assert history.status_code == 200
         history_data = history.json()
-        assert history_data["schema_version"] == 2
+        assert history_data["schema_version"] == 3
         assert history_data["storage_path"] == str(savings_path)
         assert history_data["lifetime"]["tokens_saved"] == 40
         assert history_data["lifetime"]["total_input_tokens"] == 120
@@ -709,3 +943,14 @@ def test_dashboard_includes_history_toggle_and_endpoint(tmp_path, monkeypatch):
         assert "Export CSV" in html
         assert "Weekly Savings" in html
         assert "Monthly Savings" in html
+        assert "Per-Model Breakdown" in html
+        assert "historyChartModeOptions" in html
+        assert "Expected cost (without Headroom)" in html
+        assert "toggleHistoryModel" in html
+        # Checkpoint view plots no per-model lines, so an active model
+        # filter must not suppress the aggregate line there.
+        assert "if (this.historySelectedSeriesKey === 'history') return null;" in html
+        # Breakdown header labels the effective (substituted) series.
+        assert "historyModelSourceSeriesLabel + ' buckets'" in html
+        # Non-top-5 breakdown rows swap into the last chart slot when selected.
+        assert "topModels[topModels.length - 1] = selected;" in html

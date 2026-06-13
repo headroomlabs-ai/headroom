@@ -209,13 +209,20 @@ pub fn build_app(state: AppState) -> Router {
                 "/model/:model_id/converse",
                 post(crate::bedrock::invoke::handle_invoke),
             )
-            // PR-D2: streaming counterpart. Bedrock's protocol is
+            // PR-D2/PR-D5: streaming counterparts. Bedrock's protocol is
             // binary EventStream; the handler parses incrementally,
             // optionally translates each chunk to an SSE frame, and
             // tees translated frames into AnthropicStreamState for
-            // telemetry. See `bedrock::invoke_streaming`.
+            // telemetry. `invoke-with-response-stream` and
+            // `converse-stream` share the same wire framing and
+            // processing pipeline, so both route to the same handler.
+            // See `bedrock::invoke_streaming`.
             .route(
                 "/model/:model_id/invoke-with-response-stream",
+                post(crate::bedrock::invoke_streaming::handle_invoke_streaming),
+            )
+            .route(
+                "/model/:model_id/converse-stream",
                 post(crate::bedrock::invoke_streaming::handle_invoke_streaming),
             )
             .route_layer(axum::middleware::from_fn(

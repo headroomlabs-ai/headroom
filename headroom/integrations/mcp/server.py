@@ -1,25 +1,27 @@
-"""Headroom MCP Integration: Compress tool outputs from MCP servers.
+"""Headroom MCP integration helpers for compressing tool outputs.
 
-This module provides multiple ways to integrate Headroom with MCP:
+This module currently provides these MCP integration surfaces:
 
-1. HeadroomMCPProxy - A proxy server that wraps upstream MCP servers
-2. compress_tool_result() - Standalone function for host applications
-3. HeadroomMCPMiddleware - Transport-level middleware
+1. HeadroomMCPCompressor - core compression logic for MCP tool results
+2. compress_tool_result() - standalone helper for host applications
+3. HeadroomMCPClientWrapper - client wrapper that compresses tool outputs
+4. create_headroom_mcp_proxy() - configuration helper for custom proxy setups
 
 The key insight: MCP tool outputs are the PERFECT use case for Headroom.
 They're often large (100s-1000s of items), structured (JSON), and contain
 mostly low-relevance data with a few critical items (errors, matches).
 
-Example - Proxy Server:
+Example - Custom proxy configuration:
     ```python
-    # Configure proxy to wrap your MCP servers
-    proxy = HeadroomMCPProxy(
-        upstream_servers=["slack", "database", "github"],
+    # Build config for your own MCP proxy/server wrapper
+    proxy_config = create_headroom_mcp_proxy(
+        upstream_servers=[
+            ("slack", slack_server),
+            ("database", db_server),
+            ("github", github_server),
+        ],
         config=HeadroomConfig(),
     )
-
-    # Run as MCP server - clients connect to this instead
-    proxy.run()
     ```
 
 Example - Standalone Function:
@@ -511,17 +513,18 @@ def create_headroom_mcp_proxy(
     upstream_servers: list[tuple[str, MCPServer]],
     config: HeadroomConfig | None = None,
 ) -> dict[str, Any]:
-    """Create configuration for a Headroom MCP proxy server.
+    """Create configuration for a custom Headroom MCP proxy/server wrapper.
 
-    This returns a configuration dict that can be used to set up
-    a proxy server that wraps upstream MCP servers.
+    This returns the compressor and upstream-server mapping needed by an
+    application-defined MCP proxy/server wrapper. Headroom does not yet ship
+    a ready-to-run ``HeadroomMCPProxy`` server implementation.
 
     Args:
         upstream_servers: List of (name, server) tuples.
         config: Headroom configuration.
 
     Returns:
-        Configuration dict for proxy server.
+        Configuration dict for a custom proxy/server wrapper.
 
     Example:
         ```python

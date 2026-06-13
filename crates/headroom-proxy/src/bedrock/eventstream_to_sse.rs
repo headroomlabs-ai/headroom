@@ -154,12 +154,18 @@ pub fn translate_message(
                 event_type: event_type.to_string(),
             })
         }
-        (OutputMode::Sse, "chunk") => {
+        (OutputMode::Sse, "chunk")
+        | (OutputMode::Sse, "messageStart")
+        | (OutputMode::Sse, "contentBlockStart")
+        | (OutputMode::Sse, "contentBlockDelta")
+        | (OutputMode::Sse, "contentBlockStop")
+        | (OutputMode::Sse, "messageStop")
+        | (OutputMode::Sse, "metadata") => {
             tracing::info!(
                 event = "bedrock_eventstream_translated_to_sse",
                 event_type = event_type,
                 payload_bytes = message.payload.len(),
-                "translated bedrock eventstream chunk to sse frame"
+                "translated bedrock eventstream message to sse frame"
             );
             Ok(TranslateOutcome::Emit(payload_to_sse_frame(
                 &message.payload,
@@ -377,6 +383,28 @@ mod tests {
                 assert_eq!(event_type, "future_unknown_kind");
             }
             other => panic!("expected Skip; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn translate_converse_event_to_sse_frame() {
+        let bytes = crate::bedrock::eventstream::MessageBuilder::new()
+            .header_string(":event-type", "contentBlockDelta")
+            .header_string(":message-type", "event")
+            .payload(Bytes::from_static(
+                br#"{"contentBlockIndex":0,"delta":{"text":"hi"}}"#,
+            ))
+            .build();
+        let msg = parse(&bytes).unwrap();
+        let outcome = translate_message(&msg, OutputMode::Sse).unwrap();
+        match outcome {
+            TranslateOutcome::Emit(b) => {
+                let s = std::str::from_utf8(&b).unwrap();
+                assert!(s.starts_with("data: "));
+                assert!(s.ends_with("\n\n"));
+                assert!(s.contains("contentBlockIndex"));
+            }
+            other => panic!("expected Emit; got {other:?}"),
         }
     }
 

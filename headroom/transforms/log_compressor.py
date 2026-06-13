@@ -497,7 +497,11 @@ class LogCompressor:
             return
         try:
             store: Any = get_compression_store()
-            store.store(original, compressed)
+            # The Rust-emitted marker embeds MD5(original)[:24], but
+            # store() has defaulted to SHA-256(original)[:24] since
+            # PR #395. Pass the marker's key explicitly so retrieving
+            # the marker hash actually finds the entry (issue #816).
+            store.store(original, compressed, explicit_hash=cache_key)
         except Exception as e:
             logger.warning(
                 "CCR store write failed; cache_key %s remains in-marker only: %s",

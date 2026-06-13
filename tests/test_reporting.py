@@ -92,7 +92,7 @@ def test_build_waste_histogram_empty_and_filtered_data() -> None:
             tokens_input_before=200,
             tokens_input_after=100,
             cache_alignment_score=70,
-            waste_signals={"json_bloat": 30, "html_noise": 10, "dynamic_date": 5},
+            waste_signals={"json_bloat": 30, "html_noise": 10, "dynamic_date": 5, "reread": 20},
         ),
         FakeMetrics(
             request_id="flat",
@@ -124,6 +124,11 @@ def test_build_waste_histogram_empty_and_filtered_data() -> None:
     assert histogram[0] == {"label": "History Bloat", "tokens": 55, "percentage": 100.0}
     assert histogram[1] == pytest.approx(
         {"label": "Tool JSON Bloat", "tokens": 30, "percentage": 54.54545454545454}
+    )
+    # "reread" surfaces in the histogram but is excluded from known_waste,
+    # so History Bloat above stays 100 - 45 = 55.
+    assert any(
+        item["label"] == "Re-served Tool Results" and item["tokens"] == 20 for item in histogram
     )
     assert any(item["label"] == "HTML Noise" and item["tokens"] == 10 for item in histogram)
     assert any(item["label"] == "Dynamic Dates" and item["tokens"] == 5 for item in histogram)

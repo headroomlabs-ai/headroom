@@ -1,0 +1,259 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/chopratejas/headroom/blob/main/tests/parity/fixtures/codex_openai_contracts/codex-openai-interaction.schema.json",
+  "title": "Codex <-> OpenAI interaction contracts (PR #794)",
+  "description": "Enshrines the OpenAI interaction expectations this changeset depends on, so drift is detectable. Header values are transported as strings on the wire; the `x-headroom-parsed-type` annotation on each records the semantic type the parser (headroom/subscription/codex_rate_limits.py) coerces them to. Sources: codex_rate_limits.parse_codex_rate_limits (header family + gating), openai._extract_codex_handshake_headers (WS-101 forward filter), streaming.py (SSE forward filter).",
+  "$defs": {
+    "OpenAICodexWindowHeaders": {
+      "title": "x-codex-*-{primary,secondary} window headers",
+      "description": "A rolling rate-limit/subscription window. A window is materialized iff its `*-used-percent` header is present and numeric; `*-window-minutes` and `*-reset-at` are optional. `primary` and `secondary` are independent and either may be absent.",
+      "type": "object",
+      "properties": {
+        "x-codex-primary-used-percent": {
+          "type": "string",
+          "pattern": "^\\d+(?:\\.\\d+)?$",
+          "x-headroom-parsed-type": "float (0-100, NaN-guarded)",
+          "description": "Percent of the primary window consumed. Gates creation of the primary window."
+        },
+        "x-codex-primary-window-minutes": {
+          "type": "string",
+          "pattern": "^\\d+$",
+          "x-headroom-parsed-type": "int",
+          "description": "Primary window size in minutes."
+        },
+        "x-codex-primary-reset-at": {
+          "type": "string",
+          "pattern": "^\\d+$",
+          "x-headroom-parsed-type": "int (Unix epoch seconds)",
+          "description": "Absolute reset time of the primary window."
+        },
+        "x-codex-secondary-used-percent": {
+          "type": "string",
+          "pattern": "^\\d+(?:\\.\\d+)?$",
+          "x-headroom-parsed-type": "float (0-100, NaN-guarded)",
+          "description": "Percent of the secondary window consumed. Gates creation of the secondary window."
+        },
+        "x-codex-secondary-window-minutes": {
+          "type": "string",
+          "pattern": "^\\d+$",
+          "x-headroom-parsed-type": "int"
+        },
+        "x-codex-secondary-reset-at": {
+          "type": "string",
+          "pattern": "^\\d+$",
+          "x-headroom-parsed-type": "int (Unix epoch seconds)"
+        }
+      },
+      "additionalProperties": true
+    },
+    "OpenAICodexCreditsHeaders": {
+      "title": "x-codex-credits-* headers",
+      "description": "OpenAI credits balance. A credits snapshot is materialized iff `x-codex-credits-has-credits` is present; `unlimited` defaults to false; `balance` is optional.",
+      "type": "object",
+      "properties": {
+        "x-codex-credits-has-credits": {
+          "type": "string",
+          "pattern": "^(?:[Tt][Rr][Uu][Ee]|[Ff][Aa][Ll][Ss][Ee]|[01])$",
+          "x-headroom-parsed-type": "bool (true|false|1|0, case-insensitive)",
+          "description": "Gates creation of the credits snapshot."
+        },
+        "x-codex-credits-unlimited": {
+          "type": "string",
+          "pattern": "^(?:[Tt][Rr][Uu][Ee]|[Ff][Aa][Ll][Ss][Ee]|[01])$",
+          "x-headroom-parsed-type": "bool (defaults false when absent/unparseable)"
+        },
+        "x-codex-credits-balance": {
+          "type": "string",
+          "x-headroom-parsed-type": "str (empty -> null)",
+          "description": "Free-form server string, e.g. \"$5.00\"."
+        }
+      },
+      "additionalProperties": true
+    },
+    "OpenAICodexMetaHeaders": {
+      "title": "x-codex meta headers",
+      "type": "object",
+      "properties": {
+        "x-codex-limit-name": {
+          "type": "string",
+          "x-headroom-parsed-type": "str (empty -> null)",
+          "description": "Active limit/model label, e.g. \"gpt-5.2-codex-sonic\"."
+        },
+        "x-codex-promo-message": {
+          "type": "string",
+          "x-headroom-parsed-type": "str (empty -> null)",
+          "description": "Server announcement. Also gates snapshot creation when present."
+        }
+      },
+      "additionalProperties": true
+    },
+    "OpenAICodexRateLimitHeaders": {
+      "title": "Full x-codex-* header family OpenAI may emit",
+      "description": "Superset of every x-codex-* header headroom reads. parse_codex_rate_limits returns a snapshot iff at least one of: a primary window, a secondary window, a credits snapshot, or a non-empty promo message is present; otherwise null (treated as a non-Codex response). All members are individually optional.",
+      "type": "object",
+      "allOf": [
+        { "$ref": "#/$defs/OpenAICodexWindowHeaders" },
+        { "$ref": "#/$defs/OpenAICodexCreditsHeaders" },
+        { "$ref": "#/$defs/OpenAICodexMetaHeaders" }
+      ],
+      "additionalProperties": true
+    },
+    "WSUpstreamHandshakeResponse": {
+      "title": "OpenAI WS handshake (101) response headers consumed by the WS fix",
+      "description": "On the Codex WebSocket transport the x-codex-* window is delivered ONLY on the upstream handshake response (never in data frames). handle_openai_responses_ws reads upstream.response.headers here. This is the contract the connect-before-accept reorder depends on: if OpenAI ever moves these headers off the handshake (e.g. into a frame), the WS half of the fix goes stale.",
+      "$ref": "#/$defs/OpenAICodexRateLimitHeaders"
+    },
+    "StreamingUpstreamResponseHeaders": {
+      "title": "OpenAI streaming/HTTP response headers consumed by the SSE fix",
+      "description": "On the streaming SSE/HTTP transport the same x-codex-* headers ride the HTTP response. streaming.py captures them on ALL statuses (including >=400) via update_from_headers, and forwards a wider set to the client (see ClientForwardedStreamingHeaders).",
+      "$ref": "#/$defs/OpenAICodexRateLimitHeaders"
+    },
+    "ClientForwardedHandshakeHeaders": {
+      "title": "Headers forwarded onto the CLIENT-facing WS 101 (allow/deny contract)",
+      "description": "_extract_codex_handshake_headers forwards ONLY headers whose (lowercased) name starts with `x-codex-`. Every other upstream handshake header - notably set-cookie and authorization - MUST NOT appear on the client 101. Enforced by propertyNames below and asserted by the unit tests + tests/e2e_ws_codex_usage_headers.py.",
+      "type": "object",
+      "propertyNames": {
+        "pattern": "^[Xx]-[Cc][Oo][Dd][Ee][Xx]-"
+      },
+      "not": {
+        "anyOf": [
+          { "required": ["set-cookie"] },
+          { "required": ["Set-Cookie"] },
+          { "required": ["authorization"] },
+          { "required": ["Authorization"] }
+        ]
+      },
+      "additionalProperties": { "type": "string" }
+    },
+    "ClientForwardedStreamingHeaders": {
+      "title": "Headers forwarded to the client on the streaming SSE path",
+      "description": "streaming.py forwards a header iff `\"ratelimit\" in name.lower()` OR `name.lower().startswith(\"x-codex\")`. This is a SUPERSET of the WS allow-list: it additionally passes generic *ratelimit* headers (e.g. the Anthropic streaming path) which do not contain the x-codex prefix.",
+      "type": "object",
+      "propertyNames": {
+        "pattern": "(?:[Rr][Aa][Tt][Ee][Ll][Ii][Mm][Ii][Tt])|^[Xx]-[Cc][Oo][Dd][Ee][Xx]"
+      },
+      "additionalProperties": { "type": "string" }
+    },
+    "WSClientRequestFrame": {
+      "title": "Client -> proxy WS data frame (Responses API over WS)",
+      "description": "Codex sends the request as a response.create envelope. The HTTP fallback unwraps `.response` for the POST body, forces stream=true, and strips any top-level `type`. A flattened variant (no envelope, fields at top level) is also tolerated by the fallback.",
+      "type": "object",
+      "properties": {
+        "type": { "const": "response.create" },
+        "response": {
+          "type": "object",
+          "properties": {
+            "model": { "type": "string", "description": "e.g. gpt-5.4" },
+            "input": {
+              "description": "String prompt or Responses-API structured input array.",
+              "type": ["string", "array"]
+            },
+            "stream": { "type": "boolean" }
+          },
+          "required": ["model"],
+          "additionalProperties": true
+        }
+      },
+      "required": ["type", "response"],
+      "additionalProperties": true
+    },
+    "WSRelayEvent": {
+      "title": "proxy -> client WS data frame (relayed Responses API event)",
+      "description": "SSE `data:` payloads relayed verbatim as WS text frames. `[DONE]` sentinels are dropped (not relayed). Every relayed event is a JSON object carrying a `type`. response.completed additionally carries usage under `response.usage`. anyOf (not oneOf): an error event also satisfies the looser lifecycle shape, which is fine.",
+      "anyOf": [
+        {
+          "title": "lifecycle event",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "examples": [
+                "response.created",
+                "response.output_item.added",
+                "response.completed"
+              ]
+            },
+            "response": { "type": "object", "additionalProperties": true }
+          },
+          "required": ["type"],
+          "additionalProperties": true
+        },
+        {
+          "title": "error event",
+          "type": "object",
+          "properties": {
+            "type": { "const": "error" },
+            "error": {
+              "type": "object",
+              "properties": { "message": { "type": "string" } },
+              "required": ["message"],
+              "additionalProperties": true
+            }
+          },
+          "required": ["type", "error"],
+          "additionalProperties": true
+        }
+      ]
+    },
+    "HTTPFallbackRequestBody": {
+      "title": "proxy -> OpenAI HTTP POST body on WS->HTTP fallback",
+      "description": "Derived from WSClientRequestFrame: the inner `.response` object, with `stream` forced to true and any top-level `type` removed.",
+      "type": "object",
+      "properties": {
+        "model": { "type": "string" },
+        "stream": { "const": true },
+        "input": { "type": ["string", "array"] }
+      },
+      "required": ["model", "stream"],
+      "not": { "required": ["type"] },
+      "additionalProperties": true
+    },
+    "CodexRateLimitStatsOutput": {
+      "title": "headroom /stats output for the codex tracker (CodexRateLimitSnapshot.to_dict)",
+      "description": "Internal (headroom-emitted) shape produced from the headers above; the WS and SSE update_from_headers parity tests assert this is refreshed. Included so drift in our own surface is also caught.",
+      "type": "object",
+      "properties": {
+        "limit_id": { "const": "codex" },
+        "limit_name": { "type": ["string", "null"] },
+        "primary": { "$ref": "#/$defs/CodexWindowDict" },
+        "secondary": { "$ref": "#/$defs/CodexWindowDict" },
+        "credits": {
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "properties": {
+                "has_credits": { "type": "boolean" },
+                "unlimited": { "type": "boolean" },
+                "balance": { "type": ["string", "null"] }
+              },
+              "required": ["has_credits", "unlimited", "balance"],
+              "additionalProperties": false
+            }
+          ]
+        },
+        "promo_message": { "type": ["string", "null"] },
+        "captured_at": { "type": "number", "description": "Unix epoch seconds (float)." }
+      },
+      "required": ["limit_id", "limit_name", "primary", "secondary", "credits", "promo_message", "captured_at"],
+      "additionalProperties": false
+    },
+    "CodexWindowDict": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "properties": {
+            "used_percent": { "type": "number" },
+            "window_minutes": { "type": ["integer", "null"] },
+            "window_label": { "type": "string", "description": "e.g. \"5h\", \"7d\"-style label; \"unknown\" when window_minutes is null." },
+            "resets_at": { "type": ["integer", "null"], "description": "Unix epoch seconds." },
+            "seconds_until_reset": { "type": ["integer", "null"] }
+          },
+          "required": ["used_percent", "window_minutes", "window_label", "resets_at", "seconds_until_reset"],
+          "additionalProperties": false
+        }
+      ]
+    }
+  }
+}

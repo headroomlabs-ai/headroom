@@ -14,6 +14,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -654,19 +655,23 @@ def verify_aider_wrap(base_env: dict[str, str], project_dir: Path, log_dir: Path
     entries = read_jsonl(log_dir / "aider.jsonl")
     assert_true(len(entries) > 0, "Aider shim should have been invoked")
     env_vars = entries[-1]["env"]
+    # Aider cannot send custom headers, so its wrap embeds the launch
+    # directory as a /p/<name> base-URL prefix for per-project savings;
+    # the proxy strips it before routing, so the probes still succeed.
+    project_prefix = f"/p/{quote(project_dir.name, safe='')}"
     assert_true(
-        env_vars.get("OPENAI_API_BASE") == f"http://127.0.0.1:{port}/v1",
+        env_vars.get("OPENAI_API_BASE") == f"http://127.0.0.1:{port}{project_prefix}/v1",
         "Aider wrap should set OPENAI_API_BASE",
     )
     assert_true(
-        env_vars.get("ANTHROPIC_BASE_URL") == f"http://127.0.0.1:{port}",
+        env_vars.get("ANTHROPIC_BASE_URL") == f"http://127.0.0.1:{port}{project_prefix}",
         "Aider wrap should set ANTHROPIC_BASE_URL",
     )
     assert_true(
         entries[-1]["probes"]
         == [
-            {"url": f"http://127.0.0.1:{port}/v1/models", "status": 200},
-            {"url": f"http://127.0.0.1:{port}/health", "status": 200},
+            {"url": f"http://127.0.0.1:{port}{project_prefix}/v1/models", "status": 200},
+            {"url": f"http://127.0.0.1:{port}{project_prefix}/health", "status": 200},
         ],
         "Aider shim should prove both configured base URLs point at a live proxy",
     )
@@ -686,8 +691,10 @@ def verify_cursor_wrap(base_env: dict[str, str], project_dir: Path) -> None:
     )
     try:
         output = wait_for_output(proc, "Press Ctrl+C to stop the proxy.", timeout=30)
+        # Cursor setup lines embed the /p/<name> per-project prefix.
+        cursor_prefix = f"/p/{quote(project_dir.name, safe='')}"
         assert_true(
-            f"http://127.0.0.1:{port}/v1" in output,
+            f"http://127.0.0.1:{port}{cursor_prefix}/v1" in output,
             "Cursor wrap should print the OpenAI base URL override",
         )
         assert_true(

@@ -212,9 +212,9 @@ class RequestLogger:
         """Log a request. Oldest entries are automatically removed when limit reached.
 
         Phase G PR-G3 (P4-45): base64-encoded image payloads in
-        ``request_messages`` / ``response_content`` are redacted
-        before write. Redaction also applies to the in-memory deque
-        so the ``/stats/recent_requests`` endpoint never serves a
+        ``request_messages`` / ``compressed_messages`` / ``response_content``
+        are redacted before write. Redaction also applies to the in-memory
+        deque so the ``/stats/recent_requests`` endpoint never serves a
         multi-MB image either.
         """
         # Redact image payloads in-place on the deque entry so memory
@@ -223,6 +223,8 @@ class RequestLogger:
         # ``get_recent_with_messages`` unchanged.
         if entry.request_messages is not None:
             entry.request_messages = redact_image_base64(entry.request_messages)
+        if entry.compressed_messages is not None:
+            entry.compressed_messages = redact_image_base64(entry.compressed_messages)
         if entry.response_content is not None:
             entry.response_content = redact_image_base64(entry.response_content)
 
@@ -234,20 +236,21 @@ class RequestLogger:
                     log_dict = asdict(entry)
                     if not self.log_full_messages:
                         log_dict.pop("request_messages", None)
+                        log_dict.pop("compressed_messages", None)
                         log_dict.pop("response_content", None)
                     f.write(json.dumps(log_dict) + "\n")
             except OSError:
                 pass  # Graceful degradation: memory-only logging continues
 
     def get_recent(self, n: int = 100) -> list[dict]:
-        """Get recent log entries (without request_messages and response_content)."""
+        """Get recent log entries (without request/compressed messages and response_content)."""
         # Convert deque to list for slicing (deque doesn't support slicing)
         entries = list(self._logs)[-n:]
         return [
             {
                 k: v
                 for k, v in asdict(e).items()
-                if k not in ("request_messages", "response_content")
+                if k not in ("request_messages", "compressed_messages", "response_content")
             }
             for e in entries
         ]
@@ -289,6 +292,8 @@ class RequestLogger:
             # Messages and response can be large
             if log_entry.request_messages:
                 size_bytes += sys.getsizeof(log_entry.request_messages)
+            if log_entry.compressed_messages:
+                size_bytes += sys.getsizeof(log_entry.compressed_messages)
             if log_entry.response_content:
                 size_bytes += len(log_entry.response_content)
 

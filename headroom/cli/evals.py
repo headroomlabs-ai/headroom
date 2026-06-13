@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from pathlib import Path
 
 import click
 
@@ -661,3 +662,36 @@ Running evaluation...
     if output:
         result.save(output)
         click.echo(f"\nResults saved to: {output}")
+
+
+@evals.command("probes")
+@click.option(
+    "--recordings",
+    "recordings_dir",
+    required=True,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    help="Directory of JSONL recordings written via HEADROOM_PROBE_RECORD_DIR.",
+)
+@click.option(
+    "--json-output",
+    type=click.Path(dir_okay=False, path_type=Path),
+    help="Optional machine-readable JSON report output.",
+)
+def probes(recordings_dir: Path, json_output: Path | None) -> None:
+    """Score retention of recorded compression events (offline, no LLM).
+
+    \b
+    Record sessions first by running the proxy with
+    HEADROOM_PROBE_RECORD_DIR set. Recordings contain full conversation
+    content in plaintext and stay on this machine.
+    """
+    import json as json_module
+
+    from headroom.evals.session_probes import render_report, run_probes
+
+    report = run_probes(recordings_dir)
+    click.echo(render_report(report))
+    if json_output:
+        json_output.parent.mkdir(parents=True, exist_ok=True)
+        json_output.write_text(json_module.dumps(report.to_dict(), indent=2), encoding="utf-8")
+        click.echo(f"\nWrote JSON report: {json_output}")

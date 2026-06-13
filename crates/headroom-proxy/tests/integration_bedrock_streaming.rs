@@ -218,6 +218,18 @@ async fn mount_eventstream_upstream(upstream: &MockServer, body: Bytes) {
         .await;
 }
 
+async fn mount_eventstream_upstream_for_action(upstream: &MockServer, body: Bytes, action: &str) {
+    Mock::given(method("POST"))
+        .and(path(format!("/model/{TEST_MODEL}/{action}")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/vnd.amazon.eventstream")
+                .set_body_bytes(body.to_vec()),
+        )
+        .mount(upstream)
+        .await;
+}
+
 #[tokio::test]
 async fn eventstream_translated_to_sse() {
     let _ = tracing_subscriber::fmt()
@@ -461,6 +473,53 @@ async fn client_can_choose_eventstream_or_sse() {
         default_ct.contains("text/event-stream"),
         "default Accept must select sse translation; got {default_ct}"
     );
+
+    proxy.shutdown().await;
+}
+
+#[tokio::test]
+async fn converse_stream_route_translates_to_sse() {
+    let upstream = MockServer::start().await;
+    let bedrock_bytes = synthesize_bedrock_stream();
+    mount_eventstream_upstream_for_action(&upstream, bedrock_bytes, "converse-stream").await;
+    let proxy = bedrock_proxy(&upstream, |c| {
+        c.compression_mode = headroom_proxy::config::CompressionMode::Off;
+    })
+    .await;
+
+    let body = serde_json::to_vec(&json!({
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": 16,
+        "messages": [{"role":"user","content":"hi"}]
+    }))
+    .unwrap();
+
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "{}/model/{TEST_MODEL}/converse-stream",
+            proxy.url()
+        ))
+        .header("content-type", "application/json")
+        .header("accept", "text/event-stream")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        ct.starts_with("text/event-stream"),
+        "converse-stream should emit SSE when client asks for SSE; got {ct}"
+    );
+
+    let text = resp.text().await.unwrap();
+    assert!(text.contains("event: content_block_delta"));
+    assert!(text.contains("\"text\":\"OK\""));
 
     proxy.shutdown().await;
 }

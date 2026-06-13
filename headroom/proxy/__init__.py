@@ -14,6 +14,14 @@ Usage:
     Set base URL in Cursor settings to http://localhost:8787
 """
 
-from .server import create_app, run_server
-
 __all__ = ["create_app", "run_server"]
+
+
+def __getattr__(name: str) -> object:
+    if name in ("create_app", "run_server"):
+        from .server import create_app, run_server  # noqa: F811
+
+        globals()["create_app"] = create_app
+        globals()["run_server"] = run_server
+        return globals()[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

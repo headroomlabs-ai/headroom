@@ -206,6 +206,7 @@ def compress_unit_with_router(
     *,
     router: ContentRouter,
     tokenizer: TokenCounterLike,
+    target_ratio: float | None = None,
 ) -> UnitCompressionResult:
     """Compress one safe text unit through ContentRouter.
 
@@ -251,11 +252,19 @@ def compress_unit_with_router(
         return _with_reason(reason=f"cache_zone_{unit.cache_zone}")
     if len(unit.text) < unit.min_bytes:
         return _with_reason(reason="below_unit_floor")
+
+    prior_target_ratio = getattr(router, "_runtime_target_ratio", None)
+    if target_ratio is not None:
+        router._runtime_target_ratio = target_ratio
     if _CCR_MARKER_RE.search(unit.text):
-        replacement, marker_transforms, router_result = _compress_live_text_with_markers(
-            unit,
-            router=router,
-        )
+        try:
+            replacement, marker_transforms, router_result = _compress_live_text_with_markers(
+                unit,
+                router=router,
+            )
+        finally:
+            if target_ratio is not None:
+                router._runtime_target_ratio = prior_target_ratio
         if replacement == unit.text:
             return _with_reason(
                 router_result=router_result,
@@ -287,12 +296,16 @@ def compress_unit_with_router(
             reason_category="applied",
         )
 
-    router_result = router.compress(
-        unit.text,
-        context=unit.context,
-        question=unit.question,
-        bias=unit.bias,
-    )
+    try:
+        router_result = router.compress(
+            unit.text,
+            context=unit.context,
+            question=unit.question,
+            bias=unit.bias,
+        )
+    finally:
+        if target_ratio is not None:
+            router._runtime_target_ratio = prior_target_ratio
     replacement = router_result.compressed
     strategy = router_result.strategy_used.value
     if replacement == unit.text:

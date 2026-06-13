@@ -1,0 +1,6 @@
+name: headroom_retrieve
+version: 1.0.0
+description: "Retrieve original content compressed by the headroom proxy (CCR markers)"
+author: akb4q
+provides_tools:
+  - headroom_retrieve

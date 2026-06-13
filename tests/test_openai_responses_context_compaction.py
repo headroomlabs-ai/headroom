@@ -99,6 +99,66 @@ def test_openai_tool_schema_compaction_preserves_invocation_shape() -> None:
     assert tool["parameters"]["properties"]["path"]["description"] == " ".join(verbose.split())
 
 
+def test_openai_tool_schema_compaction_preserves_property_named_title() -> None:
+    """Issue #759: drop-key list must not strip property *names* under `properties`.
+
+    Schema annotations like ``title: "ReadFileParameters"`` on a schema object
+    are safe to drop.  But a tool that has a field literally called ``title``
+    (or ``readOnly``, ``deprecated``, etc.) must survive compaction; removing
+    it while leaving ``required: ["title"]`` produces an invalid strict schema
+    that upstream (OpenAI / Codex) rejects.
+    """
+    payload = {
+        "tools": [
+            {
+                "type": "function",
+                "name": "eval",
+                "description": "Evaluate cells.",
+                "parameters": {
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
+                    "title": "EvalParameters",
+                    "type": "object",
+                    "properties": {
+                        "cells": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "title": "CellItem",
+                                "properties": {
+                                    "language": {"type": "string"},
+                                    "code": {"type": "string"},
+                                    "title": {"type": "string"},
+                                },
+                                "required": ["language", "code", "title"],
+                            },
+                        }
+                    },
+                    "required": ["cells"],
+                },
+            }
+        ]
+    }
+
+    compacted, modified, before, after = _compact_openai_responses_tools(payload)
+
+    assert modified is True
+    assert after < before
+
+    params = compacted["tools"][0]["parameters"]
+    # Schema-level annotations are still dropped.
+    assert "title" not in params
+    assert "$schema" not in params
+
+    items = params["properties"]["cells"]["items"]
+    # "title" as a JSON Schema annotation on the items object is dropped.
+    assert "title" not in items
+    # "title" as a *property name* inside properties must be preserved.
+    assert "title" in items["properties"], (
+        "property named 'title' was incorrectly stripped by compaction"
+    )
+    assert items["required"] == ["language", "code", "title"]
+
+
 def test_openai_tool_schema_compaction_is_deterministic() -> None:
     payload = {
         "tools": [

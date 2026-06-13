@@ -32,3 +32,19 @@ secret:
       match: "sk-ant-oat01-oauth-fixture"
     - name: "Anthropic-shaped fixture token (PAYG via bearer)"
       match: "sk-ant-api03-payg-bearer-fixture"
+
+    # Minimal GitHub-shaped tokens used in tests/test_copilot_auth.py to
+    # exercise _token_kind() prefix detection and _is_copilot_api_token().
+    # Values are intentionally short/low-entropy — they carry no privilege.
+    - name: "GitHub OAuth token fixture (test_copilot_auth)"
+      match: "gho_x"
+    - name: "GitHub Apps token fixture (test_copilot_auth)"
+      match: "ghs_x"
+    - name: "GitHub PAT fixture (test_copilot_auth)"
+      match: "ghp_x"
+    - name: "GitHub fine-grained PAT fixture (test_copilot_auth)"
+      match: "github_pat_x"
+    - name: "Copilot session token fixture (test_copilot_auth)"
+      match: "tid_x"
+    - name: "GitHub OAuth token fixture for exchange_token test"
+      match: "gho_test"

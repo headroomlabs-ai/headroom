@@ -7,7 +7,7 @@ import sys
 from typing import Any
 
 
-def hf_hub_download_local_first(repo_id: str, filename: str) -> str:
+def hf_hub_download_local_first(repo_id: str, filename: str, *, allow_network: bool = True) -> str:
     """Download a file from HuggingFace Hub, preferring the local cache.
 
     Tries ``local_files_only=True`` first to avoid a network HEAD request when
@@ -17,12 +17,18 @@ def hf_hub_download_local_first(repo_id: str, filename: str) -> str:
     Args:
         repo_id: HuggingFace Hub repository identifier (e.g. ``"org/model"``).
         filename: Filename within the repository.
+        allow_network: When ``False``, never fall back to a network download —
+            a cache miss re-raises the local-lookup error. Used by startup
+            preload so a cold cache cannot block (or, via native crashes in the
+            download stack, kill) the process before it binds its port.
 
     Returns:
         Absolute path to the local cached file.
 
     Raises:
-        Any exception raised by ``hf_hub_download`` on a genuine download failure.
+        Any exception raised by ``hf_hub_download`` on a genuine download failure,
+        or the local-lookup error when ``allow_network`` is ``False`` and the
+        file is not cached.
     """
     from huggingface_hub import hf_hub_download
     from huggingface_hub.errors import EntryNotFoundError, LocalEntryNotFoundError
@@ -30,6 +36,8 @@ def hf_hub_download_local_first(repo_id: str, filename: str) -> str:
     try:
         return str(hf_hub_download(repo_id, filename, local_files_only=True))
     except (LocalEntryNotFoundError, EntryNotFoundError, OSError):
+        if not allow_network:
+            raise
         return str(hf_hub_download(repo_id, filename))
 
 

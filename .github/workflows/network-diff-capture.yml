@@ -1,0 +1,164 @@
+name: Network Diff Capture
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: network-diff-capture-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  PY_VERSION: "3.12"
+
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PY_VERSION }}
+
+      - name: Install offline test tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install \
+            'tiktoken>=0.5.0' \
+            'pydantic>=2.0.0' \
+            'litellm==1.82.3' \
+            'click>=8.1.0' \
+            'rich>=13.0.0' \
+            'opentelemetry-api>=1.24.0' \
+            'ast-grep-cli>=0.30.0' \
+            'fastapi>=0.100.0' \
+            'uvicorn>=0.23.0' \
+            'httpx[http2]>=0.24.0' \
+            'openai>=2.14.0' \
+            'mcp>=1.0.0' \
+            'magika>=0.6.0' \
+            'zstandard>=0.20.0' \
+            'websockets>=13.0' \
+            'onnxruntime>=1.16.0' \
+            'transformers>=4.30.0' \
+            'watchdog>=4.0.0' \
+            'sqlite-vec>=0.1.6' \
+            pytest ruff mypy
+
+      - name: Lint capture code
+        run: ruff check headroom/capture headroom/cli/capture.py tests/test_network_diff_capture.py
+
+      - name: Format check capture code
+        run: ruff format --check headroom/capture headroom/cli/capture.py tests/test_network_diff_capture.py
+
+      - name: Type-check capture code
+        run: mypy headroom/capture/network_diff.py headroom/cli/capture.py
+
+      - name: Run capture tests
+        run: python -m pytest tests/test_network_diff_capture.py
+
+      - name: Validate compose model
+        env:
+          ANTHROPIC_API_KEY: dummy
+        run: docker compose -f docker/differential-network-capture/docker-compose.yml --profile run config
+
+      - name: Build Claude Code runner image
+        env:
+          ANTHROPIC_API_KEY: dummy
+        run: docker compose -f docker/differential-network-capture/docker-compose.yml --profile run build claude-direct
+
+      - name: Smoke Claude Code runner image
+        run: docker run --rm -e CLAUDE_COMMAND="claude --version" headroom-network-diff-claude-direct:latest
+
+  live-anthropic:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    needs: offline
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      CLAUDE_PROMPT: "Summarize this repository in one sentence. Keep the answer under 30 words."
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PY_VERSION }}
+
+      - name: Install report dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install \
+            'tiktoken>=0.5.0' \
+            'pydantic>=2.0.0' \
+            'litellm==1.82.3' \
+            'click>=8.1.0' \
+            'rich>=13.0.0' \
+            'opentelemetry-api>=1.24.0' \
+            'ast-grep-cli>=0.30.0' \
+            'fastapi>=0.100.0' \
+            'uvicorn>=0.23.0' \
+            'httpx[http2]>=0.24.0' \
+            'openai>=2.14.0' \
+            'mcp>=1.0.0' \
+            'magika>=0.6.0' \
+            'zstandard>=0.20.0' \
+            'websockets>=13.0' \
+            'onnxruntime>=1.16.0' \
+            'transformers>=4.30.0' \
+            'watchdog>=4.0.0' \
+            'sqlite-vec>=0.1.6'
+
+      - name: Run live Claude Code differential capture
+        if: env.ANTHROPIC_API_KEY != ''
+        working-directory: docker/differential-network-capture
+        run: |
+          set -euo pipefail
+          mkdir -p captures
+          docker compose up -d --build mitm-direct mitm-headroom-upstream headroom-proxy mitm-headroom-client
+          trap 'docker compose --profile run down -v' EXIT
+
+          for i in $(seq 1 90); do
+            if docker compose exec -T headroom-proxy curl --fail --silent http://127.0.0.1:8787/readyz >/dev/null; then
+              break
+            fi
+            if [ "$i" -eq 90 ]; then
+              docker compose logs headroom-proxy
+              exit 1
+            fi
+            sleep 2
+          done
+
+          docker compose --profile run run --rm claude-direct
+          docker compose --profile run run --rm claude-headroom
+
+      - name: Report skipped live capture
+        if: env.ANTHROPIC_API_KEY == ''
+        run: |
+          echo "::warning title=Live network diff skipped::ANTHROPIC_API_KEY is not configured for this repository; offline harness checks ran, but live Claude Code capture was skipped."
+          mkdir -p docker/differential-network-capture/captures
+          cat > docker/differential-network-capture/captures/skipped.md <<'EOF'
+          # Live Network Diff Capture Skipped
+
+          `ANTHROPIC_API_KEY` is not configured for this repository.
+          EOF
+
+      - name: Generate network diff report
+        if: env.ANTHROPIC_API_KEY != ''
+        run: |
+          python -m headroom.cli capture network-diff \
+            --direct docker/differential-network-capture/captures/direct.jsonl \
+            --headroom docker/differential-network-capture/captures/headroom-client.jsonl \
+            --output docker/differential-network-capture/captures/report.md \
+            --json-output docker/differential-network-capture/captures/report.json
+
+      - name: Upload capture artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: network-diff-capture-${{ github.run_number }}
+          path: docker/differential-network-capture/captures/
+          if-no-files-found: warn

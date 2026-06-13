@@ -29,6 +29,7 @@ import enum
 import inspect
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -327,15 +328,44 @@ class MemoryHandler:
             embedder_model = "all-MiniLM-L6-v2"
             vector_dimension = 384
 
+            # Opt-in GPU offload: HEADROOM_EMBEDDER_RUNTIME=pytorch_mps routes embedding
+            # through the torch sentence-transformers backend on the Apple GPU (MPS).
+            # LocalEmbedder serializes MPS encode calls (torch-MPS is not thread-safe).
+            # We switch only when MPS is actually available; otherwise keep the
+            # existing default embedder selection path (ONNX when available, then
+            # the pre-existing local sentence-transformers fallback).
+            if os.environ.get("HEADROOM_EMBEDDER_RUNTIME", "").strip().lower() == "pytorch_mps":
+                try:
+                    import sentence_transformers  # noqa: F401
+                    import torch
+
+                    if torch.backends.mps.is_available():
+                        embedder_backend = "local"
+                        logger.info(
+                            "Memory: HEADROOM_EMBEDDER_RUNTIME=pytorch_mps → "
+                            "torch embedder on Apple GPU (MPS)"
+                        )
+                    else:
+                        logger.warning(
+                            "Memory: HEADROOM_EMBEDDER_RUNTIME=pytorch_mps requested but "
+                            "MPS is not available; using default embedder selection"
+                        )
+                except ImportError:
+                    logger.warning(
+                        "Memory: HEADROOM_EMBEDDER_RUNTIME=pytorch_mps requested but "
+                        "torch/sentence-transformers not installed; using default embedder selection"
+                    )
+
             # Check if ONNX runtime is available (should be — it's in proxy deps)
-            try:
-                import onnxruntime  # noqa: F401
-            except ImportError:
-                # Fall back to sentence-transformers (requires torch)
-                embedder_backend = "local"
-                logger.info(
-                    "Memory: onnxruntime not available, falling back to sentence-transformers"
-                )
+            if embedder_backend == "onnx":
+                try:
+                    import onnxruntime  # noqa: F401
+                except ImportError:
+                    # Fall back to sentence-transformers (requires torch)
+                    embedder_backend = "local"
+                    logger.info(
+                        "Memory: onnxruntime not available, falling back to sentence-transformers"
+                    )
 
             backend_config = LocalBackendConfig(
                 db_path=self.config.db_path,

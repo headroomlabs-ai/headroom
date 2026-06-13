@@ -43,6 +43,50 @@ _MODEL_ALIASES: dict[str, str] = {
     "claude-3-sonnet-20240229": "claude-3-haiku-20240307",
 }
 
+_resolved_model_cache: dict[str, str] = {}
+
+
+def resolve_litellm_model(model: str) -> str:
+    """Resolve model name to one LiteLLM recognizes, adding provider prefix if needed.
+    Results are cached per model name to avoid blocking the event loop
+    with repeated synchronous litellm lookups.
+    """
+    if model in _resolved_model_cache:
+        return _resolved_model_cache[model]
+    resolved = _resolve_litellm_model_uncached(model)
+    _resolved_model_cache[model] = resolved
+    return resolved
+
+
+def _resolve_litellm_model_uncached(model: str) -> str:
+    """Uncached resolution — called once per unique model name."""
+    if not LITELLM_AVAILABLE:
+        return model
+    # Try as-is first
+    try:
+        litellm.cost_per_token(model=model, prompt_tokens=1, completion_tokens=0)
+        return model
+    except Exception:
+        pass
+    # Try with provider prefix
+    prefixes = {
+        "claude-": "anthropic/",
+        "gpt-": "openai/",
+        "o1-": "openai/",
+        "o3-": "openai/",
+        "o4-": "openai/",
+        "gemini-": "google/",
+    }
+    for pattern, prefix in prefixes.items():
+        if model.startswith(pattern):
+            prefixed = f"{prefix}{model}"
+            try:
+                litellm.cost_per_token(model=prefixed, prompt_tokens=1, completion_tokens=0)
+                return prefixed
+            except Exception:
+                break
+    return model
+
 
 @dataclass
 class LiteLLMModelPricing:

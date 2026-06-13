@@ -114,9 +114,17 @@ async def test_finalize_stream_response_logs_request_for_feed():
 
 
 @pytest.mark.asyncio
-async def test_finalize_stream_response_includes_messages_when_log_full_messages_enabled():
+async def test_finalize_stream_response_logs_original_and_compressed_messages():
+    """With log_full_messages enabled, both sides of the compression are
+    recorded: `request_messages` is the pre-compression snapshot the caller
+    threads in via `original_messages`, `compressed_messages` is what was
+    actually sent upstream (i.e. `body["messages"]` after in-place mutation)."""
     proxy = _build_proxy_with_real_logger(log_full_messages=True)
-    body = {"messages": [{"role": "user", "content": "hello"}]}
+    # `body["messages"]` models the post-compression list - the proxy mutates
+    # `body` in place before calling `_finalize_stream_response`, so this is
+    # already what was shipped over the wire.
+    body = {"messages": [{"role": "user", "content": "[compressed]"}]}
+    original = [{"role": "user", "content": "[original, pre-compression]"}]
 
     await proxy._finalize_stream_response(
         body=body,
@@ -130,11 +138,13 @@ async def test_finalize_stream_response_includes_messages_when_log_full_messages
         optimization_latency=1.0,
         stream_state=_stream_state(output_tokens=5),
         start_time=0.0,
+        original_messages=original,
     )
 
     entries = proxy.logger.get_recent_with_messages(10)
     assert len(entries) == 1
-    assert entries[0]["request_messages"] == body["messages"]
+    assert entries[0]["request_messages"] == original
+    assert entries[0]["compressed_messages"] == body["messages"]
 
 
 @pytest.mark.asyncio
@@ -153,11 +163,15 @@ async def test_finalize_stream_response_omits_messages_when_log_full_messages_di
         optimization_latency=1.0,
         stream_state=_stream_state(output_tokens=5),
         start_time=0.0,
+        original_messages=[{"role": "user", "content": "dropped"}],
     )
 
     entries = proxy.logger.get_recent_with_messages(10)
     assert len(entries) == 1
+    # Both sides share the same gate - neither leaks when log_full_messages
+    # is off.
     assert entries[0]["request_messages"] is None
+    assert entries[0]["compressed_messages"] is None
 
 
 @pytest.mark.asyncio

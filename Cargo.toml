@@ -55,7 +55,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 axum = "0.7"
 tower = "0.5"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-pyo3 = "0.22"
+pyo3 = { version = "0.24", features = ["abi3-py310"] }
 # Phase D PR-D1: AWS SigV4 signing for native Bedrock InvokeModel route.
 # `aws-sigv4` provides the canonical-request + signing-key implementation;
 # `aws-config` resolves credentials from the standard provider chain

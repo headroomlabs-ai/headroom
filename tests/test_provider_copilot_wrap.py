@@ -10,8 +10,11 @@ import pytest
 
 from headroom.providers.copilot.wrap import (
     build_launch_env,
+    copilot_model_from_args,
+    default_wire_api_for_model,
     detect_running_proxy_backend,
     model_configured,
+    model_prefers_responses_api,
     provider_key_source,
     query_proxy_config,
     resolve_provider_type,
@@ -58,6 +61,45 @@ def test_validate_configuration_rejects_invalid_combinations() -> None:
 
     with pytest.raises(click.ClickException, match="not supported with translated backends"):
         validate_configuration(provider_type="openai", wire_api="responses", backend="anyllm")
+
+
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        ("gpt-5.5", True),
+        ("gpt-5-codex", True),
+        ("openai/gpt-5.4", True),
+        ("o1", True),
+        ("o3-mini", True),
+        ("gpt-4.1", False),
+        ("claude-sonnet-4.6", False),
+        (None, False),
+    ],
+)
+def test_model_prefers_responses_api_for_reasoning_models(
+    model: str | None,
+    expected: bool,
+) -> None:
+    assert model_prefers_responses_api(model) is expected
+    assert default_wire_api_for_model(model) == ("responses" if expected else "completions")
+
+
+def test_copilot_model_from_args_prefers_cli_over_environment() -> None:
+    assert (
+        copilot_model_from_args(
+            ("--model", "gpt-5.5"),
+            {"COPILOT_MODEL": "gpt-4.1"},
+        )
+        == "gpt-5.5"
+    )
+    assert (
+        copilot_model_from_args(
+            ("--model=gpt-5-codex",),
+            {"COPILOT_PROVIDER_MODEL_ID": "gpt-4.1"},
+        )
+        == "gpt-5-codex"
+    )
+    assert copilot_model_from_args((), {"COPILOT_PROVIDER_MODEL_ID": "gpt-4.1"}) == "gpt-4.1"
 
 
 def test_provider_key_source_and_build_launch_env_cover_anthropic_and_openai() -> None:
@@ -122,3 +164,32 @@ def test_model_configured_detects_env_and_cli_variants() -> None:
     assert model_configured(("--model", "gpt-4o"), {}) is True
     assert model_configured(("--model=gpt-4o",), {}) is True
     assert model_configured(("--other", "value"), {}) is False
+
+
+def test_build_launch_env_applies_project_path_prefix() -> None:
+    anthropic_env, _ = build_launch_env(
+        port=8787,
+        provider_type="anthropic",
+        wire_api=None,
+        environ={"ANTHROPIC_API_KEY": "sk-ant-test"},
+        project="api server",
+    )
+    openai_env, openai_lines = build_launch_env(
+        port=8787,
+        provider_type="openai",
+        wire_api=None,
+        environ={"OPENAI_API_KEY": "sk-proj-test"},
+        project="api server",
+    )
+
+    assert anthropic_env["COPILOT_PROVIDER_BASE_URL"] == "http://127.0.0.1:8787/p/api%20server"
+    assert openai_env["COPILOT_PROVIDER_BASE_URL"] == "http://127.0.0.1:8787/p/api%20server/v1"
+    assert "COPILOT_PROVIDER_BASE_URL=http://127.0.0.1:8787/p/api%20server/v1" in openai_lines
+
+    plain_env, _ = build_launch_env(
+        port=8787,
+        provider_type="openai",
+        wire_api=None,
+        environ={"OPENAI_API_KEY": "sk-proj-test"},
+    )
+    assert plain_env["COPILOT_PROVIDER_BASE_URL"] == "http://127.0.0.1:8787/v1"

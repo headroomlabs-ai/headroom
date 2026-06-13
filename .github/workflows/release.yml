@@ -604,6 +604,22 @@ jobs:
               esac
               whl=$(find /wheels -maxdepth 1 -type f -name "headroom_ai-*-${py_tag}-${py_tag}-${arch_tag}.whl" -print -quit)
               if [ -z "$whl" ]; then
+                # No version-specific wheel — fall back to a stable-ABI
+                # (abi3) wheel. A cp3<floor>-abi3 wheel installs on any
+                # CPython >= floor, which is what makes a single wheel
+                # forward-compatible to 3.14+ (Cargo.toml pyo3 abi3-py310).
+                # Pick the abi3 wheel whose floor is <= the interpreter.
+                py_minor=${PYTHON_VERSION#*.}
+                abi3=$(find /wheels -maxdepth 1 -type f -name "headroom_ai-*-abi3-${arch_tag}.whl" -print -quit)
+                if [ -n "$abi3" ]; then
+                  abi3_base=${abi3##*/}
+                  abi3_floor=${abi3_base#*-cp3}
+                  abi3_floor=${abi3_floor%%-*}
+                  case "$abi3_floor" in *[!0-9]*) abi3_floor= ;; esac
+                  if [ -n "$abi3_floor" ] && [ "$abi3_floor" -le "$py_minor" ]; then whl="$abi3"; fi
+                fi
+              fi
+              if [ -z "$whl" ]; then
                 echo "ERROR: no wheel matching python=$PYTHON_VERSION arch=$arch_tag in /wheels/" >&2
                 find /wheels -maxdepth 1 -type f -printf "%f\n" >&2
                 exit 1
@@ -632,6 +648,19 @@ jobs:
           py_tag=cp$(echo "$PYTHON_VERSION" | tr -d .)
           # macOS wheels are tagged macosx_*_arm64 (Apple Silicon only).
           whl=$(find dist -maxdepth 1 -type f -name "headroom_ai-*-${py_tag}-${py_tag}-macosx_*_arm64.whl" -print -quit)
+          if [ -z "$whl" ]; then
+            # Stable-ABI (abi3) fallback — see the Linux path above. A
+            # cp3<floor>-abi3 wheel installs on any CPython >= floor.
+            py_minor=${PYTHON_VERSION#*.}
+            abi3=$(find dist -maxdepth 1 -type f -name "headroom_ai-*-abi3-macosx_*_arm64.whl" -print -quit)
+            if [ -n "$abi3" ]; then
+              abi3_base=${abi3##*/}
+              abi3_floor=${abi3_base#*-cp3}
+              abi3_floor=${abi3_floor%%-*}
+              case "$abi3_floor" in *[!0-9]*) abi3_floor= ;; esac
+              if [ -n "$abi3_floor" ] && [ "$abi3_floor" -le "$py_minor" ]; then whl="$abi3"; fi
+            fi
+          fi
           if [ -z "$whl" ]; then
             echo "ERROR: no macOS wheel matching python=$PYTHON_VERSION"
             find dist -maxdepth 1 -type f -exec basename {} \;

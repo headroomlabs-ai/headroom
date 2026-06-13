@@ -25,7 +25,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.95.0
+        uses: dtolnay/rust-toolchain@1.96.0
 
       - name: Cache cargo registry + build
         uses: Swatinem/rust-cache@v2

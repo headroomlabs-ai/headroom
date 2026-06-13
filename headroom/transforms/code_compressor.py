@@ -57,7 +57,7 @@ logger = logging.getLogger(__name__)
 
 # Lazy import for optional dependency
 _tree_sitter_available: bool | None = None
-_thread_local = threading.local()
+_tree_sitter_local = threading.local()
 
 
 def _check_tree_sitter_available() -> bool:
@@ -106,10 +106,10 @@ def _get_parser(language: str) -> Any:
             "This adds ~50MB for tree-sitter grammars."
         )
 
-    parsers: dict[str, Any] | None = getattr(_thread_local, "parsers", None)
+    parsers: dict[str, Any] | None = getattr(_tree_sitter_local, "parsers", None)
     if parsers is None:
         parsers = {}
-        _thread_local.parsers = parsers
+        _tree_sitter_local.parsers = parsers
 
     if language not in parsers:
         try:
@@ -151,7 +151,7 @@ def is_tree_sitter_loaded() -> bool:
     Returns:
         True if parsers are loaded in this thread's local storage.
     """
-    parsers: dict[str, Any] | None = getattr(_thread_local, "parsers", None)
+    parsers: dict[str, Any] | None = getattr(_tree_sitter_local, "parsers", None)
     return bool(parsers)
 
 
@@ -161,7 +161,7 @@ def unload_tree_sitter() -> bool:
     Returns:
         True if parsers were unloaded, False if none were loaded.
     """
-    parsers: dict[str, Any] | None = getattr(_thread_local, "parsers", None)
+    parsers: dict[str, Any] | None = getattr(_tree_sitter_local, "parsers", None)
     if parsers:
         count = len(parsers)
         parsers.clear()

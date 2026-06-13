@@ -1,5 +1,5 @@
 ARG PYTHON_VERSION=3.13
-ARG UV_VERSION=0.11.16
+ARG UV_VERSION=0.11.18
 ARG DISTROLESS_IMAGE=gcr.io/distroless/python3-debian13
 ARG PYTHON_SITE_PACKAGES=/usr/local/lib/python${PYTHON_VERSION}/site-packages
 

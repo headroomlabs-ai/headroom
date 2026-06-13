@@ -22,6 +22,7 @@ Requires: pip install litellm
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 from headroom.tokenizers import EstimatingTokenCounter
@@ -32,6 +33,10 @@ logger = logging.getLogger(__name__)
 
 # Check if litellm is available
 try:
+    # LiteLLM can print its provider-list banner during import, before the
+    # module-level suppression flags below can be set.
+    os.environ.setdefault("LITELLM_SUPPRESS_DEBUG_INFO", "True")
+
     import litellm
 
     # Suppress litellm's startup banner ("Provider List: https://...") and

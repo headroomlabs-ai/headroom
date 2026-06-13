@@ -41,7 +41,7 @@ use headroom_core::transforms::{
     SearchCompressorConfig as RustSearchConfig, SearchCompressorStats as RustSearchStats,
 };
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyString};
+use pyo3::types::{PyBytes, PyDict};
 
 /// Identity stub used by the Python smoke test to verify linkage.
 #[pyfunction]
@@ -75,7 +75,7 @@ fn build_crush_array_dict<'py>(
     compacted: Option<String>,
     compaction_kind: Option<&'static str>,
 ) -> Bound<'py, PyDict> {
-    let dict = PyDict::new_bound(py);
+    let dict = PyDict::new(py);
     dict.set_item("items", kept_json).unwrap();
     dict.set_item("ccr_hash", ccr_hash).unwrap();
     dict.set_item("dropped_summary", dropped_summary).unwrap();
@@ -677,6 +677,26 @@ impl PySmartCrusher {
         }
     }
 
+    /// Construct with the lossless-first compaction stage's formatter
+    /// chosen by name: `"csv-schema"` (the `new()` default), `"json"`,
+    /// or `"markdown-kv"`. Raises `ValueError` on unknown names so a
+    /// misconfigured knob is visible instead of silently falling back.
+    #[staticmethod]
+    #[pyo3(signature = (config = None, format_name = "csv-schema"))]
+    fn with_compaction_format(
+        config: Option<&PySmartCrusherConfig>,
+        format_name: &str,
+    ) -> PyResult<Self> {
+        let cfg = config.map(|c| c.inner.clone()).unwrap_or_default();
+        match RustSmartCrusher::with_compaction_format(cfg, format_name) {
+            Some(inner) => Ok(Self { inner }),
+            None => Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "unknown compaction format {format_name:?}; expected one of: {}",
+                headroom_core::transforms::smart_crusher::compaction::CompactionStage::SUPPORTED_FORMAT_NAMES.join(", ")
+            ))),
+        }
+    }
+
     /// `crush(content, query="", bias=1.0) -> CrushResult`. Argument
     /// order and keyword names mirror the Python implementation.
     ///
@@ -859,32 +879,31 @@ impl PyDetectionResult {
     /// the underlying Rust value.
     #[getter]
     fn metadata<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let dict = PyDict::new_bound(py);
+        let dict = PyDict::new(py);
         for (k, v) in &self.inner.metadata {
             // Convert each JSON value into the closest Python primitive.
             // Detection metadata is always a flat dict of scalars (ints,
             // bools, strings) so we don't need to recurse.
-            let py_value: PyObject = match v {
-                serde_json::Value::Bool(b) => b.into_py(py),
+            match v {
+                serde_json::Value::Bool(b) => dict.set_item(k, b)?,
                 serde_json::Value::Number(n) => {
                     if let Some(i) = n.as_u64() {
-                        i.into_py(py)
+                        dict.set_item(k, i)?
                     } else if let Some(i) = n.as_i64() {
-                        i.into_py(py)
+                        dict.set_item(k, i)?
                     } else if let Some(f) = n.as_f64() {
-                        f.into_py(py)
+                        dict.set_item(k, f)?
                     } else {
-                        py.None()
+                        dict.set_item(k, py.None())?
                     }
                 }
-                serde_json::Value::String(s) => PyString::new_bound(py, s).into_py(py),
-                serde_json::Value::Null => py.None(),
+                serde_json::Value::String(s) => dict.set_item(k, s)?,
+                serde_json::Value::Null => dict.set_item(k, py.None())?,
                 // Detection never emits arrays / objects in metadata
                 // today; if it ever does, fall through to JSON-string for
                 // visibility rather than silently dropping.
-                other => PyString::new_bound(py, &other.to_string()).into_py(py),
+                other => dict.set_item(k, other.to_string())?,
             };
-            dict.set_item(k, py_value)?;
         }
         Ok(dict)
     }
@@ -1019,7 +1038,7 @@ fn content_has_error_indicators(text: &str) -> bool {
 #[pyfunction]
 fn keyword_registry_snapshot(py: Python<'_>) -> Py<PyDict> {
     let registry = KeywordRegistry::default_set();
-    let dict = PyDict::new_bound(py);
+    let dict = PyDict::new(py);
     for (key, words) in registry.as_map() {
         dict.set_item(key, words).unwrap();
     }
@@ -1130,7 +1149,7 @@ impl PySearchCompressionResult {
     }
     #[getter]
     fn summaries<'py>(&self, py: Python<'py>) -> Bound<'py, PyDict> {
-        let dict = PyDict::new_bound(py);
+        let dict = PyDict::new(py);
         for (k, v) in &self.inner.summaries {
             dict.set_item(k, v).unwrap();
         }
@@ -1330,7 +1349,7 @@ impl PyLogCompressionResult {
     }
     #[getter]
     fn stats<'py>(&self, py: Python<'py>) -> Bound<'py, PyDict> {
-        let dict = PyDict::new_bound(py);
+        let dict = PyDict::new(py);
         for (k, v) in &self.inner.stats {
             dict.set_item(k, v).unwrap();
         }
@@ -1522,7 +1541,7 @@ fn compress_openai_responses_live_zone(
                 .collect();
             let reason = rust_summarize_openai_responses_no_change_reason(&manifest).to_string();
             (
-                PyBytes::new_bound(py, body).unbind(),
+                PyBytes::new(py, body).unbind(),
                 false,
                 saved,
                 transforms,
@@ -1540,7 +1559,7 @@ fn compress_openai_responses_live_zone(
                 .map(String::from)
                 .collect();
             (
-                PyBytes::new_bound(py, bytes).unbind(),
+                PyBytes::new(py, bytes).unbind(),
                 true,
                 saved,
                 transforms,
@@ -1551,7 +1570,7 @@ fn compress_openai_responses_live_zone(
             // BodyNotJson / NoMessagesArray are non-fatal: nothing to
             // compress, fall through to passthrough byte-for-byte.
             (
-                PyBytes::new_bound(py, body).unbind(),
+                PyBytes::new(py, body).unbind(),
                 false,
                 0,
                 Vec::new(),

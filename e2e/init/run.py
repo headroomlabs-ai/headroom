@@ -25,6 +25,11 @@ import json
 import sys
 from pathlib import Path
 
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python < 3.11
+    import tomli as tomllib  # type: ignore[no-redef]
+
 # Add repo root to sys.path so the harness import works whether the file is
 # invoked as ``python e2e/init/run.py`` or ``python -m e2e.init.run``.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -64,6 +69,15 @@ def _read_manifest(home: Path, profile: str) -> dict[str, object]:
     if not path.exists():
         raise AssertionError(f"Expected manifest at {path}")
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _expect_codex_hooks_feature(config: str) -> None:
+    parsed = tomllib.loads(config)
+    features = parsed.get("features")
+    if not isinstance(features, dict) or features.get("hooks") is not True:
+        raise AssertionError("Codex config should enable hooks")
+    if "codex_hooks" in features:
+        raise AssertionError("Codex config should not keep deprecated codex_hooks")
 
 
 # ----- existing-flow assertions (ported verbatim from the old run.py) ---------
@@ -166,8 +180,7 @@ def _verify_codex_local(ctx: CaseContext) -> None:
         raise AssertionError("Codex local init missing 'supports_websockets = true'")
     if config.count("[features]") != 1:
         raise AssertionError("Codex config should keep a single [features] table")
-    if "codex_hooks = true" not in config:
-        raise AssertionError("Codex config should enable codex_hooks")
+    _expect_codex_hooks_feature(config)
     command = hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"]
     _expect_hook_command(command, profile)
 
@@ -206,8 +219,7 @@ def _verify_codex_global(ctx: CaseContext) -> None:
         )
     if "supports_websockets = true" not in config:
         raise AssertionError("Codex global init missing 'supports_websockets = true'")
-    if "codex_hooks = true" not in config:
-        raise AssertionError("Codex user config should enable codex_hooks")
+    _expect_codex_hooks_feature(config)
     hooks = json.loads((ctx.home / ".codex" / "hooks.json").read_text(encoding="utf-8"))
     _expect_hook_command(
         hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"],

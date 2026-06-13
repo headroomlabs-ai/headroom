@@ -562,6 +562,7 @@ class PrometheusMetrics:
         cache_write_1h_tokens: int = 0,
         uncached_input_tokens: int = 0,
         attempted_input_tokens: int = 0,
+        project: str | None = None,
     ):
         """Record metrics for a request."""
         async with self._lock:
@@ -648,6 +649,8 @@ class PrometheusMetrics:
                 model=model,
                 input_tokens=input_tokens,
                 tokens_saved=tokens_saved,
+                provider=provider,
+                project=project,
                 cache_read_tokens=cache_read_tokens,
                 cache_write_tokens=cache_write_tokens,
                 uncached_input_tokens=uncached_input_tokens,

@@ -27,7 +27,7 @@ help:
 	@echo "  make ci-precheck-rust   - cargo fmt --check + clippy + test"
 	@echo "  make ci-precheck-python - smart_crusher-affected python tests"
 	@echo "  make ci-precheck-commitlint - lint commits since origin/main"
-	@echo "  make install-git-hooks  - install a pre-push hook that runs ci-precheck"
+	@echo "  make install-git-hooks  - install pre-commit, commit-msg, and pre-push hooks"
 
 test:
 	$(CARGO) test --workspace
@@ -123,16 +123,15 @@ ci-precheck-python:
 		tests/test_toin_integration.py
 
 # Lint commits since `origin/main`. Requires npx (Node 18+) on PATH.
-# Skips silently if npx is unavailable; install nodejs to enable.
 ci-precheck-commitlint:
 	@echo "── ci-precheck-commitlint ─────────────────────────────────────"
 	@if ! command -v npx >/dev/null 2>&1; then \
-		echo "skip: npx not on PATH (install node 18+ to enable commitlint pre-check)"; \
-		exit 0; \
+		echo "error: npx not on PATH (install Node 18+ to enable commitlint checks)"; \
+		exit 1; \
 	fi
 	@if ! git rev-parse --verify origin/main >/dev/null 2>&1; then \
-		echo "skip: origin/main not fetched (run 'git fetch origin main')"; \
-		exit 0; \
+		echo "error: origin/main not fetched (run 'git fetch origin main')"; \
+		exit 1; \
 	fi
 	npx --yes --package=@commitlint/cli --package=@commitlint/config-conventional -- \
 		commitlint --from origin/main --to HEAD --config .commitlintrc.json
