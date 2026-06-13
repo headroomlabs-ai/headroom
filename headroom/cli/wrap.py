@@ -42,6 +42,7 @@ from headroom.agent_savings import (
     apply_agent_savings_env_defaults,
 )
 from headroom.copilot_auth import (
+    CopilotSubscriptionTokenResolution,
     has_oauth_auth,
     resolve_client_bearer_token,
     resolve_copilot_api_url,
@@ -2998,13 +2999,13 @@ def copilot(
 
     effective_provider_type = _resolve_copilot_provider_type(effective_backend, provider_type)
     if subscription:
-        subscription_resolution = _copilot_resolve_subscription_provider_type(
+        provider_resolution = _copilot_resolve_subscription_provider_type(
             backend=effective_backend,
             provider_type=provider_type,
         )
-        if subscription_resolution.error:
-            raise click.ClickException(subscription_resolution.error)
-        effective_provider_type = subscription_resolution.provider_type
+        if provider_resolution.error:
+            raise click.ClickException(provider_resolution.error)
+        effective_provider_type = provider_resolution.provider_type
     _validate_copilot_configuration(
         provider_type=effective_provider_type,
         wire_api=wire_api,
@@ -3025,7 +3026,7 @@ def copilot(
     env = os.environ.copy()
     openai_api_url: str | None = None
     copilot_proxy_token: str | None = None
-    subscription_resolution = None
+    subscription_resolution: CopilotSubscriptionTokenResolution | None = None
     if _should_use_copilot_oauth(
         backend=effective_backend,
         provider_type=provider_type,
