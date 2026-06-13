@@ -101,6 +101,27 @@ def test_init_omits_unset_api_base_and_api_key(monkeypatch: pytest.MonkeyPatch) 
     assert create_calls == [{"provider": "openai"}]
 
 
+def test_init_treats_empty_overrides_as_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Empty-string api_base/api_key must not be forwarded (env var set to "")."""
+    fake_instance = FakeAnyLLMInstance()
+    create_calls: list[dict[str, object]] = []
+
+    class FakeAnyLLM:
+        @staticmethod
+        def create(requested_provider: str, **kwargs):  # noqa: ANN003
+            create_calls.append({"provider": requested_provider, **kwargs})
+            return fake_instance
+
+    monkeypatch.setattr(anyllm, "ANYLLM_AVAILABLE", True)
+    monkeypatch.setattr(anyllm, "AnyLLM", FakeAnyLLM)
+
+    backend = anyllm.AnyLLMBackend(provider="openai", api_key="", api_base="")
+
+    assert backend.api_base is None
+    assert backend.api_key is None
+    assert create_calls == [{"provider": "openai"}]
+
+
 def make_choice(
     content: str = "hello", finish_reason: str = "stop", tool_calls=None, index: int = 0
 ):

@@ -41,8 +41,10 @@ class AnyLLMBackend(Backend):
             )
 
         self.provider = provider.lower()
-        self.api_key = api_key
-        self.api_base = api_base
+        # Normalize empty-string overrides (e.g. an env var set to "") to None
+        # so provider defaults stay active instead of forwarding a blank value.
+        self.api_key = api_key or None
+        self.api_base = api_base or None
 
         # Create the AnyLLM instance once and reuse. api_key/api_base are only
         # forwarded when set so providers keep their own env-var defaults
