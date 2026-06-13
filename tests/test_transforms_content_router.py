@@ -718,3 +718,209 @@ def test_detect_content_python_backend_skips_native(
 
     result = _detect_content('[{"id": 1}, {"id": 2}]')
     assert result.content_type is ContentType.JSON_ARRAY
+
+
+# ---------------------------------------------------------------------------
+# BOOLEAN and NL_BOOLEAN strategy paths (PR #779)
+# ---------------------------------------------------------------------------
+
+
+def test_boolean_nl_boolean_strategies_in_enum() -> None:
+    assert CompressionStrategy.BOOLEAN.value == "boolean"
+    assert CompressionStrategy.NL_BOOLEAN.value == "nl_boolean"
+
+
+def test_strategy_from_detection_type_maps_boolean_content_types() -> None:
+    from headroom.transforms.content_detector import ContentType
+
+    router = ContentRouter()
+    assert (
+        router._strategy_from_detection_type(ContentType.BOOLEAN_LOGIC)
+        is CompressionStrategy.BOOLEAN
+    )
+    assert (
+        router._strategy_from_detection_type(ContentType.NL_BOOLEAN_LOGIC)
+        is CompressionStrategy.NL_BOOLEAN
+    )
+
+
+def test_content_type_from_strategy_maps_boolean_strategies() -> None:
+    from headroom.transforms.content_detector import ContentType
+
+    router = ContentRouter()
+    assert (
+        router._content_type_from_strategy(CompressionStrategy.BOOLEAN) is ContentType.BOOLEAN_LOGIC
+    )
+    assert (
+        router._content_type_from_strategy(CompressionStrategy.NL_BOOLEAN)
+        is ContentType.NL_BOOLEAN_LOGIC
+    )
+
+
+def test_boolean_strategy_compresses_when_compressor_available(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    router = ContentRouter()
+    content = "A B result\n0 0 0\n0 1 1\n1 0 1\n1 1 1"
+
+    fake_result = SimpleNamespace(
+        compressed="A | B",
+        compressed_tokens=3,
+        strategy="truth_table",
+        original=content,
+        original_tokens=len(content.split()),
+        variable_count=2,
+    )
+
+    class FakeBoolean:
+        def compress(self, c: str) -> object:
+            return fake_result
+
+    monkeypatch.setattr(router, "_get_boolean_compressor", lambda: FakeBoolean())
+    import headroom.transforms.boolean_compressor as bc_mod
+    monkeypatch.setattr(bc_mod, "_fire_telemetry", lambda result: None)
+
+    compressed, tokens, chain = router._apply_strategy_to_content(
+        content, CompressionStrategy.BOOLEAN, context=""
+    )
+
+    assert compressed == "A | B"
+    assert tokens == 3
+    assert chain == ["boolean"]
+
+
+def test_boolean_strategy_falls_back_to_kompress_when_compressor_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    router = ContentRouter()
+    content = "A B result\n0 0 0\n0 1 1\n1 0 1\n1 1 1"
+
+    monkeypatch.setattr(router, "_get_boolean_compressor", lambda: None)
+
+    def fake_ml(c: str, ctx: str, q: object = None) -> tuple[str, int]:
+        return ("kompress_out", 2)
+
+    monkeypatch.setattr(router, "_try_ml_compressor", fake_ml)
+
+    compressed, tokens, chain = router._apply_strategy_to_content(
+        content, CompressionStrategy.BOOLEAN, context=""
+    )
+
+    assert compressed == "kompress_out"
+    assert tokens == 2
+    assert "kompress" in chain
+
+
+def test_boolean_strategy_falls_back_when_compress_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    router = ContentRouter()
+    content = "A B result\n0 0 0\n0 1 1\n1 0 1\n1 1 1"
+
+    class FakeBooleanReturnsNone:
+        def compress(self, c: str) -> None:
+            return None
+
+    monkeypatch.setattr(router, "_get_boolean_compressor", lambda: FakeBooleanReturnsNone())
+
+    def fake_ml(c: str, ctx: str, q: object = None) -> tuple[str, int]:
+        return ("kompress_fallback", 5)
+
+    monkeypatch.setattr(router, "_try_ml_compressor", fake_ml)
+
+    compressed, tokens, chain = router._apply_strategy_to_content(
+        content, CompressionStrategy.BOOLEAN, context=""
+    )
+
+    assert compressed == "kompress_fallback"
+    assert "kompress" in chain
+
+
+def test_nl_boolean_strategy_compresses_when_compressor_available(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    router = ContentRouter()
+    content = "trigger alert when temperature above 30 and humidity above 80"
+
+    fake_result = SimpleNamespace(
+        compressed="temp>30 AND humid>80",
+        compressed_tokens=4,
+        strategy="nl_boolean",
+        original=content,
+        original_tokens=len(content.split()),
+        variable_count=2,
+    )
+
+    class FakeNLBoolean:
+        def compress(self, c: str) -> object:
+            return fake_result
+
+    monkeypatch.setattr(router, "_get_nl_boolean_compressor", lambda: FakeNLBoolean())
+    import headroom.transforms.boolean_compressor as bc_mod
+    monkeypatch.setattr(bc_mod, "_fire_telemetry", lambda result: None)
+
+    compressed, tokens, chain = router._apply_strategy_to_content(
+        content, CompressionStrategy.NL_BOOLEAN, context=""
+    )
+
+    assert compressed == "temp>30 AND humid>80"
+    assert tokens == 4
+    assert chain == ["nl_boolean"]
+
+
+def test_nl_boolean_strategy_falls_back_to_kompress_when_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    router = ContentRouter()
+    content = "trigger alert when temperature high and humidity high"
+
+    monkeypatch.setattr(router, "_get_nl_boolean_compressor", lambda: None)
+
+    def fake_ml(c: str, ctx: str, q: object = None) -> tuple[str, int]:
+        return ("kompress_nl_out", 3)
+
+    monkeypatch.setattr(router, "_try_ml_compressor", fake_ml)
+
+    compressed, tokens, chain = router._apply_strategy_to_content(
+        content, CompressionStrategy.NL_BOOLEAN, context=""
+    )
+
+    assert compressed == "kompress_nl_out"
+    assert tokens == 3
+    assert "kompress" in chain
+
+
+def test_get_boolean_compressor_caches_instance() -> None:
+    router = ContentRouter()
+    c1 = router._get_boolean_compressor()
+    c2 = router._get_boolean_compressor()
+    assert c1 is c2
+
+
+def test_get_boolean_compressor_returns_none_on_import_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sys
+
+    router = ContentRouter()
+    router._boolean_compressor = None
+    monkeypatch.setitem(sys.modules, "headroom.transforms.boolean_compressor", None)
+    assert router._get_boolean_compressor() is None
+
+
+def test_get_nl_boolean_compressor_caches_instance() -> None:
+    router = ContentRouter()
+    c1 = router._get_nl_boolean_compressor()
+    c2 = router._get_nl_boolean_compressor()
+    assert c1 is c2
+
+
+def test_get_nl_boolean_compressor_returns_none_on_import_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sys
+
+    router = ContentRouter()
+    router._nl_boolean_compressor = None
+    monkeypatch.setitem(sys.modules, "headroom.transforms.boolean_compressor", None)
+    assert router._get_nl_boolean_compressor() is None
