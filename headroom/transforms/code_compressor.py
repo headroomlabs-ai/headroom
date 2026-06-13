@@ -2436,11 +2436,6 @@ def _extract_statement_units(
     return units
 
 
-def _get_node_text(node: Any, code: str) -> str:
-    """Extract text from AST node."""
-    return code[node.start_byte : node.end_byte]
-
-
 def _get_definition_name(node: Any) -> str | None:
     """Extract the name identifier from a definition AST node."""
     for child in node.children:
