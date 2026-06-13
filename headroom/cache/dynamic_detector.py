@@ -36,29 +36,17 @@ import math
 import re
 from dataclasses import dataclass, field
 from enum import Enum
+from importlib.util import find_spec
 from typing import Any, Literal
 
 from headroom.models.config import ML_MODEL_DEFAULTS
 
-# Optional imports - graceful degradation
-_SPACY_AVAILABLE = False
-_SENTENCE_TRANSFORMERS_AVAILABLE = False
-
-try:
-    import spacy
-
-    _SPACY_AVAILABLE = True
-except ImportError:
-    spacy = None  # type: ignore
-
-try:
-    import numpy as np
-    from sentence_transformers import SentenceTransformer
-
-    _SENTENCE_TRANSFORMERS_AVAILABLE = True
-except ImportError:
-    SentenceTransformer = None  # type: ignore
-    np = None  # type: ignore
+# Optional ML dependencies are checked without importing them so this module
+# stays cheap to import during proxy startup.
+_SPACY_AVAILABLE = find_spec("spacy") is not None
+_SENTENCE_TRANSFORMERS_AVAILABLE = (
+    find_spec("numpy") is not None and find_spec("sentence_transformers") is not None
+)
 
 
 class DynamicCategory(str, Enum):
@@ -601,6 +589,11 @@ class NERDetector:
             from headroom.models.ml_models import MLModelRegistry
 
             self._nlp = MLModelRegistry.get_spacy(config.spacy_model)
+        except ImportError:
+            self._load_error = (
+                "spaCy not installed. Install with: "
+                "pip install spacy && python -m spacy download en_core_web_sm"
+            )
         except OSError:
             self._load_error = (
                 f"spaCy model '{config.spacy_model}' not found. "
@@ -731,6 +724,11 @@ class SemanticDetector:
                 self.DYNAMIC_EXEMPLARS,
                 convert_to_numpy=True,
             )
+        except ImportError:
+            self._load_error = (
+                "sentence-transformers not installed. "
+                "Install with: pip install sentence-transformers"
+            )
         except Exception as e:
             self._load_error = f"Failed to load embedding model: {e}"
 
@@ -773,6 +771,11 @@ class SemanticDetector:
         if not sentences:
             return [], None
 
+        try:
+            import numpy as np
+        except ImportError:
+            return [], "numpy not installed. Install with: pip install numpy"
+
         sentence_texts = [s[0] for s in sentences]
         sentence_embeddings = self._model.encode(  # type: ignore[union-attr]
             sentence_texts,
@@ -780,7 +783,7 @@ class SemanticDetector:
         )
 
         # Compute similarities
-        similarities = np.dot(sentence_embeddings, self._exemplar_embeddings.T)  # type: ignore[union-attr]
+        similarities = np.dot(sentence_embeddings, self._exemplar_embeddings.T)
 
         for i, (text, start, end) in enumerate(sentences):
             # Get max similarity to any exemplar

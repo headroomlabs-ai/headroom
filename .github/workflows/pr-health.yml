@@ -1,8 +1,8 @@
-name: PR Health
+name: PR Governance
 
 on:
   pull_request_target:
-    types: [opened, reopened, synchronize, ready_for_review]
+    types: [opened, edited, reopened, synchronize, ready_for_review, converted_to_draft]
   schedule:
     # Keep labels fresh even when base branches move or checks finish later.
     - cron: '23 14 * * 1-5'
@@ -20,6 +20,123 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  template:
+    if: github.event_name == 'pull_request_target'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+
+      - name: Validate PR template
+        id: validate
+        run: python3 scripts/pr-governance.py --event "$GITHUB_EVENT_PATH" --report .pr-governance-report.json
+
+      - name: Append governance summary
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          report = json.loads(Path(".pr-governance-report.json").read_text(encoding="utf-8"))
+          summary = report["summary_markdown"].strip()
+          with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a", encoding="utf-8") as handle:
+              handle.write(f"{summary}\n")
+          PY
+
+      - name: Ensure governance labels exist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          gh label create "status: needs author action" \
+            --repo "$REPO" \
+            --color "d93f0b" \
+            --description "Pull request body or readiness checklist still needs author updates" \
+            --force
+          gh label create "status: ready for review" \
+            --repo "$REPO" \
+            --color "0e8a16" \
+            --description "Pull request body is complete and the author marked it ready for human review" \
+            --force
+
+      - name: Sync governance comment and labels
+        if: steps.validate.outputs.is_bot_pr != 'true'
+        uses: actions/github-script@v7
+        env:
+          REPORT_PATH: .pr-governance-report.json
+        with:
+          script: |
+            const fs = require('fs');
+            const report = JSON.parse(fs.readFileSync(process.env.REPORT_PATH, 'utf8'));
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const issue_number = context.payload.pull_request.number;
+            const marker = report.comment_marker;
+            const body = `${marker}\n${report.comment_markdown}`.trim();
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number,
+              per_page: 100,
+            });
+
+            const existing = comments.find(
+              (comment) =>
+                comment.user?.type === 'Bot' && typeof comment.body === 'string' && comment.body.includes(marker),
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner,
+                repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number,
+                body,
+              });
+            }
+
+            if (report.labels_to_add.length > 0) {
+              await github.rest.issues.addLabels({
+                owner,
+                repo,
+                issue_number,
+                labels: report.labels_to_add,
+              });
+            }
+
+            for (const label of report.labels_to_remove) {
+              try {
+                await github.rest.issues.removeLabel({
+                  owner,
+                  repo,
+                  issue_number,
+                  name: label,
+                });
+              } catch (error) {
+                if (error.status !== 404) {
+                  throw error;
+                }
+              }
+            }
+
+      - name: Fail when the PR body is incomplete
+        if: steps.validate.outputs.valid != 'true'
+        run: |
+          echo "PR template validation failed. Update the PR body or move the PR back to draft."
+          exit 1
+
   label:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -46,6 +163,16 @@ jobs:
             --color "d73a4a" \
             --description "Required or reported CI checks are failing" \
             --force
+          gh label create "status: needs author action" \
+            --repo "$REPO" \
+            --color "d93f0b" \
+            --description "Pull request body or readiness checklist still needs author updates" \
+            --force
+          gh label create "status: ready for review" \
+            --repo "$REPO" \
+            --color "0e8a16" \
+            --description "Pull request body is complete and the author marked it ready for human review" \
+            --force
 
       - name: Label open pull requests
         run: |
@@ -59,17 +186,18 @@ jobs:
 
           for pr in $pr_numbers; do
             data="$(gh pr view "$pr" --repo "$REPO" \
-              --json mergeStateStatus,statusCheckRollup)"
+              --json isDraft,labels,mergeStateStatus,statusCheckRollup)"
 
             merge_state="$(jq -r '.mergeStateStatus // "UNKNOWN"' <<<"$data")"
             check_state="$(jq -r '
               [
-                .statusCheckRollup[]
+                (.statusCheckRollup // [])[]
                 | select((.conclusion // .state // "") as $s
                   | ["FAILURE", "TIMED_OUT", "ACTION_REQUIRED", "CANCELLED", "ERROR"] | index($s))
               ]
               | if length > 0 then "failing" else "passing" end
             ' <<<"$data")"
+            is_draft="$(jq -r '.isDraft' <<<"$data")"
 
             if [[ "$merge_state" == "BEHIND" ]]; then
               gh pr edit "$pr" --repo "$REPO" --add-label "status: needs rebase"
@@ -87,5 +215,9 @@ jobs:
               gh pr edit "$pr" --repo "$REPO" --add-label "status: ci failing"
             else
               gh pr edit "$pr" --repo "$REPO" --remove-label "status: ci failing" || true
+            fi
+
+            if [[ "$merge_state" == "BEHIND" || "$merge_state" == "DIRTY" || "$check_state" == "failing" || "$is_draft" == "true" ]]; then
+              gh pr edit "$pr" --repo "$REPO" --remove-label "status: ready for review" || true
             fi
           done
