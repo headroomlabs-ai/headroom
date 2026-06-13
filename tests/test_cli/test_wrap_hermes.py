@@ -33,12 +33,8 @@ def test_wrap_hermes_sets_provider_envs(
 
     with patch.object(wrap_mod.shutil, "which", return_value="hermes"):
         with patch.object(wrap_mod, "_launch_tool", side_effect=fake_launch_tool):
-            with patch.object(
-                wrap_mod, "_ensure_rtk_binary", return_value=Path("/tmp/rtk")
-            ):
-                result = runner.invoke(
-                    main, ["wrap", "hermes", "--port", "9000", "--", "session"]
-                )
+            with patch.object(wrap_mod, "_ensure_rtk_binary", return_value=Path("/tmp/rtk")):
+                result = runner.invoke(main, ["wrap", "hermes", "--port", "9000", "--", "session"])
 
     assert result.exit_code == 0, result.output
     env = captured["env"]
@@ -60,9 +56,7 @@ def test_wrap_hermes_missing_binary_errors_clearly(
     monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
 
     with patch.object(wrap_mod.shutil, "which", return_value=None):
-        with patch.object(
-            wrap_mod, "_ensure_rtk_binary", return_value=Path("/tmp/rtk")
-        ):
+        with patch.object(wrap_mod, "_ensure_rtk_binary", return_value=Path("/tmp/rtk")):
             result = runner.invoke(main, ["wrap", "hermes"])
 
     assert result.exit_code == 1
@@ -80,9 +74,7 @@ def test_wrap_hermes_prepare_only_exits_cleanly(
     monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
 
     with patch.object(wrap_mod, "_launch_tool") as launch_tool:
-        with patch.object(
-            wrap_mod, "_ensure_rtk_binary", return_value=Path("/tmp/rtk")
-        ):
+        with patch.object(wrap_mod, "_ensure_rtk_binary", return_value=Path("/tmp/rtk")):
             result = runner.invoke(main, ["wrap", "hermes", "--prepare-only"])
 
     assert result.exit_code == 0, result.output
@@ -104,12 +96,8 @@ def test_wrap_hermes_no_context_tool_skips_rtk_setup(
 
     with patch.object(wrap_mod.shutil, "which", return_value="hermes"):
         with patch.object(wrap_mod, "_launch_tool", side_effect=fake_launch_tool):
-            with patch.object(
-                wrap_mod, "_ensure_rtk_binary"
-            ) as ensure_rtk:
-                result = runner.invoke(
-                    main, ["wrap", "hermes", "--no-context-tool"]
-                )
+            with patch.object(wrap_mod, "_ensure_rtk_binary") as ensure_rtk:
+                result = runner.invoke(main, ["wrap", "hermes", "--no-context-tool"])
 
     assert result.exit_code == 0, result.output
     ensure_rtk.assert_not_called()
@@ -128,9 +116,7 @@ def test_wrap_hermes_prepare_only_uses_lean_ctx_when_selected(
     with patch.object(wrap_mod, "_setup_lean_ctx_agent") as setup_lean_ctx:
         with patch.object(wrap_mod, "_ensure_rtk_binary") as ensure_rtk:
             with patch.object(wrap_mod, "_launch_tool") as launch_tool:
-                result = runner.invoke(
-                    main, ["wrap", "hermes", "--prepare-only"]
-                )
+                result = runner.invoke(main, ["wrap", "hermes", "--prepare-only"])
 
     assert result.exit_code == 0, result.output
     setup_lean_ctx.assert_called_once_with("hermes", verbose=False)
@@ -150,9 +136,7 @@ def test_wrap_hermes_prepare_only_allows_missing_rtk(
     with patch.object(wrap_mod, "_ensure_rtk_binary", return_value=None):
         with patch.object(wrap_mod, "_inject_rtk_instructions") as inject_rtk:
             with patch.object(wrap_mod, "_launch_tool") as launch_tool:
-                result = runner.invoke(
-                    main, ["wrap", "hermes", "--prepare-only"]
-                )
+                result = runner.invoke(main, ["wrap", "hermes", "--prepare-only"])
 
     assert result.exit_code == 0, result.output
     inject_rtk.assert_not_called()
