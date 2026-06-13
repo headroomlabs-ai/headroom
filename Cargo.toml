@@ -24,6 +24,9 @@ license = "Apache-2.0"
 repository = "https://github.com/chopratejas/headroom"
 authors = ["Headroom Maintainers"]
 
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 # `preserve_order` makes `serde_json::Value::Object` use IndexMap so JSON

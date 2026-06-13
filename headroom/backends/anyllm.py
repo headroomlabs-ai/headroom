@@ -12,6 +12,8 @@ import uuid
 from collections.abc import AsyncIterator
 from typing import Any, cast
 
+from headroom.message_contract import preserve_message_fields
+
 from .base import Backend, BackendResponse, StreamEvent
 
 logger = logging.getLogger(__name__)
@@ -69,7 +71,7 @@ class AnyLLMBackend(Backend):
             content = msg.get("content", "")
 
             if isinstance(content, str):
-                converted.append({"role": role, "content": content})
+                converted.append(preserve_message_fields(msg, {"role": role, "content": content}))
                 continue
 
             if isinstance(content, list):
@@ -85,10 +87,17 @@ class AnyLLMBackend(Backend):
                             break
 
                 if not has_complex_content and text_parts:
-                    converted.append({"role": role, "content": "\n".join(text_parts)})
+                    converted.append(
+                        preserve_message_fields(
+                            msg,
+                            {"role": role, "content": "\n".join(text_parts)},
+                        )
+                    )
                 else:
                     openai_content = self._convert_content_blocks(content)
-                    converted.append({"role": role, "content": openai_content})
+                    converted.append(
+                        preserve_message_fields(msg, {"role": role, "content": openai_content})
+                    )
 
         return converted
 

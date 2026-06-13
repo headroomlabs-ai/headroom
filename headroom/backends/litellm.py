@@ -19,6 +19,8 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
+from headroom.message_contract import preserve_message_fields
+
 from .base import Backend, BackendResponse, StreamEvent
 
 logger = logging.getLogger(__name__)
@@ -500,7 +502,7 @@ class LiteLLMBackend(Backend):
 
             # Handle string content directly
             if isinstance(content, str):
-                converted.append({"role": role, "content": content})
+                converted.append(preserve_message_fields(msg, {"role": role, "content": content}))
                 continue
 
             # Handle content blocks (Anthropic style)
@@ -561,14 +563,20 @@ class LiteLLMBackend(Backend):
                         }
                         for tu in tool_use_blocks
                     ]
+                    preserve_message_fields(msg, assistant_msg)
                     converted.append(assistant_msg)
                     continue
 
                 # Simple text only
                 if text_parts:
-                    converted.append({"role": role, "content": "\n".join(text_parts)})
+                    converted.append(
+                        preserve_message_fields(
+                            msg,
+                            {"role": role, "content": "\n".join(text_parts)},
+                        )
+                    )
                 else:
-                    converted.append({"role": role, "content": ""})
+                    converted.append(preserve_message_fields(msg, {"role": role, "content": ""}))
 
         return converted
 
