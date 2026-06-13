@@ -38,15 +38,19 @@ if sys.platform == "win32" and hasattr(sys.stdout, "buffer"):
 import click
 
 from headroom._version import __version__ as _HEADROOM_VERSION
+from headroom.agent_savings import (
+    apply_agent_savings_env_defaults,
+)
 from headroom.copilot_auth import (
     has_oauth_auth,
     resolve_client_bearer_token,
     resolve_copilot_api_url,
-    resolve_subscription_bearer_token,
+    resolve_subscription_bearer_token_details,
 )
 from headroom.providers.aider import build_launch_env as _build_aider_launch_env
 from headroom.providers.claude import proxy_base_url as _claude_proxy_base_url
 from headroom.providers.codex import build_launch_env as _build_codex_launch_env
+from headroom.providers.codex.install import codex_uses_chatgpt_auth
 from headroom.providers.copilot import (
     build_launch_env as _build_copilot_launch_env,
 )
@@ -95,6 +99,7 @@ _CONTEXT_TOOL_ENV = "HEADROOM_CONTEXT_TOOL"
 _CONTEXT_TOOL_RTK = "rtk"
 _CONTEXT_TOOL_LEAN_CTX = "lean-ctx"
 _VALID_CONTEXT_TOOLS = {_CONTEXT_TOOL_RTK, _CONTEXT_TOOL_LEAN_CTX}
+_AGENT_SAVINGS_TARGET_AGENTS = {"claude", "codex", "cursor"}
 _WRAP_PROXY_TIMEOUT_ENV = "HEADROOM_WRAP_PROXY_TIMEOUT"
 _WRAP_PROXY_TIMEOUT_DEFAULT_SECONDS = 45
 _WRAP_PROXY_TIMEOUT_ML_DEFAULT_SECONDS = 90
@@ -360,6 +365,8 @@ def _start_proxy(
     # Ensure proxy subprocess uses UTF-8 (Windows defaults to cp1252)
     proxy_env = os.environ.copy()
     proxy_env["PYTHONIOENCODING"] = "utf-8"
+    if agent_type in {"claude", "codex", "cursor"}:
+        apply_agent_savings_env_defaults(proxy_env)
 
     # Tell the proxy which agent is being wrapped (for traffic learning output)
     if agent_type != "unknown":
@@ -367,8 +374,6 @@ def _start_proxy(
         proxy_env.setdefault("HEADROOM_STACK", f"wrap_{agent_type}")
     savings_profile = _wrap_agent_savings_profile(agent_type)
     if savings_profile is not None:
-        from headroom.agent_savings import apply_agent_savings_env_defaults
-
         apply_agent_savings_env_defaults(proxy_env, savings_profile)
     if openai_api_url:
         proxy_env["OPENAI_TARGET_API_URL"] = openai_api_url
@@ -380,6 +385,8 @@ def _start_proxy(
     # GITHUB_COPILOT_API_TOKEN directly, making upstream auth deterministic.
     if copilot_api_token:
         proxy_env["GITHUB_COPILOT_API_TOKEN"] = copilot_api_token
+        if openai_api_url:
+            proxy_env["GITHUB_COPILOT_API_URL"] = openai_api_url
 
     proc = subprocess.Popen(
         cmd,
@@ -1036,12 +1043,19 @@ def _inject_codex_provider_config(port: int) -> None:
         f'openai_base_url = "http://127.0.0.1:{port}/v1"\n'
         f"{_CODEX_END_MARKER}\n"
     )
+    # Emit requires_openai_auth only for ChatGPT-OAuth users (restores the
+    # account menu); omitting it for API-key users avoids forcing an OAuth
+    # login (#406).
+    requires_openai_auth = (
+        "requires_openai_auth = true\n" if codex_uses_chatgpt_auth(config_dir / "auth.json") else ""
+    )
     provider_section = (
         f"{_CODEX_TOP_LEVEL_MARKER}\n"
         "[model_providers.headroom]\n"
         'name = "OpenAI via Headroom proxy"\n'
         f'base_url = "http://127.0.0.1:{port}/v1"\n'
         f"supports_websockets = true\n"
+        f"{requires_openai_auth}"
         # Per-project savings: Codex sends the header only when the mapped
         # env var (HEADROOM_PROJECT, set by `headroom wrap codex`) exists at
         # Codex runtime.  Inline table keeps the key inside this section so
@@ -1551,6 +1565,77 @@ def _proxy_health_config(payload: dict[str, Any] | None) -> dict[str, Any] | Non
         return None
     config = payload.get("config")
     return config if isinstance(config, dict) else None
+
+
+def _env_bool_value(value: str) -> bool:
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _agent_savings_config_mismatches(
+    running_config: dict[str, Any],
+    agent_type: str,
+) -> list[str]:
+    """Return restart reasons when a running proxy lacks target agent savings."""
+
+    if agent_type not in _AGENT_SAVINGS_TARGET_AGENTS:
+        return []
+
+    desired_env = os.environ.copy()
+    apply_agent_savings_env_defaults(desired_env)
+    checks: tuple[tuple[str, str, str, str], ...] = (
+        ("HEADROOM_SAVINGS_PROFILE", "savings_profile", "savings-profile", "str"),
+        ("HEADROOM_TARGET_RATIO", "target_ratio", "target-ratio", "float"),
+        (
+            "HEADROOM_COMPRESS_USER_MESSAGES",
+            "compress_user_messages",
+            "compress-user-messages",
+            "bool",
+        ),
+        (
+            "HEADROOM_COMPRESS_SYSTEM_MESSAGES",
+            "compress_system_messages",
+            "compress-system-messages",
+            "bool",
+        ),
+        ("HEADROOM_PROTECT_RECENT", "protect_recent", "protect-recent", "int"),
+        (
+            "HEADROOM_PROTECT_ANALYSIS_CONTEXT",
+            "protect_analysis_context",
+            "protect-analysis-context",
+            "bool",
+        ),
+        ("HEADROOM_MIN_TOKENS", "min_tokens_to_crush", "min-tokens", "int"),
+        ("HEADROOM_MAX_ITEMS", "max_items_after_crush", "max-items", "int"),
+        (
+            "HEADROOM_SMART_CRUSHER_COMPACTION",
+            "smart_crusher_with_compaction",
+            "smart-crusher-compaction",
+            "bool",
+        ),
+        ("HEADROOM_ACCURACY_GUARD", "accuracy_guard", "accuracy-guard", "str"),
+    )
+
+    mismatches: list[str] = []
+    for env_key, config_key, label, value_type in checks:
+        expected = desired_env.get(env_key)
+        if expected is None:
+            continue
+        actual = running_config.get(config_key)
+        try:
+            if value_type == "float":
+                matches = actual is not None and abs(float(actual) - float(expected)) < 1e-9
+            elif value_type == "int":
+                matches = actual is not None and int(actual) == int(expected)
+            elif value_type == "bool":
+                matches = actual is not None and bool(actual) is _env_bool_value(expected)
+            else:
+                matches = str(actual or "").strip().lower() == expected.strip().lower()
+        except (TypeError, ValueError):
+            matches = False
+        if not matches:
+            mismatches.append(label)
+
+    return mismatches
 
 
 def _proxy_active_session_count(payload: dict[str, Any] | None) -> int:
@@ -2942,19 +3027,24 @@ def copilot(
     env = os.environ.copy()
     openai_api_url: str | None = None
     copilot_proxy_token: str | None = None
+    subscription_resolution = None
     if _should_use_copilot_oauth(
         backend=effective_backend,
         provider_type=provider_type,
         env=env,
         force_subscription=subscription,
     ):
-        client_bearer = (
-            resolve_subscription_bearer_token() if subscription else resolve_client_bearer_token()
-        )
+        if subscription:
+            subscription_resolution = resolve_subscription_bearer_token_details()
+            client_bearer = (
+                subscription_resolution.token if subscription_resolution is not None else None
+            )
+        else:
+            client_bearer = resolve_client_bearer_token()
         if not client_bearer:
             raise click.ClickException(
                 "GitHub Copilot subscription mode requires a reusable GitHub/Copilot bearer "
-                "token, but none could be resolved. Run `copilot auth login` first, or set "
+                "token, but none could be resolved. Run `headroom copilot-auth login` first, or set "
                 "GITHUB_COPILOT_TOKEN / GITHUB_COPILOT_GITHUB_TOKEN."
             )
 
@@ -2992,16 +3082,15 @@ def copilot(
                 else "COPILOT_AUTH_MODE=github-oauth"
             ),
         ]
-        # Resolve the Copilot API host: an explicit GITHUB_COPILOT_API_URL wins,
-        # otherwise the generic public host (api.githubcopilot.com). This is the
-        # same policy for --subscription and the implicit OAuth path. The
-        # account-specific endpoints.api advertised by /copilot_internal/user is
-        # deliberately NOT used to route — it returns a segmented host (e.g.
-        # api.individual.githubcopilot.com) that does not serve newer models on
-        # the responses API (#610), and it is not the host the official Copilot
-        # client routes with. Accounts that require a dedicated host (enterprise /
-        # data residency) set GITHUB_COPILOT_API_URL explicitly.
-        openai_api_url = resolve_copilot_api_url(client_bearer)
+        # Non-subscription OAuth keeps upstream's generic-host policy from
+        # #610. Subscription mode can use the endpoint returned by the Copilot
+        # token exchange, which is how Business accounts advertise their API
+        # host without requiring users to configure it manually.
+        openai_api_url = (
+            subscription_resolution.api_url
+            if subscription_resolution is not None
+            else resolve_copilot_api_url(client_bearer)
+        )
         env["GITHUB_COPILOT_API_URL"] = openai_api_url
         env["OPENAI_TARGET_API_URL"] = openai_api_url
         env_vars_display.append(f"COPILOT_PROVIDER_API_URL={openai_api_url}")
@@ -4310,6 +4399,6 @@ def unwrap_codex(port: int, no_stop_proxy: bool) -> None:
 
     click.echo()
     click.echo("✓ Codex is no longer routed through the Headroom proxy.")
-    if not no_stop_proxy:
+    if not no_stop_proxy and status != "noop":
         _echo_unwrap_proxy_stop_status(_stop_local_proxy_for_unwrap(port), port)
     click.echo()

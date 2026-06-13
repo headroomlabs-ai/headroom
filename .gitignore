@@ -17,6 +17,7 @@ scripts/*
 !scripts/sync-plugin-versions.py
 !scripts/changelog-gen.py
 !scripts/verify-versions.py
+!scripts/pr-governance.py
 !scripts/tests/
 !scripts/README.md
 !scripts/repro_codex_replay.py

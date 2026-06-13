@@ -16,6 +16,7 @@ from headroom.proxy.auth_mode import (
     SUBSCRIPTION_UA_PREFIXES,
     AuthMode,
     classify_auth_mode,
+    classify_client,
 )
 
 
@@ -186,3 +187,9 @@ def test_classify_under_100us_per_call() -> None:
     per_call_us = (elapsed / iters) * 1_000_000
 
     assert per_call_us < 100, f"classify_auth_mode took {per_call_us:.2f} us/call (limit: 100 us)"
+
+
+def test_classify_client_uses_default_when_no_client_signal():
+    headers = {"user-agent": "anthropic/0.42.0"}
+
+    assert classify_client(headers, default="claude") == "claude"

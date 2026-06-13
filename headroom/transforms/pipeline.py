@@ -212,11 +212,14 @@ class TransformPipeline:
                 - output_buffer: Output buffer override.
                 - tool_profiles: Per-tool compression profiles.
                 - request_id: Optional request ID for diff artifact.
+                - waste_messages: Optional richer conversion of the same request
+                  used for waste-signal detection only (never transformed).
 
         Returns:
             Combined TransformResult.
         """
         record_metrics = kwargs.pop("record_metrics", True)
+        waste_messages = kwargs.pop("waste_messages", None)
         tokenizer = self._get_tokenizer(model)
         provider_name = self._provider_name()
 
@@ -430,13 +433,17 @@ class TransformPipeline:
                     transforms=transform_diffs,
                 )
 
-            # Detect waste signals in original messages (only when significant compression)
+            # Detect waste signals in original messages (only when significant
+            # compression). Handlers whose wire format carries tool output the
+            # message conversion drops (e.g. Gemini functionResponse parts, #819)
+            # pass a richer waste_messages list that is parsed instead — it is
+            # telemetry-only and never transformed.
             waste_signals: WasteSignals | None = None
             if tokens_before > tokens_after and (tokens_before - tokens_after) > 100:
                 try:
                     from ..parser import parse_messages
 
-                    _, _, waste_signals = parse_messages(messages, tokenizer)
+                    _, _, waste_signals = parse_messages(waste_messages or messages, tokenizer)
                     if waste_signals.total() == 0:
                         waste_signals = None
                 except Exception:

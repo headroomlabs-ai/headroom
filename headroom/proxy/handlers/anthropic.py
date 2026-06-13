@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 
 import httpx
 
+from headroom.agent_savings import proxy_pipeline_kwargs
 from headroom.copilot_auth import build_copilot_upstream_url
 from headroom.pipeline import PipelineStage, summarize_routing_markers
 from headroom.proxy.auth_mode import classify_auth_mode, classify_client
@@ -663,7 +664,7 @@ class AnthropicHandlerMixin:
             # Identify the harness (codex / claude-code / aider / etc.)
             # from User-Agent or X-Client. Surfaced via the funnel into
             # PERF logs and RequestLog.tags — see RequestOutcome.client.
-            client = classify_client(headers)
+            client = classify_client(headers, default="claude")
             # PR-A5 (P5-49): strip internal x-headroom-* from upstream-bound
             # headers AFTER `_extract_tags` reads them. Inbound bypass gating
             # uses `request.headers.get(...)` directly above; memory user-id
@@ -1066,6 +1067,7 @@ class AnthropicHandlerMixin:
                                     biases=biases,
                                     request_id=request_id,
                                     compression_policy=compression_policy,
+                                    **proxy_pipeline_kwargs(self.config),
                                 ),
                                 timeout=COMPRESSION_TIMEOUT_SECONDS,
                             )
@@ -1106,6 +1108,7 @@ class AnthropicHandlerMixin:
                                     biases=biases,
                                     request_id=request_id,
                                     compression_policy=compression_policy,
+                                    **proxy_pipeline_kwargs(self.config),
                                 ),
                                 timeout=COMPRESSION_TIMEOUT_SECONDS,
                             )
@@ -1137,6 +1140,7 @@ class AnthropicHandlerMixin:
                                         biases=biases,
                                         request_id=request_id,
                                         compression_policy=compression_policy,
+                                        **proxy_pipeline_kwargs(self.config),
                                     ),
                                     timeout=COMPRESSION_TIMEOUT_SECONDS,
                                 )
@@ -2550,7 +2554,7 @@ class AnthropicHandlerMixin:
         headers = dict(request.headers.items())
         headers.pop("host", None)
         headers.pop("content-length", None)
-        client = classify_client(headers)
+        client = classify_client(headers, default="claude")
         tags = extract_tags(headers)
         # PR-A5 (P5-49): strip internal x-headroom-* before forwarding upstream.
         from headroom.proxy.helpers import _strip_internal_headers, log_outbound_headers
@@ -2802,7 +2806,7 @@ class AnthropicHandlerMixin:
 
         headers = dict(request.headers.items())
         headers.pop("host", None)
-        client = classify_client(headers)
+        client = classify_client(headers, default="claude")
         tags = extract_tags(headers)
         # PR-A5 (P5-49): strip internal x-headroom-* before forwarding upstream.
         from headroom.proxy.helpers import _strip_internal_headers, log_outbound_headers
@@ -2925,7 +2929,7 @@ class AnthropicHandlerMixin:
 
         headers = dict(request.headers.items())
         headers.pop("host", None)
-        client = classify_client(headers)
+        client = classify_client(headers, default="claude")
         tags = extract_tags(headers)
         # PR-A5 (P5-49): strip internal x-headroom-* before forwarding upstream.
         from headroom.proxy.helpers import _strip_internal_headers, log_outbound_headers

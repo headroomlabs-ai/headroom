@@ -15,6 +15,7 @@ from headroom.proxy.handlers.openai import (
     OpenAIHandlerMixin,
     _decode_openai_bearer_payload,
     _passthrough_usage_from_json,
+    _prefers_http1_passthrough,
 )
 from headroom.proxy.helpers import _headroom_bypass_enabled
 from headroom.proxy.server import HeadroomProxy
@@ -49,6 +50,31 @@ class _FreshCompressor:
 class _TimeoutHttpClient:
     async def request(self, **kwargs):  # noqa: ANN001, ANN201
         raise httpx.ConnectTimeout("connect timed out")
+
+
+class _RecordingHttpClient:
+    def __init__(self, label: str) -> None:
+        self.label = label
+        self.calls = 0
+
+    async def request(self, **kwargs):  # noqa: ANN001, ANN201
+        self.calls += 1
+        request = httpx.Request(kwargs["method"], kwargs["url"])
+        return httpx.Response(
+            200,
+            request=request,
+            headers={"content-type": "application/json"},
+            json={"client": self.label},
+        )
+
+
+class _ChatGPTAccountRequest:
+    method = "GET"
+    headers = {}
+    url = SimpleNamespace(path="/backend-api/me", query="")
+
+    async def body(self) -> bytes:
+        return b""
 
 
 class _PassthroughRequest:
@@ -247,6 +273,61 @@ def test_openai_passthrough_connect_timeout_returns_502() -> None:
     payload = json.loads(response.body)
     assert payload["error"]["type"] == "connection_error"
     assert "Failed to connect to upstream API" in payload["error"]["message"]
+
+
+def test_prefers_http1_passthrough_matches_chatgpt_hosts_only() -> None:
+    assert _prefers_http1_passthrough("https://chatgpt.com") is True
+    assert _prefers_http1_passthrough("https://chatgpt.com/backend-api/me") is True
+    assert _prefers_http1_passthrough("https://api.chatgpt.com") is True
+    assert _prefers_http1_passthrough("https://CHATGPT.COM/backend-api/me") is True
+    assert _prefers_http1_passthrough("https://api.openai.com") is False
+    assert _prefers_http1_passthrough("https://notchatgpt.com") is False
+    assert _prefers_http1_passthrough("https://chatgpt.com.evil.com") is False
+    assert _prefers_http1_passthrough("") is False
+
+
+def test_chatgpt_passthrough_uses_http1_client() -> None:
+    handler = object.__new__(OpenAIHandlerMixin)
+    handler.http_client = _RecordingHttpClient("h2")
+    handler.http_client_h1 = _RecordingHttpClient("h1")
+
+    response = asyncio.run(
+        handler.handle_passthrough(_ChatGPTAccountRequest(), "https://chatgpt.com")
+    )
+
+    assert response.status_code == 200
+    assert json.loads(response.body)["client"] == "h1"
+    assert handler.http_client.calls == 0
+    assert handler.http_client_h1.calls == 1
+
+
+def test_non_chatgpt_passthrough_uses_default_client() -> None:
+    handler = object.__new__(OpenAIHandlerMixin)
+    handler.http_client = _RecordingHttpClient("h2")
+    handler.http_client_h1 = _RecordingHttpClient("h1")
+
+    response = asyncio.run(
+        handler.handle_passthrough(_PassthroughRequest(), "https://api.openai.com")
+    )
+
+    assert response.status_code == 200
+    assert json.loads(response.body)["client"] == "h2"
+    assert handler.http_client.calls == 1
+    assert handler.http_client_h1.calls == 0
+
+
+def test_chatgpt_passthrough_falls_back_when_h1_client_missing() -> None:
+    handler = object.__new__(OpenAIHandlerMixin)
+    handler.http_client = _RecordingHttpClient("h2")
+    handler.http_client_h1 = None
+
+    response = asyncio.run(
+        handler.handle_passthrough(_ChatGPTAccountRequest(), "https://chatgpt.com")
+    )
+
+    assert response.status_code == 200
+    assert json.loads(response.body)["client"] == "h2"
+    assert handler.http_client.calls == 1
 
 
 def test_passthrough_usage_normalizes_vertex_usage_metadata() -> None:

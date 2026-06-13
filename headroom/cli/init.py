@@ -38,6 +38,7 @@ from headroom.install.runtime import (
 )
 from headroom.install.state import load_manifest, save_manifest
 from headroom.install.supervisors import start_supervisor
+from headroom.providers.codex.install import codex_uses_chatgpt_auth
 
 from .main import main
 
@@ -291,6 +292,14 @@ def _ensure_codex_provider(path: Path, port: int) -> None:
     import re
 
     logger.debug("ensure codex provider block: %s (port=%s)", path, port)
+    # Emit requires_openai_auth only for ChatGPT-OAuth users (restores the
+    # account menu); omitting it for API-key users avoids forcing an OAuth
+    # login (#406).
+    requires_openai_auth = (
+        "requires_openai_auth = true\n"
+        if codex_uses_chatgpt_auth(path.parent / "auth.json")
+        else ""
+    )
     block = (
         f"{_CODEX_PROVIDER_MARKER_START}\n"
         'model_provider = "headroom"\n'
@@ -299,6 +308,7 @@ def _ensure_codex_provider(path: Path, port: int) -> None:
         'name = "Headroom init proxy"\n'
         f'base_url = "http://127.0.0.1:{port}/v1"\n'
         "supports_websockets = true\n"
+        f"{requires_openai_auth}"
         f"{_CODEX_PROVIDER_MARKER_END}"
     )
     content = path.read_text(encoding="utf-8") if path.exists() else ""

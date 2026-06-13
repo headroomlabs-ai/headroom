@@ -48,6 +48,22 @@ def compute_hash(text: str) -> str:
     return hashlib.md5(text.encode()).hexdigest()[:16]  # nosec B324
 
 
+def _canonical_call_key(name: str, arguments: Any) -> str:
+    """Canonical identity for a tool invocation: name + arguments with JSON
+    key order normalized, so semantically identical calls hash equal even
+    when the provider serializes arguments differently."""
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except (ValueError, TypeError):
+            pass
+    if isinstance(arguments, (dict, list)):
+        canon = json.dumps(arguments, sort_keys=True, separators=(",", ":"), default=str)
+    else:
+        canon = str(arguments)
+    return compute_hash(f"{name}\x00{canon}")
+
+
 def _extract_tool_result_text(payload: dict[str, Any]) -> str:
     """Extract text from a tool result payload.
 
@@ -157,6 +173,7 @@ def parse_message_to_blocks(
     content = message.get("content")
     if content:
         tool_result_parts: list[dict[str, Any]] = []
+        tool_use_parts: list[dict[str, Any]] = []
         if isinstance(content, str):
             text = content
         elif isinstance(content, list):
@@ -172,6 +189,13 @@ def parse_message_to_blocks(
                 elif isinstance(part, dict) and "toolResult" in part:
                     # Strands/Bedrock converse format; same treatment.
                     tool_result_parts.append(part)
+                elif isinstance(part, dict) and part.get("type") == "tool_use":
+                    # Anthropic Messages format: call side of the tool unit;
+                    # collect for dedicated tool_call blocks below.
+                    tool_use_parts.append(part)
+                elif isinstance(part, dict) and "toolUse" in part:
+                    # Strands/Bedrock converse format; same treatment.
+                    tool_use_parts.append(part)
                 elif isinstance(part, str):
                     text_parts.append(part)
             text = "\n".join(text_parts)
@@ -242,6 +266,33 @@ def parse_message_to_blocks(
             )
         blocks.extend(tr_blocks)
 
+        for part in tool_use_parts:
+            payload = part["toolUse"] if "toolUse" in part else part
+            if not isinstance(payload, dict):
+                continue
+            tu_name = payload.get("name") or "unknown"
+            tu_args = payload.get("input", {})
+            tu_id = payload.get("toolUseId") if "toolUse" in part else payload.get("id")
+            try:
+                tu_args_text = json.dumps(tu_args, sort_keys=True, default=str)
+            except (TypeError, ValueError):
+                tu_args_text = str(tu_args)
+            tu_text = f"{tu_name}({tu_args_text})"
+            blocks.append(
+                Block(
+                    kind="tool_call",
+                    text=tu_text,
+                    tokens_est=tokenizer.count_text(tu_text) + 10,
+                    content_hash=compute_hash(tu_text),
+                    source_index=index,
+                    flags={
+                        "tool_call_id": tu_id,
+                        "function_name": tu_name,
+                        "call_key": _canonical_call_key(tu_name, tu_args),
+                    },
+                )
+            )
+
     # Handle tool calls (assistant messages with tool_calls)
     tool_calls = message.get("tool_calls")
     if tool_calls:
@@ -259,6 +310,9 @@ def parse_message_to_blocks(
                     flags={
                         "tool_call_id": tc.get("id"),
                         "function_name": func.get("name"),
+                        "call_key": _canonical_call_key(
+                            func.get("name") or "unknown", func.get("arguments", "")
+                        ),
                     },
                 )
             )
@@ -315,6 +369,7 @@ def parse_messages(
     # at more than one position means the agent re-fetched something already
     # in context — an over-compression signal (#853). The first serve is
     # free; every repeat is counted as waste.
+    counted_results: set[int] = set()
     reread_groups: dict[str, list[Block]] = {}
     for block in all_blocks:
         if block.kind == "tool_result" and block.tokens_est >= REREAD_MIN_TOKENS:
@@ -337,6 +392,44 @@ def parse_messages(
             prev_index = block.source_index
             if not is_polling:
                 total_waste.reread_tokens += block.tokens_est
+                counted_results.add(id(block))
+
+    # Re-issued-call detection: the agent invoking the same tool with the
+    # same arguments again is a re-fetch even when the result bytes differ
+    # (timestamps, mtimes, ordering defeat the content-hash pass above).
+    # Same polling guard and size floor as above, applied to the repeat
+    # invocation's result; results the content-hash pass already counted
+    # are skipped so identical-content repeats are never counted twice.
+    results_by_call_id: dict[str, Block] = {}
+    for block in all_blocks:
+        if block.kind == "tool_result":
+            tc_id = block.flags.get("tool_call_id")
+            if tc_id and tc_id not in results_by_call_id:
+                results_by_call_id[tc_id] = block
+
+    call_groups: dict[str, list[Block]] = {}
+    for block in all_blocks:
+        if block.kind == "tool_call":
+            call_key = block.flags.get("call_key")
+            if call_key:
+                call_groups.setdefault(call_key, []).append(block)
+
+    for group in call_groups.values():
+        prev_index = group[0].source_index
+        for block in group:
+            if block.source_index == prev_index:
+                continue
+            is_polling = block.source_index - prev_index <= REREAD_ADJACENT_GAP
+            prev_index = block.source_index
+            if is_polling:
+                continue
+            result = results_by_call_id.get(block.flags.get("tool_call_id") or "")
+            if result is None or result.tokens_est < REREAD_MIN_TOKENS:
+                continue
+            if id(result) in counted_results:
+                continue
+            total_waste.reread_tokens += result.tokens_est
+            counted_results.add(id(result))
 
     # Compute block breakdown
     breakdown: dict[str, int] = {}

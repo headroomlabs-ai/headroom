@@ -1,0 +1,19 @@
+{
+  "action": "ready_for_review",
+  "number": 42,
+  "pull_request": {
+    "number": 42,
+    "draft": false,
+    "title": "feat: add PR governance",
+    "body": "## Description\n\nAdd a required PR governance check and commit-msg enforcement.\n\nCloses #123\n\n## Type of Change\n\n- [x] New feature (non-breaking change that adds functionality)\n\n## Changes Made\n\n- Added workflow validation for PR template completeness.\n- Added a commit-msg hook that runs commitlint locally.\n\n## Testing\n\n- [x] Unit tests pass (`pytest`)\n- [x] Manual testing performed\n\n### Test Output\n\n```text\npytest scripts/tests/test_pr_governance.py -q\n```\n\n## Real Behavior Proof\n\n- Environment: Ubuntu runner, Python 3.12\n- Exact command / steps: Opened a PR with an incomplete template, then fixed the body.\n- Observed result: The governance check failed until the template and readiness boxes were complete.\n- Not tested: Repository-level automatic Copilot rulesets.\n\n## Review Readiness\n\n- [x] I have performed a self-review\n- [x] This PR is ready for human review\n",
+    "user": {
+      "login": "octocat"
+    },
+    "base": {
+      "sha": "dff6a199"
+    }
+  },
+  "repository": {
+    "full_name": "JerrettDavis/headroom"
+  }
+}

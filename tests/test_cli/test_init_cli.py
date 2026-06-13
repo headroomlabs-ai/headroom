@@ -529,6 +529,30 @@ def test_ensure_codex_provider_replaces_existing_model_provider(
     assert parsed["features"]["hooks"] is True
 
 
+def test_ensure_codex_provider_emits_requires_openai_auth_for_chatgpt(
+    monkeypatch, tmp_path: Path
+) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    path = tmp_path / "config.toml"
+    (tmp_path / "auth.json").write_text('{"auth_mode": "chatgpt"}', encoding="utf-8")
+
+    init_cli._ensure_codex_provider(path, 8787)
+
+    assert "requires_openai_auth = true" in path.read_text(encoding="utf-8")
+
+
+def test_ensure_codex_provider_omits_requires_openai_auth_for_api_key(
+    monkeypatch, tmp_path: Path
+) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    path = tmp_path / "config.toml"
+    (tmp_path / "auth.json").write_text('{"auth_mode": "apikey"}', encoding="utf-8")
+
+    init_cli._ensure_codex_provider(path, 8787)
+
+    assert "requires_openai_auth" not in path.read_text(encoding="utf-8")
+
+
 def test_ensure_codex_feature_flag_replaces_existing_marker(monkeypatch, tmp_path: Path) -> None:
     init_cli, _ = _load_init_module(monkeypatch)
     path = tmp_path / "config.toml"
