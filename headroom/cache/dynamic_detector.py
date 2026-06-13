@@ -782,7 +782,12 @@ class SemanticDetector:
             convert_to_numpy=True,
         )
 
-        # Compute similarities
+        # Compute similarities. `is_available` only guarantees `_model` is
+        # set; guard the exemplar matrix explicitly so a None never reaches
+        # `.T` (real crash) and mypy can narrow the `Any | None` attribute.
+        if self._exemplar_embeddings is None:
+            return [], "exemplar embeddings not initialized"
+
         similarities = np.dot(sentence_embeddings, self._exemplar_embeddings.T)
 
         for i, (text, start, end) in enumerate(sentences):
