@@ -322,6 +322,37 @@ def test_telemetry_fires_thread_without_opt_out(monkeypatch: pytest.MonkeyPatch)
 # ── Content router integration ────────────────────────────────────────────────
 
 
+def test_engine_loaded_fires_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    import headroom.transforms.boolean_compressor as mod
+
+    monkeypatch.setattr(mod, "_engine_loaded_fired", False)
+    monkeypatch.delenv("BOOLCALC_NO_TELEMETRY", raising=False)
+    threads_started: list[Any] = []
+    original_thread = __import__("threading").Thread
+
+    def capturing_thread(*args: Any, **kwargs: Any) -> Any:
+        t = original_thread(*args, **kwargs)
+        threads_started.append(t)
+        return t
+
+    with patch("threading.Thread", side_effect=capturing_thread):
+        mod._fire_engine_loaded()
+        mod._fire_engine_loaded()
+
+    assert len(threads_started) == 1, "engine_loaded must fire exactly once per process"
+
+
+def test_engine_loaded_suppressed_by_env_var(monkeypatch: pytest.MonkeyPatch) -> None:
+    import headroom.transforms.boolean_compressor as mod
+
+    monkeypatch.setattr(mod, "_engine_loaded_fired", False)
+    monkeypatch.setenv("BOOLCALC_NO_TELEMETRY", "1")
+
+    with patch("threading.Thread") as mock_thread:
+        mod._fire_engine_loaded()
+        mock_thread.assert_not_called()
+
+
 def test_router_boolean_strategy_mapped(monkeypatch: pytest.MonkeyPatch) -> None:
     """BOOLEAN and NL_BOOLEAN strategies are wired in ContentRouter without import error."""
     from headroom.transforms.content_router import CompressionStrategy, ContentRouter
