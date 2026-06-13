@@ -89,5 +89,10 @@
         "https://*:*"
       ]
     }
+  },
+  "contracts": {
+    "tools": [
+      "headroom_retrieve"
+    ]
   }
 }
