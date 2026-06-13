@@ -24,6 +24,7 @@ vi.mock("../src/proxy-manager.js", () => ({
 }));
 
 import { HeadroomContextEngine } from "../src/engine.js";
+import { compress } from "headroom-ai";
 
 afterEach(() => {
   mocked.start.mockReset();
@@ -97,5 +98,35 @@ describe("HeadroomContextEngine proxy startup helpers", () => {
       estimatedTokens: 0,
     });
     expect(mocked.start).toHaveBeenCalledTimes(1);
+  });
+
+  it("clears the request timeout after successful compression", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.mocked(compress).mockResolvedValue({
+        compressed: false,
+        messages: [{ role: "user", content: "hello" }],
+        tokensBefore: 5,
+        tokensAfter: 5,
+        tokensSaved: 0,
+      });
+
+      const engine = new HeadroomContextEngine({ requestTimeoutMs: 30_000 });
+      (engine as { proxyUrl: string | null }).proxyUrl = "http://127.0.0.1:8787";
+
+      await expect(
+        engine.assemble({
+          sessionId: "session-1",
+          messages: [{ role: "user", content: "hello" }],
+        }),
+      ).resolves.toEqual({
+        messages: [{ role: "user", content: "hello" }],
+        estimatedTokens: 5,
+      });
+
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

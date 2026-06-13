@@ -939,7 +939,7 @@ class StreamingMixin:
                             status_code=upstream_response.status_code,
                         )
                     break
-                except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
+                except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout, httpx.RemoteProtocolError) as e:
                     last_connect_error = e
                     if attempt >= retry_attempts - 1:
                         raise
@@ -958,9 +958,9 @@ class StreamingMixin:
 
             if upstream_response is None:
                 raise last_connect_error or RuntimeError("upstream connection did not start")
-        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout, httpx.RemoteProtocolError) as e:
             error_msg = str(e) or repr(e)
-            logger.error(f"[{request_id}] Connection error to upstream API: {error_msg}")
+            logger.error(f"[{request_id}] Connection/protocol error to upstream API: {error_msg}")
 
             async def _error_gen():
                 error_event = {
@@ -1269,8 +1269,13 @@ class StreamingMixin:
                         metadata={"total_bytes": stream_state["total_bytes"]},
                     )
 
-            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
-                logger.error(f"[{request_id}] Connection error to upstream API: {e}")
+            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout, httpx.RemoteProtocolError) as e:
+                # httpx.RemoteProtocolError wraps httpcore.RemoteProtocolError which is
+                # raised when Anthropic sends an HTTP/2 RST_STREAM or GOAWAY frame
+                # mid-stream (e.g. on long responses or under load).  Without this
+                # handler the exception propagates through Starlette's
+                # BaseHTTPMiddleware and leaves the client connection hanging.
+                logger.error(f"[{request_id}] Connection/protocol error during streaming: {e}")
                 error_event = {
                     "type": "error",
                     "error": {

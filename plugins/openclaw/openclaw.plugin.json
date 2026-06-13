@@ -1,6 +1,11 @@
 {
   "id": "headroom",
   "kind": "context-engine",
+  "contracts": {
+    "tools": [
+      "headroom_retrieve"
+    ]
+  },
   "uiHints": {
     "proxyUrl": {
       "label": "Proxy URL",

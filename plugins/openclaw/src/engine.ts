@@ -11,8 +11,37 @@ import { compress } from "headroom-ai";
 import { ProxyManager, defaultLogger, type ProxyManagerConfig, type ProxyManagerLogger } from "./proxy-manager.js";
 import { agentToOpenAI, normalizeAgentMessages, openAIToAgent } from "./convert.js";
 
+/** Race a promise against a timeout. Rejects with a descriptive error on expiry. */
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  let timerId: ReturnType<typeof setTimeout> | undefined;
+  const timer = new Promise<never>((_, reject) => {
+    timerId = setTimeout(() => reject(new Error(`headroom compress() timed out after ${ms}ms`)), ms);
+  });
+  return Promise.race([promise, timer]).finally(() => {
+    if (timerId !== undefined) {
+      clearTimeout(timerId);
+    }
+  });
+}
+
 export interface HeadroomEngineConfig extends ProxyManagerConfig {
   enabled?: boolean;
+  /**
+   * Milliseconds to wait for a `compress()` call before giving up and falling
+   * back to uncompressed messages. Default: 30_000 (30 s).
+   */
+  requestTimeoutMs?: number;
+  /**
+   * Number of consecutive `assemble()` errors before the circuit breaker opens
+   * and all requests bypass the proxy. Default: 3.
+   */
+  circuitBreakerThreshold?: number;
+  /**
+   * Milliseconds to keep the circuit open after the threshold is reached.
+   * After the cool-down the breaker resets and the next request probes the
+   * proxy again. Default: 60_000 (60 s).
+   */
+  circuitBreakerCooldownMs?: number;
 }
 
 export class HeadroomContextEngine {
@@ -34,6 +63,12 @@ export class HeadroomContextEngine {
     totalTokensSaved: 0,
     totalTokensBefore: 0,
     compactions: 0,
+  };
+
+  /** Circuit-breaker state — bypasses proxy after N consecutive errors. */
+  private cb = {
+    errors: 0,
+    openUntilMs: 0,
   };
 
   constructor(config: HeadroomEngineConfig = {}, logger?: ProxyManagerLogger) {
@@ -96,19 +131,30 @@ export class HeadroomContextEngine {
       return { messages: normalizeAgentMessages(params.messages), estimatedTokens: 0 };
     }
 
+    // Circuit breaker: bypass proxy during cool-down window
+    if (this.isCircuitOpen()) {
+      this.logger.warn("[headroom] Circuit open — bypassing proxy, falling back to uncompressed messages");
+      return { messages: normalizeAgentMessages(params.messages), estimatedTokens: 0 };
+    }
+
     try {
       // Convert AgentMessage → OpenAI format
       const openaiMessages = agentToOpenAI(params.messages);
 
-      // Compress via proxy — pass tokenBudget so RollingWindow enforces it
-      const result = await compress(openaiMessages, {
-        model: params.model ?? "claude-sonnet-4-5",
-        baseUrl: this.proxyUrl,
-        fallback: true,
-        tokenBudget: params.tokenBudget,
-      } as any);
+      // Compress via proxy with a hard timeout so a hung proxy never blocks OpenClaw
+      const timeoutMs = this.config.requestTimeoutMs ?? 30_000;
+      const result = await withTimeout(
+        compress(openaiMessages, {
+          model: params.model ?? "claude-sonnet-4-5",
+          baseUrl: this.proxyUrl,
+          fallback: true,
+          tokenBudget: params.tokenBudget,
+        } as any),
+        timeoutMs,
+      );
 
       if (!result.compressed || result.tokensSaved === 0) {
+        this.resetCircuit();
         return {
           messages: normalizeAgentMessages(params.messages),
           estimatedTokens: result.tokensBefore,
@@ -117,6 +163,9 @@ export class HeadroomContextEngine {
 
       // Convert back to AgentMessage format
       const compressedAgentMessages = openAIToAgent(result.messages);
+
+      // Successful compression — reset circuit breaker
+      this.resetCircuit();
 
       // Track stats
       this.stats.totalCompressions++;
@@ -136,8 +185,9 @@ export class HeadroomContextEngine {
             : undefined,
       };
     } catch (error) {
-      this.logger.error(`Assemble failed: ${error}`);
-      // Graceful fallback: return original messages
+      this.logger.error(`[headroom] Assemble failed: ${error}`);
+      this.tripCircuit(error);
+      // Graceful fallback: return original messages unchanged
       return { messages: normalizeAgentMessages(params.messages), estimatedTokens: 0 };
     }
   }
@@ -248,9 +298,10 @@ export class HeadroomContextEngine {
         this.logger.info(`Headroom proxy ready at ${proxyUrl}`);
         return proxyUrl;
       })
-      .catch((error) => {
+      .catch((error): string => {
         this.logger.warn(`Headroom proxy unavailable: ${error}`);
-        throw error;
+        // Do not re-throw — graceful degradation, compression simply skipped
+        return "";
       })
       .finally(() => {
         this.proxyStartupPromise = null;
@@ -274,6 +325,41 @@ export class HeadroomContextEngine {
       throw new Error("Headroom proxy startup is disabled");
     }
     return this.proxyStartupPromise;
+  }
+
+  // --- Circuit breaker helpers ---
+
+  private isCircuitOpen(): boolean {
+    if (this.cb.errors < (this.config.circuitBreakerThreshold ?? 3)) return false;
+    if (Date.now() < this.cb.openUntilMs) return true;
+    // Cool-down expired — reset so the next request re-probes the proxy
+    this.logger.info("[headroom] Circuit breaker cool-down expired, resetting");
+    this.cb.errors = 0;
+    this.cb.openUntilMs = 0;
+    this.proxyUrl = null; // force re-probe on next ensureProxyStarted()
+    return false;
+  }
+
+  private tripCircuit(error: unknown): void {
+    this.cb.errors++;
+    const threshold = this.config.circuitBreakerThreshold ?? 3;
+    if (this.cb.errors >= threshold) {
+      const cooldownMs = this.config.circuitBreakerCooldownMs ?? 60_000;
+      this.cb.openUntilMs = Date.now() + cooldownMs;
+      this.proxyUrl = null;
+      this.logger.warn(
+        `[headroom] Circuit breaker opened after ${this.cb.errors} consecutive errors ` +
+        `(last: ${String(error)}). Bypassing proxy for ${cooldownMs / 1000}s.`,
+      );
+    }
+  }
+
+  private resetCircuit(): void {
+    if (this.cb.errors > 0) {
+      this.logger.debug("[headroom] Circuit breaker reset after successful compression");
+    }
+    this.cb.errors = 0;
+    this.cb.openUntilMs = 0;
   }
 
   private async notifyProxyReady(proxyUrl: string): Promise<void> {
