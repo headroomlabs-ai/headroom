@@ -44,10 +44,20 @@ class AnyLLMBackend(Backend):
         self.api_key = api_key
         self.api_base = api_base
 
-        # Create the AnyLLM instance once and reuse
-        self.llm = AnyLLM.create(self.provider)
+        # Create the AnyLLM instance once and reuse. api_key/api_base are only
+        # forwarded when set so providers keep their own env-var defaults
+        # (e.g. OPENAI_API_KEY / OPENAI_BASE_URL) otherwise.
+        create_kwargs: dict[str, Any] = {}
+        if self.api_key is not None:
+            create_kwargs["api_key"] = self.api_key
+        if self.api_base is not None:
+            create_kwargs["api_base"] = self.api_base
+        self.llm = AnyLLM.create(self.provider, **create_kwargs)
 
-        logger.info(f"any-llm backend initialized (provider={provider})")
+        logger.info(
+            f"any-llm backend initialized (provider={provider}, "
+            f"api_base={self.api_base or 'default'})"
+        )
 
     @property
     def name(self) -> str:
