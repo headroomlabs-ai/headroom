@@ -2163,8 +2163,11 @@ def _collect_statement_symbols(
     )
     for assignment in assignment_nodes:
         assignment_children = getattr(assignment, "children", [])
-        if assignment_children:
-            add_identifiers(defined, assignment_children[0])
+        first_named = next(
+            (c for c in assignment_children if getattr(c, "is_named", False)), None
+        )
+        if first_named is not None:
+            add_identifiers(defined, first_named)
         else:
             add_identifiers(defined, assignment)
 
