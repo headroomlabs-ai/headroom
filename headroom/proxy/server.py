@@ -2310,6 +2310,15 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         """
         m = proxy.metrics
 
+        from headroom.perf.analyzer import build_perf_summary, parse_log_files
+
+        try:
+            perf_report = parse_log_files(last_n_hours=1.0)
+            throughput = build_perf_summary(perf_report).get("throughput")
+        except Exception as e:
+            logger.warning("Failed to calculate throughput for stats: %s", e)
+            throughput = None
+
         # Calculate average latency
         avg_latency_ms = round(m.latency_sum_ms / m.latency_count, 2) if m.latency_count > 0 else 0
         min_latency_ms = (
@@ -2725,6 +2734,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             **recent_request_payload,
             "log_full_messages": proxy.config.log_full_messages if proxy else False,
             **get_quota_registry().get_all_stats(),
+            "throughput": throughput,
         }
 
     def _dashboard_config_payload() -> dict[str, Any]:

@@ -421,6 +421,9 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         f"cache_read={outcome.cache_read_tokens} cache_write={outcome.cache_write_tokens} "
         f"cache_hit_pct={outcome.cache_hit_pct} "
         f"opt_ms={outcome.overhead_ms:.0f} "
+        f"total_ms={outcome.total_latency_ms:.0f} "
+        f"tok_out={outcome.output_tokens} "
+        f"ttfb_ms={outcome.ttfb_ms:.0f} "
         f"transforms={_summarize_transforms(list(outcome.transforms_applied))}"
         f"{client_part}"
     )
