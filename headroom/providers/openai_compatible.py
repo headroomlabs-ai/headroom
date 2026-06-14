@@ -519,3 +519,91 @@ def create_lmstudio_provider(
         name="lmstudio",
         base_url=base_url,
     )
+
+
+def create_deepseek_provider(
+    api_key: str | None = None,
+) -> OpenAICompatibleProvider:
+    """Create provider for Deepseek.
+
+    Deepseek offers high-performance LLMs at very competitive pricing,
+    including V4, V3, Coder, and Reasoner models.
+
+    Args:
+        api_key: Deepseek API key.
+
+    Returns:
+        Configured provider with Deepseek pricing.
+    """
+    provider = OpenAICompatibleProvider(
+        name="deepseek",
+        base_url="https://api.deepseek.com/v1",
+        api_key=api_key,
+    )
+
+    # V4 models
+    provider.register_model(
+        "deepseek-v4-flash",
+        context_window=1_000_000,
+        max_output_tokens=384_000,
+        input_cost_per_1m=0.27,
+        output_cost_per_1m=1.10,
+    )
+    provider.register_model(
+        "deepseek-v4-pro",
+        context_window=1_000_000,
+        max_output_tokens=384_000,
+        input_cost_per_1m=0.54,
+        output_cost_per_1m=2.19,
+    )
+
+    # V3 models
+    provider.register_model(
+        "deepseek-v3",
+        context_window=128_000,
+        input_cost_per_1m=0.27,
+        output_cost_per_1m=1.10,
+    )
+    provider.register_model(
+        "deepseek-chat",
+        context_window=131_072,
+        input_cost_per_1m=0.27,
+        output_cost_per_1m=1.10,
+    )
+    provider.register_model(
+        "deepseek-reasoner",
+        context_window=131_072,
+        max_output_tokens=16_384,
+        input_cost_per_1m=0.55,
+        output_cost_per_1m=2.19,
+    )
+
+    # V2 models
+    provider.register_model(
+        "deepseek-v2",
+        context_window=128_000,
+        input_cost_per_1m=0.27,
+        output_cost_per_1m=1.10,
+    )
+    provider.register_model(
+        "deepseek-v2-chat",
+        context_window=128_000,
+        input_cost_per_1m=0.27,
+        output_cost_per_1m=1.10,
+    )
+
+    # Coder models
+    provider.register_model(
+        "deepseek-coder",
+        context_window=16_384,
+        input_cost_per_1m=0.14,
+        output_cost_per_1m=0.28,
+    )
+    provider.register_model(
+        "deepseek-coder-v2",
+        context_window=128_000,
+        input_cost_per_1m=0.27,
+        output_cost_per_1m=1.10,
+    )
+
+    return provider
