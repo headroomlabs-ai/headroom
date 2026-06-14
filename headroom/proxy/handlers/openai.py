@@ -649,15 +649,44 @@ class OpenAIHandlerMixin:
         return max(1, len(text) // 4)
 
     @staticmethod
-    def _openai_responses_large_text_preview(text: str) -> str:
-        if len(text) <= _OPENAI_RESPONSES_LARGE_TEXT_PREVIEW_CHARS:
+    def _openai_responses_text_prefix(text: str, max_bytes: int) -> str:
+        if max_bytes <= 0:
+            return ""
+        encoded = text.encode("utf-8", errors="replace")
+        if len(encoded) <= max_bytes:
             return text
-        head_chars = _OPENAI_RESPONSES_LARGE_TEXT_PREVIEW_CHARS // 2
-        tail_chars = _OPENAI_RESPONSES_LARGE_TEXT_PREVIEW_CHARS - head_chars
+        return encoded[:max_bytes].decode("utf-8", errors="ignore")
+
+    @staticmethod
+    def _openai_responses_text_suffix(text: str, max_bytes: int) -> str:
+        if max_bytes <= 0:
+            return ""
+        encoded = text.encode("utf-8", errors="replace")
+        if len(encoded) <= max_bytes:
+            return text
+        return encoded[-max_bytes:].decode("utf-8", errors="ignore")
+
+    @classmethod
+    def _openai_responses_large_text_preview(cls, text: str, *, max_bytes: int) -> str:
+        encoded = text.encode("utf-8", errors="replace")
+        text_bytes = len(encoded)
+        if max_bytes <= 0:
+            return ""
+        if text_bytes <= min(max_bytes, _OPENAI_RESPONSES_LARGE_TEXT_PREVIEW_CHARS):
+            return text
+        max_bytes = min(max_bytes, _OPENAI_RESPONSES_LARGE_TEXT_PREVIEW_CHARS)
+        if text_bytes <= max_bytes:
+            return text
+        omission = "\n\n[... middle omitted; retrieve full content with the hash below ...]\n\n"
+        omission_bytes = len(omission.encode("utf-8"))
+        if max_bytes <= omission_bytes + 16:
+            return cls._openai_responses_text_prefix(text, max_bytes)
+        head_bytes = (max_bytes - omission_bytes) // 2
+        tail_bytes = max_bytes - omission_bytes - head_bytes
         return (
-            text[:head_chars]
-            + "\n\n[... middle omitted; retrieve full content with the hash below ...]\n\n"
-            + text[-tail_chars:]
+            cls._openai_responses_text_prefix(text, head_bytes)
+            + omission
+            + cls._openai_responses_text_suffix(text, tail_bytes)
         )
 
     def _compress_openai_responses_oversized_unit(
@@ -665,12 +694,13 @@ class OpenAIHandlerMixin:
         unit: Any,
         *,
         tool_call_id: str | None,
+        tokenizer: Any,
     ) -> Any:
         from headroom.cache.compression_store import get_compression_store
         from headroom.transforms.compression_units import UnitCompressionResult
 
         original = unit.text
-        original_tokens = self._estimate_openai_responses_text_tokens(original)
+        original_tokens = tokenizer.count_text(original)
         original_encoded = original.encode("utf-8", errors="replace")
         original_bytes = len(original_encoded)
         if _openai_responses_contains_ccr_marker(original):
@@ -691,13 +721,40 @@ class OpenAIHandlerMixin:
             )
 
         hash_key = hashlib.sha256(original_encoded).hexdigest()[:24]
-        preview = self._openai_responses_large_text_preview(original)
-        compressed = (
+        header = (
             "[Large OpenAI Responses tool output compressed by Headroom "
             f"from {original_bytes} bytes. Retrieve more: hash={hash_key}]\n"
-            f"{preview}"
         )
-        compressed_tokens = self._estimate_openai_responses_text_tokens(compressed)
+        header_bytes = len(header.encode("utf-8", errors="replace"))
+        preview_budget = min(
+            _OPENAI_RESPONSES_LARGE_TEXT_PREVIEW_CHARS,
+            original_bytes - header_bytes - 1,
+            (original_bytes // 2) - header_bytes,
+        )
+        preview = self._openai_responses_large_text_preview(
+            original,
+            max_bytes=preview_budget,
+        )
+        compressed = f"{header}{preview}"
+        compressed_bytes = len(compressed.encode("utf-8", errors="replace"))
+        if compressed_bytes >= original_bytes:
+            return UnitCompressionResult(
+                original=original,
+                compressed=original,
+                modified=False,
+                tokens_before=original_tokens,
+                tokens_after=original_tokens,
+                tokens_saved=0,
+                transforms_applied=[],
+                strategy="none",
+                reason="rejected_not_smaller",
+                router_result=None,
+                text_bytes=original_bytes,
+                min_bytes=unit.min_bytes,
+                reason_category="rejected_not_smaller",
+            )
+
+        compressed_tokens = tokenizer.count_text(compressed)
         get_compression_store().store(
             original,
             compressed,
@@ -1032,6 +1089,7 @@ class OpenAIHandlerMixin:
                 deterministic_results[unit_idx] = self._compress_openai_responses_oversized_unit(
                     unit,
                     tool_call_id=tool_call_id,
+                    tokenizer=tokenizer,
                 )
             if debug_enabled:
                 unit_debug.append(
@@ -1203,11 +1261,14 @@ class OpenAIHandlerMixin:
                     strategy_chain_union.append(s)
             cat = result.reason_category or "applied"
             units_by_category[cat] = units_by_category.get(cat, 0) + 1
-            # A unit "reached the router" iff the result carries a
-            # router_result OR was modified — both indicate we got
-            # past the early gates. Units that were size-floored,
-            # role-protected, or in a frozen cache_zone don't count.
-            if result.router_result is not None or result.modified:
+            # A unit reached active compression iff it produced a router
+            # result, was modified by deterministic CCR, or deterministic
+            # CCR explicitly rejected it for not being smaller.
+            if (
+                result.router_result is not None
+                or result.modified
+                or result.reason == "rejected_not_smaller"
+            ):
                 attempted_input_tokens += result.tokens_before
             if debug_enabled:
                 _log(
