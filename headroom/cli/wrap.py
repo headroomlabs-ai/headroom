@@ -502,6 +502,11 @@ def _setup_lean_ctx_agent(agent: str, verbose: bool = False) -> Path | None:
 # any hook entry whose command contains one of these.
 _HEADROOM_HOOK_MARKERS = ("rtk-rewrite", "headroom-init-claude")
 
+# Env vars Headroom's init/wrap inject into Claude settings.json; unwrap removes
+# them. ENABLE_TOOL_SEARCH keeps Claude Code's tool deferral on behind the proxy
+# (GH #746), paired with init/wrap setting it.
+_HEADROOM_ENV_KEYS = ("ANTHROPIC_BASE_URL", "ENABLE_TOOL_SEARCH")
+
 
 def _remove_claude_rtk_hooks(settings_path: Path | None = None) -> bool:
     """Remove Headroom-managed entries from Claude settings.json.
@@ -572,15 +577,18 @@ def _remove_claude_rtk_hooks(settings_path: Path | None = None) -> bool:
         else:
             payload.pop("hooks", None)
 
-    # Remove the ANTHROPIC_BASE_URL proxy-routing env that init/wrap injected,
-    # even when no hooks remain (the early-return bug skipped this).
+    # Remove the proxy-routing env that init/wrap injected (ANTHROPIC_BASE_URL and
+    # ENABLE_TOOL_SEARCH), even when no hooks remain (the early-return bug skipped
+    # this). List-comp, not any(), so every key is popped (no short-circuit).
     env = payload.get("env")
-    if isinstance(env, dict) and env.pop("ANTHROPIC_BASE_URL", None) is not None:
-        changed = True
-        if env:
-            payload["env"] = env
-        else:
-            payload.pop("env", None)
+    if isinstance(env, dict):
+        removed_keys = [k for k in _HEADROOM_ENV_KEYS if env.pop(k, None) is not None]
+        if removed_keys:
+            changed = True
+            if env:
+                payload["env"] = env
+            else:
+                payload.pop("env", None)
 
     if not changed:
         return False

@@ -297,3 +297,27 @@ def test_remove_claude_rtk_hooks_noop_when_nothing_managed(tmp_path: Path) -> No
     assert wrap_cli._remove_claude_rtk_hooks(settings) is False
     # nothing managed -> file untouched
     assert json.loads(settings.read_text(encoding="utf-8")) == original
+
+
+def test_remove_claude_rtk_hooks_strips_enable_tool_search(tmp_path: Path) -> None:
+    # unwrap must remove BOTH env vars init writes (ANTHROPIC_BASE_URL +
+    # ENABLE_TOOL_SEARCH, GH #746), leaving user-set vars intact.
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "env": {
+                    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8787",
+                    "ENABLE_TOOL_SEARCH": "true",
+                    "KEEP": "1",
+                }
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert wrap_cli._remove_claude_rtk_hooks(settings) is True
+
+    payload = json.loads(settings.read_text(encoding="utf-8"))
+    assert payload["env"] == {"KEEP": "1"}
