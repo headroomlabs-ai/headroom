@@ -79,6 +79,28 @@ result = runner.run()
 save_reports(result, "eval_results/")
 ```
 
+## Session Probes (real recorded sessions)
+
+The benchmark suites above prove the compressors in vitro. Session probes
+measure what compression removed from YOUR real sessions, offline and with no
+LLM or API key:
+
+```bash
+# 1. Record: run the proxy with recording enabled (opt-in; recordings contain
+#    full conversation content in plaintext and stay on this machine)
+HEADROOM_PROBE_RECORD_DIR=~/.headroom/probe-recordings headroom proxy start
+
+# 2. Use your agent through the proxy as normal, then score retention:
+headroom evals probes --recordings ~/.headroom/probe-recordings
+```
+
+Probe targets are extracted from original tool results across three
+dimensions — exact numerics, artifact trail (paths/URLs/hashes), error
+evidence — and classified as retained (verbatim or surviving a format
+conversion), recoverable (behind a CCR retrieval marker), or lost. The report
+buckets retention by compression ratio and groups it per transform. Use
+`--json-output report.json` for machine-readable results.
+
 ## Evaluation Tiers
 
 ### Tier 1: Core Report Card (~$3, ~15 min)

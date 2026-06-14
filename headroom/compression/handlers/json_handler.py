@@ -138,30 +138,44 @@ class JSONStructureHandler(BaseStructureHandler):
         # Build character-level mask
         mask = [False] * len(content)
 
-        # Track array depth for selective preservation
-        array_depth = 0
-        array_item_counts: dict[int, int] = {}  # depth -> count
+        # Track containers so commas inside objects are not counted as
+        # array item separators — only commas whose immediate enclosing
+        # container is an array advance that array's item index. Values
+        # nested in an object that is itself an array item inherit the
+        # innermost enclosing array's index via array_item_stack[-1].
+        container_stack: list[str] = []  # "[" or "{" per open container
+        array_item_stack: list[int] = []  # item count per open array
 
         for token in json_tokens:
-            # Track array items
+            # Track containers
             if token.token_type == JSONTokenType.BRACKET:
-                if token.text == "[":
-                    array_depth += 1
-                    array_item_counts[array_depth] = 0
+                if token.text in "{[":
+                    container_stack.append(token.text)
+                    if token.text == "[":
+                        array_item_stack.append(0)
+                elif token.text == "}":
+                    if container_stack and container_stack[-1] == "{":
+                        container_stack.pop()
                 elif token.text == "]":
-                    if array_depth in array_item_counts:
-                        del array_item_counts[array_depth]
-                    array_depth = max(0, array_depth - 1)
+                    if container_stack and container_stack[-1] == "[":
+                        container_stack.pop()
+                        if array_item_stack:
+                            array_item_stack.pop()
 
-            # Count array items at commas
-            if token.token_type == JSONTokenType.COMMA and array_depth > 0:
-                array_item_counts[array_depth] = array_item_counts.get(array_depth, 0) + 1
+            # Count array items only at the array's own commas
+            if (
+                token.token_type == JSONTokenType.COMMA
+                and container_stack
+                and container_stack[-1] == "["
+                and array_item_stack
+            ):
+                array_item_stack[-1] += 1
 
             # Determine if this token should be preserved
             preserve = self._should_preserve_token(
                 token,
-                array_depth,
-                array_item_counts.get(array_depth, 0),
+                len(array_item_stack),
+                array_item_stack[-1] if array_item_stack else 0,
             )
 
             # Mark in mask
@@ -225,9 +239,13 @@ class JSONStructureHandler(BaseStructureHandler):
             if self.preserve_high_entropy:
                 # Strip quotes for entropy calculation
                 value = token.text.strip('"')
-                score = EntropyScore.compute(value, self.entropy_threshold)
-                if score.should_preserve:
-                    return True
+                # Entropy targets identifiers (UUIDs, hashes, API keys).
+                # Self-normalized entropy also scores English prose >0.85,
+                # so gate on the cheapest identifier signal: no spaces.
+                if " " not in value:
+                    score = EntropyScore.compute(value, self.entropy_threshold)
+                    if score.should_preserve:
+                        return True
 
             return False
 

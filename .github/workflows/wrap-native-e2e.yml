@@ -68,4 +68,5 @@ jobs:
           file: ./coverage-wrap-native.xml
           flags: wrap-native
           name: wrap-native-${{ matrix.os }}
+          token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: false

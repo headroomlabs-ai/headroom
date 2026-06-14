@@ -63,6 +63,50 @@ def _get_parser(language: str) -> Any:
         return _tree_sitter_parsers[language]
 
 
+# tree-sitter API compatibility. tree-sitter-language-pack switched to a
+# Rust binding (>=1.0) where node accessors are METHODS (kind(),
+# start_byte(), child(i)) and parse() takes str; the classic pybind API
+# uses attributes (.type, .start_byte, .children) and parse(bytes).
+# Without this shim the tree-sitter path raises TypeError on modern
+# installs and silently falls back to regex.
+
+
+def _ts_parse(parser: Any, content: str) -> Any:
+    try:
+        return parser.parse(content.encode("utf-8"))
+    except TypeError:
+        return parser.parse(content)
+
+
+def _ts_root(tree: Any) -> Any:
+    root = tree.root_node
+    return root() if callable(root) else root
+
+
+def _ts_kind(node: Any) -> str:
+    kind = getattr(node, "type", None)
+    if isinstance(kind, str):
+        return kind
+    return str(node.kind())
+
+
+def _ts_start_byte(node: Any) -> int:
+    start = node.start_byte
+    return int(start()) if callable(start) else int(start)
+
+
+def _ts_end_byte(node: Any) -> int:
+    end = node.end_byte
+    return int(end()) if callable(end) else int(end)
+
+
+def _ts_children(node: Any) -> list[Any]:
+    children = getattr(node, "children", None)
+    if children is not None and not callable(children):
+        return list(children)
+    return [node.child(i) for i in range(node.child_count())]
+
+
 class CodeLanguage(Enum):
     """Supported programming languages."""
 
@@ -174,6 +218,23 @@ _SIGNATURE_PATTERNS: dict[str, list[re.Pattern[str]]] = {
         re.compile(r"^\s*@\w+(\([^)]*\))?\s*$", re.MULTILINE),
     ],
 }
+
+# Body child node types for container definitions (classes, impls,
+# traits). A container's span up to its body is structural (the
+# signature); the body itself is NOT marked — recursion into the body
+# emits signature spans for nested functions/methods, leaving their
+# bodies compressible.
+_CONTAINER_BODY_TYPES: frozenset[str] = frozenset(
+    {
+        "block",  # python class body
+        "statement_block",  # js/ts
+        "compound_statement",  # c/cpp
+        "class_body",  # js/ts/java class body
+        "interface_body",  # java/ts interface body
+        "declaration_list",  # rust impl/trait body
+        "enum_body",  # java enum body
+    }
+)
 
 # Import patterns for fallback
 _IMPORT_PATTERNS: dict[str, re.Pattern[str]] = {
@@ -301,15 +362,16 @@ class CodeStructureHandler(BaseStructureHandler):
             HandlerResult with mask.
         """
         parser = _get_parser(language)
-        tree = parser.parse(content.encode("utf-8"))
+        tree = _ts_parse(parser, content)
 
         # Collect structural spans
         spans: list[CodeSpan] = []
 
         def visit_node(node: Any, depth: int = 0) -> None:
             """Visit AST node and collect structural spans."""
-            node_type = node.type
+            node_type = _ts_kind(node)
             structural_types = _STRUCTURAL_NODE_TYPES.get(language, set())
+            children = _ts_children(node)
 
             # Check if this is a structural node type
             if node_type in structural_types:
@@ -317,8 +379,8 @@ class CodeStructureHandler(BaseStructureHandler):
                 if "function" in node_type or "method" in node_type:
                     # Find the body node and exclude it
                     body_node = None
-                    for child in node.children:
-                        if child.type in ("block", "statement_block", "compound_statement"):
+                    for child in children:
+                        if _ts_kind(child) in ("block", "statement_block", "compound_statement"):
                             body_node = child
                             break
 
@@ -326,8 +388,8 @@ class CodeStructureHandler(BaseStructureHandler):
                         # Signature is from start to body start
                         spans.append(
                             CodeSpan(
-                                start=node.start_byte,
-                                end=body_node.start_byte,
+                                start=_ts_start_byte(node),
+                                end=_ts_start_byte(body_node),
                                 role="signature",
                                 is_structural=True,
                             )
@@ -335,8 +397,8 @@ class CodeStructureHandler(BaseStructureHandler):
                         # Body is compressible
                         spans.append(
                             CodeSpan(
-                                start=body_node.start_byte,
-                                end=body_node.end_byte,
+                                start=_ts_start_byte(body_node),
+                                end=_ts_end_byte(body_node),
                                 role="body",
                                 is_structural=False,
                             )
@@ -345,37 +407,75 @@ class CodeStructureHandler(BaseStructureHandler):
                         # No body found, preserve whole thing
                         spans.append(
                             CodeSpan(
-                                start=node.start_byte,
-                                end=node.end_byte,
+                                start=_ts_start_byte(node),
+                                end=_ts_end_byte(node),
                                 role=node_type,
                                 is_structural=True,
                             )
                         )
+                elif node_type == "decorated_definition":
+                    # Wrapper around decorator(s) + definition. Emit no
+                    # span: recursion marks the decorators and gives the
+                    # inner function its signature/body split. A whole-
+                    # node span here would preserve the function body.
+                    pass
                 else:
-                    # Non-function structural nodes
-                    spans.append(
-                        CodeSpan(
-                            start=node.start_byte,
-                            end=node.end_byte,
-                            role=node_type,
-                            is_structural=True,
+                    # Container definitions (class, impl, trait): the
+                    # signature runs to the body start; the body is NOT
+                    # marked, so nested function bodies stay compressible
+                    # (recursion emits their signature spans). Leaf
+                    # declarations (imports, type aliases, structs) have
+                    # no such body child and are preserved whole.
+                    body_node = None
+                    for child in children:
+                        if _ts_kind(child) in _CONTAINER_BODY_TYPES:
+                            body_node = child
+                            break
+
+                    if body_node is not None:
+                        spans.append(
+                            CodeSpan(
+                                start=_ts_start_byte(node),
+                                end=_ts_start_byte(body_node),
+                                role="signature",
+                                is_structural=True,
+                            )
                         )
+                    else:
+                        spans.append(
+                            CodeSpan(
+                                start=_ts_start_byte(node),
+                                end=_ts_end_byte(node),
+                                role=node_type,
+                                is_structural=True,
+                            )
+                        )
+            elif node_type == "decorator":
+                # Decorators are structural (preserved) on their own so
+                # the decorated_definition wrapper doesn't need a span.
+                spans.append(
+                    CodeSpan(
+                        start=_ts_start_byte(node),
+                        end=_ts_end_byte(node),
+                        role="decorator",
+                        is_structural=True,
                     )
+                )
             elif node_type == "comment" and self.preserve_comments:
                 spans.append(
                     CodeSpan(
-                        start=node.start_byte,
-                        end=node.end_byte,
+                        start=_ts_start_byte(node),
+                        end=_ts_end_byte(node),
                         role="comment",
                         is_structural=True,
                     )
                 )
 
             # Recurse into children
-            for child in node.children:
+            for child in children:
                 visit_node(child, depth + 1)
 
-        visit_node(tree.root_node)
+        visit_node(_ts_root(tree))
 
         # Build mask from spans
         mask = self._spans_to_mask(spans, len(content))

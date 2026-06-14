@@ -443,7 +443,16 @@ class TransformPipeline:
                 try:
                     from ..parser import parse_messages
 
-                    _, _, waste_signals = parse_messages(waste_messages or messages, tokenizer)
+                    # current_messages (the post-transform copy) enables reread
+                    # attribution: repeats whose first serve was markerized by
+                    # this pipeline run count into reread_compressed_tokens
+                    # (#899). The length guard in parse_messages makes the
+                    # waste_messages path (different indexing) a safe no-op.
+                    _, _, waste_signals = parse_messages(
+                        waste_messages or messages,
+                        tokenizer,
+                        compressed_messages=current_messages,
+                    )
                     if waste_signals.total() == 0:
                         waste_signals = None
                 except Exception:

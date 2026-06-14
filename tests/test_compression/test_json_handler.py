@@ -153,6 +153,75 @@ class TestJSONStructureHandler:
         assert result.mask.mask[first_id] is True
         assert result.mask.mask[second_id] is True
 
+    def test_object_commas_do_not_advance_array_item_index(self):
+        """Commas between keys inside an object must not count as array
+        item separators.
+
+        Regression: depth-keyed comma counting treated every comma under
+        array_depth > 0 as an item boundary, so an array's FIRST object
+        exhausted max_array_items_full within its own keys and later
+        values were dropped despite being in item 0.
+        """
+        handler = JSONStructureHandler(
+            preserve_short_values=True,
+            short_value_threshold=20,
+            max_array_items_full=3,
+        )
+        # Single array item (index 0) with 5 short values — all must
+        # stay eligible for preservation.
+        content = '[{"a": "valuea", "b": "valueb", "c": "valuec", "d": "valued", "e": "valuee"}]'
+        result = handler.get_mask(content)
+
+        for marker in ('"valuea"', '"valueb"', '"valuec"', '"valued"', '"valuee"'):
+            start = content.index(marker)
+            for i in range(start, start + len(marker)):
+                assert result.mask.mask[i] is True, f"{marker} in array item 0 should be preserved"
+
+    def test_array_items_past_threshold_compressed(self):
+        """Items at index >= max_array_items_full are still compressed."""
+        handler = JSONStructureHandler(
+            preserve_short_values=True,
+            short_value_threshold=20,
+            max_array_items_full=2,
+        )
+        content = '[{"v": "itemzero"}, {"v": "itemone"}, {"v": "itemtwo"}]'
+        result = handler.get_mask(content)
+
+        # Items 0 and 1 preserved
+        for marker in ('"itemzero"', '"itemone"'):
+            start = content.index(marker)
+            assert result.mask.mask[start + 1] is True, f"{marker} should be preserved"
+
+        # Item 2 is past the threshold — value chars compressed
+        start = content.index('"itemtwo"')
+        inner = range(start + 1, start + len('"itemtwo"') - 1)
+        assert not any(result.mask.mask[i] for i in inner), (
+            "values in array items past max_array_items_full should be compressible"
+        )
+
+    def test_prose_not_preserved_by_entropy(self):
+        """Long natural-language strings must not pass the entropy gate.
+
+        Regression: self-normalized Shannon entropy scores English prose
+        above the 0.85 threshold, so every description survived
+        compression. Identifiers (no spaces) are still preserved.
+        """
+        handler = JSONStructureHandler(short_value_threshold=20)
+        prose = "Context optimization layer for LLM applications with caching"
+        uuid = "8f14e45f-ceea-4123-8f14-e45fceea4123"
+        content = f'{{"description": "{prose}", "id": "{uuid}"}}'
+        result = handler.get_mask(content)
+
+        prose_start = content.index(prose)
+        assert not any(result.mask.mask[i] for i in range(prose_start, prose_start + len(prose))), (
+            "long prose value should be compressible"
+        )
+
+        uuid_start = content.index(uuid)
+        assert all(result.mask.mask[i] for i in range(uuid_start, uuid_start + len(uuid))), (
+            "UUID value should be preserved via entropy"
+        )
+
     def test_metadata_contains_key_count(self, handler):
         """Test that metadata includes key count."""
         content = '{"a": 1, "b": 2, "c": 3}'

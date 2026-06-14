@@ -29,7 +29,9 @@
 //!   only. PR5 flips the ContentRouter to call us instead of the
 //!   regex-based [`crate::transforms::content_detector`].
 
+use std::sync::mpsc;
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 use magika::Session;
 use thiserror::Error;
@@ -70,8 +72,57 @@ pub enum MagikaDetectorError {
 /// missing or ort can't init, retrying just wastes cycles).
 static MAGIKA_SESSION: OnceLock<Mutex<Result<Session, String>>> = OnceLock::new();
 
+/// Default cap on magika ONNX session init.
+///
+/// On some platforms `Session::new()` can hang indefinitely instead of
+/// returning an error. Observed on Windows, where magika's transitive
+/// `ort` takes a DirectML / binary path on first init (fastembed is
+/// Windows-gated to `ort-load-dynamic` in `Cargo.toml` for the same
+/// reason, but magika carries its own `ort`). A hang — unlike an `Err` —
+/// is not caught by the tiered fallback in [`crate::transforms::detection`],
+/// so it stalls the entire compression pipeline until the proxy's own
+/// 30s+ timeout fires on every request. Bounding init converts that hang
+/// into the already-handled `Err` path. Override with
+/// `HEADROOM_MAGIKA_INIT_TIMEOUT_SECS`.
+const MAGIKA_INIT_TIMEOUT_SECS_DEFAULT: u64 = 5;
+
+fn magika_init_timeout() -> Duration {
+    let secs = std::env::var("HEADROOM_MAGIKA_INIT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .unwrap_or(MAGIKA_INIT_TIMEOUT_SECS_DEFAULT);
+    Duration::from_secs(secs)
+}
+
 fn session() -> &'static Mutex<Result<Session, String>> {
-    MAGIKA_SESSION.get_or_init(|| Mutex::new(Session::new().map_err(|e| e.to_string())))
+    MAGIKA_SESSION.get_or_init(|| {
+        let timeout = magika_init_timeout();
+        let (tx, rx) = mpsc::channel();
+        // Run the (potentially hanging) ONNX init on a side thread so we
+        // can bound it. `Session: Send` (the static itself requires it),
+        // so moving the result across the channel is sound. On timeout we
+        // record an `Err` — `detection::detect` already falls through to
+        // the unidiff/regex tiers on `Err` — and the orphaned init thread
+        // is left to finish on its own; its eventual `send` lands on a
+        // dropped receiver (harmless) and the `Session` is then dropped.
+        let spawned = std::thread::Builder::new()
+            .name("magika-init".into())
+            .spawn(move || {
+                let _ = tx.send(Session::new().map_err(|e| e.to_string()));
+            });
+        if let Err(e) = spawned {
+            return Mutex::new(Err(format!("magika init thread spawn failed: {e}")));
+        }
+        match rx.recv_timeout(timeout) {
+            Ok(res) => Mutex::new(res),
+            Err(_) => Mutex::new(Err(format!(
+                "magika session init exceeded {}s timeout; \
+                 using non-ML detection tiers",
+                timeout.as_secs()
+            ))),
+        }
+    })
 }
 
 /// Classify `content` and return the mapped Headroom [`ContentType`].
