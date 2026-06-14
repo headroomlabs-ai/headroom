@@ -122,7 +122,7 @@ ANTHROPIC_PRICING: dict[str, dict[str, float]] = {
     # Claude 4.6 (Opus tier pricing)
     "claude-opus-4-6": {"input": 5.00, "output": 25.00, "cached_input": 0.50},
     # Claude 4.5 (Opus tier pricing)
-    "claude-opus-4-5-20251101": {"input": 15.00, "output": 75.00, "cached_input": 1.50},
+    "claude-opus-4-5-20251101": {"input": 5.00, "output": 25.00, "cached_input": 0.50},
     # Claude 4 (Sonnet/Haiku tier pricing)
     "claude-sonnet-4-20250514": {"input": 3.00, "output": 15.00, "cached_input": 0.30},
     "claude-haiku-4-5-20251001": {"input": 0.80, "output": 4.00, "cached_input": 0.08},
