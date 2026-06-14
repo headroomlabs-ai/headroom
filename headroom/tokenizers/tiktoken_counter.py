@@ -41,6 +41,7 @@ def _load_timeout_seconds() -> float:
     except (TypeError, ValueError):
         return 10.0
 
+
 # Model to encoding mapping
 MODEL_TO_ENCODING = {
     # GPT-4o family (o200k_base)
@@ -116,9 +117,7 @@ def _get_encoding(encoding_name: str):
     import tiktoken
 
     if encoding_name in _load_failed:
-        raise TiktokenLoadError(
-            f"tiktoken encoding {encoding_name!r} previously failed to load"
-        )
+        raise TiktokenLoadError(f"tiktoken encoding {encoding_name!r} previously failed to load")
 
     box: dict[str, Any] = {}
 
@@ -128,9 +127,7 @@ def _get_encoding(encoding_name: str):
         except BaseException as exc:  # noqa: BLE001 - re-raised in the calling thread
             box["err"] = exc
 
-    worker = threading.Thread(
-        target=_load, name=f"tiktoken-load-{encoding_name}", daemon=True
-    )
+    worker = threading.Thread(target=_load, name=f"tiktoken-load-{encoding_name}", daemon=True)
     worker.start()
     worker.join(_load_timeout_seconds())
 
