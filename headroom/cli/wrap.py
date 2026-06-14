@@ -18,6 +18,8 @@ import importlib.util
 import io
 import json
 import os
+import re
+import shlex
 import shutil
 import signal
 import socket
@@ -445,10 +447,62 @@ def _setup_rtk(verbose: bool = False) -> Path | None:
     if register_claude_hooks(rtk_path):
         if verbose:
             click.echo("  rtk hooks registered in Claude Code")
+        try:
+            patched = _patch_rtk_hook_absolute_path(rtk_path)
+            if patched and verbose:
+                click.echo("  rtk hook script patched to use absolute path")
+        except Exception as e:
+            if verbose:
+                click.echo(f"  rtk hook absolute-path patch skipped: {e}")
     else:
         click.echo("  rtk hook registration failed — continuing without it")
 
     return rtk_path
+
+
+def _patch_rtk_hook_absolute_path(rtk_path: Path, hook_script_path: Path | None = None) -> bool:
+    """Rewrite bare ``rtk`` invocations in the generated Claude hook script
+    to use the absolute path to the RTK binary Headroom manages.
+
+    ``rtk init --global --auto-patch`` writes ``~/.claude/hooks/rtk-rewrite.sh``
+    with a bare ``rtk`` command that depends on PATH lookup. Since
+    ``~/.headroom/bin`` (where Headroom installs rtk) is not automatically
+    added to PATH, that lookup fails and the hook silently does nothing.
+
+    This rewrites bare ``rtk`` command tokens to the absolute, shell-quoted
+    path of the rtk binary so the hook works regardless of PATH.
+
+    Idempotent: only rewrites bare ``rtk`` tokens (not paths that already
+    point elsewhere), and only writes the file back if content changed.
+
+    Returns True if the hook script was modified.
+    """
+    if hook_script_path is None:
+        hook_script_path = Path.home() / ".claude" / "hooks" / "rtk-rewrite.sh"
+
+    if not hook_script_path.exists():
+        return False
+
+    original = hook_script_path.read_text()
+
+    # Quote the absolute path safely for POSIX shells. This matters because
+    # paths containing spaces or other shell-special characters (e.g.
+    # "/Users/Alice Smith/.headroom/bin/rtk") must be quoted, or the
+    # generated script will break when the shell splits on whitespace.
+    quoted_path = shlex.quote(str(rtk_path))
+
+    # Replace bare `rtk` command tokens with the quoted absolute path.
+    # Matches `rtk` as a standalone word (preceded by start-of-line or
+    # whitespace/operators, followed by whitespace or end-of-line), so it
+    # won't touch things like "rtkfoo" or "/some/path/rtk" that are already
+    # absolute.
+    patched, count = re.subn(r"(?<![\w/-])rtk(?=\s|$)", quoted_path, original)
+
+    if count and patched != original:
+        hook_script_path.write_text(patched)
+        return True
+
+    return False
 
 
 def _setup_lean_ctx_agent(agent: str, verbose: bool = False) -> Path | None:
