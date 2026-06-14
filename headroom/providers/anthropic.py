@@ -93,19 +93,31 @@ def sanitize_anthropic_model_metadata(value: Any) -> Any:
 # Anthropic model context limits
 # All Claude 3+ models have 200K context
 ANTHROPIC_CONTEXT_LIMITS: dict[str, int] = {
-    # Claude 4.8 (Opus 4.8) - 1M context. The bare key also matches the
-    # "[1m]" tier-suffixed form Claude Code sends, via partial-match lookup.
+    # Frontier — 1M context. Bare keys also match the "[1m]" tier-suffixed
+    # form Claude Code sends, via partial-match lookup.
+    "claude-fable-5": 1000000,
+    "claude-mythos-5": 1000000,
+    "claude-mythos-preview": 1000000,
+    # Opus 4.6 / 4.7 / 4.8 — 1M context
     "claude-opus-4-8": 1000000,
-    # Claude 4.7 (Opus 4.7) - 1M context
     "claude-opus-4-7": 1000000,
-    # Claude 4.6 (Opus 4.6) - 1M context
     "claude-opus-4-6": 1000000,
-    # Claude 4.5 (Opus 4.5)
+    # Opus 4.5 / 4.1 / 4.0 — 200K context
+    "claude-opus-4-5": 200000,
     "claude-opus-4-5-20251101": 200000,
-    # Claude 4.6 (Sonnet 4.6) - 1M context
+    "claude-opus-4-1": 200000,
+    "claude-opus-4-1-20250805": 200000,
+    "claude-opus-4-0": 200000,
+    "claude-opus-4-20250514": 200000,
+    # Sonnet 4.6 — 1M context
     "claude-sonnet-4-6": 1000000,
-    # Claude 4 (Sonnet 4, Haiku 4)
+    # Sonnet 4.5 / 4 — 200K context (native; 1M was a separate beta tier)
+    "claude-sonnet-4-5": 200000,
+    "claude-sonnet-4-5-20250929": 200000,
+    "claude-sonnet-4-0": 200000,
     "claude-sonnet-4-20250514": 200000,
+    # Haiku 4.5 — 200K context
+    "claude-haiku-4-5": 200000,
     "claude-haiku-4-5-20251001": 200000,
     # Claude 3.5
     "claude-3-5-sonnet-20241022": 200000,
@@ -123,23 +135,34 @@ ANTHROPIC_CONTEXT_LIMITS: dict[str, int] = {
     "claude-instant-1.2": 100000,
 }
 
-# Fallback pricing - LiteLLM is preferred source
-# NOTE: These are ESTIMATES. Always verify against actual Anthropic billing.
-# Last updated: 2025-01-14
+# Fallback pricing (USD per 1M tokens) — LiteLLM is the preferred source.
+# Verified against platform.claude.com/docs/en/about-claude/pricing on 2026-06-14.
+# cached_input = cache READ (0.1x base input). 5m cache WRITE is 1.25x base input.
 ANTHROPIC_PRICING: dict[str, dict[str, float]] = {
-    # Claude 4.8 (Opus tier pricing)
+    # Frontier (Fable / Mythos tier — $10 / $50)
+    "claude-fable-5": {"input": 10.00, "output": 50.00, "cached_input": 1.00},
+    "claude-mythos-5": {"input": 10.00, "output": 50.00, "cached_input": 1.00},
+    "claude-mythos-preview": {"input": 10.00, "output": 50.00, "cached_input": 1.00},
+    # Opus 4.5 / 4.6 / 4.7 / 4.8 (current Opus tier — $5 / $25)
     "claude-opus-4-8": {"input": 5.00, "output": 25.00, "cached_input": 0.50},
-    # Claude 4.7 (Opus tier pricing)
     "claude-opus-4-7": {"input": 5.00, "output": 25.00, "cached_input": 0.50},
-    # Claude 4.6 (Opus tier pricing)
     "claude-opus-4-6": {"input": 5.00, "output": 25.00, "cached_input": 0.50},
-    # Claude 4.5 (Opus tier pricing)
+    "claude-opus-4-5": {"input": 5.00, "output": 25.00, "cached_input": 0.50},
     "claude-opus-4-5-20251101": {"input": 5.00, "output": 25.00, "cached_input": 0.50},
-    # Claude 4.6 (Sonnet tier pricing)
+    # Opus 4.1 / 4.0 (legacy Opus tier — $15 / $75)
+    "claude-opus-4-1": {"input": 15.00, "output": 75.00, "cached_input": 1.50},
+    "claude-opus-4-1-20250805": {"input": 15.00, "output": 75.00, "cached_input": 1.50},
+    "claude-opus-4-0": {"input": 15.00, "output": 75.00, "cached_input": 1.50},
+    "claude-opus-4-20250514": {"input": 15.00, "output": 75.00, "cached_input": 1.50},
+    # Sonnet 4.6 / 4.5 / 4 ($3 / $15)
     "claude-sonnet-4-6": {"input": 3.00, "output": 15.00, "cached_input": 0.30},
-    # Claude 4 (Sonnet/Haiku tier pricing)
+    "claude-sonnet-4-5": {"input": 3.00, "output": 15.00, "cached_input": 0.30},
+    "claude-sonnet-4-5-20250929": {"input": 3.00, "output": 15.00, "cached_input": 0.30},
+    "claude-sonnet-4-0": {"input": 3.00, "output": 15.00, "cached_input": 0.30},
     "claude-sonnet-4-20250514": {"input": 3.00, "output": 15.00, "cached_input": 0.30},
-    "claude-haiku-4-5-20251001": {"input": 0.80, "output": 4.00, "cached_input": 0.08},
+    # Haiku 4.5 ($1 / $5)
+    "claude-haiku-4-5": {"input": 1.00, "output": 5.00, "cached_input": 0.10},
+    "claude-haiku-4-5-20251001": {"input": 1.00, "output": 5.00, "cached_input": 0.10},
     # Claude 3.5
     "claude-3-5-sonnet-20241022": {"input": 3.00, "output": 15.00, "cached_input": 0.30},
     "claude-3-5-sonnet-latest": {"input": 3.00, "output": 15.00, "cached_input": 0.30},
@@ -155,12 +178,15 @@ ANTHROPIC_PRICING: dict[str, dict[str, float]] = {
 # Default limits for pattern-based inference
 # Used when a model isn't in the explicit list but matches a known pattern
 _PATTERN_DEFAULTS = {
-    "opus": {"context": 200000, "pricing": {"input": 15.00, "output": 75.00, "cached_input": 1.50}},
+    # Current-generation profiles for UNRECOGNIZED future model ids only — every
+    # known model is listed explicitly above, so these never apply to them.
+    # Opus and Sonnet ship 1M context today; Haiku is 200K.
+    "opus": {"context": 1000000, "pricing": {"input": 5.00, "output": 25.00, "cached_input": 0.50}},
     "sonnet": {
-        "context": 200000,
+        "context": 1000000,
         "pricing": {"input": 3.00, "output": 15.00, "cached_input": 0.30},
     },
-    "haiku": {"context": 200000, "pricing": {"input": 0.80, "output": 4.00, "cached_input": 0.08}},
+    "haiku": {"context": 200000, "pricing": {"input": 1.00, "output": 5.00, "cached_input": 0.10}},
 }
 
 # Fallback for completely unknown Claude models
