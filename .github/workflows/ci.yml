@@ -206,13 +206,12 @@ jobs:
           files: coverage-${{ matrix.shard }}.xml
           flags: python
           name: python-shard-${{ matrix.shard }}
-          # Codecov retired tokenless uploads: without a token the upload is
-          # rejected ("Token required because branch is protected"), which with
-          # fail_ci_if_error turned every shard red even though tests passed.
+          # Token is sent so uploads authenticate once the repo is activated on
+          # Codecov. Until then Codecov may 404 ("Repository not found"); either
+          # way, coverage upload is reporting-only and must never fail a build
+          # whose tests pass — so this stays non-blocking.
           token: ${{ secrets.CODECOV_TOKEN }}
-          # Fork PRs cannot read repo secrets, so don't hard-fail the coverage
-          # upload there; same-repo PRs and pushes to main still enforce it.
-          fail_ci_if_error: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+          fail_ci_if_error: false
 
   test-extras:
     needs: [changes, build-wheel]
