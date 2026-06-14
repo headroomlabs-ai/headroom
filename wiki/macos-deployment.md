@@ -423,7 +423,7 @@ tail -f ~/Library/Logs/headroom/proxy-error.log
 
 - Missing dependencies: `pip install headroom-ai[proxy]`
 - Invalid API key: Verify `ANTHROPIC_API_KEY`
-- Python version incompatible: Requires Python 3.9+
+- Python version incompatible: Requires Python 3.10+
 
 ### ANTHROPIC_BASE_URL Not Set
 
