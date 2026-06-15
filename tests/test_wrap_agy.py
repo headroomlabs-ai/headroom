@@ -292,6 +292,18 @@ class TestWrapAgyDisclosureBanner:
         result = self._invoke_agy(monkeypatch)
         assert self._INTERCEPTED_HOST in result.output
 
+    def test_disclosure_banner_names_every_allowlisted_host(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Consent surface must not understate interception: the banner must
+        name EVERY host the terminator's allowlist will TLS-terminate, not
+        just the primary one."""
+        from headroom.proxy.agy_terminator import DEFAULT_ALLOWLIST
+
+        result = self._invoke_agy(monkeypatch)
+        for host in DEFAULT_ALLOWLIST:
+            assert host in result.output, f"disclosure omits intercepted host {host}"
+
     def test_disclosure_banner_mentions_no_intercept_option(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

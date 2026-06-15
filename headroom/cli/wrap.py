@@ -5450,9 +5450,6 @@ def _inject_ssl_bypass(env: dict[str, str], agent_type: str = "unknown") -> None
 # agy MITM lifecycle helpers
 # =============================================================================
 
-# Intercepted host surfaced in the disclosure banner.
-_AGY_INTERCEPTED_HOST = "daily-cloudcode-pa.googleapis.com"
-
 
 class _AgyServers:
     """Handle to the running terminator + dispatch pair.
@@ -5716,8 +5713,11 @@ def agy(
         click.echo("  ╚═══════════════════════════════════════════════╝")
         click.echo()
         click.echo("  ┌─ TLS INTERCEPTION DISCLOSURE ──────────────────")
-        click.echo(f"  │  Headroom terminates TLS for: {_AGY_INTERCEPTED_HOST}")
-        click.echo("  │  A process-local CA mints leaf certificates for that host.")
+        from headroom.proxy.agy_terminator import DEFAULT_ALLOWLIST
+
+        for _intercepted_host in sorted(DEFAULT_ALLOWLIST):
+            click.echo(f"  │  Headroom terminates TLS for: {_intercepted_host}")
+        click.echo("  │  A process-local CA mints leaf certificates for those hosts.")
         click.echo("  │  This CA is NEVER added to the OS trust store.")
         click.echo("  │  Compression and context injection are applied on the decrypted stream.")
         click.echo("  │")
