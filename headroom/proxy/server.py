@@ -176,6 +176,7 @@ from headroom.transforms import (
 
 AnyLLMBackend: Any = None
 LiteLLMBackend: Any = None
+DeepseekBackend: Any = None
 
 fcntl: Any = None
 try:
@@ -795,6 +796,7 @@ class HeadroomProxy(
             logger=logger,
             anyllm_backend_cls=AnyLLMBackend,
             litellm_backend_cls=LiteLLMBackend,
+            deepseek_backend_cls=DeepseekBackend,
         )
 
         # Request counter for IDs

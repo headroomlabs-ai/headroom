@@ -48,6 +48,14 @@ _PRICING_LAST_UPDATED = date(2025, 6, 1)
 _PRICING_STALE_DAYS = 60
 _PRICING_WARNING_SHOWN = False
 
+# Default for completely unknown Deepseek models
+_UNKNOWN_DEEPSEEK_DEFAULT = {
+    "context_limit": 128_000,
+    "input_price": 0.27,
+    "output_price": 1.10,
+    "max_output": 8_192,
+}
+
 
 def _check_pricing_staleness() -> str | None:
     """Check if pricing data is stale and return warning message if so."""
@@ -96,6 +104,37 @@ _MAX_OUTPUT: dict[str, int] = {
     "deepseek-coder-v2": 16_384,
     "deepseek-reasoner": 16_384,
 }
+
+# Pattern-based inference for future Deepseek models.
+# Maps model name patterns to (context_limit, pricing, max_output) defaults.
+_PATTERN_DEFAULTS: list[tuple[str, dict[str, Any]]] = [
+    ("deepseek-v4", {"context_limit": 1_000_000, "input_price": 0.27, "output_price": 1.10, "max_output": 384_000}),
+    ("deepseek-v3", {"context_limit": 128_000, "input_price": 0.27, "output_price": 1.10, "max_output": 8_192}),
+    ("deepseek-v2", {"context_limit": 128_000, "input_price": 0.27, "output_price": 1.10, "max_output": 8_192}),
+    ("deepseek-reasoner", {"context_limit": 131_072, "input_price": 0.55, "output_price": 2.19, "max_output": 16_384}),
+    ("deepseek-coder", {"context_limit": 128_000, "input_price": 0.27, "output_price": 1.10, "max_output": 16_384}),
+    ("deepseek-chat", {"context_limit": 131_072, "input_price": 0.27, "output_price": 1.10, "max_output": 8_192}),
+]
+
+
+def _infer_model_family(model: str) -> dict[str, Any] | None:
+    """Infer context limit and pricing for a model not in explicit lookup tables.
+
+    Uses prefix matching against known Deepseek model families to provide
+    reasonable defaults for future model variants.
+
+    Args:
+        model: Model identifier (e.g. "deepseek-v3-turbo")
+
+    Returns:
+        Dict with context_limit, input_price, output_price, max_output keys
+        if a match is found, None otherwise.
+    """
+    model_lower = model.lower()
+    for pattern, defaults in _PATTERN_DEFAULTS:
+        if model_lower.startswith(pattern):
+            return defaults
+    return None
 
 
 def _load_custom_model_config() -> dict[str, Any]:
@@ -207,9 +246,27 @@ class DeepseekTokenCounter:
 
 
 class DeepseekProvider(Provider):
-    """Provider for Deepseek models."""
+    """Provider for Deepseek models.
 
-    def __init__(self) -> None:
+    Supports all current Deepseek models (deepseek-chat, deepseek-reasoner,
+    deepseek-coder, deepseek-v2, deepseek-v3, deepseek-v4-flash/pro).
+    Token counting uses HuggingFace tokenizers.
+
+    To override context limits for a model, pass a ``context_limits`` dict::
+
+        DeepseekProvider(context_limits={
+            "deepseek-chat": 64_000,
+            "deepseek-custom": 32_000,
+        })
+
+    Alternatively, set ``HEADROOM_MODEL_LIMITS`` env var or add a
+    ``~/.headroom/models.json`` config file.
+    """
+
+    def __init__(
+        self,
+        context_limits: dict[str, int] | None = None,
+    ) -> None:
         self._context_limits = {**_CONTEXT_LIMITS}
         self._pricing = {**_PRICING}
         self._max_output = {**_MAX_OUTPUT}
@@ -221,6 +278,9 @@ class DeepseekProvider(Provider):
             if isinstance(pricing, list | tuple) and len(pricing) >= 2:
                 self._pricing[model] = (float(pricing[0]), float(pricing[1]))
 
+        if context_limits:
+            self._context_limits.update(context_limits)
+
         self._token_counters: dict[str, DeepseekTokenCounter] = {}
 
     @property
@@ -231,7 +291,11 @@ class DeepseekProvider(Provider):
         model_lower = model.lower()
         if model_lower in self._context_limits:
             return True
-        return model_lower.startswith("deepseek-") or model_lower.startswith("deepseek_")
+        if model_lower.startswith("deepseek-") or model_lower.startswith("deepseek_"):
+            return True
+        if _infer_model_family(model) is not None:
+            return True
+        return False
 
     def get_token_counter(self, model: str) -> TokenCounter:
         if not self.supports_model(model):
@@ -246,9 +310,13 @@ class DeepseekProvider(Provider):
     def get_context_limit(self, model: str) -> int:
         """Get context limit for a Deepseek model.
 
-        Tries LiteLLM first (with and without 'deepseek/' prefix),
-        then falls back to built-in limits.
+        Checks instance overrides first, then tries LiteLLM, then falls
+        back to built-in limits and pattern-based inference.
         """
+        model_lower = model.lower()
+        if model_lower in self._context_limits:
+            return self._context_limits[model_lower]
+
         if LITELLM_AVAILABLE:
             for model_variant in [f"deepseek/{model}", model]:
                 try:
@@ -264,14 +332,18 @@ class DeepseekProvider(Provider):
                 except Exception:
                     pass
 
-        model_lower = model.lower()
-        if model_lower in self._context_limits:
-            return self._context_limits[model_lower]
         for prefix, limit in self._context_limits.items():
             if model_lower.startswith(prefix):
                 return limit
-        self._warn_unknown_model(model, 128_000, "using default limit")
-        return 128_000
+        inferred = _infer_model_family(model)
+        if inferred is not None:
+            limit = inferred["context_limit"]
+            self._context_limits[model_lower] = limit
+            return limit
+        limit = _UNKNOWN_DEEPSEEK_DEFAULT["context_limit"]
+        self._warn_unknown_model(model, limit, "using default limit")
+        self._context_limits[model_lower] = limit
+        return limit
 
     def _warn_unknown_model(self, model: str, limit: int, reason: str) -> None:
         """Warn about unknown model (once per model)."""
@@ -290,6 +362,22 @@ class DeepseekProvider(Provider):
         model: str,
         cached_tokens: int = 0,
     ) -> float | None:
+        """Estimate cost for a Deepseek API call.
+
+        IMPORTANT: This is an ESTIMATE only.
+        - Pricing data may be outdated
+        - Cached token discount assumed at 50% (actual may vary)
+        - Always verify against your actual Deepseek billing
+
+        Args:
+            input_tokens: Number of input tokens.
+            output_tokens: Number of output tokens.
+            model: Model name.
+            cached_tokens: Number of cached tokens (estimated 50% discount).
+
+        Returns:
+            Estimated cost in USD, or None if pricing unknown.
+        """
         # Try LiteLLM first
         if LITELLM_AVAILABLE:
             for model_variant in [f"deepseek/{model}", model]:
@@ -312,13 +400,29 @@ class DeepseekProvider(Provider):
             warnings.warn(staleness_warning, UserWarning, stacklevel=2)
         for model_prefix, (inp, outp) in self._pricing.items():
             if model_lower.startswith(model_prefix):
-                input_cost = (input_tokens / 1_000_000) * inp
+                non_cached = input_tokens - cached_tokens
+                input_cost = (non_cached / 1_000_000) * inp
+                cached_cost = (cached_tokens / 1_000_000) * inp * 0.5
                 output_cost = (output_tokens / 1_000_000) * outp
-                return input_cost + output_cost
-        return None
+                return input_cost + cached_cost + output_cost
+        inferred = _infer_model_family(model)
+        if inferred is not None:
+            non_cached = input_tokens - cached_tokens
+            input_cost = (non_cached / 1_000_000) * inferred["input_price"]
+            cached_cost = (cached_tokens / 1_000_000) * inferred["input_price"] * 0.5
+            output_cost = (output_tokens / 1_000_000) * inferred["output_price"]
+            return input_cost + cached_cost + output_cost
+        non_cached = input_tokens - cached_tokens
+        input_cost = (non_cached / 1_000_000) * _UNKNOWN_DEEPSEEK_DEFAULT["input_price"]
+        cached_cost = (cached_tokens / 1_000_000) * _UNKNOWN_DEEPSEEK_DEFAULT["input_price"] * 0.5
+        output_cost = (output_tokens / 1_000_000) * _UNKNOWN_DEEPSEEK_DEFAULT["output_price"]
+        return input_cost + cached_cost + output_cost
 
     def get_output_buffer(self, model: str, default: int = 4000) -> int:
         model_lower = model.lower()
         if model_lower in self._max_output:
             return self._max_output[model_lower]
+        inferred = _infer_model_family(model)
+        if inferred is not None:
+            return inferred["max_output"]
         return default

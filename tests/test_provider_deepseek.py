@@ -9,9 +9,12 @@ from headroom.providers.deepseek import (
     DeepseekProvider,
     DeepseekTokenCounter,
     _CONTEXT_LIMITS,
+    _PATTERN_DEFAULTS,
     _PRICING,
+    _UNKNOWN_DEEPSEEK_DEFAULT,
     _UNKNOWN_MODEL_WARNINGS,
     _check_pricing_staleness,
+    _infer_model_family,
 )
 from headroom.providers.openai_compatible import (
     OpenAICompatibleProvider,
@@ -69,14 +72,16 @@ class TestDeepseekProvider:
         assert cost is not None
         assert cost > 0
 
-    def test_estimate_cost_unknown_model_returns_none(self):
+    def test_estimate_cost_unknown_model_uses_default_pricing(self):
         provider = DeepseekProvider()
         cost = provider.estimate_cost(
             input_tokens=1_000_000,
             output_tokens=1_000_000,
             model="nonexistent-model",
         )
-        assert cost is None
+        # Now returns a cost using _UNKNOWN_DEEPSEEK_DEFAULT pricing
+        assert cost is not None
+        assert cost > 0
 
     def test_get_token_counter_returns_counter(self):
         provider = DeepseekProvider()
@@ -102,8 +107,9 @@ class TestDeepseekProvider:
 
         _UNKNOWN_MODEL_WARNINGS.clear()
         provider = DeepseekProvider()
-        with caplog.at_level(logging.WARNING):
-            limit = provider.get_context_limit("deepseek-future-model")
+        with patch("headroom.providers.deepseek.LITELLM_AVAILABLE", False):
+            with caplog.at_level(logging.WARNING):
+                limit = provider.get_context_limit("deepseek-future-model")
         assert limit == 128_000
         assert "Unknown Deepseek model" in caplog.text
 
@@ -113,13 +119,75 @@ class TestDeepseekProvider:
         monkeypatch.setattr("headroom.providers.deepseek.litellm", mock_litellm)
         monkeypatch.setattr("headroom.providers.deepseek.LITELLM_AVAILABLE", True)
         provider = DeepseekProvider()
-        limit = provider.get_context_limit("deepseek-chat")
+        limit = provider.get_context_limit("deepseek-custom-v1")
         assert limit == 256000
 
     def test_supports_model_uses_instance_limits(self):
         provider = DeepseekProvider()
         provider._context_limits["custom-model"] = 32000
         assert provider.supports_model("custom-model")
+
+    def test_constructor_context_limits_override(self):
+        provider = DeepseekProvider(context_limits={"my-model": 64000})
+        assert provider.get_context_limit("my-model") == 64000
+
+    def test_constructor_context_limits_override_known_model(self):
+        provider = DeepseekProvider(context_limits={"deepseek-chat": 64000})
+        assert provider.get_context_limit("deepseek-chat") == 64000
+
+    def test_supports_pattern_inferred_model(self):
+        provider = DeepseekProvider()
+        assert provider.supports_model("deepseek-v3-turbo")
+        assert provider.supports_model("deepseek-v4-extra")
+
+    def test_context_limit_pattern_inferred(self):
+        provider = DeepseekProvider()
+        # deepseek-v3-turbo should match "deepseek-v3" pattern
+        assert provider.get_context_limit("deepseek-v3-turbo") == 128_000
+        # deepseek-v4-extra should match "deepseek-v4" pattern
+        assert provider.get_context_limit("deepseek-v4-extra") == 1_000_000
+
+    def test_estimate_cost_pattern_inferred(self):
+        provider = DeepseekProvider()
+        cost = provider.estimate_cost(
+            input_tokens=1_000_000,
+            output_tokens=1_000_000,
+            model="deepseek-v3-turbo",
+        )
+        assert cost is not None
+        assert cost > 0
+
+    def test_estimate_cost_cached_token_discount(self):
+        provider = DeepseekProvider()
+        cost_full = provider.estimate_cost(
+            input_tokens=1_000_000,
+            output_tokens=0,
+            model="deepseek-chat",
+        )
+        cost_cached = provider.estimate_cost(
+            input_tokens=1_000_000,
+            output_tokens=0,
+            model="deepseek-chat",
+            cached_tokens=1_000_000,
+        )
+        # Cached tokens should be 50% cheaper, so total cost should be lower
+        assert cost_cached < cost_full
+
+    def test_estimate_cost_partial_cached(self):
+        provider = DeepseekProvider()
+        cost_none = provider.estimate_cost(
+            input_tokens=2_000_000,
+            output_tokens=0,
+            model="deepseek-chat",
+        )
+        cost_half = provider.estimate_cost(
+            input_tokens=2_000_000,
+            output_tokens=0,
+            model="deepseek-chat",
+            cached_tokens=1_000_000,
+        )
+        # 1M non-cached + 1M cached (50% discount) should be less than 2M non-cached
+        assert cost_half < cost_none
 
 
 class TestDeepseekCustomConfig:
@@ -276,3 +344,87 @@ class TestPricingStaleness:
             result = _check_pricing_staleness()
             assert result is not None
             assert "days old" in result
+
+
+class TestPatternInference:
+    """Tests for _infer_model_family and _PATTERN_DEFAULTS."""
+
+    def test_non_deepseek_returns_none(self):
+        assert _infer_model_family("gpt-4o") is None
+
+    def test_v4_variant(self):
+        result = _infer_model_family("deepseek-v4-turbo")
+        assert result is not None
+        assert result["context_limit"] == 1_000_000
+
+    def test_v3_variant(self):
+        result = _infer_model_family("deepseek-v3-next")
+        assert result is not None
+        assert result["context_limit"] == 128_000
+
+    def test_coder_variant(self):
+        result = _infer_model_family("deepseek-coder-v3")
+        assert result is not None
+        assert result["context_limit"] == 128_000
+
+    def test_reasoner_variant(self):
+        result = _infer_model_family("deepseek-reasoner-v2")
+        assert result is not None
+        assert result["context_limit"] == 131_072
+
+    def test_known_model_matches_pattern(self):
+        # _infer_model_family is a fallback; it's fine if known models match
+        result = _infer_model_family("deepseek-chat")
+        assert result is not None
+        assert result["context_limit"] == 131_072
+
+    def test_patterns_are_sorted(self):
+        # V4 should match before V3 (more specific first)
+        result = _infer_model_family("deepseek-v4-chat")
+        assert result["context_limit"] == 1_000_000
+
+
+class TestCaching:
+    """Tests for result caching in get_context_limit."""
+
+    def test_inferred_model_cached(self):
+        provider = DeepseekProvider()
+        # deepseek-v4-turbo doesn't match any prefix in _context_limits
+        # (only deepseek-v4-flash and deepseek-v4-pro are keys), so it
+        # goes through pattern inference on first call
+        limit1 = provider.get_context_limit("deepseek-v4-turbo")
+        # Second call should return from cache (same instance)
+        limit2 = provider.get_context_limit("deepseek-v4-turbo")
+        assert limit1 == limit2
+        # Should be cached in _context_limits
+        assert "deepseek-v4-turbo" in provider._context_limits
+
+    def test_unknown_model_cached(self):
+        provider = DeepseekProvider()
+        _UNKNOWN_MODEL_WARNINGS.clear()
+        limit1 = provider.get_context_limit("deepseek-future-model")
+        # Second call should also work and be cached
+        limit2 = provider.get_context_limit("deepseek-future-model")
+        assert limit1 == limit2 == 128_000
+        assert "deepseek-future-model" in provider._context_limits
+
+
+class TestUnknownDefault:
+    """Tests for _UNKNOWN_DEEPSEEK_DEFAULT constant."""
+
+    def test_has_required_keys(self):
+        assert "context_limit" in _UNKNOWN_DEEPSEEK_DEFAULT
+        assert "input_price" in _UNKNOWN_DEEPSEEK_DEFAULT
+        assert "output_price" in _UNKNOWN_DEEPSEEK_DEFAULT
+        assert "max_output" in _UNKNOWN_DEEPSEEK_DEFAULT
+
+    def test_unknown_model_uses_default_pricing(self):
+        provider = DeepseekProvider()
+        cost = provider.estimate_cost(
+            input_tokens=1_000_000,
+            output_tokens=1_000_000,
+            model="deepseek-unknown-model-x",
+        )
+        # Should return a cost using _UNKNOWN_DEEPSEEK_DEFAULT pricing
+        assert cost is not None
+        assert cost > 0

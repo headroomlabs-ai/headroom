@@ -133,6 +133,7 @@ def test_proxy_provider_runtime_loaders_cache_backend_types(monkeypatch) -> None
 
     anyllm_loads = 0
     litellm_loads = 0
+    deepseek_loads = 0
 
     class FakeAnyLLMBackend:
         pass
@@ -140,26 +141,36 @@ def test_proxy_provider_runtime_loaders_cache_backend_types(monkeypatch) -> None
     class FakeLiteLLMBackend:
         pass
 
+    class FakeDeepseekBackend:
+        pass
+
     def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
-        nonlocal anyllm_loads, litellm_loads
+        nonlocal anyllm_loads, litellm_loads, deepseek_loads
         if name == "headroom.backends.anyllm":
             anyllm_loads += 1
             return type("Module", (), {"AnyLLMBackend": FakeAnyLLMBackend})()
         if name == "headroom.backends.litellm":
             litellm_loads += 1
             return type("Module", (), {"LiteLLMBackend": FakeLiteLLMBackend})()
+        if name == "headroom.backends.deepseek":
+            deepseek_loads += 1
+            return type("Module", (), {"DeepseekBackend": FakeDeepseekBackend})()
         raise AssertionError(name)
 
     monkeypatch.setattr(registry, "AnyLLMBackendType", None)
     monkeypatch.setattr(registry, "LiteLLMBackendType", None)
+    monkeypatch.setattr(registry, "DeepseekBackendType", None)
     monkeypatch.setattr("builtins.__import__", fake_import)
 
     assert registry._load_anyllm_backend() is FakeAnyLLMBackend
     assert registry._load_anyllm_backend() is FakeAnyLLMBackend
     assert registry._load_litellm_backend() is FakeLiteLLMBackend
     assert registry._load_litellm_backend() is FakeLiteLLMBackend
+    assert registry._load_deepseek_backend() is FakeDeepseekBackend
+    assert registry._load_deepseek_backend() is FakeDeepseekBackend
     assert anyllm_loads == 1
     assert litellm_loads == 1
+    assert deepseek_loads == 1
 
 
 def test_proxy_provider_runtime_transport_helpers_handle_missing_usage() -> None:
@@ -398,3 +409,78 @@ def test_proxy_provider_runtime_openai_transport_handles_prompt_details_without_
     assert metrics.tokens_output == 9
     assert metrics.cached_tokens == 0
     assert len(client._storage.saved) == 1
+
+
+def test_litellm_deepseek_provider_config() -> None:
+    from headroom.backends.litellm import get_provider_config
+
+    config = get_provider_config("deepseek")
+    assert config.name == "deepseek"
+    assert config.display_name == "Deepseek"
+    assert config.uses_region is False
+    assert config.pass_through is True
+    assert "DEEPSEEK_API_KEY" in config.env_vars
+
+
+def test_format_backend_status_for_deepseek() -> None:
+    assert (
+        format_backend_status(
+            backend="deepseek",
+            anyllm_provider="ignored",
+            bedrock_region=None,
+        )
+        == "Deepseek (native API)"
+    )
+
+
+def test_create_proxy_backend_deepseek_native(caplog) -> None:
+    logger = logging.getLogger("test")
+
+    class FakeBackend:
+        def __init__(self):
+            self.name = "deepseek"
+
+    with caplog.at_level(logging.INFO):
+        backend = create_proxy_backend(
+            backend="deepseek",
+            anyllm_provider="ignored",
+            bedrock_region=None,
+            logger=logger,
+            deepseek_backend_cls=FakeBackend,
+        )
+
+    assert backend is not None
+    assert backend.name == "deepseek"
+    assert "Deepseek backend enabled" in caplog.text
+
+
+def test_create_proxy_backend_deepseek_falls_back_to_litellm(caplog) -> None:
+    import headroom.providers.registry as registry
+
+    logger = logging.getLogger("test")
+
+    class FakeLiteLLMBackend:
+        def __init__(self, provider, region=None):
+            self.provider = provider
+
+    original_loader = registry._load_deepseek_backend
+
+    def _raising_loader():
+        raise ImportError("deepseek SDK missing")
+
+    registry._load_deepseek_backend = _raising_loader
+    try:
+        with caplog.at_level(logging.WARNING):
+            backend = create_proxy_backend(
+                backend="deepseek",
+                anyllm_provider="ignored",
+                bedrock_region=None,
+                logger=logger,
+                litellm_backend_cls=FakeLiteLLMBackend,
+            )
+
+        assert backend is not None
+        assert backend.provider == "deepseek"
+        assert "Deepseek backend not available" in caplog.text
+    finally:
+        registry._load_deepseek_backend = original_loader

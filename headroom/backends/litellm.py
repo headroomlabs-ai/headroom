@@ -320,6 +320,15 @@ PROVIDER_REGISTRY: dict[str, ProviderConfig] = {
         env_vars=["DATABRICKS_API_KEY", "DATABRICKS_API_BASE"],
         model_format_hint="databricks-meta-llama-3-1-70b-instruct, databricks-dbrx-instruct, etc.",
     ),
+    "deepseek": ProviderConfig(
+        name="deepseek",
+        display_name="Deepseek",
+        model_map={},  # Pass through - Deepseek uses its own model names
+        pass_through=True,
+        uses_region=False,
+        env_vars=["DEEPSEEK_API_KEY"],
+        model_format_hint="deepseek-chat, deepseek-reasoner, deepseek-v3, etc.",
+    ),
 }
 
 
