@@ -81,8 +81,20 @@ def test_build_serena_spec_uses_agent_context() -> None:
         "--project-from-cwd",
         "--context",
         "codex",
+        "--open-web-dashboard",
+        "False",
     )
     assert spec.env == {}
+
+
+def test_build_serena_spec_disables_dashboard_popup_by_default() -> None:
+    # Headroom installs Serena by default; the dashboard browser tab must not
+    # auto-open. The flag overrides the user's serena_config.yml at startup,
+    # so this holds even when the user never created a Serena config.
+    for context in ("codex", "claude-code"):
+        spec = build_serena_spec(context)
+        idx = spec.args.index("--open-web-dashboard")
+        assert spec.args[idx + 1] == "False"
 
 
 # ----------------------------------------------------------------------

@@ -648,6 +648,41 @@ def _remove_headroom_installed_serena_mcp(registrar: Any) -> str:
     return "failed"
 
 
+def _disable_serena_mcp(registrar: Any, *, verbose: bool = False) -> None:
+    """Make ``--no-serena`` actively disable Serena, not merely skip adding it.
+
+    Serena is registered by default, so a prior ``headroom wrap`` persists a
+    ``serena`` entry into the agent's MCP config; the agent then keeps
+    launching Serena on startup. Just *skipping* registration on a later
+    ``--no-serena`` run leaves that stale entry in place — so the flag has to
+    remove the entry Headroom installed. A user-managed Serena (absent from
+    our ledger) is reported but left untouched.
+    """
+    if not registrar.detect():
+        if verbose:
+            click.echo(f"  Serena MCP: {registrar.display_name} not detected — skipping")
+        return
+
+    if registrar.get_server("serena") is None:
+        if verbose:
+            click.echo("  Skipping Serena MCP (--no-serena)")
+        return
+
+    status = _remove_headroom_installed_serena_mcp(registrar)
+    if status == "removed":
+        click.echo("  Removed previously-installed Serena MCP (--no-serena)")
+        click.echo(f"    restart {registrar.display_name} if it was already running")
+    elif status == "not_headroom_owned":
+        click.echo(
+            "  Serena MCP is present but user-managed — leaving it in place "
+            "(--no-serena only removes entries Headroom installed)"
+        )
+    else:  # "failed"
+        click.echo(
+            "  Serena MCP: removal failed — remove the 'serena' entry from your MCP config manually"
+        )
+
+
 _CBM_MCP_SERVER_NAME = "codebase-memory-mcp"
 
 
@@ -2769,8 +2804,10 @@ def claude(
             from headroom.mcp_registry import ClaudeRegistrar
 
             _setup_serena_mcp(ClaudeRegistrar(), context="claude-code", verbose=verbose)
-        elif verbose:
-            click.echo("  Skipping Serena MCP (--no-serena)")
+        else:
+            from headroom.mcp_registry import ClaudeRegistrar
+
+            _disable_serena_mcp(ClaudeRegistrar(), verbose=verbose)
 
         if code_graph:
             _setup_code_graph(verbose=verbose)
@@ -3264,8 +3301,10 @@ def codex(
         from headroom.mcp_registry import CodexRegistrar
 
         _setup_serena_mcp(CodexRegistrar(), context="codex", verbose=verbose, force=True)
-    elif verbose:
-        click.echo("  Skipping Serena MCP (--no-serena)")
+    else:
+        from headroom.mcp_registry import CodexRegistrar
+
+        _disable_serena_mcp(CodexRegistrar(), verbose=verbose)
 
     # Setup memory MCP server for Codex (native tool integration)
     if memory:
@@ -4396,6 +4435,21 @@ def unwrap_codex(port: int, no_stop_proxy: bool) -> None:
                 "headroom unwrap codex."
             )
         click.echo(f"  Nothing to undo: {config_file} has no Headroom wrap markers.")
+
+    # Serena is written as its own [mcp_servers.serena] table with Headroom
+    # markers, separate from the provider block handled above — a "cleaned"
+    # restore leaves it behind. Remove it explicitly (only if we installed it),
+    # mirroring unwrap_claude. Runs after the restore so a backup-restore that
+    # already dropped Serena makes this a safe no-op.
+    from headroom.mcp_registry import CodexRegistrar
+
+    codex_registrar = CodexRegistrar()
+    if codex_registrar.detect():
+        serena_status = _remove_headroom_installed_serena_mcp(codex_registrar)
+        if serena_status == "removed":
+            click.echo("  Removed Headroom-installed Serena MCP server from Codex.")
+        elif serena_status == "failed":
+            click.echo("  Serena MCP server matched Headroom ledger but could not be removed.")
 
     click.echo()
     click.echo("✓ Codex is no longer routed through the Headroom proxy.")

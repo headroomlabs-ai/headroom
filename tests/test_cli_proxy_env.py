@@ -222,6 +222,34 @@ class TestCLIProxyEnvVars:
         assert result.exit_code == 0, result.output
         assert captured_config["config"].budget_limit_usd == 100.5
 
+    def test_budget_period_flag_and_env(self, runner):
+        """--budget-period and HEADROOM_BUDGET_PERIOD should reach ProxyConfig."""
+        captured_config = {}
+
+        def mock_run_server(config, **kwargs):
+            captured_config["config"] = config
+
+        with patch("headroom.proxy.server.run_server", mock_run_server):
+            result = runner.invoke(
+                main,
+                ["proxy", "--budget", "50", "--budget-period", "monthly"],
+                catch_exceptions=False,
+            )
+
+        assert result.exit_code == 0, result.output
+        assert captured_config["config"].budget_period == "monthly"
+
+        with patch("headroom.proxy.server.run_server", mock_run_server):
+            result = runner.invoke(
+                main,
+                ["proxy"],
+                env={"HEADROOM_BUDGET_PERIOD": "hourly"},
+                catch_exceptions=False,
+            )
+
+        assert result.exit_code == 0, result.output
+        assert captured_config["config"].budget_period == "hourly"
+
     def test_code_aware_enabled_from_env(self, runner):
         """HEADROOM_CODE_AWARE_ENABLED env var should be passed to ProxyConfig."""
         captured_config = {}
