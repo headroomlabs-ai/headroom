@@ -1970,6 +1970,7 @@ class ContentRouter(Transform):
         suffix_tokens: list[int],
         route_counts: dict[str, int],
         transforms_applied: list[str],
+        batch_state: dict[str, int | None] | None = None,
     ) -> bool:
         """Break-even gate for one candidate mutation (#856 P2, flag-gated).
 
@@ -1982,9 +1983,31 @@ class ContentRouter(Transform):
         full-penalty assumption). Every decision is logged with its inputs
         and counted in ``route_counts`` so the flag can be validated from
         telemetry before any default-on.
+
+        #856 P3a (batch deep edits): a mutation at depth K busts the
+        provider's cached suffix after K, so every *later* candidate at a
+        deeper slot rides that same invalidation for free — mutating it adds
+        no incremental cache-bust cost. ``batch_state["floor"]`` tracks the
+        shallowest slot already admitted as a net-positive mutation. When the
+        current candidate sits strictly deeper than that floor, S is charged
+        as 0 (rather than the full invalidated suffix), so the break-even
+        formula admits it on the write/read economics alone. Charging S=0 via
+        the same ``net_mutation_gain`` (instead of blanket-admitting on
+        ``delta_t > 0``) keeps the decision conservative: it never admits a
+        mutation the real economics would reject. The floor is only set/lowered
+        by full-S admits, so a slot only ever rides free behind a genuinely
+        mutated shallower slot. Each batch admission emits the
+        ``router:netcost_batch_admit`` marker and the ``netcost_batch_admitted``
+        counter for telemetry.
         """
         delta_t = max(0, original_tokens - compressed_tokens)
-        suffix = suffix_tokens[slot_idx + 1]
+        # Batch reclaim: if a shallower slot was already admitted, its
+        # cache-bust already invalidated everything after it, including this
+        # slot — so charge S=0 here. Otherwise S is the full suffix after the
+        # candidate (P2 v1 estimator).
+        floor = batch_state.get("floor") if batch_state is not None else None
+        batch_reclaim = floor is not None and slot_idx > floor
+        suffix = 0 if batch_reclaim else suffix_tokens[slot_idx + 1]
         policy = self._runtime_compression_policy
         if policy is None:
             from .compression_policy import policy_default_payg
@@ -2015,18 +2038,31 @@ class ContentRouter(Transform):
         gain = float(policy.net_mutation_gain(delta_t, suffix, reads, p_alive))
         allowed = gain > 0.0
         logger.info(
-            "NetCostPolicy slot=%d delta_t=%d suffix=%d reads=%.1f p_alive=%.2f gain=%.0f -> %s",
+            "NetCostPolicy slot=%d delta_t=%d suffix=%d reads=%.1f p_alive=%.2f "
+            "gain=%.0f batch_reclaim=%s -> %s",
             slot_idx,
             delta_t,
             suffix,
             reads,
             p_alive,
             gain,
+            batch_reclaim,
             "mutate" if allowed else "skip",
         )
         if allowed:
             route_counts.setdefault("netcost_allowed", 0)
             route_counts["netcost_allowed"] += 1
+            if batch_reclaim:
+                # Rode a shallower edit's cache-bust for free — telemetry only;
+                # the floor is unchanged (this slot is deeper than the floor).
+                route_counts.setdefault("netcost_batch_admitted", 0)
+                route_counts["netcost_batch_admitted"] += 1
+                transforms_applied.append("router:netcost_batch_admit")
+            elif batch_state is not None:
+                # First/shallower full-S admit — open (or lower) the batch
+                # floor so deeper candidates can reclaim against it.
+                current = batch_state.get("floor")
+                batch_state["floor"] = slot_idx if current is None else min(current, slot_idx)
         else:
             route_counts.setdefault("netcost_skipped", 0)
             route_counts["netcost_skipped"] += 1
@@ -2215,6 +2251,10 @@ class ContentRouter(Transform):
         # token total of every message after the candidate.
         netcost_enabled = os.environ.get("HEADROOM_NET_COST_POLICY") == "1"
         netcost_suffix_tokens: list[int] = []
+        # #856 P3a: shared batch-reclaim state for this request. ``floor`` is
+        # the shallowest slot admitted as a net-positive mutation; once set,
+        # deeper candidates charge S=0 (their cache-bust is already paid).
+        netcost_batch_state: dict[str, int | None] = {"floor": None}
         if netcost_enabled:
             netcost_suffix_tokens = [0] * (num_messages + 1)
             for j in range(num_messages - 1, -1, -1):
@@ -2411,6 +2451,7 @@ class ContentRouter(Transform):
                         suffix_tokens=netcost_suffix_tokens,
                         route_counts=route_counts,
                         transforms_applied=transforms_applied,
+                        batch_state=netcost_batch_state,
                     ):
                         # Net-cost gate: mutation would cost more in cache
                         # invalidation than it saves — leave untouched.
@@ -2492,6 +2533,7 @@ class ContentRouter(Transform):
                         suffix_tokens=netcost_suffix_tokens,
                         route_counts=route_counts,
                         transforms_applied=transforms_applied,
+                        batch_state=netcost_batch_state,
                     ):
                         result_slots[slot_idx] = message
                         continue
@@ -2547,6 +2589,8 @@ class ContentRouter(Transform):
             parts.append(f"{route_counts['cache_hit']} cache hits")
         if route_counts.get("cache_miss"):
             parts.append(f"{route_counts['cache_miss']} cache misses")
+        if route_counts.get("netcost_batch_admitted"):
+            parts.append(f"{route_counts['netcost_batch_admitted']} netcost batch-admitted")
         cs = self._cache.stats
         if cs["cache_size"] > 0 or cs["cache_skip_size"] > 0:
             parts.append(

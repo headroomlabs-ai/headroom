@@ -262,3 +262,95 @@ class TestNetCostFrozenUnlock:
         result = router.apply([dict(m) for m in messages], tokenizer, frozen_message_count=2)
         assert result.messages[1]["content"] == original[1]["content"]
         assert "router:netcost_frozen_unlock" not in result.transforms_applied
+
+
+class TestNetCostBatchReclaim:
+    """#856 P3a: batch deep edits -- once one net-positive edit is admitted at
+    slot K, deeper candidates ride that cache-bust for free (S charged as 0).
+
+    Tests are cache-cold (fresh router per fixture) so every candidate flows
+    through the parallel-merge pass in ascending slot order, which is where the
+    shared batch_state floor is set and then reclaimed.
+    """
+
+    @staticmethod
+    def _convo(slot1: str, slot2: str, filler_words: int) -> list[dict]:
+        # Two consecutive tool dumps (slots 1 and 2) followed by a filler
+        # suffix. Slot 1 is the shallower candidate; slot 2 the deeper one.
+        suffix = "analysis context word " * filler_words
+        return [
+            {"role": "user", "content": "fetch the records"},
+            {"role": "tool", "content": slot1},
+            {"role": "tool", "content": slot2},
+            {"role": "user", "content": suffix},
+            {"role": "user", "content": "summarize"},
+        ]
+
+    @staticmethod
+    def _compressed(result, original, idx: int) -> bool:
+        return result.messages[idx]["content"] != original[idx]["content"]
+
+    def test_flag_off_no_batch_marker(self, router, tokenizer, monkeypatch):
+        # Without the flag the batch path is inert -- no marker, no counter.
+        monkeypatch.delenv("HEADROOM_NET_COST_POLICY", raising=False)
+        messages = self._convo(_tool_json(2000), _tool_json(800), filler_words=5)
+        original = [dict(m) for m in messages]
+        result = router.apply([dict(m) for m in messages], tokenizer)
+        assert "router:netcost_batch_admit" not in result.transforms_applied
+        # Both deep edits still compress (no gate at all when flag off).
+        assert self._compressed(result, original, 1)
+        assert self._compressed(result, original, 2)
+
+    def test_deeper_edit_rides_free(self, router, tokenizer, monkeypatch):
+        # Slot 1 (huge shave) admits on its own merit and opens the floor;
+        # slot 2 then admits via the batch reclaim path and emits the marker.
+        monkeypatch.setenv("HEADROOM_NET_COST_POLICY", "1")
+        messages = self._convo(_tool_json(2000), _tool_json(800), filler_words=5)
+        original = [dict(m) for m in messages]
+        result = router.apply([dict(m) for m in messages], tokenizer)
+        assert self._compressed(result, original, 1)
+        assert self._compressed(result, original, 2)
+        markers = [t for t in result.transforms_applied if t == "router:netcost_batch_admit"]
+        # Exactly one deeper slot rode the floor for free.
+        assert len(markers) == 1
+
+    def test_batch_admits_otherwise_blocked_edit(self, router, tokenizer, monkeypatch):
+        # Slot 2 (modest shave, large suffix after it) would be blocked on its
+        # own S, but slot 1's admit already busted the suffix -- so slot 2 rides
+        # free. Pairs with test_no_prior_admit_keeps_block, which shows the same
+        # slot-2 config stays blocked when no shallower edit opens the floor.
+        monkeypatch.setenv("HEADROOM_NET_COST_POLICY", "1")
+        messages = self._convo(_tool_json(2000), _tool_json(300), filler_words=4000)
+        original = [dict(m) for m in messages]
+        result = router.apply([dict(m) for m in messages], tokenizer)
+        assert self._compressed(result, original, 1)  # floor-setting admit
+        assert self._compressed(result, original, 2)  # rode free
+        assert "router:netcost_batch_admit" in result.transforms_applied
+
+    def test_no_prior_admit_keeps_block(self, router, tokenizer, monkeypatch):
+        # Neither candidate beats its own S (both modest shaves under a huge
+        # suffix), so the floor is never opened and no slot rides free. Guards
+        # against a floor-init / off-by-one bug that would grant a free ride
+        # with no genuine shallower mutation behind it.
+        monkeypatch.setenv("HEADROOM_NET_COST_POLICY", "1")
+        messages = self._convo(_tool_json(300), _tool_json(300), filler_words=40000)
+        original = [dict(m) for m in messages]
+        result = router.apply([dict(m) for m in messages], tokenizer)
+        assert not self._compressed(result, original, 1)
+        assert not self._compressed(result, original, 2)
+        assert "router:netcost_batch_admit" not in result.transforms_applied
+
+    def test_frozen_unlock_and_batch_combine(self, router, tokenizer, monkeypatch):
+        # Two frozen string slots inside the prefix (frozen_message_count=3).
+        # Slot 1 unlocks and sets the floor; slot 2 unlocks AND rides free.
+        # Slot 2 carries both markers; the batch counter must not double-count.
+        monkeypatch.setenv("HEADROOM_NET_COST_POLICY", "1")
+        messages = self._convo(_tool_json(2000), _tool_json(800), filler_words=5)
+        original = [dict(m) for m in messages]
+        result = router.apply([dict(m) for m in messages], tokenizer, frozen_message_count=3)
+        assert self._compressed(result, original, 1)
+        assert self._compressed(result, original, 2)
+        unlocks = [t for t in result.transforms_applied if t == "router:netcost_frozen_unlock"]
+        batch = [t for t in result.transforms_applied if t == "router:netcost_batch_admit"]
+        assert len(unlocks) == 2  # both frozen slots opened
+        assert len(batch) == 1  # only the deeper one rode free -- no double-count
