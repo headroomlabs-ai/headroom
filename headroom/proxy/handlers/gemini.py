@@ -25,7 +25,7 @@ from headroom.proxy.outcome import RequestOutcome
 logger = logging.getLogger("headroom.proxy")
 
 DEFAULT_CLOUDCODE_API_URL = "https://cloudcode-pa.googleapis.com"
-ANTIGRAVITY_DAILY_API_URL = "https://daily-cloudcode-pa.sandbox.googleapis.com"
+ANTIGRAVITY_DAILY_API_URL = "https://daily-cloudcode-pa.googleapis.com"
 
 
 class GeminiHandlerMixin:
@@ -34,19 +34,52 @@ class GeminiHandlerMixin:
     def _is_cloudcode_antigravity_request(
         self, body: dict[str, Any], headers: dict[str, str]
     ) -> bool:
-        """Detect Pi/OpenClaw antigravity requests routed via Cloud Code Assist."""
+        """Detect Pi/OpenClaw and agy antigravity requests routed via Cloud Code Assist.
+
+        Detection paths (any one is sufficient):
+        - body requestType == "agent"  (Pi/OpenClaw classic)
+        - body userAgent == "antigravity"  (Pi/OpenClaw classic)
+        - HTTP User-Agent header starts with "antigravity/"  (case-insensitive)
+        - body model is an agent-model name (e.g. "gemini-3-flash-agent")
+        - agy-shaped body: top-level model + project + request.contents present
+        """
         user_agent = headers.get("user-agent", "").lower()
         body_user_agent = str(body.get("userAgent", "")).lower()
+        model = str(body.get("model", ""))
+        # Agent-model names carry "-agent" suffix (e.g. gemini-3-flash-agent)
+        is_agent_model = model.endswith("-agent")
+        # agy-shaped body confirmation: top-level project + request with contents.
+        # Only meaningful together with is_agent_model; the body shape alone is shared
+        # with regular Pi/OpenClaw traffic (CLOUDCODE_BODY has the same structure).
+        request_block = body.get("request", {})
+        is_agy_agent_body = is_agent_model and (
+            bool(body.get("project"))
+            and isinstance(request_block, dict)
+            and bool(request_block.get("contents"))
+        )
         return (
             body.get("requestType") == "agent"
             or body_user_agent == "antigravity"
             or user_agent.startswith("antigravity/")
+            or is_agy_agent_body
         )
 
-    def _resolve_cloudcode_base_url(self, is_antigravity: bool) -> str:
-        """Resolve upstream base URL for Pi Cloud Code Assist / Antigravity traffic."""
+    def _resolve_cloudcode_base_url(
+        self,
+        is_antigravity: bool,
+        original_host: str | None = None,  # reserved for T2 MITM dispatch; unused here
+    ) -> str:
+        """Resolve upstream base URL for Pi Cloud Code Assist / Antigravity traffic.
+
+        Resolution order (first match wins):
+        1. Antigravity path — env HEADROOM_ANTIGRAVITY_API_URL override, else corrected default.
+           ``original_host`` (populated by the MITM CONNECT path in T2) is accepted here so
+           the signature is stable; full host-preserving logic is wired in T2.
+        2. Reverse-proxy path — ``CLOUDCODE_API_URL`` instance attr or DEFAULT_CLOUDCODE_API_URL.
+        """
         if is_antigravity:
-            return ANTIGRAVITY_DAILY_API_URL
+            override = os.environ.get("HEADROOM_ANTIGRAVITY_API_URL")
+            return override.rstrip("/") if override else ANTIGRAVITY_DAILY_API_URL
         return getattr(self, "CLOUDCODE_API_URL", DEFAULT_CLOUDCODE_API_URL).rstrip("/")
 
     def _has_non_text_parts(self, content: dict) -> bool:
