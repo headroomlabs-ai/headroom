@@ -76,7 +76,7 @@ def test_get_rtk_stats_memoizes_subprocess_calls(monkeypatch: pytest.MonkeyPatch
 
     def _fake_run(args, **kwargs):
         calls["run"] += 1
-        assert args == ["/usr/bin/rtk", "gain", "--format", "json"]
+        assert [str(args[0]).replace("\\", "/")] + args[1:] == ["/usr/bin/rtk", "gain", "--format", "json"]
         summary = totals[min(calls["run"] - 1, len(totals) - 1)]
         return SimpleNamespace(
             returncode=0,
@@ -152,7 +152,7 @@ def test_get_rtk_stats_can_read_project_scoped_gain(monkeypatch: pytest.MonkeyPa
 
     def _fake_run(args, **kwargs):
         calls["run"] += 1
-        assert args == ["/usr/bin/rtk", "gain", "--project", "--format", "json"]
+        assert [str(args[0]).replace("\\", "/")] + args[1:] == ["/usr/bin/rtk", "gain", "--project", "--format", "json"]
         return SimpleNamespace(
             returncode=0,
             stdout=json.dumps(
@@ -187,7 +187,7 @@ def test_get_rtk_stats_invalid_scope_defaults_to_global(
 
     def _fake_run(args, **kwargs):
         calls["run"] += 1
-        assert args == ["/usr/bin/rtk", "gain", "--format", "json"]
+        assert [str(args[0]).replace("\\", "/")] + args[1:] == ["/usr/bin/rtk", "gain", "--format", "json"]
         return SimpleNamespace(returncode=0, stdout=json.dumps({"summary": {}}))
 
     mock_warning = MagicMock()
@@ -228,7 +228,7 @@ def test_get_context_tool_stats_reads_lean_ctx_gain(monkeypatch: pytest.MonkeyPa
 
     def _fake_run(args, **kwargs):
         calls["run"] += 1
-        assert args == ["/usr/bin/lean-ctx", "gain", "--json"]
+        assert [str(args[0]).replace("\\", "/")] + args[1:] == ["/usr/bin/lean-ctx", "gain", "--json"]
         summary = totals[min(calls["run"] - 1, len(totals) - 1)]
         return SimpleNamespace(returncode=0, stdout=json.dumps({"summary": summary}))
 
@@ -549,3 +549,60 @@ def test_dashboard_uses_cached_stats_and_lazy_history_feed_polling() -> None:
     assert "Lean-ctx" in html
     assert "Context Tool" in html
     assert "cliFilteringLabel + ' Filtered'" in html
+
+
+def test_proxy_throughput_stats_caching_and_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+    from headroom.proxy.server import create_app, _throughput_cache, require_loopback
+    from headroom.config import ProxyConfig
+    from headroom.perf import analyzer
+
+    # Reset cache
+    _throughput_cache.update({"expires_at": 0.0, "value": None})
+
+    calls = {"compute": 0}
+
+    def _fake_parse_log_files(last_n_hours=1.0):
+        calls["compute"] += 1
+        if calls["compute"] == 1:
+            raise ValueError("fake computation error")
+        return analyzer.PerfReport()
+
+    monkeypatch.setattr(analyzer, "parse_log_files", _fake_parse_log_files)
+    monkeypatch.setattr(analyzer, "build_perf_summary", lambda report: {"throughput": {"input_wall_clock": 42.0}})
+
+    app = create_app(
+        ProxyConfig(
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+            log_requests=False,
+            ccr_inject_tool=False,
+            ccr_handle_responses=False,
+            ccr_context_tracking=False,
+        )
+    )
+    app.dependency_overrides[require_loopback] = lambda: None
+
+    with TestClient(app) as client:
+        # 1. First call (should throw error and set value to None)
+        response1 = client.get("/stats")
+        assert response1.status_code == 200
+        payload1 = response1.json()
+        assert payload1["throughput"] is None
+
+        # 2. Second call (should succeed and cache)
+        response2 = client.get("/stats")
+        assert response2.status_code == 200
+        payload2 = response2.json()
+        assert payload2["throughput"] == {"input_wall_clock": 42.0}
+
+        # 3. Third call (should hit cache - compute not called again)
+        response3 = client.get("/stats")
+        assert response3.status_code == 200
+        payload3 = response3.json()
+        assert payload3["throughput"] == {"input_wall_clock": 42.0}
+        assert calls["compute"] == 2  # 1 error, 1 success, third is cached
+

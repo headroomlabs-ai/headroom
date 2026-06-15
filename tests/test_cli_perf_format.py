@@ -283,3 +283,28 @@ def test_throughput_parsing_and_calculations(monkeypatch, tmp_path):
     assert rolling["input_wall_clock"] > 0
     assert rolling["input_active_p50"] == 2500.0
     assert rolling["compression_p50"] == 10000.0
+
+
+def test_throughput_empty_and_percentiles():
+    from headroom.perf.analyzer import calculate_throughput, _percentile, _calculate_throughput_stats, PerfReport
+
+    # Empty percentiles
+    assert _percentile([], 0.5) == 0.0
+
+    # Percentiles boundary checks
+    assert _percentile([10.0], 0.5) == 10.0
+    assert _percentile([10.0, 20.0], 0.5) == 15.0
+    assert _percentile([10.0, 20.0], 0.0) == 10.0
+    assert _percentile([10.0, 20.0], 1.0) == 20.0
+    assert _percentile([10.0, 20.0], 1.5) == 20.0
+
+    # Empty calculate_throughput
+    empty_report = PerfReport()
+    tp = calculate_throughput(empty_report)
+    assert tp["rolling"]["input_wall_clock"] == 0.0
+    assert tp["current"]["input_wall_clock"] == 0.0
+
+    # _calculate_throughput_stats with empty records
+    stats = _calculate_throughput_stats([], 10.0)
+    assert stats["input_wall_clock"] == 0.0
+
