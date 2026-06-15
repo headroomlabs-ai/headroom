@@ -2315,11 +2315,14 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         m = proxy.metrics
 
         import time
+
         async with _throughput_cache_lock:
             now = time.time()
             if _throughput_cache["expires_at"] < now or _throughput_cache["value"] is None:
+
                 def _compute_throughput():
                     from headroom.perf.analyzer import build_perf_summary, parse_log_files
+
                     perf_report = parse_log_files(last_n_hours=1.0)
                     return build_perf_summary(perf_report).get("throughput")
 
