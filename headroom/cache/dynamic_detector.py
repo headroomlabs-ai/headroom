@@ -777,19 +777,22 @@ class SemanticDetector:
             return [], "numpy not installed. Install with: pip install numpy"
 
         sentence_texts = [s[0] for s in sentences]
-        if self._model is None or self._exemplar_embeddings is None:
+        # `is_available` only guarantees `_model` is set. Guard each piece
+        # separately and *before* encoding so a None never reaches `.T` (a
+        # real crash), mypy can narrow the `Any | None` attributes, and the
+        # caller gets a warning that names the actual missing piece — the
+        # model vs. the exemplar matrix. (Folding both into one guard, as a
+        # prior change did, returned the generic "semantic detector" message
+        # even when only the exemplars were missing.)
+        if self._model is None:
             return [], self._load_error or "semantic detector is not initialized"
+        if self._exemplar_embeddings is None:
+            return [], "exemplar embeddings not initialized"
 
         sentence_embeddings = self._model.encode(
             sentence_texts,
             convert_to_numpy=True,
         )
-
-        # Compute similarities. `is_available` only guarantees `_model` is
-        # set; guard the exemplar matrix explicitly so a None never reaches
-        # `.T` (real crash) and mypy can narrow the `Any | None` attribute.
-        if self._exemplar_embeddings is None:
-            return [], "exemplar embeddings not initialized"
 
         similarities = np.dot(sentence_embeddings, self._exemplar_embeddings.T)
 
