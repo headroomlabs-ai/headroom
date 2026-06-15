@@ -15,6 +15,7 @@ Usage:
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import io
 import json
@@ -25,6 +26,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.parse
 from collections.abc import Callable
@@ -2819,6 +2821,7 @@ def _launch_tool(
         if args:
             click.echo(f"  Extra args: {' '.join(args)}")
         _print_telemetry_notice()
+        _inject_ssl_bypass(env, agent_type=agent_type)
         click.echo()
 
         result = subprocess.run([binary, *args], env=env)
@@ -5341,4 +5344,371 @@ def unwrap_codex(port: int, no_stop_proxy: bool) -> None:
     click.echo("✓ Codex is no longer routed through the Headroom proxy.")
     if not no_stop_proxy and status != "noop":
         _echo_unwrap_proxy_stop_status(_stop_local_proxy_for_unwrap(port), port)
+    click.echo()
+
+def _inject_ssl_bypass(env: dict[str, str], agent_type: str = "unknown") -> None:
+    """Inject environment variables to bypass SSL verification in child processes.
+
+    For ``agent_type="agy"`` the bypass vars are intentionally NOT injected:
+    agy routes through our CONNECT terminator via HTTPS_PROXY and must trust
+    the minted CA bundle.  Blanking SSL_CERT_FILE / CACERT_PATH /
+    NODE_EXTRA_CA_CERTS / CURL_CA_BUNDLE would prevent the terminator's TLS
+    leaf from being verified, defeating the MITM entirely.  The global
+    NODE_TLS_REJECT_UNAUTHORIZED=0 / PYTHONHTTPSVERIFY=0 bypass would also
+    be counterproductive here — agy must verify TLS against our bundle.
+
+    All other agent types keep byte-identical behaviour to the original.
+    """
+    if agent_type == "agy":
+        # agy MUST trust the CA bundle — do NOT blank or disable verification.
+        return
+    ssl_verify = os.environ.get("HEADROOM_SSL_VERIFY", "true").lower()
+    if ssl_verify in ("false", "0", "no", "off"):
+        # Node.js (Claude Code is Node)
+        env["NODE_TLS_REJECT_UNAUTHORIZED"] = "0"
+        # Python
+        env["PYTHONHTTPSVERIFY"] = "0"
+        # general / some libraries
+        env["CURL_CA_BUNDLE"] = ""
+        env["SSL_CERT_FILE"] = ""
+
+
+# =============================================================================
+# agy MITM lifecycle helpers
+# =============================================================================
+
+# Intercepted host surfaced in the disclosure banner.
+_AGY_INTERCEPTED_HOST = "daily-cloudcode-pa.googleapis.com"
+
+
+class _AgyServers:
+    """Handle to the running terminator + dispatch pair.
+
+    Holds the async event-loop thread and exposes a synchronous ``stop()``
+    that schedules cleanup on that loop and joins the thread.
+    """
+
+    def __init__(
+        self,
+        terminator: Any,
+        dispatch: Any,
+        loop: asyncio.AbstractEventLoop,
+        thread: threading.Thread,
+        stop_flag: asyncio.Event,
+    ) -> None:
+        self.terminator = terminator
+        self.dispatch = dispatch
+        self._loop = loop
+        self._thread = thread
+        self._stop_flag = stop_flag
+        self._lock = threading.Lock()
+        self._stopped = False
+
+    def stop(self) -> None:
+        """Best-effort graceful shutdown (idempotent)."""
+        with self._lock:
+            if self._stopped:
+                return
+            self._stopped = True
+        # Wake the event loop so it can stop() the servers and exit.
+        self._loop.call_soon_threadsafe(self._stop_flag.set)
+        self._thread.join(timeout=10)
+
+
+def _start_agy_servers(
+    ca_key: Any,
+    ca_cert: Any,
+    base_dir: Path | None = None,
+) -> _AgyServers:
+    """Start AgyCONNECTTerminator + AgyDispatchServer on a dedicated thread.
+
+    Both servers bind loopback ephemeral ports (port=0).  Readiness is
+    signalled via a threading.Event; startup errors raise RuntimeError fast.
+
+    Returns an _AgyServers handle with ``.terminator`` and ``.dispatch``
+    already started, and a ``.stop()`` method for clean shutdown.
+    """
+    from headroom.proxy.agy_dispatch import AgyDispatchServer
+    from headroom.proxy.agy_terminator import AgyCONNECTTerminator
+
+    ready_event: threading.Event = threading.Event()
+    error_holder: list[Exception] = []
+    result_holder: list[_AgyServers] = []
+
+    def _run_loop() -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        stop_flag = asyncio.Event()
+
+        async def _main() -> None:
+            dispatch = AgyDispatchServer(
+                ca_key=ca_key,
+                ca_cert=ca_cert,
+                base_dir=base_dir,
+                port=0,
+            )
+            await dispatch.start()
+            _, dispatch_port = dispatch.address
+
+            terminator = AgyCONNECTTerminator(
+                ca_key=ca_key,
+                ca_cert=ca_cert,
+                base_dir=base_dir,
+                port=0,
+                dispatch_port=dispatch_port,
+            )
+            await terminator.start()
+
+            servers = _AgyServers(
+                terminator=terminator,
+                dispatch=dispatch,
+                loop=loop,
+                thread=current_thread,
+                stop_flag=stop_flag,
+            )
+            result_holder.append(servers)
+            ready_event.set()
+
+            # Keep event loop alive until stop_flag is set.
+            await stop_flag.wait()
+
+            # Graceful shutdown.
+            await terminator.stop()
+            await dispatch.stop()
+
+        try:
+            loop.run_until_complete(_main())
+        except Exception as exc:  # noqa: BLE001
+            error_holder.append(exc)
+            ready_event.set()
+        finally:
+            loop.close()
+
+    current_thread = threading.Thread(target=_run_loop, daemon=True, name="headroom-agy-mitm")
+    current_thread.start()
+    ready_event.wait(timeout=15)
+
+    if error_holder:
+        raise RuntimeError(f"agy MITM server startup failed: {error_holder[0]}") from error_holder[0]
+    if not result_holder:
+        raise RuntimeError("agy MITM servers did not start within 15 seconds")
+
+    return result_holder[0]
+
+
+def _stop_agy_servers(servers: _AgyServers | None) -> None:
+    """Best-effort stop of agy servers (called from finally block).
+
+    Accepts the _AgyServers handle returned by _start_agy_servers.
+    The second argument is unused and exists only so tests can patch both
+    old (terminator, dispatch) positional args without error.
+    """
+    if servers is None:
+        return
+    try:
+        servers.stop()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+# =============================================================================
+# wrap agy
+# =============================================================================
+
+
+@wrap.command(context_settings={"ignore_unknown_options": True})
+@click.option(
+    "--no-intercept",
+    is_flag=True,
+    help=(
+        "Passthrough / escape hatch: launch agy unchanged, with no TLS interception. "
+        "agy traffic is NOT compressed or inspected by Headroom.  Use this to verify "
+        "issues are caused by the MITM transport, or to opt out entirely.  "
+        "Run 'headroom unwrap agy' to revert any persistent changes."
+    ),
+)
+@click.option(
+    "--backend",
+    default=None,
+    help="API backend for the proxy (env: HEADROOM_BACKEND).  NOTE: only Python backend is supported for agy.",
+)
+@click.argument("agy_args", nargs=-1, type=click.UNPROCESSED)
+def agy(
+    no_intercept: bool,
+    backend: str | None,
+    agy_args: tuple,
+) -> None:
+    """Launch agy through Headroom's selective TLS-MITM transport.
+
+    \b
+    agy has no base-URL override knob, so Headroom intercepts its traffic via
+    an in-process HTTP CONNECT terminator that TLS-terminates only:
+        daily-cloudcode-pa.googleapis.com
+    All other connections are byte-spliced unchanged (and chained through any
+    pre-existing corporate HTTPS_PROXY).
+
+    \b
+    The process-local CA (headroom.proxy.agy_ca) is used to mint leaf
+    certificates for the intercepted host.  It is NEVER added to the OS trust
+    store; it lives only in the child process environment.
+
+    \b
+    Use --no-intercept to launch agy with no interception (passthrough mode).
+    Run 'headroom unwrap agy' to undo any persistent configuration changes.
+
+    \b
+    Examples:
+        headroom wrap agy                   # Start with MITM transport
+        headroom wrap agy -- --help         # Pass args to agy
+        headroom wrap agy --no-intercept    # Passthrough / escape hatch
+    """
+    # Resolve binary first — fast exit if not installed.
+    agy_bin = shutil.which("agy")
+    if not agy_bin:
+        click.echo("Error: 'agy' not found in PATH.")
+        click.echo("Install agy: https://github.com/google/agy (or via your package manager)")
+        raise SystemExit(1)
+
+    # Rust backend is Python-only for agy (T11 deferred).
+    effective_backend = backend or os.environ.get("HEADROOM_BACKEND")
+    if effective_backend == "rust":
+        click.echo(
+            "Error: agy MITM transport is Python-only.  "
+            "Rust backend support is deferred (T11).  "
+            "Use the Python backend (omit --backend rust / unset HEADROOM_BACKEND)."
+        )
+        raise SystemExit(1)
+
+    if no_intercept:
+        # Passthrough: launch agy unchanged, zero modification to its env.
+        click.echo()
+        click.echo("  ╔═══════════════════════════════════════════════╗")
+        click.echo("  ║           HEADROOM WRAP: AGY                  ║")
+        click.echo("  ╚═══════════════════════════════════════════════╝")
+        click.echo()
+        click.echo("  Mode: --no-intercept (passthrough).  Headroom does NOT intercept agy traffic.")
+        click.echo()
+        result = subprocess.run([agy_bin, *agy_args])
+        raise SystemExit(result.returncode)
+
+    # -----------------------------------------------------------------------
+    # MITM path
+    # -----------------------------------------------------------------------
+    from headroom.providers.agy import build_agy_env
+    from headroom.proxy.agy_ca import build_combined_bundle, ensure_root_ca
+
+    ca_key, ca_cert, _key_path, _cert_path = ensure_root_ca()
+    bundle_path = build_combined_bundle()
+
+    # Capture the corporate HTTPS_PROXY (if any) BEFORE building the child env,
+    # for transparency only.  Chaining itself needs no plumbing: build_agy_env
+    # returns a copy and never mutates os.environ, so the terminator (running in
+    # THIS parent process) still reads the original corporate
+    # os.environ["HTTPS_PROXY"] for non-allowlisted CONNECT chaining.
+    corp_proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+
+    servers: _AgyServers | None = None
+    old_sigint: Any = None
+    old_sigterm: Any = None
+    try:
+        servers = _start_agy_servers(ca_key, ca_cert)
+        term_host, term_port = servers.terminator.address
+        terminator_url = f"http://{term_host}:{term_port}"
+
+        env = build_agy_env(
+            terminator_url=terminator_url,
+            bundle_path=bundle_path,
+            base_env=os.environ.copy(),
+        )
+
+        env_vars_display = [
+            f"HTTPS_PROXY={terminator_url}  (agy CONNECT terminator)",
+            f"HTTP_PROXY={terminator_url}",
+            "NO_PROXY=127.0.0.1,localhost",
+            f"SSL_CERT_FILE={bundle_path}",
+            f"NODE_EXTRA_CA_CERTS={bundle_path}",
+        ]
+        if corp_proxy:
+            env_vars_display.append(
+                f"chaining non-allowlisted CONNECTs via {corp_proxy}"
+            )
+
+        click.echo()
+        click.echo("  ╔═══════════════════════════════════════════════╗")
+        click.echo("  ║           HEADROOM WRAP: AGY                  ║")
+        click.echo("  ╚═══════════════════════════════════════════════╝")
+        click.echo()
+        click.echo("  ┌─ TLS INTERCEPTION DISCLOSURE ──────────────────")
+        click.echo(f"  │  Headroom terminates TLS for: {_AGY_INTERCEPTED_HOST}")
+        click.echo("  │  A process-local CA mints leaf certificates for that host.")
+        click.echo("  │  This CA is NEVER added to the OS trust store.")
+        click.echo("  │  Compression and context injection are applied on the decrypted stream.")
+        click.echo("  │")
+        click.echo("  │  To opt out of interception:  headroom wrap agy --no-intercept")
+        click.echo("  │  To revert all changes:        headroom unwrap agy")
+        click.echo("  └────────────────────────────────────────────────")
+        click.echo()
+        click.echo("  Launching agy (traffic routed through Headroom MITM transport)...")
+        for var in env_vars_display:
+            click.echo(f"  {var}")
+        if agy_args:
+            click.echo(f"  Extra args: {' '.join(agy_args)}")
+        _print_telemetry_notice()
+        click.echo()
+
+        # Install signal handlers so the terminator/dispatch are always torn
+        # down on SIGINT/SIGTERM (mirrors _launch_tool's signal-safe teardown
+        # without registering agy as a proxy client).  SIGINT is ignored here
+        # so agy itself owns Ctrl-C; SIGTERM stops our servers then exits via
+        # SystemExit(143) so the finally below also runs.
+        def _agy_sigterm(_signum: int | None = None, _frame: Any = None) -> None:
+            _stop_agy_servers(servers)
+            raise SystemExit(143)
+
+        old_sigint = signal.signal(signal.SIGINT, _ignore_child_sigint)
+        old_sigterm = signal.signal(signal.SIGTERM, _agy_sigterm)
+
+        result = subprocess.run([agy_bin, *agy_args], env=env)
+        raise SystemExit(result.returncode)
+
+    except SystemExit:
+        raise
+    except Exception as e:
+        click.echo(f"  Error starting agy MITM transport: {e}")
+        raise SystemExit(1) from e
+    finally:
+        # Restore prior signal handlers so they don't leak into the click process.
+        if old_sigint is not None:
+            signal.signal(signal.SIGINT, old_sigint)
+        if old_sigterm is not None:
+            signal.signal(signal.SIGTERM, old_sigterm)
+        _stop_agy_servers(servers)
+
+
+# =============================================================================
+# unwrap agy
+# =============================================================================
+
+
+@unwrap.command("agy")
+def unwrap_agy() -> None:
+    """Undo ``headroom wrap agy`` — revert any persistent agy configuration changes.
+
+    Currently ``headroom wrap agy`` does not write any persistent configuration
+    (no GEMINI.md injection, no MCP registration).  This command is a safe
+    no-op that confirms the state and stops any in-flight terminator process.
+
+    MCP and GEMINI.md reversion will be added here when T9 (AgyRegistrar) lands.
+    # T9: call AgyRegistrar().revert() here once headroom/mcp_registry gains it.
+    """
+    click.echo()
+    click.echo("  ╔═══════════════════════════════════════════════╗")
+    click.echo("  ║         HEADROOM UNWRAP: AGY                  ║")
+    click.echo("  ╚═══════════════════════════════════════════════╝")
+    click.echo()
+    click.echo("  'headroom wrap agy' does not write persistent configuration.")
+    click.echo("  No files to revert.  The MITM terminator runs only while")
+    click.echo("  'headroom wrap agy' is active and stops when agy exits.")
+    click.echo()
+    click.echo("✓ agy is no longer routed through the Headroom MITM transport.")
     click.echo()
