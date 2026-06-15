@@ -422,7 +422,7 @@ class TestWrapAgySignalTeardown:
 
 
 class TestUnwrapAgy:
-    """unwrap agy must be a safe no-op + print a status message."""
+    """unwrap agy reverts GEMINI.md block and MCP registration."""
 
     def test_unwrap_agy_exits_0(self) -> None:
         runner = CliRunner()
@@ -434,3 +434,371 @@ class TestUnwrapAgy:
         result = runner.invoke(_get_main(), ["unwrap", "agy"])
         # Should have some output acknowledging the command ran
         assert result.output.strip() != ""
+
+
+# ---------------------------------------------------------------------------
+# T9: GEMINI.md block injection / removal
+# ---------------------------------------------------------------------------
+
+
+class TestGeminiMdBlock:
+    """_inject_gemini_md_block and _remove_gemini_md_block preserve user content."""
+
+    def _get_helpers(self):
+        from headroom.cli.wrap import (
+            _AGY_GEMINI_BLOCK_END,
+            _AGY_GEMINI_BLOCK_START,
+            _inject_gemini_md_block,
+            _remove_gemini_md_block,
+        )
+        return _inject_gemini_md_block, _remove_gemini_md_block, _AGY_GEMINI_BLOCK_START, _AGY_GEMINI_BLOCK_END
+
+    def test_inject_creates_file_when_absent(self, tmp_path: Path) -> None:
+        inject, _, start, end = self._get_helpers()
+        gemini_md = tmp_path / ".gemini" / "GEMINI.md"
+        inject(gemini_md, "## Headroom\nContext instructions.", verbose=False)
+        assert gemini_md.exists()
+        text = gemini_md.read_text()
+        assert start in text
+        assert end in text
+        assert "## Headroom" in text
+
+    def test_inject_preserves_existing_user_content(self, tmp_path: Path) -> None:
+        inject, _, start, end = self._get_helpers()
+        gemini_md = tmp_path / "GEMINI.md"
+        gemini_md.write_text("# User instructions\n\nSome personal notes.\n")
+        inject(gemini_md, "## Headroom\nContext instructions.", verbose=False)
+        text = gemini_md.read_text()
+        assert "# User instructions" in text
+        assert "Some personal notes." in text
+        assert start in text
+        assert end in text
+
+    def test_inject_is_idempotent(self, tmp_path: Path) -> None:
+        inject, _, start, end = self._get_helpers()
+        gemini_md = tmp_path / "GEMINI.md"
+        inject(gemini_md, "## Headroom\nContext instructions.", verbose=False)
+        inject(gemini_md, "## Headroom\nContext instructions.", verbose=False)
+        text = gemini_md.read_text()
+        # Block should appear exactly once
+        assert text.count(start) == 1
+        assert text.count(end) == 1
+
+    def test_inject_replaces_stale_block(self, tmp_path: Path) -> None:
+        inject, _, start, end = self._get_helpers()
+        gemini_md = tmp_path / "GEMINI.md"
+        inject(gemini_md, "old content", verbose=False)
+        inject(gemini_md, "new content", verbose=False)
+        text = gemini_md.read_text()
+        assert "new content" in text
+        assert "old content" not in text
+        assert text.count(start) == 1
+
+    def test_remove_deletes_only_headroom_block(self, tmp_path: Path) -> None:
+        inject, remove, start, end = self._get_helpers()
+        gemini_md = tmp_path / "GEMINI.md"
+        gemini_md.write_text("# User content\nKeep this.\n")
+        inject(gemini_md, "## Headroom\nContext.", verbose=False)
+        removed = remove(gemini_md, verbose=False)
+        assert removed is True
+        text = gemini_md.read_text()
+        assert "# User content" in text
+        assert "Keep this." in text
+        assert start not in text
+        assert end not in text
+
+    def test_remove_is_idempotent(self, tmp_path: Path) -> None:
+        inject, remove, start, end = self._get_helpers()
+        gemini_md = tmp_path / "GEMINI.md"
+        inject(gemini_md, "## Headroom\nContext.", verbose=False)
+        assert remove(gemini_md, verbose=False) is True
+        assert remove(gemini_md, verbose=False) is False
+
+    def test_remove_returns_false_when_file_absent(self, tmp_path: Path) -> None:
+        _, remove, _, _ = self._get_helpers()
+        gemini_md = tmp_path / "GEMINI.md"
+        assert remove(gemini_md, verbose=False) is False
+
+    def test_remove_returns_false_when_no_block(self, tmp_path: Path) -> None:
+        _, remove, _, _ = self._get_helpers()
+        gemini_md = tmp_path / "GEMINI.md"
+        gemini_md.write_text("# User content only\n")
+        assert remove(gemini_md, verbose=False) is False
+
+
+# ---------------------------------------------------------------------------
+# T9: unwrap agy reverts GEMINI.md block (integration via CLI runner)
+# ---------------------------------------------------------------------------
+
+
+class TestUnwrapAgyReverts:
+    """unwrap agy removes headroom block; preserves user content; is idempotent."""
+
+    def test_unwrap_removes_gemini_md_block(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from headroom.cli.wrap import (
+            _AGY_GEMINI_BLOCK_END,
+            _AGY_GEMINI_BLOCK_START,
+        )
+
+        gemini_md = tmp_path / ".gemini" / "GEMINI.md"
+        gemini_md.parent.mkdir(parents=True, exist_ok=True)
+        gemini_md.write_text(
+            f"# User content\n\n{_AGY_GEMINI_BLOCK_START}\n## Headroom\n"
+            f"{_AGY_GEMINI_BLOCK_END}\n"
+        )
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        runner = CliRunner()
+        result = runner.invoke(_get_main(), ["unwrap", "agy"])
+        assert result.exit_code == 0
+        text = gemini_md.read_text()
+        assert _AGY_GEMINI_BLOCK_START not in text
+        assert "# User content" in text
+
+    def test_unwrap_is_idempotent_when_already_clean(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        gemini_md = tmp_path / ".gemini" / "GEMINI.md"
+        gemini_md.parent.mkdir(parents=True, exist_ok=True)
+        gemini_md.write_text("# User content only\n")
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        runner = CliRunner()
+        result = runner.invoke(_get_main(), ["unwrap", "agy"])
+        assert result.exit_code == 0
+
+
+# ---------------------------------------------------------------------------
+# T9: MCP retrieve tool wiring (N/A-v1 for per-run ephemeral port)
+# ---------------------------------------------------------------------------
+
+
+class TestAgyMcpRetrieveNa:
+    """Verify that wrap agy does NOT register an ephemeral per-run MCP entry.
+
+    The agy dispatch server binds an ephemeral port (port=0) that dies when the
+    session exits.  Registering it in the persistent mcp_config.json would leave
+    a dead pointer for the next session.  The correct policy is N/A-v1: the
+    AgyRegistrar is available for stable-proxy scenarios via 'headroom mcp
+    install', but no registration occurs during a wrap-agy run.
+    """
+
+    def test_agy_mcp_config_not_written_during_wrap_no_intercept(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """--no-intercept path: no MCP registration should happen."""
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/agy" if name == "agy" else None)
+
+        # Redirect HOME so we never touch the real ~/.gemini.
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setattr("subprocess.run", lambda *a, **kw: MagicMock(returncode=0))
+
+        runner = CliRunner()
+        runner.invoke(_get_main(), ["wrap", "agy", "--no-intercept"])
+
+        mcp_config = tmp_path / ".gemini" / "antigravity-cli" / "mcp_config.json"
+        # No per-run registration: file must not exist OR must not contain an
+        # ephemeral headroom entry (port range check omitted; just assert no
+        # ephemeral entry was written for "headroom").
+        if mcp_config.exists():
+            import json
+
+            cfg = json.loads(mcp_config.read_text())
+            assert "headroom" not in cfg.get("mcpServers", {}), (
+                "wrap agy must not register an ephemeral headroom MCP entry"
+            )
+
+
+# ---------------------------------------------------------------------------
+# T9 Fix 1: Serena MCP WIRED for agy (full MITM path, all servers stubbed)
+# ---------------------------------------------------------------------------
+
+
+def _stub_agy_mitm_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    with_uvx: bool = True,
+):
+    """Stub the full agy MITM run so wrap agy reaches the MCP wiring.
+
+    Redirects HOME to tmp_path (isolating ~/.gemini and ~/.headroom ledger),
+    stubs server lifecycle + CA + subprocess so nothing real launches.  When
+    ``with_uvx`` is True, shutil.which("uvx") resolves so _setup_serena_mcp
+    proceeds.  Pre-creates ~/.gemini/antigravity-cli so AgyRegistrar.detect()
+    returns True.
+    """
+    import datetime
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+
+    import headroom.cli.wrap as wrap_mod
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    # Pre-create the agy config dir so AgyRegistrar.detect() is True.
+    (tmp_path / ".gemini" / "antigravity-cli").mkdir(parents=True, exist_ok=True)
+
+    def fake_which(name: str):
+        if name == "agy":
+            return "/usr/bin/agy"
+        if name == "uvx" and with_uvx:
+            return "/usr/bin/uvx"
+        return None
+
+    monkeypatch.setattr("shutil.which", fake_which)
+
+    fake_servers = MagicMock()
+    fake_servers.terminator.address = ("127.0.0.1", 54321)
+    fake_servers.dispatch.address = ("127.0.0.1", 54322)
+    monkeypatch.setattr(
+        wrap_mod, "_start_agy_servers", lambda ca_key, ca_cert, base_dir=None: fake_servers
+    )
+    monkeypatch.setattr(wrap_mod, "_stop_agy_servers", lambda s: None)
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    now = datetime.datetime.now(tz=datetime.timezone.utc)
+    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Test CA")])
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(subject)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now)
+        .not_valid_after(now + datetime.timedelta(days=1))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+        .sign(key, hashes.SHA256())
+    )
+    monkeypatch.setattr(
+        "headroom.proxy.agy_ca.ensure_root_ca",
+        lambda base_dir=None: (key, cert, Path("/tmp/ca.key"), Path("/tmp/ca.crt")),
+    )
+    monkeypatch.setattr(
+        "headroom.proxy.agy_ca.build_combined_bundle",
+        lambda base_dir=None, corp_env_vars=None: Path("/tmp/bundle.pem"),
+    )
+    # Force the RTK context-tool path so _setup_lean_ctx_agent (which would shell
+    # out to the real lean-ctx binary) is not invoked.
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    monkeypatch.setattr("subprocess.run", lambda *a, **kw: MagicMock(returncode=0))
+
+
+class TestAgySerenaWired:
+    """wrap agy registers Serena via AgyRegistrar; --no-serena removes/skips it."""
+
+    def test_wrap_agy_registers_serena(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from headroom.mcp_registry.agy import AgyRegistrar
+
+        _stub_agy_mitm_run(tmp_path, monkeypatch, with_uvx=True)
+
+        runner = CliRunner()
+        result = runner.invoke(_get_main(), ["wrap", "agy"], catch_exceptions=False)
+        assert result.exit_code == 0
+
+        reg = AgyRegistrar(home_dir=tmp_path)
+        spec = reg.get_server("serena")
+        assert spec is not None, "wrap agy must register a 'serena' MCP entry"
+        assert spec.command == "uvx"
+        assert "ide-assistant" in spec.args
+
+    def test_wrap_agy_no_serena_does_not_register(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from headroom.mcp_registry.agy import AgyRegistrar
+
+        _stub_agy_mitm_run(tmp_path, monkeypatch, with_uvx=True)
+
+        runner = CliRunner()
+        result = runner.invoke(
+            _get_main(), ["wrap", "agy", "--no-serena"], catch_exceptions=False
+        )
+        assert result.exit_code == 0
+
+        reg = AgyRegistrar(home_dir=tmp_path)
+        assert reg.get_server("serena") is None, (
+            "--no-serena must not leave a Serena MCP entry"
+        )
+
+    def test_wrap_agy_no_serena_removes_prior_headroom_entry(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """--no-serena actively removes a Headroom-installed Serena entry."""
+        from headroom.mcp_registry.agy import AgyRegistrar
+        from headroom.mcp_registry.install import build_serena_spec
+        from headroom.mcp_registry.ledger import record_install
+
+        _stub_agy_mitm_run(tmp_path, monkeypatch, with_uvx=True)
+
+        # Seed a Headroom-installed Serena entry + ledger record.
+        reg = AgyRegistrar(home_dir=tmp_path)
+        serena_spec = build_serena_spec("ide-assistant")
+        reg.register_server(serena_spec)
+        record_install("agy", serena_spec)
+
+        runner = CliRunner()
+        result = runner.invoke(
+            _get_main(), ["wrap", "agy", "--no-serena"], catch_exceptions=False
+        )
+        assert result.exit_code == 0
+        assert AgyRegistrar(home_dir=tmp_path).get_server("serena") is None
+
+
+# ---------------------------------------------------------------------------
+# T9 Fix 2: unwrap_agy Serena removal is ledger-gated (falsification guard)
+# ---------------------------------------------------------------------------
+
+
+class TestUnwrapAgySerena:
+    """unwrap_agy removes only Headroom-installed Serena; preserves user entries."""
+
+    def test_unwrap_removes_headroom_installed_serena(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from headroom.mcp_registry.agy import AgyRegistrar
+        from headroom.mcp_registry.install import build_serena_spec
+        from headroom.mcp_registry.ledger import record_install
+
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        reg = AgyRegistrar(home_dir=tmp_path)
+        serena_spec = build_serena_spec("ide-assistant")
+        reg.register_server(serena_spec)
+        record_install("agy", serena_spec)
+
+        runner = CliRunner()
+        result = runner.invoke(_get_main(), ["unwrap", "agy"])
+        assert result.exit_code == 0
+        assert AgyRegistrar(home_dir=tmp_path).get_server("serena") is None
+
+    def test_unwrap_preserves_user_managed_serena(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A user-managed serena entry (absent from ledger) must survive unwrap."""
+        from headroom.mcp_registry.agy import AgyRegistrar
+        from headroom.mcp_registry.base import ServerSpec
+
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        reg = AgyRegistrar(home_dir=tmp_path)
+        # User-managed entry: different command, NOT recorded in ledger.
+        user_spec = ServerSpec(
+            name="serena",
+            command="/opt/my-serena/bin/serena",
+            args=("custom",),
+            env={},
+        )
+        reg.register_server(user_spec)
+
+        runner = CliRunner()
+        result = runner.invoke(_get_main(), ["unwrap", "agy"])
+        assert result.exit_code == 0
+        survived = AgyRegistrar(home_dir=tmp_path).get_server("serena")
+        assert survived is not None, "user-managed serena must not be removed"
+        assert survived.command == "/opt/my-serena/bin/serena"

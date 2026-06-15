@@ -1077,6 +1077,10 @@ _MEMORY_MCP_MARKER = "# --- Headroom memory MCP (auto-injected) ---"
 _MEMORY_MCP_END = "# --- end Headroom memory ---"
 _MEMORY_AGENTS_MARKER = "<!-- headroom:memory-instructions -->"
 
+# agy / GEMINI.md instruction-block markers
+_AGY_GEMINI_BLOCK_START = "<!-- headroom:agy-instructions -->"
+_AGY_GEMINI_BLOCK_END = "<!-- /headroom:agy-instructions -->"
+
 # Codex config injection markers
 _CODEX_TOP_LEVEL_MARKER = "# --- Headroom proxy (auto-injected by headroom wrap codex) ---"
 _CODEX_END_MARKER = "# --- end Headroom ---"
@@ -1745,6 +1749,75 @@ def _remove_rtk_instructions(file_path: Path) -> bool:
         file_path.write_text(cleaned, encoding="utf-8")
     else:
         file_path.unlink()
+    return True
+
+
+def _inject_gemini_md_block(gemini_md: Path, content: str, verbose: bool = False) -> bool:
+    """Inject a Headroom-marked block into GEMINI.md (idempotent).
+
+    If the block is already present it is replaced in-place so re-runs with
+    updated instructions are safe.  User content outside the markers is
+    preserved verbatim.  Returns ``True`` if the file was written.
+    """
+    block = f"{_AGY_GEMINI_BLOCK_START}\n{content}\n{_AGY_GEMINI_BLOCK_END}"
+
+    if gemini_md.exists():
+        existing = gemini_md.read_text()
+        if _AGY_GEMINI_BLOCK_START in existing and _AGY_GEMINI_BLOCK_END in existing:
+            # Replace existing block in-place.
+            start = existing.index(_AGY_GEMINI_BLOCK_START)
+            end = existing.index(_AGY_GEMINI_BLOCK_END) + len(_AGY_GEMINI_BLOCK_END)
+            new_text = (
+                existing[:start].rstrip("\n")
+                + ("\n\n" if existing[:start].rstrip("\n") else "")
+                + block
+                + "\n"
+                + existing[end:].lstrip("\n")
+            )
+            if new_text == existing:
+                if verbose:
+                    click.echo("  GEMINI.md headroom block already up-to-date")
+                return False
+            gemini_md.write_text(new_text)
+        else:
+            # Append after existing user content.
+            sep = "\n\n" if existing.rstrip("\n") else ""
+            gemini_md.write_text(existing.rstrip("\n") + sep + block + "\n")
+    else:
+        gemini_md.parent.mkdir(parents=True, exist_ok=True)
+        gemini_md.write_text(block + "\n")
+
+    if verbose:
+        click.echo(f"  headroom block injected into {gemini_md}")
+    return True
+
+
+def _remove_gemini_md_block(gemini_md: Path, verbose: bool = False) -> bool:
+    """Remove the Headroom-marked block from GEMINI.md (idempotent).
+
+    Only removes the delimited block; all user content outside the markers is
+    preserved.  Returns ``True`` if a block was found and removed.
+    """
+    if not gemini_md.exists():
+        return False
+    existing = gemini_md.read_text()
+    if _AGY_GEMINI_BLOCK_START not in existing or _AGY_GEMINI_BLOCK_END not in existing:
+        return False
+    start = existing.index(_AGY_GEMINI_BLOCK_START)
+    end = existing.index(_AGY_GEMINI_BLOCK_END) + len(_AGY_GEMINI_BLOCK_END)
+    before = existing[:start].rstrip("\n")
+    after = existing[end:].lstrip("\n")
+    if before and after:
+        new_text = before + "\n\n" + after
+    elif before:
+        new_text = before + "\n"
+    elif after:
+        new_text = after
+    else:
+        new_text = ""
+    gemini_md.write_text(new_text)
+    if verbose:
+        click.echo(f"  headroom block removed from {gemini_md}")
     return True
 
 
@@ -5532,10 +5605,12 @@ def _stop_agy_servers(servers: _AgyServers | None) -> None:
     default=None,
     help="API backend for the proxy (env: HEADROOM_BACKEND).  NOTE: only Python backend is supported for agy.",
 )
+@click.option("--no-serena", is_flag=True, help="Skip Serena MCP server registration")
 @click.argument("agy_args", nargs=-1, type=click.UNPROCESSED)
 def agy(
     no_intercept: bool,
     backend: str | None,
+    no_serena: bool,
     agy_args: tuple,
 ) -> None:
     """Launch agy through Headroom's selective TLS-MITM transport.
@@ -5562,6 +5637,8 @@ def agy(
         headroom wrap agy -- --help         # Pass args to agy
         headroom wrap agy --no-intercept    # Passthrough / escape hatch
     """
+    from headroom.mcp_registry.agy import AgyRegistrar
+
     # Resolve binary first — fast exit if not installed.
     agy_bin = shutil.which("agy")
     if not agy_bin:
@@ -5656,6 +5733,32 @@ def agy(
         _print_telemetry_notice()
         click.echo()
 
+        # ------------------------------------------------------------------
+        # Context-tool and instruction-surface setup (idempotent, best-effort).
+        # ------------------------------------------------------------------
+        gemini_md = Path.home() / ".gemini" / "GEMINI.md"
+        if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
+            # lean-ctx supports agy via the 'antigravity-cli' agent alias.
+            _setup_lean_ctx_agent("antigravity-cli", verbose=False)
+        else:
+            # RTK path: inject context instructions into GEMINI.md.
+            _inject_gemini_md_block(gemini_md, RTK_INSTRUCTIONS_BLOCK, verbose=False)
+
+        # ------------------------------------------------------------------
+        # Serena MCP — generic uvx stdio server with no proxy-URL/ephemeral-port
+        # dependency, so it persists cleanly in mcp_config.json (unlike the
+        # Headroom retrieve tool).  context="ide-assistant": Antigravity is an
+        # IDE agent and this is Serena's generic IDE profile.  force=True mirrors
+        # codex (wrap.py:3382) so a Headroom-owned entry is refreshed.
+        # ------------------------------------------------------------------
+        if not no_serena:
+            _setup_serena_mcp(
+                AgyRegistrar(), context="ide-assistant", verbose=False, force=True
+            )
+        else:
+            _disable_serena_mcp(AgyRegistrar(), verbose=False)
+
+        # ------------------------------------------------------------------
         # Install signal handlers so the terminator/dispatch are always torn
         # down on SIGINT/SIGTERM (mirrors _launch_tool's signal-safe teardown
         # without registering agy as a proxy client).  SIGINT is ignored here
@@ -5694,21 +5797,44 @@ def agy(
 def unwrap_agy() -> None:
     """Undo ``headroom wrap agy`` — revert any persistent agy configuration changes.
 
-    Currently ``headroom wrap agy`` does not write any persistent configuration
-    (no GEMINI.md injection, no MCP registration).  This command is a safe
-    no-op that confirms the state and stops any in-flight terminator process.
-
-    MCP and GEMINI.md reversion will be added here when T9 (AgyRegistrar) lands.
-    # T9: call AgyRegistrar().revert() here once headroom/mcp_registry gains it.
+    Removes the Headroom block from GEMINI.md and unregisters any MCP server
+    entry that Headroom registered in the Antigravity CLI config.  All user
+    content outside Headroom-managed markers is preserved.
     """
+    from headroom.mcp_registry.agy import AgyRegistrar
+
     click.echo()
     click.echo("  ╔═══════════════════════════════════════════════╗")
     click.echo("  ║         HEADROOM UNWRAP: AGY                  ║")
     click.echo("  ╚═══════════════════════════════════════════════╝")
     click.echo()
-    click.echo("  'headroom wrap agy' does not write persistent configuration.")
-    click.echo("  No files to revert.  The MITM terminator runs only while")
-    click.echo("  'headroom wrap agy' is active and stops when agy exits.")
+
+    # 1. Remove headroom block from GEMINI.md.
+    gemini_md = Path.home() / ".gemini" / "GEMINI.md"
+    if _remove_gemini_md_block(gemini_md, verbose=True):
+        click.echo("  headroom block removed from GEMINI.md")
+    else:
+        click.echo("  GEMINI.md: no headroom block found (already clean)")
+
+    # 2. Unregister headroom MCP retrieve entry (defensive no-op for the
+    #    'headroom mcp install' / stable-proxy scenario).  Ephemeral per-run
+    #    registration is N/A for agy (see parity matrix).
+    agy_reg = AgyRegistrar()
+    if agy_reg.unregister_server("headroom"):
+        click.echo("  Removed Headroom MCP retrieve tool from agy.")
+    else:
+        click.echo("  Headroom MCP retrieve tool was not registered in agy.")
+
+    # 3. Remove Serena MCP only if the ledger proves Headroom installed it;
+    #    a user-managed 'serena' entry is left untouched.
+    serena_status = _remove_headroom_installed_serena_mcp(agy_reg)
+    if serena_status == "removed":
+        click.echo("  Removed Headroom-installed Serena MCP server from agy.")
+    elif serena_status == "failed":
+        click.echo("  Serena MCP server matched Headroom ledger but could not be removed.")
+    elif serena_status == "not_headroom_owned":
+        click.echo("  Kept user-managed Serena MCP server (not Headroom-owned).")
+
     click.echo()
-    click.echo("✓ agy is no longer routed through the Headroom MITM transport.")
+    click.echo("✓ agy headroom configuration reverted.")
     click.echo()
