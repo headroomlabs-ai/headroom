@@ -286,7 +286,12 @@ def test_throughput_parsing_and_calculations(monkeypatch, tmp_path):
 
 
 def test_throughput_empty_and_percentiles():
-    from headroom.perf.analyzer import calculate_throughput, _percentile, _calculate_throughput_stats, PerfReport
+    from headroom.perf.analyzer import (
+        PerfReport,
+        _calculate_throughput_stats,
+        _percentile,
+        calculate_throughput,
+    )
 
     # Empty percentiles
     assert _percentile([], 0.5) == 0.0

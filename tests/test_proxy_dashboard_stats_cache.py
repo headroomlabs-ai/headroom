@@ -562,10 +562,16 @@ def test_proxy_throughput_in_stats_endpoint(monkeypatch: pytest.MonkeyPatch) -> 
     Skipped locally when headroom._core (Rust extension) is not compiled.
     """
     pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
     import headroom.perf.analyzer as _analyzer_mod
 
     try:
-        from headroom.proxy.server import create_app, _throughput_cache, require_loopback
+        from headroom.proxy.server import (
+            _throughput_cache,
+            create_app,
+            require_loopback,
+        )
     except (ImportError, ModuleNotFoundError) as exc:
         pytest.skip(f"headroom._core not available (Rust extension not compiled): {exc}")
 
