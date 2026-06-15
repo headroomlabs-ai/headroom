@@ -5931,11 +5931,30 @@ def agy(
     # skipped entirely.
     print_mode = _agy_print_mode(agy_args)
 
+    # ------------------------------------------------------------------
+    # Observability: fail-open warning + session compression summary.
+    # Ref: headroom-30y.15
+    # ------------------------------------------------------------------
+    from headroom.providers.agy.stats import (
+        AgySessionStats,
+        FailOpenWarnHandler,
+        install_fail_open_handler,
+        remove_fail_open_handler,
+    )
+
+    session_stats = AgySessionStats()
+    fail_open_handler: FailOpenWarnHandler | None = None
+
     servers: _AgyServers | None = None
     old_sigint: Any = None
     old_sigterm: Any = None
     retrieve_registered = False
     try:
+        # Snapshot compression-store baseline and install the fail-open warning
+        # handler BEFORE the dispatch thread starts so we catch every event.
+        session_stats.snapshot_start()
+        fail_open_handler = install_fail_open_handler()
+
         servers = _start_agy_servers(ca_key, ca_cert, start_retrieve=not print_mode)
         term_host, term_port = servers.terminator.address
         terminator_url = f"http://{term_host}:{term_port}"
@@ -6119,6 +6138,10 @@ def agy(
                 _revert_headroom_retrieve_mcp_agy(AgyRegistrar())
             # code_graph_registered: persistent entry (like Serena), NOT reverted on exit.
             _stop_agy_servers(servers)
+            # Flush compression summary on kill (idempotent — won't double-print
+            # if the finally below also runs). Ref: headroom-30y.15
+            session_stats.print_summary(fail_open_handler)
+            remove_fail_open_handler(fail_open_handler)
             raise SystemExit(143)
 
         old_sigint = signal.signal(signal.SIGINT, _ignore_child_sigint)
@@ -6144,6 +6167,11 @@ def agy(
         if old_sigterm is not None:
             signal.signal(signal.SIGTERM, old_sigterm)
         _stop_agy_servers(servers)
+        # Print session compression summary (idempotent — won't double-print
+        # if _agy_sigterm already flushed it). Remove the logging handler so
+        # it doesn't leak into the click process. Ref: headroom-30y.15
+        session_stats.print_summary(fail_open_handler)
+        remove_fail_open_handler(fail_open_handler)
 
 
 # =============================================================================

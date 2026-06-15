@@ -1522,3 +1522,68 @@ class TestUnwrapAgyCbm:
         survived = AgyRegistrar(home_dir=tmp_path).get_server(_CBM_MCP_SERVER_NAME)
         assert survived is not None, "user-managed cbm entry must not be removed by unwrap"
         assert survived.command == "/opt/my-cbm/bin/cbm"
+
+
+# ---------------------------------------------------------------------------
+# headroom-30y.15: fail-open observability + session compression summary
+# ---------------------------------------------------------------------------
+
+
+class TestAgySessionCompressionSummary:
+    """Integration: wrap agy prints a session compression summary on normal exit."""
+
+    def test_summary_line_appears_on_normal_exit_mixed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Summary appears in combined output when mix_stderr=True (default)."""
+        from unittest.mock import patch
+
+        _stub_agy_mitm_run(tmp_path, monkeypatch, with_uvx=True)
+
+        _empty_stats = {
+            "entry_count": 0,
+            "total_original_tokens": 0,
+            "total_compressed_tokens": 0,
+        }
+
+        with patch(
+            "headroom.providers.agy.stats._get_compression_stats",
+            return_value=_empty_stats,
+        ):
+            runner = CliRunner()
+            result = runner.invoke(
+                _get_main(), ["wrap", "agy"], catch_exceptions=False
+            )
+
+        assert result.exit_code == 0
+        assert "Headroom agy session" in result.output
+
+    def test_fail_open_handler_removed_after_session(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The FailOpenWarnHandler must NOT remain on the logger after agy exits."""
+        import logging
+        from unittest.mock import patch
+
+        from headroom.providers.agy.stats import _GEMINI_LOGGER
+
+        _stub_agy_mitm_run(tmp_path, monkeypatch, with_uvx=True)
+
+        _empty_stats = {
+            "entry_count": 0,
+            "total_original_tokens": 0,
+            "total_compressed_tokens": 0,
+        }
+
+        logger = logging.getLogger(_GEMINI_LOGGER)
+        handlers_before = list(logger.handlers)
+
+        with patch(
+            "headroom.providers.agy.stats._get_compression_stats",
+            return_value=_empty_stats,
+        ):
+            runner = CliRunner()
+            runner.invoke(_get_main(), ["wrap", "agy"], catch_exceptions=False)
+
+        # No new handlers leaked
+        assert logger.handlers == handlers_before
