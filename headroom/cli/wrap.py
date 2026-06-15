@@ -681,6 +681,66 @@ def _setup_lean_ctx_mcp_agy(registrar: Any, *, verbose: bool = False) -> None:
         click.echo("  Context tool: lean-ctx MCP failed handshake — entry removed (agy left transport-only).")
 
 
+def _setup_headroom_retrieve_mcp_agy(
+    registrar: Any, retrieve_port: int, *, verbose: bool = False
+) -> bool:
+    """Register the headroom retrieve MCP with agy, verify-then-remove.
+
+    The retrieve tool is an ``headroom mcp serve`` stdio child that resolves
+    ``[Retrieve more: hash=…]`` markers by calling the proxy's retrieve HTTP
+    endpoint.  Here we point it at the PLAIN-HTTP loopback retrieve listener
+    (``http://127.0.0.1:<retrieve_port>``) started for this run, which shares
+    the process-global compression cache the dispatch server populates.
+
+    The entry is smoke-verified (MCP ``initialize`` handshake); a *failing*
+    handshake means the tool is broken, so the entry is removed again so a
+    dead/hanging pointer can never persist in ``mcp_config.json``.
+
+    Returns True iff a retrieve entry was registered AND survived the smoke
+    test (so the caller knows to revert it on teardown).  The URL is per-run
+    and ephemeral, so the caller MUST revert on teardown.
+    """
+    from headroom.mcp_registry import build_headroom_spec
+    from headroom.mcp_registry.base import RegisterStatus
+
+    proxy_url = f"http://127.0.0.1:{retrieve_port}"
+    spec = build_headroom_spec(proxy_url)
+    result = registrar.register_server(spec, force=True)
+    if result.status not in (RegisterStatus.REGISTERED, RegisterStatus.ALREADY):
+        click.echo(
+            f"  MCP retrieve tool: could not register headroom MCP — skipping ({result.message})."
+        )
+        return False
+
+    if _smoke_verify_mcp_handshake(spec.command, list(spec.args), dict(spec.env)):
+        if verbose:
+            click.echo(
+                f"  MCP retrieve tool: headroom MCP registered (loopback {proxy_url}) and handshake-verified."
+            )
+        else:
+            click.echo("  MCP retrieve tool: headroom MCP wired (handshake verified).")
+        return True
+
+    registrar.unregister_server("headroom")
+    click.echo(
+        "  MCP retrieve tool: headroom MCP failed handshake — entry removed (agy left transport-only)."
+    )
+    return False
+
+
+def _revert_headroom_retrieve_mcp_agy(registrar: Any) -> None:
+    """Remove the per-run headroom retrieve MCP entry from agy (best-effort).
+
+    The retrieve URL is per-run and ephemeral, so the entry must never outlive
+    the listener.  Idempotent and exception-safe so it can run from both the
+    normal finally path and the SIGTERM handler.
+    """
+    try:
+        registrar.unregister_server("headroom")
+    except Exception:  # noqa: BLE001
+        pass
+
+
 
 # Env vars Headroom's init/wrap inject into Claude settings.json; unwrap removes
 # them. ENABLE_TOOL_SEARCH keeps Claude Code's tool deferral on behind the proxy
@@ -5589,9 +5649,15 @@ class _AgyServers:
         loop: asyncio.AbstractEventLoop,
         thread: threading.Thread,
         stop_flag: asyncio.Event,
+        retrieve: Any | None = None,
+        retrieve_port: int | None = None,
     ) -> None:
         self.terminator = terminator
         self.dispatch = dispatch
+        # Plain-HTTP loopback retrieve listener (interactive mode only). ``None``
+        # in print mode, where no MCP server may run (agy hangs otherwise).
+        self.retrieve = retrieve
+        self.retrieve_port = retrieve_port
         self._loop = loop
         self._thread = thread
         self._stop_flag = stop_flag
@@ -5613,16 +5679,26 @@ def _start_agy_servers(
     ca_key: Any,
     ca_cert: Any,
     base_dir: Path | None = None,
+    *,
+    start_retrieve: bool = False,
 ) -> _AgyServers:
     """Start AgyCONNECTTerminator + AgyDispatchServer on a dedicated thread.
 
     Both servers bind loopback ephemeral ports (port=0).  Readiness is
     signalled via a threading.Event; startup errors raise RuntimeError fast.
 
+    When ``start_retrieve`` is True (INTERACTIVE mode only) an additional
+    PLAIN-HTTP loopback :class:`AgyRetrieveServer` is started on the same loop;
+    its port is exposed via ``.retrieve_port`` so the headroom retrieve MCP can
+    point at it.  In PRINT mode it is NOT started (no MCP server may run — agy
+    hangs).  The retrieve server shares the process-global compression cache the
+    dispatch server populates, so ``[Retrieve more: hash=…]`` markers resolve.
+
     Returns an _AgyServers handle with ``.terminator`` and ``.dispatch``
     already started, and a ``.stop()`` method for clean shutdown.
     """
     from headroom.proxy.agy_dispatch import AgyDispatchServer
+    from headroom.proxy.agy_retrieve import AgyRetrieveServer
     from headroom.proxy.agy_terminator import AgyCONNECTTerminator
 
     ready_event: threading.Event = threading.Event()
@@ -5653,12 +5729,21 @@ def _start_agy_servers(
             )
             await terminator.start()
 
+            retrieve: AgyRetrieveServer | None = None
+            retrieve_port: int | None = None
+            if start_retrieve:
+                retrieve = AgyRetrieveServer(port=0)
+                await retrieve.start()
+                _, retrieve_port = retrieve.address
+
             servers = _AgyServers(
                 terminator=terminator,
                 dispatch=dispatch,
                 loop=loop,
                 thread=current_thread,
                 stop_flag=stop_flag,
+                retrieve=retrieve,
+                retrieve_port=retrieve_port,
             )
             result_holder.append(servers)
             ready_event.set()
@@ -5669,6 +5754,8 @@ def _start_agy_servers(
             # Graceful shutdown.
             await terminator.stop()
             await dispatch.stop()
+            if retrieve is not None:
+                await retrieve.stop()
 
         try:
             loop.run_until_complete(_main())
@@ -5817,11 +5904,19 @@ def agy(
     # os.environ["HTTPS_PROXY"] for non-allowlisted CONNECT chaining.
     corp_proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
 
+    # Print-mode is decided up front: agy's single-shot output mode
+    # (--print/-p/--prompt) HANGS whenever ANY MCP server is present, and the
+    # retrieve tool IS an MCP server.  So the retrieve listener is started ONLY
+    # in interactive mode; in print mode it (and its MCP registration) is
+    # skipped entirely.
+    print_mode = _agy_print_mode(agy_args)
+
     servers: _AgyServers | None = None
     old_sigint: Any = None
     old_sigterm: Any = None
+    retrieve_registered = False
     try:
-        servers = _start_agy_servers(ca_key, ca_cert)
+        servers = _start_agy_servers(ca_key, ca_cert, start_retrieve=not print_mode)
         term_host, term_port = servers.terminator.address
         terminator_url = f"http://{term_host}:{term_port}"
 
@@ -5878,8 +5973,9 @@ def agy(
         # runs we activate NO MCP server — context-tool wiring is skipped and a
         # previously-installed Headroom Serena entry is removed for the run.
         # Interactive sessions keep the context tool + Serena ON (they work).
+        # (print_mode was computed up front, before the servers started, so the
+        # retrieve listener could be skipped in print mode.)
         # ------------------------------------------------------------------
-        print_mode = _agy_print_mode(agy_args)
 
         # ------------------------------------------------------------------
         # Context-tool and instruction-surface setup (idempotent, best-effort).
@@ -5922,12 +6018,30 @@ def agy(
             _disable_serena_mcp(AgyRegistrar(), verbose=False)
 
         # ------------------------------------------------------------------
+        # Headroom retrieve MCP — INTERACTIVE ONLY.  The retrieve tool is an
+        # ``headroom mcp serve`` stdio child that resolves ``[Retrieve more:
+        # hash=…]`` markers by calling the proxy's retrieve HTTP endpoint.  It
+        # points at the PLAIN-HTTP loopback retrieve listener started above
+        # (per-run, ephemeral port), which shares the process-global compression
+        # cache the dispatch server populates.  Because the URL is ephemeral the
+        # entry MUST be reverted on teardown — never leave a dead pointer in
+        # mcp_config.json.  In print mode the listener is never started (agy
+        # hangs on any MCP server), so registration is skipped entirely.
+        # ------------------------------------------------------------------
+        if not print_mode and servers is not None and servers.retrieve_port is not None:
+            retrieve_registered = _setup_headroom_retrieve_mcp_agy(
+                AgyRegistrar(), servers.retrieve_port, verbose=False
+            )
+
+        # ------------------------------------------------------------------
         # Install signal handlers so the terminator/dispatch are always torn
         # down on SIGINT/SIGTERM (mirrors _launch_tool's signal-safe teardown
         # without registering agy as a proxy client).  SIGINT is ignored here
         # so agy itself owns Ctrl-C; SIGTERM stops our servers then exits via
         # SystemExit(143) so the finally below also runs.
         def _agy_sigterm(_signum: int | None = None, _frame: Any = None) -> None:
+            if retrieve_registered:
+                _revert_headroom_retrieve_mcp_agy(AgyRegistrar())
             _stop_agy_servers(servers)
             raise SystemExit(143)
 
@@ -5943,6 +6057,11 @@ def agy(
         click.echo(f"  Error starting agy MITM transport: {e}")
         raise SystemExit(1) from e
     finally:
+        # Revert the per-run retrieve MCP entry FIRST — its URL points at the
+        # ephemeral loopback listener we are about to stop, so leaving it would
+        # leave a dead pointer in mcp_config.json that hangs the next agy run.
+        if retrieve_registered:
+            _revert_headroom_retrieve_mcp_agy(AgyRegistrar())
         # Restore prior signal handlers so they don't leak into the click process.
         if old_sigint is not None:
             signal.signal(signal.SIGINT, old_sigint)
@@ -5979,9 +6098,10 @@ def unwrap_agy() -> None:
     else:
         click.echo("  GEMINI.md: no headroom block found (already clean)")
 
-    # 2. Unregister headroom MCP retrieve entry (defensive no-op for the
-    #    'headroom mcp install' / stable-proxy scenario).  Ephemeral per-run
-    #    registration is N/A for agy (see parity matrix).
+    # 2. Unregister headroom MCP retrieve entry. wrap agy registers this
+    #    per-run (interactive mode) pointing at an ephemeral loopback retrieve
+    #    listener and reverts it on exit; this removal also clears a stale
+    #    entry left by a killed session or the 'headroom mcp install' path.
     agy_reg = AgyRegistrar()
     if agy_reg.unregister_server("headroom"):
         click.echo("  Removed Headroom MCP retrieve tool from agy.")

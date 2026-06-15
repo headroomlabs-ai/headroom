@@ -240,8 +240,12 @@ class TestWrapAgyDisclosureBanner:
         fake_servers = MagicMock()
         fake_servers.terminator.address = ("127.0.0.1", 54321)
         fake_servers.dispatch.address = ("127.0.0.1", 54322)
+        # No retrieve listener here: this test only checks the disclosure
+        # banner, and a real port would trigger MCP registration against the
+        # real ~/.gemini. retrieve_port=None makes agy() skip registration.
+        fake_servers.retrieve_port = None
 
-        def fake_start_agy_servers(ca_key, ca_cert, base_dir=None):
+        def fake_start_agy_servers(ca_key, ca_cert, base_dir=None, *, start_retrieve=False):
             return fake_servers
 
         monkeypatch.setattr(wrap_mod, "_start_agy_servers", fake_start_agy_servers)
@@ -328,7 +332,7 @@ class TestWrapAgyNoIntercept:
         import headroom.cli.wrap as wrap_mod
         server_started = []
 
-        def fake_start(ca_key, ca_cert, base_dir=None):
+        def fake_start(ca_key, ca_cert, base_dir=None, *, start_retrieve=False):
             server_started.append(True)
             raise AssertionError("Servers must NOT start in --no-intercept mode")
 
@@ -390,8 +394,13 @@ class TestWrapAgySignalTeardown:
         fake_servers = MagicMock()
         fake_servers.terminator.address = ("127.0.0.1", 54321)
         fake_servers.dispatch.address = ("127.0.0.1", 54322)
+        # No retrieve listener: keep this signal-teardown test focused and avoid
+        # touching the real ~/.gemini via MCP registration.
+        fake_servers.retrieve_port = None
         monkeypatch.setattr(
-            wrap_mod, "_start_agy_servers", lambda ca_key, ca_cert, base_dir=None: fake_servers
+            wrap_mod,
+            "_start_agy_servers",
+            lambda ca_key, ca_cert, base_dir=None, *, start_retrieve=False: fake_servers,
         )
 
         stop_calls: list[object] = []
@@ -588,13 +597,14 @@ class TestUnwrapAgyReverts:
 
 
 class TestAgyMcpRetrieveNa:
-    """Verify that wrap agy does NOT register an ephemeral per-run MCP entry.
+    """Verify wrap agy does NOT register a retrieve MCP entry outside the
+    interactive MITM path.
 
-    The agy dispatch server binds an ephemeral port (port=0) that dies when the
-    session exits.  Registering it in the persistent mcp_config.json would leave
-    a dead pointer for the next session.  The correct policy is N/A-v1: the
-    AgyRegistrar is available for stable-proxy scenarios via 'headroom mcp
-    install', but no registration occurs during a wrap-agy run.
+    Interactive MITM now starts a per-run PLAIN-HTTP loopback retrieve listener
+    and registers a per-run headroom MCP entry pointing at it (reverted on
+    teardown — see TestAgyRetrieveMcpWiring).  But --no-intercept (passthrough)
+    starts no servers, so it must register nothing: there is no listener to
+    point a persistent entry at.
     """
 
     def test_agy_mcp_config_not_written_during_wrap_no_intercept(
@@ -667,10 +677,31 @@ def _stub_agy_mitm_run(
     fake_servers = MagicMock()
     fake_servers.terminator.address = ("127.0.0.1", 54321)
     fake_servers.dispatch.address = ("127.0.0.1", 54322)
-    monkeypatch.setattr(
-        wrap_mod, "_start_agy_servers", lambda ca_key, ca_cert, base_dir=None: fake_servers
-    )
+    # Interactive-mode retrieve listener port (a real int so the headroom MCP
+    # spec gets a well-formed loopback URL). _agy_start_calls records the
+    # start_retrieve flag each call so tests can assert print-mode skips it.
+    fake_servers.retrieve_port = 54323
+    fake_servers.retrieve = MagicMock()
+
+    def _fake_start_agy_servers(ca_key, ca_cert, base_dir=None, *, start_retrieve=False):
+        _agy_start_calls.append(start_retrieve)
+        # In print mode the real server starts no retrieve listener: model that
+        # so the agy() guard (servers.retrieve_port is not None) holds.
+        if not start_retrieve:
+            fake_servers.retrieve = None
+            fake_servers.retrieve_port = None
+        else:
+            fake_servers.retrieve = MagicMock()
+            fake_servers.retrieve_port = 54323
+        return fake_servers
+
+    _agy_start_calls: list[bool] = []
+    fake_servers._agy_start_calls = _agy_start_calls
+    monkeypatch.setattr(wrap_mod, "_start_agy_servers", _fake_start_agy_servers)
     monkeypatch.setattr(wrap_mod, "_stop_agy_servers", lambda s: None)
+    # Default the MCP handshake smoke check to PASS so interactive registrations
+    # survive; individual tests override this when they exercise the failure path.
+    monkeypatch.setattr(wrap_mod, "_smoke_verify_mcp_handshake", lambda *a, **kw: True)
 
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     now = datetime.datetime.now(tz=datetime.timezone.utc)
@@ -991,6 +1022,149 @@ class TestAgyLeanCtxMcpWiring:
         )
         assert result.exit_code == 0
         assert AgyRegistrar(home_dir=tmp_path).get_server("lean-ctx") is None
+
+
+class TestAgyRetrieveMcpWiring:
+    """Headroom retrieve MCP: interactive-only, per-run loopback, reverted.
+
+    The retrieve listener is an ephemeral PLAIN-HTTP loopback server started in
+    interactive mode only; its port is registered as the headroom MCP's
+    HEADROOM_PROXY_URL, then REVERTED on teardown so no stale pointer survives.
+    Print mode starts no listener and registers no entry (any MCP hangs agy).
+    """
+
+    def test_interactive_registers_then_reverts_retrieve_entry(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Interactive: headroom entry registered with the live loopback port
+        DURING the run, then reverted on teardown (no stale entry remains)."""
+        from headroom.mcp_registry.agy import AgyRegistrar
+
+        _stub_agy_mitm_run(tmp_path, monkeypatch, with_uvx=True)
+
+        # Capture whether the headroom entry was live AT THE MOMENT agy ran
+        # (i.e. while subprocess.run executes), proving it existed mid-session.
+        seen: dict[str, object] = {}
+
+        def _capture_run(cmd, *a, **kw):
+            spec = AgyRegistrar(home_dir=tmp_path).get_server("headroom")
+            seen["spec"] = spec
+            return MagicMock(returncode=0)
+
+        monkeypatch.setattr("subprocess.run", _capture_run)
+
+        runner = CliRunner()
+        result = runner.invoke(_get_main(), ["wrap", "agy"], catch_exceptions=False)
+        assert result.exit_code == 0
+
+        live_spec = seen["spec"]
+        assert live_spec is not None, "interactive run must register a headroom retrieve entry"
+        # The entry must point at the live loopback retrieve port (54323 from the
+        # stub), via HEADROOM_PROXY_URL on the headroom mcp serve child.
+        assert live_spec.command == "headroom"
+        assert live_spec.args == ("mcp", "serve")
+        assert live_spec.env.get("HEADROOM_PROXY_URL") == "http://127.0.0.1:54323"
+
+        # After teardown the ephemeral entry MUST be gone (no dead pointer).
+        assert AgyRegistrar(home_dir=tmp_path).get_server("headroom") is None, (
+            "the per-run retrieve entry must be reverted on teardown"
+        )
+
+    def test_print_mode_does_not_register_retrieve_entry(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Print mode: no retrieve listener, no headroom MCP entry (would hang agy)."""
+        from headroom.mcp_registry.agy import AgyRegistrar
+
+        _stub_agy_mitm_run(tmp_path, monkeypatch, with_uvx=True)
+
+        # Capture mid-session too: even DURING the run no headroom entry exists.
+        seen: dict[str, object] = {}
+
+        def _capture_run(cmd, *a, **kw):
+            seen["spec"] = AgyRegistrar(home_dir=tmp_path).get_server("headroom")
+            return MagicMock(returncode=0)
+
+        monkeypatch.setattr("subprocess.run", _capture_run)
+
+        runner = CliRunner()
+        result = runner.invoke(
+            _get_main(), ["wrap", "agy", "--", "--print", "hi"], catch_exceptions=False
+        )
+        assert result.exit_code == 0
+        assert seen["spec"] is None, "print mode must not register a headroom retrieve entry mid-run"
+        assert AgyRegistrar(home_dir=tmp_path).get_server("headroom") is None
+
+    def test_print_mode_does_not_start_retrieve_listener(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Print mode: _start_agy_servers is called with start_retrieve=False."""
+        import headroom.cli.wrap as wrap_mod
+
+        _stub_agy_mitm_run(tmp_path, monkeypatch, with_uvx=True)
+        captured: list[bool] = []
+        real_stub = wrap_mod._start_agy_servers
+
+        def _spy(ca_key, ca_cert, base_dir=None, *, start_retrieve=False):
+            captured.append(start_retrieve)
+            return real_stub(ca_key, ca_cert, base_dir, start_retrieve=start_retrieve)
+
+        monkeypatch.setattr(wrap_mod, "_start_agy_servers", _spy)
+
+        runner = CliRunner()
+        result = runner.invoke(
+            _get_main(), ["wrap", "agy", "--", "-p", "hi"], catch_exceptions=False
+        )
+        assert result.exit_code == 0
+        assert captured == [False], "print mode must not start the retrieve listener"
+
+    def test_interactive_starts_retrieve_listener(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Interactive: _start_agy_servers is called with start_retrieve=True."""
+        import headroom.cli.wrap as wrap_mod
+
+        _stub_agy_mitm_run(tmp_path, monkeypatch, with_uvx=True)
+        captured: list[bool] = []
+        real_stub = wrap_mod._start_agy_servers
+
+        def _spy(ca_key, ca_cert, base_dir=None, *, start_retrieve=False):
+            captured.append(start_retrieve)
+            return real_stub(ca_key, ca_cert, base_dir, start_retrieve=start_retrieve)
+
+        monkeypatch.setattr(wrap_mod, "_start_agy_servers", _spy)
+
+        runner = CliRunner()
+        result = runner.invoke(_get_main(), ["wrap", "agy"], catch_exceptions=False)
+        assert result.exit_code == 0
+        assert captured == [True], "interactive mode must start the retrieve listener"
+
+    def test_failed_smoke_handshake_removes_retrieve_entry(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A retrieve entry that fails the MCP handshake must not persist."""
+        import headroom.cli.wrap as wrap_mod
+        from headroom.mcp_registry.agy import AgyRegistrar
+
+        _stub_agy_mitm_run(tmp_path, monkeypatch, with_uvx=True)
+        # Handshake FAILS -> verify-then-remove path for the headroom entry.
+        monkeypatch.setattr(wrap_mod, "_smoke_verify_mcp_handshake", lambda *a, **kw: False)
+
+        seen: dict[str, object] = {}
+
+        def _capture_run(cmd, *a, **kw):
+            seen["spec"] = AgyRegistrar(home_dir=tmp_path).get_server("headroom")
+            return MagicMock(returncode=0)
+
+        monkeypatch.setattr("subprocess.run", _capture_run)
+
+        runner = CliRunner()
+        result = runner.invoke(_get_main(), ["wrap", "agy"], catch_exceptions=False)
+        assert result.exit_code == 0
+        assert seen["spec"] is None, (
+            "a headroom entry that fails the handshake must be removed before agy runs"
+        )
+        assert AgyRegistrar(home_dir=tmp_path).get_server("headroom") is None
 
 
 class TestAgyRtkGate:
