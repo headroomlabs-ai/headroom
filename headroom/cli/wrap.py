@@ -604,10 +604,21 @@ def _setup_headroom_mcp(
 def _setup_serena_mcp(
     registrar: Any, *, context: str, verbose: bool = False, force: bool = False
 ) -> None:
-    """Register Serena MCP with the given agent (idempotent)."""
+    """Register Serena MCP with the given agent (idempotent).
+
+    A prior ``headroom wrap`` may have persisted a Serena entry built from an
+    older spec — e.g. before ``--open-web-dashboard False`` was added to
+    suppress the dashboard popup (#1003). ``register_server`` returns
+    ``MISMATCH`` and refuses to overwrite a differing entry unless forced, so
+    on its own a re-wrap leaves already-wrapped users stuck on the stale spec
+    (and the popup) forever. When the ledger proves the entry currently in the
+    config is one Headroom installed, force-update it to the current spec. A
+    user-managed Serena (absent from our ledger) is left untouched and the
+    mismatch is reported as before.
+    """
     from headroom.mcp_registry import build_serena_spec, format_result
     from headroom.mcp_registry.base import RegisterStatus
-    from headroom.mcp_registry.ledger import record_install
+    from headroom.mcp_registry.ledger import headroom_installed_matching, record_install
 
     if not registrar.detect():
         if verbose:
@@ -620,6 +631,21 @@ def _setup_serena_mcp(
 
     spec = build_serena_spec(context)
     result = registrar.register_server(spec, force=force)
+
+    # Migrate a stale Headroom-installed entry. register_server won't overwrite
+    # a differing spec without force, so an older Headroom Serena entry would
+    # otherwise persist across re-wraps. Force-update it only when the ledger
+    # proves Headroom installed the entry that's currently on disk — never a
+    # user-managed Serena.
+    if (
+        result.status == RegisterStatus.MISMATCH
+        and not force
+        and headroom_installed_matching(registrar.name, registrar.get_server("serena"))
+    ):
+        result = registrar.register_server(spec, force=True)
+        if result.status == RegisterStatus.REGISTERED:
+            click.echo("  Serena MCP: migrated previously-installed entry to current spec")
+
     if result.status == RegisterStatus.REGISTERED:
         record_install(registrar.name, spec)
 
