@@ -1,5 +1,6 @@
 """Tests for Deepseek provider."""
 
+import warnings
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -9,6 +10,8 @@ from headroom.providers.deepseek import (
     DeepseekTokenCounter,
     _CONTEXT_LIMITS,
     _PRICING,
+    _UNKNOWN_MODEL_WARNINGS,
+    _check_pricing_staleness,
 )
 from headroom.providers.openai_compatible import (
     OpenAICompatibleProvider,
@@ -49,7 +52,8 @@ class TestDeepseekProvider:
         assert provider.get_context_limit("deepseek-chat") == 131072
         assert provider.get_context_limit("deepseek-v4-flash") == 1000000
         assert provider.get_context_limit("deepseek-v4-pro") == 1000000
-        assert provider.get_context_limit("deepseek-coder") == 16384
+        # deepseek-coder may be overridden by LiteLLM to 128000; verify >= 16384
+        assert provider.get_context_limit("deepseek-coder") >= 16384
 
     def test_context_limit_unknown_defaults_128k(self):
         provider = DeepseekProvider()
@@ -92,6 +96,58 @@ class TestDeepseekProvider:
     def test_output_buffer_v4(self):
         provider = DeepseekProvider()
         assert provider.get_output_buffer("deepseek-v4-flash") == 384_000
+
+    def test_warns_for_unknown_model(self, caplog):
+        import logging
+
+        _UNKNOWN_MODEL_WARNINGS.clear()
+        provider = DeepseekProvider()
+        with caplog.at_level(logging.WARNING):
+            limit = provider.get_context_limit("deepseek-future-model")
+        assert limit == 128_000
+        assert "Unknown Deepseek model" in caplog.text
+
+    def test_uses_litellm_for_context_limit(self, monkeypatch):
+        mock_litellm = MagicMock()
+        mock_litellm.get_model_info.return_value = {"max_input_tokens": 256000}
+        monkeypatch.setattr("headroom.providers.deepseek.litellm", mock_litellm)
+        monkeypatch.setattr("headroom.providers.deepseek.LITELLM_AVAILABLE", True)
+        provider = DeepseekProvider()
+        limit = provider.get_context_limit("deepseek-chat")
+        assert limit == 256000
+
+    def test_supports_model_uses_instance_limits(self):
+        provider = DeepseekProvider()
+        provider._context_limits["custom-model"] = 32000
+        assert provider.supports_model("custom-model")
+
+
+class TestDeepseekCustomConfig:
+    """Tests for custom model configuration via env vars."""
+
+    def test_custom_context_limit_from_env(self, monkeypatch):
+        import json
+
+        monkeypatch.setenv(
+            "HEADROOM_MODEL_LIMITS",
+            json.dumps({"deepseek": {"context_limits": {"my-fine-tuned": 64000}}}),
+        )
+        from headroom.providers.deepseek import _load_custom_model_config
+
+        config = _load_custom_model_config()
+        assert config["context_limits"]["my-fine-tuned"] == 64000
+
+    def test_custom_pricing_from_env(self, monkeypatch):
+        import json
+
+        monkeypatch.setenv(
+            "HEADROOM_MODEL_LIMITS",
+            json.dumps({"deepseek": {"pricing": {"my-model": [1.0, 2.0]}}}),
+        )
+        from headroom.providers.deepseek import _load_custom_model_config
+
+        config = _load_custom_model_config()
+        assert config["pricing"]["my-model"] == [1.0, 2.0]
 
 
 class TestDeepseekTokenCounter:
@@ -205,3 +261,18 @@ class TestCreateDeepseekProvider:
         )
         assert cost is not None
         assert cost > 0
+
+
+class TestPricingStaleness:
+    """Tests for pricing staleness warning."""
+
+    def test_pricing_staleness_warning(self, monkeypatch):
+        import headroom.providers.deepseek as ds_mod
+
+        monkeypatch.setattr(ds_mod, "_PRICING_WARNING_SHOWN", False)
+        monkeypatch.setattr(ds_mod, "_PRICING_STALE_DAYS", 0)
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            result = _check_pricing_staleness()
+            assert result is not None
+            assert "days old" in result
