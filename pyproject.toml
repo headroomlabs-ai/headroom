@@ -76,6 +76,7 @@ proxy = [
     "transformers>=4.30.0,<6.0",  # Tokenizer only (for Kompress)
     "watchdog>=4.0.0",            # File watcher for live code graph reindexing (--code-graph)
     "sqlite-vec>=0.1.6",          # Vector index for memory (--memory). Lightweight, no torch.
+    "cryptography>=42.0.0",       # Root CA + leaf minting for agy TLS-MITM wrap (headroom wrap agy)
 ]
 # Production ASGI/WSGI server — Unix-only (gunicorn does not support Windows).
 # Kept separate from [proxy] so that dev, CI, and Windows users are not forced
