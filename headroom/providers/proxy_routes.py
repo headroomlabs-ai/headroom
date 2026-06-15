@@ -50,6 +50,16 @@ def _vertex_target_for_location(proxy: Any, location: str) -> str:
 
 
 def _select_passthrough_base_url(proxy: Any, headers: dict[str, str]) -> str:
+    # agy (Google Antigravity CLI) reaches the proxy via TLS-MITM that
+    # terminates the WHOLE connection to the Cloud Code host, so every
+    # control-plane call (loadCodeAssist / setUserSettings / listExperiments /
+    # …) lands on the catch-all. These paths only exist on the Cloud Code host
+    # itself; routing them to the generic Gemini endpoint (which agy's
+    # x-goog-api-key would otherwise select below) 404s and agy never finishes
+    # onboarding. Forward them back to the host agy addressed.
+    host = headers.get("host", "")
+    if host.endswith("cloudcode-pa.googleapis.com"):
+        return f"https://{host}"
     # Codex CLI subscription mode hits a wide surface under
     # `/backend-api/*` (rate-limit polling, agent identity, JWT
     # refresh, cloud tasks). Without this branch the catchall

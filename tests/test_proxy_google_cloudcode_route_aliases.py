@@ -292,3 +292,33 @@ def test_pi_openclaw_requesttype_agent_still_detected(monkeypatch):
         response.json()["url"]
         == "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse"
     )
+
+
+def test_agy_control_plane_passthrough_routes_to_cloudcode_host(monkeypatch):
+    """agy's non-streamGenerateContent control-plane calls (loadCodeAssist,
+    setUserSettings, …) reach the catch-all and MUST be proxied back to the
+    Cloud Code host agy addressed — not the generic Gemini endpoint that the
+    x-goog-api-key header would otherwise select. Without this the MITM dispatch
+    404s agy's onboarding and agy never issues a generateContent call."""
+
+    async def fake_passthrough(self, request, base_url, *args, **kwargs):  # type: ignore[no-untyped-def]
+        return JSONResponse({"base_url": base_url, "path": request.url.path})
+
+    monkeypatch.setattr(HeadroomProxy, "handle_passthrough", fake_passthrough)
+
+    with TestClient(create_app(ProxyConfig(optimize=False))) as client:
+        response = client.post(
+            "/v1internal:loadCodeAssist",
+            headers={
+                "host": "daily-cloudcode-pa.googleapis.com",
+                # agy sends x-goog-api-key; this previously forced the generic
+                # Gemini host. The Cloud Code host check must win over it.
+                "x-goog-api-key": "test-key",
+            },
+            json={"metadata": {"pluginType": "GEMINI"}},
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["path"] == "/v1internal:loadCodeAssist"
+    assert body["base_url"] == "https://daily-cloudcode-pa.googleapis.com"
