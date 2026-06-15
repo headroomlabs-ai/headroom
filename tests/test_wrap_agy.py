@@ -1213,24 +1213,46 @@ class TestAgyRtkGate:
 class TestUnwrapAgyLeanCtx:
     """unwrap agy removes the lean-ctx context-tool MCP entry it left behind."""
 
-    def test_unwrap_removes_lean_ctx_entry(
+    def test_unwrap_removes_headroom_installed_lean_ctx_entry(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         from headroom.mcp_registry.agy import AgyRegistrar
         from headroom.mcp_registry.install import build_lean_ctx_spec
+        from headroom.mcp_registry.ledger import record_install
 
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
         reg = AgyRegistrar(home_dir=tmp_path)
-        reg.register_server(
-            build_lean_ctx_spec("/usr/bin/lean-ctx", "/x/data")
-        )
+        spec = build_lean_ctx_spec("/usr/bin/lean-ctx", "/x/data")
+        reg.register_server(spec)
+        record_install("agy", spec)  # mark as Headroom-installed
 
         runner = CliRunner()
         result = runner.invoke(_get_main(), ["unwrap", "agy"])
         assert result.exit_code == 0
         assert AgyRegistrar(home_dir=tmp_path).get_server("lean-ctx") is None, (
-            "unwrap agy must remove the lean-ctx MCP entry"
+            "unwrap agy must remove a Headroom-installed lean-ctx MCP entry"
         )
+
+    def test_unwrap_preserves_user_managed_lean_ctx_entry(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A user's own lean-ctx MCP (not in the Headroom ledger) must survive unwrap."""
+        from headroom.mcp_registry.agy import AgyRegistrar
+        from headroom.mcp_registry.base import ServerSpec
+
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        reg = AgyRegistrar(home_dir=tmp_path)
+        # Distinct command, NO record_install -> not Headroom-owned.
+        reg.register_server(
+            ServerSpec(name="lean-ctx", command="/home/user/.local/bin/lean-ctx", args=(), env={})
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(_get_main(), ["unwrap", "agy"])
+        assert result.exit_code == 0
+        survived = AgyRegistrar(home_dir=tmp_path).get_server("lean-ctx")
+        assert survived is not None, "user-managed lean-ctx MCP must survive unwrap"
+        assert survived.command == "/home/user/.local/bin/lean-ctx"
 
     def test_unwrap_preserves_unrelated_user_entry(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

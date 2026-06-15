@@ -668,10 +668,15 @@ def _setup_lean_ctx_mcp_agy(registrar: Any, *, verbose: bool = False) -> None:
     spec = build_lean_ctx_spec(str(lean_ctx), data_dir)
     result = registrar.register_server(spec, force=True)
     if result.status not in (RegisterStatus.REGISTERED, RegisterStatus.ALREADY):
-        click.echo(f"  Context tool: could not register lean-ctx MCP — skipping ({result.message}).")
+        click.echo(f"  Context tool: could not register lean-ctx MCP — skipping ({result.detail}).")
         return
 
     if _smoke_verify_mcp_handshake(spec.command, list(spec.args), dict(spec.env)):
+        # Record in the ledger so unwrap removes only Headroom-installed entries,
+        # never a user's own pre-existing lean-ctx MCP.
+        from headroom.mcp_registry.ledger import record_install
+
+        record_install(registrar.name, spec)
         if verbose:
             click.echo("  Context tool: lean-ctx MCP registered and handshake-verified.")
         else:
@@ -708,7 +713,7 @@ def _setup_headroom_retrieve_mcp_agy(
     result = registrar.register_server(spec, force=True)
     if result.status not in (RegisterStatus.REGISTERED, RegisterStatus.ALREADY):
         click.echo(
-            f"  MCP retrieve tool: could not register headroom MCP — skipping ({result.message})."
+            f"  MCP retrieve tool: could not register headroom MCP — skipping ({result.detail})."
         )
         return False
 
@@ -1061,6 +1066,19 @@ def _remove_headroom_installed_cbm_mcp(registrar: Any) -> str:
         return "not_headroom_owned"
     if registrar.unregister_server(_CBM_MCP_SERVER_NAME):
         clear_install(registrar.name, _CBM_MCP_SERVER_NAME)
+        return "removed"
+    return "failed"
+
+
+def _remove_headroom_installed_lean_ctx_mcp(registrar: Any) -> str:
+    """Remove the lean-ctx MCP only if the ledger proves Headroom installed it."""
+    from headroom.mcp_registry.ledger import clear_install, headroom_installed_matching
+
+    current = registrar.get_server("lean-ctx")
+    if not headroom_installed_matching(registrar.name, current):
+        return "not_headroom_owned"
+    if registrar.unregister_server("lean-ctx"):
+        clear_install(registrar.name, "lean-ctx")
         return "removed"
     return "failed"
 
@@ -6222,12 +6240,15 @@ def unwrap_agy() -> None:
     elif serena_status == "not_headroom_owned":
         click.echo("  Kept user-managed Serena MCP server (not Headroom-owned).")
 
-    # 4. Remove the lean-ctx context-tool MCP entry Headroom may have
-    #    registered (idempotent; preserves all unrelated user entries).
-    if agy_reg.unregister_server("lean-ctx"):
-        click.echo("  Removed lean-ctx context-tool MCP server from agy.")
-    else:
-        click.echo("  lean-ctx context-tool MCP server was not registered in agy.")
+    # 4. Remove the lean-ctx context-tool MCP entry only if the ledger proves
+    #    Headroom installed it (preserves a user's own lean-ctx MCP entry).
+    lean_ctx_status = _remove_headroom_installed_lean_ctx_mcp(agy_reg)
+    if lean_ctx_status == "removed":
+        click.echo("  Removed Headroom-installed lean-ctx context-tool MCP server from agy.")
+    elif lean_ctx_status == "failed":
+        click.echo("  lean-ctx MCP server matched Headroom ledger but could not be removed.")
+    else:  # not_headroom_owned (absent, or a user-managed entry left untouched)
+        click.echo("  lean-ctx MCP server left as-is (not Headroom-installed).")
 
     # 5. Remove codebase-memory-mcp only if the ledger proves Headroom
     #    installed it via --code-graph (user-managed entries are left untouched).
