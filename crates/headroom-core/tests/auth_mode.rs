@@ -141,6 +141,15 @@ fn antigravity_ua_classified_subscription() {
     assert_eq!(classify(&h), AuthMode::Subscription);
 }
 
+#[test]
+fn agy_cli_ua_classified_subscription() {
+    // agy (Google Antigravity CLI) real UA: lowercase `antigravity/<semver>`.
+    // Captured from live agy traffic; the prefix list matches on the
+    // lowercased UA so this is the canonical form agy actually sends.
+    let h = headers(&[("user-agent", "antigravity/1.0.5")]);
+    assert_eq!(classify(&h), AuthMode::Subscription);
+}
+
 // ── Performance ──────────────────────────────────────────────────
 
 /// Smoke perf check — a strict bench lives at
