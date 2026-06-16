@@ -396,6 +396,7 @@ def _build_waste_histogram(
         "whitespace": 0,
         "dynamic_date": 0,
         "reread": 0,
+        "reread_compressed": 0,
         "history_bloat": 0,
     }
 
@@ -415,8 +416,12 @@ def _build_waste_histogram(
             # Subtract known waste types. "reread" is excluded: it measures
             # over-compression cost (content the agent re-fetched), not
             # waste removed by compression, so it doesn't explain any part
-            # of tokens_saved.
-            known_waste = sum(v for k, v in waste.items() if k != "reread")
+            # of tokens_saved. "reread_compressed" is a subset of "reread"
+            # (#899) and is excluded for the same reason — counting it would
+            # also double-subtract.
+            known_waste = sum(
+                v for k, v in waste.items() if k not in ("reread", "reread_compressed")
+            )
             history_bloat = max(0, tokens_saved - known_waste)
             totals["history_bloat"] += history_bloat
 
@@ -430,6 +435,7 @@ def _build_waste_histogram(
         "whitespace": "Whitespace",
         "dynamic_date": "Dynamic Dates",
         "reread": "Re-served Tool Results",
+        "reread_compressed": "Re-served After Compression",
         "history_bloat": "History Bloat",
     }
 

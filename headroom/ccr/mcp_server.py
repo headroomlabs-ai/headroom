@@ -543,6 +543,7 @@ class HeadroomMCPServer:
                     inputSchema={
                         "type": "object",
                         "properties": {},
+                        "required": [],
                     },
                 ),
             ]

@@ -371,6 +371,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
             cache_write_5m_tokens=outcome.cache_write_5m_tokens,
             cache_write_1h_tokens=outcome.cache_write_1h_tokens,
             uncached_tokens=outcome.uncached_input_tokens,
+            output_tokens=outcome.output_tokens,
         )
 
     # 3. Per-request log (optional). The ``client`` outcome field is

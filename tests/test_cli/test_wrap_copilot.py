@@ -14,7 +14,7 @@ import click
 import pytest
 from click.testing import CliRunner
 
-from headroom.copilot_auth import DEFAULT_API_URL
+from headroom.copilot_auth import DEFAULT_API_URL, CopilotSubscriptionTokenResolution
 
 
 def _expected_project_prefix() -> str:
@@ -25,6 +25,22 @@ def _expected_project_prefix() -> str:
 @pytest.fixture
 def runner() -> CliRunner:
     return CliRunner()
+
+
+def _subscription_resolution(
+    token: str = "gho-existing",
+    *,
+    api_url: str = DEFAULT_API_URL,
+    source: str = "headroom-copilot-auth:/tmp/copilot_auth.json:token-exchange",
+    confidence: str = "copilot-token-exchange",
+) -> CopilotSubscriptionTokenResolution:
+    return CopilotSubscriptionTokenResolution(
+        token=token,
+        source=source,
+        confidence=confidence,
+        api_url=api_url,
+        token_fingerprint="sha256:0123456789ab",
+    )
 
 
 @pytest.fixture
@@ -247,7 +263,10 @@ def test_wrap_copilot_subscription_uses_github_auth_without_provider_key(
 
     with (
         patch("headroom.cli.wrap.shutil.which", return_value="copilot"),
-        patch("headroom.cli.wrap.resolve_subscription_bearer_token", return_value="gho-existing"),
+        patch(
+            "headroom.cli.wrap.resolve_subscription_bearer_token_details",
+            return_value=_subscription_resolution(),
+        ),
         patch("headroom.cli.wrap.has_oauth_auth", return_value=False),
         patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch_tool),
     ):
@@ -284,7 +303,10 @@ def test_wrap_copilot_subscription_defaults_to_responses_for_reasoning_model(
 
     with (
         patch("headroom.cli.wrap.shutil.which", return_value="copilot"),
-        patch("headroom.cli.wrap.resolve_subscription_bearer_token", return_value="gho-existing"),
+        patch(
+            "headroom.cli.wrap.resolve_subscription_bearer_token_details",
+            return_value=_subscription_resolution("gho-existing"),
+        ),
         patch("headroom.cli.wrap.has_oauth_auth", return_value=False),
         patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch_tool),
     ):
@@ -321,7 +343,10 @@ def test_wrap_copilot_subscription_keeps_gpt4_on_completions(
 
     with (
         patch("headroom.cli.wrap.shutil.which", return_value="copilot"),
-        patch("headroom.cli.wrap.resolve_subscription_bearer_token", return_value="gho-existing"),
+        patch(
+            "headroom.cli.wrap.resolve_subscription_bearer_token_details",
+            return_value=_subscription_resolution("gho-existing"),
+        ),
         patch("headroom.cli.wrap.has_oauth_auth", return_value=False),
         patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch_tool),
     ):
@@ -351,7 +376,10 @@ def test_wrap_copilot_subscription_allows_explicit_responses_wire_api(
 
     with (
         patch("headroom.cli.wrap.shutil.which", return_value="copilot"),
-        patch("headroom.cli.wrap.resolve_subscription_bearer_token", return_value="gho-existing"),
+        patch(
+            "headroom.cli.wrap.resolve_subscription_bearer_token_details",
+            return_value=_subscription_resolution("gho-existing"),
+        ),
         patch("headroom.cli.wrap.has_oauth_auth", return_value=False),
         patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch_tool),
     ):
@@ -403,10 +431,9 @@ def test_wrap_copilot_subscription_pins_validated_token_for_proxy(
     with (
         patch("headroom.cli.wrap.shutil.which", return_value="copilot"),
         patch(
-            "headroom.cli.wrap.resolve_subscription_bearer_token",
-            return_value="gho-validated",
+            "headroom.cli.wrap.resolve_subscription_bearer_token_details",
+            return_value=_subscription_resolution("gho-validated", api_url=business_api),
         ),
-        patch("headroom.cli.wrap.resolve_copilot_api_url", return_value=business_api),
         patch("headroom.cli.wrap.has_oauth_auth", return_value=False),
         patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch_tool),
     ):
@@ -437,12 +464,13 @@ def test_wrap_copilot_subscription_requires_reusable_auth(
     _wrap_cli, main = wrap_modules
     with (
         patch("headroom.cli.wrap.shutil.which", return_value="copilot"),
-        patch("headroom.cli.wrap.resolve_subscription_bearer_token", return_value=None),
+        patch("headroom.cli.wrap.resolve_subscription_bearer_token_details", return_value=None),
     ):
         result = runner.invoke(main, ["wrap", "copilot", "--subscription", "--no-rtk"])
 
     assert result.exit_code != 0
     assert "subscription mode requires a reusable GitHub/Copilot bearer token" in result.output
+    assert "headroom copilot-auth login" in result.output
 
 
 def test_wrap_copilot_subscription_rejects_translated_backend(
@@ -634,6 +662,8 @@ def _clear_copilot_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "OPENAI_API_KEY",
         "ANTHROPIC_API_KEY",
         "GITHUB_COPILOT_API_URL",
+        "GITHUB_COPILOT_ENTERPRISE_URL",
+        "GITHUB_COPILOT_ENTERPRISE_DOMAIN",
         "GITHUB_COPILOT_TOKEN",
         "GITHUB_COPILOT_GITHUB_TOKEN",
         "COPILOT_MODEL",
@@ -747,17 +777,15 @@ def test_wrap_copilot_byok_never_resolves_copilot_endpoint(
     assert env["COPILOT_PROVIDER_TYPE"] == "openai"
 
 
-def test_wrap_copilot_subscription_uses_generic_endpoint_not_account(
+def test_wrap_copilot_subscription_uses_resolved_subscription_endpoint(
     runner: CliRunner,
     wrap_modules: tuple[types.ModuleType, click.Group],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """#610 (subscription has the same latent bug): --subscription must route to
-    the generic host too, even when /copilot_internal/user advertises an
-    account-specific host. The segmented host does not serve newer models on the
-    responses API, and it is not the host the official Copilot client uses."""
+    """Subscription mode uses the endpoint returned with the resolved token."""
     _wrap_cli, main = wrap_modules
     _clear_copilot_env(monkeypatch)
+    business_api = "https://api.business.githubcopilot.com"
     captured: dict[str, object] = {}
 
     def fake_launch_tool(**kwargs):  # noqa: ANN003
@@ -765,7 +793,10 @@ def test_wrap_copilot_subscription_uses_generic_endpoint_not_account(
 
     with (
         patch("headroom.cli.wrap.shutil.which", return_value="copilot"),
-        patch("headroom.cli.wrap.resolve_subscription_bearer_token", return_value="gho-sub"),
+        patch(
+            "headroom.cli.wrap.resolve_subscription_bearer_token_details",
+            return_value=_subscription_resolution("copilot-api", api_url=business_api),
+        ),
         patch("headroom.cli.wrap.has_oauth_auth", return_value=True),
         patch("headroom.copilot_auth._fetch_copilot_user_info", return_value=_ACCOUNT_USER_INFO),
         patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch_tool),
@@ -778,9 +809,9 @@ def test_wrap_copilot_subscription_uses_generic_endpoint_not_account(
     assert result.exit_code == 0, result.output
     env = captured["env"]
     assert isinstance(env, dict)
-    assert captured["openai_api_url"] == DEFAULT_API_URL
-    assert env["OPENAI_TARGET_API_URL"] == DEFAULT_API_URL
-    assert env["COPILOT_PROVIDER_BEARER_TOKEN"] == "gho-sub"
+    assert captured["openai_api_url"] == business_api
+    assert env["OPENAI_TARGET_API_URL"] == business_api
+    assert env["COPILOT_PROVIDER_BEARER_TOKEN"] == "copilot-api"
 
 
 def test_wrap_copilot_subscription_honors_api_url_override(
@@ -800,7 +831,15 @@ def test_wrap_copilot_subscription_honors_api_url_override(
 
     with (
         patch("headroom.cli.wrap.shutil.which", return_value="copilot"),
-        patch("headroom.cli.wrap.resolve_subscription_bearer_token", return_value="gho-sub"),
+        patch(
+            "headroom.cli.wrap.resolve_subscription_bearer_token_details",
+            return_value=_subscription_resolution(
+                "gho-sub",
+                api_url="https://api.enterprise.example.com",
+                source="env:GITHUB_COPILOT_API_TOKEN",
+                confidence="explicit-api-token",
+            ),
+        ),
         patch("headroom.cli.wrap.has_oauth_auth", return_value=True),
         patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch_tool),
     ):

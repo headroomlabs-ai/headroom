@@ -217,7 +217,7 @@ CLIENT_UA_MAP: tuple[tuple[str, str], ...] = (
 )
 
 
-def classify_client(headers: Mapping[str, Any] | Any) -> str | None:
+def classify_client(headers: Mapping[str, Any] | Any, *, default: str | None = None) -> str | None:
     """Identify the client harness (Codex / Claude Code / aider / etc).
 
     Decision order:
@@ -250,7 +250,7 @@ def classify_client(headers: Mapping[str, Any] | Any) -> str | None:
     for needle, name in CLIENT_UA_MAP:
         if needle in ua_lower:
             return name
-    return None
+    return default
 
 
 __all__ = [

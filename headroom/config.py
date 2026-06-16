@@ -537,6 +537,11 @@ class WasteSignals:
     dynamic_date_tokens: int = 0  # Dynamic dates in system prompt
     repetition_tokens: int = 0  # Repeated content
     reread_tokens: int = 0  # Tool results re-served after already appearing earlier
+    # Subset of reread_tokens whose first serve was compressed away (CCR
+    # marker left in its place) — re-reads attributable to over-compression
+    # rather than agent behavior (#899). Excluded from total() because the
+    # same tokens are already counted in reread_tokens.
+    reread_compressed_tokens: int = 0
 
     def total(self) -> int:
         """Total waste tokens detected."""
@@ -560,6 +565,7 @@ class WasteSignals:
             "dynamic_date": self.dynamic_date_tokens,
             "repetition": self.repetition_tokens,
             "reread": self.reread_tokens,
+            "reread_compressed": self.reread_compressed_tokens,
         }
 
 

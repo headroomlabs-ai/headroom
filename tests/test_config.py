@@ -266,6 +266,7 @@ class TestWasteSignals:
             "dynamic_date": 10,
             "repetition": 15,
             "reread": 30,
+            "reread_compressed": 0,
         }
         assert signals.to_dict() == expected
 
@@ -274,7 +275,7 @@ class TestWasteSignals:
         signals = WasteSignals()
         result = signals.to_dict()
         assert all(v == 0 for v in result.values())
-        assert len(result) == 7
+        assert len(result) == 8
 
 
 class TestCachePrefixMetrics:
