@@ -3629,6 +3629,13 @@ def aider(
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
 @click.option(
+    "--no-context-tool",
+    "--no-rtk",
+    "no_rtk",
+    is_flag=True,
+    help="Skip CLI context-tool setup (no effect for vibe)",
+)
+@click.option(
     "--code-graph",
     is_flag=True,
     help="Enable code graph indexing via codebase-memory-mcp (optional)",
@@ -3641,6 +3648,7 @@ def aider(
 @click.argument("vibe_args", nargs=-1, type=click.UNPROCESSED)
 def vibe(
     port: int,
+    no_rtk: bool,
     code_graph: bool,
     no_proxy: bool,
     learn: bool,
@@ -3659,6 +3667,7 @@ def vibe(
         headroom wrap vibe                         # Start proxy + vibe
         headroom wrap vibe -- "fix the bug"        # Pass prompt to vibe
         headroom wrap vibe --port 9999             # Custom proxy port
+        headroom wrap vibe --no-context-tool       # Skip CLI context-tool setup
     """
     if prepare_only:
         return

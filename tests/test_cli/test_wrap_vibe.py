@@ -73,6 +73,9 @@ def test_wrap_vibe_with_project_name(
     env = captured["env"]
     assert isinstance(env, dict)
 
+    providers: list[dict[str, Any]] = json.loads(env["VIBE_PROVIDERS"])
+    assert providers[0]["api_base"] == "http://127.0.0.1:7000/p/my-project/v1"
+
 
 def test_wrap_vibe_not_found(
     runner: CliRunner,
@@ -243,3 +246,39 @@ def test_wrap_vibe_providers_json_structure(
     assert (
         providers[0]["browser_auth_api_base_url"] == "https://console.mistral.ai/api"
     )
+
+
+def test_wrap_vibe_no_context_tool(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--no-context-tool and --no-rtk flags are accepted and not passed to vibe."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+
+    captured: dict[str, Any] = {}
+
+    def fake_launch_tool(**kwargs: Any) -> None:  # noqa: ANN003
+        captured.update(kwargs)
+
+    with patch.object(wrap_mod.shutil, "which", return_value="vibe"):
+        with patch.object(wrap_mod, "_launch_tool", side_effect=fake_launch_tool):
+            with patch.object(wrap_mod, "_project_name_from_cwd", return_value=None):
+                # Test --no-context-tool
+                result = runner.invoke(main, ["wrap", "vibe", "--no-context-tool", "--", "test"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["args"] == ("test",)
+    assert "--no-context-tool" not in captured["args"]
+
+    captured.clear()
+    with patch.object(wrap_mod.shutil, "which", return_value="vibe"):
+        with patch.object(wrap_mod, "_launch_tool", side_effect=fake_launch_tool):
+            with patch.object(wrap_mod, "_project_name_from_cwd", return_value=None):
+                # Test --no-rtk
+                result = runner.invoke(main, ["wrap", "vibe", "--no-rtk", "--", "test"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["args"] == ("test",)
+    assert "--no-rtk" not in captured["args"]

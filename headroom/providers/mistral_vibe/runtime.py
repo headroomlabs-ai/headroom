@@ -28,10 +28,11 @@ def build_launch_env(
     strips it and attributes savings per project.
     """
     env = dict(environ or os.environ)
-    # NOTE: When used with a persistent Headroom deployment (via headroom install),
-    # the proxy process runs with environment variables captured at its startup.
-    # Mistral Vibe reads MISTRAL_API_KEY from its own process environment (via
-    # api_key_env_var below). This will eventually expire, remove and restarting the install resolves
+    # NOTE: With a persistent Headroom deployment (`headroom install`), the proxy
+    # process captures its environment at startup. Vibe reads `MISTRAL_API_KEY`
+    # from its own process environment (via `api_key_env_var` below), so if the
+    # token changes you may need to restart the Vibe process (and, for persistent
+    # installs, the proxy) to pick up the new value.
     base_url = with_project_prefix(codex_proxy_base_url(port), project)
 
     # Build the providers JSON with mistral provider pointing to Headroom proxy
@@ -47,6 +48,7 @@ def build_launch_env(
         }
     ]
 
-    env["VIBE_PROVIDERS"] = json.dumps(providers)
+    providers_json = json.dumps(providers)
+    env["VIBE_PROVIDERS"] = providers_json
 
-    return env, [f"VIBE_PROVIDERS={json.dumps(providers)}"]
+    return env, [f"VIBE_PROVIDERS={providers_json}"]
