@@ -84,6 +84,31 @@ def _summarize_transforms(transforms: list[str]) -> str:
     return " ".join(parts)
 
 
+def header_safe_transforms(transforms: list[str]) -> list[str]:
+    """Strip enriched detail so each tag is safe in the comma-joined header.
+
+    ``x-headroom-transforms`` is built as ``",".join(transforms_applied)``, so a
+    tag must not itself contain a comma or the header can't be split back into
+    tags. The enriched ``read_lifecycle:<state>:<path>`` and
+    ``smart_crush:<n>:<names>`` tags carry comma-bearing detail (file paths may
+    contain commas; tool-name lists are comma-separated), so collapse them back
+    to their legacy counter shape for the header. Full detail stays in the
+    structured ``transforms_applied`` list (dashboards, request logs, the
+    desktop activity feed) — only the opaque header is normalized.
+    """
+    safe: list[str] = []
+    for t in transforms:
+        if t.startswith("smart_crush:"):
+            parts = t.split(":")
+            safe.append(f"smart_crush:{parts[1]}" if len(parts) >= 2 else t)
+        elif t.startswith("read_lifecycle:"):
+            parts = t.split(":")
+            safe.append(f"read_lifecycle:{parts[1]}" if len(parts) >= 2 else t)
+        else:
+            safe.append(t)
+    return safe
+
+
 def build_prefix_cache_stats(
     metrics: PrometheusMetrics,
     cost_tracker: CostTracker | None,
@@ -531,7 +556,10 @@ class CostTracker:
     """
 
     MAX_COST_ENTRIES = 100_000
-    COST_RETENTION_HOURS = 24
+    # Used by _prune_old_costs(), called from record_tokens() on every request.
+    # Must be >= the longest budget_period (monthly = up to 31 days), otherwise
+    # get_period_cost() undercounts and check_budget() silently under-enforces.
+    COST_RETENTION_HOURS = 744  # 31 days
 
     def __init__(self, budget_limit_usd: float | None = None, budget_period: str = "daily"):
         self.budget_limit_usd = budget_limit_usd
@@ -642,8 +670,9 @@ class CostTracker:
         cache_write_5m_tokens: int = 0,
         cache_write_1h_tokens: int = 0,
         uncached_tokens: int = 0,
+        output_tokens: int = 0,
     ):
-        """Record token counts per model.
+        """Record token counts per model and accumulate request cost for budget enforcement.
 
         Args:
             model: Model name.
@@ -652,6 +681,7 @@ class CostTracker:
             cache_read_tokens: Cache read tokens from API response usage.
             cache_write_tokens: Cache write tokens from API response usage.
             uncached_tokens: Non-cached input tokens from API response usage.
+            output_tokens: Output tokens from API response usage.
         """
         self._tokens_saved_by_model[model] = (
             self._tokens_saved_by_model.get(model, 0) + tokens_saved
@@ -673,6 +703,24 @@ class CostTracker:
         self._api_uncached_by_model[model] = (
             self._api_uncached_by_model.get(model, 0) + uncached_tokens
         )
+
+        # Populate _costs so check_budget() has real data to enforce against.
+        # When the call site had no API usage breakdown (all cache/uncached
+        # fields are 0), fall back to tokens_sent so input cost isn't
+        # silently dropped from the budget.
+        input_tokens = uncached_tokens
+        if not (uncached_tokens or cache_read_tokens or cache_write_tokens):
+            input_tokens = tokens_sent
+        cost = self.estimate_cost(
+            model=model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_read_tokens=cache_read_tokens,
+            cache_write_tokens=cache_write_tokens,
+        )
+        if cost is not None:
+            self._costs.append((datetime.now(), cost))
+            self._prune_old_costs()
 
     def get_period_cost(self) -> float:
         """Get cost for current budget period."""

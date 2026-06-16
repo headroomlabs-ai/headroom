@@ -41,13 +41,25 @@ class AnyLLMBackend(Backend):
             )
 
         self.provider = provider.lower()
-        self.api_key = api_key
-        self.api_base = api_base
+        # Normalize empty-string overrides (e.g. an env var set to "") to None
+        # so provider defaults stay active instead of forwarding a blank value.
+        self.api_key = api_key or None
+        self.api_base = api_base or None
 
-        # Create the AnyLLM instance once and reuse
-        self.llm = AnyLLM.create(self.provider)
+        # Create the AnyLLM instance once and reuse. api_key/api_base are only
+        # forwarded when set so providers keep their own env-var defaults
+        # (e.g. OPENAI_API_KEY / OPENAI_BASE_URL) otherwise.
+        create_kwargs: dict[str, Any] = {}
+        if self.api_key is not None:
+            create_kwargs["api_key"] = self.api_key
+        if self.api_base is not None:
+            create_kwargs["api_base"] = self.api_base
+        self.llm = AnyLLM.create(self.provider, **create_kwargs)
 
-        logger.info(f"any-llm backend initialized (provider={provider})")
+        logger.info(
+            f"any-llm backend initialized (provider={provider}, "
+            f"api_base={self.api_base or 'default'})"
+        )
 
     @property
     def name(self) -> str:

@@ -1,0 +1,67 @@
+name: Install Native E2E
+
+# Cross-platform smoke tests for safe ``headroom install`` paths. The goal here
+# is portable CLI coverage that runs on real runners without mutating OS service
+# managers or requiring Docker. Deeper lifecycle behavior remains covered by the
+# existing native installer wrapper tests and install unit tests.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "headroom/cli/install.py"
+      - "headroom/install/**"
+      - "tests/test_cli/test_install_cli.py"
+      - "tests/test_install/test_paths.py"
+      - ".github/actions/headroom-e2e-setup/**"
+      - ".github/workflows/install-native-e2e.yml"
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  install-native:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        # Windows is excluded today: upstream `esaxx-rs` (transitively from
+        # `tokenizers`) and `ort-sys` (onnxruntime via `fastembed`) link
+        # with conflicting MSVC C runtime libraries (/MT vs /MD), so the
+        # Rust extension cannot build for `win_amd64` until the upstream
+        # CRT conflict is resolved. Re-add `windows-latest` once the wheel
+        # builds cleanly there. Match init-native-e2e.yml so this workflow
+        # doesn't fail during setup before the install smoke tests run.
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup
+        uses: ./.github/actions/headroom-e2e-setup
+        with:
+          python-version: "3.11"
+
+      - name: Install pytest
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --retries 10 --timeout 60 pytest pytest-cov
+
+      - name: Run install native smoke tests
+        shell: bash
+        run: |
+          pytest tests/test_cli/test_install_cli.py tests/test_install/test_paths.py --cov=headroom --cov-report=xml:coverage-install-native.xml --cov-report=term-missing -q
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          file: ./coverage-install-native.xml
+          flags: install-native
+          name: install-native-${{ matrix.os }}
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false

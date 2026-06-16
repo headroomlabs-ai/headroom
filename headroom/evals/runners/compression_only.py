@@ -5,6 +5,7 @@ Used for:
 - CCR lossless round-trip verification
 - Information retention (probe facts survive compression)
 - Needle retention (specific values preserved in compressed output)
+- Tool schema compaction integrity (property names survive annotation stripping)
 """
 
 from __future__ import annotations
@@ -335,3 +336,275 @@ class CompressionOnlyRunner:
             )
 
         return cases[:n]
+
+    def generate_tool_schema_cases(self) -> list[dict[str, Any]]:
+        """Generate tool schema test cases for compaction integrity verification.
+
+        Each case exercises a different way a DROP_KEY can appear as a
+        property *name* inside a JSON Schema `properties` object.
+        The cases also include annotation keys at the schema level so we
+        can verify those ARE still stripped.
+        """
+        return [
+            {
+                "id": "schema_title_property",
+                "description": "property named 'title' must survive; schema-level title must be dropped",
+                "payload": {
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "eval_cells",
+                            "description": "Evaluate notebook cells.",
+                            "parameters": {
+                                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                                "title": "EvalCellsParameters",
+                                "type": "object",
+                                "properties": {
+                                    "cells": {
+                                        "type": "array",
+                                        "items": {
+                                            "type": "object",
+                                            "title": "CellItem",
+                                            "properties": {
+                                                "language": {"type": "string"},
+                                                "code": {"type": "string"},
+                                                "title": {"type": "string"},
+                                            },
+                                            "required": ["language", "code", "title"],
+                                        },
+                                    }
+                                },
+                                "required": ["cells"],
+                            },
+                        }
+                    ]
+                },
+                "must_preserve": ["title"],
+                "must_drop_schema_annotations": True,
+            },
+            {
+                "id": "schema_deprecated_property",
+                "description": "property named 'deprecated' must survive",
+                "payload": {
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "list_apis",
+                            "description": "List available APIs with their status.",
+                            "parameters": {
+                                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                                "title": "ListApisParameters",
+                                "type": "object",
+                                "properties": {
+                                    "deprecated": {
+                                        "type": "boolean",
+                                        "description": "Include deprecated APIs in results.",
+                                    },
+                                    "name": {"type": "string"},
+                                },
+                                "required": ["deprecated"],
+                            },
+                        }
+                    ]
+                },
+                "must_preserve": ["deprecated"],
+                "must_drop_schema_annotations": True,
+            },
+            {
+                "id": "schema_readonly_property",
+                "description": "property named 'readOnly' must survive",
+                "payload": {
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "update_field",
+                            "description": "Update a field in a record.",
+                            "parameters": {
+                                "title": "UpdateFieldParameters",
+                                "type": "object",
+                                "properties": {
+                                    "field_name": {"type": "string"},
+                                    "value": {"type": "string"},
+                                    "readOnly": {
+                                        "type": "boolean",
+                                        "description": "Whether the field is read-only.",
+                                    },
+                                },
+                                "required": ["field_name", "value", "readOnly"],
+                                "additionalProperties": False,
+                            },
+                        }
+                    ]
+                },
+                "must_preserve": ["readOnly"],
+                "must_drop_schema_annotations": True,
+            },
+            {
+                "id": "schema_multiple_collisions",
+                "description": "multiple DROP_KEY collisions in one schema",
+                "payload": {
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "create_field",
+                            "description": "Create a schema field descriptor.",
+                            "parameters": {
+                                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                                "title": "CreateFieldParameters",
+                                "type": "object",
+                                "properties": {
+                                    "title": {"type": "string"},
+                                    "deprecated": {"type": "boolean"},
+                                    "examples": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                    },
+                                    "readOnly": {"type": "boolean"},
+                                },
+                                "required": ["title", "deprecated", "examples", "readOnly"],
+                            },
+                        }
+                    ]
+                },
+                "must_preserve": ["title", "deprecated", "examples", "readOnly"],
+                "must_drop_schema_annotations": True,
+            },
+        ]
+
+    def evaluate_tool_schema_compaction(
+        self,
+        cases: list[dict[str, Any]] | None = None,
+    ) -> CompressionOnlyResult:
+        """Verify tool schema compaction preserves property names that collide with DROP_KEYS.
+
+        The compaction pass must never strip a key that appears as a property
+        *name* under a JSON Schema `properties` object, even if the same key
+        is in the annotation drop-list (title, deprecated, readOnly, examples, …).
+
+        Assertions per case:
+        - token count is smaller after compaction (annotations were stripped)
+        - every property name listed in `must_preserve` is present in the
+          compacted schema's `properties` dict
+        - every `required` array is a subset of the surviving `properties` keys
+          (no dangling required entry pointing at a stripped property)
+        - schema-level annotations ($schema, title at root level) ARE dropped
+        """
+        from headroom.proxy.handlers.openai import _compact_openai_responses_tools
+
+        if cases is None:
+            cases = self.generate_tool_schema_cases()
+
+        start_time = time.time()
+        passed = 0
+        failed = 0
+        total_original = 0
+        total_compressed = 0
+        details: list[dict[str, Any]] = []
+        errors: list[str] = []
+
+        for case in cases:
+            case_id = case["id"]
+            payload = case["payload"]
+            must_preserve: list[str] = case.get("must_preserve", [])
+            must_drop_schema_annotations: bool = case.get("must_drop_schema_annotations", False)
+
+            original_bytes = len(json.dumps(payload).encode())
+            total_original += original_bytes
+
+            try:
+                compacted, modified, before_bytes, after_bytes = _compact_openai_responses_tools(
+                    payload
+                )
+                total_compressed += after_bytes if modified else original_bytes
+
+                case_errors: list[str] = []
+
+                if not modified:
+                    case_errors.append(
+                        "compaction reported no modification (annotations not stripped)"
+                    )
+
+                for tool in compacted.get("tools", []):
+                    params = tool.get("parameters", {})
+                    _check_properties_recursive(params, must_preserve, tool["name"], case_errors)
+
+                if must_drop_schema_annotations:
+                    for tool in compacted.get("tools", []):
+                        params = tool.get("parameters", {})
+                        for ann_key in ("$schema", "title"):
+                            if ann_key in params:
+                                case_errors.append(
+                                    f"tool '{tool['name']}': schema annotation '{ann_key}' "
+                                    f"was not stripped from parameters root"
+                                )
+
+                is_pass = len(case_errors) == 0
+                if is_pass:
+                    passed += 1
+                else:
+                    failed += 1
+                    errors.extend(f"[{case_id}] {e}" for e in case_errors)
+
+                details.append(
+                    {
+                        "id": case_id,
+                        "passed": is_pass,
+                        "original_bytes": before_bytes,
+                        "compacted_bytes": after_bytes,
+                        "compression_ratio": 1 - (after_bytes / before_bytes)
+                        if before_bytes > 0
+                        else 0,
+                        "errors": case_errors,
+                    }
+                )
+
+            except Exception as exc:
+                failed += 1
+                total_compressed += original_bytes
+                errors.append(f"[{case_id}] unexpected exception: {exc}")
+                details.append({"id": case_id, "passed": False, "error": str(exc)})
+
+        total_cases = passed + failed
+        ratios = [d.get("compression_ratio", 0) for d in details if "compression_ratio" in d]
+
+        return CompressionOnlyResult(
+            benchmark="tool_schema_compaction",
+            total_cases=total_cases,
+            passed_cases=passed,
+            failed_cases=failed,
+            accuracy_rate=passed / total_cases if total_cases > 0 else 0.0,
+            avg_compression_ratio=sum(ratios) / len(ratios) if ratios else 0.0,
+            total_original_tokens=total_original // 4,
+            total_compressed_tokens=total_compressed // 4,
+            total_tokens_saved=(total_original - total_compressed) // 4,
+            duration_seconds=time.time() - start_time,
+            details=details,
+            errors=errors,
+        )
+
+
+def _check_properties_recursive(
+    schema: Any,
+    must_preserve: list[str],
+    tool_name: str,
+    errors: list[str],
+) -> None:
+    """Walk a JSON Schema object and assert that must_preserve keys survive inside `properties`."""
+    if not isinstance(schema, dict):
+        return
+
+    properties = schema.get("properties")
+    if isinstance(properties, dict):
+        required = schema.get("required", [])
+        for key in must_preserve:
+            if key in required and key not in properties:
+                errors.append(
+                    f"tool '{tool_name}': property '{key}' is in `required` but was "
+                    f"stripped from `properties` by compaction"
+                )
+        for sub_schema in properties.values():
+            _check_properties_recursive(sub_schema, must_preserve, tool_name, errors)
+
+    items = schema.get("items")
+    if isinstance(items, dict):
+        _check_properties_recursive(items, must_preserve, tool_name, errors)

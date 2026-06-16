@@ -397,9 +397,9 @@ def _component_tokenizations(component: str) -> list[list[str]]:
 
     add([component])
 
-    for separator in ("-", ".", "_", None):
+    for separator in (" ", "-", ".", "_", None):
         if separator is None:
-            tokens = [token for token in re.split(r"[-._]", component) if token]
+            tokens = [token for token in re.split(r"[-.\s_]", component) if token]
         else:
             tokens = [token for token in component.split(separator) if token]
         add(tokens)
@@ -407,9 +407,9 @@ def _component_tokenizations(component: str) -> list[list[str]]:
     if component.startswith(".") and len(component) > 1:
         hidden_component = component[1:]
         add(["", hidden_component])
-        for separator in ("-", ".", "_", None):
+        for separator in (" ", "-", ".", "_", None):
             if separator is None:
-                tokens = [token for token in re.split(r"[-._]", hidden_component) if token]
+                tokens = [token for token in re.split(r"[-.\s_]", hidden_component) if token]
             else:
                 tokens = [token for token in hidden_component.split(separator) if token]
             add(["", *tokens])
