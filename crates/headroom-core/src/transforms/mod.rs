@@ -48,7 +48,7 @@ pub use log_compressor::{
     LogCompressionResult, LogCompressor, LogCompressorConfig, LogCompressorStats, LogFormat,
     LogLevel, LogLine,
 };
-pub use magika_detector::{magika_detect, map_magika_label, MagikaDetectorError};
+pub use magika_detector::{magika_detect, map_magika_label, warmup as warmup_magika_session, MagikaDetectorError};
 pub use pipeline::{
     CompressionContext, CompressionPipeline, CompressionPipelineBuilder, DiffNoise, DiffOffload,
     JsonMinifier, JsonOffload, LogOffload, LogTemplate, OffloadOutput, OffloadTransform,

@@ -946,6 +946,23 @@ fn detect_content_type(py: Python<'_>, content: &str) -> PyDetectionResult {
     }
 }
 
+/// Pre-warm the magika ONNX session in a background OS thread.
+///
+/// Call once at proxy startup (before any request arrives). The init thread
+/// runs the 5-second timeout window inside `magika_detector::session()` so
+/// the `OnceLock` is already populated — either with `Ok(session)` or with
+/// `Err(timeout)` — by the time the first `detect_content_type` call lands.
+/// Either outcome is correct: on success magika classification is available;
+/// on timeout the detection chain falls through to unidiff → PlainText with
+/// no user-visible latency.
+///
+/// Releases the GIL immediately; the warmup thread runs independently.
+/// Safe to call from any platform including Windows.
+#[pyfunction]
+fn warmup_magika(py: Python<'_>) {
+    py.allow_threads(headroom_core::transforms::warmup_magika_session);
+}
+
 /// Quick check: is `content` a JSON array of dictionaries (the format
 /// `SmartCrusher` natively handles)?
 #[pyfunction]
@@ -1604,6 +1621,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(is_html_tag, m)?)?;
     m.add_function(wrap_pyfunction!(known_html_tag_names, m)?)?;
     m.add_function(wrap_pyfunction!(detect_content_type, m)?)?;
+    m.add_function(wrap_pyfunction!(warmup_magika, m)?)?;
     m.add_function(wrap_pyfunction!(is_json_array_of_dicts, m)?)?;
     m.add_function(wrap_pyfunction!(score_line, m)?)?;
     m.add_function(wrap_pyfunction!(content_has_error_indicators, m)?)?;

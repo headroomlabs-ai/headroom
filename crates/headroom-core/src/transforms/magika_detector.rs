@@ -95,6 +95,24 @@ fn magika_init_timeout() -> Duration {
     Duration::from_secs(secs)
 }
 
+/// Trigger ONNX session init in a background thread without blocking the caller.
+///
+/// Call once at proxy startup. By the time the first request arrives the
+/// `OnceLock` will already hold either `Ok(session)` (init succeeded) or
+/// `Err(timeout)` (init hung past the deadline). Either way `magika_detect`
+/// returns instantly instead of blocking for up to `MAGIKA_INIT_TIMEOUT_SECS`.
+///
+/// Safe to call multiple times — subsequent calls are no-ops because
+/// `OnceLock::get_or_init` only runs the closure once.
+pub fn warmup() {
+    std::thread::Builder::new()
+        .name("magika-warmup".into())
+        .spawn(|| {
+            let _ = session();
+        })
+        .ok(); // If spawn fails we just skip warmup; session() will init lazily.
+}
+
 fn session() -> &'static Mutex<Result<Session, String>> {
     MAGIKA_SESSION.get_or_init(|| {
         let timeout = magika_init_timeout();
