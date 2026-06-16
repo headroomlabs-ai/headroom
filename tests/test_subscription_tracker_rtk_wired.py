@@ -580,6 +580,7 @@ def test_rtk_subprocess_failure_logs_structured_warning(
 
     payload = _helpers._read_rtk_lifetime_stats()
     assert payload is not None
+    assert payload["scope"] == "global"
     assert payload["tokens_saved"] == 0
 
     # Concatenate all warning call args so the failure message shows what

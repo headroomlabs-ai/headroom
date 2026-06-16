@@ -63,4 +63,5 @@ jobs:
           file: ./coverage-install-native.xml
           flags: install-native
           name: install-native-${{ matrix.os }}
+          token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: false

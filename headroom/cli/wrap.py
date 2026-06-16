@@ -648,6 +648,41 @@ def _remove_headroom_installed_serena_mcp(registrar: Any) -> str:
     return "failed"
 
 
+def _disable_serena_mcp(registrar: Any, *, verbose: bool = False) -> None:
+    """Make ``--no-serena`` actively disable Serena, not merely skip adding it.
+
+    Serena is registered by default, so a prior ``headroom wrap`` persists a
+    ``serena`` entry into the agent's MCP config; the agent then keeps
+    launching Serena on startup. Just *skipping* registration on a later
+    ``--no-serena`` run leaves that stale entry in place — so the flag has to
+    remove the entry Headroom installed. A user-managed Serena (absent from
+    our ledger) is reported but left untouched.
+    """
+    if not registrar.detect():
+        if verbose:
+            click.echo(f"  Serena MCP: {registrar.display_name} not detected — skipping")
+        return
+
+    if registrar.get_server("serena") is None:
+        if verbose:
+            click.echo("  Skipping Serena MCP (--no-serena)")
+        return
+
+    status = _remove_headroom_installed_serena_mcp(registrar)
+    if status == "removed":
+        click.echo("  Removed previously-installed Serena MCP (--no-serena)")
+        click.echo(f"    restart {registrar.display_name} if it was already running")
+    elif status == "not_headroom_owned":
+        click.echo(
+            "  Serena MCP is present but user-managed — leaving it in place "
+            "(--no-serena only removes entries Headroom installed)"
+        )
+    else:  # "failed"
+        click.echo(
+            "  Serena MCP: removal failed — remove the 'serena' entry from your MCP config manually"
+        )
+
+
 _CBM_MCP_SERVER_NAME = "codebase-memory-mcp"
 
 
@@ -908,6 +943,69 @@ def _strip_codex_headroom_blocks(content: str, *, remove_mcp: bool = False) -> s
     return content.lstrip("\n").rstrip() + "\n" if content.strip() else ""
 
 
+# Top-level bare keys we redirect to headroom values when the user already
+# has them set.  Match the entire line (including any trailing comment) so
+# we can rewrite it cleanly.  Bare keys must precede any [section] in TOML,
+# so a `^` anchor combined with `^[ \t]*key` is sufficient — table lines
+# start with `[`, not with the key name.
+_REDIRECTABLE_KEYS: tuple[str, ...] = ("model_provider", "openai_base_url")
+
+
+def _redirect_existing_top_level_keys(content: str, port: int) -> str:
+    """Rewrite user-defined top-level keys so wrap does not create duplicates.
+
+    Codex's ``config.toml`` rejects duplicate top-level keys (TOML spec),
+    which would break ``codex`` startup after ``headroom wrap codex`` runs
+    on a config that already declares its own ``model_provider`` or
+    ``openai_base_url``.
+
+    For each redirectable key, if the user's line already sets it, replace
+    the value with the headroom one and append ``# was: <original-value>``
+    so the user can still see and recover their previous setting.  The
+    snapshot taken in ``_snapshot_codex_config_if_unwrapped`` ensures the
+    pre-wrap file can be restored byte-for-byte on ``headroom unwrap
+    codex``.
+
+    Returns the modified content.  If no redirectable keys are present,
+    the content is returned unchanged and the caller should fall back to
+    prepending the marker-delimited top-level block (current behavior).
+    """
+    import re  # local import to match the module's existing convention
+
+    if not content.strip():
+        return content
+
+    def _make_replacer(current_key: str, current_port: int) -> Callable[[re.Match[str]], str]:
+        def _replace(match: re.Match[str]) -> str:
+            original_value = match.group("value")
+            if current_key == "model_provider":
+                new_value = "headroom"
+            else:  # openai_base_url
+                new_value = f"http://127.0.0.1:{current_port}/v1"
+            if original_value == new_value:
+                return match.group(0)
+            # Keep the user's original value in a trailing comment so they
+            # can see what was changed.  This is metadata, not a TOML
+            # duplicate.
+            return f'{current_key} = "{new_value}"  # was: {original_value}'
+
+        return _replace
+
+    redirected = content
+    for key in _REDIRECTABLE_KEYS:
+        pattern = re.compile(rf'(?m)^[ \t]*{re.escape(key)}[ \t]*=[ \t]*"(?P<value>[^"\n]*)"[^\n]*')
+        redirected = pattern.sub(_make_replacer(key, port), redirected, count=1)
+    return redirected
+
+
+def _has_redirectable_top_level_key(content: str, key: str) -> bool:
+    """Return True if ``content`` declares ``key = "..."`` as a top-level key."""
+    import re  # local import to match the module's existing convention
+
+    pattern = re.compile(rf'(?m)^[ \t]*{key}[ \t]*=[ \t]*"[^"\n]*"')
+    return pattern.search(content) is not None
+
+
 def _snapshot_codex_config_if_unwrapped(config_file: Path, backup_file: Path) -> None:
     """Snapshot ``config.toml`` to ``backup_file`` before the first injection.
 
@@ -1011,7 +1109,7 @@ def _apply_project_header_env(env: dict[str, str]) -> None:
 def _inject_codex_provider_config(port: int) -> None:
     """Inject a Headroom model provider into Codex's config.toml.
 
-    Two keys are written in the top-level block:
+    Two keys need to be in effect for the proxy to route all traffic:
 
     * ``model_provider = "headroom"`` — selects the custom provider for
       API-key mode traffic.
@@ -1021,6 +1119,14 @@ def _inject_codex_provider_config(port: int) -> None:
       and routes through the built-in ``openai`` provider regardless of
       ``model_provider``, so without this override it bypasses the proxy and
       hits ``https://chatgpt.com/backend-api/codex`` directly.
+
+    If the user has not already declared these top-level keys, they are
+    added in a marker-delimited block at the top of the file.  If the
+    user *has* declared one or both, the existing lines are rewritten
+    in place to the headroom values (with the previous value kept in a
+    ``# was: …`` trailing comment) so the resulting file stays TOML-valid
+    — TOML rejects duplicate top-level keys, which would break
+    ``codex`` startup.
 
     Safe to call multiple times — the injected block is fully replaced on
     each call, so re-running with a different ``port`` updates the config.
@@ -1036,13 +1142,10 @@ def _inject_codex_provider_config(port: int) -> None:
     # TOML keys must precede any [section]) and a provider-table block (at
     # the end).  Each block has its own matching begin/end marker pair so
     # stripping them is unambiguous and never consumes user content that
-    # happens to sit between the two.
-    top_level_block = (
-        f"{_CODEX_TOP_LEVEL_MARKER}\n"
-        f'model_provider = "headroom"\n'
-        f'openai_base_url = "http://127.0.0.1:{port}/v1"\n'
-        f"{_CODEX_END_MARKER}\n"
-    )
+    # happens to sit between the two.  The top-level block is built
+    # dynamically below — it contains only keys the user has not already
+    # declared (we rewrite the existing ones in place to avoid TOML
+    # duplicate-key errors).
     # Emit requires_openai_auth only for ChatGPT-OAuth users (restores the
     # account menu); omitting it for API-key users avoids forcing an OAuth
     # login (#406).
@@ -1064,6 +1167,29 @@ def _inject_codex_provider_config(port: int) -> None:
         f"{_CODEX_END_MARKER}\n"
     )
 
+    # The two redirectable keys and their headroom target values.
+    _REDIRECT_TARGETS = {
+        "model_provider": "headroom",
+        "openai_base_url": f"http://127.0.0.1:{port}/v1",
+    }
+
+    def _build_top_level_block(user_content: str) -> str:
+        """Build a marker-delimited block containing only the keys the user
+        has not already declared at the top level.  For keys the user
+        *has* declared, the in-place rewrite below handles them.
+        """
+        lines = [_CODEX_TOP_LEVEL_MARKER]
+        for key, value in _REDIRECT_TARGETS.items():
+            if _has_redirectable_top_level_key(user_content, key):
+                continue
+            lines.append(f'{key} = "{value}"')
+        if len(lines) == 1:
+            # User already declared every redirectable key — no marker
+            # block needed (it would be empty).
+            return ""
+        lines.append(_CODEX_END_MARKER)
+        return "\n".join(lines) + "\n"
+
     try:
         config_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1077,16 +1203,41 @@ def _inject_codex_provider_config(port: int) -> None:
             # the operation is idempotent and supports port changes.
             content = _strip_codex_headroom_blocks(content)
 
-            # Place the top-level key block at the very beginning of the file
-            # (bare TOML keys must precede any [section]) and the provider
-            # table at the end.  User content, if any, sits between them.
+            # Bare top-level keys must precede any [section] in TOML, and
+            # TOML rejects duplicate top-level keys.  Rewrite any existing
+            # top-level ``model_provider`` / ``openai_base_url`` in place
+            # to the headroom values; for keys the user has not declared,
+            # add them in a marker-delimited block at the top of the
+            # file.  The original values are kept in a trailing ``# was:
+            # <value>`` comment, and the snapshot mechanism guarantees
+            # byte-for-byte restoration on unwrap.
             user_content = content.strip()
             if user_content:
-                content = top_level_block + "\n" + user_content + "\n\n" + provider_section
+                redirected = _redirect_existing_top_level_keys(user_content, port)
+                top_block = _build_top_level_block(user_content)
+                if top_block:
+                    content = top_block + "\n" + redirected + "\n\n" + provider_section
+                else:
+                    content = redirected + "\n\n" + provider_section
             else:
-                content = top_level_block + "\n" + provider_section
+                # Empty user content — no keys to rewrite in place; emit
+                # the full marker block with both redirectable keys.
+                content = (
+                    f"{_CODEX_TOP_LEVEL_MARKER}\n"
+                    f'model_provider = "{_REDIRECT_TARGETS["model_provider"]}"\n'
+                    f'openai_base_url = "{_REDIRECT_TARGETS["openai_base_url"]}"\n'
+                    f"{_CODEX_END_MARKER}\n"
+                    f"\n{provider_section}"
+                )
         else:
-            content = top_level_block + "\n" + provider_section
+            # No config file yet — same as the empty-content path.
+            content = (
+                f"{_CODEX_TOP_LEVEL_MARKER}\n"
+                f'model_provider = "{_REDIRECT_TARGETS["model_provider"]}"\n'
+                f'openai_base_url = "{_REDIRECT_TARGETS["openai_base_url"]}"\n'
+                f"{_CODEX_END_MARKER}\n"
+                f"\n{provider_section}"
+            )
 
         config_file.write_text(content)
         click.echo(f"  Codex config: injected Headroom provider (WS + HTTP) into {config_file}")
@@ -2769,8 +2920,10 @@ def claude(
             from headroom.mcp_registry import ClaudeRegistrar
 
             _setup_serena_mcp(ClaudeRegistrar(), context="claude-code", verbose=verbose)
-        elif verbose:
-            click.echo("  Skipping Serena MCP (--no-serena)")
+        else:
+            from headroom.mcp_registry import ClaudeRegistrar
+
+            _disable_serena_mcp(ClaudeRegistrar(), verbose=verbose)
 
         if code_graph:
             _setup_code_graph(verbose=verbose)
@@ -3264,8 +3417,10 @@ def codex(
         from headroom.mcp_registry import CodexRegistrar
 
         _setup_serena_mcp(CodexRegistrar(), context="codex", verbose=verbose, force=True)
-    elif verbose:
-        click.echo("  Skipping Serena MCP (--no-serena)")
+    else:
+        from headroom.mcp_registry import CodexRegistrar
+
+        _disable_serena_mcp(CodexRegistrar(), verbose=verbose)
 
     # Setup memory MCP server for Codex (native tool integration)
     if memory:
@@ -4396,6 +4551,21 @@ def unwrap_codex(port: int, no_stop_proxy: bool) -> None:
                 "headroom unwrap codex."
             )
         click.echo(f"  Nothing to undo: {config_file} has no Headroom wrap markers.")
+
+    # Serena is written as its own [mcp_servers.serena] table with Headroom
+    # markers, separate from the provider block handled above — a "cleaned"
+    # restore leaves it behind. Remove it explicitly (only if we installed it),
+    # mirroring unwrap_claude. Runs after the restore so a backup-restore that
+    # already dropped Serena makes this a safe no-op.
+    from headroom.mcp_registry import CodexRegistrar
+
+    codex_registrar = CodexRegistrar()
+    if codex_registrar.detect():
+        serena_status = _remove_headroom_installed_serena_mcp(codex_registrar)
+        if serena_status == "removed":
+            click.echo("  Removed Headroom-installed Serena MCP server from Codex.")
+        elif serena_status == "failed":
+            click.echo("  Serena MCP server matched Headroom ledger but could not be removed.")
 
     click.echo()
     click.echo("✓ Codex is no longer routed through the Headroom proxy.")

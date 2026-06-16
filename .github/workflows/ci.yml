@@ -191,6 +191,11 @@ jobs:
           cp "${SITE}/headroom/"_core*.so headroom/
           python -c "from headroom._core import DiffCompressor; print('headroom._core OK')"
 
+      # Coverage upload: without this, codecov only receives reports from
+      # the two native-e2e workflows (3 CLI test files total), so head
+      # coverage reads ~6% and codecov/patch fails for ANY diff not
+      # exercised by those files — a false negative on every PR. The main
+      # suite runs here; its coverage must be what codecov sees.
       - name: Run test shard ${{ matrix.shard }}/4
         run: |
           pytest tests scripts/tests \
@@ -206,7 +211,12 @@ jobs:
           files: coverage-${{ matrix.shard }}.xml
           flags: python
           name: python-shard-${{ matrix.shard }}
-          fail_ci_if_error: true
+          # Token is sent so uploads authenticate once the repo is activated on
+          # Codecov. Until then Codecov may 404 ("Repository not found"); either
+          # way, coverage upload is reporting-only and must never fail a build
+          # whose tests pass — so this stays non-blocking.
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
 
   test-extras:
     needs: [changes, build-wheel]

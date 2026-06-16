@@ -5,6 +5,7 @@ import shutil
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -31,6 +32,7 @@ class _ToinStub:
 @pytest.fixture(autouse=True)
 def _reset_rtk_stats_cache(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    monkeypatch.delenv("HEADROOM_RTK_GAIN_SCOPE", raising=False)
     monkeypatch.setenv("HEADROOM_REQUIRE_RUST_CORE", "false")
     proxy_helpers._rtk_stats_cache.update(
         {"expires_at": 0.0, "has_value": False, "tool": None, "value": None}
@@ -72,8 +74,9 @@ def test_get_rtk_stats_memoizes_subprocess_calls(monkeypatch: pytest.MonkeyPatch
         },
     ]
 
-    def _fake_run(*args, **kwargs):
+    def _fake_run(args, **kwargs):
         calls["run"] += 1
+        assert args == ["/usr/bin/rtk", "gain", "--format", "json"]
         summary = totals[min(calls["run"] - 1, len(totals) - 1)]
         return SimpleNamespace(
             returncode=0,
@@ -91,6 +94,7 @@ def test_get_rtk_stats_memoizes_subprocess_calls(monkeypatch: pytest.MonkeyPatch
     assert first["tool"] == "rtk"
     assert first["label"] == "RTK"
     assert first["installed"] is True
+    assert first["scope"] == "global"
     assert first["total_commands"] == 0
     assert first["input_tokens"] == 0
     assert first["output_tokens"] == 0
@@ -141,6 +145,64 @@ def test_get_rtk_stats_memoizes_subprocess_calls(monkeypatch: pytest.MonkeyPatch
         "avg_time_ms": 150.0,
     }
     assert calls["run"] == 2
+
+
+def test_get_rtk_stats_can_read_project_scoped_gain(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = {"run": 0}
+
+    def _fake_run(args, **kwargs):
+        calls["run"] += 1
+        assert args == ["/usr/bin/rtk", "gain", "--project", "--format", "json"]
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "summary": {
+                        "total_commands": 1,
+                        "total_input": 100,
+                        "total_output": 75,
+                        "total_saved": 25,
+                    }
+                }
+            ),
+        )
+
+    monkeypatch.setenv("HEADROOM_RTK_GAIN_SCOPE", "project")
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/rtk")
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+
+    payload = proxy_helpers._read_rtk_lifetime_stats()
+
+    assert payload is not None
+    assert payload["scope"] == "project"
+    assert payload["total_commands"] == 1
+    assert payload["tokens_saved"] == 25
+    assert calls["run"] == 1
+
+
+def test_get_rtk_stats_invalid_scope_defaults_to_global(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = {"run": 0}
+
+    def _fake_run(args, **kwargs):
+        calls["run"] += 1
+        assert args == ["/usr/bin/rtk", "gain", "--format", "json"]
+        return SimpleNamespace(returncode=0, stdout=json.dumps({"summary": {}}))
+
+    mock_warning = MagicMock()
+    monkeypatch.setenv("HEADROOM_RTK_GAIN_SCOPE", "workspace")
+    monkeypatch.setattr(proxy_helpers.logger, "warning", mock_warning)
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/rtk")
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+
+    payload = proxy_helpers._read_rtk_lifetime_stats()
+
+    assert payload is not None
+    assert payload["scope"] == "global"
+    assert calls["run"] == 1
+    warning_calls = " ".join(str(call) for call in mock_warning.call_args_list)
+    assert "event=rtk_gain_scope_invalid" in warning_calls
 
 
 def test_get_context_tool_stats_reads_lean_ctx_gain(monkeypatch: pytest.MonkeyPatch) -> None:
