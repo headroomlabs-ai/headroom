@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from headroom import paths as _paths
+from headroom.providers.litellm_models import resolve_litellm_model_with_probe
 
 logger = logging.getLogger(__name__)
 
@@ -155,34 +156,14 @@ def _resolve_litellm_model(model: str) -> str:
     if litellm is None:
         return model
 
-    try:
-        litellm.cost_per_token(model=model, prompt_tokens=1, completion_tokens=0)
-        return model
-    except Exception:
-        pass
+    def supports_model(candidate: str) -> bool:
+        try:
+            litellm.cost_per_token(model=candidate, prompt_tokens=1, completion_tokens=0)
+            return True
+        except Exception:
+            return False
 
-    prefixes = {
-        "claude-": "anthropic/",
-        "gpt-": "openai/",
-        "o1-": "openai/",
-        "o3-": "openai/",
-        "o4-": "openai/",
-        "gemini-": "google/",
-    }
-    for pattern, prefix in prefixes.items():
-        if model.startswith(pattern):
-            candidate = f"{prefix}{model}"
-            try:
-                litellm.cost_per_token(
-                    model=candidate,
-                    prompt_tokens=1,
-                    completion_tokens=0,
-                )
-                return candidate
-            except Exception:
-                break
-
-    return model
+    return resolve_litellm_model_with_probe(model, supports_model)
 
 
 def _estimate_compression_savings_usd(model: str, tokens_saved: int) -> float:

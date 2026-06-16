@@ -91,6 +91,7 @@ from headroom.observability import (
     shutdown_otel_metrics,
 )
 from headroom.pipeline import PipelineExtensionManager, PipelineStage
+from headroom.providers.ccr import get_ccr_adapter
 from headroom.providers.proxy_routes import register_provider_routes
 from headroom.providers.registry import (
     DEFAULT_ANTHROPIC_API_URL,
@@ -108,7 +109,6 @@ from headroom.providers.registry import (
 # Extracted modules (re-exported for backward compatibility)
 # =============================================================================
 from headroom.proxy.cost import (
-    _CACHE_ECONOMICS,  # noqa: F401
     CostTracker,  # noqa: F401
     _summarize_transforms,  # noqa: F401
     build_prefix_cache_stats,  # noqa: F401
@@ -3406,27 +3406,12 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     ),
                 }
 
-        # Format tool result for provider
         tool_call_id = tool_call.get("id", "")
         result_content = json.dumps(retrieval_data, indent=2)
-
-        if provider == "anthropic":
-            tool_result = {
-                "type": "tool_result",
-                "tool_use_id": tool_call_id,
-                "content": result_content,
-            }
-        elif provider == "openai":
-            tool_result = {
-                "role": "tool",
-                "tool_call_id": tool_call_id,
-                "content": result_content,
-            }
-        else:
-            tool_result = {
-                "tool_call_id": tool_call_id,
-                "content": result_content,
-            }
+        tool_result = get_ccr_adapter(provider).retrieval_tool_result(
+            tool_call_id,
+            result_content,
+        )
 
         return {
             "tool_result": tool_result,

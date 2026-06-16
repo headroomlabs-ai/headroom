@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import shutil
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 
 import click
 
@@ -76,24 +77,54 @@ def resolve_targets(
                 f"unsupported targets: {unsupported_list}"
             )
 
-    if provider_mode == ProviderSelectionMode.ALL.value:
-        return [target.value for target in valid_targets]
+    context = TargetResolutionContext(
+        scope=scope,
+        valid_targets=valid_targets,
+        valid_values=valid,
+        requested=requested,
+    )
+    resolver = _TARGET_RESOLVERS.get(provider_mode, _resolve_manual_targets)
+    return resolver(context)
 
-    if provider_mode == ProviderSelectionMode.AUTO.value:
-        detected = [target for target in detect_targets() if target in valid]
-        return detected or [
-            ToolTarget.CLAUDE.value,
-            ToolTarget.CODEX.value,
-            *([] if scope == ConfigScope.PROVIDER.value else [ToolTarget.COPILOT.value]),
-        ]
 
+@dataclass(frozen=True)
+class TargetResolutionContext:
+    """Inputs shared by install target resolution strategies."""
+
+    scope: str
+    valid_targets: list[ToolTarget]
+    valid_values: set[str]
+    requested: list[str]
+
+
+def _resolve_all_targets(context: TargetResolutionContext) -> list[str]:
+    return [target.value for target in context.valid_targets]
+
+
+def _resolve_auto_targets(context: TargetResolutionContext) -> list[str]:
+    detected = [target for target in detect_targets() if target in context.valid_values]
+    return detected or [
+        ToolTarget.CLAUDE.value,
+        ToolTarget.CODEX.value,
+        *([] if context.scope == ConfigScope.PROVIDER.value else [ToolTarget.COPILOT.value]),
+    ]
+
+
+def _resolve_manual_targets(context: TargetResolutionContext) -> list[str]:
     normalized = []
     seen: set[str] = set()
-    for value in requested:
-        if value in valid and value not in seen:
+    for value in context.requested:
+        if value in context.valid_values and value not in seen:
             seen.add(value)
             normalized.append(value)
     return normalized
+
+
+_TARGET_RESOLVERS: dict[str, Callable[[TargetResolutionContext], list[str]]] = {
+    ProviderSelectionMode.ALL.value: _resolve_all_targets,
+    ProviderSelectionMode.AUTO.value: _resolve_auto_targets,
+    ProviderSelectionMode.MANUAL.value: _resolve_manual_targets,
+}
 
 
 def build_tool_envs(port: int, backend: str, targets: list[str]) -> dict[str, dict[str, str]]:

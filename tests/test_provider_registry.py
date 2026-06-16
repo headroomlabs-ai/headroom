@@ -7,6 +7,7 @@ from headroom.providers.registry import (
     build_proxy_provider_runtime,
     create_proxy_backend,
     format_backend_status,
+    format_backend_usage_section,
     resolve_api_overrides,
     resolve_api_targets,
 )
@@ -91,6 +92,15 @@ def test_format_backend_status_for_anthropic_direct() -> None:
         )
         == "ANTHROPIC (direct API)"
     )
+
+
+def test_format_backend_usage_section_for_direct_and_anyllm() -> None:
+    assert format_backend_usage_section(backend="anthropic", host="127.0.0.1", port=8787) == ""
+
+    anyllm = format_backend_usage_section(backend="anyllm", host="127.0.0.1", port=8787)
+
+    assert "Set credentials for your provider" in anyllm
+    assert "any-llm/providers" in anyllm
 
 
 def test_proxy_provider_runtime_routes_model_metadata_and_passthrough() -> None:

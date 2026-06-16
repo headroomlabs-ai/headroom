@@ -7,11 +7,34 @@ import os
 import urllib.error
 import urllib.request
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 
 import click
 
 from headroom.proxy.project_context import with_project_prefix
+
+COPILOT_OPENAI_PROVIDER_TYPE = "openai"
+COPILOT_ANTHROPIC_PROVIDER_TYPE = "anthropic"
+COPILOT_DEFAULT_BACKEND = "anthropic"
+COPILOT_PROVIDER_API_KEY_ENV = "COPILOT_PROVIDER_API_KEY"
+COPILOT_PROVIDER_BEARER_TOKEN_ENV = "COPILOT_PROVIDER_BEARER_TOKEN"
+COPILOT_TRANSLATED_BACKEND_SUBSCRIPTION_ERROR = (
+    "--subscription routes to GitHub Copilot's hosted API and cannot be combined "
+    "with translated backends such as anyllm or litellm-*."
+)
+COPILOT_ANTHROPIC_SUBSCRIPTION_ERROR = (
+    "--subscription uses Copilot's OpenAI-compatible hosted API path; "
+    "do not combine it with --provider-type anthropic."
+)
+
+
+@dataclass(frozen=True)
+class SubscriptionProviderResolution:
+    """Provider-slice result for Copilot subscription compatibility."""
+
+    provider_type: str
+    error: str | None = None
 
 
 def resolve_provider_type(
@@ -22,8 +45,66 @@ def resolve_provider_type(
         return provider_type
 
     env = environ or os.environ
-    effective_backend = backend or env.get("HEADROOM_BACKEND") or "anthropic"
-    return "anthropic" if effective_backend == "anthropic" else "openai"
+    effective_backend = backend or env.get("HEADROOM_BACKEND") or COPILOT_DEFAULT_BACKEND
+    return (
+        COPILOT_ANTHROPIC_PROVIDER_TYPE
+        if effective_backend == COPILOT_DEFAULT_BACKEND
+        else COPILOT_OPENAI_PROVIDER_TYPE
+    )
+
+
+def has_explicit_provider_auth(env: Mapping[str, str]) -> bool:
+    """Return True when Copilot BYOK auth is explicitly configured."""
+    return bool(env.get(COPILOT_PROVIDER_API_KEY_ENV) or env.get(COPILOT_PROVIDER_BEARER_TOKEN_ENV))
+
+
+def backend_supports_copilot_hosted_api(backend: str | None) -> bool:
+    """Return True when the proxy backend can route Copilot hosted API traffic."""
+    return backend in (None, "", COPILOT_DEFAULT_BACKEND)
+
+
+def provider_type_supports_copilot_hosted_api(provider_type: str) -> bool:
+    """Return True when the selected Copilot provider type can use hosted API auth."""
+    return provider_type != COPILOT_ANTHROPIC_PROVIDER_TYPE
+
+
+def should_use_oauth(
+    *,
+    backend: str | None,
+    provider_type: str,
+    env: Mapping[str, str],
+    has_oauth_auth: bool,
+    force_subscription: bool = False,
+) -> bool:
+    """Prefer Copilot OAuth when the provider, backend, and auth mode support it."""
+    if force_subscription:
+        return True
+    if has_explicit_provider_auth(env):
+        return False
+    if not provider_type_supports_copilot_hosted_api(provider_type):
+        return False
+    if not backend_supports_copilot_hosted_api(backend):
+        return False
+    return has_oauth_auth
+
+
+def resolve_subscription_provider_type(
+    *,
+    backend: str | None,
+    provider_type: str,
+) -> SubscriptionProviderResolution:
+    """Resolve the Copilot provider type required for subscription routing."""
+    if not backend_supports_copilot_hosted_api(backend):
+        return SubscriptionProviderResolution(
+            provider_type=provider_type,
+            error=COPILOT_TRANSLATED_BACKEND_SUBSCRIPTION_ERROR,
+        )
+    if not provider_type_supports_copilot_hosted_api(provider_type):
+        return SubscriptionProviderResolution(
+            provider_type=provider_type,
+            error=COPILOT_ANTHROPIC_SUBSCRIPTION_ERROR,
+        )
+    return SubscriptionProviderResolution(provider_type=COPILOT_OPENAI_PROVIDER_TYPE)
 
 
 def query_proxy_config(port: int) -> dict[str, Any] | None:
@@ -106,7 +187,11 @@ def default_wire_api_for_model(model: str | None) -> str:
 
 def provider_key_source(provider_type: str) -> str:
     """Return the preferred provider key variable for the selected provider type."""
-    return "ANTHROPIC_API_KEY" if provider_type == "anthropic" else "OPENAI_API_KEY"
+    return (
+        "ANTHROPIC_API_KEY"
+        if provider_type == COPILOT_ANTHROPIC_PROVIDER_TYPE
+        else "OPENAI_API_KEY"
+    )
 
 
 def build_launch_env(
@@ -131,16 +216,16 @@ def build_launch_env(
     env["COPILOT_PROVIDER_TYPE"] = provider_type
     env.pop("COPILOT_PROVIDER_WIRE_API", None)
 
-    if not env.get("COPILOT_PROVIDER_API_KEY"):
+    if not env.get(COPILOT_PROVIDER_API_KEY_ENV):
         key = env.get(provider_key_source(provider_type), "")
         if key:
-            env["COPILOT_PROVIDER_API_KEY"] = key
+            env[COPILOT_PROVIDER_API_KEY_ENV] = key
 
-    if provider_type == "anthropic":
+    if provider_type == COPILOT_ANTHROPIC_PROVIDER_TYPE:
         base_url = with_project_prefix(f"http://127.0.0.1:{port}", project)
         env["COPILOT_PROVIDER_BASE_URL"] = base_url
         return env, [
-            "COPILOT_PROVIDER_TYPE=anthropic",
+            f"COPILOT_PROVIDER_TYPE={COPILOT_ANTHROPIC_PROVIDER_TYPE}",
             f"COPILOT_PROVIDER_BASE_URL={base_url}",
         ]
 
@@ -149,7 +234,7 @@ def build_launch_env(
     env["COPILOT_PROVIDER_BASE_URL"] = base_url
     env["COPILOT_PROVIDER_WIRE_API"] = effective_wire_api
     return env, [
-        "COPILOT_PROVIDER_TYPE=openai",
+        f"COPILOT_PROVIDER_TYPE={COPILOT_OPENAI_PROVIDER_TYPE}",
         f"COPILOT_PROVIDER_BASE_URL={base_url}",
         f"COPILOT_PROVIDER_WIRE_API={effective_wire_api}",
     ]

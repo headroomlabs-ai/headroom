@@ -11,13 +11,14 @@ Headroom wraps LLM clients to provide:
 
 Quick Start:
 
-    from headroom import HeadroomClient, OpenAIProvider
+    from headroom import HeadroomClient
+    from headroom.providers.defaults import create_default_provider
     from openai import OpenAI
 
     # Wrap your existing client
     client = HeadroomClient(
         original_client=OpenAI(),
-        provider=OpenAIProvider(),
+        provider=create_default_provider(),
         default_mode="optimize",
     )
 

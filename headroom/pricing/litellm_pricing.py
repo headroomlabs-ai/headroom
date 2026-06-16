@@ -11,6 +11,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from headroom.providers.litellm_models import resolve_litellm_model_with_probe
+
 # litellm calls `dotenv.load_dotenv()` during its own import, which loads
 # the project `.env` into `os.environ`. We don't want that side effect —
 # importing a pricing helper should not silently leak API keys into the
@@ -62,30 +64,15 @@ def _resolve_litellm_model_uncached(model: str) -> str:
     """Uncached resolution — called once per unique model name."""
     if not LITELLM_AVAILABLE:
         return model
-    # Try as-is first
-    try:
-        litellm.cost_per_token(model=model, prompt_tokens=1, completion_tokens=0)
-        return model
-    except Exception:
-        pass
-    # Try with provider prefix
-    prefixes = {
-        "claude-": "anthropic/",
-        "gpt-": "openai/",
-        "o1-": "openai/",
-        "o3-": "openai/",
-        "o4-": "openai/",
-        "gemini-": "google/",
-    }
-    for pattern, prefix in prefixes.items():
-        if model.startswith(pattern):
-            prefixed = f"{prefix}{model}"
-            try:
-                litellm.cost_per_token(model=prefixed, prompt_tokens=1, completion_tokens=0)
-                return prefixed
-            except Exception:
-                break
-    return model
+
+    def supports_model(candidate: str) -> bool:
+        try:
+            litellm.cost_per_token(model=candidate, prompt_tokens=1, completion_tokens=0)
+            return True
+        except Exception:
+            return False
+
+    return resolve_litellm_model_with_probe(model, supports_model)
 
 
 @dataclass

@@ -13,11 +13,14 @@ from headroom.providers.copilot.wrap import (
     copilot_model_from_args,
     default_wire_api_for_model,
     detect_running_proxy_backend,
+    has_explicit_provider_auth,
     model_configured,
     model_prefers_responses_api,
     provider_key_source,
     query_proxy_config,
     resolve_provider_type,
+    resolve_subscription_provider_type,
+    should_use_oauth,
     validate_configuration,
 )
 
@@ -48,6 +51,68 @@ def test_resolve_provider_type_prefers_explicit_and_env() -> None:
     assert resolve_provider_type("anthropic", "openai") == "openai"
     assert resolve_provider_type(None, "auto", {"HEADROOM_BACKEND": "anthropic"}) == "anthropic"
     assert resolve_provider_type(None, "auto", {"HEADROOM_BACKEND": "anyllm"}) == "openai"
+
+
+def test_copilot_oauth_policy_is_provider_owned() -> None:
+    assert has_explicit_provider_auth({"COPILOT_PROVIDER_API_KEY": "sk-test"}) is True
+    assert has_explicit_provider_auth({"COPILOT_PROVIDER_BEARER_TOKEN": "gho-test"}) is True
+    assert has_explicit_provider_auth({}) is False
+
+    assert (
+        should_use_oauth(
+            backend="anthropic",
+            provider_type="openai",
+            env={},
+            has_oauth_auth=True,
+        )
+        is True
+    )
+    assert (
+        should_use_oauth(
+            backend="anyllm",
+            provider_type="openai",
+            env={},
+            has_oauth_auth=True,
+        )
+        is False
+    )
+    assert (
+        should_use_oauth(
+            backend="anthropic",
+            provider_type="anthropic",
+            env={},
+            has_oauth_auth=True,
+        )
+        is False
+    )
+    assert (
+        should_use_oauth(
+            backend="anyllm",
+            provider_type="anthropic",
+            env={"COPILOT_PROVIDER_API_KEY": "sk-test"},
+            has_oauth_auth=False,
+            force_subscription=True,
+        )
+        is True
+    )
+
+
+def test_resolve_subscription_provider_type_is_provider_owned() -> None:
+    accepted = resolve_subscription_provider_type(backend="anthropic", provider_type="auto")
+    translated = resolve_subscription_provider_type(backend="anyllm", provider_type="auto")
+    anthropic = resolve_subscription_provider_type(
+        backend="anthropic",
+        provider_type="anthropic",
+    )
+
+    assert accepted.provider_type == "openai"
+    assert accepted.error is None
+    assert translated.provider_type == "auto"
+    assert translated.error is not None
+    assert "translated backends" in translated.error
+    assert anthropic.provider_type == "anthropic"
+    assert anthropic.error is not None
+    assert "--provider-type anthropic" in anthropic.error
 
 
 def test_validate_configuration_accepts_supported_combinations() -> None:

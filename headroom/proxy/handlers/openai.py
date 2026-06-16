@@ -6,7 +6,6 @@ Contains all OpenAI Chat Completions, Responses API, and passthrough handlers.
 from __future__ import annotations
 
 import asyncio
-import base64
 import contextlib
 import copy
 import hashlib
@@ -23,6 +22,11 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote, unquote, urlparse
 
+from headroom.providers.codex.runtime import (
+    decode_openai_bearer_payload,
+    resolve_codex_routing_headers,
+)
+from headroom.providers.registry import stream_usage_provider
 from headroom.proxy.helpers import (
     COMPRESSION_TIMEOUT_SECONDS,
     _headroom_bypass_enabled,
@@ -50,6 +54,9 @@ from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.cost import _summarize_transforms, header_safe_transforms
 from headroom.proxy.outcome import RequestOutcome
 from headroom.proxy.project_context import classify_project, set_current_project
+
+_decode_openai_bearer_payload = decode_openai_bearer_payload
+_resolve_codex_routing_headers = resolve_codex_routing_headers
 
 logger = logging.getLogger("headroom.proxy")
 
@@ -531,53 +538,6 @@ def _extract_responses_usage(event: dict[str, Any]) -> tuple[int, int, int, int,
     cache_write_tokens = _infer_openai_cache_write_tokens(input_tokens, cached_tokens)
     uncached_tokens = max(input_tokens - cached_tokens, 0)
     return input_tokens, output_tokens, cached_tokens, cache_write_tokens, uncached_tokens
-
-
-def _decode_openai_bearer_payload(headers: dict[str, str]) -> dict[str, Any] | None:
-    """Best-effort decode of an OpenAI OAuth bearer token payload.
-
-    OpenClaw's Codex OAuth flow may forward only the bearer token after the
-    provider base URL is overridden. In that case the explicit
-    ``ChatGPT-Account-ID`` header can be missing even though the JWT still
-    carries the account id we need to route to the ChatGPT Codex backend.
-    """
-    auth = headers.get("authorization") or headers.get("Authorization")
-    if not auth:
-        return None
-
-    scheme, _, token = auth.partition(" ")
-    if scheme.lower() != "bearer" or token.count(".") < 2:
-        return None
-
-    payload = token.split(".", 2)[1]
-    payload += "=" * (-len(payload) % 4)
-    # Intentionally no signature verification here: this is only a best-effort
-    # routing hint extractor. Upstream still performs the actual auth/authz checks.
-    try:
-        decoded = base64.urlsafe_b64decode(payload.encode("ascii"))
-        data = json.loads(decoded.decode("utf-8"))
-    except (ValueError, UnicodeDecodeError):
-        return None
-
-    return data if isinstance(data, dict) else None
-
-
-def _resolve_codex_routing_headers(headers: dict[str, str]) -> tuple[dict[str, str], bool]:
-    """Resolve ChatGPT Codex routing hints from explicit headers or OAuth JWT."""
-    resolved = dict(headers)
-    lower_lookup = {k.lower(): k for k in resolved}
-
-    if "chatgpt-account-id" in lower_lookup:
-        return resolved, True
-
-    payload = _decode_openai_bearer_payload(resolved)
-    auth_claims = payload.get("https://api.openai.com/auth") if isinstance(payload, dict) else None
-    account_id = auth_claims.get("chatgpt_account_id") if isinstance(auth_claims, dict) else None
-    if isinstance(account_id, str) and account_id.strip():
-        resolved["ChatGPT-Account-ID"] = account_id.strip()
-        return resolved, True
-
-    return resolved, False
 
 
 def _prefers_http1_passthrough(base_url: str) -> bool:
@@ -6188,7 +6148,7 @@ class OpenAIHandlerMixin:
         body = await request.body()
         headers = await apply_copilot_api_auth(headers, url=url)
         request_id = await self._next_request_id()
-        stream_provider = "gemini" if provider == "vertex:google" else "anthropic"
+        stream_provider = stream_usage_provider(provider)
         stream_state: dict[str, Any] = {
             "input_tokens": None,
             "output_tokens": None,

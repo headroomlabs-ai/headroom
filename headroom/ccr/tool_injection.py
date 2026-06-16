@@ -13,13 +13,11 @@ The LLM can then call the tool or follow instructions to retrieve more data.
 
 from __future__ import annotations
 
-import json
 import re
 from dataclasses import dataclass, field
 from typing import Any
 
-# Tool name constant - used for matching tool calls
-CCR_TOOL_NAME = "headroom_retrieve"
+from headroom.providers.ccr import CCR_TOOL_NAME, get_ccr_adapter
 
 
 def create_ccr_tool_definition(
@@ -38,96 +36,7 @@ def create_ccr_tool_definition(
     Returns:
         Tool definition dict in the appropriate format.
     """
-    # Base tool definition (OpenAI format)
-    openai_definition = {
-        "type": "function",
-        "function": {
-            "name": CCR_TOOL_NAME,
-            "description": (
-                "Retrieve original uncompressed content that was compressed to save tokens. "
-                "Use this when you need more data than what's shown in compressed tool results. "
-                "The hash is provided in compression markers like [N items compressed... hash=abc123]."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "hash": {
-                        "type": "string",
-                        "description": "Hash key from the compression marker (e.g., 'abc123' from hash=abc123)",
-                    },
-                    "query": {
-                        "type": "string",
-                        "description": (
-                            "Optional search query to filter results. "
-                            "If provided, only returns items matching the query. "
-                            "If omitted, returns all original items."
-                        ),
-                    },
-                },
-                "required": ["hash"],
-            },
-        },
-    }
-
-    if provider == "openai":
-        return openai_definition
-
-    elif provider == "anthropic":
-        # Anthropic uses a slightly different format
-        return {
-            "name": CCR_TOOL_NAME,
-            "description": (
-                "Retrieve original uncompressed content that was compressed to save tokens. "
-                "Use this when you need more data than what's shown in compressed tool results. "
-                "The hash is provided in compression markers like [N items compressed... hash=abc123]."
-            ),
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "hash": {
-                        "type": "string",
-                        "description": "Hash key from the compression marker (e.g., 'abc123' from hash=abc123)",
-                    },
-                    "query": {
-                        "type": "string",
-                        "description": (
-                            "Optional search query to filter results. "
-                            "If provided, only returns items matching the query. "
-                            "If omitted, returns all original items."
-                        ),
-                    },
-                },
-                "required": ["hash"],
-            },
-        }
-
-    elif provider == "google":
-        # Google/Gemini format
-        return {
-            "name": CCR_TOOL_NAME,
-            "description": (
-                "Retrieve original uncompressed content that was compressed to save tokens. "
-                "Use this when you need more data than what's shown in compressed tool results."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "hash": {
-                        "type": "string",
-                        "description": "Hash key from the compression marker",
-                    },
-                    "query": {
-                        "type": "string",
-                        "description": "Optional search query to filter results",
-                    },
-                },
-                "required": ["hash"],
-            },
-        }
-
-    else:
-        # Default to OpenAI format
-        return openai_definition
+    return get_ccr_adapter(provider).tool_definition()
 
 
 def create_system_instructions(
@@ -468,28 +377,9 @@ def parse_tool_call(
     Returns:
         Tuple of (hash, query) or (None, None) if not a CCR tool call.
     """
-    # Get tool name and input data based on provider format
-    if provider == "anthropic":
-        name = tool_call.get("name")
-        input_data = tool_call.get("input", {})
-    elif provider == "openai":
-        function = tool_call.get("function", {})
-        name = function.get("name")
-        # OpenAI passes args as JSON string
-        args_str = function.get("arguments", "{}")
-        try:
-            input_data = json.loads(args_str)
-        except json.JSONDecodeError:
-            input_data = {}
-    elif provider == "google":
-        # Google/Gemini format: {"functionCall": {"name": "...", "args": {...}}}
-        function_call = tool_call.get("functionCall", {})
-        name = function_call.get("name")
-        input_data = function_call.get("args", {})
-    else:
-        # Generic fallback
-        name = tool_call.get("name")
-        input_data = tool_call.get("input", tool_call.get("args", {}))
+    name, input_data = get_ccr_adapter(provider).parse_tool_call(tool_call)
+    if not isinstance(input_data, dict):
+        input_data = {}
 
     if name != CCR_TOOL_NAME:
         return None, None

@@ -566,16 +566,16 @@ def shutdown_otel_metrics() -> None:
     global _owned_meter_provider
     global _owned_metrics_config
 
-    provider = None
+    meter_backend = None
     with _metrics_lock:
-        provider = _owned_meter_provider
+        meter_backend = _owned_meter_provider
         _owned_meter_provider = None
         _owned_metrics_config = None
         _global_metrics = None
 
-    if provider is not None:
+    if meter_backend:
         try:
-            provider.shutdown()
+            meter_backend.shutdown()
         except Exception:
             logger.debug("Failed to shut down OTEL metrics provider", exc_info=True)
 

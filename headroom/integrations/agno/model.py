@@ -30,7 +30,7 @@ except ImportError:
     ModelResponse = dict  # type: ignore[misc,assignment]
 
 from headroom import HeadroomConfig, HeadroomMode
-from headroom.providers import OpenAIProvider
+from headroom.providers.defaults import create_default_provider
 from headroom.transforms import TransformPipeline
 
 from .providers import get_headroom_provider, get_model_name_from_agno
@@ -278,7 +278,7 @@ class HeadroomAgnoModel(Model):  # type: ignore[misc]
                             f"Auto-detected provider: {self._headroom_provider.__class__.__name__}"
                         )
                     else:
-                        self._headroom_provider = OpenAIProvider()
+                        self._headroom_provider = create_default_provider()
                     self._pipeline = TransformPipeline(
                         config=self.headroom_config,
                         provider=self._headroom_provider,
@@ -765,7 +765,7 @@ def optimize_messages(
     _check_agno_available()
 
     config = config or HeadroomConfig()
-    provider = OpenAIProvider()
+    provider = create_default_provider()
     pipeline = TransformPipeline(config=config, provider=provider)
 
     # Convert to OpenAI format

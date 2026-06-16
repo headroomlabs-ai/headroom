@@ -12,15 +12,31 @@ Pre-resizing to Anthropic's caps saves upload bandwidth (they'd resize anyway).
 
 from __future__ import annotations
 
-import base64
 import io
 import logging
-import math
-import re
 from dataclasses import dataclass
 from typing import Any
 
+from headroom.providers.image import (
+    decode_image_block,
+    estimate_anthropic_tokens,
+    estimate_openai_tokens,
+    find_optimal_anthropic_dimensions,
+    find_optimal_openai_dimensions,
+    rewrite_resized_image_block,
+    tile_optimization_plan,
+)
+
 logger = logging.getLogger(__name__)
+
+__all__ = [
+    "TileOptResult",
+    "estimate_anthropic_tokens",
+    "estimate_openai_tokens",
+    "find_optimal_anthropic_dimensions",
+    "find_optimal_openai_dimensions",
+    "optimize_images_in_messages",
+]
 
 
 @dataclass
@@ -45,121 +61,6 @@ class TileOptResult:
         if self.tokens_before == 0:
             return 0.0
         return self.tokens_saved / self.tokens_before * 100
-
-
-# ---------------------------------------------------------------------------
-# Token estimation formulas (must match provider pricing exactly)
-# ---------------------------------------------------------------------------
-
-
-def estimate_openai_tokens(width: int, height: int, detail: str = "high") -> int:
-    """OpenAI GPT-4o vision token formula."""
-    if detail == "low":
-        return 85
-
-    # Step 1: scale so max dimension ≤ 2048
-    max_dim = max(width, height)
-    if max_dim > 2048:
-        scale = 2048 / max_dim
-        width = int(width * scale)
-        height = int(height * scale)
-
-    # Step 2: scale so shortest side ≤ 768
-    min_dim = min(width, height)
-    if min_dim > 768:
-        scale = 768 / min_dim
-        width = int(width * scale)
-        height = int(height * scale)
-
-    # Step 3: count 512×512 tiles
-    tiles = math.ceil(width / 512) * math.ceil(height / 512)
-    return 85 + 170 * tiles
-
-
-def estimate_anthropic_tokens(width: int, height: int) -> int:
-    """Anthropic Claude vision token formula: (w * h) / 750."""
-    # Auto-downscale: longest edge ≤ 1568
-    max_edge = max(width, height)
-    if max_edge > 1568:
-        scale = 1568 / max_edge
-        width = int(width * scale)
-        height = int(height * scale)
-
-    # Auto-downscale: total pixels ≤ 1.15MP
-    total = width * height
-    if total > 1_150_000:
-        scale = math.sqrt(1_150_000 / total)
-        width = int(width * scale)
-        height = int(height * scale)
-
-    return max(1, (width * height) // 750)
-
-
-# ---------------------------------------------------------------------------
-# Tile-boundary optimization (OpenAI specific)
-# ---------------------------------------------------------------------------
-
-
-def find_optimal_openai_dimensions(width: int, height: int) -> tuple[int, int]:
-    """Find dimensions that minimize OpenAI tile count.
-
-    Tries reducing to fewer tiles while keeping ≥40% of original pixels.
-    Returns (optimal_width, optimal_height).
-    """
-    # Simulate OpenAI's internal scaling first
-    max_dim = max(width, height)
-    if max_dim > 2048:
-        scale = 2048 / max_dim
-        width = int(width * scale)
-        height = int(height * scale)
-
-    min_dim = min(width, height)
-    if min_dim > 768:
-        scale = 768 / min_dim
-        width = int(width * scale)
-        height = int(height * scale)
-
-    current_tiles = math.ceil(width / 512) * math.ceil(height / 512)
-    best_w, best_h = width, height
-    best_tiles = current_tiles
-
-    for target_cols in range(1, math.ceil(width / 512) + 1):
-        for target_rows in range(1, math.ceil(height / 512) + 1):
-            tiles = target_cols * target_rows
-            if tiles >= current_tiles:
-                continue
-
-            tw = target_cols * 512
-            th = target_rows * 512
-            scale_w = tw / width
-            scale_h = th / height
-            scale = min(scale_w, scale_h)
-            nw = int(width * scale)
-            nh = int(height * scale)
-
-            # Only accept if keeping ≥40% of original pixels
-            if nw * nh >= width * height * 0.4 and tiles < best_tiles:
-                best_w, best_h = nw, nh
-                best_tiles = tiles
-
-    return best_w, best_h
-
-
-def find_optimal_anthropic_dimensions(width: int, height: int) -> tuple[int, int]:
-    """Pre-resize to Anthropic's limits (they'd do it anyway)."""
-    max_edge = max(width, height)
-    if max_edge > 1568:
-        scale = 1568 / max_edge
-        width = int(width * scale)
-        height = int(height * scale)
-
-    total = width * height
-    if total > 1_150_000:
-        scale = math.sqrt(1_150_000 / total)
-        width = int(width * scale)
-        height = int(height * scale)
-
-    return width, height
 
 
 # ---------------------------------------------------------------------------
@@ -246,91 +147,45 @@ def _optimize_content_block(
     except ImportError:
         return None
 
-    # --- OpenAI format: {"type": "image_url", "image_url": {"url": "data:..."}} ---
-    if item.get("type") == "image_url":
-        url = item.get("image_url", {}).get("url", "")
-        if not url.startswith("data:"):
-            return None  # URL-referenced image, can't resize
+    image_block = decode_image_block(item, provider)
+    if image_block is None:
+        return None
 
-        match = re.match(r"data:image/[^;]+;base64,(.+)", url)
-        if not match:
-            return None
+    image_data = image_block.image_bytes
+    img = Image.open(io.BytesIO(image_data))
+    orig_w, orig_h = img.size
 
-        image_data = base64.b64decode(match.group(1))
-        img = Image.open(io.BytesIO(image_data))
-        orig_w, orig_h = img.size
+    plan = tile_optimization_plan(
+        block_provider=image_block.provider,
+        requested_provider=provider,
+        width=orig_w,
+        height=orig_h,
+    )
+    if plan is None or plan.tokens_after >= plan.tokens_before:
+        return None
 
-        tokens_before = estimate_openai_tokens(orig_w, orig_h, "high")
+    resized_data, media_type = _resize_image_bytes(
+        image_data,
+        plan.optimized_width,
+        plan.optimized_height,
+    )
+    new_item = rewrite_resized_image_block(
+        item,
+        image_block.provider,
+        resized_data=resized_data,
+        media_type=media_type,
+    )
 
-        if provider == "openai":
-            opt_w, opt_h = find_optimal_openai_dimensions(orig_w, orig_h)
-        else:
-            opt_w, opt_h = find_optimal_anthropic_dimensions(orig_w, orig_h)
-
-        tokens_after = estimate_openai_tokens(opt_w, opt_h, "high")
-
-        if tokens_after >= tokens_before:
-            return None  # No savings
-
-        resized_data, media_type = _resize_image_bytes(image_data, opt_w, opt_h)
-        b64 = base64.b64encode(resized_data).decode()
-        new_item = {
-            "type": "image_url",
-            "image_url": {
-                **item.get("image_url", {}),
-                "url": f"data:{media_type};base64,{b64}",
-            },
-        }
-
-        result = TileOptResult(
-            original_width=orig_w,
-            original_height=orig_h,
-            optimized_width=opt_w,
-            optimized_height=opt_h,
-            tokens_before=tokens_before,
-            tokens_after=tokens_after,
-            provider=provider,
-            resized=True,
-        )
-        return new_item, result
-
-    # --- Anthropic format: {"type": "image", "source": {"type": "base64", "data": "..."}} ---
-    if item.get("type") == "image":
-        source = item.get("source", {})
-        if source.get("type") != "base64":
-            return None
-
-        image_data = base64.b64decode(source.get("data", ""))
-        img = Image.open(io.BytesIO(image_data))
-        orig_w, orig_h = img.size
-
-        tokens_before = estimate_anthropic_tokens(orig_w, orig_h)
-        opt_w, opt_h = find_optimal_anthropic_dimensions(orig_w, orig_h)
-        tokens_after = estimate_anthropic_tokens(opt_w, opt_h)
-
-        if tokens_after >= tokens_before:
-            return None
-
-        resized_data, media_type = _resize_image_bytes(image_data, opt_w, opt_h)
-        new_item = {
-            "type": "image",
-            "source": {
-                "type": "base64",
-                "media_type": media_type,
-                "data": base64.b64encode(resized_data).decode(),
-            },
-        }
-
-        result = TileOptResult(
-            original_width=orig_w,
-            original_height=orig_h,
-            optimized_width=opt_w,
-            optimized_height=opt_h,
-            tokens_before=tokens_before,
-            tokens_after=tokens_after,
-            provider="anthropic",
-            resized=True,
-        )
-        return new_item, result
+    result = TileOptResult(
+        original_width=orig_w,
+        original_height=orig_h,
+        optimized_width=plan.optimized_width,
+        optimized_height=plan.optimized_height,
+        tokens_before=plan.tokens_before,
+        tokens_after=plan.tokens_after,
+        provider=plan.result_provider,
+        resized=True,
+    )
+    return new_item, result
 
     return None

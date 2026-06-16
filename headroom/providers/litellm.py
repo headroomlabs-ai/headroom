@@ -31,6 +31,10 @@ from .base import Provider, TokenCounter
 
 logger = logging.getLogger(__name__)
 
+LITELLM_API_BASE_BY_MODEL_PREFIX: tuple[tuple[str, str], ...] = (
+    ("claude", "https://api.anthropic.com"),
+)
+
 # Check if litellm is available
 try:
     # LiteLLM can print its provider-list banner during import, before the
@@ -64,6 +68,18 @@ def is_litellm_available() -> bool:
         True if litellm is available.
     """
     return LITELLM_AVAILABLE
+
+
+def completion_api_base_for_model(model: str) -> str | None:
+    """Return provider-owned LiteLLM API base override for a model."""
+    return next(
+        (
+            api_base
+            for prefix, api_base in LITELLM_API_BASE_BY_MODEL_PREFIX
+            if model.startswith(prefix)
+        ),
+        None,
+    )
 
 
 class LiteLLMTokenCounter:

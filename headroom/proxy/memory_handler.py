@@ -43,6 +43,16 @@ from headroom.memory.storage_router import (
     RequestContext,
     ResolvedScope,
 )
+from headroom.providers.memory import (
+    append_memory_context_tail,
+    extract_memory_tool_calls,
+    inject_memory_tool_definitions,
+    memory_tool_definitions,
+    memory_tool_id,
+    memory_tool_input,
+    memory_tool_name,
+    memory_tool_result,
+)
 
 if TYPE_CHECKING:
     from headroom.memory.backends.local import LocalBackend
@@ -498,34 +508,14 @@ class MemoryHandler:
         (matches ``_get_memory_tools()`` order) so the canonical bytes
         are deterministic across calls.
         """
-        if not self.config.inject_tools:
-            return []
-
-        if self.config.use_native_tool and provider == "anthropic":
-            return [
-                {
-                    "type": NATIVE_MEMORY_TOOL_TYPE,
-                    "name": NATIVE_MEMORY_TOOL_NAME,
-                }
-            ]
-
-        out: list[dict[str, Any]] = []
-        for memory_tool in self._get_memory_tools():
-            tool_name = memory_tool["function"]["name"]
-            if provider == "anthropic":
-                out.append(
-                    {
-                        "name": tool_name,
-                        "description": memory_tool["function"]["description"],
-                        "input_schema": memory_tool["function"]["parameters"],
-                    }
-                )
-            else:
-                # OpenAI format — return a fresh shallow copy so callers
-                # can mutate without surprise. dict() is sufficient: the
-                # nested schema is treated as immutable downstream.
-                out.append(dict(memory_tool))
-        return out
+        return memory_tool_definitions(
+            provider=provider,
+            memory_tools=self._get_memory_tools(),
+            inject_tools=self.config.inject_tools,
+            use_native_tool=self.config.use_native_tool,
+            native_tool_type=NATIVE_MEMORY_TOOL_TYPE,
+            native_tool_name=NATIVE_MEMORY_TOOL_NAME,
+        )
 
     def inject_tools(
         self,
@@ -563,29 +553,12 @@ class MemoryHandler:
             if name:
                 existing_names.add(name)
 
-        # Add missing memory tools
-        was_injected = False
-        for memory_tool in self._get_memory_tools():
-            tool_name = memory_tool["function"]["name"]
-            if tool_name in existing_names:
-                continue
-
-            # Convert to provider format
-            if provider == "anthropic":
-                tools.append(
-                    {
-                        "name": tool_name,
-                        "description": memory_tool["function"]["description"],
-                        "input_schema": memory_tool["function"]["parameters"],
-                    }
-                )
-            else:
-                # OpenAI format
-                tools.append(memory_tool)
-
-            was_injected = True
-
-        return tools, was_injected
+        return inject_memory_tool_definitions(
+            tools=tools,
+            provider=provider,
+            memory_tools=self._get_memory_tools(),
+            existing_names=existing_names,
+        )
 
     def _inject_native_tool(self, tools: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], bool]:
         """Inject Anthropic's native memory tool (memory_20250818).
@@ -961,26 +934,12 @@ your responses, not to drive new actions."""
         if not messages or not context_text:
             return messages, 0
 
-        if provider == "anthropic":
-            # Late import to avoid circular: AnthropicHandlerMixin lives in
-            # headroom.proxy.handlers.anthropic which imports MemoryHandler.
-            from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
-
-            new_messages = AnthropicHandlerMixin._append_context_to_latest_non_frozen_user_turn(
-                messages,
-                context_text,
-                frozen_message_count=frozen_message_count,
-            )
-            if new_messages is messages:
-                return messages, 0
-            return new_messages, len(context_text)
-
-        if provider == "openai":
-            from headroom.proxy.helpers import append_text_to_latest_user_chat_message
-
-            return append_text_to_latest_user_chat_message(messages, context_text)
-
-        raise ValueError(f"Unknown provider {provider!r}; expected 'anthropic' or 'openai'")
+        return append_memory_context_tail(
+            messages,
+            context_text,
+            provider=provider,
+            frozen_message_count=frozen_message_count,
+        )
 
     def _extract_user_query(self, messages: list[dict[str, Any]]) -> str:
         """Extract the user query from the last user message.
@@ -1016,7 +975,7 @@ your responses, not to drive new actions."""
         """Check if response contains memory tool calls."""
         tool_calls = self._extract_tool_calls(response, provider)
         for tc in tool_calls:
-            name = tc.get("name") or tc.get("function", {}).get("name")
+            name = memory_tool_name(tc, provider)
             # Check for both custom and native memory tools
             if name in MEMORY_TOOL_NAMES or name == NATIVE_MEMORY_TOOL_NAME:
                 return True
@@ -1028,35 +987,7 @@ your responses, not to drive new actions."""
         provider: str,
     ) -> list[dict[str, Any]]:
         """Extract tool calls from response based on provider format."""
-        if provider == "anthropic":
-            content = response.get("content", [])
-            if isinstance(content, list):
-                return [block for block in content if block.get("type") == "tool_use"]
-            return []
-
-        elif provider == "openai":
-            # Chat Completions format: choices[0].message.tool_calls
-            choices = response.get("choices", [])
-            if choices:
-                message = choices[0].get("message", {})
-                tc_list = list(message.get("tool_calls", []) or [])
-                if tc_list:
-                    return tc_list
-
-            # Responses API format: output[] with type=function_call
-            output = response.get("output", [])
-            if isinstance(output, list):
-                fc_items = [
-                    item
-                    for item in output
-                    if isinstance(item, dict) and item.get("type") == "function_call"
-                ]
-                if fc_items:
-                    return fc_items
-
-            return []
-
-        return []
+        return extract_memory_tool_calls(response, provider)
 
     async def handle_memory_tool_calls(
         self,
@@ -1083,20 +1014,9 @@ your responses, not to drive new actions."""
         results: list[dict[str, Any]] = []
 
         for tc in tool_calls:
-            tool_name = tc.get("name") or tc.get("function", {}).get("name")
-            tool_id = tc.get("id") or tc.get("call_id", "")
-
-            # Parse input data
-            if provider == "anthropic":
-                input_data = tc.get("input", {})
-            else:
-                # Chat Completions format: function.arguments
-                # Responses API format: arguments (top-level string)
-                args_str = tc.get("arguments") or tc.get("function", {}).get("arguments") or "{}"
-                try:
-                    input_data = json.loads(args_str)
-                except json.JSONDecodeError:
-                    input_data = {}
+            tool_name = memory_tool_name(tc, provider)
+            tool_id = memory_tool_id(tc, provider)
+            input_data = memory_tool_input(tc, provider)
 
             # Handle native memory tool
             if tool_name == NATIVE_MEMORY_TOOL_NAME:
@@ -1116,23 +1036,7 @@ your responses, not to drive new actions."""
             else:
                 continue
 
-            # Format result based on provider
-            if provider == "anthropic":
-                results.append(
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": tool_id,
-                        "content": result_content,
-                    }
-                )
-            else:
-                results.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tool_id,
-                        "content": result_content,
-                    }
-                )
+            results.append(memory_tool_result(tool_id, result_content, provider))
 
             logger.info(f"Memory: Executed {tool_name} for user {user_id}")
 

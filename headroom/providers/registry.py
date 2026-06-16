@@ -126,6 +126,38 @@ def resolve_api_targets(overrides: ProviderApiOverrides) -> ProviderApiTargets:
     )
 
 
+def stream_usage_provider(provider: str) -> str:
+    """Resolve provider name used by streaming usage parsers."""
+    return {"vertex:google": "gemini"}.get(provider, provider)
+
+
+def supports_sticky_memory_tools(provider: str) -> bool:
+    """Return whether session-sticky memory tools support this provider."""
+    return provider in {"anthropic", "openai"}
+
+
+def supports_sticky_ccr_tools(provider: str) -> bool:
+    """Return whether session-sticky CCR tools support this provider."""
+    return provider in {"anthropic", "openai", "google"}
+
+
+def model_matches_provider(provider: str, model_name: str) -> bool:
+    """Return whether a model identifier belongs to a provider pricing bucket."""
+    normalized = model_name.lower()
+    openai_prefixes = ("gpt", "o1", "o3", "o4")
+    return (
+        (provider == "anthropic" and "claude" in normalized)
+        or (provider == "openai" and normalized.startswith(openai_prefixes))
+        or (provider == "gemini" and "gemini" in normalized)
+        or (provider == "bedrock" and "claude" in normalized)
+    )
+
+
+def tracks_prefix_cache_busts(provider: str) -> bool:
+    """Return whether provider metrics should record prefix-cache busts."""
+    return provider == "anthropic"
+
+
 def build_proxy_provider_runtime(config: Any) -> ProxyProviderRuntime:
     """Build provider runtime objects and resolved targets for the proxy."""
     from headroom.providers.anthropic import AnthropicProvider
@@ -200,6 +232,33 @@ def format_backend_status(*, backend: str, anyllm_provider: str, bedrock_region:
     if provider_config.uses_region:
         return f"{provider_config.display_name} via LiteLLM (region={bedrock_region})"
     return f"{provider_config.display_name} via LiteLLM"
+
+
+def format_backend_usage_section(*, backend: str, host: str, port: int) -> str:
+    """Build provider-specific setup guidance shown by the proxy CLI."""
+    if backend == "anthropic":
+        return ""
+
+    if backend == "anyllm" or backend.startswith("anyllm-"):
+        return """
+  Set credentials for your provider (e.g., OPENAI_API_KEY, MISTRAL_API_KEY)
+  Providers: https://mozilla-ai.github.io/any-llm/providers/
+"""
+
+    from headroom.backends.litellm import get_provider_config
+
+    provider = backend.replace("litellm-", "")
+    provider_config = get_provider_config(provider)
+    env_vars_str = ", ".join(provider_config.env_vars) if provider_config.env_vars else "See docs"
+    section = f"""
+IMPORTANT for {provider_config.display_name} users:
+  1. Set credentials: {env_vars_str}
+  2. Set a dummy Anthropic key: ANTHROPIC_API_KEY="sk-ant-dummy"
+     (Headroom ignores this - it uses your {provider_config.display_name} credentials)
+  3. Set base URL: ANTHROPIC_BASE_URL=http://{host}:{port}"""
+    if provider_config.model_format_hint:
+        section += f"\n  4. Use model names: {provider_config.model_format_hint}"
+    return f"{section}\n"
 
 
 def call_client_transport(

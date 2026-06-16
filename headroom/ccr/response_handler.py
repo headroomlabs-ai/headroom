@@ -19,6 +19,12 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from headroom.providers.ccr import (
+    ANTHROPIC_CCR_ADAPTER,
+    OPENAI_CCR_ADAPTER,
+    get_ccr_adapter,
+)
+
 from ..cache.compression_store import format_retrieval_miss_detail, get_compression_store
 from .tool_injection import CCR_TOOL_NAME, parse_tool_call
 
@@ -126,29 +132,7 @@ class CCRResponseHandler:
         provider: str,
     ) -> list[dict[str, Any]]:
         """Extract tool calls from response based on provider format."""
-        if provider == "anthropic":
-            # Anthropic format: content blocks with type=tool_use
-            content = response.get("content", [])
-            if isinstance(content, list):
-                return [block for block in content if block.get("type") == "tool_use"]
-            return []
-
-        elif provider == "openai":
-            # OpenAI format: message.tool_calls array
-            message = response.get("choices", [{}])[0].get("message", {})
-            tool_calls = message.get("tool_calls", [])
-            return list(tool_calls) if tool_calls else []
-
-        elif provider == "google":
-            # Google/Gemini format: candidates[0].content.parts contains functionCall objects
-            # Each part with a functionCall has: {"functionCall": {"name": "...", "args": {...}}}
-            candidates = response.get("candidates", [])
-            if not candidates:
-                return []
-            parts = candidates[0].get("content", {}).get("parts", [])
-            return [part for part in parts if "functionCall" in part]
-
-        return []
+        return get_ccr_adapter(provider).extract_tool_calls(response)
 
     def _parse_ccr_tool_calls(
         self,
@@ -170,13 +154,7 @@ class CCRResponseHandler:
 
             if hash_key is not None:
                 # This is a CCR tool call - extract tool_call_id based on provider
-                if provider == "google":
-                    # Google uses function name as identifier for matching responses
-                    # The functionResponse.name must match the functionCall.name
-                    tool_call_id = tc.get("functionCall", {}).get("name", CCR_TOOL_NAME)
-                else:
-                    # Anthropic and OpenAI use explicit IDs
-                    tool_call_id = tc.get("id", "")
+                tool_call_id = get_ccr_adapter(provider).tool_call_id(tc)
                 ccr_calls.append(
                     CCRToolCall(
                         tool_call_id=tool_call_id,
@@ -312,67 +290,7 @@ class CCRResponseHandler:
         Returns:
             Message dict in the appropriate format.
         """
-        if provider == "anthropic":
-            # Anthropic: user message with tool_result content blocks
-            content_blocks = []
-            for result in results:
-                content_blocks.append(
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": result.tool_call_id,
-                        "content": result.content,
-                    }
-                )
-            return {
-                "role": "user",
-                "content": content_blocks,
-            }
-
-        elif provider == "openai":
-            # OpenAI: multiple tool messages
-            # Actually for OpenAI we return a list of messages
-            return {
-                "_openai_tool_results": [
-                    {
-                        "role": "tool",
-                        "tool_call_id": result.tool_call_id,
-                        "content": result.content,
-                    }
-                    for result in results
-                ]
-            }
-
-        elif provider == "google":
-            # Google/Gemini: user message with functionResponse parts
-            # Format: {"role": "user", "parts": [{"functionResponse": {"name": "...", "response": {...}}}]}
-            parts = []
-            for result in results:
-                # Parse the content JSON to include as response object
-                try:
-                    response_data = json.loads(result.content)
-                except json.JSONDecodeError:
-                    response_data = {"content": result.content}
-                parts.append(
-                    {
-                        "functionResponse": {
-                            "name": result.tool_call_id,  # tool_call_id contains the function name for Google
-                            "response": response_data,
-                        }
-                    }
-                )
-            return {
-                "role": "user",
-                "parts": parts,
-            }
-
-        else:
-            # Generic format
-            return {
-                "role": "tool",
-                "content": json.dumps(
-                    [{"tool_call_id": r.tool_call_id, "result": r.content} for r in results]
-                ),
-            }
+        return get_ccr_adapter(provider).tool_result_message(results)
 
     def _extract_assistant_message(
         self,
@@ -388,34 +306,7 @@ class CCRResponseHandler:
         Returns:
             The assistant message dict.
         """
-        if provider == "anthropic":
-            return {
-                "role": "assistant",
-                "content": response.get("content", []),
-            }
-        elif provider == "openai":
-            message = response.get("choices", [{}])[0].get("message", {})
-            return {
-                "role": "assistant",
-                "content": message.get("content"),
-                "tool_calls": message.get("tool_calls"),
-            }
-        elif provider == "google":
-            # Google/Gemini format: role is "model", content is in candidates[0].content.parts
-            candidates = response.get("candidates", [])
-            if candidates:
-                parts = candidates[0].get("content", {}).get("parts", [])
-            else:
-                parts = []
-            return {
-                "role": "model",
-                "parts": parts,
-            }
-        else:
-            return {
-                "role": "assistant",
-                "content": response.get("content", ""),
-            }
+        return get_ccr_adapter(provider).assistant_message(response)
 
     async def handle_response(
         self,
@@ -499,11 +390,10 @@ class CCRResponseHandler:
             # Add tool results
             tool_result_msg = self._create_tool_result_message(results, provider)
 
-            if provider == "openai" and "_openai_tool_results" in tool_result_msg:
-                # OpenAI uses multiple messages for tool results
-                current_messages.extend(tool_result_msg["_openai_tool_results"])
-            else:
-                current_messages.append(tool_result_msg)
+            get_ccr_adapter(provider).append_tool_result_messages(
+                current_messages,
+                tool_result_msg,
+            )
 
             # Make continuation API call
             try:
@@ -742,138 +632,21 @@ class StreamingCCRHandler:
                 len(buf),
             )
 
-        # Reconstruct response from events
-        # This is provider-specific
-        if self.provider == "anthropic":
-            return self._reconstruct_anthropic_response(events)
-        else:
-            return self._reconstruct_openai_response(events)
+        return get_ccr_adapter(self.provider).reconstruct_stream_response(events)
 
     def _reconstruct_anthropic_response(
         self,
         events: list[dict[str, Any]],
     ) -> dict[str, Any]:
         """Reconstruct Anthropic response from stream events."""
-        response: dict[str, Any] = {
-            "content": [],
-            "stop_reason": None,
-            "usage": {},
-        }
-
-        current_text = ""
-        current_tool: dict[str, Any] | None = None
-
-        for event in events:
-            event_type = event.get("type", "")
-
-            if event_type == "content_block_start":
-                block = event.get("content_block", {})
-                if block.get("type") == "text":
-                    current_text = block.get("text", "")
-                elif block.get("type") == "tool_use":
-                    current_tool = {
-                        "type": "tool_use",
-                        "id": block.get("id", ""),
-                        "name": block.get("name", ""),
-                        "input": {},
-                    }
-
-            elif event_type == "content_block_delta":
-                delta = event.get("delta", {})
-                if delta.get("type") == "text_delta":
-                    current_text += delta.get("text", "")
-                elif delta.get("type") == "input_json_delta":
-                    # Accumulate JSON for tool input
-                    if current_tool is not None:
-                        partial = delta.get("partial_json", "")
-                        # This is tricky - partial JSON needs accumulation
-                        # For simplicity, we'll try to parse when complete
-                        current_tool["_partial_json"] = (
-                            current_tool.get("_partial_json", "") + partial
-                        )
-
-            elif event_type == "content_block_stop":
-                if current_text:
-                    response["content"].append(
-                        {
-                            "type": "text",
-                            "text": current_text,
-                        }
-                    )
-                    current_text = ""
-                if current_tool:
-                    # Parse accumulated JSON
-                    partial = current_tool.pop("_partial_json", "")
-                    if partial:
-                        try:
-                            current_tool["input"] = json.loads(partial)
-                        except json.JSONDecodeError:
-                            current_tool["input"] = {}
-                    response["content"].append(current_tool)
-                    current_tool = None
-
-            elif event_type == "message_delta":
-                delta = event.get("delta", {})
-                if "stop_reason" in delta:
-                    response["stop_reason"] = delta["stop_reason"]
-
-            elif event_type == "message_stop":
-                pass
-
-        return response
+        return ANTHROPIC_CCR_ADAPTER.reconstruct_stream_response(events)
 
     def _reconstruct_openai_response(
         self,
         events: list[dict[str, Any]],
     ) -> dict[str, Any]:
         """Reconstruct OpenAI response from stream events."""
-        message: dict[str, Any] = {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [],
-        }
-
-        tool_calls_map: dict[int, dict[str, Any]] = {}
-
-        for event in events:
-            choices = event.get("choices", [])
-            if not choices:
-                continue
-
-            delta = choices[0].get("delta", {})
-
-            if "content" in delta and delta["content"]:
-                message["content"] = (message.get("content") or "") + delta["content"]
-
-            if "tool_calls" in delta:
-                for tc_delta in delta["tool_calls"]:
-                    idx = tc_delta.get("index", 0)
-                    if idx not in tool_calls_map:
-                        tool_calls_map[idx] = {
-                            "id": "",
-                            "type": "function",
-                            "function": {"name": "", "arguments": ""},
-                        }
-
-                    tc = tool_calls_map[idx]
-                    if "id" in tc_delta:
-                        tc["id"] = tc_delta["id"]
-                    if "function" in tc_delta:
-                        fn = tc_delta["function"]
-                        if "name" in fn:
-                            tc["function"]["name"] = fn["name"]
-                        if "arguments" in fn:
-                            tc["function"]["arguments"] += fn["arguments"]
-
-        message["tool_calls"] = [tool_calls_map[i] for i in sorted(tool_calls_map.keys())]
-        if not message["tool_calls"]:
-            del message["tool_calls"]
-        if not message["content"]:
-            message["content"] = None
-
-        return {
-            "choices": [{"message": message, "finish_reason": "stop"}],
-        }
+        return OPENAI_CCR_ADAPTER.reconstruct_stream_response(events)
 
     async def _response_to_sse(
         self,
@@ -884,13 +657,5 @@ class StreamingCCRHandler:
         This is a simplified version - in practice you might want
         to chunk the response more granularly.
         """
-        if self.provider == "anthropic":
-            # Anthropic SSE format
-            yield b"event: message_start\n"
-            yield f"data: {json.dumps({'type': 'message_start', 'message': response})}\n\n".encode()
-            yield b"event: message_stop\n"
-            yield b'data: {"type": "message_stop"}\n\n'
-        else:
-            # OpenAI SSE format
-            yield f"data: {json.dumps(response)}\n\n".encode()
-            yield b"data: [DONE]\n\n"
+        for chunk in get_ccr_adapter(self.provider).response_to_sse_chunks(response):
+            yield chunk

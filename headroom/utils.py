@@ -229,9 +229,10 @@ def estimate_cost(
     Returns:
         Estimated cost in USD, or None if not available.
     """
-    if provider is None:
+    estimate = getattr(provider, "estimate_cost", None)
+    if estimate is None:
         return None
-    result = provider.estimate_cost(input_tokens, output_tokens, model, cached_tokens)
+    result = estimate(input_tokens, output_tokens, model, cached_tokens)
     return float(result) if result is not None else None
 
 

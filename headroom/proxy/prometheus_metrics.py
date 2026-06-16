@@ -16,6 +16,8 @@ from collections import defaultdict
 from datetime import datetime
 from typing import TYPE_CHECKING
 
+from headroom.providers.registry import tracks_prefix_cache_busts
+
 if TYPE_CHECKING:
     from headroom.observability import HeadroomOtelMetrics
     from headroom.proxy.cost import CostTracker
@@ -601,7 +603,7 @@ class PrometheusMetrics:
                 # high write ratio, indicating prefix invalidation.
                 model_req_num = self._cache_requests_by_model[model]
                 self._cache_requests_by_model[model] += 1
-                if provider == "anthropic" and model_req_num > 0:
+                if tracks_prefix_cache_busts(provider) and model_req_num > 0:
                     total_cached = cache_read_tokens + cache_write_tokens
                     if total_cached > 0 and cache_write_tokens > total_cached * 0.5:
                         pc["bust_count"] += 1

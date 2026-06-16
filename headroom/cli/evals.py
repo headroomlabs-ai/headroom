@@ -7,6 +7,12 @@ from pathlib import Path
 
 import click
 
+from headroom.providers.evals import (
+    EVAL_JUDGE_PROVIDER_CHOICES,
+    create_eval_judge,
+    describe_eval_judge,
+)
+
 from .main import main
 
 
@@ -61,7 +67,7 @@ def evals() -> None:
 )
 @click.option(
     "--judge-provider",
-    type=click.Choice(["openai", "anthropic", "litellm", "simple"]),
+    type=click.Choice(EVAL_JUDGE_PROVIDER_CHOICES),
     default="litellm",
     help="LLM judge provider (default: litellm - uses same model as answer-model)",
 )
@@ -280,7 +286,7 @@ def memory_eval_v2(
 @click.option("--llm-judge", is_flag=True)
 @click.option(
     "--judge-provider",
-    type=click.Choice(["openai", "anthropic", "litellm", "simple"]),
+    type=click.Choice(EVAL_JUDGE_PROVIDER_CHOICES),
     default="litellm",
 )
 @click.option("--judge-model", default="gpt-4o")
@@ -410,10 +416,6 @@ def _run_memory_eval(
         from headroom.evals.memory import (
             LoCoMoEvaluator,
             MemoryEvalConfig,
-            create_anthropic_judge,
-            create_litellm_judge,
-            create_openai_judge,
-            simple_judge,
         )
         from headroom.memory import MemoryConfig
     except ImportError as e:
@@ -498,25 +500,15 @@ def _run_memory_eval(
         if answer_model and judge_model == "gpt-4o":
             effective_judge_model = answer_model  # Match the answer model
 
-        if judge_provider == "simple":
-            llm_judge_fn = simple_judge
-        elif judge_provider == "openai":
-            llm_judge_fn = create_openai_judge(model=effective_judge_model)
-        elif judge_provider == "anthropic":
-            llm_judge_fn = create_anthropic_judge(model=effective_judge_model)
-        else:
-            llm_judge_fn = create_litellm_judge(model=effective_judge_model)
+        llm_judge_fn = create_eval_judge(judge_provider, effective_judge_model)
 
     # Determine judge info for display
     judge_info = "DISABLED"
     if llm_judge:
-        if judge_provider == "simple":
-            judge_info = "ENABLED (rule-based F1)"
-        else:
-            jm = judge_model
-            if answer_model and judge_model == "gpt-4o":
-                jm = answer_model
-            judge_info = f"ENABLED ({judge_provider}: {jm})"
+        jm = judge_model
+        if answer_model and judge_model == "gpt-4o":
+            jm = answer_model
+        judge_info = describe_eval_judge(judge_provider, jm)
 
     extract_info = f"ENABLED ({extraction_model})" if not no_extract else "DISABLED (raw dialogue)"
     retrieval_info = "ALL memories (Path A)" if pass_all else f"Top-{top_k} retrieval"

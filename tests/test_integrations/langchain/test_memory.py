@@ -67,7 +67,7 @@ class TestHeadroomChatMessageHistoryInit:
         """Initialize with default settings."""
         from headroom.integrations.langchain.memory import HeadroomChatMessageHistory
 
-        with patch("headroom.integrations.langchain.memory.OpenAIProvider"):
+        with patch("headroom.integrations.langchain.memory.create_default_provider"):
             history = HeadroomChatMessageHistory(mock_base_history)
 
             assert history._base is mock_base_history
