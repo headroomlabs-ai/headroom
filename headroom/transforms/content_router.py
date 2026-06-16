@@ -40,6 +40,7 @@ import logging
 import math
 import os
 import re
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -54,6 +55,9 @@ from .content_detector import detect_content_type as _regex_detect_content_type
 from .error_detection import content_has_strong_error_indicators
 
 logger = logging.getLogger(__name__)
+
+
+_detect_backend_warned = False
 
 
 def _router_debug_dumps(value: Any) -> str:
@@ -109,20 +113,42 @@ def _section_debug(section: ContentSection, index: int) -> dict[str, Any]:
     }
 
 
+def _resolve_detect_backend() -> str:
+    """Pick the content-detection backend: ``"rust"`` or ``"python"``."""
+    backend = os.environ.get("HEADROOM_DETECT_BACKEND", "").strip().lower()
+    if backend in ("python", "rust"):
+        return backend
+    return "python" if sys.platform == "win32" else "rust"
+
+
 def _detect_content(content: str) -> DetectionResult:
-    """Detect content type via the Rust detection chain.
+    """Detect content type via the native chain, with a safe Windows default.
 
     Stage-3d (PR5) wired this through `headroom._core.detect_content_type`,
-    which runs the magika→unidiff→PlainText chain. The Python-side
-    Magika+regex fallback path was retired here — single detection
-    surface, no parallel paths. The Rust extension is a hard dep
-    (no Python fallback) per `feedback_no_silent_fallbacks.md`.
+    which runs the magika→unidiff→PlainText chain. On Windows, native Magika
+    initialization can leave an ONNX Runtime thread alive after timeout, so the
+    default backend there is the pure-Python regex detector.
+
+    Set `HEADROOM_DETECT_BACKEND=rust` or `python` to force a backend.
 
     The Rust binding returns the legacy `DetectionResult` shape with
     `confidence=1.0` and an empty metadata dict. Existing callers
     only consumed `.content_type` from it; the strategy mapping in
     `_strategy_from_detection` keys off that field alone.
     """
+    global _detect_backend_warned
+
+    backend = _resolve_detect_backend()
+    if backend == "python":
+        if not _detect_backend_warned:
+            _detect_backend_warned = True
+            logger.warning(
+                "Content detection using pure-Python backend "
+                "(native Magika/ONNX detector is unsafe by default on Windows; "
+                "override with HEADROOM_DETECT_BACKEND=rust)."
+            )
+        return _regex_detect_content_type(content)
+
     from headroom._core import detect_content_type as _rust_detect
 
     rust_result = _rust_detect(content)
