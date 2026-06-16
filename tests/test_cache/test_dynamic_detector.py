@@ -554,4 +554,4 @@ class TestSemanticDetectorGuards:
         spans, warning = det.detect("This is a sentence here. Here is another long one.")
 
         assert spans == []
-        assert warning == "semantic detector is not initialized"
+        assert warning == "exemplar embeddings not initialized"
