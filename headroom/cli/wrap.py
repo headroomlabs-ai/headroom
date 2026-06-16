@@ -5929,6 +5929,19 @@ def agy(
     # -----------------------------------------------------------------------
     # MITM path
     # -----------------------------------------------------------------------
+    # Quiet litellm's "Provider List: https://..." banner, which it prints to
+    # stderr on every cost lookup for models it doesn't know (agy's Cloud Code
+    # model ids). Set the global flags once, before the dispatch handles any
+    # request. Assign through an Any alias (the flags aren't in litellm's stubs).
+    try:
+        import litellm
+
+        _litellm: Any = litellm
+        _litellm.suppress_debug_info = True
+        _litellm.set_verbose = False
+    except Exception:  # noqa: BLE001 - best-effort noise suppression
+        pass
+
     from headroom.providers.agy import build_agy_env
     from headroom.proxy.agy_ca import build_combined_bundle, ensure_root_ca
 
