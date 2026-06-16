@@ -3144,7 +3144,7 @@ def copilot(
         raw_model = _copilot_model_from_args(copilot_args, env)
         if _is_auto_model(raw_model):
             click.echo(
-                "  Note: '--model auto' is not supported in Copilot BYOK mode.\n"
+                "  Error: '--model auto' is not supported in Copilot BYOK mode.\n"
                 "  BYOK routes to an external provider (Anthropic/OpenAI) which\n"
                 "  does not recognise 'auto' as a model name — the request will\n"
                 "  fail with a 400 error.\n"
@@ -3153,6 +3153,7 @@ def copilot(
                 "    • Use subscription mode for native auto-routing:\n"
                 "      headroom wrap copilot --subscription -- --model auto"
             )
+            raise SystemExit(1)
         else:
             click.echo(
                 "  Note: Copilot BYOK requires a model. Pass `--model <name>` "
