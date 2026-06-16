@@ -211,18 +211,14 @@ class AnchorConfig:
 DEFAULT_EXCLUDE_TOOLS: frozenset[str] = frozenset(
     {
         "Read",
-        "Glob",
-        "Grep",
         "Write",
         "Edit",
-        "Bash",
+        # Bash, Grep, Glob are NOT excluded — their outputs are
+        # ideal compression targets (search results, file lists, logs).
         # Lowercase variants for case-insensitive matching
         "read",
-        "glob",
-        "grep",
         "write",
         "edit",
-        "bash",
     }
 )
 

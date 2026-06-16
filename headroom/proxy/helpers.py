@@ -771,7 +771,7 @@ def parse_sse_events_from_byte_buffer(
 MAX_MESSAGE_ARRAY_LENGTH = 10000
 
 # Compression pipeline timeout in seconds
-COMPRESSION_TIMEOUT_SECONDS = 30
+COMPRESSION_TIMEOUT_SECONDS = 120
 
 # Maximum compression cache sessions (prevents unbounded memory growth)
 MAX_COMPRESSION_CACHE_SESSIONS = 500

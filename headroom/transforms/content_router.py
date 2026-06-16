@@ -110,35 +110,8 @@ def _section_debug(section: ContentSection, index: int) -> dict[str, Any]:
 
 
 def _detect_content(content: str) -> DetectionResult:
-    """Detect content type via the Rust detection chain.
-
-    Stage-3d (PR5) wired this through `headroom._core.detect_content_type`,
-    which runs the magika→unidiff→PlainText chain. The Python-side
-    Magika+regex fallback path was retired here — single detection
-    surface, no parallel paths. The Rust extension is a hard dep
-    (no Python fallback) per `feedback_no_silent_fallbacks.md`.
-
-    The Rust binding returns the legacy `DetectionResult` shape with
-    `confidence=1.0` and an empty metadata dict. Existing callers
-    only consumed `.content_type` from it; the strategy mapping in
-    `_strategy_from_detection` keys off that field alone.
-    """
-    from headroom._core import detect_content_type as _rust_detect
-
-    rust_result = _rust_detect(content)
-    # Rust's `content_type` is the lowercase string tag (e.g.
-    # "json_array"); translate to the Python `ContentType` enum so
-    # downstream mapping keys match.
-    content_type = ContentType(rust_result.content_type)
-    if content_type is ContentType.PLAIN_TEXT:
-        regex_result = _regex_detect_content_type(content)
-        if regex_result.content_type is not ContentType.PLAIN_TEXT:
-            return regex_result
-    return DetectionResult(
-        content_type=content_type,
-        confidence=rust_result.confidence,
-        metadata={},
-    )
+    """Detect content type via fast regex (skip slow Rust/Magika on Windows)."""
+    return _regex_detect_content_type(content)
 
 
 def _create_content_signature(
@@ -505,7 +478,7 @@ class ContentRouterConfig:
 
     # Enable/disable specific compressors
     enable_code_aware: bool = False  # Disabled: use code graph MCP tools instead
-    enable_kompress: bool = True  # Kompress: ModernBERT token compressor
+    enable_kompress: bool = False  # Kompress: ModernBERT token compressor — disabled (CPU too slow)
     enable_smart_crusher: bool = True
     enable_search_compressor: bool = True
     enable_log_compressor: bool = True
@@ -565,8 +538,8 @@ class ContentRouterConfig:
     # At low pressure (<30% full), use the relaxed threshold (reject marginal).
     # At high pressure (>80% full), use the aggressive threshold (accept anything helpful).
     # Linearly interpolates between the two.
-    min_ratio_relaxed: float = 0.85  # when context is mostly empty
-    min_ratio_aggressive: float = 0.65  # when context is nearly full
+    min_ratio_relaxed: float = 0.98  # when context is mostly empty — accept even 2% savings
+    min_ratio_aggressive: float = 0.50  # when context is nearly full
 
     # CCR (Compress-Cache-Retrieve) settings for SmartCrusher
     ccr_enabled: bool = True  # Enable CCR marker injection for reversible compression
@@ -1365,6 +1338,28 @@ class ContentRouter(Transform):
                             len(result.compressed.split()),
                         )
                         decision_reason = "search_compressor"
+                # Fallback: if search compressor didn't reduce enough,
+                # try simple file listing compression (dedup + truncate)
+                if compressed is not None and compressed_tokens >= original_tokens * 0.95:
+                    lines = content.strip().split("\n")
+                    if len(lines) > 10:
+                        # Deduplicate and keep first N
+                        seen = set()
+                        unique = []
+                        for line in lines:
+                            key = line.strip()
+                            if key and key not in seen:
+                                seen.add(key)
+                                unique.append(line)
+                        max_files = max(10, int(len(unique) * bias * 0.3))
+                        if len(unique) > max_files:
+                            kept = unique[:max_files]
+                            dropped = len(unique) - max_files
+                            kept.append(f"  ... ({dropped} more files truncated)")
+                            compressed = "\n".join(kept)
+                            compressed_tokens = len(compressed.split())
+                            decision_reason = "file_listing_truncate"
+                            strategy_chain.append("file_listing")
 
             elif strategy == CompressionStrategy.LOG:
                 if self.config.enable_log_compressor:
@@ -2119,7 +2114,7 @@ class ContentRouter(Transform):
         protect_analysis = kwargs.get(
             "protect_analysis_context", self.config.protect_analysis_context
         )
-        min_tokens = kwargs.get("min_tokens_to_compress", 50)
+        min_tokens = kwargs.get("min_tokens_to_compress", 20)
         # Cache-safety knobs for content-block (Anthropic-format) handling:
         compress_assistant_text_blocks = kwargs.get(
             "compress_assistant_text_blocks",
@@ -2570,7 +2565,7 @@ class ContentRouter(Transform):
         if route_counts["user_msg"]:
             parts.append(f"{route_counts['user_msg']} skipped (user)")
         if route_counts["small"]:
-            parts.append(f"{route_counts['small']} skipped (<50 words)")
+            parts.append(f"{route_counts['small']} skipped (<{min_tokens} words)")
         if route_counts["recent_code"]:
             parts.append(f"{route_counts['recent_code']} protected (recent code)")
         if route_counts["analysis_ctx"]:

@@ -154,6 +154,11 @@ def detect_content_type(content: str) -> DetectionResult:
     if search_result and search_result.confidence >= 0.6:
         return search_result
 
+    # 4b. Check for file listings (Glob output: paths with extensions)
+    listing_result = _try_detect_file_listing(content)
+    if listing_result and listing_result.confidence >= 0.6:
+        return listing_result
+
     # 5. Check for build/log output
     log_result = _try_detect_log(content)
     if log_result and log_result.confidence >= 0.5:
@@ -334,6 +339,32 @@ def _try_detect_search(content: str) -> DetectionResult | None:
         ContentType.SEARCH_RESULTS,
         confidence,
         {"matching_lines": matching_lines, "total_lines": non_empty_lines},
+    )
+
+
+def _try_detect_file_listing(content: str) -> DetectionResult | None:
+    """Try to detect file listing output (Glob, find, tree)."""
+    _FILE_PATH_PATTERN = re.compile(
+        r"^[^\s:*?\"<>|]+\.[a-zA-Z0-9]{1,10}$"  # path/with.extension
+    )
+    lines = content.split("\n")[:200]
+    if len(lines) < 5:  # Need at least 5 files to be a listing
+        return None
+
+    matching = sum(1 for l in lines if l.strip() and _FILE_PATH_PATTERN.match(l.strip()))
+    non_empty = sum(1 for l in lines if l.strip())
+    if non_empty == 0:
+        return None
+
+    ratio = matching / non_empty
+    if ratio < 0.5:
+        return None
+
+    confidence = min(1.0, 0.5 + ratio * 0.5)
+    return DetectionResult(
+        ContentType.SEARCH_RESULTS,  # Route to search compressor (dedup + truncate)
+        confidence,
+        {"matching_lines": matching, "total_lines": non_empty},
     )
 
 
