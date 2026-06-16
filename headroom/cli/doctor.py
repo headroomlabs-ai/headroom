@@ -87,7 +87,7 @@ def check_proxy_liveness(livez: dict[str, Any] | None, base_url: str) -> CheckRe
         )
     version = livez.get("version", "unknown")
     uptime = livez.get("uptime_seconds")
-    uptime_text = f"up {_format_uptime(uptime)}" if isinstance(uptime, int | float) else "up"
+    uptime_text = f"up {_format_uptime(uptime)}" if isinstance(uptime, (int, float)) else "up"
     return CheckResult(
         name="proxy",
         status=PASS,
