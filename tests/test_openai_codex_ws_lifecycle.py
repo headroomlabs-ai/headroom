@@ -815,3 +815,33 @@ async def test_many_concurrent_sessions_cleanly_drained():
         if (t.get_name() or "").startswith("codex-ws-") and not t.done()
     ]
     assert leaked == []
+
+
+@pytest.mark.asyncio
+async def test_ws_recognized_client_with_real_path_is_not_restamped():
+    """A WS caller that already classifies (recognized UA) on a real request
+    path must skip the X-Client: codex stamp — exercising the no-stamp branch
+    of the handler's path-based guard, the WS counterpart of the HTTP
+    middleware's preserve-explicit-client behaviour.
+    """
+    upstream_events = [
+        json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
+        json.dumps({"type": "response.completed", "response": {"id": "r_1"}}),
+    ]
+    upstream = _FakeUpstream(upstream_events)
+    fake_ws_mod = _make_fake_websockets_module(upstream)
+
+    client_ws = _FakeWebSocket(frames=[_first_frame()])
+    # A non-empty url path (so the handler does not fall back to the default)
+    # and a recognized codex UA (so should_stamp_codex_client returns False).
+    client_ws.url = SimpleNamespace(path="/v1/responses")
+    client_ws.headers = {"authorization": "Bearer test", "user-agent": "codex-cli/0.5"}
+    handler = _DummyOpenAIHandler()
+
+    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    # The forwarded handshake headers must not carry a proxy-injected x-client:
+    # the caller already self-identifies via its User-Agent.
+    assert "x-client" not in {k.lower() for k in client_ws.headers}
+    assert handler.ws_sessions.active_count() == 0
