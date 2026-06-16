@@ -25,7 +25,7 @@ def test_compression_cache_handles_hits_skips_evictions_and_clear(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     times = iter([100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 112.0, 112.0])
-    monkeypatch.setattr(content_router_module.time, "time", lambda: next(times))
+    monkeypatch.setattr(content_router_module.time, "monotonic", lambda: next(times))
     monkeypatch.setattr(content_router_module.time, "perf_counter_ns", lambda: 50)
 
     cache = CompressionCache(ttl_seconds=10)
