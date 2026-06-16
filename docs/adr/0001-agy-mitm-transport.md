@@ -137,7 +137,7 @@ signals extend that to the user's normal runtime.
 | # | Alternative | Verdict | Reason |
 |---|---|---|---|
 | A | **Embedded single-process MITM, Python** | **CHOSEN** | One process, reuses the Starlette-coupled handler; `cryptography` + `h2` available. Lowest effort-adjusted cost. |
-| B | Embedded MITM in the Rust proxy (`crates/headroom-proxy`) | Deferred (T11) | Steady-state perf ceiling, but the crate is **client-only** (no rustls server / `rcgen` / CONNECT acceptor) — greenfield. YAGNI for v1; tracked to prevent parity drift. |
+| B | Embedded MITM in the Rust proxy (`crates/headroom-proxy`) | **N/A (resolved, headroom-30y.11)** | The Rust proxy crate is a standalone port that **no `wrap` command launches** — every agent (claude/codex/aider/goose/openhands/openclaw/gemini/agy) runs through the Python proxy (`_start_proxy` → `python -m headroom.cli proxy`). The crate is also client-only (no rustls server / `rcgen` / CONNECT acceptor). Porting the MITM stack to a proxy that carries no wrap traffic is effort for a dead path; agy MITM is **Python-only by design**. The `wrap agy` Rust-backend hard-fail (below) is the enforced contract. No silent drift: documented here. (The Rust **core** — `headroom-core` smart_crusher + `auth_mode` agy classification — already has its agy parity via PyO3.) |
 | C | Single-host reverse target via `HTTPS_PROXY`, no per-host MITM | Rejected | The capture shows `agy` uses `CONNECT` + TLS; a passive reverse target without TLS termination cannot read the body. |
 | D | `mitmproxy` sidecar | Rejected | Second process + double TLS termination + double HTTP/2 reframe per SSE request + heavyweight dep — a middleman that erodes the latency value proposition. |
 | — | Full dynamic per-SNI MITM (intercept all hosts) | Rejected | Needless interception surface / security risk; only one upstream host matters. |
@@ -182,6 +182,8 @@ signals extend that to the user's normal runtime.
   first wrap-only command with durable on-disk state, so it gains an `unwrap` command.
 - HTTP/2 negotiated on the agy-facing side (`h2` sans-io server); upstream leg uses the
   handler's existing httpx h2 client.
-- If the Rust proxy is the active backend, `headroom wrap agy` must hard-fail with a clear
-  "unsupported on Rust backend (see T11)" message rather than mis-route.
-- The Rust proxy gains no `agy` support until T11 — tracked, not silently dropped.
+- If the Rust proxy is the active backend, `headroom wrap agy` hard-fails with a clear
+  "unsupported on Rust backend" message rather than mis-route. This is the enforced contract.
+- The Rust proxy port (`crates/headroom-proxy`) gets no `agy` support — **resolved N/A**
+  (headroom-30y.11): it carries no `wrap` traffic for any agent, so agy MITM is Python-only by
+  design. Documented, not silently dropped.
