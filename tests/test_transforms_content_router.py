@@ -652,6 +652,28 @@ def test_pinning_skips_already_compressed(monkeypatch: pytest.MonkeyPatch) -> No
     assert result["content"][0]["text"] == pinned
 
 
+def test_detect_backend_env_python_forces_python_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """HEADROOM_DETECT_BACKEND=python forces the pure-Python regex path."""
+    import headroom._core as _core
+
+    monkeypatch.setenv("HEADROOM_DETECT_BACKEND", "python")
+
+    called = []
+
+    def _record(content: str):  # type: ignore[return]
+        called.append(content)
+        raise AssertionError("native must not be called with python backend")
+
+    monkeypatch.setattr(_core, "detect_content_type", _record)
+
+    # Should not raise — native detector must be bypassed entirely.
+    result = _detect_content('[{"id": 1}]')
+    assert result.content_type is ContentType.JSON_ARRAY
+    assert called == [], "native detect_content_type was called despite python backend"
+
+
 def test_detect_backend_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
     """HEADROOM_DETECT_BACKEND pins the detector on any platform."""
     resolve = content_router_module._resolve_detect_backend
@@ -671,7 +693,7 @@ def test_detect_backend_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_detect_backend_defaults_to_python_on_windows(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Windows defaults to the pure-Python detector (native deadlock, #845)."""
+    """Windows defaults to the pure-Python detector (native ONNX hang, #845)."""
     monkeypatch.delenv("HEADROOM_DETECT_BACKEND", raising=False)
 
     monkeypatch.setattr(content_router_module.sys, "platform", "win32")

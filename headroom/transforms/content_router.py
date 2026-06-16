@@ -40,6 +40,7 @@ import logging
 import math
 import os
 import re
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -54,6 +55,9 @@ from .content_detector import detect_content_type as _regex_detect_content_type
 from .error_detection import content_has_strong_error_indicators
 
 logger = logging.getLogger(__name__)
+
+
+_detect_backend_warned = False
 
 
 def _router_debug_dumps(value: Any) -> str:
@@ -109,58 +113,40 @@ def _section_debug(section: ContentSection, index: int) -> dict[str, Any]:
     }
 
 
-def _warmup_native_detector() -> None:
-    """Pre-warm the magika ONNX session in a background thread.
-
-    The Rust magika detector (`headroom._core`) initialises its ONNX session
-    lazily on the first `detect_content_type` call. On Windows this init can
-    take up to 5 s (the configured timeout) before falling back to the
-    unidiff/PlainText tiers. Firing the warmup here — at import time, in a
-    daemon thread — means the `OnceLock` is populated before the first real
-    request arrives, so detection latency is never visible to callers.
-
-    `HEADROOM_DETECT_BACKEND=python` disables the native detector entirely;
-    warmup is skipped in that case because the native path will never be used.
-    """
+def _resolve_detect_backend() -> str:
+    """Pick the content-detection backend: ``"rust"`` or ``"python"``."""
     backend = os.environ.get("HEADROOM_DETECT_BACKEND", "").strip().lower()
-    if backend == "python":
-        return
-
-    import threading
-
-    def _run() -> None:
-        try:
-            from headroom._core import warmup_magika
-
-            warmup_magika()
-        except Exception:
-            pass  # Native extension absent (editable install, pure-Python fallback)
-
-    threading.Thread(target=_run, name="magika-warmup", daemon=True).start()
-
-
-_warmup_native_detector()
+    if backend in ("python", "rust"):
+        return backend
+    return "python" if sys.platform == "win32" else "rust"
 
 
 def _detect_content(content: str) -> DetectionResult:
-    """Detect content type via the Rust detection chain.
+    """Detect content type via the native chain, with a safe Windows default.
 
     Stage-3d (PR5) wired this through `headroom._core.detect_content_type`,
-    which runs the magika→unidiff→PlainText chain. The ONNX session is
-    pre-warmed at import time (`_warmup_native_detector`) so the first call
-    does not block waiting for the 5-second init timeout.
+    which runs the magika→unidiff→PlainText chain. On Windows, native Magika
+    initialization can leave an ONNX Runtime thread alive after timeout, so the
+    default backend there is the pure-Python regex detector.
 
-    Set `HEADROOM_DETECT_BACKEND=python` to force the pure-Python regex
-    detector on any platform (e.g. for troubleshooting or when the native
-    extension is not installed).
+    Set `HEADROOM_DETECT_BACKEND=rust` or `python` to force a backend.
 
     The Rust binding returns the legacy `DetectionResult` shape with
     `confidence=1.0` and an empty metadata dict. Existing callers
     only consumed `.content_type` from it; the strategy mapping in
     `_strategy_from_detection` keys off that field alone.
     """
-    backend = os.environ.get("HEADROOM_DETECT_BACKEND", "").strip().lower()
+    global _detect_backend_warned
+
+    backend = _resolve_detect_backend()
     if backend == "python":
+        if not _detect_backend_warned:
+            _detect_backend_warned = True
+            logger.warning(
+                "Content detection using pure-Python backend "
+                "(native Magika/ONNX detector is unsafe by default on Windows; "
+                "override with HEADROOM_DETECT_BACKEND=rust)."
+            )
         return _regex_detect_content_type(content)
 
     from headroom._core import detect_content_type as _rust_detect
