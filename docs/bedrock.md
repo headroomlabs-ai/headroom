@@ -24,7 +24,7 @@ it directly from any published image — no separate build:
 
 ```sh
 docker run --rm -p 8787:8787 \
-  -v "$HOME/.aws:/root/.aws" \
+  -v "$HOME/.aws:/home/nonroot/.aws:ro" \
   -e HEADROOM_PROXY_AWS_PROFILE=my-profile \
   --entrypoint headroom-proxy \
   ghcr.io/chopratejas/headroom:latest \
@@ -32,6 +32,11 @@ docker run --rm -p 8787:8787 \
   --upstream https://bedrock-runtime.us-east-1.amazonaws.com \
   --bedrock-region us-east-1
 ```
+
+The published images default to the `nonroot` user (home `/home/nonroot`), so AWS
+credentials are mounted at `/home/nonroot/.aws` — that is where the SDK looks for
+`~/.aws`. For a root-based image (`RUNTIME_USER=root` build), mount to `/root/.aws`
+instead, or pass `--user root`.
 
 Then point the AWS SDK / CLI at the proxy:
 

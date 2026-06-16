@@ -66,9 +66,9 @@ RUN cd /tmp && python -c "from headroom._core import DiffCompressor, SmartCrushe
 # the Rust SigV4 / live-zone compression path from the same image. The
 # binary is copied out of the cache-mounted target dir into a persistent
 # path so the COPY in the runtime stages can pick it up.
-RUN --mount=type=cache,target=/root/.cargo/registry \
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
-    cargo build --release --bin headroom-proxy && \
+    cargo build --release --locked --bin headroom-proxy && \
     cp target/release/headroom-proxy /usr/local/bin/headroom-proxy
 
 # ---- Runtime stage (python-slim): supports root/nonroot via build arg ----
