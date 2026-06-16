@@ -43,13 +43,83 @@ def make_backend(
 
     class FakeAnyLLM:
         @staticmethod
-        def create(requested_provider: str):
+        def create(requested_provider: str, **kwargs):  # noqa: ANN003
             assert requested_provider == provider
             return fake_instance
 
     monkeypatch.setattr(anyllm, "ANYLLM_AVAILABLE", True)
     monkeypatch.setattr(anyllm, "AnyLLM", FakeAnyLLM)
     return anyllm.AnyLLMBackend(provider=provider.upper()), fake_instance
+
+
+def test_init_forwards_api_base_and_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression for #942: custom api_base/api_key must reach AnyLLM.create."""
+    fake_instance = FakeAnyLLMInstance()
+    create_calls: list[dict[str, object]] = []
+
+    class FakeAnyLLM:
+        @staticmethod
+        def create(requested_provider: str, **kwargs):  # noqa: ANN003
+            create_calls.append({"provider": requested_provider, **kwargs})
+            return fake_instance
+
+    monkeypatch.setattr(anyllm, "ANYLLM_AVAILABLE", True)
+    monkeypatch.setattr(anyllm, "AnyLLM", FakeAnyLLM)
+
+    backend = anyllm.AnyLLMBackend(
+        provider="openai",
+        api_key="sk-custom",
+        api_base="https://custom-provider.example/v1",
+    )
+
+    assert backend.api_base == "https://custom-provider.example/v1"
+    assert create_calls == [
+        {
+            "provider": "openai",
+            "api_key": "sk-custom",
+            "api_base": "https://custom-provider.example/v1",
+        }
+    ]
+
+
+def test_init_omits_unset_api_base_and_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unset overrides must not be forwarded, preserving provider env defaults."""
+    fake_instance = FakeAnyLLMInstance()
+    create_calls: list[dict[str, object]] = []
+
+    class FakeAnyLLM:
+        @staticmethod
+        def create(requested_provider: str, **kwargs):  # noqa: ANN003
+            create_calls.append({"provider": requested_provider, **kwargs})
+            return fake_instance
+
+    monkeypatch.setattr(anyllm, "ANYLLM_AVAILABLE", True)
+    monkeypatch.setattr(anyllm, "AnyLLM", FakeAnyLLM)
+
+    anyllm.AnyLLMBackend(provider="openai")
+
+    assert create_calls == [{"provider": "openai"}]
+
+
+def test_init_treats_empty_overrides_as_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Empty-string api_base/api_key must not be forwarded (env var set to "")."""
+    fake_instance = FakeAnyLLMInstance()
+    create_calls: list[dict[str, object]] = []
+
+    class FakeAnyLLM:
+        @staticmethod
+        def create(requested_provider: str, **kwargs):  # noqa: ANN003
+            create_calls.append({"provider": requested_provider, **kwargs})
+            return fake_instance
+
+    monkeypatch.setattr(anyllm, "ANYLLM_AVAILABLE", True)
+    monkeypatch.setattr(anyllm, "AnyLLM", FakeAnyLLM)
+
+    backend = anyllm.AnyLLMBackend(provider="openai", api_key="", api_base="")
+
+    assert backend.api_base is None
+    assert backend.api_key is None
+    assert create_calls == [{"provider": "openai"}]
 
 
 def make_choice(

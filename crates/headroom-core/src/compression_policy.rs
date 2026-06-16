@@ -239,21 +239,24 @@ impl CompressionPolicy {
     /// removes `delta_t` tokens from a message whose cached suffix is
     /// `suffix_tokens` long (#856).
     ///
-    /// Mutating message K invalidates every cached token after it: the
-    /// suffix is re-written once at the write multiplier instead of
-    /// being read at the read multiplier, costing
-    /// `P_alive · (w − r) · S`. In exchange, `delta_t` tokens are gone
-    /// from the current write and every one of the `expected_reads`
-    /// remaining reads of the chain, saving `ΔT · (w + r·(R − 1))`.
+    /// Mutating message K invalidates every cached token after it. When
+    /// the cache is warm the mutated ΔT tokens are themselves already
+    /// cache-written, so keeping them costs only reads (`ΔT · r · R`)
+    /// while mutating re-writes the suffix: alive-case saving is
+    /// `ΔT·r·R − (w−r)·S`. When the cache is dead there is no suffix
+    /// penalty and the full `ΔT·(w + r·(R−1))` is saved. Taking the
+    /// expectation over `P_alive`:
     ///
-    ///   gain = ΔT · (w + r·(R − 1))  −  P_alive · (w − r) · S
+    ///   gain = ΔT · (w + r·(R − 1))  −  P_alive · (w − r) · (S + ΔT)
     ///
     /// Sanity anchors (Anthropic w=1.25, r=0.1), matching the unit
-    /// tests below: a 2K shave under a 50K warm suffix needs ~276
+    /// tests below: a 2K shave under a 50K warm suffix needs 287.5
     /// remaining reads to pay off (rarely profitable); a 50K shave
-    /// under a 10K suffix is profitable from the first write (its
-    /// break-even read count is negative); a live-zone edit (S = 0)
-    /// is always profitable.
+    /// under a 10K suffix breaks even at 2.3 reads (profitable in any
+    /// session with a few turns left); an edit with S = 0 is profitable
+    /// whenever at least one read remains. Callers gating not-yet-cached
+    /// content (live-zone edits) should bypass this formula — it prices
+    /// mutations of content the cache has already written.
     ///
     /// Takes `&self` so a follow-up can apply per-mode margins; today
     /// the arithmetic is mode-independent. Inputs are clamped:
@@ -276,7 +279,15 @@ impl CompressionPolicy {
         } else {
             p_alive.clamp(0.0, 1.0)
         };
-        (delta_t as f32) * (w + r * (reads - 1.0)) - alive * (w - r) * (suffix_tokens as f32)
+        // Corrected warm-case penalty (#856 follow-up): when the cache is
+        // alive, the ΔT tokens are already cache-written, so keeping them
+        // costs only reads — a mutation can avoid at most ΔT·r·R, not a
+        // fresh write. Blending alive (ΔT·r·R − (w−r)·S) and dead
+        // (ΔT·(w + r·(R−1))) cases over P_alive gives a penalty over
+        // S + ΔT, not S alone. The looser ·S form overstated gain by
+        // P_alive·(w−r)·ΔT — always pro-mutation, largest for big shaves.
+        (delta_t as f32) * (w + r * (reads - 1.0))
+            - alive * (w - r) * ((suffix_tokens as f32) + (delta_t as f32))
     }
 
     /// Decision form of [`Self::net_mutation_gain`]: mutate iff the
@@ -292,9 +303,13 @@ impl CompressionPolicy {
     }
 
     /// Remaining-read count at which a warm-cache (P_alive = 1)
-    /// mutation breaks even:
+    /// mutation breaks even. With the corrected penalty this is exactly
     ///
-    ///   R = ((w − r) / r) · (S/ΔT − 1)   ≈ 11.5 · S/ΔT  for S ≫ ΔT
+    ///   R = ((w − r) / r) · S/ΔT   = 11.5 · S/ΔT  (Anthropic 5-min)
+    ///
+    /// reproducing the #856 anchors precisely: 2K shave / 50K suffix →
+    /// 287.5 (~290 reads, rarely profitable); 50K shave / 10K suffix →
+    /// 2.3 (profitable in any session with a few turns left).
     ///
     /// Useful for decision telemetry ("this edit pays off if the
     /// session lasts N more turns"). Returns 0 when `delta_t` is 0
@@ -305,7 +320,7 @@ impl CompressionPolicy {
         }
         let w = CACHE_WRITE_MULTIPLIER;
         let r = CACHE_READ_MULTIPLIER;
-        ((w - r) / r) * ((suffix_tokens as f32) / (delta_t as f32) - 1.0)
+        ((w - r) / r) * ((suffix_tokens as f32) / (delta_t as f32))
     }
 }
 
@@ -414,31 +429,36 @@ mod tests {
     #[test]
     fn net_gain_small_shave_deep_suffix_is_loss() {
         // Shave 2K under a 50K warm suffix at R=10 remaining reads:
-        // 2000·(1.25 + 0.1·9) − 1.0·1.15·50000 = 4300 − 57500 = −53200.
+        // 2000·(1.25 + 0.1·9) − 1.0·1.15·52000 = 4300 − 59800 = −55500.
         let p = CompressionPolicy::for_mode(AuthMode::Payg);
         let gain = p.net_mutation_gain(2_000, 50_000, 10.0, 1.0);
-        assert!((gain - (-53_200.0)).abs() < 1.0, "gain = {gain}");
+        assert!((gain - (-55_500.0)).abs() < 1.0, "gain = {gain}");
         assert!(!p.should_mutate_deep(2_000, 50_000, 10.0, 1.0));
     }
 
     #[test]
     fn net_gain_big_shave_shallow_suffix_is_win() {
         // Shave 50K under a 10K warm suffix at R=3:
-        // 50000·(1.25 + 0.1·2) − 1.0·1.15·10000 = 72500 − 11500 = 61000.
+        // 50000·(1.25 + 0.1·2) − 1.0·1.15·60000 = 72500 − 69000 = 3500.
+        // Tight but positive — consistent with the 2.3-read break-even.
         let p = CompressionPolicy::for_mode(AuthMode::Payg);
         let gain = p.net_mutation_gain(50_000, 10_000, 3.0, 1.0);
-        assert!((gain - 61_000.0).abs() < 1.0, "gain = {gain}");
+        assert!((gain - 3_500.0).abs() < 1.0, "gain = {gain}");
         assert!(p.should_mutate_deep(50_000, 10_000, 3.0, 1.0));
     }
 
     #[test]
-    fn net_gain_live_zone_edit_always_profitable() {
-        // S = 0 derives the existing Subscription live-zone policy as a
-        // special case: nothing cached is invalidated, so any positive
-        // shave wins even at R=0 (gain = ΔT·(w − r) > 0).
+    fn net_gain_no_suffix_edit_profitable_with_reads_remaining() {
+        // S = 0: nothing cached after the edit is invalidated. Warm-case
+        // saving is the avoided rereads, ΔT·r·R — positive whenever at
+        // least one read remains. At R=0 with a warm cache the gain is
+        // exactly 0 (already written, never read again): the boundary
+        // where mutating is pointless rather than harmful.
         let p = CompressionPolicy::for_mode(AuthMode::Subscription);
-        assert!(p.should_mutate_deep(1, 0, 0.0, 1.0));
-        assert!(p.should_mutate_deep(2_000, 0, 0.0, 1.0));
+        assert!(p.should_mutate_deep(1, 0, 1.0, 1.0));
+        assert!(p.should_mutate_deep(2_000, 0, 1.0, 1.0));
+        let boundary = p.net_mutation_gain(2_000, 0, 0.0, 1.0);
+        assert!(boundary.abs() < f32::EPSILON, "boundary = {boundary}");
     }
 
     #[test]
@@ -472,13 +492,14 @@ mod tests {
 
     #[test]
     fn break_even_reads_matches_research_anchor() {
-        // R = 11.5·(S/ΔT − 1): 2K shave / 50K suffix → 11.5·24 = 276
-        // (rarely profitable); 50K shave / 10K suffix →
-        // 11.5·(0.2 − 1) < 0 → profitable from the first read.
+        // R = 11.5·S/ΔT, the #856 anchors exactly: 2K shave / 50K
+        // suffix → 11.5·25 = 287.5 (rarely profitable); 50K shave /
+        // 10K suffix → 11.5·0.2 = 2.3 (profitable within a few turns).
         let p = CompressionPolicy::for_mode(AuthMode::Payg);
         let r = p.break_even_reads(2_000, 50_000);
-        assert!((r - 276.0).abs() < 0.5, "break-even = {r}");
-        assert!(p.break_even_reads(50_000, 10_000) < 0.0);
+        assert!((r - 287.5).abs() < 0.5, "break-even = {r}");
+        let shallow = p.break_even_reads(50_000, 10_000);
+        assert!((shallow - 2.3).abs() < 0.05, "break-even = {shallow}");
         assert_eq!(p.break_even_reads(0, 10_000), 0.0);
     }
 }

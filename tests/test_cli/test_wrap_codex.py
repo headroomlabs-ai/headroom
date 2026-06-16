@@ -350,6 +350,30 @@ class TestSubscriptionRouting:
         content = (tmp_path / ".codex" / "config.toml").read_text()
         assert 'openai_base_url = "http://127.0.0.1:8787/v1"' in content
 
+    def test_inject_emits_requires_openai_auth_for_chatgpt(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        _set_test_home(monkeypatch, tmp_path)
+        config_dir = tmp_path / ".codex"
+        config_dir.mkdir()
+        (config_dir / "auth.json").write_text('{"auth_mode": "chatgpt"}', encoding="utf-8")
+
+        wrap_mod._inject_codex_provider_config(8787)
+
+        assert "requires_openai_auth = true" in (config_dir / "config.toml").read_text()
+
+    def test_inject_omits_requires_openai_auth_for_api_key(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        _set_test_home(monkeypatch, tmp_path)
+        config_dir = tmp_path / ".codex"
+        config_dir.mkdir()
+        (config_dir / "auth.json").write_text('{"auth_mode": "apikey"}', encoding="utf-8")
+
+        wrap_mod._inject_codex_provider_config(8787)
+
+        assert "requires_openai_auth" not in (config_dir / "config.toml").read_text()
+
     def test_openai_base_url_port_updates_on_rewrap(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
@@ -403,6 +427,131 @@ class TestSubscriptionRouting:
 
         content = (tmp_path / ".codex" / "config.toml").read_text()
         assert "env_key" not in content
+
+
+class TestInjectAvoidsDuplicateTopLevelKeys:
+    """Wrap must not produce a TOML-validity-breaking duplicate-key error.
+
+    Codex's ``config.toml`` is parsed strictly: two top-level
+    ``model_provider = …`` (or two ``openai_base_url = …``) declarations
+    cause ``codex`` to refuse to start with
+    ``Error loading config.toml: …: …:1: duplicate key``.  The injector
+    used to unconditionally prepend a top-level block, breaking any user
+    who had already configured their own provider (e.g. ``ccswitch``).
+    """
+
+    def test_inject_does_not_create_duplicate_model_provider(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        import tomllib  # Python 3.11+ stdlib
+
+        _set_test_home(monkeypatch, tmp_path)
+        config_dir = tmp_path / ".codex"
+        config_dir.mkdir()
+        config_file = config_dir / "config.toml"
+        config_file.write_text(
+            'model_provider = "ccswitch"\n'
+            'openai_base_url = "http://llm-gateway-proxy/v1"\n'
+            'model = "azure-gpt-5_5"\n'
+            "\n"
+            "[model_providers.ccswitch]\n"
+            'name = "OpenAI"\n'
+            'base_url = "http://llm-gateway-proxy/v1"\n'
+            'wire_api = "responses"\n'
+        )
+
+        wrap_mod._inject_codex_provider_config(8787)
+
+        content = config_file.read_text()
+        # The wrapped file must be TOML-parseable — duplicate keys were
+        # the failure mode the user reported.
+        tomllib.loads(content)
+        # No duplicate top-level key for either redirectable key.
+        assert content.count("model_provider =") == 1
+        assert content.count("openai_base_url =") == 1
+        # And the rewritten values are the headroom ones.
+        assert 'model_provider = "headroom"' in content
+        assert 'openai_base_url = "http://127.0.0.1:8787/v1"' in content
+
+    @pytest.mark.parametrize("blank", ["", "   ", "\n\t\n"])
+    def test_redirect_existing_top_level_keys_noop_on_blank(self, blank: str) -> None:
+        # No redirectable keys to rewrite in blank/whitespace content — the
+        # helper returns it unchanged so the caller falls back to prepending
+        # the marker-delimited top-level block.
+        assert wrap_mod._redirect_existing_top_level_keys(blank, 8787) == blank
+
+    def test_inject_preserves_user_value_in_trailing_comment(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        _set_test_home(monkeypatch, tmp_path)
+        config_dir = tmp_path / ".codex"
+        config_dir.mkdir()
+        config_file = config_dir / "config.toml"
+        config_file.write_text(
+            'model_provider = "ccswitch"\nopenai_base_url = "http://llm-gateway-proxy/v1"\n'
+        )
+
+        wrap_mod._inject_codex_provider_config(8787)
+
+        content = config_file.read_text()
+        # Original value kept in a comment so the user can recover it.
+        # The comment intentionally drops the surrounding quotes — the
+        # value is a single TOML string and the comment is human-facing.
+        assert "was: ccswitch" in content
+        assert "was: http://llm-gateway-proxy/v1" in content
+
+    def test_inject_rewrap_updates_existing_redirected_keys(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Idempotent re-wrap on a config that already has top-level keys."""
+        import tomllib
+
+        _set_test_home(monkeypatch, tmp_path)
+        config_dir = tmp_path / ".codex"
+        config_dir.mkdir()
+        config_file = config_dir / "config.toml"
+        config_file.write_text('model_provider = "ccswitch"\n')
+
+        wrap_mod._inject_codex_provider_config(8787)
+        wrap_mod._inject_codex_provider_config(9999)  # port change
+
+        content = config_file.read_text()
+        tomllib.loads(content)
+        assert content.count("model_provider =") == 1
+        assert 'model_provider = "headroom"' in content
+        # Port updated in the openai_base_url we injected.
+        assert 'openai_base_url = "http://127.0.0.1:9999/v1"' in content
+        assert 'openai_base_url = "http://127.0.0.1:8787/v1"' not in content
+
+    def test_inject_empty_file_still_uses_marker_block(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """No existing top-level keys → fall back to the marker-delimited block."""
+        _set_test_home(monkeypatch, tmp_path)
+        wrap_mod._inject_codex_provider_config(8787)
+
+        content = (tmp_path / ".codex" / "config.toml").read_text()
+        assert wrap_mod._CODEX_TOP_LEVEL_MARKER in content
+        assert 'model_provider = "headroom"' in content
+        assert 'openai_base_url = "http://127.0.0.1:8787/v1"' in content
+        assert "[model_providers.headroom]" in content
+
+    def test_unwrap_restores_prior_model_provider_after_rewrite(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The snapshot mechanism must still restore the pre-wrap state byte-for-byte."""
+        _set_test_home(monkeypatch, tmp_path)
+        config_dir = tmp_path / ".codex"
+        config_dir.mkdir()
+        config_file = config_dir / "config.toml"
+        original = 'model_provider = "ccswitch"\nopenai_base_url = "http://llm-gateway-proxy/v1"\n'
+        config_file.write_text(original)
+
+        wrap_mod._inject_codex_provider_config(8787)
+
+        status, _ = wrap_mod._restore_codex_provider_config()
+        assert status == "restored"
+        assert config_file.read_text() == original
 
 
 # ---------------------------------------------------------------------------
@@ -515,6 +664,67 @@ def test_start_proxy_uses_separate_session_for_signal_isolation(
 
     assert isinstance(proc, FakeProc)
     assert popen_kwargs["start_new_session"] == (wrap_mod.os.name == "posix")
+
+
+@pytest.mark.parametrize("agent_type", ["claude", "codex", "cursor"])
+def test_start_proxy_applies_agent_90_defaults(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, agent_type: str
+) -> None:
+    """Wrapped coding agents should start the proxy with high-savings defaults."""
+    popen_kwargs: dict[str, object] = {}
+
+    class FakeProc:
+        returncode = None
+
+        def poll(self) -> None:
+            return None
+
+    def fake_popen(*args: object, **kwargs: object) -> FakeProc:
+        popen_kwargs.update(kwargs)
+        return FakeProc()
+
+    monkeypatch.setattr(wrap_mod, "_get_log_path", lambda: tmp_path / "proxy.log")
+    monkeypatch.setattr(wrap_mod, "_check_proxy", lambda port: True)
+    monkeypatch.setattr(wrap_mod.subprocess, "Popen", fake_popen)
+
+    wrap_mod._start_proxy(8787, agent_type=agent_type)
+
+    env = popen_kwargs["env"]
+    assert isinstance(env, dict)
+    assert env["HEADROOM_SAVINGS_PROFILE"] == "agent-90"
+    assert env["HEADROOM_TARGET_RATIO"] == "0.10"
+    assert env["HEADROOM_MAX_ITEMS"] == "8"
+    assert env["HEADROOM_SMART_CRUSHER_COMPACTION"] == "0"
+
+
+def test_start_proxy_preserves_explicit_savings_overrides(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """User-provided savings env vars should override wrapper defaults."""
+    popen_kwargs: dict[str, object] = {}
+
+    class FakeProc:
+        returncode = None
+
+        def poll(self) -> None:
+            return None
+
+    def fake_popen(*args: object, **kwargs: object) -> FakeProc:
+        popen_kwargs.update(kwargs)
+        return FakeProc()
+
+    monkeypatch.setenv("HEADROOM_TARGET_RATIO", "0.20")
+    monkeypatch.setenv("HEADROOM_MAX_ITEMS", "12")
+    monkeypatch.setattr(wrap_mod, "_get_log_path", lambda: tmp_path / "proxy.log")
+    monkeypatch.setattr(wrap_mod, "_check_proxy", lambda port: True)
+    monkeypatch.setattr(wrap_mod.subprocess, "Popen", fake_popen)
+
+    wrap_mod._start_proxy(8787, agent_type="codex")
+
+    env = popen_kwargs["env"]
+    assert isinstance(env, dict)
+    assert env["HEADROOM_TARGET_RATIO"] == "0.20"
+    assert env["HEADROOM_MAX_ITEMS"] == "12"
 
 
 def test_launch_tool_ignores_sigint_in_wrapper(

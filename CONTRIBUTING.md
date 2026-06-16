@@ -73,14 +73,16 @@ A human maintainer reviews every dep change. PRs that add or bump a package must
 ## PR workflow
 
 1. Fork, branch from `main`.
-2. `pip install -e ".[dev]"` then `make install-git-hooks` — installs repo pre-commit checks on every commit and ci-precheck on every push.
+2. Install **Node 18+** and run `uv sync --extra dev` then `make install-git-hooks` — installs repo pre-commit checks on every commit, commitlint on every commit message, and ci-precheck on every push.
 3. One logical change per PR.
 4. Add tests.
-5. `pytest` · `ruff check .` · `ruff format .`
+5. `uv run pytest` · `uv run ruff check .` · `uv run ruff format .`
 6. Update `CHANGELOG.md` for user-facing changes.
-7. Open the PR with a clear description + `Real behavior proof` + any spec/justification required.
+7. Open the PR with a clear description + `Real behavior proof` + any spec/justification required, and keep the PR in draft until the `Review Readiness` boxes are complete.
 
 **Title format** (conventional commits): `feat:`, `fix:`, `docs:`, `test:`, `refactor:`.
+
+**Commit message format** is enforced locally by the repo's `commit-msg` hook and again in CI.
 
 **Review:** CI green, one maintainer review, coverage held/improved.
 
@@ -90,9 +92,15 @@ A human maintainer reviews every dep change. PRs that add or bump a package must
 git clone https://github.com/chopratejas/headroom.git
 cd headroom
 python -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev,relevance,proxy]"
-pytest
+node --version  # Node 18+ required for commitlint hooks
+python -m pip install --upgrade pip
+python -m pip install -e ".[dev,relevance,proxy]"
+python -m pytest
 ```
+
+Headroom uses a `pyproject.toml`/`maturin` build backend. Older `pip`
+versions may fail editable installs by looking for `setup.py`; upgrade `pip`
+first or use `uv sync --extra dev`.
 
 ### Dev Containers
 
@@ -102,6 +110,12 @@ Two configs ship for VS Code / Codespaces:
 - **`.devcontainer/memory-stack/devcontainer.json`** — adds Qdrant + Neo4j sidecars (use `qdrant:6333`, `neo4j://neo4j:7687`).
 
 Inside, use: `uv run ruff check .`, `uv run pytest`, etc.
+
+## Optional automated review
+
+This repository includes `.github/copilot-instructions.md` so maintainers can opt into GitHub Copilot code review without adding workflow billing noise to every PR.
+
+Enable or disable automatic Copilot review in **Settings → Rules → Rulesets → Automatically request Copilot code review**. Keep it off unless maintainers explicitly want the extra review traffic.
 
 ## Coding standards
 

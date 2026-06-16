@@ -19,6 +19,11 @@ headroom wrap codex --prepare-only
 
 Supported values are `rtk` and `lean-ctx`; unset defaults to `rtk`.
 
+The proxy reads RTK lifetime savings with global scope by default so a shared
+daemon reports savings across the operator's projects. Set
+`HEADROOM_RTK_GAIN_SCOPE=project` to query `rtk gain --project` from the
+proxy process working directory.
+
 ## Modes
 
 | Mode | Behavior | Use Case |

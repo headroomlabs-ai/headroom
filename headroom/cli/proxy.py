@@ -61,6 +61,22 @@ def _get_env_bool(name: str, default: bool) -> bool:
     return val.lower() in ("true", "1", "yes", "on")
 
 
+def _get_env_bool_optional(name: str) -> bool | None:
+    if name not in os.environ:
+        return None
+    return _get_env_bool(name, False)
+
+
+def _get_env_int_optional(name: str) -> int | None:
+    val = os.environ.get(name)
+    return int(val) if val is not None and val != "" else None
+
+
+def _get_env_float_optional(name: str) -> float | None:
+    val = os.environ.get(name)
+    return float(val) if val is not None and val != "" else None
+
+
 def _selected_context_tool() -> str:
     raw = os.environ.get(_CONTEXT_TOOL_ENV, "").strip().lower().replace("_", "-")
     if not raw:
@@ -313,8 +329,19 @@ def _selected_context_tool() -> str:
     default=None,
     envvar="HEADROOM_BUDGET",
     help=(
-        "Daily budget limit in USD. Requests are rejected with 429 once the limit is reached. "
-        "Resets at midnight UTC. Env: HEADROOM_BUDGET."
+        "Budget limit in USD per --budget-period. Requests are rejected with 429 "
+        "once the limit is reached. Env: HEADROOM_BUDGET."
+    ),
+)
+@click.option(
+    "--budget-period",
+    type=click.Choice(["hourly", "daily", "monthly"]),
+    default="daily",
+    envvar="HEADROOM_BUDGET_PERIOD",
+    help=(
+        "Period the --budget limit applies to. Hourly resets on a rolling hour, "
+        "daily at local midnight, monthly on the 1st. Default: daily. "
+        "Env: HEADROOM_BUDGET_PERIOD."
     ),
 )
 # Code-aware compression (AST-based, requires `pip install headroom-ai[code]`).
@@ -605,6 +632,7 @@ def proxy(
     codex_wire_debug: bool,
     codex_wire_debug_dir: str | None,
     budget: float | None,
+    budget_period: str,
     code_aware_flag: bool | None,
     disable_kompress: bool,
     code_graph: bool,
@@ -656,7 +684,12 @@ def proxy(
     """
     # Import here to avoid slow startup
     try:
-        from headroom.proxy.server import ProxyConfig, run_server
+        from headroom.proxy.server import (
+            ProxyConfig,
+            _parse_exclude_tools,
+            _parse_tool_profiles,
+            run_server,
+        )
     except ImportError as e:
         click.secho(
             "Error: Proxy dependencies not installed. Run: pip install headroom-ai[proxy]",
@@ -767,6 +800,18 @@ def proxy(
         optimize=not no_optimize,
         cache_enabled=not no_cache,
         rate_limit_enabled=not no_rate_limit,
+        compress_user_messages=_get_env_bool("HEADROOM_COMPRESS_USER_MESSAGES", False),
+        min_tokens_to_crush=_get_env_int_optional("HEADROOM_MIN_TOKENS") or 500,
+        max_items_after_crush=_get_env_int_optional("HEADROOM_MAX_ITEMS") or 50,
+        exclude_tools=_parse_exclude_tools(None) or None,
+        tool_profiles=_parse_tool_profiles([]) or None,
+        smart_crusher_with_compaction=_get_env_bool_optional("HEADROOM_SMART_CRUSHER_COMPACTION"),
+        savings_profile=os.environ.get("HEADROOM_SAVINGS_PROFILE") or None,
+        target_ratio=_get_env_float_optional("HEADROOM_TARGET_RATIO"),
+        compress_system_messages=_get_env_bool_optional("HEADROOM_COMPRESS_SYSTEM_MESSAGES"),
+        protect_recent=_get_env_int_optional("HEADROOM_PROTECT_RECENT"),
+        protect_analysis_context=_get_env_bool_optional("HEADROOM_PROTECT_ANALYSIS_CONTEXT"),
+        accuracy_guard=os.environ.get("HEADROOM_ACCURACY_GUARD") or None,
         # CCR opt-outs for compression-only deployments (streaming / non-MCP
         # clients that can't resolve the injected retrieve tool). Defaults keep
         # CCR fully on; each flag flips one dataclass default to False.
@@ -794,6 +839,7 @@ def proxy(
         log_full_messages=log_messages
         or os.environ.get("HEADROOM_LOG_MESSAGES", "").lower() in ("true", "1", "yes", "on"),
         budget_limit_usd=budget,
+        budget_period=cast(Literal["hourly", "daily", "monthly"], budget_period),
         # Code-aware compression resolution:
         # 1. Explicit --code-aware / --no-code-aware always wins.
         # 2. Otherwise read HEADROOM_CODE_AWARE_ENABLED (truthy = on).

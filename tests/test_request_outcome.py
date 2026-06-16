@@ -293,6 +293,7 @@ async def test_funnel_passes_canonical_record_tokens_shape() -> None:
         "cache_write_5m_tokens": 80,
         "cache_write_1h_tokens": 20,
         "uncached_tokens": 0,
+        "output_tokens": 50,
     }
 
 

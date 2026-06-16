@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 
 import httpx
 
+from headroom.agent_savings import proxy_pipeline_kwargs
 from headroom.copilot_auth import build_copilot_upstream_url
 from headroom.pipeline import PipelineStage, summarize_routing_markers
 from headroom.proxy.auth_mode import classify_auth_mode, classify_client
@@ -421,6 +422,7 @@ class AnthropicHandlerMixin:
 
         from headroom.cache.compression_store import get_compression_store
         from headroom.ccr import CCRToolInjector
+        from headroom.providers.anthropic import sanitize_anthropic_model_id
         from headroom.proxy.helpers import (
             MAX_MESSAGE_ARRAY_LENGTH,
             MAX_REQUEST_BODY_SIZE,
@@ -595,7 +597,14 @@ class AnthropicHandlerMixin:
                         },
                     },
                 )
-            model = body.get("model") or model_override or "unknown"
+            raw_model = body.get("model") or model_override or "unknown"
+            model = (
+                sanitize_anthropic_model_id(raw_model) if isinstance(raw_model, str) else raw_model
+            )
+            body_model = body.get("model")
+            if isinstance(body_model, str) and model != body_model:
+                body["model"] = model
+                body_mutation_tracker.mark_mutated("sanitize_model_id")
             messages = body.get("messages", [])
             pipeline_provider = provider_name
             pipeline_path = request.url.path if upstream_base_url else "/v1/messages"
@@ -663,7 +672,7 @@ class AnthropicHandlerMixin:
             # Identify the harness (codex / claude-code / aider / etc.)
             # from User-Agent or X-Client. Surfaced via the funnel into
             # PERF logs and RequestLog.tags — see RequestOutcome.client.
-            client = classify_client(headers)
+            client = classify_client(headers, default="claude")
             # PR-A5 (P5-49): strip internal x-headroom-* from upstream-bound
             # headers AFTER `_extract_tags` reads them. Inbound bypass gating
             # uses `request.headers.get(...)` directly above; memory user-id
@@ -1066,6 +1075,7 @@ class AnthropicHandlerMixin:
                                     biases=biases,
                                     request_id=request_id,
                                     compression_policy=compression_policy,
+                                    **proxy_pipeline_kwargs(self.config),
                                 ),
                                 timeout=COMPRESSION_TIMEOUT_SECONDS,
                             )
@@ -1106,6 +1116,7 @@ class AnthropicHandlerMixin:
                                     biases=biases,
                                     request_id=request_id,
                                     compression_policy=compression_policy,
+                                    **proxy_pipeline_kwargs(self.config),
                                 ),
                                 timeout=COMPRESSION_TIMEOUT_SECONDS,
                             )
@@ -1137,6 +1148,7 @@ class AnthropicHandlerMixin:
                                         biases=biases,
                                         request_id=request_id,
                                         compression_policy=compression_policy,
+                                        **proxy_pipeline_kwargs(self.config),
                                     ),
                                     timeout=COMPRESSION_TIMEOUT_SECONDS,
                                 )
@@ -1736,6 +1748,7 @@ class AnthropicHandlerMixin:
                             tags,
                             optimization_latency,
                             pipeline_timing=pipeline_timing,
+                            original_messages=original_client_messages,
                         )
                     else:
                         async with stage_timer.measure("upstream_connect"):
@@ -1837,7 +1850,15 @@ class AnthropicHandlerMixin:
                                 turn_id=compute_turn_id(
                                     model, body.get("system"), body.get("messages")
                                 ),
-                                request_messages=body.get("messages")
+                                # `original_client_messages` is the deep-copied
+                                # pre-compression snapshot; `body["messages"]`
+                                # is the compressed list sent upstream. Both
+                                # share the `log_full_messages` gate so the two
+                                # sides stay symmetric.
+                                request_messages=original_client_messages
+                                if self.config.log_full_messages
+                                else None,
+                                compressed_messages=body.get("messages")
                                 if self.config.log_full_messages
                                 else None,
                             )
@@ -2358,7 +2379,16 @@ class AnthropicHandlerMixin:
                             turn_id=compute_turn_id(
                                 model, body.get("system"), body.get("messages")
                             ),
-                            request_messages=messages if self.config.log_full_messages else None,
+                            # `original_client_messages` is the deep-copied
+                            # pre-compression snapshot; `body["messages"]` is the
+                            # compressed list sent upstream. Both gated by
+                            # `log_full_messages`.
+                            request_messages=original_client_messages
+                            if self.config.log_full_messages
+                            else None,
+                            compressed_messages=body.get("messages")
+                            if self.config.log_full_messages
+                            else None,
                         )
                     )
 
@@ -2532,7 +2562,7 @@ class AnthropicHandlerMixin:
         headers = dict(request.headers.items())
         headers.pop("host", None)
         headers.pop("content-length", None)
-        client = classify_client(headers)
+        client = classify_client(headers, default="claude")
         tags = extract_tags(headers)
         # PR-A5 (P5-49): strip internal x-headroom-* before forwarding upstream.
         from headroom.proxy.helpers import _strip_internal_headers, log_outbound_headers
@@ -2784,7 +2814,7 @@ class AnthropicHandlerMixin:
 
         headers = dict(request.headers.items())
         headers.pop("host", None)
-        client = classify_client(headers)
+        client = classify_client(headers, default="claude")
         tags = extract_tags(headers)
         # PR-A5 (P5-49): strip internal x-headroom-* before forwarding upstream.
         from headroom.proxy.helpers import _strip_internal_headers, log_outbound_headers
@@ -2907,7 +2937,7 @@ class AnthropicHandlerMixin:
 
         headers = dict(request.headers.items())
         headers.pop("host", None)
-        client = classify_client(headers)
+        client = classify_client(headers, default="claude")
         tags = extract_tags(headers)
         # PR-A5 (P5-49): strip internal x-headroom-* before forwarding upstream.
         from headroom.proxy.helpers import _strip_internal_headers, log_outbound_headers

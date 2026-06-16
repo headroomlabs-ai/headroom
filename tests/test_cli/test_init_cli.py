@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 import sys
 import types
 from contextlib import contextmanager
@@ -208,11 +209,26 @@ def test_init_codex_merges_feature_flag_into_existing_table(monkeypatch, tmp_pat
     content = config_path.read_text(encoding="utf-8")
     assert 'base_url = "http://127.0.0.1:9000/v1"' in content
     assert content.count("[features]") == 1
-    assert "codex_hooks = true" in content
+    assert "hooks = true" in content
     assert 'env_key = "OPENAI_API_KEY"' not in content
     hooks = json.loads((tmp_path / ".codex" / "hooks.json").read_text(encoding="utf-8"))
     assert "--profile init-local-demo" in hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"]
     assert "init hook ensure" in hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+
+
+def test_init_codex_creates_hooks_feature_flag_on_first_init(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+
+    init_cli._init_codex(global_scope=False, profile="init-local-demo", port=9000)
+
+    content = (tmp_path / ".codex" / "config.toml").read_text(encoding="utf-8")
+    parsed = tomllib.loads(content)
+    assert parsed["model_provider"] == "headroom"
+    assert parsed["features"]["hooks"] is True
+    assert "codex_hooks" not in content
 
 
 def test_init_claude_uses_custom_port(monkeypatch, tmp_path: Path) -> None:
@@ -481,7 +497,7 @@ def test_ensure_codex_provider_keeps_root_keys_above_existing_table(
     """
     init_cli, _ = _load_init_module(monkeypatch)
     path = tmp_path / "config.toml"
-    path.write_text("[features]\ncodex_hooks = true\n", encoding="utf-8")
+    path.write_text("[features]\nhooks = true\n", encoding="utf-8")
 
     init_cli._ensure_codex_provider(path, 8787)
 
@@ -491,7 +507,7 @@ def test_ensure_codex_provider_keeps_root_keys_above_existing_table(
     assert "model_provider" not in parsed["features"]
     assert "openai_base_url" not in parsed["features"]
     # The user's existing table is preserved.
-    assert parsed["features"]["codex_hooks"] is True
+    assert parsed["features"]["hooks"] is True
     assert parsed["model_providers"]["headroom"]["base_url"] == "http://127.0.0.1:8787/v1"
 
 
@@ -504,13 +520,37 @@ def test_ensure_codex_provider_replaces_existing_model_provider(
     """
     init_cli, _ = _load_init_module(monkeypatch)
     path = tmp_path / "config.toml"
-    path.write_text('model_provider = "openai"\n[features]\ncodex_hooks = true\n', encoding="utf-8")
+    path.write_text('model_provider = "openai"\n[features]\nhooks = true\n', encoding="utf-8")
 
     init_cli._ensure_codex_provider(path, 8787)
 
     parsed = tomllib.loads(path.read_text(encoding="utf-8"))  # raises on a duplicate key
     assert parsed["model_provider"] == "headroom"
-    assert parsed["features"]["codex_hooks"] is True
+    assert parsed["features"]["hooks"] is True
+
+
+def test_ensure_codex_provider_emits_requires_openai_auth_for_chatgpt(
+    monkeypatch, tmp_path: Path
+) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    path = tmp_path / "config.toml"
+    (tmp_path / "auth.json").write_text('{"auth_mode": "chatgpt"}', encoding="utf-8")
+
+    init_cli._ensure_codex_provider(path, 8787)
+
+    assert "requires_openai_auth = true" in path.read_text(encoding="utf-8")
+
+
+def test_ensure_codex_provider_omits_requires_openai_auth_for_api_key(
+    monkeypatch, tmp_path: Path
+) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    path = tmp_path / "config.toml"
+    (tmp_path / "auth.json").write_text('{"auth_mode": "apikey"}', encoding="utf-8")
+
+    init_cli._ensure_codex_provider(path, 8787)
+
+    assert "requires_openai_auth" not in path.read_text(encoding="utf-8")
 
 
 def test_ensure_codex_feature_flag_replaces_existing_marker(monkeypatch, tmp_path: Path) -> None:
@@ -525,11 +565,35 @@ def test_ensure_codex_feature_flag_replaces_existing_marker(monkeypatch, tmp_pat
 
     content = path.read_text(encoding="utf-8")
     assert content.count(init_cli._CODEX_FEATURE_MARKER_START) == 1
-    assert "codex_hooks = true" in content
+    assert "hooks = true" in content
+    assert "codex_hooks" not in content
 
 
-def test_ensure_codex_feature_flag_skips_duplicate_existing_setting(
-    monkeypatch, tmp_path: Path
+def test_ensure_codex_feature_flag_replaces_marker_inside_features_scope(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    path = tmp_path / "config.toml"
+    path.write_text(
+        "[features]\n"
+        f"{init_cli._CODEX_FEATURE_MARKER_START}\n"
+        "hooks = true\n"
+        f"{init_cli._CODEX_FEATURE_MARKER_END}\n"
+        "\n[tools]\nhooks = false\n",
+        encoding="utf-8",
+    )
+
+    init_cli._ensure_codex_feature_flag(path)
+
+    content = path.read_text(encoding="utf-8")
+    parsed = tomllib.loads(content)
+    assert parsed["features"]["hooks"] is True
+    assert parsed["tools"]["hooks"] is False
+    assert content.count(init_cli._CODEX_FEATURE_MARKER_START) == 1
+
+
+def test_ensure_codex_feature_flag_migrates_legacy_codex_hooks_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     init_cli, _ = _load_init_module(monkeypatch)
     path = tmp_path / "config.toml"
@@ -538,8 +602,199 @@ def test_ensure_codex_feature_flag_skips_duplicate_existing_setting(
     init_cli._ensure_codex_feature_flag(path)
 
     content = path.read_text(encoding="utf-8")
-    assert content.count("codex_hooks = true") == 1
+    parsed = tomllib.loads(content)
+    assert parsed["features"]["hooks"] is True
+    assert parsed["features"]["shell_tool"] is True
+    assert "codex_hooks" not in parsed["features"]
+    assert content.count("hooks = true") == 1
+    assert content.count(init_cli._CODEX_FEATURE_MARKER_START) == 1
+
+
+def test_ensure_codex_feature_flag_migrates_dotted_legacy_codex_hooks_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    path = tmp_path / "config.toml"
+    path.write_text("features.codex_hooks = true\nfeatures.shell_tool = true\n", encoding="utf-8")
+
+    init_cli._ensure_codex_feature_flag(path)
+
+    content = path.read_text(encoding="utf-8")
+    parsed = tomllib.loads(content)
+    assert parsed["features"]["hooks"] is True
+    assert parsed["features"]["shell_tool"] is True
+    assert "codex_hooks" not in parsed["features"]
+    assert "features.hooks = true" in content
+
+
+def test_ensure_codex_feature_flag_migrates_when_both_keys_present(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    path = tmp_path / "config.toml"
+    # A config that carried both the legacy and the correct key must not produce
+    # a duplicate `hooks` key (which Codex would reject as invalid TOML).
+    path.write_text("[features]\ncodex_hooks = true\nhooks = false\n", encoding="utf-8")
+
+    init_cli._ensure_codex_feature_flag(path)
+
+    content = path.read_text(encoding="utf-8")
+    parsed = tomllib.loads(content)
+    assert "codex_hooks" not in parsed["features"]
+    # The user's explicit `hooks` value is respected; only the legacy key is removed.
+    assert parsed["features"]["hooks"] is False
+
+
+def test_ensure_codex_feature_flag_migrates_when_keys_reversed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    path = tmp_path / "config.toml"
+    path.write_text("[features]\nhooks = false\ncodex_hooks = true\n", encoding="utf-8")
+
+    init_cli._ensure_codex_feature_flag(path)
+
+    content = path.read_text(encoding="utf-8")
+    parsed = tomllib.loads(content)
+    assert "codex_hooks" not in parsed["features"]
+    assert parsed["features"]["hooks"] is False
+
+
+def test_ensure_codex_feature_flag_ignores_hooks_outside_features(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    path = tmp_path / "config.toml"
+    path.write_text(
+        "[features]\nshell_tool = true\n\n[some_other_table]\nhooks = true\n",
+        encoding="utf-8",
+    )
+
+    init_cli._ensure_codex_feature_flag(path)
+
+    content = path.read_text(encoding="utf-8")
+    parsed = tomllib.loads(content)
+    assert parsed["features"]["hooks"] is True
+    assert parsed["features"]["shell_tool"] is True
+    assert parsed["some_other_table"]["hooks"] is True
+    assert content.count(init_cli._CODEX_FEATURE_MARKER_START) == 1
+
+
+def test_ensure_codex_feature_flag_ignores_hooks_after_commented_table_header(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    path = tmp_path / "config.toml"
+    path.write_text(
+        "[features]\nshell_tool = true\n\n[some_other_table] # comment\nhooks = true\n",
+        encoding="utf-8",
+    )
+
+    init_cli._ensure_codex_feature_flag(path)
+
+    parsed = tomllib.loads(path.read_text(encoding="utf-8"))
+    assert parsed["features"]["hooks"] is True
+    assert parsed["features"]["shell_tool"] is True
+    assert parsed["some_other_table"]["hooks"] is True
+
+
+def test_ensure_codex_feature_flag_respects_commented_features_header_and_quoted_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    path = tmp_path / "config.toml"
+    path.write_text('[features] # comment\n"hooks" = false\n', encoding="utf-8")
+
+    init_cli._ensure_codex_feature_flag(path)
+
+    content = path.read_text(encoding="utf-8")
+    parsed = tomllib.loads(content)
+    assert parsed["features"]["hooks"] is False
     assert init_cli._CODEX_FEATURE_MARKER_START not in content
+
+
+def test_ensure_codex_feature_flag_migrates_quoted_legacy_codex_hooks_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    path = tmp_path / "config.toml"
+    path.write_text('[features]\n"codex_hooks" = true\n', encoding="utf-8")
+
+    init_cli._ensure_codex_feature_flag(path)
+
+    parsed = tomllib.loads(path.read_text(encoding="utf-8"))
+    assert parsed["features"]["hooks"] is True
+    assert "codex_hooks" not in parsed["features"]
+
+
+def test_ensure_codex_feature_flag_respects_root_dotted_feature_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    path = tmp_path / "config.toml"
+    path.write_text("features.hooks = false\n", encoding="utf-8")
+
+    init_cli._ensure_codex_feature_flag(path)
+
+    content = path.read_text(encoding="utf-8")
+    parsed = tomllib.loads(content)
+    assert parsed["features"]["hooks"] is False
+    assert init_cli._CODEX_FEATURE_MARKER_START not in content
+
+
+def test_ensure_codex_feature_flag_preserves_legacy_key_outside_features(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    path = tmp_path / "config.toml"
+    path.write_text("[some_other_table]\ncodex_hooks = true\n", encoding="utf-8")
+
+    init_cli._ensure_codex_feature_flag(path)
+
+    parsed = tomllib.loads(path.read_text(encoding="utf-8"))
+    assert parsed["features"]["hooks"] is True
+    assert parsed["some_other_table"]["codex_hooks"] is True
+
+
+def test_ensure_codex_feature_flag_drops_legacy_key_outside_marker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    path = tmp_path / "config.toml"
+    path.write_text(
+        "[features]\n"
+        "codex_hooks = true\n"
+        f"{init_cli._CODEX_FEATURE_MARKER_START}\n"
+        "hooks = true\n"
+        f"{init_cli._CODEX_FEATURE_MARKER_END}\n",
+        encoding="utf-8",
+    )
+
+    init_cli._ensure_codex_feature_flag(path)
+
+    content = path.read_text(encoding="utf-8")
+    parsed = tomllib.loads(content)
+    assert "codex_hooks" not in parsed["features"]
+    assert parsed["features"]["hooks"] is True
+    assert content.count("hooks = true") == 1
+
+
+def test_ensure_codex_feature_flag_is_idempotent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    path = tmp_path / "config.toml"
+    path.write_text("[features]\ncodex_hooks = true\n", encoding="utf-8")
+
+    init_cli._ensure_codex_feature_flag(path)
+    first = path.read_text(encoding="utf-8")
+    init_cli._ensure_codex_feature_flag(path)
+    second = path.read_text(encoding="utf-8")
+
+    assert first == second
+    parsed = tomllib.loads(second)
+    assert parsed["features"]["hooks"] is True
+    assert second.count("hooks = true") == 1
 
 
 def test_ensure_codex_feature_flag_creates_features_section_when_missing(
@@ -553,7 +808,7 @@ def test_ensure_codex_feature_flag_creates_features_section_when_missing(
 
     content = path.read_text(encoding="utf-8")
     assert "[features]" in content
-    assert "codex_hooks = true" in content
+    assert "hooks = true" in content
 
 
 def test_manifest_changed_detects_differences(monkeypatch) -> None:
@@ -840,6 +1095,33 @@ def test_ensure_profile_running_covers_runtime_modes(monkeypatch) -> None:
     assert detached_calls == ["task-profile"]
     assert ("docker-profile", 1) in wait_calls
     assert ("docker-profile", 45) in wait_calls
+
+
+def test_ensure_profile_running_suppresses_hook_recovery_output(monkeypatch, capfd) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    manifest = SimpleNamespace(
+        preset=init_cli.InstallPreset.PERSISTENT_TASK.value,
+        supervisor_kind=init_cli.SupervisorKind.SERVICE.value,
+        profile="service-profile",
+    )
+
+    monkeypatch.setattr(init_cli, "load_manifest", lambda profile: manifest)
+    monkeypatch.setattr(init_cli, "wait_ready", lambda manifest, timeout_seconds: False)
+
+    def noisy_start_supervisor(manifest) -> None:
+        print("python stdout")
+        print("python stderr", file=sys.stderr)
+        os.write(1, b"fd stdout\n")
+        os.write(2, b"fd stderr\n")
+        raise RuntimeError("not permitted")
+
+    monkeypatch.setattr(init_cli, "start_supervisor", noisy_start_supervisor)
+
+    init_cli._ensure_profile_running("service-profile")
+
+    captured = capfd.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
 
 
 def test_ensure_profile_running_returns_when_ready_or_on_exception(monkeypatch) -> None:

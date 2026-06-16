@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -33,17 +34,20 @@ class ClaudeRegistrar(MCPRegistrar):
         *,
         claude_cli: str | None | object = ...,
         home_dir: Path | None = None,
+        config_dir: Path | None = None,
     ) -> None:
         """Allow overrides for testing.
 
         ``claude_cli`` defaults to :func:`shutil.which` lookup. Pass
         ``None`` to force the file-based fallback path. Pass an explicit
-        path to point at a specific binary.
+        path to point at a specific binary. ``CLAUDE_CONFIG_DIR`` is honored
+        for real user sessions; ``home_dir`` keeps tests isolated from the
+        caller's environment unless ``config_dir`` is passed explicitly.
         """
         home = home_dir if home_dir is not None else Path.home()
-        self._claude_dir = home / ".claude"
-        self._modern_config = home / ".claude" / ".claude.json"
-        self._legacy_config = home / ".claude" / "mcp.json"
+        self._claude_dir = _resolve_claude_config_dir(home, config_dir, honor_env=home_dir is None)
+        self._modern_config = self._claude_dir / ".claude.json"
+        self._legacy_config = self._claude_dir / "mcp.json"
         if claude_cli is ...:
             self._claude_cli = shutil.which("claude")
         else:
@@ -182,6 +186,21 @@ class ClaudeRegistrar(MCPRegistrar):
 # ----------------------------------------------------------------------
 # Helpers
 # ----------------------------------------------------------------------
+
+
+def _resolve_claude_config_dir(
+    home: Path,
+    config_dir: Path | None,
+    *,
+    honor_env: bool,
+) -> Path:
+    if config_dir is not None:
+        return config_dir
+    if honor_env:
+        env_dir = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
+        if env_dir:
+            return Path(env_dir).expanduser()
+    return home / ".claude"
 
 
 def _read_json(path: Path) -> dict[str, Any]:

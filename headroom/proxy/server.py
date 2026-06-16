@@ -61,6 +61,7 @@ except ImportError:
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from headroom._version import __version__
+from headroom.agent_savings import proxy_pipeline_kwargs
 from headroom.cache.compression_feedback import get_compression_feedback
 from headroom.cache.compression_store import format_retrieval_miss_detail, get_compression_store
 from headroom.ccr import (
@@ -188,6 +189,240 @@ except ImportError:
 _build_prefix_cache_stats = build_prefix_cache_stats
 _build_session_summary = build_session_summary
 _merge_cost_stats = merge_cost_stats
+
+
+_AGENT_LABELS: dict[str, str] = {
+    "claude": "Claude",
+    "claude-code": "Claude",
+    "claude_cli": "Claude",
+    "claude-code-cli": "Claude",
+    "codex": "Codex",
+    "codex-cli": "Codex",
+    "cursor": "Cursor",
+    "copilot": "GitHub Copilot",
+    "github-copilot": "GitHub Copilot",
+    "aider": "Aider",
+    "zed": "Zed",
+    "opencode": "OpenCode",
+    "openclaw": "OpenClaw",
+    "gemini": "Gemini",
+    "google": "Gemini",
+    "vertex:google": "Gemini",
+    "anthropic": "Claude",
+    "openai": "OpenAI",
+    "unknown": "Unidentified",
+}
+
+_AGENT_SOURCE_PRIORITY: dict[str, int] = {
+    "unknown": 0,
+    "provider": 1,
+    "model": 2,
+    "stack": 3,
+    "client": 4,
+}
+
+
+def _normalize_agent_key(raw: Any) -> str | None:
+    if raw is None:
+        return None
+    value = str(raw).strip().lower()
+    if not value:
+        return None
+    value = value.replace(" ", "-").replace("_", "-")
+    if value.startswith("wrap-"):
+        value = value.removeprefix("wrap-")
+    if value in {"claude-cli", "claude-code", "claude-code-cli"}:
+        return "claude-code"
+    if value in {"codex-cli", "codex"}:
+        return "codex"
+    if value in {"github-copilot", "copilot"}:
+        return "copilot"
+    if value in {"google", "vertex-google", "vertex:google"}:
+        return "gemini"
+    return value
+
+
+def _agent_label(agent_key: str) -> str:
+    if agent_key in _AGENT_LABELS:
+        return _AGENT_LABELS[agent_key]
+    return agent_key.replace("-", " ").replace("_", " ").title()
+
+
+def _classify_agent_from_log(entry: dict[str, Any]) -> tuple[str, str, str]:
+    raw_tags = entry.get("tags")
+    tags = raw_tags if isinstance(raw_tags, dict) else {}
+    for source, candidate in (
+        ("client", tags.get("client")),
+        ("stack", tags.get("stack") or tags.get("headroom-stack")),
+    ):
+        key = _normalize_agent_key(candidate)
+        if key:
+            return key, _agent_label(key), source
+
+    model = str(entry.get("model") or "").lower()
+    if "codex" in model:
+        return "codex", _agent_label("codex"), "model"
+    if "claude" in model:
+        return "claude-code", _agent_label("claude-code"), "model"
+    if "gemini" in model:
+        return "gemini", _agent_label("gemini"), "model"
+
+    key = _normalize_agent_key(entry.get("provider"))
+    if key:
+        return key, _agent_label(key), "provider"
+
+    return "unknown", _agent_label("unknown"), "unknown"
+
+
+def _build_agent_usage_summary(
+    logs: list[dict[str, Any]],
+    *,
+    requests_by_provider: dict[str, int],
+    requests_by_model: dict[str, int],
+    global_before_tokens: int,
+    global_after_tokens: int,
+    global_tokens_saved: int,
+    global_output_tokens: int,
+) -> dict[str, Any]:
+    agents: dict[str, dict[str, Any]] = {}
+
+    def _agent_row(agent_key: str, label: str, source: str) -> dict[str, Any]:
+        row = agents.setdefault(
+            agent_key,
+            {
+                "agent": agent_key,
+                "label": label,
+                "source": source,
+                "requests": 0,
+                "before_tokens": 0,
+                "after_tokens": 0,
+                "output_tokens": 0,
+                "tokens_saved": 0,
+                "models": {},
+                "providers": {},
+                "has_exact_tokens": False,
+            },
+        )
+        if _AGENT_SOURCE_PRIORITY.get(source, 0) > _AGENT_SOURCE_PRIORITY.get(
+            str(row.get("source") or "unknown"), 0
+        ):
+            row["source"] = source
+        return row
+
+    for entry in logs:
+        agent_key, label, source = _classify_agent_from_log(entry)
+        row = _agent_row(agent_key, label, source)
+        before = max(0, int(entry.get("input_tokens_original") or 0))
+        after = max(0, int(entry.get("input_tokens_optimized") or 0))
+        saved = max(0, int(entry.get("tokens_saved") or 0))
+        output = max(0, int(entry.get("output_tokens") or 0))
+        provider = str(entry.get("provider") or "unknown")
+        model = str(entry.get("model") or "unknown")
+
+        row["requests"] += 1
+        row["before_tokens"] += before
+        row["after_tokens"] += after
+        row["output_tokens"] += output
+        row["tokens_saved"] += saved
+        row["providers"][provider] = int(row["providers"].get(provider, 0)) + 1
+        row["models"][model] = int(row["models"].get(model, 0)) + 1
+        if before > 0 or after > 0 or saved > 0:
+            row["has_exact_tokens"] = True
+
+    if not agents:
+        inferred_model_counts: dict[str, int] = {}
+        for model, count in requests_by_model.items():
+            model_lower = str(model).lower()
+            if "codex" in model_lower:
+                key = "codex"
+            elif "claude" in model_lower:
+                key = "claude-code"
+            elif "gemini" in model_lower:
+                key = "gemini"
+            else:
+                continue
+            inferred_model_counts[str(model)] = int(count)
+
+        provider_request_count = sum(max(0, int(count)) for count in requests_by_provider.values())
+        inferred_request_count = sum(max(0, count) for count in inferred_model_counts.values())
+        use_model_fallback = (
+            inferred_request_count > 0 and inferred_request_count == provider_request_count
+        )
+
+        if not use_model_fallback:
+            for provider, count in requests_by_provider.items():
+                key = _normalize_agent_key(provider) or "unknown"
+                row = _agent_row(key, _agent_label(key), "provider")
+                row["requests"] += int(count)
+                row["providers"][provider] = int(row["providers"].get(provider, 0)) + int(count)
+        for model, count in requests_by_model.items():
+            model_lower = str(model).lower()
+            if "codex" in model_lower:
+                key = "codex"
+            elif "claude" in model_lower:
+                key = "claude-code"
+            elif "gemini" in model_lower:
+                key = "gemini"
+            else:
+                continue
+            if not use_model_fallback:
+                continue
+            row = _agent_row(key, _agent_label(key), "model")
+            row["requests"] += int(count)
+            row["models"][str(model)] = int(row["models"].get(str(model), 0)) + int(count)
+
+    rows: list[dict[str, Any]] = []
+    for row in agents.values():
+        before = int(row["before_tokens"])
+        saved = int(row["tokens_saved"])
+        after = int(row["after_tokens"])
+        if before == 0 and (after > 0 or saved > 0):
+            before = after + saved
+        savings_percent = round((saved / before) * 100.0, 2) if before else 0.0
+        row["before_tokens"] = before
+        row["savings_percent"] = savings_percent
+        row["after_percent"] = round((after / before) * 100.0, 2) if before else 0.0
+        row["share_of_saved_percent"] = (
+            round((saved / global_tokens_saved) * 100.0, 2) if global_tokens_saved else 0.0
+        )
+        row["share_of_requests_percent"] = 0.0
+        rows.append(row)
+
+    total_requests = sum(int(row["requests"]) for row in rows)
+    for row in rows:
+        row["share_of_requests_percent"] = (
+            round((int(row["requests"]) / total_requests) * 100.0, 2) if total_requests else 0.0
+        )
+
+    rows.sort(
+        key=lambda row: (
+            int(row.get("tokens_saved", 0)),
+            int(row.get("before_tokens", 0)),
+            int(row.get("requests", 0)),
+        ),
+        reverse=True,
+    )
+
+    return {
+        "agents": rows,
+        "totals": {
+            "requests": total_requests,
+            "before_tokens": global_before_tokens,
+            "after_tokens": global_after_tokens,
+            "output_tokens": global_output_tokens,
+            "tokens_saved": global_tokens_saved,
+            "savings_percent": (
+                round((global_tokens_saved / global_before_tokens) * 100.0, 2)
+                if global_before_tokens
+                else 0.0
+            ),
+        },
+        "coverage": {
+            "logged_requests": len(logs),
+            "exact_token_rows": sum(1 for row in rows if row.get("has_exact_tokens")),
+            "mode": "request_logs" if logs else "aggregate_fallback",
+        },
+    }
 
 
 logging.basicConfig(
@@ -366,10 +601,19 @@ class HeadroomProxy(
         # ContentRouter is the single proxy routing surface. Provider handlers
         # normalize their request shapes into messages or CompressionUnits, and
         # the router chooses SmartCrusher, log/search/diff/code, or Kompress.
+        profile_kwargs = proxy_pipeline_kwargs(config)
         router_config = ContentRouterConfig(
             enable_code_aware=config.code_aware_enabled,
             tool_profiles=config.tool_profiles,
             read_lifecycle=ReadLifecycleConfig(enabled=config.read_lifecycle),
+            smart_crusher_max_items_after_crush=cast(
+                int | None,
+                profile_kwargs.get("max_items_after_crush"),
+            ),
+            smart_crusher_with_compaction=cast(
+                bool,
+                profile_kwargs.get("smart_crusher_with_compaction", True),
+            ),
             ccr_inject_marker=config.ccr_inject_marker,
         )
         if config.disable_kompress:
@@ -386,7 +630,7 @@ class HeadroomProxy(
         # Off by default for prefix-cache safety; enabled for workloads where
         # user-message content dominates input (OpenAI/Azure chat with pasted
         # code/RAG context — see issue #454).
-        if config.compress_user_messages:
+        if profile_kwargs.get("compress_user_messages"):
             router_config.skip_user_messages = False
         transforms = [
             CacheAligner(CacheAlignerConfig(enabled=False)),
@@ -459,6 +703,9 @@ class HeadroomProxy(
 
         # HTTP client
         self.http_client: httpx.AsyncClient | None = None
+        # HTTP/1.1-only client for ChatGPT passthrough (Cloudflare challenges
+        # our HTTP/2 fingerprint on its sensitive account endpoints).
+        self.http_client_h1: httpx.AsyncClient | None = None
 
         # Shared cold-start warmup registry (populated by startup()).
         # Holds typed slots with loaded / loading / null / error status for
@@ -546,6 +793,7 @@ class HeadroomProxy(
             anyllm_provider=config.anyllm_provider,
             bedrock_region=config.bedrock_region,
             logger=logger,
+            openai_api_url=config.openai_api_url,
             anyllm_backend_cls=AnyLLMBackend,
             litellm_backend_cls=LiteLLMBackend,
         )
@@ -891,19 +1139,26 @@ class HeadroomProxy(
             metadata={"port": self.config.port, "host": self.config.host},
         )
         _ca_bundle = find_ca_bundle()
-        self.http_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(
+        _client_kwargs: dict[str, Any] = {
+            "timeout": httpx.Timeout(
                 connect=self.config.connect_timeout_seconds,
                 read=self.config.request_timeout_seconds,
                 write=self.config.request_timeout_seconds,
                 pool=self.config.connect_timeout_seconds,
             ),
-            limits=httpx.Limits(
+            "limits": httpx.Limits(
                 max_connections=self.config.max_connections,
                 max_keepalive_connections=self.config.max_keepalive_connections,
             ),
-            http2=self.config.http2,
-            verify=_ca_bundle if _ca_bundle is not None else True,
+            "verify": _ca_bundle if _ca_bundle is not None else True,
+        }
+        self.http_client = httpx.AsyncClient(http2=self.config.http2, **_client_kwargs)
+        # Reuse the primary client when HTTP/2 is already off; otherwise keep a
+        # dedicated HTTP/1.1 client for ChatGPT passthrough.
+        self.http_client_h1 = (
+            self.http_client
+            if not self.config.http2
+            else httpx.AsyncClient(http2=False, **_client_kwargs)
         )
         logger.info("Headroom Proxy started")
         logger.info(f"Optimization: {'ENABLED' if self.config.optimize else 'DISABLED'}")
@@ -1125,6 +1380,9 @@ class HeadroomProxy(
 
     async def shutdown(self):
         """Cleanup async resources."""
+        if self.http_client_h1 and self.http_client_h1 is not self.http_client:
+            await self.http_client_h1.aclose()
+        self.http_client_h1 = None
         if self.http_client:
             await self.http_client.aclose()
             self.http_client = None
@@ -1697,6 +1955,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "scope": os.environ.get("HEADROOM_DEPLOYMENT_SCOPE"),
             }
         if include_config:
+            profile_kwargs = proxy_pipeline_kwargs(config)
+            effective_target_ratio = cast(
+                float | None,
+                profile_kwargs.get("target_ratio", config.target_ratio),
+            )
             payload["config"] = {
                 "backend": config.backend,
                 "optimize": config.optimize,
@@ -1710,6 +1973,44 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "openai_api_url": config.openai_api_url,
                 "gemini_api_url": config.gemini_api_url,
                 "cloudcode_api_url": config.cloudcode_api_url,
+                "savings_profile": config.savings_profile,
+                "target_ratio": effective_target_ratio,
+                "target_savings_percent": (
+                    round(max(0.0, min(1.0, 1.0 - float(effective_target_ratio))) * 100, 1)
+                    if effective_target_ratio is not None
+                    else None
+                ),
+                "compress_user_messages": bool(
+                    profile_kwargs.get("compress_user_messages", config.compress_user_messages)
+                ),
+                "compress_system_messages": bool(
+                    profile_kwargs.get(
+                        "compress_system_messages",
+                        config.compress_system_messages,
+                    )
+                ),
+                "protect_recent": profile_kwargs.get(
+                    "read_protection_window",
+                    config.protect_recent,
+                ),
+                "protect_analysis_context": profile_kwargs.get(
+                    "protect_analysis_context",
+                    config.protect_analysis_context,
+                ),
+                "min_tokens_to_crush": profile_kwargs.get(
+                    "min_tokens_to_compress",
+                    config.min_tokens_to_crush,
+                ),
+                "max_items_after_crush": profile_kwargs.get(
+                    "max_items_after_crush",
+                    config.max_items_after_crush,
+                ),
+                "smart_crusher_with_compaction": profile_kwargs.get(
+                    "smart_crusher_with_compaction",
+                    config.smart_crusher_with_compaction,
+                ),
+                "force_kompress": bool(profile_kwargs.get("force_kompress", False)),
+                "accuracy_guard": config.accuracy_guard,
                 "pid": os.getpid(),
             }
         return payload
@@ -1967,6 +2268,35 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     _stats_snapshot_lock = asyncio.Lock()
     _stats_snapshot: dict[str, Any] = {"expires_at": 0.0, "value": None}
 
+    RECENT_REQUEST_LOG_WINDOW = 100
+
+    def _build_recent_request_payload(limit: int = RECENT_REQUEST_LOG_WINDOW) -> dict[str, Any]:
+        recent_request_logs = proxy.logger.get_recent(limit) if proxy.logger else []
+        dashboard_recent_requests = [
+            {
+                "request_id": log.get("request_id"),
+                "timestamp": log.get("timestamp"),
+                "provider": log.get("provider"),
+                "model": log.get("model"),
+                "input_tokens_original": log.get("input_tokens_original"),
+                "input_tokens_optimized": log.get("input_tokens_optimized"),
+                "output_tokens": log.get("output_tokens"),
+                "tokens_saved": log.get("tokens_saved"),
+                "savings_percent": log.get("savings_percent"),
+                "optimization_latency_ms": log.get("optimization_latency_ms"),
+                "total_latency_ms": log.get("total_latency_ms"),
+                "transforms_applied": log.get("transforms_applied", []),
+                "waste_signals": log.get("waste_signals"),
+            }
+            for log in recent_request_logs
+            if log.get("input_tokens_original") is not None
+            and log.get("input_tokens_optimized") is not None
+        ][-10:]
+        return {
+            "request_logs": recent_request_logs[-10:],
+            "recent_requests": dashboard_recent_requests,
+        }
+
     async def _build_stats_payload() -> dict[str, Any]:
         """Build the full `/stats` response payload.
 
@@ -2114,9 +2444,21 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         total_tokens_all_layers = all_layers_tokens_saved
         persistent_savings = m.savings_tracker.stats_preview()
         display_session = persistent_savings.get("display_session", {})
+        recent_request_logs = proxy.logger.get_recent(10_000) if proxy.logger else []
+        recent_request_payload = _build_recent_request_payload()
+        agent_usage = _build_agent_usage_summary(
+            recent_request_logs,
+            requests_by_provider=dict(m.requests_by_provider),
+            requests_by_model=dict(m.requests_by_model),
+            global_before_tokens=proxy_total_before_compression,
+            global_after_tokens=m.tokens_input_total,
+            global_tokens_saved=proxy_compression_tokens,
+            global_output_tokens=m.tokens_output_total,
+        )
 
         return {
             "summary": summary,
+            "agent_usage": agent_usage,
             "savings": {
                 "total_tokens": total_tokens_all_layers,
                 "per_project": persistent_savings.get("projects", {}),
@@ -2381,9 +2723,41 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             "proxy_inbound": proxy.metrics.inbound_snapshot(),
             "cache": await proxy.cache.stats() if proxy.cache else None,
             "rate_limiter": await proxy.rate_limiter.stats() if proxy.rate_limiter else None,
-            "recent_requests": proxy.logger.get_recent(10) if proxy.logger else [],
+            **recent_request_payload,
             "log_full_messages": proxy.config.log_full_messages if proxy else False,
             **get_quota_registry().get_all_stats(),
+        }
+
+    def _dashboard_config_payload() -> dict[str, Any]:
+        profile_kwargs = proxy_pipeline_kwargs(config)
+        target_ratio = profile_kwargs.get("target_ratio", config.target_ratio)
+        target_savings_percent = None
+        if isinstance(target_ratio, (int, float)):
+            target_savings_percent = round(max(0.0, min(1.0, 1.0 - float(target_ratio))) * 100, 1)
+        return {
+            "savings_profile": config.savings_profile,
+            "target_ratio": target_ratio,
+            "target_savings_percent": target_savings_percent,
+            "compress_user_messages": bool(
+                profile_kwargs.get("compress_user_messages", config.compress_user_messages)
+            ),
+            "compress_system_messages": bool(
+                profile_kwargs.get("compress_system_messages", config.compress_system_messages)
+            ),
+            "protect_recent": profile_kwargs.get("read_protection_window", config.protect_recent),
+            "protect_analysis_context": config.protect_analysis_context,
+            "min_tokens_to_crush": profile_kwargs.get(
+                "min_tokens_to_compress", config.min_tokens_to_crush
+            ),
+            "max_items_after_crush": profile_kwargs.get(
+                "max_items_after_crush", config.max_items_after_crush
+            ),
+            "smart_crusher_with_compaction": profile_kwargs.get(
+                "smart_crusher_with_compaction",
+                config.smart_crusher_with_compaction,
+            ),
+            "force_kompress": bool(profile_kwargs.get("force_kompress", False)),
+            "accuracy_guard": config.accuracy_guard,
         }
 
     async def _get_cached_stats_payload() -> dict[str, Any]:
@@ -2421,8 +2795,13 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         snapshot to avoid rebuilding the full payload on every UI poll.
         """
         if cached:
-            return await _get_cached_stats_payload()
-        return await _build_stats_payload()
+            payload = dict(await _get_cached_stats_payload())
+            payload.update(_build_recent_request_payload())
+            payload["config"] = _dashboard_config_payload()
+            return payload
+        payload = await _build_stats_payload()
+        payload["config"] = _dashboard_config_payload()
+        return payload
 
     @app.post("/stats/reset", dependencies=[Depends(_require_loopback)])
     async def stats_reset():
@@ -2480,6 +2859,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                         "savings_percent": log.get("savings_percent"),
                         "transforms_applied": log.get("transforms_applied", []),
                         "request_messages": log.get("request_messages"),
+                        "compressed_messages": log.get("compressed_messages"),
                         "response_content": log.get("response_content"),
                         "turn_id": log.get("turn_id"),
                     }
@@ -3224,24 +3604,36 @@ def run_server(
     app_target: Any
     uvicorn_kwargs: dict[str, Any] = {}
     if workers > 1:
-        # CCR / compression-cache / prefix-tracker / TOIN state are all
-        # per-process. Round-robin across workers fragments these caches
-        # and produces silent retrieval failures for `Retrieve original:
-        # hash=X` markers and avoidable cache busts on the upstream
-        # provider. See the "Multi-worker deployment — CCR fragmentation"
-        # section in RUST_DEV.md for the full failure modes and the
-        # sticky-session workaround.
-        logger.warning(
-            "Headroom is running with workers=%d. The in-memory CCR store, "
-            "compression cache, prefix tracker, TOIN state, and CostTracker are all "
-            "per-process; multi-worker deployments produce silent retrieval "
-            "failures, avoidable cache busts, and an unstable dashboard 'Proxy $ Saved' "
-            "hero tile (each /stats poll hits a different worker's partial total) when "
-            "sessions land on different workers. Run --workers 1 (or place a "
-            "sticky-session load balancer in front of multiple --workers 1 processes). "
-            "See RUST_DEV.md → 'Multi-worker deployment — CCR fragmentation'.",
-            workers,
-        )
+        # CompressionCache and PrefixTracker are always per-worker instance vars.
+        # Python CompressionStore defaults to InMemoryBackend (per-process), so
+        # CCR markers written on worker A are invisible to worker B unless a
+        # cross-worker backend is configured via HEADROOM_CCR_BACKEND.
+        # See RUST_DEV.md -> "Multi-worker deployment -- CCR fragmentation".
+        if os.environ.get("HEADROOM_CCR_BACKEND", "").strip():
+            logger.warning(
+                "Headroom is running with workers=%d. Compression cache, "
+                "prefix tracker, TOIN state, and CostTracker are all per-process; "
+                "multi-worker deployments produce avoidable cache busts and an "
+                "unstable dashboard 'Proxy $ Saved' hero tile (each /stats poll "
+                "hits a different worker's partial total) when sessions land on "
+                "different workers. Run --workers 1 or place a sticky-session load "
+                "balancer in front of multiple --workers 1 processes. "
+                "See RUST_DEV.md -> 'Multi-worker deployment -- CCR fragmentation'.",
+                workers,
+            )
+        else:
+            logger.warning(
+                "Headroom is running with workers=%d. The in-memory CCR store, "
+                "compression cache, prefix tracker, TOIN state, and CostTracker are all "
+                "per-process; multi-worker deployments produce silent CCR retrieval "
+                "failures, avoidable cache busts, and an unstable dashboard 'Proxy $ Saved' "
+                "hero tile (each /stats poll hits a different worker's partial total) when "
+                "sessions land on different workers. Set HEADROOM_CCR_BACKEND=sqlite for a "
+                "persistent cross-worker CCR store, run --workers 1, or place a "
+                "sticky-session load balancer in front of multiple --workers 1 processes. "
+                "See RUST_DEV.md -> 'Multi-worker deployment -- CCR fragmentation'.",
+                workers,
+            )
         os.environ[_MULTI_WORKER_CONFIG_ENV] = json.dumps(_proxy_config_payload(config))
         app_target = "headroom.proxy.server:create_app_from_env"
         uvicorn_kwargs["factory"] = True
@@ -3544,6 +3936,11 @@ if __name__ == "__main__":
         optimize=optimize,
         min_tokens_to_crush=_get_env_int("HEADROOM_MIN_TOKENS", args.min_tokens),
         max_items_after_crush=_get_env_int("HEADROOM_MAX_ITEMS", args.max_items),
+        smart_crusher_with_compaction=(
+            _get_env_bool("HEADROOM_SMART_CRUSHER_COMPACTION", False)
+            if "HEADROOM_SMART_CRUSHER_COMPACTION" in os.environ
+            else None
+        ),
         cache_enabled=cache_enabled,
         cache_ttl_seconds=_get_env_int("HEADROOM_CACHE_TTL", args.cache_ttl),
         rate_limit_enabled=rate_limit_enabled,
@@ -3566,6 +3963,28 @@ if __name__ == "__main__":
         mode=normalize_proxy_mode(_get_env_str("HEADROOM_MODE", PROXY_MODE_TOKEN)),
         compress_user_messages=args.compress_user_messages
         or _get_env_bool("HEADROOM_COMPRESS_USER_MESSAGES", False),
+        savings_profile=os.environ.get("HEADROOM_SAVINGS_PROFILE") or None,
+        target_ratio=(
+            float(os.environ["HEADROOM_TARGET_RATIO"])
+            if os.environ.get("HEADROOM_TARGET_RATIO")
+            else None
+        ),
+        compress_system_messages=(
+            _get_env_bool("HEADROOM_COMPRESS_SYSTEM_MESSAGES", False)
+            if "HEADROOM_COMPRESS_SYSTEM_MESSAGES" in os.environ
+            else None
+        ),
+        protect_recent=(
+            int(os.environ["HEADROOM_PROTECT_RECENT"])
+            if os.environ.get("HEADROOM_PROTECT_RECENT")
+            else None
+        ),
+        protect_analysis_context=(
+            _get_env_bool("HEADROOM_PROTECT_ANALYSIS_CONTEXT", False)
+            if "HEADROOM_PROTECT_ANALYSIS_CONTEXT" in os.environ
+            else None
+        ),
+        accuracy_guard=os.environ.get("HEADROOM_ACCURACY_GUARD") or None,
     )
 
     # Get worker and concurrency settings

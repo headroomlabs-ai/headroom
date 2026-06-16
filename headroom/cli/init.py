@@ -5,13 +5,21 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shlex
 import shutil
 import subprocess
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from hashlib import sha1
 from pathlib import Path
 from typing import Any
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python < 3.11
+    import tomli as tomllib  # type: ignore[no-redef]
 
 import click
 
@@ -30,6 +38,7 @@ from headroom.install.runtime import (
 )
 from headroom.install.state import load_manifest, save_manifest
 from headroom.install.supervisors import start_supervisor
+from headroom.providers.codex.install import codex_uses_chatgpt_auth
 
 from .main import main
 
@@ -49,6 +58,16 @@ _SUPPORTED_TARGETS = ("claude", "copilot", "codex", "openclaw")
 _LOCAL_TARGETS = {"claude", "codex"}
 _GLOBAL_TARGETS = {"claude", "copilot", "codex", "openclaw"}
 _STARTUP_READY_TIMEOUT_SECONDS = 15
+_TOML_TABLE_HEADER_RE = re.compile(r"^[ \t]*(?:\[\[[^\]\r\n]+\]\]|\[[^\]\r\n]+\])[ \t]*(?:#.*)?$")
+_TOML_FEATURES_NAME_RE = r"(?:features|\"features\"|'features')"
+_TOML_CODEX_HOOKS_NAME_RE = r"(?:codex_hooks|\"codex_hooks\"|'codex_hooks')"
+_CODEX_FEATURES_TABLE_RE = re.compile(
+    rf"^[ \t]*\[[ \t]*{_TOML_FEATURES_NAME_RE}[ \t]*\][ \t]*(?:#.*)?$"
+)
+_CODEX_FEATURES_DOTTED_LEGACY_RE = re.compile(
+    rf"^[ \t]*{_TOML_FEATURES_NAME_RE}[ \t]*\.[ \t]*{_TOML_CODEX_HOOKS_NAME_RE}[ \t]*="
+)
+_CODEX_FEATURES_LEGACY_KEY_RE = re.compile(rf"^[ \t]*{_TOML_CODEX_HOOKS_NAME_RE}[ \t]*=")
 
 
 def _command_string(parts: list[str]) -> str:
@@ -208,10 +227,7 @@ def _ensure_copilot_hooks(path: Path, profile: str) -> None:
 def _replace_marker_block(
     content: str, marker_start: str, marker_end: str, block: str, *, at_root: bool = False
 ) -> str:
-    if marker_start in content and marker_end in content:
-        start = content.index(marker_start)
-        end = content.index(marker_end) + len(marker_end)
-        content = content[:start].rstrip() + "\n\n" + content[end:].lstrip()
+    content = _remove_marker_block(content, marker_start, marker_end)
     block = block.strip()
     if at_root:
         # The block carries top-level keys, so it must sit above the first table
@@ -219,13 +235,20 @@ def _replace_marker_block(
         # into that table and Codex rejects the config (#260).
         lines = content.splitlines()
         for index, line in enumerate(lines):
-            stripped = line.strip()
-            if stripped.startswith("[") and stripped.endswith("]"):
+            if _TOML_TABLE_HEADER_RE.search(line):
                 head = "\n".join(lines[:index]).rstrip()
                 tail = "\n".join(lines[index:]).lstrip("\n")
                 prefix = f"{head}\n\n" if head else ""
                 return (f"{prefix}{block}\n\n{tail}").rstrip() + "\n"
     return (content.rstrip() + "\n\n" + block + "\n").lstrip()
+
+
+def _remove_marker_block(content: str, marker_start: str, marker_end: str) -> str:
+    if marker_start not in content or marker_end not in content:
+        return content
+    start = content.index(marker_start)
+    end = content.index(marker_end) + len(marker_end)
+    return content[:start].rstrip() + "\n\n" + content[end:].lstrip()
 
 
 def _strip_codex_init_block(content: str) -> str:
@@ -269,6 +292,14 @@ def _ensure_codex_provider(path: Path, port: int) -> None:
     import re
 
     logger.debug("ensure codex provider block: %s (port=%s)", path, port)
+    # Emit requires_openai_auth only for ChatGPT-OAuth users (restores the
+    # account menu); omitting it for API-key users avoids forcing an OAuth
+    # login (#406).
+    requires_openai_auth = (
+        "requires_openai_auth = true\n"
+        if codex_uses_chatgpt_auth(path.parent / "auth.json")
+        else ""
+    )
     block = (
         f"{_CODEX_PROVIDER_MARKER_START}\n"
         'model_provider = "headroom"\n'
@@ -277,6 +308,7 @@ def _ensure_codex_provider(path: Path, port: int) -> None:
         'name = "Headroom init proxy"\n'
         f'base_url = "http://127.0.0.1:{port}/v1"\n'
         "supports_websockets = true\n"
+        f"{requires_openai_auth}"
         f"{_CODEX_PROVIDER_MARKER_END}"
     )
     content = path.read_text(encoding="utf-8") if path.exists() else ""
@@ -294,59 +326,126 @@ def _ensure_codex_provider(path: Path, port: int) -> None:
     path.write_text(content, encoding="utf-8")
 
 
-def _ensure_codex_feature_flag(path: Path) -> None:
-    content = path.read_text(encoding="utf-8") if path.exists() else ""
-    if _CODEX_FEATURE_MARKER_START in content and _CODEX_FEATURE_MARKER_END in content:
-        block = f"{_CODEX_FEATURE_MARKER_START}\ncodex_hooks = true\n{_CODEX_FEATURE_MARKER_END}"
-        content = _replace_marker_block(
-            content,
-            _CODEX_FEATURE_MARKER_START,
-            _CODEX_FEATURE_MARKER_END,
-            block,
-        )
-    elif "[features]" in content:
+def _codex_feature_block() -> str:
+    return f"{_CODEX_FEATURE_MARKER_START}\nhooks = true\n{_CODEX_FEATURE_MARKER_END}"
+
+
+def _codex_dotted_feature_block() -> str:
+    return f"{_CODEX_FEATURE_MARKER_START}\nfeatures.hooks = true\n{_CODEX_FEATURE_MARKER_END}"
+
+
+def _codex_features_table_index(lines: list[str]) -> int | None:
+    return next(
+        (index for index, line in enumerate(lines) if _CODEX_FEATURES_TABLE_RE.search(line)),
+        None,
+    )
+
+
+def _codex_features(content: str) -> dict[str, Any] | None:
+    if not content.strip():
+        return None
+    try:
+        parsed = tomllib.loads(content)
+    except tomllib.TOMLDecodeError:
+        return None
+    features = parsed.get("features")
+    return features if isinstance(features, dict) else None
+
+
+def _codex_features_has_hooks(content: str) -> bool:
+    features = _codex_features(content)
+    if features is None:
+        # Keep init resilient for already-invalid user configs; this fallback
+        # only needs to avoid adding a second obvious hooks line.
         lines = content.splitlines()
-        inserted = False
-        for index, line in enumerate(lines):
-            if line.strip() != "[features]":
-                continue
-            section_end = index + 1
-            while section_end < len(lines) and not (
-                lines[section_end].startswith("[") and lines[section_end].endswith("]")
-            ):
-                if "codex_hooks" in lines[section_end]:
-                    inserted = True
-                    break
-                section_end += 1
-            if not inserted:
-                lines[index + 1 : index + 1] = [
-                    _CODEX_FEATURE_MARKER_START,
-                    "codex_hooks = true",
-                    _CODEX_FEATURE_MARKER_END,
-                ]
-                inserted = True
-            break
-        content = "\n".join(lines).rstrip() + "\n"
-        if not inserted:
-            content = (
-                content.rstrip()
-                + "\n\n[features]\n"
-                + _CODEX_FEATURE_MARKER_START
-                + "\n"
-                + "codex_hooks = true\n"
-                + _CODEX_FEATURE_MARKER_END
-                + "\n"
-            )
+        features_index = _codex_features_table_index(lines)
+        if features_index is None:
+            return False
+        for line in lines[features_index + 1 :]:
+            if _TOML_TABLE_HEADER_RE.search(line):
+                break
+            if re.search(r"^[ \t]*hooks[ \t]*=", line):
+                return True
+        return False
+
+    return "hooks" in features
+
+
+def _strip_codex_legacy_feature_flag(content: str) -> str:
+    lines = content.splitlines(keepends=True)
+    retained: list[str] = []
+    in_features = False
+    in_root = True
+
+    for line in lines:
+        if _TOML_TABLE_HEADER_RE.search(line):
+            in_root = False
+            in_features = bool(_CODEX_FEATURES_TABLE_RE.search(line))
+            retained.append(line)
+            continue
+        if (in_root and _CODEX_FEATURES_DOTTED_LEGACY_RE.search(line)) or (
+            in_features and _CODEX_FEATURES_LEGACY_KEY_RE.search(line)
+        ):
+            continue
+        retained.append(line)
+
+    return "".join(retained)
+
+
+def _ensure_codex_feature_flag(path: Path) -> None:
+    """Ensure Codex's ``[features].hooks`` flag is enabled in config.toml.
+
+    ``hooks`` is the canonical key. ``codex_hooks`` was the original key name and
+    still resolves as a deprecated alias, but Codex >= 0.129 emits a deprecation
+    warning for it (renamed in openai/codex#20522). Any legacy
+    ``[features].codex_hooks`` line is removed, whether inside or outside our
+    marker block, so a migrated config drops the deprecated key and never
+    collides with a duplicate ``hooks`` key. A user-managed ``hooks`` value
+    outside our marker block is left untouched.
+    """
+    content = path.read_text(encoding="utf-8") if path.exists() else ""
+    # Drop the deprecated alias key from [features]. Mirrors the top-level key
+    # cleanup in _ensure_codex_provider (#260) so re-running init migrates a
+    # legacy config rather than producing a duplicate `hooks` key, while leaving
+    # unrelated user tables untouched.
+    content = _strip_codex_legacy_feature_flag(content)
+    if _CODEX_FEATURE_MARKER_START in content and _CODEX_FEATURE_MARKER_END in content:
+        # init owns its marker block; remove it first, then reinsert under the
+        # correct TOML scope below.
+        content = _remove_marker_block(
+            content, _CODEX_FEATURE_MARKER_START, _CODEX_FEATURE_MARKER_END
+        )
+
+    if _codex_features_has_hooks(content):
+        # A user-managed `[features].hooks` key already exists outside our
+        # marker block; respect their value. Clearing the legacy key above was
+        # the only work.
+        pass
     else:
-        content = (
-            content.rstrip()
-            + "\n\n[features]\n"
-            + _CODEX_FEATURE_MARKER_START
-            + "\n"
-            + "codex_hooks = true\n"
-            + _CODEX_FEATURE_MARKER_END
-            + "\n"
-        ).lstrip()
+        lines = content.splitlines()
+        features_index = _codex_features_table_index(lines)
+        if features_index is not None:
+            # Leading blank line matches the normalisation _replace_marker_block
+            # applies on later runs, so re-running init is byte-idempotent.
+            lines[features_index + 1 : features_index + 1] = [
+                "",
+                *_codex_feature_block().splitlines(),
+            ]
+            content = "\n".join(lines).rstrip() + "\n"
+        elif _codex_features(content) is not None:
+            # The user expressed [features] via dotted keys, so adding a new
+            # table would duplicate it. Keep this key at the document root.
+            content = _replace_marker_block(
+                content,
+                _CODEX_FEATURE_MARKER_START,
+                _CODEX_FEATURE_MARKER_END,
+                _codex_dotted_feature_block(),
+                at_root=True,
+            )
+        else:
+            content = (
+                content.rstrip() + "\n\n[features]\n\n" + _codex_feature_block() + "\n"
+            ).lstrip()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
 
@@ -552,31 +651,54 @@ def _install_copilot_marketplace() -> None:
     )
 
 
+@contextmanager
+def _suppress_hook_output() -> Iterator[None]:
+    """Keep best-effort hook recovery from emitting invalid hook output."""
+    stdout_fd = os.dup(1)
+    stderr_fd = os.dup(2)
+    try:
+        with open(os.devnull, "w", encoding="utf-8") as devnull:
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os.dup2(devnull.fileno(), 1)
+            os.dup2(devnull.fileno(), 2)
+            with redirect_stdout(devnull), redirect_stderr(devnull):
+                yield
+    finally:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os.dup2(stdout_fd, 1)
+        os.dup2(stderr_fd, 2)
+        os.close(stdout_fd)
+        os.close(stderr_fd)
+
+
 def _ensure_profile_running(profile: str) -> None:
     manifest = load_manifest(profile)
     if manifest is None:
         return
-    if wait_ready(manifest, timeout_seconds=1):
-        return
-    try:
-        with acquire_runtime_start_lock(manifest.profile) as acquired:
-            if not acquired:
-                return
-            if wait_ready(manifest, timeout_seconds=1):
-                return
-            if runtime_status(manifest) == "running":
-                if wait_ready(manifest, timeout_seconds=_STARTUP_READY_TIMEOUT_SECONDS):
+    with _suppress_hook_output():
+        if wait_ready(manifest, timeout_seconds=1):
+            return
+        try:
+            with acquire_runtime_start_lock(manifest.profile) as acquired:
+                if not acquired:
                     return
-                stop_runtime(manifest)
-            if manifest.preset == InstallPreset.PERSISTENT_DOCKER.value:
-                start_persistent_docker(manifest)
-            elif manifest.supervisor_kind == SupervisorKind.SERVICE.value:
-                start_supervisor(manifest)
-            else:
-                start_detached_agent(manifest.profile)
-            wait_ready(manifest, timeout_seconds=45)
-    except Exception:
-        return
+                if wait_ready(manifest, timeout_seconds=1):
+                    return
+                if runtime_status(manifest) == "running":
+                    if wait_ready(manifest, timeout_seconds=_STARTUP_READY_TIMEOUT_SECONDS):
+                        return
+                    stop_runtime(manifest)
+                if manifest.preset == InstallPreset.PERSISTENT_DOCKER.value:
+                    start_persistent_docker(manifest)
+                elif manifest.supervisor_kind == SupervisorKind.SERVICE.value:
+                    start_supervisor(manifest)
+                else:
+                    start_detached_agent(manifest.profile)
+                wait_ready(manifest, timeout_seconds=45)
+        except Exception:
+            return
 
 
 def _probe_init_targets(global_scope: bool) -> list[tuple[str, str | None]]:
