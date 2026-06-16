@@ -815,3 +815,41 @@ async def test_many_concurrent_sessions_cleanly_drained():
         if (t.get_name() or "").startswith("codex-ws-") and not t.done()
     ]
     assert leaked == []
+
+
+@pytest.mark.asyncio
+async def test_ws_upstream_connect_allows_large_frames_and_no_pong_deadline():
+    """The upstream WS must accept arbitrarily large frames and never impose a
+    pong deadline.
+
+    Image-generation turns expose two failure modes the relay was previously
+    blind to: (1) the render phase goes silent for 20-60s with no data frames,
+    so a 20s pong deadline false-kills the healthy upstream mid-render; and
+    (2) the finished image arrives inline as a single base64 frame larger than
+    the websockets default 1 MiB cap, raising ``PayloadTooBig`` just as it
+    lands. Pin the connect kwargs so neither regresses.
+    """
+    upstream_events = [
+        json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
+        json.dumps({"type": "response.completed", "response": {"id": "r_1"}}),
+    ]
+    upstream = _FakeUpstream(upstream_events)
+    fake_ws_mod = _make_fake_websockets_module(upstream)
+
+    captured: dict = {}
+    inner_connect = fake_ws_mod.connect
+
+    async def _capturing_connect(*args, **kwargs):
+        captured.update(kwargs)
+        return await inner_connect(*args, **kwargs)
+
+    fake_ws_mod.connect = _capturing_connect
+
+    client_ws = _FakeWebSocket(frames=[_first_frame()])
+    handler = _DummyOpenAIHandler()
+
+    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    assert captured.get("max_size") is None, "upstream frame size must be uncapped"
+    assert captured.get("ping_timeout") is None, "upstream must not impose a pong deadline"

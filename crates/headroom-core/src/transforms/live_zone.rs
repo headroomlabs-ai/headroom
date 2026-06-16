@@ -1009,6 +1009,23 @@ enum SlotKind {
 /// latest user message. Errors out on shapes the dispatcher does not
 /// support (e.g. structured-array `content` inside a tool_result —
 /// rare; we degrade to NoChange in that case).
+/// Whether a content block (no `type` key) carries a JSON-string `text`
+/// field — the Bedrock Converse text-block shape (`{"text": "..."}`).
+/// Used to route typeless Converse text through the Anthropic text path.
+/// Blocks whose `text` is absent or non-string (e.g. `{"image": ...}`,
+/// `{"toolUse": ...}`) return false and stay unrecognized → no-op.
+fn block_has_string_text_field(block_json: &str) -> bool {
+    #[derive(Deserialize)]
+    struct Probe<'a> {
+        #[serde(borrow, default)]
+        text: Option<&'a RawValue>,
+    }
+    serde_json::from_str::<Probe<'_>>(block_json)
+        .ok()
+        .and_then(|p| p.text)
+        .is_some_and(|t| t.get().trim_start().starts_with('"'))
+}
+
 fn plan_block_replacements(
     body_raw: &[u8],
     target_msg_idx: usize,
@@ -1072,7 +1089,18 @@ fn plan_block_replacements(
 
         let header: BlockHeader<'_> =
             serde_json::from_str(block_raw.get()).map_err(|_| PlanError::ParseFailed)?;
-        let block_type = header.r#type.unwrap_or("unknown").to_string();
+        // Bedrock Converse content blocks carry no `type` discriminator —
+        // the variant is the key itself (`{"text": ...}`, `{"image": ...}`,
+        // `{"toolUse": ...}`). A typeless block whose `text` field is a
+        // JSON string is Converse text; route it through the same surgical
+        // path as an Anthropic `{"type":"text","text":...}` block so
+        // Converse user-message text compresses too. Anthropic blocks
+        // always carry `type`, so this never alters the Anthropic path.
+        let block_type = match header.r#type {
+            Some(t) => t.to_string(),
+            None if block_has_string_text_field(block_raw.get()) => "text".to_string(),
+            None => "unknown".to_string(),
+        };
 
         if HOT_ZONE_BLOCK_TYPES.iter().any(|t| *t == block_type) {
             slots.push(PlanSlot {
@@ -1609,6 +1637,61 @@ mod tests {
         }));
         let out = compress_anthropic_live_zone(&b, 0, AuthMode::Payg, DEFAULT_MODEL).unwrap();
         assert!(matches!(out, LiveZoneOutcome::NoChange { .. }));
+    }
+
+    #[test]
+    fn block_has_string_text_field_detects_converse_text_only() {
+        // Converse text block: typeless, string `text` → recognized.
+        assert!(block_has_string_text_field(r#"{"text":"hello"}"#));
+        // Non-text Converse blocks must NOT be mistaken for text.
+        assert!(!block_has_string_text_field(
+            r#"{"image":{"format":"png"}}"#
+        ));
+        assert!(!block_has_string_text_field(r#"{"toolUse":{"name":"x"}}"#));
+        // `text` present but not a JSON string → not Converse text.
+        assert!(!block_has_string_text_field(r#"{"text":["a"]}"#));
+        assert!(!block_has_string_text_field(r#"{"text":{"v":1}}"#));
+    }
+
+    #[test]
+    fn converse_typeless_text_block_routes_like_anthropic_text() {
+        // Bedrock Converse content blocks omit the `type` discriminator —
+        // `{"text": "..."}` instead of `{"type":"text","text":"..."}`. The
+        // dispatcher must treat the two identically so Converse user-message
+        // text compresses like Anthropic text.
+        let payload = "{\"k\": \"v\", \"n\": 1}\n".repeat(200);
+        let converse = body(json!({
+            "messages": [{"role": "user", "content": [{"text": payload}]}]
+        }));
+        let anthropic = body(json!({
+            "messages": [{"role": "user", "content": [{"type": "text", "text": payload}]}]
+        }));
+        let c = compress_anthropic_live_zone(&converse, 0, AuthMode::Payg, DEFAULT_MODEL).unwrap();
+        let a = compress_anthropic_live_zone(&anthropic, 0, AuthMode::Payg, DEFAULT_MODEL).unwrap();
+
+        // Identical dispatch outcome (both Modified or both NoChange).
+        assert_eq!(
+            std::mem::discriminant(&c),
+            std::mem::discriminant(&a),
+            "converse text block must dispatch like an anthropic text block"
+        );
+        let cm = match &c {
+            LiveZoneOutcome::NoChange { manifest } => manifest,
+            LiveZoneOutcome::Modified { manifest, .. } => manifest,
+        };
+        let am = match &a {
+            LiveZoneOutcome::NoChange { manifest } => manifest,
+            LiveZoneOutcome::Modified { manifest, .. } => manifest,
+        };
+        // The Converse block is now classified the same as Anthropic text
+        // (before this change it was an unrecognized typeless block).
+        assert_eq!(cm.block_outcomes.len(), 1);
+        assert_eq!(am.block_outcomes.len(), 1);
+        assert_eq!(
+            cm.block_outcomes[0].block_type,
+            am.block_outcomes[0].block_type
+        );
+        assert_eq!(cm.block_outcomes[0].block_type, "text");
     }
 
     #[test]
