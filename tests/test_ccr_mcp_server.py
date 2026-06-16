@@ -65,3 +65,31 @@ def test_mcp_retrieves_proxy_stored_content(fresh_store) -> None:
 
     assert result.get("source") == "local"
     assert result["original_content"] == original
+
+
+def test_mcp_query_retrieve_returns_empty_results_for_known_hash(fresh_store) -> None:
+    """A query miss inside a known hash is not the same as an expired hash."""
+    pytest.importorskip("mcp", reason="MCP SDK required")
+    original = "alpha\nbeta\ngamma"
+    hash_key = get_compression_store().store(original, "alpha beta")
+
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+    result = asyncio.run(server._retrieve_content(hash_key, query="needle"))
+
+    assert result == {
+        "hash": hash_key,
+        "source": "local",
+        "query": "needle",
+        "results": [],
+        "count": 0,
+    }
+
+
+def test_mcp_query_retrieve_unknown_hash_still_errors(fresh_store) -> None:
+    pytest.importorskip("mcp", reason="MCP SDK required")
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+
+    result = asyncio.run(server._retrieve_content("deadbeef", query="needle"))
+
+    assert result["hash"] == "deadbeef"
+    assert "error" in result
