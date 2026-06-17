@@ -5,8 +5,6 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 
-DEFAULT_API_URL = "https://api.openai.com"
-
 
 def proxy_base_url(port: int) -> str:
     """Return the local proxy base URL used by OpenCode-compatible integrations."""

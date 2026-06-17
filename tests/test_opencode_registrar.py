@@ -207,3 +207,60 @@ class TestOpenCodeRegistrar:
         # Verify backup is removed
         backup = config_file.with_suffix(".jsonc.headroom-backup")
         assert backup.exists() is False
+
+    def test_override_all_provider_base_urls(self, tmp_path):
+        config_dir = tmp_path / ".config" / "opencode"
+        config_dir.mkdir(parents=True)
+        config_file = config_dir / "opencode.jsonc"
+        original = {
+            "provider": {
+                "openai": {"options": {"baseURL": "https://api.openai.com/v1"}},
+                "deepseek": {"options": {"baseURL": "https://api.deepseek.com/v1"}},
+            }
+        }
+        config_file.write_text(json.dumps(original))
+
+        registrar = OpenCodeRegistrar(home_dir=tmp_path)
+        overridden = registrar.override_all_provider_base_urls("http://127.0.0.1:8787/v1")
+
+        assert sorted(overridden) == ["deepseek", "openai"]
+        config = registrar._read_config()
+        assert config["provider"]["openai"]["options"]["baseURL"] == "http://127.0.0.1:8787/v1"
+        assert config["provider"]["deepseek"]["options"]["baseURL"] == "http://127.0.0.1:8787/v1"
+
+    def test_override_all_provider_base_urls_empty_config(self, tmp_path):
+        config_dir = tmp_path / ".config" / "opencode"
+        config_dir.mkdir(parents=True)
+
+        registrar = OpenCodeRegistrar(home_dir=tmp_path)
+        overridden = registrar.override_all_provider_base_urls("http://127.0.0.1:8787/v1")
+
+        assert overridden == []
+
+    def test_is_wrapped_matches_exact_proxy_url(self, tmp_path):
+        config_dir = tmp_path / ".config" / "opencode"
+        config_dir.mkdir(parents=True)
+        config_file = config_dir / "opencode.jsonc"
+
+        # User's own localhost URL should NOT be detected as wrapped
+        config_file.write_text(json.dumps({
+            "provider": {
+                "custom": {"options": {"baseURL": "http://127.0.0.1:3000/api"}}
+            }
+        }))
+        registrar = OpenCodeRegistrar(home_dir=tmp_path)
+        assert registrar.is_wrapped() is False
+
+    def test_is_wrapped_detects_headroom_proxy_url(self, tmp_path):
+        config_dir = tmp_path / ".config" / "opencode"
+        config_dir.mkdir(parents=True)
+        config_file = config_dir / "opencode.jsonc"
+
+        # Headroom proxy URL should be detected
+        config_file.write_text(json.dumps({
+            "provider": {
+                "openai": {"options": {"baseURL": "http://127.0.0.1:8787/v1"}}
+            }
+        }))
+        registrar = OpenCodeRegistrar(home_dir=tmp_path)
+        assert registrar.is_wrapped() is True

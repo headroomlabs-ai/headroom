@@ -3749,7 +3749,9 @@ def opencode(
         click.echo("Install OpenCode: npm install -g @opencode-ai/opencode")
         raise SystemExit(1)
 
-    env, env_vars_display = _build_opencode_launch_env(port, os.environ)
+    from headroom.providers.opencode import build_launch_env
+
+    env, env_vars_display = build_launch_env(port, os.environ)
 
     # Per-project savings attribution
     _opencode_project = _project_name_from_cwd()
@@ -3785,30 +3787,23 @@ def opencode(
 
 
 def _inject_opencode_provider_config(registrar: Any, port: int) -> None:
-    """Override the built-in Deepseek provider's baseURL to route through the proxy.
+    """Override built-in providers' baseURLs to route through the proxy.
 
     Unlike Claude and Codex, OpenCode's built-in providers take precedence
     over custom providers. The only reliable way to route traffic through
-    the proxy is to override the built-in provider's baseURL.
+    the proxy is to override the built-in providers' baseURLs.
     """
     from headroom.providers.opencode import proxy_base_url
 
     base_url = proxy_base_url(port)
-    registrar.override_provider_base_url("deepseek", base_url)
+    overridden = registrar.override_all_provider_base_urls(base_url)
     if registrar._config_file.exists():
-        click.echo(f"  Deepseek provider baseURL overridden to {base_url}")
+        if overridden:
+            names = ", ".join(overridden)
+            click.echo(f"  Provider baseURLs overridden to {base_url}: {names}")
+        else:
+            click.echo(f"  No configured providers found to override in {registrar._config_file}")
 
-
-def _build_opencode_launch_env(
-    port: int, environ: dict[str, str]
-) -> tuple[dict[str, str], list[str]]:
-    """Build environment variables for OpenCode through the local proxy."""
-    env = dict(environ)
-    from headroom.providers.opencode import proxy_base_url
-
-    base_url = proxy_base_url(port)
-    env["OPENAI_BASE_URL"] = base_url
-    return env, [f"OPENAI_BASE_URL={base_url}"]
 
 
 def _inject_memory_mcp_opencode(registrar: Any, db_path: str, user_id: str) -> None:
@@ -5009,7 +5004,7 @@ def unwrap_opencode(port: int, no_stop_proxy: bool) -> None:
         return
 
     try:
-        status = _restore_opencode_config(registrar)
+        status = _restore_opencode_config(registrar, port)
     except Exception as e:
         raise click.ClickException(f"could not unwrap OpenCode config: {e}") from e
 
@@ -5029,7 +5024,7 @@ def unwrap_opencode(port: int, no_stop_proxy: bool) -> None:
     click.echo()
 
 
-def _restore_opencode_config(registrar: Any) -> str:
+def _restore_opencode_config(registrar: Any, port: int = 8787) -> str:
     """Undo ``headroom wrap opencode`` edits to the OpenCode config file.
 
     Returns a status string:
@@ -5047,10 +5042,15 @@ def _restore_opencode_config(registrar: Any) -> str:
     if registrar._config_file.exists() and registrar.is_wrapped():
         config = registrar._read_config()
 
+        from headroom.providers.opencode import proxy_base_url
+
+        proxy_url = proxy_base_url(port)
+
         # Remove Headroom custom provider if present
         registrar.remove_provider("headroom")
 
         # Remove proxy baseURL overrides from built-in providers
+        # Only match the exact proxy URL we inject, not any localhost URL
         providers = config.get("provider", {})
         if isinstance(providers, dict):
             for _provider_name, provider_config in providers.items():
@@ -5058,7 +5058,7 @@ def _restore_opencode_config(registrar: Any) -> str:
                     options = provider_config.get("options", {})
                     if isinstance(options, dict):
                         base_url = options.get("baseURL", "")
-                        if isinstance(base_url, str) and "127.0.0.1:" in base_url:
+                        if isinstance(base_url, str) and base_url == proxy_url:
                             # Remove the baseURL override
                             del options["baseURL"]
                             if not options:

@@ -3,7 +3,12 @@
 OpenCode stores its configuration in ``~/.config/opencode/opencode.jsonc``
 as a JSONC (JSON with comments) file. MCP servers are configured in the
 ``"mcp"`` section, and providers are configured in the ``"provider"`` section.
-This registrar edits the file in place using surgical JSONC modification.
+
+.. warning::
+
+   Config writes strip C-style comments (``//`` and ``/* */``) from the file.
+   A pre-wrap snapshot (``opencode.jsonc.headroom-backup``) is created so
+   ``headroom unwrap opencode`` can restore the original byte-for-byte.
 """
 
 from __future__ import annotations
@@ -93,7 +98,14 @@ def _parse_jsonc(text: str) -> dict[str, Any]:
 
 
 def _write_jsonc(path: Path, data: dict[str, Any]) -> None:
-    """Write a dict as pretty-printed JSON."""
+    """Write a dict as pretty-printed JSON.
+
+    .. warning::
+
+       This strips all C-style comments from the file. A pre-wrap snapshot
+       is created before any mutation so ``restore_config`` can recover the
+       original.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f:
         json.dump(data, f, indent=2)
@@ -229,6 +241,28 @@ class OpenCodeRegistrar(MCPRegistrar):
         options["baseURL"] = base_url
         _write_jsonc(self._config_file, config)
 
+    def override_all_provider_base_urls(self, base_url: str) -> list[str]:
+        """Override baseURL on every configured built-in provider.
+
+        Returns the list of provider names that were overridden.
+        """
+        config = self._read_config()
+        providers = config.get("provider", {})
+        if not isinstance(providers, dict):
+            return []
+        overridden: list[str] = []
+        for provider_name, provider_config in providers.items():
+            if not isinstance(provider_config, dict):
+                continue
+            options = provider_config.setdefault("options", {})
+            if not isinstance(options, dict):
+                continue
+            options["baseURL"] = base_url
+            overridden.append(provider_name)
+        if overridden:
+            _write_jsonc(self._config_file, config)
+        return overridden
+
     def add_instruction(self, path: str) -> None:
         """Add an instruction path to the OpenCode config."""
         config = self._read_config()
@@ -250,7 +284,8 @@ class OpenCodeRegistrar(MCPRegistrar):
     def is_wrapped(self) -> bool:
         """Check if the config has Headroom modifications.
 
-        Detects both custom providers and built-in provider baseURL overrides.
+        Detects both custom providers and built-in provider baseURL overrides
+        matching the Headroom proxy URL pattern (http://127.0.0.1:{port}/v1).
         """
         config = self._read_config()
         providers = config.get("provider", {})
@@ -260,13 +295,14 @@ class OpenCodeRegistrar(MCPRegistrar):
             return True
 
         # Check for proxy baseURL override on built-in providers
+        # Match the Headroom proxy URL pattern: http://127.0.0.1:{port}/v1
         if isinstance(providers, dict):
             for _provider_name, provider_config in providers.items():
                 if isinstance(provider_config, dict):
                     options = provider_config.get("options", {})
                     if isinstance(options, dict):
                         base_url = options.get("baseURL", "")
-                        if isinstance(base_url, str) and "127.0.0.1:" in base_url:
+                        if isinstance(base_url, str) and base_url.startswith("http://127.0.0.1:") and base_url.endswith("/v1"):
                             return True
 
         return False
