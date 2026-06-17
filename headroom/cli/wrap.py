@@ -26,6 +26,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
@@ -1108,12 +1109,14 @@ _PROJECT_HEADER_NAME = "X-Headroom-Project"
 def _project_name_from_cwd() -> str | None:
     """Project label for X-Headroom-Project: basename of the launch directory.
 
-    The proxy sanitizes and caps the value server-side
-    (headroom.proxy.savings_tracker.sanitize_project_name), so the raw
-    directory name is safe to send as-is.
+    Non-ASCII characters are percent-encoded (RFC 3986) so the header value
+    stays within the visible-ASCII range required by RFC 7230.  The proxy
+    decodes the value in sanitize_project_name before storing it.
     """
     name = Path.cwd().name.strip()
-    return name or None
+    if not name:
+        return None
+    return urllib.parse.quote(name, safe="-_.() ")
 
 
 def _apply_project_header_env(env: dict[str, str]) -> None:

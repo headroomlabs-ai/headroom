@@ -13,6 +13,7 @@ import logging
 import os
 import tempfile
 import threading
+import urllib.parse
 from csv import DictWriter
 from datetime import datetime, timedelta, timezone
 from io import StringIO
@@ -313,9 +314,12 @@ def sanitize_project_name(value: Any) -> str | None:
 
     Strips control characters, trims whitespace, and caps length so a
     misbehaving client cannot bloat the persisted state or the dashboard.
+    Percent-encoded values (from non-ASCII cwd names) are decoded first so
+    the stored project name matches the original directory name.
     """
     if not isinstance(value, str):
         return None
+    value = urllib.parse.unquote(value)
     cleaned = "".join(ch for ch in value if ch.isprintable()).strip()
     if not cleaned:
         return None
