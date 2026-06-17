@@ -319,8 +319,9 @@ class TestParseToolCall:
 class TestHashSecurityValidation:
     """Test hash validation security measures.
 
-    CCR hashes must be exactly 24 hex characters (96 bits of SHA256).
-    This prevents hash spoofing attacks with shorter or malformed hashes.
+    CCR hashes must be 12 or 24 hex characters (SmartCrusher SHA-256[:12]
+    or legacy compressor SHA-256[:24]). Other lengths are rejected to
+    prevent hash spoofing attacks.
     """
 
     def test_rejects_short_hash(self):
@@ -363,16 +364,26 @@ class TestHashSecurityValidation:
         hash_key, query = parse_tool_call(tool_call, "anthropic")
         assert hash_key == "abc123def456abc123def456"
 
+    def test_accepts_valid_12_char_smartcrusher_hash(self):
+        """Accepts SmartCrusher row-drop SHA-256[:12] hashes."""
+        tool_call = {
+            "name": CCR_TOOL_NAME,
+            "input": {"hash": "e21a26620105", "query": "auth middleware"},
+        }
+
+        hash_key, query = parse_tool_call(tool_call, "anthropic")
+        assert hash_key == "e21a26620105"
+        assert query == "auth middleware"
+
     def test_accepts_uppercase_hex(self):
-        """Accepts uppercase hex characters (normalized to lowercase internally)."""
+        """Accepts uppercase hex characters (normalized to lowercase)."""
         tool_call = {
             "name": CCR_TOOL_NAME,
             "input": {"hash": "ABC123DEF456ABC123DEF456"},
         }
 
         hash_key, query = parse_tool_call(tool_call, "anthropic")
-        # Note: validation accepts uppercase since we use .lower() for hex check
-        assert hash_key == "ABC123DEF456ABC123DEF456"
+        assert hash_key == "abc123def456abc123def456"
 
 
 class TestSystemInstructions:
@@ -487,3 +498,74 @@ class TestAlternativeMarkerFormats:
 
         assert len(hashes) == 1
         assert "fedcba9876543210fedcba98" in hashes
+
+
+class TestSmartCrusherAngleMarkers:
+    """Test <<ccr:HASH>> marker detection (SmartCrusher row-drop)."""
+
+    def test_scan_smartcrusher_row_drop_marker(self):
+        """Detects <<ccr:12char N_rows_offloaded>> in tool output."""
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tu1",
+                        "content": (
+                            '{"results":[],"total":1000,"kept":12,'
+                            '"ccr":"<<ccr:e21a26620105 988_rows_offloaded>>"}'
+                        ),
+                    }
+                ],
+            }
+        ]
+
+        injector = CCRToolInjector()
+        hashes = injector.scan_for_markers(messages)
+
+        assert hashes == ["e21a26620105"]
+        assert injector.has_compressed_content
+
+    def test_scan_ccr_dropped_field_marker(self):
+        """Detects <<ccr:>> inside _ccr_dropped JSON fields."""
+        messages = [
+            {
+                "role": "tool",
+                "content": '{"_ccr_dropped":"<<ccr:6c385bb16d70 6_rows_offloaded>>"}',
+            }
+        ]
+
+        injector = CCRToolInjector()
+        hashes = injector.scan_for_markers(messages)
+
+        assert hashes == ["6c385bb16d70"]
+
+    def test_scan_opaque_blob_comma_marker(self):
+        """Detects <<ccr:HASH,KIND,SIZE>> opaque-blob markers."""
+        messages = [
+            {
+                "role": "assistant",
+                "content": "payload <<ccr:deadbeefdead,string,2.3KB>> tail",
+            }
+        ]
+
+        injector = CCRToolInjector()
+        hashes = injector.scan_for_markers(messages)
+
+        assert hashes == ["deadbeefdead"]
+
+    def test_rejects_invalid_angle_marker_length(self):
+        """Ignores <<ccr:>> hashes that are not 12 or 24 hex chars."""
+        messages = [
+            {
+                "role": "tool",
+                "content": "<<ccr:abc 100_rows_offloaded>>",
+            }
+        ]
+
+        injector = CCRToolInjector()
+        hashes = injector.scan_for_markers(messages)
+
+        assert hashes == []
+        assert not injector.has_compressed_content
