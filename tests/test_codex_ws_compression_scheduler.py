@@ -67,6 +67,11 @@ def test_module_global_unit_semaphore_is_removed() -> None:
         "The HEADROOM_CODEX_WS_UNIT_WORKERS env knob was removed. It only "
         "existed to tune around the semaphore bottleneck, which is gone."
     )
+    assert "_OPENAI_RESPONSES_UNIT_EXECUTOR" not in source
+    assert "_openai_responses_unit_executor" not in source
+    assert "HEADROOM_TOOL_OUTPUT_COMPRESSION_PARALLELISM" not in source
+    assert "from concurrent.futures import ThreadPoolExecutor" not in source
+    assert "as_completed" not in source
 
 
 def test_no_per_call_threadpool_inside_compress_routed_units() -> None:
@@ -78,9 +83,8 @@ def test_no_per_call_threadpool_inside_compress_routed_units() -> None:
     pool-on-pool pattern added latency variance, fought for OS threads,
     and made the global semaphore the binding constraint.
 
-    The exact phrase ``concurrent.futures.ThreadPoolExecutor`` should not
-    appear anywhere in openai.py — the dispatch uses the proxy's shared
-    bounded executor instead.
+    ThreadPoolExecutor should not appear anywhere in openai.py — the
+    dispatch uses the proxy's shared bounded executor instead.
     """
     source = OPENAI_HANDLER.read_text()
     assert "concurrent.futures.ThreadPoolExecutor" not in source, (
@@ -89,6 +93,7 @@ def test_no_per_call_threadpool_inside_compress_routed_units() -> None:
         "instrumented, lifecycle-managed) instead of creating a new pool "
         "per frame."
     )
+    assert "ThreadPoolExecutor" not in source
 
 
 # ── PERF log emission from the Codex WS path ────────────────────────────
