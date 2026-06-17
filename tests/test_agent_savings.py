@@ -354,10 +354,10 @@ def test_unit_router_receives_agent_target_ratio() -> None:
             return len(text.split())
 
     class Router:
-        _runtime_target_ratio = None
-
         def compress(self, text: str, **kwargs: object) -> RouterCompressionResult:
-            seen["target_ratio"] = self._runtime_target_ratio
+            seen["target_ratio"] = kwargs["request_options"].target_ratio
+            old_attr = "_" + "_".join(("runtime", "target_ratio"))
+            seen["has_old_attr"] = hasattr(self, old_attr)
             return RouterCompressionResult(
                 compressed="short text",
                 original=text,
@@ -386,6 +386,7 @@ def test_unit_router_receives_agent_target_ratio() -> None:
 
     assert result.modified is True
     assert seen["target_ratio"] == 0.10
+    assert seen["has_old_attr"] is False
 
 
 def test_agent_savings_check_perf_and_accuracy_report_passes(
