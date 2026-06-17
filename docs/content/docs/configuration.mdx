@@ -19,6 +19,11 @@ headroom wrap codex --prepare-only
 
 Supported values are `rtk` and `lean-ctx`; unset defaults to `rtk`.
 
+The proxy reads RTK lifetime savings with global scope by default so a shared
+daemon reports savings across the operator's projects. Set
+`HEADROOM_RTK_GAIN_SCOPE=project` to query `rtk gain --project` from the
+proxy process working directory.
+
 ## Modes
 
 | Mode | Behavior | Use Case |
@@ -235,6 +240,24 @@ headroom proxy --learn --min-evidence 3
 | `HEADROOM_STRIP_INTERNAL_HEADERS` | Python proxy: whether to strip internal `x-headroom-*` request headers (e.g. `x-headroom-bypass`, `x-headroom-mode`, `x-headroom-user-id`, `x-headroom-stack`, `x-headroom-base-url`) before every upstream forwarder call (PR-A5, fixes P5-49). `enabled` (default) stops fingerprinting / leakage. `disabled` is an explicit operator opt-in for diagnostic shadow tracing — NOT a fallback. Inbound reads of these headers (bypass gating, memory user-id resolution) are unaffected because they read `request.headers` directly. | `enabled` |
 | `HEADROOM_PROXY_STRIP_INTERNAL_HEADERS` | Rust proxy: same policy as `HEADROOM_STRIP_INTERNAL_HEADERS` but for the Rust transparent proxy. Stripping happens inside `build_forward_request_headers` so both HTTP and WebSocket upstream calls are gated by one flag. `enabled` default; `disabled` operator opt-in for diagnostic shadow tracing. Response-side `X-Headroom-*` injection (e.g. `x-headroom-tokens-saved`) is unrelated and stays. | `enabled` |
 | `HEADROOM_EMBEDDER_RUNTIME` | Set to `pytorch_mps` to run the memory embedder via the torch sentence-transformers backend on the Apple GPU (MPS). Only engages when Apple MPS is actually available; otherwise it logs a warning and uses the existing default embedder selection path. `pytorch_mps` is the only accepted value. Requires the `[pytorch-mps]` extra. See [Memory](/docs/memory#embedding-runtime--gpu-offload-apple-silicon). | default embedder selection |
+| `HEADROOM_BETA_HEADER_STICKY` | Controls per-session `anthropic-beta` / `OpenAI-Beta` re-echo. `enabled` (default): the proxy unions beta tokens across turns within a session — if the client sends a token in turn N and omits it in turn N+1, the proxy re-injects it to preserve prefix-cache stability. `disabled`: the client's value is forwarded verbatim with no accumulation. Any other value raises at request time. See [Session Beta Header Tracking](/docs/configuration#session-beta-header-tracking). | `enabled` |
+| `HEADROOM_BETA_TRACKER_MAX_SESSIONS` | LRU capacity of the in-memory session beta tracker. Once full, the oldest session entry is evicted. | `1000` |
+
+### Session Beta Header Tracking
+
+When running as a proxy, Headroom maintains a per-session union of `anthropic-beta` (and `OpenAI-Beta`) tokens via `SessionBetaTracker`. The session key is derived from the `x-headroom-session-id` header if present, otherwise from `md5(model + system_prompt[:500])[:16]` — stable across turns of the same conversation.
+
+**Why:** clients such as Claude Code and Codex CLI may drop a beta token between consecutive turns. Because `anthropic-beta` is part of the request bytes that determine the upstream prefix-cache key, a dropped token would bust the cache mid-conversation. The tracker re-injects any token seen earlier in the session so the cache key stays stable.
+
+**Trade-off:** once the proxy has seen a beta token in a session it will continue re-sending it for the rest of that session, even if the client stops including it. Stopping the token on the client side alone is not sufficient — the proxy re-injects it. Set `HEADROOM_BETA_HEADER_STICKY=disabled` to pass the client's `anthropic-beta` value verbatim and bypass this accumulation.
+
+```bash
+# Disable sticky beta re-echo
+export HEADROOM_BETA_HEADER_STICKY=disabled
+headroom proxy ...
+```
+
+Note: disabling sticky mode may reduce prefix-cache hit rates for clients that legitimately drop-and-re-add beta tokens across turns.
 
 ### Filesystem Contract
 

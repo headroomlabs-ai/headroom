@@ -149,6 +149,7 @@ def create_proxy_backend(
     anyllm_provider: str,
     bedrock_region: str | None,
     logger: logging.Logger,
+    openai_api_url: str | None = None,
     anyllm_backend_cls: Any | None = None,
     litellm_backend_cls: Any | None = None,
 ) -> Backend | None:
@@ -160,7 +161,7 @@ def create_proxy_backend(
         provider = anyllm_provider
         try:
             backend_cls = anyllm_backend_cls or _load_anyllm_backend()
-            instance = cast("Backend", backend_cls(provider=provider))
+            instance = cast("Backend", backend_cls(provider=provider, api_base=openai_api_url))
             logger.info("any-llm backend enabled (provider=%s)", provider)
             return instance
         except ImportError as exc:

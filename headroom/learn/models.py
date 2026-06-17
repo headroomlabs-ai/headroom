@@ -112,6 +112,7 @@ class SessionData:
     timestamp: datetime | None = None
     total_input_tokens: int = 0
     total_output_tokens: int = 0
+    source: str = "main"  # "main" | "subagent" | "workflow" — where this transcript came from
 
     @property
     def failure_count(self) -> int:

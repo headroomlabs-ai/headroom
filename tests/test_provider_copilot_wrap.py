@@ -13,11 +13,13 @@ from headroom.providers.copilot.wrap import (
     copilot_model_from_args,
     default_wire_api_for_model,
     detect_running_proxy_backend,
+    is_auto_model,
     model_configured,
     model_prefers_responses_api,
     provider_key_source,
     query_proxy_config,
     resolve_provider_type,
+    strip_auto_model_args,
     validate_configuration,
 )
 
@@ -164,6 +166,70 @@ def test_model_configured_detects_env_and_cli_variants() -> None:
     assert model_configured(("--model", "gpt-4o"), {}) is True
     assert model_configured(("--model=gpt-4o",), {}) is True
     assert model_configured(("--other", "value"), {}) is False
+    # ``auto`` is not a valid BYOK model — must be treated as unconfigured.
+    assert model_configured(("--model", "auto"), {}) is False
+    assert model_configured(("--model=auto",), {}) is False
+    assert model_configured((), {"COPILOT_MODEL": "auto"}) is False
+    assert model_configured((), {"COPILOT_PROVIDER_MODEL_ID": "auto"}) is False
+
+
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        ("auto", True),
+        ("Auto", True),
+        ("AUTO", True),
+        ("  auto  ", True),
+        ("gpt-4o", False),
+        ("gpt-5", False),
+        ("claude-sonnet-4.6", False),
+        (None, False),
+        ("", False),
+    ],
+)
+def test_is_auto_model(model: str | None, expected: bool) -> None:
+    assert is_auto_model(model) is expected
+
+
+@pytest.mark.parametrize(
+    ("args", "expected"),
+    [
+        # Strips --model auto (space-separated)
+        (
+            ("--model", "auto", "--port", "8788"),
+            ("--port", "8788"),
+        ),
+        # Strips --model=auto (equals form)
+        (
+            ("--model=auto", "-p", "hello"),
+            ("-p", "hello"),
+        ),
+        # Case-insensitive stripping
+        (
+            ("--model", "AUTO", "--allow-all-tools"),
+            ("--allow-all-tools",),
+        ),
+        # Leaves concrete models untouched
+        (
+            ("--model", "gpt-4o", "--port", "8788"),
+            ("--model", "gpt-4o", "--port", "8788"),
+        ),
+        # Leaves --model=gpt-4o untouched
+        (
+            ("--model=gpt-4o",),
+            ("--model=gpt-4o",),
+        ),
+        # Empty args unchanged
+        ((), ()),
+        # --model at end with no value (malformed) — leave as-is, don't crash
+        (("--model",), ("--model",)),
+    ],
+)
+def test_strip_auto_model_args(
+    args: tuple[str, ...],
+    expected: tuple[str, ...],
+) -> None:
+    assert strip_auto_model_args(args) == expected
 
 
 def test_build_launch_env_applies_project_path_prefix() -> None:

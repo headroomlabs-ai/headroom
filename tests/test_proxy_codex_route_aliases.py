@@ -227,6 +227,14 @@ def test_codex_model_metadata_fetches_codex_registry_for_chatgpt_auth(monkeypatc
         "gpt-5.5",
         "gpt-5.3-codex-spark",
     }
+    assert {entry["slug"] for entry in list_payload["models"]} == {
+        "gpt-5.5",
+        "gpt-5.3-codex-spark",
+    }
+    for entry in list_payload["models"]:
+        assert entry["display_name"]
+        assert entry["default_reasoning_level"] == "medium"
+        assert entry["supports_parallel_tool_calls"] is True
 
     # Single-model GET returns a model object when known.
     assert known_response.status_code == 200

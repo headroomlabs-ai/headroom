@@ -5,6 +5,7 @@ Usage:
     headroom wrap copilot -- --model ...    # Start proxy + launch GitHub Copilot CLI
     headroom wrap codex                     # Start proxy + OpenAI Codex CLI
     headroom wrap aider                     # Start proxy + aider
+    headroom wrap vibe                      # Start proxy + Mistral Vibe
     headroom wrap cursor                    # Start proxy + print Cursor config instructions
     headroom wrap openclaw                  # Install + configure OpenClaw plugin
     headroom wrap claude --no-context-tool  # Without CLI context-tool setup
@@ -38,15 +39,20 @@ if sys.platform == "win32" and hasattr(sys.stdout, "buffer"):
 import click
 
 from headroom._version import __version__ as _HEADROOM_VERSION
+from headroom.agent_savings import (
+    apply_agent_savings_env_defaults,
+)
 from headroom.copilot_auth import (
     has_oauth_auth,
     resolve_client_bearer_token,
     resolve_copilot_api_url,
-    resolve_subscription_bearer_token,
+    resolve_subscription_bearer_token_details,
 )
 from headroom.providers.aider import build_launch_env as _build_aider_launch_env
 from headroom.providers.claude import proxy_base_url as _claude_proxy_base_url
 from headroom.providers.codex import build_launch_env as _build_codex_launch_env
+from headroom.providers.codex.install import codex_uses_chatgpt_auth
+from headroom.providers.codex.threads import retag_to_headroom, retag_to_native
 from headroom.providers.copilot import (
     build_launch_env as _build_copilot_launch_env,
 )
@@ -58,6 +64,9 @@ from headroom.providers.copilot import (
 )
 from headroom.providers.copilot import (
     detect_running_proxy_backend as _copilot_detect_running_proxy_backend,
+)
+from headroom.providers.copilot import (
+    is_auto_model as _is_auto_model,
 )
 from headroom.providers.copilot import (
     model_configured as _copilot_model_configured_impl,
@@ -72,9 +81,13 @@ from headroom.providers.copilot import (
     resolve_provider_type as _copilot_resolve_provider_type,
 )
 from headroom.providers.copilot import (
+    strip_auto_model_args as _strip_auto_model_args,
+)
+from headroom.providers.copilot import (
     validate_configuration as _validate_copilot_configuration,
 )
 from headroom.providers.cursor import render_setup_lines as _render_cursor_setup_lines
+from headroom.providers.mistral_vibe import build_launch_env as _build_mistral_vibe_launch_env
 from headroom.providers.openclaw import (
     build_plugin_entry as _build_openclaw_plugin_entry_impl,
 )
@@ -95,6 +108,7 @@ _CONTEXT_TOOL_ENV = "HEADROOM_CONTEXT_TOOL"
 _CONTEXT_TOOL_RTK = "rtk"
 _CONTEXT_TOOL_LEAN_CTX = "lean-ctx"
 _VALID_CONTEXT_TOOLS = {_CONTEXT_TOOL_RTK, _CONTEXT_TOOL_LEAN_CTX}
+_AGENT_SAVINGS_TARGET_AGENTS = {"claude", "codex", "cursor"}
 _WRAP_PROXY_TIMEOUT_ENV = "HEADROOM_WRAP_PROXY_TIMEOUT"
 _WRAP_PROXY_TIMEOUT_DEFAULT_SECONDS = 45
 _WRAP_PROXY_TIMEOUT_ML_DEFAULT_SECONDS = 90
@@ -360,6 +374,8 @@ def _start_proxy(
     # Ensure proxy subprocess uses UTF-8 (Windows defaults to cp1252)
     proxy_env = os.environ.copy()
     proxy_env["PYTHONIOENCODING"] = "utf-8"
+    if agent_type in {"claude", "codex", "cursor"}:
+        apply_agent_savings_env_defaults(proxy_env)
 
     # Tell the proxy which agent is being wrapped (for traffic learning output)
     if agent_type != "unknown":
@@ -367,8 +383,6 @@ def _start_proxy(
         proxy_env.setdefault("HEADROOM_STACK", f"wrap_{agent_type}")
     savings_profile = _wrap_agent_savings_profile(agent_type)
     if savings_profile is not None:
-        from headroom.agent_savings import apply_agent_savings_env_defaults
-
         apply_agent_savings_env_defaults(proxy_env, savings_profile)
     if openai_api_url:
         proxy_env["OPENAI_TARGET_API_URL"] = openai_api_url
@@ -380,6 +394,8 @@ def _start_proxy(
     # GITHUB_COPILOT_API_TOKEN directly, making upstream auth deterministic.
     if copilot_api_token:
         proxy_env["GITHUB_COPILOT_API_TOKEN"] = copilot_api_token
+        if openai_api_url:
+            proxy_env["GITHUB_COPILOT_API_URL"] = openai_api_url
 
     proc = subprocess.Popen(
         cmd,
@@ -597,10 +613,21 @@ def _setup_headroom_mcp(
 def _setup_serena_mcp(
     registrar: Any, *, context: str, verbose: bool = False, force: bool = False
 ) -> None:
-    """Register Serena MCP with the given agent (idempotent)."""
+    """Register Serena MCP with the given agent (idempotent).
+
+    A prior ``headroom wrap`` may have persisted a Serena entry built from an
+    older spec — e.g. before ``--open-web-dashboard False`` was added to
+    suppress the dashboard popup (#1003). ``register_server`` returns
+    ``MISMATCH`` and refuses to overwrite a differing entry unless forced, so
+    on its own a re-wrap leaves already-wrapped users stuck on the stale spec
+    (and the popup) forever. When the ledger proves the entry currently in the
+    config is one Headroom installed, force-update it to the current spec. A
+    user-managed Serena (absent from our ledger) is left untouched and the
+    mismatch is reported as before.
+    """
     from headroom.mcp_registry import build_serena_spec, format_result
     from headroom.mcp_registry.base import RegisterStatus
-    from headroom.mcp_registry.ledger import record_install
+    from headroom.mcp_registry.ledger import headroom_installed_matching, record_install
 
     if not registrar.detect():
         if verbose:
@@ -613,6 +640,21 @@ def _setup_serena_mcp(
 
     spec = build_serena_spec(context)
     result = registrar.register_server(spec, force=force)
+
+    # Migrate a stale Headroom-installed entry. register_server won't overwrite
+    # a differing spec without force, so an older Headroom Serena entry would
+    # otherwise persist across re-wraps. Force-update it only when the ledger
+    # proves Headroom installed the entry that's currently on disk — never a
+    # user-managed Serena.
+    if (
+        result.status == RegisterStatus.MISMATCH
+        and not force
+        and headroom_installed_matching(registrar.name, registrar.get_server("serena"))
+    ):
+        result = registrar.register_server(spec, force=True)
+        if result.status == RegisterStatus.REGISTERED:
+            click.echo("  Serena MCP: migrated previously-installed entry to current spec")
+
     if result.status == RegisterStatus.REGISTERED:
         record_install(registrar.name, spec)
 
@@ -639,6 +681,41 @@ def _remove_headroom_installed_serena_mcp(registrar: Any) -> str:
         clear_install(registrar.name, "serena")
         return "removed"
     return "failed"
+
+
+def _disable_serena_mcp(registrar: Any, *, verbose: bool = False) -> None:
+    """Make ``--no-serena`` actively disable Serena, not merely skip adding it.
+
+    Serena is registered by default, so a prior ``headroom wrap`` persists a
+    ``serena`` entry into the agent's MCP config; the agent then keeps
+    launching Serena on startup. Just *skipping* registration on a later
+    ``--no-serena`` run leaves that stale entry in place — so the flag has to
+    remove the entry Headroom installed. A user-managed Serena (absent from
+    our ledger) is reported but left untouched.
+    """
+    if not registrar.detect():
+        if verbose:
+            click.echo(f"  Serena MCP: {registrar.display_name} not detected — skipping")
+        return
+
+    if registrar.get_server("serena") is None:
+        if verbose:
+            click.echo("  Skipping Serena MCP (--no-serena)")
+        return
+
+    status = _remove_headroom_installed_serena_mcp(registrar)
+    if status == "removed":
+        click.echo("  Removed previously-installed Serena MCP (--no-serena)")
+        click.echo(f"    restart {registrar.display_name} if it was already running")
+    elif status == "not_headroom_owned":
+        click.echo(
+            "  Serena MCP is present but user-managed — leaving it in place "
+            "(--no-serena only removes entries Headroom installed)"
+        )
+    else:  # "failed"
+        click.echo(
+            "  Serena MCP: removal failed — remove the 'serena' entry from your MCP config manually"
+        )
 
 
 _CBM_MCP_SERVER_NAME = "codebase-memory-mcp"
@@ -901,6 +978,69 @@ def _strip_codex_headroom_blocks(content: str, *, remove_mcp: bool = False) -> s
     return content.lstrip("\n").rstrip() + "\n" if content.strip() else ""
 
 
+# Top-level bare keys we redirect to headroom values when the user already
+# has them set.  Match the entire line (including any trailing comment) so
+# we can rewrite it cleanly.  Bare keys must precede any [section] in TOML,
+# so a `^` anchor combined with `^[ \t]*key` is sufficient — table lines
+# start with `[`, not with the key name.
+_REDIRECTABLE_KEYS: tuple[str, ...] = ("model_provider", "openai_base_url")
+
+
+def _redirect_existing_top_level_keys(content: str, port: int) -> str:
+    """Rewrite user-defined top-level keys so wrap does not create duplicates.
+
+    Codex's ``config.toml`` rejects duplicate top-level keys (TOML spec),
+    which would break ``codex`` startup after ``headroom wrap codex`` runs
+    on a config that already declares its own ``model_provider`` or
+    ``openai_base_url``.
+
+    For each redirectable key, if the user's line already sets it, replace
+    the value with the headroom one and append ``# was: <original-value>``
+    so the user can still see and recover their previous setting.  The
+    snapshot taken in ``_snapshot_codex_config_if_unwrapped`` ensures the
+    pre-wrap file can be restored byte-for-byte on ``headroom unwrap
+    codex``.
+
+    Returns the modified content.  If no redirectable keys are present,
+    the content is returned unchanged and the caller should fall back to
+    prepending the marker-delimited top-level block (current behavior).
+    """
+    import re  # local import to match the module's existing convention
+
+    if not content.strip():
+        return content
+
+    def _make_replacer(current_key: str, current_port: int) -> Callable[[re.Match[str]], str]:
+        def _replace(match: re.Match[str]) -> str:
+            original_value = match.group("value")
+            if current_key == "model_provider":
+                new_value = "headroom"
+            else:  # openai_base_url
+                new_value = f"http://127.0.0.1:{current_port}/v1"
+            if original_value == new_value:
+                return match.group(0)
+            # Keep the user's original value in a trailing comment so they
+            # can see what was changed.  This is metadata, not a TOML
+            # duplicate.
+            return f'{current_key} = "{new_value}"  # was: {original_value}'
+
+        return _replace
+
+    redirected = content
+    for key in _REDIRECTABLE_KEYS:
+        pattern = re.compile(rf'(?m)^[ \t]*{re.escape(key)}[ \t]*=[ \t]*"(?P<value>[^"\n]*)"[^\n]*')
+        redirected = pattern.sub(_make_replacer(key, port), redirected, count=1)
+    return redirected
+
+
+def _has_redirectable_top_level_key(content: str, key: str) -> bool:
+    """Return True if ``content`` declares ``key = "..."`` as a top-level key."""
+    import re  # local import to match the module's existing convention
+
+    pattern = re.compile(rf'(?m)^[ \t]*{key}[ \t]*=[ \t]*"[^"\n]*"')
+    return pattern.search(content) is not None
+
+
 def _snapshot_codex_config_if_unwrapped(config_file: Path, backup_file: Path) -> None:
     """Snapshot ``config.toml`` to ``backup_file`` before the first injection.
 
@@ -1004,7 +1144,7 @@ def _apply_project_header_env(env: dict[str, str]) -> None:
 def _inject_codex_provider_config(port: int) -> None:
     """Inject a Headroom model provider into Codex's config.toml.
 
-    Two keys are written in the top-level block:
+    Two keys need to be in effect for the proxy to route all traffic:
 
     * ``model_provider = "headroom"`` — selects the custom provider for
       API-key mode traffic.
@@ -1014,6 +1154,14 @@ def _inject_codex_provider_config(port: int) -> None:
       and routes through the built-in ``openai`` provider regardless of
       ``model_provider``, so without this override it bypasses the proxy and
       hits ``https://chatgpt.com/backend-api/codex`` directly.
+
+    If the user has not already declared these top-level keys, they are
+    added in a marker-delimited block at the top of the file.  If the
+    user *has* declared one or both, the existing lines are rewritten
+    in place to the headroom values (with the previous value kept in a
+    ``# was: …`` trailing comment) so the resulting file stays TOML-valid
+    — TOML rejects duplicate top-level keys, which would break
+    ``codex`` startup.
 
     Safe to call multiple times — the injected block is fully replaced on
     each call, so re-running with a different ``port`` updates the config.
@@ -1029,12 +1177,15 @@ def _inject_codex_provider_config(port: int) -> None:
     # TOML keys must precede any [section]) and a provider-table block (at
     # the end).  Each block has its own matching begin/end marker pair so
     # stripping them is unambiguous and never consumes user content that
-    # happens to sit between the two.
-    top_level_block = (
-        f"{_CODEX_TOP_LEVEL_MARKER}\n"
-        f'model_provider = "headroom"\n'
-        f'openai_base_url = "http://127.0.0.1:{port}/v1"\n'
-        f"{_CODEX_END_MARKER}\n"
+    # happens to sit between the two.  The top-level block is built
+    # dynamically below — it contains only keys the user has not already
+    # declared (we rewrite the existing ones in place to avoid TOML
+    # duplicate-key errors).
+    # Emit requires_openai_auth only for ChatGPT-OAuth users (restores the
+    # account menu); omitting it for API-key users avoids forcing an OAuth
+    # login (#406).
+    requires_openai_auth = (
+        "requires_openai_auth = true\n" if codex_uses_chatgpt_auth(config_dir / "auth.json") else ""
     )
     provider_section = (
         f"{_CODEX_TOP_LEVEL_MARKER}\n"
@@ -1042,6 +1193,7 @@ def _inject_codex_provider_config(port: int) -> None:
         'name = "OpenAI via Headroom proxy"\n'
         f'base_url = "http://127.0.0.1:{port}/v1"\n'
         f"supports_websockets = true\n"
+        f"{requires_openai_auth}"
         # Per-project savings: Codex sends the header only when the mapped
         # env var (HEADROOM_PROJECT, set by `headroom wrap codex`) exists at
         # Codex runtime.  Inline table keeps the key inside this section so
@@ -1049,6 +1201,29 @@ def _inject_codex_provider_config(port: int) -> None:
         f'env_http_headers = {{ "{_PROJECT_HEADER_NAME}" = "HEADROOM_PROJECT" }}\n'
         f"{_CODEX_END_MARKER}\n"
     )
+
+    # The two redirectable keys and their headroom target values.
+    _REDIRECT_TARGETS = {
+        "model_provider": "headroom",
+        "openai_base_url": f"http://127.0.0.1:{port}/v1",
+    }
+
+    def _build_top_level_block(user_content: str) -> str:
+        """Build a marker-delimited block containing only the keys the user
+        has not already declared at the top level.  For keys the user
+        *has* declared, the in-place rewrite below handles them.
+        """
+        lines = [_CODEX_TOP_LEVEL_MARKER]
+        for key, value in _REDIRECT_TARGETS.items():
+            if _has_redirectable_top_level_key(user_content, key):
+                continue
+            lines.append(f'{key} = "{value}"')
+        if len(lines) == 1:
+            # User already declared every redirectable key — no marker
+            # block needed (it would be empty).
+            return ""
+        lines.append(_CODEX_END_MARKER)
+        return "\n".join(lines) + "\n"
 
     try:
         config_dir.mkdir(parents=True, exist_ok=True)
@@ -1063,19 +1238,47 @@ def _inject_codex_provider_config(port: int) -> None:
             # the operation is idempotent and supports port changes.
             content = _strip_codex_headroom_blocks(content)
 
-            # Place the top-level key block at the very beginning of the file
-            # (bare TOML keys must precede any [section]) and the provider
-            # table at the end.  User content, if any, sits between them.
+            # Bare top-level keys must precede any [section] in TOML, and
+            # TOML rejects duplicate top-level keys.  Rewrite any existing
+            # top-level ``model_provider`` / ``openai_base_url`` in place
+            # to the headroom values; for keys the user has not declared,
+            # add them in a marker-delimited block at the top of the
+            # file.  The original values are kept in a trailing ``# was:
+            # <value>`` comment, and the snapshot mechanism guarantees
+            # byte-for-byte restoration on unwrap.
             user_content = content.strip()
             if user_content:
-                content = top_level_block + "\n" + user_content + "\n\n" + provider_section
+                redirected = _redirect_existing_top_level_keys(user_content, port)
+                top_block = _build_top_level_block(user_content)
+                if top_block:
+                    content = top_block + "\n" + redirected + "\n\n" + provider_section
+                else:
+                    content = redirected + "\n\n" + provider_section
             else:
-                content = top_level_block + "\n" + provider_section
+                # Empty user content — no keys to rewrite in place; emit
+                # the full marker block with both redirectable keys.
+                content = (
+                    f"{_CODEX_TOP_LEVEL_MARKER}\n"
+                    f'model_provider = "{_REDIRECT_TARGETS["model_provider"]}"\n'
+                    f'openai_base_url = "{_REDIRECT_TARGETS["openai_base_url"]}"\n'
+                    f"{_CODEX_END_MARKER}\n"
+                    f"\n{provider_section}"
+                )
         else:
-            content = top_level_block + "\n" + provider_section
+            # No config file yet — same as the empty-content path.
+            content = (
+                f"{_CODEX_TOP_LEVEL_MARKER}\n"
+                f'model_provider = "{_REDIRECT_TARGETS["model_provider"]}"\n'
+                f'openai_base_url = "{_REDIRECT_TARGETS["openai_base_url"]}"\n'
+                f"{_CODEX_END_MARKER}\n"
+                f"\n{provider_section}"
+            )
 
         config_file.write_text(content)
         click.echo(f"  Codex config: injected Headroom provider (WS + HTTP) into {config_file}")
+        # Pull existing native threads into the headroom-provider menu so Codex's
+        # history list stays whole once it routes through Headroom. Best-effort.
+        retag_to_headroom(_codex_home_dir())
     except Exception as e:
         click.echo(f"  Warning: could not update Codex config: {e}")
 
@@ -1551,6 +1754,77 @@ def _proxy_health_config(payload: dict[str, Any] | None) -> dict[str, Any] | Non
         return None
     config = payload.get("config")
     return config if isinstance(config, dict) else None
+
+
+def _env_bool_value(value: str) -> bool:
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _agent_savings_config_mismatches(
+    running_config: dict[str, Any],
+    agent_type: str,
+) -> list[str]:
+    """Return restart reasons when a running proxy lacks target agent savings."""
+
+    if agent_type not in _AGENT_SAVINGS_TARGET_AGENTS:
+        return []
+
+    desired_env = os.environ.copy()
+    apply_agent_savings_env_defaults(desired_env)
+    checks: tuple[tuple[str, str, str, str], ...] = (
+        ("HEADROOM_SAVINGS_PROFILE", "savings_profile", "savings-profile", "str"),
+        ("HEADROOM_TARGET_RATIO", "target_ratio", "target-ratio", "float"),
+        (
+            "HEADROOM_COMPRESS_USER_MESSAGES",
+            "compress_user_messages",
+            "compress-user-messages",
+            "bool",
+        ),
+        (
+            "HEADROOM_COMPRESS_SYSTEM_MESSAGES",
+            "compress_system_messages",
+            "compress-system-messages",
+            "bool",
+        ),
+        ("HEADROOM_PROTECT_RECENT", "protect_recent", "protect-recent", "int"),
+        (
+            "HEADROOM_PROTECT_ANALYSIS_CONTEXT",
+            "protect_analysis_context",
+            "protect-analysis-context",
+            "bool",
+        ),
+        ("HEADROOM_MIN_TOKENS", "min_tokens_to_crush", "min-tokens", "int"),
+        ("HEADROOM_MAX_ITEMS", "max_items_after_crush", "max-items", "int"),
+        (
+            "HEADROOM_SMART_CRUSHER_COMPACTION",
+            "smart_crusher_with_compaction",
+            "smart-crusher-compaction",
+            "bool",
+        ),
+        ("HEADROOM_ACCURACY_GUARD", "accuracy_guard", "accuracy-guard", "str"),
+    )
+
+    mismatches: list[str] = []
+    for env_key, config_key, label, value_type in checks:
+        expected = desired_env.get(env_key)
+        if expected is None:
+            continue
+        actual = running_config.get(config_key)
+        try:
+            if value_type == "float":
+                matches = actual is not None and abs(float(actual) - float(expected)) < 1e-9
+            elif value_type == "int":
+                matches = actual is not None and int(actual) == int(expected)
+            elif value_type == "bool":
+                matches = actual is not None and bool(actual) is _env_bool_value(expected)
+            else:
+                matches = str(actual or "").strip().lower() == expected.strip().lower()
+        except (TypeError, ValueError):
+            matches = False
+        if not matches:
+            mismatches.append(label)
+
+    return mismatches
 
 
 def _proxy_active_session_count(payload: dict[str, Any] | None) -> int:
@@ -2058,9 +2332,9 @@ def _proc_identity(pid: int) -> tuple[str, float] | None:
     different units; we only compare like-for-like.
     """
     try:
-        import psutil  # optional dependency; portable when present
+        import psutil  # type: ignore[import-untyped]  # optional dependency; portable when present
 
-        return ("psutil", float(psutil.Process(pid).create_time()))
+        return ("psutil", psutil.Process(pid).create_time())
     except Exception:
         pass
     # Linux fallback: field 22 of /proc/<pid>/stat is starttime in clock ticks
@@ -2469,6 +2743,7 @@ def wrap() -> None:
         headroom wrap codex               # OpenAI Codex CLI
         headroom wrap copilot -- --model claude-sonnet-4-20250514
         headroom wrap aider               # Aider
+        headroom wrap vibe                # Mistral Vibe
         headroom wrap cursor              # Cursor (prints config instructions)
         headroom wrap cline               # Cline (VS Code; prints config instructions)
         headroom wrap continue            # Continue (VS Code/JetBrains; injects systemMessage)
@@ -2684,8 +2959,10 @@ def claude(
             from headroom.mcp_registry import ClaudeRegistrar
 
             _setup_serena_mcp(ClaudeRegistrar(), context="claude-code", verbose=verbose)
-        elif verbose:
-            click.echo("  Skipping Serena MCP (--no-serena)")
+        else:
+            from headroom.mcp_registry import ClaudeRegistrar
+
+            _disable_serena_mcp(ClaudeRegistrar(), verbose=verbose)
 
         if code_graph:
             _setup_code_graph(verbose=verbose)
@@ -2942,23 +3219,44 @@ def copilot(
     env = os.environ.copy()
     openai_api_url: str | None = None
     copilot_proxy_token: str | None = None
+    subscription_resolution = None
     if _should_use_copilot_oauth(
         backend=effective_backend,
         provider_type=provider_type,
         env=env,
         force_subscription=subscription,
     ):
-        client_bearer = (
-            resolve_subscription_bearer_token() if subscription else resolve_client_bearer_token()
-        )
+        if subscription:
+            subscription_resolution = resolve_subscription_bearer_token_details()
+            client_bearer = (
+                subscription_resolution.token if subscription_resolution is not None else None
+            )
+        else:
+            client_bearer = resolve_client_bearer_token()
         if not client_bearer:
             raise click.ClickException(
                 "GitHub Copilot subscription mode requires a reusable GitHub/Copilot bearer "
-                "token, but none could be resolved. Run `copilot auth login` first, or set "
+                "token, but none could be resolved. Run `headroom copilot-auth login` first, or set "
                 "GITHUB_COPILOT_TOKEN / GITHUB_COPILOT_GITHUB_TOKEN."
             )
 
         selected_model = _copilot_model_from_args(copilot_args, env)
+
+        # ``--model auto`` is a Copilot-internal routing token that the BYOK
+        # API rejects with ``400 The requested model is not supported``.  In
+        # subscription/OAuth mode we route to the real Copilot hosted API, so
+        # Copilot's own native auto-selection works fine — we just need to
+        # strip the ``--model auto`` flag before launch so Copilot doesn't
+        # forward it to the provider endpoint.
+        if _is_auto_model(selected_model):
+            copilot_args = _strip_auto_model_args(copilot_args)
+            selected_model = None
+            click.echo(
+                "  Note: '--model auto' is not forwarded to the Copilot API "
+                "(it would cause a 400). Removed it; Copilot will use its own "
+                "automatic model selection."
+            )
+
         effective_wire_api = wire_api or (
             _copilot_default_wire_api_for_model(selected_model) if subscription else "completions"
         )
@@ -2992,16 +3290,15 @@ def copilot(
                 else "COPILOT_AUTH_MODE=github-oauth"
             ),
         ]
-        # Resolve the Copilot API host: an explicit GITHUB_COPILOT_API_URL wins,
-        # otherwise the generic public host (api.githubcopilot.com). This is the
-        # same policy for --subscription and the implicit OAuth path. The
-        # account-specific endpoints.api advertised by /copilot_internal/user is
-        # deliberately NOT used to route — it returns a segmented host (e.g.
-        # api.individual.githubcopilot.com) that does not serve newer models on
-        # the responses API (#610), and it is not the host the official Copilot
-        # client routes with. Accounts that require a dedicated host (enterprise /
-        # data residency) set GITHUB_COPILOT_API_URL explicitly.
-        openai_api_url = resolve_copilot_api_url(client_bearer)
+        # Non-subscription OAuth keeps upstream's generic-host policy from
+        # #610. Subscription mode can use the endpoint returned by the Copilot
+        # token exchange, which is how Business accounts advertise their API
+        # host without requiring users to configure it manually.
+        openai_api_url = (
+            subscription_resolution.api_url
+            if subscription_resolution is not None
+            else resolve_copilot_api_url(client_bearer)
+        )
         env["GITHUB_COPILOT_API_URL"] = openai_api_url
         env["OPENAI_TARGET_API_URL"] = openai_api_url
         env_vars_display.append(f"COPILOT_PROVIDER_API_URL={openai_api_url}")
@@ -3028,10 +3325,26 @@ def copilot(
             raise SystemExit(1)
 
     if not subscription and not _copilot_model_configured(copilot_args, env):
-        click.echo(
-            "  Note: Copilot BYOK requires a model. Pass `--model <name>` "
-            "or set `COPILOT_MODEL` / `COPILOT_PROVIDER_MODEL_ID`."
-        )
+        # Distinguish between "--model auto" (wrong model for BYOK) and
+        # genuinely missing model (no --model flag at all).
+        raw_model = _copilot_model_from_args(copilot_args, env)
+        if _is_auto_model(raw_model):
+            click.echo(
+                "  Error: '--model auto' is not supported in Copilot BYOK mode.\n"
+                "  BYOK routes to an external provider (Anthropic/OpenAI) which\n"
+                "  does not recognise 'auto' as a model name — the request will\n"
+                "  fail with a 400 error.\n"
+                "  Options:\n"
+                "    • Use a concrete model: --model gpt-4o\n"
+                "    • Use subscription mode for native auto-routing:\n"
+                "      headroom wrap copilot --subscription -- --model auto"
+            )
+            raise SystemExit(1)
+        else:
+            click.echo(
+                "  Note: Copilot BYOK requires a model. Pass `--model <name>` "
+                "or set `COPILOT_MODEL` / `COPILOT_PROVIDER_MODEL_ID`."
+            )
 
     _launch_tool(
         binary=copilot_bin,
@@ -3175,8 +3488,10 @@ def codex(
         from headroom.mcp_registry import CodexRegistrar
 
         _setup_serena_mcp(CodexRegistrar(), context="codex", verbose=verbose, force=True)
-    elif verbose:
-        click.echo("  Skipping Serena MCP (--no-serena)")
+    else:
+        from headroom.mcp_registry import CodexRegistrar
+
+        _disable_serena_mcp(CodexRegistrar(), verbose=verbose)
 
     # Setup memory MCP server for Codex (native tool integration)
     if memory:
@@ -3370,6 +3685,83 @@ def aider(
         backend=backend,
         anyllm_provider=anyllm_provider,
         region=region,
+    )
+
+
+# =============================================================================
+# Mistral Vibe
+# =============================================================================
+
+
+@wrap.command(context_settings={"ignore_unknown_options": True})
+@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--no-context-tool",
+    "--no-rtk",
+    "no_rtk",
+    is_flag=True,
+    help="Skip CLI context-tool setup (no effect for vibe)",
+)
+@click.option(
+    "--code-graph",
+    is_flag=True,
+    help="Enable code graph indexing via codebase-memory-mcp (optional)",
+)
+@click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
+@click.option("--learn", is_flag=True, help="Enable live traffic learning")
+@click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
+@click.option("--verbose", "-v", is_flag=True, help="Verbose output")
+@click.option("--prepare-only", is_flag=True, hidden=True)
+@click.argument("vibe_args", nargs=-1, type=click.UNPROCESSED)
+def vibe(
+    port: int,
+    no_rtk: bool,
+    code_graph: bool,
+    no_proxy: bool,
+    learn: bool,
+    memory: bool,
+    verbose: bool,
+    prepare_only: bool,
+    vibe_args: tuple,
+) -> None:
+    """Launch Mistral Vibe through Headroom proxy.
+
+    \b
+    Sets VIBE_PROVIDERS to route all Mistral API calls through Headroom.
+
+    \b
+    Examples:
+        headroom wrap vibe                         # Start proxy + vibe
+        headroom wrap vibe -- "fix the bug"        # Pass prompt to vibe
+        headroom wrap vibe --port 9999             # Custom proxy port
+        headroom wrap vibe --no-context-tool       # Skip CLI context-tool setup
+    """
+    if prepare_only:
+        return
+
+    vibe_bin = shutil.which("vibe")
+    if not vibe_bin:
+        click.echo("Error: 'vibe' not found in PATH.")
+        click.echo("Install Mistral Vibe: https://github.com/mistralai/mistral-vibe")
+        raise SystemExit(1)
+
+    env, env_vars_display = _build_mistral_vibe_launch_env(
+        port, os.environ, project=_project_name_from_cwd()
+    )
+
+    _launch_tool(
+        binary=vibe_bin,
+        args=vibe_args,
+        env=env,
+        port=port,
+        no_proxy=no_proxy,
+        tool_label="VIBE",
+        env_vars_display=env_vars_display,
+        learn=learn,
+        memory=memory,
+        agent_type="vibe",
+        code_graph=code_graph,
+        openai_api_url="https://api.mistral.ai",
     )
 
 
@@ -4308,8 +4700,28 @@ def unwrap_codex(port: int, no_stop_proxy: bool) -> None:
             )
         click.echo(f"  Nothing to undo: {config_file} has no Headroom wrap markers.")
 
+    # Serena is written as its own [mcp_servers.serena] table with Headroom
+    # markers, separate from the provider block handled above — a "cleaned"
+    # restore leaves it behind. Remove it explicitly (only if we installed it),
+    # mirroring unwrap_claude. Runs after the restore so a backup-restore that
+    # already dropped Serena makes this a safe no-op.
+    from headroom.mcp_registry import CodexRegistrar
+
+    codex_registrar = CodexRegistrar()
+    if codex_registrar.detect():
+        serena_status = _remove_headroom_installed_serena_mcp(codex_registrar)
+        if serena_status == "removed":
+            click.echo("  Removed Headroom-installed Serena MCP server from Codex.")
+        elif serena_status == "failed":
+            click.echo("  Serena MCP server matched Headroom ledger but could not be removed.")
+
+    if status in {"restored", "cleaned", "removed"}:
+        # Hand the threads back to the native-provider menu so the full history
+        # stays visible once Codex no longer routes through Headroom. Best-effort.
+        retag_to_native(_codex_home_dir())
+
     click.echo()
     click.echo("✓ Codex is no longer routed through the Headroom proxy.")
-    if not no_stop_proxy:
+    if not no_stop_proxy and status != "noop":
         _echo_unwrap_proxy_stop_status(_stop_local_proxy_for_unwrap(port), port)
     click.echo()

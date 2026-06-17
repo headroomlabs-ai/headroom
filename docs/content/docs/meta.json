@@ -43,6 +43,8 @@
     "api-reference",
     "---Architecture---",
     "architecture",
+    "ci-cd-flows",
+    "releases",
     "benchmarks",
     "limitations",
     "---Help---",

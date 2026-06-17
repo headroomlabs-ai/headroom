@@ -258,15 +258,21 @@ class TestWorkerConfiguration:
 
         monkeypatch.delenv(_MULTI_WORKER_CONFIG_ENV, raising=False)
 
-        with patch("headroom.proxy.server.uvicorn.run", fake_run):
-            run_server(config, workers=4, limit_concurrency=250)
+        try:
+            with patch("headroom.proxy.server.uvicorn.run", fake_run):
+                run_server(config, workers=4, limit_concurrency=250)
 
-        assert captured["app"] == "headroom.proxy.server:create_app_from_env"
-        assert captured["kwargs"]["workers"] == 4
-        assert captured["kwargs"]["limit_concurrency"] == 250
-        assert captured["kwargs"]["factory"] is True
-        payload = json.loads(os.environ[_MULTI_WORKER_CONFIG_ENV])
-        assert payload["host"] == "0.0.0.0"
-        assert payload["port"] == 8787
-        assert payload["max_connections"] == 200
-        monkeypatch.delenv(_MULTI_WORKER_CONFIG_ENV, raising=False)
+            assert captured["app"] == "headroom.proxy.server:create_app_from_env"
+            assert captured["kwargs"]["workers"] == 4
+            assert captured["kwargs"]["limit_concurrency"] == 250
+            assert captured["kwargs"]["factory"] is True
+            payload = json.loads(os.environ[_MULTI_WORKER_CONFIG_ENV])
+            assert payload["host"] == "0.0.0.0"
+            assert payload["port"] == 8787
+            assert payload["max_connections"] == 200
+        finally:
+            # run_server sets this via raw os.environ. Pop it directly rather
+            # than via monkeypatch.delenv: delenv records the current (JSON)
+            # value and re-restores it on teardown, leaking the config into
+            # later tests (e.g. _proxy_config_from_env then ignores HEADROOM_*).
+            os.environ.pop(_MULTI_WORKER_CONFIG_ENV, None)

@@ -63,9 +63,10 @@ jobs:
           pytest tests/test_cli/test_wrap_bridge.py --cov=headroom --cov-report=xml:coverage-wrap-native.xml --cov-report=term-missing -q
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@v5
         with:
-          file: ./coverage-wrap-native.xml
+          files: ./coverage-wrap-native.xml
           flags: wrap-native
           name: wrap-native-${{ matrix.os }}
+          token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: false

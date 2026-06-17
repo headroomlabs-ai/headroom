@@ -52,6 +52,7 @@ Headroom compresses everything your AI agent reads — tool outputs, logs, RAG c
 - **MCP server** — `headroom_compress`, `headroom_retrieve`, `headroom_stats` for any MCP client
 - **Cross-agent memory** — shared store across Claude, Codex, Gemini, auto-dedup
 - **`headroom learn`** — mines failed sessions, writes corrections to `CLAUDE.md` / `AGENTS.md`
+- **Output token reduction** — trims what the model *writes back* (not just what you send): drops ceremony/restated code and skips deep "thinking" on routine steps. See [Output token reduction](#output-token-reduction-cut-what-the-model-writes-back).
 - **Reversible (CCR)** — originals are cached for retrieval on demand
 
 ## How it works (30 seconds)
@@ -123,6 +124,54 @@ Granular extras: `[proxy]`, `[mcp]`, `[ml]`, `[code]`, `[memory]`, `[relevance]`
 
 Reproduce: `python -m headroom.evals suite --tier 1` · [Full benchmarks & methodology](https://headroom-docs.vercel.app/docs/benchmarks)
 
+## Output token reduction (cut what the model writes back)
+
+Everything above shrinks the prompt you **send**. But you also pay for every
+token the model **writes back** — and on Opus-class models output costs 5× input.
+A lot of that output is waste: "Great, let me…" preambles, re-printing code you
+just showed it, and deep "thinking" on routine steps like reading a file.
+
+Headroom can trim that too, from the proxy, without you changing any code:
+
+- **Verbosity steering** — appends a short "be terse, don't restate context"
+  note to the end of the system prompt (so your prompt cache still hits).
+- **Effort routing** — when a turn is just the model resuming after a tool result
+  (a file read, a passing test), it dials the model's thinking effort down. New
+  questions and errors keep full effort.
+
+Turn it on:
+
+```bash
+export HEADROOM_OUTPUT_SHAPER=1     # off by default
+headroom proxy --port 8787
+```
+
+**Learn the right terseness for you.** People don't *say* how terse they want
+answers — they *show* it (they interrupt long replies, or move on before they
+could have read them). `headroom learn --verbosity` reads your past sessions and
+picks the level automatically:
+
+```bash
+headroom learn --verbosity            # preview what it found (dry run)
+headroom learn --verbosity --apply    # save it; the proxy uses it from now on
+```
+
+**See how many output tokens you saved.** Output savings are *counterfactual* —
+we never see what the model *would* have written — so Headroom reports an honest
+**estimate with a confidence range**, never a made-up number:
+
+```bash
+headroom output-savings
+# Reduction: 31.7%  (95% CI 27.7% … 35.7%)   [estimated]
+```
+
+Want a *measured* number instead of an estimate? Leave 10% of conversations
+unshaped as a control group: `export HEADROOM_OUTPUT_HOLDOUT=0.1`. The dashboard
+shows an **Output Tokens Saved** card next to input compression, labelled
+`measured` or `estimated` with the confidence band.
+
+→ Full write-up incl. the measurement methodology: [`docs/proposals/output-token-reduction.md`](docs/proposals/output-token-reduction.md)
+
 <a href="https://www.star-history.com/?repos=chopratejas%2Fheadroom&type=date&legend=top-left">
  <picture>
    <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=chopratejas/headroom&type=date&legend=top-left" />
@@ -147,10 +196,28 @@ Any OpenAI-compatible client works via `headroom proxy`. MCP-native: `headroom m
 Headroom can route GitHub Copilot CLI subscription traffic through the local proxy:
 
 ```bash
+headroom copilot-auth login
 headroom wrap copilot --subscription -- --model gpt-4o
 ```
 
-This lets Headroom intercept OpenAI-compatible Copilot CLI requests and apply the same proxy compression pipeline before forwarding to GitHub Copilot's hosted API. The wrapper resolves the account-specific Copilot API endpoint and prints it as `COPILOT_PROVIDER_API_URL=...` during launch.
+This lets Headroom intercept OpenAI-compatible Copilot CLI requests and apply the same proxy compression pipeline before forwarding to GitHub Copilot's hosted API. The wrapper exchanges Headroom's reusable GitHub OAuth token for Copilot's short-lived API token and prints the upstream endpoint as `COPILOT_PROVIDER_API_URL=...` during launch.
+
+`headroom copilot-auth login` stores a Headroom-specific Copilot OAuth token.
+This avoids relying on generic GitHub or Copilot CLI tokens that can read
+Copilot account metadata but may still be rejected by Copilot's token-exchange
+endpoint.
+
+For GitHub Enterprise Server or custom-domain Copilot deployments, set the
+deployment domain before launching:
+
+```bash
+export GITHUB_COPILOT_ENTERPRISE_DOMAIN=ghe.example.com
+```
+
+For GitHub.com Enterprise Cloud URLs such as
+`github.com/enterprises/your-enterprise`, do not set an enterprise-domain
+override. Headroom uses GitHub's normal token-exchange endpoint and the Copilot
+API endpoint advertised for the signed-in account.
 
 Platform support note: macOS auth reuse via Copilot CLI Keychain storage has been smoke-tested. Windows Credential Manager, Linux Secret Service / `secret-tool`, and Docker/CI token-injection paths are implemented or planned as auth-discovery paths, but still need real OS validation before they should be considered fully vetted. For Docker and CI, prefer passing an explicit `GITHUB_COPILOT_TOKEN` or `GITHUB_COPILOT_GITHUB_TOKEN` rather than relying on host keychain access.
 
@@ -302,7 +369,7 @@ Headroom runs **locally**, covers **every** content type, works with every major
 
 ```bash
 git clone https://github.com/chopratejas/headroom.git && cd headroom
-pip install -e ".[dev]" && pytest
+uv sync --extra dev && uv run pytest
 ```
 
 Devcontainers in `.devcontainer/` (default + `memory-stack` with Qdrant & Neo4j). See [CONTRIBUTING.md](CONTRIBUTING.md).

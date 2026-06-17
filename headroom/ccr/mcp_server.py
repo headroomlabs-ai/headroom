@@ -451,8 +451,11 @@ class HeadroomMCPServer:
         return {
             "error": "Content not found. It may have expired or the hash may be incorrect.",
             "hash": hash_key,
-            "hint": "Content compressed via headroom_compress is stored for the session. "
-            "Content compressed by the proxy uses the configured CCR TTL.",
+            "hint": "To recover: if the compression marker references a file Read, "
+            "re-read that file (the path is in the marker; disk is the source of "
+            "truth). If it was command output, re-run the command. Content "
+            "compressed via headroom_compress is stored for the session; content "
+            "compressed by the proxy uses the configured CCR TTL.",
         }
 
     async def _retrieve_via_proxy(
@@ -543,6 +546,7 @@ class HeadroomMCPServer:
                     inputSchema={
                         "type": "object",
                         "properties": {},
+                        "required": [],
                     },
                 ),
             ]

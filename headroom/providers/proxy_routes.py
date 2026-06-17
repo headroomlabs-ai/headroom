@@ -79,8 +79,71 @@ def _codex_client_version(requested_client_version: str | None = None) -> str:
     return "0.130.0"
 
 
-def _models_list_response(model_ids: tuple[str, ...]) -> Response:
-    """Build an OpenAI-compatible model-list response for Codex metadata callers."""
+_CODEX_REASONING_LEVELS: tuple[dict[str, str], ...] = (
+    {"effort": "low", "description": "Fast responses with lighter reasoning"},
+    {
+        "effort": "medium",
+        "description": "Balances speed and reasoning depth for everyday tasks",
+    },
+    {"effort": "high", "description": "Greater reasoning depth for complex problems"},
+    {"effort": "xhigh", "description": "Extra high reasoning depth for complex problems"},
+)
+
+
+def _display_name_from_model_id(model_id: str) -> str:
+    return "-".join(
+        part.upper() if part == "gpt" else part.capitalize() for part in model_id.split("-")
+    )
+
+
+def _codex_model_registry_entry(
+    model_id: str,
+    upstream_entry: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return Codex app-server model metadata with required registry fields."""
+    entry = dict(upstream_entry or {})
+    entry["slug"] = model_id
+    entry.setdefault("display_name", _display_name_from_model_id(model_id))
+    entry.setdefault("description", "Codex model available through ChatGPT subscription auth.")
+    entry.setdefault("default_reasoning_level", "medium")
+    entry.setdefault("supported_reasoning_levels", list(_CODEX_REASONING_LEVELS))
+    entry.setdefault("shell_type", "shell_command")
+    entry.setdefault("visibility", "list")
+    entry.setdefault("supported_in_api", True)
+    entry.setdefault("priority", 50)
+    entry.setdefault("additional_speed_tiers", ["fast"])
+    entry.setdefault(
+        "service_tiers",
+        [{"id": "priority", "name": "Fast", "description": "1.5x speed, increased usage"}],
+    )
+    entry.setdefault("availability_nux", None)
+    entry.setdefault("upgrade", None)
+    entry.setdefault("context_window", 272000)
+    entry.setdefault("max_context_window", 272000)
+    entry.setdefault("effective_context_window_percent", 95)
+    entry.setdefault("experimental_supported_tools", [])
+    entry.setdefault("input_modalities", ["text", "image"])
+    entry.setdefault("supports_search_tool", True)
+    entry.setdefault("use_responses_lite", False)
+    entry.setdefault("support_verbosity", True)
+    entry.setdefault("default_verbosity", "low")
+    entry.setdefault("apply_patch_tool_type", "freeform")
+    entry.setdefault("web_search_tool_type", "text_and_image")
+    entry.setdefault("truncation_policy", {"mode": "tokens", "limit": 10000})
+    entry.setdefault("supports_image_detail_original", True)
+    entry.setdefault("supports_parallel_tool_calls", True)
+    entry.setdefault("supports_reasoning_summaries", True)
+    entry.setdefault("default_reasoning_summary", "none")
+    return entry
+
+
+def _models_list_response_from_entries(model_entries: tuple[dict[str, Any], ...]) -> Response:
+    model_ids = tuple(
+        slug
+        for entry in model_entries
+        for slug in (entry.get("slug"),)
+        if isinstance(slug, str) and slug
+    )
     payload = {
         "object": "list",
         "data": [
@@ -92,6 +155,7 @@ def _models_list_response(model_ids: tuple[str, ...]) -> Response:
             }
             for model_id in model_ids
         ],
+        "models": list(model_entries),
     }
     return Response(
         content=json.dumps(payload),
@@ -102,7 +166,9 @@ def _models_list_response(model_ids: tuple[str, ...]) -> Response:
 
 def _synthetic_models_list_response() -> Response:
     """OpenAI-compatible `/v1/models` payload for Codex ChatGPT auth."""
-    return _models_list_response(_CHATGPT_AUTH_CODEX_MODELS)
+    return _models_list_response_from_entries(
+        tuple(_codex_model_registry_entry(model_id) for model_id in _CHATGPT_AUTH_CODEX_MODELS)
+    )
 
 
 def _synthetic_model_get_response(model_id: str) -> Response:
@@ -152,12 +218,12 @@ def _normalize_codex_registry_headers(headers: dict[str, str]) -> dict[str, str]
     return upstream_headers
 
 
-async def _fetch_chatgpt_codex_model_ids(
+async def _fetch_chatgpt_codex_model_entries(
     proxy: Any,
     headers: dict[str, str],
     requested_client_version: str | None,
-) -> tuple[str, ...] | None:
-    """Fetch Codex model slugs from ChatGPT, returning None when fallback should apply."""
+) -> tuple[dict[str, Any], ...] | None:
+    """Fetch Codex model metadata from ChatGPT, returning None when fallback should apply."""
     client_version = _codex_client_version(requested_client_version)
     upstream_headers = _normalize_codex_registry_headers(headers)
     url = (
@@ -185,20 +251,21 @@ async def _fetch_chatgpt_codex_model_ids(
             logger.warning("Codex model registry response did not contain models[]")
             return None
 
-        model_ids = tuple(
-            slug
+        model_entries = tuple(
+            _codex_model_registry_entry(slug, entry)
             for entry in models_raw
             if isinstance(entry, dict)
             for slug in (entry.get("slug"),)
             if isinstance(slug, str) and slug
         )
-        if not model_ids:
+        if not model_entries:
             logger.warning("Codex model registry returned no model slugs")
             return None
 
-        logger.info("Fetched %d Codex models from upstream model registry", len(model_ids))
-        logger.debug("Fetched Codex model IDs from upstream model registry: %s", list(model_ids))
-        return model_ids
+        model_ids = [entry["slug"] for entry in model_entries]
+        logger.info("Fetched %d Codex models from upstream model registry", len(model_entries))
+        logger.debug("Fetched Codex model IDs from upstream model registry: %s", model_ids)
+        return model_entries
     except Exception:
         logger.exception("Codex model registry fetch failed")
         return None
@@ -210,10 +277,12 @@ async def _fetch_chatgpt_codex_models_response(
     requested_client_version: str | None,
 ) -> Response | None:
     """Build a dynamic `/v1/models` response from the Codex registry when available."""
-    model_ids = await _fetch_chatgpt_codex_model_ids(proxy, headers, requested_client_version)
-    if model_ids is None:
+    model_entries = await _fetch_chatgpt_codex_model_entries(
+        proxy, headers, requested_client_version
+    )
+    if model_entries is None:
         return None
-    return _models_list_response(model_ids)
+    return _models_list_response_from_entries(model_entries)
 
 
 async def _fetch_chatgpt_codex_model_get_response(
@@ -223,9 +292,17 @@ async def _fetch_chatgpt_codex_model_get_response(
     requested_client_version: str | None,
 ) -> Response | None:
     """Build a dynamic `/v1/models/{id}` response from the Codex registry when available."""
-    model_ids = await _fetch_chatgpt_codex_model_ids(proxy, headers, requested_client_version)
-    if model_ids is None:
+    model_entries = await _fetch_chatgpt_codex_model_entries(
+        proxy, headers, requested_client_version
+    )
+    if model_entries is None:
         return None
+    model_ids = tuple(
+        slug
+        for entry in model_entries
+        for slug in (entry.get("slug"),)
+        if isinstance(slug, str) and slug
+    )
     if model_id in model_ids:
         return Response(
             content=json.dumps(
@@ -327,6 +404,23 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
     @app.post("/v1/messages")
     async def anthropic_messages(request: Request):
         return await proxy.handle_anthropic_messages(request)
+
+    # AWS Bedrock InvokeModel passthrough. Registered ONLY when an upstream is
+    # configured (`--bedrock-api-url` / BEDROCK_TARGET_API_URL): without it,
+    # `/model/{id}/invoke` keeps falling through to the catch-all (verbatim,
+    # signature-intact) so existing behavior is unchanged. The `{model_id:path}`
+    # converter captures inference-profile ids that contain dots, colons and
+    # slashes (e.g. `us.anthropic.claude-sonnet-4-5-20250929-v1:0`). See
+    # headroom/proxy/handlers/bedrock.py for the SigV4 caveat.
+    if getattr(proxy.config, "bedrock_api_url", None):
+
+        @app.post("/model/{model_id:path}/invoke")
+        async def bedrock_invoke(request: Request, model_id: str):
+            return await proxy.handle_bedrock_invoke(request, model_id, stream=False)
+
+        @app.post("/model/{model_id:path}/invoke-with-response-stream")
+        async def bedrock_invoke_stream(request: Request, model_id: str):
+            return await proxy.handle_bedrock_invoke(request, model_id, stream=True)
 
     @app.post("/v1/messages/count_tokens")
     async def anthropic_count_tokens(request: Request):
@@ -756,6 +850,30 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         custom_base = request.headers.get("x-headroom-base-url")
         if custom_base:
             return await proxy.handle_passthrough(request, custom_base.rstrip("/"))
+
+        # Intercept Code Assist authentication and onboarding routes
+        clean_path = path.lstrip("/")
+        if clean_path.startswith(("v1internal:", "v1/v1internal:")):
+            # Normalize path (remove v1/ prefix if present to avoid 404 on cloudcode-pa upstream)
+            normalized_path = clean_path
+            if normalized_path.startswith("v1/"):
+                normalized_path = normalized_path[3:]
+            normalized_path = f"/{normalized_path}"
+
+            # Mutate request scope so handle_passthrough uses the normalized path
+            request.scope["path"] = normalized_path
+            if "raw_path" in request.scope:
+                from urllib.parse import quote
+
+                request.scope["raw_path"] = quote(normalized_path).encode("ascii")
+            if hasattr(request, "_url"):
+                delattr(request, "_url")
+
+            return await proxy.handle_passthrough(
+                request,
+                _api_target(proxy, "cloudcode"),
+            )
+
         return await proxy.handle_passthrough(
             request,
             _select_passthrough_base_url(proxy, dict(request.headers)),

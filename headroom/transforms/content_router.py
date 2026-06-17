@@ -37,8 +37,10 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import re
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -53,6 +55,9 @@ from .content_detector import detect_content_type as _regex_detect_content_type
 from .error_detection import content_has_strong_error_indicators
 
 logger = logging.getLogger(__name__)
+
+
+_detect_backend_warned = False
 
 
 def _router_debug_dumps(value: Any) -> str:
@@ -108,20 +113,42 @@ def _section_debug(section: ContentSection, index: int) -> dict[str, Any]:
     }
 
 
+def _resolve_detect_backend() -> str:
+    """Pick the content-detection backend: ``"rust"`` or ``"python"``."""
+    backend = os.environ.get("HEADROOM_DETECT_BACKEND", "").strip().lower()
+    if backend in ("python", "rust"):
+        return backend
+    return "python" if sys.platform == "win32" else "rust"
+
+
 def _detect_content(content: str) -> DetectionResult:
-    """Detect content type via the Rust detection chain.
+    """Detect content type via the native chain, with a safe Windows default.
 
     Stage-3d (PR5) wired this through `headroom._core.detect_content_type`,
-    which runs the magika→unidiff→PlainText chain. The Python-side
-    Magika+regex fallback path was retired here — single detection
-    surface, no parallel paths. The Rust extension is a hard dep
-    (no Python fallback) per `feedback_no_silent_fallbacks.md`.
+    which runs the magika→unidiff→PlainText chain. On Windows, native Magika
+    initialization can leave an ONNX Runtime thread alive after timeout, so the
+    default backend there is the pure-Python regex detector.
+
+    Set `HEADROOM_DETECT_BACKEND=rust` or `python` to force a backend.
 
     The Rust binding returns the legacy `DetectionResult` shape with
     `confidence=1.0` and an empty metadata dict. Existing callers
     only consumed `.content_type` from it; the strategy mapping in
     `_strategy_from_detection` keys off that field alone.
     """
+    global _detect_backend_warned
+
+    backend = _resolve_detect_backend()
+    if backend == "python":
+        if not _detect_backend_warned:
+            _detect_backend_warned = True
+            logger.warning(
+                "Content detection using pure-Python backend "
+                "(native Magika/ONNX detector is unsafe by default on Windows; "
+                "override with HEADROOM_DETECT_BACKEND=rust)."
+            )
+        return _regex_detect_content_type(content)
+
     from headroom._core import detect_content_type as _rust_detect
 
     rust_result = _rust_detect(content)
@@ -189,8 +216,74 @@ def _create_content_signature(
         return None
 
 
+def _gain_bucket(gain: float) -> str:
+    """Quantize a net-cost gain into a coarse magnitude band for markers.
+
+    The net-cost gate emits a ``netcost:skip:<band>`` transform marker. Using
+    the raw rounded gain would make every distinct value a unique marker and
+    blow up the cardinality of any ``transforms_applied`` aggregation. Bands
+    keep the signal (rough magnitude + sign) while bounding cardinality to a
+    handful of values. The exact gain is still logged at INFO for debugging.
+    """
+    if not math.isfinite(gain):
+        return "nan"
+    mag = abs(gain)
+    if mag < 100:
+        band = "lt100"
+    elif mag < 1000:
+        band = "lt1k"
+    elif mag < 10000:
+        band = "lt10k"
+    else:
+        band = "gte10k"
+    if gain == 0:
+        return "0"
+    return ("neg_" if gain < 0 else "") + band
+
+
+def _netcost_message_tokens(message: dict[str, Any], tokenizer: Tokenizer) -> int:
+    """Token count of a message for net-cost suffix (S) estimation.
+
+    String content is counted directly. Anthropic block-list content is
+    counted by summing the text-bearing fields (``text`` blocks and
+    ``tool_result`` content) rather than stringifying the whole list, which
+    would count Python ``repr`` punctuation and type names and badly
+    miscount S — the value that drives the break-even gate decision.
+    """
+    content = message.get("content", "")
+    if isinstance(content, str):
+        return tokenizer.count_text(content)
+    if not isinstance(content, list):
+        return tokenizer.count_text(str(content))
+    total = 0
+    for block in content:
+        if not isinstance(block, dict):
+            total += tokenizer.count_text(str(block))
+            continue
+        block_type = block.get("type")
+        if block_type == "text":
+            total += tokenizer.count_text(str(block.get("text", "")))
+        elif block_type == "tool_result":
+            tc = block.get("content", "")
+            if isinstance(tc, str):
+                total += tokenizer.count_text(tc)
+            elif isinstance(tc, list):
+                for sub in tc:
+                    if isinstance(sub, dict) and sub.get("type") == "text":
+                        total += tokenizer.count_text(str(sub.get("text", "")))
+                    else:
+                        total += tokenizer.count_text(str(sub))
+            else:
+                total += tokenizer.count_text(str(tc))
+        else:
+            # Other blocks (image, tool_use input, …) — repr is a rough proxy
+            # but bounded; these rarely dominate a suffix.
+            total += tokenizer.count_text(str(block))
+    return total
+
+
 class CompressionCache:
-    """Two-tier compression cache with TTL.
+    """Two-tier compression cache with TTL.  Thread-safe.
 
     Tier 1 (skip set): content hashes that won't compress — instant skip,
     near-zero memory (just ints in a set).
@@ -204,9 +297,17 @@ class CompressionCache:
 
     Uses in-process dict for ultra-fast lookups (~100ns). Could be backed
     by memcached/Redis for multi-process deployments.
+
+    Thread safety: a ``threading.Lock`` guards all read-modify-write
+    operations.  The ``apply()`` path runs compression inside a
+    ``ThreadPoolExecutor``; without the lock concurrent cache misses for
+    the same content would produce duplicate compression work (correct but
+    wasteful) and metrics counters would drift.
     """
 
     def __init__(self, ttl_seconds: int = 1800):
+        import threading
+
         # Tier 2: compressed results {hash: (text, ratio, strategy, timestamp)}
         self._results: dict[int, tuple[str, float, str, float]] = {}
         # Tier 1: hashes of content that won't compress {hash: timestamp}
@@ -219,80 +320,91 @@ class CompressionCache:
         self._evictions = 0
         self._total_lookup_ns = 0
         self._lookup_count = 0
+        self._lock = threading.Lock()
 
     def get(self, key: int) -> tuple[str, float, str] | None:
-        """Get cached compression result.
+        """Get cached compression result.  Thread-safe.
 
         Returns (compressed_text, ratio, strategy) or None if not found/expired.
         Use is_skipped() first to check if content is known non-compressible.
         """
         t0 = time.perf_counter_ns()
-        entry = self._results.get(key)
-        if entry is not None:
-            compressed, ratio, strategy, created_at = entry
-            if (time.time() - created_at) < self._ttl_seconds:
-                self._hits += 1
-                self._total_lookup_ns += time.perf_counter_ns() - t0
-                self._lookup_count += 1
-                return (compressed, ratio, strategy)
-            else:
-                del self._results[key]
-                self._evictions += 1
-        self._misses += 1
-        self._total_lookup_ns += time.perf_counter_ns() - t0
-        self._lookup_count += 1
-        return None
+        with self._lock:
+            entry = self._results.get(key)
+            if entry is not None:
+                compressed, ratio, strategy, created_at = entry
+                if (time.monotonic() - created_at) < self._ttl_seconds:
+                    self._hits += 1
+                    self._total_lookup_ns += time.perf_counter_ns() - t0
+                    self._lookup_count += 1
+                    return (compressed, ratio, strategy)
+                else:
+                    del self._results[key]
+                    self._evictions += 1
+            self._misses += 1
+            self._total_lookup_ns += time.perf_counter_ns() - t0
+            self._lookup_count += 1
+            return None
 
     def is_skipped(self, key: int) -> bool:
-        """Check if content is known non-compressible (Tier 1)."""
-        ts = self._skip.get(key)
-        if ts is not None:
-            if (time.time() - ts) < self._ttl_seconds:
-                self._skip_hits += 1
-                return True
-            else:
-                del self._skip[key]
-                self._evictions += 1
-        return False
+        """Check if content is known non-compressible (Tier 1).  Thread-safe."""
+        with self._lock:
+            ts = self._skip.get(key)
+            if ts is not None:
+                if (time.monotonic() - ts) < self._ttl_seconds:
+                    self._skip_hits += 1
+                    return True
+                else:
+                    del self._skip[key]
+                    self._evictions += 1
+            return False
 
     def put(self, key: int, compressed: str, ratio: float, strategy: str) -> None:
-        """Store a compressed result (Tier 2)."""
-        self._results[key] = (compressed, ratio, strategy, time.time())
+        """Store a compressed result (Tier 2).  Thread-safe."""
+        with self._lock:
+            self._results[key] = (compressed, ratio, strategy, time.monotonic())
 
     def mark_skip(self, key: int) -> None:
-        """Mark content as non-compressible (Tier 1)."""
-        self._skip[key] = time.time()
+        """Mark content as non-compressible (Tier 1).  Thread-safe."""
+        with self._lock:
+            self._skip[key] = time.monotonic()
 
     def move_to_skip(self, key: int) -> None:
-        """Move a result to skip set (threshold tightened, no longer qualifies)."""
-        self._results.pop(key, None)
-        self._skip[key] = time.time()
+        """Move a result to skip set (threshold tightened, no longer qualifies).
+        Thread-safe."""
+        with self._lock:
+            self._results.pop(key, None)
+            self._skip[key] = time.monotonic()
 
     @property
     def size(self) -> int:
-        return len(self._results)
+        with self._lock:
+            return len(self._results)
 
     @property
     def skip_size(self) -> int:
-        return len(self._skip)
+        with self._lock:
+            return len(self._skip)
 
     @property
     def stats(self) -> dict[str, int | float]:
-        avg_ns = self._total_lookup_ns / self._lookup_count if self._lookup_count else 0
-        return {
-            "cache_hits": self._hits,
-            "cache_skip_hits": self._skip_hits,
-            "cache_misses": self._misses,
-            "cache_evictions": self._evictions,
-            "cache_size": len(self._results),
-            "cache_skip_size": len(self._skip),
-            "cache_avg_lookup_ns": avg_ns,
-        }
+        with self._lock:
+            avg_ns = self._total_lookup_ns / self._lookup_count if self._lookup_count else 0
+            return {
+                "cache_hits": self._hits,
+                "cache_skip_hits": self._skip_hits,
+                "cache_misses": self._misses,
+                "cache_evictions": self._evictions,
+                "cache_size": len(self._results),
+                "cache_skip_size": len(self._skip),
+                "cache_avg_lookup_ns": avg_ns,
+            }
 
     def clear(self) -> None:
-        """Clear all entries (e.g., on session end)."""
-        self._results.clear()
-        self._skip.clear()
+        """Clear all entries (e.g., on session end).  Thread-safe."""
+        with self._lock:
+            self._results.clear()
+            self._skip.clear()
 
 
 class CompressionStrategy(Enum):
@@ -523,6 +635,16 @@ class ContentRouterConfig:
     # Per-tool compression profiles (tool_name → CompressionProfile)
     # Set to None to use DEFAULT_TOOL_PROFILES from config
     tool_profiles: dict[str, Any] | None = None
+
+    # SmartCrusher configuration override. None → transforms-level
+    # SmartCrusherConfig() defaults. Lets deployments tune the lossless
+    # dispatch threshold and compaction heuristics without constructing
+    # the crusher themselves.
+    smart_crusher: Any | None = None
+
+    # Group search-compressor output by file (`rg --heading` style).
+    # Default False; the proxy enables it in token mode.
+    search_group_by_file: bool = False
 
 
 # Patterns for detecting mixed content
@@ -1271,21 +1393,11 @@ class ContentRouter(Transform):
                             result.compressed,
                             len(result.compressed.split()),
                         )
-                        smart_crusher_fallback = False
-                        if result.compressed == content:
-                            strategy_chain.append(CompressionStrategy.KOMPRESS.value)
-                            fallback_compressed, fallback_tokens = self._try_ml_compressor(
-                                content, context, question
-                            )
-                            if fallback_tokens < compressed_tokens:
-                                compressed = fallback_compressed
-                                compressed_tokens = fallback_tokens
-                                actual_strategy = CompressionStrategy.KOMPRESS
-                                compressor_name = "KompressCompressor"
-                                decision_reason = "smart_crusher_fallback_kompress_after_no_savings"
-                                smart_crusher_fallback = True
-                        if not smart_crusher_fallback:
-                            decision_reason = "smart_crusher"
+                        decision_reason = "smart_crusher"
+                        # Fallback to Kompress (and possibly Log) is
+                        # handled by the unified post-strategy block below
+                        # — no inline fallback here to avoid duplicate
+                        # Kompress invocations.
 
             elif strategy == CompressionStrategy.SEARCH:
                 if self.config.enable_search_compressor:
@@ -1368,10 +1480,19 @@ class ContentRouter(Transform):
             }
             fallback_no_savings = compressed == content or compressed_tokens >= original_tokens
             if fallback_eligible_strategy and fallback_no_savings:
-                strategy_chain.append(CompressionStrategy.KOMPRESS.value)
-                fallback_compressed, fallback_tokens = self._try_ml_compressor(
-                    content, context, question
-                )
+                # Skip if Kompress was already tried by an inline fallback
+                # (e.g. CODE_AWARE's code-compressor-unavailable path at
+                # line 1249).  Prevents a duplicate strategy_chain entry
+                # and a wasted second _try_ml_compressor call.
+                already_tried_kompress = CompressionStrategy.KOMPRESS.value in strategy_chain
+                if not already_tried_kompress:
+                    strategy_chain.append(CompressionStrategy.KOMPRESS.value)
+                    fallback_compressed, fallback_tokens = self._try_ml_compressor(
+                        content, context, question
+                    )
+                else:
+                    fallback_compressed = compressed
+                    fallback_tokens = compressed_tokens
                 if fallback_tokens < compressed_tokens:
                     compressed = fallback_compressed
                     compressed_tokens = fallback_tokens
@@ -1585,7 +1706,9 @@ class ContentRouter(Transform):
                     enabled=self.config.ccr_enabled,
                     inject_retrieval_marker=self.config.ccr_inject_marker,
                 )
-                crusher_config = SmartCrusherConfig()
+                # Full config override (smart_crusher) wins as the base;
+                # the per-field knobs from savings profiles still apply on top.
+                crusher_config = self.config.smart_crusher or SmartCrusherConfig()
                 if self.config.smart_crusher_max_items_after_crush is not None:
                     crusher_config.max_items_after_crush = (
                         self.config.smart_crusher_max_items_after_crush
@@ -1603,9 +1726,11 @@ class ContentRouter(Transform):
         """Get SearchCompressor (lazy load)."""
         if self._search_compressor is None:
             try:
-                from .search_compressor import SearchCompressor
+                from .search_compressor import SearchCompressor, SearchCompressorConfig
 
-                self._search_compressor = SearchCompressor()
+                self._search_compressor = SearchCompressor(
+                    SearchCompressorConfig(group_by_file=self.config.search_group_by_file)
+                )
             except ImportError:
                 logger.debug("SearchCompressor not available")
         return self._search_compressor
@@ -1894,6 +2019,118 @@ class ContentRouter(Transform):
 
         return mapping
 
+    def _net_cost_allows(
+        self,
+        *,
+        slot_idx: int,
+        original_tokens: int,
+        compressed_tokens: int,
+        suffix_tokens: list[int],
+        route_counts: dict[str, int],
+        transforms_applied: list[str],
+        batch_state: dict[str, int | None] | None = None,
+    ) -> bool:
+        """Break-even gate for one candidate mutation (#856 P2, flag-gated).
+
+        Consumes ``CompressionPolicy.net_mutation_gain`` with the issue's v1
+        estimators: ΔT is the candidate's exact token saving (the compressed
+        form is already computed when this runs), S is the token total after
+        the slot, and R / P_alive are env-tunable constants
+        (``HEADROOM_NET_COST_EXPECTED_READS``, default 10;
+        ``HEADROOM_NET_COST_P_ALIVE``, default 1.0 — the conservative
+        full-penalty assumption). Every decision is logged with its inputs
+        and counted in ``route_counts`` so the flag can be validated from
+        telemetry before any default-on.
+
+        #856 P3a (batch deep edits): a mutation at depth K busts the
+        provider's cached suffix after K, so every *later* candidate at a
+        deeper slot rides that same invalidation for free — mutating it adds
+        no incremental cache-bust cost. ``batch_state["floor"]`` tracks the
+        shallowest slot already admitted as a net-positive mutation. When the
+        current candidate sits strictly deeper than that floor, S is charged
+        as 0 (rather than the full invalidated suffix), so the break-even
+        formula admits it on the write/read economics alone. Charging S=0 via
+        the same ``net_mutation_gain`` (instead of blanket-admitting on
+        ``delta_t > 0``) keeps the decision conservative: it never admits a
+        mutation the real economics would reject. The floor is only set/lowered
+        by full-S admits, so a slot only ever rides free behind a genuinely
+        mutated shallower slot. Each batch admission emits the
+        ``router:netcost_batch_admit`` marker and the ``netcost_batch_admitted``
+        counter for telemetry.
+        """
+        delta_t = max(0, original_tokens - compressed_tokens)
+        # Batch reclaim: if a shallower slot was already admitted, its
+        # cache-bust already invalidated everything after it, including this
+        # slot — so charge S=0 here. Otherwise S is the full suffix after the
+        # candidate (P2 v1 estimator).
+        floor = batch_state.get("floor") if batch_state is not None else None
+        batch_reclaim = floor is not None and slot_idx > floor
+        suffix = 0 if batch_reclaim else suffix_tokens[slot_idx + 1]
+        policy = self._runtime_compression_policy
+        if policy is None:
+            from .compression_policy import policy_default_payg
+
+            policy = policy_default_payg()
+        # Malformed env values fall back to defaults with a warning rather
+        # than crashing the request path (same posture as the #851 breaker
+        # env guard).
+        # ``float()`` parses "nan"/"inf" without raising, so a non-finite
+        # check is needed in addition to the ValueError guard — otherwise a
+        # malformed-but-parseable value would be logged verbatim (misleading
+        # telemetry) even though ``net_mutation_gain`` clamps it internally.
+        reads, p_alive = 10.0, 1.0
+        try:
+            _reads = float(os.environ.get("HEADROOM_NET_COST_EXPECTED_READS", "") or 10.0)
+            if not math.isfinite(_reads):
+                raise ValueError("non-finite")
+            reads = _reads
+        except ValueError:
+            logger.warning("HEADROOM_NET_COST_EXPECTED_READS malformed; using 10")
+        try:
+            _p_alive = float(os.environ.get("HEADROOM_NET_COST_P_ALIVE", "") or 1.0)
+            if not math.isfinite(_p_alive):
+                raise ValueError("non-finite")
+            p_alive = _p_alive
+        except ValueError:
+            logger.warning("HEADROOM_NET_COST_P_ALIVE malformed; using 1.0")
+        gain = float(policy.net_mutation_gain(delta_t, suffix, reads, p_alive))
+        allowed = gain > 0.0
+        logger.info(
+            "NetCostPolicy slot=%d delta_t=%d suffix=%d reads=%.1f p_alive=%.2f "
+            "gain=%.0f batch_reclaim=%s -> %s",
+            slot_idx,
+            delta_t,
+            suffix,
+            reads,
+            p_alive,
+            gain,
+            batch_reclaim,
+            "mutate" if allowed else "skip",
+        )
+        if allowed:
+            route_counts.setdefault("netcost_allowed", 0)
+            route_counts["netcost_allowed"] += 1
+            if batch_reclaim:
+                # Rode a shallower edit's cache-bust for free — telemetry only;
+                # the floor is unchanged (this slot is deeper than the floor).
+                route_counts.setdefault("netcost_batch_admitted", 0)
+                route_counts["netcost_batch_admitted"] += 1
+                transforms_applied.append("router:netcost_batch_admit")
+            elif batch_state is not None:
+                # First/shallower full-S admit — open (or lower) the batch
+                # floor so deeper candidates can reclaim against it.
+                current = batch_state.get("floor")
+                batch_state["floor"] = slot_idx if current is None else min(current, slot_idx)
+        else:
+            route_counts.setdefault("netcost_skipped", 0)
+            route_counts["netcost_skipped"] += 1
+            # Bucket the gain into a coarse magnitude band rather than emitting
+            # the raw value: a distinct numeric gain per skip would explode the
+            # cardinality of any ``transforms_applied`` aggregation. The exact
+            # value is still in the INFO log above for debugging.
+            transforms_applied.append(f"netcost:skip:{_gain_bucket(gain)}")
+        return allowed
+
     def apply(
         self,
         messages: list[dict[str, Any]],
@@ -2066,17 +2303,55 @@ class ContentRouter(Transform):
         # Pre-allocate result slots — None means "pending compression".
         result_slots: list[dict[str, Any] | None] = [None] * num_messages
 
+        # #856 P2 (flag-gated, default off): net-cost mutation gate. Suffix
+        # token sums are precomputed once (reverse cumulative) so each
+        # candidate's S lookup is O(1). v1 estimator per the issue: S is the
+        # token total of every message after the candidate.
+        netcost_enabled = os.environ.get("HEADROOM_NET_COST_POLICY") == "1"
+        netcost_suffix_tokens: list[int] = []
+        # #856 P3a: shared batch-reclaim state for this request. ``floor`` is
+        # the shallowest slot admitted as a net-positive mutation; once set,
+        # deeper candidates charge S=0 (their cache-bust is already paid).
+        netcost_batch_state: dict[str, int | None] = {"floor": None}
+        if netcost_enabled:
+            netcost_suffix_tokens = [0] * (num_messages + 1)
+            for j in range(num_messages - 1, -1, -1):
+                netcost_suffix_tokens[j] = netcost_suffix_tokens[j + 1] + _netcost_message_tokens(
+                    messages[j], tokenizer
+                )
+
         # Tasks: list of (slot_index, content, context, bias, content_key)
         _PendingTask = tuple[int, str, str, float, int]
         pending_tasks: list[_PendingTask] = []
 
+        # #856 P2b (flag-gated, default off): net-cost frozen-floor unlock.
+        # Without the flag, every message in the provider's prefix cache
+        # (index < frozen_message_count) is unconditionally skipped — mutating
+        # one trades a 90% read discount for a 25% write penalty (Anthropic).
+        # That binary floor leaves money on the table: a 50K-token stale tool
+        # dump with only a 10K cached suffix after it pays for itself many
+        # times over. With HEADROOM_NET_COST_POLICY=1 a *string-content*
+        # frozen message instead falls through to the normal candidate
+        # pipeline, where the P2 break-even gate (_net_cost_allows) decides
+        # per candidate: its S is the full invalidated suffix after the slot,
+        # so the deep edit proceeds only when ΔT·(w+r(R-1)) still beats the
+        # cache-bust penalty. Block-list and non-string frozen content stay
+        # frozen — the gate is wired into the string and parallel-merge paths
+        # only, and the per-block cache_control contract in
+        # _process_content_blocks is not net-cost aware, so opening them here
+        # would mutate cached blocks ungated.
+        frozen_unlock_slots: set[int] = set()
         for i, message in enumerate(messages):
-            # Skip frozen messages (in provider's prefix cache).
-            # Modifying these would invalidate the cache, replacing a 90%
-            # read discount with a 25% write penalty (Anthropic).
             if i < frozen_message_count:
-                result_slots[i] = message
-                continue
+                if netcost_enabled and isinstance(message.get("content", ""), str):
+                    # Defer to the break-even gate below instead of skipping.
+                    frozen_unlock_slots.add(i)
+                    route_counts.setdefault("netcost_frozen_considered", 0)
+                    route_counts["netcost_frozen_considered"] += 1
+                else:
+                    # Frozen — byte-identical to preserve the prefix cache.
+                    result_slots[i] = message
+                    continue
 
             role = message.get("role", "")
             content = message.get("content", "")
@@ -2227,9 +2502,26 @@ class ContentRouter(Transform):
                 cached_compressed, cached_ratio, cached_strategy = cached
                 # Re-check ratio against current min_ratio (shifts with context pressure)
                 if cached_ratio < min_ratio:
-                    result_slots[i] = {**message, "content": cached_compressed}
-                    transforms_applied.append(f"router:{cached_strategy}:{cached_ratio:.2f}")
-                    compressed_details.append(f"{cached_strategy}:{cached_ratio:.2f}")
+                    if netcost_enabled and not self._net_cost_allows(
+                        slot_idx=i,
+                        original_tokens=tokenizer.count_text(content),
+                        compressed_tokens=tokenizer.count_text(cached_compressed),
+                        suffix_tokens=netcost_suffix_tokens,
+                        route_counts=route_counts,
+                        transforms_applied=transforms_applied,
+                        batch_state=netcost_batch_state,
+                    ):
+                        # Net-cost gate: mutation would cost more in cache
+                        # invalidation than it saves — leave untouched.
+                        result_slots[i] = message
+                    else:
+                        result_slots[i] = {**message, "content": cached_compressed}
+                        transforms_applied.append(f"router:{cached_strategy}:{cached_ratio:.2f}")
+                        compressed_details.append(f"{cached_strategy}:{cached_ratio:.2f}")
+                        if i in frozen_unlock_slots:
+                            transforms_applied.append("router:netcost_frozen_unlock")
+                            route_counts.setdefault("netcost_frozen_unlocked", 0)
+                            route_counts["netcost_frozen_unlocked"] += 1
                 else:
                     # Threshold tightened — no longer qualifies. Move to skip.
                     self._cache.move_to_skip(content_key)
@@ -2272,7 +2564,7 @@ class ContentRouter(Transform):
             compressor_timing["parallel_compress_total"] = parallel_ms
 
             # --- Pass 3: Merge results back (sequential, updates caches) ---
-            for (slot_idx, _, _, _, content_key), (result, compress_ms) in zip(
+            for (slot_idx, task_content, _, _, content_key), (result, compress_ms) in zip(
                 pending_tasks, task_results
             ):
                 message = messages[slot_idx]
@@ -2282,13 +2574,27 @@ class ContentRouter(Transform):
                 )
 
                 if result.compression_ratio < min_ratio:
-                    # Compressed — store in result cache
+                    # Compressed — store in result cache. The cache is still
+                    # warmed when the net-cost gate blocks the slot: the
+                    # gate's verdict is contextual (suffix size), the
+                    # compression result is not.
                     self._cache.put(
                         content_key,
                         result.compressed,
                         result.compression_ratio,
                         result.strategy_used.value,
                     )
+                    if netcost_enabled and not self._net_cost_allows(
+                        slot_idx=slot_idx,
+                        original_tokens=tokenizer.count_text(task_content),
+                        compressed_tokens=tokenizer.count_text(result.compressed),
+                        suffix_tokens=netcost_suffix_tokens,
+                        route_counts=route_counts,
+                        transforms_applied=transforms_applied,
+                        batch_state=netcost_batch_state,
+                    ):
+                        result_slots[slot_idx] = message
+                        continue
                     result_slots[slot_idx] = {**message, "content": result.compressed}
                     transforms_applied.append(
                         f"router:{result.strategy_used.value}:{result.compression_ratio:.2f}"
@@ -2296,6 +2602,10 @@ class ContentRouter(Transform):
                     compressed_details.append(
                         f"{result.strategy_used.value}:{result.compression_ratio:.2f}"
                     )
+                    if slot_idx in frozen_unlock_slots:
+                        transforms_applied.append("router:netcost_frozen_unlock")
+                        route_counts.setdefault("netcost_frozen_unlocked", 0)
+                        route_counts["netcost_frozen_unlocked"] += 1
                 else:
                     # Didn't compress — add to skip set
                     self._cache.mark_skip(content_key)
@@ -2337,6 +2647,8 @@ class ContentRouter(Transform):
             parts.append(f"{route_counts['cache_hit']} cache hits")
         if route_counts.get("cache_miss"):
             parts.append(f"{route_counts['cache_miss']} cache misses")
+        if route_counts.get("netcost_batch_admitted"):
+            parts.append(f"{route_counts['netcost_batch_admitted']} netcost batch-admitted")
         cs = self._cache.stats
         if cs["cache_size"] > 0 or cs["cache_skip_size"] > 0:
             parts.append(
@@ -2546,74 +2858,26 @@ class ContentRouter(Transform):
                             route_counts["already_compressed"] += 1
                         continue
 
-                    # Two-tier compression cache
-                    content_key = hash(tool_content)
-
-                    # Tier 1: skip set — instant rejection
-                    if self._cache.is_skipped(content_key):
-                        new_blocks.append(block)
-                        if route_counts is not None:
-                            route_counts["ratio_too_high"] += 1
-                            route_counts.setdefault("cache_hit", 0)
-                            route_counts["cache_hit"] += 1
-                        continue
-
-                    # Tier 2: result cache — reuse compressed output
-                    cached = self._cache.get(content_key)
-                    if cached is not None:
-                        cached_compressed, cached_ratio, cached_strategy = cached
-                        if cached_ratio < min_ratio:
-                            new_blocks.append({**block, "content": cached_compressed})
-                            transforms_applied.append(f"router:tool_result:{cached_strategy}")
-                            if compressed_details is not None:
-                                compressed_details.append(
-                                    f"tool:{cached_strategy}:{cached_ratio:.2f}"
-                                )
-                            any_compressed = True
-                        else:
-                            # Threshold tightened — move to skip
-                            self._cache.move_to_skip(content_key)
-                            new_blocks.append(block)
-                            if route_counts is not None:
-                                route_counts["ratio_too_high"] += 1
-                        if route_counts is not None:
-                            route_counts.setdefault("cache_hit", 0)
-                            route_counts["cache_hit"] += 1
-                        continue
-
-                    # Cache miss — run full compression
-                    if route_counts is not None:
-                        route_counts.setdefault("cache_miss", 0)
-                        route_counts["cache_miss"] += 1
-                    t0 = time.perf_counter()
-                    result = self.compress(tool_content, context=context, bias=bias)
-                    compress_ms = (time.perf_counter() - t0) * 1000
-                    if compressor_timing is not None:
-                        key = f"compressor:{result.strategy_used.value}"
-                        compressor_timing[key] = compressor_timing.get(key, 0.0) + compress_ms
-                    if result.compression_ratio < min_ratio:
-                        # Compressed — store in result cache
-                        self._cache.put(
-                            content_key,
-                            result.compressed,
-                            result.compression_ratio,
-                            result.strategy_used.value,
-                        )
-                        new_blocks.append({**block, "content": result.compressed})
-                        transforms_applied.append(
-                            f"router:tool_result:{result.strategy_used.value}"
-                        )
-                        if compressed_details is not None:
-                            compressed_details.append(
-                                f"tool:{result.strategy_used.value}:{result.compression_ratio:.2f}"
-                            )
+                    # Two-tier compression cache → shared helper
+                    compressed_content, was_compressed = self._compress_block_content(
+                        content=tool_content,
+                        content_key=hash(tool_content),
+                        context=context,
+                        bias=bias,
+                        min_ratio=min_ratio,
+                        compressor_timing=compressor_timing,
+                        transforms_applied=transforms_applied,
+                        route_counts=route_counts,
+                        compressed_details=compressed_details,
+                        strategy_label="tool_result",
+                        details_prefix="tool",
+                    )
+                    if compressed_content is not None:
+                        new_blocks.append({**block, "content": compressed_content})
                         any_compressed = True
-                        continue
                     else:
-                        # Didn't compress — add to skip set
-                        self._cache.mark_skip(content_key)
-                        if route_counts is not None:
-                            route_counts["ratio_too_high"] += 1
+                        new_blocks.append(block)
+                    continue
                 else:
                     if route_counts is not None:
                         route_counts["small"] += 1
@@ -2637,68 +2901,26 @@ class ContentRouter(Transform):
                             route_counts["already_compressed"] += 1
                         continue
 
-                    content_key = hash(text_content)
-
-                    # Tier 1: skip set
-                    if self._cache.is_skipped(content_key):
-                        new_blocks.append(block)
-                        if route_counts is not None:
-                            route_counts["ratio_too_high"] += 1
-                            route_counts.setdefault("cache_hit", 0)
-                            route_counts["cache_hit"] += 1
-                        continue
-
-                    # Tier 2: result cache
-                    cached = self._cache.get(content_key)
-                    if cached is not None:
-                        cached_compressed, cached_ratio, cached_strategy = cached
-                        if cached_ratio < min_ratio:
-                            new_blocks.append({**block, "text": cached_compressed})
-                            transforms_applied.append(f"router:text_block:{cached_strategy}")
-                            if compressed_details is not None:
-                                compressed_details.append(
-                                    f"text:{cached_strategy}:{cached_ratio:.2f}"
-                                )
-                            any_compressed = True
-                        else:
-                            self._cache.move_to_skip(content_key)
-                            new_blocks.append(block)
-                            if route_counts is not None:
-                                route_counts["ratio_too_high"] += 1
-                        if route_counts is not None:
-                            route_counts.setdefault("cache_hit", 0)
-                            route_counts["cache_hit"] += 1
-                        continue
-
-                    # Cache miss — full compression
-                    if route_counts is not None:
-                        route_counts.setdefault("cache_miss", 0)
-                        route_counts["cache_miss"] += 1
-                    t0 = time.perf_counter()
-                    result = self.compress(text_content, context=context, bias=1.0)
-                    compress_ms = (time.perf_counter() - t0) * 1000
-                    if compressor_timing is not None:
-                        key = f"compressor:{result.strategy_used.value}"
-                        compressor_timing[key] = compressor_timing.get(key, 0.0) + compress_ms
-                    if result.compression_ratio < min_ratio:
-                        self._cache.put(
-                            content_key,
-                            result.compressed,
-                            result.compression_ratio,
-                            result.strategy_used.value,
-                        )
-                        new_blocks.append({**block, "text": result.compressed})
-                        transforms_applied.append(f"router:text_block:{result.strategy_used.value}")
-                        if compressed_details is not None:
-                            compressed_details.append(
-                                f"text:{result.strategy_used.value}:{result.compression_ratio:.2f}"
-                            )
+                    # Two-tier compression cache → shared helper
+                    compressed_content, _was_compressed = self._compress_block_content(
+                        content=text_content,
+                        content_key=hash(text_content),
+                        context=context,
+                        bias=1.0,
+                        min_ratio=min_ratio,
+                        compressor_timing=compressor_timing,
+                        transforms_applied=transforms_applied,
+                        route_counts=route_counts,
+                        compressed_details=compressed_details,
+                        strategy_label="text_block",
+                        details_prefix="text",
+                    )
+                    if compressed_content is not None:
+                        new_blocks.append({**block, "text": compressed_content})
                         any_compressed = True
-                        continue
                     else:
-                        self._cache.mark_skip(content_key)
-                        if route_counts is not None:
-                            route_counts["ratio_too_high"] += 1
+                        new_blocks.append(block)
+                    continue
                 else:
                     if route_counts is not None:
                         route_counts["small"] += 1
@@ -2709,6 +2931,102 @@ class ContentRouter(Transform):
         if any_compressed:
             return {**message, "content": new_blocks}
         return message
+
+    def _compress_block_content(
+        self,
+        content: str,
+        content_key: int,
+        context: str,
+        bias: float,
+        min_ratio: float,
+        compressor_timing: dict[str, float] | None,
+        transforms_applied: list[str],
+        route_counts: dict[str, int] | None,
+        compressed_details: list[str] | None,
+        strategy_label: str,
+        details_prefix: str,
+    ) -> tuple[str | None, bool]:
+        """Apply two-tier cache lookup + compression to a single content string.
+
+        Encapsulates the shared cache→compress→store logic used by both
+        ``tool_result`` and ``text`` block paths in ``_process_content_blocks``.
+        Previously this logic was duplicated ~60 lines per path; centralising
+        it ensures both paths stay in sync (cache expiry, pinning, ratio gating).
+
+        Args:
+            content: The string content to compress.
+            content_key: Pre-computed ``hash(content)`` for cache lookups.
+            context: User/query context for relevance-aware compression.
+            bias: Compression bias multiplier (tool-specific or 1.0).
+            min_ratio: Adaptive minimum compression ratio threshold.
+            compressor_timing: Optional dict to accumulate per-strategy timing.
+            transforms_applied: List mutated in-place with transform labels.
+            route_counts: Optional dict mutated in-place with route counters.
+            compressed_details: Optional list mutated with compression details.
+            strategy_label: Transform label prefix (e.g. ``"tool_result"``).
+            details_prefix: Compressed-details prefix (e.g. ``"tool"``).
+
+        Returns:
+            Tuple of ``(compressed_content_or_None, was_compressed)``.
+            When ``compressed_content`` is ``None`` the caller should keep
+            the original block unchanged. When ``was_compressed`` is
+            ``True`` the caller should update the block with the returned
+            content and set ``any_compressed``.
+        """
+        # Tier 1: skip set — instant rejection
+        if self._cache.is_skipped(content_key):
+            if route_counts is not None:
+                route_counts["ratio_too_high"] = route_counts.get("ratio_too_high", 0) + 1
+                route_counts["cache_hit"] = route_counts.get("cache_hit", 0) + 1
+            return None, False
+
+        # Tier 2: result cache — reuse compressed output
+        cached = self._cache.get(content_key)
+        if cached is not None:
+            cached_compressed, cached_ratio, cached_strategy = cached
+            if route_counts is not None:
+                route_counts["cache_hit"] = route_counts.get("cache_hit", 0) + 1
+            if cached_ratio < min_ratio:
+                transforms_applied.append(f"router:{strategy_label}:{cached_strategy}")
+                if compressed_details is not None:
+                    compressed_details.append(
+                        f"{details_prefix}:{cached_strategy}:{cached_ratio:.2f}"
+                    )
+                return cached_compressed, True
+            # Threshold tightened — move result to skip set
+            self._cache.move_to_skip(content_key)
+            if route_counts is not None:
+                route_counts["ratio_too_high"] = route_counts.get("ratio_too_high", 0) + 1
+            return None, False
+
+        # Cache miss — run full compression
+        if route_counts is not None:
+            route_counts["cache_miss"] = route_counts.get("cache_miss", 0) + 1
+        t0 = time.perf_counter()
+        result = self.compress(content, context=context, bias=bias)
+        compress_ms = (time.perf_counter() - t0) * 1000
+        if compressor_timing is not None:
+            key = f"compressor:{result.strategy_used.value}"
+            compressor_timing[key] = compressor_timing.get(key, 0.0) + compress_ms
+        if result.compression_ratio < min_ratio:
+            # Compressed — store in result cache
+            self._cache.put(
+                content_key,
+                result.compressed,
+                result.compression_ratio,
+                result.strategy_used.value,
+            )
+            transforms_applied.append(f"router:{strategy_label}:{result.strategy_used.value}")
+            if compressed_details is not None:
+                compressed_details.append(
+                    f"{details_prefix}:{result.strategy_used.value}:{result.compression_ratio:.2f}"
+                )
+            return result.compressed, True
+        # Didn't compress enough — add to skip set
+        self._cache.mark_skip(content_key)
+        if route_counts is not None:
+            route_counts["ratio_too_high"] = route_counts.get("ratio_too_high", 0) + 1
+        return None, False
 
     def _detect_analysis_intent(self, messages: list[dict[str, Any]]) -> bool:
         """Detect if user wants to analyze/review code.

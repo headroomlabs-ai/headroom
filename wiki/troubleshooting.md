@@ -44,6 +44,23 @@ ps aux | grep headroom
 sudo pfctl -s rules | grep 8787
 ```
 
+### "Upstream rejects a beta token the client no longer sends"
+
+**Symptom**: The upstream API returns an error referencing a beta feature (`anthropic-beta` header) even though the client is no longer sending that header.
+
+**Cause**: Headroom's `SessionBetaTracker` re-injects any `anthropic-beta` token seen earlier in the same session to preserve prefix-cache stability. Once a token is in the tracker it persists for the rest of the session. Stopping the token on the client side alone is not sufficient.
+
+**Solution**: Set `HEADROOM_BETA_HEADER_STICKY=disabled` to pass the client's header value verbatim without accumulation:
+
+```bash
+export HEADROOM_BETA_HEADER_STICKY=disabled
+headroom proxy ...
+```
+
+Alternatively, restarting the proxy process clears the in-memory tracker. See [Session Beta Header Tracking](configuration.md#session-beta-header-tracking) for details.
+
+---
+
 ### "Proxy returns errors for some requests"
 
 **Symptom**: Some requests work, others fail with 502/503.

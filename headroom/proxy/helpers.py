@@ -592,6 +592,10 @@ def append_text_to_latest_user_input_item(
 _CONTEXT_TOOL_ENV = "HEADROOM_CONTEXT_TOOL"
 _CONTEXT_TOOL_RTK = "rtk"
 _CONTEXT_TOOL_LEAN_CTX = "lean-ctx"
+_RTK_GAIN_SCOPE_ENV = "HEADROOM_RTK_GAIN_SCOPE"
+_RTK_GAIN_SCOPE_GLOBAL = "global"
+_RTK_GAIN_SCOPE_PROJECT = "project"
+_RTK_GAIN_SCOPES = {_RTK_GAIN_SCOPE_GLOBAL, _RTK_GAIN_SCOPE_PROJECT}
 
 RTK_STATS_CACHE_TTL_SECONDS = float(os.environ.get("HEADROOM_CONTEXT_TOOL_STATS_TTL_SECONDS", "60"))
 CONTEXT_TOOL_STATS_CACHE_TTL_SECONDS = RTK_STATS_CACHE_TTL_SECONDS
@@ -766,8 +770,15 @@ def parse_sse_events_from_byte_buffer(
 # Maximum message array length (prevents DoS from deeply nested payloads)
 MAX_MESSAGE_ARRAY_LENGTH = 10000
 
-# Compression pipeline timeout in seconds
-COMPRESSION_TIMEOUT_SECONDS = 30
+# Compression pipeline timeout in seconds. Override via the
+# HEADROOM_COMPRESSION_TIMEOUT_SECONDS env var for slow CPUs or long Claude Code
+# conversations (GH #946). Falls back to 30 on an unparseable value.
+try:
+    COMPRESSION_TIMEOUT_SECONDS = float(
+        os.environ.get("HEADROOM_COMPRESSION_TIMEOUT_SECONDS", "30")
+    )
+except ValueError:
+    COMPRESSION_TIMEOUT_SECONDS = 30.0
 
 # Maximum compression cache sessions (prevents unbounded memory growth)
 MAX_COMPRESSION_CACHE_SESSIONS = 500
@@ -988,6 +999,36 @@ def _context_tool_label(tool: str) -> str:
     return "RTK"
 
 
+def _context_tool_default_scope(tool: str) -> str:
+    if tool == _CONTEXT_TOOL_LEAN_CTX:
+        return "local"
+    return _RTK_GAIN_SCOPE_GLOBAL
+
+
+def _rtk_gain_scope() -> str:
+    raw = os.environ.get(_RTK_GAIN_SCOPE_ENV, "").strip().lower()
+    if not raw:
+        return _RTK_GAIN_SCOPE_GLOBAL
+    if raw in _RTK_GAIN_SCOPES:
+        return raw
+
+    logger.warning(
+        "event=rtk_gain_scope_invalid env=%s value=%r default=%s",
+        _RTK_GAIN_SCOPE_ENV,
+        raw,
+        _RTK_GAIN_SCOPE_GLOBAL,
+    )
+    return _RTK_GAIN_SCOPE_GLOBAL
+
+
+def _rtk_gain_command(rtk_path: Any, scope: str) -> list[str]:
+    command = [str(rtk_path), "gain"]
+    if scope == _RTK_GAIN_SCOPE_PROJECT:
+        command.append("--project")
+    command.extend(["--format", "json"])
+    return command
+
+
 def _coerce_int(value: Any, default: int = 0) -> int:
     try:
         return int(value or 0)
@@ -1013,6 +1054,7 @@ def _context_tool_summary_payload(
     *,
     tool: str,
     installed: bool,
+    scope: str | None = None,
     summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Normalize RTK/lean-ctx lifetime gain output into one schema.
@@ -1085,7 +1127,7 @@ def _context_tool_summary_payload(
         "tool": tool,
         "label": _context_tool_label(tool),
         "installed": installed,
-        "scope": "project" if tool == _CONTEXT_TOOL_RTK else "local",
+        "scope": scope or _context_tool_default_scope(tool),
         "total_commands": _coerce_int(
             _first_value(
                 summary,
@@ -1110,30 +1152,37 @@ def _context_tool_summary_payload(
     }
 
 
+def _context_tool_zero_payload(
+    *,
+    tool: str,
+    installed: bool,
+    scope: str | None = None,
+) -> dict[str, Any]:
+    return _context_tool_summary_payload(
+        tool=tool,
+        installed=installed,
+        scope=scope,
+        summary={},
+    )
+
+
 def _read_rtk_lifetime_stats() -> dict[str, Any] | None:
-    """Read rtk's current project-level lifetime stats."""
+    """Read rtk's lifetime stats using the configured gain scope."""
 
     from headroom.rtk import get_rtk_path
 
+    scope = _rtk_gain_scope()
     rtk_path = get_rtk_path()
     if not rtk_path:
-        return {
-            "tool": _CONTEXT_TOOL_RTK,
-            "label": _context_tool_label(_CONTEXT_TOOL_RTK),
-            "installed": False,
-            "scope": "project",
-            "total_commands": 0,
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "tokens_saved": 0,
-            "avg_savings_pct": 0.0,
-            "lifetime_avg_savings_pct": 0.0,
-            "total_time_ms": 0,
-        }
+        return _context_tool_zero_payload(
+            tool=_CONTEXT_TOOL_RTK,
+            installed=False,
+            scope=scope,
+        )
 
     try:
         result = subprocess.run(
-            [str(rtk_path), "gain", "--project", "--format", "json"],
+            _rtk_gain_command(rtk_path, scope),
             capture_output=True,
             text=True,
             timeout=5,
@@ -1144,6 +1193,7 @@ def _read_rtk_lifetime_stats() -> dict[str, Any] | None:
             payload = _context_tool_summary_payload(
                 tool=_CONTEXT_TOOL_RTK,
                 installed=True,
+                scope=scope,
                 summary=summary if isinstance(summary, dict) else {},
             )
         else:
@@ -1157,19 +1207,11 @@ def _read_rtk_lifetime_stats() -> dict[str, Any] | None:
                 result.returncode,
                 stderr_excerpt,
             )
-            return {
-                "tool": _CONTEXT_TOOL_RTK,
-                "label": _context_tool_label(_CONTEXT_TOOL_RTK),
-                "installed": True,
-                "scope": "project",
-                "total_commands": 0,
-                "input_tokens": 0,
-                "output_tokens": 0,
-                "tokens_saved": 0,
-                "avg_savings_pct": 0.0,
-                "lifetime_avg_savings_pct": 0.0,
-                "total_time_ms": 0,
-            }
+            return _context_tool_zero_payload(
+                tool=_CONTEXT_TOOL_RTK,
+                installed=True,
+                scope=scope,
+            )
     except Exception as exc:
         # PR-G2 remediation (H2): log the exception path too. Reason is the
         # exception class name (without payload — RTK exceptions can carry
@@ -1179,19 +1221,11 @@ def _read_rtk_lifetime_stats() -> dict[str, Any] | None:
             type(exc).__name__,
             exc,
         )
-        return {
-            "tool": _CONTEXT_TOOL_RTK,
-            "label": _context_tool_label(_CONTEXT_TOOL_RTK),
-            "installed": True,
-            "scope": "project",
-            "total_commands": 0,
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "tokens_saved": 0,
-            "avg_savings_pct": 0.0,
-            "lifetime_avg_savings_pct": 0.0,
-            "total_time_ms": 0,
-        }
+        return _context_tool_zero_payload(
+            tool=_CONTEXT_TOOL_RTK,
+            installed=True,
+            scope=scope,
+        )
 
     return payload
 
@@ -1203,33 +1237,9 @@ def _read_lean_ctx_lifetime_stats() -> dict[str, Any] | None:
 
     lean_ctx_path = get_lean_ctx_path()
     if not lean_ctx_path:
-        return {
-            "tool": _CONTEXT_TOOL_LEAN_CTX,
-            "label": _context_tool_label(_CONTEXT_TOOL_LEAN_CTX),
-            "installed": False,
-            "scope": "local",
-            "total_commands": 0,
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "tokens_saved": 0,
-            "avg_savings_pct": 0.0,
-            "lifetime_avg_savings_pct": 0.0,
-            "total_time_ms": 0,
-        }
+        return _context_tool_zero_payload(tool=_CONTEXT_TOOL_LEAN_CTX, installed=False)
 
-    base_payload = {
-        "tool": _CONTEXT_TOOL_LEAN_CTX,
-        "label": _context_tool_label(_CONTEXT_TOOL_LEAN_CTX),
-        "installed": True,
-        "scope": "local",
-        "total_commands": 0,
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "tokens_saved": 0,
-        "avg_savings_pct": 0.0,
-        "lifetime_avg_savings_pct": 0.0,
-        "total_time_ms": 0,
-    }
+    base_payload = _context_tool_zero_payload(tool=_CONTEXT_TOOL_LEAN_CTX, installed=True)
 
     try:
         result = subprocess.run(

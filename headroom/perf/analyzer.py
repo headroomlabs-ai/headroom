@@ -11,6 +11,7 @@ Anthropic), not the full input price.  This prevents overstating dollar savings.
 from __future__ import annotations
 
 import logging
+import os
 import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
@@ -134,6 +135,7 @@ class PerfRecord:
     timestamp: str
     request_id: str
     model: str = ""
+    client: str = ""
     num_messages: int = 0
     tokens_before: int = 0
     tokens_after: int = 0
@@ -143,7 +145,6 @@ class PerfRecord:
     cache_hit_pct: int = 0
     optimization_ms: float = 0
     transforms: list[str] = field(default_factory=list)
-    client: str = ""
 
 
 @dataclass
@@ -234,7 +235,7 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
     report = PerfReport()
     report.requested_hours = last_n_hours
 
-    log_dir = _paths.log_dir()
+    log_dir = _paths.log_dir() if os.environ.get("HEADROOM_WORKSPACE_DIR") else LOG_DIR
     if not log_dir.exists():
         return report
 
@@ -299,6 +300,7 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
                                 timestamp=ts,
                                 request_id=m.group("rid"),
                                 model=kv.get("model", ""),
+                                client=kv.get("client", ""),
                                 num_messages=int(kv.get("msgs", 0)),
                                 tokens_before=int(kv.get("tok_before", 0)),
                                 tokens_after=int(kv.get("tok_after", 0)),
@@ -308,7 +310,6 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
                                 cache_hit_pct=int(kv.get("cache_hit_pct", 0)),
                                 optimization_ms=float(kv.get("opt_ms", 0)),
                                 transforms=transforms,
-                                client=kv.get("client", ""),
                             )
                         )
                         continue

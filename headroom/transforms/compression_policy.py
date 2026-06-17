@@ -137,7 +137,12 @@ class CompressionPolicy:
         Mirrors ``CompressionPolicy::net_mutation_gain`` in the Rust
         crate (source of truth — see its docstring for the derivation)::
 
-            gain = dT * (w + r*(R - 1)) - P_alive * (w - r) * S
+            gain = dT * (w + r*(R - 1)) - P_alive * (w - r) * (S + dT)
+
+        The warm-case penalty covers ``S + dT``: with a live cache the
+        ``dT`` tokens are already cache-written, so keeping them costs
+        only reads — a mutation avoids at most ``dT*r*R``, not a fresh
+        write.
 
         Inputs are clamped: ``delta_t``/``suffix_tokens`` to ``>= 0``
         (the Rust signature takes ``u32``), ``expected_reads`` to
@@ -152,7 +157,7 @@ class CompressionPolicy:
         # f32::max in the Rust source of truth — guard explicitly.
         reads = 0.0 if math.isnan(expected_reads) else max(expected_reads, 0.0)
         alive = 1.0 if math.isnan(p_alive) else min(max(p_alive, 0.0), 1.0)
-        return float(dt) * (w + r * (reads - 1.0)) - alive * (w - r) * float(suffix)
+        return float(dt) * (w + r * (reads - 1.0)) - alive * (w - r) * float(suffix + dt)
 
     def should_mutate_deep(
         self,
@@ -169,7 +174,10 @@ class CompressionPolicy:
         """Remaining-read count at which a warm-cache (``p_alive=1``)
         mutation breaks even::
 
-            R = ((w - r) / r) * (S/dT - 1)   ~= 11.5 * S/dT  for S >> dT
+            R = ((w - r) / r) * (S/dT)   = 11.5 * S/dT  (Anthropic 5-min)
+
+        With the corrected penalty this reproduces the #856 anchors
+        exactly: 2K/50K -> 287.5, 50K/10K -> 2.3.
 
         Returns 0 when ``delta_t`` is ``<= 0`` (no savings — callers
         gate on ``delta_t > 0``; the Rust signature takes ``u32``).
@@ -179,7 +187,7 @@ class CompressionPolicy:
             return 0.0
         w = CACHE_WRITE_MULTIPLIER
         r = CACHE_READ_MULTIPLIER
-        return ((w - r) / r) * (float(max(0, suffix_tokens)) / float(delta_t) - 1.0)
+        return ((w - r) / r) * (float(max(0, suffix_tokens)) / float(delta_t))
 
 
 def policy_for_mode(mode: AuthMode) -> CompressionPolicy:

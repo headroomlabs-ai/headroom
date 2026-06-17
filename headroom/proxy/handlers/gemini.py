@@ -108,7 +108,11 @@ class GeminiHandlerMixin:
         return result
 
     def _gemini_contents_to_messages(
-        self, contents: list[dict], system_instruction: dict | None = None
+        self,
+        contents: list[dict],
+        system_instruction: dict | None = None,
+        *,
+        include_function_responses: bool = False,
     ) -> tuple[list[dict], set[int]]:
         """Convert Gemini contents[] format to OpenAI messages[] format for optimization.
 
@@ -118,6 +122,12 @@ class GeminiHandlerMixin:
 
         OpenAI format:
             messages: [{"role": "user", "content": "..."}]
+
+        When include_function_responses is True, functionResponse payloads are
+        additionally emitted as ``role="tool"`` messages so waste-signal
+        detection can see tool output (#819). That richer list is telemetry-only:
+        entries with non-text parts stay in preserved_indices and are restored
+        verbatim, so it must never be used as the compression input.
 
         Returns:
             Tuple of (messages, preserved_indices) where preserved_indices contains
@@ -151,7 +161,28 @@ class GeminiHandlerMixin:
             if text_parts:
                 messages.append({"role": role, "content": "\n".join(text_parts)})
 
+            if include_function_responses:
+                for part in parts:
+                    if "functionResponse" not in part:
+                        continue
+                    payload = self._function_response_text(part["functionResponse"])
+                    if payload:
+                        messages.append({"role": "tool", "content": payload})
+
         return messages, preserved_indices
+
+    @staticmethod
+    def _function_response_text(function_response: dict) -> str:
+        """Serialize a functionResponse payload for waste-signal parsing."""
+        response = function_response.get("response")
+        if response is None:
+            return ""
+        if isinstance(response, str):
+            return response
+        try:
+            return json.dumps(response, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            return str(response)
 
     def _messages_to_gemini_contents(self, messages: list[dict]) -> tuple[list[dict], dict | None]:
         """Convert OpenAI messages[] format back to Gemini contents[] format.
@@ -446,11 +477,17 @@ class GeminiHandlerMixin:
             try:
                 # Use OpenAI pipeline (similar message format)
                 context_limit = self.openai_provider.get_context_limit(model)
+                # Richer conversion incl. functionResponse payloads so tool
+                # output reaches waste-signal detection (#819); telemetry-only.
+                waste_messages, _ = self._gemini_contents_to_messages(
+                    contents, system_instruction, include_function_responses=True
+                )
                 result = self.openai_pipeline.apply(
                     messages=messages,
                     model=model,
                     model_limit=context_limit,
                     context=extract_user_query(messages),
+                    waste_messages=waste_messages,
                 )
                 if result.messages != messages:
                     optimized_messages = result.messages
@@ -792,11 +829,17 @@ class GeminiHandlerMixin:
         if _decision.should_compress:
             try:
                 context_limit = self.openai_provider.get_context_limit(model)
+                # Richer conversion incl. functionResponse payloads so tool
+                # output reaches waste-signal detection (#819); telemetry-only.
+                waste_messages, _ = self._gemini_contents_to_messages(
+                    contents, system_instruction, include_function_responses=True
+                )
                 result = self.openai_pipeline.apply(
                     messages=messages,
                     model=model,
                     model_limit=context_limit,
                     context=extract_user_query(messages),
+                    waste_messages=waste_messages,
                 )
                 if result.messages != messages:
                     optimized_messages = result.messages
