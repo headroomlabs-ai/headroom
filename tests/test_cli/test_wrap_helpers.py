@@ -536,6 +536,7 @@ class TestApplyProjectHeaderEnv:
         result.encode("ascii")
         # Must round-trip back to the original name via unquote.
         import urllib.parse
+
         assert urllib.parse.unquote(result) == "第二大脑共享"
 
     def test_non_ascii_cwd_header_is_ascii_safe(
