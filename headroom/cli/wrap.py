@@ -3645,11 +3645,11 @@ def opencode(
     """Launch OpenCode through Headroom proxy.
 
     \b
-    Sets OPENAI_BASE_URL to route all OpenAI API calls through Headroom.
-    Sets up the selected CLI context tool so OpenCode uses token-optimized
-    commands (60-90% savings on shell output). Also
-    registers the headroom MCP server in the OpenCode config file
-    so OpenCode can call ``headroom_retrieve`` on compression markers.
+    Overrides built-in provider baseURLs in OpenCode's config to route
+    all API calls through Headroom. Sets up the selected CLI context tool
+    so OpenCode uses token-optimized commands (60-90% savings on shell
+    output). Also registers the headroom MCP server in the OpenCode config
+    file so OpenCode can call ``headroom_retrieve`` on compression markers.
 
     \b
     Examples:
@@ -3749,9 +3749,9 @@ def opencode(
         click.echo("Install OpenCode: npm install -g @opencode-ai/opencode")
         raise SystemExit(1)
 
-    from headroom.providers.opencode import build_launch_env
-
-    env, env_vars_display = build_launch_env(port, os.environ)
+    # OpenCode routes traffic via provider.<name>.options.baseURL in config,
+    # NOT via OPENAI_BASE_URL env var. Config write is the only routing mechanism.
+    env = dict(os.environ)
 
     # Per-project savings attribution
     _opencode_project = _project_name_from_cwd()
@@ -3775,7 +3775,7 @@ def opencode(
         port=port,
         no_proxy=no_proxy,
         tool_label="OPENCODE",
-        env_vars_display=env_vars_display,
+        env_vars_display=[],
         learn=learn,
         memory=memory,
         agent_type="opencode",
