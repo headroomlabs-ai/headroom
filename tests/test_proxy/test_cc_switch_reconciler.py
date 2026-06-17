@@ -68,9 +68,25 @@ def test_no_rewrite_loop(tmp_path):
 
 def test_switching_provider_recaptures(tmp_path):
     r, sf, captured = _make(tmp_path)
-    _write(sf, {"env": {"ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic", "ANTHROPIC_AUTH_TOKEN": "sk-d"}})
+    _write(
+        sf,
+        {
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
+                "ANTHROPIC_AUTH_TOKEN": "sk-d",
+            }
+        },
+    )
     assert r.tick() is True
-    _write(sf, {"env": {"ANTHROPIC_BASE_URL": "https://api.kimi.com/anthropic", "ANTHROPIC_AUTH_TOKEN": "sk-k"}})
+    _write(
+        sf,
+        {
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://api.kimi.com/anthropic",
+                "ANTHROPIC_AUTH_TOKEN": "sk-k",
+            }
+        },
+    )
     assert r.tick() is True
     assert captured[-1] == "https://api.kimi.com/anthropic"
     assert json.loads(sf.read_text())["env"]["ANTHROPIC_AUTH_TOKEN"] == "sk-k"

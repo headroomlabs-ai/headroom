@@ -174,7 +174,9 @@ class CCSwitchReconciler:
         env["ANTHROPIC_BASE_URL"] = self.proxy_url
         data["env"] = env
         self._atomic_write(data)
-        logger.info("cc-switch reconciler: captured upstream=%s, base_url -> %s", url, self.proxy_url)
+        logger.info(
+            "cc-switch reconciler: captured upstream=%s, base_url -> %s", url, self.proxy_url
+        )
         return True
 
     def _atomic_write(self, data: dict) -> None:
