@@ -1299,6 +1299,13 @@ class AnthropicHandlerMixin:
                         )
                 except Exception:  # advisory hint only — must never fail a request
                     pass
+            # Initialize before the gated block so the proactive-expansion
+            # gate below (which references ``ccr_workspace_key`` regardless of
+            # the inject flags) does not raise ``UnboundLocalError`` when the
+            # block is skipped — e.g. ``--no-ccr-inject-tool`` with the default
+            # ``ccr_inject_system_instructions=False``, or when ``_bypass`` is
+            # set. The downstream uses already treat falsy as "unresolved".
+            ccr_workspace_key, ccr_workspace_label = None, None
             if (
                 self.config.ccr_inject_tool or self.config.ccr_inject_system_instructions
             ) and not _bypass:
