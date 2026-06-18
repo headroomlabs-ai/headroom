@@ -49,17 +49,29 @@ def pytest_runtest_call(item):
 def _reset_headroom_logger_propagation():
     """Keep `headroom.*` log records flowing to pytest's caplog handler.
 
-    `headroom.proxy.helpers._setup_file_logging` sets
-    ``logging.getLogger("headroom").propagate = False`` once any test
-    triggers a proxy startup with `--log-file`. After that, every
-    subsequent test's `caplog` fixture stops capturing `headroom.*`
-    log records (caplog attaches to root, propagation is now blocked
-    at the headroom-logger boundary). Reset before every test so the
-    capture is deterministic regardless of run order.
+    Two sources disable propagation on the headroom logger tree and never
+    restore it, which then makes later `caplog`-based assertions flaky in
+    full-suite runs (caplog attaches to root, so a `propagate=False` anywhere
+    on the chain silently drops the records):
+
+    - ``headroom.proxy.helpers._setup_file_logging`` sets
+      ``getLogger("headroom").propagate = False`` on proxy startup.
+    - ``benchmarks.claude_session_mode_benchmark._disable_headroom_benchmark_logging``
+      (exercised by ``test_claude_session_mode_benchmark``) sets
+      ``propagate = False`` + ``CRITICAL`` on ``headroom``, ``headroom.proxy``,
+      ``headroom.transforms``, ``headroom.cache`` (and children).
+
+    Resetting only ``"headroom"`` is not enough — a child like
+    ``"headroom.proxy"`` left non-propagating blocks the record before it
+    reaches root. Reset the whole subtree before every test so capture is
+    deterministic regardless of run order.
     """
     import logging as _logging
 
     _logging.getLogger("headroom").propagate = True
+    for _name in list(_logging.root.manager.loggerDict):
+        if _name.startswith("headroom."):
+            _logging.getLogger(_name).propagate = True
     yield
 
 
