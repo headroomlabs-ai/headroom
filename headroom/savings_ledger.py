@@ -73,7 +73,7 @@ def _coerce_timestamp(value: Any) -> datetime:
 
 
 def _label(value: Any) -> str:
-    """Sanitize a free-form repo/client label, defaulting to ``unknown``."""
+    """Sanitize a free-form client label, defaulting to ``unknown``."""
 
     cleaned = sanitize_project_name(value)
     return cleaned or UNKNOWN
@@ -113,7 +113,6 @@ def record_savings_event(
     tokens_before: int,
     tokens_after: int,
     model: Any = None,
-    repo: Any = None,
     client: Any = None,
     source: str = "mcp",
     timestamp: Any = None,
@@ -154,7 +153,6 @@ def record_savings_event(
         "saved": saved,
         "cost_usd": round(cost, 6),
         "model": model_label,
-        "repo": _label(repo),
         "client": _label(client),
         "source": str(source or UNKNOWN),
         "pid": os.getpid(),
@@ -256,7 +254,6 @@ class SavingsReport:
     windows: dict[str, dict[str, Any]]
     by_model: list[dict[str, Any]]
     by_client: list[dict[str, Any]]
-    by_repo: list[dict[str, Any]]
     top_model: str = UNKNOWN
 
     def to_dict(self) -> dict[str, Any]:
@@ -268,7 +265,6 @@ class SavingsReport:
             "windows": self.windows,
             "by_model": self.by_model,
             "by_client": self.by_client,
-            "by_repo": self.by_repo,
         }
 
 
@@ -305,7 +301,6 @@ def aggregate_savings(
     last_7 = _Bucket()
     by_model: dict[str, _Bucket] = {}
     by_client: dict[str, _Bucket] = {}
-    by_repo: dict[str, _Bucket] = {}
 
     for event in events:
         ts: datetime = event["_ts"]
@@ -328,9 +323,6 @@ def aggregate_savings(
         by_client.setdefault(str(event.get("client") or UNKNOWN), _Bucket()).add(
             saved=saved, before=before, cost=cost
         )
-        by_repo.setdefault(str(event.get("repo") or UNKNOWN), _Bucket()).add(
-            saved=saved, before=before, cost=cost
-        )
 
     model_rows = _ranked(by_model, "model")
     top_model = model_rows[0]["model"] if model_rows else UNKNOWN
@@ -346,7 +338,6 @@ def aggregate_savings(
         },
         by_model=model_rows,
         by_client=_ranked(by_client, "client"),
-        by_repo=_ranked(by_repo, "repo"),
         top_model=top_model,
     )
 

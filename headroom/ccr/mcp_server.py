@@ -87,26 +87,6 @@ _READ_ENABLED = os.environ.get("HEADROOM_MCP_READ", "off").lower().strip() in (
 DEFAULT_PROXY_URL = os.environ.get("HEADROOM_PROXY_URL", "http://127.0.0.1:8787")
 
 
-def _detect_repo() -> str:
-    """Best-effort repository name for savings attribution.
-
-    Prefers the ``HEADROOM_PROJECT`` override, then the nearest enclosing git
-    work tree's directory name, then the working-directory name.
-    """
-
-    override = os.environ.get("HEADROOM_PROJECT")
-    if override:
-        return override
-    try:
-        cwd = Path.cwd()
-    except Exception:
-        return "unknown"
-    for candidate in (cwd, *cwd.parents):
-        if (candidate / ".git").exists():
-            return candidate.name or "unknown"
-    return cwd.name or "unknown"
-
-
 def _format_session_summary(summary: dict[str, Any], local_stats: dict[str, Any]) -> str:
     """Format the proxy summary + local MCP stats into clean readable text."""
     lines: list[str] = []
@@ -690,7 +670,6 @@ class HeadroomMCPServer:
             # The MCP tool doesn't know the agent's upstream model; an optional
             # hint lets a host attribute it, otherwise it records as "unknown".
             model=os.environ.get("HEADROOM_MCP_MODEL"),
-            repo=_detect_repo(),
             client=self._current_client(),
             source="mcp",
         )

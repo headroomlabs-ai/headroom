@@ -2,8 +2,8 @@
 
 Reads the append-only savings ledger (``~/.headroom/savings_events.jsonl``,
 written by both the MCP tool path and the proxy) and renders a cost-avoided
-summary with Today / Last 7 days / All time bars plus per-model, per-client,
-and per-repo breakdowns. Durable across restarts; aggregated on read.
+summary with Today / Last 7 days / All time bars plus per-model and
+per-client breakdowns. Durable across restarts; aggregated on read.
 """
 
 from __future__ import annotations
@@ -102,12 +102,4 @@ def savings(as_json: bool, days: int) -> None:
                 f"{_tokens(int(row['tokens_saved']))} tokens saved"
             )
 
-    if report.by_repo:
-        click.echo("")
-        click.echo("Per-repo totals (all time):")
-        for row in report.by_repo:
-            click.echo(
-                f"  {str(row['repo']):<24} "
-                f"tokens_saved={_tokens(int(row['tokens_saved'])):<12} "
-                f"calls={int(row['calls'])}"
-            )
+

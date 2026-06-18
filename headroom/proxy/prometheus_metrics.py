@@ -564,6 +564,7 @@ class PrometheusMetrics:
         uncached_input_tokens: int = 0,
         attempted_input_tokens: int = 0,
         project: str | None = None,
+        client: str | None = None,
     ):
         """Record metrics for a request."""
         async with self._lock:
@@ -661,14 +662,16 @@ class PrometheusMetrics:
 
             # Also append to the durable, multi-process savings ledger so
             # `headroom savings` reflects proxy traffic alongside MCP-tool usage.
-            # The real upstream model means litellm prices it accurately.
+            # The real upstream model means litellm prices it accurately. The
+            # client is the harness classified from the User-Agent / X-Client
+            # (claude-code, codex, cursor, ...); it falls back to "proxy" only
+            # when the harness is unidentified.
             if tokens_saved > 0:
                 savings_ledger.record_savings_event(
                     tokens_before=input_tokens,
                     tokens_after=max(input_tokens - tokens_saved, 0),
                     model=model,
-                    repo=project,
-                    client="proxy",
+                    client=client or "proxy",
                     source="proxy",
                 )
 

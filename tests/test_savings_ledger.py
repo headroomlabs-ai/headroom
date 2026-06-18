@@ -26,7 +26,7 @@ def _events_env(monkeypatch, tmp_path):
 def test_unknown_model_uses_blended_fallback(monkeypatch, tmp_path):
     _events_env(monkeypatch, tmp_path)
     assert L.record_savings_event(
-        tokens_before=1000, tokens_after=400, model=None, repo="r", client="c"
+        tokens_before=1000, tokens_after=400, model=None, client="c"
     )
     report = L.aggregate_savings()
     assert report.lifetime["tokens_saved"] == 600
@@ -43,7 +43,7 @@ def test_estimate_cost_unknown_short_circuits_to_fallback():
 def test_explicit_cost_is_honored(monkeypatch, tmp_path):
     _events_env(monkeypatch, tmp_path)
     L.record_savings_event(
-        tokens_before=100, tokens_after=10, model="x", repo="r", client="c", cost_usd=1.25
+        tokens_before=100, tokens_after=10, model="x", client="c", cost_usd=1.25
     )
     assert L.aggregate_savings().lifetime["cost_usd"] == pytest.approx(1.25)
 
@@ -58,16 +58,12 @@ def test_zero_or_negative_savings_not_recorded(monkeypatch, tmp_path):
 
 def test_breakdowns_aggregate_by_dimension(monkeypatch, tmp_path):
     _events_env(monkeypatch, tmp_path)
-    L.record_savings_event(tokens_before=1000, tokens_after=300, model=None, repo="alpha", client="claude-code")
-    L.record_savings_event(tokens_before=500, tokens_after=200, model=None, repo="beta", client="claude-code")
+    L.record_savings_event(tokens_before=1000, tokens_after=300, model=None, client="claude-code")
+    L.record_savings_event(tokens_before=500, tokens_after=200, model=None, client="claude-code")
     L.record_savings_event(
-        tokens_before=2000, tokens_after=600, model="gpt", repo="alpha", client="proxy", cost_usd=0.5
+        tokens_before=2000, tokens_after=600, model="gpt", client="proxy", cost_usd=0.5
     )
     report = L.aggregate_savings()
-
-    repos = {row["repo"]: row for row in report.by_repo}
-    assert repos["alpha"]["calls"] == 2
-    assert repos["alpha"]["tokens_saved"] == 700 + 1400
 
     clients = {row["client"]: row for row in report.by_client}
     assert clients["claude-code"]["calls"] == 2
@@ -77,13 +73,13 @@ def test_breakdowns_aggregate_by_dimension(monkeypatch, tmp_path):
 def test_windows_today_week_alltime(monkeypatch, tmp_path):
     _events_env(monkeypatch, tmp_path)
     now = datetime(2026, 6, 17, 12, 0, tzinfo=UTC)
-    L.record_savings_event(tokens_before=1000, tokens_after=500, model=None, repo="r", client="c", timestamp=now)
+    L.record_savings_event(tokens_before=1000, tokens_after=500, model=None, client="c", timestamp=now)
     L.record_savings_event(
-        tokens_before=1000, tokens_after=600, model=None, repo="r", client="c",
+        tokens_before=1000, tokens_after=600, model=None, client="c",
         timestamp=now - timedelta(days=3),
     )
     L.record_savings_event(
-        tokens_before=1000, tokens_after=700, model=None, repo="r", client="c",
+        tokens_before=1000, tokens_after=700, model=None, client="c",
         timestamp=now - timedelta(days=30),
     )
     report = L.aggregate_savings(now=now)
@@ -98,9 +94,9 @@ def test_windows_today_week_alltime(monkeypatch, tmp_path):
 def test_retention_excludes_old_events(monkeypatch, tmp_path):
     _events_env(monkeypatch, tmp_path)
     now = datetime(2026, 6, 17, 12, 0, tzinfo=UTC)
-    L.record_savings_event(tokens_before=1000, tokens_after=500, model=None, repo="r", client="c", timestamp=now)
+    L.record_savings_event(tokens_before=1000, tokens_after=500, model=None, client="c", timestamp=now)
     L.record_savings_event(
-        tokens_before=1000, tokens_after=500, model=None, repo="r", client="c",
+        tokens_before=1000, tokens_after=500, model=None, client="c",
         timestamp=now - timedelta(days=400),
     )
     report = L.aggregate_savings(now=now, retention_days=365)
@@ -110,7 +106,7 @@ def test_retention_excludes_old_events(monkeypatch, tmp_path):
 def test_appends_do_not_clobber_and_survive_restart(monkeypatch, tmp_path):
     path = _events_env(monkeypatch, tmp_path)
     for _ in range(5):
-        L.record_savings_event(tokens_before=100, tokens_after=10, model=None, repo="r", client="c")
+        L.record_savings_event(tokens_before=100, tokens_after=10, model=None, client="c")
     lines = [ln for ln in path.read_text().splitlines() if ln.strip()]
     assert len(lines) == 5
     # aggregate_savings holds no in-memory state — it reads purely from disk,
@@ -121,7 +117,7 @@ def test_appends_do_not_clobber_and_survive_restart(monkeypatch, tmp_path):
 
 def test_corrupt_lines_are_skipped(monkeypatch, tmp_path):
     path = _events_env(monkeypatch, tmp_path)
-    L.record_savings_event(tokens_before=1000, tokens_after=400, model=None, repo="r", client="c")
+    L.record_savings_event(tokens_before=1000, tokens_after=400, model=None, client="c")
     with open(path, "a", encoding="utf-8") as handle:
         handle.write("not json\n\n")
     assert L.aggregate_savings().lifetime["calls"] == 1
@@ -151,7 +147,7 @@ def test_cli_renders_sections_and_json(monkeypatch, tmp_path):
     from headroom.cli.savings import savings
 
     _events_env(monkeypatch, tmp_path)
-    L.record_savings_event(tokens_before=1000, tokens_after=300, model=None, repo="alpha", client="claude-code")
+    L.record_savings_event(tokens_before=1000, tokens_after=300, model=None, client="claude-code")
     runner = CliRunner()
 
     result = runner.invoke(savings, [])
@@ -159,13 +155,14 @@ def test_cli_renders_sections_and_json(monkeypatch, tmp_path):
     assert "cost avoided" in result.output
     assert "Today" in result.output and "All time" in result.output
     assert "Savings by client" in result.output and "claude-code" in result.output
-    assert "Per-repo totals" in result.output and "alpha" in result.output
+    assert "Per-repo totals" not in result.output
 
     result_json = runner.invoke(savings, ["--json"])
     assert result_json.exit_code == 0
     payload = json.loads(result_json.output)
     assert payload["lifetime"]["tokens_saved"] == 700
     assert payload["windows"]["all_time"]["calls"] == 1
+    assert "by_repo" not in payload
 
 
 # --------------------------------------------------------------------------- #
@@ -178,7 +175,6 @@ def test_mcp_compress_records_durable_event(monkeypatch, tmp_path):
     from headroom.ccr import mcp_server
 
     _events_env(monkeypatch, tmp_path)
-    monkeypatch.setenv("HEADROOM_PROJECT", "myrepo")
     monkeypatch.setenv("HEADROOM_MCP_CLIENT", "claude-code")
 
     server = mcp_server.HeadroomMCPServer(check_proxy=False)
@@ -187,7 +183,6 @@ def test_mcp_compress_records_durable_event(monkeypatch, tmp_path):
     report = L.aggregate_savings()
     assert report.lifetime["tokens_saved"] == 750
     assert {row["client"] for row in report.by_client} == {"claude-code"}
-    assert {row["repo"] for row in report.by_repo} == {"myrepo"}
 
 
 def test_mcp_record_savings_ignores_noop(monkeypatch, tmp_path):
@@ -198,14 +193,6 @@ def test_mcp_record_savings_ignores_noop(monkeypatch, tmp_path):
     server = mcp_server.HeadroomMCPServer(check_proxy=False)
     server._record_savings({"original_tokens": 500, "compressed_tokens": 500})
     assert L.aggregate_savings().lifetime["calls"] == 0
-
-
-def test_detect_repo_env_override(monkeypatch):
-    pytest.importorskip("mcp", reason="MCP SDK required")
-    from headroom.ccr import mcp_server
-
-    monkeypatch.setenv("HEADROOM_PROJECT", "overridden-repo")
-    assert mcp_server._detect_repo() == "overridden-repo"
 
 
 # --------------------------------------------------------------------------- #
@@ -231,6 +218,7 @@ def test_proxy_record_request_appends_ledger_event(tmp_path, monkeypatch):
     config = ProxyConfig(cache_enabled=False, rate_limit_enabled=False, log_requests=False)
     with TestClient(create_app(config)) as client:
         proxy = client.app.state.proxy
+        # identified harness -> recorded as that client
         asyncio.run(
             proxy.metrics.record_request(
                 provider="openai",
@@ -239,10 +227,24 @@ def test_proxy_record_request_appends_ledger_event(tmp_path, monkeypatch):
                 output_tokens=24,
                 tokens_saved=40,
                 latency_ms=15.0,
+                client="claude-code",
+            )
+        )
+        # unidentified harness -> falls back to "proxy"
+        asyncio.run(
+            proxy.metrics.record_request(
+                provider="openai",
+                model="gpt-4o",
+                input_tokens=80,
+                output_tokens=10,
+                tokens_saved=20,
+                latency_ms=15.0,
             )
         )
 
     report = L.aggregate_savings()
-    assert report.lifetime["tokens_saved"] == 40
-    assert any(row["client"] == "proxy" for row in report.by_client)
+    assert report.lifetime["tokens_saved"] == 60
+    clients = {row["client"] for row in report.by_client}
+    assert "claude-code" in clients
+    assert "proxy" in clients
     assert any(row["model"] == "gpt-4o" for row in report.by_model)

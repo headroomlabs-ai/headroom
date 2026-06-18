@@ -1,9 +1,9 @@
 ---
 title: Savings Tracking
-description: Durable, over-time compression savings — cost avoided plus Today / Last 7 days / All time and per-model / per-client / per-repo breakdowns via `headroom savings`.
+description: Durable, over-time compression savings — cost avoided plus Today / Last 7 days / All time and per-model / per-client breakdowns via `headroom savings`.
 ---
 
-`headroom savings` shows how much Headroom has saved you over time — cost avoided, token counts, and breakdowns by model, client, and repository. Unlike `headroom_stats` (a single in-memory session snapshot), it reads a **durable ledger** that survives proxy and agent restarts.
+`headroom savings` shows how much Headroom has saved you over time — cost avoided, token counts, and breakdowns by model and client. Unlike `headroom_stats` (a single in-memory session snapshot), it reads a **durable ledger** that survives proxy and agent restarts.
 
 ## Usage
 
@@ -31,10 +31,6 @@ Cost avoided per model (all time):
 Savings by client:
   proxy                    3 calls · 53,000 tokens saved
   claude-code              3 calls · 25,000 tokens saved
-
-Per-repo totals (all time):
-  dsar-service             tokens_saved=60,000       calls=3
-  agenda-service           tokens_saved=7,000        calls=1
 ```
 
 ## How it works
@@ -47,7 +43,7 @@ Every compression appends one line to an **append-only, file-locked event ledger
 
 Both compression paths feed the same ledger:
 
-- **MCP tool** — each `headroom_compress` call records its repo (working directory), client (the MCP client name), and tokens saved.
+- **MCP tool** — each `headroom_compress` call records its client (the MCP client name) and tokens saved.
 - **Proxy** — each request records its real upstream model, so cost is priced accurately.
 
 ### Cost basis
@@ -59,7 +55,6 @@ Cost avoided is the dollar value of the saved **input** tokens. Headroom uses [l
 | Variable | Purpose |
 | --- | --- |
 | `HEADROOM_SAVINGS_EVENTS_PATH` | Override the ledger location (default `~/.headroom/savings_events.jsonl`). |
-| `HEADROOM_PROJECT` | Override the repo label recorded by the MCP tool path. |
 | `HEADROOM_MCP_CLIENT` | Override the client label recorded by the MCP tool path. |
 | `HEADROOM_MCP_MODEL` | Optional model hint so MCP-tool compressions price against a known model instead of the blended fallback. |
 
