@@ -209,7 +209,7 @@ jobs:
             --tb=short -q
 
       - name: Upload coverage shard ${{ matrix.shard }} to Codecov
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v7
         with:
           files: coverage-${{ matrix.shard }}.xml
           flags: python
