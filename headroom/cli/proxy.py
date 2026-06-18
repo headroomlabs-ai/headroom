@@ -1107,6 +1107,17 @@ Endpoints:
 Press Ctrl+C to stop.
 """)
 
+    # Surface an "update available" notice (reads cache only; no network here).
+    # Best-effort: a broken update check must never block proxy startup.
+    try:
+        from headroom.update_check import format_update_notice
+
+        _update_notice = format_update_notice()
+        if _update_notice:
+            click.echo(f"\n{_update_notice}\n")
+    except Exception:  # noqa: BLE001 — banner must never crash startup
+        pass
+
     # -----------------------------------------------------------------------
     # Option E: start embedding server sidecar if requested
     # -----------------------------------------------------------------------

@@ -216,6 +216,45 @@ def _create_content_signature(
         return None
 
 
+# #856 P3b: Anthropic prompt-cache entries live in a 5-minute TTL tier (the
+# basis for the 1.25x write multiplier). As a session goes idle the cached
+# suffix approaches lapse, so P_alive — the probability the cache survives to
+# the next turn — decays toward 0. When P_alive hits 0 the net-cost penalty
+# term vanishes and a deep edit near lapse is free to make (the suffix is
+# about to be rebuilt cold anyway). This is the cache TTL, NOT the
+# session-tracker cleanup TTL (``PrefixFreezeConfig.session_ttl_seconds``).
+_NET_COST_CACHE_TTL_SECONDS = 300.0
+
+
+def _net_cost_cache_ttl_seconds() -> float:
+    """Provider cache TTL (seconds) used to decay P_alive from idle time.
+
+    Defaults to Anthropic's 5-minute tier; overridable via
+    ``HEADROOM_NET_COST_CACHE_TTL_SECONDS`` for other providers/tiers. A
+    malformed or non-positive value falls back to the default with a warning
+    rather than producing a divide-by-zero or negative TTL (same posture as
+    the other ``HEADROOM_NET_COST_*`` env guards).
+    """
+    raw = os.environ.get("HEADROOM_NET_COST_CACHE_TTL_SECONDS", "")
+    if not raw:
+        return _NET_COST_CACHE_TTL_SECONDS
+    try:
+        ttl = float(raw)
+    except ValueError:
+        logger.warning(
+            "HEADROOM_NET_COST_CACHE_TTL_SECONDS malformed; using default %s",
+            _NET_COST_CACHE_TTL_SECONDS,
+        )
+        return _NET_COST_CACHE_TTL_SECONDS
+    if not math.isfinite(ttl) or ttl <= 0.0:
+        logger.warning(
+            "HEADROOM_NET_COST_CACHE_TTL_SECONDS invalid; using default %s",
+            _NET_COST_CACHE_TTL_SECONDS,
+        )
+        return _NET_COST_CACHE_TTL_SECONDS
+    return ttl
+
+
 def _gain_bucket(gain: float) -> str:
     """Quantize a net-cost gain into a coarse magnitude band for markers.
 
@@ -2029,6 +2068,7 @@ class ContentRouter(Transform):
         route_counts: dict[str, int],
         transforms_applied: list[str],
         batch_state: dict[str, int | None] | None = None,
+        p_alive_override: float | None = None,
     ) -> bool:
         """Break-even gate for one candidate mutation (#856 P2, flag-gated).
 
@@ -2057,6 +2097,18 @@ class ContentRouter(Transform):
         mutated shallower slot. Each batch admission emits the
         ``router:netcost_batch_admit`` marker and the ``netcost_batch_admitted``
         counter for telemetry.
+
+        #856 P3b (idle-timer compaction): ``p_alive_override``, when supplied
+        by the caller, replaces the static ``HEADROOM_NET_COST_P_ALIVE``
+        constant. It is derived in ``apply`` from how long the session has
+        been idle relative to the provider cache TTL
+        (``max(0, 1 − idle_s / ttl)``). As the cached suffix nears lapse
+        P_alive → 0, the ``P_alive·(w−r)·(S+ΔT)`` penalty vanishes, and edits
+        that would lose to a warm suffix become free — the suffix is about to
+        be rebuilt cold regardless. ``None`` preserves the P2 env-constant
+        behaviour. An admit made under a decayed (``< 1.0``) idle P_alive emits
+        the ``router:netcost_idle_compaction`` marker and the
+        ``netcost_idle_admitted`` counter.
         """
         delta_t = max(0, original_tokens - compressed_tokens)
         # Batch reclaim: if a shallower slot was already admitted, its
@@ -2086,23 +2138,32 @@ class ContentRouter(Transform):
             reads = _reads
         except ValueError:
             logger.warning("HEADROOM_NET_COST_EXPECTED_READS malformed; using 10")
-        try:
-            _p_alive = float(os.environ.get("HEADROOM_NET_COST_P_ALIVE", "") or 1.0)
-            if not math.isfinite(_p_alive):
-                raise ValueError("non-finite")
-            p_alive = _p_alive
-        except ValueError:
-            logger.warning("HEADROOM_NET_COST_P_ALIVE malformed; using 1.0")
+        # #856 P3b: an idle-derived override takes precedence over the static
+        # env constant. ``net_mutation_gain`` clamps p_alive to [0, 1]
+        # internally, but clamp here too so the value logged/branched on below
+        # matches what the formula uses.
+        idle_derived = p_alive_override is not None
+        if p_alive_override is not None:
+            p_alive = min(max(p_alive_override, 0.0), 1.0)
+        else:
+            try:
+                _p_alive = float(os.environ.get("HEADROOM_NET_COST_P_ALIVE", "") or 1.0)
+                if not math.isfinite(_p_alive):
+                    raise ValueError("non-finite")
+                p_alive = _p_alive
+            except ValueError:
+                logger.warning("HEADROOM_NET_COST_P_ALIVE malformed; using 1.0")
         gain = float(policy.net_mutation_gain(delta_t, suffix, reads, p_alive))
         allowed = gain > 0.0
         logger.info(
             "NetCostPolicy slot=%d delta_t=%d suffix=%d reads=%.1f p_alive=%.2f "
-            "gain=%.0f batch_reclaim=%s -> %s",
+            "idle_derived=%s gain=%.0f batch_reclaim=%s -> %s",
             slot_idx,
             delta_t,
             suffix,
             reads,
             p_alive,
+            idle_derived,
             gain,
             batch_reclaim,
             "mutate" if allowed else "skip",
@@ -2110,6 +2171,13 @@ class ContentRouter(Transform):
         if allowed:
             route_counts.setdefault("netcost_allowed", 0)
             route_counts["netcost_allowed"] += 1
+            if idle_derived and p_alive < 1.0:
+                # Admitted under an idle-decayed P_alive: the cached suffix is
+                # near TTL lapse, so its invalidation penalty is discounted.
+                # Independent of batch reclaim — both markers may apply.
+                route_counts.setdefault("netcost_idle_admitted", 0)
+                route_counts["netcost_idle_admitted"] += 1
+                transforms_applied.append("router:netcost_idle_compaction")
             if batch_reclaim:
                 # Rode a shallower edit's cache-bust for free — telemetry only;
                 # the floor is unchanged (this slot is deeper than the floor).
@@ -2313,12 +2381,27 @@ class ContentRouter(Transform):
         # the shallowest slot admitted as a net-positive mutation; once set,
         # deeper candidates charge S=0 (their cache-bust is already paid).
         netcost_batch_state: dict[str, int | None] = {"floor": None}
+        # #856 P3b (idle-timer compaction): if the caller supplies how long the
+        # session has been idle, decay P_alive from it once per request and
+        # pass it to the gate. Absent/malformed → None → the gate keeps the P2
+        # env-constant behaviour. Derived once here (not per slot) — idle is a
+        # per-request property, like frozen_message_count.
+        netcost_p_alive_override: float | None = None
         if netcost_enabled:
             netcost_suffix_tokens = [0] * (num_messages + 1)
             for j in range(num_messages - 1, -1, -1):
                 netcost_suffix_tokens[j] = netcost_suffix_tokens[j + 1] + _netcost_message_tokens(
                     messages[j], tokenizer
                 )
+            idle_seconds = kwargs.get("idle_seconds")
+            if idle_seconds is not None:
+                try:
+                    idle_f = float(idle_seconds)
+                except (TypeError, ValueError):
+                    idle_f = None
+                if idle_f is not None and math.isfinite(idle_f) and idle_f >= 0.0:
+                    ttl = _net_cost_cache_ttl_seconds()
+                    netcost_p_alive_override = max(0.0, 1.0 - idle_f / ttl)
 
         # Tasks: list of (slot_index, content, context, bias, content_key)
         _PendingTask = tuple[int, str, str, float, int]
@@ -2512,6 +2595,7 @@ class ContentRouter(Transform):
                         route_counts=route_counts,
                         transforms_applied=transforms_applied,
                         batch_state=netcost_batch_state,
+                        p_alive_override=netcost_p_alive_override,
                     ):
                         # Net-cost gate: mutation would cost more in cache
                         # invalidation than it saves — leave untouched.
@@ -2594,6 +2678,7 @@ class ContentRouter(Transform):
                         route_counts=route_counts,
                         transforms_applied=transforms_applied,
                         batch_state=netcost_batch_state,
+                        p_alive_override=netcost_p_alive_override,
                     ):
                         result_slots[slot_idx] = message
                         continue
@@ -2651,6 +2736,8 @@ class ContentRouter(Transform):
             parts.append(f"{route_counts['cache_miss']} cache misses")
         if route_counts.get("netcost_batch_admitted"):
             parts.append(f"{route_counts['netcost_batch_admitted']} netcost batch-admitted")
+        if route_counts.get("netcost_idle_admitted"):
+            parts.append(f"{route_counts['netcost_idle_admitted']} netcost idle-admitted")
         cs = self._cache.stats
         if cs["cache_size"] > 0 or cs["cache_skip_size"] > 0:
             parts.append(

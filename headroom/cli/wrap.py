@@ -26,6 +26,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
@@ -575,6 +576,85 @@ def _remove_claude_rtk_hooks(settings_path: Path | None = None) -> bool:
     return True
 
 
+def _write_claude_wrap_base_url(
+    proxy_url: str,
+    *,
+    foundry_mode: bool = False,
+    settings_path: Path | None = None,
+) -> str | None:
+    """Persist proxy URL into project-local settings env key for daemon child inheritance.
+
+    Claude Code's cc-daemon pre-forks conversation workers using spawn (not
+    fork), so those workers read settings.json fresh rather than inheriting
+    the daemon's environment.  Writing env.ANTHROPIC_BASE_URL into the
+    project-local settings file (.claude/settings.local.json in cwd) ensures
+    every new conversation — including those started after the initial launch —
+    routes through the Headroom proxy without touching the global user settings
+    file or affecting sessions in other projects.  Returns the previous value
+    so the caller can restore it on exit (issue #951).
+    """
+    path = settings_path or (Path.cwd() / ".claude" / "settings.local.json")
+    payload: dict[str, Any] = {}
+    if path.exists():
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    env_map = dict(payload.get("env") or {}) if isinstance(payload.get("env"), dict) else {}
+    key = "ANTHROPIC_FOUNDRY_BASE_URL" if foundry_mode else "ANTHROPIC_BASE_URL"
+    previous = env_map.get(key)
+    env_map[key] = proxy_url
+    payload["env"] = env_map
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    return previous
+
+
+def _restore_claude_wrap_base_url(
+    previous: str | None,
+    *,
+    foundry_mode: bool = False,
+    settings_path: Path | None = None,
+) -> None:
+    """Restore (or remove) the env key written by _write_claude_wrap_base_url.
+
+    Called in both the wrap-session finally block and unwrap_claude so the
+    project-local settings entry is never left pointing at a dead proxy.  When
+    ``previous`` is None the key is removed; when it has a value it is
+    restored — preserving any URL the project already had set.
+    """
+    path = settings_path or (Path.cwd() / ".claude" / "settings.local.json")
+    if not path.exists():
+        return
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(payload, dict):
+        return
+    env_map = payload.get("env")
+    if not isinstance(env_map, dict):
+        return
+    key = "ANTHROPIC_FOUNDRY_BASE_URL" if foundry_mode else "ANTHROPIC_BASE_URL"
+    if previous is None:
+        if key not in env_map:
+            return
+        del env_map[key]
+        if env_map:
+            payload["env"] = env_map
+        else:
+            payload.pop("env", None)
+    else:
+        env_map[key] = previous
+        payload["env"] = env_map
+    if payload:
+        path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    else:
+        path.unlink(missing_ok=True)
+
+
 def _setup_headroom_mcp(
     registrar: Any, port: int, *, verbose: bool = False, force: bool = False
 ) -> None:
@@ -1108,12 +1188,14 @@ _PROJECT_HEADER_NAME = "X-Headroom-Project"
 def _project_name_from_cwd() -> str | None:
     """Project label for X-Headroom-Project: basename of the launch directory.
 
-    The proxy sanitizes and caps the value server-side
-    (headroom.proxy.savings_tracker.sanitize_project_name), so the raw
-    directory name is safe to send as-is.
+    Non-ASCII characters are percent-encoded (RFC 3986) so the header value
+    stays within the visible-ASCII range required by RFC 7230.  The proxy
+    decodes the value in sanitize_project_name before storing it.
     """
     name = Path.cwd().name.strip()
-    return name or None
+    if not name:
+        return None
+    return urllib.parse.quote(name, safe="-_.() ")
 
 
 def _apply_project_header_env(env: dict[str, str]) -> None:
@@ -1453,6 +1535,7 @@ def _run_proxy_only_watcher(
         proxy_holder[0] = _ensure_proxy(
             port, no_proxy, learn=learn, memory=memory, agent_type=agent_type
         )
+        _push_runtime_env(port, no_proxy)
         click.echo()
         print_setup_lines()
         click.echo()
@@ -2093,6 +2176,44 @@ def _should_use_copilot_oauth(
     return has_oauth_auth()
 
 
+def _push_runtime_env(port: int, no_proxy: bool) -> None:
+    """Hot-sync this session's live env knobs to the proxy on ``port``.
+
+    Live knobs (the output-shaper family, the ast-grep read threshold) are read
+    from the *proxy's* process environment. A proxy we reused — rather than
+    started — would otherwise ignore values exported in this shell, since its
+    environment was snapshotted when it first launched. Pushing them to
+    ``/admin/runtime-env`` applies them in memory with no disruptive restart.
+
+    Best-effort: a silent no-op when nothing is explicitly set, when there is no
+    proxy (``--no-proxy``), when the proxy is unreachable, or when it predates
+    the endpoint (older build returns 404).
+    """
+    if no_proxy:
+        return
+    from headroom.proxy import runtime_env as _rt
+
+    payload = _rt.explicit_env(os.environ)
+    if not payload:
+        return
+
+    import urllib.error
+    import urllib.request
+
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}/admin/runtime-env",
+        data=json.dumps(payload).encode("utf-8"),
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=2) as response:
+            response.read()
+    except (OSError, urllib.error.URLError, ValueError):
+        return
+    click.echo(f"  Synced output settings to proxy: {', '.join(sorted(payload))}")
+
+
 def _ensure_proxy(
     port: int,
     no_proxy: bool,
@@ -2518,6 +2639,7 @@ def _launch_tool(
             openai_api_url=openai_api_url,
             copilot_api_token=copilot_api_token,
         )
+        _push_runtime_env(port, no_proxy)
 
         if code_graph:
             _setup_code_graph(verbose=False)
@@ -2882,6 +3004,8 @@ def claude(
 
     # Setup rtk before launching (Claude-specific)
     proxy_holder: list[subprocess.Popen | None] = [None]
+    _saved_base_url: list[str | None] = [None]  # previous settings.json value for restore
+    _settings_foundry: list[bool] = [False]
     cleanup = _make_cleanup(proxy_holder, port)
     _register_proxy_client(port)
     signal.signal(signal.SIGINT, _ignore_child_sigint)
@@ -2963,6 +3087,7 @@ def claude(
             region=region,
             anthropic_api_url=foundry_upstream,
         )
+        _push_runtime_env(port, no_proxy)
 
         if not no_rtk:
             if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
@@ -3023,6 +3148,14 @@ def claude(
         else:
             env["ANTHROPIC_BASE_URL"] = proxy_url
 
+        # Issue #951: write to settings.json so daemon-spawned conversation
+        # workers (which read settings.json fresh rather than inheriting the
+        # daemon's environment) also route through Headroom.
+        _settings_foundry[0] = bool(foundry_upstream)
+        _saved_base_url[0] = _write_claude_wrap_base_url(
+            proxy_url, foundry_mode=_settings_foundry[0]
+        )
+
         # Per-project savings attribution: tag every request with the launch
         # directory's name via X-Headroom-Project (user override wins).
         _apply_project_header_env(env)
@@ -3050,6 +3183,7 @@ def claude(
         click.echo(f"  Error: {e}")
         raise SystemExit(1) from e
     finally:
+        _restore_claude_wrap_base_url(_saved_base_url[0], foundry_mode=_settings_foundry[0])
         cleanup()
 
 
@@ -3106,6 +3240,9 @@ def unwrap_claude(
             click.echo("  No rtk Claude hook found in settings.json.")
     else:
         click.echo("  Kept rtk Claude hooks (--keep-rtk).")
+
+    _restore_claude_wrap_base_url(None)
+    _restore_claude_wrap_base_url(None, foundry_mode=True)
 
     click.echo()
     click.echo("✓ Claude is no longer durably wrapped by Headroom.")
