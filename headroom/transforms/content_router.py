@@ -1773,7 +1773,7 @@ class ContentRouter(Transform):
                 from .tabular_ingest import TabularCompressor
 
                 self._tabular_compressor = TabularCompressor()
-            except ImportError:
+            except ImportError:  # pragma: no cover - defensive; tabular_ingest is pure stdlib
                 logger.debug("TabularCompressor not available")
         return self._tabular_compressor
 

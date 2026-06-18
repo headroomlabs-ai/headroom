@@ -11,13 +11,22 @@ import importlib.util
 
 import pytest
 
-from headroom.transforms.content_detector import ContentType, detect_content_type
+from headroom.transforms.content_detector import (
+    ContentType,
+    DetectionResult,
+    _is_md_separator,
+    _looks_like_prose,
+    _try_detect_delimited,
+    _try_detect_markdown_table,
+    detect_content_type,
+)
 from headroom.transforms.content_router import (
     CompressionStrategy,
     ContentRouter,
     ContentRouterConfig,
 )
 from headroom.transforms.tabular_ingest import (
+    TabularCompressionResult,
     TabularCompressor,
     parse_csv,
     parse_fixed_width,
@@ -83,6 +92,49 @@ def test_does_not_misroute_to_tabular(content: str, expected: ContentType) -> No
     assert detect_content_type(content).content_type is expected
 
 
+# Detection — edge branches --------------------------------------------------
+
+
+def test_is_md_separator_needs_two_columns() -> None:
+    assert _is_md_separator("| --- | --- |")
+    assert not _is_md_separator("| --- |")  # single column is not a separator
+    assert not _is_md_separator("| a | b |")  # cells must be dashes
+
+
+def test_markdown_table_needs_multiple_columns() -> None:
+    # Valid separator below, but the header is a single column -> not a table.
+    assert _try_detect_markdown_table(["x|", "---|---", "y|"]) is None
+
+
+def test_delimited_needs_three_rows() -> None:
+    assert _try_detect_delimited(["a,b,c", "1,2,3"]) is None
+
+
+def test_delimited_rejects_delimiter_only_in_header() -> None:
+    # Header has commas but the data rows don't: no stable column count.
+    assert _try_detect_delimited(["a,b,c", "plain", "text"]) is None
+
+
+def test_delimited_rejects_inconsistent_columns() -> None:
+    # Column count swings too much to be a real table.
+    assert _try_detect_delimited(["a,b", "c,d", "e,f,g,h", "i,j,k,l,m"]) is None
+
+
+def test_delimited_keeps_first_equal_confidence_delimiter() -> None:
+    # Comma and semicolon are both consistent; the comma candidate is set first
+    # and a later, no-better delimiter does not displace it.
+    result = _try_detect_delimited(["a,b;c", "d,e;f", "g,h;i"])
+    assert result is not None
+    assert result.metadata["delimiter"] == ","
+
+
+def test_looks_like_prose_distinguishes_sentences_from_rows() -> None:
+    # Wordy cells (avg > 3 words/cell) read as prose even without end punctuation.
+    assert _looks_like_prose(["the quick brown fox runs, over the lazy dog now"], ",")
+    # Short field tuples are real CSV rows, not prose.
+    assert not _looks_like_prose(["a,b,c", "1,2,3", "x,y,z"], ",")
+
+
 # Parsers --------------------------------------------------------------------
 
 
@@ -113,6 +165,47 @@ def test_parse_fixed_width() -> None:
 
 def test_to_records_empty_headers_returns_empty() -> None:
     assert to_records([], [["a", "b"]]) == []
+
+
+def test_parse_csv_blank_returns_empty() -> None:
+    assert parse_csv("   \n  \n") == ([], [])
+
+
+def test_parse_markdown_table_too_short_returns_empty() -> None:
+    assert parse_markdown_table("| only one row |") == ([], [])
+
+
+def test_parse_fixed_width_too_short_returns_empty() -> None:
+    assert parse_fixed_width("a single line") == ([], [])
+
+
+def test_parse_tabular_dispatches_fixed_width(monkeypatch) -> None:
+    # The detector currently emits only csv/markdown, so drive the fixed_width
+    # dispatch branch directly with a stubbed detection result.
+    import headroom.transforms.tabular_ingest as ti
+
+    monkeypatch.setattr(
+        ti,
+        "detect_content_type",
+        lambda _c: DetectionResult(ContentType.TABULAR, 0.9, {"format": "fixed_width"}),
+    )
+    headers, rows, fmt = ti.parse_tabular("name    age\nAlice   30\nBob     25")
+    assert fmt == "fixed_width"
+    assert headers == ["name", "age"]
+    assert rows[0] == ["Alice", "30"]
+
+
+def test_parse_tabular_none_when_no_data_rows_survive() -> None:
+    # Detected as a markdown table, but it is header + separator rows only:
+    # nothing survives as a data row, so parse_tabular bails to None.
+    assert parse_tabular("| a | b |\n| --- | --- |\n| --- | --- |") is None
+
+
+def test_compression_ratio_zero_for_empty_original() -> None:
+    result = TabularCompressionResult(
+        compressed="", original="", was_modified=False, fmt="csv", rows=0, columns=0
+    )
+    assert result.compression_ratio == 0.0
 
 
 # Bridge compressor ----------------------------------------------------------
@@ -148,6 +241,12 @@ def test_router_routes_tabular() -> None:
     result = ContentRouter().compress(_verbose_markdown())
     assert result.strategy_used is CompressionStrategy.TABULAR
     assert result.total_compressed_tokens <= result.total_original_tokens
+
+
+def test_router_caches_tabular_compressor() -> None:
+    router = ContentRouter()
+    first = router._get_tabular_compressor()
+    assert first is router._get_tabular_compressor()  # second call returns the cached instance
 
 
 def test_router_respects_disable_flag() -> None:
@@ -187,6 +286,21 @@ def test_load_and_compress_xlsx(tmp_path) -> None:
 
     result = compress_spreadsheet(str(path))
     assert result.tokens_after <= result.tokens_before
+
+
+@pytest.mark.skipif(not _HAS_OPENPYXL, reason="openpyxl not installed")
+def test_compress_spreadsheet_empty_workbook_returns_empty(tmp_path) -> None:
+    import openpyxl
+
+    from headroom import compress_spreadsheet
+
+    wb = openpyxl.Workbook()  # one empty sheet, no rows
+    path = tmp_path / "empty.xlsx"
+    wb.save(path)
+
+    result = compress_spreadsheet(str(path))
+    assert result.messages == []
+    assert result.tokens_saved == 0
 
 
 def test_load_spreadsheet_rejects_unknown_extension(tmp_path) -> None:
