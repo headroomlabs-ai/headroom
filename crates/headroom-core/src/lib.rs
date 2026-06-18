@@ -34,8 +34,14 @@ pub fn hello() -> &'static str {
 ///
 /// Valid values for `HEADROOM_ORT_EP`:
 /// - unset / `cpu` — no-op; ORT defaults to CPU (always available)
-/// - `openvino`    — Intel CPU, GPU, NPU via OpenVINO runtime
+/// - `openvino`    — Intel CPU, GPU, or NPU via OpenVINO runtime
 /// - `cuda`        — NVIDIA GPU via CUDA
+///
+/// OpenVINO tuning env vars (only read when `HEADROOM_ORT_EP=openvino`):
+/// - `HEADROOM_ORT_OPENVINO_DEVICE` — device string passed to OpenVINO
+///   (default: `NPU`; also accepts `CPU`, `GPU`, `GPU.0`, `HETERO:NPU,GPU`)
+/// - `HEADROOM_ORT_OPENVINO_CACHE` — directory for compiled NPU/GPU blobs;
+///   first run compiles and saves, subsequent runs load instantly
 pub fn init_ort_ep() {
     use ort::execution_providers::{CUDA, OpenVINO};
 
@@ -47,13 +53,27 @@ pub fn init_ort_ep() {
             tracing::debug!(ep = "cpu", "ORT execution provider: CPU (default)");
         }
         "openvino" => {
+            let device = std::env::var("HEADROOM_ORT_OPENVINO_DEVICE")
+                .unwrap_or_else(|_| "NPU".to_string());
+            let mut builder = OpenVINO::default().with_device_type(&device);
+            if let Ok(cache) = std::env::var("HEADROOM_ORT_OPENVINO_CACHE") {
+                builder = builder.with_cache_dir(&cache);
+            }
             if ort::init()
-                .with_execution_providers([OpenVINO::default().build()])
+                .with_execution_providers([builder.build()])
                 .commit()
             {
-                tracing::info!(ep = "openvino", "ORT execution provider: OpenVINO");
+                tracing::info!(
+                    ep = "openvino",
+                    device = %device,
+                    "ORT execution provider: OpenVINO"
+                );
             } else {
-                tracing::warn!(ep = "openvino", "ORT OpenVINO EP unavailable — falling back to CPU");
+                tracing::warn!(
+                    ep = "openvino",
+                    device = %device,
+                    "ORT OpenVINO EP unavailable — falling back to CPU"
+                );
             }
         }
         "cuda" => {
