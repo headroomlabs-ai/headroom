@@ -680,7 +680,8 @@ class HeadroomMCPServer:
         if override:
             return override
         try:
-            info = self.server.request_context.session.client_params.clientInfo
+            params = self.server.request_context.session.client_params
+            info = getattr(params, "clientInfo", None) if params else None
             name = getattr(info, "name", None)
             if name:
                 return str(name)
