@@ -566,6 +566,24 @@ class TestCLIProxyEnvVars:
         assert captured["kwargs"]["limit_concurrency"] == 250
         assert captured["kwargs"].get("print_banner") is False
 
+    def test_keepalive_expiry_env_var(self, runner):
+        captured = {}
+
+        def mock_run_server(config, **kwargs):
+            captured["config"] = config
+            captured["kwargs"] = kwargs
+
+        with patch("headroom.proxy.server.run_server", mock_run_server):
+            result = runner.invoke(
+                main,
+                ["proxy"],
+                env={"HEADROOM_KEEPALIVE_EXPIRY": "45"},
+                catch_exceptions=False,
+            )
+
+        assert result.exit_code == 0, result.output
+        assert captured["config"].keepalive_expiry == 45.0
+
     def test_production_scaling_cli_flags_override_env_vars(self, runner):
         captured = {}
 

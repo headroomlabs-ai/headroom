@@ -138,6 +138,14 @@ def _selected_context_tool() -> str:
     help="Maximum upstream keep-alive connections (default: 100, env: HEADROOM_MAX_KEEPALIVE)",
 )
 @click.option(
+    "--keepalive-expiry",
+    "keepalive_expiry",
+    default=90.0,
+    type=click.FloatRange(min=0),
+    envvar="HEADROOM_KEEPALIVE_EXPIRY",
+    help="Seconds an idle upstream keep-alive connection is kept open (default: 90, env: HEADROOM_KEEPALIVE_EXPIRY)",
+)
+@click.option(
     "--mode",
     default=None,
     metavar="[token|cache]",
@@ -636,6 +644,7 @@ def proxy(
     limit_concurrency: int,
     max_connections: int,
     max_keepalive_connections: int,
+    keepalive_expiry: float,
     intercept_tool_results: bool,
     no_optimize: bool,
     no_cache: bool,
@@ -860,6 +869,7 @@ def proxy(
         else 10,
         max_connections=max_connections,
         max_keepalive_connections=max_keepalive_connections,
+        keepalive_expiry=keepalive_expiry,
         log_file=None if is_stateless else log_file,
         log_full_messages=log_messages
         or os.environ.get("HEADROOM_LOG_MESSAGES", "").lower() in ("true", "1", "yes", "on"),

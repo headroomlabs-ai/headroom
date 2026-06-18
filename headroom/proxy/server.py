@@ -1158,6 +1158,7 @@ class HeadroomProxy(
             "limits": httpx.Limits(
                 max_connections=self.config.max_connections,
                 max_keepalive_connections=self.config.max_keepalive_connections,
+                keepalive_expiry=self.config.keepalive_expiry,
             ),
             "verify": _ca_bundle if _ca_bundle is not None else True,
         }
@@ -3625,6 +3626,7 @@ def _proxy_config_from_env() -> ProxyConfig:
         disable_kompress=_get_env_bool("HEADROOM_DISABLE_KOMPRESS", False),
         max_connections=_get_env_int("HEADROOM_MAX_CONNECTIONS", 500),
         max_keepalive_connections=_get_env_int("HEADROOM_MAX_KEEPALIVE", 100),
+        keepalive_expiry=_get_env_float("HEADROOM_KEEPALIVE_EXPIRY", 90.0),
         http2=_get_env_bool("HEADROOM_HTTP2", True),
         mode=normalize_proxy_mode(_get_env_str("HEADROOM_MODE", PROXY_MODE_TOKEN)),
     )
@@ -4102,6 +4104,7 @@ if __name__ == "__main__":
         # Connection pool settings
         max_connections=_get_env_int("HEADROOM_MAX_CONNECTIONS", args.max_connections),
         max_keepalive_connections=_get_env_int("HEADROOM_MAX_KEEPALIVE", args.max_keepalive),
+        keepalive_expiry=_get_env_float("HEADROOM_KEEPALIVE_EXPIRY", 90.0),
         http2=not args.no_http2 and _get_env_bool("HEADROOM_HTTP2", True),
         tool_profiles=tool_profiles if tool_profiles else None,
         exclude_tools=exclude_tools if exclude_tools else None,

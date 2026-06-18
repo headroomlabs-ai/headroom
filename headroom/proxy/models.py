@@ -236,6 +236,7 @@ class ProxyConfig:
     # Connection pool
     max_connections: int = 500
     max_keepalive_connections: int = 100
+    keepalive_expiry: float = 90.0
     http2: bool = True
 
     # Memory System
