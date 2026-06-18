@@ -11,7 +11,7 @@ description: Offline failure analysis for coding agents. Analyzes past sessions,
 # See recommendations for current project (dry-run, no changes)
 headroom learn
 
-# Write recommendations to CLAUDE.md and MEMORY.md
+# Write recommendations to CLAUDE.local.md and MEMORY.md
 headroom learn --apply
 
 # Analyze a specific project
@@ -19,6 +19,9 @@ headroom learn --project ~/my-project --apply
 
 # Analyze all projects
 headroom learn --all --apply
+
+# Write to the team-shared CLAUDE.md instead of CLAUDE.local.md
+headroom learn --apply --target CLAUDE.md
 ```
 
 ## Success Correlation
@@ -84,10 +87,22 @@ Files that need `offset`/`limit` with Read.
 
 | Pattern | Destination | Why |
 |---------|-------------|-----|
-| Environment, paths, search scope, commands, large files | **CLAUDE.md** | Stable project facts, version-controllable |
+| Environment, paths, search scope, commands, large files | **CLAUDE.local.md** | Personal facts (machine-specific paths), gitignored by default |
 | Missing paths, retry patterns, permissions | **MEMORY.md** | May change, agent-specific |
 
-CLAUDE.md lives in your project directory. MEMORY.md lives in `~/.claude/projects/*/memory/`.
+`CLAUDE.local.md` lives in your project directory. It is the **personal** local
+memory file in Claude Code's [memory convention](https://docs.claude.com/en/docs/claude-code/memory)
+— meant to be gitignored — so machine-specific learnings (absolute paths,
+tool-discovery byproducts) don't pollute the team-shared `CLAUDE.md`. Make sure
+`CLAUDE.local.md` is listed in your `.gitignore`. Pass `--target CLAUDE.md` to
+opt into the shared file instead, or `--target <path>` for any custom location.
+MEMORY.md lives in `~/.claude/projects/*/memory/`.
+
+If an older Headroom version already wrote a learned-patterns block into your
+team-shared `CLAUDE.md`, the next `headroom learn --apply` moves it into
+`CLAUDE.local.md` and prints a warning so you can review the diff before
+committing. If `CLAUDE.md` contained nothing but the Headroom block, it is
+removed entirely.
 
 ## Marker-Based Updates
 
@@ -122,6 +137,8 @@ Options:
   --project PATH    Project directory to analyze (default: current directory)
   --all             Analyze all discovered projects
   --apply           Write recommendations (default: dry-run)
+  --target TEXT     Context file to write to, Claude Code only (default:
+                    CLAUDE.local.md). Relative to project root, or absolute.
   --agent TEXT      Agent to analyze (e.g. claude, codex, gemini)
   --model TEXT      LLM model to use for analysis
   --workers INT     Number of parallel workers
