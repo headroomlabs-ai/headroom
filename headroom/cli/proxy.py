@@ -381,6 +381,26 @@ def _selected_context_tool() -> str:
         "Env: HEADROOM_DISABLE_KOMPRESS=1."
     ),
 )
+@click.option(
+    "--disable-kompress-anthropic/--enable-kompress-anthropic",
+    "disable_kompress_anthropic",
+    default=None,
+    envvar="HEADROOM_DISABLE_KOMPRESS_ANTHROPIC",
+    help=(
+        "Disable (or --enable-) Kompress for the Anthropic pipeline only, overriding "
+        "--disable-kompress. Env: HEADROOM_DISABLE_KOMPRESS_ANTHROPIC=1."
+    ),
+)
+@click.option(
+    "--disable-kompress-openai/--enable-kompress-openai",
+    "disable_kompress_openai",
+    default=None,
+    envvar="HEADROOM_DISABLE_KOMPRESS_OPENAI",
+    help=(
+        "Disable (or --enable-) Kompress for the OpenAI/Codex pipeline only, overriding "
+        "--disable-kompress. Env: HEADROOM_DISABLE_KOMPRESS_OPENAI=1."
+    ),
+)
 # Code graph: indexes project + watches files for live reindex via codebase-memory-mcp.
 # Only useful when the proxy is launched from a project root — it indexes the
 # current working directory.
@@ -659,6 +679,8 @@ def proxy(
     budget_period: str,
     code_aware_flag: bool | None,
     disable_kompress: bool,
+    disable_kompress_anthropic: bool | None,
+    disable_kompress_openai: bool | None,
     code_graph: bool,
     no_read_lifecycle: bool,
     memory: bool,
@@ -877,6 +899,8 @@ def proxy(
             in ("true", "1", "yes", "on")
         ),
         disable_kompress=disable_kompress,
+        disable_kompress_anthropic=disable_kompress_anthropic,
+        disable_kompress_openai=disable_kompress_openai,
         # Code graph: live file watcher for incremental reindexing
         code_graph_watcher=code_graph,
         # Read lifecycle: ON by default (use --no-read-lifecycle to disable)
