@@ -89,35 +89,11 @@ def _render_provider_block(port: int) -> str:
             "npm": "@ai-sdk/openai-compatible",
             "name": "Headroom Proxy",
             "options": {"baseURL": f"http://127.0.0.1:{port}/v1"},
-            "models": {
-                "claude-sonnet-4-6": {
-                    "name": "Claude Sonnet 4.6",
-                    "limit": {"context": 200000, "output": 16384},
-                },
-                "claude-opus-4-6": {
-                    "name": "Claude Opus 4.6",
-                    "limit": {"context": 200000, "output": 16384},
-                },
-                "claude-haiku-4-5-20251001": {
-                    "name": "Claude Haiku 4.5",
-                    "limit": {"context": 200000, "output": 8192},
-                },
-                "gpt-4o": {
-                    "name": "GPT-4o",
-                    "limit": {"context": 128000, "output": 16384},
-                },
-                "gpt-4.1": {
-                    "name": "GPT-4.1",
-                    "limit": {"context": 1048576, "output": 32768},
-                },
-            },
         }
     }
-    model = "headroom/claude-sonnet-4-6"
     lines = [
         _PROVIDER_MARKER_START,
         f'"provider": {json.dumps(provider, indent=2)},',
-        f'"model": "{model}",',
         _PROVIDER_MARKER_END,
     ]
     return "\n".join(lines)
@@ -203,38 +179,15 @@ def inject_opencode_provider_config(port: int) -> None:
             content = strip_opencode_headroom_blocks(content)
             data = _parse_json_loose(content)
 
-        # Merge provider and model into the JSON data structure.
+        # Merge provider into the JSON data structure.
         provider = {
             "headroom": {
                 "npm": "@ai-sdk/openai-compatible",
                 "name": "Headroom Proxy",
                 "options": {"baseURL": f"http://127.0.0.1:{port}/v1"},
-                "models": {
-                    "claude-sonnet-4-6": {
-                        "name": "Claude Sonnet 4.6",
-                        "limit": {"context": 200000, "output": 16384},
-                    },
-                    "claude-opus-4-6": {
-                        "name": "Claude Opus 4.6",
-                        "limit": {"context": 200000, "output": 16384},
-                    },
-                    "claude-haiku-4-5-20251001": {
-                        "name": "Claude Haiku 4.5",
-                        "limit": {"context": 200000, "output": 8192},
-                    },
-                    "gpt-4o": {
-                        "name": "GPT-4o",
-                        "limit": {"context": 128000, "output": 16384},
-                    },
-                    "gpt-4.1": {
-                        "name": "GPT-4.1",
-                        "limit": {"context": 1048576, "output": 32768},
-                    },
-                },
             }
         }
         data = _inject_key_into_json(data, "provider", provider)
-        data["model"] = "headroom/claude-sonnet-4-6"
 
         # Inject MCP if not already present.
         mcp = {

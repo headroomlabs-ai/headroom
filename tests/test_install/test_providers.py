@@ -516,7 +516,7 @@ def test_apply_and_revert_opencode_provider_scope(monkeypatch, tmp_path: Path) -
     content = config_path.read_text()
     data = json.loads(content)
     assert data["provider"]["headroom"]["options"]["baseURL"] == "http://127.0.0.1:8787/v1"
-    assert data["model"] == "headroom/claude-sonnet-4-6"
+    assert data["model"] == "openai/gpt-4o"  # user model preserved
 
     revert_opencode_provider_scope(mutation, manifest)
     reverted = json.loads(config_path.read_text())

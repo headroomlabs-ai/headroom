@@ -60,7 +60,7 @@ def test_wrap_opencode_sets_config_content_env(
     config = json.loads(env["OPENCODE_CONFIG_CONTENT"])
     assert config["provider"]["headroom"]["npm"] == "@ai-sdk/openai-compatible"
     assert config["provider"]["headroom"]["options"]["baseURL"] == "http://127.0.0.1:9000/v1"
-    assert config["model"] == "headroom/claude-sonnet-4-6"
+    assert "model" not in config  # headroom provider is a transparent pass-through
     assert captured["tool_label"] == "OPENCODE"
     assert captured["agent_type"] == "opencode"
     assert captured["args"] == ("--model", "gpt-4o")
@@ -548,7 +548,7 @@ def test_wrap_opencode_config_merges_existing_model(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Wrap sets headroom model even when user had a different model configured."""
+    """Wrap preserves the user's existing model selection."""
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
     _set_test_home(monkeypatch, tmp_path)
@@ -564,7 +564,8 @@ def test_wrap_opencode_config_merges_existing_model(
 
     assert result.exit_code == 0, result.output
     config = json.loads(config_file.read_text())
-    assert config["model"] == "headroom/claude-sonnet-4-6"
+    assert config["model"] == "openai/gpt-4o"
+    assert config["provider"]["headroom"]["npm"] == "@ai-sdk/openai-compatible"
 
 
 # ---------------------------------------------------------------------------
@@ -671,9 +672,9 @@ def test_wrap_unwrap_rewrap_is_idempotent(
             with patch.object(wrap_mod, "_ensure_rtk_binary", return_value=Path("/tmp/rtk")):
                 runner.invoke(main, ["wrap", "opencode", "--port", "9001", "--no-mcp"])
 
-    # After re-wrap, headroom should be back
+    # After re-wrap, headroom should be back, model unchanged
     after_rewrap = json.loads(config_file.read_text())
-    assert after_rewrap["model"] == "headroom/claude-sonnet-4-6"
+    assert after_rewrap["model"] == "openai/gpt-4o"
     assert "headroom" in after_rewrap.get("provider", {})
 
 

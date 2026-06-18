@@ -164,7 +164,7 @@ def test_inject_provider_config_creates_file(tmp_path: Path, monkeypatch: pytest
     assert config_file.exists()
     config = _parse_json_loose(config_file.read_text())
     assert config["provider"]["headroom"]["npm"] == "@ai-sdk/openai-compatible"
-    assert config["model"] == "headroom/claude-sonnet-4-6"
+    assert "model" not in config  # headroom provider is a transparent pass-through
 
 
 def test_inject_provider_config_idempotent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -11,10 +11,9 @@ from .config import (
     strip_opencode_headroom_blocks,
 )
 from .install import apply_provider_scope, build_install_env, revert_provider_scope
-from .runtime import DEFAULT_API_URL, build_launch_env, build_opencode_config_content, proxy_base_url
+from .runtime import build_launch_env, build_opencode_config_content, proxy_base_url
 
 __all__ = [
-    "DEFAULT_API_URL",
     "_MCP_MARKER_END",
     "_MCP_MARKER_START",
     "_PROVIDER_MARKER_END",
