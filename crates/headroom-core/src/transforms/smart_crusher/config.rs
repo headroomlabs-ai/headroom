@@ -80,6 +80,13 @@ pub struct SmartCrusherConfig {
     /// still emit always; they have no Python equivalent and no
     /// production caller has asked for them to be suppressed.
     pub enable_ccr_marker: bool,
+    /// Strict lossless mode. When `true`, lossless tabular compaction
+    /// still applies, but any path that would otherwise need a CCR
+    /// marker — the lossy row-drop sentinel AND opaque-blob offload —
+    /// leaves the content uncompacted instead. The result is always
+    /// marker-free and byte-recoverable: rows are never dropped and
+    /// opaque cells render inline. Default `false` (markers allowed).
+    pub lossless_only: bool,
     /// Compaction heuristic: a field is "core" if it appears in at
     /// least this fraction of rows. Mirrors
     /// `CompactConfig::core_field_fraction`. Default 0.8.
@@ -127,6 +134,7 @@ impl Default for SmartCrusherConfig {
             relevance_threshold: 0.3,
             lossless_min_savings_ratio: 0.15,
             enable_ccr_marker: true,
+            lossless_only: false,
             compaction_core_field_fraction: 0.8,
             compaction_heterogeneous_core_ratio: 0.6,
             compaction_max_flatten_inner_keys: 6,
@@ -164,6 +172,7 @@ mod tests {
         assert_eq!(c.relevance_threshold, 0.3);
         assert_eq!(c.lossless_min_savings_ratio, 0.15);
         assert!(c.enable_ccr_marker);
+        assert!(!c.lossless_only);
         assert_eq!(c.compaction_core_field_fraction, 0.8);
         assert_eq!(c.compaction_heterogeneous_core_ratio, 0.6);
         assert_eq!(c.compaction_max_flatten_inner_keys, 6);
