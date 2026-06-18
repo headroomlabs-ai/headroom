@@ -684,17 +684,33 @@ pub(crate) async fn forward_http(
                 observe_drift(&state.drift_state, &session_key, hash);
             }
         }
+        // Mirror the enforcement-flag override already applied to
+        // CompressionPolicy at request entry (line ~416): when
+        // `--auth-mode-policy-enforcement disabled` is set, treat every
+        // request as PAYG so Phase E byte-mutating passes (E1 tool-array
+        // sort, E2 schema-key sort, E3 cache_control auto-placement) are
+        // no longer skipped for subscription/OAuth callers. Token
+        // reduction matters for subscription users too (rate limits,
+        // context-window pressure) — the original guard was billing-only.
+        let effective_auth_mode = if state.config.auth_mode_policy_enforcement.is_enabled() {
+            auth_mode
+        } else {
+            AuthMode::Payg
+        };
         let outcome = match endpoint {
             compression::CompressibleEndpoint::AnthropicMessages => {
                 // PR-E3: thread the F1-classified auth_mode into the
                 // dispatcher so cache_control auto-placement gates on
                 // PAYG only. Pulled from request extensions where it
                 // was stashed at request entry (line ~325 above).
+                // `effective_auth_mode` folds in the enforcement-flag
+                // override so `--auth-mode-policy-enforcement disabled`
+                // also unlocks the Phase E passes for non-PAYG callers.
                 compression::compress_anthropic_request(
                     &buffered,
                     state.config.compression_mode,
                     state.config.cache_control_auto_frozen,
-                    auth_mode,
+                    effective_auth_mode,
                     &request_id,
                 )
             }

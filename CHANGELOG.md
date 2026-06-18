@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Features
 
+* **proxy:** add `HEADROOM_ORT_EP` env var to select the ONNX Runtime execution provider at startup — `openvino` for Intel CPU/GPU/NPU via OpenVINO runtime, `cuda` for NVIDIA GPU, or unset/`cpu` for the default CPU path. Both the fastembed embedding scorer and the magika content classifier share the ORT singleton, so a single env var covers both. Set `HEADROOM_ORT_OPENVINO_DEVICE` (default `NPU`) to pick the OpenVINO target device and `HEADROOM_ORT_OPENVINO_CACHE` to a directory for caching compiled NPU/GPU blobs across restarts; first run compiles and saves, subsequent runs load instantly.
+
 * **proxy:** measure and surface rolling and current token throughput metrics (active/wall-clock input, compression, effective forward, and streamed generation) in `headroom perf` CLI and the dashboard ([#959](https://github.com/chopratejas/headroom/issues/959)).
 * **vibe:** add Mistral Vibe CLI support with `headroom wrap vibe`.
 * **proxy:** per-project savings breakdown on the dashboard for all wrapped agents — Claude Code, Codex, aider, Copilot, and Cursor ([#802](https://github.com/chopratejas/headroom/issues/802)). `headroom wrap claude`/`codex` tag requests with an `X-Headroom-Project` header (launch-directory name); `wrap aider`/`copilot`/`cursor` — whose clients cannot send custom headers — use a `/p/<name>` base-URL prefix the proxy strips. Savings are aggregated per project (persisted, schema v3 with transparent v2 migration), exposed as `savings.per_project` in `/stats` and `projects` in `/stats-history`, and shown in a Per-Project Savings dashboard table.
@@ -22,6 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 * **docker:** bundle `headroom-proxy` binary in published `runtime` and `runtime-slim` images — closes [#976](https://github.com/chopratejas/headroom/issues/976) ([#999](https://github.com/chopratejas/headroom/pull/999)).
 
 ### Bug Fixes
+
+* **proxy:** Phase E byte-mutating passes (E1 tool-array sort, E2 schema-key sort, E3 `cache_control` auto-placement) were unconditionally skipped for non-PAYG auth modes even when `--auth-mode-policy-enforcement disabled` was set. Token reduction matters for subscription users too — rate limits are token-based, context windows are finite, and smaller payloads transfer faster. `effective_auth_mode` now mirrors the enforcement-flag override already applied to `CompressionPolicy` at request entry, so the Phase E passes fire as expected when the flag is present.
 
 * **proxy:** enable SSO credential resolution in the native Bedrock route via the `aws-config` `sso` feature flag, making the credential chain match what `docs/bedrock.md` already documented ([#999](https://github.com/chopratejas/headroom/pull/999)).
 * **proxy:** route native Bedrock `/model/{id}/converse` requests to the upstream Converse endpoint instead of the hard-coded `/invoke` action — the non-streaming handler now resolves the action from the inbound path, matching the streaming handler ([#999](https://github.com/chopratejas/headroom/pull/999)).
