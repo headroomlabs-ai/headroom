@@ -107,8 +107,27 @@ def test_package_location_handles_missing(monkeypatch):
 def test_user_site_and_membership(monkeypatch):
     monkeypatch.setattr(up, "_user_site", lambda: "/home/u/.local/site")
     assert up._is_user_site_install("/home/u/.local/site/headroom_ai") is True
+    assert up._is_user_site_install("/home/u/.local/site") is True
     assert up._is_user_site_install("/usr/lib/python3/site") is False
     assert up._is_user_site_install(None) is False
+
+
+def test_user_site_no_sibling_prefix_match(monkeypatch):
+    # Path-segment containment: "/.../site" must NOT match "/.../site-packages".
+    monkeypatch.setattr(up, "_user_site", lambda: "/home/u/.local/site")
+    assert up._is_user_site_install("/home/u/.local/site-packages/x") is False
+
+
+def test_format_cmd_quotes_spaces(monkeypatch):
+    monkeypatch.setattr(up.sys, "platform", "linux")
+    out = up._format_cmd(["/path with space/python", "-m", "pip", "install", "-U", "headroom-ai"])
+    assert "'/path with space/python'" in out
+
+
+def test_format_cmd_windows(monkeypatch):
+    monkeypatch.setattr(up.sys, "platform", "win32")
+    out = up._format_cmd([r"C:\\Program Files\\Python\\python.exe", "-m", "pip"])
+    assert "Program Files" in out and out.endswith("-m pip")
 
 
 def test_externally_managed_true(tmp_path, monkeypatch):

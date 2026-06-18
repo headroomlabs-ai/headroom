@@ -54,8 +54,9 @@ def _env_on(name: str) -> bool:
 def is_update_check_enabled() -> bool:
     """Whether the update check / banner should run at all.
 
-    Disabled by ``HEADROOM_UPDATE_CHECK=off``, ``--stateless`` /
-    ``HEADROOM_STATELESS``, or any CI environment (``CI`` set).
+    Disabled by ``HEADROOM_UPDATE_CHECK=off``, stateless mode
+    (``HEADROOM_STATELESS=true``/``1``/``yes``/``on``, matching the proxy's own
+    parsing), or any CI environment (``CI`` set).
     """
     if _env_off("HEADROOM_UPDATE_CHECK"):
         return False
@@ -280,7 +281,9 @@ def format_update_notice() -> str | None:
         except InvalidVersion:
             return None
 
-        return f"⬆ Headroom {latest} available (you have {current}) — run: headroom update"
+        # ASCII-only: some Windows consoles can't encode unicode and would raise
+        # UnicodeEncodeError at the echo site, breaking a "best-effort" banner.
+        return f"Update available: Headroom {latest} (you have {current}) - run: headroom update"
     except Exception:
         logger.debug("update_check: format_update_notice crashed", exc_info=True)
         return None

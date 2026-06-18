@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -116,7 +117,17 @@ def _user_site() -> str | None:
 
 def _is_user_site_install(location: str | None) -> bool:
     user = _user_site()
-    return bool(user and location and location.startswith(user))
+    if not user or not location:
+        return False
+    # Path-segment containment so "/.../site" never matches "/.../site-packages".
+    return location == user or location.startswith(user.rstrip("/") + "/")
+
+
+def _format_cmd(argv: list[str]) -> str:
+    """Render argv as a copy-pasteable shell string (handles spaces in paths)."""
+    if sys.platform.startswith("win"):
+        return subprocess.list2cmdline(argv)
+    return shlex.join(argv)
 
 
 def _is_externally_managed() -> bool:
@@ -299,7 +310,7 @@ def update(check_only: bool, assume_yes: bool, allow_pre: bool, extras: str | No
         return
 
     assert method.argv is not None
-    cmd_str = " ".join(method.argv)
+    cmd_str = _format_cmd(method.argv)
     click.echo(f"Upgrade command: {cmd_str}")
 
     if check_only:
@@ -322,7 +333,8 @@ def update(check_only: bool, assume_yes: bool, allow_pre: bool, extras: str | No
             f"Upgrade failed (exit {result.returncode}). Run manually: {cmd_str}"
         )
 
-    click.echo(f"✅ Headroom upgraded to {latest}.")
+    # ASCII-only output — emoji can raise UnicodeEncodeError on some Windows consoles.
+    click.echo(f"Headroom upgraded to {latest}.")
     click.echo("Restart any running `headroom proxy` to pick up the new version.")
 
 
