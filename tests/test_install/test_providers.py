@@ -784,3 +784,54 @@ def test_persistent_install_strip_removes_openai_base_url(monkeypatch, tmp_path:
         f"orphaned openai_base_url must be removed by revert:\n{orphan_reverted}"
     )
     assert 'model = "gpt-4o"' in orphan_reverted
+
+
+# ---------------------------------------------------------------------------
+# Planner-level opencode smoke tests
+# ---------------------------------------------------------------------------
+
+
+def test_planner_resolves_opencode_as_install_target() -> None:
+    from headroom.install.planner import resolve_targets
+
+    targets = resolve_targets("manual", ["opencode"])
+    assert "opencode" in targets
+
+
+def test_planner_opencode_in_supported_targets_enum() -> None:
+    from headroom.install.models import ToolTarget
+    from headroom.install.planner import SUPPORTED_TARGETS, PROVIDER_SCOPE_TARGETS
+
+    assert ToolTarget.OPENCODE in SUPPORTED_TARGETS
+    assert ToolTarget.OPENCODE in PROVIDER_SCOPE_TARGETS
+
+
+def test_planner_opencode_in_provider_scope_targets() -> None:
+    from headroom.install.planner import resolve_targets
+
+    targets = resolve_targets("manual", ["opencode"], scope="provider")
+    assert "opencode" in targets
+
+
+def test_planner_build_tool_envs_includes_opencode() -> None:
+    from headroom.install.planner import build_tool_envs
+
+    envs = build_tool_envs(port=8787, backend="anthropic", targets=["opencode"])
+    assert "opencode" in envs
+    assert envs["opencode"] == {"OPENAI_BASE_URL": "http://127.0.0.1:8787/v1"}
+
+
+def test_planner_resolve_all_includes_opencode() -> None:
+    from headroom.install.planner import resolve_targets
+
+    targets = resolve_targets("all", [])
+    assert "opencode" in targets
+
+
+def test_planner_provider_scope_unsupported_error_excludes_opencode() -> None:
+    import click
+    import pytest
+    from headroom.install.planner import resolve_targets
+
+    with pytest.raises(click.ClickException, match="unsupported targets"):
+        resolve_targets("manual", ["cursor"], scope="provider")

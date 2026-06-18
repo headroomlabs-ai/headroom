@@ -112,6 +112,13 @@ RUN python -m venv /opt/headroom-venv && \
     npm install -g --no-fund --no-audit "@openai/codex@${CODEX_VERSION}" "openclaw@${OPENCLAW_VERSION}" && \
     curl -fsSL https://opencode.ai/install | VERSION="${OPENCODE_VERSION}" bash
 
+# The opencode installer adds its bin dir to .bashrc. Non-login shells
+# (including CMD, docker run, and e2e shims spawned by subprocess) won't
+# source .bashrc, so add the dir to PATH explicitly. The e2e shim shadows
+# opencode anyway, but this guarantees `which opencode` works for
+# diagnostics.
+ENV PATH="/root/.opencode/bin:${PATH}"
+
 COPY e2e/wrap ./e2e/wrap
 
 CMD ["python", "e2e/wrap/run.py"]

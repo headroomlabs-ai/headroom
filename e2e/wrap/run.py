@@ -924,9 +924,9 @@ def main() -> None:
             verify_continue_wrap(base_env, project_dir)
             verify_goose_wrap(base_env, project_dir)
             verify_openhands_wrap(base_env, project_dir)
+            verify_opencode_wrap(base_env, project_dir, log_dir)
             local_plugin_dir = prepare_local_openclaw_plugin(base_env, tmp_dir)
             verify_openclaw_wrap(base_env, project_dir, local_plugin_dir)
-            verify_opencode_wrap(base_env, project_dir, log_dir)
         finally:
             mock_server.shutdown()
             mock_thread.join(timeout=5)
