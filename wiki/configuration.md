@@ -70,6 +70,44 @@ headroom proxy --no-ccr-expansion
 headroom proxy --help
 ```
 
+### Kompress backend selection
+
+Kompress (the model-based compressor) can run on two engines:
+
+- **ONNX Runtime** — lightweight, CPU-first. Installed with
+  `pip install headroom-ai[proxy]`. Optionally uses the CoreML execution
+  provider on macOS.
+- **PyTorch** — heavier, supports CUDA and Apple-Silicon MPS
+  acceleration. Installed with `pip install headroom-ai[ml]`. With
+  `device=auto` it selects `cuda`, then `mps`, then `cpu`.
+
+Select the backend via the `HEADROOM_KOMPRESS_BACKEND` environment
+variable:
+
+| Value               | Behavior                                                               |
+|---------------------|------------------------------------------------------------------------|
+| `auto`              | Default. ONNX CPU first (stable, lightweight), PyTorch as fallback.    |
+| `onnx` / `onnx_cpu` | Force ONNX Runtime on CPU.                                             |
+| `onnx_coreml`       | Force ONNX Runtime with the CoreML provider (CPU fallback).            |
+| `pytorch`           | Force PyTorch with automatic device selection (CUDA → MPS → CPU).      |
+| `pytorch_mps`       | Force PyTorch on Apple-Silicon MPS; falls back to ONNX CPU on failure. |
+
+Values are case-insensitive and hyphens are accepted (`onnx-cpu` ==
+`onnx_cpu`). Shorthand aliases: `cpu` → `onnx_cpu`, `coreml` →
+`onnx_coreml`, `mps` / `torch_mps` → `pytorch_mps`, `torch` →
+`pytorch`. Unrecognized values log a warning and fall back to `auto`.
+
+Example — opt in to MPS on an Apple-Silicon machine:
+
+```bash
+export HEADROOM_KOMPRESS_BACKEND=mps
+headroom proxy ...
+```
+
+The default deliberately stays on ONNX CPU so existing installs keep
+their compression quality and performance characteristics; accelerator
+backends are opt-in.
+
 ## Per-Request Overrides
 
 Override configuration for specific requests:
@@ -273,6 +311,25 @@ Some settings can be configured via environment variables:
 | `HEADROOM_SAVINGS_PATH` | Full path to the proxy savings JSON ledger. Always wins when set. | derived from `${HEADROOM_WORKSPACE_DIR}` |
 | `HEADROOM_TOIN_PATH` | Full path to the TOIN telemetry JSON file. Always wins when set. | derived from `${HEADROOM_WORKSPACE_DIR}` |
 | `HEADROOM_SUBSCRIPTION_STATE_PATH` | Full path to the subscription tracker state. Always wins when set. | derived from `${HEADROOM_WORKSPACE_DIR}` |
+| `HEADROOM_EMBEDDER_RUNTIME` | Set to `pytorch_mps` to run the memory embedder via the torch sentence-transformers backend on the Apple GPU (MPS). Only engages when Apple MPS is actually available; otherwise it logs a warning and uses the existing default embedder selection path. `pytorch_mps` is the only accepted value. Requires the `[pytorch-mps]` extra. See [Memory](memory.md#embedding-runtime--gpu-offload-apple-silicon). | default embedder selection |
+| `HEADROOM_BETA_HEADER_STICKY` | Controls per-session `anthropic-beta` / `OpenAI-Beta` re-echo. `enabled` (default): the proxy unions beta tokens across turns within a session — if the client sends a token in turn N and omits it in turn N+1, the proxy re-injects it to preserve prefix-cache stability. `disabled`: the client's value is forwarded verbatim with no accumulation. Any other value raises at request time. See [Session Beta Header Tracking](#session-beta-header-tracking). | `enabled` |
+| `HEADROOM_BETA_TRACKER_MAX_SESSIONS` | LRU capacity of the in-memory session beta tracker. Once full, the oldest session entry is evicted. | `1000` |
+
+## Session Beta Header Tracking
+
+When running as a proxy, Headroom maintains a per-session union of `anthropic-beta` (and `OpenAI-Beta`) tokens via `SessionBetaTracker`. The session key is derived from the `x-headroom-session-id` header if present, otherwise from `md5(model + system_prompt[:500])[:16]` — stable across turns of the same conversation.
+
+**Why:** clients such as Claude Code and Codex CLI may drop a beta token between consecutive turns. Because `anthropic-beta` is part of the request bytes that determine the upstream prefix-cache key, a dropped token would bust the cache mid-conversation. The tracker re-injects any token seen earlier in the session so the cache key stays stable.
+
+**Trade-off:** once the proxy has seen a beta token in a session it will continue re-sending it for the rest of that session, even if the client stops including it. Stopping the token on the client side alone is not sufficient — the proxy re-injects it. Set `HEADROOM_BETA_HEADER_STICKY=disabled` to pass the client's `anthropic-beta` value verbatim and bypass this accumulation.
+
+```bash
+# Disable sticky beta re-echo
+export HEADROOM_BETA_HEADER_STICKY=disabled
+headroom proxy ...
+```
+
+Note: disabling sticky mode may reduce prefix-cache hit rates for clients that legitimately drop-and-re-add beta tokens across turns.
 
 ## Filesystem Contract
 

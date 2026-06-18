@@ -1,0 +1,242 @@
+---
+title: CI/CD Flow Diagrams
+description: Visual decision trees for pull requests, release publishing, Docker images, docs deploys, and manual validation.
+---
+
+## Purpose
+
+This page is the quick visual map for Headroom automation. Use it when opening a PR, reviewing a PR, cutting a release, or deciding which workflow owns a failure.
+
+The short version:
+
+- Pull requests are gated by PR governance, path-filtered CI, targeted e2e workflows, and human review.
+- Release publishing is not triggered by every merge to `main`. `release-please` maintains a release PR; merging that release PR creates the tag and GitHub Release that trigger publishing.
+- Docker images are built as multi-architecture digests first, then merged into tagged manifests.
+- Docs deploy only after docs changes land on `main`.
+
+## PR Flow
+
+```mermaid
+flowchart TD
+    A[Open, edit, synchronize, or mark PR ready] --> B[PR Governance]
+    B --> B1{Template complete and ready?}
+    B1 -- no --> B2[Add needs author action label and governance comment]
+    B1 -- yes --> B3[Add ready for review label when no blocking status exists]
+
+    A --> C[Path filters decide workflow surface]
+    C --> D{Code paths changed?}
+    D -- yes --> E[CI changes job]
+    E --> F[lint: ruff, format, mypy]
+    E --> G[build-wheel: Rust extension wheel]
+    E --> H[prefetch-model: Hugging Face cache]
+    G --> I[test shards 1 to 4]
+    H --> I
+    G --> J[test-extras, test-agno, dashboard UI]
+    E --> K[build: release-profile wheel and sdist smoke]
+
+    C --> L{E2E paths changed?}
+    L -- yes --> M[Docker native e2e and platform wrapper checks]
+    C --> N{Init or wrap paths changed?}
+    N -- yes --> O[Init E2E, Wrap E2E, native init or wrap smoke tests]
+    C --> P{Rust paths changed?}
+    P -- yes --> Q[Rust fmt, clippy, tests, wheel build, audit]
+    C --> R{Devcontainer paths changed?}
+    R -- yes --> S[Devcontainer validation and linked worktree smoke]
+    C --> T{Release-critical paths changed?}
+    T -- yes --> U[Release dry-run: wheel matrix and smoke-import gates]
+    C --> V{Workflow files changed?}
+    V -- yes --> W[Workflow validation with actionlint and act dry-run]
+
+    F --> X{All required checks green?}
+    I --> X
+    J --> X
+    K --> X
+    M --> X
+    O --> X
+    Q --> X
+    S --> X
+    U --> X
+    W --> X
+    B3 --> X
+    X -- no --> Y[Fix, rebase, or request changes]
+    X -- yes --> Z[Human review and merge when approved]
+```
+
+## PR Decision Tree
+
+```mermaid
+flowchart TD
+    A[Review an open PR] --> B{Draft?}
+    B -- yes --> C[Do not approve. Comment with remaining readiness steps.]
+    B -- no --> D{Governance label says needs author action?}
+    D -- yes --> E[Fix or ask author to complete template and real behavior proof]
+    D -- no --> F{Merge state dirty or behind?}
+    F -- dirty --> G[Resolve conflicts before reviewing final code]
+    F -- behind --> H[Rebase or update branch, then rerun checks]
+    F -- clean or unknown --> I{Any failing check?}
+    I -- yes --> J[Read failing logs, classify as stale-main, infra, or code bug]
+    J --> K{Can maintainer safely fix without changing author intent?}
+    K -- yes --> L[Patch, test locally, push with lease]
+    K -- no --> M[Request changes with exact file and line references]
+    I -- no --> N{Code review complete?}
+    N -- no --> O[Review diff, tests, docs, and behavior proof]
+    N -- yes --> P[Approve]
+```
+
+## Fork Workflow Approval
+
+GitHub may leave product workflows in `action_required` for first-time or fork contributors. Approve only after the diff is safe enough to execute in CI.
+
+```mermaid
+flowchart TD
+    A[Fork PR has action_required workflows] --> B{Diff is understandable and not suspicious?}
+    B -- no --> C[Do not approve. Ask for changes or close if unsafe.]
+    B -- yes --> D{Workflow runs use pull_request with read-scoped token?}
+    D -- no --> E[Inspect workflow permissions before approving]
+    D -- yes --> F[Approve queued CI runs]
+    F --> G[Wait for fresh check results on latest head SHA]
+```
+
+## Release Flow
+
+```mermaid
+flowchart TD
+    A[Merge ordinary PR to main] --> B[Release Please on push to main]
+    B --> C{Commit is releasable?}
+    C -- docs, ci, chore only --> D[No release PR change]
+    C -- fix, feat, breaking change --> E[Create or update Release PR]
+    E --> F[Release PR contains version bump and changelog]
+    F --> G{Ready to ship?}
+    G -- no --> H[Keep merging regular PRs; bot updates Release PR]
+    G -- yes --> I[Merge Release PR]
+    I --> J[release-please tags vX.Y.Z and publishes GitHub Release]
+    J --> K[release.yml starts on release: published]
+    K --> L[detect-version]
+    L --> M[build: sync versions, verify versions, changelog, npm packs]
+    M --> N[build-wheels matrix]
+    N --> O[collect-dist]
+    O --> P[smoke-import wheels]
+    P --> Q{Smoke import green?}
+    Q -- no --> R[Stop before publishing broken wheels]
+    Q -- yes --> S[publish PyPI]
+    Q -- yes --> T[publish npm packages]
+    Q -- yes --> U[publish GitHub Package Registry packages]
+    Q -- yes --> V[publish Docker images through docker.yml]
+    S --> W{PyPI published or PYPI_SKIP=true?}
+    W -- no --> X[Do not update release assets]
+    W -- yes --> Y[Create or update GitHub Release assets and notes]
+    T --> Y
+    U --> Y
+    V --> Y
+```
+
+## Release Decision Tree
+
+```mermaid
+flowchart TD
+    A[Need a release?] --> B{Release PR exists?}
+    B -- no --> C[Merge at least one releasable conventional commit to main]
+    B -- yes --> D{Release PR checks green and changelog correct?}
+    D -- no --> E[Fix source PRs or release config, then let release-please update]
+    D -- yes --> F{Registry skip variables needed?}
+    F -- yes --> G[Set PYPI_SKIP, NPM_SKIP, or GH_PACKAGES_SKIP deliberately]
+    F -- no --> H[Merge Release PR]
+    G --> H
+    H --> I[Watch release.yml]
+    I --> J{Failure before publish?}
+    J -- yes --> K[Fix and rerun before any package is public]
+    J -- no --> L{Failure after partial publish?}
+    L -- yes --> M[Use rerun or skip variables to reach consistent GitHub Release state]
+    L -- no --> N[Release complete]
+```
+
+## Docker Publish Flow
+
+`docker.yml` can run directly on `push`, `workflow_dispatch`, or `release: published`, and it is also called by `release.yml`.
+
+```mermaid
+flowchart TD
+    A[Docker workflow starts] --> B[Matrix: variant x architecture]
+    B --> C[Build each platform image by digest only]
+    C --> D[Smoke-test image imports pydantic_core and headroom._core]
+    D --> E{Smoke test green?}
+    E -- no --> F[Stop before tag manifest]
+    E -- yes --> G[Upload digest marker]
+    G --> H[Per-variant manifest merge]
+    H --> I[Apply tags to multi-arch manifest]
+    I --> J{Release event?}
+    J -- yes --> K[Version tags and latest retag rules]
+    J -- no --> L[Branch, PR, dev, or manual tags as configured]
+```
+
+## Docs Deploy Flow
+
+```mermaid
+flowchart TD
+    A[Docs change in PR] --> B[PR review and normal checks]
+    B --> C[Merge to main]
+    C --> D{docs/**, mkdocs.yml, or docs workflow changed?}
+    D -- no --> E[No docs deploy]
+    D -- yes --> F[Deploy Documentation workflow]
+    F --> G[Build docs site]
+    G --> H[Deploy generated site]
+```
+
+## Manual Validation Flow
+
+Use this when editing workflows or release automation.
+
+```mermaid
+flowchart TD
+    A[Edit workflow or release scripts] --> B[Run local workflow validation]
+    B --> C[actionlint]
+    B --> D[act dry-run fixtures]
+    C --> E{Local validation green?}
+    D --> E
+    E -- no --> F[Fix before opening or updating PR]
+    E -- yes --> G[Push PR]
+    G --> H[workflow-validation job reruns same validation in CI]
+```
+
+Recommended local command:
+
+```bash
+bash scripts/validate-workflows.sh
+```
+
+For release dry-runs:
+
+```bash
+act workflow_dispatch -W .github/workflows/release.yml -e .github/act/dry-run.json
+```
+
+## Gate Summary
+
+| Flow | Trigger | Main gates | Success condition |
+|------|---------|------------|-------------------|
+| PR governance | `pull_request_target`, schedule, manual | Template, readiness labels, merge state, check labels | PR has no governance blockers |
+| CI | PR, push to `main`, manual | Path filter, lint, mypy, wheel build, model prefetch, test shards, package smoke | Required jobs green or path-skipped |
+| Rust | Rust paths, schedule | fmt, clippy, cargo test, wheel build, audit | Rust checks green; nightly parity is allowed to fail in Phase 0 |
+| E2E | CLI, install, wrap, Docker, package paths | Docker init/wrap, native init/wrap/install, platform smoke | Relevant lifecycle checks green |
+| Release dry-run | PRs touching release-critical paths | Version detection, wheel matrix, smoke imports | Publish path can build before merge |
+| Release publish | GitHub Release published by release-please | Version sync, changelog, wheels, smoke import, PyPI gate, npm, GPR, Docker | Public packages and GitHub Release assets are consistent |
+| Docs deploy | Push to `main` with docs paths | Docs build | Site deploy completes |
+
+## Workflow Ownership
+
+| Workflow | Owns |
+|----------|------|
+| `.github/workflows/pr-health.yml` | PR body governance, readiness labels, rebase/conflict/failing-check labels |
+| `.github/workflows/ci.yml` | Python lint, type checks, wheel build, test shards, package smoke, workflow validation |
+| `.github/workflows/rust.yml` | Rust workspace quality gates and native wheel smoke artifacts |
+| `.github/workflows/init-e2e.yml` | Dockerized `headroom init` behavior |
+| `.github/workflows/wrap-e2e.yml` | Dockerized `headroom wrap` behavior |
+| `.github/workflows/init-native-e2e.yml` | Host-specific `headroom init -g` smoke tests |
+| `.github/workflows/install-native-e2e.yml` | Host-specific install CLI smoke tests |
+| `.github/workflows/wrap-native-e2e.yml` | Host-specific wrap prepare-only smoke tests |
+| `.github/workflows/devcontainers.yml` | Devcontainer startup and linked worktree compatibility |
+| `.github/workflows/release-please.yml` | Release PR aggregation from conventional commits |
+| `.github/workflows/release.yml` | Release build, wheel smoke-import gates, registry publishing, GitHub Release assets |
+| `.github/workflows/docker.yml` | GHCR multi-architecture image builds and manifests |
+| `.github/workflows/docs.yml` | Documentation deploy after docs changes merge |
+

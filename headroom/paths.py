@@ -73,6 +73,7 @@ _PROXY_LOG_FILE = "proxy.log"
 _DEBUG_400_DIR = "debug_400"
 _CODEX_WIRE_DEBUG_DIR = "codex_wire"
 _BIN_DIR = "bin"
+_PROXY_CLIENTS_DIR = "clients"
 _RTK_UNIX = "rtk"
 _RTK_WIN = "rtk.exe"
 _LEAN_CTX_UNIX = "lean-ctx"
@@ -269,6 +270,12 @@ def bin_dir() -> Path:
     return workspace_dir() / _BIN_DIR
 
 
+def proxy_clients_dir(port: int) -> Path:
+    """Per-port dir of live wrap-client markers (one file per client PID)."""
+
+    return workspace_dir() / _PROXY_CLIENTS_DIR / str(port)
+
+
 def rtk_path() -> Path:
     """Return the path to the vendored ``rtk`` binary."""
 
@@ -357,6 +364,7 @@ __all__ = [
     "debug_400_dir",
     "codex_wire_debug_dir",
     "bin_dir",
+    "proxy_clients_dir",
     "rtk_path",
     "lean_ctx_path",
     "deploy_root",

@@ -73,8 +73,46 @@ class GeminiHandlerMixin:
                 return True
         return False
 
+    def _rebuild_gemini_contents(
+        self,
+        original_contents: list[dict],
+        preserved_indices: set[int],
+        preserved_contents: dict[int, dict],
+        optimized_contents: list[dict],
+    ) -> list[dict]:
+        """Interleave preserved (non-text) entries back into optimized_contents at their
+        original positions.
+
+        preserved_indices uses original contents[] indices, but optimized_contents uses
+        a different (shorter) index space because entries with no text parts were excluded
+        from the messages[] sent for compression.  Using orig_idx directly to overwrite
+        optimized_contents[orig_idx] corrupts or silently drops entries.
+
+        This method walks original_contents in order, placing each position with either
+        the preserved original (for non-text entries) or the next optimized text entry.
+        """
+        opt_iter = iter(optimized_contents)
+        result: list[dict] = []
+        for idx, content in enumerate(original_contents):
+            had_text = any("text" in p for p in content.get("parts", []))
+            if idx in preserved_indices:
+                result.append(preserved_contents[idx])
+                if had_text:
+                    # Entry also produced a message; consume but discard the optimized version
+                    next(opt_iter, None)
+            else:
+                opt_entry = next(opt_iter, None)
+                if opt_entry is not None:
+                    result.append(opt_entry)
+                # else: dropped by compression — omit
+        return result
+
     def _gemini_contents_to_messages(
-        self, contents: list[dict], system_instruction: dict | None = None
+        self,
+        contents: list[dict],
+        system_instruction: dict | None = None,
+        *,
+        include_function_responses: bool = False,
     ) -> tuple[list[dict], set[int]]:
         """Convert Gemini contents[] format to OpenAI messages[] format for optimization.
 
@@ -84,6 +122,12 @@ class GeminiHandlerMixin:
 
         OpenAI format:
             messages: [{"role": "user", "content": "..."}]
+
+        When include_function_responses is True, functionResponse payloads are
+        additionally emitted as ``role="tool"`` messages so waste-signal
+        detection can see tool output (#819). That richer list is telemetry-only:
+        entries with non-text parts stay in preserved_indices and are restored
+        verbatim, so it must never be used as the compression input.
 
         Returns:
             Tuple of (messages, preserved_indices) where preserved_indices contains
@@ -117,7 +161,28 @@ class GeminiHandlerMixin:
             if text_parts:
                 messages.append({"role": role, "content": "\n".join(text_parts)})
 
+            if include_function_responses:
+                for part in parts:
+                    if "functionResponse" not in part:
+                        continue
+                    payload = self._function_response_text(part["functionResponse"])
+                    if payload:
+                        messages.append({"role": "tool", "content": payload})
+
         return messages, preserved_indices
+
+    @staticmethod
+    def _function_response_text(function_response: dict) -> str:
+        """Serialize a functionResponse payload for waste-signal parsing."""
+        response = function_response.get("response")
+        if response is None:
+            return ""
+        if isinstance(response, str):
+            return response
+        try:
+            return json.dumps(response, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            return str(response)
 
     def _messages_to_gemini_contents(self, messages: list[dict]) -> tuple[list[dict], dict | None]:
         """Convert OpenAI messages[] format back to Gemini contents[] format.
@@ -412,11 +477,17 @@ class GeminiHandlerMixin:
             try:
                 # Use OpenAI pipeline (similar message format)
                 context_limit = self.openai_provider.get_context_limit(model)
+                # Richer conversion incl. functionResponse payloads so tool
+                # output reaches waste-signal detection (#819); telemetry-only.
+                waste_messages, _ = self._gemini_contents_to_messages(
+                    contents, system_instruction, include_function_responses=True
+                )
                 result = self.openai_pipeline.apply(
                     messages=messages,
                     model=model,
                     model_limit=context_limit,
                     context=extract_user_query(messages),
+                    waste_messages=waste_messages,
                 )
                 if result.messages != messages:
                     optimized_messages = result.messages
@@ -501,12 +572,9 @@ class GeminiHandlerMixin:
             optimized_contents, optimized_system = self._messages_to_gemini_contents(
                 optimized_messages
             )
-
-            # Restore preserved content entries that had non-text parts
-            for orig_idx, original_content in preserved_contents.items():
-                if orig_idx < len(optimized_contents):
-                    optimized_contents[orig_idx] = original_content
-
+            optimized_contents = self._rebuild_gemini_contents(
+                contents, preserved_indices, preserved_contents, optimized_contents
+            )
             body["contents"] = optimized_contents
             if optimized_system:
                 body["systemInstruction"] = optimized_system
@@ -641,7 +709,11 @@ class GeminiHandlerMixin:
                 response_headers["x-headroom-tokens-saved"] = str(tokens_saved)
                 response_headers["x-headroom-model"] = model
                 if transforms_applied:
-                    response_headers["x-headroom-transforms"] = ",".join(transforms_applied)
+                    from headroom.proxy.cost import header_safe_transforms
+
+                    response_headers["x-headroom-transforms"] = ",".join(
+                        header_safe_transforms(transforms_applied)
+                    )
                 if cache_read_tokens > 0:
                     response_headers["x-headroom-cached"] = "true"
                 if _compression_failed:
@@ -757,11 +829,17 @@ class GeminiHandlerMixin:
         if _decision.should_compress:
             try:
                 context_limit = self.openai_provider.get_context_limit(model)
+                # Richer conversion incl. functionResponse payloads so tool
+                # output reaches waste-signal detection (#819); telemetry-only.
+                waste_messages, _ = self._gemini_contents_to_messages(
+                    contents, system_instruction, include_function_responses=True
+                )
                 result = self.openai_pipeline.apply(
                     messages=messages,
                     model=model,
                     model_limit=context_limit,
                     context=extract_user_query(messages),
+                    waste_messages=waste_messages,
                 )
                 if result.messages != messages:
                     optimized_messages = result.messages
@@ -784,9 +862,12 @@ class GeminiHandlerMixin:
             optimized_contents, optimized_system = self._messages_to_gemini_contents(
                 optimized_messages
             )
-            for orig_idx, original_content in preserved_contents.items():
-                if orig_idx < len(optimized_contents):
-                    optimized_contents[orig_idx] = original_content
+            optimized_contents = self._rebuild_gemini_contents(
+                contents if isinstance(contents, list) else [],
+                preserved_indices,
+                preserved_contents,
+                optimized_contents,
+            )
             request_payload["contents"] = optimized_contents
             if not is_antigravity:
                 if optimized_system:
@@ -1028,12 +1109,9 @@ class GeminiHandlerMixin:
             optimized_contents, optimized_system = self._messages_to_gemini_contents(
                 optimized_messages
             )
-
-            # Restore preserved content entries that had non-text parts
-            for orig_idx, original_content in preserved_contents.items():
-                if orig_idx < len(optimized_contents):
-                    optimized_contents[orig_idx] = original_content
-
+            optimized_contents = self._rebuild_gemini_contents(
+                contents, preserved_indices, preserved_contents, optimized_contents
+            )
             body["contents"] = optimized_contents
             if optimized_system:
                 body["systemInstruction"] = optimized_system

@@ -156,6 +156,35 @@ def test_perf_json_raw_is_array(runner, monkeypatch):
     assert data[0]["request_id"] == "hr_1"
 
 
+def test_perf_json_raw_preserves_client_field(runner, monkeypatch):
+    report = _sample_report()
+    report.perf_records[0].client = "codex"
+    _patch_report(monkeypatch, report)
+
+    result = runner.invoke(main, ["perf", "--format", "json", "--raw"])
+
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.output)
+    assert data[0]["client"] == "codex"
+
+
+def test_parse_perf_line_preserves_client_field(monkeypatch, tmp_path):
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    (log_dir / "proxy.log").write_text(
+        "2026-06-10 10:00:00,000 - headroom.proxy - INFO - "
+        "[hr_codex] PERF model=gpt-5 msgs=3 tok_before=1000 "
+        "tok_after=90 tok_saved=910 cache_read=0 cache_write=0 "
+        "cache_hit_pct=0 opt_ms=12 transforms=content_router client=codex\n"
+    )
+    monkeypatch.setattr(analyzer, "LOG_DIR", log_dir)
+
+    report = analyzer.parse_log_files(last_n_hours=0)
+
+    assert len(report.perf_records) == 1
+    assert report.perf_records[0].client == "codex"
+
+
 def test_perf_csv_by_model(runner, monkeypatch):
     _patch_report(monkeypatch, _sample_report())
     result = runner.invoke(main, ["perf", "--format", "csv"])
@@ -167,12 +196,15 @@ def test_perf_csv_by_model(runner, monkeypatch):
 
 
 def test_perf_csv_raw_per_record(runner, monkeypatch):
-    _patch_report(monkeypatch, _sample_report())
+    report = _sample_report()
+    report.perf_records[0].client = "codex"
+    _patch_report(monkeypatch, report)
     result = runner.invoke(main, ["perf", "--format", "csv", "--raw"])
     assert result.exit_code == 0, result.output
     rows = list(csv.DictReader(io.StringIO(result.output)))
     assert len(rows) == 2
     assert rows[0]["request_id"] == "hr_1"
+    assert rows[0]["client"] == "codex"
     # transforms flattened to a string cell
     assert rows[0]["transforms"] == "content_router"
 
@@ -188,3 +220,95 @@ def test_perf_rejects_unknown_format(runner, monkeypatch):
     _patch_report(monkeypatch, _sample_report())
     result = runner.invoke(main, ["perf", "--format", "xml"])
     assert result.exit_code != 0
+
+
+def test_parse_perf_line_preserves_blank_client_field(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+    monkeypatch.setattr(analyzer, "LOG_DIR", logs_dir)
+    (logs_dir / "proxy.log").write_text(
+        "2026-06-10 10:00:00,000 - headroom.proxy - INFO - [req-blank] PERF "
+        "model=gpt-5 msgs=1 tok_before=100 tok_after=50 tok_saved=50 "
+        "cache_read=0 cache_write=0 cache_hit_pct=0 opt_ms=1 transforms=test client=\n",
+        encoding="utf-8",
+    )
+
+    report = analyzer.parse_log_files(last_n_hours=0)
+
+    assert len(report.perf_records) == 1
+    assert report.perf_records[0].client == ""
+
+
+def test_throughput_parsing_and_calculations(monkeypatch, tmp_path):
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+    monkeypatch.setattr(analyzer, "LOG_DIR", logs_dir)
+
+    log_content = (
+        '2026-06-10 10:00:00,000 - headroom.proxy - INFO - [req1] STAGE_TIMINGS {"event": "stage_timings", "stages": {"compression_first_stage": 100.0, "upstream_connect": 50.0}}\n'
+        "2026-06-10 10:00:01,000 - headroom.proxy - INFO - [req1] PERF model=gpt-5 msgs=1 tok_before=1000 tok_after=400 tok_saved=600 opt_ms=10 total_ms=500 tok_out=500 ttfb_ms=100 transforms=test client=codex\n"
+        '2026-06-10 10:00:02,000 - headroom.proxy - INFO - [req2] STAGE_TIMINGS {"event": "stage_timings", "stages": {"compression": 200.0, "upstream_connect": 50.0}}\n'
+        "2026-06-10 10:00:03,000 - headroom.proxy - INFO - [req2] PERF model=gpt-5 msgs=1 tok_before=2000 tok_after=1000 tok_saved=1000 opt_ms=20 total_ms=1000 tok_out=1000 ttfb_ms=200 transforms=test client=codex\n"
+        "2026-06-10 10:00:05,000 - headroom.proxy - INFO - [req3] PERF model=gpt-5 msgs=1 tok_before=1500 tok_after=500 tok_saved=1000 opt_ms=15 total_ms=600 tok_out=600 ttfb_ms=150 transforms=test client=codex\n"
+        '2026-06-10 10:00:06,000 - headroom.proxy - INFO - [req4] STAGE_TIMINGS {"event": "stage_timings", "stages": {"compression_first_stage": 150.0, "upstream_connect": 50.0}}\n'
+        "2026-06-10 10:00:07,000 - headroom.proxy - INFO - [req4] PERF model=gpt-5 msgs=1 tok_before=1200 tok_after=300 tok_saved=900 opt_ms=12 total_ms=400 tok_out=400 ttfb_ms=80 transforms=test client=codex\n"
+        '2026-06-10 10:00:08,000 - headroom.proxy - INFO - [req5] STAGE_TIMINGS {"event": "stage_timings", "stages": {"compression_first_stage": 50.0, "upstream_connect": 50.0}}\n'
+        "2026-06-10 10:00:09,000 - headroom.proxy - INFO - [req5] PERF model=gpt-5 msgs=1 tok_before=800 tok_after=200 tok_saved=600 opt_ms=5 total_ms=300 tok_out=300 ttfb_ms=50 transforms=test client=codex\n"
+    )
+    (logs_dir / "proxy.log").write_text(log_content, encoding="utf-8")
+
+    report = analyzer.parse_log_files(last_n_hours=0)
+
+    assert len(report.perf_records) == 5
+
+    assert report.perf_records[0].request_id == "req1"
+    assert report.perf_records[0].total_ms == 500.0
+    assert report.perf_records[0].tokens_out == 500
+    assert report.perf_records[0].ttfb_ms == 100.0
+    assert report.perf_records[0].stages == {
+        "compression_first_stage": 100.0,
+        "upstream_connect": 50.0,
+    }
+
+    assert report.perf_records[2].request_id == "req3"
+    assert report.perf_records[2].stages == {}
+
+    summary = build_perf_summary(report)
+    assert "throughput" in summary
+    tp = summary["throughput"]
+
+    rolling = tp["rolling"]
+    assert rolling["input_wall_clock"] > 0
+    assert rolling["input_active_p50"] == 2500.0
+    assert rolling["compression_p50"] == 10000.0
+
+
+def test_throughput_empty_and_percentiles():
+    from headroom.perf.analyzer import (
+        PerfReport,
+        _calculate_throughput_stats,
+        _percentile,
+        calculate_throughput,
+    )
+
+    # Empty percentiles
+    assert _percentile([], 0.5) == 0.0
+
+    # Percentiles boundary checks
+    assert _percentile([10.0], 0.5) == 10.0
+    assert _percentile([10.0, 20.0], 0.5) == 15.0
+    assert _percentile([10.0, 20.0], 0.0) == 10.0
+    assert _percentile([10.0, 20.0], 1.0) == 20.0
+    assert _percentile([10.0, 20.0], 1.5) == 20.0
+
+    # Empty calculate_throughput
+    empty_report = PerfReport()
+    tp = calculate_throughput(empty_report)
+    assert tp["rolling"]["input_wall_clock"] == 0.0
+    assert tp["current"]["input_wall_clock"] == 0.0
+
+    # _calculate_throughput_stats with empty records
+    stats = _calculate_throughput_stats([], 10.0)
+    assert stats["input_wall_clock"] == 0.0

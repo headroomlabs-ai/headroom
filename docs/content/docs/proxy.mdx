@@ -45,6 +45,7 @@ Telemetry is enabled by default. Opt out with `HEADROOM_TELEMETRY=off` or `--no-
 | `--anthropic-api-url` | Anthropic default | Custom Anthropic API URL |
 | `--gemini-api-url` | Gemini default | Custom Gemini API URL |
 | `--backend` | `anthropic` | Backend: `anthropic`, `bedrock`, `openrouter`, `anyllm`, or `litellm-<provider>` |
+| `--bedrock-api-url` | None | Bedrock InvokeModel upstream for the `/model/{id}/invoke` passthrough routes (see [Bedrock via a local gateway](#bedrock-via-a-local-gateway)) |
 | `--no-telemetry` | `false` | Disable anonymous telemetry |
 | `--stateless` | `false` | Disable filesystem writes and keep runtime state in memory |
 
@@ -243,6 +244,24 @@ headroom proxy --backend azure
 OPENROUTER_API_KEY=sk-or-... headroom proxy --backend openrouter
 ```
 
+### Bedrock via a local gateway
+
+`--backend bedrock` accepts **Anthropic** input (`/v1/messages`) and re-signs to AWS. Some setups are the other way around: the client already speaks **Bedrock** (e.g. Claude Code with `CLAUDE_CODE_USE_BEDROCK=1`, or any AWS SDK pointed at a custom endpoint), sending `POST /model/{id}/invoke` to a local gateway that re-signs and forwards to AWS (LiteLLM, LocalStack, a corporate Bedrock proxy).
+
+`--bedrock-api-url` lets Headroom sit in that chain. It registers passthrough routes for `/model/{id}/invoke` and `/model/{id}/invoke-with-response-stream`, compresses the request body with the same pipeline as `/v1/messages`, and forwards to the gateway:
+
+```bash
+headroom proxy --bedrock-api-url http://127.0.0.1:4000
+# then point the client's Bedrock endpoint at Headroom:
+AWS_ENDPOINT_URL_BEDROCK_RUNTIME=http://127.0.0.1:8787 your-bedrock-client
+```
+
+The routes are registered **only** when `--bedrock-api-url` (or `BEDROCK_TARGET_API_URL`) is set — otherwise Bedrock requests fall through unchanged.
+
+<Callout type="warn">
+Rewriting the request body invalidates the caller's **SigV4** signature (it covers a hash of the body). Point `--bedrock-api-url` at a gateway that re-signs or does not verify the inbound signature — **never raw AWS**, which would reject the request with 403. For direct-to-AWS compression, use `--backend bedrock` (which re-signs). The two are complementary.
+</Callout>
+
 ## Environment variables
 
 ```bash
@@ -255,6 +274,9 @@ export OPENAI_TARGET_API_URL=https://custom.openai.endpoint.com
 
 # Route Anthropic passthrough requests to a custom endpoint
 export ANTHROPIC_TARGET_API_URL=https://litellm.company.internal
+
+# Compress Bedrock InvokeModel traffic, forwarding to a re-signing gateway
+export BEDROCK_TARGET_API_URL=http://127.0.0.1:4000
 
 headroom proxy
 ```

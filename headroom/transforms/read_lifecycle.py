@@ -11,6 +11,12 @@ Real-world data shows 75% of Read output bytes fall into these two categories:
 - 67% stale (file edited after Read)
 - 12% superseded (file re-Read later)
 - Only 20% are fresh (untouched)
+
+NOTE: a first-sight repeat-Read dedup mechanism (DEDUP_REPEAT) was
+prototyped here and removed — `headroom audit-reads` measured
+byte-identical repeats at 0.1% of Read bytes on real traffic. If a
+deployment's audit shows otherwise, the implementation is in git history
+on the feat/compression-extraction branch.
 """
 
 from __future__ import annotations
@@ -63,6 +69,16 @@ class ReadClassification:
     file_path: str
     state: ReadState
     content_size: int
+
+
+def _format_read_lifecycle_transform(classification: ReadClassification) -> str:
+    """Format a read_lifecycle transform tag including the source file path.
+
+    Shape: ``read_lifecycle:<state>:<file_path>``. Consumers splitting on ``:``
+    must bound the split to 3 parts so paths containing ``:`` are preserved.
+    """
+    path = classification.file_path or ""
+    return f"read_lifecycle:{classification.state.value}:{path}"
 
 
 @dataclass
@@ -364,7 +380,7 @@ class ReadLifecycleManager:
         ccr_hashes: list[str] = []
         bytes_before = 0
         bytes_after = 0
-        counts = {ReadState.FRESH: 0, ReadState.STALE: 0, ReadState.SUPERSEDED: 0}
+        counts = dict.fromkeys(ReadState, 0)
 
         for c in classifications:
             counts[c.state] += 1
@@ -381,7 +397,7 @@ class ReadLifecycleManager:
                     replaced, marker, ccr_hash = self._replace_content(content, classification)
                     if replaced:
                         result_messages.append({**msg, "content": marker})
-                        transforms.append(f"read_lifecycle:{classification.state.value}")
+                        transforms.append(_format_read_lifecycle_transform(classification))
                         if ccr_hash:
                             ccr_hashes.append(ccr_hash)
                         bytes_before += len(content.encode("utf-8"))
@@ -435,7 +451,7 @@ class ReadLifecycleManager:
                 replaced, marker, ccr_hash = self._replace_content(tool_content, classification)
                 if replaced:
                     new_blocks.append({**block, "content": marker})
-                    transforms.append(f"read_lifecycle:{classification.state.value}")
+                    transforms.append(_format_read_lifecycle_transform(classification))
                     if ccr_hash:
                         ccr_hashes.append(ccr_hash)
                     any_replaced = True
@@ -476,14 +492,19 @@ class ReadLifecycleManager:
 
         file_display = classification.file_path or "unknown"
 
+        # NOTE: the literal phrase "Retrieve original: hash=" is load-bearing —
+        # the compression-pinning checks in ContentRouter and the
+        # marker-preserving regex in compression_units.py match on it.
         if classification.state == ReadState.STALE:
             marker = (
-                f"[Read content stale: {file_display} was modified after this read. "
+                f"[Read content stale: {file_display} was modified after this read — "
+                f"re-read the file for current content. "
                 f"Retrieve original: hash={ccr_hash}]"
             )
         else:  # SUPERSEDED
             marker = (
-                f"[Read content superseded: {file_display} was re-read later. "
+                f"[Read content superseded: {file_display} was re-read later — "
+                f"re-read the file if needed. "
                 f"Retrieve original: hash={ccr_hash}]"
             )
 

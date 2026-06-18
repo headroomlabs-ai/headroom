@@ -106,27 +106,57 @@ class ClaudeCodePlugin(LearnPlugin, ConversationScanner):
 
         return projects
 
-    def scan_project(self, project: ProjectInfo, max_workers: int = 1) -> list[SessionData]:
-        """Scan all conversation JSONL files for a project."""
-        jsonl_files = sorted(project.data_path.glob("*.jsonl"))
+    def scan_project(
+        self, project: ProjectInfo, max_workers: int = 1, include_subagents: bool = True
+    ) -> list[SessionData]:
+        """Scan all conversation JSONL files for a project.
+
+        Claude Code writes the main session at ``<project>/<uuid>.jsonl`` and
+        nests the transcripts it spawns under ``<project>/<uuid>/subagents/**``
+        (subagents) and ``.../subagents/workflows/**`` (workflow agents). Each
+        nested transcript is its own context window with its own token spend, so
+        by default we descend into them. Pass ``include_subagents=False`` to
+        restrict to top-level main sessions only.
+        """
+        data_path = project.data_path
+        if include_subagents:
+            jsonl_files = sorted(data_path.rglob("*.jsonl"))
+        else:
+            jsonl_files = sorted(data_path.glob("*.jsonl"))
         if not jsonl_files:
             return []
 
+        file_sources = [(f, self._classify_source(data_path, f)) for f in jsonl_files]
+
         if max_workers <= 1 or len(jsonl_files) <= 1:
-            return [s for f in jsonl_files if (s := self._scan_session(f)) and s.tool_calls]
+            return [
+                s
+                for f, src in file_sources
+                if (s := self._scan_session(f, source=src)) and s.tool_calls
+            ]
 
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
         sessions: list[SessionData] = []
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(self._scan_session, f): f for f in jsonl_files}
+            futures = {executor.submit(self._scan_session, f, src): f for f, src in file_sources}
             for future in as_completed(futures):
                 session = future.result()
                 if session and session.tool_calls:
                     sessions.append(session)
         return sessions
 
-    def _scan_session(self, jsonl_path: Path) -> SessionData | None:
+    @staticmethod
+    def _classify_source(data_path: Path, jsonl_path: Path) -> str:
+        """Tag a transcript as main / subagent / workflow from its path depth."""
+        parts = jsonl_path.relative_to(data_path).parts
+        if len(parts) == 1:
+            return "main"
+        if "workflows" in parts:
+            return "workflow"
+        return "subagent"
+
+    def _scan_session(self, jsonl_path: Path, source: str = "main") -> SessionData | None:
         """Scan a single JSONL conversation file."""
         session_id = jsonl_path.stem
         tool_uses: dict[str, tuple[str, dict]] = {}
@@ -174,6 +204,7 @@ class ClaudeCodePlugin(LearnPlugin, ConversationScanner):
             events=events,
             total_input_tokens=total_input_tokens,
             total_output_tokens=total_output_tokens,
+            source=source,
         )
 
     def _extract_tool_uses(self, d: dict, tool_uses: dict[str, tuple[str, dict]]) -> None:
@@ -397,9 +428,9 @@ def _component_tokenizations(component: str) -> list[list[str]]:
 
     add([component])
 
-    for separator in ("-", ".", "_", None):
+    for separator in (" ", "-", ".", "_", None):
         if separator is None:
-            tokens = [token for token in re.split(r"[-._]", component) if token]
+            tokens = [token for token in re.split(r"[-.\s_]", component) if token]
         else:
             tokens = [token for token in component.split(separator) if token]
         add(tokens)
@@ -407,9 +438,9 @@ def _component_tokenizations(component: str) -> list[list[str]]:
     if component.startswith(".") and len(component) > 1:
         hidden_component = component[1:]
         add(["", hidden_component])
-        for separator in ("-", ".", "_", None):
+        for separator in (" ", "-", ".", "_", None):
             if separator is None:
-                tokens = [token for token in re.split(r"[-._]", hidden_component) if token]
+                tokens = [token for token in re.split(r"[-.\s_]", hidden_component) if token]
             else:
                 tokens = [token for token in hidden_component.split(separator) if token]
             add(["", *tokens])

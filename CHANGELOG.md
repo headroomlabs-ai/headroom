@@ -6,6 +6,155 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## Unreleased
+
+### Features
+
+* **proxy:** measure and surface rolling and current token throughput metrics (active/wall-clock input, compression, effective forward, and streamed generation) in `headroom perf` CLI and the dashboard ([#959](https://github.com/chopratejas/headroom/issues/959)).
+* **vibe:** add Mistral Vibe CLI support with `headroom wrap vibe`.
+* **proxy:** per-project savings breakdown on the dashboard for all wrapped agents — Claude Code, Codex, aider, Copilot, and Cursor ([#802](https://github.com/chopratejas/headroom/issues/802)). `headroom wrap claude`/`codex` tag requests with an `X-Headroom-Project` header (launch-directory name); `wrap aider`/`copilot`/`cursor` — whose clients cannot send custom headers — use a `/p/<name>` base-URL prefix the proxy strips. Savings are aggregated per project (persisted, schema v3 with transparent v2 migration), exposed as `savings.per_project` in `/stats` and `projects` in `/stats-history`, and shown in a Per-Project Savings dashboard table.
+* **memory:** opt-in Apple-GPU (MPS) embedding offload via `HEADROOM_EMBEDDER_RUNTIME=pytorch_mps`. When set (and Apple MPS is available), the memory embedder runs on the torch sentence-transformers backend on the Apple GPU instead of the default ONNX CPU embedder, freeing the CPU under load. If MPS or the dependencies are unavailable, Headroom logs a warning and uses the existing default embedder selection path (ONNX when available, then the pre-existing local fallback). MPS encode calls are serialized internally (torch-MPS is not thread-safe). Adds the new `[pytorch-mps]` extra (`pip install 'headroom-ai[pytorch-mps]'`). Default behavior is unchanged.
+
+### Features
+
+* **proxy:** cross-region Bedrock inference-profile detection — geo-prefixed model IDs (`eu.`/`us.`/`apac.`/`global.`) are now resolved to their canonical vendor, so Anthropic cross-region profiles (e.g. `eu.anthropic.claude-haiku-4-5-20251001-v1:0`) receive live-zone compression instead of being silently skipped ([#999](https://github.com/chopratejas/headroom/pull/999)).
+* **proxy:** Converse-body compression on the native Bedrock route — the live-zone dispatcher now recognizes Bedrock Converse content blocks (typeless `{"text": …}`, not only Anthropic `{"type":"text", …}`), so Converse user-message text compresses; `run_anthropic_compression` no longer bails to passthrough when the body lacks an InvokeModel `anthropic_version` envelope, and envelope re-emit stays gated on successful parse ([#999](https://github.com/chopratejas/headroom/pull/999)).
+* **docker:** bundle `headroom-proxy` binary in published `runtime` and `runtime-slim` images — closes [#976](https://github.com/chopratejas/headroom/issues/976) ([#999](https://github.com/chopratejas/headroom/pull/999)).
+
+### Bug Fixes
+
+* **proxy:** enable SSO credential resolution in the native Bedrock route via the `aws-config` `sso` feature flag, making the credential chain match what `docs/bedrock.md` already documented ([#999](https://github.com/chopratejas/headroom/pull/999)).
+* **proxy:** route native Bedrock `/model/{id}/converse` requests to the upstream Converse endpoint instead of the hard-coded `/invoke` action — the non-streaming handler now resolves the action from the inbound path, matching the streaming handler ([#999](https://github.com/chopratejas/headroom/pull/999)).
+* **ccr:** make retrieval store TTL configurable with `HEADROOM_CCR_TTL_SECONDS`, expose the effective TTL in `/v1/retrieve/stats`, and distinguish expired retrievals from missing hashes.
+* **proxy:** add native Bedrock `/model/{id}/converse-stream` route and forward it through the existing streaming EventStream/SSE pipeline.
+* **wrap (codex):** fix `headroom wrap codex` producing a `config.toml` with duplicate top-level `model_provider` / `openai_base_url` keys (TOML-spec error) when the user had already configured their own provider. The injector now rewrites pre-existing top-level `model_provider` and `openai_base_url` lines in place — the previous value is kept in a `# was: …` trailing comment — instead of unconditionally prepending a duplicate, so `codex` can start against the proxy. The pre-wrap snapshot mechanism continues to byte-for-byte restore the original file on `headroom unwrap codex`.
+
+
+## [0.26.0](https://github.com/chopratejas/headroom/compare/v0.25.0...v0.26.0) (2026-06-16)
+
+
+### Features
+
+* add Copilot BYOK provider wrapper utilities and CLI support ([#1041](https://github.com/chopratejas/headroom/issues/1041)) ([e67ee2a](https://github.com/chopratejas/headroom/commit/e67ee2af658bce35fb4c71b45a0c5b294d7dcfdc))
+* add dashboard agent usage stats ([#814](https://github.com/chopratejas/headroom/issues/814)) ([6d3f39f](https://github.com/chopratejas/headroom/commit/6d3f39f213f4eb2d1c6c814b34e1bf6fe2a5c959))
+* Add support for Mistral Vibe CLI ([#935](https://github.com/chopratejas/headroom/issues/935)) ([0932b8b](https://github.com/chopratejas/headroom/commit/0932b8bef4db9109665382b6d7c079a368f08d52))
+* attribute reread waste to over-compression via marker check ([#901](https://github.com/chopratejas/headroom/issues/901)) ([f928576](https://github.com/chopratejas/headroom/commit/f9285766dda77b116c7834165849264e55339720))
+* **bedrock:** cross-region + Converse compression; bundle proxy binary in images ([#999](https://github.com/chopratejas/headroom/issues/999)) ([0dc2e1c](https://github.com/chopratejas/headroom/commit/0dc2e1cb3f7278332d450644831007316d6ac18c))
+* **dashboard:** surface compression-vs-cache net impact in Prefix Cache panel ([#913](https://github.com/chopratejas/headroom/issues/913)) ([2a4d300](https://github.com/chopratejas/headroom/commit/2a4d300841c8cbb55435f821fc2d01c3b3b43a59))
+* **evals:** adversarial-input robustness grid for compressors ([#918](https://github.com/chopratejas/headroom/issues/918)) ([5939004](https://github.com/chopratejas/headroom/commit/5939004185a1f9b4ef2e88ee3e72a10e5c8fa4a6))
+* **parser:** detect re-issued identical tool calls as reread waste ([#909](https://github.com/chopratejas/headroom/issues/909)) ([7d4ae86](https://github.com/chopratejas/headroom/commit/7d4ae86ec0bb09efff765422b89db587b050cd08))
+* **policy:** batch deep edits through one cache-bust ([#856](https://github.com/chopratejas/headroom/issues/856) P3a) ([#1015](https://github.com/chopratejas/headroom/issues/1015)) ([c2e52fe](https://github.com/chopratejas/headroom/commit/c2e52fe7439b464edaee83827ca7d8c8091d7e9a))
+* **policy:** consume net-cost mutation gate in ContentRouter ([#856](https://github.com/chopratejas/headroom/issues/856) P2) ([#905](https://github.com/chopratejas/headroom/issues/905)) ([553ade4](https://github.com/chopratejas/headroom/commit/553ade4ec66793c1707df6a95888ca2c1506c0b1))
+* **proxy:** compress AWS Bedrock InvokeModel requests via configurable upstream ([#720](https://github.com/chopratejas/headroom/issues/720)) ([7edb27a](https://github.com/chopratejas/headroom/commit/7edb27ab2496b070cbe835b31eb2f828798ddfaa))
+
+
+### Bug Fixes
+
+* **anthropic:** strip styled Claude model ids ([#651](https://github.com/chopratejas/headroom/issues/651)) ([0c5c89d](https://github.com/chopratejas/headroom/commit/0c5c89d05cefabaa833e54decfdeb677edacc0d7))
+* **anyllm:** forward openai api_base/api_key to the any-llm backend ([#942](https://github.com/chopratejas/headroom/issues/942)) ([#954](https://github.com/chopratejas/headroom/issues/954)) ([a7ee8a6](https://github.com/chopratejas/headroom/commit/a7ee8a60a7ac28a8adcc7a7fa83a04a59afe41d5))
+* **cache:** guard None exemplar embeddings in dynamic detector ([#950](https://github.com/chopratejas/headroom/issues/950)) ([1ec9320](https://github.com/chopratejas/headroom/commit/1ec93208883f2606cc7ec3db0b8bd8e071646984))
+* **cache:** name the missing piece in semantic detector guard ([#1018](https://github.com/chopratejas/headroom/issues/1018)) ([3b0bcee](https://github.com/chopratejas/headroom/commit/3b0bceecf4281eb34112de8dd546d4a58beb3fcc))
+* **ci:** check out repo in PR Governance label job ([#1021](https://github.com/chopratejas/headroom/issues/1021)) ([4558bc2](https://github.com/chopratejas/headroom/commit/4558bc2465e52d575070e5a0d6312cd400c8aee1))
+* **ci:** make PR governance advisory ([#1047](https://github.com/chopratejas/headroom/issues/1047)) ([74dff94](https://github.com/chopratejas/headroom/commit/74dff94fb8580426f5713991be71df94c4f31598))
+* **codex:** compute waste signals on the OpenAI Responses path ([#898](https://github.com/chopratejas/headroom/issues/898)) ([b9e2761](https://github.com/chopratejas/headroom/commit/b9e27614c613a1e5f97eb51af74d3c796fb1ab18))
+* **codex:** poll /wham/usage for subscription limits (handshake no longer sends x-codex-* headers) ([#924](https://github.com/chopratejas/headroom/issues/924)) ([8c00f71](https://github.com/chopratejas/headroom/commit/8c00f7103cf0288991d703cc002ac354e6266534))
+* **codex:** PR health label check state ([#986](https://github.com/chopratejas/headroom/issues/986)) ([99c874d](https://github.com/chopratejas/headroom/commit/99c874d4233ec2d35c5c12a709ba32fd2fd96f3d))
+* **codex:** retag thread providers so history menu stays whole across the proxy boundary ([#1034](https://github.com/chopratejas/headroom/issues/1034)) ([74ae781](https://github.com/chopratejas/headroom/commit/74ae7816444ae972b55f3da0ff5e28c8638ab4f3))
+* **codex:** write canonical hooks feature flag and migrate deprecated codex_hooks ([#743](https://github.com/chopratejas/headroom/issues/743)) ([dff6a19](https://github.com/chopratejas/headroom/commit/dff6a19946b8f96bb8b16fa945b69a1ed09709af))
+* **compression:** convert tree-sitter byte offsets to char offsets ([#892](https://github.com/chopratejas/headroom/issues/892)) ([b1f700f](https://github.com/chopratejas/headroom/commit/b1f700fc275bf1d7e9461b61a9ebfdb1fba19620))
+* **compression:** correct JSON array item counting and entropy gate ([#887](https://github.com/chopratejas/headroom/issues/887)) ([d6f0f0f](https://github.com/chopratejas/headroom/commit/d6f0f0f64269bfbdf36070cb304703c606c64b72))
+* **compression:** keep container bodies compressible in code handler ([#890](https://github.com/chopratejas/headroom/issues/890)) ([16ed73b](https://github.com/chopratejas/headroom/commit/16ed73bca68e602a86a385480d484c3a60025b8c))
+* **compression:** measure short-value threshold on payload, not token ([#889](https://github.com/chopratejas/headroom/issues/889)) ([65b0e8c](https://github.com/chopratejas/headroom/commit/65b0e8c58dbbc0b77e4b7159b279287979767c4c))
+* **compression:** use thread-local tree-sitter parsers in code handler ([#893](https://github.com/chopratejas/headroom/issues/893)) ([6cdb846](https://github.com/chopratejas/headroom/commit/6cdb8462000d9610b5d15f6c7c45adb787bfec1e))
+* **gemini:** surface functionResponse payloads to waste-signal detection ([#897](https://github.com/chopratejas/headroom/issues/897)) ([9b0c840](https://github.com/chopratejas/headroom/commit/9b0c840dd7c181d6266b31cd16f493393ccc5c1a))
+* **learn:** decode directory names with spaces in Windows project paths ([#997](https://github.com/chopratejas/headroom/issues/997)) ([#1027](https://github.com/chopratejas/headroom/issues/1027)) ([2d3701b](https://github.com/chopratejas/headroom/commit/2d3701b59e9ff8aedc2a282c4467f27ca2355d62))
+* **learn:** scan subagent and workflow transcripts ([#1045](https://github.com/chopratejas/headroom/issues/1045)) ([0ddd4ed](https://github.com/chopratejas/headroom/commit/0ddd4ed9e92fe898373036ba3be228f9afc3bc5a))
+* **openclaw:** declare headroom_retrieve tool contract ([#947](https://github.com/chopratejas/headroom/issues/947)) ([7c8c909](https://github.com/chopratejas/headroom/commit/7c8c909c853a264c833c645403cbbb1894b91432))
+* **policy:** correct warm-cache penalty in net_mutation_gain to (S + dT) ([#903](https://github.com/chopratejas/headroom/issues/903)) ([0632eba](https://github.com/chopratejas/headroom/commit/0632eba6c3bdf5b030d794d3dfefa3c29543d2e8))
+* **proxy:** add native Bedrock converse-stream route ([#917](https://github.com/chopratejas/headroom/issues/917)) ([b08ec15](https://github.com/chopratejas/headroom/commit/b08ec15b0d392b8b8cf93dbadaee4b7e6b465f1c))
+* **proxy:** keep codex image-generation WS turns alive through the relay ([#1000](https://github.com/chopratejas/headroom/issues/1000)) ([7dbbb40](https://github.com/chopratejas/headroom/commit/7dbbb4077e7bb11b3da4634573cfc1d998e139ec))
+* **proxy:** make budget enforcement actually work ([#885](https://github.com/chopratejas/headroom/issues/885)) ([a14ab45](https://github.com/chopratejas/headroom/commit/a14ab45cf0e6e698c52a0efd0448ca7c8ba0b31f))
+* **proxy:** read RTK gain stats globally by default ([#957](https://github.com/chopratejas/headroom/issues/957)) ([b70fccb](https://github.com/chopratejas/headroom/commit/b70fccbe174e1adff0f52ceaf9bec0dcda0c73da))
+* route v1internal code assist requests to cloudcode-pa.googleapis… ([#821](https://github.com/chopratejas/headroom/issues/821)) ([e20f16b](https://github.com/chopratejas/headroom/commit/e20f16b1a65710f532aa019ef60ac7a18a4e7f46))
+* **serena:** stop the Serena dashboard popup and make --no-serena actually disable Serena ([#1003](https://github.com/chopratejas/headroom/issues/1003)) ([919379a](https://github.com/chopratejas/headroom/commit/919379a8a1731a0002d813a79d880ad35f8bbbc9))
+* support Copilot Business subscription auth ([#641](https://github.com/chopratejas/headroom/issues/641)) ([0b4a4bd](https://github.com/chopratejas/headroom/commit/0b4a4bd4830ecec1bca64c2f62455c4c923d91df))
+* wire HEADROOM_EXCLUDE_TOOLS / HEADROOM_TOOL_PROFILES into Click proxy entrypoint ([#943](https://github.com/chopratejas/headroom/issues/943)) ([9b7b436](https://github.com/chopratejas/headroom/commit/9b7b436b04118d6ec4dcaebafc1c82e03e786f27))
+* **wrap:** avoid duplicate top-level keys when injecting codex provider ([#884](https://github.com/chopratejas/headroom/issues/884)) ([dd22cfd](https://github.com/chopratejas/headroom/commit/dd22cfd72ad9265c25a95ef5536dc3d17e85dbbf))
+
+
+### Code Refactoring
+
+* DRY cache logic, add thread safety, fix Bash exclusion ([#704](https://github.com/chopratejas/headroom/issues/704)) ([e36fccd](https://github.com/chopratejas/headroom/commit/e36fccd8cfe6b963398d3d0fa1637a45bd6421af))
+
+## [0.25.0](https://github.com/chopratejas/headroom/compare/v0.24.0...v0.25.0) (2026-06-12)
+
+
+### Features
+
+* add differential network capture harness ([#761](https://github.com/chopratejas/headroom/issues/761)) ([11ab5f8](https://github.com/chopratejas/headroom/commit/11ab5f83a1ccd617a2608349a42feff7f7e72b98))
+* add light mode for dashboard ([#834](https://github.com/chopratejas/headroom/issues/834)) ([c425893](https://github.com/chopratejas/headroom/commit/c425893d123e67c62ee20ff64ae350eb4ea56477))
+* add OAuth2 client-credentials upstream-auth proxy extension ([#778](https://github.com/chopratejas/headroom/issues/778)) ([#784](https://github.com/chopratejas/headroom/issues/784)) ([eb2e50f](https://github.com/chopratejas/headroom/commit/eb2e50feb26bacadf8812d6e608a458a990096b9))
+* add Vertex AI proxy routing ([#793](https://github.com/chopratejas/headroom/issues/793)) ([3c77e52](https://github.com/chopratejas/headroom/commit/3c77e52ce431210e6045671cf5f7c66c79f90a32))
+* **cli:** comprehensive help text, validation, and exception handling improvements ([#640](https://github.com/chopratejas/headroom/issues/640)) ([028efab](https://github.com/chopratejas/headroom/commit/028efabb4e611d77118baefb8ffdd13b0edc4fc5))
+* compression safety rails — error-output protection, pipeline circuit breaker, library inflation guard ([#851](https://github.com/chopratejas/headroom/issues/851)) ([c0cadcc](https://github.com/chopratejas/headroom/commit/c0cadccff98e572f126185f371e4de9e241b12e0))
+* **dashboard:** per-model savings breakdown and expected-vs-actual cost on historical charts ([#807](https://github.com/chopratejas/headroom/issues/807)) ([34dafe6](https://github.com/chopratejas/headroom/commit/34dafe69d907c9a2971abc0d801ff9bfa498b3a8))
+* detect re-served tool results as over-compression waste signal ([#854](https://github.com/chopratejas/headroom/issues/854)) ([5f1d88a](https://github.com/chopratejas/headroom/commit/5f1d88ad2701ed186df93d8e2a3980f0329d9dbb))
+* **evals:** add zero-cost tool schema compaction integrity eval ([#817](https://github.com/chopratejas/headroom/issues/817)) ([53a08c6](https://github.com/chopratejas/headroom/commit/53a08c63bf56a76d4fb7b649e37c8e62b0b4cebf))
+* gated Markdown-KV compaction formatter (serialization-aware output) ([#859](https://github.com/chopratejas/headroom/issues/859)) ([06b2625](https://github.com/chopratejas/headroom/commit/06b2625b17b0b032f688d321c6aa30ae3f2b7d96))
+* **kompress:** warn on unrecognized HEADROOM_KOMPRESS_BACKEND + document backend selection ([#204](https://github.com/chopratejas/headroom/issues/204)) ([6367d0b](https://github.com/chopratejas/headroom/commit/6367d0b7228f53b29bbd20f55c1729476ba5ea68))
+* **memory:** add opt-in Apple-GPU (MPS) embedding runtime ([#766](https://github.com/chopratejas/headroom/issues/766)) ([c71592d](https://github.com/chopratejas/headroom/commit/c71592d4214adf1022e4c608518ae0c3ac4aa5e9))
+* net-cost cache mutation formula on CompressionPolicy ([#856](https://github.com/chopratejas/headroom/issues/856) P1) ([#857](https://github.com/chopratejas/headroom/issues/857)) ([d5f5802](https://github.com/chopratejas/headroom/commit/d5f58026e2a882bc508acfbddfc9d472100d6e16))
+* **plugins:** Hermes agent headroom_retrieve plugin ([#824](https://github.com/chopratejas/headroom/issues/824)) ([058bced](https://github.com/chopratejas/headroom/commit/058bcedab838f3b34ac8e38853e1924329efd820))
+* probe-based retention scoring of recorded compression events ([#862](https://github.com/chopratejas/headroom/issues/862)) ([c2106cb](https://github.com/chopratejas/headroom/commit/c2106cbdabb905e1980c6694000c220a5042171c))
+* **proxy:** add CLI opt-outs for CCR injection (compression-only mode) ([#823](https://github.com/chopratejas/headroom/issues/823)) ([693d9d2](https://github.com/chopratejas/headroom/commit/693d9d20e2b2d9bfce3a0c48314850ee77ff8af3))
+* **proxy:** attribute savings history rollups per provider ([#791](https://github.com/chopratejas/headroom/issues/791)) ([0b8b8d9](https://github.com/chopratejas/headroom/commit/0b8b8d92de3bd5e0301eadedacfb4b1d20a8de7f))
+* **proxy:** log compressed messages alongside original request ([#261](https://github.com/chopratejas/headroom/issues/261)) ([2269e40](https://github.com/chopratejas/headroom/commit/2269e40bde7e1b9fb0620bd2cec9e33a92834080))
+* **proxy:** per-project savings breakdown on the dashboard (claude, codex, aider, copilot, cursor) ([#803](https://github.com/chopratejas/headroom/issues/803)) ([914a60a](https://github.com/chopratejas/headroom/commit/914a60a2b07caad8488c1e19a5465726b95f83d3))
+* support Python 3.14+ via pyo3 abi3 stable ABI ([#516](https://github.com/chopratejas/headroom/issues/516)) ([19eac8e](https://github.com/chopratejas/headroom/commit/19eac8e00dc9e3911f3afe8e8e5dcc9e00346baa))
+* switch Kompress default to kompress-v2-base with weight-only int8 ONNX ([#799](https://github.com/chopratejas/headroom/issues/799)) ([74392b2](https://github.com/chopratejas/headroom/commit/74392b238e4f76fa061e673d1415fc7fa2830011))
+* **transforms:** attribute read_lifecycle + smart_crush tags ([#249](https://github.com/chopratejas/headroom/issues/249)) ([8f37426](https://github.com/chopratejas/headroom/commit/8f374263d3971c072b5c977375c873864fb05763))
+
+
+### Bug Fixes
+
+* **anthropic:** CCR exception must re-raise, not silently swallow ([#838](https://github.com/chopratejas/headroom/issues/838)) ([8db5efc](https://github.com/chopratejas/headroom/commit/8db5efc6f9f6de59e9d55cbcd63b75c37a81a26e))
+* **ccr:** key Rust search/diff/log markers with explicit_hash ([#852](https://github.com/chopratejas/headroom/issues/852)) ([bfcb07d](https://github.com/chopratejas/headroom/commit/bfcb07d78ea7eba539a65b11e100ec23b336d8d1))
+* **ccr:** make retrieval TTL configurable ([#715](https://github.com/chopratejas/headroom/issues/715)) ([2533f77](https://github.com/chopratejas/headroom/commit/2533f7703ee261dc35767b11e46b8eab6e0c454d))
+* **ccr:** skip CCR when model calls headroom_retrieve alongside user tools ([#839](https://github.com/chopratejas/headroom/issues/839)) ([30078f8](https://github.com/chopratejas/headroom/commit/30078f8465fb6bb78a5a9c394b75e60cd3c4eeec))
+* **ccr:** use shared compression store ([#875](https://github.com/chopratejas/headroom/issues/875)) ([249af6c](https://github.com/chopratejas/headroom/commit/249af6cc7b379678e60da3e98e552368632fd4f4))
+* **ci:** correct comments, timeouts, and pip reliability in native e2e workflows ([#878](https://github.com/chopratejas/headroom/issues/878)) ([b716c8c](https://github.com/chopratejas/headroom/commit/b716c8c2ee7ccc68dd1b9294760db1af866843f2))
+* **ci:** pin cosign-installer to v3 (v4 does not exist) ([#774](https://github.com/chopratejas/headroom/issues/774)) ([199d693](https://github.com/chopratejas/headroom/commit/199d693f98ecd72d80181c8fee8422b6b64651a2))
+* **codex:** respect CODEX_HOME for wrap config ([#731](https://github.com/chopratejas/headroom/issues/731)) ([96abf38](https://github.com/chopratejas/headroom/commit/96abf38b0972adf5e5c66f9a49aa9d9f951b1aa0))
+* **content_router:** guard against empty compression output causing Anthropic 400 ([#771](https://github.com/chopratejas/headroom/issues/771)) ([2f9ff07](https://github.com/chopratejas/headroom/commit/2f9ff07e6caef0fe32d00ece6266a476eecff5a3))
+* **copilot:** use responses API for subscription reasoning models ([#647](https://github.com/chopratejas/headroom/issues/647)) ([84ac332](https://github.com/chopratejas/headroom/commit/84ac332d14dafacedc2f0b46f5ac6b3977b098d0))
+* correct preserved-entry index mapping in Gemini content round-trip ([#836](https://github.com/chopratejas/headroom/issues/836)) ([0ffe2b6](https://github.com/chopratejas/headroom/commit/0ffe2b6ea49e5c8d3bff5fe2c90873c71a95c457))
+* **dashboard:** stable 'Proxy $ Saved' hero tile under --workers &gt; 1 ([#481](https://github.com/chopratejas/headroom/issues/481)) ([fd73b88](https://github.com/chopratejas/headroom/commit/fd73b88368b22beeb586b8e1aa37fcd2afb12532))
+* don't inject empty tools:[] when client omitted the tools field ([#772](https://github.com/chopratejas/headroom/issues/772)) ([574bbae](https://github.com/chopratejas/headroom/commit/574bbae2cbe2f20b3f0e12b421c25ac256712f0a))
+* harden Copilot API auth token handling ([#557](https://github.com/chopratejas/headroom/issues/557)) ([6b0c09f](https://github.com/chopratejas/headroom/commit/6b0c09ffd5f2ce18c4d2cfa6233feaf37d487ead))
+* **health:** readyz verifies upstream connectivity, not just process liveness ([#744](https://github.com/chopratejas/headroom/issues/744)) ([5dfb446](https://github.com/chopratejas/headroom/commit/5dfb446da1fb65002e0dea18a90210a2a026f0b3))
+* **init:** guard persistent task startup ([#616](https://github.com/chopratejas/headroom/issues/616)) ([9252d85](https://github.com/chopratejas/headroom/commit/9252d852c5a4c716eb5438b8f438d50e59a55fef))
+* **init:** normalize Windows hook paths to forward slashes ([#788](https://github.com/chopratejas/headroom/issues/788)) ([6ea6e31](https://github.com/chopratejas/headroom/commit/6ea6e31f09845b2ad5c8bae73bcf353f3b629188))
+* **init:** suppress hook recovery output ([#760](https://github.com/chopratejas/headroom/issues/760)) ([b439599](https://github.com/chopratejas/headroom/commit/b4395993aecbb65b85a5b2479dfdb35ea243bf54))
+* **learn:** claude-cli streams output with idle timeout ([#373](https://github.com/chopratejas/headroom/issues/373)) ([9bff575](https://github.com/chopratejas/headroom/commit/9bff5752bbd769902f249cdfde42bc53539afd02))
+* make headroom wrap readiness probe timeout configurable for slow ML imports ([#581](https://github.com/chopratejas/headroom/issues/581)) ([163677b](https://github.com/chopratejas/headroom/commit/163677b405d7ca8a54d6d7c798bf6ead90da7880))
+* **parser:** detect waste signals in Anthropic tool_result content blocks ([#815](https://github.com/chopratejas/headroom/issues/815)) ([929698a](https://github.com/chopratejas/headroom/commit/929698af1030e5926f3766d7d6ac292d6e38437b))
+* **proxy:** F4 — trust X-Forwarded-* only behind allow-listed gateway ([d10bd5f](https://github.com/chopratejas/headroom/commit/d10bd5f59c5a36e14f6c5f0480b821532521b753))
+* **proxy:** lazy-import server to avoid fastapi crash ([#442](https://github.com/chopratejas/headroom/issues/442)) ([93c6937](https://github.com/chopratejas/headroom/commit/93c69372e614f2b04873bed75602a88d2256a7fc))
+* **proxy:** make CCR multi-worker warning conditional on backend ([#770](https://github.com/chopratejas/headroom/issues/770)) ([d76a729](https://github.com/chopratejas/headroom/commit/d76a7296df121365d74c415b8c702a3ad80abd30))
+* **proxy:** make Kompress eager preload cache-only so a cold cache can't block startup ([#783](https://github.com/chopratejas/headroom/issues/783)) ([841663d](https://github.com/chopratejas/headroom/commit/841663da16971b1e0d8e204fdf18e4bafedaf9e0))
+* **proxy:** restore Codex usage headers on WS and streaming SSE transports ([#577](https://github.com/chopratejas/headroom/issues/577)) ([#794](https://github.com/chopratejas/headroom/issues/794)) ([0ce68de](https://github.com/chopratejas/headroom/commit/0ce68dedd770d5411d16abe30e5ea9dd0b7d8eee))
+* schema compaction must not drop property names that match DROP_KEYS ([#785](https://github.com/chopratejas/headroom/issues/785)) ([ae2122f](https://github.com/chopratejas/headroom/commit/ae2122fda8ff0efc03d609d27270453fea3a8718))
+* **security:** block DNS-rebinding on /debug/* and /stats/reset via Host-header allowlist ([#605](https://github.com/chopratejas/headroom/issues/605)) ([b4b5025](https://github.com/chopratejas/headroom/commit/b4b50253f16d0a30f1d17a959753137e997efbac))
+* **ssl:** upstream httpx client inherits SSL_CERT_FILE, REQUESTS_CA_BUNDLE, NODE_EXTRA_CA_CERTS ([#745](https://github.com/chopratejas/headroom/issues/745)) ([e50fbb3](https://github.com/chopratejas/headroom/commit/e50fbb3e0d61d561456d7b0ff9e0a8ee106a2f02))
+* suppress LiteLLM provider banner before import ([#874](https://github.com/chopratejas/headroom/issues/874)) ([f9384ef](https://github.com/chopratejas/headroom/commit/f9384ef4b780eaa1d8ca6dcc314ad430b87f524a))
+* **transforms:** use thread-local tree-sitter parsers to prevent pyo3 Unsendable panic ([#604](https://github.com/chopratejas/headroom/issues/604)) ([2ad300a](https://github.com/chopratejas/headroom/commit/2ad300aff801838efe5649b00a0396523a401a2a))
+* **wrap:** track shared proxy clients with markers ([#877](https://github.com/chopratejas/headroom/issues/877)) ([05bd56b](https://github.com/chopratejas/headroom/commit/05bd56bcb6b103fab5522da2b14295cf7bd8dbc1))
+
+
+### Code Refactoring
+
+* extract litellm model resolution to shared utility ([ec7d006](https://github.com/chopratejas/headroom/commit/ec7d0065cc5055e504e79cf24f3951e404fe4cb9))
+
 ## [0.24.0](https://github.com/chopratejas/headroom/compare/v0.23.0...v0.24.0) (2026-06-08)
 
 
@@ -35,7 +184,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+* **kompress:** warn when `HEADROOM_KOMPRESS_BACKEND` is set to an unrecognized
+  value instead of silently falling back to `auto`, and document the backend
+  selection env var (`auto` / `onnx` / `onnx_cpu` / `onnx_coreml` / `pytorch` /
+  `pytorch_mps` plus shorthand aliases) in `wiki/configuration.md` (issue
+  [#202](https://github.com/chopratejas/headroom/issues/202), PR
+  [#204](https://github.com/chopratejas/headroom/pull/204)).
 * **proxy:** per-provider attribution in the savings history rollups. Each `/stats-history` bucket (hourly/daily/weekly/monthly) now carries a `by_provider` map breaking down `tokens_saved`, `compression_savings_usd_delta`, `total_input_tokens_delta`, and `total_input_cost_usd_delta` per provider, so consumers can show how savings and spend are distributed across providers within a time period. Providers only appear in a bucket where they moved a counter; legacy history checkpoints with no provider collapse into `"unknown"`. Affected files: `headroom/proxy/savings_tracker.py`, `headroom/proxy/prometheus_metrics.py`.
+* **cli:** startup banner now includes a `Performance Tuning` section that surfaces active `HEADROOM_COMPRESSION_STABLE_AFTER_TURN`, `HEADROOM_STALE_READ_COMPRESS_AFTER_TURNS`, and embedding-server socket values when set; shows a hint to set them when all defaults are in use.
 
 ### Changed
 
@@ -55,9 +211,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
-
+* **codex:** respect `CODEX_HOME` when `headroom wrap codex` writes provider, MCP, memory, backup, and global `AGENTS.md` config, and warn when `unwrap codex` may be looking at the default Codex home because `CODEX_HOME` is unset.
+* **proxy:** multi-worker CCR warning is now conditional on backend — when `HEADROOM_CCR_BACKEND` is unset (default `InMemoryBackend`, per-process), the startup warning includes CCR retrieval failures and suggests `HEADROOM_CCR_BACKEND=sqlite`; when a cross-worker backend is already configured, the warning covers only the remaining per-worker stores (compression cache, prefix tracker, TOIN, CostTracker). Updated `RUST_DEV.md` to accurately document Python `CompressionStore` as per-process by default.
 * **deps:** move `gunicorn` to `[proxy-prod]` extra with `sys_platform != 'win32'` guard; removed from `[proxy]` to avoid forcing a Unix-only package on dev, CI, and Windows users ([#537](https://github.com/chopratejas/headroom/pull/537))
-* **startup:** suppress proxy startup log noise — litellm banner, trafilatura parse errors, HuggingFace Hub unauthenticated warnings, tiktoken fallback warning, and httpx INFO lines from sentence_transformers HEAD checks. Affected files: `headroom/providers/litellm.py`, `headroom/transforms/html_extractor.py`, `headroom/memory/adapters/embedders.py`, `headroom/providers/anthropic.py`, `headroom/providers/registry.py`, `headroom/image/onnx_router.py`, `headroom/transforms/kompress_compressor.py`.
+* **startup:** suppress proxy startup log noise -- litellm banner, trafilatura parse errors, HuggingFace Hub unauthenticated warnings, tiktoken fallback warning, and httpx INFO lines from sentence_transformers HEAD checks. Affected files: `headroom/providers/litellm.py`, `headroom/transforms/html_extractor.py`, `headroom/memory/adapters/embedders.py`, `headroom/providers/anthropic.py`, `headroom/providers/registry.py`, `headroom/image/onnx_router.py`, `headroom/transforms/kompress_compressor.py`.
 
 ## [0.23.0](https://github.com/chopratejas/headroom/compare/v0.22.4...v0.23.0) (2026-06-04)
 
@@ -157,6 +314,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resolution, made PyPI publish failures block GitHub Releases unless
   `PYPI_SKIP=true`, and added an sdist `LICENSE` invariant.
 
+- **`headroom learn` with claude-cli no longer fails silently on slow
+  networks or large digests.** The CLI backend timeout was a hard 120s
+  wall-clock cap with no liveness signal: a successful long analysis and
+  a hung connection looked identical, and exit 0 with "no recommendations"
+  was the only user-visible signal. Two changes:
+  (1) **Streaming + idle timeout for claude-cli**: the command now uses
+  `--output-format stream-json --verbose` and a watchdog thread reads
+  events as they arrive. The process is killed only after
+  `HEADROOM_LEARN_CLI_IDLE_TIMEOUT_SECS` (default 60s) of zero output, or
+  after `HEADROOM_LEARN_CLI_TIMEOUT_SECS` (default 300s, was 120s) total.
+  Long-but-active analyses run to completion; genuine hangs are caught
+  fast. The final `type:"result"` event carries the assistant response.
+  Drains stdout/stderr via reader threads so the watchdog works on
+  Windows too. (2) **Env-var overrides for all CLI backends**:
+  `HEADROOM_LEARN_CLI_TIMEOUT_SECS` is honored by gemini-cli and
+  codex-cli as the wall-clock timeout; idle override applies only to the
+  streaming claude-cli path.
 - **`Learned: error recovery` section in MEMORY.md no longer bloats with
   stale, one-shot, or contradictory entries.** The matchers paired up
   unrelated tool calls (e.g. `state.rs` and `lib.rs` in the same dir

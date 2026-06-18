@@ -92,6 +92,11 @@ class SearchCompressorConfig:
     boost_errors: bool = True
     enable_ccr: bool = True
     min_matches_for_ccr: int = 10
+    # Group output by file (`rg --heading` style): path emitted once per
+    # file, then `line:content` rows. Removes per-match path repetition.
+    # Default False (classic `file:line:content`); the proxy enables it
+    # in token mode.
+    group_by_file: bool = False
 
 
 @dataclass
@@ -161,6 +166,7 @@ class SearchCompressor:
                 enable_ccr=cfg.enable_ccr,
                 min_matches_for_ccr=cfg.min_matches_for_ccr,
                 min_compression_ratio_for_ccr=0.8,
+                group_by_file=getattr(cfg, "group_by_file", False),
             )
         )
 
@@ -340,10 +346,10 @@ class SearchCompressor:
         `CompressionStore`. Failures are surfaced via logging instead of
         being silently swallowed (see no-silent-fallbacks rule).
 
-        Note: the Rust path computes the hash and the Python store
-        accepts the original directly. We do not rely on the Python
-        store's hash matching Rust's — the Rust hash IS the canonical
-        one (MD5(original)[:24]).
+        Note: the Rust path computes the hash and embeds it in the
+        emitted marker text — the Rust hash IS the canonical one
+        (MD5(original)[:24]). The store must be keyed by that exact
+        hash or the marker dangles.
         """
         try:
             from ..cache.compression_store import get_compression_store
@@ -353,11 +359,11 @@ class SearchCompressor:
 
         try:
             store: Any = get_compression_store()
-            # The Python `CompressionStore.store` API takes original,
-            # compressed, and an optional original_item_count. The
-            # cache_key it returns will be the same as Rust's because
-            # both use MD5(original)[:24].
-            store.store(original, compressed)
+            # The Rust-emitted marker embeds MD5(original)[:24], but
+            # store() has defaulted to SHA-256(original)[:24] since
+            # PR #395. Pass the marker's key explicitly so retrieving
+            # the marker hash actually finds the entry (issue #816).
+            store.store(original, compressed, explicit_hash=cache_key)
         except Exception as e:
             logger.warning(
                 "CCR store write failed; cache_key %s remains in-marker only: %s", cache_key, e

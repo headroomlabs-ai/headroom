@@ -11,6 +11,7 @@ Anthropic), not the full input price.  This prevents overstating dollar savings.
 from __future__ import annotations
 
 import logging
+import os
 import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
@@ -45,6 +46,11 @@ _PIPELINE_RE = re.compile(
 _TOIN_RE = re.compile(
     r"TOIN: (?P<patterns>\d+) patterns, (?P<compressions>\d+) compressions, "
     r"(?P<retrievals>\d+) retrievals, (?P<rate>[\d.]+)% retrieval rate"
+)
+
+# Matches structured stage timing logs: [hr_...] STAGE_TIMINGS {"event": "stage_timings", ...}
+_STAGE_TIMINGS_RE = re.compile(
+    r"^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d+) .* \[(?P<rid>[^\]]+)\] STAGE_TIMINGS (?P<payload>.+)$"
 )
 
 
@@ -111,7 +117,14 @@ def _parse_kv(kv_str: str) -> dict[str, str]:
     # Handle transforms= specially since its value contains spaces
     if "transforms=" in kv_str:
         before, transforms_val = kv_str.split("transforms=", 1)
-        result["transforms"] = transforms_val.strip()
+        transform_parts: list[str] = []
+        for part in transforms_val.split():
+            if "=" in part:
+                k, v = part.split("=", 1)
+                result[k] = v
+            else:
+                transform_parts.append(part)
+        result["transforms"] = " ".join(transform_parts).strip()
         kv_str = before
     for part in kv_str.split():
         if "=" in part:
@@ -127,6 +140,7 @@ class PerfRecord:
     timestamp: str
     request_id: str
     model: str = ""
+    client: str = ""
     num_messages: int = 0
     tokens_before: int = 0
     tokens_after: int = 0
@@ -136,6 +150,10 @@ class PerfRecord:
     cache_hit_pct: int = 0
     optimization_ms: float = 0
     transforms: list[str] = field(default_factory=list)
+    total_ms: float = 0.0
+    tokens_out: int = 0
+    ttfb_ms: float = 0.0
+    stages: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -225,8 +243,10 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
     """
     report = PerfReport()
     report.requested_hours = last_n_hours
+    stages_by_rid: dict[str, dict[str, float]] = {}
 
-    if not LOG_DIR.exists():
+    log_dir = _paths.log_dir() if os.environ.get("HEADROOM_WORKSPACE_DIR") else LOG_DIR
+    if not log_dir.exists():
         return report
 
     cutoff = datetime.now() - timedelta(hours=last_n_hours) if last_n_hours > 0 else None
@@ -250,7 +270,7 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
             report.newest_kept_ts = ts_str
 
     # Collect log files: proxy.log, proxy.log.1, proxy.log.2, ...
-    log_files = sorted(LOG_DIR.glob("proxy.log*"), key=lambda p: p.stat().st_mtime)
+    log_files = sorted(log_dir.glob("proxy.log*"), key=lambda p: p.stat().st_mtime)
 
     for log_file in log_files:
         report.log_files_read += 1
@@ -259,6 +279,27 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
                 for line in f:
                     report.total_lines_parsed += 1
                     line = line.rstrip()
+
+                    # STAGE_TIMINGS lines
+                    m_stage = _STAGE_TIMINGS_RE.match(line)
+                    if m_stage:
+                        ts = m_stage.group("ts")
+                        if not _within_window(ts):
+                            report.records_filtered_out += 1
+                            continue
+                        _track_window(ts)
+                        rid = m_stage.group("rid")
+                        try:
+                            import json
+
+                            payload = json.loads(m_stage.group("payload"))
+                            stages = payload.get("stages", {})
+                            stages_by_rid[rid] = {
+                                k: float(v) for k, v in stages.items() if v is not None
+                            }
+                        except Exception:
+                            pass
+                        continue
 
                     # PERF lines (richest data)
                     m = _PERF_RE.match(line)
@@ -290,6 +331,7 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
                                 timestamp=ts,
                                 request_id=m.group("rid"),
                                 model=kv.get("model", ""),
+                                client=kv.get("client", ""),
                                 num_messages=int(kv.get("msgs", 0)),
                                 tokens_before=int(kv.get("tok_before", 0)),
                                 tokens_after=int(kv.get("tok_after", 0)),
@@ -299,6 +341,10 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
                                 cache_hit_pct=int(kv.get("cache_hit_pct", 0)),
                                 optimization_ms=float(kv.get("opt_ms", 0)),
                                 transforms=transforms,
+                                total_ms=float(kv.get("total_ms", 0)),
+                                tokens_out=int(kv.get("tok_out", 0)),
+                                ttfb_ms=float(kv.get("ttfb_ms", 0)),
+                                stages=stages_by_rid.get(m.group("rid"), {}),
                             )
                         )
                         continue
@@ -501,6 +547,37 @@ def format_report(report: PerfReport) -> str:
                 lines.append(f"  >500ms:   {len(slow)} requests")
             lines.append("")
 
+        # Throughput
+        tp = calculate_throughput(report)
+        rolling = tp["rolling"]
+        current = tp["current"]
+        if rolling["input_wall_clock"] > 0 or rolling["input_active_p50"] > 0:
+            lines.append("Throughput")
+            lines.append("-" * 40)
+            lines.append(
+                f"  Input (wall-clock):   {rolling['input_wall_clock']:.1f} tok/s"
+                f" (current: {current['input_wall_clock']:.1f} tok/s)"
+            )
+            lines.append(
+                f"  Input (active p50/95): {rolling['input_active_p50']:.1f} / {rolling['input_active_p95']:.1f} tok/s"
+                f" (current: {current['input_active_p50']:.1f} / {current['input_active_p95']:.1f} tok/s)"
+            )
+            if rolling["compression_p50"] > 0:
+                lines.append(
+                    f"  Compression (p50/95):  {rolling['compression_p50']:.1f} / {rolling['compression_p95']:.1f} tok/s"
+                    f" (current: {current['compression_p50']:.1f} / {current['compression_p95']:.1f} tok/s)"
+                )
+            lines.append(
+                f"  Forward (p50/95):      {rolling['forward_p50']:.1f} / {rolling['forward_p95']:.1f} tok/s"
+                f" (current: {current['forward_p50']:.1f} / {current['forward_p95']:.1f} tok/s)"
+            )
+            if rolling["generation_p50"] > 0:
+                lines.append(
+                    f"  Generation (p50/95):   {rolling['generation_p50']:.1f} / {rolling['generation_p95']:.1f} tok/s"
+                    f" (current: {current['generation_p50']:.1f} / {current['generation_p95']:.1f} tok/s)"
+                )
+            lines.append("")
+
         # Conversation size distribution
         msg_counts = [r.num_messages for r in records if r.num_messages > 0]
         if msg_counts:
@@ -589,7 +666,7 @@ def format_report(report: PerfReport) -> str:
     lines.append(
         f"Log files: {report.log_files_read} | Lines parsed: {report.total_lines_parsed:,}"
     )
-    lines.append(f"Log dir: {LOG_DIR}")
+    lines.append(f"Log dir: {_paths.log_dir()}")
 
     return "\n".join(lines)
 
@@ -611,6 +688,7 @@ PERF_RECORD_FIELDS = [
     "timestamp",
     "request_id",
     "model",
+    "client",
     "num_messages",
     "tokens_before",
     "tokens_after",
@@ -620,12 +698,134 @@ PERF_RECORD_FIELDS = [
     "cache_hit_pct",
     "optimization_ms",
     "transforms",
+    "total_ms",
+    "tokens_out",
+    "ttfb_ms",
+    "stages",
 ]
 
 
 def _pct(saved: int, before: int) -> float:
     """Reduction percentage, rounded to 1dp, guarding divide-by-zero."""
     return round(saved / before * 100, 1) if before > 0 else 0.0
+
+
+def _percentile(data: list[float], pct: float) -> float:
+    if not data:
+        return 0.0
+    sorted_data = sorted(data)
+    index = (len(sorted_data) - 1) * pct
+    lower = int(index)
+    upper = lower + 1
+    weight = index - lower
+    if upper < len(sorted_data):
+        return sorted_data[lower] * (1.0 - weight) + sorted_data[upper] * weight
+    return sorted_data[lower]
+
+
+def calculate_throughput(report: PerfReport) -> dict:
+    records = report.perf_records
+    parsed_records = []
+    for r in records:
+        ts = _parse_log_ts(r.timestamp)
+        if ts:
+            parsed_records.append((r, ts))
+
+    if not parsed_records:
+        empty = {
+            "input_wall_clock": 0.0,
+            "input_active_p50": 0.0,
+            "input_active_p95": 0.0,
+            "compression_p50": 0.0,
+            "compression_p95": 0.0,
+            "forward_p50": 0.0,
+            "forward_p95": 0.0,
+            "generation_p50": 0.0,
+            "generation_p95": 0.0,
+        }
+        return {"rolling": empty.copy(), "current": empty.copy()}
+
+    # Calculate window from PERF timestamps to prevent dilution from other log lines
+    perf_timestamps = [pair[1] for pair in parsed_records]
+    oldest = min(perf_timestamps)
+    newest = max(perf_timestamps)
+    window_seconds = max(1.0, (newest - oldest).total_seconds())
+
+    rolling = _calculate_throughput_stats(records, window_seconds)
+
+    # 5-minute window calculations
+    current_records = []
+    current_window_seconds = 0.0
+    cutoff_5m = newest - timedelta(minutes=5)
+    current_pairs = [pair for pair in parsed_records if pair[1] >= cutoff_5m]
+    if current_pairs:
+        current_records = [pair[0] for pair in current_pairs]
+        cur_oldest = min(pair[1] for pair in current_pairs)
+        current_window_seconds = max(1.0, (newest - cur_oldest).total_seconds())
+
+    current = _calculate_throughput_stats(current_records, current_window_seconds)
+
+    return {"rolling": rolling, "current": current}
+
+
+def _calculate_throughput_stats(records: list[PerfRecord], window_seconds: float) -> dict:
+    if not records:
+        return {
+            "input_wall_clock": 0.0,
+            "input_active_p50": 0.0,
+            "input_active_p95": 0.0,
+            "compression_p50": 0.0,
+            "compression_p95": 0.0,
+            "forward_p50": 0.0,
+            "forward_p95": 0.0,
+            "generation_p50": 0.0,
+            "generation_p95": 0.0,
+        }
+
+    # 1. Input Wall-Clock
+    total_tokens_before = sum(r.tokens_before for r in records)
+    input_wall = total_tokens_before / window_seconds if window_seconds > 0 else 0.0
+
+    # 2. Input Active
+    input_active_rates = []
+    for r in records:
+        if r.total_ms > 0:
+            input_active_rates.append(r.tokens_before / (r.total_ms / 1000.0))
+
+    # 3. Compression
+    compression_rates = []
+    for r in records:
+        duration_ms = r.stages.get("compression_first_stage") or r.stages.get("compression")
+        if duration_ms is not None and duration_ms > 0:
+            compression_rates.append(r.tokens_before / (duration_ms / 1000.0))
+
+    # 4. Effective Forward
+    forward_rates = []
+    for r in records:
+        if r.total_ms > 0:
+            forward_rates.append(r.tokens_after / (r.total_ms / 1000.0))
+
+    # 5. Output / Generation (Approximate generation throughput)
+    generation_rates = []
+    for r in records:
+        if r.tokens_out > 0:
+            duration_ms = r.total_ms
+            if r.ttfb_ms > 0 and r.total_ms > r.ttfb_ms:
+                duration_ms = r.total_ms - r.ttfb_ms
+            if duration_ms > 0:
+                generation_rates.append(r.tokens_out / (duration_ms / 1000.0))
+
+    return {
+        "input_wall_clock": round(input_wall, 2),
+        "input_active_p50": round(_percentile(input_active_rates, 0.5), 2),
+        "input_active_p95": round(_percentile(input_active_rates, 0.95), 2),
+        "compression_p50": round(_percentile(compression_rates, 0.5), 2),
+        "compression_p95": round(_percentile(compression_rates, 0.95), 2),
+        "forward_p50": round(_percentile(forward_rates, 0.5), 2),
+        "forward_p95": round(_percentile(forward_rates, 0.95), 2),
+        "generation_p50": round(_percentile(generation_rates, 0.5), 2),
+        "generation_p95": round(_percentile(generation_rates, 0.95), 2),
+    }
 
 
 def build_perf_summary(report: PerfReport) -> dict:
@@ -702,6 +902,7 @@ def build_perf_summary(report: PerfReport) -> dict:
         "cache_hit_pct": cache_hit_pct,
         "by_model": by_model,
         "by_transform": by_transform,
+        "throughput": calculate_throughput(report),
         "log_files_read": report.log_files_read,
         "total_lines_parsed": report.total_lines_parsed,
     }

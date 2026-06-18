@@ -145,6 +145,33 @@ def content_has_error_indicators(text: str) -> bool:
     return bool(_rust_content_has_error_indicators(text))
 
 
+def content_has_strong_error_indicators(text: str) -> bool:
+    """Stricter triage for compression-protection gates.
+
+    :func:`content_has_error_indicators` substring-matches a single
+    keyword, which false-positives on benign outputs that merely
+    mention errors — grep hits, ``"errors": []`` JSON fields,
+    ``error_handler.py`` filenames, ``except Exception`` in file
+    reads. Protection gates exempt content from compression entirely,
+    so a lax match there silently costs savings on the hot path.
+
+    Require at least two DISTINCT indicator keywords: genuine failure
+    output nearly always pairs the failure kind with a second
+    indicator (``Traceback`` + ``ValueError``, ``fatal`` +
+    ``crash``), while passing mentions rarely do. Misses here are
+    safe — downstream compressors (LogCompressor) still preserve
+    error lines.
+    """
+    lowered = text.lower()
+    hits = 0
+    for keyword in ERROR_INDICATOR_KEYWORDS:
+        if keyword in lowered:
+            hits += 1
+            if hits >= 2:
+                return True
+    return False
+
+
 __all__ = [
     "ERROR_KEYWORDS",
     "IMPORTANCE_KEYWORDS",
@@ -158,5 +185,6 @@ __all__ = [
     "PRIORITY_PATTERNS_DIFF",
     "PRIORITY_PATTERNS_TEXT",
     "content_has_error_indicators",
+    "content_has_strong_error_indicators",
     "score_line",
 ]

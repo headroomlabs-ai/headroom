@@ -9,8 +9,12 @@ Covers the fixes in:
 
 from __future__ import annotations
 
+import builtins
+import importlib
 import logging
+import sys
 import warnings
+from types import ModuleType
 
 
 class TestAnthropicWarnParameter:
@@ -109,6 +113,40 @@ class TestEmbedderLogLevels:
 
 class TestLiteLLMLogSuppression:
     """litellm startup banner suppression must be applied at import time."""
+
+    def test_litellm_suppress_env_is_set_before_import(self, monkeypatch):
+        """The env flag must exist before litellm itself is imported."""
+        import os
+
+        monkeypatch.delenv("LITELLM_SUPPRESS_DEBUG_INFO", raising=False)
+        sys.modules.pop("headroom.providers.litellm", None)
+        sys.modules.pop("litellm", None)
+
+        original_import = builtins.__import__
+        fake_litellm = ModuleType("litellm")
+        fake_litellm.suppress_debug_info = False
+        fake_litellm.set_verbose = True
+        fake_litellm.get_model_info = lambda _model: {}
+        fake_litellm.model_cost = {}
+        fake_litellm.token_counter = lambda **_kwargs: 0
+        observed_env: list[str | None] = []
+
+        def import_spy(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "litellm":
+                observed_env.append(os.environ.get("LITELLM_SUPPRESS_DEBUG_INFO"))
+                sys.modules["litellm"] = fake_litellm
+                return fake_litellm
+            return original_import(name, globals, locals, fromlist, level)
+
+        monkeypatch.setattr(builtins, "__import__", import_spy)
+        try:
+            importlib.import_module("headroom.providers.litellm")
+        finally:
+            sys.modules.pop("headroom.providers.litellm", None)
+            sys.modules.pop("litellm", None)
+
+        assert observed_env
+        assert all(value == "True" for value in observed_env)
 
     def test_litellm_suppress_debug_info_is_set(self):
         """litellm.suppress_debug_info must be True after importing the litellm provider."""

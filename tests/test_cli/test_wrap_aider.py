@@ -4,11 +4,17 @@ from __future__ import annotations
 
 from pathlib import Path
 from unittest.mock import patch
+from urllib.parse import quote
 
 import pytest
 from click.testing import CliRunner
 
 from headroom.cli.main import main
+
+
+def _expected_project_prefix() -> str:
+    """The /p/<name> prefix the wrap now embeds (launch-directory basename)."""
+    return f"/p/{quote(Path.cwd().name, safe='')}"
 
 
 @pytest.fixture
@@ -32,8 +38,8 @@ def test_wrap_aider_sets_provider_envs(
     assert result.exit_code == 0, result.output
     env = captured["env"]
     assert isinstance(env, dict)
-    assert env["OPENAI_API_BASE"] == "http://127.0.0.1:8787/v1"
-    assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:8787"
+    assert env["OPENAI_API_BASE"] == f"http://127.0.0.1:8787{_expected_project_prefix()}/v1"
+    assert env["ANTHROPIC_BASE_URL"] == f"http://127.0.0.1:8787{_expected_project_prefix()}"
     assert captured["tool_label"] == "AIDER"
     assert captured["agent_type"] == "aider"
     assert captured["args"] == ("--model", "gpt-4o")

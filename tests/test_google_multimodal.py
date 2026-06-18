@@ -627,3 +627,80 @@ class TestParametrizedPreservation:
         """Parametrized test for preserved indices."""
         _, preserved_indices = proxy._gemini_contents_to_messages(contents)
         assert preserved_indices == expected_indices
+
+
+# =============================================================================
+# Tests for _rebuild_gemini_contents
+# =============================================================================
+
+
+class TestRebuildGeminiContents:
+    """_rebuild_gemini_contents must re-insert preserved entries at their original positions."""
+
+    def _round_trip(self, proxy, contents):
+        """Simulate the full compression round-trip for a given contents list.
+
+        Mimics what the handler does: convert → strip system msg → convert back → rebuild.
+        """
+        messages, preserved_indices = proxy._gemini_contents_to_messages(contents)
+        preserved_contents = {idx: contents[idx] for idx in preserved_indices}
+        optimized_contents, _ = proxy._messages_to_gemini_contents(messages)
+        return proxy._rebuild_gemini_contents(
+            contents, preserved_indices, preserved_contents, optimized_contents
+        )
+
+    def test_text_only_unchanged(self, proxy):
+        """Text-only round-trip should produce identical contents."""
+        contents = [TEXT_ONLY_CONTENT, MODEL_TEXT_CONTENT]
+        result = self._round_trip(proxy, contents)
+        assert len(result) == 2
+        assert result[0]["parts"][0]["text"] == "Hello, world!"
+        assert result[1]["parts"][0]["text"] == "Hello! How can I help you today?"
+
+    def test_function_call_sequence_preserved(self, proxy):
+        """functionCall and functionResponse entries must survive and appear at correct positions."""
+        contents = [
+            TEXT_ONLY_CONTENT,  # idx 0: text
+            FUNCTION_CALL_CONTENT,  # idx 1: functionCall only — no text → preserved
+            FUNCTION_RESPONSE_CONTENT,  # idx 2: functionResponse only — no text → preserved
+            MODEL_TEXT_CONTENT,  # idx 3: text
+        ]
+        result = self._round_trip(proxy, contents)
+
+        assert len(result) == 4, f"Expected 4 entries, got {len(result)}: {result}"
+        # Position 0: original text
+        assert result[0]["parts"][0].get("text") == "Hello, world!"
+        # Position 1: functionCall preserved exactly
+        assert "functionCall" in result[1]["parts"][0], "functionCall missing at position 1"
+        assert result[1]["parts"][0]["functionCall"]["name"] == "get_weather"
+        # Position 2: functionResponse preserved exactly
+        assert "functionResponse" in result[2]["parts"][0], "functionResponse missing at position 2"
+        # Position 3: text preserved
+        assert result[3]["parts"][0].get("text") == "Hello! How can I help you today?"
+
+    def test_function_call_at_start(self, proxy):
+        """Preserved entry at idx=0 must not overwrite idx=0 of optimized_contents."""
+        contents = [
+            FUNCTION_CALL_CONTENT,  # idx 0: no text → preserved
+            TEXT_ONLY_CONTENT,  # idx 1: text
+        ]
+        result = self._round_trip(proxy, contents)
+
+        assert len(result) == 2
+        assert "functionCall" in result[0]["parts"][0]
+        assert result[1]["parts"][0].get("text") == "Hello, world!"
+
+    def test_hybrid_entry_uses_original(self, proxy):
+        """Entry with both text and functionCall keeps the original (with functionCall intact)."""
+        contents = [
+            TEXT_ONLY_CONTENT,
+            FUNCTION_CALL_WITH_TEXT_CONTENT,  # idx 1: has both text and functionCall → preserved
+            MODEL_TEXT_CONTENT,
+        ]
+        result = self._round_trip(proxy, contents)
+
+        assert len(result) == 3
+        # Hybrid entry must come back as the original (functionCall retained)
+        hybrid = result[1]
+        part_keys = {k for p in hybrid["parts"] for k in p}
+        assert "functionCall" in part_keys, "functionCall lost from hybrid entry"

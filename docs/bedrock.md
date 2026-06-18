@@ -16,6 +16,40 @@ This document covers how to deploy the Bedrock-native surface, how compression p
 | Per-model + per-region Prometheus metrics | PR-D3 — exposed at `GET /metrics` |
 | OAuth compression policy gates (no auto cache_control, lossless-only) | Phase F PR-F2/F3 (gates the marker D3 wires) |
 
+## Running the proxy
+
+The native surface lives in the `headroom-proxy` binary, which ships in the published
+container images (every `proxy`-extra tag) at `/usr/local/bin/headroom-proxy`. You can run
+it directly from any published image — no separate build:
+
+```sh
+docker run --rm -p 8787:8787 \
+  -v "$HOME/.aws:/home/nonroot/.aws:ro" \
+  -e HEADROOM_PROXY_AWS_PROFILE=my-profile \
+  --entrypoint headroom-proxy \
+  ghcr.io/chopratejas/headroom:latest \
+  --listen 0.0.0.0:8787 \
+  --upstream https://bedrock-runtime.us-east-1.amazonaws.com \
+  --bedrock-region us-east-1
+```
+
+The published images default to the `nonroot` user (home `/home/nonroot`), so AWS
+credentials are mounted at `/home/nonroot/.aws` — that is where the SDK looks for
+`~/.aws`. For a root-based image (`RUNTIME_USER=root` build), mount to `/root/.aws`
+instead, or pass `--user root`.
+
+Then point the AWS SDK / CLI at the proxy:
+
+```sh
+AWS_ENDPOINT_URL_BEDROCK_RUNTIME=http://localhost:8787 \
+  aws bedrock-runtime invoke-model --model-id anthropic.claude-3-haiku-20240307-v1:0 ...
+```
+
+The proxy can also drop in front of the Python proxy (`--upstream http://127.0.0.1:8788`)
+so non-Bedrock traffic is forwarded while Bedrock requests are signed + compressed
+natively. The default `--enable-bedrock-native=true` mounts the Bedrock routes; everything
+else is passed through to `--upstream`.
+
 ## AWS credential configuration
 
 The proxy uses the [aws-config default credential chain](https://docs.aws.amazon.com/sdkref/latest/guide/standardized-credentials.html), resolved once at startup.
@@ -75,17 +109,19 @@ headroom-proxy \
 
 ## Supported model IDs
 
-The proxy classifies model IDs by **literal vendor prefix** — no regexes. Any model ID starting with `anthropic.` is treated as Anthropic-shape: the live-zone compression dispatcher runs over the body, the envelope is re-emitted with `anthropic_version` preserved as the first key, and the request is signed with SigV4.
+The proxy classifies model IDs by **literal vendor match** — no regexes. It strips a known cross-region inference-profile geo prefix (`eu.`, `us.`, `apac.`, `global.`) if present, then takes the leading dot-segment as the vendor. A model is treated as Anthropic-shape when that canonical vendor is `anthropic` — so both the bare `anthropic.…` foundation models and the geo-prefixed inference profiles (`eu.anthropic.…`, `us.anthropic.…`, `apac.anthropic.…`, `global.anthropic.…`) qualify. For those, the live-zone compression dispatcher runs over the body, the envelope is re-emitted with `anthropic_version` preserved as the first key, and the request is signed with SigV4.
 
 Examples that hit the Anthropic compression path:
 
-- `anthropic.claude-3-haiku-20240307-v1:0`
+- `anthropic.claude-3-haiku-20240307-v1:0` (foundation model)
 - `anthropic.claude-3-5-sonnet-20241022-v2:0`
-- `anthropic.claude-3-opus-20240229-v1:0`
+- `eu.anthropic.claude-haiku-4-5-20251001-v1:0` (EU cross-region inference profile)
+- `us.anthropic.claude-3-5-sonnet-20241022-v2:0` (US inference profile)
+- `global.anthropic.claude-haiku-4-5-20251001-v1:0`
 
-Other Bedrock vendors (`amazon.titan-...`, `meta.llama3-...`, `cohere.command-...`, `ai21.j2-...`, `stability.stable-diffusion-...`) are signed and forwarded **without compression** — the proxy does not yet understand their body shapes and would risk corrupting them. These model IDs log `event=bedrock_compression_skipped, reason=non_anthropic_vendor` per request. Full Anthropic envelopes only.
+Other Bedrock vendors (`amazon.titan-...`, `meta.llama3-...`, `cohere.command-...`, `ai21.j2-...`, `stability.stable-diffusion-...`, and their geo-prefixed inference profiles such as `eu.amazon.nova-...`) are signed and forwarded **without compression** — the proxy does not yet understand their body shapes and would risk corrupting them. These model IDs log `event=bedrock_compression_skipped, reason=non_anthropic_vendor` per request. Full Anthropic envelopes only.
 
-The contract: **any new model ID that AWS adds under the `anthropic.` prefix automatically picks up the full compression + signing pipeline.** No code change in the proxy is needed for new versions of Claude on Bedrock.
+The contract: **any new model ID that AWS adds under the `anthropic.` vendor (as a bare prefix or behind a cross-region geo prefix) automatically picks up the full compression + signing pipeline.** No code change in the proxy is needed for new versions of Claude on Bedrock.
 
 ## Compression behaviour
 

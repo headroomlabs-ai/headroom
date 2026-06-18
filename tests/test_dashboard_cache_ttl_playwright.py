@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -161,21 +162,24 @@ def _install_dashboard_routes(page: Page) -> None:
     dashboard_html = get_dashboard_html()
 
     def handler(route) -> None:  # type: ignore[no-untyped-def]
-        url = route.request.url
-        if url.endswith("/dashboard") or url == "http://headroom.local/":
+        # Match on the URL path only: the dashboard fetches /stats?cached=1,
+        # so suffix checks against the full URL miss it and the request
+        # escapes the harness to the real network.
+        path = urlsplit(route.request.url).path
+        if path in ("/dashboard", "/"):
             route.fulfill(status=200, content_type="text/html", body=dashboard_html)
             return
-        if url.endswith("/stats"):
-            route.fulfill(status=200, content_type="application/json", body=json.dumps(stats))
-            return
-        if "/stats-history" in url:
+        if "/stats-history" in path:
             route.fulfill(
                 status=200,
                 content_type="application/json",
                 body=json.dumps(history),
             )
             return
-        if url.endswith("/health"):
+        if path.endswith("/stats"):
+            route.fulfill(status=200, content_type="application/json", body=json.dumps(stats))
+            return
+        if path.endswith("/health"):
             route.fulfill(status=200, content_type="application/json", body=json.dumps(health))
             return
         route.continue_()
