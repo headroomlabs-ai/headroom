@@ -861,8 +861,7 @@ impl PySmartCrusher {
                 .unwrap_or_else(|e| panic!("doc_json must be JSON: {e}"));
             let mut dc = DocumentCompactor::new().with_config(CompactConfig {
                 classify: ClassifyConfig {
-                    emit_opaque_markers: self.inner.config.enable_ccr_marker
-                        && !self.inner.config.lossless_only,
+                    emit_opaque_markers: self.inner.config.opaque_markers_enabled(),
                     ..ClassifyConfig::default()
                 },
                 ..CompactConfig::default()

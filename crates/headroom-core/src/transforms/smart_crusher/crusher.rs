@@ -167,7 +167,7 @@ impl SmartCrusher {
             // the row-drop path), so `enable_ccr_marker=false` yields
             // marker-free, lossless output. Fixes #1091.
             classify: ClassifyConfig {
-                emit_opaque_markers: config.enable_ccr_marker && !config.lossless_only,
+                emit_opaque_markers: config.opaque_markers_enabled(),
                 ..ClassifyConfig::default()
             },
             ..CompactConfig::default()
@@ -203,8 +203,7 @@ impl SmartCrusher {
     /// fallback/error policy. `"csv-schema"` is equivalent to `new`.
     pub fn with_compaction_format(config: SmartCrusherConfig, format_name: &str) -> Option<Self> {
         let mut stage = CompactionStage::from_format_name(format_name)?;
-        stage.config.classify.emit_opaque_markers =
-            config.enable_ccr_marker && !config.lossless_only;
+        stage.config.classify.emit_opaque_markers = config.opaque_markers_enabled();
         Some(
             SmartCrusherBuilder::new(config)
                 .with_default_oss_setup()
@@ -607,7 +606,7 @@ impl SmartCrusher {
         // Gated by `enable_ccr_marker` so disabling markers stays lossless
         // here too (#1091).
         let cfg = ClassifyConfig {
-            emit_opaque_markers: self.config.enable_ccr_marker && !self.config.lossless_only,
+            emit_opaque_markers: self.config.opaque_markers_enabled(),
             ..ClassifyConfig::default()
         };
         if let CellClass::Opaque(kind) = classify_cell(&Value::String(s.to_string()), &cfg) {
@@ -721,6 +720,21 @@ impl SmartCrusher {
         // tool can serve dropped rows back to the LLM on demand.
         // **No data is lost** — "lossy" here means "compressed view
         // inline; full payload retrievable via CCR cache."
+        //
+        // Load-bearing invariant: a `lossless_only` crusher MUST NOT
+        // reach this point — the early return above guarantees it. The
+        // Python per-call override (`crush(..., lossless_only=True)`)
+        // relies on this: it swaps in a separate Rust crusher whose CCR
+        // store stays empty precisely because no lossless_only run ever
+        // executes the store write below. If that early return is ever
+        // removed, the alternate crusher's store would diverge and
+        // retrieval could resolve markers the prompt can't reference.
+        debug_assert!(
+            !self.config.lossless_only,
+            "lossy path reached under lossless_only — the early return \
+             above must keep this codepath (and its CCR store write) \
+             unreachable in strict lossless mode",
+        );
 
         let effective_max_items = adaptive_k;
         let analysis = self.analyzer.analyze_array(items);
@@ -1796,6 +1810,45 @@ mod tests {
         assert!(
             rendered.contains(&"x".repeat(300)),
             "blob should be inline under lossless_only: {rendered}"
+        );
+    }
+
+    #[test]
+    fn lossless_only_never_writes_to_ccr_store() {
+        // Load-bearing invariant for the Python per-call override: a
+        // lossless_only crusher MUST NOT write to the CCR store. Force
+        // the would-be-lossy row-drop path (ratio 0.99) and assert the
+        // store does not grow. This pins the early-return guard that the
+        // `debug_assert` in `crush_array` documents — if that return is
+        // ever removed, this test (and the alternate-crusher design)
+        // breaks loudly.
+        use crate::ccr::InMemoryCcrStore;
+        use crate::transforms::smart_crusher::SmartCrusherBuilder;
+        use std::sync::Arc;
+
+        let store: Arc<dyn CcrStore> = Arc::new(InMemoryCcrStore::new());
+        let cfg = SmartCrusherConfig {
+            lossless_min_savings_ratio: 0.99, // force the would-be-lossy path
+            lossless_only: true,
+            ..SmartCrusherConfig::default()
+        };
+        let c = SmartCrusherBuilder::new(cfg)
+            .with_ccr_store(Arc::clone(&store))
+            .build();
+        let items: Vec<Value> = (0..50).map(|_| json!({"status": "ok"})).collect();
+
+        let store_len_before = store.len();
+        let result = c.crush_array(&items, "", 1.0);
+
+        assert_eq!(
+            result.items, items,
+            "lossless_only must keep every row (no drop)"
+        );
+        assert!(result.ccr_hash.is_none(), "no hash under lossless_only");
+        assert_eq!(
+            store.len(),
+            store_len_before,
+            "ccr_store grew under lossless_only — invariant violated"
         );
     }
 }

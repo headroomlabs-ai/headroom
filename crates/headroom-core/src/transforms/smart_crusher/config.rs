@@ -110,6 +110,22 @@ pub struct SmartCrusherConfig {
     pub compaction_max_buckets: usize,
 }
 
+impl SmartCrusherConfig {
+    /// Whether opaque blobs should be offloaded to a `<<ccr:…>>` marker.
+    ///
+    /// Single source of truth for the opaque-marker gate. Markers are
+    /// emitted only when CCR markers are enabled AND strict lossless
+    /// mode is off — `lossless_only` forbids any offload because the
+    /// marker would break the marker-free / byte-recoverable guarantee.
+    /// Both compaction-stage construction (`new` /
+    /// `with_compaction_format`) and the top-level `process_string` path
+    /// derive `ClassifyConfig::emit_opaque_markers` from this method so
+    /// the three call sites can never drift apart.
+    pub fn opaque_markers_enabled(&self) -> bool {
+        self.enable_ccr_marker && !self.lossless_only
+    }
+}
+
 impl Default for SmartCrusherConfig {
     fn default() -> Self {
         // These defaults must match smart_crusher.py:934-957 byte-for-byte.
