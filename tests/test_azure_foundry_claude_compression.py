@@ -15,7 +15,6 @@ from pathlib import Path
 from headroom.cli import wrap as wrap_cli
 from headroom.providers.registry import resolve_api_overrides
 
-
 # --------------------------------------------------------------------------
 # Upstream URL derivation from ANTHROPIC_FOUNDRY_RESOURCE
 # --------------------------------------------------------------------------
