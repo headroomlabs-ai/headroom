@@ -466,6 +466,105 @@ impl TransformComparator for ContentDetectorComparator {
     }
 }
 
+/// Kompress comparator — runs the ML prose compressor against fixtures
+/// recorded from the Python reference.
+///
+/// Unlike the deterministic compressors, Kompress needs the
+/// `kompress-v2-base` ONNX model + ModernBERT tokenizer. The comparator
+/// resolves them **from the local HuggingFace cache only** (never the
+/// network) and lazily loads once. When the artifacts are absent — CI
+/// with no preloaded model — `run` returns `Err`, so the harness marks
+/// every kompress fixture `Skipped` rather than failing. Record + run
+/// locally (after `python scripts/record_fixtures.py`) for the real
+/// byte-parity assertion.
+///
+/// Fixtures are recorded with `enable_ccr=False` so the output is the
+/// pure joined kept-word stream (the Rust engine never emits the Python
+/// inline CCR marker; live-zone CCR uses the `<<ccr:>>` convention).
+pub struct KompressComparator {
+    model: std::sync::OnceLock<Option<headroom_core::transforms::kompress::Kompress>>,
+}
+
+impl Default for KompressComparator {
+    fn default() -> Self {
+        Self {
+            model: std::sync::OnceLock::new(),
+        }
+    }
+}
+
+impl KompressComparator {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn hf_cache_file(repo_dir: &str, rel: &[&str]) -> Option<PathBuf> {
+        let home = std::env::var("HOME").ok()?;
+        let snapshots = Path::new(&home)
+            .join(".cache/huggingface/hub")
+            .join(repo_dir)
+            .join("snapshots");
+        for snap in fs::read_dir(snapshots).ok()?.filter_map(|e| e.ok()) {
+            let mut cand = snap.path();
+            for part in rel {
+                cand = cand.join(part);
+            }
+            if cand.exists() {
+                return Some(cand);
+            }
+        }
+        None
+    }
+
+    fn model(&self) -> Option<&headroom_core::transforms::kompress::Kompress> {
+        self.model
+            .get_or_init(|| {
+                use headroom_core::transforms::kompress::{Kompress, KompressConfig};
+                let tok = Self::hf_cache_file(
+                    "models--answerdotai--ModernBERT-base",
+                    &["tokenizer.json"],
+                )?;
+                let onnx = Self::hf_cache_file(
+                    "models--chopratejas--kompress-v2-base",
+                    &["onnx", "kompress-int8-wo.onnx"],
+                )?;
+                Kompress::from_files(&tok, &onnx, KompressConfig::default()).ok()
+            })
+            .as_ref()
+    }
+}
+
+impl TransformComparator for KompressComparator {
+    fn name(&self) -> &str {
+        "kompress"
+    }
+
+    fn run(
+        &self,
+        input: &serde_json::Value,
+        _config: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let content = input
+            .as_str()
+            .context("kompress fixture input must be a JSON string")?;
+        let model = self
+            .model()
+            .context("kompress model/tokenizer not in local HF cache (fixture skipped)")?;
+        let r = model.compress(content);
+        Ok(serde_json::json!({
+            "compressed": r.compressed,
+            "original": r.original,
+            "original_tokens": r.original_tokens,
+            "compressed_tokens": r.compressed_tokens,
+            "compression_ratio": r.compression_ratio,
+            // Engine never emits CCR markers; dispatcher owns CCR. Python
+            // fixtures are recorded with enable_ccr=False so cache_key is null.
+            "cache_key": serde_json::Value::Null,
+            "model_used": r.model_used,
+        }))
+    }
+}
+
 /// Every built-in comparator, in a stable order.
 pub fn builtin_comparators() -> Vec<Box<dyn TransformComparator>> {
     vec![
@@ -476,6 +575,7 @@ pub fn builtin_comparators() -> Vec<Box<dyn TransformComparator>> {
         Box::new(CcrComparator),
         Box::new(SmartCrusherComparator),
         Box::new(ContentDetectorComparator),
+        Box::new(KompressComparator::new()),
     ]
 }
 

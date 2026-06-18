@@ -280,6 +280,20 @@ def record_all(root: Path | None = None) -> dict[str, str]:
     except Exception as e:
         statuses["content_detector"] = f"blocked:{e.__class__.__name__}:{e}"
 
+    # --- kompress ----------------------------------------------------------
+    # ML prose compressor. Requires onnxruntime + the kompress-v2-base model
+    # cached locally; "blocked" (soft) when either is missing so recording
+    # still succeeds for the deterministic transforms. The workload driver
+    # constructs it with enable_ccr=False so the recorded output is the pure
+    # joined kept-word stream (deterministic, store-independent).
+    try:
+        from headroom.transforms.kompress_compressor import KompressCompressor
+
+        _wrap_method(KompressCompressor, "compress", "kompress", root=root)
+        statuses["kompress"] = "patched"
+    except Exception as e:
+        statuses["kompress"] = f"blocked:{e.__class__.__name__}:{e}"
+
     return statuses
 
 
@@ -750,6 +764,7 @@ def run_default_workload(root: Path | None = None) -> dict[str, int]:
         "cache_aligner": 0,
         "ccr": 0,
         "content_detector": 0,
+        "kompress": 0,
     }
 
     # log_compressor
@@ -839,7 +854,95 @@ def run_default_workload(root: Path | None = None) -> dict[str, int]:
     except Exception as e:
         LOG.warning("content_detector workload failed: %s", e)
 
+    # kompress — ML prose compressor. enable_ccr=False so the recorded
+    # `compressed` is the deterministic joined kept-word stream. Soft-fails
+    # when onnxruntime / the model are unavailable (the Rust comparator
+    # likewise skips when the model is not cached).
+    try:
+        from headroom.transforms.kompress_compressor import (
+            KompressCompressor,
+            KompressConfig,
+        )
+
+        kc = KompressCompressor(KompressConfig(enable_ccr=False))
+        for s in _varied_kompress_inputs():
+            kc.compress(s)
+            counts["kompress"] += 1
+    except Exception as e:
+        LOG.warning("kompress workload failed: %s", e)
+
     return counts
+
+
+def _varied_kompress_inputs() -> list[str]:
+    """≥20 varied prose/log/mixed inputs for the Kompress ML compressor.
+
+    Spans short passthrough (<10 words), single-chunk prose, multi-chunk
+    bodies (>350 words), whitespace-irregular text, and log/error-like
+    content so the recorded fixtures cover chunking, max-score-per-word
+    reduction, the >0.5 threshold, and the passthrough short-circuit.
+    """
+    fox = "The quick brown fox jumps over the lazy dog. "
+    engineer = (
+        "Meanwhile the diligent engineer reviews the compression output "
+        "carefully to ensure the most salient tokens survive while redundant "
+        "filler is discarded without losing the essential meaning. "
+    )
+    log = (
+        "ERROR 2026-06-18 connection refused to upstream after 3 retries; "
+        "WARN falling back to cache; INFO request completed in 421ms status 200; "
+        "DEBUG tracing span closed for request abc123; "
+    )
+    inputs: list[str] = [
+        # short → passthrough
+        "only nine words here so it passes through cleanly",
+        "tiny input",
+        "just a handful of words below the threshold now",
+        # single-chunk prose of growing length
+        fox * 3,
+        fox * 6 + engineer,
+        engineer * 2,
+        fox * 4 + engineer * 2,
+        # log / error-like
+        log * 3,
+        log * 6,
+        "Traceback (most recent call last): File main.py line 42 in handler "
+        "raise ValueError invalid token; the request could not be processed "
+        "because the upstream returned an unexpected payload shape repeatedly. "
+        * 3,
+        # whitespace-irregular
+        "tokens   with\tirregular\n\nwhitespace   runs   and\ttabs   scattered "
+        + "throughout the body of the text repeatedly again and again here " * 5,
+        # mixed prose + paths + assignments
+        "Configure the service by setting config.timeout = 30 and config.retries = 5 "
+        "then restart /etc/service/daemon to apply; verify via /health endpoint "
+        "returning 200 within the configured start_period window of fifteen seconds. "
+        * 3,
+        # multi-chunk (>350 words)
+        (fox + engineer) * 20,
+        (log + engineer) * 18,
+        fox * 120,
+        # medium prose variations
+        engineer + fox * 5,
+        "Summarize the following document while preserving every named entity "
+        "and numeric figure so the reader can reconstruct the key facts later. "
+        * 4,
+        "The committee reviewed the quarterly report and concluded that revenue "
+        "grew twelve percent while operating costs declined by four percent "
+        "year over year across all major regional markets surveyed. " * 4,
+        "Installation requires Python three point ten or newer along with the "
+        "optional machine learning extra which pulls onnxruntime and transformers "
+        "for the token compression model used by the proxy at request time. " * 3,
+        "Once the migration completes the application reads its runtime feature "
+        "flags from the host mounted configuration file and hot reloads them on "
+        "change without requiring a full restart of the running service process. "
+        * 3,
+        "Performance benchmarks on the reference hardware show the int8 weight "
+        "only model matching the full precision baseline within one tenth of a "
+        "percent on the held out evaluation split across five hundred samples. "
+        * 3,
+    ]
+    return inputs
 
 
 __all__ = [

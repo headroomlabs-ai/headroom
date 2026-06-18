@@ -1,0 +1,22 @@
+{
+  "config": {
+    "chunk_words": 350,
+    "device": "auto",
+    "enable_ccr": false,
+    "model_id": "chopratejas/kompress-v2-base",
+    "score_threshold": 0.5
+  },
+  "input": "ERROR 2026-06-18 connection refused to upstream after 3 retries; WARN falling back to cache; INFO request completed in 421ms status 200; DEBUG tracing span closed for request abc123; ERROR 2026-06-18 connection refused to upstream after 3 retries; WARN falling back to cache; INFO request completed in 421ms status 200; DEBUG tracing span closed for request abc123; ERROR 2026-06-18 connection refused to upstream after 3 retries; WARN falling back to cache; INFO request completed in 421ms status 200; DEBUG tracing span closed for request abc123; ERROR 2026-06-18 connection refused to upstream after 3 retries; WARN falling back to cache; INFO request completed in 421ms status 200; DEBUG tracing span closed for request abc123; ERROR 2026-06-18 connection refused to upstream after 3 retries; WARN falling back to cache; INFO request completed in 421ms status 200; DEBUG tracing span closed for request abc123; ERROR 2026-06-18 connection refused to upstream after 3 retries; WARN falling back to cache; INFO request completed in 421ms status 200; DEBUG tracing span closed for request abc123; ",
+  "input_sha256": "0321ef8700c1fd257ca9f5a435eeb71b17c46b0086e8e30697ab2473dd232fea",
+  "output": {
+    "cache_key": null,
+    "compressed": "ERROR 2026-06-18 connection refused upstream after 3 retries; WARN falling back to cache; INFO request completed in 421ms status 200; DEBUG tracing span closed for request abc123; ERROR 2026-06-18 connection refused upstream after 3 retries; WARN falling back to cache; INFO request completed in 421ms status 200; DEBUG tracing span closed for request abc123; ERROR 2026-06-18 connection refused upstream after 3 retries; WARN falling back to cache; INFO request completed in 421ms status 200; DEBUG tracing span closed request abc123; ERROR 2026-06-18 connection refused upstream after 3 retries; WARN falling back to cache; INFO request completed in 421ms status 200; DEBUG tracing span closed request abc123; ERROR 2026-06-18 connection refused upstream after 3 retries; WARN falling back to cache; INFO request completed in 421ms status 200; DEBUG tracing span closed for request abc123; ERROR 2026-06-18 connection refused upstream after 3 retries; WARN falling back to cache; INFO request completed in 421ms status 200; DEBUG tracing span closed for request abc123;",
+    "compressed_tokens": 160,
+    "compression_ratio": 0.9523809523809523,
+    "model_used": "chopratejas/kompress-v2-base",
+    "original": "ERROR 2026-06-18 connection refused to upstream after 3 retries; WARN falling back to cache; INFO request completed in 421ms status 200; DEBUG tracing span closed for request abc123; ERROR 2026-06-18 connection refused to upstream after 3 retries; WARN falling back to cache; INFO request completed in 421ms status 200; DEBUG tracing span closed for request abc123; ERROR 2026-06-18 connection refused to upstream after 3 retries; WARN falling back to cache; INFO request completed in 421ms status 200; DEBUG tracing span closed for request abc123; ERROR 2026-06-18 connection refused to upstream after 3 retries; WARN falling back to cache; INFO request completed in 421ms status 200; DEBUG tracing span closed for request abc123; ERROR 2026-06-18 connection refused to upstream after 3 retries; WARN falling back to cache; INFO request completed in 421ms status 200; DEBUG tracing span closed for request abc123; ERROR 2026-06-18 connection refused to upstream after 3 retries; WARN falling back to cache; INFO request completed in 421ms status 200; DEBUG tracing span closed for request abc123; ",
+    "original_tokens": 168
+  },
+  "recorded_at": "2026-06-18T23:18:25.091568+00:00",
+  "transform": "kompress"
+}

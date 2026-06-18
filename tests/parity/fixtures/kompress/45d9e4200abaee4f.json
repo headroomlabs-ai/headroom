@@ -1,0 +1,22 @@
+{
+  "config": {
+    "chunk_words": 350,
+    "device": "auto",
+    "enable_ccr": false,
+    "model_id": "chopratejas/kompress-v2-base",
+    "score_threshold": 0.5
+  },
+  "input": "Summarize the following document while preserving every named entity and numeric figure so the reader can reconstruct the key facts later. Summarize the following document while preserving every named entity and numeric figure so the reader can reconstruct the key facts later. Summarize the following document while preserving every named entity and numeric figure so the reader can reconstruct the key facts later. Summarize the following document while preserving every named entity and numeric figure so the reader can reconstruct the key facts later. ",
+  "input_sha256": "45d9e4200abaee4fbaa71006890e11acc3eacdcfa50856f5cac953e19b6be643",
+  "output": {
+    "cache_key": null,
+    "compressed": "Summarize following document while preserving every named entity and numeric figure so reader can reconstruct key facts later. Summarize following document while preserving every named entity and numeric figure so reader can reconstruct key facts later. Summarize following document while preserving every named entity and numeric figure so reader can reconstruct key facts later. Summarize following document while preserving every named entity and numeric figure so reader can reconstruct key facts later.",
+    "compressed_tokens": 72,
+    "compression_ratio": 0.8571428571428571,
+    "model_used": "chopratejas/kompress-v2-base",
+    "original": "Summarize the following document while preserving every named entity and numeric figure so the reader can reconstruct the key facts later. Summarize the following document while preserving every named entity and numeric figure so the reader can reconstruct the key facts later. Summarize the following document while preserving every named entity and numeric figure so the reader can reconstruct the key facts later. Summarize the following document while preserving every named entity and numeric figure so the reader can reconstruct the key facts later. ",
+    "original_tokens": 84
+  },
+  "recorded_at": "2026-06-18T23:18:31.416183+00:00",
+  "transform": "kompress"
+}
