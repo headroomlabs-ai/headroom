@@ -91,7 +91,7 @@ def savings(as_json: bool, days: int, reset: bool) -> None:
 
     if report.by_model:
         click.echo("")
-        click.echo("Cost avoided per model (all time):")
+        click.echo("Cost avoided per model:")
         for row in report.by_model:
             click.echo(f"  {str(row['model']):<24} {_money(float(row['cost_usd']))}")
 
