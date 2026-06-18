@@ -418,6 +418,7 @@ class CompressionStrategy(Enum):
     TEXT = "text"
     DIFF = "diff"
     HTML = "html"
+    TABULAR = "tabular"
     MIXED = "mixed"
     PASSTHROUGH = "passthrough"
 
@@ -538,6 +539,7 @@ class ContentRouterConfig:
         enable_smart_crusher: Enable JSON array compression.
         enable_search_compressor: Enable search result compression.
         enable_log_compressor: Enable build/test log compression.
+        enable_tabular_compressor: Enable CSV/TSV/markdown-table compression.
         enable_image_optimizer: Enable image token optimization.
         prefer_code_aware_for_code: Use CodeAware over Kompress for code.
         mixed_content_threshold: Min distinct types to consider "mixed".
@@ -554,6 +556,7 @@ class ContentRouterConfig:
     enable_smart_crusher: bool = True
     enable_search_compressor: bool = True
     enable_log_compressor: bool = True
+    enable_tabular_compressor: bool = True  # CSV/TSV/markdown tables via SmartCrusher
     enable_html_extractor: bool = True  # HTML content extraction
     enable_image_optimizer: bool = True  # Image token optimization
 
@@ -896,6 +899,7 @@ class ContentRouter(Transform):
         self._log_compressor: Any = None
         self._diff_compressor: Any = None
         self._html_extractor: Any = None
+        self._tabular_compressor: Any = None
         self._kompress: Any = None
 
         # TOIN integration for cross-strategy learning
@@ -1193,6 +1197,7 @@ class ContentRouter(Transform):
             ContentType.BUILD_OUTPUT: CompressionStrategy.LOG,
             ContentType.GIT_DIFF: CompressionStrategy.DIFF,
             ContentType.HTML: CompressionStrategy.HTML,
+            ContentType.TABULAR: CompressionStrategy.TABULAR,
             ContentType.PLAIN_TEXT: CompressionStrategy.TEXT,
         }
 
@@ -1427,6 +1432,18 @@ class ContentRouter(Transform):
                         )
                         decision_reason = "log_compressor"
 
+            elif strategy == CompressionStrategy.TABULAR:
+                if self.config.enable_tabular_compressor:
+                    compressor = self._get_tabular_compressor()
+                    if compressor:
+                        compressor_name = type(compressor).__name__
+                        result = compressor.compress(content, context=context, bias=bias)
+                        compressed, compressed_tokens = (
+                            result.compressed,
+                            len(result.compressed.split()),
+                        )
+                        decision_reason = "tabular_compressor"
+
             elif strategy == CompressionStrategy.DIFF:
                 compressor = self._get_diff_compressor()
                 if compressor:
@@ -1477,6 +1494,7 @@ class ContentRouter(Transform):
             fallback_eligible_strategy = strategy in {
                 CompressionStrategy.SMART_CRUSHER,
                 CompressionStrategy.CODE_AWARE,
+                CompressionStrategy.TABULAR,
             }
             fallback_no_savings = compressed == content or compressed_tokens >= original_tokens
             if fallback_eligible_strategy and fallback_no_savings:
@@ -1659,6 +1677,7 @@ class ContentRouter(Transform):
             ContentType.BUILD_OUTPUT: CompressionStrategy.LOG,
             ContentType.GIT_DIFF: CompressionStrategy.DIFF,
             ContentType.HTML: CompressionStrategy.HTML,
+            ContentType.TABULAR: CompressionStrategy.TABULAR,
             ContentType.PLAIN_TEXT: CompressionStrategy.TEXT,
         }
         return mapping.get(content_type, self.config.fallback_strategy)
@@ -1672,6 +1691,7 @@ class ContentRouter(Transform):
             CompressionStrategy.LOG: ContentType.BUILD_OUTPUT,
             CompressionStrategy.DIFF: ContentType.GIT_DIFF,
             CompressionStrategy.HTML: ContentType.HTML,
+            CompressionStrategy.TABULAR: ContentType.TABULAR,
             CompressionStrategy.TEXT: ContentType.PLAIN_TEXT,
             CompressionStrategy.KOMPRESS: ContentType.PLAIN_TEXT,
             CompressionStrategy.PASSTHROUGH: ContentType.PLAIN_TEXT,
@@ -1745,6 +1765,17 @@ class ContentRouter(Transform):
             except ImportError:
                 logger.debug("LogCompressor not available")
         return self._log_compressor
+
+    def _get_tabular_compressor(self) -> Any:
+        """Get TabularCompressor (lazy load)."""
+        if self._tabular_compressor is None:
+            try:
+                from .tabular_ingest import TabularCompressor
+
+                self._tabular_compressor = TabularCompressor()
+            except ImportError:
+                logger.debug("TabularCompressor not available")
+        return self._tabular_compressor
 
     def _get_diff_compressor(self) -> Any:
         """Get DiffCompressor (lazy load). Rust-only — Python implementation
