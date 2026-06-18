@@ -54,8 +54,18 @@ def _window_line(label: str, window: dict[str, Any]) -> str:
     show_default=True,
     help="Retention/lookback window for the ledger, in days.",
 )
-def savings(as_json: bool, days: int) -> None:
+@click.option("--reset", is_flag=True, help="Delete the savings ledger and start fresh.")
+def savings(as_json: bool, days: int, reset: bool) -> None:
     """Show durable compression savings over time."""
+
+    if reset:
+        path = savings_ledger._resolve_path(None)
+        if path.exists():
+            path.unlink()
+            click.echo(f"Ledger reset: {path}")
+        else:
+            click.echo("Nothing to reset — ledger does not exist.")
+        return
 
     report = savings_ledger.aggregate_savings(retention_days=days)
 
