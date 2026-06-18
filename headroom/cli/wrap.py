@@ -2,6 +2,7 @@
 
 Usage:
     headroom wrap claude                    # Start proxy + context tool + claude
+    headroom wrap pi                        # Start proxy + Pi coding agent
     headroom wrap copilot -- --model ...    # Start proxy + launch GitHub Copilot CLI
     headroom wrap codex                     # Start proxy + OpenAI Codex CLI
     headroom wrap aider                     # Start proxy + aider
@@ -100,6 +101,15 @@ from headroom.providers.openclaw import (
 from headroom.providers.openclaw import (
     normalize_gateway_provider_ids as _normalize_openclaw_gateway_provider_ids_impl,
 )
+from headroom.providers.pi import (
+    gemini_proxy_base_url as _pi_gemini_proxy_base_url,
+)
+from headroom.providers.pi import (
+    vertex_proxy_base_url as _pi_vertex_proxy_base_url,
+)
+from headroom.providers.pi import (
+    write_proxy_extension as _write_pi_proxy_extension,
+)
 from headroom.proxy.project_context import with_project_prefix as _with_project_prefix
 
 from .main import main
@@ -108,7 +118,7 @@ _CONTEXT_TOOL_ENV = "HEADROOM_CONTEXT_TOOL"
 _CONTEXT_TOOL_RTK = "rtk"
 _CONTEXT_TOOL_LEAN_CTX = "lean-ctx"
 _VALID_CONTEXT_TOOLS = {_CONTEXT_TOOL_RTK, _CONTEXT_TOOL_LEAN_CTX}
-_AGENT_SAVINGS_TARGET_AGENTS = {"claude", "codex", "cursor"}
+_AGENT_SAVINGS_TARGET_AGENTS = {"claude", "codex", "cursor", "pi"}
 _WRAP_PROXY_TIMEOUT_ENV = "HEADROOM_WRAP_PROXY_TIMEOUT"
 _WRAP_PROXY_TIMEOUT_DEFAULT_SECONDS = 45
 _WRAP_PROXY_TIMEOUT_ML_DEFAULT_SECONDS = 90
@@ -123,7 +133,7 @@ _WRAP_PROXY_TIMEOUT_ML_MODULES = ("torch", "sentence_transformers", "spacy")
 # Code, so the agent loop is unaffected).
 _TOOL_SEARCH_ENV = "ENABLE_TOOL_SEARCH"
 _TOOL_SEARCH_DEFAULT = "true"
-_AGENT_SAVINGS_WRAP_AGENTS = {"claude", "codex", "cursor"}
+_AGENT_SAVINGS_WRAP_AGENTS = {"claude", "codex", "cursor", "pi"}
 _DEFAULT_AGENT_SAVINGS_PROFILE = "agent-90"
 
 
@@ -374,7 +384,7 @@ def _start_proxy(
     # Ensure proxy subprocess uses UTF-8 (Windows defaults to cp1252)
     proxy_env = os.environ.copy()
     proxy_env["PYTHONIOENCODING"] = "utf-8"
-    if agent_type in {"claude", "codex", "cursor"}:
+    if agent_type in _AGENT_SAVINGS_WRAP_AGENTS:
         apply_agent_savings_env_defaults(proxy_env)
 
     # Tell the proxy which agent is being wrapped (for traffic learning output)
@@ -2398,7 +2408,7 @@ def _marker_pid_reused(marker: Path, pid: int) -> bool:
         return False
     src = rec.get("start_src")
     recorded = rec.get("start_time")
-    if not isinstance(src, str) or not isinstance(recorded, (int, float)):
+    if not isinstance(src, str) or not isinstance(recorded, int | float):
         return False  # legacy / identity-less marker — can't tell
     ident = _proc_identity(pid)
     if ident is None or ident[0] != src:
@@ -2740,6 +2750,7 @@ def wrap() -> None:
     \b
     Supported tools (one Click subcommand per tool):
         headroom wrap claude              # Claude Code (Anthropic)
+        headroom wrap pi                  # Pi coding agent
         headroom wrap codex               # OpenAI Codex CLI
         headroom wrap copilot -- --model claude-sonnet-4-20250514
         headroom wrap aider               # Aider
@@ -3112,6 +3123,115 @@ def unwrap_claude(
     if not no_stop_proxy:
         _echo_unwrap_proxy_stop_status(_stop_local_proxy_for_unwrap(port), port)
     click.echo()
+
+
+# =============================================================================
+# Pi coding agent
+# =============================================================================
+
+
+@wrap.command("pi", context_settings={"ignore_unknown_options": True})
+@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--no-context-tool",
+    "--no-rtk",
+    "no_rtk",
+    is_flag=True,
+    help="Skip CLI context-tool setup",
+)
+@click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
+@click.option("--learn", is_flag=True, help="Enable live traffic learning")
+@click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
+@click.option(
+    "--backend", default=None, help="API backend: 'anthropic', 'anyllm', 'litellm-vertex', etc."
+)
+@click.option("--anyllm-provider", default=None, help="Provider for any-llm backend")
+@click.option("--region", default=None, help="Cloud region for Bedrock/Vertex")
+@click.option("--verbose", "-v", is_flag=True, help="Verbose output")
+@click.option("--prepare-only", is_flag=True, hidden=True)
+@click.argument("pi_args", nargs=-1, type=click.UNPROCESSED)
+def pi(
+    port: int,
+    no_rtk: bool,
+    no_proxy: bool,
+    learn: bool,
+    memory: bool,
+    backend: str | None,
+    anyllm_provider: str | None,
+    region: str | None,
+    verbose: bool,
+    prepare_only: bool,
+    pi_args: tuple,
+) -> None:
+    """Launch Pi through Headroom proxy.
+
+    \b
+    Pi does not read ANTHROPIC_BASE_URL or OPENAI_BASE_URL directly. This
+    wrapper creates a temporary Pi extension and launches Pi with ``-e`` so
+    the extension can register provider overrides for Pi's built-in Anthropic,
+    Google Gemini/Vertex, OpenAI, and OpenAI Codex providers. The user's normal
+    Pi auth and model selection keep working; only the provider base URLs are
+    pointed at the local Headroom proxy for the wrapped process.
+
+    \b
+    Examples:
+        headroom wrap pi                         # Start proxy + context tool + pi
+        headroom wrap pi -- -p "explain this"    # Pass args to pi
+        headroom wrap pi --no-context-tool       # Skip AGENTS.md rtk guidance
+    """
+    agents_md: Path | None = Path.cwd() / "AGENTS.md" if not no_rtk else None
+    if not no_rtk:
+        _setup_context_tool_for_agent(
+            agent="pi",
+            agent_display="Pi",
+            marker_path=agents_md,
+            on_rtk_ready=lambda _rtk: _inject_rtk_instructions(
+                cast(Path, agents_md), verbose=verbose
+            ),
+            verbose=verbose,
+        )
+
+    if prepare_only:
+        return
+
+    pi_bin = shutil.which("pi")
+    if not pi_bin:
+        click.echo("Error: 'pi' not found in PATH.")
+        click.echo("Install Pi: npm install -g --ignore-scripts @earendil-works/pi-coding-agent")
+        raise SystemExit(1)
+
+    env = os.environ.copy()
+    with tempfile.TemporaryDirectory(prefix="headroom-pi-") as extension_dir:
+        extension_path = _write_pi_proxy_extension(
+            Path(extension_dir),
+            port,
+            project=_project_name_from_cwd(),
+            project_header=_PROJECT_HEADER_NAME,
+        )
+        launch_args = ("-e", str(extension_path), *pi_args)
+        env_vars_display = [
+            f"Pi extension={extension_path}",
+            f"Anthropic base URL={_claude_proxy_base_url(port)}",
+            f"Google/Gemini base URL={_pi_gemini_proxy_base_url(port)}",
+            f"Google Vertex base URL={_pi_vertex_proxy_base_url(port)}",
+            f"OpenAI/OpenAI Codex base URL=http://127.0.0.1:{port}/v1",
+        ]
+
+        _launch_tool(
+            binary=pi_bin,
+            args=launch_args,
+            env=env,
+            port=port,
+            no_proxy=no_proxy,
+            tool_label="PI",
+            env_vars_display=env_vars_display,
+            learn=learn,
+            memory=memory,
+            agent_type="pi",
+            backend=backend,
+            anyllm_provider=anyllm_provider,
+            region=region,
+        )
 
 
 # =============================================================================
