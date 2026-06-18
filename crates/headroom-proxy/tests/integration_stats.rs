@@ -322,3 +322,79 @@ async fn stats_history_endpoint_serves_history_contract() {
 
     proxy.shutdown().await;
 }
+
+#[tokio::test]
+async fn stats_counts_failed_when_upstream_returns_5xx() {
+    // A non-2xx upstream must count toward requests.failed — the request is
+    // recorded after the upstream status is known, not optimistically before.
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path_matcher("/v1/messages"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+        .mount(&upstream)
+        .await;
+    let proxy = start_proxy_with(&upstream.uri(), |c| c.compression = true).await;
+
+    let req_body = serde_json::json!({
+        "model": "claude-haiku-4-5",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 10
+    });
+    let resp = reqwest::Client::new()
+        .post(format!("{}/v1/messages", proxy.url()))
+        .header("content-type", "application/json")
+        .body(req_body.to_string())
+        .send()
+        .await
+        .expect("POST /v1/messages");
+    assert_eq!(resp.status(), 500);
+
+    let stats: serde_json::Value = reqwest::Client::new()
+        .get(format!("{}/stats", proxy.url()))
+        .send()
+        .await
+        .expect("GET /stats")
+        .json()
+        .await
+        .expect("stats json");
+    assert_eq!(stats["requests"]["total"], 1);
+    assert_eq!(
+        stats["requests"]["failed"], 1,
+        "5xx upstream must count as failed"
+    );
+
+    proxy.shutdown().await;
+}
+
+#[tokio::test]
+async fn stats_does_not_count_failed_on_2xx() {
+    // Sanity counterpart: a 2xx upstream records total but not failed.
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path_matcher("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&upstream)
+        .await;
+    let proxy = start_proxy_with(&upstream.uri(), |c| c.compression = true).await;
+
+    reqwest::Client::new()
+        .post(format!("{}/v1/messages", proxy.url()))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"hi"}],"max_tokens":10}"#)
+        .send()
+        .await
+        .expect("POST /v1/messages");
+
+    let stats: serde_json::Value = reqwest::Client::new()
+        .get(format!("{}/stats", proxy.url()))
+        .send()
+        .await
+        .expect("GET /stats")
+        .json()
+        .await
+        .expect("stats json");
+    assert_eq!(stats["requests"]["total"], 1);
+    assert_eq!(stats["requests"]["failed"], 0);
+
+    proxy.shutdown().await;
+}

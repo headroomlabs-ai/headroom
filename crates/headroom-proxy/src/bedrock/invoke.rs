@@ -189,21 +189,21 @@ pub async fn handle_invoke(
 
     // Phase H: record every Bedrock request into the savings store so `/stats`
     // and the dashboard cover this backend too — unified with the Anthropic /
-    // OpenAI lanes that flow through `forward_http`.
+    // OpenAI lanes that flow through `forward_http`. The request-side outcome is
+    // built here (compression token counts are known now) but recorded only once
+    // the upstream result is known, so `requests.failed` reflects connect
+    // errors / non-2xx upstreams instead of counting every attempt as a success.
     let rec_price = state.price_book.lookup(&model_id).unwrap_or_default();
-    state.savings.record(
-        &crate::observability::stats::RequestOutcome {
-            provider: "bedrock".to_string(),
-            model: model_id.clone(),
-            tokens_before: rec_tokens_before,
-            tokens_after: rec_tokens_after,
-            input_cost_per_token: rec_price.input,
-            cache_read_cost_per_token: rec_price.cache_read,
-            cache_write_cost_per_token: rec_price.cache_write,
-            ..Default::default()
-        },
-        std::time::SystemTime::now(),
-    );
+    let rec_outcome = crate::observability::stats::RequestOutcome {
+        provider: "bedrock".to_string(),
+        model: model_id.clone(),
+        tokens_before: rec_tokens_before,
+        tokens_after: rec_tokens_after,
+        input_cost_per_token: rec_price.input,
+        cache_read_cost_per_token: rec_price.cache_read,
+        cache_write_cost_per_token: rec_price.cache_write,
+        ..Default::default()
+    };
 
     // Resolve the Bedrock action from the inbound path so `/converse`
     // forwards to the upstream Converse endpoint instead of `/invoke`.
@@ -356,6 +356,10 @@ pub async fn handle_invoke(
                 error = %e,
                 "bedrock invoke: upstream request failed"
             );
+            // Connect/timeout failure — record as a failed request.
+            let mut o = rec_outcome;
+            o.failed = true;
+            state.savings.record(&o, std::time::SystemTime::now());
             let status = if e.is_timeout() {
                 StatusCode::GATEWAY_TIMEOUT
             } else {
@@ -367,6 +371,13 @@ pub async fn handle_invoke(
 
     let status =
         StatusCode::from_u16(upstream_resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    // Record now that the upstream status is known: a non-2xx upstream counts
+    // toward `requests.failed`.
+    let mut rec_outcome = rec_outcome;
+    rec_outcome.failed = !status.is_success();
+    state
+        .savings
+        .record(&rec_outcome, std::time::SystemTime::now());
     let resp_headers = filter_response_headers(upstream_resp.headers());
 
     tracing::info!(

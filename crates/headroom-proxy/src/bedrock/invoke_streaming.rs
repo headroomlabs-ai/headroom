@@ -166,21 +166,20 @@ pub async fn handle_invoke_streaming(
         (body.clone(), 0, 0)
     };
 
-    // Phase H: record this Bedrock streaming request into the savings store.
+    // Phase H: build this Bedrock streaming request's savings outcome now (token
+    // counts are known) but record it only once the upstream result is known, so
+    // `requests.failed` reflects connect errors / non-2xx upstreams.
     let rec_price = state.price_book.lookup(&model_id).unwrap_or_default();
-    state.savings.record(
-        &crate::observability::stats::RequestOutcome {
-            provider: "bedrock".to_string(),
-            model: model_id.clone(),
-            tokens_before: rec_tokens_before,
-            tokens_after: rec_tokens_after,
-            input_cost_per_token: rec_price.input,
-            cache_read_cost_per_token: rec_price.cache_read,
-            cache_write_cost_per_token: rec_price.cache_write,
-            ..Default::default()
-        },
-        std::time::SystemTime::now(),
-    );
+    let rec_outcome = crate::observability::stats::RequestOutcome {
+        provider: "bedrock".to_string(),
+        model: model_id.clone(),
+        tokens_before: rec_tokens_before,
+        tokens_after: rec_tokens_after,
+        input_cost_per_token: rec_price.input,
+        cache_read_cost_per_token: rec_price.cache_read,
+        cache_write_cost_per_token: rec_price.cache_write,
+        ..Default::default()
+    };
 
     // 2. Resolve the Bedrock streaming action from the inbound path and
     // build the upstream URL.
@@ -324,6 +323,10 @@ pub async fn handle_invoke_streaming(
                 error = %e,
                 "bedrock invoke-streaming: upstream request failed"
             );
+            // Connect/timeout failure — record as a failed request.
+            let mut o = rec_outcome;
+            o.failed = true;
+            state.savings.record(&o, std::time::SystemTime::now());
             let status = if e.is_timeout() {
                 StatusCode::GATEWAY_TIMEOUT
             } else {
@@ -335,6 +338,12 @@ pub async fn handle_invoke_streaming(
 
     let status =
         StatusCode::from_u16(upstream_resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    // Record now that the upstream status is known.
+    let mut rec_outcome = rec_outcome;
+    rec_outcome.failed = !status.is_success();
+    state
+        .savings
+        .record(&rec_outcome, std::time::SystemTime::now());
     let upstream_content_type = upstream_resp
         .headers()
         .get(http::header::CONTENT_TYPE)

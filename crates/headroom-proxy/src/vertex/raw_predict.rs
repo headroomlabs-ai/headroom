@@ -205,22 +205,20 @@ pub(crate) async fn forward_vertex_request(
         buffered
     };
 
-    // Phase H: record this Vertex request so `/stats` and the dashboard cover
-    // the Vertex backend too, unified with the other lanes.
+    // Phase H: build this Vertex request's savings outcome now but record it once
+    // the upstream result is known, so `requests.failed` reflects connect errors
+    // / non-2xx upstreams.
     let rec_price = state.price_book.lookup(&ctx.model_id).unwrap_or_default();
-    state.savings.record(
-        &crate::observability::stats::RequestOutcome {
-            provider: "vertex".to_string(),
-            model: ctx.model_id.clone(),
-            tokens_before: rec_tokens_before,
-            tokens_after: rec_tokens_after,
-            input_cost_per_token: rec_price.input,
-            cache_read_cost_per_token: rec_price.cache_read,
-            cache_write_cost_per_token: rec_price.cache_write,
-            ..Default::default()
-        },
-        std::time::SystemTime::now(),
-    );
+    let rec_outcome = crate::observability::stats::RequestOutcome {
+        provider: "vertex".to_string(),
+        model: ctx.model_id.clone(),
+        tokens_before: rec_tokens_before,
+        tokens_after: rec_tokens_after,
+        input_cost_per_token: rec_price.input,
+        cache_read_cost_per_token: rec_price.cache_read,
+        cache_write_cost_per_token: rec_price.cache_write,
+        ..Default::default()
+    };
 
     // ─── 4. RESOLVE BEARER TOKEN ───────────────────────────────────────
     let bearer = match state.vertex_token_source.bearer().await {
@@ -349,6 +347,10 @@ pub(crate) async fn forward_vertex_request(
                 error = %e,
                 "vertex upstream call failed"
             );
+            // Connect/timeout failure — record as a failed request.
+            let mut o = rec_outcome;
+            o.failed = true;
+            state.savings.record(&o, std::time::SystemTime::now());
             return error_response(StatusCode::BAD_GATEWAY, "vertex upstream error");
         }
     };
@@ -356,6 +358,12 @@ pub(crate) async fn forward_vertex_request(
     // ─── 8. STREAM RESPONSE ────────────────────────────────────────────
     let upstream_status = upstream_resp.status();
     let status = StatusCode::from_u16(upstream_status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    // Record now that the upstream status is known.
+    let mut rec_outcome = rec_outcome;
+    rec_outcome.failed = !status.is_success();
+    state
+        .savings
+        .record(&rec_outcome, std::time::SystemTime::now());
     let resp_headers = filter_response_headers(upstream_resp.headers());
 
     // PR-C1 reuse: when `attach_sse_tee` is set AND the upstream

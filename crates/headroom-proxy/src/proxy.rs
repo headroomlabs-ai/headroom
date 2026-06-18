@@ -707,6 +707,14 @@ pub(crate) async fn forward_http(
     let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())
         .map_err(|e| ProxyError::InvalidHeader(e.to_string()))?;
 
+    // Phase H / failed-accuracy: the savings outcome is built on the buffered
+    // (intercept) path where token counts are known, but recorded only once the
+    // upstream status is known below, so `requests.failed` reflects non-2xx
+    // upstreams. A connect error short-circuits via `?` before the status is
+    // known and is intentionally left unrecorded (it never reached the
+    // provider), rather than being mis-counted as a success.
+    let mut pending_record: Option<crate::observability::stats::RequestOutcome> = None;
+
     let upstream_resp = if should_intercept {
         // Buffer up to `compression_max_body_bytes`. If the body
         // exceeds this, the body is already partially consumed and
@@ -1000,19 +1008,16 @@ pub(crate) async fn forward_http(
         // accurate from day one. USD is valued via the price book when the model
         // is priced; otherwise savings stay token-only with USD at zero.
         let rec_price = state.price_book.lookup(&rec_model).unwrap_or_default();
-        state.savings.record(
-            &crate::observability::stats::RequestOutcome {
-                provider: rec_provider.to_string(),
-                model: rec_model,
-                tokens_before: rec_tokens_before,
-                tokens_after: rec_tokens_after,
-                input_cost_per_token: rec_price.input,
-                cache_read_cost_per_token: rec_price.cache_read,
-                cache_write_cost_per_token: rec_price.cache_write,
-                ..Default::default()
-            },
-            std::time::SystemTime::now(),
-        );
+        pending_record = Some(crate::observability::stats::RequestOutcome {
+            provider: rec_provider.to_string(),
+            model: rec_model,
+            tokens_before: rec_tokens_before,
+            tokens_after: rec_tokens_after,
+            input_cost_per_token: rec_price.input,
+            cache_read_cost_per_token: rec_price.cache_read,
+            cache_write_cost_per_token: rec_price.cache_write,
+            ..Default::default()
+        });
 
         // C2 fix: cache-safety alarm. When the dispatcher returned
         // `NoCompression` or `Passthrough`, the post-dispatcher body
@@ -1093,6 +1098,14 @@ pub(crate) async fn forward_http(
 
     let upstream_status = upstream_resp.status();
     let status = StatusCode::from_u16(upstream_status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+
+    // Record the request now that the upstream status is known: a non-2xx
+    // upstream counts toward `requests.failed`. Only intercepted LLM requests
+    // populated `pending_record`; pure passthrough/streaming requests do not.
+    if let Some(mut outcome) = pending_record.take() {
+        outcome.failed = !upstream_status.is_success();
+        state.savings.record(&outcome, std::time::SystemTime::now());
+    }
 
     // PR-A8 / P5-57: capture the upstream request id BEFORE we move
     // `upstream_resp.headers()` into the response filter. Anthropic
