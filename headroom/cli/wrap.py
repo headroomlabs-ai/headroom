@@ -266,6 +266,28 @@ def _print_telemetry_notice() -> None:
 # Proxy health check (reused from evals/suite_runner.py pattern)
 
 
+def _find_available_port(start_port: int, max_attempts: int = 10) -> int:
+    """Return the first available port >= *start_port* that is not in use.
+
+    Skips ports occupied by another headroom proxy (e.g. claude already
+    running on 8787).  Works for all agents — claude, codex, copilot,
+    opencode, aider, etc.
+
+    Raises ``click.ClickException`` if no port is free after *max_attempts*.
+    """
+    port = start_port
+    for _ in range(max_attempts):
+        if not _check_proxy(port):
+            if port != start_port:
+                click.echo(f"  port {start_port} in use — using {port}")
+            return port
+        port += 1
+    raise click.ClickException(
+        f"No free port found from {start_port} to {start_port + max_attempts - 1}. "
+        "Stop one of the running headroom proxies first."
+    )
+
+
 def _check_proxy(port: int) -> bool:
     """Check if Headroom proxy is running on given port."""
     try:
@@ -1442,6 +1464,8 @@ def _run_proxy_only_watcher(
     launch a child binary via ``_launch_tool`` instead and never come
     through here. ``_launch_tool`` owns the proxy lifecycle on that path.
     """
+    if not no_proxy:
+        port = _find_available_port(port)
     proxy_holder: list[subprocess.Popen | None] = [None]
     cleanup = _make_cleanup(proxy_holder, port)
     _register_proxy_client(port)
@@ -2492,6 +2516,10 @@ def _launch_tool(
 ) -> None:
     """Common logic: start proxy, launch tool, clean up."""
     proxy_holder: list[subprocess.Popen | None] = [None]
+    # Port conflict detection: skip ports occupied by another headroom
+    # proxy.  Works for all agents — claude, codex, copilot, aider, etc.
+    if not no_proxy:
+        port = _find_available_port(port)
     cleanup = _make_cleanup(proxy_holder, port)
     _register_proxy_client(port)
     signal.signal(signal.SIGINT, _ignore_child_sigint)
@@ -2935,6 +2963,10 @@ def claude(
         click.echo("  ║            HEADROOM WRAP: CLAUDE              ║")
         click.echo("  ╚═══════════════════════════════════════════════╝")
         click.echo()
+
+        # Port conflict detection: skip if occupied by another headroom proxy.
+        if not no_proxy:
+            port = _find_available_port(port)
 
         # Detect Foundry mode: Claude Code uses ANTHROPIC_FOUNDRY_BASE_URL instead of
         # ANTHROPIC_BASE_URL when CLAUDE_CODE_USE_FOUNDRY=1 is set.
