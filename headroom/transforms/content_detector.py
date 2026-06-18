@@ -472,11 +472,8 @@ def _looks_like_prose(sample: list[str], delim: str) -> bool:
     if enders / len(sample) >= 0.5:
         return True
     cells = [c.strip() for r in sample for c in r.split(delim)]
-    if cells:
-        avg_words = sum(len(c.split()) for c in cells) / len(cells)
-        if avg_words > 3:
-            return True
-    return False
+    avg_words = sum(len(c.split()) for c in cells) / len(cells)
+    return avg_words > 3
 
 
 def _try_detect_tabular(content: str) -> DetectionResult | None:

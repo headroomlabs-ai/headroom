@@ -1435,7 +1435,7 @@ class ContentRouter(Transform):
             elif strategy == CompressionStrategy.TABULAR:
                 if self.config.enable_tabular_compressor:
                     compressor = self._get_tabular_compressor()
-                    if compressor:
+                    if compressor:  # pragma: no branch - getter is pure stdlib, never None
                         compressor_name = type(compressor).__name__
                         result = compressor.compress(content, context=context, bias=bias)
                         compressed, compressed_tokens = (
