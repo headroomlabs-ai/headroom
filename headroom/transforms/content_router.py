@@ -215,10 +215,16 @@ def _net_cost_cache_ttl_seconds() -> float:
     try:
         ttl = float(raw)
     except ValueError:
-        logger.warning("HEADROOM_NET_COST_CACHE_TTL_SECONDS malformed; using default %s", _NET_COST_CACHE_TTL_SECONDS)
+        logger.warning(
+            "HEADROOM_NET_COST_CACHE_TTL_SECONDS malformed; using default %s",
+            _NET_COST_CACHE_TTL_SECONDS,
+        )
         return _NET_COST_CACHE_TTL_SECONDS
     if not math.isfinite(ttl) or ttl <= 0.0:
-        logger.warning("HEADROOM_NET_COST_CACHE_TTL_SECONDS non-positive; using 300")
+        logger.warning(
+            "HEADROOM_NET_COST_CACHE_TTL_SECONDS invalid; using default %s",
+            _NET_COST_CACHE_TTL_SECONDS,
+        )
         return _NET_COST_CACHE_TTL_SECONDS
     return ttl
 
