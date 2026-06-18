@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import InitVar, dataclass, field
 from datetime import datetime
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 from headroom.memory import qdrant_env
 from headroom.providers.registry import ProviderApiOverrides
@@ -115,6 +115,12 @@ class ProxyConfig:
     # SigV4 signature. Leave unset (default) to keep `--backend bedrock`'s
     # direct-to-AWS, re-signing behavior unchanged.
     bedrock_api_url: str | None = None
+    # Optional callable that returns a boto3 ``bedrock-runtime`` client
+    # for the LiteLLM backend. When set, the returned client is passed
+    # to ``litellm.acompletion(..., aws_bedrock_client=client)`` so the
+    # session can transparently refresh STS credentials. ``None`` keeps
+    # the default behavior (litellm builds its own client from env).
+    bedrock_client_factory: "Callable[[str | None], Any] | None" = None
     anyllm_provider: str = "openai"
 
     # Optimization mode: "token" (rewrite for max compression) or

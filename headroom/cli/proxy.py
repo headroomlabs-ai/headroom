@@ -1,10 +1,11 @@
 """Proxy server CLI commands."""
 
+import importlib
 import logging
 import os
 import sys
 import warnings
-from typing import Any, Literal, cast
+from typing import Any, Callable, Literal, cast
 
 import click
 
@@ -112,6 +113,45 @@ def _selected_context_tool() -> str:
             f"{_CONTEXT_TOOL_ENV} must be one of: {', '.join(sorted(_VALID_CONTEXT_TOOLS))}"
         )
     return raw
+
+
+def _resolve_bedrock_client_hook(hook_spec: str | None) -> "Callable[[str | None], Any] | None":
+    """Resolve a 'module:function' string to a callable for ``--bedrock-client-hook``.
+
+    The returned callable receives the configured AWS region as its only
+    positional argument and must return a boto3 ``bedrock-runtime`` client
+    (or ``None`` to defer to the default env-based client).
+
+    Examples of valid specs:
+        ``my_pkg.refresh:make_client``
+        ``my_pkg.session:build_bedrock_client``
+    """
+    if not hook_spec:
+        return None
+    # Strip whitespace so users can paste ``module:fn`` from docs or
+    # align with pretty-printed config files without hitting
+    # confusing ``ImportError: No module named '...'`` for the
+    # surrounding spaces.
+    spec = hook_spec.strip()
+    module_name, _, attr = spec.partition(":")
+    module_name = module_name.strip()
+    attr = attr.strip()
+    if not module_name or not attr:
+        raise click.ClickException(
+            f"Invalid --bedrock-client-hook {hook_spec!r}: expected 'module:function'."
+        )
+    try:
+        module = importlib.import_module(module_name)
+    except ImportError as exc:
+        raise click.ClickException(
+            f"--bedrock-client-hook: cannot import {module_name!r}: {exc}"
+        ) from exc
+    factory = getattr(module, attr, None)
+    if factory is None or not callable(factory):
+        raise click.ClickException(
+            f"--bedrock-client-hook: {hook_spec!r} resolved to {factory!r}, which is not callable."
+        )
+    return factory
 
 
 @main.command()
@@ -784,6 +824,21 @@ def dashboard(port: int, no_open: bool) -> None:
     help="Opt in to anonymous usage telemetry — off by default (env: HEADROOM_TELEMETRY=on)",
 )
 @click.option(
+    "--bedrock-client-hook",
+    default=None,
+    envvar="HEADROOM_BEDROCK_CLIENT_HOOK",
+    help=(
+        "Optional 'module:function' hook that returns a custom "
+        "boto3 'bedrock-runtime' client. Use this to plug in session "
+        "implementations that refresh STS credentials transparently "
+        "(e.g. 'my_pkg.refresh:make_client'). The hook is called once "
+        "at proxy startup with the configured --region as the only "
+        "argument and must return a boto3 bedrock-runtime client (or "
+        "None to fall back to the default env-based client). "
+        "(env: HEADROOM_BEDROCK_CLIENT_HOOK)"
+    ),
+)
+@click.option(
     "--no-telemetry",
     is_flag=True,
     help="Force anonymous usage telemetry off (already the default; env: HEADROOM_TELEMETRY=off)",
@@ -886,6 +941,7 @@ def proxy(
     bedrock_profile: str | None,
     bedrock_api_url: str | None,
     telemetry: bool,
+    bedrock_client_hook: str | None,
     no_telemetry: bool,
     stateless: bool,
     embedding_server: bool,
@@ -1156,6 +1212,9 @@ def proxy(
         # CLI flag > env > unset. Matches the BEDROCK_TARGET_API_URL naming of
         # the sibling *_TARGET_API_URL passthrough overrides.
         bedrock_api_url=bedrock_api_url or os.environ.get("BEDROCK_TARGET_API_URL"),
+        # Optional 'module:function' resolver. Returns a boto3
+        # 'bedrock-runtime' client (or None to fall back to default).
+        bedrock_client_factory=_resolve_bedrock_client_hook(bedrock_client_hook),
         anyllm_provider=effective_anyllm_provider,
         # License / Usage Reporting (managed/enterprise)
         license_key=license_key,

@@ -253,3 +253,4 @@ uv.lock
 /headroom/_core.*.so
 /headroom/_core.so
 .tokensave
+tests/hooks/

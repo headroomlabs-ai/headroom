@@ -17,7 +17,7 @@ import logging
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from .base import Backend, BackendResponse, StreamEvent
 
@@ -400,6 +400,7 @@ class LiteLLMBackend(Backend):
         self,
         provider: str = "bedrock",
         region: str | None = None,
+        bedrock_client_factory: "Callable[[str | None], Any] | None" = None,
         **kwargs: Any,
     ):
         """Initialize LiteLLM backend.
@@ -407,6 +408,16 @@ class LiteLLMBackend(Backend):
         Args:
             provider: LiteLLM provider prefix (bedrock, vertex_ai, openrouter, etc.)
             region: Cloud region (provider-specific)
+            bedrock_client_factory: Optional callable that returns a
+                ``boto3.session.Session.client('bedrock-runtime', ...)``
+                instance. When provided for the ``bedrock`` provider, the
+                returned client is reused across requests and passed to
+                ``litellm.acompletion(..., aws_bedrock_client=client)`` so
+                callers can plug in custom sessions (e.g.
+                ``boto3-refresh-session``) that refresh STS credentials
+                transparently. Returning ``None`` (or omitting the
+                argument) preserves the default behavior: litellm
+                creates its own client from the process environment.
             **kwargs: Additional provider-specific config
         """
         if not LITELLM_AVAILABLE:
@@ -417,6 +428,10 @@ class LiteLLMBackend(Backend):
         self.provider = provider
         self.region = region
         self.kwargs = kwargs
+        self._bedrock_client_factory = bedrock_client_factory
+        # Eagerly built only when provider == "bedrock"; the default
+        # env-based client is what runs in every other case.
+        self._bedrock_client: Any = None
 
         # Get provider config from registry
         self._config = get_provider_config(provider)
@@ -424,11 +439,50 @@ class LiteLLMBackend(Backend):
         # For Bedrock, fetch model map dynamically from AWS API
         if provider == "bedrock":
             self._model_map = _fetch_bedrock_inference_profiles(region)
+            # Eagerly create the Bedrock client so the first request
+            # doesn't pay the connect cost.
+            self._bedrock_client = self._build_bedrock_client()
             litellm.set_verbose = False  # Reduce noise
         else:
             self._model_map = self._config.model_map
 
         logger.info(f"LiteLLM backend initialized (provider={provider}, region={region})")
+
+    def _build_bedrock_client(self) -> Any:
+        """Return a ``bedrock-runtime`` boto3 client.
+
+        Delegates to ``bedrock_client_factory`` when one is provided.
+        Returning ``None`` lets ``litellm`` build the client from the
+        process environment (the default behavior).
+        """
+        factory = self._bedrock_client_factory
+        if factory is None:
+            return None
+        # Let exceptions propagate to the caller — they already get a
+        # full traceback via the default excepthook, no need to log
+        # the message here (which would duplicate the output).
+        client = factory(self.region)
+        if client is None:
+            return None
+        if not hasattr(client, "converse") and not hasattr(client, "invoke_model"):
+            raise TypeError(
+                "bedrock_client_factory must return a boto3 bedrock-runtime "
+                f"client (got {type(client).__name__})"
+            )
+        return client
+
+    def _inject_bedrock_client(self, kwargs: dict[str, Any]) -> None:
+        """Forward the custom ``bedrock-runtime`` boto3 client to litellm.
+
+        litellm accepts an external client and reuses it across
+        calls, which is what makes custom-session hooks (e.g.
+        ``boto3-refresh-session``) viable: the session object can
+        transparently refresh STS credentials without the caller
+        having to know. When no custom client was built, this is a
+        no-op and litellm falls back to the env-based default.
+        """
+        if self._bedrock_client is not None:
+            kwargs["aws_bedrock_client"] = self._bedrock_client
 
     @property
     def name(self) -> str:
@@ -681,6 +735,8 @@ class LiteLLMBackend(Backend):
                 elif self.provider in ("vertex_ai", "vertex_ai_beta"):
                     kwargs["vertex_location"] = self.region
 
+            self._inject_bedrock_client(kwargs)
+
             # Forward API key from request headers if present.
             # Skip for Bedrock/Vertex: they use env-based auth (AWS SigV4 / Google ADC).
             # Forwarding x-api-key (e.g. sk-ant-dummy) would override their credentials.
@@ -784,6 +840,8 @@ class LiteLLMBackend(Backend):
                     kwargs["aws_region_name"] = self.region
                 elif self.provider in ("vertex_ai", "vertex_ai_beta"):
                     kwargs["vertex_location"] = self.region
+
+            self._inject_bedrock_client(kwargs)
 
             # Forward API key from request headers if present.
             # Skip for Bedrock/Vertex: they use env-based auth (AWS SigV4 / Google ADC).
@@ -1009,6 +1067,8 @@ class LiteLLMBackend(Backend):
                 elif self.provider in ("vertex_ai", "vertex_ai_beta"):
                     kwargs["vertex_location"] = self.region
 
+            self._inject_bedrock_client(kwargs)
+
             # Forward API key from request headers if present.
             # Skip for Bedrock/Vertex: they use env-based auth (AWS SigV4 / Google ADC).
             # Forwarding x-api-key (e.g. sk-ant-dummy) would override their credentials.
@@ -1183,6 +1243,8 @@ class LiteLLMBackend(Backend):
                     kwargs["aws_region_name"] = self.region
                 elif self.provider in ("vertex_ai", "vertex_ai_beta"):
                     kwargs["vertex_location"] = self.region
+
+            self._inject_bedrock_client(kwargs)
 
             # Forward API key from request headers if present.
             # Skip for Bedrock/Vertex: they use env-based auth (AWS SigV4 / Google ADC).

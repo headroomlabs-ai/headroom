@@ -937,6 +937,7 @@ class HeadroomProxy(
             openai_api_url=config.openai_api_url,
             anyllm_backend_cls=AnyLLMBackend,
             litellm_backend_cls=LiteLLMBackend,
+            bedrock_client_factory=getattr(config, "bedrock_client_factory", None),
         )
 
         # Request counter for IDs
