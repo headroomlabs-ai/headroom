@@ -16,6 +16,10 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - 'wiki/**'
+      - '**/*.md'
   workflow_dispatch:
 
 permissions:
@@ -54,7 +58,6 @@ jobs:
               - 'Cargo.lock'
               - 'tests/**'
               - 'scripts/**'
-              - '.github/workflows/ci.yml'
             e2e:
               - 'headroom/**'
               - 'crates/**'
@@ -191,6 +194,11 @@ jobs:
           cp "${SITE}/headroom/"_core*.so headroom/
           python -c "from headroom._core import DiffCompressor; print('headroom._core OK')"
 
+      # Coverage upload: without this, codecov only receives reports from
+      # the two native-e2e workflows (3 CLI test files total), so head
+      # coverage reads ~6% and codecov/patch fails for ANY diff not
+      # exercised by those files — a false negative on every PR. The main
+      # suite runs here; its coverage must be what codecov sees.
       - name: Run test shard ${{ matrix.shard }}/4
         run: |
           pytest tests scripts/tests \

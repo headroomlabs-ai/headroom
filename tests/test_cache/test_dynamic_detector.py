@@ -486,7 +486,9 @@ class TestSemanticDetector:
         spans, warning = detector.detect("The current stock price changes every minute.")
 
         assert spans == []
-        assert warning == "semantic detector is not initialized"
+        # Model present but exemplar matrix missing → the warning names the
+        # actual missing piece (matches TestSemanticDetectorGuards below).
+        assert warning == "exemplar embeddings not initialized"
 
 
 class TestIntegrationWithAllTiers:
@@ -525,3 +527,31 @@ Be helpful and accurate."""
 
         assert len(result.spans) == 1
         assert result.spans[0].tier == "regex"
+
+
+class TestSemanticDetectorGuards:
+    """Defensive guards in SemanticDetector.detect()."""
+
+    def test_none_exemplars_early_return(self):
+        """detect() must early-return, not crash, when exemplar embeddings
+        are unset while a model is present.
+
+        Regression for the `None.T` guard: `is_available` only checks
+        `_model`, so `_exemplar_embeddings` can be None at the `np.dot`
+        call. The guard returns the method's `(spans, warning)` contract.
+        """
+        np = pytest.importorskip("numpy")
+        from unittest.mock import MagicMock
+
+        from headroom.cache.dynamic_detector import SemanticDetector
+
+        det = object.__new__(SemanticDetector)
+        det._model = MagicMock()
+        det._model.encode.return_value = np.zeros((1, 3))
+        det._exemplar_embeddings = None
+        det._load_error = None
+
+        spans, warning = det.detect("This is a sentence here. Here is another long one.")
+
+        assert spans == []
+        assert warning == "exemplar embeddings not initialized"

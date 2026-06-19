@@ -103,6 +103,8 @@ from headroom.providers.registry import (
     format_backend_status,
     resolve_api_targets,
 )
+from headroom.proxy import runtime_env
+from headroom.proxy.auth_mode import should_stamp_codex_client
 
 # =============================================================================
 # Extracted modules (re-exported for backward compatibility)
@@ -167,7 +169,6 @@ from headroom.transforms import (
     CacheAligner,
     CodeAwareCompressor,
     CodeCompressorConfig,
-    CompressionStrategy,
     ContentRouter,
     ContentRouterConfig,
     TransformPipeline,
@@ -425,6 +426,11 @@ def _build_agent_usage_summary(
     }
 
 
+# Suppress "[transformers] PyTorch was not found" warning emitted when
+# transformers is imported for availability checks (e.g. kompress ONNX probe).
+# PyTorch is optional in headroom; the warning is not actionable for operators.
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
@@ -526,6 +532,7 @@ def _check_rust_core() -> tuple[str, str | None]:
 from headroom.proxy.handlers import (  # noqa: E402
     AnthropicHandlerMixin,
     BatchHandlerMixin,
+    BedrockHandlerMixin,
     GeminiHandlerMixin,
     OpenAIHandlerMixin,
     StreamingMixin,
@@ -538,6 +545,7 @@ class HeadroomProxy(
     OpenAIHandlerMixin,
     GeminiHandlerMixin,
     BatchHandlerMixin,
+    BedrockHandlerMixin,
 ):
     """Production-ready Headroom optimization proxy."""
 
@@ -618,14 +626,16 @@ class HeadroomProxy(
         )
         if config.disable_kompress:
             router_config.enable_kompress = False
-            router_config.fallback_strategy = CompressionStrategy.PASSTHROUGH
         # A non-None exclude_tools replaces DEFAULT_EXCLUDE_TOOLS in
         # ContentRouter, so merge rather than assign.
         if config.exclude_tools:
             router_config.exclude_tools = set(DEFAULT_EXCLUDE_TOOLS) | config.exclude_tools
-        # Token mode: allow compression of older excluded-tool results.
+        # Token mode: allow compression of older excluded-tool results,
+        # and emit search results grouped by file (path once per file
+        # instead of repeated on every match line).
         if is_token_mode(config.mode):
             router_config.protect_recent_reads_fraction = 0.3
+            router_config.search_group_by_file = True
         # `--compress-user-messages` flips the router's default skip rule.
         # Off by default for prefix-cache safety; enabled for workloads where
         # user-message content dominates input (OpenAI/Azure chat with pasted
@@ -793,6 +803,7 @@ class HeadroomProxy(
             anyllm_provider=config.anyllm_provider,
             bedrock_region=config.bedrock_region,
             logger=logger,
+            openai_api_url=config.openai_api_url,
             anyllm_backend_cls=AnyLLMBackend,
             litellm_backend_cls=LiteLLMBackend,
         )
@@ -1663,6 +1674,32 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     config = config or ProxyConfig()
     proxy = HeadroomProxy(config)
 
+    # cc-switch reconciler (opt-in: HEADROOM_CC_SWITCH_RECONCILE=1).
+    # Keeps Headroom in the request path while cc-switch overwrites
+    # ~/.claude/settings.json on every provider switch. See
+    # headroom/proxy/cc_switch_reconciler.py for the full rationale.
+    from headroom.proxy.cc_switch_reconciler import (
+        CCSwitchReconciler,
+        reconciler_enabled,
+    )
+
+    _cc_reconciler: CCSwitchReconciler | None = None
+    if reconciler_enabled():
+        _cc_proxy_port = config.port if hasattr(config, "port") else 8787
+
+        def _set_anthropic_upstream(url: str) -> None:
+            from headroom.providers.registry import _normalize_api_url
+
+            HeadroomProxy.ANTHROPIC_API_URL = _normalize_api_url(
+                url, default=DEFAULT_ANTHROPIC_API_URL
+            )
+
+        _cc_reconciler = CCSwitchReconciler(
+            proxy_url=f"http://127.0.0.1:{_cc_proxy_port}",
+            default_upstream=DEFAULT_ANTHROPIC_API_URL,
+            set_upstream=_set_anthropic_upstream,
+        )
+
     # Telemetry beacon (anonymous aggregate stats).
     # With uvicorn workers > 1, each worker runs the lifespan independently.
     # We must ensure only ONE beacon runs across all workers — otherwise each
@@ -1762,6 +1799,15 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 else:
                     logger.debug("Beacon: skipping (another worker owns the lock)")
 
+                # Only the beacon-lock owner runs the reconciler. With
+                # uvicorn workers > 1 each worker runs this lifespan; without
+                # this guard every worker would watch + rewrite settings.json
+                # concurrently and each process would hold its own
+                # HeadroomProxy.ANTHROPIC_API_URL, so workers could disagree on
+                # the upstream. Single-owner mirrors the beacon's reasoning.
+                if _cc_reconciler is not None and _beacon_is_owner[0]:
+                    await _cc_reconciler.start()
+
                 app.state.ready = True
                 yield
             except Exception as exc:
@@ -1770,6 +1816,8 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         finally:
             app.state.ready = False
             # Shutdown
+            if _cc_reconciler is not None:
+                await _cc_reconciler.stop()
             if _beacon_is_owner[0]:
                 await _beacon.stop()
                 _release_beacon_lock()
@@ -2010,6 +2058,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 ),
                 "force_kompress": bool(profile_kwargs.get("force_kompress", False)),
                 "accuracy_guard": config.accuracy_guard,
+                # Live (per-request) env knobs the proxy reads after startup.
+                # Surfaced so `headroom wrap` can see what a reused proxy is
+                # actually using and hot-sync it via /admin/runtime-env.
+                "runtime_env": runtime_env.effective_runtime_env(),
                 "pid": os.getpid(),
             }
         return payload
@@ -2106,6 +2158,15 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         query = request.url.query
         headers = dict(request.headers.items())
         set_current_project(classify_project(headers) or prefix_project)
+        # Path-based Codex identification: stamp X-Client: codex on the
+        # Responses endpoint for callers that don't otherwise classify (e.g.
+        # Codex Desktop, whose User-Agent isn't a known codex UA). Without it
+        # the backend refuses oversized
+        # requests with a 413 on a compression timeout, which Codex treats as a
+        # hard connection failure. Mutating scope["headers"] before call_next
+        # makes every downstream classify_client(headers) read "codex".
+        if should_stamp_codex_client(path, headers):
+            request.scope["headers"].append((b"x-client", b"codex"))
         client = getattr(request, "client", None)
         client_addr = ""
         if client is not None:
@@ -2230,6 +2291,21 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     )
     from headroom.proxy.loopback_guard import require_loopback as _require_loopback
 
+    @app.get("/admin/upstream", dependencies=[Depends(_require_loopback)])
+    async def get_upstream():
+        """Current Anthropic upstream + cc-switch reconciler state (loopback-only).
+
+        Read-only. The upstream is mutated only via the in-process cc-switch
+        reconciler (driven by ~/.claude/settings.json) — there is deliberately
+        no HTTP write route, so a local process cannot redirect credential-
+        bearing traffic to an arbitrary URL through this surface.
+        """
+        return {
+            "anthropic": HeadroomProxy.ANTHROPIC_API_URL,
+            "cc_switch_reconcile": _cc_reconciler is not None,
+            "captured_upstream": getattr(_cc_reconciler, "current_upstream", None),
+        }
+
     @app.get("/debug/tasks", dependencies=[Depends(_require_loopback)])
     async def debug_tasks(stack: bool = False):
         """Enumerate running asyncio tasks.
@@ -2258,6 +2334,39 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         payload["runtime"] = _runtime_payload()
         return JSONResponse(status_code=200, content=payload)
 
+    @app.post("/admin/runtime-env", dependencies=[Depends(_require_loopback)])
+    async def admin_runtime_env(request: Request):
+        """Hot-reload live env knobs (the output-shaper family, the ast-grep
+        read threshold) without restarting the proxy.
+
+        Live knobs are read from the proxy's *process* environment, so a proxy
+        that ``headroom wrap`` reused — rather than started — never sees values
+        a user exported afterwards. Instead of a disruptive restart (cold ML
+        load, dropped requests, lost caches), ``wrap`` POSTs the values here and
+        the proxy applies them in memory, effective on the next request.
+
+        Loopback-only. The body is a flat ``{ENV_NAME: "value"}`` map; unknown
+        keys and non-string values are ignored. Returns what was applied plus
+        the resulting live config. Last writer wins (overrides are global to the
+        proxy, which is inherent — every wrapper shares one process).
+        """
+        try:
+            body = await request.json()
+        except (ValueError, UnicodeDecodeError):
+            body = None
+        if not isinstance(body, dict):
+            return JSONResponse(
+                status_code=400,
+                content={"error": "expected a JSON object of {ENV_NAME: value}"},
+            )
+        applied = runtime_env.set_overrides(body)
+        if applied:
+            logger.info("runtime-env hot-reload applied: %s", sorted(applied))
+        return JSONResponse(
+            status_code=200,
+            content={"applied": applied, "runtime_env": runtime_env.effective_runtime_env()},
+        )
+
     @app.get("/dashboard", response_class=HTMLResponse)
     async def dashboard():
         """Serve the Headroom dashboard UI."""
@@ -2266,6 +2375,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     DASHBOARD_STATS_CACHE_TTL_SECONDS = 5.0
     _stats_snapshot_lock = asyncio.Lock()
     _stats_snapshot: dict[str, Any] = {"expires_at": 0.0, "value": None}
+
+    THROUGHPUT_CACHE_TTL_SECONDS = 10.0
+    _throughput_cache_lock = asyncio.Lock()
+    _throughput_cache: dict[str, Any] = {"expires_at": 0.0, "value": None}
 
     RECENT_REQUEST_LOG_WINDOW = 100
 
@@ -2309,6 +2422,28 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         - Cache and rate limiter stats
         """
         m = proxy.metrics
+
+        import time
+
+        async with _throughput_cache_lock:
+            now = time.time()
+            if _throughput_cache["expires_at"] < now or _throughput_cache["value"] is None:
+
+                def _compute_throughput():
+                    from headroom.perf.analyzer import build_perf_summary, parse_log_files
+
+                    perf_report = parse_log_files(last_n_hours=1.0)
+                    return build_perf_summary(perf_report).get("throughput")
+
+                try:
+                    throughput = await asyncio.to_thread(_compute_throughput)
+                    _throughput_cache["value"] = throughput
+                    _throughput_cache["expires_at"] = now + THROUGHPUT_CACHE_TTL_SECONDS
+                except Exception as e:
+                    logger.warning("Failed to calculate throughput for stats: %s", e, exc_info=True)
+                    if _throughput_cache["value"] is None:
+                        _throughput_cache["value"] = None
+            throughput = _throughput_cache["value"]
 
         # Calculate average latency
         avg_latency_ms = round(m.latency_sum_ms / m.latency_count, 2) if m.latency_count > 0 else 0
@@ -2455,6 +2590,30 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             global_output_tokens=m.tokens_output_total,
         )
 
+        # Output-side reduction (counterfactual estimate from the shaper's
+        # ledger). Distinct from input compression above: these are OUTPUT
+        # tokens the model didn't emit because we steered verbosity / routed
+        # effort down. Always labelled estimated-vs-measured + a CI so it's
+        # never mistaken for an exact count. Best-effort — never break /stats.
+        output_reduction: dict[str, Any] = {"available": False}
+        try:
+            from headroom.proxy.output_savings import get_recorder
+
+            _oest = get_recorder().estimate()
+            if _oest.n_requests > 0:
+                output_reduction = {
+                    "available": True,
+                    "method": _oest.kind,  # "measured" | "estimated"
+                    "tokens_saved": round(_oest.tokens_saved),
+                    "baseline_tokens": round(_oest.baseline_tokens),
+                    "reduction_percent": round(_oest.pct, 1),
+                    "ci_low_percent": round(_oest.ci_low_pct, 1),
+                    "ci_high_percent": round(_oest.ci_high_pct, 1),
+                    "requests": _oest.n_requests,
+                }
+        except Exception:  # pragma: no cover - defensive
+            pass
+
         return {
             "summary": summary,
             "agent_usage": agent_usage,
@@ -2511,6 +2670,15 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                             "baseline caching is provider-native."
                         ),
                     },
+                    "output_shaping": {
+                        **output_reduction,
+                        "description": (
+                            "OUTPUT tokens the model didn't emit because the shaper "
+                            "steered verbosity / routed effort down. Counterfactual — "
+                            "shown as an estimate (vs a learned baseline) or measured "
+                            "(A/B holdout), always with a confidence band."
+                        ),
+                    },
                 },
             },
             "requests": {
@@ -2525,6 +2693,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             "tokens": {
                 "input": m.tokens_input_total,
                 "output": m.tokens_output_total,
+                "output_saved": output_reduction.get("tokens_saved", 0),
+                "output_reduction_percent": output_reduction.get("reduction_percent", 0),
+                "output_reduction": output_reduction,
                 "saved": all_layers_tokens_saved,
                 "proxy_compression_saved": proxy_compression_tokens,
                 "cli_filtering_saved": cli_tokens_avoided,
@@ -2725,13 +2896,14 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             **recent_request_payload,
             "log_full_messages": proxy.config.log_full_messages if proxy else False,
             **get_quota_registry().get_all_stats(),
+            "throughput": throughput,
         }
 
     def _dashboard_config_payload() -> dict[str, Any]:
         profile_kwargs = proxy_pipeline_kwargs(config)
         target_ratio = profile_kwargs.get("target_ratio", config.target_ratio)
         target_savings_percent = None
-        if isinstance(target_ratio, (int, float)):
+        if isinstance(target_ratio, int | float):
             target_savings_percent = round(max(0.0, min(1.0, 1.0 - float(target_ratio))) * 100, 1)
         return {
             "savings_profile": config.savings_profile,
@@ -2970,7 +3142,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             )
 
         if query:
-            # Search within cached content
+            # Search within cached content. The get_entry_status check above
+            # (clean_expired=True) already guaranteed availability or raised
+            # 404, so no second exists()/status backend read is needed here.
             results = store.search(hash_key, query)
             return {
                 "hash": hash_key,
@@ -3484,6 +3658,7 @@ def _proxy_config_from_env() -> ProxyConfig:
         backend=_get_env_str("HEADROOM_BACKEND", "anthropic"),
         bedrock_region=_get_env_str("HEADROOM_BEDROCK_REGION", "us-west-2"),
         bedrock_profile=os.environ.get("AWS_PROFILE"),
+        bedrock_api_url=os.environ.get("BEDROCK_TARGET_API_URL"),
         anyllm_provider=_get_env_str("HEADROOM_ANYLLM_PROVIDER", "openai"),
         disable_kompress=_get_env_bool("HEADROOM_DISABLE_KOMPRESS", False),
         max_connections=_get_env_int("HEADROOM_MAX_CONNECTIONS", 500),
@@ -3786,6 +3961,14 @@ if __name__ == "__main__":
         help="AWS profile for Bedrock backend (default: use default credentials)",
     )
     parser.add_argument(
+        "--bedrock-api-url",
+        help=(
+            "Custom Bedrock InvokeModel upstream for the /model/{id}/invoke "
+            "passthrough routes — point at a re-signing gateway, not raw AWS "
+            "(env: BEDROCK_TARGET_API_URL)"
+        ),
+    )
+    parser.add_argument(
         "--openrouter-api-key",
         help="OpenRouter API key (or set OPENROUTER_API_KEY env var)",
     )
@@ -3931,6 +4114,7 @@ if __name__ == "__main__":
         backend=_get_env_str("HEADROOM_BACKEND", args.backend),  # type: ignore[arg-type]
         bedrock_region=_get_env_str("HEADROOM_BEDROCK_REGION", args.bedrock_region),
         bedrock_profile=args.bedrock_profile or os.environ.get("AWS_PROFILE"),
+        bedrock_api_url=_get_env_str("BEDROCK_TARGET_API_URL", args.bedrock_api_url),
         anyllm_provider=_get_env_str("HEADROOM_ANYLLM_PROVIDER", args.anyllm_provider),
         optimize=optimize,
         min_tokens_to_crush=_get_env_int("HEADROOM_MIN_TOKENS", args.min_tokens),
@@ -3963,10 +4147,12 @@ if __name__ == "__main__":
         compress_user_messages=args.compress_user_messages
         or _get_env_bool("HEADROOM_COMPRESS_USER_MESSAGES", False),
         savings_profile=os.environ.get("HEADROOM_SAVINGS_PROFILE") or None,
+        # Default 0.4 keep-ratio so the Kompress text (prose/code) path compresses
+        # meaningfully out of the box; HEADROOM_TARGET_RATIO overrides.
         target_ratio=(
             float(os.environ["HEADROOM_TARGET_RATIO"])
             if os.environ.get("HEADROOM_TARGET_RATIO")
-            else None
+            else 0.4
         ),
         compress_system_messages=(
             _get_env_bool("HEADROOM_COMPRESS_SYSTEM_MESSAGES", False)

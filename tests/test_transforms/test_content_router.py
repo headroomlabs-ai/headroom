@@ -150,6 +150,12 @@ def test_force_kompress_routes_anthropic_tool_result_to_targeted_kompress(
     captured: dict[str, object] = {}
 
     class FakeKompress:
+        def is_ready(self) -> bool:
+            return True
+
+        def ensure_background_load(self) -> None:
+            pass
+
         def compress(self, content, **kwargs):
             captured.update(kwargs)
             compressed = " ".join(content.split()[:20])
@@ -878,3 +884,438 @@ class TestExcludeTools:
         # OtherTool may or may not be compressed, but should be processed
         # (we just verify it wasn't excluded)
         assert "router:excluded:tool" in result.transforms_applied
+
+    def test_bash_not_in_default_exclude_tools(self):
+        """Bash is NOT excluded by default — its outputs (build logs, test
+        output) are ideal compression targets. Regression test for PR #704.
+
+        This test validates the DEFAULT_EXCLUDE_TOOLS frozenset directly
+        (pure config check — no Rust dependency).
+        """
+        from headroom.config import DEFAULT_EXCLUDE_TOOLS
+
+        assert "Bash" not in DEFAULT_EXCLUDE_TOOLS, (
+            "Bash should NOT be in DEFAULT_EXCLUDE_TOOLS — "
+            "its outputs (build logs, test output) are ideal compression targets"
+        )
+        assert "bash" not in DEFAULT_EXCLUDE_TOOLS, "'bash' should NOT be in DEFAULT_EXCLUDE_TOOLS"
+
+    def test_bash_lowercase_not_in_exclude_tools(self):
+        """Lowercase 'bash' is also NOT in default exclude tools."""
+        from headroom.config import DEFAULT_EXCLUDE_TOOLS
+
+        assert "bash" not in DEFAULT_EXCLUDE_TOOLS
+
+    def test_default_exclude_tools_membership(self):
+        """Verify all expected exclude tools and their lowercase variants."""
+        from headroom.config import DEFAULT_EXCLUDE_TOOLS
+
+        # Tools that SHOULD be excluded (fresh Read/Write/Edit/Glob/Grep outputs)
+        for tool in ("Read", "Glob", "Grep", "Write", "Edit"):
+            assert tool in DEFAULT_EXCLUDE_TOOLS, f"{tool} should be in DEFAULT_EXCLUDE_TOOLS"
+            assert tool.lower() in DEFAULT_EXCLUDE_TOOLS, (
+                f"{tool.lower()} should be in DEFAULT_EXCLUDE_TOOLS"
+            )
+
+        # Tools that should NOT be excluded
+        for tool in ("Bash", "bash", "TodoWrite", "todo_write"):
+            assert tool not in DEFAULT_EXCLUDE_TOOLS, (
+                f"{tool} should NOT be in DEFAULT_EXCLUDE_TOOLS"
+            )
+
+
+# =============================================================================
+# TestSmartCrusherFallback — PR #704 regression suite
+# =============================================================================
+
+
+class TestSmartCrusherFallback:
+    """Verify SmartCrusher→Kompress→Log fallback chain.
+
+    The post-strategy unified fallback block (added in PR #704) replaces
+    inline duplicate Kompress invocations. When SmartCrusher returns no
+    savings, the unified block tries Kompress, then Log (structurally
+    repetitive content), without double-invoking Kompress.
+
+    Uses ``_apply_strategy_to_content`` + monkeypatched fallback
+    compressors to avoid network/ML-model downloads in test environments.
+    """
+
+    def test_smart_crusher_with_no_savings_triggers_kompress_fallback(self, router, monkeypatch):
+        """When SmartCrusher produces no savings (returns content unchanged),
+        the unified post-strategy block must fire Kompress fallback.
+
+        Monkeypatches ``_get_smart_crusher`` to return a mock whose
+        ``crush()`` returns *content* unchanged — this simulates "ran
+        but produced no savings" without depending on the Rust
+        ``headroom._core`` extension or an LLM round-trip.
+        """
+        from unittest.mock import MagicMock
+
+        import headroom.transforms.content_router as crm
+        from headroom.transforms.smart_crusher import CrushResult
+
+        content = "this is repetitive text. " * 300
+
+        # Mock SmartCrusher: ran successfully but returned content as-is
+        # (no savings), so the unified fallback block is entered.
+        mock_crush_result = CrushResult(
+            compressed=content,
+            original=content,
+            was_modified=False,
+            strategy="passthrough",
+        )
+        mock_crusher = MagicMock()
+        mock_crusher.crush.return_value = mock_crush_result
+        monkeypatch.setattr(
+            crm.ContentRouter,
+            "_get_smart_crusher",
+            lambda self: mock_crusher,
+        )
+
+        # Patch _try_ml_compressor to simulate Kompress also returning
+        # unchanged (no savings), forcing the full chain to exercise
+        monkeypatch.setattr(
+            crm.ContentRouter,
+            "_try_ml_compressor",
+            lambda self, c, context="", question=None: (
+                c,
+                len(c.split()),
+            ),
+        )
+
+        compressed, compressed_tokens, strategy_chain = router._apply_strategy_to_content(
+            content,
+            CompressionStrategy.SMART_CRUSHER,
+            context="",
+        )
+
+        # Strategy chain must include smart_crusher
+        assert "smart_crusher" in strategy_chain
+        # Kompress fallback should have been attempted
+        assert "kompress" in strategy_chain, (
+            f"Expected kompress in chain {strategy_chain} — "
+            f"unified post-strategy block should have fired"
+        )
+
+    def test_smart_crusher_json_compresses_directly(self, router, monkeypatch):
+        """When SmartCrusher successfully compresses JSON, the chain is
+        just [smart_crusher] with no fallback entries.
+
+        Uses a mock SmartCrusher to avoid depending on the Rust
+        ``headroom._core`` extension in test environments.
+        """
+        import json
+        from unittest.mock import MagicMock
+
+        import headroom.transforms.content_router as crm
+        from headroom.transforms.smart_crusher import CrushResult
+
+        content = json.dumps([{"id": i, "name": f"item_{i}", "value": i * 10} for i in range(100)])
+
+        # Mock SmartCrusher: simulated compression (shorter output)
+        mock_compressed = json.dumps([{"id": i, "name": f"item_{i}"} for i in range(50)])
+        mock_crush_result = CrushResult(
+            compressed=mock_compressed,
+            original=content,
+            was_modified=True,
+            strategy="smart_crusher",
+        )
+        mock_crusher = MagicMock()
+        mock_crusher.crush.return_value = mock_crush_result
+        monkeypatch.setattr(
+            crm.ContentRouter,
+            "_get_smart_crusher",
+            lambda self: mock_crusher,
+        )
+
+        compressed, compressed_tokens, strategy_chain = router._apply_strategy_to_content(
+            content,
+            CompressionStrategy.SMART_CRUSHER,
+            context="",
+        )
+
+        # SmartCrusher should handle JSON directly
+        assert "smart_crusher" in strategy_chain
+        # With real savings, no fallback should be triggered
+        assert "kompress" not in strategy_chain
+        assert len(compressed.strip()) > 0
+
+    def test_post_strategy_block_no_duplicate_kompress(self, router, monkeypatch):
+        """The unified post-strategy block must NOT produce duplicate
+        'kompress' entries in the strategy chain.
+
+        Pre-PR #704: an inline duplicate Kompress fallback existed for
+        SmartCrusher that could fire alongside the post-strategy block,
+        causing 'kompress' to appear twice in the chain.
+
+        Uses a mock SmartCrusher returning no savings so the fallback
+        block is entered deterministically, without depending on the
+        Rust ``headroom._core`` extension.
+        """
+        from unittest.mock import MagicMock
+
+        import headroom.transforms.content_router as crm
+        from headroom.transforms.smart_crusher import CrushResult
+
+        repetitive = "line " * 300 + "\n"
+
+        # Mock SmartCrusher: ran successfully but returned content as-is
+        # (no savings) — fallback block must fire.
+        mock_crush_result = CrushResult(
+            compressed=repetitive,
+            original=repetitive,
+            was_modified=False,
+            strategy="passthrough",
+        )
+        mock_crusher = MagicMock()
+        mock_crusher.crush.return_value = mock_crush_result
+        monkeypatch.setattr(
+            crm.ContentRouter,
+            "_get_smart_crusher",
+            lambda self: mock_crusher,
+        )
+
+        # Monkeypatch Kompress to return unchanged (no savings),
+        # forcing the full fallback chain without network access
+        monkeypatch.setattr(
+            crm.ContentRouter,
+            "_try_ml_compressor",
+            lambda self, c, context="", question=None: (
+                c,
+                len(c.split()),
+            ),
+        )
+
+        compressed, compressed_tokens, strategy_chain = router._apply_strategy_to_content(
+            repetitive,
+            CompressionStrategy.SMART_CRUSHER,
+            context="",
+        )
+
+        # The chain must include the requested strategy
+        assert "smart_crusher" in strategy_chain
+
+        # No duplicate "kompress" entries — the key regression check
+        kompress_count = strategy_chain.count("kompress")
+        assert kompress_count <= 1, (
+            f"Kompress appeared {kompress_count} times in chain; "
+            f"duplicate fallback suggests inline+post-strategy both fired: "
+            f"{strategy_chain}"
+        )
+
+    def test_code_aware_fallback_also_uses_unified_block(self, router, monkeypatch):
+        """CodeAware strategy also uses the unified fallback block.
+        Verify it doesn't double-invoke Kompress either."""
+        import headroom.transforms.content_router as crm
+
+        monkeypatch.setattr(
+            crm.ContentRouter,
+            "_try_ml_compressor",
+            lambda self, content, context="", question=None: (
+                content,
+                len(content.split()),
+            ),
+        )
+
+        plain = "This is just plain text. " * 200
+
+        compressed, compressed_tokens, strategy_chain = router._apply_strategy_to_content(
+            plain,
+            CompressionStrategy.CODE_AWARE,
+            context="",
+        )
+
+        # CodeAware should be in the chain
+        assert "code_aware" in strategy_chain
+
+        # No duplicate fallback entries
+        kompress_count = strategy_chain.count("kompress")
+        assert kompress_count <= 1, (
+            f"Kompress appeared {kompress_count} times; "
+            f"duplicate fallback in CodeAware path: {strategy_chain}"
+        )
+
+
+# =============================================================================
+# TestCompressBlockContent — PR #704 shared-path regression
+# =============================================================================
+
+
+class TestCompressBlockContent:
+    """Verify `_compress_block_content` shared path for tool_result and text blocks.
+
+    Before PR #704, the two block paths had ~60 lines of duplicate cache
+    logic each. The shared helper ensures both paths stay in sync (cache
+    expiry, pinning, ratio gating).
+
+    Tests target the two-tier ``CompressionCache`` (content_router-local,
+    line 191) and the ``_compress_block_content`` method directly,
+    avoiding the Rust content-detection extension by pre-populating
+    the cache and verifying cache-hit/skip behaviour.
+    """
+
+    @pytest.fixture
+    def router_with_cache(self):
+        """ContentRouter with all compressors enabled."""
+        config = ContentRouterConfig(
+            enable_smart_crusher=True,
+            enable_kompress=True,
+            enable_log_compressor=True,
+            min_section_tokens=10,
+        )
+        return ContentRouter(config)
+
+    def test_skip_set_prevents_recompression(self, router_with_cache):
+        """Tier 1 (skip set): content_key in the skip set returns
+        (None, False) immediately — no compression attempted."""
+        cache = router_with_cache._cache
+        key = hash("test-content-that-wont-compress")
+
+        # Mark as skipped
+        cache.mark_skip(key)
+        assert cache.is_skipped(key) is True
+
+        # _compress_block_content should return early on skip
+        compressed, was_compressed = router_with_cache._compress_block_content(
+            content="test-content-that-wont-compress",
+            content_key=key,
+            context="",
+            bias=1.0,
+            min_ratio=0.5,
+            compressor_timing=None,
+            transforms_applied=[],
+            route_counts=None,
+            compressed_details=None,
+            strategy_label="test",
+            details_prefix="test",
+        )
+
+        assert compressed is None
+        assert was_compressed is False
+
+    def test_result_cache_hit_returns_cached(self, router_with_cache):
+        """Tier 2 (result cache): cached content is returned without
+        re-running compression."""
+        cache = router_with_cache._cache
+        key = hash("cacheable-content")
+        original = "compressed-version-of-content"
+
+        # Populate result cache
+        cache.put(key, original, ratio=0.3, strategy="kompress")
+        assert cache.get(key) == (original, 0.3, "kompress")
+
+        # _compress_block_content should return cached result
+        compressed, was_compressed = router_with_cache._compress_block_content(
+            content="cacheable-content",
+            content_key=key,
+            context="",
+            bias=1.0,
+            min_ratio=0.5,
+            compressor_timing=None,
+            transforms_applied=[],
+            route_counts=None,
+            compressed_details=None,
+            strategy_label="test",
+            details_prefix="test",
+        )
+
+        assert compressed == original
+        assert was_compressed is True
+
+    def test_result_cache_ratio_above_min_moves_to_skip(self, router_with_cache):
+        """When the cached ratio is ≥ min_ratio, the entry is moved from
+        Tier 2 to Tier 1 (skip set) — ratio threshold has tightened."""
+        cache = router_with_cache._cache
+        key = hash("borderline-content")
+
+        # Cached with ratio 0.8 (high — barely compressed)
+        cache.put(key, "slightly-compressed", ratio=0.8, strategy="text")
+
+        # min_ratio=0.7 — cached ratio (0.8) ≥ threshold → move to skip
+        compressed, was_compressed = router_with_cache._compress_block_content(
+            content="borderline-content",
+            content_key=key,
+            context="",
+            bias=1.0,
+            min_ratio=0.7,
+            compressor_timing=None,
+            transforms_applied=[],
+            route_counts=None,
+            compressed_details=None,
+            strategy_label="test",
+            details_prefix="test",
+        )
+
+        assert compressed is None, "Should move to skip when ratio ≥ min_ratio"
+        assert was_compressed is False
+        assert cache.is_skipped(key), "Entry should now be in skip set"
+        assert cache.get(key) is None, "Entry should be removed from result cache"
+
+    def test_compress_block_content_route_counts_mutated(self, router_with_cache):
+        """route_counts dict is mutated in-place with cache hit/miss info."""
+        cache = router_with_cache._cache
+        key_skip = hash("skip-content")
+        key_hit = hash("hit-content")
+
+        cache.mark_skip(key_skip)
+        cache.put(key_hit, "compressed", ratio=0.3, strategy="kompress")
+
+        route_counts: dict[str, int] = {}
+
+        # Skip hit
+        router_with_cache._compress_block_content(
+            content="skip-content",
+            content_key=key_skip,
+            context="",
+            bias=1.0,
+            min_ratio=0.5,
+            compressor_timing=None,
+            transforms_applied=[],
+            route_counts=route_counts,
+            compressed_details=None,
+            strategy_label="test",
+            details_prefix="test",
+        )
+        assert route_counts.get("ratio_too_high", 0) >= 1
+        assert route_counts.get("cache_hit", 0) >= 1
+
+        # Cache hit
+        router_with_cache._compress_block_content(
+            content="hit-content",
+            content_key=key_hit,
+            context="",
+            bias=1.0,
+            min_ratio=0.5,
+            compressor_timing=None,
+            transforms_applied=[],
+            route_counts=route_counts,
+            compressed_details=None,
+            strategy_label="test",
+            details_prefix="test",
+        )
+
+    def test_compress_block_content_transforms_applied_mutated(self, router_with_cache):
+        """transforms_applied list is mutated with strategy info on cache hit."""
+        cache = router_with_cache._cache
+        key = hash("transform-test-content")
+        cache.put(key, "short", ratio=0.25, strategy="kompress")
+
+        transforms_applied: list[str] = []
+        router_with_cache._compress_block_content(
+            content="transform-test-content",
+            content_key=key,
+            context="",
+            bias=1.0,
+            min_ratio=0.5,
+            compressor_timing=None,
+            transforms_applied=transforms_applied,
+            route_counts=None,
+            compressed_details=None,
+            strategy_label="tool_result",
+            details_prefix="tool",
+        )
+
+        assert any("router:tool_result" in t for t in transforms_applied), (
+            f"Expected router:tool_result:* in transforms, got: {transforms_applied}"
+        )

@@ -179,11 +179,27 @@ class SmartCrusherConfig:
     dedup_identical_items: bool = True
     first_fraction: float = 0.3
     last_fraction: float = 0.15
-    # Lossless compaction only replaces the original when it saves at
-    # least this byte fraction vs the (minified) input. Mirrors the Rust
-    # default; mainly lowered in tests and KV experiments — KV repeats
-    # field names per row, so it clears the gate less often than CSV.
-    lossless_min_savings_ratio: float = 0.30
+    # Minimum byte-savings ratio for the lossless Table/CSV compaction
+    # path to win over the lossy path (0.15, matching the Rust default —
+    # the two must stay in lockstep, see config.rs). Lossless output
+    # needs no CCR retrieval round-trip when the model wants more rows,
+    # so it gets a lower bar than the lossy path. Mainly raised in tests
+    # and KV experiments — KV repeats field names per row, so it clears
+    # the gate less often than CSV.
+    lossless_min_savings_ratio: float = 0.15
+
+    # Compaction heuristics (mirror Rust CompactConfig; see
+    # crates/headroom-core/src/transforms/smart_crusher/compaction/compactor.rs).
+    # A field is "core" if present in at least this fraction of rows.
+    compaction_core_field_fraction: float = 0.8
+    # Below this fraction of core keys, treat the array as heterogeneous
+    # and look for a discriminator to bucket by.
+    compaction_heterogeneous_core_ratio: float = 0.6
+    # Cap on inner-key count for nested-uniform flattening.
+    compaction_max_flatten_inner_keys: int = 6
+    # Bucket-count bounds for discriminator usefulness.
+    compaction_min_buckets: int = 2
+    compaction_max_buckets: int = 8
 
 
 # ─── Rust-backed SmartCrusher ─────────────────────────────────────────────
@@ -316,11 +332,21 @@ class SmartCrusher(Transform):
             dedup_identical_items=cfg.dedup_identical_items,
             first_fraction=cfg.first_fraction,
             last_fraction=cfg.last_fraction,
-            lossless_min_savings_ratio=cfg.lossless_min_savings_ratio,
             relevance_threshold=0.3,
             enable_ccr_marker=(
                 self._ccr_config.enabled and self._ccr_config.inject_retrieval_marker
             ),
+            # getattr fallbacks: callers may pass the structurally-similar
+            # `headroom.config.SmartCrusherConfig` (MCP server, SDK) or a
+            # pre-existing config object that predates these fields.
+            lossless_min_savings_ratio=getattr(cfg, "lossless_min_savings_ratio", 0.15),
+            compaction_core_field_fraction=getattr(cfg, "compaction_core_field_fraction", 0.8),
+            compaction_heterogeneous_core_ratio=getattr(
+                cfg, "compaction_heterogeneous_core_ratio", 0.6
+            ),
+            compaction_max_flatten_inner_keys=getattr(cfg, "compaction_max_flatten_inner_keys", 6),
+            compaction_min_buckets=getattr(cfg, "compaction_min_buckets", 2),
+            compaction_max_buckets=getattr(cfg, "compaction_max_buckets", 8),
         )
         # Default: lossless-first compaction (PR4). Lossless wins for
         # cleanly tabular input where it saves ≥ 30% bytes; otherwise

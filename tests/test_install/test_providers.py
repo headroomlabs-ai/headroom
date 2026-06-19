@@ -382,7 +382,10 @@ def test_claude_build_install_env_returns_proxy_base_url() -> None:
     env = build_claude_install_env(port=5566, backend="ignored")
 
     # Assert
-    assert env == {"ANTHROPIC_BASE_URL": "http://127.0.0.1:5566"}
+    assert env == {
+        "ANTHROPIC_BASE_URL": "http://127.0.0.1:5566",
+        "ENABLE_TOOL_SEARCH": "true",
+    }
 
 
 def test_copilot_build_install_env_uses_provider_type_specific_proxy_urls() -> None:
