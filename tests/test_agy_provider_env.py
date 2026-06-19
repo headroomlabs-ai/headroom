@@ -46,9 +46,7 @@ class TestBuildAgyEnv:
         assert env["CACERT_PATH"] == str(bundle)
         assert env["NODE_EXTRA_CA_CERTS"] == str(bundle)
 
-    def test_corp_proxy_not_leaked_into_child_and_base_env_unmutated(
-        self, tmp_path: Path
-    ) -> None:
+    def test_corp_proxy_not_leaked_into_child_and_base_env_unmutated(self, tmp_path: Path) -> None:
         """A pre-existing corporate HTTPS_PROXY must NOT leak into the child agy
         env as its proxy (the child must talk to the terminator), and build_agy_env
         must NOT mutate base_env — so the terminator, running in the PARENT process,

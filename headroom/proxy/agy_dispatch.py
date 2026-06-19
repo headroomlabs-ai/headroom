@@ -44,7 +44,9 @@ _BIND_HOST = "127.0.0.1"
 # ---------------------------------------------------------------------------
 
 
-def _build_sni_ssl_context(leaf_cache: _LeafCache, ca_key: RSAPrivateKey, ca_cert: Certificate) -> ssl.SSLContext:
+def _build_sni_ssl_context(
+    leaf_cache: _LeafCache, ca_key: RSAPrivateKey, ca_cert: Certificate
+) -> ssl.SSLContext:
     """Return a server SSLContext whose SNI callback mints leaf certs on demand.
 
     The initial certfile/keyfile uses a wildcard placeholder cert so that
@@ -65,8 +67,12 @@ def _build_sni_ssl_context(leaf_cache: _LeafCache, ca_key: RSAPrivateKey, ca_cer
 
     # Load the placeholder cert chain (required before SNI callback fires).
     with (
-        tempfile.NamedTemporaryFile(prefix="hr_disp_cert_", suffix=".pem", delete=True, mode="wb") as cf,
-        tempfile.NamedTemporaryFile(prefix="hr_disp_key_", suffix=".pem", delete=True, mode="wb") as kf,
+        tempfile.NamedTemporaryFile(
+            prefix="hr_disp_cert_", suffix=".pem", delete=True, mode="wb"
+        ) as cf,
+        tempfile.NamedTemporaryFile(
+            prefix="hr_disp_key_", suffix=".pem", delete=True, mode="wb"
+        ) as kf,
     ):
         cf.write(init_cert_pem)
         cf.flush()
@@ -88,8 +94,12 @@ def _build_sni_ssl_context(leaf_cache: _LeafCache, ca_key: RSAPrivateKey, ca_cer
         new_ctx.set_alpn_protocols(["h2", "http/1.1"])
 
         with (
-            tempfile.NamedTemporaryFile(prefix="hr_sni_cert_", suffix=".pem", delete=True, mode="wb") as cf,
-            tempfile.NamedTemporaryFile(prefix="hr_sni_key_", suffix=".pem", delete=True, mode="wb") as kf,
+            tempfile.NamedTemporaryFile(
+                prefix="hr_sni_cert_", suffix=".pem", delete=True, mode="wb"
+            ) as cf,
+            tempfile.NamedTemporaryFile(
+                prefix="hr_sni_key_", suffix=".pem", delete=True, mode="wb"
+            ) as kf,
         ):
             cf.write(cert_pem)
             cf.flush()
@@ -143,7 +153,7 @@ class AgyDispatchServer:
         self._server: asyncio.Server | None = None
         self._lifespan_task: asyncio.Task[None] | None = None
         self._lifespan: Any | None = None  # hypercorn.asyncio.run.Lifespan
-        self._context: Any | None = None   # hypercorn.asyncio.run.WorkerContext
+        self._context: Any | None = None  # hypercorn.asyncio.run.WorkerContext
         self._app_wrapper: Any | None = None
         self._config: Any | None = None
         self._lifespan_state: dict[str, Any] = {}
@@ -168,7 +178,7 @@ class AgyDispatchServer:
         # Build minimal hypercorn Config (no certfile/keyfile — we supply ssl directly).
         config = Config()
         config.bind = [f"{_BIND_HOST}:{self._port}"]
-        config.accesslog = "-"   # suppress hypercorn access log noise in tests
+        config.accesslog = "-"  # suppress hypercorn access log noise in tests
         config.errorlog = "-"
         config.loglevel = "WARNING"
         self._config = config

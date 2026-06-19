@@ -45,10 +45,7 @@ _LARGE_AGY_BODY: dict[str, Any] = {
 
 # Minimal SSE payload the handler's _stream_response would return.
 _SSE_PAYLOAD = (
-    b'data: {"candidates":[{"content":{"parts":[{"text":"ok"}]}}]}\r\n'
-    b"\r\n"
-    b"data: [DONE]\r\n"
-    b"\r\n"
+    b'data: {"candidates":[{"content":{"parts":[{"text":"ok"}]}}]}\r\n\r\ndata: [DONE]\r\n\r\n'
 )
 
 # ---------------------------------------------------------------------------
@@ -127,9 +124,7 @@ def test_antigravity_routes_to_daily_endpoint(monkeypatch: pytest.MonkeyPatch) -
     """antigravity UA → https://daily-cloudcode-pa.googleapis.com target URL."""
     captured: list[str] = []
 
-    async def _fake_stream(
-        proxy_self: Any, url: str, *args: Any, **kwargs: Any
-    ) -> JSONResponse:
+    async def _fake_stream(proxy_self: Any, url: str, *args: Any, **kwargs: Any) -> JSONResponse:
         captured.append(url)
         return JSONResponse({"url": url})
 
@@ -211,9 +206,7 @@ def test_stealth_no_x_headroom_headers_upstream(monkeypatch: pytest.MonkeyPatch)
 
     assert response.status_code == 200
     x_headroom_keys = [k for k in captured_headers if k.lower().startswith("x-headroom-")]
-    assert x_headroom_keys == [], (
-        f"x-headroom-* headers leaked to upstream: {x_headroom_keys}"
-    )
+    assert x_headroom_keys == [], f"x-headroom-* headers leaked to upstream: {x_headroom_keys}"
 
 
 # ---------------------------------------------------------------------------
@@ -244,9 +237,7 @@ def test_stealth_agy_user_agent_unchanged(monkeypatch: pytest.MonkeyPatch) -> No
 
     assert response.status_code == 200
     sent_ua = captured_headers.get("user-agent", "")
-    assert sent_ua == _AGY_UA, (
-        f"UA was rewritten: expected {_AGY_UA!r}, got {sent_ua!r}"
-    )
+    assert sent_ua == _AGY_UA, f"UA was rewritten: expected {_AGY_UA!r}, got {sent_ua!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -292,9 +283,7 @@ def test_single_upstream_origination(monkeypatch: pytest.MonkeyPatch) -> None:
     """_stream_response is called EXACTLY once per request (no duplicate origination)."""
     call_count = 0
 
-    async def _fake_stream(
-        proxy_self: Any, url: str, *args: Any, **kwargs: Any
-    ) -> JSONResponse:
+    async def _fake_stream(proxy_self: Any, url: str, *args: Any, **kwargs: Any) -> JSONResponse:
         nonlocal call_count
         call_count += 1
         return JSONResponse({"ok": True})
@@ -376,9 +365,7 @@ def test_auth_not_leaked_in_default_logs(
     SECRET_BEARER = "supersecret-bearer-token-xyz789"
     SECRET_API_KEY = "AIzaSyFakeSecret1234567890"
 
-    async def _fake_stream(
-        proxy_self: Any, url: str, *args: Any, **kwargs: Any
-    ) -> JSONResponse:
+    async def _fake_stream(proxy_self: Any, url: str, *args: Any, **kwargs: Any) -> JSONResponse:
         return JSONResponse({"ok": True})
 
     monkeypatch.setattr(HeadroomProxy, "_stream_response", _fake_stream)
@@ -485,10 +472,7 @@ def test_fail_open_on_compression_pipeline_exception(
     assert any(
         "optimization failed" in msg.lower() or "cloud code assist" in msg.lower()
         for msg in warning_messages
-    ), (
-        "Expected a warning about compression failure. Got: "
-        + "\n".join(warning_messages)
-    )
+    ), "Expected a warning about compression failure. Got: " + "\n".join(warning_messages)
 
 
 # ---------------------------------------------------------------------------

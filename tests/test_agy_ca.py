@@ -40,9 +40,7 @@ def _make_cert(
 ) -> bytes:
     """Generate a minimal PEM certificate for testing."""
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    subject = issuer = x509.Name(
-        [x509.NameAttribute(NameOID.COMMON_NAME, "test")]
-    )
+    subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "test")])
     builder = (
         x509.CertificateBuilder()
         .subject_name(subject)
@@ -51,8 +49,7 @@ def _make_cert(
         .serial_number(x509.random_serial_number())
         .not_valid_before(datetime.datetime.now(datetime.timezone.utc))
         .not_valid_after(
-            datetime.datetime.now(datetime.timezone.utc)
-            + datetime.timedelta(days=days_valid)
+            datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=days_valid)
         )
         .add_extension(
             x509.BasicConstraints(ca=is_ca, path_length=path_length if is_ca else None),
@@ -150,9 +147,7 @@ def _write_expiring_ca(base_dir: Path, days_valid: int = 1) -> None:
     ca_dir = base_dir / "ca"
     ca_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    subject = issuer = x509.Name(
-        [x509.NameAttribute(NameOID.COMMON_NAME, "expiring")]
-    )
+    subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "expiring")])
     now = datetime.datetime.now(datetime.timezone.utc)
     cert = (
         x509.CertificateBuilder()
@@ -388,9 +383,7 @@ def test_bundle_contains_corp_ca_but_not_leaf(
     assert leaf_pem not in bundle_data
 
 
-def test_bundle_not_in_os_trust_paths(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_bundle_not_in_os_trust_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Bundle path must not reside under any known OS trust store location."""
     sys_bundle = _fake_system_bundle(tmp_path)
     monkeypatch.setattr(
@@ -423,9 +416,7 @@ def test_ca_never_written_to_os_trust_store(
 # ---------------------------------------------------------------------------
 
 
-def test_no_system_bundle_raises(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_no_system_bundle_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "headroom.proxy.agy_ca._SYSTEM_BUNDLE_CANDIDATES",
         (),
@@ -456,9 +447,7 @@ def test_cert_near_expiry_false_for_valid() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_build_bundle_twice_same_content(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_build_bundle_twice_same_content(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Building the bundle twice without CA regen produces identical content."""
     sys_bundle = _fake_system_bundle(tmp_path)
     monkeypatch.setattr(
@@ -477,9 +466,7 @@ def test_build_bundle_twice_same_content(
 # ---------------------------------------------------------------------------
 
 
-def test_clean_install_nested_base_dir(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_clean_install_nested_base_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """ensure_root_ca then build_combined_bundle on a completely fresh nested
     base_dir must succeed and leave base_dir at 0o700.
 

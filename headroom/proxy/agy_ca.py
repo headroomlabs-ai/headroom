@@ -53,14 +53,14 @@ _OS_TRUST_PATHS: tuple[str, ...] = (
 
 # Candidate system CA bundle paths (ordered by prevalence).
 _SYSTEM_BUNDLE_CANDIDATES: tuple[str, ...] = (
-    "/etc/ssl/certs/ca-certificates.crt",   # Debian/Ubuntu/Alpine
-    "/etc/pki/tls/certs/ca-bundle.crt",     # RHEL/CentOS/Fedora
-    "/etc/ssl/ca-bundle.pem",               # openSUSE
-    "/usr/share/ssl/certs/ca-bundle.crt",   # legacy RHEL
-    "/usr/local/etc/openssl/cert.pem",      # macOS Homebrew OpenSSL
-    "/etc/ssl/cert.pem",                    # macOS system / BSDs
+    "/etc/ssl/certs/ca-certificates.crt",  # Debian/Ubuntu/Alpine
+    "/etc/pki/tls/certs/ca-bundle.crt",  # RHEL/CentOS/Fedora
+    "/etc/ssl/ca-bundle.pem",  # openSUSE
+    "/usr/share/ssl/certs/ca-bundle.crt",  # legacy RHEL
+    "/usr/local/etc/openssl/cert.pem",  # macOS Homebrew OpenSSL
+    "/etc/ssl/cert.pem",  # macOS system / BSDs
     "/usr/local/share/certs/ca-root-nss.crt",  # FreeBSD
-    "/etc/pki/tls/cacert.pem",              # older RHEL
+    "/etc/pki/tls/cacert.pem",  # older RHEL
 )
 
 # Environment variables that may point at a corporate CA bundle.
@@ -82,8 +82,7 @@ def _assert_perms(path: Path, expected_mode: int) -> None:
     actual = stat.S_IMODE(path.stat().st_mode)
     if actual != expected_mode:
         raise PermissionError(
-            f"Permission check failed for {path}: "
-            f"expected {oct(expected_mode)}, got {oct(actual)}"
+            f"Permission check failed for {path}: expected {oct(expected_mode)}, got {oct(actual)}"
         )
 
 
@@ -122,8 +121,7 @@ def _not_in_os_trust(path: Path) -> None:
     for trust_path in _OS_TRUST_PATHS:
         if resolved.startswith(trust_path):
             raise RuntimeError(
-                f"CA file {path} resolves to {resolved}, "
-                f"which is inside OS trust path {trust_path}"
+                f"CA file {path} resolves to {resolved}, which is inside OS trust path {trust_path}"
             )
 
 
@@ -212,8 +210,7 @@ def _detect_system_bundle() -> Path:
             logger.debug("event=system_bundle_found path=%s", p)
             return p
     raise RuntimeError(
-        "No system CA bundle found. Searched: "
-        + ", ".join(_SYSTEM_BUNDLE_CANDIDATES)
+        "No system CA bundle found. Searched: " + ", ".join(_SYSTEM_BUNDLE_CANDIDATES)
     )
 
 

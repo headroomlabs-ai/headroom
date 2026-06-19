@@ -23,6 +23,7 @@ def _import_inject_ssl_bypass():
     import importlib
 
     import headroom.cli.wrap as wrap_mod
+
     importlib.reload(wrap_mod)
     return wrap_mod._inject_ssl_bypass  # type: ignore[attr-defined]
 
@@ -37,6 +38,7 @@ class TestInjectSslBypassAgentAware:
 
     def _get_fn(self):
         from headroom.cli.wrap import _inject_ssl_bypass
+
         return _inject_ssl_bypass
 
     # ------------------------------------------------------------------
@@ -52,45 +54,35 @@ class TestInjectSslBypassAgentAware:
         fn(env, agent_type="agy")
         assert "NODE_TLS_REJECT_UNAUTHORIZED" not in env
 
-    def test_agy_does_not_set_pythonhttpsverify(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_agy_does_not_set_pythonhttpsverify(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("HEADROOM_SSL_VERIFY", "false")
         fn = self._get_fn()
         env: dict[str, str] = {}
         fn(env, agent_type="agy")
         assert "PYTHONHTTPSVERIFY" not in env
 
-    def test_agy_does_not_blank_ssl_cert_file(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_agy_does_not_blank_ssl_cert_file(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("HEADROOM_SSL_VERIFY", "false")
         fn = self._get_fn()
         env: dict[str, str] = {"SSL_CERT_FILE": "/some/bundle.pem"}
         fn(env, agent_type="agy")
         assert env["SSL_CERT_FILE"] == "/some/bundle.pem"
 
-    def test_agy_does_not_blank_cacert_path(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_agy_does_not_blank_cacert_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("HEADROOM_SSL_VERIFY", "false")
         fn = self._get_fn()
         env: dict[str, str] = {"CACERT_PATH": "/some/bundle.pem"}
         fn(env, agent_type="agy")
         assert env["CACERT_PATH"] == "/some/bundle.pem"
 
-    def test_agy_does_not_blank_node_extra_ca_certs(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_agy_does_not_blank_node_extra_ca_certs(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("HEADROOM_SSL_VERIFY", "false")
         fn = self._get_fn()
         env: dict[str, str] = {"NODE_EXTRA_CA_CERTS": "/some/bundle.pem"}
         fn(env, agent_type="agy")
         assert env["NODE_EXTRA_CA_CERTS"] == "/some/bundle.pem"
 
-    def test_agy_does_not_blank_curl_ca_bundle(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_agy_does_not_blank_curl_ca_bundle(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("HEADROOM_SSL_VERIFY", "false")
         fn = self._get_fn()
         env: dict[str, str] = {"CURL_CA_BUNDLE": "/some/bundle.pem"}
@@ -110,27 +102,21 @@ class TestInjectSslBypassAgentAware:
         fn(env, agent_type="claude")
         assert env["NODE_TLS_REJECT_UNAUTHORIZED"] == "0"
 
-    def test_claude_sets_pythonhttpsverify_0(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_claude_sets_pythonhttpsverify_0(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("HEADROOM_SSL_VERIFY", "false")
         fn = self._get_fn()
         env: dict[str, str] = {}
         fn(env, agent_type="claude")
         assert env["PYTHONHTTPSVERIFY"] == "0"
 
-    def test_claude_blanks_curl_ca_bundle(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_claude_blanks_curl_ca_bundle(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("HEADROOM_SSL_VERIFY", "false")
         fn = self._get_fn()
         env: dict[str, str] = {}
         fn(env, agent_type="claude")
         assert env["CURL_CA_BUNDLE"] == ""
 
-    def test_claude_blanks_ssl_cert_file(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_claude_blanks_ssl_cert_file(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("HEADROOM_SSL_VERIFY", "false")
         fn = self._get_fn()
         env: dict[str, str] = {}
@@ -147,18 +133,14 @@ class TestInjectSslBypassAgentAware:
         assert env["NODE_TLS_REJECT_UNAUTHORIZED"] == "0"
         assert env["PYTHONHTTPSVERIFY"] == "0"
 
-    def test_no_mutation_when_ssl_verify_is_true(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_no_mutation_when_ssl_verify_is_true(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("HEADROOM_SSL_VERIFY", "true")
         fn = self._get_fn()
         env: dict[str, str] = {}
         fn(env, agent_type="agy")
         assert env == {}
 
-    def test_no_mutation_when_ssl_verify_unset(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_no_mutation_when_ssl_verify_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("HEADROOM_SSL_VERIFY", raising=False)
         fn = self._get_fn()
         env: dict[str, str] = {}
@@ -173,23 +155,20 @@ class TestInjectSslBypassAgentAware:
 
 def _get_main():
     from headroom.cli.main import main
+
     return main
 
 
 class TestWrapAgyBinaryMissing:
     """Binary-missing path must exit 1 with install hint."""
 
-    def test_exits_1_when_agy_not_found(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_exits_1_when_agy_not_found(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr("shutil.which", lambda _: None)
         runner = CliRunner()
         result = runner.invoke(_get_main(), ["wrap", "agy"])
         assert result.exit_code == 1
 
-    def test_prints_install_hint_when_agy_not_found(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_prints_install_hint_when_agy_not_found(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr("shutil.which", lambda _: None)
         runner = CliRunner()
         result = runner.invoke(_get_main(), ["wrap", "agy"])
@@ -213,9 +192,7 @@ class TestWrapAgyRustBackendFails:
         result = self._run_with_rust_backend(monkeypatch, via_env=False)
         assert result.exit_code == 1
 
-    def test_rust_backend_flag_prints_clear_message(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_rust_backend_flag_prints_clear_message(self, monkeypatch: pytest.MonkeyPatch) -> None:
         result = self._run_with_rust_backend(monkeypatch, via_env=False)
         output = result.output.lower()
         assert "rust" in output or "python" in output or "not supported" in output
@@ -314,9 +291,7 @@ class TestWrapAgyDisclosureBanner:
         result = self._invoke_agy(monkeypatch)
         assert "--no-intercept" in result.output
 
-    def test_disclosure_banner_mentions_unwrap(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_disclosure_banner_mentions_unwrap(self, monkeypatch: pytest.MonkeyPatch) -> None:
         result = self._invoke_agy(monkeypatch)
         assert "unwrap" in result.output.lower()
 
@@ -324,12 +299,11 @@ class TestWrapAgyDisclosureBanner:
 class TestWrapAgyNoIntercept:
     """--no-intercept flag must change behavior (no MITM server startup)."""
 
-    def test_no_intercept_does_not_start_servers(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_no_intercept_does_not_start_servers(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/agy" if name == "agy" else None)
 
         import headroom.cli.wrap as wrap_mod
+
         server_started = []
 
         def fake_start(ca_key, ca_cert, base_dir=None, *, start_retrieve=False):
@@ -472,7 +446,13 @@ class TestGeminiMdBlock:
             _inject_gemini_md_block,
             _remove_gemini_md_block,
         )
-        return _inject_gemini_md_block, _remove_gemini_md_block, _AGY_GEMINI_BLOCK_START, _AGY_GEMINI_BLOCK_END
+
+        return (
+            _inject_gemini_md_block,
+            _remove_gemini_md_block,
+            _AGY_GEMINI_BLOCK_START,
+            _AGY_GEMINI_BLOCK_END,
+        )
 
     def test_inject_creates_file_when_absent(self, tmp_path: Path) -> None:
         inject, _, start, end = self._get_helpers()
@@ -566,8 +546,7 @@ class TestUnwrapAgyReverts:
         gemini_md = tmp_path / ".gemini" / "GEMINI.md"
         gemini_md.parent.mkdir(parents=True, exist_ok=True)
         gemini_md.write_text(
-            f"# User content\n\n{_AGY_GEMINI_BLOCK_START}\n## Headroom\n"
-            f"{_AGY_GEMINI_BLOCK_END}\n"
+            f"# User content\n\n{_AGY_GEMINI_BLOCK_START}\n## Headroom\n{_AGY_GEMINI_BLOCK_END}\n"
         )
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
@@ -759,15 +738,11 @@ class TestAgySerenaWired:
         _stub_agy_mitm_run(tmp_path, monkeypatch, with_uvx=True)
 
         runner = CliRunner()
-        result = runner.invoke(
-            _get_main(), ["wrap", "agy", "--no-serena"], catch_exceptions=False
-        )
+        result = runner.invoke(_get_main(), ["wrap", "agy", "--no-serena"], catch_exceptions=False)
         assert result.exit_code == 0
 
         reg = AgyRegistrar(home_dir=tmp_path)
-        assert reg.get_server("serena") is None, (
-            "--no-serena must not leave a Serena MCP entry"
-        )
+        assert reg.get_server("serena") is None, "--no-serena must not leave a Serena MCP entry"
 
     def test_wrap_agy_no_serena_removes_prior_headroom_entry(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -786,9 +761,7 @@ class TestAgySerenaWired:
         record_install("agy", serena_spec)
 
         runner = CliRunner()
-        result = runner.invoke(
-            _get_main(), ["wrap", "agy", "--no-serena"], catch_exceptions=False
-        )
+        result = runner.invoke(_get_main(), ["wrap", "agy", "--no-serena"], catch_exceptions=False)
         assert result.exit_code == 0
         assert AgyRegistrar(home_dir=tmp_path).get_server("serena") is None
 
@@ -857,6 +830,7 @@ class TestAgyPrintModeDetection:
 
     def _fn(self):
         from headroom.cli.wrap import _agy_print_mode
+
         return _agy_print_mode
 
     def test_detects_print(self) -> None:
@@ -967,14 +941,10 @@ class TestAgyLeanCtxMcpWiring:
             "headroom.lean_ctx.get_lean_ctx_path", lambda: Path("/usr/bin/lean-ctx")
         )
         # Smoke handshake passes.
-        monkeypatch.setattr(
-            wrap_mod, "_smoke_verify_mcp_handshake", lambda *a, **kw: True
-        )
+        monkeypatch.setattr(wrap_mod, "_smoke_verify_mcp_handshake", lambda *a, **kw: True)
 
         runner = CliRunner()
-        result = runner.invoke(
-            _get_main(), ["wrap", "agy"], catch_exceptions=False
-        )
+        result = runner.invoke(_get_main(), ["wrap", "agy"], catch_exceptions=False)
         assert result.exit_code == 0
         spec = AgyRegistrar(home_dir=tmp_path).get_server("lean-ctx")
         assert spec is not None, "interactive lean-ctx must register an MCP entry"
@@ -994,14 +964,10 @@ class TestAgyLeanCtxMcpWiring:
             "headroom.lean_ctx.get_lean_ctx_path", lambda: Path("/usr/bin/lean-ctx")
         )
         # Smoke handshake FAILS -> entry must be removed (never persist a hanger).
-        monkeypatch.setattr(
-            wrap_mod, "_smoke_verify_mcp_handshake", lambda *a, **kw: False
-        )
+        monkeypatch.setattr(wrap_mod, "_smoke_verify_mcp_handshake", lambda *a, **kw: False)
 
         runner = CliRunner()
-        result = runner.invoke(
-            _get_main(), ["wrap", "agy"], catch_exceptions=False
-        )
+        result = runner.invoke(_get_main(), ["wrap", "agy"], catch_exceptions=False)
         assert result.exit_code == 0
         assert AgyRegistrar(home_dir=tmp_path).get_server("lean-ctx") is None, (
             "a lean-ctx entry that fails the handshake must be removed"
@@ -1017,9 +983,7 @@ class TestAgyLeanCtxMcpWiring:
         monkeypatch.setattr("headroom.lean_ctx.get_lean_ctx_path", lambda: None)
 
         runner = CliRunner()
-        result = runner.invoke(
-            _get_main(), ["wrap", "agy"], catch_exceptions=False
-        )
+        result = runner.invoke(_get_main(), ["wrap", "agy"], catch_exceptions=False)
         assert result.exit_code == 0
         assert AgyRegistrar(home_dir=tmp_path).get_server("lean-ctx") is None
 
@@ -1092,7 +1056,9 @@ class TestAgyRetrieveMcpWiring:
             _get_main(), ["wrap", "agy", "--", "--print", "hi"], catch_exceptions=False
         )
         assert result.exit_code == 0
-        assert seen["spec"] is None, "print mode must not register a headroom retrieve entry mid-run"
+        assert seen["spec"] is None, (
+            "print mode must not register a headroom retrieve entry mid-run"
+        )
         assert AgyRegistrar(home_dir=tmp_path).get_server("headroom") is None
 
     def test_print_mode_does_not_start_retrieve_listener(
@@ -1177,9 +1143,7 @@ class TestAgyRtkGate:
         # Default context tool is rtk; _stub sets which() to resolve only agy/uvx,
         # so shutil.which("rtk") is None.
         runner = CliRunner()
-        result = runner.invoke(
-            _get_main(), ["wrap", "agy"], catch_exceptions=False
-        )
+        result = runner.invoke(_get_main(), ["wrap", "agy"], catch_exceptions=False)
         assert result.exit_code == 0
         gemini_md = tmp_path / ".gemini" / "GEMINI.md"
         if gemini_md.exists():
@@ -1201,9 +1165,7 @@ class TestAgyRtkGate:
 
         monkeypatch.setattr("shutil.which", which_with_rtk)
         runner = CliRunner()
-        result = runner.invoke(
-            _get_main(), ["wrap", "agy"], catch_exceptions=False
-        )
+        result = runner.invoke(_get_main(), ["wrap", "agy"], catch_exceptions=False)
         assert result.exit_code == 0
         gemini_md = tmp_path / ".gemini" / "GEMINI.md"
         assert gemini_md.exists()
@@ -1262,9 +1224,7 @@ class TestUnwrapAgyLeanCtx:
 
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
         reg = AgyRegistrar(home_dir=tmp_path)
-        reg.register_server(
-            ServerSpec(name="my-tool", command="/opt/my-tool", args=(), env={})
-        )
+        reg.register_server(ServerSpec(name="my-tool", command="/opt/my-tool", args=(), env={}))
 
         runner = CliRunner()
         result = runner.invoke(_get_main(), ["unwrap", "agy"])
@@ -1296,10 +1256,7 @@ class TestSmokeVerifyMcpHandshake:
     def test_returns_false_for_nonexistent_command(self) -> None:
         from headroom.cli.wrap import _smoke_verify_mcp_handshake
 
-        assert (
-            _smoke_verify_mcp_handshake("/nonexistent/mcp-bin", [], {}, timeout=5.0)
-            is False
-        )
+        assert _smoke_verify_mcp_handshake("/nonexistent/mcp-bin", [], {}, timeout=5.0) is False
 
     def test_returns_false_when_no_response_in_time(self, tmp_path: Path) -> None:
         from headroom.cli.wrap import _smoke_verify_mcp_handshake
@@ -1382,9 +1339,7 @@ def _stub_agy_with_cbm(
     # Stub _setup_code_graph so no real indexing runs.
     monkeypatch.setattr(wrap_mod, "_setup_code_graph", lambda verbose=False: True)
     # Override smoke verify for code-graph tests.
-    monkeypatch.setattr(
-        wrap_mod, "_smoke_verify_mcp_handshake", lambda *a, **kw: smoke_passes
-    )
+    monkeypatch.setattr(wrap_mod, "_smoke_verify_mcp_handshake", lambda *a, **kw: smoke_passes)
 
 
 class TestAgyCodeGraphFlag:
@@ -1400,9 +1355,7 @@ class TestAgyCodeGraphFlag:
         _stub_agy_with_cbm(tmp_path, monkeypatch, smoke_passes=True)
 
         runner = CliRunner()
-        result = runner.invoke(
-            _get_main(), ["wrap", "agy", "--code-graph"], catch_exceptions=False
-        )
+        result = runner.invoke(_get_main(), ["wrap", "agy", "--code-graph"], catch_exceptions=False)
         assert result.exit_code == 0
         spec = AgyRegistrar(home_dir=tmp_path).get_server(_CBM_MCP_SERVER_NAME)
         assert spec is not None, "interactive --code-graph must register the cbm MCP entry"
@@ -1424,9 +1377,7 @@ class TestAgyCodeGraphFlag:
         monkeypatch.setattr(wrap_mod, "_smoke_verify_mcp_handshake", _spy)
 
         runner = CliRunner()
-        result = runner.invoke(
-            _get_main(), ["wrap", "agy", "--code-graph"], catch_exceptions=False
-        )
+        result = runner.invoke(_get_main(), ["wrap", "agy", "--code-graph"], catch_exceptions=False)
         assert result.exit_code == 0
         # Smoke was called at least once (for cbm).
         assert len(smoke_calls) >= 1
@@ -1461,9 +1412,7 @@ class TestAgyCodeGraphFlag:
         _stub_agy_with_cbm(tmp_path, monkeypatch, smoke_passes=True)
 
         runner = CliRunner()
-        result = runner.invoke(
-            _get_main(), ["wrap", "agy"], catch_exceptions=False
-        )
+        result = runner.invoke(_get_main(), ["wrap", "agy"], catch_exceptions=False)
         assert result.exit_code == 0
         assert AgyRegistrar(home_dir=tmp_path).get_server(_CBM_MCP_SERVER_NAME) is None, (
             "omitting --code-graph must NOT register cbm (default off)"
@@ -1479,9 +1428,7 @@ class TestAgyCodeGraphFlag:
         _stub_agy_with_cbm(tmp_path, monkeypatch, smoke_passes=False)
 
         runner = CliRunner()
-        result = runner.invoke(
-            _get_main(), ["wrap", "agy", "--code-graph"], catch_exceptions=False
-        )
+        result = runner.invoke(_get_main(), ["wrap", "agy", "--code-graph"], catch_exceptions=False)
         assert result.exit_code == 0
         assert AgyRegistrar(home_dir=tmp_path).get_server(_CBM_MCP_SERVER_NAME) is None, (
             "a cbm entry that fails the handshake must be removed"
@@ -1573,9 +1520,7 @@ class TestAgySessionCompressionSummary:
             return_value=_empty_stats,
         ):
             runner = CliRunner()
-            result = runner.invoke(
-                _get_main(), ["wrap", "agy"], catch_exceptions=False
-            )
+            result = runner.invoke(_get_main(), ["wrap", "agy"], catch_exceptions=False)
 
         assert result.exit_code == 0
         assert "Headroom agy session" in result.output

@@ -38,13 +38,9 @@ NON_ALLOWLIST_HOST = "example.com"
 
 def _make_test_ca() -> tuple[RSAPrivateKey, Certificate, bytes]:
     """Generate a fast 2048-bit RSA root CA for tests (never touches disk)."""
-    key: RSAPrivateKey = rsa.generate_private_key(
-        public_exponent=65537, key_size=2048
-    )
+    key: RSAPrivateKey = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     now = datetime.datetime.now(tz=datetime.timezone.utc)
-    subject = issuer = x509.Name(
-        [x509.NameAttribute(NameOID.COMMON_NAME, "Headroom Test CA")]
-    )
+    subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Headroom Test CA")])
     cert = (
         x509.CertificateBuilder()
         .subject_name(subject)
@@ -53,9 +49,7 @@ def _make_test_ca() -> tuple[RSAPrivateKey, Certificate, bytes]:
         .serial_number(x509.random_serial_number())
         .not_valid_before(now)
         .not_valid_after(now + datetime.timedelta(days=365))
-        .add_extension(
-            x509.BasicConstraints(ca=True, path_length=0), critical=True
-        )
+        .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
         .add_extension(
             x509.KeyUsage(
                 digital_signature=True,
@@ -308,11 +302,7 @@ async def test_tls_termination_and_alpn(tmp_ca: tuple) -> None:
 
         # Step 1: TCP CONNECT.
         raw_reader, raw_writer = await asyncio.open_connection(proxy_host, proxy_port)
-        connect_req = (
-            f"CONNECT {ALLOWLIST_HOST}:443 HTTP/1.1\r\n"
-            f"Host: {ALLOWLIST_HOST}:443\r\n"
-            "\r\n"
-        )
+        connect_req = f"CONNECT {ALLOWLIST_HOST}:443 HTTP/1.1\r\nHost: {ALLOWLIST_HOST}:443\r\n\r\n"
         raw_writer.write(connect_req.encode())
         await raw_writer.drain()
         response = await raw_reader.readline()
@@ -372,9 +362,7 @@ async def test_leaf_cache_reuse_across_connections(tmp_ca: tuple) -> None:
         proxy_host, proxy_port = terminator.address
 
         async def do_connect_and_tls() -> int:
-            raw_reader, raw_writer = await asyncio.open_connection(
-                proxy_host, proxy_port
-            )
+            raw_reader, raw_writer = await asyncio.open_connection(proxy_host, proxy_port)
             raw_writer.write(
                 f"CONNECT {ALLOWLIST_HOST}:443 HTTP/1.1\r\nHost: {ALLOWLIST_HOST}:443\r\n\r\n".encode()
             )
@@ -418,9 +406,7 @@ async def test_blind_tunnel_byte_faithful(tmp_ca: tuple) -> None:
     # Spin up a plain TCP echo server.
     echo_host = "127.0.0.1"
 
-    async def echo_handler(
-        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
-    ) -> None:
+    async def echo_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
             data = await asyncio.wait_for(reader.read(1024), timeout=5.0)
             if data:
@@ -444,9 +430,7 @@ async def test_blind_tunnel_byte_faithful(tmp_ca: tuple) -> None:
 
         raw_reader, raw_writer = await asyncio.open_connection(proxy_host, proxy_port)
         connect_req = (
-            f"CONNECT {echo_host}:{echo_port} HTTP/1.1\r\n"
-            f"Host: {echo_host}:{echo_port}\r\n"
-            "\r\n"
+            f"CONNECT {echo_host}:{echo_port} HTTP/1.1\r\nHost: {echo_host}:{echo_port}\r\n\r\n"
         )
         raw_writer.write(connect_req.encode())
         await raw_writer.drain()
@@ -492,16 +476,12 @@ async def test_self_loop_guard_via_https_proxy_env(
         proxy_host, proxy_port = terminator.address
         raw_reader, raw_writer = await asyncio.open_connection(proxy_host, proxy_port)
         connect_req = (
-            f"CONNECT {NON_ALLOWLIST_HOST}:443 HTTP/1.1\r\n"
-            f"Host: {NON_ALLOWLIST_HOST}:443\r\n"
-            "\r\n"
+            f"CONNECT {NON_ALLOWLIST_HOST}:443 HTTP/1.1\r\nHost: {NON_ALLOWLIST_HOST}:443\r\n\r\n"
         )
         raw_writer.write(connect_req.encode())
         await raw_writer.drain()
         response = await raw_reader.readline()
-        assert b"403" in response, (
-            f"Expected 403 when HTTPS_PROXY is loopback, got {response!r}"
-        )
+        assert b"403" in response, f"Expected 403 when HTTPS_PROXY is loopback, got {response!r}"
     finally:
         await terminator.stop()
 

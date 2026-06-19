@@ -94,9 +94,7 @@ async def test_get_unknown_hash_returns_404() -> None:
     try:
         _, port = srv.address
         async with httpx.AsyncClient() as client:
-            resp = await client.get(
-                f"http://127.0.0.1:{port}/v1/retrieve/deadbeefdeadbeefdeadbeef"
-            )
+            resp = await client.get(f"http://127.0.0.1:{port}/v1/retrieve/deadbeefdeadbeefdeadbeef")
         assert resp.status_code == 404
     finally:
         await srv.stop()
@@ -137,9 +135,7 @@ async def test_retrieve_server_clean_start_stop_no_leaked_server_tasks() -> None
 
     # Any leftover must be ONLY the app-level periodic stats task; no hypercorn
     # connection / lifespan task may survive stop().
-    offending = [
-        t for t in leaked if "_log_toin_stats_periodically" not in repr(t.get_coro())
-    ]
+    offending = [t for t in leaked if "_log_toin_stats_periodically" not in repr(t.get_coro())]
     assert not offending, f"retrieve server leaked server-owned tasks: {offending}"
 
     # Model the production loop-teardown sweep: every leftover cancels cleanly.

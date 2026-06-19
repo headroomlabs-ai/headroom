@@ -50,18 +50,14 @@ def _emit_fail_open(handler: FailOpenWarnHandler) -> None:
 class TestFailOpenWarnHandler:
     """FailOpenWarnHandler emits exactly ONE user notice regardless of fire count."""
 
-    def test_emits_one_notice_on_first_fail_open(
-        self, capsys: pytest.CaptureFixture[str]
-    ) -> None:
+    def test_emits_one_notice_on_first_fail_open(self, capsys: pytest.CaptureFixture[str]) -> None:
         handler = FailOpenWarnHandler()
         _emit_fail_open(handler)
         captured = capsys.readouterr()
         assert "Headroom: compression failed" in captured.err
         assert "fail-open" in captured.err
 
-    def test_does_not_emit_second_notice(
-        self, capsys: pytest.CaptureFixture[str]
-    ) -> None:
+    def test_does_not_emit_second_notice(self, capsys: pytest.CaptureFixture[str]) -> None:
         handler = FailOpenWarnHandler()
         _emit_fail_open(handler)
         capsys.readouterr()  # drain first notice
@@ -76,9 +72,7 @@ class TestFailOpenWarnHandler:
             _emit_fail_open(handler)
         assert handler.fail_open_count == 5
 
-    def test_ignores_unrelated_warning(
-        self, capsys: pytest.CaptureFixture[str]
-    ) -> None:
+    def test_ignores_unrelated_warning(self, capsys: pytest.CaptureFixture[str]) -> None:
         handler = FailOpenWarnHandler()
         record = logging.LogRecord(
             name=_GEMINI_LOGGER,
@@ -141,9 +135,7 @@ class TestInstallRemoveHandler:
         remove_fail_open_handler(handler)
         remove_fail_open_handler(handler)  # must not raise
 
-    def test_handler_receives_real_log_record(
-        self, capsys: pytest.CaptureFixture[str]
-    ) -> None:
+    def test_handler_receives_real_log_record(self, capsys: pytest.CaptureFixture[str]) -> None:
         logger = logging.getLogger(_GEMINI_LOGGER)
         logger.setLevel(logging.WARNING)
         handler = install_fail_open_handler()
@@ -293,9 +285,7 @@ class TestFormatSummary:
 class TestAgySessionStats:
     """print_summary is idempotent: prints exactly once."""
 
-    def _make_stats_patch(
-        self, stats_list: list[dict[str, Any]]
-    ):
+    def _make_stats_patch(self, stats_list: list[dict[str, Any]]):
         """Patch _get_compression_stats to return successive values from stats_list."""
         call_count = [0]
 
@@ -304,13 +294,9 @@ class TestAgySessionStats:
             call_count[0] += 1
             return stats_list[idx]
 
-        return patch(
-            "headroom.providers.agy.stats._get_compression_stats", side_effect=_fake
-        )
+        return patch("headroom.providers.agy.stats._get_compression_stats", side_effect=_fake)
 
-    def test_print_summary_outputs_once(
-        self, capsys: pytest.CaptureFixture[str]
-    ) -> None:
+    def test_print_summary_outputs_once(self, capsys: pytest.CaptureFixture[str]) -> None:
         start_snap = {"entry_count": 0, "total_original_tokens": 0, "total_compressed_tokens": 0}
         end_snap = {"entry_count": 2, "total_original_tokens": 800, "total_compressed_tokens": 320}
 

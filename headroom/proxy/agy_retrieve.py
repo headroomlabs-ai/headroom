@@ -60,7 +60,7 @@ class AgyRetrieveServer:
         self._server: asyncio.Server | None = None
         self._lifespan_task: asyncio.Task[None] | None = None
         self._lifespan: Any | None = None  # hypercorn.asyncio.run.Lifespan
-        self._context: Any | None = None   # hypercorn.asyncio.run.WorkerContext
+        self._context: Any | None = None  # hypercorn.asyncio.run.WorkerContext
         self._app_wrapper: Any | None = None
         self._config: Any | None = None
         self._lifespan_state: dict[str, Any] = {}
@@ -74,7 +74,7 @@ class AgyRetrieveServer:
         # Build minimal hypercorn Config (no TLS — plain HTTP loopback).
         config = Config()
         config.bind = [f"{_BIND_HOST}:{self._port}"]
-        config.accesslog = "-"   # suppress hypercorn access log noise in tests
+        config.accesslog = "-"  # suppress hypercorn access log noise in tests
         config.errorlog = "-"
         config.loglevel = "WARNING"
         self._config = config

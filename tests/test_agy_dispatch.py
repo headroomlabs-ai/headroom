@@ -130,9 +130,7 @@ async def test_dispatch_server_tls_and_route(
 
     from headroom.proxy.server import HeadroomProxy
 
-    async def _fake_stream(
-        self: Any, *args: Any, **kwargs: Any
-    ) -> StreamingResponse:
+    async def _fake_stream(self: Any, *args: Any, **kwargs: Any) -> StreamingResponse:
         async def _body() -> bytes:
             yield b'data: {"candidates":[]}\n\ndata: [DONE]\n\n'
 
@@ -385,12 +383,8 @@ async def test_secret_headers_not_logged(
     log_text = "\n".join(r.getMessage() for r in caplog.records)
     # Default path (log_outbound_headers) only logs counts, never values.
     # Assert no header VALUE leaks into any log record on the default path.
-    assert "supersecret-token-xyz" not in log_text, (
-        "Bearer token leaked into headroom logs"
-    )
-    assert "AIzaSySecret1234" not in log_text, (
-        "x-goog-api-key leaked into headroom logs"
-    )
+    assert "supersecret-token-xyz" not in log_text, "Bearer token leaked into headroom logs"
+    assert "AIzaSySecret1234" not in log_text, "x-goog-api-key leaked into headroom logs"
 
 
 # ---------------------------------------------------------------------------
@@ -437,6 +431,7 @@ def test_redaction_is_load_bearing() -> None:
 
     # 3. Secret VALUES must not appear in the redacted output at all.
     import json as _json
+
     redacted_str = _json.dumps(redacted)
     assert secret_auth not in redacted_str, "Bearer token survived redact_for_wire_debug"
     assert secret_api_key not in redacted_str, "API key survived redact_for_wire_debug"

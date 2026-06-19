@@ -123,7 +123,9 @@ class AgyRegistrar(MCPRegistrar):
         try:
             _write_json(self._config_file, config)
         except OSError as exc:
-            return RegisterResult(RegisterStatus.FAILED, f"could not write {self._config_file}: {exc}")
+            return RegisterResult(
+                RegisterStatus.FAILED, f"could not write {self._config_file}: {exc}"
+            )
         return RegisterResult(RegisterStatus.REGISTERED, f"wrote {self._config_file}")
 
 

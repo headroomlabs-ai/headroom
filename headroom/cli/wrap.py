@@ -582,7 +582,9 @@ def _agy_print_mode(agy_args: tuple[str, ...] | list[str]) -> bool:
     return any(arg.split("=", 1)[0] in _AGY_PRINT_FLAGS for arg in agy_args)
 
 
-def _smoke_verify_mcp_handshake(command: str, args: list[str], env: dict[str, str], *, timeout: float = 8.0) -> bool:
+def _smoke_verify_mcp_handshake(
+    command: str, args: list[str], env: dict[str, str], *, timeout: float = 8.0
+) -> bool:
     """Spawn an stdio MCP server and assert it answers an ``initialize`` request.
 
     Sends a minimal JSON-RPC ``initialize`` over stdin and waits up to
@@ -633,7 +635,11 @@ def _smoke_verify_mcp_handshake(command: str, args: list[str], env: dict[str, st
                 payload = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if isinstance(payload, dict) and payload.get("jsonrpc") == "2.0" and payload.get("id") == 1:
+            if (
+                isinstance(payload, dict)
+                and payload.get("jsonrpc") == "2.0"
+                and payload.get("id") == 1
+            ):
                 return True
         return False
     except (OSError, ValueError):
@@ -661,7 +667,9 @@ def _setup_lean_ctx_mcp_agy(registrar: Any, *, verbose: bool = False) -> None:
 
     lean_ctx = get_lean_ctx_path()
     if lean_ctx is None:
-        click.echo("  Context tool: lean-ctx not found — skipping (agy still works transport-only).")
+        click.echo(
+            "  Context tool: lean-ctx not found — skipping (agy still works transport-only)."
+        )
         return
 
     data_dir = str(Path.home() / ".config" / "lean-ctx")
@@ -683,7 +691,9 @@ def _setup_lean_ctx_mcp_agy(registrar: Any, *, verbose: bool = False) -> None:
             click.echo("  Context tool: lean-ctx MCP wired (handshake verified).")
     else:
         registrar.unregister_server("lean-ctx")
-        click.echo("  Context tool: lean-ctx MCP failed handshake — entry removed (agy left transport-only).")
+        click.echo(
+            "  Context tool: lean-ctx MCP failed handshake — entry removed (agy left transport-only)."
+        )
 
 
 def _setup_headroom_retrieve_mcp_agy(
@@ -744,7 +754,6 @@ def _revert_headroom_retrieve_mcp_agy(registrar: Any) -> None:
         registrar.unregister_server("headroom")
     except Exception:  # noqa: BLE001
         pass
-
 
 
 # Env vars Headroom's init/wrap inject into Claude settings.json; unwrap removes
@@ -5634,6 +5643,7 @@ def unwrap_codex(port: int, no_stop_proxy: bool) -> None:
         _echo_unwrap_proxy_stop_status(_stop_local_proxy_for_unwrap(port), port)
     click.echo()
 
+
 def _inject_ssl_bypass(env: dict[str, str], agent_type: str = "unknown") -> None:
     """Inject environment variables to bypass SSL verification in child processes.
 
@@ -5813,7 +5823,9 @@ def _start_agy_servers(
     ready_event.wait(timeout=15)
 
     if error_holder:
-        raise RuntimeError(f"agy MITM server startup failed: {error_holder[0]}") from error_holder[0]
+        raise RuntimeError(f"agy MITM server startup failed: {error_holder[0]}") from error_holder[
+            0
+        ]
     if not result_holder:
         raise RuntimeError("agy MITM servers did not start within 15 seconds")
 
@@ -5921,7 +5933,9 @@ def agy(
         click.echo("  ║           HEADROOM WRAP: AGY                  ║")
         click.echo("  ╚═══════════════════════════════════════════════╝")
         click.echo()
-        click.echo("  Mode: --no-intercept (passthrough).  Headroom does NOT intercept agy traffic.")
+        click.echo(
+            "  Mode: --no-intercept (passthrough).  Headroom does NOT intercept agy traffic."
+        )
         click.echo()
         result = subprocess.run([agy_bin, *agy_args])
         raise SystemExit(result.returncode)
@@ -6005,9 +6019,7 @@ def agy(
             f"NODE_EXTRA_CA_CERTS={bundle_path}",
         ]
         if corp_proxy:
-            env_vars_display.append(
-                f"chaining non-allowlisted CONNECTs via {corp_proxy}"
-            )
+            env_vars_display.append(f"chaining non-allowlisted CONNECTs via {corp_proxy}")
 
         click.echo()
         click.echo("  ╔═══════════════════════════════════════════════╗")
@@ -6081,9 +6093,7 @@ def agy(
         if print_mode:
             _disable_serena_mcp(AgyRegistrar(), verbose=False)
         elif not no_serena:
-            _setup_serena_mcp(
-                AgyRegistrar(), context="ide-assistant", verbose=False, force=True
-            )
+            _setup_serena_mcp(AgyRegistrar(), context="ide-assistant", verbose=False, force=True)
         else:
             _disable_serena_mcp(AgyRegistrar(), verbose=False)
 
@@ -6119,10 +6129,14 @@ def agy(
                 cbm_spec = build_codegraph_spec(cbm_bin)
                 cbm_result = AgyRegistrar().register_server(cbm_spec, force=True)
                 if cbm_result.status in (RegisterStatus.REGISTERED, RegisterStatus.ALREADY):
-                    if _smoke_verify_mcp_handshake(cbm_spec.command, list(cbm_spec.args), dict(cbm_spec.env)):
+                    if _smoke_verify_mcp_handshake(
+                        cbm_spec.command, list(cbm_spec.args), dict(cbm_spec.env)
+                    ):
                         if cbm_result.status == RegisterStatus.REGISTERED:
                             _record_install(AgyRegistrar().name, cbm_spec)
-                        click.echo("  Code graph: codebase-memory-mcp MCP wired (handshake verified).")
+                        click.echo(
+                            "  Code graph: codebase-memory-mcp MCP wired (handshake verified)."
+                        )
                         # Also index the project (idempotent).
                         _setup_code_graph(verbose=False)
                     else:

@@ -116,9 +116,7 @@ def mint_leaf(
 
     cert = (
         x509.CertificateBuilder()
-        .subject_name(
-            x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, host)])
-        )
+        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, host)]))
         .issuer_name(ca_cert.subject)
         .public_key(leaf_key.public_key())
         .serial_number(x509.random_serial_number())
@@ -250,9 +248,7 @@ async def _blind_splice(
     t1 = asyncio.create_task(_splice_half(client_reader, target_writer))
     t2 = asyncio.create_task(_splice_half(target_reader, client_writer))
     try:
-        done, pending = await asyncio.wait(
-            {t1, t2}, return_when=asyncio.FIRST_COMPLETED
-        )
+        done, pending = await asyncio.wait({t1, t2}, return_when=asyncio.FIRST_COMPLETED)
         for task in pending:
             task.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
@@ -303,7 +299,9 @@ async def _connect_via_upstream_proxy(
         asyncio.open_connection(proxy_host, proxy_port),
         timeout=_CONNECT_TIMEOUT,
     )
-    connect_line = f"CONNECT {target_host}:{target_port} HTTP/1.1\r\nHost: {target_host}:{target_port}\r\n"
+    connect_line = (
+        f"CONNECT {target_host}:{target_port} HTTP/1.1\r\nHost: {target_host}:{target_port}\r\n"
+    )
     if proxy_auth:
         connect_line += f"Proxy-Authorization: {proxy_auth}\r\n"
     connect_line += "\r\n"
@@ -386,9 +384,7 @@ async def _handle_connect(
     proxy_auth: str | None = None
     while True:
         try:
-            hdr_bytes = await asyncio.wait_for(
-                client_reader.readline(), timeout=_CONNECT_TIMEOUT
-            )
+            hdr_bytes = await asyncio.wait_for(client_reader.readline(), timeout=_CONNECT_TIMEOUT)
         except asyncio.TimeoutError:
             break
         if hdr_bytes in (b"\r\n", b"\n", b""):
@@ -459,9 +455,7 @@ async def _handle_mitm(
                 timeout=_CONNECT_TIMEOUT,
             )
         except (OSError, asyncio.TimeoutError) as exc:
-            logger.error(
-                "event=dispatch_connect_failed port=%d err=%s", dispatch_port, exc
-            )
+            logger.error("event=dispatch_connect_failed port=%d err=%s", dispatch_port, exc)
             try:
                 client_writer.close()
             except Exception:  # noqa: BLE001
@@ -506,8 +500,8 @@ async def _handle_mitm(
     logger.debug(
         "event=tls_terminated host=%s alpn=%s",
         host,
-        tls_writer.get_extra_info("ssl_object") and
-        tls_writer.get_extra_info("ssl_object").selected_alpn_protocol(),
+        tls_writer.get_extra_info("ssl_object")
+        and tls_writer.get_extra_info("ssl_object").selected_alpn_protocol(),
     )
 
     try:
