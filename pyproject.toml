@@ -174,6 +174,18 @@ langchain = [
     "langchain-core>=1.3.3,<4.0",
     "langchain-openai>=1.1.14,<2.0",
 ]
+# Boolean algebra compression (lossless, zero-LLM, Quine-McCluskey via boolean-algebra-engine)
+boolean = [
+    "boolean-algebra-engine>=0.3.0",
+]
+# Boolean + NL extraction via Anthropic
+boolean-nl-anthropic = [
+    "boolean-algebra-engine[nl-anthropic]>=0.3.0",
+]
+# Boolean + NL extraction via OpenAI
+boolean-nl-openai = [
+    "boolean-algebra-engine[nl-openai]>=0.3.0",
+]
 # Agno agent framework integration
 agno = [
     "agno>=1.0.0",
