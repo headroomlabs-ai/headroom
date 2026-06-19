@@ -107,6 +107,7 @@ from headroom.providers.openclaw import (
 from headroom.providers.openclaw import (
     normalize_gateway_provider_ids as _normalize_openclaw_gateway_provider_ids_impl,
 )
+from headroom.providers.opencode import build_launch_env as _build_opencode_launch_env
 from headroom.proxy.project_context import with_project_prefix as _with_project_prefix
 
 from .main import main
@@ -2910,6 +2911,7 @@ def wrap() -> None:
         headroom wrap goose               # Goose (Block) CLI
         headroom wrap openhands           # OpenHands CLI
         headroom wrap openclaw            # OpenClaw plugin bootstrap
+        headroom wrap opencode            # OpenCode (anomalyco) via OPENCODE_CONFIG_CONTENT
 
     \b
     `wrap` vs `proxy`:
@@ -2918,11 +2920,6 @@ def wrap() -> None:
         - `headroom proxy` — just the proxy. Use this with any
           OpenAI/Anthropic-compatible client by setting
           ANTHROPIC_BASE_URL / OPENAI_BASE_URL yourself.
-
-    \b
-    Note: `headroom wrap opencode` does NOT exist. For opencode, run
-    `headroom proxy` and point opencode at it via OPENAI_BASE_URL.
-    `openclaw` is a separate tool — different from opencode.
     """
 
 
@@ -3892,6 +3889,95 @@ def aider(
         learn=learn,
         memory=memory,
         agent_type="aider",
+        code_graph=code_graph,
+        backend=backend,
+        anyllm_provider=anyllm_provider,
+        region=region,
+    )
+
+
+# =============================================================================
+# OpenCode
+# =============================================================================
+
+
+@wrap.command(context_settings={"ignore_unknown_options": True})
+@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--no-context-tool",
+    "--no-rtk",
+    "no_rtk",
+    is_flag=True,
+    help="Skip CLI context-tool setup",
+)
+@click.option(
+    "--code-graph",
+    is_flag=True,
+    help="Enable code graph indexing via codebase-memory-mcp (optional)",
+)
+@click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
+@click.option("--learn", is_flag=True, help="Enable live traffic learning")
+@click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
+@click.option(
+    "--backend", default=None, help="API backend: 'anthropic', 'anyllm', 'litellm-vertex', etc."
+)
+@click.option("--anyllm-provider", default=None, help="Provider for any-llm backend")
+@click.option("--region", default=None, help="Cloud region for Bedrock/Vertex")
+@click.option("--verbose", "-v", is_flag=True, help="Verbose output")
+@click.option("--prepare-only", is_flag=True, hidden=True)
+@click.argument("opencode_args", nargs=-1, type=click.UNPROCESSED)
+def opencode(
+    port: int,
+    no_rtk: bool,
+    code_graph: bool,
+    no_proxy: bool,
+    learn: bool,
+    memory: bool,
+    backend: str | None,
+    anyllm_provider: str | None,
+    region: str | None,
+    verbose: bool,
+    prepare_only: bool,
+    opencode_args: tuple,
+) -> None:
+    """Launch OpenCode through Headroom proxy.
+
+    \b
+    OpenCode ignores OPENAI_BASE_URL / ANTHROPIC_BASE_URL, so the proxy
+    endpoint is injected via OPENCODE_CONFIG_CONTENT (inline JSON setting
+    provider.<id>.options.baseURL). Same family as aider/copilot: starts
+    the proxy and launches the tool.
+
+    \b
+    Examples:
+        headroom wrap opencode                           # Start proxy + opencode
+        headroom wrap opencode -- --model gpt-4o         # Pass args to opencode
+        headroom wrap opencode --port 9999               # Custom proxy port
+    """
+    if prepare_only:
+        return
+
+    opencode_bin = shutil.which("opencode")
+    if not opencode_bin:
+        click.echo("Error: 'opencode' not found in PATH.")
+        click.echo("Install OpenCode: https://github.com/anomalyco/opencode")
+        raise SystemExit(1)
+
+    env, env_vars_display = _build_opencode_launch_env(
+        port, os.environ, project=_project_name_from_cwd()
+    )
+
+    _launch_tool(
+        binary=opencode_bin,
+        args=opencode_args,
+        env=env,
+        port=port,
+        no_proxy=no_proxy,
+        tool_label="OPENCODE",
+        env_vars_display=env_vars_display,
+        learn=learn,
+        memory=memory,
+        agent_type="opencode",
         code_graph=code_graph,
         backend=backend,
         anyllm_provider=anyllm_provider,

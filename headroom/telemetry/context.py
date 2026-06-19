@@ -21,7 +21,9 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
-_KNOWN_WRAP_AGENTS = frozenset({"claude", "copilot", "codex", "aider", "cursor", "openclaw"})
+_KNOWN_WRAP_AGENTS = frozenset(
+    {"claude", "copilot", "codex", "aider", "cursor", "openclaw", "opencode"}
+)
 
 # Stack slugs must start with a letter and contain only [a-z0-9_], max 64 chars.
 # Applied at every ingress (env var, HTTP header, stats aggregation) so downstream
