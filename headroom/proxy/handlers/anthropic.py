@@ -1299,6 +1299,7 @@ class AnthropicHandlerMixin:
                         )
                 except Exception:  # advisory hint only — must never fail a request
                     pass
+            ccr_workspace_key = ccr_workspace_label = None
             if (
                 self.config.ccr_inject_tool or self.config.ccr_inject_system_instructions
             ) and not _bypass:
@@ -1696,6 +1697,64 @@ class AnthropicHandlerMixin:
             if presend_event.messages is not previous_presend_messages:
                 optimized_tokens = tokenizer.count_messages(body["messages"])
                 tokens_saved = max(0, original_tokens - optimized_tokens)
+
+            # Output shaping (opt-in via HEADROOM_OUTPUT_SHAPER): verbosity
+            # steering appended to the system-prompt tail + effort routing on
+            # mechanical tool_result continuations. Runs after every other
+            # body mutation so the turn classifier sees the final messages,
+            # and respects the same bypass header as compression.
+            if not _bypass:
+                from headroom.proxy.output_savings import (
+                    assign_arm,
+                    conversation_key_from_body,
+                    stratum_key,
+                    stratum_label,
+                )
+                from headroom.proxy.output_shaper import (
+                    OutputShaperSettings,
+                    classify_turn,
+                    resolve_verbosity_level,
+                    shape_request,
+                )
+
+                _shaper_settings = OutputShaperSettings.from_env()
+                if _shaper_settings.enabled:
+                    # Conversation-stable holdout assignment: a whole
+                    # conversation is treatment or control. This keeps the A/B
+                    # comparison clean AND keeps the prefix cache stable (we
+                    # never flip a conversation's system-prompt tail mid-stream).
+                    from headroom.proxy import runtime_env
+
+                    _holdout = 0.0
+                    try:
+                        _holdout = float(runtime_env.getenv("HEADROOM_OUTPUT_HOLDOUT", "0") or "0")
+                    except ValueError:
+                        _holdout = 0.0
+                    _arm = assign_arm(conversation_key_from_body(body), _holdout)
+
+                    # Stratum from request features observable now (mirrors the
+                    # offline baseline so live and learned strata line up).
+                    _turn_kind = classify_turn(body.get("messages", [])).value
+                    _stratum = stratum_key(
+                        turn_kind=_turn_kind,
+                        input_tokens=original_tokens,
+                        model=model,
+                        has_tools=bool(body.get("tools")),
+                    )
+                    # Carry (arm, stratum) on the existing label channel so the
+                    # outcome funnel can feed the savings ledger from any path.
+                    transforms_applied.append(stratum_label(_arm, _stratum))
+
+                    if _arm == "treatment":
+                        _level, _src = resolve_verbosity_level(_shaper_settings)
+                        shape_result = shape_request(body, _shaper_settings, level_override=_level)
+                        if shape_result.changed:
+                            body_mutation_tracker.mark_mutated("output_shaper")
+                            transforms_applied.extend(shape_result.labels or [])
+                            logger.info(
+                                f"[{request_id}] OutputShaper(L{_level}/{_src}): "
+                                f"{shape_result.labels}"
+                            )
 
             # Unit 2: mark end of pre-upstream phase. Everything after this
             # point is upstream I/O or post-response bookkeeping.

@@ -84,10 +84,11 @@ _DEFAULT_CONTEXT_LIMITS: dict[str, int] = {
     "qwen2-72b": 32768,
     "qwen2.5": 131072,
     # DeepSeek
-    "deepseek": 32768,
-    "deepseek-coder": 16384,
+    "deepseek": 1048576,
+    "deepseek-coder": 128000,
     "deepseek-v2": 128000,
-    "deepseek-v3": 128000,
+    "deepseek-v3": 1048576,
+    "deepseek-v4": 1048576,
     # Yi
     "yi": 32768,
     "yi-34b": 32768,

@@ -229,6 +229,31 @@ class TestTreeSitterContainers:
             result.mask.mask[i] for i in range(start, start + len("let body_line = 5;"))
         ), "impl method body must be compressible"
 
+    def test_concurrent_parsing_uses_tree_sitter(self, handler):
+        """Parsers must be thread-local.
+
+        Regression: parsers were cached in a process-global dict and
+        shared across threads. tree-sitter Parser objects are pyo3
+        unsendable — touching one from a non-creator thread panics (or
+        raises, dropping the handler to the regex fallback). Parsing
+        from a thread pool must succeed on the tree-sitter path in
+        every thread.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        code = "class Foo:\n    def m(self):\n        x = 1\n        return x\n"
+
+        def work(_: int) -> str:
+            result = handler.get_mask(code, language="python")
+            return str(result.metadata["parser"])
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            parsers = list(pool.map(work, range(16)))
+
+        assert parsers == ["tree-sitter"] * 16, (
+            f"all threads must parse via tree-sitter, got: {set(parsers)}"
+        )
+
     def test_non_ascii_content_mask_alignment(self, handler):
         """Byte offsets must be converted to char offsets.
 

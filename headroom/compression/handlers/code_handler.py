@@ -29,8 +29,7 @@ logger = logging.getLogger(__name__)
 
 # Lazy-loaded tree-sitter
 _tree_sitter_available: bool | None = None
-_tree_sitter_parsers: dict[str, Any] = {}
-_tree_sitter_lock = threading.Lock()
+_tree_sitter_local = threading.local()
 
 
 def _check_tree_sitter() -> bool:
@@ -47,19 +46,28 @@ def _check_tree_sitter() -> bool:
 
 
 def _get_parser(language: str) -> Any:
-    """Get tree-sitter parser for language."""
-    global _tree_sitter_parsers
+    """Return a **thread-local** tree-sitter parser for ``language``.
 
+    tree-sitter ``Parser`` objects are pyo3 ``unsendable`` — touching
+    one from a thread other than its creator panics. Handlers run on
+    executor pool threads in the proxy, so parsers must never be shared
+    across threads. One parser per (thread, language); same fix as
+    ``transforms/code_compressor.py`` (#604).
+    """
     if not _check_tree_sitter():
         raise ImportError("tree-sitter-language-pack not installed")
 
-    with _tree_sitter_lock:
-        if language not in _tree_sitter_parsers:
-            from tree_sitter_language_pack import get_parser
+    cache: dict[str, Any] | None = getattr(_tree_sitter_local, "parsers", None)
+    if cache is None:
+        cache = {}
+        _tree_sitter_local.parsers = cache
 
-            _tree_sitter_parsers[language] = get_parser(language)  # type: ignore[arg-type]
+    if language not in cache:
+        from tree_sitter_language_pack import get_parser
 
-        return _tree_sitter_parsers[language]
+        cache[language] = get_parser(language)  # type: ignore[arg-type]
+
+    return cache[language]
 
 
 # tree-sitter API compatibility. tree-sitter-language-pack switched to a

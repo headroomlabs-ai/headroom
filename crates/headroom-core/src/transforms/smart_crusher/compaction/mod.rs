@@ -59,6 +59,16 @@ impl CompactionStage {
         }
     }
 
+    /// CSV+schema formatter with an explicit config. Used by
+    /// `SmartCrusher::new` to honor the compaction heuristics carried
+    /// on `SmartCrusherConfig` instead of pinning `CompactConfig::default()`.
+    pub fn csv_schema(config: CompactConfig) -> Self {
+        Self {
+            config,
+            formatter: Box::new(CsvSchemaFormatter::new()),
+        }
+    }
+
     /// JSON formatter, default config — useful for debugging or for
     /// downstream consumers that want structured rather than CSV-shaped
     /// output.
