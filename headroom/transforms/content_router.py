@@ -1663,21 +1663,28 @@ class ContentRouter(Transform):
         compressed: str | None = None
         compressed_tokens: int | None = None
 
-        # Primary: Kompress — downloads from chopratejas/kompress-v2-base on first use
+        # Primary: Kompress. On a cold cache the model is fetched once in the
+        # background (ensure_background_load) instead of blocking this request
+        # thread on a 274MB download that races the compression timeout and
+        # fails open. Until it is cached, route around the deep path.
         if self.config.enable_kompress:
             compressor = self._get_kompress()
             if compressor:
-                try:
-                    result = compressor.compress(
-                        text_to_compress,
-                        context=context,
-                        question=question,
-                        target_ratio=getattr(self, "_runtime_target_ratio", None),
-                    )
-                    compressed = result.compressed
-                    compressed_tokens = result.compressed_tokens
-                except Exception as e:
-                    logger.warning("Kompress failed: %s", e)
+                if not compressor.is_ready():
+                    compressor.ensure_background_load()
+                else:
+                    try:
+                        result = compressor.compress(
+                            text_to_compress,
+                            context=context,
+                            question=question,
+                            target_ratio=getattr(self, "_runtime_target_ratio", None),
+                            allow_download=False,
+                        )
+                        compressed = result.compressed
+                        compressed_tokens = result.compressed_tokens
+                    except Exception as e:
+                        logger.warning("Kompress failed: %s", e)
 
         if compressed is None:
             return content, len(content.split())
