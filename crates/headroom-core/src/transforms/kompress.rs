@@ -86,12 +86,20 @@ pub const MIN_WORDS: usize = 10;
 /// Max ModernBERT sequence length per chunk (truncation bound).
 pub const MAX_SEQ_LEN: usize = 512;
 
-/// ONNX artifact candidates, tried in order: weight-only int8 (smallest,
-/// fp32-equivalent quality), then fp32 (lossless reference), then the
-/// v1-era dynamic int8. A candidate is skipped on download miss or on
-/// session-load failure (e.g. an onnxruntime build without the 8-bit
-/// `MatMulNBits` kernel falls through to fp32).
+/// ONNX artifact candidates, tried in order. The first is a fp32 model whose
+/// input shape is frozen to a static `[1, MAX_SEQ_LEN]` — required by the
+/// OpenVINO **NPU** EP, which cannot compile dynamic `seq` (it hangs during
+/// graph compilation on the dynamic-shape variants). When a static model is
+/// loaded, `score_chunk` right-pads each chunk to its fixed length (detected
+/// via [`detect_static_seq`]); dynamic models take the chunk's natural length
+/// and pay no padding cost. The static model is absent from a vanilla install
+/// (it is generated separately for NPU deployments), so this entry is simply
+/// skipped on CPU/GPU. The remaining variants are the dynamic fall-throughs:
+/// weight-only int8 (smallest; `MatMulNBits`, unsupported on NPU), then dynamic
+/// fp32 (lossless reference), then the v1-era dynamic int8. A candidate is
+/// skipped on download miss or on session-load failure.
 pub const ONNX_CANDIDATES: &[&str] = &[
+    "onnx/kompress-fp32-static512.onnx",
     "onnx/kompress-int8-wo.onnx",
     "onnx/kompress-fp32.onnx",
     "onnx/kompress-int8.onnx",
@@ -186,6 +194,14 @@ pub struct Kompress {
     config: KompressConfig,
     tokenizer: Tokenizer,
     session: Mutex<Session>,
+    /// `Some(n)` when the loaded ONNX has a **fixed** sequence dimension (a
+    /// static `[1, n]` input), in which case `score_chunk` right-pads every
+    /// chunk to `n`. `None` for the usual dynamic-`seq` models, which take the
+    /// chunk's natural length. Detected from the session's `input_ids` shape
+    /// (see [`detect_static_seq`]). The static path exists for execution
+    /// providers that cannot compile dynamic shapes (OpenVINO NPU); masked
+    /// padding leaves the real-token scores unchanged, so output is identical.
+    static_seq: Option<usize>,
 }
 
 impl std::fmt::Debug for Kompress {
@@ -196,7 +212,29 @@ impl std::fmt::Debug for Kompress {
     }
 }
 
+/// Inspect a built session's `input_ids` input: return `Some(n)` if its
+/// sequence dimension is a fixed `n > 0` (a static-shape model), else `None`
+/// (dynamic `seq`). ONNX inputs are `[batch, seq]`; a dynamic dim is reported
+/// as `-1` by ONNX Runtime.
+fn detect_static_seq(session: &Session) -> Option<usize> {
+    let outlet = session.inputs().iter().find(|o| o.name() == "input_ids")?;
+    let seq = *outlet.dtype().tensor_shape()?.get(1)?;
+    (seq > 0).then_some(seq as usize)
+}
+
 impl Kompress {
+    /// Wrap built artifacts into a `Kompress`, detecting whether the loaded
+    /// model has a static sequence length (so `score_chunk` knows to pad).
+    fn assemble(config: KompressConfig, tokenizer: Tokenizer, session: Session) -> Self {
+        let static_seq = detect_static_seq(&session);
+        Self {
+            config,
+            tokenizer,
+            session: Mutex::new(session),
+            static_seq,
+        }
+    }
+
     /// Build from local artifact paths — no network. Used by tests and
     /// the parity harness against the on-disk HuggingFace cache.
     pub fn from_files(
@@ -210,11 +248,7 @@ impl Kompress {
             tried: vec![onnx_path.as_ref().display().to_string()],
             source: e,
         })?;
-        Ok(Self {
-            config,
-            tokenizer,
-            session: Mutex::new(session),
-        })
+        Ok(Self::assemble(config, tokenizer, session))
     }
 
     /// Build by resolving artifacts from the HuggingFace Hub (cache-first,
@@ -249,11 +283,7 @@ impl Kompress {
             };
             match build_session(&onnx_path) {
                 Ok(session) => {
-                    return Ok(Self {
-                        config,
-                        tokenizer,
-                        session: Mutex::new(session),
-                    });
+                    return Ok(Self::assemble(config, tokenizer, session));
                 }
                 Err(e) => {
                     last_err = Some(e);
@@ -266,6 +296,77 @@ impl Kompress {
             tried,
             source: last_err.unwrap_or_else(|| "no ONNX candidates configured".to_string().into()),
         })
+    }
+
+    /// Cache-only construction: resolve the tokenizer + ONNX artifact from
+    /// the local HuggingFace cache **without ever hitting the network**, and
+    /// return `Ok(None)` when they are not present (or no candidate loads).
+    ///
+    /// This is the Rust mirror of the Python reference's
+    /// `allow_download=False` path (`KompressModelNotCached` → defer): it lets
+    /// the live-zone dispatcher attempt a load on a hot path without risking a
+    /// blocking 261 MB download. When the model isn't cached the caller passes
+    /// plain text through untouched, exactly as Python does when Kompress is
+    /// unavailable.
+    pub fn from_cache(config: KompressConfig) -> Result<Option<Self>, KompressError> {
+        let Some(tok_path) = hf_cache_file(&config.tokenizer_repo, &["tokenizer.json"]) else {
+            // Diagnostic: a `None` here is the #1 cause of a silent
+            // `kompress_ready=false`. Name the repo + the roots searched so
+            // operators don't have to guess between "not downloaded" and
+            // "present but unreadable" (e.g. HF symlinks over `\\wsl$`, which
+            // native Windows can't follow — `path.exists()` returns false on
+            // the unresolved symlink). Cache-only, so this is a defer, not an
+            // error: the caller passes plain text through.
+            tracing::warn!(
+                event = "kompress_cache_miss",
+                stage = "tokenizer",
+                tokenizer_repo = %config.tokenizer_repo,
+                searched_roots = ?hf_hub_roots(),
+                "Kompress deferred: tokenizer.json not found in HF cache \
+                 (not downloaded, or present but unreadable — e.g. HF symlinks \
+                 over \\\\wsl$ which native Windows cannot follow)"
+            );
+            return Ok(None);
+        };
+        let tokenizer = load_tokenizer(&tok_path, &config.tokenizer_repo)?;
+        let mut found_onnx = false;
+        for candidate in ONNX_CANDIDATES {
+            let rel: Vec<&str> = candidate.split('/').collect();
+            let Some(onnx_path) = hf_cache_file(&config.model_id, &rel) else {
+                continue;
+            };
+            found_onnx = true;
+            match build_session(&onnx_path) {
+                Ok(session) => {
+                    return Ok(Some(Self::assemble(config, tokenizer, session)));
+                }
+                Err(e) => {
+                    // The ONNX file is present but the session would not
+                    // build — e.g. the active ORT execution provider rejects
+                    // the graph (OpenVINO/NPU cannot compile the int8
+                    // weight-only `MatMulNBits` op). Loudly surface it and try
+                    // the next candidate (fp32) rather than die silently.
+                    tracing::warn!(
+                        event = "kompress_session_build_failed",
+                        candidate = %candidate,
+                        onnx_path = %onnx_path.display(),
+                        error = %e,
+                        "Kompress: ONNX found but session build failed; trying next candidate"
+                    );
+                }
+            }
+        }
+        tracing::warn!(
+            event = "kompress_cache_miss",
+            stage = "onnx",
+            model_id = %config.model_id,
+            candidates = ?ONNX_CANDIDATES,
+            any_onnx_found = found_onnx,
+            searched_roots = ?hf_hub_roots(),
+            "Kompress deferred: no usable ONNX session \
+             (no candidate file in cache, or every candidate failed to build)"
+        );
+        Ok(None)
     }
 
     /// Model-decides compression (the proxy path): keep words scoring
@@ -349,7 +450,28 @@ impl Kompress {
             .map(|&x| x as i64)
             .collect();
         let word_ids = encoding.get_word_ids();
-        let seq = ids.len();
+        let mut ids = ids;
+        let mut attn = attn;
+
+        // Static-shape models (e.g. the OpenVINO NPU build, which cannot
+        // compile a dynamic `seq`) require a fixed `[1, static_seq]` input, so
+        // right-pad every chunk to that length. Real tokens occupy
+        // `0..real_seq`; the tail is padding with `attention_mask = 0`, which
+        // masks those positions out of self-attention — the scores at real
+        // positions are identical to an unpadded run, so keep/discard decisions
+        // (hence parity) are unchanged. The tokenizer truncates to
+        // `MAX_SEQ_LEN`, so the chunk never exceeds a `static_seq` of that size.
+        // Dynamic models (`static_seq == None`) take the chunk's natural length
+        // and pay no padding cost — the default for CPU/GPU.
+        let seq = match self.static_seq {
+            Some(n) => {
+                debug_assert!(ids.len() <= n);
+                ids.resize(n, 0);
+                attn.resize(n, 0);
+                n
+            }
+            None => ids.len(),
+        };
 
         let input_ids = Tensor::from_array(([1usize, seq], ids))?;
         let attention_mask = Tensor::from_array(([1usize, seq], attn))?;
@@ -457,6 +579,56 @@ fn load_tokenizer(path: &Path, repo: &str) -> Result<Tokenizer, KompressError> {
 fn build_session(path: &Path) -> Result<Session, Box<dyn std::error::Error + Send + Sync>> {
     let session = Session::builder()?.commit_from_file(path)?;
     Ok(session)
+}
+
+/// Resolve `rel` (e.g. `["tokenizer.json"]` or `["onnx", "kompress-int8-wo.onnx"]`)
+/// inside the local HuggingFace cache for `repo` (`"owner/name"`), searching
+/// every snapshot under every candidate cache root. Returns `None` if not
+/// present — never touches the network.
+fn hf_cache_file(repo: &str, rel: &[&str]) -> Option<PathBuf> {
+    let repo_dir = format!("models--{}", repo.replace('/', "--"));
+    for hub in hf_hub_roots() {
+        let snapshots = hub.join(&repo_dir).join("snapshots");
+        let Ok(entries) = std::fs::read_dir(&snapshots) else {
+            continue;
+        };
+        for snap in entries.flatten() {
+            let mut cand = snap.path();
+            for part in rel {
+                cand = cand.join(part);
+            }
+            if cand.exists() {
+                return Some(cand);
+            }
+        }
+    }
+    None
+}
+
+/// HuggingFace hub cache roots in resolution precedence. Cross-platform so
+/// the cache-only loader works on Windows (native `headroom-proxy.exe`) as
+/// well as Linux: `HF_HUB_CACHE` (the hub dir directly) → `HF_HOME/hub` →
+/// `{HOME|USERPROFILE}/.cache/huggingface/hub`. `HOME` is the unix home; on
+/// Windows the process sees `USERPROFILE` (and often no `HOME`), so both are
+/// tried. Honoring `HF_HOME` also lets a Windows proxy point at a WSL cache.
+fn hf_hub_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let push_env = |roots: &mut Vec<PathBuf>, var: &str, suffix: &[&str]| {
+        if let Ok(v) = std::env::var(var) {
+            if !v.is_empty() {
+                let mut p = PathBuf::from(v);
+                for s in suffix {
+                    p = p.join(s);
+                }
+                roots.push(p);
+            }
+        }
+    };
+    push_env(&mut roots, "HF_HUB_CACHE", &[]);
+    push_env(&mut roots, "HF_HOME", &["hub"]);
+    push_env(&mut roots, "HOME", &[".cache", "huggingface", "hub"]);
+    push_env(&mut roots, "USERPROFILE", &[".cache", "huggingface", "hub"]);
+    roots
 }
 
 #[cfg(test)]
