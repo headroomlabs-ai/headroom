@@ -3633,6 +3633,39 @@ def copilot(
 
 
 # =============================================================================
+# GitHub Copilot CLI (unwrap)
+# =============================================================================
+
+
+@unwrap.command("copilot")
+@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option("--no-stop-proxy", is_flag=True, help="Do not stop the local Headroom proxy")
+def unwrap_copilot(port: int, no_stop_proxy: bool) -> None:
+    """Undo ``headroom wrap copilot`` proxy configuration changes.
+
+    The copilot wrap is a proxy-runtime-only change (no config files are
+    modified on disk).  This unwrap stops the proxy and prints a summary.
+    Copilot-specific environment variables (COPILOT_PROVIDER_TYPE,
+    COPILOT_PROVIDER_BASE_URL, etc.) were set in the sub-process that ran
+    copilot and are already gone when that process exits, so there is no
+    filesystem state to revert.
+    """
+    click.echo()
+    click.echo("  ╔═══════════════════════════════════════════════╗")
+    click.echo("  ║          HEADROOM UNWRAP: COPILOT             ║")
+    click.echo("  ╚═══════════════════════════════════════════════╝")
+    click.echo()
+
+    click.echo("  Copilot CLI environment is process-scoped — no filesystem state to revert.")
+
+    click.echo()
+    click.echo("✓ Copilot is no longer routed through the Headroom proxy.")
+    if not no_stop_proxy:
+        _echo_unwrap_proxy_stop_status(_stop_local_proxy_for_unwrap(port), port)
+    click.echo()
+
+
+# =============================================================================
 # OpenAI Codex CLI
 # =============================================================================
 
