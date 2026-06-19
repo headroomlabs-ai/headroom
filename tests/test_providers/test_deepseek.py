@@ -156,3 +156,62 @@ class TestDeepSeekLiteLLMInjection:
             "max_tokens": 384_000,
             "max_input_tokens": 1_000_000,
         }
+
+
+class TestDeepSeekAnthropicProviderFallback:
+    """Tests that Anthropic provider's _get_pricing handles DeepSeek models."""
+
+    def test_deepseek_v4_flash_fallback(self):
+        from headroom.providers.anthropic import AnthropicProvider
+        provider = AnthropicProvider()
+        pricing = provider._get_pricing("deepseek-v4-flash")
+        assert pricing is not None
+        assert pricing["input"] == 0.14
+        assert pricing["output"] == 0.28
+        assert pricing["cached_input"] == 0.0028
+
+    def test_deepseek_v4_pro_fallback(self):
+        from headroom.providers.anthropic import AnthropicProvider
+        provider = AnthropicProvider()
+        pricing = provider._get_pricing("deepseek-v4-pro")
+        assert pricing is not None
+        assert pricing["input"] == 0.435
+        assert pricing["output"] == 0.87
+        assert pricing["cached_input"] == 0.003625
+
+    def test_deepseek_unknown_model_returns_none(self):
+        from headroom.providers.anthropic import AnthropicProvider
+        provider = AnthropicProvider()
+        pricing = provider._get_pricing("deepseek-unknown-model")
+        assert pricing is None
+
+    def test_deepseek_partial_match_v4_flash_alias(self):
+        from headroom.providers.anthropic import AnthropicProvider
+        provider = AnthropicProvider()
+        # Should match via partial match (flash in v4-flash)
+        pricing = provider._get_pricing("deepseek-v4-flash-v1")
+        assert pricing is not None
+
+    def test_estimate_cost_deepseek_v4_flash(self):
+        from headroom.providers.anthropic import AnthropicProvider
+        provider = AnthropicProvider()
+        cost = provider.estimate_cost(
+            input_tokens=1_000_000,
+            output_tokens=0,
+            model="deepseek-v4-flash",
+        )
+        assert cost is not None
+        assert cost == 0.14
+
+    def test_estimate_cost_deepseek_v4_flash_with_cache(self):
+        from headroom.providers.anthropic import AnthropicProvider
+        provider = AnthropicProvider()
+        cost = provider.estimate_cost(
+            input_tokens=1_000_000,
+            output_tokens=0,
+            model="deepseek-v4-flash",
+            cached_tokens=1_000_000,
+        )
+        assert cost is not None
+        # All 1M input tokens are cached, so cost = cached_input only
+        assert cost == 0.0028
