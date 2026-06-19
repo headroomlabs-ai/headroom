@@ -17,6 +17,7 @@
 
 pub mod adaptive_sizer;
 pub mod anchor_selector;
+pub mod code_compressor;
 pub mod content_detector;
 pub mod detection;
 pub mod diff_compressor;
@@ -32,6 +33,10 @@ pub mod smart_crusher;
 pub mod tag_protector;
 pub mod unidiff_detector;
 
+pub use code_compressor::{
+    detect_language, CodeAwareCompressor, CodeCompressionResult, CodeCompressorConfig,
+    CodeLanguage, DocstringMode,
+};
 pub use content_detector::{
     detect_content_type, is_json_array_of_dicts, ContentType, DetectionResult,
 };

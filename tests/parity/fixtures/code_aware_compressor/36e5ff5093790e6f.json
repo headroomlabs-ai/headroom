@@ -1,0 +1,37 @@
+{
+  "config": {
+    "ccr_ttl": 300,
+    "compress_comments": true,
+    "docstring_mode": "first_line",
+    "enable_ccr": false,
+    "fallback_to_kompress": false,
+    "language_hint": null,
+    "max_body_lines": 5,
+    "min_tokens_for_compression": 100,
+    "preserve_decorators": true,
+    "preserve_imports": true,
+    "preserve_signatures": true,
+    "preserve_type_annotations": true,
+    "semantic_analysis": true,
+    "target_compression_rate": 0.2
+  },
+  "input": "def f(x):\n    return x + 1\n",
+  "input_sha256": "36e5ff5093790e6fc3473727b0f49b944a68d1e9b0417ac97c4d0c18536d4d96",
+  "output": {
+    "cache_key": null,
+    "compressed": "def f(x):\n    return x + 1\n",
+    "compressed_bodies": 0,
+    "compressed_tokens": 6,
+    "compression_ratio": 1.0,
+    "language": "unknown",
+    "language_confidence": 0.0,
+    "original": "def f(x):\n    return x + 1\n",
+    "original_tokens": 6,
+    "preserved_imports": 0,
+    "preserved_signatures": 0,
+    "symbol_scores": {},
+    "syntax_valid": true
+  },
+  "recorded_at": "2026-06-19T00:15:16.336336+00:00",
+  "transform": "code_aware_compressor"
+}

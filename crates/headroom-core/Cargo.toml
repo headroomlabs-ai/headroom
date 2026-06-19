@@ -130,6 +130,24 @@ http = "1"
 # the runtime. EP selection (CPU/OpenVINO/CUDA) is libloading-based at
 # runtime; there are no compile-time EP feature flags.
 ort = { version = "=2.0.0-rc.12", default-features = false }
+# tree-sitter + per-language grammars for the CodeCompressor AST port.
+# Versions are pinned to EXACTLY match the Python reference grammars
+# (`tree-sitter-<lang>` PyPI wheels) so the Rust and Python parsers emit
+# node-for-node identical ASTs — the precondition for byte-parity. Same
+# version number on crates.io + PyPI means the same `grammar.js` source,
+# hence the same generated `parser.c`. The grammar-parity canary (9
+# samples × 8 languages) confirmed 100% identical node-type + line-span
+# trees at these exact pins. Bumping any pin requires re-running the
+# canary and re-recording the code_aware_compressor fixtures.
+tree-sitter = "=0.25.2"
+tree-sitter-python = "=0.25.0"
+tree-sitter-javascript = "=0.25.0"
+tree-sitter-typescript = "=0.23.2"
+tree-sitter-go = "=0.25.0"
+tree-sitter-rust = "=0.24.2"
+tree-sitter-java = "=0.23.5"
+tree-sitter-c = "=0.24.2"
+tree-sitter-cpp = "=0.23.4"
 
 [target.'cfg(not(windows))'.dependencies]
 fastembed = { version = "5", default-features = false, features = [

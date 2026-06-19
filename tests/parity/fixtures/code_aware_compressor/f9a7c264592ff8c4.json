@@ -1,0 +1,37 @@
+{
+  "config": {
+    "ccr_ttl": 300,
+    "compress_comments": true,
+    "docstring_mode": "first_line",
+    "enable_ccr": false,
+    "fallback_to_kompress": false,
+    "language_hint": null,
+    "max_body_lines": 5,
+    "min_tokens_for_compression": 100,
+    "preserve_decorators": true,
+    "preserve_imports": true,
+    "preserve_signatures": true,
+    "preserve_type_annotations": true,
+    "semantic_analysis": true,
+    "target_compression_rate": 0.2
+  },
+  "input": "import { Foo } from './foo';\n\ninterface User {\n    id: number;\n    name: string;\n    email?: string;\n}\n\ntype Maybe<T> = T | null;\n\nexport function lookup(users: User[], id: number): Maybe<User> {\n    for (const user of users) {\n        if (user.id === id) {\n            return user;\n        }\n    }\n    return null;\n}\n\nclass Repository<T> {\n    private items: T[] = [];\n\n    add(item: T): void {\n        this.items.push(item);\n        if (this.items.length > 1000) {\n            this.items.shift();\n        }\n    }\n}\n",
+  "input_sha256": "f9a7c264592ff8c4f726600ef7a89beb9ef1a625cad83a6d1700f09466778889",
+  "output": {
+    "cache_key": null,
+    "compressed": "import { Foo } from './foo';\n\ninterface User {\n    id: number;\n    name: string;\n    email?: string;\n}\n\ntype Maybe<T> = T | null;\n\nexport function lookup(users: User[], id: number): Maybe<User> {\n    for (const user of users) {\n        if (user.id === id) {\n            return user;\n        }\n    }\n    return null;\n}\n\nclass Repository<T> {\n    private items: T[] = [];\n\n    add(item: T): void {\n        this.items.push(item);\n        if (this.items.length > 1000) {\n            this.items.shift();\n        }\n    }\n}\n",
+    "compressed_bodies": 0,
+    "compressed_tokens": 129,
+    "compression_ratio": 1.0,
+    "language": "typescript",
+    "language_confidence": 1.0,
+    "original": "import { Foo } from './foo';\n\ninterface User {\n    id: number;\n    name: string;\n    email?: string;\n}\n\ntype Maybe<T> = T | null;\n\nexport function lookup(users: User[], id: number): Maybe<User> {\n    for (const user of users) {\n        if (user.id === id) {\n            return user;\n        }\n    }\n    return null;\n}\n\nclass Repository<T> {\n    private items: T[] = [];\n\n    add(item: T): void {\n        this.items.push(item);\n        if (this.items.length > 1000) {\n            this.items.shift();\n        }\n    }\n}\n",
+    "original_tokens": 129,
+    "preserved_imports": 0,
+    "preserved_signatures": 0,
+    "symbol_scores": {},
+    "syntax_valid": true
+  },
+  "recorded_at": "2026-06-19T00:15:16.325460+00:00",
+  "transform": "code_aware_compressor"
+}
