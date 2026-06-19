@@ -90,7 +90,7 @@ RUN mkdir -p /home/nonroot /data && \
     if [ "$RUNTIME_USER" = "nonroot" ]; then \
       groupadd --gid 1000 nonroot && \
       useradd --uid 1000 --gid nonroot --create-home nonroot && \
-      mkdir -p /home/nonroot/.headroom && \
+      mkdir -p /root/.headroom && \
       chown -R nonroot:nonroot /data /home/nonroot; \
     else \
       mkdir -p /root/.headroom; \
@@ -106,7 +106,7 @@ ENV HEADROOM_HOST=0.0.0.0 \
 # Declare ~/.headroom as a volume so Docker (and ACA) can attach persistent
 # storage here.  Bare `docker run` gets an anonymous volume as a fallback so
 # state is never silently written to the ephemeral container layer.
-VOLUME ["/home/nonroot/.headroom"]
+VOLUME ["/root/.headroom"]
 
 EXPOSE 8787
 
