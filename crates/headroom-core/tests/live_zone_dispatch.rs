@@ -305,7 +305,10 @@ fn main() {
             original_tokens,
             compressed_tokens,
         } => {
-            assert_eq!(strategy, "code_aware_compressor", "expected CodeCompressor dispatch");
+            assert_eq!(
+                strategy, "code_aware_compressor",
+                "expected CodeCompressor dispatch"
+            );
             assert!(
                 compressed_bytes < original_bytes,
                 "CodeCompressor must produce smaller output ({compressed_bytes} < {original_bytes})"
@@ -363,7 +366,10 @@ fn plain_text_tool_result_routes_to_kompress() {
     let prose = "The quick brown fox jumps over the lazy dog while the diligent \
                  engineer carefully reviews the output and discards redundant filler. "
         .repeat(12);
-    assert!(prose.len() > 512, "prose must clear the PlainText threshold");
+    assert!(
+        prose.len() > 512,
+        "prose must clear the PlainText threshold"
+    );
     let (body, _) = body_with_tool_result(&prose);
     let out = dispatch(&body);
 

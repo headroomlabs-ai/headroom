@@ -37,10 +37,7 @@ fn hf_cache_file(repo_dir: &str, rel: &[&str]) -> Option<PathBuf> {
 
 #[test]
 fn kompress_matches_python_fixtures_byte_for_byte() {
-    let tok = hf_cache_file(
-        "models--answerdotai--ModernBERT-base",
-        &["tokenizer.json"],
-    );
+    let tok = hf_cache_file("models--answerdotai--ModernBERT-base", &["tokenizer.json"]);
     let onnx = hf_cache_file(
         "models--chopratejas--kompress-v2-base",
         &["onnx", "kompress-int8-wo.onnx"],
@@ -56,8 +53,8 @@ fn kompress_matches_python_fixtures_byte_for_byte() {
         }
     };
 
-    let fixtures_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/parity/fixtures/kompress");
+    let fixtures_dir =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/parity/fixtures/kompress");
     if !fixtures_dir.exists() {
         eprintln!("SKIP: fixtures dir {} missing", fixtures_dir.display());
         return;
@@ -73,7 +70,9 @@ fn kompress_matches_python_fixtures_byte_for_byte() {
         .map(|e| e.path())
         .filter(|p| {
             p.extension().map(|x| x == "json").unwrap_or(false)
-                && p.file_name().map(|n| n != "_manifest.json").unwrap_or(false)
+                && p.file_name()
+                    .map(|n| n != "_manifest.json")
+                    .unwrap_or(false)
         })
         .collect();
     paths.sort();

@@ -264,8 +264,7 @@ impl Kompress {
         Err(KompressError::Onnx {
             model_id: config.model_id.clone(),
             tried,
-            source: last_err
-                .unwrap_or_else(|| "no ONNX candidates configured".to_string().into()),
+            source: last_err.unwrap_or_else(|| "no ONNX candidates configured".to_string().into()),
         })
     }
 
@@ -433,9 +432,7 @@ impl Kompress {
                 let mut ordered: Vec<(usize, f32)> =
                     word_scores.iter().map(|(&w, &s)| (w, s)).collect();
                 ordered.sort_by_key(|&(w, _)| w);
-                ordered.sort_by(|a, b| {
-                    b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-                });
+                ordered.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                 let num_keep = ((ordered.len() as f64 * ratio) as usize).max(1);
                 for &(w, _) in ordered.iter().take(num_keep) {
                     kept_ids.insert(w + chunk_start);

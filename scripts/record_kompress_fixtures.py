@@ -9,6 +9,7 @@ no churn to other transforms' fixtures.
 Run after the model is cached:
     python scripts/record_kompress_fixtures.py
 """
+
 from __future__ import annotations
 
 import sys
@@ -38,8 +39,7 @@ def main() -> int:
 
     out_dir = REPO / "tests" / "parity" / "fixtures" / "kompress"
     n = len(list(out_dir.glob("*.json")))
-    print(f"recorded {n} kompress fixtures from {len(inputs)} inputs -> {out_dir}",
-          file=sys.stderr)
+    print(f"recorded {n} kompress fixtures from {len(inputs)} inputs -> {out_dir}", file=sys.stderr)
     return 0
 
 
