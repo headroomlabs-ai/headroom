@@ -590,7 +590,11 @@ fn kompress() -> Option<&'static Kompress> {
     }
     static INSTANCE: OnceLock<Option<Kompress>> = OnceLock::new();
     INSTANCE
-        .get_or_init(|| Kompress::from_cache(KompressConfig::default()).ok().flatten())
+        .get_or_init(|| {
+            Kompress::from_cache(KompressConfig::default())
+                .ok()
+                .flatten()
+        })
         .as_ref()
 }
 
