@@ -27,6 +27,13 @@ from .openai_prices import (
     OPENAI_PRICES,
     get_openai_registry,
 )
+from .deepseek_prices import (
+    DEEPSEEK_PRICES,
+    get_deepseek_registry,
+)
+from .deepseek_prices import (
+    LAST_UPDATED as DEEPSEEK_LAST_UPDATED,
+)
 from .registry import CostEstimate, ModelPricing, PricingRegistry
 
 __all__ = [
@@ -48,4 +55,8 @@ __all__ = [
     "ANTHROPIC_LAST_UPDATED",
     "ANTHROPIC_PRICES",
     "get_anthropic_registry",
+    # DeepSeek
+    "DEEPSEEK_LAST_UPDATED",
+    "DEEPSEEK_PRICES",
+    "get_deepseek_registry",
 ]
