@@ -42,6 +42,7 @@ class FakePlugin:
         self._projects = projects
         self.writer = FakeWriter()
         self.scan_calls: list[tuple[object, int]] = []
+        self.last_include_subagents: bool | None = None
 
     def detect(self) -> bool:
         return True
@@ -52,8 +53,9 @@ class FakePlugin:
     def discover_projects(self) -> list[object]:
         return self._projects
 
-    def scan_project(self, project, max_workers: int = 1):  # noqa: ANN001, ANN201
+    def scan_project(self, project, max_workers: int = 1, include_subagents: bool = True):  # noqa: ANN001, ANN201
         self.scan_calls.append((project, max_workers))
+        self.last_include_subagents = include_subagents
         return [SimpleNamespace(events=["event"], tool_calls=[], failure_count=0)]
 
 
@@ -259,7 +261,7 @@ def test_learn_handles_empty_sessions_and_no_pattern_outputs(
     no_actions = SimpleNamespace(name="no-actions", project_path=tmp_path / "no-actions")
 
     class BranchingPlugin(FakePlugin):
-        def scan_project(self, project, max_workers: int = 1):  # noqa: ANN001, ANN201
+        def scan_project(self, project, max_workers: int = 1, include_subagents: bool = True):  # noqa: ANN001, ANN201
             self.scan_calls.append((project, max_workers))
             if project is no_sessions:
                 return []
@@ -297,3 +299,29 @@ def test_learn_handles_empty_sessions_and_no_pattern_outputs(
     assert "No conversation data found." in result.output
     assert "No failures or patterns found." in result.output
     assert "No actionable patterns found." in result.output
+
+
+def test_learn_main_only_flag_threads_to_scanner(
+    monkeypatch: pytest.MonkeyPatch, runner: CliRunner, tmp_path: Path
+) -> None:
+    project_path = tmp_path / "proj"
+    project_path.mkdir()
+    proj = SimpleNamespace(name="proj", project_path=project_path)
+    plugin = FakePlugin("codex", "Codex", [proj])
+
+    monkeypatch.setattr("headroom.learn.analyzer._detect_default_model", lambda: "gpt-4o")
+    monkeypatch.setattr("headroom.learn.registry.get_plugin", lambda name: plugin)
+    monkeypatch.setattr("headroom.learn.analyzer.SessionAnalyzer", FakeAnalyzer)
+
+    # Default: descend into subagent/workflow transcripts.
+    result = runner.invoke(main, ["learn", "--agent", "codex", "--all"], catch_exceptions=False)
+    assert result.exit_code == 0, result.output
+    assert plugin.last_include_subagents is True
+
+    # --main-only restricts to top-level main sessions.
+    plugin.last_include_subagents = None
+    result = runner.invoke(
+        main, ["learn", "--agent", "codex", "--all", "--main-only"], catch_exceptions=False
+    )
+    assert result.exit_code == 0, result.output
+    assert plugin.last_include_subagents is False

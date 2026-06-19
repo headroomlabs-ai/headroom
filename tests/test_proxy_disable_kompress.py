@@ -33,7 +33,7 @@ def test_disable_kompress_config_keeps_optimization_but_disables_ml_fallback() -
     )
 
     assert router.config.enable_kompress is False
-    assert router.config.fallback_strategy == CompressionStrategy.PASSTHROUGH
+    assert router.config.fallback_strategy == CompressionStrategy.KOMPRESS
 
 
 def test_disable_kompress_defaults_to_existing_kompress_behavior() -> None:

@@ -59,8 +59,11 @@ pub trait CcrStore: Send + Sync {
 /// Default capacity — matches Python's `CompressionStore` default.
 pub const DEFAULT_CAPACITY: usize = 1000;
 
-/// Default TTL — 5 minutes, matching Python.
-pub const DEFAULT_TTL: Duration = Duration::from_secs(300);
+/// Default TTL — 30 minutes, matching Python
+/// (`CCRConfig.store_ttl_seconds`). Session-scale: agentic sessions
+/// routinely outlive the old 5-minute default, and an expired entry
+/// silently converts "lossless with retrieval" into "lossy".
+pub const DEFAULT_TTL: Duration = Duration::from_secs(1800);
 
 /// Compute the canonical CCR key for `payload`. BLAKE3 → first 24 hex
 /// chars (96 bits — collision-resistant for the bounded LRU population

@@ -106,8 +106,14 @@ class GeminiPlugin(LearnPlugin, ConversationScanner):
 
         return projects
 
-    def scan_project(self, project: ProjectInfo, max_workers: int = 1) -> list[SessionData]:
-        """Scan all Gemini session files for a project."""
+    def scan_project(
+        self, project: ProjectInfo, max_workers: int = 1, include_subagents: bool = True
+    ) -> list[SessionData]:
+        """Scan all Gemini session files for a project.
+
+        ``include_subagents`` is accepted for a uniform plugin contract but is a
+        no-op: Gemini stores sessions flat, with no nested transcript hierarchy.
+        """
         session_files = sorted(project.data_path.glob("session-*.json")) + sorted(
             project.data_path.glob("session-*.jsonl")
         )
