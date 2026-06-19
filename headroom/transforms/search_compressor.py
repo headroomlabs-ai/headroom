@@ -92,6 +92,11 @@ class SearchCompressorConfig:
     boost_errors: bool = True
     enable_ccr: bool = True
     min_matches_for_ccr: int = 10
+    # Group output by file (`rg --heading` style): path emitted once per
+    # file, then `line:content` rows. Removes per-match path repetition.
+    # Default False (classic `file:line:content`); the proxy enables it
+    # in token mode.
+    group_by_file: bool = False
 
 
 @dataclass
@@ -161,6 +166,7 @@ class SearchCompressor:
                 enable_ccr=cfg.enable_ccr,
                 min_matches_for_ccr=cfg.min_matches_for_ccr,
                 min_compression_ratio_for_ccr=0.8,
+                group_by_file=getattr(cfg, "group_by_file", False),
             )
         )
 

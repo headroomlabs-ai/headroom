@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "headroom-ai"
-version = "0.25.0"
+version = "0.26.0"
 description = "The Context Optimization Layer for LLM Applications - Cut costs by 50-90%"
 readme = "README.md"
 license = "Apache-2.0"
@@ -49,7 +49,11 @@ dependencies = [
     # Core: lightweight compression (SmartCrusher, ContentRouter, CCR, TOIN)
     "tiktoken>=0.5.0",            # Tokenizer for all compressors
     "pydantic>=2.0.0",            # Config and data models
-    "litellm>=1.86.2,<2.0",        # Model registry, pricing, and provider support
+    # litellm's own metadata pins requires-python <3.14, and headroom only uses it for
+    # model registry / pricing / non-core providers — all lazily imported and
+    # ImportError-guarded. Marking it 3.14-optional lets headroom install on Python 3.14
+    # (core compression + the Anthropic proxy path never import litellm). See GH #956.
+    "litellm>=1.86.2,<2.0; python_version < '3.14'",  # model registry, pricing, providers (lazy)
     "click>=8.1.0",               # CLI framework
     "rich>=13.0.0",               # Rich terminal output
     "opentelemetry-api>=1.24.0",  # Safe no-op OTEL API for instrumentation
@@ -228,7 +232,7 @@ dev = [
     "pre-commit>=3.0.0",
     "openai>=1.0.0",
     "anthropic>=0.18.0",
-    "litellm>=1.86.2,<2.0",
+    "litellm>=1.86.2,<2.0; python_version < '3.14'",  # see core deps note (GH #956)
     "fastapi>=0.100.0",
     "uvicorn>=0.23.0,<1.0",
     "httpx[http2]>=0.24.0",

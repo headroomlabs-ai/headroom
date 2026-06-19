@@ -21,6 +21,7 @@ scripts/*
 !scripts/tests/
 !scripts/README.md
 !scripts/repro_codex_replay.py
+!scripts/eval_output_shaper.py
 !scripts/fixtures/
 !scripts/fixtures/*.json
 !scripts/record_fixtures.py

@@ -202,17 +202,24 @@ class CCRToolInjector:
     # - Generic: any [... compressed ... hash=xxx] pattern
     _marker_patterns: list[re.Pattern] = field(
         default_factory=lambda: [
-            # All patterns require exactly 24 hex characters for hash validation
-            # CCR uses SHA256 truncated to 24 hex chars (96 bits) for collision resistance
-            # Requiring exact length prevents hash spoofing attacks with shorter hashes
+            # Hash length is validated by the patterns themselves. Legacy
+            # bracket markers carry a 24-hex-char hash (SHA-256[:24], 96 bits
+            # for collision resistance); SmartCrusher's `<<ccr:>>` markers carry
+            # a 12-hex-char hash (see transforms/smart_crusher.py and
+            # cache/compression_store.py). Both real lengths are accepted.
             #
             # Standard format: [N <type> compressed to M. Retrieve more: hash=xxx]
             # Matches items, lines, matches, or any other type
             re.compile(r"\[(\d+) \w+ compressed to (\d+)\. Retrieve more: hash=([a-f0-9]{24})\]"),
             # Legacy format without "to M" or "Retrieve more:" (old TextCompressor)
             re.compile(r"\[(\d+) \w+ compressed\. hash=([a-f0-9]{24})\]"),
-            # Generic fallback: any compression marker with hash (exactly 24 chars)
+            # Generic fallback: any bracket compression marker with hash (exactly 24 chars)
             re.compile(r"\[.*?compressed.*?hash=([a-f0-9]{24})\]", re.IGNORECASE),
+            # SmartCrusher markers: the row-drop summary
+            # `<<ccr:HASH N_rows_offloaded>>` and the opaque-blob form
+            # `<<ccr:HASH,KIND,SIZE>>`. HASH is 12-24 hex chars, terminated by a
+            # space, comma, or the closing `>>`.
+            re.compile(r"<<ccr:([a-f0-9]{12,24})\b"),
         ]
     )
 
@@ -497,10 +504,11 @@ def parse_tool_call(
     hash_key = input_data.get("hash")
     query = input_data.get("query")
 
-    # Validate hash format: must be exactly 24 hex characters
-    # This prevents hash spoofing attacks with malformed hashes
+    # Validate hash format. SmartCrusher emits 12-hex-char hashes while legacy
+    # bracket markers / the compression_store use 24-hex-char hashes; accept
+    # either real length and reject anything else as malformed.
     if hash_key is not None:
-        if not isinstance(hash_key, str) or len(hash_key) != 24:
+        if not isinstance(hash_key, str) or len(hash_key) not in (12, 24):
             return None, None
         # Validate hex characters only
         if not all(c in "0123456789abcdef" for c in hash_key.lower()):
