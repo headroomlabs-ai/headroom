@@ -18,6 +18,7 @@ ASTs; verified by the grammar-parity canary):
         tree-sitter-c==0.24.2 tree-sitter-cpp==0.23.4
     python scripts/record_code_compressor_fixtures.py
 """
+
 from __future__ import annotations
 
 import sys
@@ -52,9 +53,7 @@ def main() -> int:
     )
 
     inputs = _varied_code_inputs()
-    cac = CodeAwareCompressor(
-        CodeCompressorConfig(enable_ccr=False, fallback_to_kompress=False)
-    )
+    cac = CodeAwareCompressor(CodeCompressorConfig(enable_ccr=False, fallback_to_kompress=False))
     for s in inputs:
         cac.compress(s)
 
@@ -64,9 +63,7 @@ def main() -> int:
     extra = 0
     for mode in (DocstringMode.FULL, DocstringMode.REMOVE):
         c = CodeAwareCompressor(
-            CodeCompressorConfig(
-                enable_ccr=False, fallback_to_kompress=False, docstring_mode=mode
-            )
+            CodeCompressorConfig(enable_ccr=False, fallback_to_kompress=False, docstring_mode=mode)
         )
         for s in ds_inputs:
             c.compress(s)

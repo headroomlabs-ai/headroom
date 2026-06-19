@@ -425,7 +425,11 @@ fn is_public_symbol(name: &str, language: CodeLanguage) -> bool {
 
 /// Look up the allocated body-line limit for a function. `max_body_lines`
 /// always acts as a hard cap. Mirrors `_get_body_limit`.
-fn get_body_limit(func_name: Option<&str>, body_limits: &HashMap<String, i64>, max_body_lines: i64) -> i64 {
+fn get_body_limit(
+    func_name: Option<&str>,
+    body_limits: &HashMap<String, i64>,
+    max_body_lines: i64,
+) -> i64 {
     if let Some(name) = func_name {
         if !body_limits.is_empty() {
             if let Some(&v) = body_limits.get(name) {
@@ -474,7 +478,8 @@ fn make_omitted_comment(
             if let Some(called) = analysis.calls_of(key) {
                 if !called.is_empty() {
                     // BTreeSet iterates sorted == Python sorted(called).
-                    let sorted_calls: Vec<&str> = called.iter().take(5).map(|s| s.as_str()).collect();
+                    let sorted_calls: Vec<&str> =
+                        called.iter().take(5).map(|s| s.as_str()).collect();
                     calls_info = format!("; calls: {}", sorted_calls.join(", "));
                     if called.len() > 5 {
                         calls_info.push_str(&format!(" +{} more", called.len() - 5));
@@ -670,7 +675,10 @@ pub fn detect_language(code: &str) -> (CodeLanguage, f64) {
         get(&candidates, CodeLanguage::Javascript),
     ) {
         if ts >= 2 {
-            if let Some(e) = candidates.iter_mut().find(|(x, _)| *x == CodeLanguage::Javascript) {
+            if let Some(e) = candidates
+                .iter_mut()
+                .find(|(x, _)| *x == CodeLanguage::Javascript)
+            {
                 e.1 = 0;
             }
         }
@@ -1089,9 +1097,7 @@ impl CodeAwareCompressor {
 
             // Language conventions are mutually exclusive, so collapsing the
             // nested guards preserves the reference's branch behavior.
-            if language == CodeLanguage::Python
-                && short.starts_with("__")
-                && short.ends_with("__")
+            if language == CodeLanguage::Python && short.starts_with("__") && short.ends_with("__")
             {
                 raw += 2.0;
             } else if language == CodeLanguage::Go
@@ -1164,7 +1170,9 @@ impl CodeAwareCompressor {
 
         let mut limits: HashMap<String, i64> = HashMap::new();
         if total_weight == 0.0 {
-            let per_func = (body_budget / (analysis.scores.len().max(1) as f64)).trunc().max(0.0) as i64;
+            let per_func = (body_budget / (analysis.scores.len().max(1) as f64))
+                .trunc()
+                .max(0.0) as i64;
             for (name, _) in &analysis.scores {
                 let size = *analysis.body_line_counts.get(name).unwrap_or(&0);
                 limits.insert(name.clone(), per_func.min(size));
@@ -1173,12 +1181,20 @@ impl CodeAwareCompressor {
         }
 
         for (qname, _) in &analysis.scores {
-            let weight = weights.iter().find(|(k, _)| k == qname).map(|(_, w)| *w).unwrap_or(0.0);
+            let weight = weights
+                .iter()
+                .find(|(k, _)| k == qname)
+                .map(|(_, w)| *w)
+                .unwrap_or(0.0);
             let allocation = body_budget * weight / total_weight;
             let max_lines = *analysis.body_line_counts.get(qname).unwrap_or(&0);
             let limit = py_round_int(allocation).min(max_lines);
             limits.insert(qname.clone(), limit);
-            let short = analysis.bare_names.get(qname).cloned().unwrap_or_else(|| qname.clone());
+            let short = analysis
+                .bare_names
+                .get(qname)
+                .cloned()
+                .unwrap_or_else(|| qname.clone());
             match limits.get(&short) {
                 Some(&existing) if limit <= existing => {}
                 _ => {
@@ -1213,7 +1229,15 @@ fn collect_definitions<'t>(
             bare_names.insert(qualified.clone(), short);
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
-                collect_definitions(child, &qualified, code, is_def, decorator_node, definitions, bare_names);
+                collect_definitions(
+                    child,
+                    &qualified,
+                    code,
+                    is_def,
+                    decorator_node,
+                    definitions,
+                    bare_names,
+                );
             }
             return;
         }
@@ -1233,7 +1257,15 @@ fn collect_definitions<'t>(
                         bare_names.insert(qualified.clone(), short);
                         let mut gc = child.walk();
                         for grandchild in child.children(&mut gc) {
-                            collect_definitions(grandchild, &qualified, code, is_def, decorator_node, definitions, bare_names);
+                            collect_definitions(
+                                grandchild,
+                                &qualified,
+                                code,
+                                is_def,
+                                decorator_node,
+                                definitions,
+                                bare_names,
+                            );
                         }
                         return;
                     }
@@ -1243,7 +1275,15 @@ fn collect_definitions<'t>(
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_definitions(child, parent_name, code, is_def, decorator_node, definitions, bare_names);
+        collect_definitions(
+            child,
+            parent_name,
+            code,
+            is_def,
+            decorator_node,
+            definitions,
+            bare_names,
+        );
     }
 }
 
@@ -1296,7 +1336,8 @@ impl<'a> Ctx<'a> {
     /// Extract structure from the AST. Mirrors `_extract_structure`.
     fn extract_structure(&self, root: Node) -> CodeStructure {
         let mut structure = CodeStructure::default();
-        let mut captured: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+        let mut captured: std::collections::HashSet<(usize, usize)> =
+            std::collections::HashSet::new();
         self.visit(root, &mut structure, &mut captured);
 
         // Top-level children not captured → top_level_code.
@@ -1324,7 +1365,9 @@ impl<'a> Ctx<'a> {
 
         // Package declarations (Go, Java).
         if self.lang.package_node == Some(nt) {
-            structure.imports.insert(0, self.node_text(node).to_string());
+            structure
+                .imports
+                .insert(0, self.node_text(node).to_string());
             captured.insert(range);
             return;
         }
@@ -1407,7 +1450,9 @@ impl<'a> Ctx<'a> {
         }
         // Type definitions.
         if self.lang.is_type(nt) {
-            structure.type_definitions.push(self.node_text(node).to_string());
+            structure
+                .type_definitions
+                .push(self.node_text(node).to_string());
             captured.insert(range);
             return;
         }
@@ -1479,11 +1524,17 @@ impl<'a> Ctx<'a> {
         if !self.lang.uses_colon_after_signature {
             if brace_in_signature {
                 // opening brace already in signature line.
-            } else if body_lines.first().is_some_and(|l| l.trim_start().starts_with('{')) {
+            } else if body_lines
+                .first()
+                .is_some_and(|l| l.trim_start().starts_with('{'))
+            {
                 opening_brace_line = Some(body_lines[0]);
                 body_lines = body_lines[1..].to_vec();
             }
-            if body_lines.last().is_some_and(|l| l.trim_end().ends_with('}')) {
+            if body_lines
+                .last()
+                .is_some_and(|l| l.trim_end().ends_with('}'))
+            {
                 closing_brace_line = Some(body_lines[body_lines.len() - 1]);
                 body_lines = body_lines[..body_lines.len() - 1].to_vec();
             }
@@ -1544,8 +1595,15 @@ impl<'a> Ctx<'a> {
             ds_end_row = (body_node.start_position().row + ds_skip_lines) as i64 - 1;
         }
 
-        const SKIP_TYPES: &[&str] =
-            &["{", "}", ";", ",", "comment", "line_comment", "block_comment"];
+        const SKIP_TYPES: &[&str] = &[
+            "{",
+            "}",
+            ";",
+            ",",
+            "comment",
+            "line_comment",
+            "block_comment",
+        ];
 
         let mut body_stmts: Vec<(usize, usize)> = Vec::new();
         let mut bcursor = body_node.walk();
@@ -1725,7 +1783,9 @@ fn first_line_docstring(first_ds_line: &str, body_lines: &[&str], ds_start_rel: 
     let mut first_content = stripped[content_start..].trim().to_string();
     for q in ["\"\"\"", "'''"] {
         if first_content.ends_with(q) {
-            first_content = first_content[..first_content.len() - q.len()].trim().to_string();
+            first_content = first_content[..first_content.len() - q.len()]
+                .trim()
+                .to_string();
         }
     }
 
@@ -1736,7 +1796,9 @@ fn first_line_docstring(first_ds_line: &str, body_lines: &[&str], ds_start_rel: 
         let mut second_line = body_lines[ds_start_rel + 1].trim().to_string();
         for q in ["\"\"\"", "'''"] {
             if second_line.ends_with(q) {
-                second_line = second_line[..second_line.len() - q.len()].trim().to_string();
+                second_line = second_line[..second_line.len() - q.len()]
+                    .trim()
+                    .to_string();
             }
         }
         if !second_line.is_empty() {
