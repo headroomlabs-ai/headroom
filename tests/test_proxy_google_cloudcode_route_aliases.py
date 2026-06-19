@@ -218,6 +218,7 @@ AGY_AGENT_BODY = {
 
 def test_agy_agent_model_body_routes_to_daily_endpoint(monkeypatch):
     """agy traffic with agent-model name + project + request.contents hits non-sandbox daily host."""
+
     async def fake_stream(self, url, _headers, _body, provider, model, *_args, **_kwargs):  # type: ignore[no-untyped-def]
         return JSONResponse({"url": url, "provider": provider, "model": model})
 
@@ -243,6 +244,7 @@ def test_agy_agent_model_body_routes_to_daily_endpoint(monkeypatch):
 
 def test_headroom_antigravity_api_url_env_override(monkeypatch):
     """HEADROOM_ANTIGRAVITY_API_URL env var overrides the corrected default for antigravity traffic."""
+
     async def fake_stream(self, url, _headers, _body, provider, model, *_args, **_kwargs):  # type: ignore[no-untyped-def]
         return JSONResponse({"url": url, "provider": provider, "model": model})
 
@@ -265,6 +267,7 @@ def test_headroom_antigravity_api_url_env_override(monkeypatch):
 
 def test_pi_openclaw_requesttype_agent_still_detected(monkeypatch):
     """Pi/OpenClaw requestType=='agent' detection is not broken by new agy checks."""
+
     async def fake_stream(self, url, _headers, _body, provider, model, *_args, **_kwargs):  # type: ignore[no-untyped-def]
         return JSONResponse({"url": url, "provider": provider, "model": model})
 
@@ -275,9 +278,7 @@ def test_pi_openclaw_requesttype_agent_still_detected(monkeypatch):
         "model": "gemini-1.5-pro",
         "requestType": "agent",
         "userAgent": "pi-coding-agent",
-        "request": {
-            "contents": [{"role": "user", "parts": [{"text": "ping"}]}]
-        },
+        "request": {"contents": [{"role": "user", "parts": [{"text": "ping"}]}]},
     }
 
     with TestClient(create_app(ProxyConfig(optimize=False))) as client:
@@ -322,3 +323,30 @@ def test_agy_control_plane_passthrough_routes_to_cloudcode_host(monkeypatch):
     body = response.json()
     assert body["path"] == "/v1internal:loadCodeAssist"
     assert body["base_url"] == "https://daily-cloudcode-pa.googleapis.com"
+
+
+def test_agy_control_plane_passthrough_rejects_non_allowlisted_host(monkeypatch):
+    """The v1internal control-plane branch forwards to the incoming Host only
+    when it is an allowlisted Cloud Code host. A look-alike host (e.g. a suffix
+    match like ``evilcloudcode-pa.googleapis.com``) must NOT be used as the
+    upstream — it falls back to the static cloudcode target, so a forged Host
+    header cannot steer the MITM passthrough to an attacker-controlled origin."""
+
+    async def fake_passthrough(self, request, base_url, *args, **kwargs):  # type: ignore[no-untyped-def]
+        return JSONResponse({"base_url": base_url, "path": request.url.path})
+
+    monkeypatch.setattr(HeadroomProxy, "handle_passthrough", fake_passthrough)
+
+    with TestClient(create_app(ProxyConfig(optimize=False))) as client:
+        response = client.post(
+            "/v1internal:loadCodeAssist",
+            headers={
+                "host": "evilcloudcode-pa.googleapis.com",
+                "x-goog-api-key": "test-key",
+            },
+            json={"metadata": {"pluginType": "GEMINI"}},
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["base_url"] != "https://evilcloudcode-pa.googleapis.com"

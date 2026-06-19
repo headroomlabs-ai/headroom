@@ -11,6 +11,7 @@ from urllib.parse import quote
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import Response
 
+from headroom.proxy.agy_terminator import DEFAULT_ALLOWLIST
 from headroom.proxy.handlers.openai import _resolve_codex_routing_headers
 
 logger = logging.getLogger("headroom.proxy.routes")
@@ -982,10 +983,16 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
             if hasattr(request, "_url"):
                 delattr(request, "_url")
 
-            return await proxy.handle_passthrough(
-                request,
-                _api_target(proxy, "cloudcode"),
+            # agy's TLS-MITM terminated the connection at the exact Cloud Code
+            # host it addressed (e.g. the `daily-` staging host); forward back to
+            # that host so control-plane onboarding (loadCodeAssist/...) lands on
+            # the right backend instead of the static default. Allowlisted hosts
+            # only, so a forged Host cannot steer the passthrough.
+            host = request.headers.get("host", "")
+            cloudcode_base = (
+                f"https://{host}" if host in DEFAULT_ALLOWLIST else _api_target(proxy, "cloudcode")
             )
+            return await proxy.handle_passthrough(request, cloudcode_base)
 
         return await proxy.handle_passthrough(
             request,
