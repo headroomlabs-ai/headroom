@@ -108,7 +108,8 @@ from .main import main
 _CONTEXT_TOOL_ENV = "HEADROOM_CONTEXT_TOOL"
 _CONTEXT_TOOL_RTK = "rtk"
 _CONTEXT_TOOL_LEAN_CTX = "lean-ctx"
-_VALID_CONTEXT_TOOLS = {_CONTEXT_TOOL_RTK, _CONTEXT_TOOL_LEAN_CTX}
+_CONTEXT_TOOL_CTX_FORGE = "ctx-forge"
+_VALID_CONTEXT_TOOLS = {_CONTEXT_TOOL_RTK, _CONTEXT_TOOL_LEAN_CTX, _CONTEXT_TOOL_CTX_FORGE}
 _AGENT_SAVINGS_TARGET_AGENTS = {"claude", "codex", "cursor"}
 _WRAP_PROXY_TIMEOUT_ENV = "HEADROOM_WRAP_PROXY_TIMEOUT"
 _WRAP_PROXY_TIMEOUT_DEFAULT_SECONDS = 45
@@ -185,7 +186,9 @@ def _selected_context_tool() -> str:
 
     RTK remains the default for backward compatibility. Set
     ``HEADROOM_CONTEXT_TOOL=lean-ctx`` to let lean-ctx configure the supported
-    coding agent instead.
+    coding agent instead, or ``HEADROOM_CONTEXT_TOOL=ctx-forge`` to use a
+    repo's generated ctx-forge toolset (detection + guidance only — there is
+    no binary to install).
     """
 
     raw = os.environ.get(_CONTEXT_TOOL_ENV, "").strip().lower().replace("_", "-")
@@ -193,6 +196,8 @@ def _selected_context_tool() -> str:
         return _CONTEXT_TOOL_RTK
     if raw == "leanctx":
         raw = _CONTEXT_TOOL_LEAN_CTX
+    if raw == "ctxforge":
+        raw = _CONTEXT_TOOL_CTX_FORGE
     if raw not in _VALID_CONTEXT_TOOLS:
         raise click.ClickException(
             f"{_CONTEXT_TOOL_ENV} must be one of: {', '.join(sorted(_VALID_CONTEXT_TOOLS))}"
@@ -506,6 +511,74 @@ def _setup_lean_ctx_agent(agent: str, verbose: bool = False) -> Path | None:
         else:
             click.echo(f"  lean-ctx configured for {agent}")
     return lean_ctx
+
+
+# Marker pair for idempotent ctx-forge guidance injection. Only plain-text
+# marker files are injected; structured configs (e.g. Continue's JSON
+# systemMessage) are skipped with a note rather than risking user data.
+_CTX_FORGE_MARKER = "<!-- headroom:ctx-forge-instructions -->"
+_CTX_FORGE_END_MARKER = "<!-- /headroom:ctx-forge-instructions -->"
+_CTX_FORGE_PLAIN_MARKER_FILES = {".cursorrules", ".clinerules", ".goosehints"}
+
+
+def _inject_ctx_forge_instructions(file_path: Path, guidance: str, verbose: bool = False) -> bool:
+    """Inject ctx-forge guidance into a plain-text marker file.
+
+    Idempotent — skips if the marker is already present. Appends to existing
+    content. Returns True if guidance is present afterwards.
+    """
+    block = f"{_CTX_FORGE_MARKER}\n{guidance}\n{_CTX_FORGE_END_MARKER}\n"
+    if file_path.exists():
+        existing = file_path.read_text()
+        if _CTX_FORGE_MARKER in existing:
+            if verbose:
+                click.echo(f"  ctx-forge guidance already in {file_path.name}")
+            return True
+        with open(file_path, "a") as f:
+            f.write("\n\n" + block)
+    else:
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text(block)
+
+    click.echo(f"  ctx-forge guidance injected into {file_path}")
+    return True
+
+
+def _setup_ctx_forge_agent(
+    agent_display: str, marker_path: Path | None = None, verbose: bool = False
+) -> None:
+    """Detect the repo's ctx-forge toolset and surface/inject its guidance.
+
+    ctx-forge has no binary to download: toolsets are generated into the
+    target repo by the ctx-forge skill and live under ``.ctx/``. Detection
+    failure is reported with a pointer and wrap continues with plain proxy
+    compression. When a toolset exists and ``marker_path`` is a plain-text
+    marker file (``.cursorrules``/``.clinerules``/``.goosehints``), the
+    guidance block is injected there in place of rtk guidance; agents that
+    read repo docs (CLAUDE.md / AGENTS.md) already carry the guidance the
+    skill wrote at generation time.
+    """
+    from headroom import ctx_forge
+
+    toolset = ctx_forge.find_toolset()
+    click.echo(f"  {ctx_forge.setup_summary(toolset)}")
+    if toolset is None:
+        return
+    if marker_path is not None:
+        if marker_path.name in _CTX_FORGE_PLAIN_MARKER_FILES:
+            _inject_ctx_forge_instructions(
+                marker_path, ctx_forge.guidance_text(toolset), verbose=verbose
+            )
+        elif verbose:
+            click.echo(
+                f"  ctx-forge: not injecting into {marker_path.name} "
+                f"(structured config) — guidance lives in the repo's agent docs"
+            )
+    if not toolset.trusted:
+        click.echo(
+            f"  Warning: toolset selftest is {toolset.selftest_result!r} — "
+            f"{agent_display} should prefer raw exploration until `ctx regen` passes."
+        )
 
 
 def _remove_claude_rtk_hooks(settings_path: Path | None = None) -> bool:
@@ -1454,9 +1527,9 @@ def _setup_context_tool_for_agent(
     rtk_required: bool = False,
     verbose: bool = False,
 ) -> Path | None:
-    """Run the rtk-or-lean-ctx context-tool setup with KeyboardInterrupt handling.
+    """Run the selected context-tool setup with KeyboardInterrupt handling.
 
-    Replaces the ``try / except KeyboardInterrupt / rtk-vs-lean-ctx fork``
+    Replaces the ``try / except KeyboardInterrupt / context-tool fork``
     each wrap subcommand was inlining. Returns the rtk binary path if rtk
     mode was selected and the install succeeded; otherwise ``None``.
 
@@ -1480,6 +1553,10 @@ def _setup_context_tool_for_agent(
         if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
             click.echo(f"  Setting up lean-ctx for {agent_display}...")
             _setup_lean_ctx_agent(agent, verbose=verbose)
+            return None
+        if _selected_context_tool() == _CONTEXT_TOOL_CTX_FORGE:
+            click.echo(f"  Setting up ctx-forge for {agent_display}...")
+            _setup_ctx_forge_agent(agent_display, marker_path=marker_path, verbose=verbose)
             return None
         click.echo(f"  Setting up rtk for {agent_display}...")
         rtk_path = _ensure_rtk_binary(verbose=verbose)
@@ -2988,6 +3065,8 @@ def claude(
         if not no_rtk:
             if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
                 _setup_lean_ctx_agent("claude", verbose=verbose)
+            elif _selected_context_tool() == _CONTEXT_TOOL_CTX_FORGE:
+                _setup_ctx_forge_agent("Claude", verbose=verbose)
             else:
                 _prepare_wrap_rtk(verbose=verbose, label="Claude")
         return
@@ -3093,6 +3172,9 @@ def claude(
             if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
                 click.echo("  Setting up lean-ctx...")
                 _setup_lean_ctx_agent("claude", verbose=verbose)
+            elif _selected_context_tool() == _CONTEXT_TOOL_CTX_FORGE:
+                click.echo("  Setting up ctx-forge...")
+                _setup_ctx_forge_agent("Claude", verbose=verbose)
             else:
                 click.echo("  Setting up rtk...")
                 _setup_rtk(verbose=verbose)
@@ -3382,6 +3464,9 @@ def copilot(
         if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
             click.echo("  Setting up lean-ctx for Copilot...")
             _setup_lean_ctx_agent("copilot", verbose=verbose)
+        elif _selected_context_tool() == _CONTEXT_TOOL_CTX_FORGE:
+            click.echo("  Setting up ctx-forge for Copilot...")
+            _setup_ctx_forge_agent("Copilot", verbose=verbose)
         else:
             click.echo("  Setting up rtk for Copilot...")
             rtk_path = _ensure_rtk_binary(verbose=verbose)
@@ -3633,6 +3718,9 @@ def codex(
         if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
             click.echo("  Setting up lean-ctx for Codex...")
             _setup_lean_ctx_agent("codex", verbose=verbose)
+        elif _selected_context_tool() == _CONTEXT_TOOL_CTX_FORGE:
+            click.echo("  Setting up ctx-forge for Codex...")
+            _setup_ctx_forge_agent("Codex", verbose=verbose)
         else:
             click.echo("  Setting up rtk for Codex...")
             rtk_path = _ensure_rtk_binary(verbose=verbose)
@@ -3822,6 +3910,9 @@ def aider(
         if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
             click.echo("  Setting up lean-ctx for aider...")
             _setup_lean_ctx_agent("aider", verbose=verbose)
+        elif _selected_context_tool() == _CONTEXT_TOOL_CTX_FORGE:
+            click.echo("  Setting up ctx-forge for aider...")
+            _setup_ctx_forge_agent("aider", verbose=verbose)
         else:
             click.echo("  Setting up rtk for aider...")
             rtk_path = _ensure_rtk_binary(verbose=verbose)
@@ -4007,6 +4098,8 @@ def cursor(
             click.echo()
             if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
                 click.echo("  lean-ctx configured for Cursor")
+            elif _selected_context_tool() == _CONTEXT_TOOL_CTX_FORGE:
+                click.echo("  ctx-forge configured for Cursor (guidance in .cursorrules)")
             else:
                 click.echo("  rtk instructions injected into .cursorrules")
             click.echo("  Cursor will use token-optimized commands automatically.")
@@ -4107,6 +4200,8 @@ def cline(
             click.echo()
             if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
                 click.echo("  lean-ctx configured for Cline")
+            elif _selected_context_tool() == _CONTEXT_TOOL_CTX_FORGE:
+                click.echo("  ctx-forge configured for Cline (guidance in .clinerules)")
             else:
                 click.echo("  rtk instructions injected into .clinerules")
             click.echo("  Cline will use token-optimized commands automatically.")
@@ -4229,6 +4324,10 @@ def continue_dev(
             click.echo()
             if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
                 click.echo("  lean-ctx configured for Continue")
+            elif _selected_context_tool() == _CONTEXT_TOOL_CTX_FORGE:
+                click.echo(
+                    "  ctx-forge configured for Continue (guidance lives in the repo's agent docs)"
+                )
             else:
                 click.echo(f"  rtk instructions injected into {config_file.name} systemMessage")
             click.echo("  Continue will use token-optimized commands automatically.")

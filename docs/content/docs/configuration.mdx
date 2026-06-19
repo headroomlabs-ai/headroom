@@ -17,7 +17,16 @@ headroom wrap claude
 headroom wrap codex --prepare-only
 ```
 
-Supported values are `rtk` and `lean-ctx`; unset defaults to `rtk`.
+Set `HEADROOM_CONTEXT_TOOL=ctx-forge` to use a repo's generated
+[ctx-forge](https://github.com/dvk31/ctx-forge) toolset instead. There is no
+binary to install: wrap detects the nearest `.ctx/ctx.toml`, reports whether
+the toolset's selftest passed, and injects its command guidance into
+plain-text agent marker files (`.cursorrules`, `.clinerules`, `.goosehints`)
+in place of RTK guidance. Repos without a toolset degrade gracefully to plain
+proxy compression.
+
+Supported values are `rtk`, `lean-ctx`, and `ctx-forge`; unset defaults to
+`rtk`.
 
 The proxy reads RTK lifetime savings with global scope by default so a shared
 daemon reports savings across the operator's projects. Set
