@@ -576,43 +576,58 @@ pub fn set_kompress_enabled(enabled: bool) {
     KOMPRESS_ENABLED.store(enabled, Ordering::Relaxed);
 }
 
+// Loaded Kompress singleton. Populated **only** by `warm_live_zone_compressors`
+// (an off-request-path startup call) — never by `kompress()` on the request
+// path. The model is a ~261 MB ONNX session whose load can be slow (on the
+// OpenVINO/NPU EP the graph compile takes ~13s+), so the request path must
+// never trigger or block on that init. See `kompress()`.
+static KOMPRESS_INSTANCE: OnceLock<Option<Kompress>> = OnceLock::new();
+
 // Kompress is the ML prose compressor. Unlike the others it carries a ~261 MB
-// ONNX model, so: (1) it is gated behind `KOMPRESS_ENABLED` (checked before
-// the `OnceLock` so a disabled proxy never loads the model), and (2) it loads
-// **cache-only**, mirroring the Python reference's `allow_download=False`
-// path — never download on a hot/startup path, and yield `None` when the
-// model isn't cached so the dispatcher passes plain text through untouched
-// (exactly as Python does when Kompress is unavailable). Warm it once off the
-// request path via `warm_live_zone_compressors`.
+// ONNX model, so: (1) it is gated behind `KOMPRESS_ENABLED` (a disabled proxy
+// never loads the model), and (2) it loads **cache-only**, mirroring the
+// Python reference's `allow_download=False` path.
+//
+// CRITICAL: this request-path accessor is **non-blocking**. It does a plain
+// `OnceLock::get()` — if the model has not finished warming yet (or was never
+// cached), it returns `None` and the dispatcher passes plain text through,
+// exactly as when Kompress is unavailable. It must NOT call `get_or_init`:
+// that would make a request thread block on the (possibly slow) model load.
+// The load happens once, off the request path, in `warm_live_zone_compressors`.
 fn kompress() -> Option<&'static Kompress> {
     if !KOMPRESS_ENABLED.load(Ordering::Relaxed) {
         return None;
     }
-    static INSTANCE: OnceLock<Option<Kompress>> = OnceLock::new();
-    INSTANCE
-        .get_or_init(|| {
-            Kompress::from_cache(KompressConfig::default())
-                .ok()
-                .flatten()
-        })
-        .as_ref()
+    // Non-blocking: `None` until `warm` has populated the slot.
+    KOMPRESS_INSTANCE.get().and_then(|slot| slot.as_ref())
 }
 
 /// Eagerly initialize the live-zone compressor singletons off the request
 /// path — the Rust mirror of the Python reference's `eager_load_compressors`.
 ///
-/// Kompress is only warmed when it has been enabled via
-/// [`set_kompress_enabled`], and even then loads **cache-only** (never
-/// downloads), so this is safe to call on a blocking startup/lifespan path: a
-/// cold cache simply leaves Kompress deferred (PlainText passes through)
-/// instead of stalling the bind. Call once at proxy startup to move the
-/// model-init cost off the first `PlainText` request. Returns whether the
-/// Kompress model was cached/loaded (always `false` when Kompress is disabled).
+/// This is the **only** place the Kompress model is loaded. Kompress is loaded
+/// only when enabled via [`set_kompress_enabled`], and even then **cache-only**
+/// (never downloads). The load can block (an NPU graph compile takes seconds),
+/// so call this on a dedicated blocking/startup thread — never on the request
+/// path. Until it completes, [`kompress`] returns `None` and `PlainText` blocks
+/// pass through; once it completes the model is live for subsequent requests.
+/// Returns whether the Kompress model was cached/loaded (`false` when disabled
+/// or not cached). Idempotent: the underlying `OnceLock` loads at most once.
 pub fn warm_live_zone_compressors() -> bool {
     // CodeCompressor: statically-linked grammars, trivial to construct.
     let _ = code_compressor();
-    // Kompress: `Some` iff enabled AND the model was already in the HF cache.
-    kompress().is_some()
+    // Kompress: perform the (potentially slow) load here, off the request path.
+    // `Some` iff enabled AND the model was already in the HF cache.
+    KOMPRESS_INSTANCE
+        .get_or_init(|| {
+            if !KOMPRESS_ENABLED.load(Ordering::Relaxed) {
+                return None;
+            }
+            Kompress::from_cache(KompressConfig::default())
+                .ok()
+                .flatten()
+        })
+        .is_some()
 }
 
 // ─── Public entry point ────────────────────────────────────────────────
