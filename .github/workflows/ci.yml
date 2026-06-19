@@ -16,6 +16,10 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - 'wiki/**'
+      - '**/*.md'
   workflow_dispatch:
 
 permissions:
@@ -54,7 +58,6 @@ jobs:
               - 'Cargo.lock'
               - 'tests/**'
               - 'scripts/**'
-              - '.github/workflows/ci.yml'
             e2e:
               - 'headroom/**'
               - 'crates/**'

@@ -42,7 +42,7 @@ use super::builder::SmartCrusherBuilder;
 use super::classifier::{classify_array, ArrayType};
 use super::compaction::{
     classify_cell, emit_opaque_ccr_marker, try_parse_json_container, CellClass, ClassifyConfig,
-    Compaction, CompactionStage,
+    CompactConfig, Compaction, CompactionStage,
 };
 use super::config::SmartCrusherConfig;
 use super::crushers::{compute_k_split, crush_number_array, crush_object, crush_string_array};
@@ -154,9 +154,20 @@ impl SmartCrusher {
     /// CCR cache, not to nowhere — same semantics as Python's
     /// SmartCrusher with CCR enabled.
     pub fn new(config: SmartCrusherConfig) -> Self {
+        // Carry the compaction heuristics from the crusher config into
+        // the compaction stage; everything not exposed on
+        // SmartCrusherConfig keeps its CompactConfig default.
+        let compact_cfg = CompactConfig {
+            core_field_fraction: config.compaction_core_field_fraction,
+            heterogeneous_core_ratio: config.compaction_heterogeneous_core_ratio,
+            max_flatten_inner_keys: config.compaction_max_flatten_inner_keys,
+            min_buckets: config.compaction_min_buckets,
+            max_buckets: config.compaction_max_buckets,
+            ..CompactConfig::default()
+        };
         SmartCrusherBuilder::new(config)
             .with_default_oss_setup()
-            .with_default_compaction()
+            .with_compaction(CompactionStage::csv_schema(compact_cfg))
             .with_default_ccr_store()
             .build()
     }
@@ -263,16 +274,49 @@ impl SmartCrusher {
     /// kept-items list in original-array order. Mirrors Python's
     /// `_execute_plan` (line 3617-3633).
     ///
-    /// Schema-preserving: each kept item is cloned unchanged. No
-    /// summary objects, generated fields, or wrapper metadata.
+    /// Schema-preserving by default: each kept item is cloned unchanged.
+    /// No summary objects, generated fields, or wrapper metadata.
+    ///
+    /// When `factor_out_constants` is enabled (default off), fields the
+    /// analyzer found constant across ALL items are stripped from each
+    /// kept object and emitted once in a leading
+    /// `{"_constant_fields": {...}}` sentinel — same output-shape
+    /// convention as the `_ccr_dropped` sentinel. Stripping is
+    /// defensive: a key is only removed from an item when its value
+    /// equals the recorded constant, so a drifted item keeps its own
+    /// value. The CCR store always holds the full unfactored original.
     pub fn execute_plan(&self, plan: &CompressionPlan, items: &[Value]) -> Vec<Value> {
         let mut indices = plan.keep_indices.clone();
         indices.sort_unstable();
-        indices
+        let mut kept: Vec<Value> = indices
             .into_iter()
             .filter(|&idx| idx < items.len())
             .map(|idx| items[idx].clone())
-            .collect()
+            .collect();
+
+        if self.config.factor_out_constants && !plan.constant_fields.is_empty() && kept.len() >= 2 {
+            let mut any_stripped = false;
+            for item in kept.iter_mut() {
+                if let Value::Object(map) = item {
+                    for (key, constant) in &plan.constant_fields {
+                        if map.get(key) == Some(constant) {
+                            map.remove(key);
+                            any_stripped = true;
+                        }
+                    }
+                }
+            }
+            if any_stripped {
+                let mut sentinel = serde_json::Map::new();
+                sentinel.insert(
+                    "_constant_fields".to_string(),
+                    Value::Object(plan.constant_fields.clone().into_iter().collect()),
+                );
+                kept.insert(0, Value::Object(sentinel));
+            }
+        }
+
+        kept
     }
 
     /// Top-level entry point. Mirrors Python `SmartCrusher.crush`
@@ -1021,6 +1065,80 @@ mod tests {
         };
         let result = c.execute_plan(&plan, &items);
         assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn execute_plan_factors_constants_when_enabled() {
+        let cfg = SmartCrusherConfig {
+            factor_out_constants: true,
+            ..Default::default()
+        };
+        let c = SmartCrusher::new(cfg);
+        let items: Vec<Value> = (0..4)
+            .map(|i| json!({"id": i, "region": "us-west-2", "status": "ok"}))
+            .collect();
+        let mut constant_fields = std::collections::BTreeMap::new();
+        constant_fields.insert("region".to_string(), json!("us-west-2"));
+        constant_fields.insert("status".to_string(), json!("ok"));
+        let plan = CompressionPlan {
+            keep_indices: vec![0, 1, 2],
+            constant_fields,
+            ..CompressionPlan::default()
+        };
+        let result = c.execute_plan(&plan, &items);
+        // Sentinel first, then 3 slim items.
+        assert_eq!(result.len(), 4);
+        assert_eq!(result[0]["_constant_fields"]["region"], "us-west-2");
+        assert_eq!(result[0]["_constant_fields"]["status"], "ok");
+        for item in &result[1..] {
+            assert!(item.get("region").is_none());
+            assert!(item.get("status").is_none());
+            assert!(item.get("id").is_some());
+        }
+    }
+
+    #[test]
+    fn execute_plan_keeps_drifted_values_when_factoring() {
+        // Defensive strip: an item whose value differs from the recorded
+        // constant keeps its own value.
+        let cfg = SmartCrusherConfig {
+            factor_out_constants: true,
+            ..Default::default()
+        };
+        let c = SmartCrusher::new(cfg);
+        let items = vec![
+            json!({"id": 0, "status": "ok"}),
+            json!({"id": 1, "status": "FAILED"}),
+        ];
+        let mut constant_fields = std::collections::BTreeMap::new();
+        constant_fields.insert("status".to_string(), json!("ok"));
+        let plan = CompressionPlan {
+            keep_indices: vec![0, 1],
+            constant_fields,
+            ..CompressionPlan::default()
+        };
+        let result = c.execute_plan(&plan, &items);
+        assert_eq!(result.len(), 3);
+        assert!(result[1].get("status").is_none()); // matched → stripped
+        assert_eq!(result[2]["status"], "FAILED"); // drifted → kept
+    }
+
+    #[test]
+    fn execute_plan_default_off_leaves_items_unchanged() {
+        // factor_out_constants defaults to false: schema preserved even
+        // when the plan carries constant_fields.
+        let c = crusher();
+        let items: Vec<Value> = (0..3).map(|i| json!({"id": i, "k": "v"})).collect();
+        let mut constant_fields = std::collections::BTreeMap::new();
+        constant_fields.insert("k".to_string(), json!("v"));
+        let plan = CompressionPlan {
+            keep_indices: vec![0, 1, 2],
+            constant_fields,
+            ..CompressionPlan::default()
+        };
+        let result = c.execute_plan(&plan, &items);
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0]["k"], "v");
     }
 
     // ---------- crush_array ----------

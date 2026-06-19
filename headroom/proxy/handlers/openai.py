@@ -45,7 +45,11 @@ import httpx
 from headroom.agent_savings import proxy_pipeline_kwargs
 from headroom.copilot_auth import apply_copilot_api_auth, build_copilot_upstream_url
 from headroom.pipeline import PipelineStage, summarize_routing_markers
-from headroom.proxy.auth_mode import classify_auth_mode, classify_client
+from headroom.proxy.auth_mode import (
+    classify_auth_mode,
+    classify_client,
+    should_stamp_codex_client,
+)
 from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.cost import _summarize_transforms, header_safe_transforms
 from headroom.proxy.outcome import RequestOutcome
@@ -760,18 +764,43 @@ class OpenAIHandlerMixin:
                 item["output"] = replacement
 
         headroom_retrieve_call_ids: set[str] = set()
+        # Map each Responses tool call to its name so that outputs belonging to
+        # excluded tools (HEADROOM_EXCLUDE_TOOLS) can be protected from
+        # compression. The chat/Anthropic paths get this via
+        # ContentRouter._build_tool_name_map; the Responses payload carries the
+        # name on the `function_call` item and the originating call_id on the
+        # matching `function_call_output`, so we correlate them here.
+        function_name_by_call_id: dict[str, str] = {}
         for item in items:
             if not isinstance(item, dict):
                 continue
             if item.get("type") != "function_call":
                 continue
             name = item.get("name")
+            call_id = item.get("call_id")
+            if isinstance(name, str) and isinstance(call_id, str) and call_id:
+                function_name_by_call_id[call_id] = name
             if isinstance(name, str) and (
                 name == "headroom_retrieve" or name.endswith("__headroom_retrieve")
             ):
-                call_id = item.get("call_id")
                 if isinstance(call_id, str) and call_id:
                     headroom_retrieve_call_ids.add(call_id)
+
+        # Resolve the effective exclude set once (None -> built-in defaults),
+        # mirroring ContentRouter's policy. exclude_tools already contains both
+        # original and lowercased name variants (see _parse_exclude_tools), but
+        # we also test the lowercased name defensively for case-insensitivity.
+        from headroom.config import DEFAULT_EXCLUDE_TOOLS
+
+        router_exclude_tools = getattr(router.config, "exclude_tools", None)
+        effective_exclude_tools = (
+            router_exclude_tools if router_exclude_tools is not None else DEFAULT_EXCLUDE_TOOLS
+        )
+        excluded_call_ids: set[str] = {
+            call_id
+            for call_id, fn_name in function_name_by_call_id.items()
+            if fn_name in effective_exclude_tools or fn_name.lower() in effective_exclude_tools
+        }
 
         timing_sink: dict[str, float] = timing if timing is not None else {}
 
@@ -808,6 +837,20 @@ class OpenAIHandlerMixin:
                                 "reason": "headroom_retrieve_output_protected",
                                 "item_type": item_type,
                                 "call_id": call_id,
+                                "item": item,
+                            }
+                        )
+                    continue
+                if isinstance(call_id, str) and call_id in excluded_call_ids:
+                    if debug_enabled:
+                        extraction_debug.append(
+                            {
+                                "index": idx,
+                                "eligible": False,
+                                "reason": "exclude_tools_protected",
+                                "item_type": item_type,
+                                "call_id": call_id,
+                                "tool_name": function_name_by_call_id.get(call_id),
                                 "item": item,
                             }
                         )
@@ -3498,17 +3541,22 @@ class OpenAIHandlerMixin:
 
         # Forward client headers to upstream, adding required OpenAI-Beta header
         ws_headers = dict(websocket.headers)
+        _ws_url_obj = getattr(websocket, "url", None)
+        _ws_url = str(_ws_url_obj) if _ws_url_obj is not None else ""
+        _ws_path = getattr(_ws_url_obj, "path", "") if _ws_url_obj is not None else ""
+        if not _ws_path:
+            _ws_path = "/v1/responses"
+        # WS sessions bypass the HTTP middleware that stamps X-Client: codex on
+        # the Responses endpoint, so apply the same path-based stamp here before
+        # classify_client runs (parallels server.py / should_stamp_codex_client).
+        if should_stamp_codex_client(_ws_path, ws_headers):
+            ws_headers["x-client"] = "codex"
         # Identify the WS harness before downstream auth/header rewrites.
         # Captured in closure so per-turn RequestOutcome can stamp it.
         client = classify_client(ws_headers)
         # WS sessions bypass the HTTP middleware, so bind the project here;
         # per-turn outcome emission inside this task inherits the context.
         set_current_project(classify_project(ws_headers))
-        _ws_url_obj = getattr(websocket, "url", None)
-        _ws_url = str(_ws_url_obj) if _ws_url_obj is not None else ""
-        _ws_path = getattr(_ws_url_obj, "path", "") if _ws_url_obj is not None else ""
-        if not _ws_path:
-            _ws_path = "/v1/responses"
         metrics_for_inbound_ws = getattr(self, "metrics", None)
         if metrics_for_inbound_ws is not None and hasattr(
             metrics_for_inbound_ws, "record_inbound_request"
