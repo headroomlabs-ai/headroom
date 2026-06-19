@@ -46,12 +46,20 @@ loop is now a first-class reason to analyze, fixing the early-return), surfaced
 in the digest, the system prompt makes loops the #1 priority, and weighting +
 re-sort run after parsing.
 
-### Why measured-waste weighting (vs. asking the LLM for a bigger number)
+### Why measured-waste weighting (vs. relying on the LLM's estimate)
 
-The LLM already estimates savings and gets loops wrong (it rated the eval's
-loop at 150 tokens vs. ~5,000 measured). Prompting harder is unreliable.
-Deriving the weight from *observed repetition* is deterministic and auditable —
-the boost equals waste we actually counted in the transcript.
+The LLM's `estimated_tokens_saved` is a free-form guess, not grounded in the
+transcript, so ranking on it alone is unreliable. Deriving the weight from
+*observed repetition* — the real output bytes summed across the repeated calls
+— is deterministic and auditable: the boost equals waste we actually counted.
+
+Honest caveat on the current implementation: we do BOTH — the digest also tells
+the model the measured waste and asks it to rank loops first. In real-LLM runs
+that prompt hint is doing much of the work (the model echoes the measured
+figure), while the post-hoc `apply_loop_weighting` boost is fuzzy-match-based
+and does not always fire. Making the measured-waste boost the deterministic,
+load-bearing mechanism — independent of the model's wording — is tracked as
+follow-up.
 
 ## The eval
 

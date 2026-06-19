@@ -80,7 +80,7 @@ def _stub_llm_phase1(digest: str, model: str) -> dict:
                     "result once (grep into a file and read it) instead of "
                     "re-running grep with larger `head` limits."
                 ),
-                "estimated_tokens_saved": 150,  # model UNDER-rates the loop
+                "estimated_tokens_saved": 150,  # simulated low estimate (stub value, not a real-model figure)
                 "evidence_count": 1,
             },
         ],
