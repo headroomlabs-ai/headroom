@@ -414,8 +414,9 @@ class HeadroomMCPServer:
         # Check local store first
         store = self._get_local_store()
         if query:
-            results = store.search(hash_key, query)
-            if results:
+            entry = store.get_metadata(hash_key)
+            if entry is not None:
+                results = store.search(hash_key, query)
                 self._stats.record_retrieval(hash_key)
                 return {
                     "hash": hash_key,
