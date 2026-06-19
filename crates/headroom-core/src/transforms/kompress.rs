@@ -269,6 +269,37 @@ impl Kompress {
         })
     }
 
+    /// Cache-only construction: resolve the tokenizer + ONNX artifact from
+    /// the local HuggingFace cache **without ever hitting the network**, and
+    /// return `Ok(None)` when they are not present (or no candidate loads).
+    ///
+    /// This is the Rust mirror of the Python reference's
+    /// `allow_download=False` path (`KompressModelNotCached` → defer): it lets
+    /// the live-zone dispatcher attempt a load on a hot path without risking a
+    /// blocking 261 MB download. When the model isn't cached the caller passes
+    /// plain text through untouched, exactly as Python does when Kompress is
+    /// unavailable.
+    pub fn from_cache(config: KompressConfig) -> Result<Option<Self>, KompressError> {
+        let Some(tok_path) = hf_cache_file(&config.tokenizer_repo, &["tokenizer.json"]) else {
+            return Ok(None);
+        };
+        let tokenizer = load_tokenizer(&tok_path, &config.tokenizer_repo)?;
+        for candidate in ONNX_CANDIDATES {
+            let rel: Vec<&str> = candidate.split('/').collect();
+            let Some(onnx_path) = hf_cache_file(&config.model_id, &rel) else {
+                continue;
+            };
+            if let Ok(session) = build_session(&onnx_path) {
+                return Ok(Some(Self {
+                    config,
+                    tokenizer,
+                    session: Mutex::new(session),
+                }));
+            }
+        }
+        Ok(None)
+    }
+
     /// Model-decides compression (the proxy path): keep words scoring
     /// above `config.score_threshold`.
     pub fn compress(&self, content: &str) -> KompressResult {
@@ -460,6 +491,29 @@ fn load_tokenizer(path: &Path, repo: &str) -> Result<Tokenizer, KompressError> {
 fn build_session(path: &Path) -> Result<Session, Box<dyn std::error::Error + Send + Sync>> {
     let session = Session::builder()?.commit_from_file(path)?;
     Ok(session)
+}
+
+/// Resolve `rel` (e.g. `["tokenizer.json"]` or `["onnx", "kompress-int8-wo.onnx"]`)
+/// inside the local HuggingFace cache for `repo` (`"owner/name"`), searching
+/// every snapshot. Returns `None` if not present — never touches the network.
+/// Mirrors the resolution the parity comparator uses.
+fn hf_cache_file(repo: &str, rel: &[&str]) -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    let repo_dir = format!("models--{}", repo.replace('/', "--"));
+    let snapshots = Path::new(&home)
+        .join(".cache/huggingface/hub")
+        .join(repo_dir)
+        .join("snapshots");
+    for snap in std::fs::read_dir(snapshots).ok()?.flatten() {
+        let mut cand = snap.path();
+        for part in rel {
+            cand = cand.join(part);
+        }
+        if cand.exists() {
+            return Some(cand);
+        }
+    }
+    None
 }
 
 #[cfg(test)]

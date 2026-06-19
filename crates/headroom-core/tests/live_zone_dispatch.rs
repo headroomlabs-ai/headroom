@@ -262,10 +262,13 @@ fn diff_tool_result_routes_to_diff_compressor() {
 }
 
 #[test]
-fn source_code_tool_result_routes_to_no_op() {
-    // Detector classifies this as SourceCode. PR-B3 routes it to
-    // no-op (Rust code-compressor port pending). Pin the contract
-    // so a future "wire it up" PR can flip this assertion.
+fn source_code_tool_result_routes_to_code_compressor() {
+    // Detector classifies this as SourceCode; the dispatcher now routes it
+    // to the Rust CodeCompressor (was no-op before the port landed). Twenty
+    // identical multi-line Rust functions are well above the SourceCode byte
+    // threshold and compress (each body is truncated to a budget + an
+    // omitted-lines comment), so the dispatch yields a strictly smaller,
+    // token-shrinking block.
     let code = "
 fn main() {
     let x: i32 = 42;
@@ -282,10 +285,10 @@ fn main() {
     let (body, _) = body_with_tool_result(&code);
     let out = dispatch(&body);
     let manifest = match &out {
-        LiveZoneOutcome::NoChange { manifest } => manifest,
-        LiveZoneOutcome::Modified { manifest, .. } => {
-            panic!("PR-B3 must NOT compress SourceCode (Rust port pending). manifest: {manifest:?}")
-        }
+        LiveZoneOutcome::Modified { manifest, .. } => manifest,
+        LiveZoneOutcome::NoChange { manifest } => panic!(
+            "expected CodeCompressor to compress 20 Rust functions; got NoChange. manifest: {manifest:?}"
+        ),
     };
     let action = manifest
         .block_outcomes
@@ -295,26 +298,107 @@ fn main() {
         .action
         .clone();
     match action {
-        BlockAction::NoCompressionApplied { content_type } => {
-            // Source-code-shaped content above the SourceCode byte
-            // threshold (2 KiB) but below any active compressor:
-            // SmartCrusher / log / search / diff don't apply, and
-            // the Rust code-compressor port is not yet wired.
+        BlockAction::Compressed {
+            strategy,
+            original_bytes,
+            compressed_bytes,
+            original_tokens,
+            compressed_tokens,
+        } => {
+            assert_eq!(strategy, "code_aware_compressor", "expected CodeCompressor dispatch");
             assert!(
-                content_type == "source_code" || content_type == "text",
-                "unexpected content_type tag: {content_type}"
+                compressed_bytes < original_bytes,
+                "CodeCompressor must produce smaller output ({compressed_bytes} < {original_bytes})"
+            );
+            assert!(
+                compressed_tokens < original_tokens,
+                "tokenizer-validated gate must accept only token-shrinking output \
+                 ({compressed_tokens} < {original_tokens})"
             );
         }
-        BlockAction::BelowByteThreshold { content_type, .. } => {
-            // Detector may classify code-with-prose as PlainText
-            // (5 KiB threshold) — for ~2.6 KiB of mixed code/prose
-            // that still routes to no-op for B4. Pin the tag.
-            assert!(
-                content_type == "text" || content_type == "source_code",
-                "unexpected content_type tag: {content_type}"
-            );
+        other => panic!("expected BlockAction::Compressed (code_aware_compressor), got {other:?}"),
+    }
+}
+
+/// True iff the Kompress model + ModernBERT tokenizer are in the local HF
+/// cache. The PlainText dispatch loads cache-only, so its behavior is
+/// model-gated exactly like the kompress parity test.
+fn kompress_model_cached() -> bool {
+    use std::path::Path;
+    let Ok(home) = std::env::var("HOME") else {
+        return false;
+    };
+    let hub = Path::new(&home).join(".cache/huggingface/hub");
+    let has = |repo: &str, rel: &[&str]| -> bool {
+        let snaps = hub.join(repo).join("snapshots");
+        let Ok(rd) = std::fs::read_dir(&snaps) else {
+            return false;
+        };
+        rd.flatten().any(|e| {
+            let mut p = e.path();
+            for part in rel {
+                p = p.join(part);
+            }
+            p.exists()
+        })
+    };
+    has("models--answerdotai--ModernBERT-base", &["tokenizer.json"])
+        && has(
+            "models--chopratejas--kompress-v2-base",
+            &["onnx", "kompress-int8-wo.onnx"],
+        )
+}
+
+#[test]
+fn plain_text_tool_result_routes_to_kompress() {
+    // Long, repetitive English prose → detector classifies as PlainText,
+    // comfortably above the 512-byte threshold. The dispatcher now routes it
+    // to Kompress (cache-only). Model-gated: when the model isn't cached the
+    // dispatcher passes through (mirroring the Python "unavailable → unchanged"
+    // behavior), so we assert the wiring contract under both conditions.
+    let prose = "The quick brown fox jumps over the lazy dog while the diligent \
+                 engineer carefully reviews the output and discards redundant filler. "
+        .repeat(12);
+    assert!(prose.len() > 512, "prose must clear the PlainText threshold");
+    let (body, _) = body_with_tool_result(&prose);
+    let out = dispatch(&body);
+
+    let action = match &out {
+        LiveZoneOutcome::Modified { manifest, .. } | LiveZoneOutcome::NoChange { manifest } => {
+            manifest
+                .block_outcomes
+                .iter()
+                .find(|b| b.block_type == "tool_result")
+                .expect("tool_result block present")
+                .action
+                .clone()
         }
-        other => panic!("expected NoCompressionApplied or BelowByteThreshold, got {other:?}"),
+    };
+
+    if kompress_model_cached() {
+        // Model present → Kompress ran. It either compressed (strategy
+        // "kompress") or, if it kept every word / the tokenizer gate rejected
+        // it, declined cleanly. Any outcome that names a *different*
+        // compressor would mean mis-routing.
+        match action {
+            BlockAction::Compressed { strategy, .. } => {
+                assert_eq!(strategy, "kompress", "PlainText must route to Kompress");
+            }
+            BlockAction::NoCompressionApplied { .. }
+            | BlockAction::RejectedNotSmaller { .. }
+            | BlockAction::BelowByteThreshold { .. } => {}
+            other => panic!("unexpected PlainText action with model cached: {other:?}"),
+        }
+    } else {
+        // Model not cached → passthrough, exactly like Python when Kompress
+        // is unavailable.
+        assert!(
+            matches!(
+                action,
+                BlockAction::NoCompressionApplied { .. } | BlockAction::BelowByteThreshold { .. }
+            ),
+            "PlainText must pass through when the Kompress model isn't cached: {action:?}"
+        );
     }
 }
 

@@ -52,8 +52,8 @@
 //! - **PR-B3** (this PR) wires per-content-type compressors:
 //!   `JsonArray` → SmartCrusher; `BuildOutput` → LogCompressor;
 //!   `SearchResults` → SearchCompressor; `GitDiff` → DiffCompressor;
-//!   `SourceCode` / `PlainText` / `Html` → no-op (B4 + a Rust
-//!   code-compressor port follow-up).
+//!   `SourceCode` → CodeCompressor; `PlainText` → Kompress (cache-only ML
+//!   model, passthrough when not cached); `Html` → no-op (no compressor).
 //! - **PR-B4** adds the tokenizer-validation gate (per-block
 //!   `compressed.tokens >= original.tokens` → fall back) and the
 //!   per-content-type byte threshold below which compression is
@@ -101,8 +101,10 @@ use serde_json::value::RawValue;
 use serde_json::Value;
 use thiserror::Error;
 
+use super::code_compressor::{CodeAwareCompressor, CodeCompressorConfig};
 use super::content_detector::{detect_content_type, ContentType};
 use super::diff_compressor::{DiffCompressor, DiffCompressorConfig};
+use super::kompress::{Kompress, KompressConfig};
 use super::log_compressor::{LogCompressor, LogCompressorConfig};
 use super::search_compressor::{SearchCompressor, SearchCompressorConfig};
 use super::smart_crusher::{SmartCrusher, SmartCrusherConfig};
@@ -119,6 +121,10 @@ const STRATEGY_LOG_COMPRESSOR: &str = "log_compressor";
 const STRATEGY_SEARCH_COMPRESSOR: &str = "search_compressor";
 /// Strategy tag emitted when DiffCompressor rewrote a unified-diff block.
 const STRATEGY_DIFF_COMPRESSOR: &str = "diff_compressor";
+/// Strategy tag emitted when CodeCompressor rewrote a source-code block.
+const STRATEGY_CODE_COMPRESSOR: &str = "code_aware_compressor";
+/// Strategy tag emitted when Kompress rewrote a plain-text block.
+const STRATEGY_KOMPRESS: &str = "kompress";
 
 /// Empty query context passed to compressors that take a relevance
 /// query string. PR-B3 dispatcher does not yet plumb the user's last
@@ -264,9 +270,8 @@ pub struct BlockOutcome {
 #[derive(Debug, Clone)]
 pub enum BlockAction {
     /// Content type was inspected, no compressor was applicable.
-    /// Examples: `PlainText` (Kompress wires in PR-B4), `SourceCode`
-    /// (Rust code-compressor port pending), `Html` (no compressor),
-    /// `Image` (binary), unknown shapes.
+    /// Examples: `PlainText` when the Kompress model isn't cached,
+    /// `Html` (no compressor), `Image` (binary), unknown shapes.
     NoCompressionApplied {
         /// String form of the detected content type — `"text"`,
         /// `"source_code"`, `"html"`, `"image"`, `"unknown"`, etc.
@@ -547,6 +552,41 @@ fn search_compressor() -> &'static SearchCompressor {
 fn diff_compressor() -> &'static DiffCompressor {
     static INSTANCE: OnceLock<DiffCompressor> = OnceLock::new();
     INSTANCE.get_or_init(|| DiffCompressor::new(DiffCompressorConfig::default()))
+}
+
+// CodeCompressor needs no model or network — the tree-sitter grammars are
+// statically linked, so `OnceLock` construction is microseconds.
+fn code_compressor() -> &'static CodeAwareCompressor {
+    static INSTANCE: OnceLock<CodeAwareCompressor> = OnceLock::new();
+    INSTANCE.get_or_init(|| CodeAwareCompressor::new(CodeCompressorConfig::default()))
+}
+
+// Kompress is the ML prose compressor. Unlike the others it carries a ~261 MB
+// ONNX model, so this mirrors the Python reference's `allow_download=False`
+// path: load **cache-only** (never download on a hot/startup path) and yield
+// `None` when the model isn't cached — the dispatcher then passes plain text
+// through untouched, exactly as Python does when Kompress is unavailable. Warm
+// it once off the request path via `warm_live_zone_compressors`.
+fn kompress() -> Option<&'static Kompress> {
+    static INSTANCE: OnceLock<Option<Kompress>> = OnceLock::new();
+    INSTANCE
+        .get_or_init(|| Kompress::from_cache(KompressConfig::default()).ok().flatten())
+        .as_ref()
+}
+
+/// Eagerly initialize the live-zone compressor singletons off the request
+/// path — the Rust mirror of the Python reference's `eager_load_compressors`.
+///
+/// Kompress is loaded **cache-only** (never downloads), so this is safe to
+/// call on a blocking startup/lifespan path: a cold cache simply leaves
+/// Kompress deferred (PlainText passes through) instead of stalling the bind.
+/// Call once at proxy startup to move the model-init cost off the first
+/// `PlainText` request. Returns whether the Kompress model was cached/loaded.
+pub fn warm_live_zone_compressors() -> bool {
+    // CodeCompressor: statically-linked grammars, trivial to construct.
+    let _ = code_compressor();
+    // Kompress: `Some` iff the model was already in the local HF cache.
+    kompress().is_some()
 }
 
 // ─── Public entry point ────────────────────────────────────────────────
@@ -1324,8 +1364,9 @@ enum DispatchResult {
 /// - `BuildOutput` → LogCompressor
 /// - `SearchResults` → SearchCompressor
 /// - `GitDiff` → DiffCompressor
-/// - `SourceCode` → no-op (Rust port pending; see TODO below)
-/// - `PlainText` → no-op (PR-B4 wires Kompress)
+/// - `SourceCode` → CodeCompressor
+/// - `PlainText` → Kompress (cache-only; passthrough when the model is
+///   not in the local HF cache — never downloads on the dispatch thread)
 /// - `Html` → no-op (no compressor)
 fn dispatch_compressor(text: &str, content_type: ContentType) -> DispatchResult {
     if text.is_empty() {
@@ -1387,17 +1428,44 @@ fn dispatch_compressor(text: &str, content_type: ContentType) -> DispatchResult 
                 compressed: result.compressed,
             }
         }
-        // TODO(PR-B4 / Rust code-compressor port): Python has a
-        // CodeAwareCompressor; the Rust port is not yet shipped. Once
-        // that crate lands, `ContentType::SourceCode` routes here
-        // exactly as the others above.
-        ContentType::SourceCode => DispatchResult::NoOp {
-            content_type: content_type.as_str(),
-        },
-        // TODO(PR-B4): wire Kompress (lossless prose compressor) for
-        // PlainText. For now, leave untouched.
-        ContentType::PlainText => DispatchResult::NoOp {
-            content_type: content_type.as_str(),
+        ContentType::SourceCode => {
+            let result = code_compressor().compress(text);
+            // The engine returns the input unchanged for passthrough
+            // branches (below min-tokens, UNKNOWN language, invalid-syntax
+            // fallback, ratio guard). Treat that as NoOp.
+            if result.compressed == text {
+                return DispatchResult::NoOp {
+                    content_type: content_type.as_str(),
+                };
+            }
+            DispatchResult::Compressed {
+                strategy: STRATEGY_CODE_COMPRESSOR,
+                compressed: result.compressed,
+            }
+        }
+        ContentType::PlainText => match kompress() {
+            // Cache-only model present → let it score the prose. Passes
+            // through (NoOp) when the model keeps everything or the input is
+            // too short (engine returns the input unchanged).
+            Some(model) => {
+                let result = model.compress(text);
+                if result.compressed == text {
+                    return DispatchResult::NoOp {
+                        content_type: content_type.as_str(),
+                    };
+                }
+                DispatchResult::Compressed {
+                    strategy: STRATEGY_KOMPRESS,
+                    compressed: result.compressed,
+                }
+            }
+            // Model not cached → passthrough, mirroring the Python reference's
+            // "unavailable → unchanged" behavior. A background warm-up
+            // (`warm_live_zone_compressors`) populates the cache off the
+            // request path.
+            None => DispatchResult::NoOp {
+                content_type: content_type.as_str(),
+            },
         },
         // No HTML compressor on the Rust side; pages are handled by
         // upstream extractors, not the proxy.
