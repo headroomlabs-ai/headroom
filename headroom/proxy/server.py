@@ -3953,6 +3953,12 @@ if __name__ == "__main__":
         "--max-keepalive", type=int, default=100, help="Max keepalive connections (default: 100)"
     )
     parser.add_argument(
+        "--keepalive-expiry",
+        type=float,
+        default=90.0,
+        help="Seconds an idle upstream keep-alive connection is kept open (default: 90)",
+    )
+    parser.add_argument(
         "--no-http2",
         action="store_true",
         help="Disable HTTP/2 (enabled by default for better throughput)",
@@ -4104,7 +4110,7 @@ if __name__ == "__main__":
         # Connection pool settings
         max_connections=_get_env_int("HEADROOM_MAX_CONNECTIONS", args.max_connections),
         max_keepalive_connections=_get_env_int("HEADROOM_MAX_KEEPALIVE", args.max_keepalive),
-        keepalive_expiry=_get_env_float("HEADROOM_KEEPALIVE_EXPIRY", 90.0),
+        keepalive_expiry=_get_env_float("HEADROOM_KEEPALIVE_EXPIRY", args.keepalive_expiry),
         http2=not args.no_http2 and _get_env_bool("HEADROOM_HTTP2", True),
         tool_profiles=tool_profiles if tool_profiles else None,
         exclude_tools=exclude_tools if exclude_tools else None,

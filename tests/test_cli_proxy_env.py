@@ -832,6 +832,29 @@ class TestArgparseBackendValidation:
 
         assert config.disable_kompress is True
 
+    def test_argparse_registers_keepalive_expiry_flag(self):
+        """The argparse path (python -m headroom.proxy.server) must register
+        --keepalive-expiry as a float flag, so it can override the
+        HEADROOM_KEEPALIVE_EXPIRY fallback. A bad value makes argparse exit
+        before the server boots, which both proves the flag exists and keeps
+        the test fast.
+        """
+        import subprocess
+        import sys
+
+        result = subprocess.run(
+            [sys.executable, "-m", "headroom.proxy.server", "--keepalive-expiry", "notafloat"],
+            capture_output=True,
+            text=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+
+        assert result.returncode == 2, result.stderr
+        # "invalid float value" only appears if --keepalive-expiry is a registered
+        # float arg; a missing flag would instead say "unrecognized arguments".
+        assert "--keepalive-expiry" in result.stderr
+        assert "invalid float value" in result.stderr
+
 
 class TestCLIProxyExcludeToolsEnvVar:
     """HEADROOM_EXCLUDE_TOOLS and HEADROOM_TOOL_PROFILES must reach ProxyConfig via the Click path.
