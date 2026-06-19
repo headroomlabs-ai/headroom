@@ -10,7 +10,7 @@ services:
     ports:
       - "8787:8787"
     volumes:
-      - headroom_workspace:/home/nonroot/.headroom
+      - headroom_workspace:/root/.headroom
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8787/readyz"]
       interval: 30s
