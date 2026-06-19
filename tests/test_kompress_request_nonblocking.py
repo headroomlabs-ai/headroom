@@ -121,8 +121,9 @@ def test_router_compresses_cache_only_when_ready(monkeypatch):
         def ensure_background_load(self) -> None:
             raise AssertionError("must not fetch when the model is already cached")
 
-        def compress(self, content, *, context="", question=None, target_ratio=None,
-                     allow_download=True):
+        def compress(
+            self, content, *, context="", question=None, target_ratio=None, allow_download=True
+        ):
             seen["allow_download"] = allow_download
             return ReadyResult()
 
