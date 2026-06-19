@@ -94,6 +94,7 @@
 //! parameter in the signature now means later PRs are pure
 //! implementation swaps, not signature redesigns.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{collections::HashSet, sync::OnceLock};
 
 use serde::Deserialize;
@@ -561,13 +562,32 @@ fn code_compressor() -> &'static CodeAwareCompressor {
     INSTANCE.get_or_init(|| CodeAwareCompressor::new(CodeCompressorConfig::default()))
 }
 
+// Process-wide gate for the Kompress (PlainText) compressor. Default OFF:
+// unlike the always-on structural compressors and CodeCompressor, Kompress
+// carries a ~261 MB ONNX model, so an operator must opt in before it is ever
+// loaded. Mirrors the Python reference's `config.enable_kompress`. The proxy
+// sets this once at startup from `--enable-kompress`.
+static KOMPRESS_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Enable or disable the Kompress `PlainText` compressor process-wide. Call
+/// once at startup (before serving) from config. When disabled, plain-text
+/// blocks pass through and the model is never loaded.
+pub fn set_kompress_enabled(enabled: bool) {
+    KOMPRESS_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
 // Kompress is the ML prose compressor. Unlike the others it carries a ~261 MB
-// ONNX model, so this mirrors the Python reference's `allow_download=False`
-// path: load **cache-only** (never download on a hot/startup path) and yield
-// `None` when the model isn't cached — the dispatcher then passes plain text
-// through untouched, exactly as Python does when Kompress is unavailable. Warm
-// it once off the request path via `warm_live_zone_compressors`.
+// ONNX model, so: (1) it is gated behind `KOMPRESS_ENABLED` (checked before
+// the `OnceLock` so a disabled proxy never loads the model), and (2) it loads
+// **cache-only**, mirroring the Python reference's `allow_download=False`
+// path — never download on a hot/startup path, and yield `None` when the
+// model isn't cached so the dispatcher passes plain text through untouched
+// (exactly as Python does when Kompress is unavailable). Warm it once off the
+// request path via `warm_live_zone_compressors`.
 fn kompress() -> Option<&'static Kompress> {
+    if !KOMPRESS_ENABLED.load(Ordering::Relaxed) {
+        return None;
+    }
     static INSTANCE: OnceLock<Option<Kompress>> = OnceLock::new();
     INSTANCE
         .get_or_init(|| Kompress::from_cache(KompressConfig::default()).ok().flatten())
@@ -577,15 +597,17 @@ fn kompress() -> Option<&'static Kompress> {
 /// Eagerly initialize the live-zone compressor singletons off the request
 /// path — the Rust mirror of the Python reference's `eager_load_compressors`.
 ///
-/// Kompress is loaded **cache-only** (never downloads), so this is safe to
-/// call on a blocking startup/lifespan path: a cold cache simply leaves
-/// Kompress deferred (PlainText passes through) instead of stalling the bind.
-/// Call once at proxy startup to move the model-init cost off the first
-/// `PlainText` request. Returns whether the Kompress model was cached/loaded.
+/// Kompress is only warmed when it has been enabled via
+/// [`set_kompress_enabled`], and even then loads **cache-only** (never
+/// downloads), so this is safe to call on a blocking startup/lifespan path: a
+/// cold cache simply leaves Kompress deferred (PlainText passes through)
+/// instead of stalling the bind. Call once at proxy startup to move the
+/// model-init cost off the first `PlainText` request. Returns whether the
+/// Kompress model was cached/loaded (always `false` when Kompress is disabled).
 pub fn warm_live_zone_compressors() -> bool {
     // CodeCompressor: statically-linked grammars, trivial to construct.
     let _ = code_compressor();
-    // Kompress: `Some` iff the model was already in the local HF cache.
+    // Kompress: `Some` iff enabled AND the model was already in the HF cache.
     kompress().is_some()
 }
 

@@ -356,6 +356,10 @@ fn plain_text_tool_result_routes_to_kompress() {
     // to Kompress (cache-only). Model-gated: when the model isn't cached the
     // dispatcher passes through (mirroring the Python "unavailable → unchanged"
     // behavior), so we assert the wiring contract under both conditions.
+    // Kompress is gated off by default (it loads a ~261 MB model); enable it
+    // for this test exactly as the proxy does at startup from config.
+    headroom_core::transforms::set_kompress_enabled(true);
+
     let prose = "The quick brown fox jumps over the lazy dog while the diligent \
                  engineer carefully reviews the output and discards redundant filler. "
         .repeat(12);
