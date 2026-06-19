@@ -19,7 +19,7 @@ These tests cover the three contract points:
 from __future__ import annotations
 
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 from tests._dotenv import importorskip_no_env_leak
 
@@ -101,24 +101,22 @@ def test_factory_returning_client_is_reused_across_calls() -> None:
 def test_factory_returning_none_falls_back_to_default() -> None:
     """If the factory returns ``None`` (or ``False``), the backend
     skips client construction and stays on the env-based path."""
+
     def factory(_region: str | None) -> Any:
         return None
 
-    backend = LiteLLMBackend(
-        provider="bedrock", region="us-west-2", bedrock_client_factory=factory
-    )
+    backend = LiteLLMBackend(provider="bedrock", region="us-west-2", bedrock_client_factory=factory)
     assert backend._bedrock_client is None
 
 
 def test_factory_returning_non_bedrock_client_raises() -> None:
     """Defensive: refuse factories that return an object that does
     not look like a ``bedrock-runtime`` client."""
+
     def factory(_region: str | None) -> Any:
         return object()  # no converse / no invoke_model attrs
 
     import pytest
 
     with pytest.raises(TypeError, match="bedrock_client_factory"):
-        LiteLLMBackend(
-            provider="bedrock", region="us-west-2", bedrock_client_factory=factory
-        )
+        LiteLLMBackend(provider="bedrock", region="us-west-2", bedrock_client_factory=factory)

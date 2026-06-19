@@ -27,7 +27,6 @@ def make_client(region: str | None) -> Any:
     Headroom then falls back to the default env-based client.
     """
     try:
-        import boto3
         from boto3_refresh_session import refreshable_session  # type: ignore[import-not-found]
     except ImportError:
         return None

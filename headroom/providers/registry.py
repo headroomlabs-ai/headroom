@@ -152,7 +152,7 @@ def create_proxy_backend(
     openai_api_url: str | None = None,
     anyllm_backend_cls: Any | None = None,
     litellm_backend_cls: Any | None = None,
-    bedrock_client_factory: "Callable[[str | None], Any] | None" = None,
+    bedrock_client_factory: Callable[[str | None], Any] | None = None,
 ) -> Backend | None:
     """Create the optional translated backend for Anthropic proxy requests."""
     if backend == "anthropic":
@@ -187,7 +187,7 @@ def create_proxy_backend(
     # keep the API surface honest.
     factory_kwarg: dict[str, Any] = (
         {"bedrock_client_factory": bedrock_client_factory}
-        if provider == "bedrock"
+        if provider == "bedrock" and bedrock_client_factory is not None
         else {}
     )
     try:

@@ -6,9 +6,10 @@ Extracted from server.py to keep the codebase maintainable.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import InitVar, dataclass, field
 from datetime import datetime
-from typing import Any, Callable, Literal
+from typing import Any, Literal
 
 from headroom.memory import qdrant_env
 from headroom.providers.registry import ProviderApiOverrides
@@ -120,7 +121,7 @@ class ProxyConfig:
     # to ``litellm.acompletion(..., aws_bedrock_client=client)`` so the
     # session can transparently refresh STS credentials. ``None`` keeps
     # the default behavior (litellm builds its own client from env).
-    bedrock_client_factory: "Callable[[str | None], Any] | None" = None
+    bedrock_client_factory: Callable[[str | None], Any] | None = None
     anyllm_provider: str = "openai"
 
     # Optimization mode: "token" (rewrite for max compression) or

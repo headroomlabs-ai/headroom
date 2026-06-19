@@ -5,7 +5,8 @@ import logging
 import os
 import sys
 import warnings
-from typing import Any, Callable, Literal, cast
+from collections.abc import Callable
+from typing import Any, Literal, cast
 
 import click
 
