@@ -920,6 +920,40 @@ class TestNoCcrMarkerCompressors:
             f"{result.compressed[:300]!r}"
         )
 
+    def test_code_compressor_suppresses_markers_with_enable_ccr_false(self):
+        """CodeAwareCompressor with enable_ccr=False must not emit <<ccr:
+        markers when tree-sitter is available (#1022 coverage gap)."""
+        from headroom.transforms.code_compressor import (
+            CodeAwareCompressor,
+            CodeCompressorConfig,
+            _check_tree_sitter_available,
+        )
+
+        if not _check_tree_sitter_available():
+            pytest.skip("tree-sitter not available in this environment")
+
+        # Code that would compress with tree-sitter (enough to trigger CCR)
+        func_template = (
+            "def func_{i}(x: int) -> int:\n"
+            '    """Docstring for func_{i}."""\n'
+            "    # Line {j}\n"
+            "    result = x + {j}\n"
+            "    result *= 2\n"
+            "    return result\n"
+        )
+        content = "\n".join(
+            func_template.format(i=i, j=j) for i in range(30) for j in range(1, 6)
+        )
+
+        compressor = CodeAwareCompressor(
+            CodeCompressorConfig(enable_ccr=False, min_tokens_for_compression=1)
+        )
+        result = compressor.compress(content)
+        assert "<<ccr:" not in result.compressed, (
+            f"CodeAwareCompressor emitted marker when enable_ccr=False: "
+            f"{result.compressed[:300]!r}"
+        )
+
 
 class TestArgparseBackendValidation:
     """Test that the argparse path (python -m headroom.proxy.server) accepts litellm-* backends."""
