@@ -113,3 +113,25 @@ def test_wrap_agy_learn_memory(
     assert result.exit_code == 0, result.output
     assert captured["learn"] is True
     assert captured["memory"] is True
+
+
+def test_wrap_agy_prepare_only(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--prepare-only flag is handled and exits early without launching the tool."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+
+    captured: dict[str, Any] = {}
+
+    def fake_launch_tool(**kwargs: Any) -> None:  # noqa: ANN003
+        captured.update(kwargs)
+
+    with patch.object(wrap_mod.shutil, "which", return_value="agy"):
+        with patch.object(wrap_mod, "_launch_tool", side_effect=fake_launch_tool):
+            result = runner.invoke(main, ["wrap", "agy", "--prepare-only"])
+
+    assert result.exit_code == 0, result.output
+    assert not captured  # _launch_tool was not called

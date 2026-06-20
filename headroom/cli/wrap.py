@@ -4563,6 +4563,7 @@ def openhands(
 @click.option("--anyllm-provider", default=None, help="Provider for any-llm backend")
 @click.option("--region", default=None, help="Cloud region for Bedrock/Vertex")
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
+@click.option("--prepare-only", is_flag=True, hidden=True)
 @click.argument("agy_args", nargs=-1, type=click.UNPROCESSED)
 def agy(
     port: int,
@@ -4573,6 +4574,7 @@ def agy(
     anyllm_provider: str | None,
     region: str | None,
     verbose: bool,
+    prepare_only: bool,
     agy_args: tuple,
 ) -> None:
     """Launch Google Antigravity CLI (agy) through Headroom proxy.
@@ -4586,6 +4588,9 @@ def agy(
         headroom wrap agy                          # Start proxy + agy
         headroom wrap agy -- --model gemini-2.5-pro  # Pass args to agy
     """
+    if prepare_only:
+        return
+
     agy_bin = shutil.which("agy")
     if not agy_bin:
         click.echo("Error: 'agy' not found in PATH.")
