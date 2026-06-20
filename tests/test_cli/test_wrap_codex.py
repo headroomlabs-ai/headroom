@@ -170,7 +170,8 @@ class TestSnapshotCodexConfig:
         config_file.write_text(
             f"{wrap_mod._CODEX_TOP_LEVEL_MARKER}\n"
             'model_provider = "headroom"\n'
-            f"{wrap_mod._CODEX_END_MARKER}\n"
+            f"{wrap_mod._CODEX_END_MARKER}\n",
+            encoding="utf-8",
         )
 
         wrap_mod._snapshot_codex_config_if_unwrapped(config_file, backup_file)
@@ -351,7 +352,8 @@ class TestInjectAndRestoreRoundTrip:
             'model_provider = "headroom"\n\n'
             "[model_providers.headroom]\n"
             'base_url = "http://127.0.0.1:8787/v1"\n'
-            f"{wrap_mod._CODEX_END_MARKER}\n"
+            f"{wrap_mod._CODEX_END_MARKER}\n",
+            encoding="utf-8",
         )
 
         status, _ = wrap_mod._restore_codex_provider_config()
@@ -381,7 +383,8 @@ class TestInjectAndRestoreRoundTrip:
             f"{wrap_mod._MEMORY_MCP_MARKER}\n"
             "[mcp_servers.headroom_memory]\n"
             'command = "python"\n'
-            f"{wrap_mod._MEMORY_MCP_END}\n"
+            f"{wrap_mod._MEMORY_MCP_END}\n",
+            encoding="utf-8",
         )
 
         status, _ = wrap_mod._restore_codex_provider_config()
@@ -649,7 +652,8 @@ class TestInjectAvoidsDuplicateTopLevelKeys:
             "[model_providers.ccswitch]\n"
             'name = "OpenAI"\n'
             'base_url = "http://llm-gateway-proxy/v1"\n'
-            'wire_api = "responses"\n'
+            'wire_api = "responses"\n',
+            encoding="utf-8",
         )
 
         wrap_mod._inject_codex_provider_config(8787)
@@ -680,7 +684,8 @@ class TestInjectAvoidsDuplicateTopLevelKeys:
         config_dir.mkdir()
         config_file = config_dir / "config.toml"
         config_file.write_text(
-            'model_provider = "ccswitch"\nopenai_base_url = "http://llm-gateway-proxy/v1"\n'
+            'model_provider = "ccswitch"\nopenai_base_url = "http://llm-gateway-proxy/v1"\n',
+            encoding="utf-8",
         )
 
         wrap_mod._inject_codex_provider_config(8787)
@@ -996,7 +1001,8 @@ def test_wrap_codex_prepare_only_updates_stale_mcp_proxy_url(
         "\n"
         "[mcp_servers.headroom.env]\n"
         'HEADROOM_PROXY_URL = "http://127.0.0.1:9000"\n'
-        "# --- end Headroom MCP server ---\n"
+        "# --- end Headroom MCP server ---\n",
+        encoding="utf-8",
     )
 
     with patch("headroom.cli.wrap._ensure_rtk_binary", return_value=None):

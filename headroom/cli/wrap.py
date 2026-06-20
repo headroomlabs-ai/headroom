@@ -418,7 +418,7 @@ def _start_proxy(
     timeout_seconds = _resolve_wrap_proxy_timeout_seconds()
     log_path = _get_log_path()
     stdio_log_path = _get_proxy_stdio_log_path()
-    stdio_log_file = open(stdio_log_path, "a")  # noqa: SIM115
+    stdio_log_file = open(stdio_log_path, "a", encoding="utf-8")  # noqa: SIM115
 
     # Ensure proxy subprocess uses UTF-8 (Windows defaults to cp1252)
     proxy_env = os.environ.copy()
