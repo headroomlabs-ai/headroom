@@ -2910,6 +2910,7 @@ def wrap() -> None:
         headroom wrap goose               # Goose (Block) CLI
         headroom wrap openhands           # OpenHands CLI
         headroom wrap openclaw            # OpenClaw plugin bootstrap
+        headroom wrap antigravity         # Google Antigravity (agy) CLI
 
     \b
     `wrap` vs `proxy`:
@@ -4540,6 +4541,89 @@ def openhands(
         memory=memory,
         agent_type="openhands",
         code_graph=code_graph,
+        backend=backend,
+        anyllm_provider=anyllm_provider,
+        region=region,
+    )
+
+
+# =============================================================================
+# Antigravity (agy)
+# =============================================================================
+
+
+@wrap.command(context_settings={"ignore_unknown_options": True})
+@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
+@click.option("--learn", is_flag=True, help="Enable live traffic learning")
+@click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
+@click.option(
+    "--backend", default=None, help="API backend: 'anthropic', 'anyllm', 'litellm-vertex', etc."
+)
+@click.option("--anyllm-provider", default=None, help="Provider for any-llm backend")
+@click.option("--region", default=None, help="Cloud region for Bedrock/Vertex")
+@click.option("--verbose", "-v", is_flag=True, help="Verbose output")
+@click.argument("antigravity_args", nargs=-1, type=click.UNPROCESSED)
+def antigravity(
+    port: int,
+    no_proxy: bool,
+    learn: bool,
+    memory: bool,
+    backend: str | None,
+    anyllm_provider: str | None,
+    region: str | None,
+    verbose: bool,
+    antigravity_args: tuple,
+) -> None:
+    """Launch Google Antigravity CLI (agy) through Headroom proxy.
+
+    \b
+    Sets environment variables (GEMINI_BASE_URL, GOOGLE_GENAI_API_BASE,
+    OPENAI_BASE_URL, ANTHROPIC_BASE_URL) to route all API calls through Headroom.
+
+    \b
+    Examples:
+        headroom wrap antigravity                          # Start proxy + agy
+        headroom wrap antigravity -- --model claude-3-5-sonnet  # Pass args to agy
+    """
+    agy_bin = shutil.which("agy")
+    if not agy_bin:
+        click.echo("Error: 'agy' not found in PATH.")
+        click.echo("Install Antigravity: https://antigravity.google/docs")
+        raise SystemExit(1)
+
+    # Route native Gemini, OpenAI, and Anthropic endpoints to Headroom
+    env = os.environ.copy()
+    openai_base = f"http://127.0.0.1:{port}/v1"
+    anthropic_base = _claude_proxy_base_url(port)
+    gemini_base = f"http://127.0.0.1:{port}/v1beta"
+
+    env["OPENAI_BASE_URL"] = openai_base
+    env["OPENAI_API_BASE"] = openai_base
+    env["ANTHROPIC_BASE_URL"] = anthropic_base
+    env["GEMINI_BASE_URL"] = gemini_base
+    env["GOOGLE_GENAI_API_BASE"] = gemini_base
+    env["AGY_BASE_URL"] = gemini_base
+    env["ANTIGRAVITY_BASE_URL"] = gemini_base
+
+    env_vars_display = [
+        f"GEMINI_BASE_URL={gemini_base}",
+        f"GOOGLE_GENAI_API_BASE={gemini_base}",
+        f"OPENAI_BASE_URL={openai_base}",
+        f"ANTHROPIC_BASE_URL={anthropic_base}",
+    ]
+
+    _launch_tool(
+        binary=agy_bin,
+        args=antigravity_args,
+        env=env,
+        port=port,
+        no_proxy=no_proxy,
+        tool_label="ANTIGRAVITY",
+        env_vars_display=env_vars_display,
+        learn=learn,
+        memory=memory,
+        agent_type="antigravity",
         backend=backend,
         anyllm_provider=anyllm_provider,
         region=region,
