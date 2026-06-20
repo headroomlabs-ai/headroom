@@ -79,8 +79,11 @@ def perf(hours: float, raw: bool, output_format: str) -> None:
                 "tokens_before",
                 "tokens_after",
                 "tokens_saved",
+                "prompt_reduction_tokens",
+                "accounting_delta_tokens",
                 "savings_pct",
                 "list_price_per_mtok",
+                "estimated_list_price_savings_usd",
             ]
             writer = csv.DictWriter(buf, fieldnames=fieldnames)
             writer.writeheader()
