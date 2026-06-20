@@ -25,6 +25,9 @@ from headroom.providers.codex.install import (
 from headroom.providers.copilot.install import (
     build_install_env as _build_copilot_install_env,
 )
+from headroom.providers.cortex_code.install import (
+    build_install_env as _build_cortex_code_install_env,
+)
 from headroom.providers.cursor.install import build_install_env as _build_cursor_install_env
 from headroom.providers.openclaw.install import (
     apply_provider_scope as _apply_openclaw_provider_scope,
@@ -42,6 +45,7 @@ _ENV_BUILDERS: dict[str, _InstallEnvBuilder] = {
     "copilot": _build_copilot_install_env,
     "codex": _build_codex_install_env,
     "aider": _build_aider_install_env,
+    "cortex-code": _build_cortex_code_install_env,
     "cursor": _build_cursor_install_env,
 }
 
