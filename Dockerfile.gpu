@@ -101,9 +101,13 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --system "tree-sitter-language-pack>=0.10.0,<1.6.3"
 
 # Replace CPU onnxruntime with CUDA build.
+# Pin <1.27: onnxruntime-gpu 1.27.0 made libcudart.so.13 a hard import-time
+# dep but stopped declaring any nvidia-* wheels, so a fresh install fails to
+# import ("ImportError: libcudart.so.13"). 1.26.0 imports standalone and
+# lazy-loads CUDA at session create (torch's nvidia/cu13 wheels provide it).
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip uninstall --system onnxruntime || true && \
-    uv pip install --system "onnxruntime-gpu>=1.19.0"
+    uv pip install --system "onnxruntime-gpu>=1.19.0,<1.27"
 
 COPY headroom/ headroom/
 RUN --mount=type=cache,target=/root/.cache/uv \
