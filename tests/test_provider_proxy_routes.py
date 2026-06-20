@@ -129,6 +129,7 @@ def test_provider_passthrough_routes_forward_expected_targets(monkeypatch) -> No
         assert client.post("/v1/embeddings").json()["provider"] == "openai"
         assert client.post("/v1/moderations").json()["sub_path"] == "moderations"
         assert client.post("/v1/images/generations").json()["sub_path"] == "images/generations"
+        assert client.post("/v1/images/edits").json()["sub_path"] == "images/edits"
         assert client.post("/v1/audio/transcriptions").json()["sub_path"] == "audio/transcriptions"
         assert client.post("/v1/audio/speech").json()["sub_path"] == "audio/speech"
         assert client.get("/v1beta/models").json()["provider"] == "gemini"
@@ -462,6 +463,70 @@ def test_openai_response_subpath_aliases_and_chatgpt_auth_use_expected_targets(m
         ("POST", "https://chatgpt.com/backend-api/codex/responses/items/resp_2"),
         ("DELETE", "https://chatgpt.com/backend-api/codex/responses/items/resp_3"),
     ]
+
+
+def test_openai_image_routes_use_codex_backend_under_chatgpt_auth(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "headroom.providers.proxy_routes._resolve_codex_routing_headers",
+        lambda headers: ({**headers, "ChatGPT-Account-ID": "acct_123"}, True),
+    )
+
+    class FakeAsyncClient:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str, dict[str, str], bytes]] = []
+
+        async def request(self, method, url, **kwargs):  # type: ignore[no-untyped-def]
+            self.calls.append(
+                (
+                    method,
+                    url,
+                    dict(kwargs.get("headers", {})),
+                    kwargs.get("content", b""),
+                )
+            )
+            return httpx.Response(200, json={"url": url})
+
+        async def aclose(self) -> None:
+            return None
+
+    with TestClient(_app()) as client:
+        fake = FakeAsyncClient()
+        client.app.state.proxy.http_client = fake
+        client.app.state.proxy.http_client_h1 = fake
+
+        generate_response = client.post(
+            "/v1/images/generations?client_version=0.142.0",
+            headers={"Authorization": "Bearer oauth-token"},
+            json={"model": "gpt-image-2", "prompt": "a route probe"},
+        )
+        edit_response = client.post(
+            "/v1/images/edits",
+            headers={"Authorization": "Bearer oauth-token"},
+            json={"model": "gpt-image-2", "prompt": "edit route probe", "images": []},
+        )
+
+    assert generate_response.status_code == 200
+    assert edit_response.status_code == 200
+    assert len(fake.calls) == 2
+
+    generate_method, generate_url, generate_headers, generate_body = fake.calls[0]
+    assert generate_method == "POST"
+    assert (
+        generate_url
+        == "https://chatgpt.com/backend-api/codex/images/generations?client_version=0.142.0"
+    )
+    assert generate_headers["authorization"] == "Bearer oauth-token"
+    assert generate_headers["ChatGPT-Account-ID"] == "acct_123"
+    assert "host" not in generate_headers
+    assert generate_body == b'{"model":"gpt-image-2","prompt":"a route probe"}'
+
+    edit_method, edit_url, edit_headers, edit_body = fake.calls[1]
+    assert edit_method == "POST"
+    assert edit_url == "https://chatgpt.com/backend-api/codex/images/edits"
+    assert edit_headers["authorization"] == "Bearer oauth-token"
+    assert edit_headers["ChatGPT-Account-ID"] == "acct_123"
+    assert "host" not in edit_headers
+    assert edit_body == b'{"model":"gpt-image-2","prompt":"edit route probe","images":[]}'
 
 
 def test_gemini_batch_embed_contents_passthrough_uses_gemini_target(monkeypatch) -> None:
