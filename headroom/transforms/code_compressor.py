@@ -66,6 +66,7 @@ def _check_tree_sitter_available() -> bool:
     if _tree_sitter_available is None:
         try:
             import tree_sitter_language_pack  # noqa: F401
+            from tree_sitter import Parser  # noqa: F401
 
             _tree_sitter_available = True
         except ImportError:
