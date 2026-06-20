@@ -12,6 +12,7 @@ from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import Response
 
 from headroom.proxy.handlers.openai import _resolve_codex_routing_headers
+from headroom.proxy.helpers import request_upstream_override
 
 logger = logging.getLogger("headroom.proxy.routes")
 
@@ -424,7 +425,9 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
 
     @app.post("/v1/messages")
     async def anthropic_messages(request: Request):
-        return await proxy.handle_anthropic_messages(request)
+        return await proxy.handle_anthropic_messages(
+            request, upstream_base_url=request_upstream_override(request)
+        )
 
     # AWS Bedrock InvokeModel passthrough. Registered ONLY when an upstream is
     # configured (`--bedrock-api-url` / BEDROCK_TARGET_API_URL): without it,

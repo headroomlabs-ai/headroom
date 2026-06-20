@@ -262,6 +262,46 @@ The routes are registered **only** when `--bedrock-api-url` (or `BEDROCK_TARGET_
 Rewriting the request body invalidates the caller's **SigV4** signature (it covers a hash of the body). Point `--bedrock-api-url` at a gateway that re-signs or does not verify the inbound signature — **never raw AWS**, which would reject the request with 403. For direct-to-AWS compression, use `--backend bedrock` (which re-signs). The two are complementary.
 </Callout>
 
+## Per-request upstream override (`X-Headroom-Upstream`)
+
+A single Headroom proxy normally forwards to one configured upstream per provider (`OPENAI_TARGET_API_URL`, `ANTHROPIC_TARGET_API_URL`, …). The `X-Headroom-Upstream` request header overrides that upstream **per request**, so one proxy instance can fan out to many upstreams — no need to run one proxy per provider.
+
+Set the header to the upstream base URL. It is normalized the same way as the `*_TARGET_API_URL` env vars (trailing slash and a trailing `/v1` segment are stripped), then the proxy appends the incoming request path:
+
+| Header value | Request path | Forwarded to |
+| --- | --- | --- |
+| `https://api.deepseek.com` | `/v1/chat/completions` | `https://api.deepseek.com/v1/chat/completions` |
+| `https://api.deepseek.com/v1` | `/v1/chat/completions` | `https://api.deepseek.com/v1/chat/completions` |
+| `https://api.groq.com/openai/v1` | `/v1/chat/completions` | `https://api.groq.com/openai/v1/chat/completions` |
+| `https://api.anthropic.com` | `/v1/messages` | `https://api.anthropic.com/v1/messages` |
+
+The header is an internal `x-headroom-*` control flag: it is consumed by the proxy and stripped before the upstream call, so it never leaks to the provider. Honored on the OpenAI (`/v1/chat/completions`, `/v1/responses`), Anthropic (`/v1/messages`), and every passthrough / catch-all route.
+
+### Use case: many providers through one proxy
+
+Clients that can attach custom per-provider headers (e.g. [OpenCode](https://github.com/anomalyco/opencode), which supports `options.headers` in its provider config) point every provider's base URL at the same proxy and tag each with its real upstream:
+
+```json
+{
+  "provider": {
+    "deepseek": {
+      "options": {
+        "baseURL": "http://127.0.0.1:8787/v1",
+        "headers": { "X-Headroom-Upstream": "https://api.deepseek.com" }
+      }
+    },
+    "groq": {
+      "options": {
+        "baseURL": "http://127.0.0.1:8787/v1",
+        "headers": { "X-Headroom-Upstream": "https://api.groq.com/openai" }
+      }
+    }
+  }
+}
+```
+
+One proxy, one port — every provider is compressed and forwarded to its own upstream. Auth stays on the client (the `Authorization` / `x-api-key` header passes through), so no API keys live in the proxy config.
+
 ## Environment variables
 
 ```bash

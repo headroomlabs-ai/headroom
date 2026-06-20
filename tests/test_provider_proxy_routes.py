@@ -245,7 +245,7 @@ def test_provider_specific_routes_delegate_to_expected_proxy_handlers(monkeypatc
     delegated: list[tuple[str, str, tuple[str, ...]]] = []
 
     def install(name: str) -> None:
-        async def fake(self, request, *args):  # type: ignore[no-untyped-def]
+        async def fake(self, request, *args, **kwargs):  # type: ignore[no-untyped-def]
             delegated.append((name, request.url.path, tuple(str(arg) for arg in args)))
             return JSONResponse({"handler": name, "path": request.url.path, "args": list(args)})
 

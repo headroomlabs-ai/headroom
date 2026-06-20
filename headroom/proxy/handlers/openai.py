@@ -28,6 +28,7 @@ from headroom.proxy.helpers import (
     _headroom_bypass_enabled,
     extract_tags,
     jitter_delay_ms,
+    request_upstream_override,
 )
 from headroom.proxy.stage_timer import StageTimer, emit_stage_timings_log
 from headroom.proxy.ws_session_registry import (
@@ -2385,7 +2386,8 @@ class OpenAIHandlerMixin:
                 )
 
         # Direct OpenAI API (no backend configured)
-        url = build_copilot_upstream_url(self.OPENAI_API_URL, "/v1/chat/completions")
+        _upstream = request_upstream_override(request) or self.OPENAI_API_URL
+        url = build_copilot_upstream_url(_upstream, "/v1/chat/completions")
 
         try:
             if stream:
@@ -3118,7 +3120,8 @@ class OpenAIHandlerMixin:
         if is_chatgpt_auth:
             url = "https://chatgpt.com/backend-api/codex/responses"
         else:
-            url = build_copilot_upstream_url(self.OPENAI_API_URL, "/v1/responses")
+            _upstream = request_upstream_override(request) or self.OPENAI_API_URL
+            url = build_copilot_upstream_url(_upstream, "/v1/responses")
 
         # The standalone Rust proxy has native /v1/responses item handling,
         # but the default CLI runtime is this Python proxy. Compress the
@@ -6066,6 +6069,13 @@ class OpenAIHandlerMixin:
             provider: Optional provider name for stats (e.g., "openai", "anthropic", "gemini")
         """
         from fastapi.responses import Response
+
+        # Per-request upstream override (e.g. headroom wrap opencode). Honored
+        # here so every passthrough route and the verbatim catch-all fan out to
+        # the caller-specified upstream from a single proxy instance.
+        override = request_upstream_override(request)
+        if override:
+            base_url = override
 
         if endpoint_name in {"streamGenerateContent", "streamRawPredict"} and provider:
             return await self._handle_streaming_passthrough(

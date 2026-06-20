@@ -1538,7 +1538,8 @@ def _strip_internal_headers(headers: dict[str, str]) -> dict[str, str]:
 
     Used at every upstream call site to prevent fingerprinting / leakage of
     internal flags like ``x-headroom-bypass``, ``x-headroom-mode``,
-    ``x-headroom-user-id``, ``x-headroom-stack``, ``x-headroom-base-url``.
+    ``x-headroom-user-id``, ``x-headroom-stack``, ``x-headroom-base-url``,
+    ``x-headroom-upstream``.
     Case-insensitive on the prefix. Returns a NEW dict; never mutates the
     caller's mapping. Pure function. No regex.
 
@@ -1551,6 +1552,46 @@ def _strip_internal_headers(headers: dict[str, str]) -> dict[str, str]:
         # Always return a copy so callers can mutate without surprise.
         return dict(headers)
     return {k: v for k, v in headers.items() if not k.lower().startswith(_INTERNAL_HEADER_PREFIX)}
+
+
+# Per-request upstream override header. A client or launcher (e.g.
+# ``headroom wrap opencode``) sets this to route a single request through an
+# arbitrary upstream, overriding the proxy's startup default for the
+# matching provider. Lets one proxy instance fan out to many providers
+# instead of one proxy per upstream. The value is normalized the same way as
+# ``OPENAI_TARGET_API_URL`` / ``ANTHROPIC_TARGET_API_URL`` (trailing slash and
+# a trailing ``/v1`` segment stripped); the proxy appends the incoming
+# request path. Stripped from upstream-bound requests by
+# ``_strip_internal_headers`` (it matches the ``x-headroom-`` prefix).
+_UPSTREAM_OVERRIDE_HEADER = "x-headroom-upstream"
+
+
+def request_upstream_override(request: Request) -> str | None:
+    """Return the per-request upstream base URL from ``X-Headroom-Upstream``.
+
+    Enables a single proxy instance to route to many upstreams: the caller
+    tags each request with the real upstream base (e.g. OpenCode's 75+
+    providers) and the proxy forwards there instead of its startup default.
+
+    The value is normalized to match the proxy's internal ``*_API_URL``
+    format (trailing slash and a trailing ``/v1`` segment are stripped), so
+    both ``https://api.deepseek.com`` and ``https://api.deepseek.com/v1``
+    resolve to ``https://api.deepseek.com``. The proxy then appends the
+    incoming request path (e.g. ``/v1/chat/completions``).
+
+    Returns ``None`` when the header is unset or empty. The header is an
+    ``x-headroom-*`` control flag and is stripped from upstream-bound
+    requests by :func:`_strip_internal_headers`.
+    """
+    raw = request.headers.get(_UPSTREAM_OVERRIDE_HEADER)
+    if not raw:
+        return None
+    normalized = raw.strip().rstrip("/")
+    if not normalized:
+        return None
+    if normalized.endswith("/v1"):
+        normalized = normalized[:-3]
+    return normalized
 
 
 def log_outbound_headers(
