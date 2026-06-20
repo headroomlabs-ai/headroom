@@ -154,6 +154,13 @@ class ProxyConfig:
     # CLI: --disable-kompress; env: HEADROOM_DISABLE_KOMPRESS=1.
     disable_kompress: bool = False
 
+    # With disable_kompress, route fall-through content to PASSTHROUGH instead
+    # of the default KOMPRESS fallback strategy. Restores the legacy
+    # --disable-kompress behaviour for callers that relied on it. No effect
+    # unless disable_kompress is also set.
+    # CLI: --disable-kompress-fallback; env: HEADROOM_DISABLE_KOMPRESS_FALLBACK=1.
+    disable_kompress_fallback: bool = False
+
     # Code graph live watcher (triggers incremental reindex on file changes)
     code_graph_watcher: bool = False
 

@@ -381,6 +381,16 @@ def _selected_context_tool() -> str:
         "Env: HEADROOM_DISABLE_KOMPRESS=1."
     ),
 )
+@click.option(
+    "--disable-kompress-fallback",
+    is_flag=True,
+    envvar="HEADROOM_DISABLE_KOMPRESS_FALLBACK",
+    help=(
+        "With --disable-kompress, route fall-through content to PASSTHROUGH instead of "
+        "the default KOMPRESS fallback (restores legacy --disable-kompress behaviour). "
+        "Env: HEADROOM_DISABLE_KOMPRESS_FALLBACK=1."
+    ),
+)
 # Code graph: indexes project + watches files for live reindex via codebase-memory-mcp.
 # Only useful when the proxy is launched from a project root — it indexes the
 # current working directory.
@@ -659,6 +669,7 @@ def proxy(
     budget_period: str,
     code_aware_flag: bool | None,
     disable_kompress: bool,
+    disable_kompress_fallback: bool,
     code_graph: bool,
     no_read_lifecycle: bool,
     memory: bool,
@@ -877,6 +888,7 @@ def proxy(
             in ("true", "1", "yes", "on")
         ),
         disable_kompress=disable_kompress,
+        disable_kompress_fallback=disable_kompress_fallback,
         # Code graph: live file watcher for incremental reindexing
         code_graph_watcher=code_graph,
         # Read lifecycle: ON by default (use --no-read-lifecycle to disable)

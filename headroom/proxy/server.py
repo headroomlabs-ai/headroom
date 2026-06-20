@@ -169,6 +169,7 @@ from headroom.transforms import (
     CacheAligner,
     CodeAwareCompressor,
     CodeCompressorConfig,
+    CompressionStrategy,
     ContentRouter,
     ContentRouterConfig,
     TransformPipeline,
@@ -626,6 +627,10 @@ class HeadroomProxy(
         )
         if config.disable_kompress:
             router_config.enable_kompress = False
+            # Opt-in restore of the legacy behaviour: send fall-through content
+            # to PASSTHROUGH instead of the default KOMPRESS fallback strategy.
+            if config.disable_kompress_fallback:
+                router_config.fallback_strategy = CompressionStrategy.PASSTHROUGH
         # A non-None exclude_tools replaces DEFAULT_EXCLUDE_TOOLS in
         # ContentRouter, so merge rather than assign.
         if config.exclude_tools:
@@ -2013,6 +2018,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "cache": config.cache_enabled,
                 "rate_limit": config.rate_limit_enabled,
                 "disable_kompress": config.disable_kompress,
+                "disable_kompress_fallback": config.disable_kompress_fallback,
                 "memory": config.memory_enabled,
                 "learn": config.traffic_learning_enabled,
                 "code_graph": config.code_graph_watcher,
@@ -3661,6 +3667,7 @@ def _proxy_config_from_env() -> ProxyConfig:
         bedrock_api_url=os.environ.get("BEDROCK_TARGET_API_URL"),
         anyllm_provider=_get_env_str("HEADROOM_ANYLLM_PROVIDER", "openai"),
         disable_kompress=_get_env_bool("HEADROOM_DISABLE_KOMPRESS", False),
+        disable_kompress_fallback=_get_env_bool("HEADROOM_DISABLE_KOMPRESS_FALLBACK", False),
         max_connections=_get_env_int("HEADROOM_MAX_CONNECTIONS", 500),
         max_keepalive_connections=_get_env_int("HEADROOM_MAX_KEEPALIVE", 100),
         http2=_get_env_bool("HEADROOM_HTTP2", True),
@@ -4038,6 +4045,15 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--disable-kompress-fallback",
+        action="store_true",
+        help=(
+            "With --disable-kompress, route fall-through content to PASSTHROUGH instead of "
+            "the default KOMPRESS fallback (restores legacy --disable-kompress behaviour). "
+            "Also settable via HEADROOM_DISABLE_KOMPRESS_FALLBACK=1."
+        ),
+    )
+    parser.add_argument(
         "--exclude-tools",
         default=None,
         help="Comma-separated tool names whose output is never compressed, "
@@ -4094,6 +4110,9 @@ if __name__ == "__main__":
     cache_enabled = env_cache if not args.no_cache else False
     rate_limit_enabled = env_rate_limit if not args.no_rate_limit else False
     disable_kompress = args.disable_kompress or _get_env_bool("HEADROOM_DISABLE_KOMPRESS", False)
+    disable_kompress_fallback = args.disable_kompress_fallback or _get_env_bool(
+        "HEADROOM_DISABLE_KOMPRESS_FALLBACK", False
+    )
 
     # Set OpenRouter API key from CLI if provided
     if hasattr(args, "openrouter_api_key") and args.openrouter_api_key:
@@ -4137,6 +4156,7 @@ if __name__ == "__main__":
         log_full_messages=args.log_messages or _get_env_bool("HEADROOM_LOG_MESSAGES", False),
         code_aware_enabled=code_aware_enabled,
         disable_kompress=disable_kompress,
+        disable_kompress_fallback=disable_kompress_fallback,
         # Connection pool settings
         max_connections=_get_env_int("HEADROOM_MAX_CONNECTIONS", args.max_connections),
         max_keepalive_connections=_get_env_int("HEADROOM_MAX_KEEPALIVE", args.max_keepalive),
