@@ -208,3 +208,116 @@ def test_unwrap_claude_keep_flags_skip_cleanup(
     registrar.assert_not_called()
     remove_rtk.assert_not_called()
     stop_proxy.assert_not_called()
+
+
+def test_remove_claude_rtk_hooks_removes_init_hooks_and_env(tmp_path: Path) -> None:
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "model": "opus",
+                "env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8787", "FOO": "bar"},
+                "hooks": {
+                    "SessionStart": [
+                        {
+                            "matcher": "startup|resume",
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": (
+                                        "/home/u/.local/bin/headroom init hook ensure "
+                                        "--profile init-user --marker headroom-init-claude"
+                                    ),
+                                    "timeout": 15,
+                                }
+                            ],
+                        }
+                    ],
+                    "PreToolUse": [
+                        {
+                            "matcher": "Bash",
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "headroom init hook ensure --marker headroom-init-claude",
+                                },
+                                {"type": "command", "command": "echo keep-me"},
+                            ],
+                        }
+                    ],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert wrap_cli._remove_claude_rtk_hooks(settings) is True
+
+    payload = json.loads(settings.read_text(encoding="utf-8"))
+    # ANTHROPIC_BASE_URL stripped; unrelated env var preserved
+    assert payload.get("env") == {"FOO": "bar"}
+    # SessionStart removed entirely (its only hook was the init marker)
+    assert "SessionStart" not in payload.get("hooks", {})
+    # PreToolUse: init-marker hook gone, unrelated hook kept
+    assert payload["hooks"]["PreToolUse"][0]["hooks"] == [
+        {"type": "command", "command": "echo keep-me"}
+    ]
+    assert payload["model"] == "opus"
+
+
+def test_remove_claude_rtk_hooks_strips_env_without_hooks(tmp_path: Path) -> None:
+    # Regression: unwrap previously returned early when no hooks existed,
+    # leaving init's ANTHROPIC_BASE_URL behind in settings.json.
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        json.dumps({"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8787"}}) + "\n",
+        encoding="utf-8",
+    )
+
+    assert wrap_cli._remove_claude_rtk_hooks(settings) is True
+
+    payload = json.loads(settings.read_text(encoding="utf-8"))
+    assert "env" not in payload  # emptied env dict is dropped
+
+
+def test_remove_claude_rtk_hooks_noop_when_nothing_managed(tmp_path: Path) -> None:
+    settings = tmp_path / "settings.json"
+    original = {
+        "model": "opus",
+        "env": {"FOO": "bar"},
+        "hooks": {
+            "PreToolUse": [
+                {"matcher": "Bash", "hooks": [{"type": "command", "command": "echo hi"}]}
+            ]
+        },
+    }
+    settings.write_text(json.dumps(original) + "\n", encoding="utf-8")
+
+    assert wrap_cli._remove_claude_rtk_hooks(settings) is False
+    # nothing managed -> file untouched
+    assert json.loads(settings.read_text(encoding="utf-8")) == original
+
+
+def test_remove_claude_rtk_hooks_strips_enable_tool_search(tmp_path: Path) -> None:
+    # unwrap must remove BOTH env vars init writes (ANTHROPIC_BASE_URL +
+    # ENABLE_TOOL_SEARCH, GH #746), leaving user-set vars intact.
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "env": {
+                    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8787",
+                    "ENABLE_TOOL_SEARCH": "true",
+                    "KEEP": "1",
+                }
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert wrap_cli._remove_claude_rtk_hooks(settings) is True
+
+    payload = json.loads(settings.read_text(encoding="utf-8"))
+    assert payload["env"] == {"KEEP": "1"}

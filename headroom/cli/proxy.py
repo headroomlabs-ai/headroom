@@ -165,6 +165,19 @@ def _selected_context_tool() -> str:
     ),
 )
 @click.option(
+    "--target-ratio",
+    type=float,
+    default=None,
+    show_default=True,
+    envvar="HEADROOM_TARGET_RATIO",
+    help=(
+        "Override Kompress keep-ratio for text (prose/code) compression — lower is "
+        "more aggressive (e.g. 0.4 keeps ~40% of tokens). Unset (default): let "
+        "Kompress decide via its own importance threshold (conservative). "
+        "Env: HEADROOM_TARGET_RATIO."
+    ),
+)
+@click.option(
     "--intercept-tool-results",
     is_flag=True,
     help=(
@@ -616,6 +629,7 @@ def _selected_context_tool() -> str:
 def proxy(
     ctx: click.Context,
     mode: str | None,
+    target_ratio: float | None,
     host: str,
     port: int,
     workers: int,
@@ -818,7 +832,7 @@ def proxy(
         tool_profiles=_parse_tool_profiles([]) or None,
         smart_crusher_with_compaction=_get_env_bool_optional("HEADROOM_SMART_CRUSHER_COMPACTION"),
         savings_profile=os.environ.get("HEADROOM_SAVINGS_PROFILE") or None,
-        target_ratio=_get_env_float_optional("HEADROOM_TARGET_RATIO"),
+        target_ratio=target_ratio,
         compress_system_messages=_get_env_bool_optional("HEADROOM_COMPRESS_SYSTEM_MESSAGES"),
         protect_recent=_get_env_int_optional("HEADROOM_PROTECT_RECENT"),
         protect_analysis_context=_get_env_bool_optional("HEADROOM_PROTECT_ANALYSIS_CONTEXT"),
@@ -1092,6 +1106,17 @@ Endpoints:
 
 Press Ctrl+C to stop.
 """)
+
+    # Surface an "update available" notice (reads cache only; no network here).
+    # Best-effort: a broken update check must never block proxy startup.
+    try:
+        from headroom.update_check import format_update_notice
+
+        _update_notice = format_update_notice()
+        if _update_notice:
+            click.echo(f"\n{_update_notice}\n")
+    except Exception:  # noqa: BLE001 — banner must never crash startup
+        pass
 
     # -----------------------------------------------------------------------
     # Option E: start embedding server sidecar if requested

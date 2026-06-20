@@ -150,6 +150,12 @@ def test_force_kompress_routes_anthropic_tool_result_to_targeted_kompress(
     captured: dict[str, object] = {}
 
     class FakeKompress:
+        def is_ready(self) -> bool:
+            return True
+
+        def ensure_background_load(self) -> None:
+            pass
+
         def compress(self, content, **kwargs):
             captured.update(kwargs)
             compressed = " ".join(content.split()[:20])

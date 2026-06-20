@@ -160,6 +160,11 @@ image = [
 reports = [
     "jinja2>=3.0.0",
 ]
+# Binary spreadsheet ingestion (.xlsx / .xls -> tabular text)
+spreadsheet = [
+    "openpyxl>=3.1.0",      # .xlsx
+    "xlrd>=2.0.1",          # legacy .xls
+]
 # OpenTelemetry metrics export
 otel = [
     "opentelemetry-sdk>=1.24.0",
@@ -245,10 +250,11 @@ dev = [
     "sqlite-vec>=0.1.6",
     "sentence-transformers>=2.2.0,<6.0",
     "numpy>=1.24.0",
+    "openpyxl>=3.1.0",  # exercises spreadsheet_ingest (.xlsx) in the test suite
 ]
 # All optional dependencies (everything you need)
 all = [
-    "headroom-ai[proxy,code,ml,memory,relevance,image,reports,otel,evals,voice,html,benchmark,mcp]",
+    "headroom-ai[proxy,code,ml,memory,relevance,image,reports,otel,evals,voice,html,benchmark,mcp,spreadsheet]",
 ]
 
 [project.scripts]

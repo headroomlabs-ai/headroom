@@ -1299,6 +1299,7 @@ class AnthropicHandlerMixin:
                         )
                 except Exception:  # advisory hint only — must never fail a request
                     pass
+            ccr_workspace_key = ccr_workspace_label = None
             if (
                 self.config.ccr_inject_tool or self.config.ccr_inject_system_instructions
             ) and not _bypass:
@@ -1722,11 +1723,11 @@ class AnthropicHandlerMixin:
                     # conversation is treatment or control. This keeps the A/B
                     # comparison clean AND keeps the prefix cache stable (we
                     # never flip a conversation's system-prompt tail mid-stream).
-                    import os as _os
+                    from headroom.proxy import runtime_env
 
                     _holdout = 0.0
                     try:
-                        _holdout = float(_os.environ.get("HEADROOM_OUTPUT_HOLDOUT", "0") or "0")
+                        _holdout = float(runtime_env.getenv("HEADROOM_OUTPUT_HOLDOUT", "0") or "0")
                     except ValueError:
                         _holdout = 0.0
                     _arm = assign_arm(conversation_key_from_body(body), _holdout)

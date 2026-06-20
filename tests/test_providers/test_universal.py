@@ -81,6 +81,14 @@ class TestOpenAICompatibleProvider:
         limit = provider.get_context_limit("llama-3.1-8b")
         assert limit == 128000
 
+    def test_get_context_limit_deepseek_v3_is_1m(self):
+        """DeepSeek V3/V4 support 1M context, not 128K (#1038)."""
+        provider = OpenAICompatibleProvider()
+        assert provider.get_context_limit("deepseek-v3") == 1048576
+        assert provider.get_context_limit("deepseek-v4") == 1048576
+        assert provider.get_context_limit("deepseek") == 1048576
+        assert provider.get_context_limit("deepseek-v2") == 128000
+
     def test_get_context_limit_unknown_model(self):
         """Test context limit for unknown models (defaults to 128K)."""
         provider = OpenAICompatibleProvider()

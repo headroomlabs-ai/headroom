@@ -215,6 +215,24 @@ class PrefixCacheTracker:
         """Check if this tracker has been idle beyond TTL."""
         return (time.time() - self._last_activity) > self.config.session_ttl_seconds
 
+    def seconds_since_activity(self) -> float:
+        """Wall-clock seconds since this tracker last saw activity.
+
+        #856 P3b feeds this to the net-cost gate as an idle signal: as it
+        approaches the provider's prompt-cache TTL (~300s for Anthropic),
+        P_alive decays toward 0 and deep edits near cache lapse become free.
+        Distinct from :attr:`is_expired`, which uses the much longer
+        session-tracker *cleanup* TTL (``session_ttl_seconds``), not the cache
+        TTL.
+
+        Wiring caveat: ``SessionTrackerStore.get_or_create`` refreshes
+        ``_last_activity`` on access, so a caller that wants the idle gap
+        since the *previous turn's response* must read this before fetching
+        the tracker for the current request (or the store must capture it at
+        fetch time). ``update_from_response`` is the per-turn activity stamp.
+        """
+        return max(0.0, time.time() - self._last_activity)
+
     @property
     def stats(self) -> FreezeStats:
         """Return stats for dashboard/metrics."""

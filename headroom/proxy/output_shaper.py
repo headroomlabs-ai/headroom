@@ -34,10 +34,11 @@ flags) — no content regexes or keyword patterns.
 from __future__ import annotations
 
 import logging
-import os
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
+
+from headroom.proxy import runtime_env
 
 logger = logging.getLogger(__name__)
 
@@ -106,22 +107,22 @@ class OutputShaperSettings:
 
     @classmethod
     def from_env(cls) -> OutputShaperSettings:
-        enabled = os.environ.get("HEADROOM_OUTPUT_SHAPER", "").lower() in (
+        enabled = runtime_env.getenv("HEADROOM_OUTPUT_SHAPER", "").lower() in (
             "1",
             "true",
             "yes",
         )
         try:
-            level = int(os.environ.get("HEADROOM_VERBOSITY_LEVEL", "2"))
+            level = int(runtime_env.getenv("HEADROOM_VERBOSITY_LEVEL", "2"))
         except ValueError:
             level = 2
         level = max(0, min(4, level))
-        router = os.environ.get("HEADROOM_EFFORT_ROUTER", "1").lower() not in (
+        router = runtime_env.getenv("HEADROOM_EFFORT_ROUTER", "1").lower() not in (
             "0",
             "false",
             "no",
         )
-        mech = os.environ.get("HEADROOM_MECHANICAL_EFFORT", "low")
+        mech = runtime_env.getenv("HEADROOM_MECHANICAL_EFFORT", "low")
         if mech not in _EFFORT_RANK:
             mech = "low"
         return cls(
@@ -144,9 +145,7 @@ def resolve_verbosity_level(settings: OutputShaperSettings) -> tuple[int, str]:
     Returns ``(level, source)``. Kept separate from :func:`shape_request` so the
     body-mutating core stays a pure function of an explicit level.
     """
-    import os
-
-    if os.environ.get("HEADROOM_VERBOSITY_LEVEL"):
+    if runtime_env.getenv("HEADROOM_VERBOSITY_LEVEL"):
         return settings.verbosity_level, "env"
 
     try:
@@ -156,7 +155,7 @@ def resolve_verbosity_level(settings: OutputShaperSettings) -> tuple[int, str]:
     except Exception:
         return settings.verbosity_level, "default"
 
-    autotune = os.environ.get("HEADROOM_VERBOSITY_AUTOTUNE", "").lower() in ("1", "true", "yes")
+    autotune = runtime_env.getenv("HEADROOM_VERBOSITY_AUTOTUNE", "").lower() in ("1", "true", "yes")
     if autotune:
         ctrl_path = ws / "verbosity_controller.json"
         if ctrl_path.exists():

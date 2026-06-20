@@ -146,6 +146,15 @@ export HEADROOM_OUTPUT_SHAPER=1     # off by default
 headroom proxy --port 8787
 ```
 
+> **Already running a proxy?** These switches are read *live* on every request,
+> so a proxy that `headroom wrap` **reused** (rather than started) would not see
+> a value you export afterwards — its environment was snapshotted at launch.
+> `headroom wrap` now hot-syncs your current settings to the running proxy via a
+> loopback `POST /admin/runtime-env`, so they take effect immediately with **no
+> restart** (no cold start, no dropped requests, no lost caches). Set them before
+> you `wrap`. On a shared proxy these overrides are global — the last explicit
+> setting wins.
+
 **Learn the right terseness for you.** People don't *say* how terse they want
 answers — they *show* it (they interrupt long replies, or move on before they
 could have read them). `headroom learn --verbosity` reads your past sessions and
@@ -304,6 +313,23 @@ pipx install --python python3.13 "headroom-ai[all]"
 ```
 
 → [Installation guide](https://headroom-docs.vercel.app/docs/installation) — Docker tags, persistent service, PowerShell, devcontainers.
+
+### Updating
+
+```bash
+headroom update          # detects pip / pipx / uv tool and upgrades in place
+headroom update --check  # report the latest release without upgrading
+headroom update --pre    # include pre-releases
+```
+
+`headroom update` figures out how Headroom was installed (pip/venv, `pip --user`,
+pipx, uv tool) and runs the matching upgrade across macOS, Linux, and Windows.
+For git checkouts, editable installs, Docker images, and externally-managed
+system Pythons (PEP 668) it prints the correct manual step instead of guessing.
+
+The proxy also shows a one-line "update available" notice on startup. It checks
+PyPI at most once a day, in the background, and never blocks. Opt out with
+`HEADROOM_UPDATE_CHECK=off` (also skipped in `--stateless` mode and CI).
 
 ### Corporate / SSL-inspection environments
 

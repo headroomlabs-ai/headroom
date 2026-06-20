@@ -28,6 +28,27 @@ def _api_target(proxy: Any, provider_name: str) -> str:
     return cast(str, getattr(proxy, legacy_attr, proxy.provider_runtime.api_target(provider_name)))
 
 
+def _vertex_target_for_location(proxy: Any, location: str) -> str:
+    """Resolve the Vertex upstream host for a request, region-aware.
+
+    The Vertex regional host must match the ``locations/{location}`` in the
+    request path (e.g. a ``europe-west1`` request cannot go to a
+    ``us-central1`` host). The configured target is a single fixed-region host
+    (default ``us-central1``), so unless the operator pinned an explicit
+    non-default upstream (e.g. a private gateway), derive the host from the
+    request's own location. ``global`` maps to the unprefixed host.
+    """
+    from headroom.providers.registry import DEFAULT_VERTEX_API_URL
+
+    configured = _api_target(proxy, "vertex")
+    if configured and configured != DEFAULT_VERTEX_API_URL:
+        # Operator pinned an explicit upstream (gateway / specific host) — honor it.
+        return configured
+    if not location or location == "global":
+        return "https://aiplatform.googleapis.com"
+    return f"https://{location}-aiplatform.googleapis.com"
+
+
 def _select_passthrough_base_url(proxy: Any, headers: dict[str, str]) -> str:
     # Codex CLI subscription mode hits a wide surface under
     # `/backend-api/*` (rate-limit polling, agent identity, JWT
@@ -644,11 +665,11 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         publisher: str,
         model: str,
     ):
-        del api_version, project, location
+        del api_version, project
         if publisher == "anthropic":
             return await proxy.handle_anthropic_messages(
                 request,
-                _api_target(proxy, "vertex"),
+                _vertex_target_for_location(proxy, location),
                 "vertex:anthropic",
                 model,
             )
@@ -665,11 +686,11 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         publisher: str,
         model: str,
     ):
-        del api_version, project, location
+        del api_version, project
         if publisher == "anthropic":
             return await proxy.handle_anthropic_messages(
                 request,
-                _api_target(proxy, "vertex"),
+                _vertex_target_for_location(proxy, location),
                 "vertex:anthropic",
                 model,
                 True,

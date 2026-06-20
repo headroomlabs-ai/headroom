@@ -103,6 +103,7 @@ from headroom.providers.registry import (
     format_backend_status,
     resolve_api_targets,
 )
+from headroom.proxy import runtime_env
 from headroom.proxy.auth_mode import should_stamp_codex_client
 
 # =============================================================================
@@ -2057,6 +2058,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 ),
                 "force_kompress": bool(profile_kwargs.get("force_kompress", False)),
                 "accuracy_guard": config.accuracy_guard,
+                # Live (per-request) env knobs the proxy reads after startup.
+                # Surfaced so `headroom wrap` can see what a reused proxy is
+                # actually using and hot-sync it via /admin/runtime-env.
+                "runtime_env": runtime_env.effective_runtime_env(),
                 "pid": os.getpid(),
             }
         return payload
@@ -2328,6 +2333,39 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         payload = warmup_registry.to_dict() if warmup_registry is not None else {}
         payload["runtime"] = _runtime_payload()
         return JSONResponse(status_code=200, content=payload)
+
+    @app.post("/admin/runtime-env", dependencies=[Depends(_require_loopback)])
+    async def admin_runtime_env(request: Request):
+        """Hot-reload live env knobs (the output-shaper family, the ast-grep
+        read threshold) without restarting the proxy.
+
+        Live knobs are read from the proxy's *process* environment, so a proxy
+        that ``headroom wrap`` reused — rather than started — never sees values
+        a user exported afterwards. Instead of a disruptive restart (cold ML
+        load, dropped requests, lost caches), ``wrap`` POSTs the values here and
+        the proxy applies them in memory, effective on the next request.
+
+        Loopback-only. The body is a flat ``{ENV_NAME: "value"}`` map; unknown
+        keys and non-string values are ignored. Returns what was applied plus
+        the resulting live config. Last writer wins (overrides are global to the
+        proxy, which is inherent — every wrapper shares one process).
+        """
+        try:
+            body = await request.json()
+        except (ValueError, UnicodeDecodeError):
+            body = None
+        if not isinstance(body, dict):
+            return JSONResponse(
+                status_code=400,
+                content={"error": "expected a JSON object of {ENV_NAME: value}"},
+            )
+        applied = runtime_env.set_overrides(body)
+        if applied:
+            logger.info("runtime-env hot-reload applied: %s", sorted(applied))
+        return JSONResponse(
+            status_code=200,
+            content={"applied": applied, "runtime_env": runtime_env.effective_runtime_env()},
+        )
 
     @app.get("/dashboard", response_class=HTMLResponse)
     async def dashboard():
@@ -4109,10 +4147,12 @@ if __name__ == "__main__":
         compress_user_messages=args.compress_user_messages
         or _get_env_bool("HEADROOM_COMPRESS_USER_MESSAGES", False),
         savings_profile=os.environ.get("HEADROOM_SAVINGS_PROFILE") or None,
+        # Default 0.4 keep-ratio so the Kompress text (prose/code) path compresses
+        # meaningfully out of the box; HEADROOM_TARGET_RATIO overrides.
         target_ratio=(
             float(os.environ["HEADROOM_TARGET_RATIO"])
             if os.environ.get("HEADROOM_TARGET_RATIO")
-            else None
+            else 0.4
         ),
         compress_system_messages=(
             _get_env_bool("HEADROOM_COMPRESS_SYSTEM_MESSAGES", False)

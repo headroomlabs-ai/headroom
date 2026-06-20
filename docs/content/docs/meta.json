@@ -32,6 +32,7 @@
     "agno",
     "strands",
     "litellm",
+    "claude-code-vertex",
     "mcp",
     "---Configuration---",
     "configuration",
