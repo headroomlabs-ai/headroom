@@ -4584,7 +4584,7 @@ def agy(
     \b
     Examples:
         headroom wrap agy                          # Start proxy + agy
-        headroom wrap agy -- --model claude-3-5-sonnet  # Pass args to agy
+        headroom wrap agy -- --model gemini-2.5-pro  # Pass args to agy
     """
     agy_bin = shutil.which("agy")
     if not agy_bin:
