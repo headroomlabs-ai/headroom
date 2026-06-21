@@ -272,7 +272,8 @@ headroom proxy --mode cache
 | `--region` | `us-west-2` | Cloud region for Bedrock / Vertex / related backends |
 | `--bedrock-region` | unset | Deprecated Bedrock region override |
 | `--bedrock-profile` | unset | AWS profile name for Bedrock |
-| `--no-telemetry` | off | Disable anonymous usage telemetry |
+| `--telemetry` | off | Opt in to anonymous usage telemetry (off by default) |
+| `--no-telemetry` | off | Force anonymous usage telemetry off (already the default) |
 
 Notes:
 
@@ -603,7 +604,10 @@ Options:
                                   backends.
   --mode TEXT                     Proxy optimization mode.  [default: token]
   --memory                        Enable persistent memory in the proxy runtime.
-  --no-telemetry                  Disable anonymous telemetry in the runtime.
+  --telemetry                     Opt in to anonymous telemetry in the runtime
+                                  (off by default).
+  --no-telemetry                  Force anonymous telemetry off in the runtime
+                                  (already the default).
   --image TEXT                    Docker image to use when runtime=docker or
                                   preset=persistent-docker.  [default:
                                   ghcr.io/chopratejas/headroom:latest]
@@ -632,7 +636,8 @@ headroom install apply --preset persistent-docker --scope user
 | `--region` | unset | Cloud region override |
 | `--mode` | `token` | Proxy optimization mode |
 | `--memory` | off | Enable persistent memory in the managed runtime |
-| `--no-telemetry` | off | Disable anonymous telemetry |
+| `--telemetry` | off | Opt in to anonymous telemetry (off by default) |
+| `--no-telemetry` | off | Force anonymous telemetry off (already the default) |
 | `--image` | `ghcr.io/chopratejas/headroom:latest` | Docker image for Docker-backed installs |
 
 `apply` stores a manifest under

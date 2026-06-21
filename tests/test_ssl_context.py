@@ -4,7 +4,8 @@ Covers:
 - Returns None when no env var is set
 - Returns a path string when SSL_CERT_FILE points to a valid PEM file
 - Returns a path string when REQUESTS_CA_BUNDLE points to a valid PEM file
-- Returns a path string when NODE_EXTRA_CA_CERTS points to a valid PEM file
+- Returns an ssl.SSLContext when NODE_EXTRA_CA_CERTS points to a valid PEM file
+- The SSLContext is additive: default/system roots are preserved (#998)
 - Priority order: SSL_CERT_FILE beats REQUESTS_CA_BUNDLE beats NODE_EXTRA_CA_CERTS
 - Nonexistent paths are skipped (returns None if all paths are missing)
 """
@@ -12,6 +13,7 @@ Covers:
 from __future__ import annotations
 
 import os
+import ssl
 
 import pytest
 
@@ -78,12 +80,23 @@ class TestFindCaBundleWithValidPem:
         assert isinstance(ctx, str)
         assert os.path.isfile(ctx)
 
-    def test_node_extra_ca_certs_returns_path(self, monkeypatch, ca_pem_file):
+    def test_node_extra_ca_certs_returns_ssl_context(self, monkeypatch, ca_pem_file):
+        """NODE_EXTRA_CA_CERTS returns an SSLContext, not a bare path (#998)."""
         _clean_env(monkeypatch)
         monkeypatch.setenv("NODE_EXTRA_CA_CERTS", ca_pem_file)
         ctx = find_ca_bundle()
-        assert isinstance(ctx, str)
-        assert os.path.isfile(ctx)
+        assert isinstance(ctx, ssl.SSLContext)
+
+    def test_node_extra_ca_certs_is_additive(self, monkeypatch, ca_pem_file):
+        """The SSLContext must contain default/system roots plus the extra cert (#998)."""
+        _clean_env(monkeypatch)
+        monkeypatch.setenv("NODE_EXTRA_CA_CERTS", ca_pem_file)
+        ctx = find_ca_bundle()
+        assert isinstance(ctx, ssl.SSLContext)
+        stats = ctx.cert_store_stats()
+        # The default trust store has dozens of CAs; if only the test cert
+        # were loaded (replacement), x509_ca would be 1.
+        assert stats["x509_ca"] > 1
 
 
 class TestFindCaBundlePriority:

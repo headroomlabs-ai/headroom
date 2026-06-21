@@ -7,37 +7,41 @@ deployments with custom certificate authorities work without extra
 configuration.
 
 Priority order (first match wins):
-1. ``SSL_CERT_FILE``
-2. ``REQUESTS_CA_BUNDLE``
-3. ``NODE_EXTRA_CA_CERTS``
+1. ``SSL_CERT_FILE``  — replacement semantics (only these CAs are trusted)
+2. ``REQUESTS_CA_BUNDLE`` — replacement semantics
+3. ``NODE_EXTRA_CA_CERTS`` — **additive** semantics (extra roots loaded
+   on top of the default/system trust store, matching Node.js behavior)
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import ssl
 
 logger = logging.getLogger("headroom.proxy")
 
-_CA_BUNDLE_ENV_VARS = (
+_REPLACEMENT_CA_VARS = (
     "SSL_CERT_FILE",
     "REQUESTS_CA_BUNDLE",
-    "NODE_EXTRA_CA_CERTS",
 )
 
 
-def find_ca_bundle() -> str | None:
-    """Return the CA bundle path if any CA-bundle env var points to a file.
+def find_ca_bundle() -> str | ssl.SSLContext | None:
+    """Return a CA verification target for httpx's ``verify=`` parameter.
 
-    Iterates ``SSL_CERT_FILE``, ``REQUESTS_CA_BUNDLE``, and
-    ``NODE_EXTRA_CA_CERTS`` in that order.  The first variable that is set
-    *and* points to an existing file is returned as a string path so that
-    httpx can build its own SSL context (with correct ALPN setup for HTTP/2).
+    ``SSL_CERT_FILE`` and ``REQUESTS_CA_BUNDLE`` use **replacement**
+    semantics: the returned path becomes the *only* trust store.
+
+    ``NODE_EXTRA_CA_CERTS`` uses **additive** semantics (matching Node.js):
+    an ``ssl.SSLContext`` is returned that contains the default/system
+    roots *plus* the extra certificate, so public upstreams stay reachable
+    when the extra bundle contains only a private/internal root.
 
     Returns ``None`` when no env var is set (or all paths are missing),
     which signals to the caller to use httpx's default TLS verification.
     """
-    for var in _CA_BUNDLE_ENV_VARS:
+    for var in _REPLACEMENT_CA_VARS:
         path = os.environ.get(var)
         if path and os.path.isfile(path):
             logger.info(
@@ -52,4 +56,21 @@ def find_ca_bundle() -> str | None:
                 var,
                 path,
             )
+
+    node_path = os.environ.get("NODE_EXTRA_CA_CERTS")
+    if node_path and os.path.isfile(node_path):
+        ctx = ssl.create_default_context()
+        ctx.load_verify_locations(cafile=node_path)
+        ctx.set_alpn_protocols(["h2", "http/1.1"])
+        logger.info(
+            "event=ssl_ca_bundle_loaded env_var=NODE_EXTRA_CA_CERTS path=%s additive=true",
+            node_path,
+        )
+        return ctx
+    if node_path and not os.path.isfile(node_path):
+        logger.warning(
+            "event=ssl_ca_bundle_missing env_var=NODE_EXTRA_CA_CERTS path=%r (skipped)",
+            node_path,
+        )
+
     return None

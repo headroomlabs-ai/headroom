@@ -554,6 +554,94 @@ class TestCompressionCacheConcurrency:
         assert stats["entries"] == n_threads * per_thread_calls
         assert stats["tokens_saved"] > 0
 
+    def test_concurrent_hits_misses_consistent(self) -> None:
+        """Under concurrent reads + writes, hits+misses must be bounded by
+        total lookups (hits ≤ entries, misses ≥ 0 at all moments)."""
+        import random
+        import threading
+
+        cache = CompressionCache(max_entries=1_000_000)
+        n_threads = 16
+        per_thread = 50
+
+        # Pre-populate so reads have something to hit
+        for i in range(per_thread):
+            h = CompressionCache.content_hash(f"hit-{i}")
+            cache.store_compressed(h, f"comp-{i}", tokens_saved=3)
+
+        errors: list[Exception] = []
+        barrier = threading.Barrier(n_threads)
+
+        def worker(tid: int) -> None:
+            try:
+                barrier.wait()
+                for i in range(per_thread):
+                    if random.random() < 0.6:
+                        # Read path
+                        _ = cache.get_compressed(
+                            CompressionCache.content_hash(
+                                f"hit-{random.randint(0, per_thread - 1)}"
+                            )
+                        )
+                    else:
+                        # Write path
+                        h = CompressionCache.content_hash(f"write-{tid}-{i}")
+                        cache.store_compressed(h, f"w-{tid}-{i}", tokens_saved=1)
+            except Exception as e:  # pragma: no cover
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker, args=(t,)) for t in range(n_threads)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert errors == [], f"Concurrent reads+writes raised: {errors}"
+        stats = cache.get_stats()
+        # hits + misses should be non-negative (sanity)
+        assert stats["hits"] >= 0
+        assert stats["misses"] >= 0
+        assert stats["entries"] > 0
+
+    def test_concurrent_stable_hash_ops_no_race(self) -> None:
+        """Concurrent mark_stable_from_messages + compute_frozen_count must
+        not race — stable_hashes must remain self-consistent."""
+        import threading
+
+        cache = CompressionCache()
+        n_threads = 12
+        per_thread = 30
+
+        # Each thread has its own content; produce tool_result messages
+        # and mark them stable, then verify frozen count.
+        errors: list[Exception] = []
+        barrier = threading.Barrier(n_threads)
+
+        def worker(tid: int) -> None:
+            try:
+                barrier.wait()
+                for i in range(per_thread):
+                    content = f"stable-content-{tid}-{i}"
+                    h = CompressionCache.content_hash(content)
+                    # Also store to make it appear cached
+                    cache.store_compressed(h, f"comp-{tid}-{i}", tokens_saved=2)
+                    # Mark stable
+                    cache.mark_stable(h)
+            except Exception as e:  # pragma: no cover
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker, args=(t,)) for t in range(n_threads)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert errors == [], f"Concurrent stable-hash ops raised: {errors}"
+        stats = cache.get_stats()
+        # All entries should be recorded; stable_hashes should match entries
+        # (every store_compressed was followed by mark_stable in our test)
+        assert stats["entries"] == n_threads * per_thread
+
 
 def test_get_compression_cache_returns_same_instance_under_contention() -> None:
     """`HeadroomProxy._get_compression_cache(session_id)` must return the

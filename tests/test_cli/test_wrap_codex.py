@@ -9,6 +9,7 @@ way a user would from the shell.
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 from unittest.mock import patch
 
@@ -327,6 +328,66 @@ class TestInjectAndRestoreRoundTrip:
 
         assert status == "restored"
         assert config_file.read_text() == malformed
+
+
+# ---------------------------------------------------------------------------
+# Thread retag: wrap pulls native threads into the headroom menu, unwrap hands
+# them back, so the Codex history list stays whole across the proxy boundary.
+# ---------------------------------------------------------------------------
+
+
+class TestWrapRetagsThreadProviders:
+    """``wrap codex`` retags ``openai`` threads to ``headroom`` and back."""
+
+    @staticmethod
+    def _seed_threads(db: Path, rows: list[tuple[str, str]]) -> None:
+        db.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(db))
+        try:
+            conn.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, model_provider TEXT NOT NULL)")
+            conn.executemany("INSERT INTO threads (id, model_provider) VALUES (?, ?)", rows)
+            conn.commit()
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _count(db: Path, provider: str) -> int:
+        conn = sqlite3.connect(str(db))
+        try:
+            (n,) = conn.execute(
+                "SELECT COUNT(*) FROM threads WHERE model_provider = ?", (provider,)
+            ).fetchone()
+            return n
+        finally:
+            conn.close()
+
+    def test_wrap_unwrap_round_trips_thread_providers(
+        self, runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        _set_test_home(monkeypatch, tmp_path)
+        gui_db = tmp_path / ".codex" / "sqlite" / "state_5.sqlite"
+        cli_db = tmp_path / ".codex" / "state_5.sqlite"
+        self._seed_threads(gui_db, [("a", "openai"), ("b", "headroom"), ("c", "anthropic")])
+        self._seed_threads(cli_db, [("d", "openai")])
+
+        with patch("headroom.cli.wrap._ensure_rtk_binary", return_value=None):
+            wrap_result = runner.invoke(main, ["wrap", "codex", "--prepare-only", "--port", "8787"])
+        assert wrap_result.exit_code == 0, wrap_result.output
+        # Native threads are now visible under the headroom provider menu;
+        # third-party providers are left untouched.
+        assert self._count(gui_db, "headroom") == 2
+        assert self._count(gui_db, "openai") == 0
+        assert self._count(gui_db, "anthropic") == 1
+        assert self._count(cli_db, "headroom") == 1
+
+        with patch("headroom.cli.wrap._stop_local_proxy_for_unwrap", return_value="stopped"):
+            unwrap_result = runner.invoke(main, ["unwrap", "codex", "--port", "8787"])
+        assert unwrap_result.exit_code == 0, unwrap_result.output
+        # Back to native so the unproxied Codex menu is whole again.
+        assert self._count(gui_db, "openai") == 2
+        assert self._count(gui_db, "headroom") == 0
+        assert self._count(gui_db, "anthropic") == 1
+        assert self._count(cli_db, "openai") == 1
 
 
 # ---------------------------------------------------------------------------

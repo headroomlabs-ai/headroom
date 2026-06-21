@@ -1,0 +1,117 @@
+---
+title: Claude Code on Vertex AI
+description: Run Claude Code against Claude models on Google Vertex AI, with Headroom compressing your prompts — fewer input tokens, same answers, your own GCP login.
+---
+
+If your Claude models live on **Google Vertex AI**, you can still get Headroom's
+prompt compression. Headroom sits between Claude Code and Vertex: it shrinks the
+big stuff in each request (file reads, logs, tool output) and forwards the rest to
+Vertex using **your own Google credentials**. You keep your GCP setup; Headroom
+just makes each call cheaper.
+
+## What you get
+
+- **Fewer input tokens** on every Claude Code request to Vertex (often 30–60% on
+  agent workloads), so you pay Vertex for less.
+- **Same answers** — compression is reversible and content-aware.
+- **No new secrets** — Headroom never holds your Google credentials. Claude Code
+  keeps authenticating to Vertex with its own ADC token; Headroom passes it through.
+
+## Before you start
+
+You should already have Claude Code working against Vertex **without** Headroom.
+That means these are set in your shell:
+
+```bash
+export CLAUDE_CODE_USE_VERTEX=1
+export ANTHROPIC_VERTEX_PROJECT_ID=<your-gcp-project>
+export CLOUD_ML_REGION=us-east5          # your Vertex region (or "global")
+gcloud auth application-default login    # or set GOOGLE_APPLICATION_CREDENTIALS
+```
+
+No `ANTHROPIC_API_KEY` is needed — Vertex mode uses your Google login.
+
+## Run it (one command)
+
+```bash
+pip install headroom
+headroom wrap claude
+```
+
+That's it. Because `CLAUDE_CODE_USE_VERTEX=1` is set, `headroom wrap claude`
+automatically:
+
+1. starts the Headroom proxy,
+2. points Claude Code's Vertex endpoint at it (`ANTHROPIC_VERTEX_BASE_URL`),
+3. leaves your project, region, and Google login untouched.
+
+You'll see a line like:
+
+```
+Vertex mode: ANTHROPIC_VERTEX_BASE_URL=http://127.0.0.1:8787
+  → compress, then forward to Vertex with your GCP ADC token
+```
+
+Use Claude Code exactly as you normally would.
+
+## How it works
+
+```
+Claude Code ──(Vertex request)──▶ Headroom ──(compressed)──▶ Vertex AI (Claude)
+   in Vertex mode                  compresses                 your project + region
+   (your ADC token) ───────────── passed through ───────────▶ authenticates you
+```
+
+Claude Code sends its normal Vertex `…:rawPredict` / `:streamRawPredict` request to
+Headroom. Headroom compresses the messages (keeping the Vertex request shape
+intact), then forwards to the correct regional Vertex host — derived from the
+request itself, so multi-region and `global` both work — using the Google token
+Claude Code already attached.
+
+## Check that compression is working
+
+1. Open the dashboard: [http://localhost:8787/dashboard](http://localhost:8787/dashboard).
+   "Tokens saved" should climb as you use Claude Code.
+2. Or look at the response headers on a request: `x-headroom-tokens-before`,
+   `x-headroom-tokens-after`, `x-headroom-tokens-saved`.
+
+If "tokens saved" stays at 0 on large prompts, see Troubleshooting below.
+
+## Troubleshooting
+
+- **It still goes straight to Google (no savings).** Make sure `CLAUDE_CODE_USE_VERTEX=1`
+  is exported *in the same shell* before `headroom wrap claude`. The wrapper only
+  switches to Vertex mode when it sees that variable.
+- **Wrong region / 404 from Vertex.** Confirm `CLOUD_ML_REGION` matches a region
+  where your Claude model is enabled. `global` is supported and maps to the
+  non-regional host.
+- **Auth errors.** Headroom forwards your token as-is — if `gcloud auth
+  application-default login` (or `GOOGLE_APPLICATION_CREDENTIALS`) works for Claude
+  Code without Headroom, it works with it.
+
+## Alternative: let Headroom talk to Vertex for you
+
+If you'd rather **not** run Claude Code in Vertex mode, you can have Headroom be the
+translator instead: Claude Code speaks plain Anthropic to Headroom, and Headroom
+calls Vertex on your behalf.
+
+```bash
+export HEADROOM_BACKEND=litellm-vertex_ai     # note the _ai suffix
+export HEADROOM_REGION=us-east5
+export VERTEXAI_PROJECT=<your-gcp-project>
+export GOOGLE_APPLICATION_CREDENTIALS=/path/sa.json   # or gcloud ADC
+export ANTHROPIC_API_KEY=placeholder          # Claude Code needs *a* key to start
+headroom wrap claude --backend litellm-vertex_ai --region us-east5
+```
+
+The native Vertex-mode flow above is recommended — it keeps your existing GCP auth
+and has the smallest moving parts. Use this alternative only if you can't set
+`CLAUDE_CODE_USE_VERTEX`.
+
+## Notes
+
+- Pick a Claude model that is enabled in your Vertex project/region
+  (e.g. `claude-sonnet-4-6`, `claude-haiku-4-5`).
+- Streaming, tool use, and prompt caching all work through Headroom.
+- Want to point at a private Vertex gateway instead of Google's host? Start the
+  proxy with `--vertex-api-url https://your-gateway` and Headroom will forward there.

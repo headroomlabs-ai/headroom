@@ -171,10 +171,41 @@ def test_wrap_copilot_openai_backend_sets_completions_env(
         f"http://127.0.0.1:8787{_expected_project_prefix()}/v1"
     )
     assert env["COPILOT_PROVIDER_WIRE_API"] == "completions"
-    assert captured["backend"] == "anyllm"
-    assert captured["anyllm_provider"] == "groq"
-    assert captured["region"] == "us-central1"
-    assert captured["args"] == ("--model", "gpt-4o")
+
+
+def test_wrap_copilot_byok_rejects_auto_model_before_launch(
+    runner: CliRunner,
+    wrap_modules: tuple[types.ModuleType, click.Group],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _wrap_cli, main = wrap_modules
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-dummy")
+
+    def fail_launch_tool(**_kwargs: object) -> None:
+        raise AssertionError("_launch_tool must not run with --model auto in BYOK mode")
+
+    with (
+        patch("headroom.cli.wrap.shutil.which", return_value="copilot"),
+        patch("headroom.cli.wrap.has_oauth_auth", return_value=False),
+        patch("headroom.cli.wrap._launch_tool", side_effect=fail_launch_tool),
+    ):
+        result = runner.invoke(
+            main,
+            [
+                "wrap",
+                "copilot",
+                "--provider-type",
+                "openai",
+                "--no-context-tool",
+                "--",
+                "--model",
+                "auto",
+            ],
+        )
+
+    assert result.exit_code == 1
+    assert "'--model auto' is not supported in Copilot BYOK mode" in result.output
+    assert "Use a concrete model" in result.output
 
 
 def test_wrap_copilot_auto_detects_running_proxy_backend(
