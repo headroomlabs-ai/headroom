@@ -3,6 +3,7 @@ import { tool } from "@opencode-ai/plugin";
 import { z } from "zod";
 
 import { createHeadroomRetrieveTool, getDefaultProxyUrl } from "./retrieve.js";
+import { installHeadroomTransport } from "./transport.js";
 
 export interface HeadroomOpenCodePluginOptions {
   proxyUrl?: string;
@@ -28,15 +29,22 @@ export const HeadroomPlugin: Plugin = async (input, options = {}) => {
   const pluginOptions = options as HeadroomOpenCodePluginOptions;
   const proxyUrl = resolveProxyUrl(pluginOptions);
   const retrieveTool = createHeadroomRetrieveTool({ proxyBaseUrl: proxyUrl });
+  const uninstallTransport = installHeadroomTransport({
+    proxyUrl,
+    debug: pluginOptions.debug,
+  });
 
   return {
+    dispose: async () => {
+      uninstallTransport();
+    },
     tool: {
       headroom_retrieve: tool({
         description: retrieveTool.description,
         args: {
           hash: z
             .string()
-            .regex(/^[a-f0-9]{24}$/i, "Expected a 24-character hex hash"),
+            .regex(/^[a-f0-9]{24}$/i, "Expected 24-character hex hash"),
           query: z.string().optional(),
         },
         async execute(args) {

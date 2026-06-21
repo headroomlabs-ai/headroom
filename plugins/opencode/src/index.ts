@@ -19,3 +19,5 @@ export {
 export type { RetrieveToolConfig } from "./retrieve.js";
 export { HeadroomPlugin, default } from "./plugin.js";
 export type { HeadroomOpenCodePluginOptions } from "./plugin.js";
+
+export { installHeadroomTransport } from "./transport.js";

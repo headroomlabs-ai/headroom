@@ -109,9 +109,9 @@ from headroom.providers.openclaw import (
 )
 from headroom.providers.opencode import build_launch_env as _build_opencode_launch_env
 from headroom.providers.opencode.config import (
-    _MCP_MARKER_END,
+    _MCP_MARKER_END,  # noqa: F401
     _MCP_MARKER_START,
-    _PROVIDER_MARKER_END,
+    _PROVIDER_MARKER_END,  # noqa: F401
     _PROVIDER_MARKER_START,
     inject_opencode_provider_config,
     opencode_config_paths,

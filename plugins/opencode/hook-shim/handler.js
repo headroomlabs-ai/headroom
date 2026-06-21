@@ -1,4 +1,8 @@
-#!/usr/bin/env node
+import { installHeadroomTransport } from "../dist/index.js";
 
-console.log("headroom-opencode hook-shim: no-op");
-process.exit(0);
+const proxyUrl = process.env.HEADROOM_OPENCODE_TRANSPORT_PROXY_URL;
+if (!proxyUrl) {
+  throw new Error("Headroom OpenCode transport shim loaded without HEADROOM_OPENCODE_TRANSPORT_PROXY_URL");
+}
+
+installHeadroomTransport({ proxyUrl });

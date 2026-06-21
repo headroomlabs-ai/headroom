@@ -6,9 +6,11 @@ import json
 import os
 from collections.abc import Mapping
 
+from .config import HEADROOM_OPENCODE_PLUGIN
+
 
 def proxy_base_url(port: int) -> str:
-    """Return the local proxy base URL used by OpenCode-compatible integrations."""
+    """Return the local proxy base URL used by OpenCode integrations."""
     return f"http://127.0.0.1:{port}/v1"
 
 
@@ -16,19 +18,21 @@ def build_opencode_config_content(
     *,
     port: int,
     include_mcp: bool = True,
+    include_plugin: bool = True,
 ) -> dict[str, object]:
-    """Build the JSON payload for ``OPENCODE_CONFIG_CONTENT``.
+    """Build JSON payload for ``OPENCODE_CONFIG_CONTENT``.
 
-    Registers a transparent headroom provider via ``@ai-sdk/openai-compatible``
-    without restricting which models are available.  The user's existing
-    model selection is left untouched.
+    Runtime wrap injects the Headroom provider as a stable explicit fallback,
+    plus the Headroom plugin which transparently routes provider fetch traffic
+    through the local proxy without rewriting user provider config URLs.
     """
+    base_url = proxy_base_url(port)
     config: dict[str, object] = {
         "provider": {
             "headroom": {
                 "npm": "@ai-sdk/openai-compatible",
                 "name": "Headroom Proxy",
-                "options": {"baseURL": proxy_base_url(port)},
+                "options": {"baseURL": base_url},
             }
         }
     }
@@ -40,6 +44,8 @@ def build_opencode_config_content(
                 "enabled": True,
             }
         }
+    if include_plugin:
+        config["plugin"] = [[HEADROOM_OPENCODE_PLUGIN, {"proxyUrl": base_url}]]
     return config
 
 
@@ -49,28 +55,27 @@ def build_launch_env(
     project: str | None = None,
     *,
     include_mcp: bool = True,
+    include_plugin: bool = True,
 ) -> tuple[dict[str, str], list[str]]:
-    """Build environment variables for OpenCode through the local proxy.
+    """Build environment variables for launching OpenCode through Headroom.
 
-    Sets ``OPENCODE_CONFIG_CONTENT`` with the headroom provider definition.
-    Existing provider/base URL environment variables are preserved, but
-    Headroom does not set or overwrite them for OpenCode.
+    ``OPENCODE_CONFIG_CONTENT`` carries Headroom provider/MCP/plugin config.
+    Existing provider/base URL environment variables are preserved.
     """
     env = dict(environ or os.environ)
-    base_url = proxy_base_url(port)
 
     config_content = build_opencode_config_content(
         port=port,
         include_mcp=include_mcp,
+        include_plugin=include_plugin,
     )
     env["OPENCODE_CONFIG_CONTENT"] = json.dumps(config_content, separators=(",", ":"))
 
-    env_vars_display = [
-        "OPENCODE_CONFIG_CONTENT={provider: headroom}",
-    ]
+    display = ["OPENCODE_CONFIG_CONTENT={provider: headroom}"]
+    if include_plugin:
+        display.append(f"plugin={HEADROOM_OPENCODE_PLUGIN}")
 
-    # Per-project savings attribution (same pattern as codex).
     if project and "HEADROOM_PROJECT" not in env:
         env["HEADROOM_PROJECT"] = project
 
-    return env, env_vars_display
+    return env, display

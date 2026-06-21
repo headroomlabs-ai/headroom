@@ -274,7 +274,7 @@ def test_strip_blocks_preserves_non_headroom_jsonc() -> None:
 
 def test_strip_blocks_removes_only_one_of_two_identical_blocks() -> None:
     """strip_opencode_headroom_blocks removes all provider blocks, not just the first."""
-    from headroom.providers.opencode.config import _PROVIDER_MARKER_START, _PROVIDER_MARKER_END
+    from headroom.providers.opencode.config import _PROVIDER_MARKER_END, _PROVIDER_MARKER_START
     content = (
         _PROVIDER_MARKER_START + "\nblock1\n" + _PROVIDER_MARKER_END + "\n"
         + _PROVIDER_MARKER_START + "\nblock2\n" + _PROVIDER_MARKER_END
@@ -287,7 +287,7 @@ def test_strip_blocks_removes_only_one_of_two_identical_blocks() -> None:
 
 def test_strip_blocks_handles_only_mcp_markers() -> None:
     """strip_opencode_headroom_blocks also strips MCP markers."""
-    from headroom.providers.opencode.config import _MCP_MARKER_START, _MCP_MARKER_END
+    from headroom.providers.opencode.config import _MCP_MARKER_END, _MCP_MARKER_START
     content = (
         _MCP_MARKER_START + "\nmcp data\n" + _MCP_MARKER_END
     )
@@ -384,8 +384,8 @@ def test_inject_provider_config_no_crash_on_unwriteable_dir(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """inject_opencode_provider_config raises click.ClickException on OSError."""
+
     import click as click_mod
-    import os as _os
     monkeypatch.setenv("HOME", "/nonexistent/path/that/cannot/be/created")
     try:
         inject_opencode_provider_config(port=8787)
@@ -407,6 +407,7 @@ def test_build_opencode_config_content_without_mcp() -> None:
     assert "provider" in config
     assert "mcp" not in config
     assert "model" not in config
+    assert config["plugin"] == [["headroom-opencode", {"proxyUrl": "http://127.0.0.1:8787/v1"}]]
 
 
 def test_build_launch_env_with_project(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -422,6 +423,7 @@ def test_build_launch_env_with_project(monkeypatch: pytest.MonkeyPatch) -> None:
         include_mcp=False,
     )
     assert env["HEADROOM_PROJECT"] == "test-proj"
+    assert "headroom-opencode" in env["OPENCODE_CONFIG_CONTENT"]
     assert "OPENAI_BASE_URL" not in env
     assert "ANTHROPIC_BASE_URL" not in env
 
