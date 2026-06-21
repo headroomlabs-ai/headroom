@@ -1,0 +1,151 @@
+"""Tests for the tokensave release-binary installer."""
+
+from __future__ import annotations
+
+import io
+import tarfile
+import zipfile
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from headroom.graph import tokensave_installer as ts
+
+
+def _tar_archive(member_name: str = ts.TOKENSAVE_BIN_NAME) -> bytes:
+    payload = io.BytesIO()
+    with tarfile.open(fileobj=payload, mode="w:gz") as tar:
+        data = b"#!/bin/sh\necho version\n"
+        info = tarfile.TarInfo(name=member_name)
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+    return payload.getvalue()
+
+
+def _zip_archive(member_name: str = "tokensave.exe") -> bytes:
+    payload = io.BytesIO()
+    with zipfile.ZipFile(payload, "w") as zf:
+        zf.writestr(member_name, b"binary")
+    return payload.getvalue()
+
+
+class FakeResponse:
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        return None
+
+    def read(self) -> bytes:
+        return self._data
+
+
+@pytest.mark.parametrize(
+    ("system", "machine", "expected"),
+    [
+        ("darwin", "arm64", ("tokensave-v9-aarch64-macos.tar.gz", "tar.gz")),
+        ("linux", "aarch64", ("tokensave-v9-aarch64-linux.tar.gz", "tar.gz")),
+        ("linux", "arm64", ("tokensave-v9-aarch64-linux.tar.gz", "tar.gz")),
+        ("linux", "x86_64", ("tokensave-v9-x86_64-linux.tar.gz", "tar.gz")),
+        ("windows", "amd64", ("tokensave-v9-x86_64-windows.zip", "zip")),
+    ],
+)
+def test_detect_asset_variants(monkeypatch, system, machine, expected) -> None:
+    monkeypatch.setattr(ts.platform, "system", lambda: system)
+    monkeypatch.setattr(ts.platform, "machine", lambda: machine)
+    assert ts._detect_asset("v9") == expected
+
+
+def test_detect_asset_returns_none_for_intel_mac_and_unknown(monkeypatch) -> None:
+    monkeypatch.setattr(ts.platform, "system", lambda: "darwin")
+    monkeypatch.setattr(ts.platform, "machine", lambda: "x86_64")
+    assert ts._detect_asset("v9") is None  # no x86_64-macos asset is published
+
+    monkeypatch.setattr(ts.platform, "system", lambda: "solaris")
+    monkeypatch.setattr(ts.platform, "machine", lambda: "sparc")
+    assert ts._detect_asset("v9") is None
+
+
+def test_get_tokensave_path_prefers_path_then_install_dir(monkeypatch, tmp_path: Path) -> None:
+    on_path = tmp_path / "on-path"
+    installed = tmp_path / ts.TOKENSAVE_BIN_NAME
+    installed.write_text("bin")
+    monkeypatch.setattr(ts, "TOKENSAVE_BIN_DIR", tmp_path)
+    monkeypatch.setattr("shutil.which", lambda name: str(on_path))
+    assert ts.get_tokensave_path() == on_path
+
+    monkeypatch.setattr("shutil.which", lambda name: None)
+    assert ts.get_tokensave_path() == installed
+
+    installed.unlink()
+    assert ts.get_tokensave_path() is None
+
+
+def test_ensure_offline_returns_none_when_absent(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(ts, "TOKENSAVE_BIN_DIR", tmp_path)
+    monkeypatch.setattr("shutil.which", lambda name: None)
+    monkeypatch.setenv("HEADROOM_BINARIES_OFFLINE", "1")
+
+    def _boom(*a, **k):
+        raise AssertionError("download must not run when offline")
+
+    monkeypatch.setattr(ts, "download_tokensave", _boom)
+    assert ts.ensure_tokensave() is None
+
+
+def test_ensure_returns_existing_without_download(monkeypatch, tmp_path: Path) -> None:
+    existing = tmp_path / ts.TOKENSAVE_BIN_NAME
+    existing.write_text("bin")
+    monkeypatch.setattr(ts, "get_tokensave_path", lambda: existing)
+
+    def _boom(*a, **k):
+        raise AssertionError("download must not run when binary present")
+
+    monkeypatch.setattr(ts, "download_tokensave", _boom)
+    assert ts.ensure_tokensave() == existing
+
+
+def test_ensure_returns_none_on_unsupported_platform(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(ts, "get_tokensave_path", lambda: None)
+    monkeypatch.delenv("HEADROOM_BINARIES_OFFLINE", raising=False)
+    monkeypatch.setattr(ts.platform, "system", lambda: "darwin")
+    monkeypatch.setattr(ts.platform, "machine", lambda: "x86_64")  # no asset
+    assert ts.ensure_tokensave() is None
+
+
+def test_download_tokensave_tarball(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(ts, "TOKENSAVE_BIN_DIR", tmp_path)
+    monkeypatch.setattr(ts.platform, "system", lambda: "linux")
+    monkeypatch.setattr(ts.platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(ts, "urlopen", lambda url, timeout=60: FakeResponse(_tar_archive()))
+    monkeypatch.setattr(
+        "subprocess.run", lambda *a, **k: SimpleNamespace(returncode=0, stdout="tokensave 6\n")
+    )
+    path = ts.download_tokensave(version="v6.4.4")
+    assert path == tmp_path / ts.TOKENSAVE_BIN_NAME
+    assert path.exists()
+
+
+def test_download_tokensave_zip_windows(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(ts, "TOKENSAVE_BIN_DIR", tmp_path)
+    monkeypatch.setattr(ts.platform, "system", lambda: "windows")
+    monkeypatch.setattr(ts.platform, "machine", lambda: "amd64")
+    monkeypatch.setattr(ts, "urlopen", lambda url, timeout=60: FakeResponse(_zip_archive()))
+    monkeypatch.setattr(
+        "subprocess.run", lambda *a, **k: SimpleNamespace(returncode=0, stdout="tokensave 6\n")
+    )
+    path = ts.download_tokensave(version="v6.4.4")
+    assert path == tmp_path / "tokensave.exe"
+    assert path.exists()
+
+
+def test_download_raises_for_unsupported_platform(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(ts, "TOKENSAVE_BIN_DIR", tmp_path)
+    monkeypatch.setattr(ts.platform, "system", lambda: "darwin")
+    monkeypatch.setattr(ts.platform, "machine", lambda: "x86_64")
+    with pytest.raises(RuntimeError, match="no prebuilt tokensave asset"):
+        ts.download_tokensave(version="v6.4.4")

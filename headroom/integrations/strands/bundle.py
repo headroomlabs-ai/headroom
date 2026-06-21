@@ -11,8 +11,14 @@ Strands-native primitives:
   needs the original; Strands' MCP dispatcher resolves it via this
   server. Works identically in streaming and non-streaming.
 
-* **Serena MCP** — semantic code intelligence (symbol search,
-  references, etc.). Auto-installed via ``uvx`` on first launch.
+* **tokensave MCP** — the primary coding-task compressor: a local
+  semantic code-graph server (``tokensave serve``) the agent queries
+  for symbols, call chains, and impact analysis instead of reading
+  whole files. Requires the ``tokensave`` binary on PATH.
+
+* **Serena MCP** — the backup coding-task compressor (symbol search,
+  references, etc.), auto-installed via ``uvx`` on first launch.
+  Off by default; enable with ``enable_serena_mcp=True``.
 
 * **HeadroomHookProvider** — the RTK-equivalent for Strands.
   Compresses tool outputs in-place via ``AfterToolCallEvent`` so
@@ -77,6 +83,7 @@ from headroom.mcp_registry.install import (
     DEFAULT_PROXY_URL,
     build_headroom_spec,
     build_serena_spec,
+    build_tokensave_spec,
 )
 
 from .hooks import HeadroomHookProvider
@@ -89,8 +96,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_SERENA_CONTEXT = "ide-assistant"
 
 
-def _make_headroom_client(proxy_url: str) -> MCPClient:
-    spec = build_headroom_spec(proxy_url)
+def _client_for(spec: Any) -> MCPClient:
     params = StdioServerParameters(
         command=spec.command,
         args=list(spec.args),
@@ -100,14 +106,16 @@ def _make_headroom_client(proxy_url: str) -> MCPClient:
     return MCPClient(partial(stdio_client, params))
 
 
+def _make_headroom_client(proxy_url: str) -> MCPClient:
+    return _client_for(build_headroom_spec(proxy_url))
+
+
+def _make_tokensave_client() -> MCPClient:
+    return _client_for(build_tokensave_spec())
+
+
 def _make_serena_client(context: str) -> MCPClient:
-    spec = build_serena_spec(context)
-    params = StdioServerParameters(
-        command=spec.command,
-        args=list(spec.args),
-        env=dict(spec.env) if spec.env else None,
-    )
-    return MCPClient(partial(stdio_client, params))
+    return _client_for(build_serena_spec(context))
 
 
 @dataclass
@@ -120,8 +128,12 @@ class HeadroomBundle:
             (``http://127.0.0.1:8787``).
         serena_context: Serena context label. Default ``"ide-assistant"``.
         enable_headroom_mcp: Include the Headroom MCP server. Default True.
-        enable_serena_mcp: Include the Serena MCP server. Default True.
-            Disabling skips the ``uvx`` first-launch download entirely.
+        enable_tokensave_mcp: Include the tokensave MCP server — the primary
+            coding-task compressor. Default True. Requires the ``tokensave``
+            binary on PATH (``tokensave serve``).
+        enable_serena_mcp: Include the Serena MCP server — the backup
+            coding-task compressor. Default False (tokensave is primary).
+            Enabling adds the ``uvx`` first-launch download.
         enable_hooks: Include :class:`HeadroomHookProvider` for in-place
             tool-output compression (the RTK-equivalent for Strands).
             Default True.
@@ -138,7 +150,10 @@ class HeadroomBundle:
     proxy_url: str = DEFAULT_PROXY_URL
     serena_context: str = DEFAULT_SERENA_CONTEXT
     enable_headroom_mcp: bool = True
-    enable_serena_mcp: bool = True
+    # tokensave is the primary coding-task compressor; Serena is the backup
+    # and stays off unless explicitly enabled.
+    enable_tokensave_mcp: bool = True
+    enable_serena_mcp: bool = False
     # The proxy is the single source of truth for compression — it sees
     # the full message list, owns CompressionPolicy, owns PrefixCacheTracker,
     # and places `cache_control` breakpoints. The in-process hook
@@ -151,6 +166,7 @@ class HeadroomBundle:
     config: HeadroomConfig | None = None
 
     _headroom_mcp: MCPClient | None = field(default=None, init=False, repr=False, compare=False)
+    _tokensave_mcp: MCPClient | None = field(default=None, init=False, repr=False, compare=False)
     _serena_mcp: MCPClient | None = field(default=None, init=False, repr=False, compare=False)
     _hook: HeadroomHookProvider | None = field(default=None, init=False, repr=False, compare=False)
 
@@ -161,10 +177,13 @@ class HeadroomBundle:
                 "HeadroomBundle: Headroom MCP client constructed (proxy_url=%s)",
                 self.proxy_url,
             )
+        if self.enable_tokensave_mcp:
+            self._tokensave_mcp = _make_tokensave_client()
+            logger.info("HeadroomBundle: tokensave MCP client constructed (primary)")
         if self.enable_serena_mcp:
             self._serena_mcp = _make_serena_client(self.serena_context)
             logger.info(
-                "HeadroomBundle: Serena MCP client constructed (context=%s)",
+                "HeadroomBundle: Serena MCP client constructed (backup, context=%s)",
                 self.serena_context,
             )
         if self.enable_hooks:
@@ -181,6 +200,8 @@ class HeadroomBundle:
         out: list[Any] = []
         if self._headroom_mcp is not None:
             out.append(self._headroom_mcp)
+        if self._tokensave_mcp is not None:
+            out.append(self._tokensave_mcp)
         if self._serena_mcp is not None:
             out.append(self._serena_mcp)
         return out
@@ -194,6 +215,11 @@ class HeadroomBundle:
     def headroom_mcp(self) -> MCPClient | None:
         """Direct handle to the Headroom MCPClient (for advanced callers)."""
         return self._headroom_mcp
+
+    @property
+    def tokensave_mcp(self) -> MCPClient | None:
+        """Direct handle to the tokensave MCPClient (for advanced callers)."""
+        return self._tokensave_mcp
 
     @property
     def serena_mcp(self) -> MCPClient | None:

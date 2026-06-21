@@ -59,7 +59,7 @@ Telemetry is **off by default** (opt-in). Opt in with `HEADROOM_TELEMETRY=on` or
 | `--intercept-tool-results` | `false` | Opt into tool-result interceptors such as ast-grep Read outlining. |
 | `--no-read-lifecycle` | `false` | Disable stale/superseded Read-output compression. |
 | `--code-aware` / `--no-code-aware` | disabled | Enable or disable AST-based code compression. Requires `headroom-ai[code]`. |
-| `--code-graph` | `false` | Index the current project and watch files via codebase-memory-mcp. |
+| `--code-graph` | `false` | Force a tokensave code-graph index of the current project (tokensave is the default coding-task compressor registered by `headroom wrap`). |
 
 By default, the proxy uses the shared **ContentRouter** pipeline. It routes text, logs, JSON, code, images, and tool outputs through the currently enabled compressors and preserves reversible CCR markers where applicable.
 
