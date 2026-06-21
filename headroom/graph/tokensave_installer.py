@@ -145,9 +145,7 @@ def download_tokensave(version: str | None = None) -> Path:
         raise RuntimeError(f"Failed to extract tokensave archive: {e}") from e
 
     if kind != "zip":
-        target_path.chmod(
-            target_path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH
-        )
+        target_path.chmod(target_path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
 
     try:
         result = subprocess.run(

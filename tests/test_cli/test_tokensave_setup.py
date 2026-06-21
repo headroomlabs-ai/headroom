@@ -204,9 +204,7 @@ def test_policy_serena_fallback_when_tokensave_unavailable(
 
 def test_policy_force_serena_even_when_tokensave_ok(monkeypatch: pytest.MonkeyPatch) -> None:
     calls = _spy_compressor(monkeypatch, tokensave_ok=True)
-    wrap_cli._setup_coding_compressor(
-        _FakeRegistrar(), serena_context="claude-code", serena=True
-    )
+    wrap_cli._setup_coding_compressor(_FakeRegistrar(), serena_context="claude-code", serena=True)
     assert calls["serena_setup"] is True
 
 

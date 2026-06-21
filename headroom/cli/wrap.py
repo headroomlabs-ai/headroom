@@ -1025,7 +1025,9 @@ def _setup_coding_compressor(registrar: Any, *, serena_context: str, **kwargs: A
     else:
         # tokensave is primary (or Serena was explicitly disabled): drop any
         # Serena entry a prior wrap installed; user-managed entries are kept.
-        reason = "--no-serena" if no_serena else "tokensave is now the primary code-graph compressor"
+        reason = (
+            "--no-serena" if no_serena else "tokensave is now the primary code-graph compressor"
+        )
         _disable_serena_mcp(registrar, verbose=verbose, reason=reason)
 
 
