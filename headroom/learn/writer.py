@@ -26,6 +26,23 @@ _MARKER_PATTERN = re.compile(
 )
 
 
+def _read_text_tolerant(file_path: Path) -> str:
+    """Read an existing context file that we are about to rewrite as UTF-8.
+
+    These files are predominantly valid UTF-8 but may carry a stray legacy
+    byte (e.g. a cp1252 em-dash ``0x97``). Strict UTF-8 decoding aborts the
+    whole ``--apply`` on a single such byte, so fall back to UTF-8 with
+    replacement: this preserves the valid UTF-8 content — a full-file cp1252
+    fallback would instead turn every genuine UTF-8 em-dash into mojibake —
+    and the subsequent ``write_text(encoding="utf-8")`` self-heals the file.
+    """
+    raw = file_path.read_bytes()
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode("utf-8", errors="replace")
+
+
 # =============================================================================
 # Abstract Writer
 # =============================================================================
@@ -153,7 +170,7 @@ def _merge_recommendations(
     """
     if not file_path.exists():
         return new_recommendations
-    prior = _parse_prior_recommendations(file_path.read_text(encoding="utf-8"))
+    prior = _parse_prior_recommendations(_read_text_tolerant(file_path))
     if not prior:
         return new_recommendations
     new_sections = {r.section for r in new_recommendations}
@@ -166,7 +183,7 @@ def _merge_into_file(file_path: Path, new_recommendations: list[Recommendation])
     merged = _merge_recommendations(file_path, new_recommendations)
     section = _build_section(merged)
     if file_path.exists():
-        existing = file_path.read_text(encoding="utf-8")
+        existing = _read_text_tolerant(file_path)
         if _MARKER_START in existing:
             return _MARKER_PATTERN.sub(lambda _match: section, existing)
         return existing.rstrip() + "\n\n" + section + "\n"

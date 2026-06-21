@@ -236,9 +236,15 @@ def learn(
             click.echo(f"Path: {proj.project_path}")
             click.echo(f"{'=' * 60}")
 
-            sessions = plugin.scan_project(
-                proj, max_workers=max_workers, include_subagents=not main_only
-            )
+            try:
+                sessions = plugin.scan_project(
+                    proj, max_workers=max_workers, include_subagents=not main_only
+                )
+            except Exception as exc:
+                # One unreadable agent/project must not abort the whole
+                # cross-agent run; skip it with a warning and continue.
+                click.echo(f"  Skipping (could not scan sessions): {exc}")
+                continue
             if not sessions:
                 click.echo("  No conversation data found.")
                 continue

@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+import pytest
+
 from headroom.learn.models import ProjectInfo, Recommendation, RecommendationTarget
 from headroom.learn.writer import (
     _MARKER_END,
@@ -9,6 +11,7 @@ from headroom.learn.writer import (
     ClaudeCodeWriter,
     _merge_into_file,
     _parse_prior_recommendations,
+    _read_text_tolerant,
     extract_marker_block,
 )
 
@@ -308,3 +311,41 @@ class TestExtractMarkerBlock:
         block = extract_marker_block(content)
         assert block is not None
         assert block == f"{_MARKER_START}\n{_MARKER_END}"
+
+
+class TestEncodingResilience:
+    """Regression tests for #1202 — ``learn --apply`` must not crash merging into
+    an existing context file that carries a stray non-UTF-8 byte (e.g. a legacy
+    cp1252 em-dash ``0x97``)."""
+
+    def test_read_text_tolerant_preserves_valid_utf8(self, tmp_path):
+        path = tmp_path / "AGENTS.md"
+        path.write_text("Use em-dashes — and arrows →.", encoding="utf-8")
+        assert _read_text_tolerant(path) == "Use em-dashes — and arrows →."
+
+    def test_read_text_tolerant_survives_stray_legacy_byte(self, tmp_path):
+        # Predominantly valid UTF-8 (genuine em-dash E2 80 94) plus one stray
+        # cp1252 em-dash byte (0x97) that strict UTF-8 cannot decode.
+        path = tmp_path / "AGENTS.md"
+        path.write_bytes("real em-dash — here\n".encode() + b"legacy \x97 byte\n")
+
+        # The old strict read aborts the whole --apply on that single byte.
+        with pytest.raises(UnicodeDecodeError):
+            path.read_text(encoding="utf-8")
+
+        text = _read_text_tolerant(path)
+        # Valid UTF-8 content is preserved (no cp1252 "â€" mojibake) and the
+        # stray byte is replaced rather than fatal.
+        assert "real em-dash — here" in text
+        assert "\x97" not in text
+        assert "â€" not in text
+
+    def test_merge_into_file_applies_over_file_with_stray_byte(self, tmp_path):
+        path = tmp_path / "AGENTS.md"
+        path.write_bytes("# Notes — existing\n".encode() + b"stray \x97 byte\n")
+        recs = [_rec(RecommendationTarget.CONTEXT_FILE, "Environment", "- Use uv")]
+
+        merged = _merge_into_file(path, recs)
+
+        assert "Use uv" in merged
+        assert "Notes — existing" in merged
