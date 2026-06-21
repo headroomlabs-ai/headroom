@@ -65,3 +65,11 @@ def test_dataset_recall_empty_suite_is_safe() -> None:
     assert result.total_cases == 0
     assert result.accuracy_rate == 0.0
     assert result.errors == []
+
+
+def test_warm_kompress_model_returns_false_when_unavailable(monkeypatch) -> None:
+    # Guard path: no Kompress backend -> no download attempt, returns False.
+    import headroom.transforms.kompress_compressor as kc
+
+    monkeypatch.setattr(kc, "is_kompress_available", lambda: False)
+    assert kc.warm_kompress_model() is False
