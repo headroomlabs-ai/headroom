@@ -411,6 +411,71 @@ def test_compression_off_numeric_precision_preserved() -> None:
     assert upstream == inbound_bytes
 
 
+def test_anthropic_tools_canonical_order_preserves_byte_faithful_request() -> None:
+    client, transport = _make_no_optimize_app()
+    inbound_dict = {
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": "plan test"}],
+        "tools": [
+            {"name": "alpha"},
+            {"name": "zeta", "description": "later"},
+        ],
+    }
+    inbound_bytes = serialize_body_canonical(inbound_dict)
+
+    response = client.post(
+        "/v1/messages",
+        headers={
+            "x-api-key": "test-key",
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        content=inbound_bytes,
+    )
+    assert response.status_code == 200, response.text
+    upstream = transport.captured_body or b""
+    assert upstream == inbound_bytes, (
+        f"Expected byte-faithful passthrough for canonical tools; upstream={upstream!r}"
+    )
+
+
+def test_anthropic_tools_unsorted_reordered_and_canonicalized() -> None:
+    client, transport = _make_no_optimize_app()
+    inbound_dict = {
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": "plan test"}],
+        "tools": [
+            {"name": "zeta", "description": "later"},
+            {"name": "alpha"},
+        ],
+    }
+    expected_dict = {
+        **inbound_dict,
+        "tools": [
+            inbound_dict["tools"][1],
+            inbound_dict["tools"][0],
+        ],
+    }
+    inbound_bytes = serialize_body_canonical(inbound_dict)
+    expected_bytes = serialize_body_canonical(expected_dict)
+
+    response = client.post(
+        "/v1/messages",
+        headers={
+            "x-api-key": "test-key",
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        content=inbound_bytes,
+    )
+    assert response.status_code == 200, response.text
+    upstream = transport.captured_body or b""
+    assert upstream == expected_bytes
+    assert upstream != inbound_bytes
+
+
 def test_legacy_json_kwarg_mode_yields_drifted_bytes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

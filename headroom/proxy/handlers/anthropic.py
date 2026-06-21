@@ -1671,8 +1671,10 @@ class AnthropicHandlerMixin:
             # Update body
             body["messages"] = optimized_messages
             if tools or _original_tools is not None:
-                tools = self._sort_tools_deterministically(tools)
-                body["tools"] = tools
+                sorted_tools = self._sort_tools_deterministically(tools)
+                if sorted_tools != tools:
+                    tools = sorted_tools
+                    body["tools"] = tools
 
             presend_event = self.pipeline_extensions.emit(
                 PipelineStage.PRE_SEND,
@@ -1690,8 +1692,12 @@ class AnthropicHandlerMixin:
                 optimized_messages = presend_event.messages
                 body["messages"] = optimized_messages
             if presend_event.tools is not None:
-                tools = self._sort_tools_deterministically(presend_event.tools)
-                body["tools"] = tools
+                sorted_tools = self._sort_tools_deterministically(presend_event.tools)
+                if sorted_tools != presend_event.tools:
+                    tools = sorted_tools
+                    body["tools"] = tools
+                else:
+                    tools = presend_event.tools
             if presend_event.headers is not None:
                 headers = presend_event.headers
             if presend_event.messages is not previous_presend_messages:
@@ -2648,7 +2654,9 @@ class AnthropicHandlerMixin:
             canonical_params = dict(params)
             canonical_tools = canonical_params.get("tools")
             if canonical_tools is not None:
-                canonical_params["tools"] = self._sort_tools_deterministically(canonical_tools)
+                sorted_tools = self._sort_tools_deterministically(canonical_tools)
+                if sorted_tools != canonical_tools:
+                    canonical_params["tools"] = sorted_tools
             messages = params.get("messages", [])
             original_messages = copy.deepcopy(messages)
             model = params.get("model", "unknown")
@@ -2725,7 +2733,9 @@ class AnthropicHandlerMixin:
                 # Create compressed batch request
                 compressed_params = {**params, "messages": optimized_messages}
                 if tools is not None:
-                    compressed_params["tools"] = self._sort_tools_deterministically(tools)
+                    sorted_tools = self._sort_tools_deterministically(tools)
+                    if sorted_tools != tools:
+                        compressed_params["tools"] = sorted_tools
                 compressed_requests.append(
                     {
                         "custom_id": custom_id,
