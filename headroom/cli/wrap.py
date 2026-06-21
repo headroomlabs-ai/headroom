@@ -107,6 +107,23 @@ from headroom.providers.openclaw import (
 from headroom.providers.openclaw import (
     normalize_gateway_provider_ids as _normalize_openclaw_gateway_provider_ids_impl,
 )
+from headroom.providers.opencode import (
+    build_launch_env as _build_opencode_launch_env,
+)
+from headroom.providers.opencode import (
+    proxy_base_url as _opencode_proxy_base_url,
+)
+from headroom.providers.opencode.config import (
+    _opencode_config_path,
+    opencode_config_paths,
+    snapshot_opencode_config_if_unwrapped,
+    strip_opencode_headroom_blocks,
+)
+from headroom.port_utils import (
+    DEFAULT_PROXY_PORT,
+    allocate_ports,
+    find_opencode_ports,
+)
 from headroom.proxy.project_context import with_project_prefix as _with_project_prefix
 
 from .main import main
@@ -4936,3 +4953,259 @@ def unwrap_codex(port: int, no_stop_proxy: bool) -> None:
     if not no_stop_proxy and status != "noop":
         _echo_unwrap_proxy_stop_status(_stop_local_proxy_for_unwrap(port), port)
     click.echo()
+
+
+# =============================================================================
+# OpenCode
+# =============================================================================
+
+
+@wrap.command(context_settings={"ignore_unknown_options": True})
+@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option("--no-context-tool", "--no-rtk", "no_rtk", is_flag=True, help="Skip CLI context-tool setup")
+@click.option("--no-mcp", is_flag=True, help="Skip headroom MCP server registration")
+@click.option("--no-serena", is_flag=True, help="Skip Serena MCP server registration")
+@click.option("--code-graph", is_flag=True, help="Enable code graph indexing via codebase-memory-mcp (optional)")
+@click.option("--routing-mode", default="multi", type=click.Choice(["multi", "single"]), help="Proxy routing mode: 'multi' (one proxy per upstream) or 'single' (shared proxy with header routing)")
+@click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
+@click.option("--learn", is_flag=True, help="Enable live traffic learning")
+@click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
+@click.option("--backend", default=None, help="API backend: 'anthropic', 'anyllm', 'litellm-vertex', etc.")
+@click.option("--anyllm-provider", default=None, help="Provider for any-llm backend")
+@click.option("--region", default=None, help="Cloud region for Bedrock/Vertex")
+@click.option("--verbose", "-v", is_flag=True, help="Verbose output")
+@click.option("--prepare-only", is_flag=True, hidden=True)
+@click.argument("opencode_args", nargs=-1, type=click.UNPROCESSED)
+def opencode(
+    port: int,
+    no_rtk: bool,
+    no_mcp: bool,
+    no_serena: bool,
+    code_graph: bool,
+    routing_mode: str,
+    no_proxy: bool,
+    learn: bool,
+    memory: bool,
+    backend: str | None,
+    anyllm_provider: str | None,
+    region: str | None,
+    verbose: bool,
+    prepare_only: bool,
+    opencode_args: tuple,
+) -> None:
+    """Launch OpenCode through Headroom proxy.
+
+    \b
+    Discovers providers from auth.json and opencode.json, builds a config
+    overlay via ``OPENCODE_CONFIG_CONTENT``, and routes OpenCode's API
+    calls through Headroom proxy instances.  In multi-proxy mode (default)
+    each unique upstream URL gets its own proxy.  In single-proxy mode
+    (``--routing-mode single``) providers share a single proxy with
+    ``x-headroom-base-url`` header routing.
+
+    \b
+    The overlay does NOT overwrite OpenCode's on-disk config — it is
+    injected at launch via the ``OPENCODE_CONFIG_CONTENT`` environment
+    variable.  Cleanup is automatic on process exit.
+
+    \b
+    Provider keys (``apiKey``) are never set by the overlay — OpenCode
+    resolves them from ``auth.json``, environment variables, and
+    lower-precedence config files.
+
+    \b
+    Examples:
+        headroom wrap opencode                    # Multi-proxy, all providers
+        headroom wrap opencode --routing-mode single
+        headroom wrap opencode --no-mcp --no-serena
+        headroom wrap opencode --port 9999
+        headroom wrap opencode -- "Hello world"
+    """
+    # ---- config backup (pre-wrap snapshot) ----
+    _opencode_config_file, _opencode_backup_file = opencode_config_paths()
+    snapshot_opencode_config_if_unwrapped(_opencode_config_file, _opencode_backup_file)
+
+    # ---- context tool (RTK / lean-ctx) ----
+    if not no_rtk:
+        _setup_context_tool_for_agent(
+            agent="opencode",
+            agent_display="OpenCode",
+            marker_path=_opencode_config_file,
+            rtk_required=True,
+            verbose=verbose,
+        )
+        # Inject RTK instructions into AGENTS.md files
+        rtk_path = _ensure_rtk_binary(verbose=verbose)
+        if rtk_path:
+            project_agents = Path.cwd() / "AGENTS.md"
+            _inject_rtk_instructions(project_agents, verbose=verbose)
+            global_agents = _opencode_home_dir() / "AGENTS.md"
+            _inject_rtk_instructions(global_agents, verbose=verbose)
+
+    # ---- MCP registration ----
+    if not no_mcp:
+        from headroom.mcp_registry import OpencodeRegistrar
+
+        _setup_headroom_mcp(OpencodeRegistrar(), port, verbose=verbose, force=True)
+    elif verbose:
+        click.echo("  Skipping MCP retrieve tool (--no-mcp)")
+
+    # ---- Serena MCP ----
+    if not no_serena:
+        from headroom.mcp_registry import OpencodeRegistrar
+
+        _setup_serena_mcp(
+            OpencodeRegistrar(), context="opencode", verbose=verbose, force=True
+        )
+    else:
+        from headroom.mcp_registry import OpencodeRegistrar
+
+        _disable_serena_mcp(OpencodeRegistrar(), verbose=verbose)
+
+    # ---- memory setup ----
+    if memory:
+        click.echo("  Setting up memory for OpenCode...")
+        mem_dir = Path.cwd() / ".headroom"
+        mem_dir.mkdir(parents=True, exist_ok=True)
+        mem_user = os.environ.get("USER", os.environ.get("USERNAME", "default"))
+        opencode_home = _opencode_home_dir()
+        agents_md = opencode_home / "AGENTS.md"
+        _inject_memory_agents_md(agents_md)
+
+    # ---- prepare-only: exit after setup, before launch ----
+    if prepare_only:
+        return
+
+    # ---- discover binary ----
+    opencode_bin = shutil.which("opencode")
+    if not opencode_bin:
+        click.echo("Error: 'opencode' not found in PATH.")
+        click.echo("Install OpenCode: https://opencode.ai")
+        raise SystemExit(1)
+
+    # ---- build launch environment ----
+    env, env_vars_display = _build_opencode_launch_env(
+        port,
+        os.environ,
+        project=_project_name_from_cwd(),
+        routing_mode=routing_mode,
+        include_mcp=not no_mcp,
+    )
+
+    # ---- memory MCP registration (after build_launch_env, before _launch_tool) ----
+    if memory:
+        mem_dir = Path.cwd() / ".headroom"
+        mem_dir.mkdir(parents=True, exist_ok=True)
+        db_path = str(mem_dir / "memory.db")
+        mem_user = os.environ.get("USER", os.environ.get("USERNAME", "default"))
+        _inject_memory_mcp_config(db_path, mem_user)
+
+    # ---- launch OpenCode through proxy ----
+    _launch_tool(
+        binary=opencode_bin,
+        args=opencode_args,
+        env=env,
+        port=port,
+        no_proxy=no_proxy,
+        tool_label="OPENCODE",
+        env_vars_display=env_vars_display,
+        learn=learn,
+        memory=memory,
+        agent_type="opencode",
+        code_graph=code_graph,
+        backend=backend,
+        anyllm_provider=anyllm_provider,
+        region=region,
+    )
+
+
+# =============================================================================
+# OpenCode (unwrap)
+# =============================================================================
+
+
+@unwrap.command("opencode")
+@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option("--no-stop-proxy", is_flag=True, help="Do not stop the local Headroom proxy")
+def unwrap_opencode(port: int, no_stop_proxy: bool) -> None:
+    """Undo ``headroom wrap opencode`` edits to the active OpenCode config file."""
+    click.echo()
+    click.echo("  ╔═══════════════════════════════════════════════╗")
+    click.echo("  ║         HEADROOM UNWRAP: OPENCODE             ║")
+    click.echo("  ╚═══════════════════════════════════════════════╝")
+    click.echo()
+
+    config_file, backup_file = opencode_config_paths()
+
+    status: str
+    if backup_file.exists():
+        try:
+            shutil.copy2(backup_file, config_file)
+            backup_file.unlink()
+            click.echo(f"  Restored prior {config_file} from pre-wrap backup.")
+            status = "restored"
+        except OSError as exc:
+            raise click.ClickException(
+                f"could not restore OpenCode config from backup: {exc}"
+            ) from exc
+    elif config_file.exists():
+        content = config_file.read_text(encoding="utf-8")
+        if _PROVIDER_MARKER_START in content or _MCP_MARKER_START in content:
+            cleaned = strip_opencode_headroom_blocks(content)
+            if cleaned.strip():
+                config_file.write_text(cleaned + "\n", encoding="utf-8")
+                click.echo(
+                    f"  Removed Headroom block from {config_file}; other content preserved."
+                )
+                status = "cleaned"
+            else:
+                config_file.unlink()
+                click.echo(
+                    f"  Removed {config_file} (contained only Headroom-written config)."
+                )
+                status = "removed"
+        else:
+            click.echo(
+                f"  Nothing to undo: {config_file} has no Headroom wrap markers."
+            )
+            status = "noop"
+    else:
+        click.echo(f"  Nothing to undo: {config_file} does not exist.")
+        status = "noop"
+
+    # ---- MCP cleanup ----
+    from headroom.mcp_registry import OpencodeRegistrar
+
+    opencode_registrar = OpencodeRegistrar()
+    if opencode_registrar.detect():
+        if opencode_registrar.unregister_server("headroom"):
+            click.echo("  Removed Headroom MCP server from OpenCode.")
+        serena_status = _remove_headroom_installed_serena_mcp(opencode_registrar)
+        if serena_status == "removed":
+            click.echo("  Removed Headroom-installed Serena MCP server from OpenCode.")
+        elif serena_status == "failed":
+            click.echo(
+                "  Serena MCP server matched Headroom ledger but could not be removed."
+            )
+
+    # ---- stop proxies ----
+    click.echo()
+    click.echo("✓ OpenCode is no longer routed through the Headroom proxy.")
+    if not no_stop_proxy and status != "noop":
+        for _port in find_opencode_ports(port):
+            _echo_unwrap_proxy_stop_status(
+                _stop_local_proxy_for_unwrap(_port), _port
+            )
+    click.echo()
+
+
+# =============================================================================
+# OpenCode (install apply / revert) — CLI passthrough registrations
+# =============================================================================
+
+
+def _opencode_home_dir() -> Path:
+    env_path = os.environ.get("OPENCODE_HOME", "").strip()
+    if env_path:
+        return Path(env_path).expanduser()
+    return Path.home() / ".config" / "opencode"

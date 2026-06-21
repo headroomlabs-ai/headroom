@@ -118,3 +118,17 @@ def openclaw_config_path() -> Path:
     """Return the OpenClaw config path."""
 
     return Path.home() / ".openclaw" / "openclaw.json"
+
+
+def opencode_config_path() -> Path:
+    """Return the OpenCode config path.
+
+    Respects ``$OPENCODE_CONFIG`` if set, otherwise returns
+    ``~/.config/opencode/opencode.json``.
+    """
+    import os
+
+    env_path = os.environ.get("OPENCODE_CONFIG", "").strip()
+    if env_path:
+        return Path(env_path).expanduser()
+    return Path.home() / ".config" / "opencode" / "opencode.json"

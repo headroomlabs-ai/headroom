@@ -21,17 +21,14 @@ from .models import (
 from .paths import validate_profile_name
 
 SUPPORTED_TARGETS = [
-    ToolTarget.CLAUDE,
-    ToolTarget.COPILOT,
-    ToolTarget.CODEX,
-    ToolTarget.AIDER,
-    ToolTarget.CURSOR,
-    ToolTarget.OPENCLAW,
+    ToolTarget.CLAUDE, ToolTarget.COPILOT, ToolTarget.CODEX,
+    ToolTarget.AIDER, ToolTarget.CURSOR, ToolTarget.OPENCLAW, ToolTarget.OPENCODE
 ]
 PROVIDER_SCOPE_TARGETS = [
     ToolTarget.CLAUDE,
     ToolTarget.CODEX,
     ToolTarget.OPENCLAW,
+    ToolTarget.OPENCODE,
 ]
 
 
@@ -72,7 +69,7 @@ def resolve_targets(
         if unsupported:
             unsupported_list = ", ".join(sorted(set(unsupported)))
             raise click.ClickException(
-                "Provider scope supports only claude, codex, and openclaw; "
+                "Provider scope supports only claude, codex, openclaw, and opencode; "
                 f"unsupported targets: {unsupported_list}"
             )
 

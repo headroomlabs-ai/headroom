@@ -74,7 +74,7 @@ def _runtime_env(manifest: DeploymentManifest) -> dict[str, str]:
 
 
 def _ensure_host_dirs() -> None:
-    for subdir in (".headroom", ".claude", ".codex", ".gemini"):
+    for subdir in (".headroom", ".claude", ".codex", ".gemini", ".config/opencode"):
         (Path.home() / subdir).mkdir(parents=True, exist_ok=True)
 
 

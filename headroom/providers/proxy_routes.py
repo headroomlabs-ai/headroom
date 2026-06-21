@@ -12,6 +12,7 @@ from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import Response
 
 from headroom.proxy.handlers.openai import _resolve_codex_routing_headers
+from headroom.proxy.helpers import normalize_upstream_base
 
 logger = logging.getLogger("headroom.proxy.routes")
 
@@ -424,6 +425,10 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
 
     @app.post("/v1/messages")
     async def anthropic_messages(request: Request):
+        custom_base = request.headers.get("x-headroom-base-url")
+        if custom_base:
+            normalized = normalize_upstream_base(custom_base)
+            return await proxy.handle_anthropic_messages(request, upstream_base_url=normalized)
         return await proxy.handle_anthropic_messages(request)
 
     # AWS Bedrock InvokeModel passthrough. Registered ONLY when an upstream is
@@ -474,6 +479,10 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
 
     @app.post("/v1/chat/completions")
     async def openai_chat(request: Request):
+        custom_base = request.headers.get("x-headroom-base-url")
+        if custom_base:
+            normalized = normalize_upstream_base(custom_base)
+            return await proxy.handle_passthrough(request, normalized)
         return await proxy.handle_openai_chat(request)
 
     @app.post("/v1/responses")
@@ -573,6 +582,10 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
 
     @app.post("/v1beta/models/{model}:generateContent")
     async def gemini_generate_content(request: Request, model: str):
+        custom_base = request.headers.get("x-headroom-base-url")
+        if custom_base:
+            normalized = normalize_upstream_base(custom_base)
+            return await proxy.handle_gemini_generate_content(request, model, upstream_base_url=normalized)
         return await proxy.handle_gemini_generate_content(request, model)
 
     @app.post("/v1beta/models/{model}:streamGenerateContent")

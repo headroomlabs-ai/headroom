@@ -1553,6 +1553,31 @@ def _strip_internal_headers(headers: dict[str, str]) -> dict[str, str]:
     return {k: v for k, v in headers.items() if not k.lower().startswith(_INTERNAL_HEADER_PREFIX)}
 
 
+def normalize_upstream_base(url: str) -> str:
+    """Strip ``/v1`` or ``/v1beta`` suffix from an upstream base URL.
+
+    ``build_copilot_upstream_url(base_url, request.url.path)`` does
+    raw concatenation — if *base_url* still carries a version segment
+    the path doubles (``.../v1/v1/messages``).  This helper removes the
+    version suffix so the upstream URL is constructed correctly.
+
+    >>> normalize_upstream_base("https://api.anthropic.com/v1")
+    'https://api.anthropic.com'
+    >>> normalize_upstream_base("https://api.deepseek.com")
+    'https://api.deepseek.com'
+    >>> normalize_upstream_base("https://opencode.ai/zen/go/v1")
+    'https://opencode.ai/zen/go'
+    >>> normalize_upstream_base("https://generativelanguage.googleapis.com/v1beta")
+    'https://generativelanguage.googleapis.com'
+    """
+    normalized = url.rstrip("/")
+    for suffix in ("/v1beta", "/v1"):
+        if normalized.endswith(suffix):
+            normalized = normalized[:-len(suffix)]
+            break
+    return normalized
+
+
 def log_outbound_headers(
     *,
     forwarder: str,
