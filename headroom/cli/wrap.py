@@ -1621,6 +1621,34 @@ def _inject_rtk_instructions(file_path: Path, verbose: bool = False) -> bool:
     return True
 
 
+def _remove_rtk_instructions(file_path: Path) -> bool:
+    """Remove Headroom's marker-fenced rtk guidance from an instruction file."""
+    if not file_path.exists():
+        return False
+
+    content = file_path.read_text(encoding="utf-8")
+    end_marker = "<!-- /headroom:rtk-instructions -->"
+    start = content.find(_RTK_MARKER)
+    if start < 0:
+        return False
+
+    end = content.find(end_marker, start)
+    if end < 0:
+        return False
+    end += len(end_marker)
+    prefix = content[:start].rstrip()
+    suffix = content[end:].lstrip("\r\n")
+    cleaned = "\n\n".join(part for part in (prefix, suffix) if part)
+    if cleaned:
+        cleaned = cleaned.rstrip() + "\n"
+
+    if cleaned:
+        file_path.write_text(cleaned, encoding="utf-8")
+    else:
+        file_path.unlink()
+    return True
+
+
 def _inject_memory_mcp_config(db_path: str, user_id: str) -> None:
     """Register headroom memory as an MCP server in Codex's config.toml.
 
@@ -3574,6 +3602,26 @@ def copilot(
         openai_api_url=openai_api_url,
         copilot_api_token=copilot_proxy_token,
     )
+
+
+# =============================================================================
+# GitHub Copilot CLI (unwrap)
+# =============================================================================
+
+
+@unwrap.command("copilot")
+@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option("--no-stop-proxy", is_flag=True, help="Do not stop the local Headroom proxy")
+def unwrap_copilot(port: int, no_stop_proxy: bool) -> None:
+    """Undo durable setup from ``headroom wrap copilot``."""
+    instructions = Path.cwd() / ".github" / "copilot-instructions.md"
+    if _remove_rtk_instructions(instructions):
+        click.echo("  Removed Headroom rtk instructions from Copilot.")
+    else:
+        click.echo("  No Headroom rtk instructions found for Copilot.")
+
+    if not no_stop_proxy:
+        _echo_unwrap_proxy_stop_status(_stop_local_proxy_for_unwrap(port), port)
 
 
 # =============================================================================

@@ -668,6 +668,117 @@ def test_wrap_copilot_fails_when_binary_missing(
     assert "Install GitHub Copilot CLI" in result.output
 
 
+def test_unwrap_copilot_removes_rtk_instructions_and_stops_proxy(
+    runner: CliRunner,
+    wrap_modules: tuple[types.ModuleType, click.Group],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wrap_cli, main = wrap_modules
+    monkeypatch.chdir(tmp_path)
+    instructions = tmp_path / ".github" / "copilot-instructions.md"
+    instructions.parent.mkdir()
+    instructions.write_text(
+        "Keep user guidance.\n\n" + wrap_cli.RTK_INSTRUCTIONS_BLOCK,
+        encoding="utf-8",
+    )
+
+    with patch(
+        "headroom.cli.wrap._stop_local_proxy_for_unwrap",
+        return_value="stopped",
+    ) as stop_proxy:
+        result = runner.invoke(main, ["unwrap", "copilot", "--port", "9999"])
+
+    assert result.exit_code == 0, result.output
+    assert instructions.read_text(encoding="utf-8") == "Keep user guidance.\n"
+    stop_proxy.assert_called_once_with(9999)
+    assert "Removed Headroom rtk instructions from Copilot." in result.output
+    assert "Stopped local Headroom proxy on port 9999" in result.output
+
+
+def test_unwrap_copilot_preserves_instructions_after_rtk_block(
+    runner: CliRunner,
+    wrap_modules: tuple[types.ModuleType, click.Group],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wrap_cli, main = wrap_modules
+    monkeypatch.chdir(tmp_path)
+    instructions = tmp_path / ".github" / "copilot-instructions.md"
+    instructions.parent.mkdir()
+    instructions.write_text(
+        wrap_cli.RTK_INSTRUCTIONS_BLOCK + "\nKeep trailing guidance.\n",
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(main, ["unwrap", "copilot", "--no-stop-proxy"])
+
+    assert result.exit_code == 0, result.output
+    assert instructions.read_text(encoding="utf-8") == "Keep trailing guidance.\n"
+
+
+def test_unwrap_copilot_leaves_malformed_marker_content_unchanged(
+    runner: CliRunner,
+    wrap_modules: tuple[types.ModuleType, click.Group],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wrap_cli, main = wrap_modules
+    monkeypatch.chdir(tmp_path)
+    instructions = tmp_path / ".github" / "copilot-instructions.md"
+    instructions.parent.mkdir()
+    content = f"<!-- /headroom:rtk-instructions -->\nKeep user guidance.\n{wrap_cli._RTK_MARKER}\n"
+    instructions.write_text(content, encoding="utf-8")
+
+    result = runner.invoke(main, ["unwrap", "copilot", "--no-stop-proxy"])
+
+    assert result.exit_code == 0, result.output
+    assert instructions.read_text(encoding="utf-8") == content
+    assert "No Headroom rtk instructions found for Copilot." in result.output
+
+
+def test_unwrap_copilot_deletes_generated_only_instruction_file(
+    runner: CliRunner,
+    wrap_modules: tuple[types.ModuleType, click.Group],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wrap_cli, main = wrap_modules
+    monkeypatch.chdir(tmp_path)
+    instructions = tmp_path / ".github" / "copilot-instructions.md"
+    instructions.parent.mkdir()
+    instructions.write_text(wrap_cli.RTK_INSTRUCTIONS_BLOCK, encoding="utf-8")
+
+    result = runner.invoke(main, ["unwrap", "copilot", "--no-stop-proxy"])
+
+    assert result.exit_code == 0, result.output
+    assert not instructions.exists()
+
+
+@pytest.mark.parametrize("create_user_file", [False, True])
+def test_unwrap_copilot_is_noop_without_managed_instructions(
+    runner: CliRunner,
+    wrap_modules: tuple[types.ModuleType, click.Group],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    create_user_file: bool,
+) -> None:
+    _wrap_cli, main = wrap_modules
+    monkeypatch.chdir(tmp_path)
+    instructions = tmp_path / ".github" / "copilot-instructions.md"
+    if create_user_file:
+        instructions.parent.mkdir()
+        instructions.write_text("Keep user guidance.\n", encoding="utf-8")
+
+    result = runner.invoke(main, ["unwrap", "copilot", "--no-stop-proxy"])
+
+    assert result.exit_code == 0, result.output
+    assert instructions.exists() is create_user_file
+    if create_user_file:
+        assert instructions.read_text(encoding="utf-8") == "Keep user guidance.\n"
+    assert "No Headroom rtk instructions found for Copilot." in result.output
+
+
 # ---------------------------------------------------------------------------
 # Regression suite for #610 — GitHub Copilot endpoint routing per auth mode.
 #
