@@ -149,3 +149,83 @@ def test_download_raises_for_unsupported_platform(monkeypatch, tmp_path: Path) -
     monkeypatch.setattr(ts.platform, "machine", lambda: "x86_64")
     with pytest.raises(RuntimeError, match="no prebuilt tokensave asset"):
         ts.download_tokensave(version="v6.4.4")
+
+
+def test_download_wraps_network_failure(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(ts, "TOKENSAVE_BIN_DIR", tmp_path)
+    monkeypatch.setattr(ts.platform, "system", lambda: "linux")
+    monkeypatch.setattr(ts.platform, "machine", lambda: "x86_64")
+
+    def _boom(url, timeout=60):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(ts, "urlopen", _boom)
+    with pytest.raises(RuntimeError, match="Failed to download tokensave"):
+        ts.download_tokensave(version="v6.4.4")
+
+
+def test_download_raises_when_binary_missing_from_tarball(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(ts, "TOKENSAVE_BIN_DIR", tmp_path)
+    monkeypatch.setattr(ts.platform, "system", lambda: "linux")
+    monkeypatch.setattr(ts.platform, "machine", lambda: "x86_64")
+    # Archive contains an unrelated member, not the tokensave binary.
+    monkeypatch.setattr(
+        ts, "urlopen", lambda url, timeout=60: FakeResponse(_tar_archive("README.md"))
+    )
+    with pytest.raises(RuntimeError, match="binary not found in archive"):
+        ts.download_tokensave(version="v6.4.4")
+
+
+def test_download_raises_when_binary_missing_from_zip(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(ts, "TOKENSAVE_BIN_DIR", tmp_path)
+    monkeypatch.setattr(ts.platform, "system", lambda: "windows")
+    monkeypatch.setattr(ts.platform, "machine", lambda: "amd64")
+    monkeypatch.setattr(
+        ts, "urlopen", lambda url, timeout=60: FakeResponse(_zip_archive("notes.txt"))
+    )
+    with pytest.raises(RuntimeError, match="binary not found in archive"):
+        ts.download_tokensave(version="v6.4.4")
+
+
+def test_download_tolerates_failed_version_check(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(ts, "TOKENSAVE_BIN_DIR", tmp_path)
+    monkeypatch.setattr(ts.platform, "system", lambda: "linux")
+    monkeypatch.setattr(ts.platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(ts, "urlopen", lambda url, timeout=60: FakeResponse(_tar_archive()))
+    # Non-zero return code and a raising probe must both be non-fatal.
+    monkeypatch.setattr(
+        "subprocess.run", lambda *a, **k: SimpleNamespace(returncode=1, stdout="", stderr="x")
+    )
+    assert ts.download_tokensave(version="v6.4.4") == tmp_path / ts.TOKENSAVE_BIN_NAME
+
+    monkeypatch.setattr(
+        "subprocess.run", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("probe boom"))
+    )
+    assert ts.download_tokensave(version="v6.4.4") == tmp_path / ts.TOKENSAVE_BIN_NAME
+
+
+def test_download_honors_invalid_url_scheme(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(ts, "TOKENSAVE_BIN_DIR", tmp_path)
+    monkeypatch.setattr(ts.platform, "system", lambda: "linux")
+    monkeypatch.setattr(ts.platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(ts, "GITHUB_RELEASE_URL", "ftp://example.test/releases")
+    with pytest.raises(RuntimeError, match="Failed to download tokensave"):
+        ts.download_tokensave(version="v6.4.4")
+
+
+def test_ensure_returns_none_when_download_fails(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(ts, "get_tokensave_path", lambda: None)
+    monkeypatch.delenv("HEADROOM_BINARIES_OFFLINE", raising=False)
+
+    def _raise(version=None):
+        raise RuntimeError("download failed")
+
+    monkeypatch.setattr(ts, "download_tokensave", _raise)
+    assert ts.ensure_tokensave() is None
+
+
+def test_pinned_version_env_override(monkeypatch) -> None:
+    monkeypatch.setenv("HEADROOM_TOKENSAVE_VERSION", "v9.9.9")
+    assert ts._pinned_version() == "v9.9.9"
+    monkeypatch.delenv("HEADROOM_TOKENSAVE_VERSION", raising=False)
+    assert ts._pinned_version() == ts.TOKENSAVE_VERSION
