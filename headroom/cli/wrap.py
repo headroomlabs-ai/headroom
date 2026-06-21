@@ -3675,11 +3675,7 @@ def codex(
             click.echo("  Setting up rtk for Codex...")
             rtk_path = _ensure_rtk_binary(verbose=verbose)
             if rtk_path:
-                # Inject into project AGENTS.md (Codex reads this automatically)
-                agents_md = Path.cwd() / "AGENTS.md"
-                _inject_rtk_instructions(agents_md, verbose=verbose)
-
-                # Also inject into global Codex AGENTS.md
+                # Keep RTK guidance local to the user's Codex configuration.
                 global_agents = _codex_home_dir() / "AGENTS.md"
                 _inject_rtk_instructions(global_agents, verbose=verbose)
 
