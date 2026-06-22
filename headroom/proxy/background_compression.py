@@ -13,6 +13,14 @@ This is per-process by design: ``CompressionCache`` is already per-process
 (``HeadroomProxy._compression_caches``), and multi-worker deployments are
 already warned to use ``--workers 1`` or sticky sessions, so a per-process
 drain matches the existing cache semantics without any new cross-process lock.
+
+Limitations, all fail-open (lost savings, never lost correctness): only the
+token-mode cold-start path defers here -- other modes compress synchronously;
+the queue is in-memory, so a restart mid-drain drops queued jobs (they re-defer
+on a later turn); and a full queue or a duplicate in-flight key drops the job,
+surfaced to telemetry as ``deferred:dropped``. Background work is bounded by the
+Phase 1 kompress deadline (a non-terminating compressor would pin the single
+drain thread, but the compressors terminate).
 """
 
 from __future__ import annotations

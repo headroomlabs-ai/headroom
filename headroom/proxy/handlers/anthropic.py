@@ -1079,6 +1079,10 @@ class AnthropicHandlerMixin:
                             and frozen_message_count == 0
                             and original_tokens >= self._background_compression_min_tokens
                         ):
+                            # Snapshot refs for the async job. The handler must
+                            # NOT mutate these lists/dicts in-place after this
+                            # point -- the background job reads them on a later
+                            # turn. It doesn't today; keep it that way.
                             _bg_messages = messages
                             _bg_working = working_messages
                             _bg_frozen = frozen_message_count
@@ -1087,7 +1091,7 @@ class AnthropicHandlerMixin:
                             # session_id alone is the right granularity -- one
                             # background job per session in flight -- and avoids
                             # JSON-serializing the large message list for a key.
-                            self._background_compressor.enqueue(
+                            accepted = self._background_compressor.enqueue(
                                 session_id,
                                 lambda: self.anthropic_pipeline.apply(
                                     messages=_bg_working,
@@ -1104,8 +1108,16 @@ class AnthropicHandlerMixin:
                                     _bg_messages, result.messages
                                 ),
                             )
+                            # Forward uncompressed either way (the request can't
+                            # wait); only CLAIM deferral when the job was actually
+                            # queued. A full-queue drop is visible in telemetry as
+                            # "deferred:dropped" and self-heals on a later turn.
                             optimized_messages = working_messages
-                            transforms_applied = ["deferred:background_compression"]
+                            transforms_applied = [
+                                "deferred:background_compression"
+                                if accepted
+                                else "deferred:dropped"
+                            ]
                             pipeline_timing = {}
                         else:
                             async with stage_timer.measure("compression_first_stage"):

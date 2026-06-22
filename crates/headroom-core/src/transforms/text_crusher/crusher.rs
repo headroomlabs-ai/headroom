@@ -3,7 +3,8 @@
 //! Splits prose into sentence segments, scores each by recency + query
 //! relevance + structural salience, suppresses near-duplicates via a global
 //! word-shingle index, and keeps the top segments (in original order) up to a
-//! target ratio. Output is byte-verbatim (extractive: no invented words).
+//! target ratio. Output is extractive: the kept sentences are verbatim words
+//! (each segment trimmed, re-joined with `\n`) -- no invented words, no rewrite.
 //!
 //! The relevance term REUSES the shared [`BM25Scorer`](crate::relevance) rather
 //! than reimplementing BM25 -- only the prose-specific splitting + selection

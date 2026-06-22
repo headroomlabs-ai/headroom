@@ -7,7 +7,9 @@ reusing the same scorer SmartCrusher uses rather than reimplementing it. This
 wrapper only keeps the Python-facing interface stable for ContentRouter + tests.
 
 TextCrusher is the request-path-safe alternative to ModernBERT (kompress) for
-large plain text: ~milliseconds instead of minutes, output byte-verbatim.
+large plain text: ~milliseconds instead of minutes. Extractive -- the kept
+sentences are verbatim words (each segment trimmed, re-joined with newlines),
+never paraphrased; it selects, it does not rewrite.
 """
 
 from __future__ import annotations
@@ -31,8 +33,9 @@ class TextCrusherConfig:
 
 class TextCrusher:
     """Extractive prose compressor. ``compress`` returns a result whose
-    ``compressed`` text is a byte-verbatim subset of the kept input sentences,
-    joined in original order. Backed by the Rust core."""
+    ``compressed`` text is the kept input sentences verbatim (each trimmed,
+    re-joined with newlines) in original order -- selection, not rewriting.
+    Backed by the Rust core."""
 
     def __init__(self, config: TextCrusherConfig | None = None) -> None:
         cfg = config or TextCrusherConfig()
