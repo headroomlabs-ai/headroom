@@ -2331,7 +2331,7 @@ class OpenAIHandlerMixin:
                             cache_read_tokens,
                         )
 
-                    uncached_input_tokens = max(0, total_input_tokens - cache_read_tokens)
+                    uncached_input_tokens = max(0, total_input_tokens - cache_read_tokens - cache_write_tokens)
 
                     openai_prefix_tracker.update_from_response(
                         cache_read_tokens=cache_read_tokens,
