@@ -198,7 +198,7 @@ def _build_prior_patterns_section(project: ProjectInfo) -> str:
     for label, path in candidates:
         if path is None or not path.exists():
             continue
-        block = extract_marker_block(path.read_text())
+        block = extract_marker_block(path.read_text(encoding="utf-8", errors="replace"))
         if block:
             parts.append((label, block))
 
@@ -486,6 +486,8 @@ def _call_cli_llm(digest: str, model: str) -> dict:
             input=prompt,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=hard_cap,
         )
     except FileNotFoundError:
@@ -541,6 +543,8 @@ def _call_claude_cli_streaming(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             bufsize=1,  # line-buffered
         )
     except FileNotFoundError:

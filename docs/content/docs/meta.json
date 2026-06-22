@@ -33,6 +33,7 @@
     "strands",
     "litellm",
     "claude-code-vertex",
+    "opencode",
     "mcp",
     "---Configuration---",
     "configuration",

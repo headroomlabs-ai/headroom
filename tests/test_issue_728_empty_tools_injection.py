@@ -16,6 +16,7 @@ from __future__ import annotations
 import pytest
 
 from headroom.ccr.tool_injection import CCR_TOOL_NAME
+from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
 from headroom.proxy.helpers import (
     _reset_session_ccr_tracker_for_test,
     apply_session_sticky_ccr_tool,
@@ -37,6 +38,29 @@ def _reset_tracker():
 def _should_set_body_tools(tools: list | None, original_tools: list | None) -> bool:
     """Mirror the fixed handler condition: ``if tools or _original_tools is not None``."""
     return bool(tools or original_tools is not None)
+
+
+def _sort_tools(tools: list | None) -> list | None:
+    return AnthropicHandlerMixin._sort_tools_deterministically(tools)
+
+
+def _should_set_body_tools_after_sort(tools: list | None, original_tools: list | None) -> bool:
+    """Mirror fixed logic when candidate tools may already be sorted."""
+    if not _should_set_body_tools(tools, original_tools):
+        return False
+    sorted_tools = _sort_tools(tools)
+    if sorted_tools != tools:
+        tools = sorted_tools
+    return tools != original_tools
+
+
+def _legacy_should_set_body_tools_after_sort(
+    tools: list | None, original_tools: list | None
+) -> bool:
+    """Older comparator that only wrote when sorting reordered."""
+    if not _should_set_body_tools(tools, original_tools):
+        return False
+    return _sort_tools(tools) != tools
 
 
 class TestHandlerGuardCondition:
@@ -77,6 +101,14 @@ class TestHandlerGuardCondition:
         tools_after_helpers = original_tools[:]
 
         assert _should_set_body_tools(tools_after_helpers, original_tools)
+
+    def test_sorted_replacement_reaches_body(self):
+        """A sorted replacement that differs from payload still needs to be written."""
+        original_tools = [{"name": "zeta"}, {"name": "alpha"}]
+        tools_after_helpers = [{"name": "alpha"}, {"name": "zeta"}]
+
+        assert not _legacy_should_set_body_tools_after_sort(tools_after_helpers, original_tools)
+        assert _should_set_body_tools_after_sort(tools_after_helpers, original_tools)
 
 
 # ---------------------------------------------------------------------------
