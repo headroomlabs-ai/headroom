@@ -196,7 +196,7 @@ shows an **Output Tokens Saved** card next to input compression, labelled
 | Cursor       | ✅              | prints config — paste once       |
 | Aider        | ✅              | starts proxy + launches          |
 | Copilot CLI  | ✅              | starts proxy + launches          |
-| OpenCode     | ✅              | edits `opencode.json` + launches |
+| OpenCode     | ✅              | `opencode.json` + MCP retrieve · agent-90 |
 | OpenClaw     | ✅              | installs as ContextEngine plugin |
 | Cortex Code  | ✅              | 60–65% savings · library mode   |
 

@@ -129,3 +129,31 @@ def strip_provider_overrides(config: dict[str, Any]) -> dict[str, Any]:
     if not providers:
         result.pop("provider", None)
     return result
+
+
+def _is_headroom_retrieve_entry(entry: Any) -> bool:
+    """Return True for the ``mcp.headroom`` retrieve server Headroom registers."""
+    if not isinstance(entry, dict):
+        return False
+    command = entry.get("command")
+    if isinstance(command, list) and command:
+        return str(command[0]) == "headroom"
+    return False
+
+
+def strip_managed_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of *config* with all Headroom-managed entries removed.
+
+    Strips the provider ``baseURL`` overrides (see
+    :func:`strip_provider_overrides`) and the ``mcp.headroom`` retrieve server
+    Headroom registers. The Serena MCP entry is tracked in the install ledger
+    and removed by the CLI unwrap path, not here.
+    """
+    result = strip_provider_overrides(config)
+    mcp = result.get("mcp")
+    if isinstance(mcp, dict):
+        if _is_headroom_retrieve_entry(mcp.get("headroom")):
+            mcp.pop("headroom", None)
+        if not mcp:
+            result.pop("mcp", None)
+    return result

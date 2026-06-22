@@ -77,15 +77,22 @@ cd your-project
 headroom wrap opencode
 ```
 
-`headroom wrap opencode`:
+`headroom wrap opencode` gives OpenCode the same first-class treatment as
+`wrap claude` / `wrap codex`:
 
-1. Starts the local Headroom proxy (port 8787 by default).
+1. Starts the local Headroom proxy with the **`agent-90` high-savings profile**
+   (the aggressive compression defaults Claude Code and Codex use).
 2. Sets up the CLI context tool — injects `rtk` guidance into `AGENTS.md` so
    OpenCode prefers token-optimized shell commands.
 3. Merges the Headroom provider overrides into the project-local `opencode.json`
    (your existing config and keys are preserved; the pre-wrap file is backed up
    to `opencode.json.headroom-backup`).
-4. Launches `opencode`, with all model traffic routed through the proxy.
+4. Registers the **`headroom_retrieve` MCP server** in `opencode.json` so
+   OpenCode can expand the proxy's `[Retrieve more: hash=…]` compression markers
+   — lossless retrieval of anything that was compressed away.
+5. Registers **Serena** (semantic code navigation) via the `ide-assistant`
+   context, unless `uvx` is unavailable or you pass `--no-serena`.
+6. Launches `opencode`, with all model traffic routed through the proxy.
 
 Pass arguments through to OpenCode after `--`:
 
@@ -93,7 +100,18 @@ Pass arguments through to OpenCode after `--`:
 headroom wrap opencode -- run "fix the failing 503 retry test"
 headroom wrap opencode --port 9999          # custom proxy port
 headroom wrap opencode --no-context-tool    # skip the AGENTS.md rtk setup
+headroom wrap opencode --no-mcp             # skip the headroom_retrieve MCP server
+headroom wrap opencode --no-serena          # skip the Serena MCP server
 ```
+
+### Retrieval (parity with Claude Code / Codex)
+
+When Headroom compresses a tool result it leaves a `[Retrieve more: hash=…]`
+marker. The `headroom_retrieve` MCP server registered above is what makes those
+markers actionable — OpenCode calls the tool to pull back the full content on
+demand. Skipping it with `--no-mcp` leaves the markers unexpandable, so keep it
+on unless you have a reason not to. `headroom mcp install opencode` registers the
+same server outside of a wrap.
 
 ## Library mode (no wrap)
 
@@ -117,7 +135,8 @@ headroom unwrap opencode
 ```
 
 This restores your original `opencode.json` byte-for-byte from the pre-wrap
-backup (or strips just the Headroom provider overrides if the backup is gone),
+backup (or strips the Headroom provider overrides **and** the `headroom_retrieve`
+MCP server if the backup is gone), removes the Headroom-installed Serena entry,
 and stops the local proxy.
 
 ## Limitations

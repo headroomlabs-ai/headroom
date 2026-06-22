@@ -117,7 +117,7 @@ from headroom.providers.opencode import (
     config_has_headroom_overrides as _opencode_config_has_headroom_overrides,
 )
 from headroom.providers.opencode import (
-    strip_provider_overrides as _strip_opencode_provider_overrides,
+    strip_managed_config as _strip_opencode_managed_config,
 )
 from headroom.proxy.project_context import with_project_prefix as _with_project_prefix
 
@@ -127,7 +127,7 @@ _CONTEXT_TOOL_ENV = "HEADROOM_CONTEXT_TOOL"
 _CONTEXT_TOOL_RTK = "rtk"
 _CONTEXT_TOOL_LEAN_CTX = "lean-ctx"
 _VALID_CONTEXT_TOOLS = {_CONTEXT_TOOL_RTK, _CONTEXT_TOOL_LEAN_CTX}
-_AGENT_SAVINGS_TARGET_AGENTS = {"claude", "codex", "cursor"}
+_AGENT_SAVINGS_TARGET_AGENTS = {"claude", "codex", "cursor", "opencode"}
 _WRAP_PROXY_TIMEOUT_ENV = "HEADROOM_WRAP_PROXY_TIMEOUT"
 _WRAP_PROXY_TIMEOUT_DEFAULT_SECONDS = 45
 _WRAP_PROXY_TIMEOUT_ML_DEFAULT_SECONDS = 90
@@ -143,7 +143,7 @@ _WRAP_PROXY_TIMEOUT_ML_MODULES = ("torch", "sentence_transformers", "spacy")
 # `init` and `install` via the Claude provider package to prevent drift.
 _TOOL_SEARCH_ENV = TOOL_SEARCH_ENV
 _TOOL_SEARCH_DEFAULT = TOOL_SEARCH_DEFAULT
-_AGENT_SAVINGS_WRAP_AGENTS = {"claude", "codex", "cursor"}
+_AGENT_SAVINGS_WRAP_AGENTS = {"claude", "codex", "cursor", "opencode"}
 _DEFAULT_AGENT_SAVINGS_PROFILE = "agent-90"
 
 
@@ -394,7 +394,7 @@ def _start_proxy(
     # Ensure proxy subprocess uses UTF-8 (Windows defaults to cp1252)
     proxy_env = os.environ.copy()
     proxy_env["PYTHONIOENCODING"] = "utf-8"
-    if agent_type in {"claude", "codex", "cursor"}:
+    if agent_type in {"claude", "codex", "cursor", "opencode"}:
         apply_agent_savings_env_defaults(proxy_env)
 
     # Tell the proxy which agent is being wrapped (for traffic learning output)
@@ -1584,10 +1584,12 @@ def _restore_opencode_provider_config() -> tuple[str, Path]:
         except (OSError, json.JSONDecodeError):
             return "noop", config_file
         if isinstance(data, dict) and _opencode_config_has_headroom_overrides(data):
-            cleaned = _strip_opencode_provider_overrides(data)
-            # A file that only ever held Headroom content (provider overrides
-            # plus the schema line we add) is removed so OpenCode falls back to
-            # its defaults.
+            cleaned = _strip_opencode_managed_config(data)
+            # A file that only ever held Headroom content (provider overrides,
+            # the headroom_retrieve MCP server, plus the schema line we add) is
+            # removed so OpenCode falls back to its defaults. The Serena MCP
+            # entry is ledger-tracked and removed by ``unwrap opencode`` before
+            # this runs, so it does not block the empty-file cleanup.
             leftover = {k: v for k, v in cleaned.items() if k != "$schema"}
             if not leftover:
                 config_file.unlink()
@@ -4144,6 +4146,12 @@ def vibe(
     help="Skip CLI context-tool setup",
 )
 @click.option(
+    "--no-mcp",
+    is_flag=True,
+    help="Skip headroom MCP server registration (compression markers will be unactionable)",
+)
+@click.option("--no-serena", is_flag=True, help="Skip Serena MCP server registration")
+@click.option(
     "--code-graph",
     is_flag=True,
     help="Enable code graph indexing via codebase-memory-mcp (optional)",
@@ -4162,6 +4170,8 @@ def vibe(
 def opencode(
     port: int,
     no_rtk: bool,
+    no_mcp: bool,
+    no_serena: bool,
     code_graph: bool,
     no_proxy: bool,
     learn: bool,
@@ -4182,21 +4192,32 @@ def opencode(
     ``anthropic`` and ``openai`` providers through the proxy. Your existing
     model selection (``anthropic/claude-…``, ``openai/gpt-…``) keeps working —
     every request is just sent through Headroom first. It also sets up the
-    selected CLI context tool (rtk guidance in ``AGENTS.md``) and launches
-    ``opencode``.
+    selected CLI context tool (rtk guidance in ``AGENTS.md``), registers the
+    headroom MCP server so OpenCode can call ``headroom_retrieve`` on
+    compression markers, and launches ``opencode``.
 
     \b
-    The config edit is reversible: run ``headroom unwrap opencode`` from the
+    The config edits are reversible: run ``headroom unwrap opencode`` from the
     same directory to restore your original ``opencode.json``.
 
     \b
     Examples:
-        headroom wrap opencode                       # Start proxy + context tool + opencode
+        headroom wrap opencode                       # Start proxy + context tool + mcp + opencode
         headroom wrap opencode -- run "fix the bug"  # Pass args to opencode
         headroom wrap opencode --no-context-tool     # Skip CLI context-tool setup
+        headroom wrap opencode --no-mcp              # Skip MCP retrieve tool registration
+        headroom wrap opencode --no-serena           # Skip Serena MCP registration
         headroom wrap opencode --port 9999           # Custom proxy port
     """
     project = _project_name_from_cwd()
+
+    # Snapshot opencode.json BEFORE any wrap-time mutation so
+    # ``headroom unwrap opencode`` can restore the pre-wrap file byte-for-byte.
+    # The provider injection and the MCP registrar both write to this file; the
+    # snapshot is a no-op once a backup exists or the config is already wrapped,
+    # so this is safe to run before either.
+    _opencode_cfg, _opencode_backup = _opencode_config_paths()
+    _snapshot_opencode_config_if_unwrapped(_opencode_cfg, _opencode_backup)
 
     # Setup CLI context tool for OpenCode. OpenCode reads AGENTS.md (project
     # root) for guidance, the same file Codex uses.
@@ -4214,6 +4235,28 @@ def opencode(
 
     # Route OpenCode through the proxy by editing its opencode.json config.
     _inject_opencode_provider_config(port, project)
+
+    # Register the headroom MCP server in opencode.json so OpenCode can call
+    # headroom_retrieve on the proxy's compression markers. force=True keeps a
+    # prior wrap's port from going stale on a re-wrap (same as Codex).
+    if not no_mcp:
+        from headroom.mcp_registry import OpenCodeRegistrar
+
+        _setup_headroom_mcp(OpenCodeRegistrar(), port, verbose=verbose, force=True)
+    elif verbose:
+        click.echo("  Skipping MCP retrieve tool (--no-mcp)")
+
+    # Serena MCP (semantic code navigation). OpenCode has its own built-in
+    # tools, so the augmenting ``ide-assistant`` context is used (OpenCode has
+    # no dedicated Serena context).
+    if not no_serena:
+        from headroom.mcp_registry import OpenCodeRegistrar
+
+        _setup_serena_mcp(OpenCodeRegistrar(), context="ide-assistant", verbose=verbose, force=True)
+    else:
+        from headroom.mcp_registry import OpenCodeRegistrar
+
+        _disable_serena_mcp(OpenCodeRegistrar(), verbose=verbose)
 
     if prepare_only:
         return
@@ -5243,6 +5286,20 @@ def unwrap_opencode(port: int, no_stop_proxy: bool) -> None:
     click.echo("  ║          HEADROOM UNWRAP: OPENCODE            ║")
     click.echo("  ╚═══════════════════════════════════════════════╝")
     click.echo()
+
+    # Remove the Serena MCP server we installed (ledger-checked) before the
+    # provider/MCP restore, so a Headroom-only opencode.json can be dropped
+    # entirely. A backup-restore below reverts everything anyway, making this a
+    # safe no-op in that case. A user-managed Serena is left untouched.
+    from headroom.mcp_registry import OpenCodeRegistrar
+
+    opencode_registrar = OpenCodeRegistrar()
+    if opencode_registrar.detect():
+        serena_status = _remove_headroom_installed_serena_mcp(opencode_registrar)
+        if serena_status == "removed":
+            click.echo("  Removed Headroom-installed Serena MCP server from OpenCode.")
+        elif serena_status == "failed":
+            click.echo("  Serena MCP server matched Headroom ledger but could not be removed.")
 
     try:
         status, config_file = _restore_opencode_provider_config()

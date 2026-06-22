@@ -270,3 +270,150 @@ def test_unwrap_opencode_noop_when_never_wrapped(
     result = runner.invoke(main, ["unwrap", "opencode", "--no-stop-proxy"])
     assert result.exit_code == 0, result.output
     assert "Nothing to undo" in result.output
+
+
+# ---------------------------------------------------------------------------
+# MCP retrieve tool parity (mirrors `wrap codex` --no-mcp behaviour)
+# ---------------------------------------------------------------------------
+
+
+def test_wrap_opencode_registers_headroom_mcp(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    with monkeypatch.context() as m:
+        m.setattr(wrap_mod, "_ensure_rtk_binary", lambda verbose=False: None)
+        result = runner.invoke(
+            main, ["wrap", "opencode", "--prepare-only", "--no-serena", "--port", "8787"]
+        )
+    assert result.exit_code == 0, result.output
+    data = json.loads((tmp_path / "opencode.json").read_text())
+    entry = data["mcp"]["headroom"]
+    assert entry["type"] == "local"
+    assert entry["command"] == ["headroom", "mcp", "serve"]
+    assert entry["enabled"] is True
+
+
+def test_wrap_opencode_no_mcp_skips_headroom_server(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    with monkeypatch.context() as m:
+        m.setattr(wrap_mod, "_ensure_rtk_binary", lambda verbose=False: None)
+        result = runner.invoke(
+            main,
+            ["wrap", "opencode", "--prepare-only", "--no-mcp", "--no-serena", "--no-context-tool"],
+        )
+    assert result.exit_code == 0, result.output
+    data = json.loads((tmp_path / "opencode.json").read_text())
+    assert "headroom" not in data.get("mcp", {})
+    # Provider routing is still injected even without the MCP tool.
+    assert "127.0.0.1" in data["provider"]["openai"]["options"]["baseURL"]
+
+
+def test_wrap_unwrap_opencode_reverts_mcp_via_backup(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    config_file = tmp_path / "opencode.json"
+    original = json.dumps({"model": "anthropic/claude-sonnet-4-5"}, indent=2) + "\n"
+    config_file.write_text(original)
+
+    with monkeypatch.context() as m:
+        m.setattr(wrap_mod, "_ensure_rtk_binary", lambda verbose=False: None)
+        runner.invoke(main, ["wrap", "opencode", "--prepare-only", "--no-serena", "--port", "8787"])
+    assert "headroom" in json.loads(config_file.read_text())["mcp"]
+
+    with monkeypatch.context() as m:
+        m.setattr(wrap_mod, "_stop_local_proxy_for_unwrap", lambda port: "stopped")
+        result = runner.invoke(main, ["unwrap", "opencode", "--port", "9999"])
+    assert result.exit_code == 0, result.output
+    # Backup-restore reverts providers AND the MCP server byte-for-byte.
+    assert config_file.read_text() == original
+
+
+def test_restore_opencode_no_backup_strips_provider_and_mcp(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    config_file = tmp_path / "opencode.json"
+    # Crash case: wrapped config with no pre-wrap backup.
+    config_file.write_text(
+        json.dumps(
+            {
+                "model": "openai/gpt-4o",
+                "provider": {"openai": {"options": {"baseURL": "http://127.0.0.1:8787/v1"}}},
+                "mcp": {
+                    "headroom": {
+                        "type": "local",
+                        "command": ["headroom", "mcp", "serve"],
+                        "enabled": True,
+                    }
+                },
+            },
+            indent=2,
+        )
+    )
+
+    status, _ = wrap_mod._restore_opencode_provider_config()
+    assert status == "cleaned"
+    data = json.loads(config_file.read_text())
+    assert data == {"model": "openai/gpt-4o"}
+
+
+def test_restore_opencode_removes_headroom_only_file_with_mcp(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    config_file = tmp_path / "opencode.json"
+    config_file.write_text(
+        json.dumps(
+            {
+                "$schema": "https://opencode.ai/config.json",
+                "provider": {"openai": {"options": {"baseURL": "http://127.0.0.1:8787/v1"}}},
+                "mcp": {
+                    "headroom": {
+                        "type": "local",
+                        "command": ["headroom", "mcp", "serve"],
+                        "enabled": True,
+                    }
+                },
+            }
+        )
+    )
+
+    status, _ = wrap_mod._restore_opencode_provider_config()
+    assert status == "removed"
+    assert not config_file.exists()
+
+
+# ---------------------------------------------------------------------------
+# Savings parity: opencode joins the agent-90 high-savings profile set
+# ---------------------------------------------------------------------------
+
+
+def test_start_proxy_applies_agent_90_for_opencode(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    popen_kwargs: dict[str, object] = {}
+
+    class FakeProc:
+        returncode = None
+
+        def poll(self) -> None:
+            return None
+
+    def fake_popen(*args: object, **kwargs: object) -> FakeProc:
+        popen_kwargs.update(kwargs)
+        return FakeProc()
+
+    monkeypatch.setattr(wrap_mod, "_get_log_path", lambda: tmp_path / "proxy.log")
+    monkeypatch.setattr(wrap_mod, "_check_proxy", lambda port: True)
+    monkeypatch.setattr(wrap_mod.subprocess, "Popen", fake_popen)
+
+    wrap_mod._start_proxy(8787, agent_type="opencode")
+
+    env = popen_kwargs["env"]
+    assert isinstance(env, dict)
+    assert env["HEADROOM_SAVINGS_PROFILE"] == "agent-90"
+    assert env["HEADROOM_TARGET_RATIO"] == "0.10"
