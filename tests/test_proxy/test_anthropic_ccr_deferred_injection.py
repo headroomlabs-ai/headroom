@@ -501,3 +501,90 @@ def test_cache_mode_skip_forwards_original_prefix_when_tool_injection_is_deferre
         forwarded = captured["body"]
         assert forwarded["messages"] == original_messages
         assert "tools" not in forwarded
+
+
+def test_cache_mode_exact_prefix_replay_forwards_original_messages_when_tool_injection_is_deferred(
+    monkeypatch,
+) -> None:
+    captured: dict[str, object] = {}
+    original_messages = [{"role": "user", "content": _RAW_TRANSCRIPT}]
+    previous_forwarded_messages = [
+        {
+            "role": "user",
+            "content": "[100 items compressed to 10. Retrieve more: hash=abc123def456abc123def456]",
+        }
+    ]
+    _force_compression(monkeypatch)
+
+    with _make_proxy_client() as client:
+        proxy = client.app.state.proxy
+        proxy.config.optimize = True
+        proxy.config.image_optimize = False
+        proxy.config.ccr_inject_tool = True
+        proxy.config.mode = "cache"
+        _disable_pipeline_extensions(proxy)
+
+        fake_tracker = _FakePrefixTracker(frozen_count=1)
+        fake_tracker._last_original_messages = original_messages.copy()
+        fake_tracker._last_forwarded_messages = previous_forwarded_messages
+        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
+            "stable-session"
+        )
+        proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+
+        def _fake_apply(**kwargs):
+            captured.setdefault("compression_calls", []).append(kwargs["messages"])
+            return SimpleNamespace(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": (
+                            "[100 items compressed to 10. "
+                            "Retrieve more: hash=abc123def456abc123def456]"
+                        ),
+                    }
+                ],
+                transforms_applied=["fake:ccr"],
+                timing={},
+                tokens_before=40,
+                tokens_after=10,
+                waste_signals=None,
+            )
+
+        proxy.anthropic_pipeline.apply = _fake_apply
+
+        async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
+            captured["body"] = body
+            return httpx.Response(
+                200,
+                json={
+                    "id": "msg_ccr_cache_mode_exact_prefix",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "ok"}],
+                    "usage": {
+                        "input_tokens": 20,
+                        "output_tokens": 3,
+                        "cache_read_input_tokens": 0,
+                        "cache_creation_input_tokens": 0,
+                    },
+                },
+            )
+
+        proxy._retry_request = _fake_retry
+
+        response = client.post(
+            "/v1/messages",
+            headers={"x-api-key": "test-key", "anthropic-version": "2023-06-01"},
+            json={
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 64,
+                "messages": original_messages,
+            },
+        )
+
+        assert response.status_code == 200
+        assert captured.get("compression_calls", []) == []
+        forwarded = captured["body"]
+        assert forwarded["messages"] == original_messages
+        assert "tools" not in forwarded

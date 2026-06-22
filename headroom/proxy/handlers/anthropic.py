@@ -1206,8 +1206,12 @@ class AnthropicHandlerMixin:
                                     pipeline_timing = result.timing
                                     optimized_tokens = tokenizer.count_messages(optimized_messages)
                             else:
-                                optimized_messages = stable_forwarded_prefix
-                                optimized_tokens = tokenizer.count_messages(optimized_messages)
+                                if skip_ccr_request_compression:
+                                    optimized_messages = messages
+                                    optimized_tokens = tokenizer.count_messages(optimized_messages)
+                                else:
+                                    optimized_messages = stable_forwarded_prefix
+                                    optimized_tokens = tokenizer.count_messages(optimized_messages)
                         else:
                             # Conservative rule for cache mode:
                             # only replay exact stable message-prefix extensions.
