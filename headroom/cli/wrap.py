@@ -1080,7 +1080,12 @@ def _codex_config_paths() -> tuple[Path, Path]:
     return config_file, backup_file
 
 
-def _strip_codex_headroom_blocks(content: str, *, remove_mcp: bool = False) -> str:
+def _strip_codex_headroom_blocks(
+    content: str,
+    *,
+    remove_mcp: bool = False,
+    remove_named_mcp: bool = True,
+) -> str:
     """Remove all Headroom-managed blocks from a Codex ``config.toml`` string.
 
     Returns the cleaned content.  Safe to call on content that never contained
@@ -1107,12 +1112,13 @@ def _strip_codex_headroom_blocks(content: str, *, remove_mcp: bool = False) -> s
     if remove_mcp:
         # Remove Headroom-managed MCP blocks written by `wrap codex`.
         content = _remove_marker_span(content, _CODEX_MCP_MARKER, _CODEX_MCP_END)
-        content = re.sub(
-            r"(?ms)^# --- Headroom MCP server: [^\n]+ ---\n.*?"
-            r"^# --- end Headroom MCP server: [^\n]+ ---\n?",
-            "",
-            content,
-        )
+        if remove_named_mcp:
+            content = re.sub(
+                r"(?ms)^# --- Headroom MCP server: [^\n]+ ---\n.*?"
+                r"^# --- end Headroom MCP server: [^\n]+ ---\n?",
+                "",
+                content,
+            )
         content = _remove_marker_span(content, _MEMORY_MCP_MARKER, _MEMORY_MCP_END)
 
     # Strip any leftover top-level keys that older (or crashed) versions of
@@ -1481,7 +1487,22 @@ def _restore_codex_provider_config() -> tuple[str, Path]:
     if config_file.exists():
         original = config_file.read_text()
         if _codex_config_has_headroom_markers(original):
-            cleaned = _strip_codex_headroom_blocks(original, remove_mcp=True)
+            # Without a backup, only remove named MCP blocks when this file
+            # also carries wrap-owned provider markers from a full wrap.
+            remove_named_mcp = any(
+                marker in original
+                for marker in (
+                    _CODEX_TOP_LEVEL_MARKER,
+                    _CODEX_END_MARKER,
+                    _CODEX_MCP_MARKER,
+                    _CODEX_MCP_END,
+                )
+            )
+            cleaned = _strip_codex_headroom_blocks(
+                original,
+                remove_mcp=True,
+                remove_named_mcp=remove_named_mcp,
+            )
             if not cleaned.strip():
                 # Nothing left but Headroom content — remove the file entirely
                 # so Codex falls back to its default config.

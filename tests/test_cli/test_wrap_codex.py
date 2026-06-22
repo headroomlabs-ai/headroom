@@ -394,6 +394,30 @@ class TestInjectAndRestoreRoundTrip:
         assert status == "restored"
         assert config_file.read_text() == original
 
+    def test_memory_only_wrap_without_backup_preserves_named_mcp_block(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        _set_test_home(monkeypatch, tmp_path)
+        config_dir = tmp_path / ".codex"
+        config_dir.mkdir()
+        config_file = config_dir / "config.toml"
+        backup_file = config_dir / "config.toml.headroom-backup"
+        original = (
+            "# --- Headroom MCP server: headroom ---\n"
+            "[mcp_servers.headroom]\n"
+            'command = "headroom"\n'
+            "# --- end Headroom MCP server: headroom ---\n"
+        )
+        config_file.write_text(original)
+
+        wrap_mod._inject_memory_mcp_config("codex-user")
+        backup_file.unlink()
+
+        status, _ = wrap_mod._restore_codex_provider_config()
+
+        assert status == "cleaned"
+        assert config_file.read_text() == original
+
     def test_unwrap_handles_malformed_prior_config(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:

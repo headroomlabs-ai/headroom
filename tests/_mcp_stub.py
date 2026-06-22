@@ -57,6 +57,14 @@ def _build_mcp_sdk_stub() -> dict[str, ModuleType]:
 
 def import_module_with_mcp_stub(module_name: str):
     original_target_module = sys.modules.get(module_name)
+    parent_name, _, child_name = module_name.rpartition(".")
+    original_parent_module = sys.modules.get(parent_name) if parent_name else None
+    original_parent_attr_exists = bool(
+        original_parent_module and child_name and hasattr(original_parent_module, child_name)
+    )
+    original_parent_attr = (
+        getattr(original_parent_module, child_name) if original_parent_attr_exists else None
+    )
     original_modules = {name: sys.modules.get(name) for name in _MCP_MODULE_NAMES}
     stub_modules = _build_mcp_sdk_stub()
 
@@ -71,6 +79,16 @@ def import_module_with_mcp_stub(module_name: str):
             sys.modules.pop(module_name, None)
         else:
             sys.modules[module_name] = original_target_module
+        if child_name:
+            current_parent_module = sys.modules.get(parent_name) or original_parent_module
+            if current_parent_module is not None:
+                if original_parent_attr_exists:
+                    setattr(current_parent_module, child_name, original_parent_attr)
+                else:
+                    try:
+                        delattr(current_parent_module, child_name)
+                    except AttributeError:
+                        pass
         for name, original_module in original_modules.items():
             if original_module is None:
                 sys.modules.pop(name, None)

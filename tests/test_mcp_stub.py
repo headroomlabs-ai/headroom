@@ -79,3 +79,24 @@ def test_import_module_with_mcp_stub_reimports_target_and_restores_originals(mon
     assert sys.modules["fake_target"] is existing
     for name, module in original_modules.items():
         assert sys.modules[name] is module
+
+
+def test_import_module_with_mcp_stub_cleans_up_dotted_target_attribute(monkeypatch) -> None:
+    parent = ModuleType("fakepkg")
+    monkeypatch.setitem(sys.modules, "fakepkg", parent)
+    for name in mcp_stub._MCP_MODULE_NAMES:
+        sys.modules.pop(name, None)
+
+    imported = ModuleType("fakepkg.fake_target")
+
+    def fake_import_module(module_name: str) -> ModuleType:
+        assert module_name == "fakepkg.fake_target"
+        parent.fake_target = imported
+        return imported
+
+    monkeypatch.setattr(mcp_stub.importlib, "import_module", fake_import_module)
+
+    result = mcp_stub.import_module_with_mcp_stub("fakepkg.fake_target")
+
+    assert result is imported
+    assert not hasattr(parent, "fake_target")
