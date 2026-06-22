@@ -107,6 +107,18 @@ from headroom.providers.openclaw import (
 from headroom.providers.openclaw import (
     normalize_gateway_provider_ids as _normalize_openclaw_gateway_provider_ids_impl,
 )
+from headroom.providers.opencode import (
+    CONFIG_SCHEMA_URL as _OPENCODE_CONFIG_SCHEMA_URL,
+)
+from headroom.providers.opencode import (
+    apply_provider_overrides as _apply_opencode_provider_overrides,
+)
+from headroom.providers.opencode import (
+    config_has_headroom_overrides as _opencode_config_has_headroom_overrides,
+)
+from headroom.providers.opencode import (
+    strip_provider_overrides as _strip_opencode_provider_overrides,
+)
 from headroom.proxy.project_context import with_project_prefix as _with_project_prefix
 
 from .main import main
@@ -1438,6 +1450,151 @@ def _restore_codex_provider_config() -> tuple[str, Path]:
             return "cleaned", config_file
 
     # Nothing to undo.
+    return "noop", config_file
+
+
+# =============================================================================
+# OpenCode (sst/opencode) config injection
+#
+# OpenCode reads a JSON config file (project-local `opencode.json`, overriding
+# the global `~/.config/opencode/opencode.json`) and ignores OPENAI_BASE_URL /
+# OPENAI_API_BASE for built-in providers. To route traffic through the proxy we
+# override the `baseURL` of the built-in `anthropic` and `openai` providers in
+# the project-local file, mirroring the byte-for-byte snapshot/restore approach
+# used for Codex's config.toml.
+# =============================================================================
+
+_OPENCODE_CONFIG_FILENAME = "opencode.json"
+_OPENCODE_CONFIG_BACKUP_SUFFIX = ".headroom-backup"
+
+
+def _opencode_config_paths() -> tuple[Path, Path]:
+    """Return ``(config_file, backup_file)`` for the project-local OpenCode config.
+
+    OpenCode resolves project config from the current working directory, so the
+    file is anchored at ``$PWD/opencode.json`` (not a home-scoped path). The
+    pre-wrap snapshot sits beside it so ``headroom unwrap opencode`` — run from
+    the same directory — can restore the original byte-for-byte.
+    """
+    config_file = Path.cwd() / _OPENCODE_CONFIG_FILENAME
+    backup_file = config_file.parent / f"{config_file.name}{_OPENCODE_CONFIG_BACKUP_SUFFIX}"
+    return config_file, backup_file
+
+
+def _snapshot_opencode_config_if_unwrapped(config_file: Path, backup_file: Path) -> None:
+    """Snapshot ``opencode.json`` before the first Headroom injection.
+
+    Rules mirror the Codex snapshot helper:
+
+    * If the backup already exists, leave it — only the *pre-wrap* state is
+      snapshotted, so re-running wrap must not clobber it.
+    * If the config file doesn't exist, there's nothing to back up; unwrap will
+      remove the injected file instead of restoring a snapshot.
+    * If the config already routes a provider through Headroom, a wrap run is
+      already active: do not snapshot the injected state.
+    * A config that isn't valid JSON is still snapshotted verbatim so unwrap can
+      restore it byte-for-byte.
+    """
+    if backup_file.exists():
+        return
+    if not config_file.exists():
+        return
+    try:
+        data = json.loads(config_file.read_text(encoding="utf-8") or "{}")
+    except (OSError, json.JSONDecodeError):
+        # Unreadable or malformed JSON — still capture the exact bytes so unwrap
+        # restores precisely what the user had.
+        backup_file.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(config_file, backup_file)
+        return
+    if isinstance(data, dict) and _opencode_config_has_headroom_overrides(data):
+        return
+    backup_file.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(config_file, backup_file)
+
+
+def _inject_opencode_provider_config(port: int, project: str | None = None) -> None:
+    """Route OpenCode's built-in anthropic + openai providers through the proxy.
+
+    Merges ``provider.<name>.options.baseURL`` overrides into the project-local
+    ``opencode.json`` while preserving every other key the user configured.
+    Safe to call repeatedly — any prior Headroom override is stripped before the
+    current one is written, so re-running with a different ``port`` updates the
+    config in place. Before the first injection the pre-wrap file is snapshotted
+    so ``headroom unwrap opencode`` can restore it byte-for-byte.
+    """
+    config_file, backup_file = _opencode_config_paths()
+    config_file.parent.mkdir(parents=True, exist_ok=True)
+
+    _snapshot_opencode_config_if_unwrapped(config_file, backup_file)
+
+    existed = config_file.exists()
+    data: dict[str, Any] = {}
+    if existed:
+        try:
+            loaded = json.loads(config_file.read_text(encoding="utf-8") or "{}")
+            if isinstance(loaded, dict):
+                data = loaded
+            else:
+                click.echo(
+                    "  Warning: opencode.json is not a JSON object; writing a fresh "
+                    "Headroom config (original backed up)."
+                )
+        except (OSError, json.JSONDecodeError):
+            click.echo(
+                "  Warning: opencode.json is not valid JSON; writing a fresh Headroom "
+                "config (original backed up)."
+            )
+
+    data = _apply_opencode_provider_overrides(data, port, project)
+    # Add the schema reference only when we're creating the file, so an existing
+    # user config is touched only by the provider overrides we manage.
+    if not existed:
+        data = {"$schema": _OPENCODE_CONFIG_SCHEMA_URL, **data}
+
+    config_file.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    click.echo(
+        f"  OpenCode config: routed anthropic + openai providers through Headroom ({config_file})"
+    )
+
+
+def _restore_opencode_provider_config() -> tuple[str, Path]:
+    """Undo ``_inject_opencode_provider_config`` for the project-local config.
+
+    Returns ``(status, config_file)`` where status is one of:
+
+    * ``"restored"`` — a pre-wrap backup existed and was restored byte-for-byte;
+      the backup file has been removed.
+    * ``"cleaned"``  — no backup existed, but the Headroom provider overrides
+      were found and stripped (preserving the user's other config).
+    * ``"removed"``  — the config only contained Headroom-written content and the
+      file has been deleted.
+    * ``"noop"``     — nothing to undo; no Headroom override and no backup.
+    """
+    config_file, backup_file = _opencode_config_paths()
+
+    if backup_file.exists():
+        shutil.copy2(backup_file, config_file)
+        backup_file.unlink()
+        return "restored", config_file
+
+    if config_file.exists():
+        try:
+            data = json.loads(config_file.read_text(encoding="utf-8") or "{}")
+        except (OSError, json.JSONDecodeError):
+            return "noop", config_file
+        if isinstance(data, dict) and _opencode_config_has_headroom_overrides(data):
+            cleaned = _strip_opencode_provider_overrides(data)
+            # A file that only ever held Headroom content (provider overrides
+            # plus the schema line we add) is removed so OpenCode falls back to
+            # its defaults.
+            leftover = {k: v for k, v in cleaned.items() if k != "$schema"}
+            if not leftover:
+                config_file.unlink()
+                return "removed", config_file
+            config_file.write_text(json.dumps(cleaned, indent=2) + "\n", encoding="utf-8")
+            return "cleaned", config_file
+
     return "noop", config_file
 
 
@@ -2909,6 +3066,7 @@ def wrap() -> None:
         headroom wrap continue            # Continue (VS Code/JetBrains; injects systemMessage)
         headroom wrap goose               # Goose (Block) CLI
         headroom wrap openhands           # OpenHands CLI
+        headroom wrap opencode            # OpenCode (sst/opencode) CLI
         headroom wrap openclaw            # OpenClaw plugin bootstrap
 
     \b
@@ -2920,9 +3078,10 @@ def wrap() -> None:
           ANTHROPIC_BASE_URL / OPENAI_BASE_URL yourself.
 
     \b
-    Note: `headroom wrap opencode` does NOT exist. For opencode, run
-    `headroom proxy` and point opencode at it via OPENAI_BASE_URL.
-    `openclaw` is a separate tool — different from opencode.
+    Note: `opencode` and `openclaw` are different tools. `wrap opencode`
+    routes sst/opencode through the proxy by editing its `opencode.json`
+    config (OpenCode ignores OPENAI_BASE_URL); `wrap openclaw` installs the
+    OpenClaw ContextEngine plugin.
     """
 
 
@@ -3971,6 +4130,131 @@ def vibe(
 
 
 # =============================================================================
+# OpenCode (sst/opencode)
+# =============================================================================
+
+
+@wrap.command(context_settings={"ignore_unknown_options": True})
+@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--no-context-tool",
+    "--no-rtk",
+    "no_rtk",
+    is_flag=True,
+    help="Skip CLI context-tool setup",
+)
+@click.option(
+    "--code-graph",
+    is_flag=True,
+    help="Enable code graph indexing via codebase-memory-mcp (optional)",
+)
+@click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
+@click.option("--learn", is_flag=True, help="Enable live traffic learning")
+@click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
+@click.option(
+    "--backend", default=None, help="API backend: 'anthropic', 'anyllm', 'litellm-vertex', etc."
+)
+@click.option("--anyllm-provider", default=None, help="Provider for any-llm backend")
+@click.option("--region", default=None, help="Cloud region for Bedrock/Vertex")
+@click.option("--verbose", "-v", is_flag=True, help="Verbose output")
+@click.option("--prepare-only", is_flag=True, hidden=True)
+@click.argument("opencode_args", nargs=-1, type=click.UNPROCESSED)
+def opencode(
+    port: int,
+    no_rtk: bool,
+    code_graph: bool,
+    no_proxy: bool,
+    learn: bool,
+    memory: bool,
+    backend: str | None,
+    anyllm_provider: str | None,
+    region: str | None,
+    verbose: bool,
+    prepare_only: bool,
+    opencode_args: tuple,
+) -> None:
+    """Launch OpenCode (sst/opencode) through Headroom proxy.
+
+    \b
+    OpenCode reads its provider configuration from ``opencode.json`` rather
+    than environment variables, so this command merges a Headroom override
+    into the project-local ``opencode.json`` that routes the built-in
+    ``anthropic`` and ``openai`` providers through the proxy. Your existing
+    model selection (``anthropic/claude-…``, ``openai/gpt-…``) keeps working —
+    every request is just sent through Headroom first. It also sets up the
+    selected CLI context tool (rtk guidance in ``AGENTS.md``) and launches
+    ``opencode``.
+
+    \b
+    The config edit is reversible: run ``headroom unwrap opencode`` from the
+    same directory to restore your original ``opencode.json``.
+
+    \b
+    Examples:
+        headroom wrap opencode                       # Start proxy + context tool + opencode
+        headroom wrap opencode -- run "fix the bug"  # Pass args to opencode
+        headroom wrap opencode --no-context-tool     # Skip CLI context-tool setup
+        headroom wrap opencode --port 9999           # Custom proxy port
+    """
+    project = _project_name_from_cwd()
+
+    # Setup CLI context tool for OpenCode. OpenCode reads AGENTS.md (project
+    # root) for guidance, the same file Codex uses.
+    if not no_rtk:
+        agents_md: Path | None = Path.cwd() / "AGENTS.md"
+        _setup_context_tool_for_agent(
+            agent="opencode",
+            agent_display="OpenCode",
+            marker_path=agents_md,
+            on_rtk_ready=lambda _rtk: _inject_rtk_instructions(
+                cast(Path, agents_md), verbose=verbose
+            ),
+            verbose=verbose,
+        )
+
+    # Route OpenCode through the proxy by editing its opencode.json config.
+    _inject_opencode_provider_config(port, project)
+
+    if prepare_only:
+        return
+
+    opencode_bin = shutil.which("opencode")
+    if not opencode_bin:
+        click.echo("Error: 'opencode' not found in PATH.")
+        click.echo("Install OpenCode: https://opencode.ai/docs/  (e.g. npm i -g opencode-ai)")
+        raise SystemExit(1)
+
+    # OpenCode takes no base-URL environment variables — routing is entirely via
+    # opencode.json (injected above), so the child inherits the current env.
+    env = dict(os.environ)
+    env_vars_display = [
+        f"opencode.json → providers via {_render_opencode_proxy_url(port, project)}"
+    ]
+
+    _launch_tool(
+        binary=opencode_bin,
+        args=opencode_args,
+        env=env,
+        port=port,
+        no_proxy=no_proxy,
+        tool_label="OPENCODE",
+        env_vars_display=env_vars_display,
+        learn=learn,
+        memory=memory,
+        agent_type="opencode",
+        code_graph=code_graph,
+        backend=backend,
+        anyllm_provider=anyllm_provider,
+        region=region,
+    )
+
+
+def _render_opencode_proxy_url(port: int, project: str | None) -> str:
+    """Return the project-prefixed proxy base URL shown in the OpenCode launch banner."""
+    return _with_project_prefix(f"http://127.0.0.1:{port}/v1", project)
+
+
+# =============================================================================
 # Cursor
 # =============================================================================
 
@@ -4927,6 +5211,58 @@ def unwrap_codex(port: int, no_stop_proxy: bool) -> None:
 
     click.echo()
     click.echo("✓ Codex is no longer routed through the Headroom proxy.")
+    if not no_stop_proxy and status != "noop":
+        _echo_unwrap_proxy_stop_status(_stop_local_proxy_for_unwrap(port), port)
+    click.echo()
+
+
+@unwrap.command("opencode")
+@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option("--no-stop-proxy", is_flag=True, help="Do not stop the local Headroom proxy")
+def unwrap_opencode(port: int, no_stop_proxy: bool) -> None:
+    """Undo ``headroom wrap opencode`` edits to the project-local ``opencode.json``.
+
+    Run this from the same directory you wrapped from — OpenCode's project
+    config lives in the working directory, so unwrap looks for
+    ``$PWD/opencode.json``.
+
+    \b
+    Behaviour:
+
+    * If a pre-wrap backup (``opencode.json.headroom-backup``) exists, the
+      original file is restored byte-for-byte and the backup is removed.
+    * Otherwise, if the config still contains the Headroom provider overrides,
+      only those overrides are stripped and the rest of the config is kept.
+    * If the config only ever held Headroom-written content, the file is removed
+      so OpenCode falls back to its defaults.
+    * If neither a backup nor a Headroom override is present, this is a safe
+      no-op.
+    """
+    click.echo()
+    click.echo("  ╔═══════════════════════════════════════════════╗")
+    click.echo("  ║          HEADROOM UNWRAP: OPENCODE            ║")
+    click.echo("  ╚═══════════════════════════════════════════════╝")
+    click.echo()
+
+    try:
+        status, config_file = _restore_opencode_provider_config()
+    except Exception as e:  # pragma: no cover - filesystem-level errors
+        raise click.ClickException(f"could not unwrap OpenCode config: {e}") from e
+
+    if status == "restored":
+        click.echo(f"  Restored prior {config_file} from pre-wrap backup.")
+    elif status == "cleaned":
+        click.echo(f"  Removed Headroom provider overrides from {config_file}; other content kept.")
+    elif status == "removed":
+        click.echo(f"  Removed {config_file} (contained only Headroom-written config).")
+    else:
+        click.echo(
+            f"  Nothing to undo: {config_file} has no Headroom provider overrides. "
+            "Run unwrap from the directory you wrapped from if you don't see your config."
+        )
+
+    click.echo()
+    click.echo("✓ OpenCode is no longer routed through the Headroom proxy.")
     if not no_stop_proxy and status != "noop":
         _echo_unwrap_proxy_stop_status(_stop_local_proxy_for_unwrap(port), port)
     click.echo()
