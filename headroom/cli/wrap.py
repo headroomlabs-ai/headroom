@@ -3719,8 +3719,7 @@ def codex(
         try:
             import asyncio
 
-            from headroom.memory.backends.local import LocalBackend, LocalBackendConfig
-            from headroom.memory.sync import sync_import
+            from headroom.memory.sync import _build_sync_backend, sync_import
             from headroom.memory.sync_adapters.claude_code import (
                 ClaudeCodeAdapter,
                 get_claude_memory_dir,
@@ -3729,8 +3728,7 @@ def codex(
             claude_memory_dir = get_claude_memory_dir()
 
             async def _import_claude_memories() -> int:
-                config = LocalBackendConfig(db_path=db_path)
-                backend = LocalBackend(config)
+                backend = _build_sync_backend(db_path)
                 await backend._ensure_initialized()
                 adapter = ClaudeCodeAdapter(claude_memory_dir)
                 count = await sync_import(backend, adapter, mem_user)
