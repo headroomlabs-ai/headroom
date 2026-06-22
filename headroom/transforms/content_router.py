@@ -58,6 +58,7 @@ logger = logging.getLogger(__name__)
 
 
 _detect_backend_warned = False
+_detect_panic_warned = False
 
 
 def _router_debug_dumps(value: Any) -> str:
@@ -151,11 +152,30 @@ def _detect_content(content: str) -> DetectionResult:
 
     from headroom._core import detect_content_type as _rust_detect
 
-    rust_result = _rust_detect(content)
-    # Rust's `content_type` is the lowercase string tag (e.g.
-    # "json_array"); translate to the Python `ContentType` enum so
-    # downstream mapping keys match.
-    content_type = ContentType(rust_result.content_type)
+    global _detect_panic_warned
+    try:
+        rust_result = _rust_detect(content)
+        # Rust's `content_type` is the lowercase string tag (e.g.
+        # "json_array"); translate to the Python `ContentType` enum so
+        # downstream mapping keys match.
+        content_type = ContentType(rust_result.content_type)
+    except (KeyboardInterrupt, SystemExit, GeneratorExit):
+        raise
+    except BaseException as exc:  # noqa: BLE001
+        # A native Rust panic surfaces as pyo3_runtime.PanicException, which
+        # derives from BaseException — so ``except Exception`` would miss it and
+        # the panic would propagate out as an HTTP 500. Any detector failure
+        # (panic, or an unrecognized content-type tag) degrades to the
+        # pure-Python detector instead of aborting the request. See #1123.
+        if not _detect_panic_warned:
+            _detect_panic_warned = True
+            logger.warning(
+                "Native content detector failed (%s); falling back to "
+                "pure-Python detection.",
+                type(exc).__name__,
+            )
+        return _regex_detect_content_type(content)
+
     if content_type is ContentType.PLAIN_TEXT:
         regex_result = _regex_detect_content_type(content)
         if regex_result.content_type is not ContentType.PLAIN_TEXT:
