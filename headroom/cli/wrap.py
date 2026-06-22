@@ -1214,8 +1214,8 @@ def _snapshot_codex_config_if_unwrapped(config_file: Path, backup_file: Path) ->
       *pre-wrap* state, so running wrap repeatedly must not clobber it.
     * If the config file doesn't exist yet, there's nothing to back up; unwrap
       will remove the file entirely instead of restoring a snapshot.
-    * If the config already contains a Headroom marker, a wrap run is already
-      active: do not snapshot the injected state.
+    * If the config already contains any Headroom-managed Codex marker, a wrap
+      run is already active: do not snapshot the injected state.
     """
     if backup_file.exists():
         return
@@ -1225,7 +1225,15 @@ def _snapshot_codex_config_if_unwrapped(config_file: Path, backup_file: Path) ->
         content = config_file.read_text()
     except OSError:
         return
-    if _CODEX_TOP_LEVEL_MARKER in content or _CODEX_END_MARKER in content:
+    managed_markers = (
+        _CODEX_TOP_LEVEL_MARKER,
+        _CODEX_END_MARKER,
+        _CODEX_MCP_MARKER,
+        _MEMORY_MCP_MARKER,
+    )
+    if any(marker in content for marker in managed_markers):
+        return
+    if "# --- Headroom MCP server:" in content:
         return
     backup_file.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(config_file, backup_file)
