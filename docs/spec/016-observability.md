@@ -104,6 +104,8 @@ logging:
 - Cache hit rate
 - Top compressed endpoints
 - Session overview
+- Recent requests feed (latest requests with per-request token savings)
+- Per-provider / per-model breakdown
 
 **Requires:** the proxy process to be running. The dashboard is served by default at `/dashboard`.
 
