@@ -13,6 +13,13 @@ from .anthropic_prices import (
 from .anthropic_prices import (
     LAST_UPDATED as ANTHROPIC_LAST_UPDATED,
 )
+from .deepseek_prices import (
+    DEEPSEEK_PRICES,
+    get_deepseek_registry,
+)
+from .deepseek_prices import (
+    LAST_UPDATED as DEEPSEEK_LAST_UPDATED,
+)
 from .litellm_pricing import (
     LiteLLMModelPricing,
     estimate_cost,
@@ -26,13 +33,6 @@ from .openai_prices import (
 from .openai_prices import (
     OPENAI_PRICES,
     get_openai_registry,
-)
-from .deepseek_prices import (
-    DEEPSEEK_PRICES,
-    get_deepseek_registry,
-)
-from .deepseek_prices import (
-    LAST_UPDATED as DEEPSEEK_LAST_UPDATED,
 )
 from .registry import CostEstimate, ModelPricing, PricingRegistry
 
