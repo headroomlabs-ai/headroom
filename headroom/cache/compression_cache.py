@@ -54,6 +54,19 @@ def _extract_tool_result_content(msg: dict) -> str | None:
                 inner = block.get("content")
                 if isinstance(inner, str):
                     return inner
+                # Claude Code (and the Anthropic Messages API generally) sends
+                # tool_result content as a list of blocks. Only all-text lists
+                # are safe to flatten — mixed lists (e.g. images) pass through.
+                if isinstance(inner, list) and inner:
+                    texts: list[str] = []
+                    for b in inner:
+                        if not (isinstance(b, dict) and b.get("type") == "text"):
+                            continue
+                        text = b.get("text")
+                        if isinstance(text, str):
+                            texts.append(text)
+                    if len(texts) == len(inner):
+                        return "\n".join(texts)
     return None
 
 
@@ -69,7 +82,12 @@ def _swap_tool_result_content(msg: dict, new_content: str) -> dict:
     if isinstance(content, list):
         for block in content:
             if isinstance(block, dict) and block.get("type") == "tool_result":
-                block["content"] = new_content
+                # Preserve the block-list shape the client sent so the
+                # rewritten request stays valid for strict API consumers.
+                if isinstance(block.get("content"), list):
+                    block["content"] = [{"type": "text", "text": new_content}]
+                else:
+                    block["content"] = new_content
                 break
     return new_msg
 

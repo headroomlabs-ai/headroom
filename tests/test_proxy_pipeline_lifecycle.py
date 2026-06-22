@@ -8,7 +8,7 @@ import httpx
 from fastapi.testclient import TestClient
 
 from headroom.pipeline import PipelineStage
-from headroom.proxy.server import ProxyConfig, create_app
+from headroom.proxy.server import HeadroomProxy, ProxyConfig, create_app
 
 
 class _RecordingExtension:
@@ -235,3 +235,27 @@ def test_anthropic_messages_pipeline_events_cover_proxy_lifecycle(monkeypatch) -
     assert response.status_code == 200
     _assert_stage_order(recorder.stages)
     _assert_compressed_event_carries_originals(recorder.events)
+
+
+def _interceptor_test_config() -> ProxyConfig:
+    return ProxyConfig(
+        optimize=True,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+        code_aware_enabled=False,
+    )
+
+
+def test_intercept_env_registers_interceptor_first(monkeypatch):
+    monkeypatch.setenv("HEADROOM_INTERCEPT_ENABLED", "1")
+    proxy = HeadroomProxy(_interceptor_test_config())
+    assert proxy.anthropic_pipeline.transforms[0].name == "tool_result_interceptors"
+    assert proxy.openai_pipeline.transforms[0].name == "tool_result_interceptors"
+
+
+def test_interceptor_absent_without_env(monkeypatch):
+    monkeypatch.delenv("HEADROOM_INTERCEPT_ENABLED", raising=False)
+    proxy = HeadroomProxy(_interceptor_test_config())
+    names = [t.name for t in proxy.anthropic_pipeline.transforms]
+    assert "tool_result_interceptors" not in names

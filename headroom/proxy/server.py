@@ -646,6 +646,14 @@ class HeadroomProxy(
             CacheAligner(CacheAlignerConfig(enabled=False)),
             ContentRouter(router_config, observer=self.metrics),
         ]
+        # The CLI exports HEADROOM_INTERCEPT_ENABLED for --intercept-tool-results,
+        # but only TransformPipeline's default builder honors it; this explicit
+        # transforms list bypasses that, leaving the flag inert in the proxy.
+        if os.environ.get("HEADROOM_INTERCEPT_ENABLED"):
+            from headroom.proxy.interceptors import ToolResultInterceptorTransform
+
+            transforms.insert(0, ToolResultInterceptorTransform())
+            logger.info("Tool-result interceptors: ENABLED (ast-grep Read outliner)")
         self._code_aware_status = "lazy" if config.code_aware_enabled else "disabled"
 
         self.anthropic_pipeline = TransformPipeline(
