@@ -29,6 +29,10 @@ from .runtime import resolve_headroom_command
 _MACOS_BOOTSTRAP_RETRIES = 30
 _MACOS_BOOTSTRAP_RETRY_DELAY = 0.5
 
+# `launchctl bootout` of an already-absent job exits with ESRCH ("No such
+# process"). That single code is the only failure we treat as already-stopped.
+_LAUNCHCTL_ESRCH = 3
+
 
 def _is_windows() -> bool:
     return sys.platform.startswith("win")
@@ -376,14 +380,21 @@ def stop_supervisor(manifest: DeploymentManifest) -> None:
             and manifest.supervisor_kind == SupervisorKind.SERVICE.value
             else f"gui/{os.getuid()}"
         )
-        # `bootout` returns non-zero when the job is not present in the domain
-        # (error 3 / "No such process"). Treat that as already stopped rather
-        # than raising — otherwise `restart` aborts before it can start again.
-        subprocess.run(
+        # `bootout` exits with ESRCH ("No such process") when the job is already
+        # absent — tolerate only that, so `restart` can proceed to start again.
+        # Any other non-zero result is a real failure (permissions, malformed
+        # domain, launchd error) and must surface; otherwise `restart` could
+        # report success while a stale job is still running.
+        result = subprocess.run(
             ["launchctl", "bootout", f"{domain}/{label}"],
             capture_output=True,
             text=True,
         )
+        if result.returncode not in (0, _LAUNCHCTL_ESRCH):
+            detail = (result.stderr or result.stdout or "").strip()
+            raise click.ClickException(
+                f"launchctl bootout failed for {domain}/{label}: {detail or 'unknown error'}"
+            )
         return
     if _is_windows() and manifest.supervisor_kind == SupervisorKind.SERVICE.value:
         subprocess.run(["sc.exe", "stop", manifest.service_name], check=True)

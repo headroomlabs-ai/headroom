@@ -444,8 +444,8 @@ def test_macos_start_raises_after_bootstrap_keeps_failing(monkeypatch, tmp_path:
 
 
 def test_macos_stop_tolerates_missing_job(monkeypatch) -> None:
-    # `bootout` of an absent job returns non-zero; stop must not raise so that
-    # `restart` can proceed to start again.
+    # `bootout` of an absent job exits with ESRCH (3); stop must not raise so
+    # that `restart` can proceed to start again.
     monkeypatch.setattr("headroom.install.supervisors.sys.platform", "darwin")
     monkeypatch.setattr("headroom.install.supervisors.os.getuid", lambda: 77, raising=False)
     calls: list[list[str]] = []
@@ -459,6 +459,23 @@ def test_macos_stop_tolerates_missing_job(monkeypatch) -> None:
 
     stop_supervisor(_manifest(supervisor=SupervisorKind.SERVICE.value))
     assert calls == [["launchctl", "bootout", "gui/77/com.headroom.default"]]
+
+
+def test_macos_stop_raises_on_non_esrch_failure(monkeypatch) -> None:
+    # A non-3 `bootout` failure (e.g. permissions) is a real error and must
+    # surface — otherwise `restart` could report success with a stale job still
+    # running.
+    monkeypatch.setattr("headroom.install.supervisors.sys.platform", "darwin")
+    monkeypatch.setattr("headroom.install.supervisors.os.getuid", lambda: 77, raising=False)
+    monkeypatch.setattr(
+        "headroom.install.supervisors.subprocess.run",
+        lambda command, **kwargs: _LaunchctlResult(
+            9, stderr="Boot-out failed: 9: Operation not permitted"
+        ),
+    )
+
+    with pytest.raises(click.ClickException, match="bootout failed"):
+        stop_supervisor(_manifest(supervisor=SupervisorKind.SERVICE.value))
 
 
 def test_remove_supervisor_removes_user_crontab_block(monkeypatch) -> None:
