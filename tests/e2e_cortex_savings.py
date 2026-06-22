@@ -449,7 +449,9 @@ def main() -> int:
     avg_usd_per_call = tu / max(len(results), 1)
     print(f"  Tokens saved  :  {ts:>8,}  prompt tokens  ({len(results)} calls)")
     print(f"  Avg per call  :  {avg_saved_per_call:>8,.0f}  tokens  /  ${avg_usd_per_call:.5f}")
-    print(f"  At 1k/day     :  ${avg_usd_per_call * 1_000:.2f}/day  │  ${avg_usd_per_call * 365_000:,.0f}/year")
+    print(
+        f"  At 1k/day     :  ${avg_usd_per_call * 1_000:.2f}/day  │  ${avg_usd_per_call * 365_000:,.0f}/year"
+    )
     print("╚══════════════════════════════════════════════════════════╝")
     return 0
 
