@@ -317,3 +317,30 @@ class TestBuildLaunchEnv:
         environ = {"OPENAI_BASE_URL": "https://original.openai.com"}
         env, display = build_launch_env(8787, environ=environ)
         assert env["OPENAI_BASE_URL"] == "https://original.openai.com"
+
+    def test_single_mode_sets_headroom_proxy_url(self):
+        env, display = build_launch_env(8787, routing_mode="single")
+        assert env.get("HEADROOM_PROXY_URL") == "http://127.0.0.1:8787"
+
+    def test_single_mode_sets_node_options_with_import_flag(self):
+        env, display = build_launch_env(9000, routing_mode="single")
+        node_opts = env.get("NODE_OPTIONS", "")
+        assert "--import=" in node_opts
+        assert "shim.mjs" in node_opts
+
+    def test_single_mode_preserves_existing_node_options(self):
+        environ = {"NODE_OPTIONS": "--max-old-space-size=4096"}
+        env, display = build_launch_env(8787, environ=environ, routing_mode="single")
+        node_opts = env.get("NODE_OPTIONS", "")
+        assert "--import=" in node_opts
+        assert "--max-old-space-size=4096" in node_opts
+
+    def test_multi_mode_does_not_set_shim_env_vars(self):
+        env, display = build_launch_env(8787, routing_mode="multi")
+        assert "HEADROOM_PROXY_URL" not in env
+        assert "NODE_OPTIONS" not in env or "--import=" not in env.get("NODE_OPTIONS", "")
+
+    def test_shim_file_exists(self):
+        import importlib.resources
+        shim = importlib.resources.files("headroom.providers.opencode").joinpath("shim.mjs")
+        assert Path(str(shim)).exists(), "shim.mjs must be present in the package"

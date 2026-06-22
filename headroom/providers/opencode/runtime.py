@@ -11,21 +11,25 @@ Routing modes
 -------------
 Two routing strategies are supported:
 
-**multi** (default)
+**single** (default)
+  A single Headroom proxy on one port.  A lightweight ESM fetch shim
+  (``shim.mjs``) is injected via ``NODE_OPTIONS=--import=...`` so that
+  *every* outbound AI-provider call — including providers added
+  mid-session via ``/connect`` — is intercepted and routed through the
+  proxy.  The original upstream origin is passed as the
+  ``x-headroom-base-url`` header; proxy route handlers read it and
+  forward to the real provider.  Providers that were known at launch
+  are also listed in the ``OPENCODE_CONFIG_CONTENT`` overlay so
+  OpenCode's model-picker shows real provider names (``deepseek``,
+  ``opencode-go``) rather than a generic wrapper name.
+
+**multi** (``--routing-mode multi``)
   One Headroom proxy process per unique upstream URL.  Each proxy's
   OpenAI and Anthropic API targets are set to its upstream so the
   proxy's existing handlers (compression, CCR, caching) operate
   correctly.  OpenCode's ``baseURL`` is pointed at the port for that
-  upstream.  Zero proxy handler changes required.
-
-**single** (``--routing-mode single``)
-  A single Headroom proxy on one port.  Providers that support the
-  ``x-headroom-base-url`` request header (Anthropic, Gemini, and
-  OpenAI-compatible passthrough) share this proxy.  Providers that
-  require handler-specific processing (OpenAI itself, Gemini
-  streaming) get their own dedicated proxy.  The ``x-headroom-base-url``
-  header is read by the proxy route handlers and stripped before
-  the upstream call.
+  upstream.  Zero proxy handler changes required.  Does not cover
+  providers added mid-session.
 
 Provider routing strategy
 -------------------------
@@ -64,6 +68,7 @@ Per-project attribution uses a ``/p/<name>`` path prefix inserted
 
 from __future__ import annotations
 
+import importlib.resources
 import json
 import os
 import re
@@ -397,7 +402,7 @@ def build_launch_env(
     environ: Mapping[str, str] | None = None,
     project: str | None = None,
     *,
-    routing_mode: str = "multi",
+    routing_mode: str = "single",
     include_mcp: bool = True,
 ) -> tuple[dict[str, str], list[str]]:
     """Build the process environment for ``headroom wrap opencode``.
@@ -405,8 +410,13 @@ def build_launch_env(
     Returns ``(env_dict, display_lines)``.  The display lines are
     human-readable summaries of the env vars we set, for the CLI banner.
 
-    The overlay is injected via ``OPENCODE_CONFIG_CONTENT`` so OpenCode
-    picks it up at runtime without modifying the on-disk config.
+    In single-proxy mode (default) a fetch shim is injected via
+    ``NODE_OPTIONS=--import=<shim.mjs>`` so that *all* outbound AI calls —
+    including providers added mid-session — route through the proxy.
+    ``OPENCODE_CONFIG_CONTENT`` still lists known providers so the model
+    picker shows real provider names.
+
+    The overlay does NOT modify OpenCode's on-disk config.
     """
     env = dict(environ or os.environ)
     provider_map = build_provider_upstream_map()
@@ -421,6 +431,25 @@ def build_launch_env(
     display = [
         f"OPENCODE_CONFIG_CONTENT={{provider: {','.join(provider_map.keys())}}}"
     ]
+
+    # In single-proxy mode inject the fetch shim so mid-session /connect
+    # providers are also captured (shim intercepts at the HTTP boundary).
+    if routing_mode == "single":
+        proxy_url = f"http://127.0.0.1:{port}"
+        env["HEADROOM_PROXY_URL"] = proxy_url
+
+        shim_path = (
+            importlib.resources.files("headroom.providers.opencode")
+            .joinpath("shim.mjs")
+        )
+        existing_node_opts = env.get("NODE_OPTIONS", "")
+        import_flag = f"--import={shim_path}"
+        env["NODE_OPTIONS"] = (
+            f"{import_flag} {existing_node_opts}".strip()
+            if existing_node_opts
+            else import_flag
+        )
+        display.append(f"HEADROOM_PROXY_URL={proxy_url} (fetch shim active)")
 
     if project and "HEADROOM_PROJECT" not in env:
         env["HEADROOM_PROJECT"] = project

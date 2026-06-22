@@ -4962,7 +4962,7 @@ def unwrap_codex(port: int, no_stop_proxy: bool) -> None:
 @click.option("--no-mcp", is_flag=True, help="Skip headroom MCP server registration")
 @click.option("--no-serena", is_flag=True, help="Skip Serena MCP server registration")
 @click.option("--code-graph", is_flag=True, help="Enable code graph indexing via codebase-memory-mcp (optional)")
-@click.option("--routing-mode", default="multi", type=click.Choice(["multi", "single"]), help="Proxy routing mode: 'multi' (one proxy per upstream) or 'single' (shared proxy with header routing)")
+@click.option("--routing-mode", default="single", type=click.Choice(["multi", "single"]), help="Proxy routing mode: 'single' (shared proxy + fetch shim, default) or 'multi' (one proxy per upstream)")
 @click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
 @click.option("--learn", is_flag=True, help="Enable live traffic learning")
 @click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
@@ -4993,11 +4993,11 @@ def opencode(
 
     \b
     Discovers providers from auth.json and opencode.json, builds a config
-    overlay via ``OPENCODE_CONFIG_CONTENT``, and routes OpenCode's API
-    calls through Headroom proxy instances.  In multi-proxy mode (default)
-    each unique upstream URL gets its own proxy.  In single-proxy mode
-    (``--routing-mode single``) providers share a single proxy with
-    ``x-headroom-base-url`` header routing.
+    overlay via ``OPENCODE_CONFIG_CONTENT``, and routes ALL of OpenCode's
+    API calls through a Headroom proxy — including providers added
+    mid-session via ``/connect``.  A fetch-level shim (``shim.mjs``) is
+    injected via ``NODE_OPTIONS`` so interception happens at the HTTP
+    boundary, transparently and without touching user config.
 
     \b
     The overlay does NOT overwrite OpenCode's on-disk config — it is
