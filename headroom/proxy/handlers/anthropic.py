@@ -1082,12 +1082,13 @@ class AnthropicHandlerMixin:
                             _bg_messages = messages
                             _bg_working = working_messages
                             _bg_frozen = frozen_message_count
-                            # Cheap dedup key: the gate only fires at frozen==0
-                            # (first deferral of a session), so session_id + size
-                            # disambiguates enough -- avoids JSON-serializing the
-                            # full large message list on the event loop for a key.
+                            # Dedup key: the gate only fires at frozen==0 (the
+                            # first in-flight deferral of a session episode), so
+                            # session_id alone is the right granularity -- one
+                            # background job per session in flight -- and avoids
+                            # JSON-serializing the large message list for a key.
                             self._background_compressor.enqueue(
-                                f"{session_id}:{original_tokens}",
+                                session_id,
                                 lambda: self.anthropic_pipeline.apply(
                                     messages=_bg_working,
                                     model=model,

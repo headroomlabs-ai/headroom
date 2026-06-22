@@ -1889,6 +1889,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 await proxy.traffic_learner.stop()
             if proxy._background_compression_enabled:
                 await proxy._background_compressor.stop()
+            proxy._background_compression_executor.shutdown(wait=False)
             if proxy.code_graph_watcher:
                 proxy.code_graph_watcher.stop()
             await proxy.shutdown()

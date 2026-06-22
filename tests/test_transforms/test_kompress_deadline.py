@@ -37,13 +37,13 @@ def test_compress_partial_run_keeps_processed_head_plus_verbatim_tail(monkeypatc
     # the deadline (kept verbatim). Output must be compressed-head + verbatim-tail.
     # Clock: call1=t_deadline(0); calls 2-4 are chunk-0's check+inference reads
     # (under budget); call 5+ is chunk-1's check -> trips.
-    state = {"n": 0}
+    # Robust clock: jump past the deadline only AFTER chunk 0 is processed
+    # (tracked via the model mock), so adding perf_counter calls inside the chunk
+    # body -- e.g. sub-stage timing -- can't shift when the deadline trips.
+    state = {"chunks_done": 0}
 
     def fake_clock():
-        state["n"] += 1
-        if state["n"] == 1:
-            return 0.0
-        return 0.001 if state["n"] <= 4 else 999.0
+        return 999.0 if state["chunks_done"] >= 1 else 0.0
 
     monkeypatch.setattr(kc.time, "perf_counter", fake_clock)
 
@@ -59,7 +59,9 @@ def test_compress_partial_run_keeps_processed_head_plus_verbatim_tail(monkeypatc
     class _Model:
         def get_keep_mask(self, input_ids, attention_mask):
             n = len(input_ids[0])
-            return [[i < n // 2 for i in range(n)]]  # keep first half of the chunk
+            mask = [[i < n // 2 for i in range(n)]]  # keep first half of the chunk
+            state["chunks_done"] += 1  # after chunk 0, the clock trips the deadline
+            return mask
 
     monkeypatch.setattr(kc, "_load_kompress", lambda *a, **k: (_Model(), _Tok(), "onnx"))
     monkeypatch.setattr(kc, "_model_device_type", lambda *a, **k: "cpu")
