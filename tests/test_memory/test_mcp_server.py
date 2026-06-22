@@ -1,4 +1,5 @@
 import asyncio
+import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -8,6 +9,20 @@ from headroom.memory.models import Memory
 from tests._mcp_stub import import_module_with_mcp_stub
 
 mcp_server_mod = import_module_with_mcp_stub("headroom.memory.mcp_server")
+
+
+def test_import_module_with_mcp_stub_restores_sys_modules_slot() -> None:
+    module_name = "headroom.memory.mcp_server"
+    original_module = sys.modules.pop(module_name, None)
+
+    try:
+        stubbed_module = import_module_with_mcp_stub(module_name)
+        assert stubbed_module.__name__ == module_name
+        assert getattr(stubbed_module.Server, "__name__", "") == "DummyServer"
+        assert sys.modules.get(module_name) is original_module
+    finally:
+        if original_module is not None:
+            sys.modules[module_name] = original_module
 
 
 def test_warm_up_backend_batches_embedding_and_indexing() -> None:

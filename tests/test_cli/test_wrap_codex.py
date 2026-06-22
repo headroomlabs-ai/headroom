@@ -174,19 +174,21 @@ class TestSnapshotCodexConfig:
 
         assert not backup_file.exists()
 
-    def test_no_backup_when_config_already_contains_named_mcp_marker(self, tmp_path: Path) -> None:
+    def test_backup_when_config_contains_named_mcp_marker(self, tmp_path: Path) -> None:
         config_file = tmp_path / "config.toml"
         backup_file = tmp_path / "config.toml.headroom-backup"
-        config_file.write_text(
+        original = (
             "# --- Headroom MCP server: headroom ---\n"
             "[mcp_servers.headroom]\n"
             'command = "headroom"\n'
             "# --- end Headroom MCP server: headroom ---\n"
         )
+        config_file.write_text(original)
 
         wrap_mod._snapshot_codex_config_if_unwrapped(config_file, backup_file)
 
-        assert not backup_file.exists()
+        assert backup_file.exists()
+        assert backup_file.read_text() == original
 
 
 class TestCodexMemoryMcpConfig:
@@ -369,6 +371,28 @@ class TestInjectAndRestoreRoundTrip:
         cleaned = config_file.read_text()
         assert 'model = "gpt-4o"' in cleaned
         assert "headroom" not in cleaned
+
+    def test_memory_only_wrap_restores_preexisting_named_mcp_block(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        _set_test_home(monkeypatch, tmp_path)
+        config_dir = tmp_path / ".codex"
+        config_dir.mkdir()
+        config_file = config_dir / "config.toml"
+        original = (
+            "# --- Headroom MCP server: headroom ---\n"
+            "[mcp_servers.headroom]\n"
+            'command = "headroom"\n'
+            "# --- end Headroom MCP server: headroom ---\n"
+        )
+        config_file.write_text(original)
+
+        wrap_mod._inject_memory_mcp_config("codex-user")
+
+        status, _ = wrap_mod._restore_codex_provider_config()
+
+        assert status == "restored"
+        assert config_file.read_text() == original
 
     def test_unwrap_handles_malformed_prior_config(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

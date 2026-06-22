@@ -56,17 +56,21 @@ def _build_mcp_sdk_stub() -> dict[str, ModuleType]:
 
 
 def import_module_with_mcp_stub(module_name: str):
+    original_target_module = sys.modules.get(module_name)
     original_modules = {name: sys.modules.get(name) for name in _MCP_MODULE_NAMES}
     stub_modules = _build_mcp_sdk_stub()
 
+    sys.modules.pop(module_name, None)
     for name, module in stub_modules.items():
         sys.modules[name] = module
 
     try:
-        if module_name in sys.modules:
-            return importlib.reload(sys.modules[module_name])
         return importlib.import_module(module_name)
     finally:
+        if original_target_module is None:
+            sys.modules.pop(module_name, None)
+        else:
+            sys.modules[module_name] = original_target_module
         for name, original_module in original_modules.items():
             if original_module is None:
                 sys.modules.pop(name, None)

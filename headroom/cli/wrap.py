@@ -1202,17 +1202,14 @@ def _has_redirectable_top_level_key(content: str, key: str) -> bool:
 
 
 def _codex_config_has_headroom_markers(content: str) -> bool:
-    """Return whether a Codex config already contains Headroom-managed markers."""
+    """Return whether a Codex config already contains wrap-owned markers."""
     managed_markers = (
         _CODEX_TOP_LEVEL_MARKER,
         _CODEX_END_MARKER,
         _CODEX_MCP_MARKER,
         _MEMORY_MCP_MARKER,
     )
-    return (
-        any(marker in content for marker in managed_markers)
-        or "# --- Headroom MCP server:" in content
-    )
+    return any(marker in content for marker in managed_markers)
 
 
 def _snapshot_codex_config_if_unwrapped(config_file: Path, backup_file: Path) -> None:
