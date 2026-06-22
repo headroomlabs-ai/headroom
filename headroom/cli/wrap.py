@@ -1691,7 +1691,7 @@ def _remove_rtk_instructions(file_path: Path) -> bool:
     return True
 
 
-def _inject_memory_mcp_config(db_path: str, user_id: str) -> None:
+def _inject_memory_mcp_config(user_id: str) -> None:
     """Register headroom memory as an MCP server in Codex's config.toml.
 
     Idempotent — replaces existing section if present.
@@ -1704,12 +1704,11 @@ def _inject_memory_mcp_config(db_path: str, user_id: str) -> None:
     # Use forward slashes in TOML paths (works on all platforms, avoids
     # backslash escaping issues on Windows)
     python_bin = sys.executable.replace("\\", "/")
-    db_path_toml = db_path.replace("\\", "/")
     mcp_section = (
         f"\n{_MEMORY_MCP_MARKER}\n"
         f"[mcp_servers.headroom_memory]\n"
         f'command = "{python_bin}"\n'
-        f'args = ["-m", "headroom.memory.mcp_server", "--db", "{db_path_toml}", "--user", "{user_id}"]\n'
+        f'args = ["-m", "headroom.memory.mcp_server", "--user", "{user_id}"]\n'
         f"startup_timeout_sec = 30\n"
         f"tool_timeout_sec = 30\n"
         f"{_MEMORY_MCP_END}\n"
@@ -3813,7 +3812,7 @@ def codex(
         mem_user = os.environ.get("USER", os.environ.get("USERNAME", "default"))
 
         # Register MCP server in Codex config
-        _inject_memory_mcp_config(db_path, mem_user)
+        _inject_memory_mcp_config(mem_user)
 
         # Inject memory guidance into project AGENTS.md
         agents_md = Path.cwd() / "AGENTS.md"
@@ -3871,11 +3870,7 @@ def codex(
     # the config file.  Re-inject MCP config after if memory is enabled.
     _inject_codex_provider_config(port)
     if memory:
-        mem_dir = Path.cwd() / ".headroom"
-        _inject_memory_mcp_config(
-            str(mem_dir / "memory.db"),
-            os.environ.get("USER", os.environ.get("USERNAME", "default")),
-        )
+        _inject_memory_mcp_config(os.environ.get("USER", os.environ.get("USERNAME", "default")))
 
     _launch_tool(
         binary=codex_bin,

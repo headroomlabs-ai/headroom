@@ -159,6 +159,34 @@ class TestSnapshotCodexConfig:
         assert not backup_file.exists()
 
 
+class TestCodexMemoryMcpConfig:
+    """Tests for the persisted Codex memory MCP block."""
+
+    def test_inject_omits_db_and_replaces_existing_memory_block(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        _set_test_home(monkeypatch, tmp_path)
+        config_file = tmp_path / ".codex" / "config.toml"
+        config_file.parent.mkdir(parents=True)
+        config_file.write_text(
+            '[profiles.default]\nmodel = "gpt-4o"\n\n'
+            f"{wrap_mod._MEMORY_MCP_MARKER}\n"
+            "[mcp_servers.headroom_memory]\n"
+            'command = "python"\n'
+            'args = ["-m", "headroom.memory.mcp_server", "--db", "/tmp/project-a/.headroom/memory.db", "--user", "old-user"]\n'
+            f"{wrap_mod._MEMORY_MCP_END}\n"
+        )
+
+        wrap_mod._inject_memory_mcp_config("codex-user")
+
+        content = config_file.read_text()
+        assert content.count(wrap_mod._MEMORY_MCP_MARKER) == 1
+        assert "[mcp_servers.headroom_memory]" in content
+        assert '"--user", "codex-user"' in content
+        assert "--db" not in content
+        assert 'model = "gpt-4o"' in content
+
+
 class TestInjectAndRestoreRoundTrip:
     """End-to-end wrap → unwrap cycle operating directly on a temp $HOME."""
 
@@ -877,6 +905,71 @@ def test_wrap_codex_prepare_only_updates_stale_mcp_proxy_url(
     assert 'command = "headroom"' in content
     assert 'args = ["mcp", "serve"]' in content
     assert "http://127.0.0.1:9000" not in content
+
+
+def test_wrap_codex_memory_prepare_only_uses_local_db_without_persisting_it(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_test_home(monkeypatch, tmp_path)
+    monkeypatch.setenv("USER", "codex-user")
+    project_dir = tmp_path / "project-a"
+    project_dir.mkdir()
+    monkeypatch.chdir(project_dir)
+    backend_paths: list[str] = []
+    imported_users: list[str] = []
+
+    class FakeBackend:
+        async def _ensure_initialized(self) -> None:
+            return None
+
+        async def close(self) -> None:
+            return None
+
+    class FakeClaudeCodeAdapter:
+        def __init__(self, memory_dir: Path) -> None:
+            self.memory_dir = memory_dir
+
+    def fake_build_sync_backend(db_path: str) -> FakeBackend:
+        backend_paths.append(db_path)
+        return FakeBackend()
+
+    async def fake_sync_import(
+        backend: FakeBackend, adapter: FakeClaudeCodeAdapter, user_id: str
+    ) -> int:
+        imported_users.append(user_id)
+        return 0
+
+    with patch("headroom.cli.wrap._ensure_rtk_binary", return_value=None):
+        with patch("headroom.memory.sync._build_sync_backend", side_effect=fake_build_sync_backend):
+            with patch("headroom.memory.sync.sync_import", side_effect=fake_sync_import):
+                with patch(
+                    "headroom.memory.sync_adapters.claude_code.ClaudeCodeAdapter",
+                    FakeClaudeCodeAdapter,
+                ):
+                    with patch(
+                        "headroom.memory.sync_adapters.claude_code.get_claude_memory_dir",
+                        return_value=tmp_path / "claude-memory",
+                    ):
+                        result = runner.invoke(
+                            main,
+                            [
+                                "wrap",
+                                "codex",
+                                "--memory",
+                                "--prepare-only",
+                                "--no-mcp",
+                                "--no-serena",
+                            ],
+                        )
+
+    assert result.exit_code == 0, result.output
+    assert backend_paths == [str(project_dir / ".headroom" / "memory.db")]
+    assert imported_users == ["codex-user"]
+
+    content = (tmp_path / ".codex" / "config.toml").read_text()
+    assert "[mcp_servers.headroom_memory]" in content
+    assert '"--user", "codex-user"' in content
+    assert "--db" not in content
 
 
 def test_wrap_codex_prepare_only_registers_serena_when_uvx_exists(
