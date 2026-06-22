@@ -16,6 +16,13 @@ from headroom.providers.codex.install import apply_provider_scope as apply_codex
 from headroom.providers.codex.install import build_install_env as build_codex_install_env
 from headroom.providers.codex.install import revert_provider_scope as revert_codex_provider_scope
 from headroom.providers.copilot.install import build_install_env as build_copilot_install_env
+from headroom.providers.opencode.install import (
+    apply_provider_scope as apply_opencode_provider_scope,
+)
+from headroom.providers.opencode.install import build_install_env as build_opencode_install_env
+from headroom.providers.opencode.install import (
+    revert_provider_scope as revert_opencode_provider_scope,
+)
 
 
 def _manifest(tmp_path: Path) -> DeploymentManifest:
@@ -488,6 +495,88 @@ def test_revert_claude_provider_scope_ignores_missing_settings_file(tmp_path: Pa
 
 
 # ---------------------------------------------------------------------------
+# OpenCode provider tests
+# ---------------------------------------------------------------------------
+
+
+def test_opencode_build_install_env_leaves_provider_env_unset() -> None:
+    env = build_opencode_install_env(port=5566, backend="ignored")
+    assert env == {}
+
+
+def test_apply_and_revert_opencode_provider_scope(monkeypatch, tmp_path: Path) -> None:
+    config_path = tmp_path / "opencode.json"
+    config_path.write_text('{"model": "openai/gpt-4o"}')
+    monkeypatch.setattr(
+        "headroom.providers.opencode.install.opencode_config_path", lambda: config_path
+    )
+    manifest = _manifest(tmp_path)
+
+    mutation = apply_opencode_provider_scope(manifest)
+    assert mutation is not None
+    assert mutation.target == "opencode"
+    assert mutation.kind == "json-block"
+
+    content = config_path.read_text()
+    data = json.loads(content)
+    assert data["provider"]["headroom"]["options"]["baseURL"] == "http://127.0.0.1:8787/v1"
+    assert data["model"] == "openai/gpt-4o"  # user model preserved
+
+    revert_opencode_provider_scope(mutation, manifest)
+    reverted = json.loads(config_path.read_text())
+    assert reverted["model"] == "openai/gpt-4o"
+    assert "headroom" not in reverted.get("provider", {})
+
+
+def test_apply_opencode_provider_scope_skips_non_provider_scope(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config_path = tmp_path / "opencode.json"
+    monkeypatch.setattr(
+        "headroom.providers.opencode.install.opencode_config_path", lambda: config_path
+    )
+    manifest = _manifest(tmp_path)
+    manifest.scope = "user"
+
+    mutation = apply_opencode_provider_scope(manifest)
+    assert mutation is None
+    assert not config_path.exists()
+
+
+def test_apply_opencode_provider_scope_creates_new_config_when_missing(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config_path = tmp_path / "nested" / "opencode.json"
+    monkeypatch.setattr(
+        "headroom.providers.opencode.install.opencode_config_path", lambda: config_path
+    )
+    manifest = _manifest(tmp_path)
+
+    mutation = apply_opencode_provider_scope(manifest)
+    assert mutation is not None
+    data = json.loads(config_path.read_text())
+    assert data["provider"]["headroom"]["options"]["baseURL"] == "http://127.0.0.1:8787/v1"
+
+
+def test_revert_opencode_provider_scope_ignores_missing_path_and_file(
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest(tmp_path)
+    revert_opencode_provider_scope(
+        ManagedMutation(target="opencode", kind="json-block"),
+        manifest,
+    )
+    revert_opencode_provider_scope(
+        ManagedMutation(
+            target="opencode",
+            kind="json-block",
+            path=str(tmp_path / "missing.json"),
+        ),
+        manifest,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Bug 3 regression tests (#406): requires_openai_auth and openai_base_url
 # must never appear in the headroom provider block.
 # ---------------------------------------------------------------------------
@@ -699,3 +788,104 @@ def test_persistent_install_strip_removes_openai_base_url(monkeypatch, tmp_path:
         f"orphaned openai_base_url must be removed by revert:\n{orphan_reverted}"
     )
     assert 'model = "gpt-4o"' in orphan_reverted
+
+
+# ---------------------------------------------------------------------------
+# Planner-level opencode smoke tests
+# ---------------------------------------------------------------------------
+
+
+def test_planner_resolves_opencode_as_install_target() -> None:
+    from headroom.install.planner import resolve_targets
+
+    targets = resolve_targets("manual", ["opencode"])
+    assert "opencode" in targets
+
+
+def test_planner_opencode_in_supported_targets_enum() -> None:
+    from headroom.install.models import ToolTarget
+    from headroom.install.planner import PROVIDER_SCOPE_TARGETS, SUPPORTED_TARGETS
+
+    assert ToolTarget.OPENCODE in SUPPORTED_TARGETS
+    assert ToolTarget.OPENCODE in PROVIDER_SCOPE_TARGETS
+
+
+def test_planner_opencode_in_provider_scope_targets() -> None:
+    from headroom.install.planner import resolve_targets
+
+    targets = resolve_targets("manual", ["opencode"], scope="provider")
+    assert "opencode" in targets
+
+
+def test_planner_build_tool_envs_includes_opencode() -> None:
+    from headroom.install.planner import build_tool_envs
+
+    envs = build_tool_envs(port=8787, backend="anthropic", targets=["opencode"])
+    assert "opencode" in envs
+    assert envs["opencode"] == {}
+
+
+def test_planner_resolve_all_includes_opencode() -> None:
+    from headroom.install.planner import resolve_targets
+
+    targets = resolve_targets("all", [])
+    assert "opencode" in targets
+
+
+def test_planner_provider_scope_unsupported_error_excludes_opencode() -> None:
+    import click
+    import pytest
+
+    from headroom.install.planner import resolve_targets
+
+    with pytest.raises(click.ClickException, match="unsupported targets"):
+        resolve_targets("manual", ["cursor"], scope="provider")
+
+
+# ---------------------------------------------------------------------------
+# Opencode revert OSError fallback
+# ---------------------------------------------------------------------------
+
+
+def test_revert_opencode_provider_scope_fallback_on_oserror(monkeypatch, tmp_path: Path) -> None:
+    """revert_opencode_provider_scope falls back to strip when backup copy fails."""
+    config_path = tmp_path / "opencode.json"
+    backup_path = config_path.with_suffix(".json.headroom-backup")
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+
+    from headroom.install.models import ManagedMutation
+    from headroom.providers.opencode.config import (
+        _PROVIDER_MARKER_END,
+        _PROVIDER_MARKER_START,
+    )
+
+    original = '{"model": "openai/gpt-4o"}'
+    backup_path.write_text(original)
+
+    provider_json = '{"headroom":{"npm":"@ai-sdk/openai-compatible","name":"Headroom Proxy","options":{"baseURL":"http://127.0.0.1:8787/v1"}}}'
+    config_path.write_text(
+        f'{_PROVIDER_MARKER_START}\n"provider": {provider_json},\n{_PROVIDER_MARKER_END}\n'
+    )
+
+    monkeypatch.setattr(
+        "headroom.providers.opencode.install.opencode_config_path",
+        lambda: config_path,
+    )
+
+    from headroom.providers.opencode.install import revert_provider_scope
+
+    manifest = _manifest(tmp_path)
+
+    def _fail_copy2(src, dst):
+        msg = "permission denied"
+        raise OSError(msg)
+
+    monkeypatch.setattr("shutil.copy2", _fail_copy2)
+
+    revert_provider_scope(
+        ManagedMutation(target="opencode", kind="json-block", path=str(config_path)),
+        manifest,
+    )
+
+    assert backup_path.exists()  # backup preserved when copy fails
+    assert not config_path.exists() or "headroom" not in config_path.read_text()

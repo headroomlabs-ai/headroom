@@ -1476,15 +1476,15 @@ main() {
         return
       fi
 
-      (($# >= 2)) || die "Usage: headroom wrap <claude|codex|aider|cursor|openclaw> [...]"
+      (($# >= 2)) || die "Usage: headroom wrap <claude|codex|aider|cursor|openclaw|opencode> [...]"
       local tool="$2"
       shift 2
 
       case "${tool}" in
-        claude|codex|aider|cursor|openclaw)
+        claude|codex|aider|cursor|openclaw|opencode)
           ;;
         *)
-          die "Docker-native wrapper does not support 'wrap ${tool}'. Supported targets: claude, codex, aider, cursor, openclaw"
+          die "Docker-native wrapper does not support 'wrap ${tool}'. Supported targets: claude, codex, aider, cursor, openclaw, opencode"
           ;;
       esac
 
