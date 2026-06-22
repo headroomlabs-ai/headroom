@@ -145,23 +145,43 @@ async fn dashboard_endpoint_serves_embedded_html() {
 
 #[tokio::test]
 async fn stats_folds_in_supplemental_python_blocks() {
-    let upstream = MockServer::start().await; // LLM upstream (unused here)
+    let upstream = MockServer::start().await; // Rust-native LLM upstream
     let python = MockServer::start().await; // transitional Python proxy
 
+    // Rust lane: a real /v1/messages request the Rust proxy records itself.
+    Mock::given(method("POST"))
+        .and(path_matcher("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&upstream)
+        .await;
+    // Python lane: a transitional /stats with a Python-only block plus a
+    // `requests.total` that must NOT clobber the Rust-native count.
     Mock::given(method("GET"))
         .and(path_matcher("/stats"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "copilot_quota": {"latest": {"used": 7}},
-            "requests": {"total": 999}  // must NOT override the Rust-native value
+            "requests": {"total": 999}
         })))
         .mount(&python)
         .await;
 
     let url = format!("{}/stats", python.uri());
     let proxy = start_proxy_with(&upstream.uri(), move |c| {
-        c.upstream_stats_url = Some(url.clone())
+        c.compression = true; // recording gated on the master switch
+        c.upstream_stats_url = Some(url.clone());
     })
     .await;
+
+    // Drive one Rust-native request so the unified store holds real Rust data
+    // alongside the folded-in Python block.
+    let resp = reqwest::Client::new()
+        .post(format!("{}/v1/messages", proxy.url()))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"hi"}],"max_tokens":10}"#)
+        .send()
+        .await
+        .expect("POST /v1/messages");
+    assert_eq!(resp.status(), 200);
 
     let stats: serde_json::Value = reqwest::Client::new()
         .get(format!("{}/stats", proxy.url()))
@@ -172,9 +192,10 @@ async fn stats_folds_in_supplemental_python_blocks() {
         .await
         .expect("stats json");
 
-    // Python-only block surfaced; Rust-native `requests.total` untouched.
+    // Harmony: the Python-only block surfaces AND the Rust-native count is the
+    // real one (1), not the Python proxy's 999 — both backends coexist.
     assert_eq!(stats["copilot_quota"]["latest"]["used"], 7);
-    assert_eq!(stats["requests"]["total"], 0);
+    assert_eq!(stats["requests"]["total"], 1);
 
     proxy.shutdown().await;
 }
