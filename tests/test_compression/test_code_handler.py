@@ -1,9 +1,12 @@
 """Tests for code structure handler."""
 
+from unittest.mock import patch
+
 import pytest
 
 from headroom.compression.handlers.code_handler import (
     CodeStructureHandler,
+    _check_tree_sitter,
     is_tree_sitter_available,
 )
 
@@ -129,6 +132,49 @@ class TestRegexFallbackLanguages:
     def test_regex_confidence_lower_than_tree_sitter(self, handler):
         result = handler.get_mask("def f():\n    pass\n", language="python")
         assert result.confidence == 0.7
+
+
+class TestAvailabilityProbe:
+    """_check_tree_sitter must exercise a real parse, not just an import."""
+
+    def test_abi_mismatch_returns_false(self):
+        import types
+
+        import headroom.compression.handlers.code_handler as mod
+
+        mod._tree_sitter_available = None
+
+        fake_ts = types.ModuleType("tree_sitter")
+
+        class FakeParser:
+            def __setattr__(self, name, value):
+                if name == "language":
+                    raise RuntimeError("ABI mismatch")
+                super().__setattr__(name, value)
+
+        fake_ts.Parser = FakeParser
+
+        fake_pack = types.ModuleType("tree_sitter_language_pack")
+        fake_pack.get_language = lambda name: object()
+
+        with patch.dict(
+            "sys.modules",
+            {
+                "tree_sitter": fake_ts,
+                "tree_sitter_language_pack": fake_pack,
+            },
+        ):
+            result = _check_tree_sitter()
+        assert result is False
+        mod._tree_sitter_available = None
+
+    @requires_tree_sitter
+    def test_healthy_install_returns_true(self):
+        import headroom.compression.handlers.code_handler as mod
+
+        mod._tree_sitter_available = None
+        assert _check_tree_sitter() is True
+        mod._tree_sitter_available = None
 
 
 class TestEdgeCases:
