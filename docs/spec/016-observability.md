@@ -150,6 +150,12 @@ truth for savings.
 | `/metrics` | `observability/prometheus.rs` | yes | Prometheus scrape → Grafana / alerting |
 | `/stats` (JSON), `/dashboard` (HTML) | `observability/stats.rs` | no (persisted) | Dashboard savings view |
 
+> **Access control:** like `/metrics`, the `/stats` and `/dashboard` surfaces are
+> unauthenticated and expose usage/savings data (model names, token counts, USD).
+> They carry no secrets, but operators should keep the proxy port on a trusted
+> network or behind a firewall / authenticating reverse proxy rather than the
+> public internet.
+
 ---
 
 ## Alerting
