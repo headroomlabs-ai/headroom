@@ -151,6 +151,7 @@ from headroom.proxy.project_context import (
 from headroom.proxy.prometheus_metrics import PrometheusMetrics  # noqa: F401
 from headroom.proxy.rate_limiter import TokenBucketRateLimiter  # noqa: F401
 from headroom.proxy.request_logger import RequestLogger  # noqa: F401
+from headroom.proxy.savings_tracker import LITELLM_AVAILABLE
 from headroom.proxy.semantic_cache import SemanticCache  # noqa: F401
 from headroom.proxy.ssl_context import find_ca_bundle
 from headroom.proxy.warmup import WarmupRegistry
@@ -2929,6 +2930,12 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             },
             "savings_history": m.savings_history[-100:],  # Last 100 data points
             "display_session": display_session,
+            # Whether LiteLLM is importable. Pricing (the "$ Saved" tile) is
+            # derived entirely from LiteLLM's cost tables, and LiteLLM is gated
+            # off on Python >=3.14 in pyproject — so when this is False the
+            # dashboard tells the user to reinstall on 3.13 instead of just
+            # showing $0.00 forever.
+            "litellm_available": LITELLM_AVAILABLE,
             "persistent_savings": persistent_savings,
             "prefix_cache": prefix_cache_stats,
             "cost": _merge_cost_stats(
