@@ -122,7 +122,8 @@ def _parse_json_loose(text: str) -> dict[str, Any]:
     comments that follow a comma.
     """
     try:
-        return json.loads(text)
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, dict) else {}
     except json.JSONDecodeError:
         pass
     # Pass 1: remove lines that are ONLY a comment.
@@ -130,7 +131,8 @@ def _parse_json_loose(text: str) -> dict[str, Any]:
     # Pass 2: remove inline trailing comments (", // comment").
     cleaned = re.sub(r",\s*//[^\n]*", ",", cleaned)
     try:
-        return json.loads(cleaned)
+        parsed = json.loads(cleaned)
+        return parsed if isinstance(parsed, dict) else {}
     except json.JSONDecodeError:
         return {}
 
