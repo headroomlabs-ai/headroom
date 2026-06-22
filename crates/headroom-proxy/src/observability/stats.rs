@@ -29,6 +29,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
@@ -439,7 +440,14 @@ pub struct SavingsStore {
     state: Mutex<SavingsState>,
     path: Option<PathBuf>,
     cfg: StoreConfig,
+    /// Epoch-millis of the last disk persist, for debouncing (see `record`).
+    last_persist_ms: AtomicU64,
 }
+
+/// Minimum gap between disk persists. The recorder runs on every request, so an
+/// unconditional full-state write here would thrash disk and block the runtime
+/// under load. Stats tolerate losing the last sub-window on a crash.
+const PERSIST_MIN_INTERVAL_MS: u64 = 2000;
 
 impl SavingsStore {
     /// Create a store with no persistence (in-memory only).
@@ -448,6 +456,7 @@ impl SavingsStore {
             state: Mutex::new(SavingsState::default()),
             path: None,
             cfg: StoreConfig::default(),
+            last_persist_ms: AtomicU64::new(0),
         }
     }
 
@@ -459,6 +468,7 @@ impl SavingsStore {
             state: Mutex::new(state),
             path: Some(path),
             cfg,
+            last_persist_ms: AtomicU64::new(0),
         }
     }
 
@@ -469,7 +479,20 @@ impl SavingsStore {
             let mut state = self.state.lock().expect("savings store mutex poisoned");
             state.record(outcome, now, &self.cfg);
         }
-        self.persist();
+        // Debounced persist: at most one disk write per PERSIST_MIN_INTERVAL_MS.
+        // Debounce on the injected `now` so it's deterministic under test. First
+        // write is immediate (last starts at 0). ponytail: a load/store race can
+        // double-write at an interval boundary under heavy concurrency — bounded,
+        // far from per-request, not worth a CAS.
+        let now_ms = now
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        if now_ms.saturating_sub(self.last_persist_ms.load(Ordering::Relaxed)) >= PERSIST_MIN_INTERVAL_MS
+        {
+            self.last_persist_ms.store(now_ms, Ordering::Relaxed);
+            self.persist();
+        }
     }
 
     /// Snapshot the current state (clone under the lock).
@@ -1162,6 +1185,30 @@ mod tests {
         store.record(&outcome("anthropic", "claude", 100, 50), at(T0));
         // No path → persist is a no-op; snapshot still reflects the record.
         assert_eq!(store.snapshot().lifetime.requests, 1);
+    }
+
+    #[test]
+    fn record_debounces_disk_persist() {
+        let dir = std::env::temp_dir().join(format!("hr-debounce-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.json");
+        let store = SavingsStore::with_path(&path, StoreConfig::default());
+        let o = outcome("anthropic", "claude", 100, 50);
+
+        store.record(&o, at(T0)); // first write is immediate
+        assert_eq!(load_state(&path).lifetime.requests, 1);
+
+        // Within the interval → skipped: the file is NOT rewritten (still 1),
+        // even though in-memory state advanced to 2.
+        store.record(&o, at(T0) + Duration::from_millis(500));
+        assert_eq!(store.snapshot().lifetime.requests, 2);
+        assert_eq!(load_state(&path).lifetime.requests, 1);
+
+        // Past the interval → persists again (now 3 on disk).
+        store.record(&o, at(T0) + Duration::from_secs(3));
+        assert_eq!(load_state(&path).lifetime.requests, 3);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
