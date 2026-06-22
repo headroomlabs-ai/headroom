@@ -23,6 +23,7 @@ from typing import Any
 import pytest
 
 from headroom.memory.sync import (
+    _build_sync_backend,
     sync,
     sync_export,
     sync_import,
@@ -675,3 +676,14 @@ class TestCrossAgentInterop:
         # AGENTS.md has both (from DB)
         agents_content = agents_md.read_text()
         assert "FastAPI" in agents_content or "8787" in agents_content
+
+
+def test_sync_backend_uses_onnx_embedder(tmp_path):
+    """#1092: the sync subprocess must pick the torch-free ONNX embedder.
+
+    Defaulting to the LOCAL (sentence-transformers) embedder makes
+    `wrap --memory` crash with an ImportError on the proxy extras. The backend
+    must match the proxy MCP server, which uses ONNX.
+    """
+    backend = _build_sync_backend(str(tmp_path / "memory.db"))
+    assert backend._config.embedder_backend == "onnx"
