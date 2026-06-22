@@ -4,23 +4,34 @@
 
 ## TL;DR (read this first)
 
-**Yes, Headroom can compress Claude traffic that goes to Vertex AI — but only if you
-set it up by hand, and only if you work around one real bug.** There is **no
-turnkey path today**: `headroom wrap claude` does not know anything about Vertex,
-and the one backend flag everybody is told to use (`--backend litellm-vertex`) is
-broken.
+**Yes — and the working path is now validated end-to-end (2026-06-19). See the
+copy-paste runbook: [`docs/claude-code-vertex-headroom.md`](../claude-code-vertex-headroom.md).**
 
-Two setups actually work (both need manual environment variables):
+> **2026-06-19 update — tested against live Vertex quota (Claude Code 2.1.181):**
+> Of the two setups below, **only Setup B works in practice.**
+>
+> - **Setup A (Vertex mode + `ANTHROPIC_VERTEX_BASE_URL`→proxy) is blocked by Claude
+>   Code itself.** In Vertex mode Claude Code runs a client-side `probeVertexModel`
+>   check *before any request*; pointing its Vertex URL at a non-Google host makes that
+>   probe fail instantly ("model … not available on your vertex deployment") and the
+>   proxy never receives a byte. Not a Headroom bug — the native `:rawPredict`
+>   passthrough is correct and compresses (verified by direct curl), but the client
+>   won't route to it.
+> - **Setup B (normal Anthropic mode + `--backend litellm-vertex_ai`) is the working
+>   path.** Verified: Claude Code → Headroom → LiteLLM → Vertex (`global`), real
+>   answers, and **~22% context compression on a code-heavy request**. Two gotchas:
+>   (1) `pip install "google-cloud-aiplatform>=1.38"` or requests 500 with
+>   `No module named 'vertexai'`; (2) start the proxy with **`--code-aware`** or code
+>   content silently no-ops (it is disabled by default).
 
-- **Setup A — keep Claude Code in Vertex mode**, and point its Vertex URL at
-  Headroom. Headroom compresses, then forwards to real Vertex.
-- **Setup B — run Claude Code in normal Anthropic mode**, and let Headroom be the
-  translator that talks to Vertex (`--backend litellm-vertex_ai`).
+There is still **no `headroom wrap claude` turnkey** for Vertex, and the one backend
+flag older help text advertises (`--backend litellm-vertex`) is broken — use
+`--backend litellm-vertex_ai`.
 
 Everything in the *middle* (compression, request/response translation, streaming,
 tool calls) is implemented correctly. The gaps are all at the **edges**: how the
-client is pointed at Headroom, one mis-named backend, and a few env vars Headroom
-never sets for you.
+client is pointed at Headroom, one mis-named backend, a missing pip extra, a
+default-off compressor, and a few env vars Headroom never sets for you.
 
 > Correction to an earlier claim: it is **not** true that "the Python proxy just
 > passes Vertex through without compressing." For the Anthropic publisher it runs

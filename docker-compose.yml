@@ -9,6 +9,8 @@ services:
       # - OPENAI_TARGET_API_URL=https://api.x.ai
     ports:
       - "8787:8787"
+    volumes:
+      - headroom_workspace:/home/nonroot/.headroom
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8787/readyz"]
       interval: 30s
@@ -46,5 +48,6 @@ services:
       - NEO4J_apoc_import_file_use__neo4j__config=true
 
 volumes:
+  headroom_workspace:    # persists proxy_savings, memory.db, session_stats, toin across image updates
   qdrant_data:
   neo4j_data:

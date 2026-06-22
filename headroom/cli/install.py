@@ -157,7 +157,16 @@ def _reject_task_lifecycle(manifest: DeploymentManifest, action: str) -> None:
     "--mode", "proxy_mode", default="token", show_default=True, help="Proxy optimization mode."
 )
 @click.option("--memory", is_flag=True, help="Enable persistent memory in the proxy runtime.")
-@click.option("--no-telemetry", is_flag=True, help="Disable anonymous telemetry in the runtime.")
+@click.option(
+    "--telemetry",
+    is_flag=True,
+    help="Opt in to anonymous telemetry in the runtime (off by default).",
+)
+@click.option(
+    "--no-telemetry",
+    is_flag=True,
+    help="Force anonymous telemetry off in the runtime (already the default).",
+)
 @click.option(
     "--image",
     default="ghcr.io/chopratejas/headroom:latest",
@@ -177,6 +186,7 @@ def install_apply(
     region: str | None,
     proxy_mode: str,
     memory: bool,
+    telemetry: bool,
     no_telemetry: bool,
     image: str,
 ) -> None:
@@ -198,7 +208,7 @@ def install_apply(
         region=region,
         proxy_mode=proxy_mode,
         memory_enabled=memory,
-        telemetry_enabled=not no_telemetry,
+        telemetry_enabled=telemetry and not no_telemetry,
         image=image,
     )
 

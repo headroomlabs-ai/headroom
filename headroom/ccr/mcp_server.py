@@ -424,6 +424,23 @@ class HeadroomMCPServer:
                     "results": results,
                     "count": len(results),
                 }
+            # The query matched no items above the relevance floor, but the
+            # entry itself may still be present and unexpired. An empty search
+            # is not the same as a missing/expired hash, so fall back to the
+            # full content rather than reporting it as not found.
+            entry = store.retrieve(hash_key)
+            if entry:
+                self._stats.record_retrieval(hash_key)
+                return {
+                    "hash": hash_key,
+                    "source": "local",
+                    "query": query,
+                    "results": [],
+                    "count": 0,
+                    "original_content": entry.original_content,
+                    "note": "Entry exists but no item matched the query above "
+                    "the relevance threshold; returning the full content.",
+                }
         else:
             entry = store.retrieve(hash_key)
             if entry:

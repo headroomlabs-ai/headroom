@@ -167,7 +167,7 @@ class ClaudeCodePlugin(LearnPlugin, ConversationScanner):
         msg_index = 0
 
         try:
-            with open(jsonl_path) as f:
+            with open(jsonl_path, encoding="utf-8", errors="replace") as f:
                 for line in f:
                     try:
                         d = json.loads(line)

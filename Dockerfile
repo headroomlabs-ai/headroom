@@ -75,6 +75,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 FROM python:${PYTHON_VERSION}-slim AS runtime-slim-base
 
 ARG RUNTIME_USER=nonroot
+ARG RUNTIME_HOME=/home/nonroot
 ARG PYTHON_SITE_PACKAGES
 
 RUN apt-get update && \
@@ -97,11 +98,18 @@ RUN mkdir -p /home/nonroot /data && \
     fi
 
 USER ${RUNTIME_USER}
-WORKDIR /home/nonroot
+WORKDIR ${RUNTIME_HOME}
 
 ENV HEADROOM_HOST=0.0.0.0 \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
+
+# Declare ~/.headroom as a volume so Docker (and ACA) can attach persistent
+# storage here.  Bare `docker run` gets an anonymous volume as a fallback so
+# state is never silently written to the ephemeral container layer.
+# RUNTIME_HOME defaults to /home/nonroot (the published image default); pass
+# --build-arg RUNTIME_HOME=/root when building with RUNTIME_USER=root.
+VOLUME ${RUNTIME_HOME}/.headroom
 
 EXPOSE 8787
 

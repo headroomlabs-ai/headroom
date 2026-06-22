@@ -57,6 +57,11 @@ pub struct ClassifyConfig {
     /// `<` count above which a long string is considered HTML-ish.
     /// Default: 3.
     pub html_min_open_brackets: usize,
+    /// When false, long strings are NOT classified as opaque — they stay
+    /// `Scalar` and render verbatim, so output is marker-free and
+    /// guaranteed-lossless. Mirrors the row-drop path's `enable_ccr_marker`
+    /// gate (see `crusher.rs`). Default: true.
+    pub emit_opaque_markers: bool,
 }
 
 impl Default for ClassifyConfig {
@@ -65,6 +70,7 @@ impl Default for ClassifyConfig {
             opaque_min_bytes: 256,
             base64_alphabet_ratio: 0.95,
             html_min_open_brackets: 3,
+            emit_opaque_markers: true,
         }
     }
 }
@@ -94,8 +100,10 @@ fn classify_string(s: &str, cfg: &ClassifyConfig) -> CellClass {
         }
     }
 
-    // Opaque-blob check — only for strings above the byte threshold.
-    if s.len() <= cfg.opaque_min_bytes {
+    // Opaque-blob check — only for strings above the byte threshold, and
+    // only when opaque markers are enabled. With markers off, keep the full
+    // string verbatim (Scalar) so the output stays lossless and marker-free.
+    if s.len() <= cfg.opaque_min_bytes || !cfg.emit_opaque_markers {
         return CellClass::Scalar;
     }
 
@@ -232,6 +240,22 @@ mod tests {
             CellClass::Opaque(OpaqueKind::LongString) => {}
             other => panic!("expected LongString, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn long_string_stays_scalar_when_opaque_markers_disabled() {
+        // #1091: with opaque markers disabled, a long string must NOT be
+        // classified Opaque (which would emit a `<<ccr:>>` marker); it stays
+        // Scalar and renders verbatim, so the output is lossless.
+        let v = Value::String("x".repeat(512));
+        // Default config classifies it Opaque.
+        assert!(matches!(classify_cell(&v, &cfg()), CellClass::Opaque(_)));
+        // Markers disabled → Scalar (verbatim).
+        let no_markers = ClassifyConfig {
+            emit_opaque_markers: false,
+            ..ClassifyConfig::default()
+        };
+        assert_eq!(classify_cell(&v, &no_markers), CellClass::Scalar);
     }
 
     #[test]
