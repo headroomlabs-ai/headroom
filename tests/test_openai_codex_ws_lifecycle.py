@@ -112,6 +112,13 @@ class _FakeWebSocketDisconnect(Exception):
 _FakeWebSocketDisconnect.__name__ = "WebSocketDisconnect_Fake"
 
 
+class _FakeUpstreamClose(Exception):
+    def __init__(self, code: int, reason: str) -> None:
+        super().__init__(reason)
+        self.code = code
+        self.reason = reason
+
+
 class _FakeWebSocket:
     """Scripted client WebSocket that can delay / disconnect mid-stream."""
 
@@ -133,6 +140,7 @@ class _FakeWebSocket:
         self.accepted_headers: list[tuple[bytes, bytes]] | None = None
         self.closed = False
         self.close_code: int | None = None
+        self.close_reason: str | None = None
         self._call_log = call_log
         # "client" can trip this event to simulate mid-stream disconnect.
         self._disconnect_event = asyncio.Event()
@@ -169,7 +177,10 @@ class _FakeWebSocket:
 
     async def close(self, code: int | None = None, reason: str | None = None) -> None:
         self.closed = True
-        self.close_code = code
+        if code is not None or self.close_code is None:
+            self.close_code = code
+        if reason is not None or self.close_reason is None:
+            self.close_reason = reason
 
     def trigger_disconnect(self) -> None:
         self._disconnect_event.set()
@@ -441,6 +452,77 @@ async def test_ws_session_metrics_include_dashboard_performance_timings():
     assert (
         recorded["pipeline_timing"]["codex_ws.compression_unit_router_strategy_passthrough"] == 3.0
     )
+
+
+@pytest.mark.asyncio
+async def test_ws_opt_in_flattens_response_create_for_openai_compatible_upstream(monkeypatch):
+    """Some OpenAI-compatible WS gateways expect top-level response.create payloads."""
+
+    monkeypatch.setenv("HEADROOM_OPENAI_WS_FLATTEN_RESPONSE_CREATE", "1")
+    upstream_events = [
+        json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
+        json.dumps({"type": "response.completed", "response": {"id": "r_1"}}),
+    ]
+    upstream = _FakeUpstream(upstream_events)
+    fake_ws_mod = _make_fake_websockets_module(upstream)
+
+    first = json.dumps(
+        {
+            "type": "response.create",
+            "event_id": "evt_flatten",
+            "response": {
+                "model": "gpt-5.4",
+                "input": "hello",
+                "instructions": "be concise",
+                "tools": [{"type": "function", "name": "shell"}],
+            },
+        }
+    )
+    client_ws = _FakeWebSocket(frames=[first])
+    handler = _DummyOpenAIHandler()
+
+    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    assert upstream.sent
+    sent = json.loads(upstream.sent[0])
+    assert sent == {
+        "model": "gpt-5.4",
+        "input": "hello",
+        "instructions": "be concise",
+        "tools": [{"type": "function", "name": "shell"}],
+        "type": "response.create",
+        "event_id": "evt_flatten",
+    }
+
+
+@pytest.mark.asyncio
+async def test_ws_opt_in_propagates_upstream_close_code_and_reason(monkeypatch):
+    """Expose upstream close details to Codex instead of swallowing them in debug logs."""
+
+    monkeypatch.setenv("HEADROOM_OPENAI_WS_PROPAGATE_UPSTREAM_CLOSE", "1")
+    upstream = _FakeUpstream(
+        [],
+        raise_mid_stream=_FakeUpstreamClose(4001, "bad request shape"),
+    )
+    fake_ws_mod = _make_fake_websockets_module(upstream)
+
+    client_ws = _FakeWebSocket(
+        frames=[_first_frame()],
+        hold_after_initial=True,
+    )
+    handler = _DummyOpenAIHandler()
+
+    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
+        await asyncio.wait_for(
+            handler.handle_openai_responses_ws(client_ws),
+            timeout=2.0,
+        )
+
+    assert client_ws.closed
+    assert client_ws.close_code == 4001
+    assert client_ws.close_reason == "bad request shape"
+    assert handler.metrics.termination_causes[-1] == "upstream_error"
 
 
 @pytest.mark.asyncio

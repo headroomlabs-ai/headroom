@@ -3964,6 +3964,40 @@ class OpenAIHandlerMixin:
                     model or "unknown",
                 )
 
+            def _normalize_ws_response_create_for_upstream(raw_msg: str) -> str:
+                """Optionally flatten Codex WS response.create frames for gateways.
+
+                Codex sends {"type":"response.create","response":{...}}. Some
+                OpenAI-compatible gateways accept the WebSocket upgrade but expect
+                model/input/tools at the top level of response.create frames.
+                Preserve default upstream behavior unless explicitly enabled.
+                """
+                if os.environ.get(
+                    "HEADROOM_OPENAI_WS_FLATTEN_RESPONSE_CREATE", ""
+                ).strip().lower() not in (
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                ):
+                    return raw_msg
+                try:
+                    parsed = json.loads(raw_msg)
+                except (json.JSONDecodeError, TypeError):
+                    return raw_msg
+                if not isinstance(parsed, dict) or parsed.get("type") != "response.create":
+                    return raw_msg
+                inner = parsed.get("response")
+                if not isinstance(inner, dict):
+                    return raw_msg
+
+                flattened = dict(inner)
+                flattened["type"] = "response.create"
+                for key, value in parsed.items():
+                    if key not in {"type", "response"} and key not in flattened:
+                        flattened[key] = value
+                return json.dumps(flattened, ensure_ascii=False)
+
             body: dict[str, Any] = {}
             tokens_saved = 0
             # Session-scoped accumulator for tokens we *attempted* to
@@ -4523,6 +4557,7 @@ class OpenAIHandlerMixin:
                     else "unknown",
                 )
 
+            first_msg_raw = _normalize_ws_response_create_for_upstream(first_msg_raw)
             _first_upstream_body: Any = None
             try:
                 _first_upstream_body = json.loads(first_msg_raw)
@@ -4831,6 +4866,7 @@ class OpenAIHandlerMixin:
                                     msg,
                                     frame_index=client_frame_index,
                                 )
+                                msg = _normalize_ws_response_create_for_upstream(msg)
                                 _outbound_frame_body: Any = None
                                 try:
                                     _outbound_frame_body = json.loads(msg)
@@ -5280,7 +5316,11 @@ class OpenAIHandlerMixin:
                                             }
                                             if resp_id:
                                                 cont["response"]["previous_response_id"] = resp_id
-                                            await upstream.send(json.dumps(cont))
+                                            await upstream.send(
+                                                _normalize_ws_response_create_for_upstream(
+                                                    json.dumps(cont)
+                                                )
+                                            )
                                             logger.info(
                                                 f"[{request_id}] WS Memory: Sent continuation "
                                                 f"with {len(tool_outputs)} result(s)"
@@ -5302,9 +5342,41 @@ class OpenAIHandlerMixin:
                                 # distinguished from a clean
                                 # upstream disconnect.
                                 upstream_relay_error = relay_err
-                                logger.debug(
-                                    f"[{request_id}] WS upstream→client relay ended: {relay_err}"
+                                _upstream_close_code = (
+                                    getattr(relay_err, "code", None)
+                                    or getattr(getattr(relay_err, "rcvd", None), "code", None)
                                 )
+                                _upstream_close_reason = (
+                                    getattr(relay_err, "reason", None)
+                                    or getattr(getattr(relay_err, "rcvd", None), "reason", None)
+                                    or str(relay_err)
+                                )
+                                logger.warning(
+                                    "[%s] WS upstream→client relay ended: %s code=%s reason=%s",
+                                    request_id,
+                                    type(relay_err).__name__,
+                                    _upstream_close_code,
+                                    _upstream_close_reason,
+                                )
+                                if os.environ.get(
+                                    "HEADROOM_OPENAI_WS_PROPAGATE_UPSTREAM_CLOSE", ""
+                                ).strip().lower() in (
+                                    "1",
+                                    "true",
+                                    "yes",
+                                    "on",
+                                ):
+                                    _client_close_code = (
+                                        int(_upstream_close_code)
+                                        if isinstance(_upstream_close_code, int)
+                                        and 1000 <= int(_upstream_close_code) <= 4999
+                                        else 1011
+                                    )
+                                    with contextlib.suppress(Exception):
+                                        await websocket.close(
+                                            code=_client_close_code,
+                                            reason=str(_upstream_close_reason)[:120],
+                                        )
                         finally:
                             with contextlib.suppress(Exception):
                                 await websocket.close()
