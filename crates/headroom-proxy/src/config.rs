@@ -384,6 +384,23 @@ pub struct CliArgs {
     )]
     pub enable_bedrock_native: bool,
 
+    /// Enable the Kompress ML prose compressor for `PlainText` blocks in the
+    /// live zone. Default `false`: Kompress loads a ~261 MB ONNX model
+    /// (resolved CACHE-ONLY — the proxy never downloads it), so — unlike the
+    /// always-on structural compressors and the AST CodeCompressor — operators
+    /// opt in. When `false`, plain-text blocks pass through untouched and the
+    /// model is never loaded. Mirrors the Python reference's `enable_kompress`.
+    ///
+    /// Source priority: CLI flag → `HEADROOM_PROXY_ENABLE_KOMPRESS`
+    /// env var → default (`false`).
+    #[arg(
+        long = "enable-kompress",
+        env = "HEADROOM_PROXY_ENABLE_KOMPRESS",
+        default_value_t = false,
+        action = clap::ArgAction::Set,
+    )]
+    pub enable_kompress: bool,
+
     /// AWS region to use when signing Bedrock requests. Default
     /// `us-east-1`. The Bedrock endpoint URL derived from this
     /// region is `https://bedrock-runtime.{region}.amazonaws.com`
@@ -531,6 +548,10 @@ pub struct Config {
     /// mounted; operators relying on the Python LiteLLM converter
     /// keep their existing path.
     pub enable_bedrock_native: bool,
+    /// Enable the Kompress ML prose compressor for `PlainText` live-zone
+    /// blocks. Default `false` — it loads a ~261 MB cache-only model, so
+    /// operators opt in. Mirrors the Python reference's `enable_kompress`.
+    pub enable_kompress: bool,
     /// PR-D1: AWS region used to sign Bedrock requests + (when no
     /// explicit endpoint is set) derive the Bedrock endpoint URL.
     pub bedrock_region: String,
@@ -581,6 +602,7 @@ impl Config {
             enable_responses_streaming: args.enable_responses_streaming,
             enable_conversations_passthrough: args.enable_conversations_passthrough,
             enable_bedrock_native: args.enable_bedrock_native,
+            enable_kompress: args.enable_kompress,
             bedrock_region: args.bedrock_region,
             bedrock_endpoint: args.bedrock_endpoint,
             aws_profile: args.aws_profile,
@@ -631,6 +653,10 @@ impl Config {
             // `bedrock_endpoint` to a wiremock URL get the full
             // sign-and-forward path.
             enable_bedrock_native: true,
+            // Kompress off by default in tests (and production): operators
+            // opt in to the ~261 MB model. Tests that exercise the PlainText
+            // path enable it explicitly via `set_kompress_enabled`.
+            enable_kompress: false,
             bedrock_region: "us-east-1".to_string(),
             bedrock_endpoint: None,
             aws_profile: None,

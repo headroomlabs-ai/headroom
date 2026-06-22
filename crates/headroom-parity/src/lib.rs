@@ -466,6 +466,223 @@ impl TransformComparator for ContentDetectorComparator {
     }
 }
 
+/// Kompress comparator — runs the ML prose compressor against fixtures
+/// recorded from the Python reference.
+///
+/// Unlike the deterministic compressors, Kompress needs the
+/// `kompress-v2-base` ONNX model + ModernBERT tokenizer. The comparator
+/// resolves them **from the local HuggingFace cache only** (never the
+/// network) and lazily loads once. When the artifacts are absent — CI
+/// with no preloaded model — `run` returns `Err`, so the harness marks
+/// every kompress fixture `Skipped` rather than failing. Record + run
+/// locally (after `python scripts/record_fixtures.py`) for the real
+/// byte-parity assertion.
+///
+/// Fixtures are recorded with `enable_ccr=False` so the output is the
+/// pure joined kept-word stream (the Rust engine never emits the Python
+/// inline CCR marker; live-zone CCR uses the `<<ccr:>>` convention).
+pub struct KompressComparator {
+    model: std::sync::OnceLock<Option<headroom_core::transforms::kompress::Kompress>>,
+}
+
+impl Default for KompressComparator {
+    fn default() -> Self {
+        Self {
+            model: std::sync::OnceLock::new(),
+        }
+    }
+}
+
+impl KompressComparator {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn hf_cache_file(repo_dir: &str, rel: &[&str]) -> Option<PathBuf> {
+        let home = std::env::var("HOME").ok()?;
+        let snapshots = Path::new(&home)
+            .join(".cache/huggingface/hub")
+            .join(repo_dir)
+            .join("snapshots");
+        for snap in fs::read_dir(snapshots).ok()?.filter_map(|e| e.ok()) {
+            let mut cand = snap.path();
+            for part in rel {
+                cand = cand.join(part);
+            }
+            if cand.exists() {
+                return Some(cand);
+            }
+        }
+        None
+    }
+
+    fn model(&self) -> Option<&headroom_core::transforms::kompress::Kompress> {
+        self.model
+            .get_or_init(|| {
+                use headroom_core::transforms::kompress::{Kompress, KompressConfig};
+                let tok = Self::hf_cache_file(
+                    "models--answerdotai--ModernBERT-base",
+                    &["tokenizer.json"],
+                )?;
+                let onnx = Self::hf_cache_file(
+                    "models--chopratejas--kompress-v2-base",
+                    &["onnx", "kompress-int8-wo.onnx"],
+                )?;
+                Kompress::from_files(&tok, &onnx, KompressConfig::default()).ok()
+            })
+            .as_ref()
+    }
+}
+
+impl TransformComparator for KompressComparator {
+    fn name(&self) -> &str {
+        "kompress"
+    }
+
+    fn run(
+        &self,
+        input: &serde_json::Value,
+        _config: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let content = input
+            .as_str()
+            .context("kompress fixture input must be a JSON string")?;
+        let model = self
+            .model()
+            .context("kompress model/tokenizer not in local HF cache (fixture skipped)")?;
+        let r = model.compress(content);
+        Ok(serde_json::json!({
+            "compressed": r.compressed,
+            "original": r.original,
+            "original_tokens": r.original_tokens,
+            "compressed_tokens": r.compressed_tokens,
+            "compression_ratio": r.compression_ratio,
+            // Engine never emits CCR markers; dispatcher owns CCR. Python
+            // fixtures are recorded with enable_ccr=False so cache_key is null.
+            "cache_key": serde_json::Value::Null,
+            "model_used": r.model_used,
+        }))
+    }
+}
+
+/// Real comparator for the `code_aware_compressor` transform. Drives the
+/// Rust AST code compressor over the recorded fixture inputs and emits the
+/// same shape Python's recorder serializes for `CodeCompressionResult`
+/// (dataclass fields via `asdict`; the `@property` derivatives are not
+/// serialized). Fixtures are recorded with `enable_ccr=False` and
+/// `fallback_to_kompress=False` so the output is deterministic and
+/// store/model-independent.
+///
+/// Grammar-version parity is the precondition: the Rust `tree-sitter-<lang>`
+/// crates are pinned to the exact versions of the Python wheels the fixtures
+/// were recorded against (see `headroom-core/Cargo.toml`).
+pub struct CodeCompressorComparator;
+
+impl TransformComparator for CodeCompressorComparator {
+    fn name(&self) -> &str {
+        "code_aware_compressor"
+    }
+
+    fn run(
+        &self,
+        input: &serde_json::Value,
+        config: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        use headroom_core::transforms::code_compressor::{
+            CodeAwareCompressor, CodeCompressorConfig, DocstringMode,
+        };
+
+        let content = input
+            .as_str()
+            .context("code_aware_compressor fixture input must be a JSON string")?;
+
+        let defaults = CodeCompressorConfig::default();
+        let cfg = CodeCompressorConfig {
+            preserve_imports: config
+                .get("preserve_imports")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(defaults.preserve_imports),
+            preserve_signatures: config
+                .get("preserve_signatures")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(defaults.preserve_signatures),
+            preserve_type_annotations: config
+                .get("preserve_type_annotations")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(defaults.preserve_type_annotations),
+            preserve_decorators: config
+                .get("preserve_decorators")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(defaults.preserve_decorators),
+            docstring_mode: config
+                .get("docstring_mode")
+                .and_then(|v| v.as_str())
+                .and_then(DocstringMode::from_value)
+                .unwrap_or(defaults.docstring_mode),
+            target_compression_rate: config
+                .get("target_compression_rate")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(defaults.target_compression_rate),
+            max_body_lines: config
+                .get("max_body_lines")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(defaults.max_body_lines),
+            compress_comments: config
+                .get("compress_comments")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(defaults.compress_comments),
+            min_tokens_for_compression: config
+                .get("min_tokens_for_compression")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(defaults.min_tokens_for_compression),
+            language_hint: config
+                .get("language_hint")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            fallback_to_kompress: config
+                .get("fallback_to_kompress")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(defaults.fallback_to_kompress),
+            semantic_analysis: config
+                .get("semantic_analysis")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(defaults.semantic_analysis),
+            enable_ccr: config
+                .get("enable_ccr")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(defaults.enable_ccr),
+            ccr_ttl: config
+                .get("ccr_ttl")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(defaults.ccr_ttl),
+        };
+
+        let compressor = CodeAwareCompressor::new(cfg);
+        let result = compressor.compress(content);
+
+        let mut symbol_scores = serde_json::Map::new();
+        for (name, score) in &result.symbol_scores {
+            symbol_scores.insert(name.clone(), serde_json::json!(score));
+        }
+
+        Ok(serde_json::json!({
+            "cache_key": result.cache_key,
+            "compressed": result.compressed,
+            "compressed_bodies": result.compressed_bodies,
+            "compressed_tokens": result.compressed_tokens,
+            "compression_ratio": result.compression_ratio,
+            "language": result.language.value(),
+            "language_confidence": result.language_confidence,
+            "original": result.original,
+            "original_tokens": result.original_tokens,
+            "preserved_imports": result.preserved_imports,
+            "preserved_signatures": result.preserved_signatures,
+            "symbol_scores": serde_json::Value::Object(symbol_scores),
+            "syntax_valid": result.syntax_valid,
+        }))
+    }
+}
+
 /// Every built-in comparator, in a stable order.
 pub fn builtin_comparators() -> Vec<Box<dyn TransformComparator>> {
     vec![
@@ -476,6 +693,8 @@ pub fn builtin_comparators() -> Vec<Box<dyn TransformComparator>> {
         Box::new(CcrComparator),
         Box::new(SmartCrusherComparator),
         Box::new(ContentDetectorComparator),
+        Box::new(KompressComparator::new()),
+        Box::new(CodeCompressorComparator),
     ]
 }
 

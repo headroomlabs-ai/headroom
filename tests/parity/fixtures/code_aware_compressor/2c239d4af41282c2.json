@@ -1,0 +1,41 @@
+{
+  "config": {
+    "ccr_ttl": 300,
+    "compress_comments": true,
+    "docstring_mode": "first_line",
+    "enable_ccr": false,
+    "fallback_to_kompress": false,
+    "language_hint": null,
+    "max_body_lines": 5,
+    "min_tokens_for_compression": 100,
+    "preserve_decorators": true,
+    "preserve_imports": true,
+    "preserve_signatures": true,
+    "preserve_type_annotations": true,
+    "semantic_analysis": true,
+    "target_compression_rate": 0.2
+  },
+  "input": "import json\n\n\ndef load(path):\n    with open(path) as fh:\n        data = json.load(fh)\n    cleaned = {}\n    for key, value in data.items():\n        if value is None:\n            continue\n        cleaned[key] = value\n    return cleaned\n\n\ndef transform(records, factor):\n    out = []\n    for r in records:\n        scaled = r * factor\n        if scaled > 1000:\n            scaled = 1000\n        out.append(scaled)\n    return out\n\n\ndef run(path, factor):\n    data = load(path)\n    values = list(data.values())\n    result = transform(values, factor)\n    return sum(result)\n",
+  "input_sha256": "2c239d4af41282c27453261058252f76b9f173d4b16d69fa1094010556969416",
+  "output": {
+    "cache_key": null,
+    "compressed": "import json\n\ndef load(path):\n    with open(path) as fh:\n        data = json.load(fh)\n    # [6 lines omitted]\n    pass\ndef transform(records, factor):\n    out = []\n    # [6 lines omitted]\n    pass\ndef run(path, factor):\n    data = load(path)\n    # [3 lines omitted; calls: load, transform]\n    pass",
+    "compressed_bodies": 0,
+    "compressed_tokens": 74,
+    "compression_ratio": 0.524822695035461,
+    "language": "python",
+    "language_confidence": 1.0,
+    "original": "import json\n\n\ndef load(path):\n    with open(path) as fh:\n        data = json.load(fh)\n    cleaned = {}\n    for key, value in data.items():\n        if value is None:\n            continue\n        cleaned[key] = value\n    return cleaned\n\n\ndef transform(records, factor):\n    out = []\n    for r in records:\n        scaled = r * factor\n        if scaled > 1000:\n            scaled = 1000\n        out.append(scaled)\n    return out\n\n\ndef run(path, factor):\n    data = load(path)\n    values = list(data.values())\n    result = transform(values, factor)\n    return sum(result)\n",
+    "original_tokens": 141,
+    "preserved_imports": 1,
+    "preserved_signatures": 3,
+    "symbol_scores": {
+      "load": 1.0,
+      "run": 0.0,
+      "transform": 0.0
+    },
+    "syntax_valid": true
+  },
+  "recorded_at": "2026-06-19T00:15:16.321701+00:00",
+  "transform": "code_aware_compressor"
+}
