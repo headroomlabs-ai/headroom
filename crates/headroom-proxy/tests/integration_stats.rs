@@ -77,6 +77,47 @@ async fn stats_records_llm_request_attributed_by_provider() {
 }
 
 #[tokio::test]
+async fn stats_attributes_openai_chat_completions() {
+    // The Copilot lane reaches the proxy as OpenAI Chat Completions; it must
+    // land in the unified store attributed to `openai`, not lumped with others.
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path_matcher("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&upstream)
+        .await;
+    let proxy = start_proxy_with(&upstream.uri(), |c| c.compression = true).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{}/v1/chat/completions", proxy.url()))
+        .header("content-type", "application/json")
+        .body(
+            serde_json::json!({
+                "model": "gpt-4o",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 10
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .expect("POST /v1/chat/completions");
+    assert_eq!(resp.status(), 200);
+
+    let stats: serde_json::Value = reqwest::Client::new()
+        .get(format!("{}/stats", proxy.url()))
+        .send()
+        .await
+        .expect("GET /stats")
+        .json()
+        .await
+        .expect("stats json");
+    assert_eq!(stats["requests"]["by_provider"]["openai"], 1);
+
+    proxy.shutdown().await;
+}
+
+#[tokio::test]
 async fn dashboard_endpoint_serves_embedded_html() {
     let upstream = MockServer::start().await;
     let proxy = start_proxy(&upstream.uri()).await;

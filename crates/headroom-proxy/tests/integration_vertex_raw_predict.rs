@@ -226,6 +226,45 @@ async fn native_envelope_round_trip_byte_equal() {
     proxy.shutdown().await;
 }
 
+/// A Vertex rawPredict request lands in the unified savings store attributed
+/// to `vertex` — completes the per-backend attribution matrix alongside the
+/// anthropic/openai/bedrock tests.
+#[tokio::test]
+async fn stats_attributes_vertex_raw_predict() {
+    let upstream = MockServer::start().await;
+    mount_capture_json(&upstream).await;
+    let proxy = start_proxy_with_state(
+        &upstream.uri(),
+        |c| {
+            // Recording is gated on the compression master switch.
+            c.compression = true;
+        },
+        |s| install_static_token_source(s, TEST_BEARER),
+    )
+    .await;
+
+    let resp = reqwest::Client::new()
+        .post(raw_predict_url(&proxy.url()))
+        .header("content-type", "application/json")
+        .body(serde_json::to_vec(&minimal_vertex_body()).unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let stats: Value = reqwest::Client::new()
+        .get(format!("{}/stats", proxy.url()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(stats["requests"]["by_provider"]["vertex"], 1);
+
+    proxy.shutdown().await;
+}
+
 // ─── TEST 2 ────────────────────────────────────────────────────────────
 
 #[tokio::test]
