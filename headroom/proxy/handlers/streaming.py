@@ -1075,15 +1075,27 @@ class StreamingMixin:
                 headers=response_headers,
             )
 
-        # Forward upstream rate-limit headers to the client. We pass both the
-        # generic ``*ratelimit*`` headers (Anthropic) and Codex's ``x-codex-*``
-        # window/credit headers — the latter do not contain the ``ratelimit``
-        # substring, so without the second clause the Codex CLI's own
-        # session/weekly display would stop updating on the streaming path.
+        # Forward upstream response headers to the client, minus the body-framing
+        # / hop-by-hop headers that StreamingResponse manages itself (it re-streams
+        # a possibly-rewritten body and sets its own ``content-type`` via
+        # ``media_type``). This previously forwarded ONLY ``*ratelimit*`` and
+        # ``x-codex-*`` headers, silently dropping every other upstream header on
+        # the streaming path — including the one Claude Code reads to confirm the
+        # 1M-context tier, so its statusline fell back to the 200K default even
+        # though the API was serving 1M context. The non-streaming path already
+        # forwards the full set (minus the same framing headers); mirror it here.
+        # ``*ratelimit*`` / ``x-codex-*`` are a subset of this and keep flowing.
+        _DROP_RESPONSE_HEADERS = {
+            "content-length",
+            "transfer-encoding",
+            "connection",
+            "content-encoding",
+            "content-type",
+        }
         forwarded_headers = {
             k: v
             for k, v in upstream_response.headers.items()
-            if "ratelimit" in k.lower() or k.lower().startswith("x-codex")
+            if k.lower() not in _DROP_RESPONSE_HEADERS
         }
 
         async def generate():
