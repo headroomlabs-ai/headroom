@@ -1050,9 +1050,6 @@ class AnthropicHandlerMixin:
                     if is_token_mode(self.config.mode):
                         comp_cache = self._get_compression_cache(session_id)
 
-                        # Zone 1: Swap cached compressed versions into working copy
-                        working_messages = comp_cache.apply_cached(messages)
-
                         # Re-freeze boundary: consecutive stable messages from start.
                         # Safety: never freeze beyond provider-confirmed cached prefix.
                         # `prefix_tracker.frozen_message_count` (set above) is the
@@ -1090,9 +1087,11 @@ class AnthropicHandlerMixin:
                                 f"(frozen prefix={frozen_message_count}) because tool injection is deferred"
                             )
                         if skip_ccr_request_compression:
-                            optimized_messages = working_messages
+                            optimized_messages = messages
                             optimized_tokens = tokenizer.count_messages(optimized_messages)
                         else:
+                            # Zone 1: Swap cached compressed versions into working copy
+                            working_messages = comp_cache.apply_cached(messages)
                             async with stage_timer.measure("compression_first_stage"):
                                 result = await self._run_compression_in_executor(
                                     lambda: self.anthropic_pipeline.apply(
@@ -1185,7 +1184,7 @@ class AnthropicHandlerMixin:
                             stable_forwarded_prefix, delta_messages = delta
                             if delta_messages:
                                 if skip_ccr_request_compression:
-                                    optimized_messages = stable_forwarded_prefix + delta_messages
+                                    optimized_messages = messages
                                     optimized_tokens = tokenizer.count_messages(optimized_messages)
                                 else:
                                     result = await self._run_compression_in_executor(
