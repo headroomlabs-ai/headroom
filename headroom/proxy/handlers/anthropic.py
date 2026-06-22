@@ -26,6 +26,7 @@ import httpx
 from headroom.agent_savings import proxy_pipeline_kwargs
 from headroom.copilot_auth import build_copilot_upstream_url
 from headroom.pipeline import PipelineStage, summarize_routing_markers
+from headroom.providers.registry import UpstreamAuthUnavailable
 from headroom.proxy.auth_mode import classify_auth_mode, classify_client
 from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.forwarded_headers import resolve_client_ip
@@ -39,6 +40,28 @@ logger = logging.getLogger("headroom.proxy")
 
 class AnthropicHandlerMixin:
     """Mixin providing Anthropic API handler methods for HeadroomProxy."""
+
+    def _anthropic_route_auth_error(self) -> Any:
+        """502 returned when a matched multi-upstream BearerAuth route has
+        no token (``UpstreamAuthUnavailable``). Fails closed before the
+        upstream is contacted; the message is generic so the env-var name
+        is never leaked to the client.
+        """
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse(
+            status_code=502,
+            content={
+                "type": "error",
+                "error": {
+                    "type": "server_error",
+                    "message": (
+                        "Upstream route is not configured with a valid "
+                        "credential. Please contact the proxy operator."
+                    ),
+                },
+            },
+        )
 
     @staticmethod
     def _resolve_ccr_workspace(
@@ -1955,9 +1978,12 @@ class AnthropicHandlerMixin:
                 if request.url.query:
                     url = f"{url}?{request.url.query}"
             else:
-                base_url, headers = self.resolve_upstream(
-                    protocol="anthropic", model=model, headers=headers
-                )
+                try:
+                    base_url, headers = self.resolve_upstream(
+                        protocol="anthropic", model=model, headers=headers
+                    )
+                except UpstreamAuthUnavailable:
+                    return self._anthropic_route_auth_error()
                 url = f"{base_url}/v1/messages"
 
             try:

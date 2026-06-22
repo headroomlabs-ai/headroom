@@ -99,6 +99,7 @@ from headroom.providers.registry import (
     DEFAULT_OPENAI_API_URL,
     DEFAULT_VERTEX_API_URL,
     BearerAuth,
+    UpstreamAuthUnavailable,
     build_proxy_provider_runtime,
     create_proxy_backend,
     format_backend_status,
@@ -1036,9 +1037,14 @@ class HeadroomProxy(
         so behavior is identical to a build without this feature. With
         routes, walks the table by model prefix; on a BearerAuth route,
         strips inbound Authorization / x-api-key and injects the
-        env-sourced bearer. If the env var is unset/empty on a BearerAuth
-        route, returns (base_url, {}) so the caller can detect the empty
-        auth and fail closed (502).
+        env-sourced bearer.
+
+        Raises ``UpstreamAuthUnavailable`` when a matched BearerAuth route
+        has an unset/empty env var: the inbound auth has been stripped and
+        there is no replacement token, so the only safe outcome is to fail
+        closed. Call sites must catch this and return a 502 (or a WS error
+        event) *before* contacting the upstream — never forward the request
+        unauthenticated.
         """
         resolution = self.provider_runtime.resolve_upstream(
             protocol=protocol, model=model, headers=headers
@@ -1049,14 +1055,14 @@ class HeadroomProxy(
             for h in list(outbound):
                 if h.lower() in ("authorization", "x-api-key", "api-key"):
                     del outbound[h]
-            if token:
-                outbound["Authorization"] = f"Bearer {token}"
-            else:
+            if not token:
                 self._route_logger.error(
                     "multi-upstream: route auth env var %s is empty; failing closed for model=%s",
                     resolution.auth.env_var,
                     model,
                 )
+                raise UpstreamAuthUnavailable(resolution.auth.env_var, model)
+            outbound["Authorization"] = f"Bearer {token}"
         return resolution.base_url, outbound
 
     def resolve_upstream_url(

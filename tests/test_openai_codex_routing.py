@@ -185,6 +185,12 @@ class _DummyOpenAIHandler(OpenAIHandlerMixin):
         self.captured_request: tuple[str, str, dict, dict] | None = None
         self.captured_stream_request: tuple[str, dict, dict] | None = None
 
+    def resolve_upstream(self, *, protocol, model, headers):
+        # Legacy single-upstream resolve. HEADROOM_UPSTREAM_ROUTES routing
+        # is covered in test_multi_upstream_*; these routing tests reproduce
+        # the pre-routing behavior (OPENAI_API_URL, headers unchanged).
+        return self.OPENAI_API_URL, headers
+
     async def _next_request_id(self) -> str:
         return "req-1"
 

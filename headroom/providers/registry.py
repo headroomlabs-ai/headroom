@@ -42,6 +42,26 @@ class BearerAuth:
 AuthMode = PassthroughAuth | BearerAuth
 
 
+class UpstreamAuthUnavailable(Exception):
+    """A matched BearerAuth route has no token in its configured env var.
+
+    Raised by the proxy's ``resolve_upstream`` so call sites fail closed
+    (return 502 / a WS error event) *before* contacting the upstream rather
+    than forwarding the request with inbound auth stripped and no
+    replacement ``Authorization`` header. Carries the offending ``env_var``
+    and the request ``model`` for logging; the message is intentionally
+    generic so it can be surfaced to clients without leaking the env-var
+    name.
+    """
+
+    def __init__(self, env_var: str, model: str | None) -> None:
+        self.env_var = env_var
+        self.model = model
+        super().__init__(
+            f"upstream route auth env var {env_var!r} is empty (model={model!r}); failing closed"
+        )
+
+
 @dataclass(frozen=True)
 class UpstreamRoute:
     """One entry in the HEADROOM_UPSTREAM_ROUTES table.
