@@ -142,6 +142,9 @@ def validate_pull_request(event: dict[str, Any]) -> GovernanceReport:
     is_draft = bool(pull_request.get("draft", False))
     is_bot_pr = author.endswith("[bot]")
     body = pull_request.get("body") or ""
+    # Normalize Windows line endings so regex patterns expecting \n
+    # (particularly the code-block fence regex) match correctly.
+    body = body.replace("\r\n", "\n")
 
     if is_bot_pr:
         summary = "### PR governance\n\nBot-authored PR detected; template enforcement is skipped."

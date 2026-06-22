@@ -1104,15 +1104,18 @@ class ContentRouter(Transform):
                 routing_log=[],
             )
         else:
-            # Determine strategy from content analysis
-            mixed = is_mixed_content(content)
-            detection = _detect_content(content)
+            # Determine strategy from content analysis. When runtime settings
+            # force Kompress, skip the full router detection path so large
+            # proxy payloads do not pay for an unused strategy decision.
             force_kompress = bool(getattr(self, "_runtime_force_kompress", False))
-            strategy = (
-                CompressionStrategy.KOMPRESS
-                if force_kompress
-                else self._determine_strategy(content)
-            )
+            if force_kompress:
+                mixed = False
+                detection = DetectionResult(ContentType.PLAIN_TEXT, 1.0, {})
+                strategy = CompressionStrategy.KOMPRESS
+            else:
+                mixed = is_mixed_content(content)
+                detection = _detect_content(content)
+                strategy = self._determine_strategy(content)
             if debug_enabled:
                 _log_router_debug(
                     "content_router_input",
@@ -2569,8 +2572,14 @@ class ContentRouter(Transform):
                 route_counts["error_protected"] += 1
                 continue
 
-            # Detect content type for protection decisions
-            detection = _detect_content(content)
+            # Detect content type for protection decisions. Even when the
+            # runtime strategy is forced to Kompress, keep code-protection
+            # checks but use the lightweight regex detector instead of the
+            # full router chain.
+            force_kompress = bool(getattr(self, "_runtime_force_kompress", False))
+            detection = (
+                _regex_detect_content_type(content) if force_kompress else _detect_content(content)
+            )
             is_code = detection.content_type == ContentType.SOURCE_CODE
 
             # Protection 2: Don't compress recent CODE
