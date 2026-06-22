@@ -2471,6 +2471,7 @@ def _ensure_proxy(
                 ),
             )
             click.echo(f"  Proxy ready on http://127.0.0.1:{port}")
+            click.echo(f"  Dashboard:    http://127.0.0.1:{port}/dashboard")
             return proc
         except RuntimeError as e:
             click.echo(f"  Error: {e}")

@@ -92,6 +92,32 @@ def _selected_context_tool() -> str:
 
 @main.command()
 @click.option(
+    "--port",
+    "-p",
+    default=8787,
+    type=int,
+    envvar="HEADROOM_PORT",
+    help="Proxy port (default: 8787, env: HEADROOM_PORT)",
+)
+@click.option("--no-open", is_flag=True, help="Print the URL instead of opening a browser")
+def dashboard(port: int, no_open: bool) -> None:
+    """Open the Headroom savings dashboard in your browser.
+
+    Requires a running proxy (start one with `headroom proxy` or `headroom wrap ...`).
+    """
+    import webbrowser
+
+    url = f"http://127.0.0.1:{port}/dashboard"
+    click.echo(f"  Dashboard: {url}")
+    if not no_open:
+        try:
+            webbrowser.open(url)
+        except Exception:  # noqa: BLE001 — headless/no browser: URL already printed
+            pass
+
+
+@main.command()
+@click.option(
     "--host",
     default="127.0.0.1",
     envvar="HEADROOM_HOST",
