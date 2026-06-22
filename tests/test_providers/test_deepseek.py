@@ -68,7 +68,7 @@ class TestDeepSeekLiteLLMInjection:
     """Tests for DeepSeek V4 pricing injection into litellm."""
 
     def test_deepseek_v4_models_in_litellm_model_cost(self):
-        from headroom.pricing.litellm_pricing import litellm, LITELLM_AVAILABLE
+        from headroom.pricing.litellm_pricing import LITELLM_AVAILABLE, litellm
 
         if not LITELLM_AVAILABLE:
             pytest.skip("litellm not available")
@@ -76,7 +76,7 @@ class TestDeepSeekLiteLLMInjection:
         assert "deepseek-v4-pro" in litellm.model_cost
 
     def test_deepseek_v4_prefixed_models_in_litellm_model_cost(self):
-        from headroom.pricing.litellm_pricing import litellm, LITELLM_AVAILABLE
+        from headroom.pricing.litellm_pricing import LITELLM_AVAILABLE, litellm
 
         if not LITELLM_AVAILABLE:
             pytest.skip("litellm not available")
@@ -84,7 +84,7 @@ class TestDeepSeekLiteLLMInjection:
         assert "deepseek/deepseek-v4-pro" in litellm.model_cost
 
     def test_deepseek_v4_flash_litellm_pricing(self):
-        from headroom.pricing.litellm_pricing import litellm, LITELLM_AVAILABLE
+        from headroom.pricing.litellm_pricing import LITELLM_AVAILABLE, litellm
 
         if not LITELLM_AVAILABLE:
             pytest.skip("litellm not available")
@@ -95,7 +95,7 @@ class TestDeepSeekLiteLLMInjection:
         assert flash["litellm_provider"] == "deepseek"
 
     def test_deepseek_v4_pro_litellm_pricing(self):
-        from headroom.pricing.litellm_pricing import litellm, LITELLM_AVAILABLE
+        from headroom.pricing.litellm_pricing import LITELLM_AVAILABLE, litellm
 
         if not LITELLM_AVAILABLE:
             pytest.skip("litellm not available")
@@ -107,8 +107,8 @@ class TestDeepSeekLiteLLMInjection:
 
     def test_cost_per_token_resolves_deepseek_v4_flash(self):
         from headroom.pricing.litellm_pricing import (
-            litellm,
             LITELLM_AVAILABLE,
+            litellm,
             resolve_litellm_model,
         )
 
@@ -135,7 +135,7 @@ class TestDeepSeekLiteLLMInjection:
 
     def test_injection_does_not_overwrite_existing_upstream_entries(self):
         """If litellm upstream already has these, our injection is a no-op."""
-        from headroom.pricing.litellm_pricing import litellm, LITELLM_AVAILABLE
+        from headroom.pricing.litellm_pricing import LITELLM_AVAILABLE, litellm
 
         if not LITELLM_AVAILABLE:
             pytest.skip("litellm not available")
@@ -143,6 +143,7 @@ class TestDeepSeekLiteLLMInjection:
         litellm.model_cost["deepseek-v4-flash"] = {"input_cost_per_token": 999}
         # Reimport to trigger _inject_deepseek_pricing — but it should NOT overwrite
         import importlib
+
         import headroom.pricing.litellm_pricing as lp
 
         importlib.reload(lp)
