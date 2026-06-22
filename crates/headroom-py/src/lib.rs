@@ -23,6 +23,10 @@ use headroom_core::transforms::smart_crusher::{
     CrushResult as RustCrushResult, SmartCrusher as RustSmartCrusher,
     SmartCrusherConfig as RustSmartCrusherConfig,
 };
+use headroom_core::transforms::{
+    TextCrusher as RustTextCrusher, TextCrusherConfig as RustTextCrusherConfig,
+    TextCrusherResult as RustTextCrusherResult,
+};
 use headroom_core::transforms::tag_protector::{
     is_known_html_tag as rust_is_known_html_tag, known_html_tag_names as rust_known_html_tag_names,
     protect_tags as rust_protect_tags, restore_tags as rust_restore_tags,
@@ -1622,6 +1626,129 @@ fn compress_openai_responses_live_zone(
     }
 }
 
+// --- TextCrusher (Phase 2, #1171): fast extractive prose compressor ---
+
+#[pyclass(name = "TextCrusherConfig", module = "headroom._core")]
+#[derive(Clone)]
+struct PyTextCrusherConfig {
+    inner: RustTextCrusherConfig,
+}
+
+#[pymethods]
+impl PyTextCrusherConfig {
+    #[new]
+    #[pyo3(signature = (
+        target_ratio = 0.5,
+        w_recency = 1.0,
+        w_relevance = 2.0,
+        w_salience = 1.5,
+        min_segment_chars = 12,
+        near_dup_threshold = 0.85,
+        min_segments_for_crush = 6,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        target_ratio: f64,
+        w_recency: f64,
+        w_relevance: f64,
+        w_salience: f64,
+        min_segment_chars: usize,
+        near_dup_threshold: f64,
+        min_segments_for_crush: usize,
+    ) -> Self {
+        Self {
+            inner: RustTextCrusherConfig {
+                target_ratio,
+                w_recency,
+                w_relevance,
+                w_salience,
+                min_segment_chars,
+                near_dup_threshold,
+                min_segments_for_crush,
+            },
+        }
+    }
+
+    #[getter]
+    fn target_ratio(&self) -> f64 {
+        self.inner.target_ratio
+    }
+    #[getter]
+    fn near_dup_threshold(&self) -> f64 {
+        self.inner.near_dup_threshold
+    }
+    #[getter]
+    fn min_segments_for_crush(&self) -> usize {
+        self.inner.min_segments_for_crush
+    }
+}
+
+#[pyclass(name = "TextCrusherResult", module = "headroom._core")]
+struct PyTextCrusherResult {
+    inner: RustTextCrusherResult,
+}
+
+#[pymethods]
+impl PyTextCrusherResult {
+    #[getter]
+    fn compressed(&self) -> String {
+        self.inner.compressed.clone()
+    }
+    #[getter]
+    fn original_tokens(&self) -> usize {
+        self.inner.original_tokens
+    }
+    #[getter]
+    fn compressed_tokens(&self) -> usize {
+        self.inner.compressed_tokens
+    }
+    #[getter]
+    fn compression_ratio(&self) -> f64 {
+        self.inner.compression_ratio
+    }
+    #[getter]
+    fn kept_segments(&self) -> usize {
+        self.inner.kept_segments
+    }
+    #[getter]
+    fn total_segments(&self) -> usize {
+        self.inner.total_segments
+    }
+}
+
+#[pyclass(name = "TextCrusher", module = "headroom._core")]
+struct PyTextCrusher {
+    inner: RustTextCrusher,
+}
+
+#[pymethods]
+impl PyTextCrusher {
+    #[new]
+    #[pyo3(signature = (config = None))]
+    fn new(config: Option<&PyTextCrusherConfig>) -> Self {
+        let cfg = config.map(|c| c.inner.clone()).unwrap_or_default();
+        Self {
+            inner: RustTextCrusher::new(cfg),
+        }
+    }
+
+    /// `compress(content, context="", target_ratio=None) -> TextCrusherResult`.
+    /// Releases the GIL across the Rust compress call.
+    #[pyo3(signature = (content, context = "", target_ratio = None))]
+    fn compress(
+        &self,
+        py: Python<'_>,
+        content: &str,
+        context: &str,
+        target_ratio: Option<f64>,
+    ) -> PyTextCrusherResult {
+        let content = content.to_string();
+        let context = context.to_string();
+        let inner = py.allow_threads(|| self.inner.compress(&content, &context, target_ratio));
+        PyTextCrusherResult { inner }
+    }
+}
+
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(hello, m)?)?;
@@ -1636,6 +1763,9 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PySmartCrusherConfig>()?;
     m.add_class::<PyCrushResult>()?;
     m.add_class::<PySmartCrusher>()?;
+    m.add_class::<PyTextCrusherConfig>()?;
+    m.add_class::<PyTextCrusherResult>()?;
+    m.add_class::<PyTextCrusher>()?;
     m.add_class::<PyDetectionResult>()?;
     m.add_class::<PyLogCompressorConfig>()?;
     m.add_class::<PyLogCompressionResult>()?;
