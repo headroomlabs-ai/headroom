@@ -477,8 +477,9 @@ impl SavingsStore {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        if now_ms.saturating_sub(self.last_persist_ms.load(Ordering::Relaxed)) >= PERSIST_MIN_INTERVAL_MS
-        {
+        let since_last_persist =
+            now_ms.saturating_sub(self.last_persist_ms.load(Ordering::Relaxed));
+        if since_last_persist >= PERSIST_MIN_INTERVAL_MS {
             self.last_persist_ms.store(now_ms, Ordering::Relaxed);
             self.persist();
         }
