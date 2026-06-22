@@ -1703,8 +1703,9 @@ class ContentRouter(Transform):
         compressed_tokens: int | None = None
 
         # Phase 0 (#1171): size gate. This is the single ML boundary, so gating
-        # here covers ALL three kompress entry points (TEXT, KOMPRESS-direct,
-        # CODE_AWARE->KOMPRESS). Kompress ONNX inference is O(tokens) and runs
+        # here covers EVERY kompress entry point -- TEXT, KOMPRESS-direct,
+        # CODE_AWARE->KOMPRESS, and the strategy-fallback path all route through
+        # _try_ml_compressor. Kompress ONNX inference is O(tokens) and runs
         # synchronously on the request thread; on a large/cold context it
         # exceeds the 30s budget and leaks a non-preemptible worker (#1171).
         # Above the ceiling, route to the fast LogCompressor (or pass through)
@@ -1873,13 +1874,19 @@ class ContentRouter(Transform):
         return self._log_compressor
 
     def _get_text_crusher(self) -> Any:
-        """Get TextCrusher (Phase 2, lazy load). Returns None when disabled."""
+        """Get TextCrusher (Phase 2, lazy load). Returns None when disabled, or
+        when the native ``headroom._core`` extension is not built (mirrors the
+        ImportError handling of the other ``_get_*`` compressor getters)."""
         if not getattr(self, "_text_crusher_enabled", False):
             return None
         if self._text_crusher is None:
-            from .text_crusher import TextCrusher
+            try:
+                from .text_crusher import TextCrusher
 
-            self._text_crusher = TextCrusher()
+                self._text_crusher = TextCrusher()
+            except ImportError:
+                logger.debug("TextCrusher (headroom._core) unavailable; disabling gate route")
+                self._text_crusher_enabled = False
         return self._text_crusher
 
     def _get_tabular_compressor(self) -> Any:

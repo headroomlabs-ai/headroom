@@ -68,9 +68,13 @@ class BackgroundCompressor:
         savings to a later turn."""
         if key in self._pending:
             return False  # already queued / in flight -- dedup
+        # Claim the slot BEFORE the job is observable in the queue so dedup is
+        # atomic against another enqueue of the same key.
+        self._pending.add(key)
         try:
             self._queue.put_nowait(_Job(key, compress, store))
         except asyncio.QueueFull:
+            self._pending.discard(key)
             self._dropped += 1
             logger.warning(
                 "background compression queue full (%d); dropping %s "
@@ -79,7 +83,6 @@ class BackgroundCompressor:
                 key,
             )
             return False
-        self._pending.add(key)
         return True
 
     async def _process_one(self, job: _Job) -> None:

@@ -5,12 +5,16 @@ the request thread under the 30s compression budget. Above a size ceiling the
 router must route around the ML path (to the fast LogCompressor, else
 passthrough) so a large/cold context can't blow the timeout and leak a
 non-preemptible worker. The gate lives inside ``_try_ml_compressor`` so it
-covers all three kompress entry points (TEXT, KOMPRESS-direct, CODE_AWARE).
+covers EVERY kompress entry point (TEXT, KOMPRESS-direct, CODE_AWARE, and the
+strategy-fallback path), all of which funnel through that single boundary.
 """
 
 from __future__ import annotations
 
+import pytest
+
 from headroom.transforms import ContentRouter
+from headroom.transforms.content_router import CompressionStrategy
 
 
 def test_oversized_input_is_gated_away_from_kompress(monkeypatch):
@@ -52,3 +56,21 @@ def test_gate_disabled_when_threshold_zero(monkeypatch):
     out, ntok = router._try_ml_compressor(big, "")
 
     assert router._kompress_gate_fires == 0  # disabled → never gates
+
+
+@pytest.mark.parametrize("strategy", [CompressionStrategy.KOMPRESS, CompressionStrategy.TEXT])
+def test_gate_fires_through_strategy_dispatch(monkeypatch, strategy):
+    # Funnel check: drive the strategy dispatch (not _try_ml_compressor directly)
+    # and confirm both ML strategies reach the single gate boundary.
+    router = ContentRouter()
+    router._kompress_max_tokens = 50
+
+    def _boom():
+        raise AssertionError("kompress must not run for gated input")
+
+    monkeypatch.setattr(router, "_get_kompress", _boom)
+
+    big = "the quick brown fox jumps over the lazy dog. " * 100
+    router._apply_strategy_to_content(big, strategy, "")
+
+    assert router._kompress_gate_fires == 1

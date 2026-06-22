@@ -170,7 +170,26 @@ def eval_transcript(jsonl_path: str, ratio: float = 0.4, min_words: int = 1500, 
     print(f"  -> keeps salient info at {sum(retentions)/n:.0%} while dropping to {sum(ratios)/n:.0%} of tokens")
 
 
+def eval_speed(scale_words: int = 250_000):
+    # Reproducible throughput on a large synthetic prose block (no external data).
+    text = " ".join(
+        f"Sentence {i} discusses subsystem {i} and its failure mode {i % 7} in detail."
+        for i in range(scale_words // 9)
+    )
+    nwords = len(text.split())
+    tc = TextCrusher()
+    t0 = time.perf_counter()
+    out = tc.compress(text, target_ratio=0.3)
+    ms = (time.perf_counter() - t0) * 1000
+    print(f"\n=== Part C: speed (synthetic, {nwords:,} words, fully reproducible) ===")
+    print(f"  TextCrusher compress:  {ms:.0f} ms  ({nwords / max(ms / 1000, 1e-6):,.0f} words/sec)")
+    print(f"  kept ratio:            {out.compressed_tokens / max(1, out.original_tokens):.2f}")
+    print("  reference: kompress (ModernBERT ONNX) ~272s for ~1M tokens (measured, query-blind)")
+    print("  -> fast-vs-slow CONTRAST, not a same-input side-by-side run")
+
+
 if __name__ == "__main__":
+    eval_speed()
     squad = sys.argv[1] if len(sys.argv) > 1 else "/tmp/squad_dev.json"
     tx = sys.argv[2] if len(sys.argv) > 2 else None
     if os.path.exists(squad):

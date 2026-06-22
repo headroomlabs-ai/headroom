@@ -862,12 +862,17 @@ class KompressCompressor(Transform):
         # executor-saturation -> queue-timeout cascade). Bail at the next chunk
         # boundary past this budget, keeping the unprocessed tail verbatim. 0
         # disables. Env HEADROOM_COMPRESSION_DEADLINE_MS overrides (default 20s).
-        try:
-            deadline_s = max(
-                0.0, float(os.environ.get("HEADROOM_COMPRESSION_DEADLINE_MS", "20000")) / 1000.0
-            )
-        except ValueError:
-            deadline_s = 20.0
+        # Cached per instance: operator config, read once -- not per compress() call.
+        deadline_s = getattr(self, "_deadline_s", None)
+        if deadline_s is None:
+            try:
+                deadline_s = max(
+                    0.0,
+                    float(os.environ.get("HEADROOM_COMPRESSION_DEADLINE_MS", "20000")) / 1000.0,
+                )
+            except ValueError:
+                deadline_s = 20.0
+            self._deadline_s = deadline_s
 
         try:
             model, tokenizer, backend = _load_kompress(

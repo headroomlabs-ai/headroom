@@ -30,3 +30,51 @@ def test_compress_bails_at_deadline_keeping_tail_verbatim(monkeypatch):
     # Deadline tripped on the first chunk -> nothing dropped, tail kept verbatim.
     assert result.compressed_tokens == 1000
     assert result.compressed.split() == content.split()
+
+
+def test_compress_partial_run_keeps_processed_head_plus_verbatim_tail(monkeypatch):
+    # The real partial case: chunk 0 processes (gets compressed), chunk 1 trips
+    # the deadline (kept verbatim). Output must be compressed-head + verbatim-tail.
+    # Clock: call1=t_deadline(0); calls 2-4 are chunk-0's check+inference reads
+    # (under budget); call 5+ is chunk-1's check -> trips.
+    state = {"n": 0}
+
+    def fake_clock():
+        state["n"] += 1
+        if state["n"] == 1:
+            return 0.0
+        return 0.001 if state["n"] <= 4 else 999.0
+
+    monkeypatch.setattr(kc.time, "perf_counter", fake_clock)
+
+    class _Enc(dict):
+        def word_ids(self, batch_index=0):
+            return self["_word_ids"]
+
+    class _Tok:
+        def __call__(self, chunk_words, **kw):
+            n = len(chunk_words)
+            return _Enc(input_ids=[[0] * n], attention_mask=[[1] * n], _word_ids=list(range(n)))
+
+    class _Model:
+        def get_keep_mask(self, input_ids, attention_mask):
+            n = len(input_ids[0])
+            return [[i < n // 2 for i in range(n)]]  # keep first half of the chunk
+
+    monkeypatch.setattr(kc, "_load_kompress", lambda *a, **k: (_Model(), _Tok(), "onnx"))
+    monkeypatch.setattr(kc, "_model_device_type", lambda *a, **k: "cpu")
+    monkeypatch.setenv("HEADROOM_COMPRESSION_DEADLINE_MS", "20000")
+
+    comp = kc.KompressCompressor()
+    comp.config.chunk_words = 10  # 20 words -> 2 chunks
+    monkeypatch.setattr(comp, "_should_batch_single_content", lambda *a, **k: False)
+
+    words = [f"w{i}" for i in range(20)]
+    out = comp.compress(" ".join(words)).compressed.split()
+
+    # chunk 0 processed: first half kept (w0..w4), second half dropped (w5..w9)
+    assert "w0" in out and "w4" in out
+    assert "w5" not in out and "w9" not in out
+    # chunk 1 tripped the deadline -> its words kept verbatim (w10..w19 all present)
+    for i in range(10, 20):
+        assert f"w{i}" in out

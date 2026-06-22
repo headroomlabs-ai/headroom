@@ -794,6 +794,12 @@ class HeadroomProxy(
             )
         except ValueError:
             self._background_compression_min_tokens = 50000
+        # Dedicated single thread: no-timeout background jobs never contend with
+        # the request-path executor (Phase 3, #1171). Lazy -- no thread spawns
+        # until the first off-path job is submitted.
+        self._background_compression_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="headroom-bg-compress"
+        )
         self._background_compressor = BackgroundCompressor(self._run_compression_background)
         # Gauge: currently-running compression tasks. Mutated under
         # ``_compression_metrics_lock`` from worker threads + the asyncio
@@ -1102,9 +1108,10 @@ class HeadroomProxy(
         Unlike ``_run_compression_in_executor`` there is no ``asyncio.wait_for``
         and no leaked-thread accounting: no caller is waiting, so a slow run
         backs up the background queue rather than starving the request executor.
+        Runs on the dedicated single-thread background executor.
         """
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self._compression_executor, fn)
+        return await loop.run_in_executor(self._background_compression_executor, fn)
 
     def _get_compression_cache(self, session_id: str) -> CompressionCache:
         """Get or create a CompressionCache for a session.

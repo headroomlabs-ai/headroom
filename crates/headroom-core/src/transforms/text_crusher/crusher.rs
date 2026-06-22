@@ -77,7 +77,9 @@ impl TextCrusher {
 
         let n = segments.len();
         let total_chars: usize = segments.iter().map(|s| s.len()).sum();
-        let target_chars = (total_chars as f64 * ratio) as usize;
+        // .max(1) so a tiny input never truncates the budget to 0 (which would
+        // admit nothing and silently fall back to a 100% passthrough).
+        let target_chars = ((total_chars as f64 * ratio) as usize).max(1);
 
         // Relevance via the shared BM25 scorer (already [0, 1]).
         let seg_refs: Vec<&str> = segments.iter().map(|s| s.as_str()).collect();
@@ -215,7 +217,15 @@ fn shingles(words: &[String], k: usize) -> HashSet<String> {
         return set;
     }
     if words.len() < k {
-        set.insert(words.join("\u{1}"));
+        // Short segment: emit every sub-window (1..=len) so identical/overlapping
+        // short segments still near-dup-match each other. (They can't match a
+        // longer segment's k-grams, but short segments are score-penalized and
+        // rarely survive selection anyway.)
+        for size in 1..=words.len() {
+            for w in words.windows(size) {
+                set.insert(w.join("\u{1}"));
+            }
+        }
         return set;
     }
     for w in words.windows(k) {

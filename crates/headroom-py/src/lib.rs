@@ -1681,6 +1681,22 @@ impl PyTextCrusherConfig {
     fn min_segments_for_crush(&self) -> usize {
         self.inner.min_segments_for_crush
     }
+    #[getter]
+    fn w_recency(&self) -> f64 {
+        self.inner.w_recency
+    }
+    #[getter]
+    fn w_relevance(&self) -> f64 {
+        self.inner.w_relevance
+    }
+    #[getter]
+    fn w_salience(&self) -> f64 {
+        self.inner.w_salience
+    }
+    #[getter]
+    fn min_segment_chars(&self) -> usize {
+        self.inner.min_segment_chars
+    }
 }
 
 #[pyclass(name = "TextCrusherResult", module = "headroom._core")]
