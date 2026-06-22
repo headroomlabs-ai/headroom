@@ -451,8 +451,27 @@ class SavingsRecorder:
             return True
         return False
 
+    def _reload_baseline_locked(self) -> None:
+        """Adopt the on-disk baseline when it's richer than ours.
+
+        ``learn --verbosity --apply`` writes the baseline to the same file a
+        running proxy holds open. Without this, two things break: (1) a baseline
+        learned while the proxy is up never takes effect until a restart, so the
+        treatment lookups all miss (``m == 0``) and the output-reduction tile
+        stays at "—"; and (2) our periodic flush would write our in-memory
+        (empty) baseline straight over the one ``learn`` just persisted. Pulling
+        the disk baseline in before estimating and before every flush fixes both
+        without a restart. ``total_samples`` only grows, so the guard is safe."""
+        try:
+            disk = SavingsLedger.load(self._path)
+        except OSError:
+            return
+        if disk.baseline.total_samples > self._ledger.baseline.total_samples:
+            self._ledger.baseline = disk.baseline
+
     def _flush_locked(self) -> None:
         try:
+            self._reload_baseline_locked()
             self._ledger.save(self._path)
             self._since_flush = 0
         except OSError:
@@ -464,6 +483,7 @@ class SavingsRecorder:
 
     def estimate(self) -> SavingsEstimate:
         with self._lock:
+            self._reload_baseline_locked()
             return self._ledger.best_estimate()
 
 
