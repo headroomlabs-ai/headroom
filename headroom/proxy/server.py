@@ -3101,7 +3101,23 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 headers={"Content-Disposition": f'attachment; filename="{filename}"'},
             )
 
-        return proxy.metrics.savings_tracker.history_response(history_mode=history_mode)
+        history = proxy.metrics.savings_tracker.history_response(history_mode=history_mode)
+
+        # Augment with live RTK/cli-filtering lifetime stats so the Historical
+        # tab can display them.  These live in the context-tool's own stats file
+        # and survive proxy restarts — exactly what the Historical tab needs.
+        cli_stats = await asyncio.to_thread(_get_context_tool_stats)
+        if cli_stats:
+            history["cli_filtering"] = {
+                "tool": str(cli_stats.get("tool", "rtk")),
+                "label": str(cli_stats.get("label", "RTK")),
+                "lifetime": cli_stats.get("lifetime", {}),
+                "session": cli_stats.get("session", {}),
+            }
+        else:
+            history["cli_filtering"] = None
+
+        return history
 
     @app.get("/transformations/feed", dependencies=[Depends(_require_loopback)])
     async def transformations_feed(limit: int = 20):
