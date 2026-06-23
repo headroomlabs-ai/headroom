@@ -24,9 +24,7 @@ def test_embedding_server_missing_sidecar_falls_back(monkeypatch):
 
     monkeypatch.setattr(server_mod, "run_server", lambda *args, **kwargs: None)
 
-    result = CliRunner().invoke(
-        main, ["proxy", "--embedding-server", "--port", "8799"]
-    )
+    result = CliRunner().invoke(main, ["proxy", "--embedding-server", "--port", "8799"])
 
     assert result.exit_code == 0, f"proxy crashed instead of falling back: {result.output}"
     assert result.exception is None
