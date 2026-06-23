@@ -1380,6 +1380,50 @@ class TestRealASTRuns:
         # Output is still valid Python.
         compile(result.compressed, "<test>", "exec")
 
+    def test_get_node_text_uses_utf8_byte_offsets(self):
+        """tree-sitter byte offsets must not be sliced as Python str indexes."""
+        from headroom.transforms.code_compressor import _get_node_text, _get_parser
+
+        code = 'def first():\n    """中文占位"""\n    return 1\n\ndef second():\n    return 2\n'
+        root = _get_parser("python").parse(code.encode("utf-8")).root_node
+        functions = [node for node in root.children if node.type == "function_definition"]
+
+        assert _get_node_text(functions[1], code) == "def second():\n    return 2"
+
+    def test_ast_compresses_python_after_non_ascii_source(self):
+        """CJK/emoji before a later function must not corrupt downstream slices."""
+        compressor = CodeAwareCompressor(
+            CodeCompressorConfig(
+                min_tokens_for_compression=1,
+                max_body_lines=2,
+                enable_ccr=False,
+                semantic_analysis=False,
+            )
+        )
+        code = (
+            "def first():\n"
+            '    """中文占位 with emoji 🔥."""\n'
+            "    return 1\n"
+            "\n"
+            "def second():\n"
+            "    values = []\n"
+            "    for i in range(10):\n"
+            "        values.append(i)\n"
+            "        values.append(i * 2)\n"
+            "        values.append(i * 3)\n"
+            "        values.append(i * 4)\n"
+            "    return sum(values)\n"
+        )
+
+        result = compressor.compress(code, language="python")
+
+        assert result.language == CodeLanguage.PYTHON
+        assert result.syntax_valid is True
+        assert result.compression_ratio < 1.0
+        assert "def second():" in result.compressed
+        assert "中文占位" in result.compressed
+        compile(result.compressed, "<test>", "exec")
+
     def test_ast_runs_for_rust_no_fallback(self):
         """A second supported language (Rust) also runs through real AST."""
         code = (
