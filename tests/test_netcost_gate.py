@@ -354,3 +354,60 @@ class TestNetCostBatchReclaim:
         batch = [t for t in result.transforms_applied if t == "router:netcost_batch_admit"]
         assert len(unlocks) == 2  # both frozen slots opened
         assert len(batch) == 1  # only the deeper one rode free -- no double-count
+
+
+class TestNetCostIdleCompaction:
+    """#856 P3b: derive P_alive from idle time. As the session goes idle the
+    cached suffix nears TTL lapse, P_alive -> 0, the net-cost penalty term
+    vanishes, and edits that lose to a warm suffix become free.
+
+    Baseline shape (mirrors TestNetCostGate.test_flag_on_blocks...): a modest
+    tool-dump shave under a huge cached suffix is BLOCKED at the default
+    P_alive=1.0. These tests vary only the idle signal.
+    """
+
+    def test_idle_near_ttl_unlocks_blocked_edit(self, router, tokenizer, monkeypatch):
+        # idle ~= cache TTL (default 300s) -> P_alive ~= 0 -> penalty ~= 0 ->
+        # the otherwise-blocked deep edit is admitted and marked.
+        monkeypatch.setenv("HEADROOM_NET_COST_POLICY", "1")
+        messages = _messages(_tool_json(300), suffix_filler_words=40000)
+        result = router.apply([dict(m) for m in messages], tokenizer, idle_seconds=295.0)
+        assert _tool_slot_compressed(result, messages)
+        assert "router:netcost_idle_compaction" in result.transforms_applied
+        assert not any(t.startswith("netcost:skip:") for t in result.transforms_applied)
+
+    def test_idle_zero_matches_constant_baseline(self, router, tokenizer, monkeypatch):
+        # idle=0 -> P_alive=1.0, identical to the env-constant default: the
+        # edit stays blocked and no idle marker is emitted.
+        monkeypatch.setenv("HEADROOM_NET_COST_POLICY", "1")
+        messages = _messages(_tool_json(300), suffix_filler_words=40000)
+        result = router.apply([dict(m) for m in messages], tokenizer, idle_seconds=0.0)
+        assert not _tool_slot_compressed(result, messages)
+        assert "router:netcost_idle_compaction" not in result.transforms_applied
+        assert any(t.startswith("netcost:skip:") for t in result.transforms_applied)
+
+    def test_idle_absent_uses_env_constant(self, router, tokenizer, monkeypatch):
+        # No idle_seconds kwarg -> override is None -> P2 env-constant path.
+        monkeypatch.setenv("HEADROOM_NET_COST_POLICY", "1")
+        messages = _messages(_tool_json(300), suffix_filler_words=40000)
+        result = router.apply([dict(m) for m in messages], tokenizer)
+        assert not _tool_slot_compressed(result, messages)
+        assert "router:netcost_idle_compaction" not in result.transforms_applied
+
+    def test_malformed_idle_falls_back_to_constant(self, router, tokenizer, monkeypatch):
+        # Non-numeric idle_seconds is ignored (override stays None), so the
+        # gate keeps the constant behaviour rather than crashing the request.
+        monkeypatch.setenv("HEADROOM_NET_COST_POLICY", "1")
+        messages = _messages(_tool_json(300), suffix_filler_words=40000)
+        result = router.apply([dict(m) for m in messages], tokenizer, idle_seconds="soon")
+        assert not _tool_slot_compressed(result, messages)
+        assert "router:netcost_idle_compaction" not in result.transforms_applied
+
+    def test_custom_ttl_env_controls_decay(self, router, tokenizer, monkeypatch):
+        # A shorter TTL makes the same idle fully decay P_alive -> unlock.
+        monkeypatch.setenv("HEADROOM_NET_COST_POLICY", "1")
+        monkeypatch.setenv("HEADROOM_NET_COST_CACHE_TTL_SECONDS", "60")
+        messages = _messages(_tool_json(300), suffix_filler_words=40000)
+        result = router.apply([dict(m) for m in messages], tokenizer, idle_seconds=59.0)
+        assert _tool_slot_compressed(result, messages)
+        assert "router:netcost_idle_compaction" in result.transforms_applied

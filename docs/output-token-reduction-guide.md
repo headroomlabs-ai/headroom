@@ -21,6 +21,15 @@ export HEADROOM_OUTPUT_SHAPER=1     # off by default
 headroom proxy --port 8787
 ```
 
+> **If a proxy is already running** (e.g. `headroom wrap claude` attaches to one
+> on port 8787 instead of starting a fresh one), it reads this switch from the
+> environment it was launched with — so exporting it afterwards wouldn't reach
+> it. `headroom wrap` handles this for you: it hot-syncs your current output
+> settings to the running proxy (loopback `POST /admin/runtime-env`), applied
+> immediately with no restart. Set the variables before you run `wrap`. Because
+> one proxy is shared by every session attached to it, these settings are global
+> — the most recent explicit value wins.
+
 That's it. Two things now happen on every request:
 
 1. **Verbosity steering** — a short "be terse, don't restate context" instruction

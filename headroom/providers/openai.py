@@ -298,7 +298,14 @@ class OpenAITokenCounter:
         """Count tokens in text."""
         if not text:
             return 0
-        return len(self._encoding.encode(text))
+        try:
+            return len(self._encoding.encode(text))
+        except ValueError:
+            # Passthrough content can legitimately contain strings that look
+            # like tiktoken special tokens (e.g. "<|endoftext|>"). Treat them
+            # as ordinary text instead of raising. Matches
+            # AnthropicTokenCounter.count_text.
+            return len(self._encoding.encode(text, disallowed_special=()))
 
     def count_message(self, message: dict[str, Any]) -> int:
         """

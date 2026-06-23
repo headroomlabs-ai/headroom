@@ -30,6 +30,8 @@ class EstimatingTokenCounter(BaseTokenizer):
     - Base: ~4 characters per token (calibrated against GPT-4)
     - Adjustments for code, URLs, numbers, whitespace
     - Special handling for JSON structure
+    - CJK / Kana / Hangul characters priced at ~1 token each (these scripts
+      tokenize far denser than Latin text)
 
     Example:
         counter = EstimatingTokenCounter()
@@ -41,6 +43,13 @@ class EstimatingTokenCounter(BaseTokenizer):
     CHARS_PER_TOKEN = 4.0  # Average for English text
     CHARS_PER_TOKEN_CODE = 3.5  # Code is denser
     CHARS_PER_TOKEN_JSON = 3.2  # JSON has more structure
+    # CJK / Kana / Hangul scripts tokenize at roughly 0.6-1.7 tokens *per
+    # character* (cl100k_base ~1.0-1.7, DeepSeek/Qwen native ~0.6-0.8), versus
+    # ~0.25 tokens/char for English. A flat 4.0 ratio under-counts them ~4-6x,
+    # so dense-script codepoints are priced separately. 1.5 chars/token keeps
+    # the estimate on the conservative (slight-overestimate) side for native
+    # CJK tokenizers while staying close for cl100k_base.
+    CHARS_PER_TOKEN_CJK = 1.5
 
     # Patterns for content type detection
     CODE_PATTERN = re.compile(
@@ -50,6 +59,21 @@ class EstimatingTokenCounter(BaseTokenizer):
         re.MULTILINE,
     )
     JSON_PATTERN = re.compile(r"^\s*[\[\{]")
+    # Dense scripts where one character is worth roughly one token: CJK
+    # symbols/punctuation, Hiragana/Katakana, CJK Unified (+ Ext A), Hangul,
+    # CJK compatibility ideographs, fullwidth forms, and astral CJK extensions.
+    CJK_PATTERN = re.compile(
+        "["
+        "\u3000-\u303f"  # CJK symbols and punctuation
+        "\u3040-\u30ff"  # Hiragana + Katakana
+        "\u3400-\u4dbf"  # CJK Unified Ideographs Extension A
+        "\u4e00-\u9fff"  # CJK Unified Ideographs
+        "\uac00-\ud7af"  # Hangul syllables
+        "\uf900-\ufaff"  # CJK compatibility ideographs
+        "\uff00-\uffef"  # Halfwidth and fullwidth forms
+        "\U00020000-\U0002a6df"  # CJK Unified Ideographs Extension B
+        "]"
+    )
     URL_PATTERN = re.compile(r"https?://\S+")
     UUID_PATTERN = re.compile(
         r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE
@@ -83,13 +107,31 @@ class EstimatingTokenCounter(BaseTokenizer):
         # Auto-detect content type and adjust ratio
         ratio = self._detect_ratio(text)
 
-        # Apply ratio with minimum of 1 token
-        base_count = int(len(text) / ratio + 0.5)
+        # Price dense scripts (CJK/Kana/Hangul) separately: they tokenize at
+        # roughly one token per character, so applying the Latin ratio to them
+        # under-counts by 4-6x. The remaining characters keep the detected ratio.
+        cjk_chars = self._count_cjk_chars(text)
+        other_chars = len(text) - cjk_chars
+        base_count = int(other_chars / ratio + cjk_chars / self.CHARS_PER_TOKEN_CJK + 0.5)
 
         # Add overhead for special patterns
         overhead = self._count_special_overhead(text)
 
         return max(1, base_count + overhead)
+
+    def _count_cjk_chars(self, text: str) -> int:
+        """Count dense-script (CJK/Kana/Hangul/fullwidth) codepoints.
+
+        These scripts encode at ~1 token per character, unlike Latin text
+        (~4 chars per token), so they are priced with CHARS_PER_TOKEN_CJK.
+
+        Args:
+            text: Text to analyze.
+
+        Returns:
+            Number of dense-script characters in the text.
+        """
+        return len(self.CJK_PATTERN.findall(text))
 
     def _detect_ratio(self, text: str) -> float:
         """Detect optimal chars-per-token ratio based on content.

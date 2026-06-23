@@ -38,6 +38,7 @@ from headroom.install.runtime import (
 )
 from headroom.install.state import load_manifest, save_manifest
 from headroom.install.supervisors import start_supervisor
+from headroom.providers.claude import TOOL_SEARCH_DEFAULT, TOOL_SEARCH_ENV
 from headroom.providers.codex.install import codex_uses_chatgpt_auth
 
 from .main import main
@@ -161,6 +162,12 @@ def _ensure_claude_hooks(path: Path, profile: str, port: int) -> None:
     payload = _json_file(path)
     env_map = dict(payload.get("env") or {}) if isinstance(payload.get("env"), dict) else {}
     env_map["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{port}"
+    # GH #746: with a custom ANTHROPIC_BASE_URL and ENABLE_TOOL_SEARCH unset,
+    # Claude Code stops deferring MCP/system tool schemas and materializes them
+    # all into its context window — overflowing it (breaks sub-agent spawns,
+    # forces constant compaction). Keep deferral on; respect a user-set value.
+    # Shares the TOOL_SEARCH_* constants with `wrap` and `install`.
+    env_map.setdefault(TOOL_SEARCH_ENV, TOOL_SEARCH_DEFAULT)
     payload["env"] = env_map
 
     hooks = dict(payload.get("hooks") or {}) if isinstance(payload.get("hooks"), dict) else {}

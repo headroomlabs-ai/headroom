@@ -274,11 +274,18 @@ class AnthropicTokenCounter(TokenCounter):
             )
             _FALLBACK_WARNING_SHOWN = True
 
-        # Load tiktoken as fallback
+        # Load tiktoken as fallback — bounded, so a stalled vocab download can't
+        # hang token counting inside a request (tiktoken's downloader has no
+        # network timeout); on timeout we estimate by characters instead (GH #956).
         try:
-            import tiktoken
+            from headroom.tokenizers.tiktoken_counter import (
+                TiktokenLoadError,
+                load_encoding,
+            )
 
-            self._encoding = tiktoken.get_encoding("cl100k_base")
+            self._encoding = load_encoding("cl100k_base")
+        except TiktokenLoadError:
+            self._encoding = None  # count_text() falls back to a character estimate
         except ImportError:
             if not self._use_api:
                 warnings.warn(

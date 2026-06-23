@@ -21,27 +21,6 @@ from typing import Any
 # Tool name constant - used for matching tool calls
 CCR_TOOL_NAME = "headroom_retrieve"
 
-# SmartCrusher row-drop emits SHA-256[:12]; legacy compressors use SHA-256[:24].
-# Only these lengths are accepted — rejects spoofing with arbitrary short hashes.
-_VALID_CCR_HASH_LENGTHS = frozenset({12, 24})
-_CCR_HASH_HEX_RE = re.compile(r"^[0-9a-f]+$", re.IGNORECASE)
-# SmartCrusher / opaque-blob markers: <<ccr:HASH ...>> or <<ccr:HASH,KIND,SIZE>>
-_CCR_ANGLE_MARKER_RE = re.compile(
-    r"<<ccr:([0-9a-f]{12}|[0-9a-f]{24})(?=[\s,>])",
-    re.IGNORECASE,
-)
-
-
-def _normalize_ccr_hash(hash_key: str | None) -> str | None:
-    """Return lowercase hash if valid (12 or 24 hex chars), else None."""
-    if hash_key is None or not isinstance(hash_key, str):
-        return None
-    if len(hash_key) not in _VALID_CCR_HASH_LENGTHS:
-        return None
-    if not _CCR_HASH_HEX_RE.match(hash_key):
-        return None
-    return hash_key.lower()
-
 
 def create_ccr_tool_definition(
     provider: str = "anthropic",
@@ -67,8 +46,7 @@ def create_ccr_tool_definition(
             "description": (
                 "Retrieve original uncompressed content that was compressed to save tokens. "
                 "Use this when you need more data than what's shown in compressed tool results. "
-                "The hash is provided in compression markers like "
-                "[N items compressed... hash=abc123] or <<ccr:abc123 ...>>."
+                "The hash is provided in compression markers like [N items compressed... hash=abc123]."
             ),
             "parameters": {
                 "type": "object",
@@ -101,8 +79,7 @@ def create_ccr_tool_definition(
             "description": (
                 "Retrieve original uncompressed content that was compressed to save tokens. "
                 "Use this when you need more data than what's shown in compressed tool results. "
-                "The hash is provided in compression markers like "
-                "[N items compressed... hash=abc123] or <<ccr:abc123 ...>>."
+                "The hash is provided in compression markers like [N items compressed... hash=abc123]."
             ),
             "input_schema": {
                 "type": "object",
@@ -184,8 +161,7 @@ the full uncompressed data, you can retrieve it using the `{CCR_TOOL_NAME}` tool
 **Available hashes:** {hash_list}
 
 Look for markers like `[N items compressed to M. Retrieve more: hash=abc123]`
-or `<<ccr:abc123 N_rows_offloaded>>` in tool results to find the hash for
-each compressed output.
+in tool results to find the hash for each compressed output.
 """
 
 
@@ -226,15 +202,24 @@ class CCRToolInjector:
     # - Generic: any [... compressed ... hash=xxx] pattern
     _marker_patterns: list[re.Pattern] = field(
         default_factory=lambda: [
-            # Bracket markers (legacy compressors): SHA-256[:24]
+            # Hash length is validated by the patterns themselves. Legacy
+            # bracket markers carry a 24-hex-char hash (SHA-256[:24], 96 bits
+            # for collision resistance); SmartCrusher's `<<ccr:>>` markers carry
+            # a 12-hex-char hash (see transforms/smart_crusher.py and
+            # cache/compression_store.py). Both real lengths are accepted.
+            #
             # Standard format: [N <type> compressed to M. Retrieve more: hash=xxx]
+            # Matches items, lines, matches, or any other type
             re.compile(r"\[(\d+) \w+ compressed to (\d+)\. Retrieve more: hash=([a-f0-9]{24})\]"),
             # Legacy format without "to M" or "Retrieve more:" (old TextCompressor)
             re.compile(r"\[(\d+) \w+ compressed\. hash=([a-f0-9]{24})\]"),
-            # Generic fallback: any compression marker with hash (exactly 24 chars)
+            # Generic fallback: any bracket compression marker with hash (exactly 24 chars)
             re.compile(r"\[.*?compressed.*?hash=([a-f0-9]{24})\]", re.IGNORECASE),
-            # SmartCrusher row-drop / opaque-blob: <<ccr:HASH ...>> (12 or 24 hex)
-            _CCR_ANGLE_MARKER_RE,
+            # SmartCrusher markers: the row-drop summary
+            # `<<ccr:HASH N_rows_offloaded>>` and the opaque-blob form
+            # `<<ccr:HASH,KIND,SIZE>>`. HASH is 12-24 hex chars, terminated by a
+            # space, comma, or the closing `>>`.
+            re.compile(r"<<ccr:([a-f0-9]{12,24})\b"),
         ]
     )
 
@@ -318,9 +303,8 @@ class CCRToolInjector:
                     hash_key = match[-1]  # Last capture group is the hash
                 else:
                     hash_key = match  # Single capture group (generic pattern)
-                normalized = _normalize_ccr_hash(hash_key)
-                if normalized and normalized not in self._detected_hashes:
-                    self._detected_hashes.append(normalized)
+                if hash_key and hash_key not in self._detected_hashes:
+                    self._detected_hashes.append(hash_key)
 
     def inject_tool_definition(
         self,
@@ -517,10 +501,17 @@ def parse_tool_call(
     if name != CCR_TOOL_NAME:
         return None, None
 
-    hash_key = _normalize_ccr_hash(input_data.get("hash"))
+    hash_key = input_data.get("hash")
     query = input_data.get("query")
 
-    if hash_key is None:
-        return None, None
+    # Validate hash format. SmartCrusher emits 12-hex-char hashes while legacy
+    # bracket markers / the compression_store use 24-hex-char hashes; accept
+    # either real length and reject anything else as malformed.
+    if hash_key is not None:
+        if not isinstance(hash_key, str) or len(hash_key) not in (12, 24):
+            return None, None
+        # Validate hex characters only
+        if not all(c in "0123456789abcdef" for c in hash_key.lower()):
+            return None, None
 
     return hash_key, query
