@@ -1232,7 +1232,7 @@
                                         <div class="px-4 py-3 text-right">
                                             <!-- Failed rows show the *attempted* compression struck through: the
                                                  request was compressed but the upstream failed, so no savings count. -->
-                                            <span class="font-mono tabular-nums" :class="req.failed ? 'text-gray-600 line-through' : 'text-accent'" x-text="req.savings_percent.toFixed(0) + '%'" :title="req.failed ? 'Upstream failed — compression was attempted but these savings are not counted in the totals' : ''"></span>
+                                            <span class="font-mono tabular-nums" :class="req.failed ? 'text-gray-600 line-through' : 'text-accent'" x-text="(req.savings_percent || 0).toFixed(0) + '%'" :title="req.failed ? 'Upstream failed — compression was attempted but these savings are not counted in the totals' : ''"></span>
                                         </div>
                                         <div class="px-4 py-3 text-right font-mono tabular-nums text-gray-400" x-text="(req.total_latency_ms || 0).toFixed(0) + 'ms'"></div>
                                     </div>

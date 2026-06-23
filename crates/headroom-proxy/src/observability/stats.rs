@@ -760,6 +760,11 @@ pub fn save_state(path: &Path, state: &SavingsState) -> std::io::Result<()> {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
+    // fsync the parent directory so the rename itself is durable: without it a
+    // power loss right after rename can lose the directory entry and revert to
+    // the pre-flush file. Best-effort, same as the temp-file sync above.
+    let parent = path.parent().unwrap_or(Path::new("."));
+    let _ = std::fs::File::open(parent).and_then(|d| d.sync_all());
     Ok(())
 }
 
