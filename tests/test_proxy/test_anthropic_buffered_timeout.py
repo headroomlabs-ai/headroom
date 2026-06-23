@@ -42,6 +42,9 @@ class _BufferedPassthroughClient:
         _assert_buffered_timeout(timeout)
         return self.response
 
+    async def get(self, url, headers=None, timeout=None):  # noqa: ANN001
+        return await self.request("GET", url, headers=headers, timeout=timeout)
+
     async def aclose(self) -> None:
         return None
 
@@ -196,6 +199,34 @@ def test_anthropic_batch_passthrough_buffered_timeout_override_reaches_http_clie
 
     assert response.status_code == 200, response.text
     assert len(http_client.calls) == 1
+    assert isinstance(http_client.calls[0]["timeout"], httpx.Timeout)
+
+
+def test_anthropic_batch_results_buffered_timeout_override_reaches_http_client_get():
+    config = _make_config()
+    app = create_app(config)
+    with TestClient(app) as client:
+        proxy = client.app.state.proxy
+        http_client = _BufferedPassthroughClient(
+            httpx.Response(
+                200,
+                content=b'{"custom_id":"req-1","result":{"type":"succeeded"}}\n',
+                headers={"content-type": "application/jsonl"},
+            )
+        )
+        proxy.http_client = http_client
+
+        response = client.get(
+            "/v1/messages/batches/batch_test_1/results",
+            headers={
+                "x-api-key": "test-key",
+                "anthropic-version": "2023-06-01",
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    assert len(http_client.calls) == 1
+    assert http_client.calls[0]["method"] == "GET"
     assert isinstance(http_client.calls[0]["timeout"], httpx.Timeout)
 
 
