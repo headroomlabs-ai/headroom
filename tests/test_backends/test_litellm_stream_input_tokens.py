@@ -171,9 +171,7 @@ async def test_stream_message_emits_real_output_tokens_in_message_delta() -> Non
 
     msg_delta = next(e for e in events if e["type"] == "message_delta")
     output_tokens = msg_delta["data"]["usage"]["output_tokens"]
-    assert output_tokens == 42, (
-        f"Expected output_tokens=42 in message_delta, got {output_tokens}."
-    )
+    assert output_tokens == 42, f"Expected output_tokens=42 in message_delta, got {output_tokens}."
 
 
 @pytest.mark.asyncio
