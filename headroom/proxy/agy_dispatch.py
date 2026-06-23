@@ -10,7 +10,9 @@ Architecture (ADR 0001 §"Dispatch via hypercorn"):
 
 Security invariants:
   - Binds 127.0.0.1 only (loopback guard).
-  - Leaf private keys never written to disk (in-memory SSLContext via SNI callback).
+  - Leaf private keys are loaded from anonymous memory (memfd) on Linux and
+    never touch the filesystem; on platforms without memfd, a 0600 temp file
+    is written and unlinked immediately after load (perms asserted).
   - ALPN offers ["h2", "http/1.1"] matching the terminator leaf context.
 
 Header handling: the Gemini handler strips the inbound ``accept-encoding``
@@ -25,14 +27,13 @@ import asyncio
 import logging
 import socket
 import ssl
-import tempfile
 from pathlib import Path
 from typing import Any
 
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
 from cryptography.x509 import Certificate
 
-from headroom.proxy.agy_ca import ensure_root_ca
+from headroom.proxy.agy_ca import ensure_root_ca, load_cert_chain_in_memory
 from headroom.proxy.agy_terminator import DEFAULT_ALLOWLIST, _LeafCache
 
 logger = logging.getLogger("headroom.proxy.agy_dispatch")
@@ -90,19 +91,7 @@ def _build_sni_ssl_context(
     ctx.set_alpn_protocols(["h2", "http/1.1"])
 
     # Load the placeholder cert chain (required before SNI callback fires).
-    with (
-        tempfile.NamedTemporaryFile(
-            prefix="hr_disp_cert_", suffix=".pem", delete=True, mode="wb"
-        ) as cf,
-        tempfile.NamedTemporaryFile(
-            prefix="hr_disp_key_", suffix=".pem", delete=True, mode="wb"
-        ) as kf,
-    ):
-        cf.write(init_cert_pem)
-        cf.flush()
-        kf.write(init_key_pem)
-        kf.flush()
-        ctx.load_cert_chain(cf.name, kf.name)
+    load_cert_chain_in_memory(ctx, init_cert_pem, init_key_pem)
 
     def _sni_callback(
         ssl_obj: ssl.SSLObject,
@@ -119,20 +108,7 @@ def _build_sni_ssl_context(
         new_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         new_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         new_ctx.set_alpn_protocols(["h2", "http/1.1"])
-
-        with (
-            tempfile.NamedTemporaryFile(
-                prefix="hr_sni_cert_", suffix=".pem", delete=True, mode="wb"
-            ) as cf,
-            tempfile.NamedTemporaryFile(
-                prefix="hr_sni_key_", suffix=".pem", delete=True, mode="wb"
-            ) as kf,
-        ):
-            cf.write(cert_pem)
-            cf.flush()
-            kf.write(key_pem)
-            kf.flush()
-            new_ctx.load_cert_chain(cf.name, kf.name)
+        load_cert_chain_in_memory(new_ctx, cert_pem, key_pem)
 
         ssl_obj.context = new_ctx  # type: ignore[assignment]
         return None

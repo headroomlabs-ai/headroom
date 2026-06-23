@@ -6,6 +6,7 @@ All tests use pytest's tmp_path; real ~/.headroom is never touched.
 from __future__ import annotations
 
 import datetime
+import os
 from pathlib import Path
 
 import pytest
@@ -26,6 +27,7 @@ from headroom.proxy.agy_ca import (
     _parse_ca_certs_from_pem,
     build_combined_bundle,
     ensure_root_ca,
+    load_cert_chain_in_memory,
 )
 
 # ---------------------------------------------------------------------------
@@ -490,3 +492,298 @@ def test_clean_install_nested_base_dir(tmp_path: Path, monkeypatch: pytest.Monke
     # base_dir itself must be 0o700 (the root cause of the original bug).
     _assert_perms(base_dir, 0o700)
     assert bundle_path.exists()
+
+
+# ---------------------------------------------------------------------------
+# Helpers shared by load_cert_chain_in_memory tests
+# ---------------------------------------------------------------------------
+
+
+def _make_leaf_pem_pair() -> tuple[bytes, bytes]:
+    """Return (cert_pem, key_pem) for a minimal self-signed leaf."""
+    from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "leaf.test")]))
+        .issuer_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "leaf.test")]))
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now)
+        .not_valid_after(now + datetime.timedelta(hours=72))
+        .add_extension(
+            x509.SubjectAlternativeName([x509.DNSName("leaf.test")]), critical=False
+        )
+        .add_extension(
+            x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=True
+        )
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .sign(key, hashes.SHA256())
+    )
+    cert_pem = cert.public_bytes(serialization.Encoding.PEM)
+    key_pem = key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.TraditionalOpenSSL,
+        serialization.NoEncryption(),
+    )
+    return cert_pem, key_pem
+
+
+# ---------------------------------------------------------------------------
+# load_cert_chain_in_memory — primary path (memfd on Linux)
+# ---------------------------------------------------------------------------
+
+
+def test_load_cert_chain_in_memory_loads_usable_ctx() -> None:
+    """Combined cert+key is loaded into a usable SSLContext; no exception."""
+    import ssl
+
+    cert_pem, key_pem = _make_leaf_pem_pair()
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    # Must not raise.
+    load_cert_chain_in_memory(ctx, cert_pem, key_pem)
+
+
+def test_load_cert_chain_in_memory_no_fd_leak() -> None:
+    """After load, the memfd (or temp file) is closed — no leaked descriptors."""
+    import ssl
+
+    cert_pem, key_pem = _make_leaf_pem_pair()
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+
+    before = set(os.listdir("/proc/self/fd"))
+    load_cert_chain_in_memory(ctx, cert_pem, key_pem)
+    after = set(os.listdir("/proc/self/fd"))
+
+    # The only new fd allowed is the /proc/self/fd dirfd opened by listdir itself.
+    new_fds = after - before
+    # Filter out the dirfd from the listdir call above (it closes immediately).
+    assert len(new_fds) == 0, f"Leaked file descriptors after load: {new_fds}"
+
+
+def test_load_cert_chain_in_memory_no_tmpfile_on_linux(monkeypatch: pytest.MonkeyPatch) -> None:
+    """On Linux (memfd available), mkstemp and NamedTemporaryFile are NOT called."""
+    import ssl
+    import tempfile as _tempfile
+
+    cert_pem, key_pem = _make_leaf_pem_pair()
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+
+    mkstemp_called = [False]
+    named_tmp_called = [False]
+
+    original_mkstemp = _tempfile.mkstemp
+    original_named = _tempfile.NamedTemporaryFile
+
+    def _spy_mkstemp(*args: object, **kwargs: object) -> object:
+        mkstemp_called[0] = True
+        return original_mkstemp(*args, **kwargs)
+
+    def _spy_named(*args: object, **kwargs: object) -> object:
+        named_tmp_called[0] = True
+        return original_named(*args, **kwargs)
+
+    monkeypatch.setattr(_tempfile, "mkstemp", _spy_mkstemp)
+    monkeypatch.setattr(_tempfile, "NamedTemporaryFile", _spy_named)
+
+    if hasattr(os, "memfd_create"):
+        load_cert_chain_in_memory(ctx, cert_pem, key_pem)
+        assert not mkstemp_called[0], "mkstemp must NOT be called when memfd_create is available"
+        assert not named_tmp_called[0], (
+            "NamedTemporaryFile must NOT be called when memfd_create is available"
+        )
+
+
+# ---------------------------------------------------------------------------
+# load_cert_chain_in_memory — short-write safety
+# ---------------------------------------------------------------------------
+
+
+def test_load_cert_chain_in_memory_short_write_handled() -> None:
+    """Helper writes all bytes even if os.write short-writes (1 byte at a time)."""
+    import ssl
+
+    cert_pem, key_pem = _make_leaf_pem_pair()
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+
+    if not hasattr(os, "memfd_create"):
+        pytest.skip("memfd_create not available on this platform")
+
+    original_write = os.write
+    written_chunks: list[int] = []
+
+    def _one_byte_write(fd: int, data: bytes | bytearray) -> int:
+        # Only short-write to memfd fds; pass through others.
+        try:
+            path = os.readlink(f"/proc/self/fd/{fd}")
+        except OSError:
+            path = ""
+        if "memfd" in path or "anon" in path.lower():
+            n = original_write(fd, data[:1])
+            written_chunks.append(n)
+            return n
+        return original_write(fd, data)
+
+    import unittest.mock
+
+    with unittest.mock.patch("os.write", side_effect=_one_byte_write):
+        # Must succeed despite 1-byte writes.
+        load_cert_chain_in_memory(ctx, cert_pem, key_pem)
+
+    total = sum(written_chunks)
+    expected = len(cert_pem + key_pem)
+    assert total == expected, f"Expected {expected} bytes written in chunks, got {total}"
+
+
+# ---------------------------------------------------------------------------
+# load_cert_chain_in_memory — fallback path (memfd absent/unavailable)
+# ---------------------------------------------------------------------------
+
+
+def test_load_cert_chain_in_memory_fallback_when_no_memfd(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When memfd_create is absent, fallback uses mkstemp (0600) and unlinks it."""
+    import ssl
+    import tempfile as _tempfile
+
+    cert_pem, key_pem = _make_leaf_pem_pair()
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+
+    # Force fallback: remove memfd_create from os.
+    monkeypatch.delattr(os, "memfd_create", raising=False)
+
+    tmp_paths_created: list[str] = []
+    tmp_paths_unlinked: list[str] = []
+    original_mkstemp = _tempfile.mkstemp
+    original_unlink = os.unlink
+
+    def _spy_mkstemp(*args: object, **kwargs: object) -> tuple[int, str]:
+        fd, path = original_mkstemp(*args, **kwargs)
+        tmp_paths_created.append(path)
+        return fd, path
+
+    def _spy_unlink(path: str, *args: object, **kwargs: object) -> None:
+        if any(path == p for p in tmp_paths_created):
+            tmp_paths_unlinked.append(path)
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(_tempfile, "mkstemp", _spy_mkstemp)
+    monkeypatch.setattr(os, "unlink", _spy_unlink)
+
+    load_cert_chain_in_memory(ctx, cert_pem, key_pem)
+
+    assert tmp_paths_created, "Fallback must call mkstemp"
+    for p in tmp_paths_created:
+        assert not os.path.exists(p), f"Temp file {p} must be unlinked after load"
+    assert set(tmp_paths_created) == set(tmp_paths_unlinked), (
+        "Every temp file created must be unlinked"
+    )
+
+
+def test_load_cert_chain_in_memory_fallback_0600(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fallback temp file has 0600 permissions (asserted by helper)."""
+    import ssl
+    import stat as _stat
+    import tempfile as _tempfile
+
+    cert_pem, key_pem = _make_leaf_pem_pair()
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+
+    monkeypatch.delattr(os, "memfd_create", raising=False)
+
+    observed_modes: list[int] = []
+    original_mkstemp = _tempfile.mkstemp
+
+    def _spy_mkstemp(*args: object, **kwargs: object) -> tuple[int, str]:
+        fd, path = original_mkstemp(*args, **kwargs)
+        mode = _stat.S_IMODE(os.stat(path).st_mode)
+        observed_modes.append(mode)
+        return fd, path
+
+    monkeypatch.setattr(_tempfile, "mkstemp", _spy_mkstemp)
+
+    load_cert_chain_in_memory(ctx, cert_pem, key_pem)
+
+    assert observed_modes, "Fallback must call mkstemp"
+    for mode in observed_modes:
+        assert mode == 0o600, f"Temp file mode must be 0600, got {oct(mode)}"
+
+
+def test_load_cert_chain_in_memory_fallback_unlinks_on_load_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fallback unlinks temp file even when load_cert_chain raises."""
+    import ssl
+    import tempfile as _tempfile
+
+    cert_pem, key_pem = _make_leaf_pem_pair()
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+
+    monkeypatch.delattr(os, "memfd_create", raising=False)
+
+    tmp_paths_created: list[str] = []
+    original_mkstemp = _tempfile.mkstemp
+
+    def _spy_mkstemp(*args: object, **kwargs: object) -> tuple[int, str]:
+        fd, path = original_mkstemp(*args, **kwargs)
+        tmp_paths_created.append(path)
+        return fd, path
+
+    monkeypatch.setattr(_tempfile, "mkstemp", _spy_mkstemp)
+
+    # Patch load_cert_chain to always raise.
+    monkeypatch.setattr(ctx, "load_cert_chain", lambda *a, **kw: (_ for _ in ()).throw(ssl.SSLError("injected")))
+
+    with pytest.raises(ssl.SSLError):
+        load_cert_chain_in_memory(ctx, cert_pem, key_pem)
+
+    # Temp file must still be cleaned up.
+    assert tmp_paths_created, "mkstemp must have been called"
+    for p in tmp_paths_created:
+        assert not os.path.exists(p), f"Temp file {p} must be unlinked even after load exception"
+
+
+def test_load_cert_chain_in_memory_fallback_via_proc_oserror(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When memfd exists but /proc path raises OSError, fallback is triggered."""
+    import ssl
+    import tempfile as _tempfile
+
+    cert_pem, key_pem = _make_leaf_pem_pair()
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+
+    if not hasattr(os, "memfd_create"):
+        pytest.skip("memfd_create not available; fallback-via-OSError path not applicable")
+
+    # Patch load_cert_chain to raise OSError on first call (simulating /proc failure),
+    # then succeed on second call (fallback's mkstemp path).
+    calls: list[int] = [0]
+    original_load = ctx.__class__.load_cert_chain
+
+    def _raise_once(self: ssl.SSLContext, *args: object, **kwargs: object) -> None:
+        calls[0] += 1
+        if calls[0] == 1:
+            raise OSError("simulated /proc not mounted")
+        original_load(self, *args, **kwargs)
+
+    monkeypatch.setattr(ssl.SSLContext, "load_cert_chain", _raise_once)
+
+    tmp_paths_created: list[str] = []
+    original_mkstemp = _tempfile.mkstemp
+
+    def _spy_mkstemp(*args: object, **kwargs: object) -> tuple[int, str]:
+        fd, path = original_mkstemp(*args, **kwargs)
+        tmp_paths_created.append(path)
+        return fd, path
+
+    monkeypatch.setattr(_tempfile, "mkstemp", _spy_mkstemp)
+
+    load_cert_chain_in_memory(ctx, cert_pem, key_pem)
+
+    assert tmp_paths_created, "Fallback (mkstemp) must be triggered when /proc path raises OSError"
+    for p in tmp_paths_created:
+        assert not os.path.exists(p), f"Fallback temp {p} must be unlinked"

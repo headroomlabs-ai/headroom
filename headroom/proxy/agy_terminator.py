@@ -12,7 +12,9 @@ Binds to 127.0.0.1 ONLY. Accepts HTTP CONNECT:
   NEVER chain to a loopback address (self-loop guard).
 
 Security invariants:
-- Leaf private keys are never written to disk.
+- Leaf private keys are loaded from anonymous memory (memfd) on Linux and
+  never touch the filesystem; on platforms without memfd, a 0600 temp file
+  is written and unlinked immediately after load (perms asserted).
 - Proxy-Authorization is never logged.
 - Listener bind address is 127.0.0.1, never 0.0.0.0.
 """
@@ -25,7 +27,6 @@ import ipaddress
 import logging
 import os
 import ssl
-import tempfile
 import urllib.parse
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -38,7 +39,7 @@ from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
 from cryptography.x509 import Certificate
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
-from headroom.proxy.agy_ca import ensure_root_ca
+from headroom.proxy.agy_ca import ensure_root_ca, load_cert_chain_in_memory
 
 logger = logging.getLogger("headroom.proxy.agy_terminator")
 
@@ -105,7 +106,10 @@ def mint_leaf(
     Returns
     -------
     (cert_pem, key_pem)
-        Both as PEM bytes. Key is never written to disk.
+        Both as PEM bytes. Leaf private keys are loaded from anonymous memory
+        (memfd) on Linux and never touch the filesystem; on platforms without
+        memfd, a 0600 temp file is written and unlinked immediately after load
+        (perms asserted).
     """
     leaf_key: RSAPrivateKey = rsa.generate_private_key(
         public_exponent=65537,
@@ -330,16 +334,7 @@ def _build_server_ssl_context(cert_pem: bytes, key_pem: bytes) -> ssl.SSLContext
     """Build an ssl.SSLContext for server-side TLS with ALPN h2+http/1.1."""
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-    # Write cert+key to a secure temp file (no other process sees it).
-    with tempfile.NamedTemporaryFile(
-        prefix="hr_leaf_",
-        suffix=".pem",
-        delete=True,
-        mode="wb",
-    ) as tf:
-        tf.write(cert_pem + key_pem)
-        tf.flush()
-        ctx.load_cert_chain(tf.name)
+    load_cert_chain_in_memory(ctx, cert_pem, key_pem)
     ctx.set_alpn_protocols(["h2", "http/1.1"])
     return ctx
 

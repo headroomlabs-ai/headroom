@@ -20,7 +20,9 @@ from __future__ import annotations
 import datetime
 import logging
 import os
+import ssl
 import stat
+import tempfile
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -417,3 +419,93 @@ def build_combined_bundle(
         len(corp_pems),
     )
     return bundle_path
+
+
+# ---------------------------------------------------------------------------
+# In-memory leaf cert/key loader
+# ---------------------------------------------------------------------------
+
+
+def load_cert_chain_in_memory(
+    ctx: ssl.SSLContext,
+    cert_pem: bytes,
+    key_pem: bytes,
+) -> None:
+    """Load *cert_pem* + *key_pem* into *ctx* without writing a persistent key file.
+
+    Leaf private keys are loaded from anonymous memory (memfd) on Linux and
+    never touch the filesystem; on platforms without memfd, a 0600 temp file
+    is written and unlinked immediately after load (perms asserted).
+
+    Primary path (Linux, ``os.memfd_create`` available):
+        An anonymous, unnamed in-kernel file descriptor is created via
+        ``memfd_create``.  The combined ``cert_pem + key_pem`` PEM is written
+        into it (looping on ``os.write`` to handle short-writes).
+        ``load_cert_chain`` reads it through ``/proc/self/fd/{fd}``; the fd is
+        closed in a ``finally`` block *after* the load (the ``/proc`` path dies
+        the moment the fd is closed).
+
+    Fallback path (memfd absent or ``/proc`` unusable):
+        ``tempfile.mkstemp`` creates a 0600 temp file.  The combined PEM is
+        written in full (loop on ``os.write``).  ``_assert_perms`` validates
+        the 0600 mode (fail-loud; no silent chmod since mkstemp already yields
+        0600).  ``load_cert_chain`` is called; ``os.unlink`` removes the file
+        in a ``finally`` block even if ``load_cert_chain`` raises.
+
+    Parameters
+    ----------
+    ctx:
+        Target ``ssl.SSLContext`` (must be server-side, ``PROTOCOL_TLS_SERVER``).
+    cert_pem:
+        Leaf certificate in PEM encoding.
+    key_pem:
+        Leaf private key in PEM encoding (unencrypted).
+    """
+    combined = cert_pem + key_pem
+
+    if hasattr(os, "memfd_create"):
+        fd = os.memfd_create("hr_leaf")  # type: ignore[attr-defined]
+        try:
+            _write_all_fd(fd, combined)
+            ctx.load_cert_chain(f"/proc/self/fd/{fd}")
+            return
+        except OSError:
+            # /proc not mounted (some containers) — fall through to mkstemp.
+            # (FileNotFoundError is an OSError subclass; an ssl.SSLError for a
+            # malformed cert is NOT an OSError and correctly propagates.)
+            pass
+        finally:
+            os.close(fd)
+
+    _load_via_mkstemp(ctx, combined)
+
+
+def _write_all_fd(fd: int, data: bytes) -> None:
+    """Write all of *data* to *fd*, handling short-writes."""
+    view = memoryview(data)
+    written = 0
+    total = len(data)
+    while written < total:
+        n = os.write(fd, view[written:])
+        written += n
+
+
+def _load_via_mkstemp(ctx: ssl.SSLContext, combined: bytes) -> None:
+    """Write *combined* to a 0600 mkstemp file, load it, then unlink."""
+    fd, path = tempfile.mkstemp(prefix="hr_leaf_", suffix=".pem")
+    try:
+        _write_all_fd(fd, combined)
+        os.close(fd)
+        fd = -1  # prevent double-close in finally
+        _assert_perms(Path(path), 0o600)
+        ctx.load_cert_chain(path)
+    finally:
+        if fd != -1:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            os.unlink(path)
+        except OSError:
+            pass

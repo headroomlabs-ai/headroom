@@ -154,6 +154,16 @@ signals extend that to the user's normal runtime.
   predictable world-writable temp path); perms asserted after write.
 - Leaf certs minted **only** for the cloudcode allowlist host(s), validity ≤ 72h, SAN/EKU
   constrained to that host + `serverAuth` only, cached (bound = allowlist size, 1–2 entries).
+- **Leaf private key handling:** `load_cert_chain_in_memory` (`headroom/proxy/agy_ca.py`) is
+  used at all three `load_cert_chain` call sites (terminator `_build_server_ssl_context`;
+  dispatch placeholder init; dispatch `_sni_callback`). Primary path (Linux, `os.memfd_create`
+  available): combined cert+key PEM is written into an anonymous `memfd_create("hr_leaf")`
+  file descriptor and loaded via `/proc/self/fd/{fd}`; the fd is closed after load so no file
+  ever exists on a filesystem. Fallback path (`memfd_create` absent or `/proc` inaccessible,
+  e.g., certain containers): `tempfile.mkstemp` creates a 0600 temp file; perms are asserted
+  via `_assert_perms`; `load_cert_chain` reads it; `os.unlink` removes it in a `finally`
+  block even if load raises. Leaf private keys are **never** added to any trust store and
+  **never** persist beyond the single `load_cert_chain` call.
 - `~/.headroom` (the bundle's parent dir) is `0700`; the CA store `~/.headroom/ca/` is `0700`
   with key `0600`; the combined bundle file is `0600`. All perms asserted after write.
 - Listener bound to `127.0.0.1` only; `NO_PROXY=127.0.0.1,localhost` loop-guard so the

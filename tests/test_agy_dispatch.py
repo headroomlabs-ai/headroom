@@ -972,3 +972,95 @@ async def test_host_guard_mixed_case_host_passes(
         f"Guard must NOT refuse mixed-case Host (normalized to lower); got HTTP status {status}"
     )
     assert status != 0, "Expected a valid HTTP response (guard passed request to app)"
+
+
+# ---------------------------------------------------------------------------
+# Tests: load_cert_chain_in_memory used in dispatch (headroom-oqb.2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dispatch_no_tmpfile_on_linux(
+    tmp_ca: tuple[RSAPrivateKey, Certificate, bytes],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On Linux (memfd_create available), load_cert_chain is never called with
+    a regular filesystem path for leaf key material — only /proc/self/fd/ paths."""
+    import os
+    import ssl as _ssl
+
+    ca_key, ca_cert, _ = tmp_ca
+
+    if not hasattr(os, "memfd_create"):
+        pytest.skip("memfd_create not available; primary path not applicable")
+
+    # Spy on ssl.SSLContext.load_cert_chain to check which paths are passed.
+    leaf_fs_paths: list[str] = []
+    original_load = _ssl.SSLContext.load_cert_chain
+
+    def _spy_load(
+        self: _ssl.SSLContext, certfile: str, keyfile: object = None, **kwargs: object
+    ) -> None:
+        # Flag any certfile that is NOT an anonymous memfd /proc path.
+        if not certfile.startswith("/proc/self/fd/"):
+            leaf_fs_paths.append(certfile)
+        original_load(self, certfile, keyfile, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(_ssl.SSLContext, "load_cert_chain", _spy_load)
+
+    async with AgyDispatchServer(ca_key=ca_key, ca_cert=ca_cert):
+        pass
+
+    assert not leaf_fs_paths, (
+        f"load_cert_chain must only use /proc/self/fd/ on Linux (memfd), "
+        f"but got regular fs paths: {leaf_fs_paths}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_dispatch_handshake_still_works_via_helper(
+    tmp_ca: tuple[RSAPrivateKey, Certificate, bytes],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AgyDispatchServer (using load_cert_chain_in_memory) still completes
+    a TLS handshake for an allowlisted SNI host — regression guard."""
+    from fastapi.responses import StreamingResponse
+
+    from headroom.proxy.server import HeadroomProxy
+
+    ca_key, ca_cert, ca_cert_pem = tmp_ca
+
+    async def _fake_stream(self: Any, *args: Any, **kwargs: Any) -> StreamingResponse:
+        async def _body() -> bytes:
+            yield b"data: [DONE]\n\n"
+
+        return StreamingResponse(_body(), status_code=200, media_type="text/event-stream")
+
+    monkeypatch.setattr(HeadroomProxy, "_stream_response", _fake_stream)
+
+    async with AgyDispatchServer(ca_key=ca_key, ca_cert=ca_cert) as srv:
+        _, port = srv.address
+        ssl_ctx = _build_client_ssl_ctx(ca_cert_pem)
+        ssl_ctx.set_alpn_protocols(["http/1.1"])
+        conn_reader, conn_writer = await asyncio.open_connection(
+            "127.0.0.1",
+            port,
+            ssl=ssl_ctx,
+            server_hostname=ALLOWLIST_HOST,
+        )
+        try:
+            request = (
+                f"GET / HTTP/1.1\r\n"
+                f"Host: {ALLOWLIST_HOST}\r\n"
+                f"\r\n"
+            ).encode()
+            conn_writer.write(request)
+            await conn_writer.drain()
+            response_line = await asyncio.wait_for(conn_reader.readline(), timeout=10.0)
+        finally:
+            conn_writer.close()
+
+    # Any HTTP response (even 404/421) confirms the TLS handshake succeeded.
+    assert response_line.startswith(b"HTTP/"), (
+        f"Expected HTTP response; TLS handshake must succeed via helper. Got: {response_line!r}"
+    )

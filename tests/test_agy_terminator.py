@@ -519,3 +519,135 @@ async def test_bad_connect_returns_400(tmp_ca: tuple) -> None:
         response = await reader.readline()
         assert b"400" in response
         writer.close()
+
+
+# ---------------------------------------------------------------------------
+# Tests: load_cert_chain_in_memory used in terminator (headroom-oqb.2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_terminator_no_tmpfile_on_linux(
+    tmp_ca: tuple,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On Linux (memfd_create available), the self-terminate TLS path calls
+    load_cert_chain only with /proc/self/fd/ paths — never a regular fs path."""
+    import os
+    import ssl as _ssl
+
+    ca_key, ca_cert, ca_cert_pem = tmp_ca
+
+    if not hasattr(os, "memfd_create"):
+        pytest.skip("memfd_create not available; primary path not applicable")
+
+    leaf_fs_paths: list[str] = []
+    original_load = _ssl.SSLContext.load_cert_chain
+
+    def _spy_load(
+        self: _ssl.SSLContext, certfile: str, keyfile: object = None, **kwargs: object
+    ) -> None:
+        if not certfile.startswith("/proc/self/fd/"):
+            leaf_fs_paths.append(certfile)
+        original_load(self, certfile, keyfile, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(_ssl.SSLContext, "load_cert_chain", _spy_load)
+
+    dispatch_called = [False]
+
+    async def _capture_dispatch(
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        host: str,
+        port: int,
+    ) -> None:
+        dispatch_called[0] = True
+        await asyncio.sleep(0.05)
+
+    terminator = AgyCONNECTTerminator(
+        allowlist=frozenset({ALLOWLIST_HOST}),
+        dispatch=_capture_dispatch,
+        ca_key=ca_key,
+        ca_cert=ca_cert,
+    )
+    await terminator.start()
+    try:
+        proxy_host, proxy_port = terminator.address
+        raw_reader, raw_writer = await asyncio.open_connection(proxy_host, proxy_port)
+        connect_req = (
+            f"CONNECT {ALLOWLIST_HOST}:443 HTTP/1.1\r\nHost: {ALLOWLIST_HOST}:443\r\n\r\n"
+        )
+        raw_writer.write(connect_req.encode())
+        await raw_writer.drain()
+        response = await raw_reader.readline()
+        assert b"200" in response
+
+        # Perform TLS handshake using the self-terminate path.
+        client_ssl_ctx = _build_client_ssl_context(ca_cert_pem)
+        loop = asyncio.get_event_loop()
+        raw_writer.transport.pause_reading()
+        new_transport = await loop.start_tls(
+            raw_writer.transport,
+            raw_writer.transport.get_protocol(),
+            client_ssl_ctx,
+            server_hostname=ALLOWLIST_HOST,
+        )
+        new_transport.close()
+    finally:
+        await terminator.stop()
+
+    assert not leaf_fs_paths, (
+        f"load_cert_chain must only use /proc/self/fd/ on Linux (memfd), "
+        f"but got regular fs paths: {leaf_fs_paths}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_terminator_self_terminate_path_works_via_helper(tmp_ca: tuple) -> None:
+    """Self-terminate TLS path (legacy dispatch callback) completes handshake
+    via load_cert_chain_in_memory — regression guard."""
+    ca_key, ca_cert, ca_cert_pem = tmp_ca
+
+    dispatch_called = [False]
+
+    async def _capture_dispatch(
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        host: str,
+        port: int,
+    ) -> None:
+        dispatch_called[0] = True
+        await asyncio.sleep(0.05)
+
+    terminator = AgyCONNECTTerminator(
+        allowlist=frozenset({ALLOWLIST_HOST}),
+        dispatch=_capture_dispatch,
+        ca_key=ca_key,
+        ca_cert=ca_cert,
+    )
+    await terminator.start()
+    try:
+        proxy_host, proxy_port = terminator.address
+        raw_reader, raw_writer = await asyncio.open_connection(proxy_host, proxy_port)
+        raw_writer.write(
+            f"CONNECT {ALLOWLIST_HOST}:443 HTTP/1.1\r\nHost: {ALLOWLIST_HOST}:443\r\n\r\n".encode()
+        )
+        await raw_writer.drain()
+        response = await raw_reader.readline()
+        assert b"200" in response, f"Expected 200, got {response!r}"
+
+        client_ssl_ctx = _build_client_ssl_context(ca_cert_pem)
+        loop = asyncio.get_event_loop()
+        raw_writer.transport.pause_reading()
+        new_transport = await loop.start_tls(
+            raw_writer.transport,
+            raw_writer.transport.get_protocol(),
+            client_ssl_ctx,
+            server_hostname=ALLOWLIST_HOST,
+        )
+        # Handshake completed successfully; tear down.
+        new_transport.close()
+    finally:
+        await terminator.stop()
+
+    assert dispatch_called[0], "Dispatch callback must have been invoked"
