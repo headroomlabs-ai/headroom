@@ -47,6 +47,7 @@ HEADROOM_WORKSPACE_DIR_ENV = "HEADROOM_WORKSPACE_DIR"
 # ---------------------------------------------------------------------------
 
 HEADROOM_SAVINGS_PATH_ENV = "HEADROOM_SAVINGS_PATH"
+HEADROOM_SAVINGS_EVENTS_PATH_ENV = "HEADROOM_SAVINGS_EVENTS_PATH"
 HEADROOM_TOIN_PATH_ENV = "HEADROOM_TOIN_PATH"
 HEADROOM_SUBSCRIPTION_STATE_PATH_ENV = "HEADROOM_SUBSCRIPTION_STATE_PATH"
 
@@ -66,6 +67,7 @@ _MEMORY_DB_FILE = "memory.db"
 _MEMORIES_DIR = "memories"
 _LICENSE_CACHE_FILE = "license_cache.json"
 _SESSION_STATS_FILE = "session_stats.jsonl"
+_SAVINGS_EVENTS_FILE = "savings_events.jsonl"
 _SYNC_STATE_FILE = "sync_state.json"
 _BRIDGE_STATE_FILE = "bridge_state.json"
 _LOGS_DIR = "logs"
@@ -228,6 +230,21 @@ def session_stats_path() -> Path:
     return workspace_dir() / _SESSION_STATS_FILE
 
 
+def savings_events_path(explicit: str | os.PathLike[str] | None = None) -> Path:
+    """Return the path for the durable append-only savings event ledger.
+
+    Unlike :func:`session_stats_path` (pruned to a short rolling window), this
+    file accrues one line per compression across proxy restarts and concurrent
+    MCP processes, and is the source of truth for ``headroom savings``.
+    """
+
+    return _resolve(
+        explicit,
+        HEADROOM_SAVINGS_EVENTS_PATH_ENV,
+        workspace_dir() / _SAVINGS_EVENTS_FILE,
+    )
+
+
 def sync_state_path() -> Path:
     """Return the path for memory sync state."""
 
@@ -344,6 +361,7 @@ __all__ = [
     "HEADROOM_CONFIG_DIR_ENV",
     "HEADROOM_WORKSPACE_DIR_ENV",
     "HEADROOM_SAVINGS_PATH_ENV",
+    "HEADROOM_SAVINGS_EVENTS_PATH_ENV",
     "HEADROOM_TOIN_PATH_ENV",
     "HEADROOM_SUBSCRIPTION_STATE_PATH_ENV",
     "config_dir",
@@ -357,6 +375,7 @@ __all__ = [
     "native_memory_dir",
     "license_cache_path",
     "session_stats_path",
+    "savings_events_path",
     "sync_state_path",
     "bridge_state_path",
     "log_dir",

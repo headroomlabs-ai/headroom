@@ -98,6 +98,7 @@ headroom proxy --port 8787              # drop-in proxy, zero code changes
 
 # 3 — See the savings
 headroom perf
+headroom dashboard                      # live savings dashboard (proxy must be running)
 ```
 
 Granular extras: `[proxy]`, `[mcp]`, `[ml]`, `[code]`, `[memory]`, `[relevance]`, `[image]`, `[agno]`, `[langchain]`, `[evals]`, `[pytorch-mps]` (Apple-GPU memory-embedder offload — set `HEADROOM_EMBEDDER_RUNTIME=pytorch_mps`). Requires **Python 3.10+**.
@@ -189,14 +190,15 @@ shows an **Output Tokens Saved** card next to input compression, labelled
 
 ## Agent compatibility matrix
 
-| Agent       | `headroom wrap` | Notes                            |
-|-------------|:---------------:|----------------------------------|
-| Claude Code | ✅              | `--memory` · `--code-graph`      |
-| Codex       | ✅              | shares memory with Claude        |
-| Cursor      | ✅              | prints config — paste once       |
-| Aider       | ✅              | starts proxy + launches          |
-| Copilot CLI | ✅              | starts proxy + launches          |
-| OpenClaw    | ✅              | installs as ContextEngine plugin |
+| Agent        | `headroom wrap` | Notes                            |
+|--------------|:---------------:|----------------------------------|
+| Claude Code  | ✅              | `--memory` · `--code-graph`      |
+| Codex        | ✅              | shares memory with Claude        |
+| Cursor       | ✅              | prints config — paste once       |
+| Aider        | ✅              | starts proxy + launches          |
+| Copilot CLI  | ✅              | starts proxy + launches          |
+| OpenClaw     | ✅              | installs as ContextEngine plugin |
+| Cortex Code  | ✅              | 60–65% savings · library mode   |
 
 Any OpenAI-compatible client works via `headroom proxy`. MCP-native: `headroom mcp install`.
 

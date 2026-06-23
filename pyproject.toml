@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "headroom-ai"
-version = "0.26.0"
+version = "0.27.0"
 description = "The Context Optimization Layer for LLM Applications - Cut costs by 50-90%"
 readme = "README.md"
 license = "Apache-2.0"
@@ -93,6 +93,7 @@ proxy-prod = [
 # logic continues to work.  See issue #1216.
 code = [
     "tree-sitter-language-pack>=0.10.0,<1.0.0",
+    "tree-sitter>=0.25.2,<0.26",
 ]
 # ML-based compression with Kompress (ModernBERT).
 # (The legacy [llmlingua] extra was removed in 0.9.x — no live code path used it.

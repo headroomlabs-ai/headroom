@@ -369,6 +369,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         uncached_input_tokens=outcome.uncached_input_tokens,
         attempted_input_tokens=outcome.attempted_input_tokens,
         project=project,
+        client=outcome.client,
     )
 
     # 2. Cost tracker (optional).

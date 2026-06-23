@@ -59,7 +59,16 @@ def _reset_headroom_logger_propagation():
     """
     import logging as _logging
 
-    _logging.getLogger("headroom").propagate = True
+    for logger_name in (
+        "headroom",
+        "headroom.proxy",
+        "headroom.proxy.forwarded_headers",
+        "headroom.transforms",
+        "headroom.transforms.kompress_compressor",
+    ):
+        logger = _logging.getLogger(logger_name)
+        logger.disabled = False
+        logger.propagate = True
     yield
 
 
