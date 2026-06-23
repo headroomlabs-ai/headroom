@@ -83,6 +83,32 @@ describe("HeadroomContextEngine proxy startup helpers", () => {
     expect(mocked.start).not.toHaveBeenCalled();
   });
 
+  it("does not schedule proxy startup when autoStart is disabled and no proxyUrl is configured", async () => {
+    const engine = new HeadroomContextEngine({ autoStart: false });
+
+    await expect(
+      engine.bootstrap({
+        sessionId: "session-1",
+        sessionFile: "session.jsonl",
+      }),
+    ).resolves.toEqual({
+      bootstrapped: true,
+      reason: "proxy startup disabled until proxyUrl is configured",
+    });
+
+    await expect(
+      engine.assemble({
+        sessionId: "session-1",
+        messages: [{ role: "user", content: "hello" }],
+      }),
+    ).resolves.toEqual({
+      messages: [{ role: "user", content: "hello" }],
+      estimatedTokens: 0,
+    });
+
+    expect(mocked.start).not.toHaveBeenCalled();
+  });
+
   it("schedules startup and returns original messages when assembling before proxy readiness", async () => {
     const engine = new HeadroomContextEngine();
     const messages = [{ role: "user", content: "hello" }];

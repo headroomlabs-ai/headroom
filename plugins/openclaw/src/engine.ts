@@ -53,6 +53,13 @@ export class HeadroomContextEngine {
       return { bootstrapped: false, reason: "disabled" };
     }
 
+    if (!this.canStartProxy()) {
+      return {
+        bootstrapped: true,
+        reason: "proxy startup disabled until proxyUrl is configured",
+      };
+    }
+
     this.ensureProxyStarted();
     return { bootstrapped: true, reason: "proxy startup scheduled" };
   }
@@ -236,7 +243,12 @@ export class HeadroomContextEngine {
   }
 
   ensureProxyStarted(): void {
-    if (this.config.enabled === false || this.proxyUrl || this.proxyStartupPromise) {
+    if (
+      this.config.enabled === false ||
+      !this.canStartProxy() ||
+      this.proxyUrl ||
+      this.proxyStartupPromise
+    ) {
       return;
     }
 
@@ -280,5 +292,13 @@ export class HeadroomContextEngine {
     for (const listener of this.proxyReadyListeners) {
       await listener(proxyUrl);
     }
+  }
+
+  private canStartProxy(): boolean {
+    if (this.config.autoStart !== false) {
+      return true;
+    }
+
+    return typeof this.config.proxyUrl === "string" && this.config.proxyUrl.trim().length > 0;
   }
 }

@@ -36,6 +36,75 @@ afterEach(() => {
 });
 
 describe("headroomPlugin runtime routing", () => {
+  it("declares and registers the retrieval tool by name", async () => {
+    const api: any = {
+      config: {
+        plugins: {
+          entries: {
+            headroom: {
+              config: {
+                routeCodexViaProxy: false,
+                autoStart: false,
+              },
+            },
+          },
+        },
+      },
+      logger: {
+        info: vi.fn(),
+        warn: vi.fn(),
+        error: vi.fn(),
+        debug: vi.fn(),
+      },
+      registerContextEngine: vi.fn(),
+      registerTool: vi.fn(),
+      on: vi.fn(),
+    };
+
+    headroomPlugin(api);
+    await Promise.resolve();
+
+    expect(api.registerTool).toHaveBeenCalledWith(expect.any(Function), {
+      name: "headroom_retrieve",
+    });
+    expect(mocked.ensureProxyStarted).not.toHaveBeenCalled();
+  });
+
+  it("does not start the proxy when gateway routing is disabled", async () => {
+    const gatewayHandlers = new Map<string, () => Promise<void>>();
+    const api: any = {
+      config: {
+        plugins: {
+          entries: {
+            headroom: {
+              config: {
+                routeCodexViaProxy: false,
+                autoStart: false,
+              },
+            },
+          },
+        },
+      },
+      logger: {
+        info: vi.fn(),
+        warn: vi.fn(),
+        error: vi.fn(),
+        debug: vi.fn(),
+      },
+      registerContextEngine: vi.fn(),
+      registerTool: vi.fn(),
+      on: vi.fn((event: string, handler: () => Promise<void>) => {
+        gatewayHandlers.set(event, handler);
+      }),
+    };
+
+    headroomPlugin(api);
+    await Promise.resolve();
+    await gatewayHandlers.get("gateway_start")?.();
+
+    expect(mocked.ensureProxyStarted).not.toHaveBeenCalled();
+  });
+
   it("routes configured providers in memory once the proxy becomes available", async () => {
     const gatewayHandlers = new Map<string, () => Promise<void>>();
     const writeConfigFile = vi.fn();
@@ -101,7 +170,7 @@ describe("headroomPlugin runtime routing", () => {
     await Promise.resolve();
 
     expect(mocked.ensureProxyUrl).not.toHaveBeenCalled();
-    expect(mocked.ensureProxyStarted).toHaveBeenCalledTimes(1);
+    expect(mocked.ensureProxyStarted).not.toHaveBeenCalled();
     expect(writeConfigFile).not.toHaveBeenCalled();
     expect(loadConfig).not.toHaveBeenCalled();
     expect(api.config.models.providers["openai-codex"]).toBeUndefined();
@@ -133,7 +202,7 @@ describe("headroomPlugin runtime routing", () => {
     const gatewayStart = gatewayHandlers.get("gateway_start");
     expect(gatewayStart).toBeTypeOf("function");
     await gatewayStart?.();
-    expect(mocked.ensureProxyStarted).toHaveBeenCalledTimes(2);
+    expect(mocked.ensureProxyStarted).toHaveBeenCalledTimes(1);
     expect(writeConfigFile).not.toHaveBeenCalled();
     expect(loadConfig).not.toHaveBeenCalled();
     expect(mocked.ensureProxyUrl).not.toHaveBeenCalled();

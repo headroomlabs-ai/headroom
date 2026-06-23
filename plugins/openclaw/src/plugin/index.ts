@@ -72,6 +72,10 @@ function headroomPlugin(api: any) {
   };
 
   const ensureGatewayRouting = async () => {
+    if (gatewayProviderIds.length === 0) {
+      return;
+    }
+
     const activeProxyUrl = engine.getProxyUrl();
     if (!activeProxyUrl) {
       logger.debug?.("[headroom] Deferring upstream gateway routing until proxy is available");
@@ -93,13 +97,13 @@ function headroomPlugin(api: any) {
     const activeProxyUrl = engine.getProxyUrl() ?? proxyUrl;
     if (!activeProxyUrl) return null;
     return createHeadroomRetrieveTool({ proxyUrl: activeProxyUrl });
+  }, {
+    name: "headroom_retrieve",
   });
 
   api.on("gateway_start", async () => {
     await ensureGatewayRouting();
   });
-
-  void ensureGatewayRouting();
 
   logger.info("[headroom] Plugin registered");
 }
