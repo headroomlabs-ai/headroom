@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 
 import httpx
 
+from headroom.agent_savings import proxy_pipeline_kwargs
 from headroom.copilot_auth import build_copilot_upstream_url
 from headroom.pipeline import PipelineStage, summarize_routing_markers
 from headroom.proxy.auth_mode import classify_auth_mode, classify_client
@@ -421,6 +422,7 @@ class AnthropicHandlerMixin:
 
         from headroom.cache.compression_store import get_compression_store
         from headroom.ccr import CCRToolInjector
+        from headroom.providers.anthropic import sanitize_anthropic_model_id
         from headroom.proxy.helpers import (
             MAX_MESSAGE_ARRAY_LENGTH,
             MAX_REQUEST_BODY_SIZE,
@@ -595,7 +597,14 @@ class AnthropicHandlerMixin:
                         },
                     },
                 )
-            model = body.get("model") or model_override or "unknown"
+            raw_model = body.get("model") or model_override or "unknown"
+            model = (
+                sanitize_anthropic_model_id(raw_model) if isinstance(raw_model, str) else raw_model
+            )
+            body_model = body.get("model")
+            if isinstance(body_model, str) and model != body_model:
+                body["model"] = model
+                body_mutation_tracker.mark_mutated("sanitize_model_id")
             messages = body.get("messages", [])
             pipeline_provider = provider_name
             pipeline_path = request.url.path if upstream_base_url else "/v1/messages"
@@ -663,7 +672,7 @@ class AnthropicHandlerMixin:
             # Identify the harness (codex / claude-code / aider / etc.)
             # from User-Agent or X-Client. Surfaced via the funnel into
             # PERF logs and RequestLog.tags — see RequestOutcome.client.
-            client = classify_client(headers)
+            client = classify_client(headers, default="claude")
             # PR-A5 (P5-49): strip internal x-headroom-* from upstream-bound
             # headers AFTER `_extract_tags` reads them. Inbound bypass gating
             # uses `request.headers.get(...)` directly above; memory user-id
@@ -1066,6 +1075,7 @@ class AnthropicHandlerMixin:
                                     biases=biases,
                                     request_id=request_id,
                                     compression_policy=compression_policy,
+                                    **proxy_pipeline_kwargs(self.config),
                                 ),
                                 timeout=COMPRESSION_TIMEOUT_SECONDS,
                             )
@@ -1106,6 +1116,7 @@ class AnthropicHandlerMixin:
                                     biases=biases,
                                     request_id=request_id,
                                     compression_policy=compression_policy,
+                                    **proxy_pipeline_kwargs(self.config),
                                 ),
                                 timeout=COMPRESSION_TIMEOUT_SECONDS,
                             )
@@ -1137,6 +1148,7 @@ class AnthropicHandlerMixin:
                                         biases=biases,
                                         request_id=request_id,
                                         compression_policy=compression_policy,
+                                        **proxy_pipeline_kwargs(self.config),
                                     ),
                                     timeout=COMPRESSION_TIMEOUT_SECONDS,
                                 )
@@ -1210,6 +1222,9 @@ class AnthropicHandlerMixin:
                     "tokens_before": original_tokens,
                     "tokens_after": optimized_tokens,
                     "transforms_applied": transforms_applied,
+                    # Read-only reference for recording extensions (probe
+                    # recorder); extensions must not mutate it.
+                    "original_messages": original_messages,
                 },
             )
             if compressed_event.messages is not None:
@@ -1284,6 +1299,7 @@ class AnthropicHandlerMixin:
                         )
                 except Exception:  # advisory hint only — must never fail a request
                     pass
+            ccr_workspace_key = ccr_workspace_label = None
             if (
                 self.config.ccr_inject_tool or self.config.ccr_inject_system_instructions
             ) and not _bypass:
@@ -1655,8 +1671,11 @@ class AnthropicHandlerMixin:
             # Update body
             body["messages"] = optimized_messages
             if tools or _original_tools is not None:
-                tools = self._sort_tools_deterministically(tools)
-                body["tools"] = tools
+                sorted_tools = self._sort_tools_deterministically(tools)
+                if sorted_tools != tools:
+                    tools = sorted_tools
+                if tools != _original_tools:
+                    body["tools"] = tools
 
             presend_event = self.pipeline_extensions.emit(
                 PipelineStage.PRE_SEND,
@@ -1674,13 +1693,77 @@ class AnthropicHandlerMixin:
                 optimized_messages = presend_event.messages
                 body["messages"] = optimized_messages
             if presend_event.tools is not None:
-                tools = self._sort_tools_deterministically(presend_event.tools)
-                body["tools"] = tools
+                sorted_tools = self._sort_tools_deterministically(presend_event.tools)
+                if sorted_tools != presend_event.tools:
+                    tools = sorted_tools
+                else:
+                    tools = presend_event.tools
+                if tools or body.get("tools") is not None:
+                    if tools != body.get("tools"):
+                        body["tools"] = tools
             if presend_event.headers is not None:
                 headers = presend_event.headers
             if presend_event.messages is not previous_presend_messages:
                 optimized_tokens = tokenizer.count_messages(body["messages"])
                 tokens_saved = max(0, original_tokens - optimized_tokens)
+
+            # Output shaping (opt-in via HEADROOM_OUTPUT_SHAPER): verbosity
+            # steering appended to the system-prompt tail + effort routing on
+            # mechanical tool_result continuations. Runs after every other
+            # body mutation so the turn classifier sees the final messages,
+            # and respects the same bypass header as compression.
+            if not _bypass:
+                from headroom.proxy.output_savings import (
+                    assign_arm,
+                    conversation_key_from_body,
+                    stratum_key,
+                    stratum_label,
+                )
+                from headroom.proxy.output_shaper import (
+                    OutputShaperSettings,
+                    classify_turn,
+                    resolve_verbosity_level,
+                    shape_request,
+                )
+
+                _shaper_settings = OutputShaperSettings.from_env()
+                if _shaper_settings.enabled:
+                    # Conversation-stable holdout assignment: a whole
+                    # conversation is treatment or control. This keeps the A/B
+                    # comparison clean AND keeps the prefix cache stable (we
+                    # never flip a conversation's system-prompt tail mid-stream).
+                    from headroom.proxy import runtime_env
+
+                    _holdout = 0.0
+                    try:
+                        _holdout = float(runtime_env.getenv("HEADROOM_OUTPUT_HOLDOUT", "0") or "0")
+                    except ValueError:
+                        _holdout = 0.0
+                    _arm = assign_arm(conversation_key_from_body(body), _holdout)
+
+                    # Stratum from request features observable now (mirrors the
+                    # offline baseline so live and learned strata line up).
+                    _turn_kind = classify_turn(body.get("messages", [])).value
+                    _stratum = stratum_key(
+                        turn_kind=_turn_kind,
+                        input_tokens=original_tokens,
+                        model=model,
+                        has_tools=bool(body.get("tools")),
+                    )
+                    # Carry (arm, stratum) on the existing label channel so the
+                    # outcome funnel can feed the savings ledger from any path.
+                    transforms_applied.append(stratum_label(_arm, _stratum))
+
+                    if _arm == "treatment":
+                        _level, _src = resolve_verbosity_level(_shaper_settings)
+                        shape_result = shape_request(body, _shaper_settings, level_override=_level)
+                        if shape_result.changed:
+                            body_mutation_tracker.mark_mutated("output_shaper")
+                            transforms_applied.extend(shape_result.labels or [])
+                            logger.info(
+                                f"[{request_id}] OutputShaper(L{_level}/{_src}): "
+                                f"{shape_result.labels}"
+                            )
 
             # Unit 2: mark end of pre-upstream phase. Everything after this
             # point is upstream I/O or post-response bookkeeping.
@@ -1733,6 +1816,7 @@ class AnthropicHandlerMixin:
                             tags,
                             optimization_latency,
                             pipeline_timing=pipeline_timing,
+                            original_messages=original_client_messages,
                         )
                     else:
                         async with stage_timer.measure("upstream_connect"):
@@ -1834,7 +1918,15 @@ class AnthropicHandlerMixin:
                                 turn_id=compute_turn_id(
                                     model, body.get("system"), body.get("messages")
                                 ),
-                                request_messages=body.get("messages")
+                                # `original_client_messages` is the deep-copied
+                                # pre-compression snapshot; `body["messages"]`
+                                # is the compressed list sent upstream. Both
+                                # share the `log_full_messages` gate so the two
+                                # sides stay symmetric.
+                                request_messages=original_client_messages
+                                if self.config.log_full_messages
+                                else None,
+                                compressed_messages=body.get("messages")
                                 if self.config.log_full_messages
                                 else None,
                             )
@@ -2355,7 +2447,16 @@ class AnthropicHandlerMixin:
                             turn_id=compute_turn_id(
                                 model, body.get("system"), body.get("messages")
                             ),
-                            request_messages=messages if self.config.log_full_messages else None,
+                            # `original_client_messages` is the deep-copied
+                            # pre-compression snapshot; `body["messages"]` is the
+                            # compressed list sent upstream. Both gated by
+                            # `log_full_messages`.
+                            request_messages=original_client_messages
+                            if self.config.log_full_messages
+                            else None,
+                            compressed_messages=body.get("messages")
+                            if self.config.log_full_messages
+                            else None,
                         )
                     )
 
@@ -2372,7 +2473,11 @@ class AnthropicHandlerMixin:
                     response_headers["x-headroom-tokens-saved"] = str(tokens_saved)
                     response_headers["x-headroom-model"] = model
                     if transforms_applied:
-                        response_headers["x-headroom-transforms"] = ",".join(transforms_applied)
+                        from headroom.proxy.cost import header_safe_transforms
+
+                        response_headers["x-headroom-transforms"] = ",".join(
+                            header_safe_transforms(transforms_applied)
+                        )
                     if cache_hit:
                         response_headers["x-headroom-cached"] = "true"
                     if _compression_failed:
@@ -2525,7 +2630,7 @@ class AnthropicHandlerMixin:
         headers = dict(request.headers.items())
         headers.pop("host", None)
         headers.pop("content-length", None)
-        client = classify_client(headers)
+        client = classify_client(headers, default="claude")
         tags = extract_tags(headers)
         # PR-A5 (P5-49): strip internal x-headroom-* before forwarding upstream.
         from headroom.proxy.helpers import _strip_internal_headers, log_outbound_headers
@@ -2550,9 +2655,11 @@ class AnthropicHandlerMixin:
             custom_id = batch_req.get("custom_id", "")
             params = batch_req.get("params", {})
             canonical_params = dict(params)
-            canonical_tools = canonical_params.get("tools")
-            if canonical_tools is not None:
-                canonical_params["tools"] = self._sort_tools_deterministically(canonical_tools)
+            original_tools = canonical_params.get("tools")
+            if original_tools is not None:
+                sorted_tools = self._sort_tools_deterministically(original_tools)
+                if sorted_tools != original_tools:
+                    canonical_params["tools"] = sorted_tools
             messages = params.get("messages", [])
             original_messages = copy.deepcopy(messages)
             model = params.get("model", "unknown")
@@ -2588,6 +2695,7 @@ class AnthropicHandlerMixin:
                         context=extract_user_query(messages),
                         frozen_message_count=frozen_message_count,
                         request_id=request_id,
+                        **proxy_pipeline_kwargs(self.config),
                     )
 
                     optimized_messages = result.messages
@@ -2629,7 +2737,12 @@ class AnthropicHandlerMixin:
                 # Create compressed batch request
                 compressed_params = {**params, "messages": optimized_messages}
                 if tools is not None:
-                    compressed_params["tools"] = self._sort_tools_deterministically(tools)
+                    sorted_tools = self._sort_tools_deterministically(tools)
+                    if sorted_tools != tools:
+                        tools = sorted_tools
+                    if tools or original_tools is not None:
+                        if tools != original_tools:
+                            compressed_params["tools"] = tools
                 compressed_requests.append(
                     {
                         "custom_id": custom_id,
@@ -2777,7 +2890,7 @@ class AnthropicHandlerMixin:
 
         headers = dict(request.headers.items())
         headers.pop("host", None)
-        client = classify_client(headers)
+        client = classify_client(headers, default="claude")
         tags = extract_tags(headers)
         # PR-A5 (P5-49): strip internal x-headroom-* before forwarding upstream.
         from headroom.proxy.helpers import _strip_internal_headers, log_outbound_headers
@@ -2900,7 +3013,7 @@ class AnthropicHandlerMixin:
 
         headers = dict(request.headers.items())
         headers.pop("host", None)
-        client = classify_client(headers)
+        client = classify_client(headers, default="claude")
         tags = extract_tags(headers)
         # PR-A5 (P5-49): strip internal x-headroom-* before forwarding upstream.
         from headroom.proxy.helpers import _strip_internal_headers, log_outbound_headers

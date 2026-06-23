@@ -423,7 +423,7 @@ tail -f ~/Library/Logs/headroom/proxy-error.log
 
 - Missing dependencies: `pip install headroom-ai[proxy]`
 - Invalid API key: Verify `ANTHROPIC_API_KEY`
-- Python version incompatible: Requires Python 3.9+
+- Python version incompatible: Requires Python 3.10+
 
 ### ANTHROPIC_BASE_URL Not Set
 
@@ -647,6 +647,34 @@ Limit CPU and memory usage:
     <integer>536870912</integer> <!-- 512 MB -->
 </dict>
 ```
+
+## Apple GPU (MPS) Embedding Offload
+
+On Apple Silicon, the proxy's memory embedder can run on the Apple GPU (MPS)
+instead of the default ONNX CPU backend. Offloading embedding to the GPU frees
+the CPU under load, keeping the proxy responsive — useful on fanless Macs (e.g.
+the M5 Air) that are prone to CPU-saturation timeouts.
+
+Enable it by installing the extra and setting the env var:
+
+```bash
+pip install 'headroom-ai[pytorch-mps]'   # also works as [pytorch_mps]
+export HEADROOM_EMBEDDER_RUNTIME=pytorch_mps
+```
+
+Under a LaunchAgent, set the env var in the plist `EnvironmentVariables`
+section:
+
+```xml
+<key>HEADROOM_EMBEDDER_RUNTIME</key>
+<string>pytorch_mps</string>
+```
+
+It only engages when Apple MPS is actually available (Apple Silicon + torch).
+If MPS is unavailable or the dependencies are missing, the proxy logs a warning
+and uses the existing default embedder selection path. This is strictly opt-in;
+default behavior is unchanged. See [Memory](memory.md#embedding-runtime--gpu-offload-apple-silicon)
+for details.
 
 ## FAQ
 

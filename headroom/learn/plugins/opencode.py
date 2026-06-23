@@ -32,7 +32,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .._shared import classify_error, is_error_content
+from .._shared import classify_error, is_error_content, normalize_tool_name
 from ..base import ConversationScanner, LearnPlugin
 from ..models import (
     ErrorCategory,
@@ -190,7 +190,7 @@ class OpenCodePlugin(LearnPlugin, ConversationScanner):
             FROM   part p
             JOIN   message m ON p.message_id = m.id
             WHERE  m.session_id = ?
-            AND    p.data LIKE '%"type":"tool"%'
+            AND    p.data LIKE '%"type"%tool%'
             ORDER  BY p.time_created
             """,
             (session_id,),
@@ -209,11 +209,14 @@ class OpenCodePlugin(LearnPlugin, ConversationScanner):
             if data.get("type") != "tool":
                 continue
 
-            tool_name: str = data.get("tool", "unknown")
-            call_id: str = data.get("callID", f"oc_{session_id}_{idx}")
-            state: dict = data.get("state", {})
-            status: str = state.get("status", "unknown")
-            input_data: dict = state.get("input") or {}
+            raw_tool_name = str(data.get("tool") or "unknown")
+            tool_name = "Bash" if raw_tool_name.lower() == "bash" else normalize_tool_name(raw_tool_name)
+            call_id = str(data.get("callID") or f"oc_{session_id}_{idx}")
+            state_raw = data.get("state")
+            state: dict = state_raw if isinstance(state_raw, dict) else {}
+            status = str(state.get("status") or "unknown")
+            input_raw = state.get("input")
+            input_data: dict = input_raw if isinstance(input_raw, dict) else {}
             output: str = str(state.get("output") or "")
 
             # Detect truncated output pointer.

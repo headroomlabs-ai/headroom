@@ -74,14 +74,14 @@ use crate::proxy::AppState;
 // `Extension<AuthMode>` extractor.
 use headroom_core::auth_mode::AuthMode;
 
-/// Anthropic vendor prefix as encoded in Bedrock model ids.
-const ANTHROPIC_VENDOR_PREFIX: &str = "anthropic.";
+use crate::bedrock::vendor::is_anthropic_model_id;
 
 /// AWS Bedrock Runtime DNS template.
 const BEDROCK_RUNTIME_HOST_TEMPLATE: &str = "bedrock-runtime.{region}.amazonaws.com";
 
-/// Path action for the streaming route.
+/// Path action for the streaming routes.
 const STREAMING_ACTION: &str = "invoke-with-response-stream";
+const CONVERSE_STREAM_ACTION: &str = "converse-stream";
 
 /// RAII guard that observes the `bedrock_invoke_latency_seconds`
 /// histogram on drop. Mirrors the [`crate::bedrock::invoke`] guard
@@ -152,7 +152,7 @@ pub async fn handle_invoke_streaming(
     );
 
     // 1. Live-zone compression for Anthropic-shape bodies (same as D1).
-    let is_anthropic = model_id.starts_with(ANTHROPIC_VENDOR_PREFIX);
+    let is_anthropic = is_anthropic_model_id(&model_id);
     let outbound_body: Bytes = if is_anthropic {
         run_anthropic_compression(&body, &state, auth_mode, &request_id)
     } else {
@@ -166,8 +166,26 @@ pub async fn handle_invoke_streaming(
         body.clone()
     };
 
-    // 2. Build upstream URL.
-    let upstream_url = match build_bedrock_streaming_upstream(&state, &model_id, &uri) {
+    // 2. Resolve the Bedrock streaming action from the inbound path and
+    // build the upstream URL.
+    let action = match extract_streaming_action(uri.path()) {
+        Some(a) => a,
+        None => {
+            tracing::error!(
+                event = "bedrock_streaming_action_invalid",
+                request_id = %request_id,
+                path = %uri.path(),
+                "bedrock invoke-streaming: unrecognized streaming action path"
+            );
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "bedrock_streaming_action_invalid",
+                "Unsupported Bedrock streaming action path",
+            );
+        }
+    };
+
+    let upstream_url = match build_bedrock_streaming_upstream(&state, &model_id, &uri, action) {
         Ok(u) => u,
         Err(msg) => {
             tracing::error!(
@@ -836,14 +854,13 @@ fn run_anthropic_compression(
 ) -> Bytes {
     use crate::bedrock::envelope::BedrockEnvelope;
 
-    if let Err(e) = BedrockEnvelope::parse(body) {
-        tracing::warn!(
-            event = "bedrock_envelope_parse_error",
+    let parsed_envelope = BedrockEnvelope::parse(body).is_ok();
+    if !parsed_envelope {
+        tracing::info!(
+            event = "bedrock_envelope_parse_skipped",
             request_id = %request_id,
-            error = %e,
-            "bedrock invoke-streaming: envelope parse failed; passing body through unchanged"
+            "bedrock invoke-streaming: envelope parse skipped; attempting generic anthropic compression"
         );
-        return body.clone();
     }
 
     // PR-E3: Bedrock channel hard-codes OAuth so cache_control
@@ -868,17 +885,21 @@ fn run_anthropic_compression(
             body.clone()
         }
         AnthropicOutcome::Compressed { body: new_body, .. } => {
-            match BedrockEnvelope::ensure_anthropic_version_first(&new_body) {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::error!(
-                        event = "bedrock_envelope_reemit_failed",
-                        request_id = %request_id,
-                        error = %e,
-                        "bedrock invoke-streaming: failed to re-emit envelope"
-                    );
-                    body.clone()
+            if parsed_envelope {
+                match BedrockEnvelope::ensure_anthropic_version_first(&new_body) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::error!(
+                            event = "bedrock_envelope_reemit_failed",
+                            request_id = %request_id,
+                            error = %e,
+                            "bedrock invoke-streaming: failed to re-emit envelope"
+                        );
+                        body.clone()
+                    }
                 }
+            } else {
+                new_body
             }
         }
     }
@@ -888,6 +909,7 @@ fn build_bedrock_streaming_upstream(
     state: &AppState,
     model_id: &str,
     uri: &Uri,
+    action: &str,
 ) -> Result<Url, String> {
     let base = match state.config.bedrock_endpoint.as_ref() {
         Some(u) => u.clone(),
@@ -901,7 +923,7 @@ fn build_bedrock_streaming_upstream(
     let path = format!(
         "/model/{model_id}/{action}",
         model_id = model_id,
-        action = STREAMING_ACTION,
+        action = action,
     );
     let mut joined = base;
     joined.set_path(&path);
@@ -909,6 +931,16 @@ fn build_bedrock_streaming_upstream(
         joined.set_query(Some(q));
     }
     Ok(joined)
+}
+
+fn extract_streaming_action(path: &str) -> Option<&'static str> {
+    if path.ends_with(&format!("/{STREAMING_ACTION}")) {
+        Some(STREAMING_ACTION)
+    } else if path.ends_with(&format!("/{CONVERSE_STREAM_ACTION}")) {
+        Some(CONVERSE_STREAM_ACTION)
+    } else {
+        None
+    }
 }
 
 fn collect_signed_headers(headers: &HeaderMap, upstream_url: &Url) -> Vec<(String, String)> {
@@ -996,6 +1028,7 @@ mod tests {
             &state,
             "anthropic.claude-3-haiku-20240307-v1:0",
             &uri,
+            STREAMING_ACTION,
         )
         .unwrap();
         assert_eq!(
@@ -1011,5 +1044,55 @@ mod tests {
         assert!(s.starts_with("event: error\ndata: "));
         assert!(s.ends_with("\n\n"));
         assert!(s.contains("bedrock_eventstream_crc_mismatch"));
+    }
+
+    #[test]
+    fn build_streaming_upstream_supports_converse_stream_action() {
+        use crate::config::Config;
+        let mut config = Config::for_test(Url::parse("http://up:8080").unwrap());
+        config.bedrock_region = "eu-west-1".to_string();
+        let state = AppState {
+            config: std::sync::Arc::new(config),
+            client: reqwest::Client::new(),
+            bedrock_credentials: None,
+            drift_state: crate::cache_stabilization::drift_detector::DriftState::new(8),
+            vertex_token_source: std::sync::Arc::new(crate::vertex::StaticTokenSource::new(
+                "test".to_string(),
+            )),
+        };
+        let uri: Uri = "/model/anthropic.claude-3-haiku-20240307-v1:0/converse-stream"
+            .parse()
+            .unwrap();
+        let url = build_bedrock_streaming_upstream(
+            &state,
+            "anthropic.claude-3-haiku-20240307-v1:0",
+            &uri,
+            CONVERSE_STREAM_ACTION,
+        )
+        .unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://bedrock-runtime.eu-west-1.amazonaws.com/model/anthropic.claude-3-haiku-20240307-v1:0/converse-stream"
+        );
+    }
+
+    #[test]
+    fn extract_streaming_action_supports_both_bedrock_paths() {
+        assert_eq!(
+            extract_streaming_action(
+                "/model/anthropic.claude-3-haiku-20240307-v1:0/invoke-with-response-stream"
+            ),
+            Some(STREAMING_ACTION)
+        );
+        assert_eq!(
+            extract_streaming_action(
+                "/model/anthropic.claude-3-haiku-20240307-v1:0/converse-stream"
+            ),
+            Some(CONVERSE_STREAM_ACTION)
+        );
+        assert_eq!(
+            extract_streaming_action("/model/anthropic.claude-3-haiku-20240307-v1:0/invoke"),
+            None
+        );
     }
 }

@@ -30,8 +30,8 @@ pub mod ir;
 pub mod walker;
 
 pub use classifier::{classify_cell, CellClass, ClassifyConfig};
-pub use compactor::{compact, CompactConfig};
-pub use formatter::{CsvSchemaFormatter, Formatter, JsonFormatter};
+pub use compactor::{compact, compact_with_store, CompactConfig};
+pub use formatter::{CsvSchemaFormatter, Formatter, JsonFormatter, MarkdownKvFormatter};
 pub use ir::{Bucket, CellValue, Compaction, FieldSpec, OpaqueKind, Row, Schema};
 pub use walker::{
     compact_document, emit_opaque_ccr_marker, try_parse_json_container, DocumentCompactor,
@@ -59,6 +59,16 @@ impl CompactionStage {
         }
     }
 
+    /// CSV+schema formatter with an explicit config. Used by
+    /// `SmartCrusher::new` to honor the compaction heuristics carried
+    /// on `SmartCrusherConfig` instead of pinning `CompactConfig::default()`.
+    pub fn csv_schema(config: CompactConfig) -> Self {
+        Self {
+            config,
+            formatter: Box::new(CsvSchemaFormatter::new()),
+        }
+    }
+
     /// JSON formatter, default config — useful for debugging or for
     /// downstream consumers that want structured rather than CSV-shaped
     /// output.
@@ -69,11 +79,57 @@ impl CompactionStage {
         }
     }
 
+    /// Markdown-KV formatter, default config — opt-in trade of tokens
+    /// for model read accuracy (field names repeat per row, but
+    /// format-comprehension benchmarks favor KV over CSV).
+    pub fn default_markdown_kv() -> Self {
+        Self {
+            config: CompactConfig::default(),
+            formatter: Box::new(MarkdownKvFormatter::new()),
+        }
+    }
+
+    /// Formatter names accepted by [`Self::from_format_name`]. The
+    /// single source of truth for caller error messages (the PyO3
+    /// bridge renders this list) — keep in sync with the match below.
+    pub const SUPPORTED_FORMAT_NAMES: &'static [&'static str] =
+        &["csv-schema", "json", "markdown-kv"];
+
+    /// Look up a preset by its formatter name (see
+    /// [`Self::SUPPORTED_FORMAT_NAMES`]). `None` for unknown names —
+    /// callers own the fallback/error policy.
+    pub fn from_format_name(name: &str) -> Option<Self> {
+        match name {
+            "csv-schema" => Some(Self::default_csv_schema()),
+            "json" => Some(Self::default_json()),
+            "markdown-kv" => Some(Self::default_markdown_kv()),
+            _ => None,
+        }
+    }
+
     /// Run the stage end-to-end: compact + format. Returns the
     /// [`Compaction`] tree (so callers can inspect kept/total row
     /// counts) alongside the rendered bytes.
     pub fn run(&self, items: &[serde_json::Value]) -> (Compaction, String) {
         let c = compact(items, &self.config);
+        let rendered = self.formatter.format(&c);
+        (c, rendered)
+    }
+
+    /// Like [`Self::run`], but stash every opaque-blob payload into `store`
+    /// under the same hash the rendered `<<ccr:HASH,...>>` marker carries,
+    /// so `GET /v1/retrieve/{hash}` and the `headroom_retrieve` tool can
+    /// serve the original back. `SmartCrusher::crush_array`'s lossless
+    /// branch passes the proxy's CCR store here; previously it called
+    /// [`Self::run`], which rendered markers whose payload was never stored
+    /// (issue #1083). When `store` is `None`, behaves exactly like
+    /// [`Self::run`].
+    pub fn run_with_store(
+        &self,
+        items: &[serde_json::Value],
+        store: Option<&std::sync::Arc<dyn crate::ccr::CcrStore>>,
+    ) -> (Compaction, String) {
+        let c = compact_with_store(items, &self.config, store);
         let rendered = self.formatter.format(&c);
         (c, rendered)
     }

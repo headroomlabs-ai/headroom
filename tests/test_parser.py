@@ -407,6 +407,131 @@ class TestParseMessages:
         assert len(tool_result_blocks) >= 1
 
 
+# --- TestRereadDetection ---
+
+
+class TestRereadDetection:
+    """Tests for cross-message re-read detection in parse_messages."""
+
+    LARGE_CONTENT = "def handler(event):\n    return process(event)\n" * 10  # > 200 chars
+
+    def _expected_tokens(self, text):
+        """Mirror mock_tokenizer + message overhead used for tool_result blocks."""
+        return len(text) // 4 + 1 + 4
+
+    @staticmethod
+    def _filler(n):
+        """Interleaved turns that push a repeat beyond the polling gap."""
+        return [
+            {"role": "assistant" if i % 2 == 0 else "user", "content": f"step {i} of the task"}
+            for i in range(n)
+        ]
+
+    def test_reread_detected_openai_tool_messages(self, mock_tokenizer):
+        """Identical large tool outputs far apart count as re-read."""
+        messages = (
+            [{"role": "tool", "tool_call_id": "c1", "content": self.LARGE_CONTENT}]
+            + self._filler(4)
+            + [{"role": "tool", "tool_call_id": "c2", "content": self.LARGE_CONTENT}]
+        )
+        _, _, waste = parse_messages(messages, mock_tokenizer)
+        assert waste.reread_tokens == self._expected_tokens(self.LARGE_CONTENT)
+
+    def test_reread_detected_anthropic_tool_result_blocks(self, mock_tokenizer):
+        """Anthropic-format tool_result parts are matched by content, not id."""
+        part = {"type": "tool_result", "tool_use_id": "t1", "content": self.LARGE_CONTENT}
+        part2 = {"type": "tool_result", "tool_use_id": "t2", "content": self.LARGE_CONTENT}
+        messages = (
+            [{"role": "user", "content": [part]}]
+            + self._filler(4)
+            + [{"role": "user", "content": [part2]}]
+        )
+        _, _, waste = parse_messages(messages, mock_tokenizer)
+        assert waste.reread_tokens == self._expected_tokens(self.LARGE_CONTENT)
+
+    def test_three_occurrences_count_repeats_only(self, mock_tokenizer):
+        """First serve is free; every distant repeat is counted."""
+        msg = {"role": "tool", "tool_call_id": "c", "content": self.LARGE_CONTENT}
+        messages = [dict(msg)] + self._filler(4) + [dict(msg)] + self._filler(4) + [dict(msg)]
+        _, _, waste = parse_messages(messages, mock_tokenizer)
+        assert waste.reread_tokens == 2 * self._expected_tokens(self.LARGE_CONTENT)
+
+    def test_single_occurrence_no_signal(self, mock_tokenizer):
+        """One large tool result is not a re-read."""
+        messages = [{"role": "tool", "tool_call_id": "c1", "content": self.LARGE_CONTENT}]
+        _, _, waste = parse_messages(messages, mock_tokenizer)
+        assert waste.reread_tokens == 0
+
+    def test_short_duplicates_ignored(self, mock_tokenizer):
+        """Trivially short outputs (\"ok\") legitimately repeat and are skipped."""
+        messages = [
+            {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+            {"role": "tool", "tool_call_id": "c2", "content": "ok"},
+            {"role": "tool", "tool_call_id": "c3", "content": "ok"},
+        ]
+        _, _, waste = parse_messages(messages, mock_tokenizer)
+        assert waste.reread_tokens == 0
+
+    def test_same_message_duplicates_ignored(self, mock_tokenizer):
+        """Duplicates within a single message are not a re-read."""
+        part = {"type": "tool_result", "tool_use_id": "t1", "content": self.LARGE_CONTENT}
+        part2 = {"type": "tool_result", "tool_use_id": "t2", "content": self.LARGE_CONTENT}
+        messages = [{"role": "user", "content": [part, part2]}]
+        _, _, waste = parse_messages(messages, mock_tokenizer)
+        assert waste.reread_tokens == 0
+
+    def test_mixed_same_message_duplicate_not_counted(self, mock_tokenizer):
+        """A duplicate inside the original message stays excluded even when
+        a later message also re-serves the content."""
+        part = {"type": "tool_result", "tool_use_id": "t1", "content": self.LARGE_CONTENT}
+        part2 = {"type": "tool_result", "tool_use_id": "t2", "content": self.LARGE_CONTENT}
+        part3 = {"type": "tool_result", "tool_use_id": "t3", "content": self.LARGE_CONTENT}
+        messages = (
+            [{"role": "user", "content": [part, part2]}]
+            + self._filler(4)
+            + [{"role": "user", "content": [part3]}]
+        )
+        _, _, waste = parse_messages(messages, mock_tokenizer)
+        assert waste.reread_tokens == self._expected_tokens(self.LARGE_CONTENT)
+
+    def test_adjacent_polling_repeats_ignored(self, mock_tokenizer):
+        """Back-to-back identical results (poll loop) are not re-reads."""
+        messages = [
+            {"role": "tool", "tool_call_id": "c1", "content": self.LARGE_CONTENT},
+            {"role": "assistant", "content": "Still pending, checking again."},
+            {"role": "tool", "tool_call_id": "c2", "content": self.LARGE_CONTENT},
+        ]
+        _, _, waste = parse_messages(messages, mock_tokenizer)
+        assert waste.reread_tokens == 0
+
+    def test_polling_chain_never_accumulates(self, mock_tokenizer):
+        """Each poll advances the baseline — long chains stay at zero."""
+        msg = {"role": "tool", "tool_call_id": "c", "content": self.LARGE_CONTENT}
+        nudge = {"role": "assistant", "content": "polling"}
+        messages = [dict(msg), dict(nudge), dict(msg), dict(nudge), dict(msg), dict(nudge)]
+        _, _, waste = parse_messages(messages, mock_tokenizer)
+        assert waste.reread_tokens == 0
+
+    def test_distant_repeat_after_polling_chain_counts(self, mock_tokenizer):
+        """A far repeat counts even when earlier repeats were polling."""
+        msg = {"role": "tool", "tool_call_id": "c", "content": self.LARGE_CONTENT}
+        messages = (
+            [dict(msg), {"role": "assistant", "content": "polling"}, dict(msg)]
+            + self._filler(4)
+            + [dict(msg)]
+        )
+        _, _, waste = parse_messages(messages, mock_tokenizer)
+        assert waste.reread_tokens == self._expected_tokens(self.LARGE_CONTENT)
+
+    def test_reread_in_total_and_dict(self):
+        """reread_tokens participates in total() and to_dict()."""
+        from headroom.config import WasteSignals
+
+        ws = WasteSignals(reread_tokens=42)
+        assert ws.total() == 42
+        assert ws.to_dict()["reread"] == 42
+
+
 # --- TestFindToolUnits ---
 
 
@@ -926,3 +1051,229 @@ class TestStrandsToolResultBlocks:
 
         assert anthropic_waste.total() > 0
         assert anthropic_waste.total() == openai_waste.total()
+
+
+# --- TestCallArgMatchReread ---
+
+
+class TestCallArgMatchReread:
+    """Tests for re-issued-call (arg-match) reread detection in parse_messages."""
+
+    LARGE_CONTENT = "def handler(event):\n    return process(event)\n" * 10  # > 200 chars
+    CHANGED_CONTENT = LARGE_CONTENT + "# mtime 1718000000\n"
+
+    def _expected_tokens(self, text):
+        """Mirror mock_tokenizer + message overhead used for tool_result blocks."""
+        return len(text) // 4 + 1 + 4
+
+    @staticmethod
+    def _filler(n):
+        """Interleaved turns that push a repeat beyond the polling gap."""
+        return [
+            {"role": "assistant" if i % 2 == 0 else "user", "content": f"step {i} of the task"}
+            for i in range(n)
+        ]
+
+    @staticmethod
+    def _openai_call(call_id, name, arguments):
+        return {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"id": call_id, "function": {"name": name, "arguments": arguments}}],
+        }
+
+    @staticmethod
+    def _openai_result(call_id, content):
+        return {"role": "tool", "tool_call_id": call_id, "content": content}
+
+    def test_canonical_call_key_normalizes_serialization(self):
+        """Reordered JSON-string args, dict args, and spaced JSON hash equal."""
+        from headroom.parser import _canonical_call_key
+
+        k1 = _canonical_call_key("read_file", '{"path": "a.py", "lines": 100}')
+        k2 = _canonical_call_key("read_file", '{"lines":100,"path":"a.py"}')
+        k3 = _canonical_call_key("read_file", {"path": "a.py", "lines": 100})
+        assert k1 == k2 == k3
+        assert _canonical_call_key("read_file", '{"path": "b.py", "lines": 100}') != k1
+        assert _canonical_call_key("grep", '{"path": "a.py", "lines": 100}') != k1
+
+    def test_reissued_call_changed_result_counts(self, mock_tokenizer):
+        """Identical call re-issued far apart counts even when result bytes differ."""
+        messages = (
+            [
+                self._openai_call("c1", "read_file", '{"path": "a.py", "lines": 100}'),
+                self._openai_result("c1", self.LARGE_CONTENT),
+            ]
+            + self._filler(4)
+            + [
+                self._openai_call("c2", "read_file", '{"lines":100,"path":"a.py"}'),
+                self._openai_result("c2", self.CHANGED_CONTENT),
+            ]
+        )
+        _, _, waste = parse_messages(messages, mock_tokenizer)
+        assert waste.reread_tokens == self._expected_tokens(self.CHANGED_CONTENT)
+
+    def test_identical_result_not_double_counted(self, mock_tokenizer):
+        """Byte-identical repeat is counted once (content-hash pass wins)."""
+        messages = (
+            [
+                self._openai_call("c1", "read_file", '{"path": "a.py"}'),
+                self._openai_result("c1", self.LARGE_CONTENT),
+            ]
+            + self._filler(4)
+            + [
+                self._openai_call("c2", "read_file", '{"path": "a.py"}'),
+                self._openai_result("c2", self.LARGE_CONTENT),
+            ]
+        )
+        _, _, waste = parse_messages(messages, mock_tokenizer)
+        assert waste.reread_tokens == self._expected_tokens(self.LARGE_CONTENT)
+
+    def test_adjacent_reissue_is_polling(self, mock_tokenizer):
+        """Back-to-back identical calls (poll loop) are not re-reads."""
+        messages = [
+            self._openai_call("c1", "check_ci", '{"run": 7}'),
+            self._openai_result("c1", self.LARGE_CONTENT),
+            self._openai_call("c2", "check_ci", '{"run": 7}'),
+            self._openai_result("c2", self.CHANGED_CONTENT),
+        ]
+        _, _, waste = parse_messages(messages, mock_tokenizer)
+        assert waste.reread_tokens == 0
+
+    def test_different_args_not_matched(self, mock_tokenizer):
+        """Same tool with different arguments is not a re-issued call."""
+        messages = (
+            [
+                self._openai_call("c1", "read_file", '{"path": "a.py"}'),
+                self._openai_result("c1", self.LARGE_CONTENT),
+            ]
+            + self._filler(4)
+            + [
+                self._openai_call("c2", "read_file", '{"path": "b.py"}'),
+                self._openai_result("c2", self.CHANGED_CONTENT),
+            ]
+        )
+        _, _, waste = parse_messages(messages, mock_tokenizer)
+        assert waste.reread_tokens == 0
+
+    def test_small_result_ignored(self, mock_tokenizer):
+        """Repeat of a call whose result is trivially small is skipped."""
+        messages = (
+            [
+                self._openai_call("c1", "run_tests", "{}"),
+                self._openai_result("c1", "ok"),
+            ]
+            + self._filler(4)
+            + [
+                self._openai_call("c2", "run_tests", "{}"),
+                self._openai_result("c2", "ok again"),
+            ]
+        )
+        _, _, waste = parse_messages(messages, mock_tokenizer)
+        assert waste.reread_tokens == 0
+
+    def test_repeat_call_without_result_not_counted(self, mock_tokenizer):
+        """A re-issued call with no recorded result contributes nothing."""
+        messages = (
+            [
+                self._openai_call("c1", "read_file", '{"path": "a.py"}'),
+                self._openai_result("c1", self.LARGE_CONTENT),
+            ]
+            + self._filler(4)
+            + [self._openai_call("c2", "read_file", '{"path": "a.py"}')]
+        )
+        _, _, waste = parse_messages(messages, mock_tokenizer)
+        assert waste.reread_tokens == 0
+
+    def test_anthropic_tool_use_produces_tool_call_blocks(self, mock_tokenizer):
+        """Anthropic tool_use parts become tool_call blocks with call metadata."""
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "Reading the file now."},
+                    {
+                        "type": "tool_use",
+                        "id": "t1",
+                        "name": "read_file",
+                        "input": {"path": "a.py"},
+                    },
+                ],
+            }
+        ]
+        blocks, _, _ = parse_messages(messages, mock_tokenizer)
+        tool_calls = [b for b in blocks if b.kind == "tool_call"]
+        assert len(tool_calls) == 1
+        assert tool_calls[0].flags["function_name"] == "read_file"
+        assert tool_calls[0].flags["tool_call_id"] == "t1"
+        assert tool_calls[0].flags["call_key"]
+
+    def test_anthropic_reissued_call_changed_result_counts(self, mock_tokenizer):
+        """Full Anthropic-format flow: re-issued tool_use with drifted result."""
+
+        def call(uid):
+            return {
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": uid, "name": "read_file", "input": {"path": "a.py"}}
+                ],
+            }
+
+        def result(uid, content):
+            return {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": uid, "content": content}],
+            }
+
+        messages = (
+            [call("t1"), result("t1", self.LARGE_CONTENT)]
+            + self._filler(4)
+            + [call("t2"), result("t2", self.CHANGED_CONTENT)]
+        )
+        _, _, waste = parse_messages(messages, mock_tokenizer)
+        assert waste.reread_tokens == self._expected_tokens(self.CHANGED_CONTENT)
+
+    def test_strands_tooluse_matched(self, mock_tokenizer):
+        """Strands/Bedrock toolUse/toolResult format is matched the same way."""
+
+        def call(uid):
+            return {
+                "role": "assistant",
+                "content": [{"toolUse": {"toolUseId": uid, "name": "search", "input": {"q": "x"}}}],
+            }
+
+        def result(uid, content):
+            return {
+                "role": "user",
+                "content": [{"toolResult": {"toolUseId": uid, "content": [{"text": content}]}}],
+            }
+
+        messages = (
+            [call("s1"), result("s1", self.LARGE_CONTENT)]
+            + self._filler(4)
+            + [call("s2"), result("s2", self.CHANGED_CONTENT)]
+        )
+        _, _, waste = parse_messages(messages, mock_tokenizer)
+        assert waste.reread_tokens == self._expected_tokens(self.CHANGED_CONTENT)
+
+    def test_cross_format_call_key_parity(self, mock_tokenizer):
+        """OpenAI JSON-string args and Anthropic dict input produce the same call_key."""
+        openai_msgs = [self._openai_call("c1", "read_file", '{"lines": 100, "path": "a.py"}')]
+        anthropic_msgs = [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "t1",
+                        "name": "read_file",
+                        "input": {"path": "a.py", "lines": 100},
+                    }
+                ],
+            }
+        ]
+        o_blocks, _, _ = parse_messages(openai_msgs, mock_tokenizer)
+        a_blocks, _, _ = parse_messages(anthropic_msgs, mock_tokenizer)
+        o_key = [b for b in o_blocks if b.kind == "tool_call"][0].flags["call_key"]
+        a_key = [b for b in a_blocks if b.kind == "tool_call"][0].flags["call_key"]
+        assert o_key == a_key

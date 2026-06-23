@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import fnmatch
+from collections.abc import Iterable
 from dataclasses import InitVar, dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -215,16 +217,36 @@ DEFAULT_EXCLUDE_TOOLS: frozenset[str] = frozenset(
         "Grep",
         "Write",
         "Edit",
-        "Bash",
         # Lowercase variants for case-insensitive matching
         "read",
         "glob",
         "grep",
         "write",
         "edit",
-        "bash",
     }
 )
+
+
+def is_tool_excluded(name: str, exclude_tools: Iterable[str]) -> bool:
+    """Return True if ``name`` matches the tool-exclusion set.
+
+    Plain entries match by exact (case-insensitive) name, so the common case
+    stays a set lookup. Entries containing a glob metacharacter (``*``, ``?`` or
+    ``[``) are matched with :func:`fnmatch.fnmatchcase`, letting a single pattern
+    such as ``mcp__*`` cover every tool an MCP server exposes without listing
+    each name (issue #870).
+    """
+    if not exclude_tools:
+        return False
+    if name in exclude_tools or name.lower() in exclude_tools:
+        return True
+    lname = name.lower()
+    return any(
+        fnmatch.fnmatchcase(lname, pat.lower())
+        for pat in exclude_tools
+        if "*" in pat or "?" in pat or "[" in pat
+    )
+
 
 # Tool names recognized as Read/Edit/Write for lifecycle tracking
 _READ_TOOL_NAMES: frozenset[str] = frozenset({"Read", "read"})
@@ -358,6 +380,21 @@ class SmartCrusherConfig:
     first_fraction: float = 0.3  # 30% of K from start of array
     last_fraction: float = 0.15  # 15% of K from end of array
 
+    # Lossless-first dispatch: minimum byte-savings ratio for the lossless
+    # Table/CSV compaction path to win over the lossy path. Must stay in
+    # lockstep with the Rust default (smart_crusher config.rs) and the
+    # transforms-level dataclass.
+    lossless_min_savings_ratio: float = 0.15
+
+    # Compaction heuristics (mirror Rust CompactConfig). A field is "core"
+    # if present in at least this fraction of rows; arrays whose key sets
+    # are mostly non-core are bucketed by a discriminator instead.
+    compaction_core_field_fraction: float = 0.8
+    compaction_heterogeneous_core_ratio: float = 0.6
+    compaction_max_flatten_inner_keys: int = 6
+    compaction_min_buckets: int = 2
+    compaction_max_buckets: int = 8
+
 
 @dataclass
 class CacheOptimizerConfig:
@@ -407,14 +444,20 @@ class CCRConfig:
     - Network effect: retrieval patterns improve compression for all users
 
     GOTCHAS:
-    - Cache has TTL (default 300 seconds) - retrieval fails after expiration
+    - Cache has TTL (default 30 min) - retrieval fails after expiration
     - Memory usage: ~1KB per cached entry
     - Only works with array compression (not string truncation)
     """
 
     enabled: bool = True  # Enable CCR (cache + retrieval markers)
     store_max_entries: int = 1000  # Max entries in compression store
-    store_ttl_seconds: int = 300  # Cache TTL in seconds
+    # Session-scale TTL. The original 5-minute default predates agentic
+    # sessions that routinely run 30+ minutes; an expired entry silently
+    # converts "lossless with retrieval" into "lossy", so the TTL is the
+    # weakest link in the no-accuracy-loss guarantee. Kept in lockstep
+    # with Rust DEFAULT_TTL (crates/headroom-core/src/ccr/mod.rs) and
+    # DEFAULT_CCR_TTL_SECONDS (cache/compression_store.py).
+    store_ttl_seconds: int = 1800  # Cache TTL (30 minutes)
     inject_retrieval_marker: bool = True  # Add retrieval hint to compressed output
     feedback_enabled: bool = True  # Track retrieval events for learning
     min_items_to_cache: int = 20  # Only cache if original had >= N items
@@ -531,6 +574,12 @@ class WasteSignals:
     whitespace_tokens: int = 0  # Repeated whitespace
     dynamic_date_tokens: int = 0  # Dynamic dates in system prompt
     repetition_tokens: int = 0  # Repeated content
+    reread_tokens: int = 0  # Tool results re-served after already appearing earlier
+    # Subset of reread_tokens whose first serve was compressed away (CCR
+    # marker left in its place) — re-reads attributable to over-compression
+    # rather than agent behavior (#899). Excluded from total() because the
+    # same tokens are already counted in reread_tokens.
+    reread_compressed_tokens: int = 0
 
     def total(self) -> int:
         """Total waste tokens detected."""
@@ -541,6 +590,7 @@ class WasteSignals:
             + self.whitespace_tokens
             + self.dynamic_date_tokens
             + self.repetition_tokens
+            + self.reread_tokens
         )
 
     def to_dict(self) -> dict[str, int]:
@@ -552,6 +602,8 @@ class WasteSignals:
             "whitespace": self.whitespace_tokens,
             "dynamic_date": self.dynamic_date_tokens,
             "repetition": self.repetition_tokens,
+            "reread": self.reread_tokens,
+            "reread_compressed": self.reread_compressed_tokens,
         }
 
 

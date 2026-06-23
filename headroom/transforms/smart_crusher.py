@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -54,6 +55,12 @@ from ..utils import compute_short_hash, create_tool_digest_marker, deep_copy_mes
 from .base import Transform
 
 logger = logging.getLogger(__name__)
+
+
+# Lossless-compaction renderers known to the Rust core — mirrors
+# `CompactionStage::SUPPORTED_FORMAT_NAMES` in
+# `crates/headroom-core/.../compaction/mod.rs`.
+_SUPPORTED_COMPACTION_FORMATS = ("csv-schema", "json", "markdown-kv")
 
 
 # ─── CCR sentinel ─────────────────────────────────────────────────────────
@@ -87,6 +94,47 @@ def strip_ccr_sentinels(items: Any) -> Any:
     if not isinstance(items, list):
         return items
     return [x for x in items if not is_ccr_sentinel(x)]
+
+
+# ─── Tool-name attribution ────────────────────────────────────────────────
+
+
+def _build_tool_name_index(messages: list[dict[str, Any]]) -> dict[str, str]:
+    """Map tool_call_id/tool_use_id → tool name across OpenAI + Anthropic formats.
+
+    Skips entries where id or name is missing; those calls still crush, but
+    won't contribute a tool-name to the ``smart_crush`` tag.
+    """
+    index: dict[str, str] = {}
+    for msg in messages:
+        if msg.get("role") != "assistant":
+            continue
+        for tc in msg.get("tool_calls") or []:
+            tc_id = tc.get("id")
+            name = (tc.get("function") or {}).get("name")
+            if tc_id and name:
+                index[tc_id] = name
+        content = msg.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_use":
+                    continue
+                bid = block.get("id")
+                name = block.get("name")
+                if bid and name:
+                    index[bid] = name
+    return index
+
+
+def _format_smart_crush_transform(count: int, tool_names: list[str]) -> str:
+    """Format ``smart_crush:<count>[:<name1,name2,...>]``.
+
+    Names are included when known so consumers can show what was crushed. Empty
+    names fall back to the count-only form for backwards compatibility.
+    """
+    if tool_names:
+        return f"smart_crush:{count}:{','.join(tool_names)}"
+    return f"smart_crush:{count}"
 
 
 # ─── Public dataclasses ───────────────────────────────────────────────────
@@ -131,6 +179,27 @@ class SmartCrusherConfig:
     dedup_identical_items: bool = True
     first_fraction: float = 0.3
     last_fraction: float = 0.15
+    # Minimum byte-savings ratio for the lossless Table/CSV compaction
+    # path to win over the lossy path (0.15, matching the Rust default —
+    # the two must stay in lockstep, see config.rs). Lossless output
+    # needs no CCR retrieval round-trip when the model wants more rows,
+    # so it gets a lower bar than the lossy path. Mainly raised in tests
+    # and KV experiments — KV repeats field names per row, so it clears
+    # the gate less often than CSV.
+    lossless_min_savings_ratio: float = 0.15
+
+    # Compaction heuristics (mirror Rust CompactConfig; see
+    # crates/headroom-core/src/transforms/smart_crusher/compaction/compactor.rs).
+    # A field is "core" if present in at least this fraction of rows.
+    compaction_core_field_fraction: float = 0.8
+    # Below this fraction of core keys, treat the array as heterogeneous
+    # and look for a discriminator to bucket by.
+    compaction_heterogeneous_core_ratio: float = 0.6
+    # Cap on inner-key count for nested-uniform flattening.
+    compaction_max_flatten_inner_keys: int = 6
+    # Bucket-count bounds for discriminator usefulness.
+    compaction_min_buckets: int = 2
+    compaction_max_buckets: int = 8
 
 
 # ─── Rust-backed SmartCrusher ─────────────────────────────────────────────
@@ -157,6 +226,7 @@ class SmartCrusher(Transform):
         ccr_config: CCRConfig | None = None,
         with_compaction: bool = True,
         observer: Any = None,
+        compaction_format: str | None = None,
     ):
         # Hard import — no Python fallback. If the wheel is missing the
         # caller must build it (scripts/build_rust_extension.sh) or
@@ -266,6 +336,17 @@ class SmartCrusher(Transform):
             enable_ccr_marker=(
                 self._ccr_config.enabled and self._ccr_config.inject_retrieval_marker
             ),
+            # getattr fallbacks: callers may pass the structurally-similar
+            # `headroom.config.SmartCrusherConfig` (MCP server, SDK) or a
+            # pre-existing config object that predates these fields.
+            lossless_min_savings_ratio=getattr(cfg, "lossless_min_savings_ratio", 0.15),
+            compaction_core_field_fraction=getattr(cfg, "compaction_core_field_fraction", 0.8),
+            compaction_heterogeneous_core_ratio=getattr(
+                cfg, "compaction_heterogeneous_core_ratio", 0.6
+            ),
+            compaction_max_flatten_inner_keys=getattr(cfg, "compaction_max_flatten_inner_keys", 6),
+            compaction_min_buckets=getattr(cfg, "compaction_min_buckets", 2),
+            compaction_max_buckets=getattr(cfg, "compaction_max_buckets", 8),
         )
         # Default: lossless-first compaction (PR4). Lossless wins for
         # cleanly tabular input where it saves ≥ 30% bytes; otherwise
@@ -273,10 +354,34 @@ class SmartCrusher(Transform):
         # markers. Pass `with_compaction=False` to opt into the
         # pre-PR4 lossy-only path (used by retention-property tests
         # that depend on row-level item preservation).
-        if with_compaction:
+        #
+        # `compaction_format` picks the lossless renderer:
+        # "csv-schema" (default), "json", or "markdown-kv" (opt-in
+        # trade of tokens for model read accuracy). Falls back to the
+        # HEADROOM_COMPACTION_FORMAT env var when the kwarg is None.
+        # Ignored when with_compaction=False.
+        resolved_format = compaction_format or os.environ.get(
+            "HEADROOM_COMPACTION_FORMAT", "csv-schema"
+        )
+        # Validate even when with_compaction=False: an explicit bogus
+        # format (kwarg or env var) is a misconfiguration that should be
+        # visible, not silently accepted because the knob happens to be
+        # ignored on this path.
+        if resolved_format not in _SUPPORTED_COMPACTION_FORMATS:
+            raise ValueError(
+                f"unknown compaction format {resolved_format!r}; "
+                f"expected one of: {', '.join(_SUPPORTED_COMPACTION_FORMATS)}"
+            )
+        self._compaction_format = resolved_format if with_compaction else None
+        if not with_compaction:
+            self._rust = _RustSmartCrusher.without_compaction(rust_cfg)
+        elif resolved_format == "csv-schema":
+            # Keep the `new()` constructor for the default path so its
+            # byte-parity coverage stays on the exact production
+            # codepath.
             self._rust = _RustSmartCrusher(rust_cfg)
         else:
-            self._rust = _RustSmartCrusher.without_compaction(rust_cfg)
+            self._rust = _RustSmartCrusher.with_compaction_format(rust_cfg, resolved_format)
 
     def crush(self, content: str, query: str = "", bias: float = 1.0) -> CrushResult:
         """Crush a single JSON content string.
@@ -827,6 +932,16 @@ class SmartCrusher(Transform):
         crushed_count = 0
         frozen_message_count = kwargs.get("frozen_message_count", 0)
 
+        crushed_tool_names: list[str] = []
+        seen_tool_names: set[str] = set()
+        tool_names_by_id = _build_tool_name_index(result_messages)
+
+        def _record(tool_id: str | None) -> None:
+            name = tool_names_by_id.get(tool_id or "")
+            if name and name not in seen_tool_names:
+                seen_tool_names.add(name)
+                crushed_tool_names.append(name)
+
         for msg_idx, msg in enumerate(result_messages):
             if msg_idx < frozen_message_count:
                 continue
@@ -844,6 +959,7 @@ class SmartCrusher(Transform):
                             marker = create_tool_digest_marker(compute_short_hash(content))
                             msg["content"] = crushed + "\n" + marker
                             crushed_count += 1
+                            _record(msg.get("tool_call_id"))
                             markers_inserted.append(marker)
                             if info:
                                 transforms_applied.append(f"smart:{info}")
@@ -870,13 +986,16 @@ class SmartCrusher(Transform):
                         marker = create_tool_digest_marker(compute_short_hash(tool_content))
                         content[i]["content"] = crushed + "\n" + marker
                         crushed_count += 1
+                        _record(block.get("tool_use_id"))
                         markers_inserted.append(marker)
                         if info:
                             transforms_applied.append(f"smart:{info}")
                         self._notify_observer(tokens, tokenizer.count_text(crushed))
 
         if crushed_count > 0:
-            transforms_applied.insert(0, f"smart_crush:{crushed_count}")
+            transforms_applied.insert(
+                0, _format_smart_crush_transform(crushed_count, crushed_tool_names)
+            )
 
         tokens_after = tokenizer.count_messages(result_messages)
 

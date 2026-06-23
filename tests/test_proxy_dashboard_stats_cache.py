@@ -5,6 +5,7 @@ import shutil
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -31,6 +32,7 @@ class _ToinStub:
 @pytest.fixture(autouse=True)
 def _reset_rtk_stats_cache(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    monkeypatch.delenv("HEADROOM_RTK_GAIN_SCOPE", raising=False)
     monkeypatch.setenv("HEADROOM_REQUIRE_RUST_CORE", "false")
     proxy_helpers._rtk_stats_cache.update(
         {"expires_at": 0.0, "has_value": False, "tool": None, "value": None}
@@ -72,8 +74,14 @@ def test_get_rtk_stats_memoizes_subprocess_calls(monkeypatch: pytest.MonkeyPatch
         },
     ]
 
-    def _fake_run(*args, **kwargs):
+    def _fake_run(args, **kwargs):
         calls["run"] += 1
+        assert [str(args[0]).replace("\\", "/")] + args[1:] == [
+            "/usr/bin/rtk",
+            "gain",
+            "--format",
+            "json",
+        ]
         summary = totals[min(calls["run"] - 1, len(totals) - 1)]
         return SimpleNamespace(
             returncode=0,
@@ -91,6 +99,7 @@ def test_get_rtk_stats_memoizes_subprocess_calls(monkeypatch: pytest.MonkeyPatch
     assert first["tool"] == "rtk"
     assert first["label"] == "RTK"
     assert first["installed"] is True
+    assert first["scope"] == "global"
     assert first["total_commands"] == 0
     assert first["input_tokens"] == 0
     assert first["output_tokens"] == 0
@@ -143,6 +152,75 @@ def test_get_rtk_stats_memoizes_subprocess_calls(monkeypatch: pytest.MonkeyPatch
     assert calls["run"] == 2
 
 
+def test_get_rtk_stats_can_read_project_scoped_gain(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = {"run": 0}
+
+    def _fake_run(args, **kwargs):
+        calls["run"] += 1
+        assert [str(args[0]).replace("\\", "/")] + args[1:] == [
+            "/usr/bin/rtk",
+            "gain",
+            "--project",
+            "--format",
+            "json",
+        ]
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "summary": {
+                        "total_commands": 1,
+                        "total_input": 100,
+                        "total_output": 75,
+                        "total_saved": 25,
+                    }
+                }
+            ),
+        )
+
+    monkeypatch.setenv("HEADROOM_RTK_GAIN_SCOPE", "project")
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/rtk")
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+
+    payload = proxy_helpers._read_rtk_lifetime_stats()
+
+    assert payload is not None
+    assert payload["scope"] == "project"
+    assert payload["total_commands"] == 1
+    assert payload["tokens_saved"] == 25
+    assert calls["run"] == 1
+
+
+def test_get_rtk_stats_invalid_scope_defaults_to_global(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = {"run": 0}
+
+    def _fake_run(args, **kwargs):
+        calls["run"] += 1
+        assert [str(args[0]).replace("\\", "/")] + args[1:] == [
+            "/usr/bin/rtk",
+            "gain",
+            "--format",
+            "json",
+        ]
+        return SimpleNamespace(returncode=0, stdout=json.dumps({"summary": {}}))
+
+    mock_warning = MagicMock()
+    monkeypatch.setenv("HEADROOM_RTK_GAIN_SCOPE", "workspace")
+    monkeypatch.setattr(proxy_helpers.logger, "warning", mock_warning)
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/rtk")
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+
+    payload = proxy_helpers._read_rtk_lifetime_stats()
+
+    assert payload is not None
+    assert payload["scope"] == "global"
+    assert calls["run"] == 1
+    warning_calls = " ".join(str(call) for call in mock_warning.call_args_list)
+    assert "event=rtk_gain_scope_invalid" in warning_calls
+
+
 def test_get_context_tool_stats_reads_lean_ctx_gain(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HEADROOM_CONTEXT_TOOL", "lean-ctx")
     now = {"value": 100.0}
@@ -166,7 +244,11 @@ def test_get_context_tool_stats_reads_lean_ctx_gain(monkeypatch: pytest.MonkeyPa
 
     def _fake_run(args, **kwargs):
         calls["run"] += 1
-        assert args == ["/usr/bin/lean-ctx", "gain", "--json"]
+        assert [str(args[0]).replace("\\", "/")] + args[1:] == [
+            "/usr/bin/lean-ctx",
+            "gain",
+            "--json",
+        ]
         summary = totals[min(calls["run"] - 1, len(totals) - 1)]
         return SimpleNamespace(returncode=0, stdout=json.dumps({"summary": summary}))
 
@@ -487,3 +569,68 @@ def test_dashboard_uses_cached_stats_and_lazy_history_feed_polling() -> None:
     assert "Lean-ctx" in html
     assert "Context Tool" in html
     assert "cliFilteringLabel + ' Filtered'" in html
+
+
+def test_proxy_throughput_in_stats_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify that the /stats endpoint includes a 'throughput' key in the response.
+
+    The server's _compute_throughput closure does a fresh
+    `from headroom.perf.analyzer import ...` on every call, so we patch the
+    names directly on the `headroom.perf.analyzer` module so the local import
+    inside the closure picks up our fakes.
+
+    Skipped locally when headroom._core (Rust extension) is not compiled.
+    """
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    import headroom.perf.analyzer as _analyzer_mod
+
+    try:
+        from headroom.proxy.server import (
+            _throughput_cache,
+            create_app,
+            require_loopback,
+        )
+    except (ImportError, ModuleNotFoundError) as exc:
+        pytest.skip(f"headroom._core not available (Rust extension not compiled): {exc}")
+
+    from headroom.config import ProxyConfig
+
+    # Reset the module-level cache so CI doesn't reuse a stale value
+    _throughput_cache.update({"expires_at": 0.0, "value": None})
+
+    # Patch at the module level so the local import inside _compute_throughput
+    # picks up our stubs instead of the real implementations.
+    monkeypatch.setattr(
+        _analyzer_mod,
+        "parse_log_files",
+        lambda last_n_hours=1.0: _analyzer_mod.PerfReport(),
+    )
+    monkeypatch.setattr(
+        _analyzer_mod,
+        "build_perf_summary",
+        lambda report: {"throughput": {"input_wall_clock": 99.0}},
+    )
+
+    app = create_app(
+        ProxyConfig(
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+            log_requests=False,
+            ccr_inject_tool=False,
+            ccr_handle_responses=False,
+            ccr_context_tracking=False,
+        )
+    )
+    app.dependency_overrides[require_loopback] = lambda: None
+
+    with TestClient(app) as client:
+        response = client.get("/stats")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert "throughput" in payload
+    assert payload["throughput"] == {"input_wall_clock": 99.0}

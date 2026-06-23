@@ -5,10 +5,11 @@ The subscription flow has to behave identically on macOS, Linux, and Windows
 Copilot CLI token from the platform secret store — is impossible to exercise
 portably. This suite proves the *portable* contract instead:
 
-1. With an explicit token in the environment, resolution + API-URL discovery
-   succeed on every platform without touching any secret store. This is the
-   universal escape hatch (``GITHUB_COPILOT_TOKEN`` etc.) that makes the
-   feature work anywhere, including headless CI.
+1. With an explicit Copilot API token in the environment, resolution + API-URL
+   discovery succeed on every platform without touching any secret store. This
+   is the deterministic escape hatch (``GITHUB_COPILOT_API_TOKEN``) for
+   headless CI. OAuth tokens still need successful token exchange before
+   subscription mode can use them.
 2. Each OS-specific secret reader is inert on a foreign platform — so on any
    given OS only that OS's reader can fire, and a missing/foreign secret store
    degrades to ``None`` rather than crashing.
@@ -33,6 +34,7 @@ BUSINESS_API = "https://api.business.githubcopilot.com"
 
 def _stub_all_secret_stores(monkeypatch: pytest.MonkeyPatch) -> None:
     """Simulate 'no OS secret store / not logged in' on every platform."""
+    monkeypatch.setattr(copilot_auth, "read_headroom_copilot_oauth_token", lambda: None)
     monkeypatch.setattr(copilot_auth, "_read_windows_copilot_cli_oauth_token", lambda: None)
     monkeypatch.setattr(copilot_auth, "_read_macos_keychain_oauth_token", lambda: None)
     monkeypatch.setattr(copilot_auth, "_read_linux_secret_oauth_token", lambda: None)
@@ -50,28 +52,31 @@ def _clear_token_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 1. The env-var path resolves on any platform with no secret store.
+# 1. The explicit API-token env path resolves on any platform with no secret store.
 # ---------------------------------------------------------------------------
-def test_env_token_resolves_subscription_without_secret_store(
+def test_api_token_env_resolves_subscription_without_secret_store(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _stub_all_secret_stores(monkeypatch)
     _clear_token_env(monkeypatch)
-    monkeypatch.setenv("GITHUB_COPILOT_TOKEN", "gho-env-universal")
+    monkeypatch.setenv("GITHUB_COPILOT_API_TOKEN", "tid_env_universal")
+    monkeypatch.setattr(
+        copilot_auth, "_subscription_resolution_from_token_exchange", lambda _: None
+    )
     monkeypatch.setattr(
         copilot_auth,
         "_fetch_copilot_user_info",
         lambda token: (
-            {"endpoints": {"api": BUSINESS_API}} if token == "gho-env-universal" else None
+            {"endpoints": {"api": BUSINESS_API}} if token == "tid_env_universal" else None
         ),
     )
 
-    assert copilot_auth.resolve_subscription_bearer_token() == "gho-env-universal"
+    assert copilot_auth.resolve_subscription_bearer_token() == "tid_env_universal"
     # Routing is override -> generic; the account host advertised by user-info is
     # NOT used (it regressed newer models on the responses API, #610). With no
     # GITHUB_COPILOT_API_URL pin set, the generic public host is returned.
     monkeypatch.delenv("GITHUB_COPILOT_API_URL", raising=False)
-    assert copilot_auth.resolve_copilot_api_url("gho-env-universal") == copilot_auth.DEFAULT_API_URL
+    assert copilot_auth.resolve_copilot_api_url("tid_env_universal") == copilot_auth.DEFAULT_API_URL
 
 
 def test_api_url_falls_back_to_default_when_user_info_unavailable(
@@ -85,13 +90,16 @@ def test_api_url_falls_back_to_default_when_user_info_unavailable(
     assert copilot_auth.resolve_copilot_api_url("gho-anything") == copilot_auth.DEFAULT_API_URL
 
 
-def test_subscription_rejects_token_github_does_not_accept(
+def test_subscription_rejects_generic_token_and_accepts_api_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _stub_all_secret_stores(monkeypatch)
     _clear_token_env(monkeypatch)
-    # A generic GitHub token is present but GitHub's Copilot API rejects it;
-    # a valid Copilot token is discoverable behind it.
+    monkeypatch.setattr(
+        copilot_auth, "_subscription_resolution_from_token_exchange", lambda _: None
+    )
+    # A generic GitHub token is present but cannot be exchanged for a Copilot
+    # API token; a valid Copilot API token is discoverable behind it.
     monkeypatch.setattr(
         copilot_auth,
         "iter_oauth_token_candidates",
@@ -100,7 +108,7 @@ def test_subscription_rejects_token_github_does_not_accept(
                 token="ghp-generic-pat", source="env:GITHUB_TOKEN", confidence="generic-github"
             ),
             copilot_auth.CopilotTokenCandidate(
-                token="gho-real-copilot",
+                token="tid_real_copilot",
                 source="macos-keychain:copilot-cli",
                 confidence="high",
             ),
@@ -109,10 +117,10 @@ def test_subscription_rejects_token_github_does_not_accept(
     monkeypatch.setattr(
         copilot_auth,
         "_fetch_copilot_user_info",
-        lambda token: {"endpoints": {"api": BUSINESS_API}} if token == "gho-real-copilot" else None,
+        lambda token: {"endpoints": {"api": BUSINESS_API}} if token == "tid_real_copilot" else None,
     )
 
-    assert copilot_auth.resolve_subscription_bearer_token() == "gho-real-copilot"
+    assert copilot_auth.resolve_subscription_bearer_token() == "tid_real_copilot"
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +192,16 @@ def test_end_to_end_subscription_chain(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GITHUB_COPILOT_API_URL", BUSINESS_API)
     monkeypatch.setattr(
         copilot_auth,
+        "_subscription_resolution_from_token_exchange",
+        lambda _candidate: copilot_auth._subscription_resolution(
+            token="tid-seat-token",
+            source="env:GITHUB_COPILOT_TOKEN:token-exchange",
+            confidence="copilot-token-exchange",
+            api_url=BUSINESS_API,
+        ),
+    )
+    monkeypatch.setattr(
+        copilot_auth,
         "_fetch_copilot_user_info",
         lambda token: (
             {"endpoints": {"api": "https://api.individual.githubcopilot.com"}}
@@ -193,7 +211,7 @@ def test_end_to_end_subscription_chain(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     resolved_token = copilot_auth.resolve_subscription_bearer_token()
     resolved_url = copilot_auth.resolve_copilot_api_url(resolved_token)
-    assert resolved_token == "gho-seat-token"
+    assert resolved_token == "tid-seat-token"
     assert resolved_url == BUSINESS_API  # the pin wins; the user-info host is ignored
 
     # (b) hand-off: the wrapper exports exactly these for the proxy.

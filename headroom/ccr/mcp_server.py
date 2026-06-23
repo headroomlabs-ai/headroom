@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any
 
 from headroom import paths as _paths
+from headroom import savings_ledger
 
 # fcntl is Unix-only; on Windows we skip file locking (stats are best-effort).
 # Keep the module typed as Any so Windows mypy runs don't try to resolve Unix-only attrs.
@@ -342,14 +343,17 @@ class HeadroomMCPServer:
         self._setup_handlers()
 
     def _get_local_store(self) -> Any:
-        """Get or create the local compression store (lazy init)."""
-        if self._local_store is None:
-            from headroom.cache.compression_store import CompressionStore
+        """Get the shared compression store singleton (lazy init).
 
-            self._local_store = CompressionStore(
-                max_entries=500,
-                default_ttl=MCP_SESSION_TTL,
-            )
+        Returns the same instance the proxy and response_handler use so
+        retrieval can see content either side compressed in-process.
+        Called with no args to keep one shared config; the compress path
+        passes its own per-entry ``ttl`` at store time.
+        """
+        if self._local_store is None:
+            from headroom.cache.compression_store import get_compression_store
+
+            self._local_store = get_compression_store()
         return self._local_store
 
     def _compress_content(self, content: str) -> dict[str, Any]:
@@ -421,6 +425,23 @@ class HeadroomMCPServer:
                     "results": results,
                     "count": len(results),
                 }
+            # The query matched no items above the relevance floor, but the
+            # entry itself may still be present and unexpired. An empty search
+            # is not the same as a missing/expired hash, so fall back to the
+            # full content rather than reporting it as not found.
+            entry = store.retrieve(hash_key)
+            if entry:
+                self._stats.record_retrieval(hash_key)
+                return {
+                    "hash": hash_key,
+                    "source": "local",
+                    "query": query,
+                    "results": [],
+                    "count": 0,
+                    "original_content": entry.original_content,
+                    "note": "Entry exists but no item matched the query above "
+                    "the relevance threshold; returning the full content.",
+                }
         else:
             entry = store.retrieve(hash_key)
             if entry:
@@ -448,8 +469,11 @@ class HeadroomMCPServer:
         return {
             "error": "Content not found. It may have expired or the hash may be incorrect.",
             "hash": hash_key,
-            "hint": "Content compressed via headroom_compress is stored for the session. "
-            "Content compressed by the proxy uses the configured CCR TTL.",
+            "hint": "To recover: if the compression marker references a file Read, "
+            "re-read that file (the path is in the marker; disk is the source of "
+            "truth). If it was command output, re-run the command. Content "
+            "compressed via headroom_compress is stored for the session; content "
+            "compressed by the proxy uses the configured CCR TTL.",
         }
 
     async def _retrieve_via_proxy(
@@ -540,6 +564,7 @@ class HeadroomMCPServer:
                     inputSchema={
                         "type": "object",
                         "properties": {},
+                        "required": [],
                     },
                 ),
             ]
@@ -638,7 +663,48 @@ class HeadroomMCPServer:
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(None, self._compress_content, content)
 
+        # Record durably so `headroom savings` reflects this compression across
+        # restarts. Best-effort: never let savings bookkeeping break the tool.
+        try:
+            self._record_savings(result)
+        except Exception:
+            logger.debug("durable savings recording failed", exc_info=True)
+
         return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
+    def _record_savings(self, result: dict[str, Any]) -> None:
+        """Append a durable savings event for a completed compression."""
+        try:
+            before = int(result.get("original_tokens", 0) or 0)
+            after = int(result.get("compressed_tokens", 0) or 0)
+        except (TypeError, ValueError):
+            return
+        if before <= after:
+            return
+        savings_ledger.record_savings_event(
+            tokens_before=before,
+            tokens_after=after,
+            # The MCP tool doesn't know the agent's upstream model; an optional
+            # hint lets a host attribute it, otherwise it records as "unknown".
+            model=os.environ.get("HEADROOM_MCP_MODEL"),
+            client=self._current_client(),
+            source="mcp",
+        )
+
+    def _current_client(self) -> str:
+        """Name of the MCP client driving this session (best-effort)."""
+        override = os.environ.get("HEADROOM_MCP_CLIENT")
+        if override:
+            return override
+        try:
+            params = self.server.request_context.session.client_params
+            info = getattr(params, "clientInfo", None) if params else None
+            name = getattr(info, "name", None)
+            if name:
+                return str(name)
+        except Exception:
+            pass
+        return "unknown"
 
     async def _handle_retrieve(self, arguments: dict[str, Any]) -> list[TextContent]:
         """Handle headroom_retrieve tool call."""

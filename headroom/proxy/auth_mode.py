@@ -217,7 +217,7 @@ CLIENT_UA_MAP: tuple[tuple[str, str], ...] = (
 )
 
 
-def classify_client(headers: Mapping[str, Any] | Any) -> str | None:
+def classify_client(headers: Mapping[str, Any] | Any, *, default: str | None = None) -> str | None:
     """Identify the client harness (Codex / Claude Code / aider / etc).
 
     Decision order:
@@ -250,13 +250,40 @@ def classify_client(headers: Mapping[str, Any] | Any) -> str | None:
     for needle, name in CLIENT_UA_MAP:
         if needle in ua_lower:
             return name
-    return None
+    return default
+
+
+# OpenAI's Responses API endpoint. In practice this is Codex's endpoint, but a
+# proxy can't assume every caller here is Codex — hence
+# :func:`should_stamp_codex_client` only stamps callers that don't already
+# classify.
+CODEX_RESPONSES_PATH = "/v1/responses"
+
+
+def should_stamp_codex_client(path: str, headers: Mapping[str, Any] | Any) -> bool:
+    """Whether to stamp ``X-Client: codex`` on a request to the proxy.
+
+    Stamping ``X-Client: codex`` on the Responses endpoint makes the backend
+    take the codex fail-open branch on a compression timeout — Codex treats the
+    proxy's 413/1009 refusal as a hard connection failure. This is needed
+    because Codex Desktop's User-Agent (``Codex Desktop/...``) isn't in
+    :data:`CLIENT_UA_MAP` and would otherwise be refused.
+
+    Returns ``True`` only for an unidentified caller (no ``X-Client`` and no
+    recognized User-Agent) on the Responses endpoint. A caller that already
+    classifies is left untouched.
+    """
+    if path != CODEX_RESPONSES_PATH and not path.startswith(CODEX_RESPONSES_PATH + "/"):
+        return False
+    return classify_client(headers) is None
 
 
 __all__ = [
     "AuthMode",
     "CLIENT_UA_MAP",
+    "CODEX_RESPONSES_PATH",
     "SUBSCRIPTION_UA_PREFIXES",
     "classify_auth_mode",
     "classify_client",
+    "should_stamp_codex_client",
 ]

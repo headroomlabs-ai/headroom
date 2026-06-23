@@ -127,6 +127,12 @@ class RequestOutcome:
     num_messages: int = 0
     turn_id: str | None = None
     request_messages: list[dict[str, Any]] | None = None
+    # Post-compression messages actually sent upstream, paired with
+    # ``request_messages`` (pre-compression) so consumers can diff the two.
+    # Only populated when a caller threads in the pre-compression snapshot
+    # (``original_messages``); otherwise ``request_messages`` carries the sent
+    # body for backward compatibility and this stays ``None``.
+    compressed_messages: list[dict[str, Any]] | None = None
     tags: dict[str, str] = field(default_factory=dict)
     client: str | None = None
     project: str | None = None
@@ -201,6 +207,7 @@ class RequestOutcome:
         ttfb_ms: float = 0.0,
         pipeline_timing: dict[str, float] | None = None,
         waste_signals: dict[str, int] | None = None,
+        original_messages: list[dict] | None = None,
     ) -> RequestOutcome:
         """Construct an outcome from the locals available at streaming
         finalize. Three streaming finalizers
@@ -246,6 +253,25 @@ class RequestOutcome:
         if system is None:
             system = body.get("systemInstruction")
 
+        # ``request_items`` is ``body["messages"]`` (or ``body["contents"]``
+        # for Gemini, falling back to ``[]``) — the post-compression list the
+        # caller already mutated in place before finalize. When a
+        # caller threads in ``original_messages`` (the pre-compression
+        # snapshot), log it as ``request_messages`` and the sent body as
+        # ``compressed_messages`` so the two sides stay diffable. Callers that
+        # don't thread it in (gemini ``contents``, OpenAI-via-backend) keep the
+        # prior behaviour: sent body under ``request_messages``, no compressed
+        # side. Both sides share the ``log_full_messages`` gate.
+        if not log_full_messages:
+            log_request_messages = None
+            log_compressed_messages = None
+        elif original_messages is not None:
+            log_request_messages = original_messages
+            log_compressed_messages = request_items
+        else:
+            log_request_messages = request_items
+            log_compressed_messages = None
+
         return cls(
             request_id=request_id,
             provider=provider,
@@ -271,7 +297,8 @@ class RequestOutcome:
             turn_id=compute_turn_id(model, system, turn_messages),
             tags=tags or {},
             client=client,
-            request_messages=request_items if log_full_messages else None,
+            request_messages=log_request_messages,
+            compressed_messages=log_compressed_messages,
         )
 
 
@@ -306,6 +333,18 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     from headroom.proxy.models import RequestLog
     from headroom.proxy.project_context import get_current_project
 
+    # Output-shaping savings ledger (counterfactual estimator). The shaper
+    # tags each request's (arm, stratum) onto ``transforms_applied``; feed the
+    # observed output tokens to the recorder so it can produce an honest
+    # reduction estimate. Best-effort: never let bookkeeping break a response.
+    if any(str(t).startswith("output_shaper:") for t in outcome.transforms_applied):
+        try:
+            from headroom.proxy.output_savings import get_recorder
+
+            get_recorder().record_from_labels(outcome.transforms_applied, outcome.output_tokens)
+        except Exception:  # pragma: no cover - defensive
+            pass
+
     # Project attribution: explicit outcome field wins, else the value the
     # HTTP middleware / WS accept captured from ``X-Headroom-Project``.
     project = outcome.project or get_current_project()
@@ -330,6 +369,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         uncached_input_tokens=outcome.uncached_input_tokens,
         attempted_input_tokens=outcome.attempted_input_tokens,
         project=project,
+        client=outcome.client,
     )
 
     # 2. Cost tracker (optional).
@@ -344,6 +384,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
             cache_write_5m_tokens=outcome.cache_write_5m_tokens,
             cache_write_1h_tokens=outcome.cache_write_1h_tokens,
             uncached_tokens=outcome.uncached_input_tokens,
+            output_tokens=outcome.output_tokens,
         )
 
     # 3. Per-request log (optional). The ``client`` outcome field is
@@ -376,6 +417,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
                 transforms_applied=list(outcome.transforms_applied),
                 waste_signals=outcome.waste_signals,
                 request_messages=outcome.request_messages,
+                compressed_messages=outcome.compressed_messages,
                 turn_id=outcome.turn_id,
             )
         )
@@ -393,6 +435,9 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         f"cache_read={outcome.cache_read_tokens} cache_write={outcome.cache_write_tokens} "
         f"cache_hit_pct={outcome.cache_hit_pct} "
         f"opt_ms={outcome.overhead_ms:.0f} "
+        f"total_ms={outcome.total_latency_ms:.0f} "
+        f"tok_out={outcome.output_tokens} "
+        f"ttfb_ms={outcome.ttfb_ms:.0f} "
         f"transforms={_summarize_transforms(list(outcome.transforms_applied))}"
         f"{client_part}"
     )

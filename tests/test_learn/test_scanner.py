@@ -104,6 +104,26 @@ class TestGreedyPathDecode:
         result = _greedy_path_decode(tmp_path, ["my", "cool", "project", "nosync", "headroom"])
         assert result == tmp_path / "my-cool-project.nosync" / "headroom"
 
+    # ---- Space tests (issue #997) ----
+
+    def test_single_space_in_dirname(self, tmp_path: Path) -> None:
+        """Directory name contains a space (e.g. 'Claude Projects')."""
+        _make_dirs(tmp_path, "Claude Projects")
+        result = _greedy_path_decode(tmp_path, ["Claude", "Projects"])
+        assert result == tmp_path / "Claude Projects"
+
+    def test_multiple_spaces_in_dirname(self, tmp_path: Path) -> None:
+        """Directory name contains multiple spaces (e.g. 'Claude Code Projects')."""
+        _make_dirs(tmp_path, "Claude Code Projects")
+        result = _greedy_path_decode(tmp_path, ["Claude", "Code", "Projects"])
+        assert result == tmp_path / "Claude Code Projects"
+
+    def test_space_nested_path(self, tmp_path: Path) -> None:
+        """Nested path like Desktop/'Claude Code Projects' should decode correctly."""
+        _make_dirs(tmp_path, "Desktop/Claude Code Projects")
+        result = _greedy_path_decode(tmp_path, ["Desktop", "Claude", "Code", "Projects"])
+        assert result == tmp_path / "Desktop" / "Claude Code Projects"
+
     # ---- Underscore tests (issue #159) ----
 
     def test_single_underscore_in_dirname(self, tmp_path: Path) -> None:
@@ -144,8 +164,8 @@ class TestGreedyPathDecode:
         result = _greedy_path_decode(tmp_path, [])
         assert result == tmp_path
 
-    def test_empty_parts_returns_none_when_not_exists(self) -> None:
-        result = _greedy_path_decode(Path("/nonexistent/path"), [])
+    def test_empty_parts_returns_none_when_not_exists(self, tmp_path: Path) -> None:
+        result = _greedy_path_decode(tmp_path / "missing", [])
         assert result is None
 
 
@@ -331,6 +351,32 @@ class TestDecodeProjectPath:
         assert "john.doe" in rendered
         assert "john\\doe" not in rendered
         assert "john/doe" not in rendered
+
+    def test_windows_path_with_spaces_decoded_via_greedy(self) -> None:
+        """Spaces in Windows dir names must not split into separate components (#997).
+
+        Claude Code encodes 'C:\\Users\\user\\Desktop\\Claude Code Projects' as
+        '-C-Users-user-Desktop-Claude-Code-Projects'. The greedy decoder must
+        reconstruct 'Claude Code Projects' as a single directory.
+        """
+        import sys
+        import tempfile
+
+        if sys.platform != "win32":
+            pytest.skip("greedy Windows-path decode requires real Windows filesystem")
+
+        with tempfile.TemporaryDirectory() as td:
+            space_dir = Path(td) / "Claude Code Projects"
+            space_dir.mkdir()
+
+            drive = Path(td).drive[0]
+            rest = str(Path(td))[3:]  # strip 'C:\\'
+            rest_parts = rest.replace("\\", "-").replace(" ", "-")
+            encoded = f"-{drive}-{rest_parts}-Claude-Code-Projects"
+
+            result = _decode_project_path(encoded)
+            assert result is not None
+            assert result == space_dir
 
     def test_discover_windows_project_uses_leaf_name(self, tmp_path: Path) -> None:
         """A syntactic Windows path decoded on Unix should still display the project leaf."""

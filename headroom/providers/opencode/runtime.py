@@ -1,66 +1,81 @@
-"""Runtime helpers for OpenCode integrations.
-
-OpenCode supports multiple LLM backends. The primary path for users who
-rely on GitHub Copilot is the ``github-copilot/`` backend prefix that the
-headroom proxy already understands (see :mod:`headroom.proxy.auth_mode`).
-
-For users who configure Anthropic or OpenAI directly, the proxy is reached
-via the standard ``ANTHROPIC_BASE_URL`` / ``OPENAI_BASE_URL`` env vars that
-OpenCode passes straight through to the AI SDK.
-
-The github-copilot provider in OpenCode reads its base URL from
-``opencode.json`` (patched by :func:`headroom.providers.opencode.install.apply_provider_scope`),
-not from an environment variable.  Do NOT set ``GITHUB_COPILOT_HOST`` here;
-that env var controls GitHub Enterprise host resolution in
-:mod:`headroom.copilot_auth` and would break credential discovery.
-"""
+"""Runtime helpers for OpenCode integrations."""
 
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Mapping
 
-# Headroom proxy speaks the Anthropic wire protocol on the root path and the
-# OpenAI wire protocol under /v1, exactly what OpenCode expects.
-DEFAULT_API_URL = "https://api.anthropic.com"
+from .config import HEADROOM_OPENCODE_PLUGIN
 
 
 def proxy_base_url(port: int) -> str:
-    """Return the Anthropic-protocol proxy URL for OpenCode."""
-    return f"http://127.0.0.1:{port}"
-
-
-def proxy_openai_url(port: int) -> str:
-    """Return the OpenAI-protocol proxy URL for OpenCode."""
+    """Return the local proxy base URL used by OpenCode integrations."""
     return f"http://127.0.0.1:{port}/v1"
+
+
+def build_opencode_config_content(
+    *,
+    port: int,
+    include_mcp: bool = True,
+    include_plugin: bool = True,
+) -> dict[str, object]:
+    """Build JSON payload for ``OPENCODE_CONFIG_CONTENT``.
+
+    Runtime wrap injects the Headroom provider as a stable explicit fallback,
+    plus the Headroom plugin which transparently routes provider fetch traffic
+    through the local proxy without rewriting user provider config URLs.
+    """
+    base_url = proxy_base_url(port)
+    config: dict[str, object] = {
+        "provider": {
+            "headroom": {
+                "npm": "@ai-sdk/openai-compatible",
+                "name": "Headroom Proxy",
+                "options": {"baseURL": base_url},
+            }
+        }
+    }
+    if include_mcp:
+        config["mcp"] = {
+            "headroom": {
+                "type": "remote",
+                "url": f"http://127.0.0.1:{port}/mcp",
+                "enabled": True,
+            }
+        }
+    if include_plugin:
+        config["plugin"] = [[HEADROOM_OPENCODE_PLUGIN, {"proxyUrl": base_url}]]
+    return config
 
 
 def build_launch_env(
     port: int,
     environ: Mapping[str, str] | None = None,
+    project: str | None = None,
     *,
-    backend: str | None = None,
+    include_mcp: bool = True,
+    include_plugin: bool = True,
 ) -> tuple[dict[str, str], list[str]]:
-    """Build environment variables to route OpenCode through the headroom proxy.
+    """Build environment variables for launching OpenCode through Headroom.
 
-    OpenCode reads standard AI SDK env vars.  We set:
-
-    * ``ANTHROPIC_BASE_URL``  — for ``anthropic/*`` models
-    * ``OPENAI_BASE_URL``     — for ``openai/*`` models
-
-    The ``github-copilot`` provider gets its base URL from ``opencode.json``
-    (see :func:`~headroom.providers.opencode.install.apply_provider_scope`).
+    ``OPENCODE_CONFIG_CONTENT`` carries Headroom provider/MCP/plugin config.
+    Existing provider/base URL environment variables are preserved.
     """
-    env = dict(environ if environ is not None else os.environ)
+    env = dict(environ or os.environ)
 
-    anthropic_url = proxy_base_url(port)
-    openai_url = proxy_openai_url(port)
+    config_content = build_opencode_config_content(
+        port=port,
+        include_mcp=include_mcp,
+        include_plugin=include_plugin,
+    )
+    env["OPENCODE_CONFIG_CONTENT"] = json.dumps(config_content, separators=(",", ":"))
 
-    env["ANTHROPIC_BASE_URL"] = anthropic_url
-    env["OPENAI_BASE_URL"] = openai_url
+    display = ["OPENCODE_CONFIG_CONTENT={provider: headroom}"]
+    if include_plugin:
+        display.append(f"plugin={HEADROOM_OPENCODE_PLUGIN}")
 
-    display = [
-        f"ANTHROPIC_BASE_URL={anthropic_url}",
-        f"OPENAI_BASE_URL={openai_url}",
-    ]
+    if project and "HEADROOM_PROJECT" not in env:
+        env["HEADROOM_PROJECT"] = project
+
     return env, display

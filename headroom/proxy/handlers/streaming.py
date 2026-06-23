@@ -663,6 +663,7 @@ class StreamingMixin:
         full_sse_data: str = "",
         parsed_response: dict[str, Any] | None = None,
         client: str | None = None,
+        waste_signals: dict[str, int] | None = None,
     ) -> None:
         from headroom.proxy.outcome import RequestOutcome
 
@@ -785,6 +786,8 @@ class StreamingMixin:
             uncached_input_tokens=uncached_input_tokens,
             ttfb_ms=stream_state["ttfb_ms"] or total_latency,
             pipeline_timing=pipeline_timing,
+            original_messages=original_messages,
+            waste_signals=waste_signals,
         )
         await self._record_request_outcome(outcome)
 
@@ -812,6 +815,7 @@ class StreamingMixin:
         mutation_reasons: list[str] | None = None,
         memory_request_ctx: Any | None = None,
         outcome_provider: str | None = None,
+        waste_signals: dict[str, int] | None = None,
     ) -> Response | StreamingResponse:
         """Stream response with metrics tracking and memory tool handling.
 
@@ -1063,6 +1067,7 @@ class StreamingMixin:
                 prefix_tracker=prefix_tracker,
                 original_messages=original_messages,
                 client=client,
+                waste_signals=waste_signals,
             )
             return Response(
                 content=error_content,
@@ -1327,6 +1332,7 @@ class StreamingMixin:
                     full_sse_data=_final_full_sse_data,
                     parsed_response=parsed_response,
                     client=client,
+                    waste_signals=waste_signals,
                 )
 
         return StreamingResponse(
@@ -1349,6 +1355,7 @@ class StreamingMixin:
         tags: dict[str, str],
         optimization_latency: float,
         pipeline_timing: dict[str, float] | None = None,
+        original_messages: list[dict] | None = None,
     ) -> StreamingResponse:
         """Stream response from Bedrock backend with metrics tracking.
 
@@ -1455,6 +1462,7 @@ class StreamingMixin:
                     cache_write_1h_tokens=stream_state["cache_creation_ephemeral_1h_input_tokens"],
                     ttfb_ms=stream_state["ttfb_ms"] or 0,
                     pipeline_timing=pipeline_timing,
+                    original_messages=original_messages,
                 )
                 await self._record_request_outcome(outcome)
 

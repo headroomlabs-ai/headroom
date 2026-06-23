@@ -256,6 +256,7 @@ class TestWasteSignals:
             whitespace_tokens=25,
             dynamic_date_tokens=10,
             repetition_tokens=15,
+            reread_tokens=30,
         )
         expected = {
             "json_bloat": 100,
@@ -264,6 +265,8 @@ class TestWasteSignals:
             "whitespace": 25,
             "dynamic_date": 10,
             "repetition": 15,
+            "reread": 30,
+            "reread_compressed": 0,
         }
         assert signals.to_dict() == expected
 
@@ -272,7 +275,7 @@ class TestWasteSignals:
         signals = WasteSignals()
         result = signals.to_dict()
         assert all(v == 0 for v in result.values())
-        assert len(result) == 6
+        assert len(result) == 8
 
 
 class TestCachePrefixMetrics:

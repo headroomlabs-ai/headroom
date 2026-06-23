@@ -22,12 +22,16 @@ help:
 	@echo "  make lint               - cargo clippy --workspace -- -D warnings"
 	@echo "  make clean              - cargo clean"
 	@echo ""
+	@echo "E2e targets:"
+	@echo "  make build-e2e-wrap     - build the wrap-e2e Docker image"
+	@echo "  make run-e2e-wrap       - build + run the wrap-e2e Docker container"
+	@echo ""
 	@echo "Pre-push verification (run BEFORE git push to catch CI failures locally):"
 	@echo "  make ci-precheck        - run all CI gates (rust + python + commitlint)"
 	@echo "  make ci-precheck-rust   - cargo fmt --check + clippy + test"
 	@echo "  make ci-precheck-python - smart_crusher-affected python tests"
 	@echo "  make ci-precheck-commitlint - lint commits since origin/main"
-	@echo "  make install-git-hooks  - install a pre-push hook that runs ci-precheck"
+	@echo "  make install-git-hooks  - install pre-commit, commit-msg, and pre-push hooks"
 
 test:
 	$(CARGO) test --workspace
@@ -123,19 +127,31 @@ ci-precheck-python:
 		tests/test_toin_integration.py
 
 # Lint commits since `origin/main`. Requires npx (Node 18+) on PATH.
-# Skips silently if npx is unavailable; install nodejs to enable.
 ci-precheck-commitlint:
 	@echo "── ci-precheck-commitlint ─────────────────────────────────────"
 	@if ! command -v npx >/dev/null 2>&1; then \
-		echo "skip: npx not on PATH (install node 18+ to enable commitlint pre-check)"; \
-		exit 0; \
+		echo "error: npx not on PATH (install Node 18+ to enable commitlint checks)"; \
+		exit 1; \
 	fi
 	@if ! git rev-parse --verify origin/main >/dev/null 2>&1; then \
-		echo "skip: origin/main not fetched (run 'git fetch origin main')"; \
-		exit 0; \
+		echo "error: origin/main not fetched (run 'git fetch origin main')"; \
+		exit 1; \
 	fi
 	npx --yes --package=@commitlint/cli --package=@commitlint/config-conventional -- \
 		commitlint --from origin/main --to HEAD --config .commitlintrc.json
 
 install-git-hooks:
 	@scripts/install-git-hooks.sh
+
+# ─── E2e Docker targets ────────────────────────────────────────────────────
+#
+# The wrap-e2e Dockerfile uses manylinux_2_28_x86_64 as its builder stage,
+# which only ships amd64 binaries. Pass --platform linux/amd64 explicitly
+# so the build works on Apple Silicon (requires QEMU emulation). On native
+# x86_64 hosts the flag is harmless and matches CI behaviour.
+
+build-e2e-wrap:
+	docker build --platform linux/amd64 -f e2e/wrap/Dockerfile -t headroom-wrap-e2e .
+
+run-e2e-wrap: build-e2e-wrap
+	docker run --rm headroom-wrap-e2e

@@ -51,6 +51,7 @@ pip install "headroom-ai[all]"
 | `langchain` | LangChain `HeadroomChatModel` wrapper | `pip install "headroom-ai[langchain]"` |
 | `agno` | Agno `HeadroomAgnoModel` wrapper | `pip install "headroom-ai[agno]"` |
 | `evals` | Evaluation framework (GSM8K, SQuAD, BFCL benchmarks) | `pip install "headroom-ai[evals]"` |
+| `pytorch-mps` | Apple-GPU (MPS) memory-embedder offload — **macOS only**, not in `[all]` (torch + sentence-transformers); opt in with `HEADROOM_EMBEDDER_RUNTIME=pytorch_mps` | `pip install "headroom-ai[pytorch-mps]"` |
 | `all` | Everything above | `pip install "headroom-ai[all]"` |
 
 You can combine extras:
@@ -226,7 +227,8 @@ These variables configure Headroom at runtime. Set them in your shell, `.env` fi
 | `HEADROOM_PORT` | `8787` | Port the proxy listens on |
 | `HEADROOM_HOST` | `127.0.0.1` | Host the proxy binds to |
 | `HEADROOM_MODE` | `token` | Default optimization mode: `token` or `cache` |
-| `HEADROOM_TELEMETRY` | enabled | Set to `off` to disable anonymous telemetry |
+| `HEADROOM_TELEMETRY` | `off` (opt-in) | Set to `on` to opt in to anonymous telemetry |
+| `HEADROOM_REQUEST_TIMEOUT` | `300` | Request timeout in seconds |
 
 ### TypeScript SDK
 
@@ -268,6 +270,18 @@ python3 -m pip install --upgrade pip
 Some tests require Rust tooling.
 
 The recommended way to install rust is using `rustup`. You can find the official installation instructions [here](https://rust-lang.org/tools/install/).
+
+## Dashboard
+
+Headroom serves a live savings dashboard while the proxy is running. Open it with:
+
+```bash
+headroom dashboard            # opens http://localhost:8787/dashboard in your browser
+headroom dashboard --no-open  # just print the URL
+```
+
+Or browse to `http://localhost:8787/dashboard` directly (use `--port` / `HEADROOM_PORT` if you
+run the proxy on a different port).
 
 ## Next steps
 
