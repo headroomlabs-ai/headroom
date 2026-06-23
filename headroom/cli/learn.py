@@ -78,6 +78,14 @@ Use 'auto' (default) to scan all detected agents."""
     help="Write recommendations to context/memory files (default: dry-run).",
 )
 @click.option(
+    "--target",
+    type=str,
+    default=None,
+    help="Override the context file learnings are written to (Claude Code only). "
+    "Path is relative to the project root, or absolute. Defaults to CLAUDE.local.md "
+    "(personal, gitignored). Pass CLAUDE.md to write to the team-shared file instead.",
+)
+@click.option(
     "--agent",
     type=_AgentChoice(),
     default="auto",
@@ -124,6 +132,7 @@ def learn(
     project: Path | None,
     analyze_all: bool,
     apply: bool,
+    target: str | None,
     agent: str,
     model: str | None,
     workers: int | None,
@@ -148,6 +157,7 @@ def learn(
         headroom learn --model gpt-4o         # Use GPT-4o for analysis
         headroom learn --all                  # Analyze all projects
         headroom learn --agent codex --all    # Analyze all Codex sessions
+        headroom learn --target CLAUDE.md     # Write to the team-shared file
     """
     import os
 
@@ -200,6 +210,11 @@ def learn(
 
     for agent_name, plugin in agent_configs:
         writer = plugin.create_writer()
+        if target is not None:
+            if hasattr(writer, "set_context_target"):
+                writer.set_context_target(target)
+            else:
+                click.echo(f"Note: --target is not supported for {agent_name}; ignoring.")
         all_projects = plugin.discover_projects()
         if not all_projects:
             continue
@@ -279,6 +294,9 @@ def learn(
                     f"  Warning: failed to write recommendations for {proj.project_path}: {e}"
                 )
                 continue
+
+            for warning in getattr(result, "warnings", None) or []:
+                click.echo(f"\n  ⚠ {warning}")
 
             for file_path, content in result.content_by_file.items():
                 click.echo(f"\n  {'[WOULD WRITE]' if result.dry_run else '[WROTE]'} {file_path}")

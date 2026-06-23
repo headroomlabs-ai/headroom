@@ -208,6 +208,47 @@ def hello():
         count = counter.count_text(code_text)
         assert count > 0
 
+    def test_count_text_cjk_not_underestimated(self):
+        """CJK text must not be priced at the Latin ~4-chars/token ratio.
+
+        Regression: count_text divided the whole string length by the Latin
+        ratio (4.0), so 100 Chinese characters estimated ~25 tokens while real
+        tokenizers (cl100k_base / DeepSeek / Qwen) produce ~60-150. Dense
+        scripts tokenize at roughly one token per character, so the estimate
+        must be far above len/4 and on the order of the character count.
+        """
+        counter = EstimatingTokenCounter()
+        text = "你好世界" * 25  # 100 CJK characters
+        count = counter.count_text(text)
+        # Old behavior returned len/4 == 25; require clearly above that floor.
+        assert count > len(text) / 3
+        # And in the right ballpark for one-token-per-char scripts.
+        assert count >= int(len(text) * 0.6)
+
+    def test_count_text_cjk_japanese_and_korean(self):
+        """Japanese (Kana) and Korean (Hangul) are also dense scripts."""
+        counter = EstimatingTokenCounter()
+        for text in ("こんにちは世界" * 10, "안녕하세요" * 10):
+            count = counter.count_text(text)
+            assert count >= int(len(text) * 0.6)
+
+    def test_count_text_mixed_latin_cjk(self):
+        """Mixed text prices the Latin part and the CJK part independently."""
+        counter = EstimatingTokenCounter()
+        latin = "The quick brown fox jumps over the lazy dog. "  # 45 chars
+        cjk = "今天天气很好"  # 6 CJK chars
+        mixed = counter.count_text(latin + cjk)
+        # Must exceed the all-Latin estimate of the same length, since the CJK
+        # tail is priced denser than 4 chars/token.
+        latin_only = counter.count_text(latin + "x" * len(cjk))
+        assert mixed > latin_only
+
+    def test_count_text_latin_unchanged(self):
+        """Pure-Latin estimates are unchanged by the CJK adjustment."""
+        counter = EstimatingTokenCounter()
+        text = "Hello, world!"
+        assert 2 <= counter.count_text(text) <= 6
+
     def test_repr(self):
         """Test string representation."""
         counter = EstimatingTokenCounter()

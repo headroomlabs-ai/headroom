@@ -74,7 +74,7 @@ def _runtime_env(manifest: DeploymentManifest) -> dict[str, str]:
 
 
 def _ensure_host_dirs() -> None:
-    for subdir in (".headroom", ".claude", ".codex", ".gemini"):
+    for subdir in (".headroom", ".claude", ".codex", ".gemini", ".config/opencode"):
         (Path.home() / subdir).mkdir(parents=True, exist_ok=True)
 
 
@@ -120,6 +120,8 @@ def build_runtime_command(manifest: DeploymentManifest) -> list[str]:
         f"{_mount_source(home, '.codex')}:{container_home}/.codex",
         "--volume",
         f"{_mount_source(home, '.gemini')}:{container_home}/.gemini",
+        "--volume",
+        f"{_mount_source(home, '.config/opencode')}:{container_home}/.config/opencode",
     ]
     if not _is_windows():
         getuid = getattr(os, "getuid", None)
