@@ -99,11 +99,14 @@ def _build_sni_ssl_context(
         ctx_in: ssl.SSLContext,  # noqa: ARG001
     ) -> int | None:
         """Guard SNI then mint or reuse a leaf cert for *server_name* and swap it in-place."""
-        if server_name is None or server_name not in allowlist:
+        # Case-insensitive per RFC 6066; lowercase once so the membership check
+        # AND the cache key match the (lowercase) allowlist and the Host guard.
+        host = server_name.lower() if server_name is not None else None
+        if host is None or host not in allowlist:
             logger.warning("event=sni_refused host=%s", server_name)
             return ssl.ALERT_DESCRIPTION_UNRECOGNIZED_NAME
 
-        cert_pem, key_pem = leaf_cache.get_or_mint(server_name, ca_key, ca_cert)
+        cert_pem, key_pem = leaf_cache.get_or_mint(host, ca_key, ca_cert)
 
         new_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         new_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
@@ -205,12 +208,17 @@ class AgyDispatchServer:
             send: Any,
         ) -> None:
             if scope.get("type") in ("http", "websocket"):
-                raw_host: bytes | None = None
-                for name, value in scope.get("headers", ()):
-                    if name.lower() == b"host":
-                        raw_host = value
-                        break
-                host_str = raw_host.decode("latin-1") if raw_host else ""
+                # Enforce exactly ONE Host header — multiple Host headers are a
+                # request-smuggling vector (guard validates one, backend may
+                # route on another). RFC 7230 §5.4 requires rejecting them.
+                host_values = [
+                    value for name, value in scope.get("headers", ()) if name.lower() == b"host"
+                ]
+                if len(host_values) != 1:
+                    logger.warning("event=host_refused host_count=%d", len(host_values))
+                    await _send_421(send)
+                    return
+                host_str = host_values[0].decode("latin-1")
                 # Normalize: reject empty; strip a single trailing :port; lowercase.
                 if not host_str:
                     logger.warning("event=host_refused host=%r", host_str)

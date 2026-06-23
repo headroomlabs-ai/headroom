@@ -749,7 +749,13 @@ def test_load_cert_chain_in_memory_fallback_unlinks_on_load_exception(
 def test_load_cert_chain_in_memory_fallback_via_proc_oserror(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """When memfd exists but /proc path raises OSError, fallback is triggered."""
+    """When memfd exists but the /proc path is missing (FileNotFoundError),
+    the helper falls back to mkstemp.
+
+    Real ``/proc``-absent failure surfaces as FileNotFoundError (ENOENT), which
+    is what the helper catches narrowly — a bare OSError/SSLError must NOT
+    trigger the disk fallback (see test_..._bad_cert_propagates_without_disk).
+    """
     import ssl
     import tempfile as _tempfile
 
@@ -757,17 +763,17 @@ def test_load_cert_chain_in_memory_fallback_via_proc_oserror(
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 
     if not hasattr(os, "memfd_create"):
-        pytest.skip("memfd_create not available; fallback-via-OSError path not applicable")
+        pytest.skip("memfd_create not available; fallback-via-/proc path not applicable")
 
-    # Patch load_cert_chain to raise OSError on first call (simulating /proc failure),
-    # then succeed on second call (fallback's mkstemp path).
+    # Patch load_cert_chain to raise FileNotFoundError on first call (simulating
+    # /proc not mounted), then succeed on the second (fallback's mkstemp path).
     calls: list[int] = [0]
     original_load = ctx.__class__.load_cert_chain
 
     def _raise_once(self: ssl.SSLContext, *args: object, **kwargs: object) -> None:
         calls[0] += 1
         if calls[0] == 1:
-            raise OSError("simulated /proc not mounted")
+            raise FileNotFoundError("simulated /proc not mounted")
         original_load(self, *args, **kwargs)
 
     monkeypatch.setattr(ssl.SSLContext, "load_cert_chain", _raise_once)
@@ -784,6 +790,35 @@ def test_load_cert_chain_in_memory_fallback_via_proc_oserror(
 
     load_cert_chain_in_memory(ctx, cert_pem, key_pem)
 
-    assert tmp_paths_created, "Fallback (mkstemp) must be triggered when /proc path raises OSError"
+    assert tmp_paths_created, "Fallback (mkstemp) must trigger when /proc path is FileNotFoundError"
     for p in tmp_paths_created:
         assert not os.path.exists(p), f"Fallback temp {p} must be unlinked"
+
+
+def test_load_cert_chain_in_memory_bad_cert_propagates_without_disk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A malformed cert/key (ssl.SSLError, an OSError subclass) must propagate
+    and NOT silently disk-fall-back via mkstemp."""
+    import ssl
+    import tempfile as _tempfile
+
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+
+    if not hasattr(os, "memfd_create"):
+        pytest.skip("memfd_create not available; primary path not exercised")
+
+    mkstemp_called = [False]
+    original_mkstemp = _tempfile.mkstemp
+
+    def _spy_mkstemp(*args: object, **kwargs: object) -> tuple[int, str]:
+        mkstemp_called[0] = True
+        return original_mkstemp(*args, **kwargs)
+
+    monkeypatch.setattr(_tempfile, "mkstemp", _spy_mkstemp)
+
+    # Garbage PEM -> load_cert_chain raises ssl.SSLError (subclass of OSError).
+    with pytest.raises(ssl.SSLError):
+        load_cert_chain_in_memory(ctx, b"-----BEGIN CERTIFICATE-----\nnope\n", b"not-a-key")
+
+    assert not mkstemp_called[0], "bad cert must NOT trigger the disk fallback"

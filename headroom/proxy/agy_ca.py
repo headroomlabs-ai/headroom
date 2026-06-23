@@ -450,7 +450,10 @@ def load_cert_chain_in_memory(
         written in full (loop on ``os.write``).  ``_assert_perms`` validates
         the 0600 mode (fail-loud; no silent chmod since mkstemp already yields
         0600).  ``load_cert_chain`` is called; ``os.unlink`` removes the file
-        in a ``finally`` block even if ``load_cert_chain`` raises.
+        in a ``finally`` block even if ``load_cert_chain`` raises.  Residual
+        risk: a hard crash (SIGKILL/OOM) during the brief load window could
+        orphan a 0600 temp until OS temp cleanup.  This fallback only runs on
+        platforms without ``memfd_create``; Linux never writes the key to disk.
 
     Parameters
     ----------
@@ -469,10 +472,11 @@ def load_cert_chain_in_memory(
             _write_all_fd(fd, combined)
             ctx.load_cert_chain(f"/proc/self/fd/{fd}")
             return
-        except OSError:
-            # /proc not mounted (some containers) — fall through to mkstemp.
-            # (FileNotFoundError is an OSError subclass; an ssl.SSLError for a
-            # malformed cert is NOT an OSError and correctly propagates.)
+        except (FileNotFoundError, PermissionError):
+            # /proc not mounted / inaccessible (some containers) — fall through
+            # to mkstemp. Caught narrowly ON PURPOSE: ssl.SSLError is a subclass
+            # of OSError, so a broad `except OSError` would swallow a malformed
+            # cert/key and silently disk-fall-back. Those propagate instead.
             pass
         finally:
             os.close(fd)
@@ -487,6 +491,8 @@ def _write_all_fd(fd: int, data: bytes) -> None:
     total = len(data)
     while written < total:
         n = os.write(fd, view[written:])
+        if n == 0:
+            raise OSError("os.write wrote 0 bytes; cannot persist leaf PEM")
         written += n
 
 
