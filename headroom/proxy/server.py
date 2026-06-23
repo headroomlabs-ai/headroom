@@ -169,6 +169,7 @@ from headroom.transforms import (
     CacheAligner,
     CodeAwareCompressor,
     CodeCompressorConfig,
+    CompressionStrategy,
     ContentRouter,
     ContentRouterConfig,
     TransformPipeline,
@@ -626,6 +627,10 @@ class HeadroomProxy(
         )
         if config.disable_kompress:
             router_config.enable_kompress = False
+            # Opt-in restore of the legacy behaviour: send fall-through content
+            # to PASSTHROUGH instead of the default KOMPRESS fallback strategy.
+            if config.disable_kompress_fallback:
+                router_config.fallback_strategy = CompressionStrategy.PASSTHROUGH
         # A non-None exclude_tools replaces DEFAULT_EXCLUDE_TOOLS in
         # ContentRouter, so merge rather than assign.
         if config.exclude_tools:
@@ -2068,6 +2073,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "cache": config.cache_enabled,
                 "rate_limit": config.rate_limit_enabled,
                 "disable_kompress": config.disable_kompress,
+                "disable_kompress_fallback": config.disable_kompress_fallback,
                 "disable_kompress_anthropic": config.disable_kompress_anthropic,
                 "disable_kompress_openai": config.disable_kompress_openai,
                 "memory": config.memory_enabled,
@@ -3770,6 +3776,7 @@ def _proxy_config_from_env() -> ProxyConfig:
         bedrock_api_url=os.environ.get("BEDROCK_TARGET_API_URL"),
         anyllm_provider=_get_env_str("HEADROOM_ANYLLM_PROVIDER", "openai"),
         disable_kompress=_get_env_bool("HEADROOM_DISABLE_KOMPRESS", False),
+        disable_kompress_fallback=_get_env_bool("HEADROOM_DISABLE_KOMPRESS_FALLBACK", False),
         disable_kompress_anthropic=_get_env_optional_bool("HEADROOM_DISABLE_KOMPRESS_ANTHROPIC"),
         disable_kompress_openai=_get_env_optional_bool("HEADROOM_DISABLE_KOMPRESS_OPENAI"),
         max_connections=_get_env_int("HEADROOM_MAX_CONNECTIONS", 500),
@@ -3778,6 +3785,12 @@ def _proxy_config_from_env() -> ProxyConfig:
         http2=_get_env_bool("HEADROOM_HTTP2", True),
         periodic_toin_stats_enabled=_get_env_bool("HEADROOM_PERIODIC_TOIN_STATS", True),
         mode=normalize_proxy_mode(_get_env_str("HEADROOM_MODE", PROXY_MODE_TOKEN)),
+        read_maturation=_get_env_bool("HEADROOM_READ_MATURATION", False),
+        read_maturation_quiesce_turns=_get_env_int("HEADROOM_READ_MATURATION_QUIESCE_TURNS", 5),
+        read_maturation_max_hold_turns=_get_env_int("HEADROOM_READ_MATURATION_MAX_HOLD_TURNS", 25),
+        read_maturation_min_size_bytes=_get_env_int(
+            "HEADROOM_READ_MATURATION_MIN_SIZE_BYTES", 2048
+        ),
     )
 
 
@@ -4166,6 +4179,15 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--disable-kompress-fallback",
+        action="store_true",
+        help=(
+            "With --disable-kompress, route fall-through content to PASSTHROUGH instead of "
+            "the default KOMPRESS fallback (restores legacy --disable-kompress behaviour). "
+            "Also settable via HEADROOM_DISABLE_KOMPRESS_FALLBACK=1."
+        ),
+    )
+    parser.add_argument(
         "--disable-kompress-anthropic",
         dest="disable_kompress_anthropic",
         action="store_const",
@@ -4259,6 +4281,9 @@ if __name__ == "__main__":
     cache_enabled = env_cache if not args.no_cache else False
     rate_limit_enabled = env_rate_limit if not args.no_rate_limit else False
     disable_kompress = args.disable_kompress or _get_env_bool("HEADROOM_DISABLE_KOMPRESS", False)
+    disable_kompress_fallback = args.disable_kompress_fallback or _get_env_bool(
+        "HEADROOM_DISABLE_KOMPRESS_FALLBACK", False
+    )
     disable_kompress_anthropic = (
         args.disable_kompress_anthropic
         if args.disable_kompress_anthropic is not None
@@ -4312,6 +4337,7 @@ if __name__ == "__main__":
         log_full_messages=args.log_messages or _get_env_bool("HEADROOM_LOG_MESSAGES", False),
         code_aware_enabled=code_aware_enabled,
         disable_kompress=disable_kompress,
+        disable_kompress_fallback=disable_kompress_fallback,
         disable_kompress_anthropic=disable_kompress_anthropic,
         disable_kompress_openai=disable_kompress_openai,
         # Connection pool settings
@@ -4319,6 +4345,12 @@ if __name__ == "__main__":
         max_keepalive_connections=_get_env_int("HEADROOM_MAX_KEEPALIVE", args.max_keepalive),
         keepalive_expiry=_get_env_float("HEADROOM_KEEPALIVE_EXPIRY", args.keepalive_expiry),
         http2=not args.no_http2 and _get_env_bool("HEADROOM_HTTP2", True),
+        read_maturation=_get_env_bool("HEADROOM_READ_MATURATION", False),
+        read_maturation_quiesce_turns=_get_env_int("HEADROOM_READ_MATURATION_QUIESCE_TURNS", 5),
+        read_maturation_max_hold_turns=_get_env_int("HEADROOM_READ_MATURATION_MAX_HOLD_TURNS", 25),
+        read_maturation_min_size_bytes=_get_env_int(
+            "HEADROOM_READ_MATURATION_MIN_SIZE_BYTES", 2048
+        ),
         tool_profiles=tool_profiles if tool_profiles else None,
         exclude_tools=exclude_tools if exclude_tools else None,
         mode=normalize_proxy_mode(_get_env_str("HEADROOM_MODE", PROXY_MODE_TOKEN)),

@@ -927,6 +927,15 @@ class TestArgparseBackendValidation:
 
         assert config.disable_kompress is True
 
+    def test_proxy_config_from_env_reads_disable_kompress_fallback(self):
+        """The direct server env path should honor HEADROOM_DISABLE_KOMPRESS_FALLBACK."""
+        from headroom.proxy.server import _proxy_config_from_env
+
+        with patch.dict(os.environ, {"HEADROOM_DISABLE_KOMPRESS_FALLBACK": "1"}):
+            config = _proxy_config_from_env()
+
+        assert config.disable_kompress_fallback is True
+
     def test_argparse_registers_keepalive_expiry_flag(self):
         """The argparse path (python -m headroom.proxy.server) must register
         --keepalive-expiry as a float flag, so it can override the

@@ -427,6 +427,16 @@ def dashboard(port: int, no_open: bool) -> None:
     ),
 )
 @click.option(
+    "--disable-kompress-fallback",
+    is_flag=True,
+    envvar="HEADROOM_DISABLE_KOMPRESS_FALLBACK",
+    help=(
+        "With --disable-kompress, route fall-through content to PASSTHROUGH instead of "
+        "the default KOMPRESS fallback (restores legacy --disable-kompress behaviour). "
+        "Env: HEADROOM_DISABLE_KOMPRESS_FALLBACK=1."
+    ),
+)
+@click.option(
     "--disable-kompress-anthropic/--enable-kompress-anthropic",
     "disable_kompress_anthropic",
     default=None,
@@ -463,6 +473,41 @@ def dashboard(port: int, no_open: bool) -> None:
     "--no-read-lifecycle",
     is_flag=True,
     help="Disable Read lifecycle management (stale/superseded Read compression)",
+)
+# Read maturation (Mechanism B) — experimental, OFF by default
+@click.option(
+    "--read-maturation",
+    is_flag=True,
+    envvar="HEADROOM_READ_MATURATION",
+    help=(
+        "EXPERIMENTAL: activity-based read maturation — hold fresh Reads "
+        "out of the provider prefix cache and compress them once their "
+        "file quiesces (env: HEADROOM_READ_MATURATION=1)"
+    ),
+)
+@click.option(
+    "--read-maturation-quiesce-turns",
+    type=int,
+    default=5,
+    show_default=True,
+    envvar="HEADROOM_READ_MATURATION_QUIESCE_TURNS",
+    help="Read maturation: mature a held Read once its file is quiet this many assistant turns.",
+)
+@click.option(
+    "--read-maturation-max-hold-turns",
+    type=int,
+    default=25,
+    show_default=True,
+    envvar="HEADROOM_READ_MATURATION_MAX_HOLD_TURNS",
+    help="Read maturation: force-mature a Read held this many turns even if its file stays active.",
+)
+@click.option(
+    "--read-maturation-min-size-bytes",
+    type=int,
+    default=2048,
+    show_default=True,
+    envvar="HEADROOM_READ_MATURATION_MIN_SIZE_BYTES",
+    help="Read maturation: only hold/mature Read outputs at least this many bytes.",
 )
 # Memory System (Multi-Provider Support)
 @click.option(
@@ -731,10 +776,15 @@ def proxy(
     budget_period: str,
     code_aware_flag: bool | None,
     disable_kompress: bool,
+    disable_kompress_fallback: bool,
     disable_kompress_anthropic: bool | None,
     disable_kompress_openai: bool | None,
     code_graph: bool,
     no_read_lifecycle: bool,
+    read_maturation: bool,
+    read_maturation_quiesce_turns: int,
+    read_maturation_max_hold_turns: int,
+    read_maturation_min_size_bytes: int,
     memory: bool,
     memory_db_path: str,
     memory_storage: str,
@@ -959,12 +1009,18 @@ def proxy(
             in ("true", "1", "yes", "on")
         ),
         disable_kompress=disable_kompress,
+        disable_kompress_fallback=disable_kompress_fallback,
         disable_kompress_anthropic=disable_kompress_anthropic,
         disable_kompress_openai=disable_kompress_openai,
         # Code graph: live file watcher for incremental reindexing
         code_graph_watcher=code_graph,
         # Read lifecycle: ON by default (use --no-read-lifecycle to disable)
         read_lifecycle=not no_read_lifecycle,
+        # Read maturation (Mechanism B): experimental, OFF by default
+        read_maturation=read_maturation,
+        read_maturation_quiesce_turns=read_maturation_quiesce_turns,
+        read_maturation_max_hold_turns=read_maturation_max_hold_turns,
+        read_maturation_min_size_bytes=read_maturation_min_size_bytes,
         # Memory System (Multi-Provider with auto-detection)
         # --learn implies --memory (need backend for storing patterns)
         # Stateless mode disables memory (requires SQLite on disk)
