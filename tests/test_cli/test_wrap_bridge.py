@@ -89,8 +89,9 @@ def test_wrap_codex_prepare_only_updates_config(monkeypatch, tmp_path: Path) -> 
     assert result.exit_code == 0, result.output
     config_file = tmp_path / ".codex" / "config.toml"
     assert config_file.exists()
-    assert 'model_provider = "headroom"' in config_file.read_text(encoding="utf-8")
-    assert 'base_url = "http://127.0.0.1:8787/v1"' in config_file.read_text(encoding="utf-8")
+    content = config_file.read_text(encoding="utf-8")
+    assert 'model_provider = "headroom"' in content
+    assert 'base_url = "http://127.0.0.1:8787/v1"' in content
 
 
 def test_wrap_codex_prepare_only_uses_lean_ctx_when_configured(monkeypatch, tmp_path: Path) -> None:
