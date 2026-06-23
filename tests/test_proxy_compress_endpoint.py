@@ -26,7 +26,8 @@ def client():
         cost_tracking_enabled=False,
     )
     app = create_app(config)
-    with TestClient(app) as c:
+    # /v1/compress is loopback-gated (#1227).
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)) as c:
         yield c
 
 
@@ -40,7 +41,8 @@ def client_no_optimize():
         cost_tracking_enabled=False,
     )
     app = create_app(config)
-    with TestClient(app) as c:
+    # /v1/compress is loopback-gated (#1227).
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)) as c:
         yield c
 
 

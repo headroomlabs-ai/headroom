@@ -60,6 +60,22 @@ def test_loopback_caller_allowed(method: str, path: str) -> None:
     assert resp.status_code == 200, resp.text
 
 
+# CCR data endpoints — cached session content, gated to 404 off-loopback (#1227).
+CCR_GATED = [
+    ("post", "/v1/retrieve"),
+    ("get", "/v1/retrieve/stats"),
+    ("get", "/v1/retrieve/somehash"),
+    ("post", "/v1/retrieve/tool_call"),
+    ("post", "/v1/compress"),
+]
+
+
+@pytest.mark.parametrize("method,path", CCR_GATED)
+def test_ccr_non_loopback_gets_404(method: str, path: str) -> None:
+    resp = TestClient(_make_app()).request(method, path, json={})
+    assert resp.status_code == 404, resp.text
+
+
 def test_dns_rebinding_host_header_rejected() -> None:
     # Loopback peer IP but an attacker-controlled Host header (the DNS-rebinding
     # shape) must still be rejected by the second gate.
