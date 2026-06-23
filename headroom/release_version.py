@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import os
 import re
-import subprocess
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
+
+from headroom._subprocess import run
 
 SEMVER_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 RELEASE_TAG_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)(?:\.(\d+))?$")
@@ -220,7 +221,7 @@ def get_canonical_version(root: Path) -> str:
 def list_release_tags(root: Path) -> list[str]:
     """List release tags from the local Git checkout."""
 
-    result = subprocess.run(
+    result = run(
         ["git", "tag", "-l", "v*"],
         cwd=root,
         check=True,
@@ -239,7 +240,7 @@ def list_release_commits(root: Path, previous_tag: str) -> list[CommitInfo]:
     else:
         cmd.append("HEAD")
 
-    result = subprocess.run(
+    result = run(
         cmd,
         cwd=root,
         check=True,
@@ -262,7 +263,7 @@ def commit_height_since(root: Path, previous_tag: str) -> str:
     if not previous_tag:
         return "0"
 
-    result = subprocess.run(
+    result = run(
         ["git", "rev-list", f"{previous_tag}..HEAD", "--count"],
         cwd=root,
         check=True,
@@ -283,9 +284,49 @@ def write_github_outputs(info: ReleaseVersionInfo, output_path: str) -> None:
 def main() -> None:
     root = Path.cwd()
     manual_version = os.environ.get("MANUAL_VER", "").strip()
+    manual_raw = os.environ.get("MANUAL_VER") or os.environ.get("LEVEL") or "patch"
+    manual_match = re.fullmatch(
+        r"v?(\d+\.\d+\.\d+(?:[abrc]\d+)?)",
+        manual_raw.strip(),
+    )
+    if manual_match:
+        version = manual_match.group(1)
+        info = ReleaseVersionInfo(
+            version=version,
+            npm_version=version,
+            canonical=get_canonical_version(root),
+            bump="manual",
+            height="0",
+            previous_tag="",
+        )
+        output_path = os.environ.get("GITHUB_OUTPUT")
+        if output_path:
+            write_github_outputs(info, output_path)
+        print(f"version={info.version}")
+        print(f"npm_version={info.npm_version}")
+        print(f"height={info.height}")
+        return
     tags = list_release_tags(root)
     previous_tag = find_latest_release_tag(tags) or ""
     level = os.environ.get("LEVEL", "").strip()
+    manual_match = re.fullmatch(r"v?(\d+\.\d+\.\d+(?:[abrc]\d+)?)", level.strip())
+    if manual_match:
+        version = manual_match.group(1)
+        info = ReleaseVersionInfo(
+            version=version,
+            npm_version=version,
+            canonical=get_canonical_version(root),
+            bump="manual",
+            height="0",
+            previous_tag="",
+        )
+        output_path = os.environ.get("GITHUB_OUTPUT")
+        if output_path:
+            write_github_outputs(info, output_path)
+        print(f"version={info.version}")
+        print(f"npm_version={info.npm_version}")
+        print(f"height={info.height}")
+        return
     if not level:
         level = determine_bump_level(list_release_commits(root, previous_tag))
 

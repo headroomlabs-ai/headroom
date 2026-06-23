@@ -93,6 +93,11 @@ class PrefixCacheTracker:
         self._last_original_messages: list[dict[str, Any]] = []
         self._last_forwarded_messages: list[dict[str, Any]] = []
 
+        # Session-scoped ReadMaturationManager (Mechanism B), created
+        # lazily by the handler when read maturation is enabled. Rides
+        # here so it shares the session's affinity and TTL cleanup.
+        self.read_maturation_manager: Any = None
+
         # Stats
         self._busts_avoided: int = 0
         self._tokens_preserved: int = 0

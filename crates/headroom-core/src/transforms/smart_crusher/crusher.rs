@@ -163,6 +163,13 @@ impl SmartCrusher {
             max_flatten_inner_keys: config.compaction_max_flatten_inner_keys,
             min_buckets: config.compaction_min_buckets,
             max_buckets: config.compaction_max_buckets,
+            // Honor the CCR marker gate for opaque-blob cells too (not just
+            // the row-drop path), so `enable_ccr_marker=false` yields
+            // marker-free, lossless output. Fixes #1091.
+            classify: ClassifyConfig {
+                emit_opaque_markers: config.opaque_markers_enabled(),
+                ..ClassifyConfig::default()
+            },
             ..CompactConfig::default()
         };
         SmartCrusherBuilder::new(config)
@@ -195,7 +202,8 @@ impl SmartCrusher {
     /// `"markdown-kv"`). `None` for unknown names — callers own the
     /// fallback/error policy. `"csv-schema"` is equivalent to `new`.
     pub fn with_compaction_format(config: SmartCrusherConfig, format_name: &str) -> Option<Self> {
-        let stage = CompactionStage::from_format_name(format_name)?;
+        let mut stage = CompactionStage::from_format_name(format_name)?;
+        stage.config.classify.emit_opaque_markers = config.opaque_markers_enabled();
         Some(
             SmartCrusherBuilder::new(config)
                 .with_default_oss_setup()
@@ -595,7 +603,12 @@ impl SmartCrusher {
         // 2. Opaque blob: substitute with CCR marker AND stash the
         // original in the store (PR8) so retrieval works. Hash + format
         // identical to walker.rs via the shared helper — zero drift.
-        let cfg = ClassifyConfig::default();
+        // Gated by `enable_ccr_marker` so disabling markers stays lossless
+        // here too (#1091).
+        let cfg = ClassifyConfig {
+            emit_opaque_markers: self.config.opaque_markers_enabled(),
+            ..ClassifyConfig::default()
+        };
         if let CellClass::Opaque(kind) = classify_cell(&Value::String(s.to_string()), &cfg) {
             let marker = emit_opaque_ccr_marker(s, &kind, self.ccr_store.as_ref());
             let kind_label = opaque_kind_label(&kind);
@@ -660,7 +673,11 @@ impl SmartCrusher {
         // ship it — nothing dropped, no CCR retrieval needed.
         // Otherwise fall through to the lossy path.
         if let Some(stage) = &self.compaction {
-            let (c, rendered) = stage.run(items);
+            // Thread the CCR store so opaque-blob `<<ccr:HASH,...>>` markers
+            // emitted by lossless:table compaction are actually retrievable
+            // (issue #1083); the row-drop lossy path below stores its own
+            // payload separately.
+            let (c, rendered) = stage.run_with_store(items, self.ccr_store.as_ref());
             if c.was_compacted() {
                 let input_bytes = estimate_array_bytes(&item_strings);
                 let savings_ratio = if input_bytes > 0 {
@@ -682,6 +699,24 @@ impl SmartCrusher {
             }
         }
 
+        // ── Strict lossless-only mode ──
+        //
+        // The lossless attempt above either shipped or didn't. Either way
+        // `lossless_only` forbids the lossy row-drop fallback: dropping
+        // rows needs a CCR marker to stay recoverable, and the whole
+        // point of this mode is a marker-free, byte-recoverable result.
+        // Leave the array uncompacted instead.
+        if self.config.lossless_only {
+            return CrushArrayResult {
+                items: items.to_vec(),
+                strategy_info: "lossless_only:uncompacted".to_string(),
+                ccr_hash: None,
+                dropped_summary: String::new(),
+                compacted: None,
+                compaction_kind: None,
+            };
+        }
+
         // ── Lossy path: compress inline + cache full original via CCR ──
         //
         // The runtime caller (PyO3 bridge / proxy server) is expected
@@ -689,6 +724,21 @@ impl SmartCrusher {
         // tool can serve dropped rows back to the LLM on demand.
         // **No data is lost** — "lossy" here means "compressed view
         // inline; full payload retrievable via CCR cache."
+        //
+        // Load-bearing invariant: a `lossless_only` crusher MUST NOT
+        // reach this point — the early return above guarantees it. The
+        // Python per-call override (`crush(..., lossless_only=True)`)
+        // relies on this: it swaps in a separate Rust crusher whose CCR
+        // store stays empty precisely because no lossless_only run ever
+        // executes the store write below. If that early return is ever
+        // removed, the alternate crusher's store would diverge and
+        // retrieval could resolve markers the prompt can't reference.
+        debug_assert!(
+            !self.config.lossless_only,
+            "lossy path reached under lossless_only — the early return \
+             above must keep this codepath (and its CCR store write) \
+             unreachable in strict lossless mode",
+        );
 
         let effective_max_items = adaptive_k;
         let analysis = self.analyzer.analyze_array(items);
@@ -1660,6 +1710,149 @@ mod tests {
         assert!(
             store_len_after > store_len_before,
             "default should write to ccr_store"
+        );
+    }
+
+    #[test]
+    fn enable_ccr_marker_false_suppresses_opaque_markers() {
+        // Opaque-blob path symmetry. A long string cell normally renders
+        // as a `<<ccr:HASH,kind,size>>` marker in the lossless table.
+        // With `enable_ccr_marker = false` it must render inline instead,
+        // so no configuration leaks markers into a "lossless-only" prompt.
+        let rows: Vec<Value> = (0..10)
+            .map(|i| json!({"path": "a.py", "line": i, "content": "x".repeat(300)}))
+            .collect();
+
+        // ratio 0.0 forces the lossless table to ship, exercising the
+        // compactor's opaque arm directly (not the lossy row-drop path).
+        let off = SmartCrusher::new(SmartCrusherConfig {
+            lossless_min_savings_ratio: 0.0,
+            enable_ccr_marker: false,
+            ..SmartCrusherConfig::default()
+        });
+        let rendered_off = off
+            .crush_array(&rows, "", 1.0)
+            .compacted
+            .expect("lossless table should ship at ratio 0.0");
+        assert!(
+            !rendered_off.contains("<<ccr:"),
+            "opaque marker leaked despite enable_ccr_marker=false: {rendered_off}"
+        );
+        assert!(
+            rendered_off.contains(&"x".repeat(300)),
+            "blob should be inline when markers are off: {rendered_off}"
+        );
+
+        // Default (markers on) still emits the opaque marker — the gate
+        // is opt-out, not opt-in.
+        let on = SmartCrusher::new(SmartCrusherConfig {
+            lossless_min_savings_ratio: 0.0,
+            ..SmartCrusherConfig::default()
+        });
+        let rendered_on = on
+            .crush_array(&rows, "", 1.0)
+            .compacted
+            .expect("lossless table should ship at ratio 0.0");
+        assert!(
+            rendered_on.contains("<<ccr:"),
+            "default should still emit the opaque marker: {rendered_on}"
+        );
+    }
+
+    // ---------- lossless_only mode (PR part 2) ----------
+
+    #[test]
+    fn lossless_only_leaves_array_uncompacted_instead_of_dropping() {
+        // When the lossless table can't win (forced via ratio 0.99),
+        // lossless_only must NOT fall through to the lossy row-drop path.
+        // The array passes through untouched, so it is marker-free and
+        // byte-recoverable (every original row is preserved verbatim).
+        let rows: Vec<Value> = (0..50)
+            .map(|i| json!({"path": "a.py", "line": i, "content": "x".repeat(300)}))
+            .collect();
+
+        let crusher = SmartCrusher::new(SmartCrusherConfig {
+            lossless_min_savings_ratio: 0.99, // force the would-be-lossy path
+            lossless_only: true,
+            ..SmartCrusherConfig::default()
+        });
+        let result = crusher.crush_array(&rows, "", 1.0);
+
+        assert_eq!(result.items, rows, "lossless_only must not drop rows");
+        assert!(result.ccr_hash.is_none(), "no hash under lossless_only");
+        assert!(
+            result.dropped_summary.is_empty(),
+            "no drop sentinel under lossless_only: {:?}",
+            result.dropped_summary
+        );
+        assert!(
+            result.compacted.is_none(),
+            "nothing shipped, nothing dropped"
+        );
+    }
+
+    #[test]
+    fn lossless_only_inlines_opaque_blobs_when_table_ships() {
+        // When the lossless table DOES win, opaque cells render inline
+        // (no marker) because lossless_only suppresses opaque offload.
+        let rows: Vec<Value> = (0..10)
+            .map(|i| json!({"path": "a.py", "line": i, "content": "x".repeat(300)}))
+            .collect();
+        let crusher = SmartCrusher::new(SmartCrusherConfig {
+            lossless_min_savings_ratio: 0.0, // table ships
+            lossless_only: true,
+            ..SmartCrusherConfig::default()
+        });
+        let rendered = crusher
+            .crush_array(&rows, "", 1.0)
+            .compacted
+            .expect("table should ship at ratio 0.0");
+        assert!(
+            !rendered.contains("<<ccr:"),
+            "opaque marker leaked under lossless_only: {rendered}"
+        );
+        assert!(
+            rendered.contains(&"x".repeat(300)),
+            "blob should be inline under lossless_only: {rendered}"
+        );
+    }
+
+    #[test]
+    fn lossless_only_never_writes_to_ccr_store() {
+        // Load-bearing invariant for the Python per-call override: a
+        // lossless_only crusher MUST NOT write to the CCR store. Force
+        // the would-be-lossy row-drop path (ratio 0.99) and assert the
+        // store does not grow. This pins the early-return guard that the
+        // `debug_assert` in `crush_array` documents — if that return is
+        // ever removed, this test (and the alternate-crusher design)
+        // breaks loudly.
+        use crate::ccr::InMemoryCcrStore;
+        use crate::transforms::smart_crusher::SmartCrusherBuilder;
+        use std::sync::Arc;
+
+        let store: Arc<dyn CcrStore> = Arc::new(InMemoryCcrStore::new());
+        let cfg = SmartCrusherConfig {
+            lossless_min_savings_ratio: 0.99, // force the would-be-lossy path
+            lossless_only: true,
+            ..SmartCrusherConfig::default()
+        };
+        let c = SmartCrusherBuilder::new(cfg)
+            .with_ccr_store(Arc::clone(&store))
+            .build();
+        let items: Vec<Value> = (0..50).map(|_| json!({"status": "ok"})).collect();
+
+        let store_len_before = store.len();
+        let result = c.crush_array(&items, "", 1.0);
+
+        assert_eq!(
+            result.items, items,
+            "lossless_only must keep every row (no drop)"
+        );
+        assert!(result.ccr_hash.is_none(), "no hash under lossless_only");
+        assert_eq!(
+            store.len(),
+            store_len_before,
+            "ccr_store grew under lossless_only — invariant violated"
         );
     }
 }

@@ -48,7 +48,7 @@ Headroom compresses everything your AI agent reads — tool outputs, logs, RAG c
 
 - **Library** — `compress(messages)` in Python or TypeScript, inline in any app
 - **Proxy** — `headroom proxy --port 8787`, zero code changes, any language
-- **Agent wrap** — `headroom wrap claude|codex|cursor|aider|copilot` in one command
+- **Agent wrap** — `headroom wrap claude|codex|cursor|aider|copilot|opencode` in one command
 - **MCP server** — `headroom_compress`, `headroom_retrieve`, `headroom_stats` for any MCP client
 - **Cross-agent memory** — shared store across Claude, Codex, Gemini, auto-dedup
 - **`headroom learn`** — mines failed sessions, writes corrections to `CLAUDE.md` / `AGENTS.md`
@@ -98,6 +98,7 @@ headroom proxy --port 8787              # drop-in proxy, zero code changes
 
 # 3 — See the savings
 headroom perf
+headroom dashboard                      # live savings dashboard (proxy must be running)
 ```
 
 Granular extras: `[proxy]`, `[mcp]`, `[ml]`, `[code]`, `[memory]`, `[relevance]`, `[image]`, `[agno]`, `[langchain]`, `[evals]`, `[pytorch-mps]` (Apple-GPU memory-embedder offload — set `HEADROOM_EMBEDDER_RUNTIME=pytorch_mps`). Requires **Python 3.10+**.
@@ -189,14 +190,16 @@ shows an **Output Tokens Saved** card next to input compression, labelled
 
 ## Agent compatibility matrix
 
-| Agent       | `headroom wrap` | Notes                            |
-|-------------|:---------------:|----------------------------------|
-| Claude Code | ✅              | `--memory` · `--code-graph`      |
-| Codex       | ✅              | shares memory with Claude        |
-| Cursor      | ✅              | prints config — paste once       |
-| Aider       | ✅              | starts proxy + launches          |
-| Copilot CLI | ✅              | starts proxy + launches          |
-| OpenClaw    | ✅              | installs as ContextEngine plugin |
+| Agent        | `headroom wrap` | Notes                            |
+|--------------|:---------------:|----------------------------------|
+| Claude Code  | ✅              | `--memory` · `--code-graph`      |
+| Codex        | ✅              | shares memory with Claude        |
+| Cursor       | ✅              | prints config — paste once       |
+| Aider        | ✅              | starts proxy + launches          |
+| Copilot CLI  | ✅              | starts proxy + launches          |
+| OpenClaw     | ✅              | installs as ContextEngine plugin |
+| OpenCode     | ✅              | injects config · starts proxy + launches |
+| Cortex Code  | ✅              | 60–65% savings · library mode   |
 
 Any OpenAI-compatible client works via `headroom proxy`. MCP-native: `headroom mcp install`.
 

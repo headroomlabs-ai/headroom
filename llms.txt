@@ -21,7 +21,7 @@ The canonical, always-current documentation index lives at the docs site below. 
 - TypeScript / Node: `npm install headroom-ai` (or `pnpm add headroom-ai`, `bun add headroom-ai`)
 - Docker: `docker run -p 8787:8787 ghcr.io/chopratejas/headroom:latest`
 - Run the proxy: `headroom proxy --port 8787` then point any client at `http://127.0.0.1:8787`
-- Wrap an agent in one command: `headroom wrap claude` (also: `codex`, `cursor`, `aider`, `copilot`, `gemini`)
+- Wrap an agent in one command: `headroom wrap claude` (also: `codex`, `cursor`, `aider`, `copilot`, `opencode`)
 
 ## Entry points
 

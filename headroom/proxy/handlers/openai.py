@@ -321,6 +321,29 @@ def _compact_openai_responses_tools(
     return updated, True, before, after
 
 
+def _ensure_responses_store_for_memory_tools(
+    payload: dict[str, Any],
+    *,
+    memory_tools_injected: bool,
+) -> bool:
+    """Keep Responses API memory-tool continuations addressable.
+
+    Memory tools are transparent to clients: Headroom executes the emitted
+    function_call, then sends function_call_output in a continuation request
+    using previous_response_id. OpenAI only allows that continuation when the
+    previous response was stored. Clients such as pi/Codex can set store=false
+    to avoid retaining ordinary responses, but that makes memory-tool
+    continuations fail with previous_response_not_found.
+
+    Return True when this function changes the payload.
+    """
+
+    if memory_tools_injected and payload.get("store") is False:
+        payload["store"] = True
+        return True
+    return False
+
+
 def _responses_input_item_text_bytes(item: Any) -> int:
     if not isinstance(item, dict):
         return _json_byte_len(item)
@@ -790,7 +813,7 @@ class OpenAIHandlerMixin:
         # mirroring ContentRouter's policy. exclude_tools already contains both
         # original and lowercased name variants (see _parse_exclude_tools), but
         # we also test the lowercased name defensively for case-insensitivity.
-        from headroom.config import DEFAULT_EXCLUDE_TOOLS
+        from headroom.config import DEFAULT_EXCLUDE_TOOLS, is_tool_excluded
 
         router_exclude_tools = getattr(router.config, "exclude_tools", None)
         effective_exclude_tools = (
@@ -799,7 +822,7 @@ class OpenAIHandlerMixin:
         excluded_call_ids: set[str] = {
             call_id
             for call_id, fn_name in function_name_by_call_id.items()
-            if fn_name in effective_exclude_tools or fn_name.lower() in effective_exclude_tools
+            if is_tool_excluded(fn_name, effective_exclude_tools)
         }
 
         timing_sink: dict[str, float] = timing if timing is not None else {}
@@ -3093,6 +3116,14 @@ class OpenAIHandlerMixin:
                 if mem_tools_injected:
                     body["tools"] = resp_tools
                     logger.info(f"[{request_id}] Memory: Injected memory tools (openai/responses)")
+
+                    if _ensure_responses_store_for_memory_tools(
+                        body,
+                        memory_tools_injected=True,
+                    ):
+                        logger.info(
+                            f"[{request_id}] Memory: forced store=true for Responses memory tool continuation"
+                        )
             except Exception as e:
                 logger.warning(f"[{request_id}] Memory injection failed (responses): {e}")
         elif self.memory_handler and memory_user_id and _bypass:

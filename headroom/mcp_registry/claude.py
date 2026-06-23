@@ -14,9 +14,10 @@ import json
 import logging
 import os
 import shutil
-import subprocess
 from pathlib import Path
 from typing import Any
+
+from headroom._subprocess import run
 
 from .base import MCPRegistrar, RegisterResult, RegisterStatus, ServerSpec
 
@@ -91,7 +92,7 @@ class ClaudeRegistrar(MCPRegistrar):
 
     def unregister_server(self, server_name: str) -> bool:
         if self._claude_cli:
-            result = subprocess.run(
+            result = run(
                 [str(self._claude_cli), "mcp", "remove", server_name, "-s", "user"],
                 capture_output=True,
                 text=True,
@@ -116,7 +117,11 @@ class ClaudeRegistrar(MCPRegistrar):
             cmd += ["-e", f"{k}={v}"]
         cmd += ["--", spec.command, *spec.args]
 
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = run(
+            cmd,
+            capture_output=True,
+            text=True,
+        )
         if result.returncode == 0:
             return RegisterResult(RegisterStatus.REGISTERED, "via `claude mcp add` (scope: user)")
         # CLI failed — try the file fallback rather than giving up.

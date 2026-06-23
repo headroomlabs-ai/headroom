@@ -1004,6 +1004,9 @@ def _install_plugin_registry(monkeypatch, plugin):
     fake.auto_detect_plugins = lambda: [plugin] if plugin is not None else []  # type: ignore[attr-defined]
     fake.get_plugin = lambda agent_type: plugin  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "headroom.learn.registry", fake)
+    import headroom.learn as learn_pkg
+
+    monkeypatch.setattr(learn_pkg, "registry", fake, raising=False)
 
 
 def _make_project(path):
@@ -1022,11 +1025,12 @@ class TestFlushToFile:
         db = tmp_path / "memory.db"
         _init_db(db)
         backend = _FakeBackend(db)
+        project_path = tmp_path.resolve()
 
         learner = TrafficLearner(backend=backend, agent_type="claude", min_evidence=2)
         writer = _FakeWriter()
-        writer.files_to_return = [tmp_path / "CLAUDE.md"]
-        proj = _make_project(str(tmp_path))
+        writer.files_to_return = [project_path / "CLAUDE.md"]
+        proj = _make_project(str(project_path))
         plugin = _FakePlugin(roots=[proj], writer=writer)
         _install_plugin_registry(monkeypatch, plugin)
 
@@ -1038,7 +1042,7 @@ class TestFlushToFile:
             def mk() -> ExtractedPattern:
                 return ExtractedPattern(
                     category=PatternCategory.ENVIRONMENT,
-                    content=f"Use /usr/bin/python3 at {tmp_path}/main.py",
+                    content=f"Use /usr/bin/python3 at {project_path}/main.py",
                     importance=0.6,
                 )
 
@@ -1138,7 +1142,8 @@ class TestFlushToFile:
     async def test_unanchored_patterns_dropped(self, tmp_path, monkeypatch):
         """Patterns with no path anchoring are dropped before writer is called."""
         writer = _FakeWriter()
-        plugin = _FakePlugin(roots=[_make_project(str(tmp_path))], writer=writer)
+        project_path = tmp_path.resolve()
+        plugin = _FakePlugin(roots=[_make_project(str(project_path))], writer=writer)
         _install_plugin_registry(monkeypatch, plugin)
 
         learner = TrafficLearner(backend=None, agent_type="claude", min_evidence=1)
@@ -1160,14 +1165,15 @@ class TestFlushToFile:
         """A writer raising should be logged; flush must not bubble the error."""
         writer = _FakeWriter()
         writer.raise_on_write = True
-        plugin = _FakePlugin(roots=[_make_project(str(tmp_path))], writer=writer)
+        project_path = tmp_path.resolve()
+        plugin = _FakePlugin(roots=[_make_project(str(project_path))], writer=writer)
         _install_plugin_registry(monkeypatch, plugin)
 
         learner = TrafficLearner(backend=None, agent_type="claude", min_evidence=1)
         learner._pattern_counts["h"] = (
             ExtractedPattern(
                 category=PatternCategory.ENVIRONMENT,
-                content=f"Use {tmp_path}/tool.py",
+                content=f"Use {project_path}/tool.py",
                 importance=0.6,
                 evidence_count=2,
             ),

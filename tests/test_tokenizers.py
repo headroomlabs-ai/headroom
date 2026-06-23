@@ -111,6 +111,29 @@ class TestTiktokenCounter:
         decoded = counter.decode(tokens)
         assert decoded == text
 
+    def test_count_text_allows_literal_special_tokens(self):
+        """count_text must not raise on literal tiktoken special-token strings.
+
+        Regression: passthrough/tool content containing "<|endoftext|>" (or FIM
+        markers) made tiktoken raise ValueError under its default
+        disallowed_special="all", aborting token counting for the whole request.
+        Through the proxy this surfaced as an HTTP 413 compression_refused.
+        """
+        counter = TiktokenCounter("gpt-4o")
+        text = "before <|endoftext|> after <|fim_prefix|> end"
+        # Must not raise; markers are counted as ordinary text.
+        count = counter.count_text(text)
+        assert count > counter.count_text("before  after  end")
+
+    def test_encode_allows_literal_special_tokens(self):
+        """encode must treat literal special-token strings as ordinary text."""
+        counter = TiktokenCounter("gpt-4o")
+        text = "x <|endoftext|> y"
+        tokens = counter.encode(text)
+        assert isinstance(tokens, list) and len(tokens) > 0
+        # Encoding as ordinary text round-trips back to the original literal.
+        assert counter.decode(tokens) == text
+
     def test_repr(self):
         """Test string representation."""
         counter = TiktokenCounter("gpt-4o")
@@ -184,6 +207,47 @@ def hello():
 """
         count = counter.count_text(code_text)
         assert count > 0
+
+    def test_count_text_cjk_not_underestimated(self):
+        """CJK text must not be priced at the Latin ~4-chars/token ratio.
+
+        Regression: count_text divided the whole string length by the Latin
+        ratio (4.0), so 100 Chinese characters estimated ~25 tokens while real
+        tokenizers (cl100k_base / DeepSeek / Qwen) produce ~60-150. Dense
+        scripts tokenize at roughly one token per character, so the estimate
+        must be far above len/4 and on the order of the character count.
+        """
+        counter = EstimatingTokenCounter()
+        text = "你好世界" * 25  # 100 CJK characters
+        count = counter.count_text(text)
+        # Old behavior returned len/4 == 25; require clearly above that floor.
+        assert count > len(text) / 3
+        # And in the right ballpark for one-token-per-char scripts.
+        assert count >= int(len(text) * 0.6)
+
+    def test_count_text_cjk_japanese_and_korean(self):
+        """Japanese (Kana) and Korean (Hangul) are also dense scripts."""
+        counter = EstimatingTokenCounter()
+        for text in ("こんにちは世界" * 10, "안녕하세요" * 10):
+            count = counter.count_text(text)
+            assert count >= int(len(text) * 0.6)
+
+    def test_count_text_mixed_latin_cjk(self):
+        """Mixed text prices the Latin part and the CJK part independently."""
+        counter = EstimatingTokenCounter()
+        latin = "The quick brown fox jumps over the lazy dog. "  # 45 chars
+        cjk = "今天天气很好"  # 6 CJK chars
+        mixed = counter.count_text(latin + cjk)
+        # Must exceed the all-Latin estimate of the same length, since the CJK
+        # tail is priced denser than 4 chars/token.
+        latin_only = counter.count_text(latin + "x" * len(cjk))
+        assert mixed > latin_only
+
+    def test_count_text_latin_unchanged(self):
+        """Pure-Latin estimates are unchanged by the CJK adjustment."""
+        counter = EstimatingTokenCounter()
+        text = "Hello, world!"
+        assert 2 <= counter.count_text(text) <= 6
 
     def test_repr(self):
         """Test string representation."""
@@ -460,3 +524,74 @@ class TestMistralTokenizer:
         tokenizer = get_tokenizer("codestral")
         MistralTokenizer = get_mistral_tokenizer()
         assert isinstance(tokenizer, MistralTokenizer)
+
+
+class TestLargeToolBlobEstimation:
+    """Oversized tool blobs are token-estimated without serializing them in full."""
+
+    def test_oversized_tool_blob_count_text_is_bounded(self, monkeypatch):
+        """Regression: count_text over a multi-megabyte serialized blob froze the
+        event loop (~seconds). json.dumps itself is cheap; count_text over the
+        whole string is the cost, so its input must stay bounded for oversized
+        blobs.
+        """
+        tok = EstimatingTokenCounter()
+        sizes: list[int] = []
+        real_count_text = tok.count_text
+
+        def spy(text):
+            sizes.append(len(text))
+            return real_count_text(text)
+
+        monkeypatch.setattr(tok, "count_text", spy)
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "content": {"small": "x"}},
+                    {"type": "tool_result", "content": {"data": "A" * 4_000_000}},
+                ],
+            }
+        ]
+        tok.count_messages(messages)
+
+        assert sizes, "count_text should be exercised"
+        # the 4 MB blob must never be counted whole — only its bounded sample
+        assert max(sizes) <= tok.SAMPLE_CHARS + tok.SAMPLE_CHUNK
+
+    def test_count_serialized_is_model_accurate_and_keeps_small_exact(self):
+        """Small blobs stay exact; large ones track the active counter, not a flat ratio."""
+        import json
+
+        tok = EstimatingTokenCounter(chars_per_token=3.5)  # Claude-like ratio
+        small = {"k": "v"}
+        assert tok._count_serialized(small) == tok.count_text(json.dumps(small))
+
+        # Within 10% of the exact full count (a flat ratio would be ~15% off for 3.5).
+        big = {"k": "A" * 200_000}
+        exact = tok.count_text(json.dumps(big))
+        assert abs(tok._count_serialized(big) - exact) / exact < 0.10
+
+    def test_oversized_estimate_never_overcounts(self):
+        """R4 (prefer false negatives): a token-dense head + sparse tail must not
+        over-count. Counting per leaf cannot extrapolate a dense front slice to the
+        whole the way scaling one sample could.
+        """
+        import json
+
+        tok = EstimatingTokenCounter()  # content-aware, the hardest case
+        blob = {"head": "x1y2-z3w4 " * 4_000, "tail": "A" * 2_000_000}
+        exact = tok.count_text(json.dumps(blob))
+        assert tok._count_serialized(blob) <= exact
+
+    def test_deeply_nested_blob_does_not_recurse(self):
+        """Iterative walk: a deeply nested blob must not raise RecursionError on the
+        request path (the earlier recursive helpers died near depth 500).
+        """
+        deep: dict = {}
+        cur = deep
+        for _ in range(2_000):
+            cur["n"] = {}
+            cur = cur["n"]
+        cur["leaf"] = "x" * 60_000
+        assert EstimatingTokenCounter()._count_serialized(deep) >= 0

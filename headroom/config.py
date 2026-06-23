@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import fnmatch
+from collections.abc import Iterable
 from dataclasses import InitVar, dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -224,6 +226,28 @@ DEFAULT_EXCLUDE_TOOLS: frozenset[str] = frozenset(
     }
 )
 
+
+def is_tool_excluded(name: str, exclude_tools: Iterable[str]) -> bool:
+    """Return True if ``name`` matches the tool-exclusion set.
+
+    Plain entries match by exact (case-insensitive) name, so the common case
+    stays a set lookup. Entries containing a glob metacharacter (``*``, ``?`` or
+    ``[``) are matched with :func:`fnmatch.fnmatchcase`, letting a single pattern
+    such as ``mcp__*`` cover every tool an MCP server exposes without listing
+    each name (issue #870).
+    """
+    if not exclude_tools:
+        return False
+    if name in exclude_tools or name.lower() in exclude_tools:
+        return True
+    lname = name.lower()
+    return any(
+        fnmatch.fnmatchcase(lname, pat.lower())
+        for pat in exclude_tools
+        if "*" in pat or "?" in pat or "[" in pat
+    )
+
+
 # Tool names recognized as Read/Edit/Write for lifecycle tracking
 _READ_TOOL_NAMES: frozenset[str] = frozenset({"Read", "read"})
 _EDIT_TOOL_NAMES: frozenset[str] = frozenset({"Edit", "edit"})
@@ -251,6 +275,48 @@ class ReadLifecycleConfig:
     compress_stale: bool = True  # Replace Reads of files that were later edited
     compress_superseded: bool = False  # Disabled: busts Anthropic prompt cache prefix
     min_size_bytes: int = 512  # Skip tiny Read outputs (not worth the overhead)
+
+
+@dataclass
+class ReadMaturationConfig:
+    """Mechanism B: hold-back Read maturation (compress before cache entry).
+
+    Motivation (measured by `headroom audit-reads`): the median Read stays
+    in context for ~118 assistant turns after it appears, billed at the
+    provider's cache-read rate every request — a Read's lifetime cost is
+    roughly 13x its size. The only cache-safe moment to shrink it is
+    BEFORE it is ever cache-written.
+
+    Mechanics: a fresh large Read is held out of the provider prefix
+    cache (the trailing cache breakpoint is relocated to just before it)
+    while its file is ACTIVE, stays verbatim the whole time the model is
+    working with it, and matures into a CCR-backed marker once the file
+    has been quiet for `quiesce_turns`. Only that final compressed form
+    ever enters the cache. No cached byte is ever mutated — there is
+    nothing to bust.
+
+    Activity-based (not a fixed hold window) because the audit-reads
+    simulation showed touch gaps are fat-tailed: next-touch p50 is 4
+    turns but p90 is 81 — no fixed window covers the tail, while a
+    quiesce rule covers the activity cluster and lets the tail self-heal
+    via the model's observed habit of re-reading ranges from disk (95%
+    of re-reads in real traffic are partial-range reads made while the
+    full text was still in context).
+
+    Disabled by default while the mechanism is validated in pilots.
+    """
+
+    enabled: bool = False
+    # Mature a held Read once its FILE has had no activity (reads or
+    # edits) for this many assistant turns. Simulation: next-touch p50
+    # is 4 turns, so 5 covers the median activity cluster.
+    quiesce_turns: int = 5
+    # Safety valve: mature regardless once held this many turns, bounding
+    # the hold-out cost for files that stay active for long stretches.
+    max_hold_turns: int = 25
+    # Only hold/mature Reads at least this large; small Reads are cached
+    # immediately as before (holding them costs more than it saves).
+    min_size_bytes: int = 2048
 
 
 @dataclass
@@ -361,6 +427,14 @@ class SmartCrusherConfig:
     # lockstep with the Rust default (smart_crusher config.rs) and the
     # transforms-level dataclass.
     lossless_min_savings_ratio: float = 0.15
+
+    # Strict lossless mode. When True, lossless tabular compaction still
+    # applies, but any path that would emit a CCR marker (lossy row-drop
+    # OR opaque-blob offload) leaves the content uncompacted instead, so
+    # the output is always marker-free and byte-recoverable. Mirrors the
+    # Rust default. See also `CCRConfig` — with this on, no `<<ccr:…>>`
+    # markers are produced regardless of CCR settings.
+    lossless_only: bool = False
 
     # Compaction heuristics (mirror Rust CompactConfig). A field is "core"
     # if present in at least this fraction of rows; arrays whose key sets

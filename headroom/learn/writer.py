@@ -26,6 +26,23 @@ _MARKER_PATTERN = re.compile(
 )
 
 
+def _read_text_tolerant(file_path: Path) -> str:
+    """Read an existing context file that we are about to rewrite as UTF-8.
+
+    These files are predominantly valid UTF-8 but may carry a stray legacy
+    byte (e.g. a cp1252 em-dash ``0x97``). Strict UTF-8 decoding aborts the
+    whole ``--apply`` on a single such byte, so fall back to UTF-8 with
+    replacement: this preserves the valid UTF-8 content — a full-file cp1252
+    fallback would instead turn every genuine UTF-8 em-dash into mojibake —
+    and the subsequent ``write_text(encoding="utf-8")`` self-heals the file.
+    """
+    raw = file_path.read_bytes()
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode("utf-8", errors="replace")
+
+
 # =============================================================================
 # Abstract Writer
 # =============================================================================
@@ -55,6 +72,8 @@ class WriteResult:
         self.files_written: list[Path] = []
         self.content_by_file: dict[Path, str] = {}
         self.dry_run: bool = True
+        # Human-readable notices (e.g. legacy CLAUDE.md migration) surfaced by the CLI.
+        self.warnings: list[str] = []
 
     def add(self, path: Path, content: str) -> None:
         self.files_written.append(path)
@@ -153,7 +172,7 @@ def _merge_recommendations(
     """
     if not file_path.exists():
         return new_recommendations
-    prior = _parse_prior_recommendations(file_path.read_text(encoding="utf-8"))
+    prior = _parse_prior_recommendations(_read_text_tolerant(file_path))
     if not prior:
         return new_recommendations
     new_sections = {r.section for r in new_recommendations}
@@ -166,11 +185,22 @@ def _merge_into_file(file_path: Path, new_recommendations: list[Recommendation])
     merged = _merge_recommendations(file_path, new_recommendations)
     section = _build_section(merged)
     if file_path.exists():
-        existing = file_path.read_text(encoding="utf-8")
+        existing = _read_text_tolerant(file_path)
         if _MARKER_START in existing:
             return _MARKER_PATTERN.sub(lambda _match: section, existing)
         return existing.rstrip() + "\n\n" + section + "\n"
     return section + "\n"
+
+
+def _strip_marker_block(content: str) -> str:
+    """Remove the headroom:learn marker block from text, tidying blank lines.
+
+    Used when migrating a stale block out of the team-shared CLAUDE.md into the
+    personal CLAUDE.local.md. Returns "" if nothing but the block remained.
+    """
+    cleaned = _MARKER_PATTERN.sub("", content)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned + "\n" if cleaned else ""
 
 
 # =============================================================================
@@ -179,7 +209,29 @@ def _merge_into_file(file_path: Path, new_recommendations: list[Recommendation])
 
 
 class ClaudeCodeWriter(ContextWriter):
-    """Writes learned patterns to CLAUDE.md and MEMORY.md for Claude Code."""
+    """Writes learned patterns to CLAUDE.local.md and MEMORY.md for Claude Code.
+
+    Project-level learnings default to ``CLAUDE.local.md`` rather than
+    ``CLAUDE.md``: per Claude Code's memory convention ``CLAUDE.md`` is
+    team-shared and checked into git, while ``CLAUDE.local.md`` is personal and
+    gitignored by default. Learned patterns are personal-by-default (they hold
+    machine-specific absolute paths and tool-discovery byproducts), so writing
+    them to the shared file pollutes it for teammates (issue #1072).
+
+    Pass an explicit target via :meth:`set_context_target` (CLI ``--target``) to
+    override -- e.g. ``CLAUDE.md`` to opt back into the shared file.
+    """
+
+    def __init__(self, context_target: str | None = None) -> None:
+        # Explicit write target for CONTEXT_FILE recs (overrides the default).
+        self._context_target = context_target
+
+    def set_context_target(self, context_target: str | None) -> None:
+        """Override where CONTEXT_FILE recommendations are written.
+
+        Accepts a path relative to the project root or an absolute path.
+        """
+        self._context_target = context_target
 
     def write(
         self,
@@ -194,12 +246,18 @@ class ClaudeCodeWriter(ContextWriter):
         memory_recs = [r for r in recommendations if r.target == RecommendationTarget.MEMORY_FILE]
 
         if context_recs:
-            claude_md_path = self._resolve_context_path(project)
-            full_content = _merge_into_file(claude_md_path, context_recs)
-            result.add(claude_md_path, full_content)
+            target_path = self._resolve_context_path(project)
+            # Migrate any stale block left in the team-shared CLAUDE.md by older
+            # headroom versions into the new target, then strip it from CLAUDE.md
+            # so the shared file is no longer polluted.
+            migrated = self._migrate_legacy_block(project, target_path, result, dry_run)
+            new_sections = {r.section for r in context_recs}
+            merged_recs = context_recs + [r for r in migrated if r.section not in new_sections]
+            full_content = _merge_into_file(target_path, merged_recs)
+            result.add(target_path, full_content)
             if not dry_run:
-                claude_md_path.parent.mkdir(parents=True, exist_ok=True)
-                claude_md_path.write_text(full_content, encoding="utf-8")
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                target_path.write_text(full_content, encoding="utf-8")
 
         if memory_recs:
             memory_path = self._resolve_memory_path(project)
@@ -212,13 +270,68 @@ class ClaudeCodeWriter(ContextWriter):
         return result
 
     def _resolve_context_path(self, project: ProjectInfo) -> Path:
-        if project.context_file:
-            return project.context_file
-        # If project path is the home directory, write to ~/.claude/CLAUDE.md
-        # (the global location Claude Code reads) instead of ~/CLAUDE.md
+        # Explicit --target wins over every default.
+        if self._context_target is not None:
+            target = Path(self._context_target).expanduser()
+            return target if target.is_absolute() else project.project_path / target
+        # The home directory's CLAUDE.md (~/.claude/CLAUDE.md) is the user's
+        # personal global memory, not a team-shared file, so keep writing there.
         if project.project_path == Path.home():
             return Path.home() / ".claude" / "CLAUDE.md"
-        return project.project_path / "CLAUDE.md"
+        # Project level: default to the gitignored, personal CLAUDE.local.md so
+        # we never pollute the team-shared CLAUDE.md (issue #1072).
+        return project.project_path / "CLAUDE.local.md"
+
+    def _migrate_legacy_block(
+        self,
+        project: ProjectInfo,
+        target_path: Path,
+        result: WriteResult,
+        dry_run: bool,
+    ) -> list[Recommendation]:
+        """Move a stale headroom block out of CLAUDE.md into the new target.
+
+        Only fires for the default project-level case (no explicit --target, not
+        the home directory) when CLAUDE.md still carries a marker block and the
+        new target doesn't yet own one. Returns the migrated recommendations so
+        the caller can carry them forward; records the cleaned CLAUDE.md and a
+        warning on ``result``. Honors ``dry_run`` (no writes, warning still set).
+        """
+        legacy_path = project.project_path / "CLAUDE.md"
+        if self._context_target is not None or project.project_path == Path.home():
+            return []
+        if target_path == legacy_path or not legacy_path.exists():
+            return []
+        legacy_text = legacy_path.read_text(encoding="utf-8")
+        if _MARKER_START not in legacy_text:
+            return []
+        # If the target already owns a block, it is the source of truth -- don't
+        # double-migrate or clobber accumulated learnings.
+        if target_path.exists() and _MARKER_START in target_path.read_text(encoding="utf-8"):
+            return []
+
+        migrated = _parse_prior_recommendations(legacy_text)
+        cleaned = _strip_marker_block(legacy_text)
+        gitignore_hint = f" Ensure {target_path.name} is in your .gitignore so it stays personal."
+        if cleaned:
+            # CLAUDE.md has hand-written content too — keep it, drop only the block.
+            result.add(legacy_path, cleaned)
+            result.warnings.append(
+                f"Moved Headroom learnings out of {legacy_path} into {target_path}: "
+                f"CLAUDE.md is team-shared, so personal learnings now live in "
+                f"{target_path.name}. Review the diff before committing.{gitignore_hint}"
+            )
+            if not dry_run:
+                legacy_path.write_text(cleaned, encoding="utf-8")
+        else:
+            # CLAUDE.md held nothing but the Headroom block — remove the husk.
+            result.warnings.append(
+                f"Removed {legacy_path} (it contained only Headroom learnings) and "
+                f"moved them into {target_path}.{gitignore_hint}"
+            )
+            if not dry_run:
+                legacy_path.unlink()
+        return migrated
 
     def _resolve_memory_path(self, project: ProjectInfo) -> Path:
         if project.memory_file:

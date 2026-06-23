@@ -42,7 +42,6 @@ import logging
 import os
 import platform
 import stat
-import subprocess
 import tarfile
 import zipfile
 from pathlib import Path
@@ -213,7 +212,9 @@ def download_tokensave(version: str | None = None) -> Path:
         target_path.chmod(target_path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
 
     try:
-        result = subprocess.run(
+        from headroom._subprocess import run as _run
+
+        result = _run(
             [str(target_path), "--version"],
             capture_output=True,
             text=True,

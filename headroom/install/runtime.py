@@ -13,6 +13,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, cast
 
+from headroom._subprocess import run
+
 from .health import probe_ready
 from .models import DeploymentManifest, InstallPreset, RuntimeKind
 from .paths import log_path, pid_path, profile_root
@@ -74,7 +76,7 @@ def _runtime_env(manifest: DeploymentManifest) -> dict[str, str]:
 
 
 def _ensure_host_dirs() -> None:
-    for subdir in (".headroom", ".claude", ".codex", ".gemini"):
+    for subdir in (".headroom", ".claude", ".codex", ".gemini", ".config/opencode"):
         (Path.home() / subdir).mkdir(parents=True, exist_ok=True)
 
 
@@ -120,6 +122,8 @@ def build_runtime_command(manifest: DeploymentManifest) -> list[str]:
         f"{_mount_source(home, '.codex')}:{container_home}/.codex",
         "--volume",
         f"{_mount_source(home, '.gemini')}:{container_home}/.gemini",
+        "--volume",
+        f"{_mount_source(home, '.config/opencode')}:{container_home}/.config/opencode",
     ]
     if not _is_windows():
         getuid = getattr(os, "getuid", None)
@@ -190,7 +194,8 @@ def acquire_runtime_start_lock(profile: str) -> Iterator[bool]:
             import fcntl
 
             try:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl_any = cast(Any, fcntl)
+                fcntl_any.flock(lock_file.fileno(), fcntl_any.LOCK_EX | fcntl_any.LOCK_NB)
                 acquired = True
             except BlockingIOError:
                 yield False
@@ -215,7 +220,8 @@ def acquire_runtime_start_lock(profile: str) -> Iterator[bool]:
                 else:
                     import fcntl
 
-                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                    fcntl_any = cast(Any, fcntl)
+                    fcntl_any.flock(lock_file.fileno(), fcntl_any.LOCK_UN)
 
 
 def run_foreground(manifest: DeploymentManifest) -> int:
@@ -278,7 +284,11 @@ def start_persistent_docker(manifest: DeploymentManifest) -> None:
         manifest.container_name,
         *command[5:],  # drop initial `docker run --rm --name ...`
     ]
-    subprocess.run(["docker", "rm", "-f", manifest.container_name], capture_output=True, text=True)
+    run(
+        ["docker", "rm", "-f", manifest.container_name],
+        capture_output=True,
+        text=True,
+    )
     subprocess.run(docker_cmd, check=True)
 
 
@@ -286,9 +296,15 @@ def stop_runtime(manifest: DeploymentManifest) -> None:
     """Stop the raw runtime for the deployment."""
 
     if manifest.preset == InstallPreset.PERSISTENT_DOCKER.value:
-        subprocess.run(["docker", "stop", manifest.container_name], capture_output=True, text=True)
-        subprocess.run(
-            ["docker", "rm", "-f", manifest.container_name], capture_output=True, text=True
+        run(
+            ["docker", "stop", manifest.container_name],
+            capture_output=True,
+            text=True,
+        )
+        run(
+            ["docker", "rm", "-f", manifest.container_name],
+            capture_output=True,
+            text=True,
         )
         return
 
@@ -316,8 +332,10 @@ def runtime_status(manifest: DeploymentManifest) -> str:
     """Return a short status string for the deployment runtime."""
 
     if manifest.preset == InstallPreset.PERSISTENT_DOCKER.value:
-        result = subprocess.run(
-            ["docker", "ps", "--format", "{{.Names}}"], capture_output=True, text=True
+        result = run(
+            ["docker", "ps", "--format", "{{.Names}}"],
+            capture_output=True,
+            text=True,
         )
         if manifest.container_name in result.stdout.splitlines():
             return "running"
