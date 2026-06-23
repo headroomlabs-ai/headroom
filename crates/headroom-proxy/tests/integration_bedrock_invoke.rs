@@ -36,7 +36,7 @@
 mod common;
 
 use aws_credential_types::Credentials;
-use common::start_proxy_with_state;
+use common::{get_stats, start_proxy_with_state};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex};
@@ -590,14 +590,7 @@ async fn bedrock_invoke_recorded_in_stats() {
         .expect("POST bedrock invoke");
     assert_eq!(resp.status(), 200);
 
-    let stats: Value = reqwest::Client::new()
-        .get(format!("{}/stats", proxy.url()))
-        .send()
-        .await
-        .expect("GET /stats")
-        .json()
-        .await
-        .expect("stats json");
+    let stats = get_stats(&proxy).await;
     assert_eq!(stats["requests"]["total"], 1);
     assert_eq!(stats["requests"]["by_provider"]["bedrock"], 1);
 
@@ -631,14 +624,7 @@ async fn bedrock_not_recorded_when_mode_off() {
         .expect("POST bedrock invoke");
     assert_eq!(resp.status(), 200);
 
-    let stats: Value = reqwest::Client::new()
-        .get(format!("{}/stats", proxy.url()))
-        .send()
-        .await
-        .expect("GET /stats")
-        .json()
-        .await
-        .expect("stats json");
+    let stats = get_stats(&proxy).await;
     assert_eq!(stats["requests"]["total"], 0);
 
     proxy.shutdown().await;

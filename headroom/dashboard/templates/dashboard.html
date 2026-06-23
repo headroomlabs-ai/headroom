@@ -1227,7 +1227,7 @@
                                             <span class="px-2 py-0.5 bg-border rounded text-xs truncate" x-text="truncateModel(req.model)"></span>
                                             <span x-show="req.failed" class="ml-1 px-1.5 py-0.5 bg-rose-500/20 text-rose-400 rounded text-xs">failed</span>
                                         </div>
-                                        <div class="px-4 py-3 text-right font-mono tabular-nums" x-text="formatNumber(req.input_tokens_optimized)"></div>
+                                        <div class="px-4 py-3 text-right font-mono tabular-nums" x-text="formatNumber(req.input_tokens_optimized || 0)"></div>
                                         <div class="px-4 py-3 text-right font-mono tabular-nums" x-text="formatNumber(req.output_tokens || 0)"></div>
                                         <div class="px-4 py-3 text-right">
                                             <!-- Failed rows show the *attempted* compression struck through: the
@@ -1247,7 +1247,7 @@
                                             </div>
                                             <div>
                                                 <div class="text-gray-500 uppercase tracking-wide mb-1">Compressed Tokens</div>
-                                                <div class="font-mono" x-text="formatNumber(req.input_tokens_optimized)"></div>
+                                                <div class="font-mono" x-text="formatNumber(req.input_tokens_optimized || 0)"></div>
                                             </div>
                                             <div>
                                                 <div class="text-gray-500 uppercase tracking-wide mb-1">Tokens Removed</div>

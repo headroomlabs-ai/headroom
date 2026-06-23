@@ -27,7 +27,7 @@
 
 mod common;
 
-use common::{install_static_token_source, start_proxy_with_state};
+use common::{get_stats, install_static_token_source, start_proxy_with_state};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex};
@@ -253,14 +253,7 @@ async fn stats_attributes_vertex_raw_predict() {
         .unwrap();
     assert_eq!(resp.status(), 200);
 
-    let stats: Value = reqwest::Client::new()
-        .get(format!("{}/stats", proxy.url()))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let stats = get_stats(&proxy).await;
     assert_eq!(stats["requests"]["by_provider"]["vertex"], 1);
 
     proxy.shutdown().await;
@@ -289,14 +282,7 @@ async fn vertex_not_recorded_when_compression_off() {
         .unwrap();
     assert_eq!(resp.status(), 200);
 
-    let stats: Value = reqwest::Client::new()
-        .get(format!("{}/stats", proxy.url()))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let stats = get_stats(&proxy).await;
     assert_eq!(stats["requests"]["total"], 0);
 
     proxy.shutdown().await;
@@ -328,14 +314,7 @@ async fn vertex_not_recorded_when_mode_off() {
         .unwrap();
     assert_eq!(resp.status(), 200);
 
-    let stats: Value = reqwest::Client::new()
-        .get(format!("{}/stats", proxy.url()))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let stats = get_stats(&proxy).await;
     assert_eq!(stats["requests"]["total"], 0);
 
     proxy.shutdown().await;
