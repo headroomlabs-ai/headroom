@@ -7,8 +7,9 @@ services:
     command: ["--host", "0.0.0.0"]
     environment:
       - HEADROOM_HOST=0.0.0.0
-      - OPENAI_TARGET_API_URL=https://api.githubcopilot.com
-      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      # if you want to use a custom OpenAI-compatible API endpoint,
+      # uncomment and set the following line with the desired URL
+      # - OPENAI_TARGET_API_URL=https://api.x.ai
     ports:
       - "8787:8787"
     healthcheck:

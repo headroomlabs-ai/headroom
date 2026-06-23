@@ -1,0 +1,17 @@
+# docker-compose.copilot.yml — Copilot overlay for headroom
+#
+# Routes GitHub Copilot Chat requests through headroom for token compression.
+# Requires the patched VS Code extension: https://github.com/damnthonyy/vscode
+#
+# Usage:
+#   export GITHUB_TOKEN=$(gh auth token)
+#   docker compose -f docker-compose.yml -f docker-compose.copilot.yml up headroom-proxy
+#
+# Then in VS Code settings (Ctrl/Cmd+Shift+P → Open User Settings JSON):
+#   "github.copilot.chat.proxy.url": "http://localhost:8787/v1"
+
+services:
+  headroom-proxy:
+    environment:
+      - OPENAI_TARGET_API_URL=https://api.githubcopilot.com
+      - GITHUB_TOKEN=${GITHUB_TOKEN}

@@ -195,6 +195,41 @@ def test_provider_passthrough_routes_forward_expected_targets(monkeypatch) -> No
             ).json()["base_url"]
             == "https://explicit.example"
         )
+        # All other Copilot hostnames in the allowlist must also be accepted
+        for allowed_host in [
+            "api.individual.githubcopilot.com",
+            "api.business.githubcopilot.com",
+            "api.enterprise.githubcopilot.com",
+            "api-model-lab.githubcopilot.com",
+        ]:
+            assert (
+                client.post(
+                    "/chat/completions",
+                    headers={"x-original-host": allowed_host},
+                ).json()["base_url"]
+                == f"https://{allowed_host}"
+            ), f"Expected {allowed_host} to be accepted"
+        # SSRF guard: hosts outside the Copilot allowlist must NOT be forwarded.
+        # The passthrough falls back to the default OpenAI target for these requests.
+        for rejected_host in [
+            "localhost",
+            "localhost:8080",
+            "127.0.0.1",
+            "0.0.0.0",
+            "169.254.169.254",                  # AWS/GCP link-local metadata
+            "internal-service",
+            "internal-service.corp",
+            "evil.example.com",
+            "api.githubcopilot.com.evil.com",   # subdomain confusion
+            "",
+        ]:
+            result = client.post(
+                "/chat/completions",
+                headers={"x-original-host": rejected_host},
+            ).json()
+            assert result.get("base_url") != f"https://{rejected_host}", (
+                f"SSRF: X-Original-Host {rejected_host!r} should have been rejected"
+            )
         assert client.get("/another/path", headers={"x-goog-api-key": "test"}).json()[
             "base_url"
         ] == ("https://api.gemini.test")
