@@ -1140,10 +1140,8 @@ pub(crate) async fn forward_http(
     let upstream_resp = match upstream_send_result {
         Ok(resp) => resp,
         Err(e) => {
-            if let Some(mut outcome) = pending_record.take() {
-                outcome.failed = true;
-                outcome.latency_ms = start.elapsed().as_millis() as u64;
-                state.savings.record(&outcome, std::time::SystemTime::now());
+            if let Some(outcome) = pending_record.take() {
+                state.savings.record_finalized(outcome, true, start);
             }
             return Err(e.into());
         }
@@ -1155,10 +1153,10 @@ pub(crate) async fn forward_http(
     // Record the request now that the upstream status is known: a non-2xx
     // upstream counts toward `requests.failed`. Only intercepted LLM requests
     // populated `pending_record`; pure passthrough/streaming requests do not.
-    if let Some(mut outcome) = pending_record.take() {
-        outcome.failed = !upstream_status.is_success();
-        outcome.latency_ms = start.elapsed().as_millis() as u64;
-        state.savings.record(&outcome, std::time::SystemTime::now());
+    if let Some(outcome) = pending_record.take() {
+        state
+            .savings
+            .record_finalized(outcome, !upstream_status.is_success(), start);
     }
 
     // PR-A8 / P5-57: capture the upstream request id BEFORE we move

@@ -136,9 +136,11 @@ impl PriceBook {
         }
         // Longest stored id contained in the request id. `max_by_key` keeps the
         // selection branch in std (deterministic, not a coverage region here).
+        // Skip empty ids: a malformed price book with an empty model key would
+        // otherwise `contains("")`-match (and misprice) every request.
         self.models
             .iter()
-            .filter(|(id, _)| key.contains(id.as_str()))
+            .filter(|(id, _)| !id.is_empty() && key.contains(id.as_str()))
             .max_by_key(|(id, _)| id.len())
             .map(|(_, price)| *price)
     }
@@ -250,6 +252,21 @@ mod tests {
     fn unknown_model_misses() {
         let book = PriceBook::from_models_dev_json(SAMPLE);
         assert_eq!(book.lookup("totally-unknown-model"), None);
+    }
+
+    #[test]
+    fn empty_stored_model_id_never_matches() {
+        // A malformed price book with an empty/whitespace model key must not
+        // `contains("")`-match (and misprice) every request.
+        let json = r#"{"p":{"models":{
+            "   ": {"cost":{"input":99.0,"output":99.0}},
+            "gpt-5-mini": {"cost":{"input":0.25,"output":2.0}}
+        }}}"#;
+        let book = PriceBook::from_models_dev_json(json);
+        // A request containing neither real id misses — not the empty-key entry.
+        assert_eq!(book.lookup("totally-unrelated"), None);
+        // Real models still resolve via substring.
+        assert!(book.lookup("copilot-gpt-5-mini").is_some());
     }
 
     #[test]

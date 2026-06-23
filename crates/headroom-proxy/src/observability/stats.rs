@@ -243,12 +243,13 @@ pub struct Bucket {
 }
 
 impl Bucket {
-    fn apply(&mut self, o: &RequestOutcome) {
+    /// Add one request to this bucket. `count_savings` is the caller's single
+    /// failure decision (`!failed`) — when false (a failed request) only the
+    /// request count is bumped, no savings, so the bucket can't drift from the
+    /// lifetime/session totals which apply the same rule.
+    fn apply(&mut self, o: &RequestOutcome, count_savings: bool) {
         self.requests += 1;
-        // A failed upstream produced no successful completion, so it accrues no
-        // savings — only the request count above. (Counting its savings would
-        // inflate the totals, and a client retry would double-count.)
-        if o.failed {
+        if !count_savings {
             return;
         }
         self.tokens_before += o.tokens_before;
@@ -419,16 +420,17 @@ impl SavingsState {
             session.started_at = Some(now_iso.clone());
         }
 
-        // Per-provider / per-model (`Bucket::apply` counts the request and
-        // excludes failed requests from its savings).
+        // Per-provider / per-model. `!failed` is the single failure decision,
+        // the same one that zeroed the savings locals above, so buckets and the
+        // lifetime/session totals can never disagree about what a failure counts.
         self.by_provider
             .entry(outcome.provider_key().to_string())
             .or_default()
-            .apply(outcome);
+            .apply(outcome, !failed);
         self.by_model
             .entry(outcome.model_key().to_string())
             .or_default()
-            .apply(outcome);
+            .apply(outcome, !failed);
 
         // History checkpoint (only when something was actually saved → never on
         // a failed request, since `saved` is zeroed above).
@@ -571,6 +573,24 @@ impl SavingsStore {
             state.record(outcome, now, &self.cfg);
         }
         self.dirty.store(true, Ordering::Release);
+    }
+
+    /// Finalize and record a request-side outcome: stamp `failed` and the
+    /// end-to-end latency (measured from `started`), then [`record`] it. The
+    /// single finalize-and-record path every recorder lane (forward_http,
+    /// Bedrock invoke + streaming, Vertex rawPredict) uses once the request's
+    /// fate is known — the symmetric counterpart to [`RequestOutcome::priced`].
+    ///
+    /// [`record`]: SavingsStore::record
+    pub fn record_finalized(
+        &self,
+        mut outcome: RequestOutcome,
+        failed: bool,
+        started: std::time::Instant,
+    ) {
+        outcome.failed = failed;
+        outcome.latency_ms = started.elapsed().as_millis() as u64;
+        self.record(&outcome, SystemTime::now());
     }
 
     /// Whether this store persists to disk (`--savings-path` was set). Used to
@@ -802,7 +822,7 @@ fn build_stats_json(state: &SavingsState, now: SystemTime, cfg: &StoreConfig) ->
         "cost": {
             "compression_savings_usd": round6(state.lifetime.compression_savings_usd),
             "cache_savings_usd": round6(state.lifetime.cache_savings_usd),
-            "savings_usd": round6(state.lifetime.compression_savings_usd),
+            "savings_usd": total_saved_usd,
             "per_model": per_model,
         },
         "summary": {

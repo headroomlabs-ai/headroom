@@ -323,10 +323,7 @@ pub async fn handle_invoke_streaming(
                 "bedrock invoke-streaming: upstream request failed"
             );
             // Connect/timeout failure — record as a failed request.
-            let mut o = rec_outcome;
-            o.failed = true;
-            o.latency_ms = rec_start.elapsed().as_millis() as u64;
-            state.savings.record(&o, std::time::SystemTime::now());
+            state.savings.record_finalized(rec_outcome, true, rec_start);
             let status = if e.is_timeout() {
                 StatusCode::GATEWAY_TIMEOUT
             } else {
@@ -339,12 +336,9 @@ pub async fn handle_invoke_streaming(
     let status =
         StatusCode::from_u16(upstream_resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     // Record now that the upstream status is known.
-    let mut rec_outcome = rec_outcome;
-    rec_outcome.failed = !status.is_success();
-    rec_outcome.latency_ms = rec_start.elapsed().as_millis() as u64;
     state
         .savings
-        .record(&rec_outcome, std::time::SystemTime::now());
+        .record_finalized(rec_outcome, !status.is_success(), rec_start);
     let upstream_content_type = upstream_resp
         .headers()
         .get(http::header::CONTENT_TYPE)

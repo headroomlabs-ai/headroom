@@ -194,8 +194,14 @@ pub async fn handle_invoke(
     // and the dashboard cover this backend too — unified with the Anthropic /
     // OpenAI lanes that flow through `forward_http`. The request-side outcome is
     // built here (compression token counts are known now) but recorded only once
-    // the upstream result is known, so `requests.failed` reflects connect
-    // errors / non-2xx upstreams instead of counting every attempt as a success.
+    // the upstream result is known, so `requests.failed` reflects connect errors
+    // / non-2xx upstreams instead of counting every attempt as a success.
+    //
+    // Recording boundary (same as forward_http): only requests that *attempt* the
+    // upstream are recorded. Pre-upstream rejections below — missing credentials,
+    // SigV4 failure, an invalid endpoint or action path — return before the
+    // record site and are intentionally NOT counted; they are config/client
+    // errors, not upstream interactions.
     let rec_outcome = crate::observability::stats::RequestOutcome::priced(
         "bedrock",
         model_id.clone(),
@@ -357,10 +363,7 @@ pub async fn handle_invoke(
                 "bedrock invoke: upstream request failed"
             );
             // Connect/timeout failure — record as a failed request.
-            let mut o = rec_outcome;
-            o.failed = true;
-            o.latency_ms = rec_start.elapsed().as_millis() as u64;
-            state.savings.record(&o, std::time::SystemTime::now());
+            state.savings.record_finalized(rec_outcome, true, rec_start);
             let status = if e.is_timeout() {
                 StatusCode::GATEWAY_TIMEOUT
             } else {
@@ -374,12 +377,9 @@ pub async fn handle_invoke(
         StatusCode::from_u16(upstream_resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     // Record now that the upstream status is known: a non-2xx upstream counts
     // toward `requests.failed`.
-    let mut rec_outcome = rec_outcome;
-    rec_outcome.failed = !status.is_success();
-    rec_outcome.latency_ms = rec_start.elapsed().as_millis() as u64;
     state
         .savings
-        .record(&rec_outcome, std::time::SystemTime::now());
+        .record_finalized(rec_outcome, !status.is_success(), rec_start);
     let resp_headers = filter_response_headers(upstream_resp.headers());
 
     tracing::info!(

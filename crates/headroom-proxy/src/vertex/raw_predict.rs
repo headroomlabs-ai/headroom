@@ -347,10 +347,7 @@ pub(crate) async fn forward_vertex_request(
                 "vertex upstream call failed"
             );
             // Connect/timeout failure — record as a failed request.
-            let mut o = rec_outcome;
-            o.failed = true;
-            o.latency_ms = rec_start.elapsed().as_millis() as u64;
-            state.savings.record(&o, std::time::SystemTime::now());
+            state.savings.record_finalized(rec_outcome, true, rec_start);
             return error_response(StatusCode::BAD_GATEWAY, "vertex upstream error");
         }
     };
@@ -359,12 +356,9 @@ pub(crate) async fn forward_vertex_request(
     let upstream_status = upstream_resp.status();
     let status = StatusCode::from_u16(upstream_status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     // Record now that the upstream status is known.
-    let mut rec_outcome = rec_outcome;
-    rec_outcome.failed = !status.is_success();
-    rec_outcome.latency_ms = rec_start.elapsed().as_millis() as u64;
     state
         .savings
-        .record(&rec_outcome, std::time::SystemTime::now());
+        .record_finalized(rec_outcome, !status.is_success(), rec_start);
     let resp_headers = filter_response_headers(upstream_resp.headers());
 
     // PR-C1 reuse: when `attach_sse_tee` is set AND the upstream
