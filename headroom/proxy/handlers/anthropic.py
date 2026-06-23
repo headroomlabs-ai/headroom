@@ -130,6 +130,15 @@ class AnthropicHandlerMixin:
             int(cache_creation.get("ephemeral_1h_input_tokens", 0) or 0),
         )
 
+    def _anthropic_buffered_request_timeout(self) -> httpx.Timeout:
+        """Timeout for buffered Anthropic reads."""
+        return httpx.Timeout(
+            connect=self.config.connect_timeout_seconds,
+            read=self.config.anthropic_buffered_request_timeout_seconds,
+            write=self.config.request_timeout_seconds,
+            pool=self.config.connect_timeout_seconds,
+        )
+
     @classmethod
     def _sort_tools_deterministically(
         cls, tools: list[dict[str, Any]] | None
@@ -2144,6 +2153,7 @@ class AnthropicHandlerMixin:
                             request_id=request_id,
                             forwarder_name="anthropic_messages",
                             path_for_log="/v1/messages",
+                            timeout=self._anthropic_buffered_request_timeout(),
                         )
                     self.pipeline_extensions.emit(
                         PipelineStage.POST_SEND,
@@ -2922,6 +2932,7 @@ class AnthropicHandlerMixin:
                 request_id=request_id,
                 forwarder_name="anthropic_batch",
                 path_for_log="/v1/messages/batches",
+                timeout=self._anthropic_buffered_request_timeout(),
             )
 
             # Batch create: tokens accumulated across all requests in
@@ -3047,6 +3058,7 @@ class AnthropicHandlerMixin:
             url=url,
             headers=headers,
             content=body,
+            timeout=self._anthropic_buffered_request_timeout(),
         )
 
         # Batch passthrough: no compression, no transforms — but we
@@ -3163,7 +3175,11 @@ class AnthropicHandlerMixin:
             request_id=None,
         )
 
-        response = await self.http_client.get(url, headers=headers)  # type: ignore[union-attr]
+        response = await self.http_client.get(  # type: ignore[union-attr]
+            url,
+            headers=headers,
+            timeout=self._anthropic_buffered_request_timeout(),
+        )
 
         if response.status_code != 200:
             # Error - pass through
