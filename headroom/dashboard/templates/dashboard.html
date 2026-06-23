@@ -216,7 +216,10 @@
                     <span x-text="cliFilteringLabel + ' ' + formatNumber(cliFilteringSaved) + ' (' + cliFilteringShareOfTotal.toFixed(1) + '%)'"></span>
                 </div>
                 <div class="mt-1 text-xs text-gray-600 leading-relaxed">
-                    <span x-text="'Of total wire: ' + (stats.tokens?.savings_percent || 0).toFixed(2) + '%'" title="Savings as fraction of all input tokens including frozen prefix"></span>
+                    <span x-text="'Reduction on compressed input: ' + (stats.tokens?.savings_percent || 0).toFixed(2) + '%'" title="Input-token reduction over the requests that were actually compressed — not over all traffic; passthrough requests are not tokenized."></span>
+                </div>
+                <div class="mt-1 text-xs text-gray-600 leading-relaxed">
+                    <span x-text="'Compressed ' + formatNumber(stats.requests?.compressed || 0) + ' of ' + formatNumber(stats.requests?.total || 0) + ' requests' + ((stats.requests?.total || 0) > 0 ? ' (' + ((stats.requests?.compressed || 0) / (stats.requests?.total || 1) * 100).toFixed(0) + '%)' : '')" title="Coverage: how much of the traffic the reduction above applies to."></span>
                 </div>
                 <div class="mt-2 h-8">
                     <svg class="w-full h-full" viewBox="0 0 100 32" preserveAspectRatio="none">

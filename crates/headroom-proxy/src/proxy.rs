@@ -741,10 +741,15 @@ pub(crate) async fn forward_http(
 
     // Phase H / failed-accuracy: the savings outcome is built on the buffered
     // (intercept) path where token counts are known, but recorded only once the
-    // upstream status is known below, so `requests.failed` reflects non-2xx
-    // upstreams. A connect error short-circuits via `?` before the status is
-    // known and is intentionally left unrecorded (it never reached the
-    // provider), rather than being mis-counted as a success.
+    // request's fate is known — a non-2xx upstream AND a connect/transport error
+    // both count toward `requests.failed` (the error case is recorded at the send
+    // site below, matching the Bedrock/Vertex handlers).
+    //
+    // Recording boundary: only requests that *attempted* the upstream are
+    // recorded. Pre-upstream rejections (413 payload-too-large, missing Bedrock
+    // credentials, an unrecognized action path) return before this is populated
+    // and are intentionally NOT recorded — they are client/config errors, not
+    // upstream interactions, and counting them as failed would conflate the two.
     let mut pending_record: Option<crate::observability::stats::RequestOutcome> = None;
 
     let upstream_send_result = if should_intercept {

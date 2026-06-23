@@ -24,6 +24,9 @@ async fn stats_endpoint_serves_savings_json_by_default() {
     // Core contract the dashboard consumes is present and well-formed on a
     // fresh proxy (no traffic yet → zeros, not missing keys).
     assert_eq!(body["requests"]["total"], 0);
+    assert_eq!(body["requests"]["failed"], 0);
+    // Coverage field the dashboard reads to contextualize savings_percent.
+    assert_eq!(body["requests"]["compressed"], 0);
     assert_eq!(body["tokens"]["saved"], 0);
     assert_eq!(body["tokens"]["savings_percent"], 0.0);
     assert!(body["requests"]["by_provider"].is_object());

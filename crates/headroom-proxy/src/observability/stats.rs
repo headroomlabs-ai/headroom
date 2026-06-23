@@ -74,9 +74,13 @@ pub struct RequestOutcome {
     pub tokens_after: u64,
     /// Output tokens, when known (`0` means "not measured").
     pub output_tokens: u64,
-    /// Provider prefix-cache read tokens, when reported.
+    /// Provider prefix-cache read tokens, when reported. NOTE: no recorder lane
+    /// populates the cache-token fields yet — they (and the `cache_savings_usd`
+    /// math) are forward-schema for the response-side token-capture follow-up, so
+    /// `cache_savings_usd` is `0` in production today. Kept (and tested) so that
+    /// follow-up only has to feed the fields, not reshape the contract.
     pub cache_read_tokens: u64,
-    /// Provider prefix-cache write tokens, when reported.
+    /// Provider prefix-cache write tokens, when reported (see `cache_read_tokens`).
     pub cache_write_tokens: u64,
     /// Whether the upstream call failed (counts toward `requests.failed`).
     pub failed: bool,
