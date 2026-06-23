@@ -329,6 +329,29 @@ class TestNewEnvVarWiring:
         assert result.exit_code == 0, result.output
         assert mock_run_server["config"].connect_timeout_seconds == 30
 
+    def test_headroom_anthropic_buffered_timeout_from_env(
+        self, runner: CliRunner, mock_run_server: dict
+    ) -> None:
+        result = runner.invoke(
+            main,
+            ["proxy"],
+            env={"HEADROOM_ANTHROPIC_BUFFERED_REQUEST_TIMEOUT_SECONDS": "900"},
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0, result.output
+        assert mock_run_server["config"].anthropic_buffered_request_timeout_seconds == 900
+
+    def test_anthropic_buffered_timeout_cli_flag(
+        self, runner: CliRunner, mock_run_server: dict
+    ) -> None:
+        result = runner.invoke(
+            main,
+            ["proxy", "--anthropic-buffered-request-timeout-seconds", "901"],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0, result.output
+        assert mock_run_server["config"].anthropic_buffered_request_timeout_seconds == 901
+
     def test_headroom_backend_from_env(self, runner: CliRunner, mock_run_server: dict) -> None:
         result = runner.invoke(
             main,
