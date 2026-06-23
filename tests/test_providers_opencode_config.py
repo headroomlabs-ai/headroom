@@ -32,9 +32,7 @@ def _set_test_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_opencode_config_paths_default(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_opencode_config_paths_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Default config path resolves to ~/.config/opencode/opencode.json."""
     _set_test_home(monkeypatch, tmp_path)
     config_file, backup_file = opencode_config_paths()
@@ -42,9 +40,7 @@ def test_opencode_config_paths_default(
     assert backup_file == tmp_path / ".config" / "opencode" / "opencode.json.headroom-backup"
 
 
-def test_opencode_config_paths_from_env(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_opencode_config_paths_from_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """OPENCODE_CONFIG env var overrides the default path."""
     custom_path = tmp_path / "custom" / "opencode.json"
     monkeypatch.setenv("OPENCODE_CONFIG", str(custom_path))
@@ -82,7 +78,7 @@ def test_snapshot_skips_if_markers_present(tmp_path: Path) -> None:
     """snapshot skips if the config already contains Headroom markers."""
     config_file = tmp_path / "opencode.json"
     backup_file = tmp_path / "opencode.json.headroom-backup"
-    config_file.write_text('// --- Headroom proxy provider ---\n{}')
+    config_file.write_text("// --- Headroom proxy provider ---\n{}")
     snapshot_opencode_config_if_unwrapped(config_file, backup_file)
     assert not backup_file.exists()
 
@@ -158,7 +154,9 @@ def test_inject_key_overwrites_non_dict() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_inject_provider_config_creates_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_inject_provider_config_creates_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """inject_opencode_provider_config creates the config file when missing."""
     _set_test_home(monkeypatch, tmp_path)
     inject_opencode_provider_config(port=8787)
@@ -192,13 +190,7 @@ def test_parse_json_loose_handles_valid_json() -> None:
 
 def test_parse_json_loose_handles_jsonc_with_comments() -> None:
     """_parse_json_loose strips comments and returns valid data."""
-    text = (
-        '{\n'
-        '  "model": "gpt-4o",\n'
-        '  // this is a comment\n'
-        '  "provider": {}\n'
-        '}'
-    )
+    text = '{\n  "model": "gpt-4o",\n  // this is a comment\n  "provider": {}\n}'
     data = _parse_json_loose(text)
     assert data["model"] == "gpt-4o"
     assert data["provider"] == {}
@@ -214,11 +206,11 @@ def test_parse_json_loose_handles_urls_in_json() -> None:
 def test_parse_json_loose_handles_comments_and_urls() -> None:
     """_parse_json_loose handles both comments and URLs in the same file."""
     text = (
-        '{\n'
-        '  // proxy configuration\n'
+        "{\n"
+        "  // proxy configuration\n"
         '  "baseURL": "http://127.0.0.1:8787/v1",\n'
         '  "name": "Headroom // Proxy"\n'
-        '}'
+        "}"
     )
     data = _parse_json_loose(text)
     assert data["baseURL"] == "http://127.0.0.1:8787/v1"
@@ -262,22 +254,24 @@ def test_strip_blocks_handles_whitespace_only() -> None:
 
 def test_strip_blocks_preserves_non_headroom_jsonc() -> None:
     """strip_opencode_headroom_blocks preserves JSONC comments not from Headroom."""
-    content = (
-        '// user comment\n'
-        '{"model": "gpt-4o"}\n'
-        '// another user comment\n'
-    )
+    content = '// user comment\n{"model": "gpt-4o"}\n// another user comment\n'
     cleaned = strip_opencode_headroom_blocks(content)
-    assert '// user comment' in cleaned
+    assert "// user comment" in cleaned
     assert '{"model": "gpt-4o"}' in cleaned
 
 
 def test_strip_blocks_removes_only_one_of_two_identical_blocks() -> None:
     """strip_opencode_headroom_blocks removes all provider blocks, not just the first."""
     from headroom.providers.opencode.config import _PROVIDER_MARKER_END, _PROVIDER_MARKER_START
+
     content = (
-        _PROVIDER_MARKER_START + "\nblock1\n" + _PROVIDER_MARKER_END + "\n"
-        + _PROVIDER_MARKER_START + "\nblock2\n" + _PROVIDER_MARKER_END
+        _PROVIDER_MARKER_START
+        + "\nblock1\n"
+        + _PROVIDER_MARKER_END
+        + "\n"
+        + _PROVIDER_MARKER_START
+        + "\nblock2\n"
+        + _PROVIDER_MARKER_END
     )
     cleaned = strip_opencode_headroom_blocks(content)
     assert _PROVIDER_MARKER_START not in cleaned
@@ -288,9 +282,8 @@ def test_strip_blocks_removes_only_one_of_two_identical_blocks() -> None:
 def test_strip_blocks_handles_only_mcp_markers() -> None:
     """strip_opencode_headroom_blocks also strips MCP markers."""
     from headroom.providers.opencode.config import _MCP_MARKER_END, _MCP_MARKER_START
-    content = (
-        _MCP_MARKER_START + "\nmcp data\n" + _MCP_MARKER_END
-    )
+
+    content = _MCP_MARKER_START + "\nmcp data\n" + _MCP_MARKER_END
     cleaned = strip_opencode_headroom_blocks(content)
     assert _MCP_MARKER_START not in cleaned
 
@@ -307,7 +300,9 @@ def test_inject_provider_config_merges_with_existing_mcp(
     _set_test_home(monkeypatch, tmp_path)
     config_file = tmp_path / ".config" / "opencode" / "opencode.json"
     config_file.parent.mkdir(parents=True, exist_ok=True)
-    config_file.write_text('{"mcp": {"existing-server": {"type": "remote", "url": "https://example.com"}}}')
+    config_file.write_text(
+        '{"mcp": {"existing-server": {"type": "remote", "url": "https://example.com"}}}'
+    )
 
     inject_opencode_provider_config(port=8787)
 
@@ -323,11 +318,15 @@ def test_inject_provider_config_idempotent_with_complex_config(
     _set_test_home(monkeypatch, tmp_path)
     config_file = tmp_path / ".config" / "opencode" / "opencode.json"
     config_file.parent.mkdir(parents=True, exist_ok=True)
-    config_file.write_text(json.dumps({
-        "model": "openai/gpt-4o",
-        "provider": {"openai": {"models": {"gpt-4o": {}}}},
-        "mcp": {"myserver": {"type": "local", "command": ["echo"]}},
-    }))
+    config_file.write_text(
+        json.dumps(
+            {
+                "model": "openai/gpt-4o",
+                "provider": {"openai": {"models": {"gpt-4o": {}}}},
+                "mcp": {"myserver": {"type": "local", "command": ["echo"]}},
+            }
+        )
+    )
 
     inject_opencode_provider_config(port=8787)
     inject_opencode_provider_config(port=8787)
@@ -346,11 +345,15 @@ def test_inject_provider_config_preserves_unrelated_top_level_keys(
     _set_test_home(monkeypatch, tmp_path)
     config_file = tmp_path / ".config" / "opencode" / "opencode.json"
     config_file.parent.mkdir(parents=True, exist_ok=True)
-    config_file.write_text(json.dumps({
-        "plugin": ["some-plugin"],
-        "permission": {"bash": {"*": "ask"}},
-        "model": "openai/gpt-4o",
-    }))
+    config_file.write_text(
+        json.dumps(
+            {
+                "plugin": ["some-plugin"],
+                "permission": {"bash": {"*": "ask"}},
+                "model": "openai/gpt-4o",
+            }
+        )
+    )
 
     inject_opencode_provider_config(port=8787)
 
@@ -375,9 +378,7 @@ def test_append_headroom_plugin_preserves_configured_tuple_entry() -> None:
     }
 
     assert append_headroom_plugin(config) is False
-    assert config["plugin"] == [
-        [HEADROOM_OPENCODE_PLUGIN, {"proxyUrl": "http://127.0.0.1:8787"}]
-    ]
+    assert config["plugin"] == [[HEADROOM_OPENCODE_PLUGIN, {"proxyUrl": "http://127.0.0.1:8787"}]]
 
 
 def test_inject_provider_config_no_crash_on_unwriteable_dir(
@@ -386,6 +387,7 @@ def test_inject_provider_config_no_crash_on_unwriteable_dir(
     """inject_opencode_provider_config raises click.ClickException on OSError."""
 
     import click as click_mod
+
     monkeypatch.setenv("HOME", "/nonexistent/path/that/cannot/be/created")
     try:
         inject_opencode_provider_config(port=8787)

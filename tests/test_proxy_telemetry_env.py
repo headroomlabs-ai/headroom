@@ -114,3 +114,37 @@ class TestProxyPeriodicTOINStatsEnv:
             pass
 
         assert requested is False
+
+    def test_lifespan_schedules_periodic_toin_stats_when_enabled(self, monkeypatch):
+        """Enabled periodic TOIN stats schedules the stats loop at startup."""
+        monkeypatch.setenv("HEADROOM_SKIP_UPSTREAM_CHECK", "1")
+        requested = False
+
+        def fake_periodic_toin_stats():
+            nonlocal requested
+            requested = True
+
+            async def noop():
+                await asyncio.sleep(0)
+
+            return noop()
+
+        monkeypatch.setattr(
+            "headroom.proxy.server._log_toin_stats_periodically",
+            fake_periodic_toin_stats,
+        )
+
+        app = create_app(
+            ProxyConfig(
+                optimize=False,
+                cache_enabled=False,
+                rate_limit_enabled=False,
+                cost_tracking_enabled=False,
+                periodic_toin_stats_enabled=True,
+            )
+        )
+
+        with TestClient(app):
+            pass
+
+        assert requested is True

@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 
+from headroom.mcp_registry.base import RegisterStatus
 from headroom.mcp_registry.opencode import (
     OpencodeRegistrar,
     _diff_specs,
@@ -15,7 +16,6 @@ from headroom.mcp_registry.opencode import (
     _spec_to_entry,
     _specs_equivalent,
 )
-from headroom.mcp_registry.base import RegisterStatus
 
 
 def _write_json(path: Path, data: dict[str, Any]) -> None:
@@ -164,6 +164,7 @@ def test_unregister_removes_mcp_key_when_empty(tmp_path: Path) -> None:
     assert registrar.get_server("headroom") is None
     # mcp key should be removed entirely
     import json
+
     data = json.loads((tmp_path / "opencode.json").read_text())
     assert "mcp" not in data
 
@@ -174,11 +175,18 @@ def test_register_server_leaves_other_mcp_servers(tmp_path: Path) -> None:
     from headroom.mcp_registry.base import ServerSpec
 
     # Pre-populate with a user-managed MCP server
-    _write_json(tmp_path / "opencode.json", {
-        "mcp": {
-            "existing-server": {"type": "remote", "url": "https://example.com", "enabled": True},
-        }
-    })
+    _write_json(
+        tmp_path / "opencode.json",
+        {
+            "mcp": {
+                "existing-server": {
+                    "type": "remote",
+                    "url": "https://example.com",
+                    "enabled": True,
+                },
+            }
+        },
+    )
 
     spec = ServerSpec(name="headroom", command="headroom", args=("mcp", "serve"))
     registrar.register_server(spec)
@@ -193,11 +201,14 @@ def test_unregister_preserves_other_mcp_servers(tmp_path: Path) -> None:
     registrar = _registrar(tmp_path)
     from headroom.mcp_registry.base import ServerSpec
 
-    _write_json(tmp_path / "opencode.json", {
-        "mcp": {
-            "existing-server": {"type": "remote", "url": "https://example.com"},
-        }
-    })
+    _write_json(
+        tmp_path / "opencode.json",
+        {
+            "mcp": {
+                "existing-server": {"type": "remote", "url": "https://example.com"},
+            }
+        },
+    )
     spec = ServerSpec(name="headroom", command="headroom", args=("mcp", "serve"))
     registrar.register_server(spec)
     registrar.unregister_server("headroom")
@@ -364,9 +375,7 @@ def test_register_server_returns_already_status(
     assert result.status == RegisterStatus.ALREADY
 
 
-def test_unregister_server_handles_oserror(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_unregister_server_handles_oserror(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     r = _registrar(tmp_path)
     from headroom.mcp_registry.base import ServerSpec
 
@@ -377,9 +386,7 @@ def test_unregister_server_handles_oserror(
         msg = "permission denied"
         raise OSError(msg)
 
-    monkeypatch.setattr(
-        "headroom.mcp_registry.opencode._write_json", _fail_write
-    )
+    monkeypatch.setattr("headroom.mcp_registry.opencode._write_json", _fail_write)
     ok = r.unregister_server("bad-unregister")
     assert ok is False
 

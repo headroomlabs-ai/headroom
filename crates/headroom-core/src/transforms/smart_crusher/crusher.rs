@@ -672,7 +672,11 @@ impl SmartCrusher {
         // ship it — nothing dropped, no CCR retrieval needed.
         // Otherwise fall through to the lossy path.
         if let Some(stage) = &self.compaction {
-            let (c, rendered) = stage.run(items);
+            // Thread the CCR store so opaque-blob `<<ccr:HASH,...>>` markers
+            // emitted by lossless:table compaction are actually retrievable
+            // (issue #1083); the row-drop lossy path below stores its own
+            // payload separately.
+            let (c, rendered) = stage.run_with_store(items, self.ccr_store.as_ref());
             if c.was_compacted() {
                 let input_bytes = estimate_array_bytes(&item_strings);
                 let savings_ratio = if input_bytes > 0 {

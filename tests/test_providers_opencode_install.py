@@ -57,6 +57,7 @@ def test_apply_provider_scope_creates_config(
     config_file = tmp_path / ".config" / "opencode" / "opencode.json"
     assert config_file.exists()
     import json
+
     config = json.loads(config_file.read_text())
     assert config["provider"]["headroom"]["options"]["baseURL"] == "http://127.0.0.1:8787/v1"
 
@@ -86,6 +87,7 @@ def test_revert_provider_scope_restores_file(
     config_file.write_text('{"model": "openai/gpt-4o"}')
 
     from headroom.install.models import ManagedMutation
+
     mutation = ManagedMutation(
         target="opencode",
         kind="json-block",
@@ -102,6 +104,7 @@ def test_revert_provider_scope_noop_when_file_missing(
 ) -> None:
     """revert_provider_scope is a safe no-op when the config file is gone."""
     from headroom.install.models import ManagedMutation
+
     mutation = ManagedMutation(
         target="opencode",
         kind="json-block",

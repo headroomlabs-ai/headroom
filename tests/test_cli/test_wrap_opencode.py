@@ -52,7 +52,8 @@ def test_wrap_opencode_sets_config_content_env(
         with patch.object(wrap_mod, "_launch_tool", side_effect=fake_launch_tool):
             with patch.object(wrap_mod, "_ensure_rtk_binary", return_value=Path("/tmp/rtk")):
                 result = runner.invoke(
-                    main, ["wrap", "opencode", "--port", "9000", "--no-mcp", "--", "--model", "gpt-4o"]
+                    main,
+                    ["wrap", "opencode", "--port", "9000", "--no-mcp", "--", "--model", "gpt-4o"],
                 )
 
     assert result.exit_code == 0, result.output
@@ -491,7 +492,9 @@ def test_wrap_opencode_respects_opencode_config_env(
     assert result.exit_code == 0, result.output
     assert custom_config.exists()
     default_config = tmp_path / ".config" / "opencode" / "opencode.json"
-    assert not default_config.exists(), "default config should not be created when OPENCODE_CONFIG is set"
+    assert not default_config.exists(), (
+        "default config should not be created when OPENCODE_CONFIG is set"
+    )
 
 
 def test_wrap_opencode_headroom_project_from_cwd(
@@ -590,9 +593,7 @@ def test_unwrap_opencode_removes_config_when_only_headroom_content(
     config_file = tmp_path / ".config" / "opencode" / "opencode.json"
     config_file.parent.mkdir(parents=True, exist_ok=True)
     wrapped_content = (
-        wrap_mod._PROVIDER_MARKER_START
-        + '\n"provider": {},\n'
-        + wrap_mod._PROVIDER_MARKER_END
+        wrap_mod._PROVIDER_MARKER_START + '\n"provider": {},\n' + wrap_mod._PROVIDER_MARKER_END
     )
     config_file.write_text(wrapped_content)
 
@@ -766,11 +767,18 @@ def test_wrap_opencode_with_backend_and_anyllm_provider(
         with patch.object(wrap_mod, "_launch_tool", side_effect=SystemExit(0)):
             with patch.object(wrap_mod, "_ensure_rtk_binary", return_value=Path("/tmp/rtk")):
                 result = runner.invoke(
-                    main, [
-                        "wrap", "opencode", "--port", "9000",
-                        "--backend", "anyllm", "--anyllm-provider", "groq",
+                    main,
+                    [
+                        "wrap",
+                        "opencode",
+                        "--port",
+                        "9000",
+                        "--backend",
+                        "anyllm",
+                        "--anyllm-provider",
+                        "groq",
                         "--no-mcp",
-                    ]
+                    ],
                 )
 
     assert result.exit_code == 0, result.output
@@ -831,9 +839,7 @@ def test_wrap_opencode_respects_opencode_home_env(
     with patch.object(wrap_mod.shutil, "which", return_value="opencode"):
         with patch.object(wrap_mod, "_launch_tool", side_effect=SystemExit(0)):
             with patch.object(wrap_mod, "_ensure_rtk_binary", return_value=Path("/tmp/rtk")):
-                result = runner.invoke(
-                    main, ["wrap", "opencode", "--port", "9000", "--no-mcp"]
-                )
+                result = runner.invoke(main, ["wrap", "opencode", "--port", "9000", "--no-mcp"])
 
     assert result.exit_code == 0, result.output
     agents_md = Path(custom_home) / "AGENTS.md"

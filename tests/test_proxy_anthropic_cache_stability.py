@@ -685,6 +685,71 @@ def test_batch_optimization_freezes_previous_turns_only() -> None:
         ]
 
 
+def test_batch_optimization_passes_savings_profile_kwargs() -> None:
+    captured = {}
+    with _make_proxy_client() as client:
+        proxy = client.app.state.proxy
+        proxy.config.optimize = True
+        proxy.config.mode = "token"
+        proxy.config.savings_profile = "agent-90"
+        proxy.config.ccr_inject_tool = False
+
+        def _fake_apply(**kwargs):
+            captured["pipeline_kwargs"] = kwargs
+            return SimpleNamespace(
+                messages=kwargs["messages"],
+                transforms_applied=[],
+                timing={},
+                tokens_before=100,
+                tokens_after=80,
+                waste_signals=None,
+            )
+
+        proxy.anthropic_pipeline.apply = _fake_apply
+
+        async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
+            captured["body"] = body
+            return httpx.Response(
+                200,
+                json={
+                    "id": "msgbatch_profile",
+                    "type": "message_batch",
+                    "processing_status": "in_progress",
+                    "request_counts": {
+                        "processing": 1,
+                        "succeeded": 0,
+                        "errored": 0,
+                        "canceled": 0,
+                    },
+                },
+            )
+
+        proxy._retry_request = _fake_retry
+
+        response = client.post(
+            "/v1/messages/batches",
+            headers={"x-api-key": "test-key", "anthropic-version": "2023-06-01"},
+            json={
+                "requests": [
+                    {
+                        "custom_id": "req-1",
+                        "params": {
+                            "model": "claude-sonnet-4-6",
+                            "max_tokens": 128,
+                            "messages": [{"role": "user", "content": "compress me"}],
+                        },
+                    }
+                ]
+            },
+        )
+
+        assert response.status_code == 200
+        pipeline_kwargs = captured["pipeline_kwargs"]
+        assert pipeline_kwargs["force_kompress"] is True
+        assert pipeline_kwargs["target_ratio"] == 0.10
+        assert pipeline_kwargs["compress_user_messages"] is True
+
+
 def test_token_mode_does_not_force_freeze_all_previous_turns() -> None:
     captured = {}
     with _make_proxy_client() as client:

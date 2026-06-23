@@ -17,7 +17,6 @@ from .base import MCPRegistrar, RegisterResult, RegisterStatus, ServerSpec
 from .claude import ClaudeRegistrar
 from .codex import CodexRegistrar
 from .display import any_succeeded, format_result, format_results
-from .opencode import OpencodeRegistrar
 from .install import (
     DEFAULT_PROXY_URL,
     build_headroom_spec,
@@ -25,6 +24,7 @@ from .install import (
     get_all_registrars,
     install_everywhere,
 )
+from .opencode import OpencodeRegistrar
 
 __all__ = [
     "DEFAULT_PROXY_URL",

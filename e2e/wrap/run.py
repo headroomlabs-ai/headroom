@@ -934,9 +934,7 @@ def main() -> None:
     log("All Docker wrap e2e checks passed.")
 
 
-def verify_opencode_wrap(
-    base_env: dict[str, str], project_dir: Path, log_dir: Path
-) -> None:
+def verify_opencode_wrap(base_env: dict[str, str], project_dir: Path, log_dir: Path) -> None:
     port = OPENCODE_PORT
     run(
         ["headroom", "wrap", "opencode", "--port", str(port), "--", "--help"],
@@ -948,7 +946,10 @@ def verify_opencode_wrap(
     project_agents = project_dir / "AGENTS.md"
     assert_true(global_agents.exists(), "Opencode wrap should create ~/.config/opencode/AGENTS.md")
     assert_true(project_agents.exists(), "Opencode wrap should create project AGENTS.md")
-    assert_true(RTK_MARKER in global_agents.read_text(encoding="utf-8"), "Missing RTK marker in global AGENTS.md")
+    assert_true(
+        RTK_MARKER in global_agents.read_text(encoding="utf-8"),
+        "Missing RTK marker in global AGENTS.md",
+    )
     assert_true(
         RTK_MARKER in project_agents.read_text(encoding="utf-8"),
         "Missing RTK marker in project AGENTS.md",
@@ -967,7 +968,12 @@ def verify_opencode_wrap(
         "Opencode wrap should inject headroom provider baseURL",
     )
 
-    run(["headroom", "unwrap", "opencode", "--port", str(port)], env=base_env, cwd=project_dir, timeout=120)
+    run(
+        ["headroom", "unwrap", "opencode", "--port", str(port)],
+        env=base_env,
+        cwd=project_dir,
+        timeout=120,
+    )
     config_path = Path(base_env["HOME"]) / ".config" / "opencode" / "opencode.json"
     if config_path.exists():
         content = config_path.read_text(encoding="utf-8")

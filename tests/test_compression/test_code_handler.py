@@ -70,6 +70,10 @@ class TestLanguageDetection:
         code = "use std::io;\n\npub fn main() {\n    let mut x = 1;\n}\n"
         assert handler._detect_language(code) == "rust"
 
+    def test_detects_perl(self, handler):
+        code = "use strict;\npackage Foo;\n\nsub greet {\n    my $name = shift;\n    return $name;\n}\n"
+        assert handler._detect_language(code) == "perl"
+
     def test_falls_back_to_default(self):
         handler = CodeStructureHandler(default_language="javascript")
         assert handler._detect_language("plain words only here") == "javascript"
@@ -109,6 +113,18 @@ class TestRegexFallbackLanguages:
         sig = "const add = (a, b) =>"
         start = code.index(sig)
         assert all(result.mask.mask[i] for i in range(start, start + len(sig)))
+
+    def test_perl_sub_signature_preserved(self, handler):
+        code = "sub add {\n    my ($a, $b) = @_;\n    return $a + $b;\n}\n"
+        result = handler.get_mask(code, language="perl")
+        sig = "sub add"
+        start = code.index(sig)
+        assert all(result.mask.mask[i] for i in range(start, start + len(sig)))
+
+    def test_perl_use_import_preserved(self, handler):
+        code = "use strict;\nuse warnings;\n\nmy $x = 1;\n"
+        result = handler.get_mask(code, language="perl")
+        assert all(result.mask.mask[i] for i in range(len("use strict")))
 
     def test_regex_confidence_lower_than_tree_sitter(self, handler):
         result = handler.get_mask("def f():\n    pass\n", language="python")
