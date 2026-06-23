@@ -108,7 +108,9 @@ def test_litellm_minimax_mixed_case_with_provider_prefix(monkeypatch) -> None:
     otherwise miss and the resolver would return the input unchanged.
     """
 
-    def fake_cost_per_token(model: str, prompt_tokens: int = 0, completion_tokens: int = 0) -> tuple[float, float]:
+    def fake_cost_per_token(
+        model: str, prompt_tokens: int = 0, completion_tokens: int = 0
+    ) -> tuple[float, float]:
         if model in fake_litellm.model_cost:
             entry = fake_litellm.model_cost[model]
             return (
