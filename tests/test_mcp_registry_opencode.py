@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 
+from headroom.mcp_registry.base import RegisterStatus
 from headroom.mcp_registry.opencode import (
     OpencodeRegistrar,
     _diff_specs,
@@ -15,7 +16,6 @@ from headroom.mcp_registry.opencode import (
     _spec_to_entry,
     _specs_equivalent,
 )
-from headroom.mcp_registry.base import RegisterStatus
 
 
 def _write_json(path: Path, data: dict[str, Any]) -> None:

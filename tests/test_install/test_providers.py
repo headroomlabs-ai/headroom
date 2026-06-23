@@ -16,9 +16,13 @@ from headroom.providers.codex.install import apply_provider_scope as apply_codex
 from headroom.providers.codex.install import build_install_env as build_codex_install_env
 from headroom.providers.codex.install import revert_provider_scope as revert_codex_provider_scope
 from headroom.providers.copilot.install import build_install_env as build_copilot_install_env
-from headroom.providers.opencode.install import apply_provider_scope as apply_opencode_provider_scope
+from headroom.providers.opencode.install import (
+    apply_provider_scope as apply_opencode_provider_scope,
+)
 from headroom.providers.opencode.install import build_install_env as build_opencode_install_env
-from headroom.providers.opencode.install import revert_provider_scope as revert_opencode_provider_scope
+from headroom.providers.opencode.install import (
+    revert_provider_scope as revert_opencode_provider_scope,
+)
 
 
 def _manifest(tmp_path: Path) -> DeploymentManifest:
@@ -800,7 +804,7 @@ def test_planner_resolves_opencode_as_install_target() -> None:
 
 def test_planner_opencode_in_supported_targets_enum() -> None:
     from headroom.install.models import ToolTarget
-    from headroom.install.planner import SUPPORTED_TARGETS, PROVIDER_SCOPE_TARGETS
+    from headroom.install.planner import PROVIDER_SCOPE_TARGETS, SUPPORTED_TARGETS
 
     assert ToolTarget.OPENCODE in SUPPORTED_TARGETS
     assert ToolTarget.OPENCODE in PROVIDER_SCOPE_TARGETS
@@ -831,6 +835,7 @@ def test_planner_resolve_all_includes_opencode() -> None:
 def test_planner_provider_scope_unsupported_error_excludes_opencode() -> None:
     import click
     import pytest
+
     from headroom.install.planner import resolve_targets
 
     with pytest.raises(click.ClickException, match="unsupported targets"):
@@ -852,8 +857,8 @@ def test_revert_opencode_provider_scope_fallback_on_oserror(
 
     from headroom.install.models import ManagedMutation
     from headroom.providers.opencode.config import (
-        _PROVIDER_MARKER_START,
         _PROVIDER_MARKER_END,
+        _PROVIDER_MARKER_START,
     )
     original = '{"model": "openai/gpt-4o"}'
     backup_path.write_text(original)
