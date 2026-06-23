@@ -21,15 +21,11 @@ _MCP_MARKER_END = "// --- end Headroom MCP server ---"
 
 # Regex to strip headroom blocks (including the marker comments).
 _PROVIDER_BLOCK_RE = re.compile(
-    re.escape(_PROVIDER_MARKER_START)
-    + r".*?"
-    + re.escape(_PROVIDER_MARKER_END),
+    re.escape(_PROVIDER_MARKER_START) + r".*?" + re.escape(_PROVIDER_MARKER_END),
     re.DOTALL,
 )
 _MCP_BLOCK_RE = re.compile(
-    re.escape(_MCP_MARKER_START)
-    + r".*?"
-    + re.escape(_MCP_MARKER_END),
+    re.escape(_MCP_MARKER_START) + r".*?" + re.escape(_MCP_MARKER_END),
     re.DOTALL,
 )
 HEADROOM_OPENCODE_PLUGIN = "headroom-opencode"
@@ -126,7 +122,8 @@ def _parse_json_loose(text: str) -> dict[str, Any]:
     comments that follow a comma.
     """
     try:
-        return json.loads(text)
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, dict) else {}
     except json.JSONDecodeError:
         pass
     # Pass 1: remove lines that are ONLY a comment.
@@ -134,14 +131,13 @@ def _parse_json_loose(text: str) -> dict[str, Any]:
     # Pass 2: remove inline trailing comments (", // comment").
     cleaned = re.sub(r",\s*//[^\n]*", ",", cleaned)
     try:
-        return json.loads(cleaned)
+        parsed = json.loads(cleaned)
+        return parsed if isinstance(parsed, dict) else {}
     except json.JSONDecodeError:
         return {}
 
 
-def _inject_key_into_json(
-    data: dict[str, Any], key: str, value: Any
-) -> dict[str, Any]:
+def _inject_key_into_json(data: dict[str, Any], key: str, value: Any) -> dict[str, Any]:
     """Merge ``value`` into ``data[key]`` idempotently."""
     existing = data.get(key)
     if isinstance(existing, dict) and isinstance(value, dict):

@@ -154,6 +154,21 @@ For multiple proxy instances, register one stdio MCP server per proxy URL:
 
 Do not assume that a running proxy exposes an HTTP MCP endpoint at `/mcp`. If `http://127.0.0.1:<port>/mcp` returns `404`, use the stdio configuration above.
 
+### `command: "headroom"` fails to start
+
+The configurations above use `"command": "headroom"`, which only works if the `headroom`
+executable is on the PATH your MCP host (Codex, etc.) sees at startup. If you installed Headroom
+into a project virtualenv — for example with `uv add headroom-ai` — the CLI lives only inside
+that venv, and the host fails at launch with:
+
+```text
+MCP client for `headroom` failed to start: MCP startup failed: No such file or directory (os error 2)
+```
+
+Install Headroom so it's globally on PATH — `uv tool install "headroom-ai[mcp]"` (or
+`pipx install "headroom-ai[mcp]"`) — or replace `"headroom"` with the absolute path to the binary
+(`command -v headroom`, or `where headroom` on Windows).
+
 ## Cross-tool compatibility
 
 | Tool | MCP Support | Setup |

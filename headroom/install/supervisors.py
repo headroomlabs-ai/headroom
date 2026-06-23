@@ -7,6 +7,7 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import click
@@ -21,6 +22,16 @@ from .paths import (
     windows_run_script_path,
 )
 from .runtime import resolve_headroom_command
+
+# After `launchctl bootout`, a follow-up `bootstrap` of the same label can
+# return EIO (error 5) for several seconds while launchd releases it. Retry the
+# bootstrap up to ~15s (30 attempts x 0.5s) to ride out that settle window.
+_MACOS_BOOTSTRAP_RETRIES = 30
+_MACOS_BOOTSTRAP_RETRY_DELAY = 0.5
+
+# `launchctl bootout` of an already-absent job exits with ESRCH ("No such
+# process"). That single code is the only failure we treat as already-stopped.
+_LAUNCHCTL_ESRCH = 3
 
 
 def _is_windows() -> bool:
@@ -310,8 +321,44 @@ def start_supervisor(manifest: DeploymentManifest) -> None:
             and manifest.supervisor_kind == SupervisorKind.SERVICE.value
             else f"gui/{os.getuid()}"
         )
-        subprocess.run(["launchctl", "kickstart", "-k", f"{domain}/{label}"], check=True)
-        return
+        # Fast path: when the job is already bootstrapped (e.g. `start` right
+        # after `install apply`, or `start` on a running service), `kickstart`
+        # restarts it in place.
+        kick = subprocess.run(
+            ["launchctl", "kickstart", "-k", f"{domain}/{label}"],
+            capture_output=True,
+            text=True,
+        )
+        if kick.returncode == 0:
+            return
+        # Otherwise the job is not registered in the domain. This is the state
+        # `stop`/`restart` leave behind, since they `bootout` the job, and
+        # `kickstart` cannot recover it (launchctl error 113). Bootstrap fresh
+        # instead — a successful bootstrap also starts the job via RunAtLoad.
+        # launchd can return EIO (error 5) from bootstrap for several seconds
+        # after a bootout while it releases the label, so retry for ~15s.
+        plist_dir = (
+            Path("/Library/LaunchDaemons")
+            if manifest.scope == "system"
+            and manifest.supervisor_kind == SupervisorKind.SERVICE.value
+            else Path.home() / "Library" / "LaunchAgents"
+        )
+        plist_path = plist_dir / f"{label}.plist"
+        last = kick
+        for _ in range(_MACOS_BOOTSTRAP_RETRIES):
+            boot = subprocess.run(
+                ["launchctl", "bootstrap", domain, str(plist_path)],
+                capture_output=True,
+                text=True,
+            )
+            if boot.returncode == 0:
+                return
+            last = boot
+            time.sleep(_MACOS_BOOTSTRAP_RETRY_DELAY)
+        detail = (last.stderr or last.stdout or "").strip()
+        raise click.ClickException(
+            f"launchctl could not start {domain}/{label}: {detail or 'unknown error'}"
+        )
     if _is_windows() and manifest.supervisor_kind == SupervisorKind.SERVICE.value:
         subprocess.run(["sc.exe", "start", manifest.service_name], check=True)
 
@@ -333,7 +380,21 @@ def stop_supervisor(manifest: DeploymentManifest) -> None:
             and manifest.supervisor_kind == SupervisorKind.SERVICE.value
             else f"gui/{os.getuid()}"
         )
-        subprocess.run(["launchctl", "bootout", f"{domain}/{label}"], check=True)
+        # `bootout` exits with ESRCH ("No such process") when the job is already
+        # absent — tolerate only that, so `restart` can proceed to start again.
+        # Any other non-zero result is a real failure (permissions, malformed
+        # domain, launchd error) and must surface; otherwise `restart` could
+        # report success while a stale job is still running.
+        result = subprocess.run(
+            ["launchctl", "bootout", f"{domain}/{label}"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode not in (0, _LAUNCHCTL_ESRCH):
+            detail = (result.stderr or result.stdout or "").strip()
+            raise click.ClickException(
+                f"launchctl bootout failed for {domain}/{label}: {detail or 'unknown error'}"
+            )
         return
     if _is_windows() and manifest.supervisor_kind == SupervisorKind.SERVICE.value:
         subprocess.run(["sc.exe", "stop", manifest.service_name], check=True)

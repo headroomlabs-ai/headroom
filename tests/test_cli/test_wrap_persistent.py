@@ -321,7 +321,38 @@ def test_ensure_proxy_restarts_ephemeral_proxy_for_openai_api_url_mismatch(monke
     assert calls[1][2]["openai_api_url"] == "https://api.individual.githubcopilot.com"
 
 
-def test_ensure_proxy_restarts_agent_proxy_without_savings_profile(monkeypatch) -> None:
+def test_ensure_proxy_reuses_agent_proxy_without_savings_profile(monkeypatch) -> None:
+    health = {
+        "version": wrap_cli._HEADROOM_VERSION,
+        "runtime": {"websocket_sessions": {"active_sessions": 0, "active_relay_tasks": 0}},
+        "config": {"pid": "12345", "memory": False, "learn": False, "code_graph": False},
+    }
+
+    monkeypatch.delenv("HEADROOM_SAVINGS_PROFILE", raising=False)
+    monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: None)
+    monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: True)
+    monkeypatch.setattr(wrap_cli, "_query_proxy_health", lambda port: health)
+    monkeypatch.setattr(
+        wrap_cli,
+        "_kill_proxy_by_pid",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("default agent proxy should not restart for savings profile")
+        ),
+    )
+    monkeypatch.setattr(
+        wrap_cli,
+        "_start_proxy",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("replacement proxy should not start")
+        ),
+    )
+
+    result = wrap_cli._ensure_proxy(8787, False, agent_type="codex")
+
+    assert result is None
+
+
+def test_ensure_proxy_restarts_for_explicit_agent_savings_profile(monkeypatch) -> None:
     calls: list[object] = []
     health = {
         "version": wrap_cli._HEADROOM_VERSION,
@@ -329,6 +360,7 @@ def test_ensure_proxy_restarts_agent_proxy_without_savings_profile(monkeypatch) 
         "config": {"pid": "12345", "memory": False, "learn": False, "code_graph": False},
     }
 
+    monkeypatch.setenv("HEADROOM_SAVINGS_PROFILE", "agent-90")
     monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: None)
     monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: len(calls) == 0)
     monkeypatch.setattr(wrap_cli, "_query_proxy_health", lambda port: health)
@@ -373,6 +405,7 @@ def test_ensure_proxy_reuses_agent_proxy_with_savings_profile(monkeypatch) -> No
         },
     }
 
+    monkeypatch.setenv("HEADROOM_SAVINGS_PROFILE", "agent-90")
     monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: None)
     monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: True)
     monkeypatch.setattr(wrap_cli, "_query_proxy_health", lambda port: health)

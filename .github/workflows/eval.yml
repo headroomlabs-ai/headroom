@@ -126,6 +126,24 @@ jobs:
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+      # Recall-based fidelity report on the production routing path. Zero cost
+      # (synthetic structured cases -> Rust compressors; no model, no API, no
+      # secrets). Non-blocking: surfaces recall trends weekly without gating.
+      # The blocking per-PR fidelity gate lives in
+      # tests/test_compression_fidelity_regression.py (runs in the [dev] shard).
+      - name: Information-retention recall report (zero cost, non-blocking)
+        run: |
+          python -c "
+          from headroom.evals.runners.compression_only import CompressionOnlyRunner
+          runner = CompressionOnlyRunner()
+          cases = runner.generate_info_retention_cases(n=50)
+          result = runner.evaluate_information_retention(cases)
+          print(f'Information retention: {result.passed_cases}/{result.total_cases} cases >=0.9 recall, avg compression {result.avg_compression_ratio:.1%}')
+          if not result.passed:
+              print(f'::warning title=Fidelity recall::{result.failed_cases} case(s) fell below 0.9 recall: {result.errors[:3]}')
+          "
+
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v7

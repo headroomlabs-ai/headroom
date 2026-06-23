@@ -1280,3 +1280,119 @@ function _internalDebug(msg) {
         """semantic_analysis is True by default in config."""
         config = CodeCompressorConfig()
         assert config.semantic_analysis is True
+
+
+# =============================================================================
+# Regression: tree-sitter ABI mismatch (real AST must run, no silent fallback)
+# =============================================================================
+
+
+@pytest.mark.skipif(not TREE_SITTER_INSTALLED, reason="tree-sitter grammar pack not installed")
+class TestRealASTRuns:
+    """Guards against the regression where the code-aware compressor silently
+    fell back to a lossy stripper because ``_get_parser`` built a stock
+    ``tree_sitter.Parser`` and assigned it a foreign grammar-pack ``Language``
+    (raising ``TypeError`` that was swallowed into a fallback).
+    """
+
+    def _compressor(self):
+        return CodeAwareCompressor(
+            CodeCompressorConfig(
+                min_tokens_for_compression=10,
+                enable_ccr=False,
+            )
+        )
+
+    def test_get_parser_returns_stock_node_api(self):
+        """The parser must yield nodes with the stock tree_sitter property API
+        that the tree-walking code relies on (``.type``/``.children``/...)."""
+        from headroom.transforms.code_compressor import _get_parser
+
+        parser = _get_parser("python")
+        tree = parser.parse(b"def foo(x):\n    return x + 1\n")
+        root = tree.root_node
+
+        # Property access (NOT method calls) — the old pack binding exposed
+        # methods like ``.kind()`` which would break every call site.
+        assert root.type == "module"
+        assert root.child_count >= 1
+        assert isinstance(root.children, list)
+
+        func = root.children[0]
+        assert func.type == "function_definition"
+        assert isinstance(func.start_byte, int)
+        assert isinstance(func.end_byte, int)
+        # start_point must be index-able like a (row, col) tuple.
+        assert func.start_point[0] == 0
+        assert b"def foo" in func.text
+
+    def test_check_tree_sitter_available_verifies_real_parse(self):
+        """``_check_tree_sitter_available`` must only return True when an actual
+        parse succeeds — not merely when the package imports."""
+        import headroom.transforms.code_compressor as cc
+
+        cc._tree_sitter_available = None  # reset memoized result
+        assert cc._check_tree_sitter_available() is True
+
+    def test_check_tree_sitter_available_false_when_parse_broken(self):
+        """If parsing raises (e.g. the old foreign-Language bug), availability
+        must report False instead of green-lighting the broken path."""
+        import headroom.transforms.code_compressor as cc
+
+        cc._tree_sitter_available = None
+        with patch.object(cc, "_get_parser", side_effect=TypeError("boom")):
+            assert cc._check_tree_sitter_available() is False
+        cc._tree_sitter_available = None  # reset for other tests
+
+    def test_ast_runs_for_python_no_fallback(self):
+        """A supported language must be compressed via real AST, not the
+        UNKNOWN-language Kompress fallback."""
+        result = self._compressor().compress(_payment_processing_code(), language="python")
+
+        # The fallback path forces language=UNKNOWN and syntax_valid=False.
+        # Real AST keeps the detected language and guarantees valid syntax.
+        assert result.language == CodeLanguage.PYTHON
+        assert result.syntax_valid is True
+        compile(result.compressed, "<test>", "exec")
+
+    def test_ast_preserves_structure_for_python(self):
+        """AST output retains signatures/scopes/imports (unlike the old
+        whitespace garble)."""
+        code = (
+            "import math\n"
+            "\n"
+            "def compute(values):\n"
+            "    total = 0\n"
+            "    for v in values:\n"
+            "        total += v * v\n"
+            "        total -= 1\n"
+            "        total *= 2\n"
+            "        total //= 3\n"
+            "    return math.sqrt(total)\n"
+        )
+        result = self._compressor().compress(code, language="python")
+
+        assert result.language == CodeLanguage.PYTHON
+        assert result.syntax_valid is True
+        # Structure markers survive compression.
+        assert "import math" in result.compressed
+        assert "def compute(values):" in result.compressed
+        # Output is still valid Python.
+        compile(result.compressed, "<test>", "exec")
+
+    def test_ast_runs_for_rust_no_fallback(self):
+        """A second supported language (Rust) also runs through real AST."""
+        code = (
+            "pub fn add(a: i64, b: i64) -> i64 {\n"
+            "    let mut acc = a;\n"
+            "    acc += b;\n"
+            "    acc -= 0;\n"
+            "    acc\n"
+            "}\n"
+        )
+        result = self._compressor().compress(code, language="rust")
+
+        assert result.language == CodeLanguage.RUST
+        assert result.syntax_valid is True
+        # Signature is preserved verbatim.
+        assert "pub fn add(a: i64, b: i64) -> i64" in result.compressed

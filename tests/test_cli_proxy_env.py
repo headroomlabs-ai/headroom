@@ -106,6 +106,32 @@ class TestCLIWrapProxyTimeout:
         assert env["GITHUB_COPILOT_API_URL"] == "https://copilot-api.acme.ghe.com"
         assert env["GITHUB_COPILOT_API_TOKEN"] == "copilot-api-token"
 
+    def test_start_proxy_redirects_subprocess_stdio_to_standalone_log(self, monkeypatch, tmp_path):
+        fake_proc = _FakeProxyProcess()
+        captured: dict[str, object] = {}
+        logs: list[str] = []
+
+        monkeypatch.delenv(wrap_mod._WRAP_PROXY_TIMEOUT_ENV, raising=False)
+        monkeypatch.setattr(wrap_mod, "_get_log_path", lambda: tmp_path / "proxy.log")
+        monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: True)
+        monkeypatch.setattr(wrap_mod.time, "sleep", lambda _seconds: None)
+        monkeypatch.setattr(wrap_mod, "_ml_wrap_extras_detected", lambda: False)
+        monkeypatch.setattr(wrap_mod.click, "echo", lambda message: logs.append(str(message)))
+
+        def fake_popen(*args, **kwargs):  # noqa: ANN002, ANN003
+            captured["kwargs"] = kwargs
+            return fake_proc
+
+        monkeypatch.setattr(wrap_mod.subprocess, "Popen", fake_popen)
+
+        proc = wrap_mod._start_proxy(8787, agent_type="codex")
+
+        assert proc is fake_proc
+        assert captured["kwargs"]["stdout"] is captured["kwargs"]["stderr"]
+        assert captured["kwargs"]["stdout"].name == str(tmp_path / "proxy-stdio.log")
+        assert captured["kwargs"]["stdout"].name != str(tmp_path / "proxy.log")
+        assert f"  Logs: {tmp_path / 'proxy.log'}" in logs
+
     def test_env_timeout_allows_slow_start_proxy_to_succeed(self, monkeypatch, tmp_path):
         fake_proc = _FakeProxyProcess()
         sleeps = []
@@ -128,6 +154,30 @@ class TestCLIWrapProxyTimeout:
         assert checks == [8787, 8787, 8787, 8787]
         assert sleeps == [1, 1, 1, 1]
         assert fake_proc.killed is False
+
+    def test_start_proxy_tail_reads_standalone_stdio_log_on_process_exit(
+        self, monkeypatch, tmp_path
+    ):
+        fake_proc = _FakeProxyProcess()
+        fake_proc.returncode = 1
+        fake_proc.poll = lambda: fake_proc.returncode
+
+        monkeypatch.setenv(wrap_mod._WRAP_PROXY_TIMEOUT_ENV, "2")
+        monkeypatch.setattr(wrap_mod, "_get_log_path", lambda: tmp_path / "proxy.log")
+        monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: False)
+        monkeypatch.setattr(wrap_mod.time, "sleep", lambda _seconds: None)
+        monkeypatch.setattr(wrap_mod.subprocess, "Popen", lambda *args, **kwargs: fake_proc)
+
+        (tmp_path / "proxy.log").write_text("canonical runtime log output")
+        (tmp_path / "proxy-stdio.log").write_text("proxy stdio startup output")
+
+        with pytest.raises(RuntimeError) as excinfo:
+            wrap_mod._start_proxy(8787, agent_type="codex")
+
+        message = str(excinfo.value)
+        assert "Proxy exited with code 1" in message
+        assert "proxy stdio startup output" in message
+        assert "canonical runtime log output" not in message
 
     def test_timeout_error_names_configured_timeout_and_env_var(self, monkeypatch, tmp_path):
         fake_proc = _FakeProxyProcess()
@@ -512,6 +562,51 @@ class TestCLIProxyEnvVars:
         assert captured_config["config"].openai_api_url == "http://my-vllm:4000"
         assert captured_config["config"].gemini_api_url == "http://my-gemini:5000"
 
+    @pytest.mark.parametrize("timeout", [-1, 0, 1, 10000])
+    def test_request_timeout_cli_flags(self, runner, timeout):
+        """Fast-fail CLI flags should map into ProxyConfig."""
+        captured_config = {}
+
+        def mock_run_server(config, **kwargs):
+            captured_config["config"] = config
+
+        with patch("headroom.proxy.server.run_server", mock_run_server):
+            result = runner.invoke(
+                main,
+                ["proxy", "--request-timeout-seconds", f"{timeout}"],
+                catch_exceptions=False,
+            )
+
+        assert result.exit_code == 0, result.output
+        assert (
+            captured_config["config"].request_timeout_seconds == timeout
+            if timeout and timeout > 0
+            else 300
+        )
+
+    @pytest.mark.parametrize("timeout", [-1, 0, 1, 10000])
+    def test_request_timeout_from_env(self, runner, timeout):
+        """HEADROOM_REQUEST_TIMEOUT env var should be passed to ProxyConfig."""
+        captured_config = {}
+
+        def mock_run_server(config, **kwargs):
+            captured_config["config"] = config
+
+        with patch("headroom.proxy.server.run_server", mock_run_server):
+            result = runner.invoke(
+                main,
+                ["proxy"],
+                env={"HEADROOM_REQUEST_TIMEOUT": f"{timeout}"},
+                catch_exceptions=False,
+            )
+
+        assert result.exit_code == 0, result.output
+        assert (
+            captured_config["config"].request_timeout_seconds == timeout
+            if timeout and timeout > 0
+            else 300
+        )
+
     def test_retry_and_connect_timeout_cli_flags(self, runner):
         """Fast-fail CLI flags should map into ProxyConfig."""
         captured_config = {}
@@ -565,6 +660,24 @@ class TestCLIProxyEnvVars:
         assert captured["kwargs"]["workers"] == 4
         assert captured["kwargs"]["limit_concurrency"] == 250
         assert captured["kwargs"].get("print_banner") is False
+
+    def test_keepalive_expiry_env_var(self, runner):
+        captured = {}
+
+        def mock_run_server(config, **kwargs):
+            captured["config"] = config
+            captured["kwargs"] = kwargs
+
+        with patch("headroom.proxy.server.run_server", mock_run_server):
+            result = runner.invoke(
+                main,
+                ["proxy"],
+                env={"HEADROOM_KEEPALIVE_EXPIRY": "45"},
+                catch_exceptions=False,
+            )
+
+        assert result.exit_code == 0, result.output
+        assert captured["config"].keepalive_expiry == 45.0
 
     def test_production_scaling_cli_flags_override_env_vars(self, runner):
         captured = {}
@@ -813,6 +926,38 @@ class TestArgparseBackendValidation:
             config = _proxy_config_from_env()
 
         assert config.disable_kompress is True
+
+    def test_proxy_config_from_env_reads_disable_kompress_fallback(self):
+        """The direct server env path should honor HEADROOM_DISABLE_KOMPRESS_FALLBACK."""
+        from headroom.proxy.server import _proxy_config_from_env
+
+        with patch.dict(os.environ, {"HEADROOM_DISABLE_KOMPRESS_FALLBACK": "1"}):
+            config = _proxy_config_from_env()
+
+        assert config.disable_kompress_fallback is True
+
+    def test_argparse_registers_keepalive_expiry_flag(self):
+        """The argparse path (python -m headroom.proxy.server) must register
+        --keepalive-expiry as a float flag, so it can override the
+        HEADROOM_KEEPALIVE_EXPIRY fallback. A bad value makes argparse exit
+        before the server boots, which both proves the flag exists and keeps
+        the test fast.
+        """
+        import subprocess
+        import sys
+
+        result = subprocess.run(
+            [sys.executable, "-m", "headroom.proxy.server", "--keepalive-expiry", "notafloat"],
+            capture_output=True,
+            text=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+
+        assert result.returncode == 2, result.stderr
+        # "invalid float value" only appears if --keepalive-expiry is a registered
+        # float arg; a missing flag would instead say "unrecognized arguments".
+        assert "--keepalive-expiry" in result.stderr
+        assert "invalid float value" in result.stderr
 
 
 class TestCLIProxyExcludeToolsEnvVar:

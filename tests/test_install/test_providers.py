@@ -847,9 +847,7 @@ def test_planner_provider_scope_unsupported_error_excludes_opencode() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_revert_opencode_provider_scope_fallback_on_oserror(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_revert_opencode_provider_scope_fallback_on_oserror(monkeypatch, tmp_path: Path) -> None:
     """revert_opencode_provider_scope falls back to strip when backup copy fails."""
     config_path = tmp_path / "opencode.json"
     backup_path = config_path.with_suffix(".json.headroom-backup")
@@ -860,6 +858,7 @@ def test_revert_opencode_provider_scope_fallback_on_oserror(
         _PROVIDER_MARKER_END,
         _PROVIDER_MARKER_START,
     )
+
     original = '{"model": "openai/gpt-4o"}'
     backup_path.write_text(original)
 
@@ -884,9 +883,7 @@ def test_revert_opencode_provider_scope_fallback_on_oserror(
     monkeypatch.setattr("shutil.copy2", _fail_copy2)
 
     revert_provider_scope(
-        ManagedMutation(
-            target="opencode", kind="json-block", path=str(config_path)
-        ),
+        ManagedMutation(target="opencode", kind="json-block", path=str(config_path)),
         manifest,
     )
 

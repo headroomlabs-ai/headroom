@@ -174,7 +174,74 @@ def test_compress_savings_profile_does_not_mutate_supplied_config(monkeypatch) -
     assert config.min_tokens_to_compress == 999
 
 
-def test_agent_savings_config_mismatches_returns_specific_labels() -> None:
+def test_wrap_agent_savings_profile_is_opt_in(monkeypatch) -> None:
+    monkeypatch.delenv("HEADROOM_SAVINGS_PROFILE", raising=False)
+
+    assert wrap_module._wrap_agent_savings_profile("codex") is None
+
+    monkeypatch.setenv("HEADROOM_SAVINGS_PROFILE", AGENT_90_PROFILE)
+
+    assert wrap_module._wrap_agent_savings_profile("codex") == AGENT_90_PROFILE
+
+
+def test_agent_savings_config_mismatches_requires_explicit_profile(monkeypatch) -> None:
+    monkeypatch.delenv("HEADROOM_SAVINGS_PROFILE", raising=False)
+
+    assert wrap_module._agent_savings_config_mismatches({}, "claude") == []
+
+
+def test_start_proxy_does_not_inject_agent_savings_by_default(monkeypatch, tmp_path) -> None:
+    captured_env: dict[str, str] = {}
+
+    class Proc:
+        returncode = None
+
+        def poll(self) -> None:
+            return None
+
+    def popen(cmd, **kwargs):  # noqa: ANN001
+        captured_env.update(kwargs["env"])
+        return Proc()
+
+    monkeypatch.delenv("HEADROOM_SAVINGS_PROFILE", raising=False)
+    monkeypatch.setattr(wrap_module.subprocess, "Popen", popen)
+    monkeypatch.setattr(wrap_module.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(wrap_module, "_check_proxy", lambda port: True)
+    monkeypatch.setattr(wrap_module, "_get_log_path", lambda: tmp_path / "proxy.log")
+
+    wrap_module._start_proxy(8787, agent_type="codex")
+
+    assert "HEADROOM_SAVINGS_PROFILE" not in captured_env
+    assert "HEADROOM_TARGET_RATIO" not in captured_env
+
+
+def test_start_proxy_injects_explicit_agent_savings_profile(monkeypatch, tmp_path) -> None:
+    captured_env: dict[str, str] = {}
+
+    class Proc:
+        returncode = None
+
+        def poll(self) -> None:
+            return None
+
+    def popen(cmd, **kwargs):  # noqa: ANN001
+        captured_env.update(kwargs["env"])
+        return Proc()
+
+    monkeypatch.setenv("HEADROOM_SAVINGS_PROFILE", AGENT_90_PROFILE)
+    monkeypatch.setattr(wrap_module.subprocess, "Popen", popen)
+    monkeypatch.setattr(wrap_module.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(wrap_module, "_check_proxy", lambda port: True)
+    monkeypatch.setattr(wrap_module, "_get_log_path", lambda: tmp_path / "proxy.log")
+
+    wrap_module._start_proxy(8787, agent_type="codex")
+
+    assert captured_env["HEADROOM_SAVINGS_PROFILE"] == AGENT_90_PROFILE
+    assert captured_env["HEADROOM_TARGET_RATIO"] == "0.10"
+
+
+def test_agent_savings_config_mismatches_returns_specific_labels(monkeypatch) -> None:
+    monkeypatch.setenv("HEADROOM_SAVINGS_PROFILE", AGENT_90_PROFILE)
     profile = get_agent_savings_profile(AGENT_90_PROFILE)
     running_config = {
         "savings_profile": profile.name,
@@ -196,7 +263,8 @@ def test_agent_savings_config_mismatches_ignores_non_target_agents() -> None:
     assert wrap_module._agent_savings_config_mismatches({}, "openhands") == []
 
 
-def test_agent_savings_config_mismatches_accepts_matching_runtime_config() -> None:
+def test_agent_savings_config_mismatches_accepts_matching_runtime_config(monkeypatch) -> None:
+    monkeypatch.setenv("HEADROOM_SAVINGS_PROFILE", AGENT_90_PROFILE)
     profile = get_agent_savings_profile(AGENT_90_PROFILE)
     running_config = {
         "savings_profile": profile.name,
@@ -214,7 +282,8 @@ def test_agent_savings_config_mismatches_accepts_matching_runtime_config() -> No
     assert wrap_module._agent_savings_config_mismatches(running_config, "cursor") == []
 
 
-def test_agent_savings_config_mismatches_reports_unparseable_values() -> None:
+def test_agent_savings_config_mismatches_reports_unparseable_values(monkeypatch) -> None:
+    monkeypatch.setenv("HEADROOM_SAVINGS_PROFILE", AGENT_90_PROFILE)
     running_config = {
         "savings_profile": None,
         "target_ratio": "not-a-float",

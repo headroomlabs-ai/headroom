@@ -6,6 +6,7 @@ from typing import Any
 from headroom.proxy.handlers.openai import (
     OpenAIHandlerMixin,
     _compact_openai_responses_tools,
+    _ensure_responses_store_for_memory_tools,
     _openai_responses_context_budget,
 )
 from headroom.transforms.content_router import (
@@ -435,3 +436,50 @@ def test_content_router_retries_kompress_when_structured_strategy_noops(monkeypa
     assert compressed_tokens == 2
     # The fallback chain must record both strategies it tried.
     assert strategy_chain == ["smart_crusher", "kompress"]
+
+
+def test_responses_memory_tools_store_false_regression() -> None:
+    """Regression: store=false makes previous_response_id continuations fail."""
+
+    payload = {"model": "gpt-5.5", "input": "remember this", "store": False}
+
+    changed = _ensure_responses_store_for_memory_tools(
+        payload,
+        memory_tools_injected=True,
+    )
+
+    assert changed is True
+    assert payload["store"] is True
+
+
+def test_responses_memory_tools_do_not_change_unrelated_requests() -> None:
+    no_memory_payload = {"model": "gpt-5.5", "input": "plain", "store": False}
+    already_stored_payload = {"model": "gpt-5.5", "input": "plain", "store": True}
+    default_store_payload = {"model": "gpt-5.5", "input": "plain"}
+
+    assert (
+        _ensure_responses_store_for_memory_tools(
+            no_memory_payload,
+            memory_tools_injected=False,
+        )
+        is False
+    )
+    assert no_memory_payload["store"] is False
+
+    assert (
+        _ensure_responses_store_for_memory_tools(
+            already_stored_payload,
+            memory_tools_injected=True,
+        )
+        is False
+    )
+    assert already_stored_payload["store"] is True
+
+    assert (
+        _ensure_responses_store_for_memory_tools(
+            default_store_payload,
+            memory_tools_injected=True,
+        )
+        is False
+    )
+    assert "store" not in default_store_payload

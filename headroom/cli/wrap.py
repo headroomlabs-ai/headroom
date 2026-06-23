@@ -143,7 +143,6 @@ _WRAP_PROXY_TIMEOUT_ML_MODULES = ("torch", "sentence_transformers", "spacy")
 _TOOL_SEARCH_ENV = TOOL_SEARCH_ENV
 _TOOL_SEARCH_DEFAULT = TOOL_SEARCH_DEFAULT
 _AGENT_SAVINGS_WRAP_AGENTS = {"claude", "codex", "cursor"}
-_DEFAULT_AGENT_SAVINGS_PROFILE = "agent-90"
 
 
 def _normalize_tool_search_mode(value: str) -> str:
@@ -238,7 +237,7 @@ def _wrap_agent_savings_profile(agent_type: str) -> str | None:
 
     if agent_type not in _AGENT_SAVINGS_WRAP_AGENTS:
         return None
-    return os.environ.get("HEADROOM_SAVINGS_PROFILE") or _DEFAULT_AGENT_SAVINGS_PROFILE
+    return os.environ.get("HEADROOM_SAVINGS_PROFILE") or None
 
 
 def _default_wrap_proxy_timeout_seconds() -> int:
@@ -328,6 +327,11 @@ def _get_log_path() -> Path:
     return log_dir / "proxy.log"
 
 
+def _get_proxy_stdio_log_path() -> Path:
+    """Get path for dedicated proxy stdio capture."""
+    return _get_log_path().with_name("proxy-stdio.log")
+
+
 def _start_proxy(
     port: int,
     *,
@@ -344,9 +348,9 @@ def _start_proxy(
 ) -> subprocess.Popen:
     """Start Headroom proxy as a background subprocess.
 
-    Logs are written to ~/.headroom/logs/proxy.log to avoid pipe buffer
-    deadlocks (macOS pipe buffer is ~64KB — a busy proxy fills it quickly,
-    blocking the process).
+    Stdout and stderr are written to a dedicated sibling file, usually
+    `~/.headroom/logs/proxy-stdio.log`, to avoid pipe deadlock risk without
+    competing with the rotating `proxy.log` runtime log.
     """
     cmd = [sys.executable, "-m", "headroom.cli", "proxy", "--port", str(port)]
 
@@ -388,14 +392,12 @@ def _start_proxy(
 
     timeout_seconds = _resolve_wrap_proxy_timeout_seconds()
     log_path = _get_log_path()
-    log_file = open(log_path, "a")  # noqa: SIM115
+    stdio_log_path = _get_proxy_stdio_log_path()
+    stdio_log_file = open(stdio_log_path, "a")  # noqa: SIM115
 
     # Ensure proxy subprocess uses UTF-8 (Windows defaults to cp1252)
     proxy_env = os.environ.copy()
     proxy_env["PYTHONIOENCODING"] = "utf-8"
-    if agent_type in {"claude", "codex", "cursor"}:
-        apply_agent_savings_env_defaults(proxy_env)
-
     # Tell the proxy which agent is being wrapped (for traffic learning output)
     if agent_type != "unknown":
         proxy_env["HEADROOM_AGENT_TYPE"] = agent_type
@@ -418,8 +420,8 @@ def _start_proxy(
 
     proc = subprocess.Popen(
         cmd,
-        stdout=log_file,
-        stderr=log_file,
+        stdout=stdio_log_file,
+        stderr=stdio_log_file,
         env=proxy_env,
         start_new_session=os.name == "posix",
     )
@@ -431,19 +433,20 @@ def _start_proxy(
         time.sleep(1)
         if _check_proxy(port):
             click.echo(f"  Logs: {log_path}")
+            stdio_log_file.close()
             return proc
         # Check if process died
         if proc.poll() is not None:
-            log_file.close()
+            stdio_log_file.close()
             # Read last few lines of log for error context
             try:
-                tail = log_path.read_text()[-500:]
+                tail = stdio_log_path.read_text()[-500:]
             except Exception:
                 tail = "(no log output)"
             raise RuntimeError(f"Proxy exited with code {proc.returncode}: {tail}")
 
     proc.kill()
-    log_file.close()
+    stdio_log_file.close()
     raise RuntimeError(
         f"Proxy failed to start on port {port} within {timeout_seconds} seconds. "
         f"Set {_WRAP_PROXY_TIMEOUT_ENV} to a larger number of seconds for slow startup."
@@ -623,6 +626,34 @@ def _remove_claude_rtk_hooks(settings_path: Path | None = None) -> bool:
 
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     return True
+
+
+def _foundry_upstream_url(resource: str) -> str:
+    """Derive the Azure AI Foundry endpoint URL from a resource name.
+
+    When CLAUDE_CODE_USE_FOUNDRY=1 is set, Claude Code routes requests to the
+    Azure AI Services endpoint it constructs from ANTHROPIC_FOUNDRY_RESOURCE.
+    If ANTHROPIC_FOUNDRY_BASE_URL is not already set in the environment,
+    we derive it here so the proxy knows where to forward compressed requests.
+
+    Azure AI Foundry (AI Services) hosts the Anthropic-format Claude API at:
+      https://{resource}.services.ai.azure.com/anthropic
+    This matches the URL Claude Code constructs internally from ANTHROPIC_FOUNDRY_RESOURCE,
+    and what ANTHROPIC_FOUNDRY_BASE_URL must point to for the Anthropic SDK to reach Claude.
+    """
+    return f"https://{resource.strip()}.services.ai.azure.com/anthropic"
+
+
+def _foundry_proxy_url(proxy_url: str) -> str:
+    """Return the local proxy URL that Claude Code should use in Foundry mode.
+
+    ANTHROPIC_FOUNDRY_BASE_URL is the full base URL the Anthropic SDK appends
+    /v1/messages to, so it must include the /anthropic path component to match
+    the Azure AI Foundry endpoint structure.  _claude_proxy_base_url() returns
+    the bare http://127.0.0.1:<port> — this helper appends /anthropic so the
+    proxy URL Claude Code receives mirrors the real Foundry URL shape.
+    """
+    return proxy_url.rstrip("/") + "/anthropic"
 
 
 def _write_claude_wrap_base_url(
@@ -1632,6 +1663,34 @@ def _inject_rtk_instructions(file_path: Path, verbose: bool = False) -> bool:
     return True
 
 
+def _remove_rtk_instructions(file_path: Path) -> bool:
+    """Remove Headroom's marker-fenced rtk guidance from an instruction file."""
+    if not file_path.exists():
+        return False
+
+    content = file_path.read_text(encoding="utf-8")
+    end_marker = "<!-- /headroom:rtk-instructions -->"
+    start = content.find(_RTK_MARKER)
+    if start < 0:
+        return False
+
+    end = content.find(end_marker, start)
+    if end < 0:
+        return False
+    end += len(end_marker)
+    prefix = content[:start].rstrip()
+    suffix = content[end:].lstrip("\r\n")
+    cleaned = "\n\n".join(part for part in (prefix, suffix) if part)
+    if cleaned:
+        cleaned = cleaned.rstrip() + "\n"
+
+    if cleaned:
+        file_path.write_text(cleaned, encoding="utf-8")
+    else:
+        file_path.unlink()
+    return True
+
+
 def _inject_memory_mcp_config(db_path: str, user_id: str) -> None:
     """Register headroom memory as an MCP server in Codex's config.toml.
 
@@ -1899,6 +1958,9 @@ def _agent_savings_config_mismatches(
     """Return restart reasons when a running proxy lacks target agent savings."""
 
     if agent_type not in _AGENT_SAVINGS_TARGET_AGENTS:
+        return []
+
+    if _wrap_agent_savings_profile(agent_type) is None:
         return []
 
     desired_env = os.environ.copy()
@@ -2471,6 +2533,7 @@ def _ensure_proxy(
                 ),
             )
             click.echo(f"  Proxy ready on http://127.0.0.1:{port}")
+            click.echo(f"  Dashboard:    http://127.0.0.1:{port}/dashboard")
             return proc
         except RuntimeError as e:
             click.echo(f"  Error: {e}")
@@ -3110,9 +3173,16 @@ def claude(
 
         # Detect Foundry mode: Claude Code uses ANTHROPIC_FOUNDRY_BASE_URL instead of
         # ANTHROPIC_BASE_URL when CLAUDE_CODE_USE_FOUNDRY=1 is set.
+        # Users typically set ANTHROPIC_FOUNDRY_RESOURCE (the resource name) rather
+        # than the full ANTHROPIC_FOUNDRY_BASE_URL.  When the URL is absent we derive
+        # it from the resource name so the proxy has an upstream to forward to.
         foundry_upstream = None
         if os.environ.get("CLAUDE_CODE_USE_FOUNDRY"):
             foundry_upstream = os.environ.get("ANTHROPIC_FOUNDRY_BASE_URL")
+            if not foundry_upstream:
+                resource = os.environ.get("ANTHROPIC_FOUNDRY_RESOURCE", "").strip()
+                if resource:
+                    foundry_upstream = _foundry_upstream_url(resource)
 
         # Detect Vertex mode: with CLAUDE_CODE_USE_VERTEX=1, Claude Code IGNORES
         # ANTHROPIC_BASE_URL and authenticates to Google Vertex with GCP ADC. The
@@ -3176,7 +3246,7 @@ def claude(
             )
         elif foundry_upstream:
             click.echo(
-                f"  Foundry mode: ANTHROPIC_FOUNDRY_BASE_URL={proxy_url} → upstream {foundry_upstream}"
+                f"  Foundry mode: ANTHROPIC_FOUNDRY_BASE_URL={_foundry_proxy_url(proxy_url)} → upstream {foundry_upstream}"
             )
         else:
             click.echo(f"  ANTHROPIC_BASE_URL={proxy_url}")
@@ -3192,7 +3262,10 @@ def claude(
             # we only redirect its Vertex endpoint to Headroom.
             env["ANTHROPIC_VERTEX_BASE_URL"] = proxy_url
         elif foundry_upstream:
-            env["ANTHROPIC_FOUNDRY_BASE_URL"] = proxy_url
+            # ANTHROPIC_FOUNDRY_BASE_URL is the base URL the Anthropic SDK
+            # appends /v1/messages to.  The real Foundry URL includes /anthropic,
+            # so the proxy URL must mirror that structure.
+            env["ANTHROPIC_FOUNDRY_BASE_URL"] = _foundry_proxy_url(proxy_url)
         else:
             env["ANTHROPIC_BASE_URL"] = proxy_url
 
@@ -3201,7 +3274,8 @@ def claude(
         # daemon's environment) also route through Headroom.
         _settings_foundry[0] = bool(foundry_upstream)
         _saved_base_url[0] = _write_claude_wrap_base_url(
-            proxy_url, foundry_mode=_settings_foundry[0]
+            _foundry_proxy_url(proxy_url) if _settings_foundry[0] else proxy_url,
+            foundry_mode=_settings_foundry[0],
         )
 
         # Per-project savings attribution: tag every request with the launch
@@ -3584,6 +3658,26 @@ def copilot(
         openai_api_url=openai_api_url,
         copilot_api_token=copilot_proxy_token,
     )
+
+
+# =============================================================================
+# GitHub Copilot CLI (unwrap)
+# =============================================================================
+
+
+@unwrap.command("copilot")
+@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option("--no-stop-proxy", is_flag=True, help="Do not stop the local Headroom proxy")
+def unwrap_copilot(port: int, no_stop_proxy: bool) -> None:
+    """Undo durable setup from ``headroom wrap copilot``."""
+    instructions = Path.cwd() / ".github" / "copilot-instructions.md"
+    if _remove_rtk_instructions(instructions):
+        click.echo("  Removed Headroom rtk instructions from Copilot.")
+    else:
+        click.echo("  No Headroom rtk instructions found for Copilot.")
+
+    if not no_stop_proxy:
+        _echo_unwrap_proxy_stop_status(_stop_local_proxy_for_unwrap(port), port)
 
 
 # =============================================================================
