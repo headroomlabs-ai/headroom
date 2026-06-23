@@ -1624,6 +1624,17 @@ fn compress_openai_responses_live_zone(
 
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Bridge Rust diagnostics into Python's `logging`. headroom-core emits
+    // `tracing` events (e.g. magika init timeout warnings), but a cdylib has
+    // no tracing subscriber, so they were silently dropped. The workspace
+    // `tracing` dep now enables the `log` compat feature — events become
+    // `log` records when no subscriber is active — and pyo3-log forwards
+    // those to Python loggers (named like
+    // `headroom_core.transforms.magika_detector`), which is what lands in
+    // the proxy's log file. `try_init` because the global logger may
+    // legitimately already be set (re-import, embedders).
+    let _ = pyo3_log::try_init();
+
     m.add_function(wrap_pyfunction!(hello, m)?)?;
     m.add_class::<PyDiffCompressorConfig>()?;
     m.add_class::<PyDiffCompressionResult>()?;
