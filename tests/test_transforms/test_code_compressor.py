@@ -19,6 +19,9 @@ from headroom.transforms.code_compressor import (
     CodeCompressorConfig,
     CodeLanguage,
     DocstringMode,
+    _get_node_text,
+    _get_parser,
+    _slice_code_bytes,
     detect_language,
     is_tree_sitter_available,
     is_tree_sitter_loaded,
@@ -1396,3 +1399,33 @@ class TestRealASTRuns:
         assert result.syntax_valid is True
         # Signature is preserved verbatim.
         assert "pub fn add(a: i64, b: i64) -> i64" in result.compressed
+
+
+@pytest.mark.skipif(not TREE_SITTER_INSTALLED, reason="tree-sitter-languages not installed")
+class TestNonAsciiByteOffsets:
+    """Regression for #1319: tree-sitter reports UTF-8 *byte* offsets, but the
+    compressor indexed them into the code-point-indexed ``str``, so any non-ASCII
+    (CJK/emoji) character earlier in the file shifted every later slice and cut
+    nodes mid-token (e.g. ``import os`` -> ``port os`` / dropped)."""
+
+    def test_slice_code_bytes_uses_byte_offsets(self):
+        code = "中文xy"  # 中, 文 are 3 bytes each in UTF-8
+        # bytes 6..8 are "xy"; code-point slice [6:8] would be out of range / wrong
+        assert _slice_code_bytes(code, 6, 8) == "xy"
+
+    def test_get_node_text_for_node_after_non_ascii(self):
+        code = 'def first():\n    """中文占位"""\n    return 1\n\ndef second():\n    return 2\n'
+        root = _get_parser("python").parse(bytes(code, "utf-8")).root_node
+        funcs = [n for n in root.children if n.type == "function_definition"]
+        # The second function follows a multi-byte docstring; its slice must not
+        # be shifted by the byte/char drift.
+        assert _get_node_text(funcs[1], code) == "def second():\n    return 2"
+
+    def test_imports_after_cjk_module_docstring_not_corrupted(self):
+        code = '"""模块中文中文中文 占位."""\nimport os\nimport sys\n'
+        root = _get_parser("python").parse(bytes(code, "utf-8")).root_node
+        imports = [
+            n for n in root.children if n.type in ("import_statement", "import_from_statement")
+        ]
+        assert _get_node_text(imports[0], code) == "import os"
+        assert _get_node_text(imports[1], code) == "import sys"

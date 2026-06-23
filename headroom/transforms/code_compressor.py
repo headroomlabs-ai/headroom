@@ -851,7 +851,7 @@ class CodeAwareCompressor(Transform):
         body_line_counts: dict[str, int] = {}
         for qname, node in definitions.items():
             collect_calls_in_function(node, qname)
-            node_text = code[node.start_byte : node.end_byte]
+            node_text = _get_node_text(node, code)
             body_line_counts[qname] = max(1, len(node_text.split("\n")) - 2)
 
         # Reference counts: subtract definition occurrences
@@ -1257,8 +1257,8 @@ class CodeAwareCompressor(Transform):
                             child, code, language, lang_config, body_limits, analysis
                         )
                         # Reconstruct export with compressed inner definition
-                        export_prefix = code[node.start_byte : child.start_byte]
-                        export_suffix = code[child.end_byte : node.end_byte]
+                        export_prefix = _slice_code_bytes(code, node.start_byte, child.start_byte)
+                        export_suffix = _slice_code_bytes(code, child.end_byte, node.end_byte)
                         structure.function_signatures.append(
                             export_prefix + compressed + export_suffix
                         )
@@ -1568,7 +1568,7 @@ class CodeAwareCompressor(Transform):
         if signature_lines:
             result_parts.extend(signature_lines)
         else:
-            sig_text = code[node.start_byte : body_node.start_byte].rstrip()
+            sig_text = _slice_code_bytes(code, node.start_byte, body_node.start_byte).rstrip()
             result_parts.append(sig_text)
 
         if opening_brace_line is not None:
@@ -1977,9 +1977,20 @@ class CodeAwareCompressor(Transform):
 # =========================================================================
 
 
+def _slice_code_bytes(code: str, start_byte: int, end_byte: int) -> str:
+    """Slice source by tree-sitter UTF-8 *byte* offsets.
+
+    tree-sitter reports node positions as UTF-8 byte offsets, but a Python
+    ``str`` is indexed by code point, so ``code[start_byte:end_byte]`` cuts
+    non-ASCII (CJK/emoji) source mid-token once a multi-byte character appears
+    earlier in the file. Index the encoded bytes instead.
+    """
+    return code.encode("utf-8")[start_byte:end_byte].decode("utf-8")
+
+
 def _get_node_text(node: Any, code: str) -> str:
-    """Extract text from AST node."""
-    return code[node.start_byte : node.end_byte]
+    """Extract text from an AST node, honoring UTF-8 byte offsets."""
+    return _slice_code_bytes(code, node.start_byte, node.end_byte)
 
 
 def _get_definition_name(node: Any) -> str | None:
