@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import sys
 from pathlib import Path
@@ -123,10 +124,9 @@ def openclaw_config_path() -> Path:
 def opencode_config_path() -> Path:
     """Return the OpenCode config path.
 
-    Respects ``$OPENCODE_CONFIG`` if set, otherwise returns
-    ``~/.config/opencode/opencode.json``.
+    Resolves ``~/.config/opencode/opencode.json`` when ``OPENCODE_CONFIG``
+    is unset; otherwise the value of that environment variable.
     """
-    import os
 
     env_path = os.environ.get("OPENCODE_CONFIG", "").strip()
     if env_path:

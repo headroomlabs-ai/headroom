@@ -23,7 +23,16 @@ import {
 import { normalizeAndValidateProxyUrl } from "../proxy-manager.js";
 import { createHeadroomRetrieveTool } from "../tools/headroom-retrieve.js";
 
-export default function headroomPlugin(api: any) {
+/**
+ * OpenClaw 2026.x plugin API requires a `{ register(api) }` object export.
+ * The previous bare-function default export was silently skipped by the loader.
+ * See: https://github.com/chopratejas/headroom/issues/XXX
+ */
+export default {
+  register: headroomPlugin,
+};
+
+function headroomPlugin(api: any) {
   const config = api.config?.plugins?.entries?.headroom?.config ?? {};
   const logger = api.logger ?? console;
   const rawProxyUrl = config.proxyUrl;

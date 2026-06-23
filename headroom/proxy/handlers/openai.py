@@ -790,7 +790,7 @@ class OpenAIHandlerMixin:
         # mirroring ContentRouter's policy. exclude_tools already contains both
         # original and lowercased name variants (see _parse_exclude_tools), but
         # we also test the lowercased name defensively for case-insensitivity.
-        from headroom.config import DEFAULT_EXCLUDE_TOOLS
+        from headroom.config import DEFAULT_EXCLUDE_TOOLS, is_tool_excluded
 
         router_exclude_tools = getattr(router.config, "exclude_tools", None)
         effective_exclude_tools = (
@@ -799,7 +799,7 @@ class OpenAIHandlerMixin:
         excluded_call_ids: set[str] = {
             call_id
             for call_id, fn_name in function_name_by_call_id.items()
-            if fn_name in effective_exclude_tools or fn_name.lower() in effective_exclude_tools
+            if is_tool_excluded(fn_name, effective_exclude_tools)
         }
 
         timing_sink: dict[str, float] = timing if timing is not None else {}

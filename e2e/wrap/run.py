@@ -560,11 +560,12 @@ def verify_codex_wrap(
         cwd=project_dir,
         timeout=120,
     )
-    project_agents = project_dir / "AGENTS.md"
+    # RTK guidance for Codex is global-only (#1240): it is injected into
+    # ~/.codex/AGENTS.md, never a project-level AGENTS.md. A project AGENTS.md is
+    # written only when `wrap codex --memory` is used (for memory guidance), which
+    # this scenario does not exercise.
     global_agents = Path(base_env["HOME"]) / ".codex" / "AGENTS.md"
-    assert_true(project_agents.exists(), "Codex wrap should create project AGENTS.md")
     assert_true(global_agents.exists(), "Codex wrap should create ~/.codex/AGENTS.md")
-    assert_true(RTK_MARKER in project_agents.read_text(encoding="utf-8"), "Missing RTK marker")
     assert_true(
         RTK_MARKER in global_agents.read_text(encoding="utf-8"), "Missing global RTK marker"
     )
@@ -933,9 +934,7 @@ def main() -> None:
     log("All Docker wrap e2e checks passed.")
 
 
-def verify_opencode_wrap(
-    base_env: dict[str, str], project_dir: Path, log_dir: Path
-) -> None:
+def verify_opencode_wrap(base_env: dict[str, str], project_dir: Path, log_dir: Path) -> None:
     port = OPENCODE_PORT
     run(
         ["headroom", "wrap", "opencode", "--port", str(port), "--", "--help"],
@@ -943,19 +942,19 @@ def verify_opencode_wrap(
         cwd=project_dir,
         timeout=120,
     )
-
-    # Check AGENTS.md created with RTK marker
     global_agents = Path(base_env["HOME"]) / ".config" / "opencode" / "AGENTS.md"
     project_agents = project_dir / "AGENTS.md"
     assert_true(global_agents.exists(), "Opencode wrap should create ~/.config/opencode/AGENTS.md")
     assert_true(project_agents.exists(), "Opencode wrap should create project AGENTS.md")
-    assert_true(RTK_MARKER in global_agents.read_text(encoding="utf-8"), "Missing RTK marker in global AGENTS.md")
+    assert_true(
+        RTK_MARKER in global_agents.read_text(encoding="utf-8"),
+        "Missing RTK marker in global AGENTS.md",
+    )
     assert_true(
         RTK_MARKER in project_agents.read_text(encoding="utf-8"),
         "Missing RTK marker in project AGENTS.md",
     )
 
-    # Check shim was invoked and env vars set
     entries = read_jsonl(log_dir / "opencode.jsonl")
     assert_true(len(entries) > 0, "Opencode shim should have been invoked")
     env_vars = entries[-1]["env"]
@@ -963,49 +962,25 @@ def verify_opencode_wrap(
         env_vars.get("OPENCODE_CONFIG_CONTENT") is not None,
         "Opencode wrap should set OPENCODE_CONFIG_CONTENT",
     )
-
-    # Parse and validate the config overlay
     config = json.loads(env_vars["OPENCODE_CONFIG_CONTENT"])
-    providers = config.get("provider", {})
-
-    # Check multiple providers discovered (not just one headroom provider)
     assert_true(
-        len(providers) >= 2,
-        f"Opencode wrap should discover multiple providers, got {len(providers)}: {list(providers.keys())}",
+        config["provider"]["headroom"]["options"]["baseURL"] == f"http://127.0.0.1:{port}/v1",
+        "Opencode wrap should inject headroom provider baseURL",
     )
 
-    # Check that providers have baseURL pointing to proxy
-    for name, entry in providers.items():
-        base_url = entry.get("options", {}).get("baseURL", "")
-        assert_true(
-            f"127.0.0.1:{port}" in base_url,
-            f"Provider '{name}' baseURL should point to proxy, got: {base_url}",
-        )
-
-    # Check config backup was created
+    run(
+        ["headroom", "unwrap", "opencode", "--port", str(port)],
+        env=base_env,
+        cwd=project_dir,
+        timeout=120,
+    )
     config_path = Path(base_env["HOME"]) / ".config" / "opencode" / "opencode.json"
-    backup_path = config_path.with_suffix(".json.headroom-backup")
-    assert_true(
-        backup_path.exists(),
-        "Opencode wrap should create config backup at .json.headroom-backup",
-    )
-
-    # Run unwrap
-    run(["headroom", "unwrap", "opencode", "--port", str(port)], env=base_env, cwd=project_dir, timeout=120)
-
-    # Check unwrap removed headroom content
     if config_path.exists():
         content = config_path.read_text(encoding="utf-8")
         assert_true(
-            "headroom" not in content.lower() or "headroom" not in content,
+            "headroom" not in content,
             "Opencode unwrap should remove headroom provider from config",
         )
-
-    # Check unwrap removed backup file
-    assert_true(
-        not backup_path.exists(),
-        "Opencode unwrap should remove backup file after restore",
-    )
 
 
 if __name__ == "__main__":

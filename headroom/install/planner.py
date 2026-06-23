@@ -21,8 +21,13 @@ from .models import (
 from .paths import validate_profile_name
 
 SUPPORTED_TARGETS = [
-    ToolTarget.CLAUDE, ToolTarget.COPILOT, ToolTarget.CODEX,
-    ToolTarget.AIDER, ToolTarget.CURSOR, ToolTarget.OPENCLAW, ToolTarget.OPENCODE
+    ToolTarget.CLAUDE,
+    ToolTarget.COPILOT,
+    ToolTarget.CODEX,
+    ToolTarget.AIDER,
+    ToolTarget.CURSOR,
+    ToolTarget.OPENCLAW,
+    ToolTarget.OPENCODE,
 ]
 PROVIDER_SCOPE_TARGETS = [
     ToolTarget.CLAUDE,
