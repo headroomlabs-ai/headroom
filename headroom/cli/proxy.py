@@ -1273,9 +1273,13 @@ Press Ctrl+C to stop.
 
         import asyncio as _asyncio
 
-        from headroom.memory.adapters.watchdog import EmbeddingServerWatchdog
-
         async def _start_embed_watchdog() -> Any:
+            # Import lazily inside the guarded coroutine. The sidecar module is
+            # optional and may be absent; keeping the import here lets the
+            # try/except below fall back to the per-worker embedder instead of
+            # crashing the proxy at startup with ModuleNotFoundError.
+            from headroom.memory.adapters.watchdog import EmbeddingServerWatchdog
+
             wd = EmbeddingServerWatchdog(socket_path=_embed_socket)
             await wd.start()
             ok = await wd.wait_until_healthy(timeout=30.0)

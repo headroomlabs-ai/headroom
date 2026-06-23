@@ -53,6 +53,39 @@ curl https://api.openai.com/v1/models \
   -H "Authorization: Bearer $OPENAI_API_KEY"
 ```
 
+### Windows: ML content detection hangs or silently falls back
+
+**Symptom**: On Windows 11 24H2+, every proxied request stalls (historically
+`Optimization failed: TimeoutError`), or the first detection in each process
+burns ~5 seconds and compression quality drops because detection runs on the
+non-ML fallback tiers. The proxy log may show
+`magika ONNX session init timed out`.
+
+**Cause**: The Rust core loads ONNX Runtime dynamically. Without
+`ORT_DYLIB_PATH`, the bare Windows DLL search resolves `onnxruntime.dll` to
+`C:\Windows\System32\onnxruntime.dll` — the Windows ML OS component (1.17.x),
+which deadlocks ort session initialization instead of returning an error.
+
+**Fix**: Headroom pins `ORT_DYLIB_PATH` automatically at import time to the
+DLL inside the `onnxruntime` pip package (included in `headroom-ai[proxy]`).
+Confirm in the startup log:
+
+```
+Pinned ORT_DYLIB_PATH to bundled ONNX Runtime: ...\onnxruntime\capi\onnxruntime.dll
+```
+
+If the pin is skipped (library install without `onnxruntime`), either install
+it or point the variable at any modern ONNX Runtime yourself:
+
+```powershell
+pip install onnxruntime
+# or
+$env:ORT_DYLIB_PATH = "C:\path\to\onnxruntime.dll"
+```
+
+`HEADROOM_MAGIKA_INIT_TIMEOUT_SECS` (default `5`) bounds the init as a safety
+net; on timeout detection degrades to non-ML tiers for the process lifetime.
+
 ## No Token Savings
 
 **Symptom**: `stats['session']['tokens_saved_total']` is 0.
