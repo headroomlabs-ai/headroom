@@ -16,9 +16,8 @@ emit `message_start` with real `input_tokens` / cache token fields.
 
 from __future__ import annotations
 
-import asyncio
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -27,7 +26,6 @@ from tests._dotenv import importorskip_no_env_leak
 importorskip_no_env_leak("litellm")
 
 from headroom.backends.litellm import LiteLLMBackend  # noqa: E402
-
 
 # ---------------------------------------------------------------------------
 # Helpers
