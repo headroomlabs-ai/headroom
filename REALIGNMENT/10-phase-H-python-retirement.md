@@ -125,8 +125,8 @@ The Rust proxy therefore serves, served by default:
   (`include_str!`) so no separate file ships.
 
 **Transitional source-of-truth.** Until the remaining Python-only stat sources
-(`copilot_quota`, `subscription_window`, `codex_rate_limits`, `context_tool`)
-are ported, `observability/stats.rs` exposes an optional *supplemental sources*
+(`copilot_quota`, `subscription_window`, `codex_rate_limits`, `context_tool`,
+`cli_filtering`) are ported, `observability/stats.rs` exposes an optional *supplemental sources*
 seam that fetches those blocks from the still-running Python integration and
 folds them into `/stats`, so the Rust dashboard is the single source of truth
 from day one. Each block's seam is removed as that source is ported to Rust.
