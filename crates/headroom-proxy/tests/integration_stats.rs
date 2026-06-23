@@ -511,3 +511,46 @@ async fn stats_exposes_recent_requests_feed() {
 
     proxy.shutdown().await;
 }
+
+#[tokio::test]
+async fn background_flusher_persists_off_the_request_path() {
+    // End-to-end proof of the off-hot-path design: `record` writes nothing, and
+    // the background flusher (spawned with a short interval here) does the disk
+    // I/O on the blocking pool. Guards against reintroducing synchronous
+    // request-path persistence.
+    use headroom_proxy::observability::stats::{
+        load_state, RequestOutcome, SavingsStore, StoreConfig,
+    };
+    use std::sync::Arc;
+
+    let dir = std::env::temp_dir().join(format!("hr-bgflush-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("s.json");
+
+    let store = Arc::new(SavingsStore::with_path(&path, StoreConfig::default()));
+    headroom_proxy::spawn_savings_flusher(store.clone(), std::time::Duration::from_millis(40));
+
+    // record() only marks dirty — the file does not exist yet.
+    store.record(
+        &RequestOutcome {
+            provider: "anthropic".to_string(),
+            model: "claude-haiku-4-5".to_string(),
+            tokens_before: 100,
+            tokens_after: 50,
+            ..Default::default()
+        },
+        std::time::SystemTime::now(),
+    );
+    assert!(!path.exists(), "record must not write on the request path");
+
+    // The background flusher persists it within a couple of intervals.
+    for _ in 0..50 {
+        if path.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(load_state(&path).lifetime.requests, 1);
+
+    std::fs::remove_dir_all(&dir).ok();
+}

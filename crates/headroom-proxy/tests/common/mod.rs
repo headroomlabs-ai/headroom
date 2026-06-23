@@ -15,6 +15,9 @@ pub struct ProxyHandle {
     pub addr: SocketAddr,
     pub shutdown: Option<oneshot::Sender<()>>,
     pub task: tokio::task::JoinHandle<()>,
+    /// Mirrors production: persistence is off the request path, so the final
+    /// write happens on shutdown. Held so `shutdown()` can flush.
+    pub savings: std::sync::Arc<headroom_proxy::observability::stats::SavingsStore>,
 }
 
 #[allow(dead_code)]
@@ -30,6 +33,12 @@ impl ProxyHandle {
             let _ = tx.send(());
         }
         let _ = self.task.await;
+        // Same as production's shutdown hook: persist whatever the request path
+        // marked dirty (record never writes to disk itself).
+        let savings = self.savings.clone();
+        tokio::task::spawn_blocking(move || savings.flush())
+            .await
+            .ok();
     }
 }
 
@@ -70,6 +79,7 @@ where
     customize(&mut config);
     let state = AppState::new(config.clone()).expect("app state");
     let state = customize_state(state);
+    let savings = state.savings.clone();
     let app = build_app(state).into_make_service_with_connect_info::<SocketAddr>();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -89,6 +99,7 @@ where
         addr,
         shutdown: Some(tx),
         task,
+        savings,
     }
 }
 

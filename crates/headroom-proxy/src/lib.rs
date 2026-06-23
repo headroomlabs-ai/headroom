@@ -26,4 +26,4 @@ pub mod websocket;
 
 pub use config::Config;
 pub use error::ProxyError;
-pub use proxy::{build_app, AppState};
+pub use proxy::{build_app, spawn_savings_flusher, AppState};

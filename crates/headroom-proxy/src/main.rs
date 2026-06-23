@@ -73,6 +73,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     }
 
+    // Phase H: persistence runs off the request path. `record` only marks the
+    // savings store dirty; this background task does the disk I/O on an interval
+    // (on the blocking pool), and we flush once more on shutdown below.
+    let savings = state.savings.clone();
+    headroom_proxy::spawn_savings_flusher(savings.clone(), std::time::Duration::from_secs(2));
+
     let app = build_app(state).into_make_service_with_connect_info::<SocketAddr>();
 
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
@@ -89,6 +95,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             tokio::time::sleep(grace).await;
         })
         .await?;
+
+    // Final durable flush after the server stops, so the last sub-interval of
+    // recorded savings is not lost on a clean shutdown.
+    tokio::task::spawn_blocking(move || savings.flush())
+        .await
+        .ok();
 
     Ok(())
 }

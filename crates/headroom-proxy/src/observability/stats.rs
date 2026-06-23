@@ -29,7 +29,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
@@ -429,14 +429,15 @@ pub struct SavingsStore {
     state: Mutex<SavingsState>,
     path: Option<PathBuf>,
     cfg: StoreConfig,
-    /// Epoch-millis of the last disk persist, for debouncing (see `record`).
-    last_persist_ms: AtomicU64,
+    /// Set by `record` when state changes, cleared by `flush`. Lets the request
+    /// path mark "needs persisting" without ever touching disk — a background
+    /// flusher (see `proxy::AppState::new`) and the shutdown hook do the I/O.
+    dirty: AtomicBool,
+    /// Serializes `flush` so the background flusher and the shutdown flush never
+    /// write the shared temp file concurrently. Distinct from `state` so it is
+    /// never held across the request path — `record` does not take it.
+    flush_lock: Mutex<()>,
 }
-
-/// Minimum gap between disk persists. The recorder runs on every request, so an
-/// unconditional full-state write here would thrash disk and block the runtime
-/// under load. Stats tolerate losing the last sub-window on a crash.
-const PERSIST_MIN_INTERVAL_MS: u64 = 2000;
 
 impl SavingsStore {
     /// Create a store with no persistence (in-memory only).
@@ -445,7 +446,8 @@ impl SavingsStore {
             state: Mutex::new(SavingsState::default()),
             path: None,
             cfg: StoreConfig::default(),
-            last_persist_ms: AtomicU64::new(0),
+            dirty: AtomicBool::new(false),
+            flush_lock: Mutex::new(()),
         }
     }
 
@@ -457,31 +459,51 @@ impl SavingsStore {
             state: Mutex::new(state),
             path: Some(path),
             cfg,
-            last_persist_ms: AtomicU64::new(0),
+            dirty: AtomicBool::new(false),
+            flush_lock: Mutex::new(()),
         }
     }
 
-    /// Record one outcome and persist (best-effort). `now` is injected so tests
-    /// stay deterministic; production passes `SystemTime::now()`.
+    /// Record one outcome. `now` is injected so tests stay deterministic;
+    /// production passes `SystemTime::now()`.
+    ///
+    /// This runs on the request path, so it does **no disk I/O** — it updates
+    /// in-memory state and marks the store dirty. Persistence happens off the
+    /// async request worker via [`SavingsStore::flush`], driven by a background
+    /// interval task and the shutdown hook (see `proxy::AppState::new`).
     pub fn record(&self, outcome: &RequestOutcome, now: SystemTime) {
         {
             let mut state = self.state.lock().expect("savings store mutex poisoned");
             state.record(outcome, now, &self.cfg);
         }
-        // Debounced persist: at most one disk write per PERSIST_MIN_INTERVAL_MS.
-        // Debounce on the injected `now` so it's deterministic under test. First
-        // write is immediate (last starts at 0). ponytail: a load/store race can
-        // double-write at an interval boundary under heavy concurrency — bounded,
-        // far from per-request, not worth a CAS.
-        let now_ms = now
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        let since_last_persist =
-            now_ms.saturating_sub(self.last_persist_ms.load(Ordering::Relaxed));
-        if since_last_persist >= PERSIST_MIN_INTERVAL_MS {
-            self.last_persist_ms.store(now_ms, Ordering::Relaxed);
-            self.persist();
+        self.dirty.store(true, Ordering::Release);
+    }
+
+    /// Whether this store persists to disk (`--savings-path` was set). Used to
+    /// decide whether to spawn the background flusher.
+    pub fn is_persistent(&self) -> bool {
+        self.path.is_some()
+    }
+
+    /// Write pending state to disk when something changed since the last flush.
+    ///
+    /// Performs blocking filesystem I/O, so it must be called from a blocking
+    /// context (the background flusher's `spawn_blocking`, or the shutdown hook)
+    /// — never directly from an async request handler. A no-op when nothing is
+    /// dirty or the store is in-memory.
+    pub fn flush(&self) {
+        // Serialize concurrent flushers (background interval vs. shutdown hook)
+        // so they never write the shared temp file at the same time.
+        let _guard = self
+            .flush_lock
+            .lock()
+            .expect("savings flush mutex poisoned");
+        // Clear dirty up front so a `record` concurrent with the write re-arms
+        // it (its update lands in the next flush). If the write itself fails,
+        // re-arm so a transient I/O error is retried by the next flush rather
+        // than silently dropping the accumulated state until new traffic.
+        if self.dirty.swap(false, Ordering::AcqRel) && !self.persist() {
+            self.dirty.store(true, Ordering::Release);
         }
     }
 
@@ -511,12 +533,15 @@ impl SavingsStore {
         build_history_json(&state)
     }
 
-    fn persist(&self) {
+    /// Snapshot and write to disk. Returns `true` on success (or when there is
+    /// no path to persist to); `false` if the write failed, so `flush` can
+    /// re-arm the dirty flag and retry.
+    fn persist(&self) -> bool {
         let Some(path) = self.path.as_ref() else {
-            return;
+            return true;
         };
         let state = self.snapshot();
-        let _ = save_state(path, &state);
+        save_state(path, &state).is_ok()
     }
 }
 
@@ -557,13 +582,17 @@ fn ensure_parent_dir(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Persist state atomically: write a sibling temp file, fsync, then rename over
-/// the target so a crash mid-write never truncates the live file.
+/// Persist state atomically: write a sibling temp file, fsync it (best-effort),
+/// then rename over the target so a crash mid-write never truncates the live
+/// file. The fsync forces the temp contents to disk (not just the page cache)
+/// before the rename; a sync failure is non-fatal and still proceeds to the
+/// atomic rename.
 pub fn save_state(path: &Path, state: &SavingsState) -> std::io::Result<()> {
     ensure_parent_dir(path)?;
     let json = serialize_state(state);
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, &json)?;
+    let _ = std::fs::File::open(&tmp).and_then(|f| f.sync_all());
     std::fs::rename(&tmp, path)?;
     Ok(())
 }
@@ -1101,6 +1130,9 @@ mod tests {
         {
             let store = SavingsStore::with_path(&path, cfg.clone());
             store.record(&outcome("anthropic", "claude", 1000, 400), at(T0));
+            // Persistence is off the request path now — flush explicitly (in
+            // production a background task / the shutdown hook does this).
+            store.flush();
         }
         assert!(path.exists());
         // reload picks up persisted lifetime
@@ -1172,31 +1204,68 @@ mod tests {
     #[test]
     fn in_memory_store_does_not_persist() {
         let store = SavingsStore::in_memory();
+        assert!(!store.is_persistent());
         store.record(&outcome("anthropic", "claude", 100, 50), at(T0));
-        // No path → persist is a no-op; snapshot still reflects the record.
+        // No path → flush is a no-op even though dirty; snapshot still reflects
+        // the record.
+        store.flush();
         assert_eq!(store.snapshot().lifetime.requests, 1);
     }
 
     #[test]
-    fn record_debounces_disk_persist() {
-        let dir = std::env::temp_dir().join(format!("hr-debounce-{}", uuid::Uuid::new_v4()));
+    fn flush_rearms_dirty_when_write_fails() {
+        // A transient write failure must not drop the accumulated state: flush
+        // re-arms the dirty flag so the next flush retries.
+        let dir = std::env::temp_dir().join(format!("hr-rearm-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.json");
+        // Make the target a directory so save_state's rename-over fails.
+        std::fs::create_dir(&path).unwrap();
+
+        let store = SavingsStore::with_path(&path, StoreConfig::default());
+        store.record(&outcome("anthropic", "claude", 100, 50), at(T0));
+        store.flush(); // write fails (target is a dir) → dirty re-armed
+        assert!(
+            path.is_dir(),
+            "save_state should have failed, leaving the dir"
+        );
+
+        // Clear the obstruction; the re-armed dirty flag means the next flush
+        // still persists the earlier record (it was not lost).
+        std::fs::remove_dir(&path).unwrap();
+        store.flush();
+        assert_eq!(load_state(&path).lifetime.requests, 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn record_does_no_disk_io_until_flush() {
+        // The request path must never touch disk. `record` only marks the store
+        // dirty; `flush` (called off the request worker) does the actual write.
+        let dir = std::env::temp_dir().join(format!("hr-flush-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("s.json");
         let store = SavingsStore::with_path(&path, StoreConfig::default());
+        assert!(store.is_persistent());
         let o = outcome("anthropic", "claude", 100, 50);
 
-        store.record(&o, at(T0)); // first write is immediate
+        // record() writes nothing to disk.
+        store.record(&o, at(T0));
+        assert!(!path.exists(), "record must not perform disk I/O");
+        assert_eq!(store.snapshot().lifetime.requests, 1);
+
+        // flush() performs the (single) write.
+        store.flush();
         assert_eq!(load_state(&path).lifetime.requests, 1);
 
-        // Within the interval → skipped: the file is NOT rewritten (still 1),
-        // even though in-memory state advanced to 2.
-        store.record(&o, at(T0) + Duration::from_millis(500));
-        assert_eq!(store.snapshot().lifetime.requests, 2);
-        assert_eq!(load_state(&path).lifetime.requests, 1);
-
-        // Past the interval → persists again (now 3 on disk).
-        store.record(&o, at(T0) + Duration::from_secs(3));
-        assert_eq!(load_state(&path).lifetime.requests, 3);
+        // flush() with nothing dirty is a no-op — it does not rewrite the file.
+        std::fs::remove_file(&path).unwrap();
+        store.flush();
+        assert!(
+            !path.exists(),
+            "flush with no pending changes must not write"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

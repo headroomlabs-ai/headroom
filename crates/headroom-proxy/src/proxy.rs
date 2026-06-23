@@ -133,6 +133,10 @@ impl AppState {
             ),
             None => crate::observability::stats::SavingsStore::in_memory(),
         });
+        // Persistence runs off the request path: `record` only marks the store
+        // dirty; `spawn_savings_flusher` (wired in `main`) does the disk I/O on a
+        // background interval. Kept out of this constructor so building an
+        // `AppState` never silently spawns a task.
         let price_book = Arc::new(load_price_book());
 
         Ok(Self {
@@ -173,6 +177,33 @@ impl AppState {
 /// everything else hits the catch-all forwarder. WebSocket upgrades are
 /// handled inside the catch-all handler when an `Upgrade: websocket` header
 /// is present.
+/// Spawn the background savings flusher.
+///
+/// On the request path, `SavingsStore::record` only marks the store dirty — it
+/// never touches disk. This task performs the actual filesystem write on the
+/// blocking pool every `interval`, keeping disk I/O off the async request
+/// workers under slow/stalled/network filesystems. It runs until the process
+/// exits; the shutdown hook performs a final flush so the last sub-interval
+/// window is not lost. No-op for in-memory stores.
+pub fn spawn_savings_flusher(
+    store: Arc<crate::observability::stats::SavingsStore>,
+    interval: std::time::Duration,
+) {
+    if !store.is_persistent() {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(interval);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            let store = store.clone();
+            // Filesystem I/O on the blocking pool, never an async request worker.
+            let _ = tokio::task::spawn_blocking(move || store.flush()).await;
+        }
+    });
+}
+
 pub fn build_app(state: AppState) -> Router {
     let mut router = Router::new()
         .route("/healthz", get(healthz))
