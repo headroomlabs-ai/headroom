@@ -20,7 +20,7 @@ headroom proxy \
   --budget 100.0
 ```
 
-Telemetry is enabled by default. Opt out with `HEADROOM_TELEMETRY=off` or `--no-telemetry`.
+Telemetry is **off by default** (opt-in). Opt in with `HEADROOM_TELEMETRY=on` or `--telemetry`.
 
 ## CLI options
 
@@ -46,7 +46,8 @@ Telemetry is enabled by default. Opt out with `HEADROOM_TELEMETRY=off` or `--no-
 | `--gemini-api-url` | Gemini default | Custom Gemini API URL |
 | `--backend` | `anthropic` | Backend: `anthropic`, `bedrock`, `openrouter`, `anyllm`, or `litellm-<provider>` |
 | `--bedrock-api-url` | None | Bedrock InvokeModel upstream for the `/model/{id}/invoke` passthrough routes (see [Bedrock via a local gateway](#bedrock-via-a-local-gateway)) |
-| `--no-telemetry` | `false` | Disable anonymous telemetry |
+| `--telemetry` | `false` | Opt in to anonymous telemetry (off by default) |
+| `--no-telemetry` | `false` | Force anonymous telemetry off (already the default) |
 | `--stateless` | `false` | Disable filesystem writes and keep runtime state in memory |
 
 ### Context management

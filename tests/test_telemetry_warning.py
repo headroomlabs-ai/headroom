@@ -97,12 +97,38 @@ class TestProxyCLITelemetryBanner:
         return CliRunner()
 
     def test_banner_shows_telemetry_enabled(self, runner, monkeypatch):
+        # Telemetry is opt-in: it only shows ENABLED once explicitly turned on.
+        monkeypatch.setenv("HEADROOM_TELEMETRY", "on")
+
+        from headroom.cli.main import main
+
+        with patch("headroom.proxy.server.run_server", side_effect=SystemExit(0)):
+            result = runner.invoke(main, ["proxy"])
+
+        assert "Telemetry:" in result.output
+        assert "ENABLED" in result.output
+
+    def test_banner_disabled_by_default(self, runner, monkeypatch):
+        # The whole point of opt-in: unset env => telemetry off, banner says so
+        # and surfaces how to opt in.
         monkeypatch.delenv("HEADROOM_TELEMETRY", raising=False)
 
         from headroom.cli.main import main
 
         with patch("headroom.proxy.server.run_server", side_effect=SystemExit(0)):
             result = runner.invoke(main, ["proxy"])
+
+        assert "Telemetry:" in result.output
+        assert "DISABLED" in result.output
+        assert "HEADROOM_TELEMETRY=on" in result.output or "--telemetry" in result.output
+
+    def test_telemetry_flag_opts_in(self, runner, monkeypatch):
+        monkeypatch.delenv("HEADROOM_TELEMETRY", raising=False)
+
+        from headroom.cli.main import main
+
+        with patch("headroom.proxy.server.run_server", side_effect=SystemExit(0)):
+            result = runner.invoke(main, ["proxy", "--telemetry"])
 
         assert "Telemetry:" in result.output
         assert "ENABLED" in result.output
@@ -130,7 +156,7 @@ class TestProxyCLITelemetryBanner:
         assert "DISABLED" in result.output
 
     def test_banner_shows_opt_out_instructions_when_enabled(self, runner, monkeypatch):
-        monkeypatch.delenv("HEADROOM_TELEMETRY", raising=False)
+        monkeypatch.setenv("HEADROOM_TELEMETRY", "on")
 
         from headroom.cli.main import main
 
@@ -202,7 +228,8 @@ class TestStatsEndpointTelemetryFlag:
     pytest.importorskip("fastapi")
 
     async def test_stats_includes_anon_telemetry_shipping_true(self, monkeypatch):
-        monkeypatch.delenv("HEADROOM_TELEMETRY", raising=False)
+        # Opt-in: shipping is only true once telemetry is explicitly enabled.
+        monkeypatch.setenv("HEADROOM_TELEMETRY", "on")
         from headroom.proxy.server import ProxyConfig, create_app
 
         app = create_app(

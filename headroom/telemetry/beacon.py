@@ -3,9 +3,9 @@
 Sends aggregate-only stats (tokens saved, compression ratios, cache hit rates,
 performance overhead) to help improve Headroom.  No prompts, no content, no PII.
 
-On by default. Opt out with:
-    HEADROOM_TELEMETRY=off headroom proxy
-    headroom proxy --no-telemetry
+Off by default (opt-in). Nothing is collected or sent unless you opt in with:
+    HEADROOM_TELEMETRY=on headroom proxy
+    headroom proxy --telemetry
 """
 
 from __future__ import annotations
@@ -42,6 +42,7 @@ _INTERVAL_SECONDS = 300
 
 
 _OFF_VALUES = frozenset(("off", "false", "0", "no", "disable", "disabled"))
+_ON_VALUES = frozenset(("on", "true", "1", "yes", "enable", "enabled"))
 
 
 def _build_pipeline_timing(stats: dict) -> dict[str, object]:
@@ -69,9 +70,14 @@ def _build_pipeline_timing(stats: dict) -> dict[str, object]:
 
 
 def is_telemetry_enabled() -> bool:
-    """Check if telemetry is enabled (on by default, opt out with env var)."""
-    val = os.environ.get("HEADROOM_TELEMETRY", "on").lower().strip()
-    return val not in _OFF_VALUES
+    """Check if telemetry is enabled (off by default, opt in with env var).
+
+    Fail-closed: telemetry is only enabled when HEADROOM_TELEMETRY is set to an
+    explicit on-value (on/true/1/yes/enable/enabled). Anything else — including
+    unset, empty, or an unrecognized value — leaves it disabled.
+    """
+    val = os.environ.get("HEADROOM_TELEMETRY", "").lower().strip()
+    return val in _ON_VALUES
 
 
 def is_telemetry_warn_enabled() -> bool:

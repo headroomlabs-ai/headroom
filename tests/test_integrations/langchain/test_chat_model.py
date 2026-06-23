@@ -7,6 +7,7 @@ Tests cover:
 4. optimize_messages() - Standalone optimization function
 """
 
+import asyncio
 import json
 from datetime import datetime
 from unittest.mock import MagicMock, patch
@@ -616,6 +617,389 @@ class TestIntegrationWithRealHeadroom:
 
         # Should compress (rolling window, etc.)
         assert metrics["tokens_before"] >= metrics["tokens_after"]
+
+
+class TestAinvokeStreamingTrue:
+    """Tests for ainvoke() / _agenerate() when wrapped model has streaming=True.
+
+    Reproduces and verifies the fix for GitHub #1285:
+    AttributeError: 'AsyncStream' object has no attribute 'model_dump'
+    """
+
+    @pytest.fixture
+    def streaming_mock_model(self):
+        """Create a mock model with streaming=True that simulates the bug.
+
+        When streaming=True, _agenerate returns a raw AsyncStream-like object
+        (no model_dump). When streaming=False, it returns a proper ChatResult.
+        This mirrors ChatOpenAI's real behavior with streaming=True.
+
+        The mock supports model_copy() so that the per-call copy approach
+        works correctly: the copy gets streaming=False and its own
+        _agenerate that references the copy (not the original).
+        """
+        mock = MagicMock()
+        mock._llm_type = "mock-streaming"
+        mock._identifying_params = {"model": "mock-streaming-model"}
+        mock.model_name = "gpt-4o"
+        mock.streaming = True
+
+        class FakeAsyncStream:
+            """Simulates openai.AsyncStream — has no model_dump attribute."""
+
+            async def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                raise StopAsyncIteration
+
+        def make_agenerate(model_ref):
+            """Create an _agenerate that checks model_ref.streaming.
+
+            This closure pattern lets the per-call copy's _agenerate
+            see the copy's streaming=False, while the original's
+            _agenerate sees streaming=True.
+            """
+
+            async def agenerate(messages, **kwargs):
+                if model_ref.streaming:
+                    # Simulate the bug: return raw AsyncStream instead of ChatResult
+                    return FakeAsyncStream()
+                # Non-streaming path returns a proper ChatResult
+                return ChatResult(
+                    generations=[
+                        ChatGeneration(
+                            message=AIMessage(content="Hello from non-streaming path!"),
+                        )
+                    ],
+                    llm_output={
+                        "token_usage": {
+                            "prompt_tokens": 10,
+                            "completion_tokens": 5,
+                            "total_tokens": 15,
+                        }
+                    },
+                )
+
+            return agenerate
+
+        mock._agenerate = make_agenerate(mock)
+
+        # Also mock _generate for completeness
+        def mock_generate(messages, **kwargs):
+            return ChatResult(
+                generations=[
+                    ChatGeneration(
+                        message=AIMessage(content="Hello from sync path!"),
+                    )
+                ],
+                llm_output={
+                    "token_usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+                },
+            )
+
+        mock._generate = MagicMock(side_effect=mock_generate)
+        mock._stream = MagicMock(
+            return_value=iter([ChatGeneration(message=AIMessage(content="Streaming..."))])
+        )
+
+        # Configure model_copy to return a shallow copy with updated streaming
+        # and its own _agenerate that references the copy (not the original).
+        def mock_model_copy(update=None, **kwargs):
+            new_mock = MagicMock()
+            new_mock._llm_type = mock._llm_type
+            new_mock._identifying_params = mock._identifying_params
+            new_mock.model_name = mock.model_name
+            new_mock.streaming = mock.streaming
+            new_mock._generate = mock._generate
+            new_mock._stream = mock._stream
+            if update:
+                for key, value in update.items():
+                    setattr(new_mock, key, value)
+            new_mock._agenerate = make_agenerate(new_mock)
+            return new_mock
+
+        mock.model_copy = mock_model_copy
+
+        return mock
+
+    @pytest.fixture
+    def _patched_pipeline(self, streaming_mock_model):
+        """Create a HeadroomChatModel with a mocked optimization pipeline."""
+        from headroom.integrations import HeadroomChatModel
+        from headroom.providers import OpenAIProvider
+
+        model = HeadroomChatModel(streaming_mock_model)
+        model._provider = OpenAIProvider()
+        _ = model.pipeline  # Force lazy init
+
+        mock_result = MagicMock()
+        mock_result.messages = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "What is the capital of France?"},
+        ]
+        mock_result.tokens_before = 100
+        mock_result.tokens_after = 80
+        mock_result.transforms_applied = ["cache_aligner"]
+
+        ctx = patch.object(model._pipeline, "apply", return_value=mock_result)
+        ctx.model = model  # type: ignore[attr-defined]
+        return ctx
+
+    async def test_agenerate_returns_chatresult_with_streaming_true(
+        self, streaming_mock_model, sample_messages
+    ):
+        """_agenerate() returns a ChatResult (not AsyncStream) when streaming=True.
+
+        This is the core fix for #1285 — without the fix, the mock's _agenerate
+        returns a FakeAsyncStream and the test would fail the isinstance check.
+        """
+        from headroom.integrations import HeadroomChatModel
+        from headroom.providers import OpenAIProvider
+
+        model = HeadroomChatModel(streaming_mock_model)
+        model._provider = OpenAIProvider()
+        _ = model.pipeline
+
+        with patch.object(model._pipeline, "apply") as mock_apply:
+            mock_result = MagicMock()
+            mock_result.messages = [
+                {"role": "system", "content": "You are helpful."},
+                {"role": "user", "content": "What is the capital of France?"},
+            ]
+            mock_result.tokens_before = 100
+            mock_result.tokens_after = 80
+            mock_result.transforms_applied = ["cache_aligner"]
+            mock_apply.return_value = mock_result
+
+            result = await model._agenerate(sample_messages)
+
+            # Must be a ChatResult, not a FakeAsyncStream
+            assert isinstance(result, ChatResult)
+            assert len(result.generations) == 1
+            assert isinstance(result.generations[0].message, AIMessage)
+            assert result.generations[0].message.content == "Hello from non-streaming path!"
+
+    async def test_streaming_never_changed_after_agenerate(
+        self, streaming_mock_model, sample_messages
+    ):
+        """streaming=True is never changed on the wrapped model during/after _agenerate()."""
+        from headroom.integrations import HeadroomChatModel
+        from headroom.providers import OpenAIProvider
+
+        model = HeadroomChatModel(streaming_mock_model)
+        model._provider = OpenAIProvider()
+        _ = model.pipeline
+
+        with patch.object(model._pipeline, "apply") as mock_apply:
+            mock_result = MagicMock()
+            mock_result.messages = [
+                {"role": "system", "content": "You are helpful."},
+                {"role": "user", "content": "Hello"},
+            ]
+            mock_result.tokens_before = 50
+            mock_result.tokens_after = 40
+            mock_result.transforms_applied = []
+            mock_apply.return_value = mock_result
+
+            # Before the call, streaming is True
+            assert streaming_mock_model.streaming is True
+
+            await model._agenerate(sample_messages)
+
+            # After the call, streaming must still be True — never mutated
+            assert streaming_mock_model.streaming is True
+
+    async def test_original_streaming_unchanged_during_agenerate(
+        self, streaming_mock_model, sample_messages
+    ):
+        """Original model's streaming is never changed during _agenerate().
+
+        With the per-call copy approach, the original model is never mutated.
+        The copy gets streaming=False, which is why we still get a ChatResult.
+        """
+        from headroom.integrations import HeadroomChatModel
+        from headroom.providers import OpenAIProvider
+
+        model = HeadroomChatModel(streaming_mock_model)
+        model._provider = OpenAIProvider()
+        _ = model.pipeline
+
+        # Track the original model's streaming state when model_copy is called
+        streaming_states_when_copy: list[bool] = []
+        original_model_copy = streaming_mock_model.model_copy
+
+        def tracking_model_copy(update=None, **kwargs):
+            streaming_states_when_copy.append(streaming_mock_model.streaming)
+            return original_model_copy(update=update, **kwargs)
+
+        streaming_mock_model.model_copy = tracking_model_copy
+
+        with patch.object(model._pipeline, "apply") as mock_apply:
+            mock_result = MagicMock()
+            mock_result.messages = [
+                {"role": "system", "content": "You are helpful."},
+                {"role": "user", "content": "Hello"},
+            ]
+            mock_result.tokens_before = 50
+            mock_result.tokens_after = 40
+            mock_result.transforms_applied = []
+            mock_apply.return_value = mock_result
+
+            result = await model._agenerate(sample_messages)
+
+            # The original model's streaming was True when model_copy was called
+            assert streaming_states_when_copy == [True]
+            # And it's still True after the call
+            assert streaming_mock_model.streaming is True
+            # The copy had streaming=False, so we got a ChatResult
+            assert isinstance(result, ChatResult)
+
+    async def test_streaming_unchanged_on_exception(self, streaming_mock_model, sample_messages):
+        """Original model's streaming is unchanged even if _agenerate raises."""
+        from headroom.integrations import HeadroomChatModel
+        from headroom.providers import OpenAIProvider
+
+        model = HeadroomChatModel(streaming_mock_model)
+        model._provider = OpenAIProvider()
+        _ = model.pipeline
+
+        # Make the copy's _agenerate raise
+        async def failing_agenerate(messages, **kwargs):
+            raise RuntimeError("upstream error")
+
+        original_model_copy = streaming_mock_model.model_copy
+
+        def failing_model_copy(update=None, **kwargs):
+            new_mock = original_model_copy(update=update, **kwargs)
+            new_mock._agenerate = failing_agenerate
+            return new_mock
+
+        streaming_mock_model.model_copy = failing_model_copy
+
+        with patch.object(model._pipeline, "apply") as mock_apply:
+            mock_result = MagicMock()
+            mock_result.messages = [
+                {"role": "system", "content": "You are helpful."},
+                {"role": "user", "content": "Hello"},
+            ]
+            mock_result.tokens_before = 50
+            mock_result.tokens_after = 40
+            mock_result.transforms_applied = []
+            mock_apply.return_value = mock_result
+
+            with pytest.raises(RuntimeError, match="upstream error"):
+                await model._agenerate(sample_messages)
+
+            # Original model's streaming is unchanged — never mutated
+            assert streaming_mock_model.streaming is True
+
+    async def test_concurrent_ainvoke_no_race_condition(
+        self, streaming_mock_model, sample_messages
+    ):
+        """Concurrent _agenerate() calls don't race on shared model state.
+
+        With the per-call copy approach, two overlapping _agenerate() calls
+        each get their own copy with streaming=False, so the original model's
+        streaming is never mutated. Both calls return ChatResult.
+        """
+        from headroom.integrations import HeadroomChatModel
+        from headroom.providers import OpenAIProvider
+
+        model = HeadroomChatModel(streaming_mock_model)
+        model._provider = OpenAIProvider()
+        _ = model.pipeline
+
+        # Wrap model_copy to add a delay inside _agenerate, forcing overlap
+        original_model_copy = streaming_mock_model.model_copy
+
+        def slow_model_copy(update=None, **kwargs):
+            new_mock = original_model_copy(update=update, **kwargs)
+            base_agenerate = new_mock._agenerate
+
+            async def slow_agenerate(messages, **kwargs):
+                await asyncio.sleep(0.1)
+                return await base_agenerate(messages, **kwargs)
+
+            new_mock._agenerate = slow_agenerate
+            return new_mock
+
+        streaming_mock_model.model_copy = slow_model_copy
+
+        with patch.object(model._pipeline, "apply") as mock_apply:
+            mock_result = MagicMock()
+            mock_result.messages = [
+                {"role": "system", "content": "You are helpful."},
+                {"role": "user", "content": "Hello"},
+            ]
+            mock_result.tokens_before = 50
+            mock_result.tokens_after = 40
+            mock_result.transforms_applied = []
+            mock_apply.return_value = mock_result
+
+            # Original streaming must be True before
+            assert streaming_mock_model.streaming is True
+
+            # Two concurrent calls
+            results = await asyncio.gather(
+                model._agenerate(sample_messages),
+                model._agenerate(sample_messages),
+            )
+
+            # Original streaming was never mutated — still True
+            assert streaming_mock_model.streaming is True
+
+            # Both calls returned ChatResult (not AsyncStream)
+            for r in results:
+                assert isinstance(r, ChatResult)
+                assert len(r.generations) == 1
+                assert isinstance(r.generations[0].message, AIMessage)
+
+    async def test_agenerate_no_streaming_attr_passthrough(self, sample_messages):
+        """_agenerate() works when wrapped model has no streaming attribute."""
+        from headroom.integrations import HeadroomChatModel
+        from headroom.providers import OpenAIProvider
+
+        # Mock without streaming attribute — MagicMock auto-generates
+        # attributes, so we must explicitly delete streaming to simulate
+        # a model that genuinely lacks it.
+        mock = MagicMock()
+        mock._llm_type = "mock-no-streaming"
+        mock._identifying_params = {"model": "mock-model"}
+        mock.model_name = "gpt-4o"
+        del mock.streaming  # simulate no streaming attribute
+
+        async def mock_agenerate(messages, **kwargs):
+            return ChatResult(
+                generations=[
+                    ChatGeneration(message=AIMessage(content="No streaming attr!")),
+                ],
+                llm_output={
+                    "token_usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+                },
+            )
+
+        mock._agenerate = mock_agenerate
+
+        model = HeadroomChatModel(mock)
+        model._provider = OpenAIProvider()
+        _ = model.pipeline
+
+        with patch.object(model._pipeline, "apply") as mock_apply:
+            mock_result = MagicMock()
+            mock_result.messages = [
+                {"role": "system", "content": "You are helpful."},
+                {"role": "user", "content": "Hello"},
+            ]
+            mock_result.tokens_before = 50
+            mock_result.tokens_after = 40
+            mock_result.transforms_applied = []
+            mock_apply.return_value = mock_result
+
+            result = await model._agenerate(sample_messages)
+
+            assert isinstance(result, ChatResult)
+            assert result.generations[0].message.content == "No streaming attr!"
 
 
 # ============================================================================

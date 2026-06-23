@@ -87,6 +87,16 @@ def test_validate_pull_request_marks_ready_pr_valid() -> None:
     assert module.AUTHOR_ACTION_LABEL in report.labels_to_remove
 
 
+def test_validate_pull_request_accepts_crlf_test_output_code_block() -> None:
+    module = _load_module()
+    body = VALID_BODY.replace("\n", "\r\n")
+
+    report = module.validate_pull_request(_event(body))
+
+    assert report.valid is True
+    assert report.problems == []
+
+
 def test_validate_pull_request_allows_draft_without_ready_checkboxes() -> None:
     module = _load_module()
     body = VALID_BODY.replace(

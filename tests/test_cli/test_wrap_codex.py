@@ -662,6 +662,39 @@ def test_wrap_codex_prepare_only_respects_codex_home(
     assert not (tmp_path / ".codex" / "config.toml").exists()
 
 
+def test_wrap_codex_injects_rtk_globally_without_changing_project_agents(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_test_home(monkeypatch, tmp_path)
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    project_agents = project_dir / "AGENTS.md"
+    original = "# Project instructions\n\nUse the repository conventions.\n"
+    project_agents.write_text(original, encoding="utf-8")
+    original_bytes = project_agents.read_bytes()
+    monkeypatch.chdir(project_dir)
+
+    with patch(
+        "headroom.cli.wrap._ensure_rtk_binary",
+        return_value=tmp_path / "rtk",
+    ):
+        result = runner.invoke(
+            main,
+            [
+                "wrap",
+                "codex",
+                "--prepare-only",
+                "--no-mcp",
+                "--no-serena",
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert project_agents.read_bytes() == original_bytes
+    global_agents = tmp_path / ".codex" / "AGENTS.md"
+    assert wrap_mod._RTK_MARKER.encode() in global_agents.read_bytes()
+
+
 def test_unwrap_codex_without_codex_home_warns_on_ambiguous_noop(
     runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -728,10 +761,10 @@ def test_start_proxy_uses_separate_session_for_signal_isolation(
 
 
 @pytest.mark.parametrize("agent_type", ["claude", "codex", "cursor"])
-def test_start_proxy_applies_agent_90_defaults(
+def test_start_proxy_does_not_apply_agent_90_defaults(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, agent_type: str
 ) -> None:
-    """Wrapped coding agents should start the proxy with high-savings defaults."""
+    """Wrapped coding agents keep agent-savings opt-in by default."""
     popen_kwargs: dict[str, object] = {}
 
     class FakeProc:
@@ -752,10 +785,10 @@ def test_start_proxy_applies_agent_90_defaults(
 
     env = popen_kwargs["env"]
     assert isinstance(env, dict)
-    assert env["HEADROOM_SAVINGS_PROFILE"] == "agent-90"
-    assert env["HEADROOM_TARGET_RATIO"] == "0.10"
-    assert env["HEADROOM_MAX_ITEMS"] == "8"
-    assert env["HEADROOM_SMART_CRUSHER_COMPACTION"] == "0"
+    assert "HEADROOM_SAVINGS_PROFILE" not in env
+    assert "HEADROOM_TARGET_RATIO" not in env
+    assert "HEADROOM_MAX_ITEMS" not in env
+    assert "HEADROOM_SMART_CRUSHER_COMPACTION" not in env
 
 
 def test_start_proxy_preserves_explicit_savings_overrides(
