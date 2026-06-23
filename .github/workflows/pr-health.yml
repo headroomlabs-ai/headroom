@@ -131,11 +131,10 @@ jobs:
               }
             }
 
-      - name: Fail when the PR body is incomplete
+      - name: Report incomplete PR body
         if: steps.validate.outputs.valid != 'true'
         run: |
-          echo "PR template validation failed. Update the PR body or move the PR back to draft."
-          exit 1
+          echo "PR template validation found missing fields. The governance comment and labels identify the required author updates."
 
   label:
     runs-on: ubuntu-latest
@@ -144,6 +143,10 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       REPO: ${{ github.repository }}
     steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+
       - name: Ensure maintenance labels exist
         run: |
           set -euo pipefail
@@ -189,14 +192,7 @@ jobs:
               --json isDraft,labels,mergeStateStatus,statusCheckRollup)"
 
             merge_state="$(jq -r '.mergeStateStatus // "UNKNOWN"' <<<"$data")"
-            check_state="$(jq -r '
-              [
-                (.statusCheckRollup // [])[]
-                | select((.conclusion // .state // "") as $s
-                  | ["FAILURE", "TIMED_OUT", "ACTION_REQUIRED", "CANCELLED", "ERROR"] | index($s))
-              ]
-              | if length > 0 then "failing" else "passing" end
-            ' <<<"$data")"
+            check_state="$(python3 .github/scripts/pr-health-labels.py --state-json "$data")"
             is_draft="$(jq -r '.isDraft' <<<"$data")"
 
             if [[ "$merge_state" == "BEHIND" ]]; then

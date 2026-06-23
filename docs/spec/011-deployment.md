@@ -125,7 +125,7 @@ deployment:
 | `HEADROOM_HOST` | `127.0.0.1` | Proxy host |
 | `ANTHROPIC_API_KEY` | - | Anthropic API key |
 | `OPENAI_API_KEY` | - | OpenAI API key |
-| `HEADROOM_TELEMETRY` | enabled | Set to `off` to disable telemetry |
+| `HEADROOM_TELEMETRY` | `off` (opt-in) | Set to `on` to opt in to telemetry |
 
 ### Config File
 

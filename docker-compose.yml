@@ -33,6 +33,8 @@ services:
       # - OPENAI_TARGET_API_URL=https://api.x.ai
     ports:
       - "8787:8787"
+    volumes:
+      - headroom_workspace:/home/nonroot/.headroom
     # Readiness probe: the orchestrator polls /readyz so dependents and
     # `docker compose up --wait` only see the proxy as healthy once it's serving.
     healthcheck:
@@ -84,5 +86,6 @@ services:
 # Named volumes — managed by Docker, survive `docker compose down` (use
 # `docker compose down -v` to delete the stored data as well).
 volumes:
+  headroom_workspace:    # persists proxy_savings, memory.db, session_stats, toin across image updates
   qdrant_data:
   neo4j_data:

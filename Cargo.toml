@@ -62,7 +62,7 @@ pyo3 = { version = "0.24", features = ["abi3-py310"] }
 # (env vars, profiles, IMDS, ECS task role, etc); `aws-credential-types`
 # exposes `Credentials` so the signer accepts whatever the chain returned.
 aws-sigv4 = { version = "1", default-features = false, features = ["sign-http", "http1"] }
-aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rustls", "rt-tokio"] }
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rustls", "rt-tokio", "sso"] }
 aws-credential-types = { version = "1", default-features = false }
 # `Identity` lives in aws-smithy-runtime-api; the SigV4 builder
 # accepts `&Identity`. Pinning the version explicitly avoids a

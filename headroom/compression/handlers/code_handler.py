@@ -20,7 +20,6 @@ import logging
 import re
 import threading
 from dataclasses import dataclass
-from enum import Enum
 from typing import Any
 
 from headroom.compression.handlers.base import BaseStructureHandler, HandlerResult
@@ -30,8 +29,7 @@ logger = logging.getLogger(__name__)
 
 # Lazy-loaded tree-sitter
 _tree_sitter_available: bool | None = None
-_tree_sitter_parsers: dict[str, Any] = {}
-_tree_sitter_lock = threading.Lock()
+_tree_sitter_local = threading.local()
 
 
 def _check_tree_sitter() -> bool:
@@ -48,19 +46,28 @@ def _check_tree_sitter() -> bool:
 
 
 def _get_parser(language: str) -> Any:
-    """Get tree-sitter parser for language."""
-    global _tree_sitter_parsers
+    """Return a **thread-local** tree-sitter parser for ``language``.
 
+    tree-sitter ``Parser`` objects are pyo3 ``unsendable`` — touching
+    one from a thread other than its creator panics. Handlers run on
+    executor pool threads in the proxy, so parsers must never be shared
+    across threads. One parser per (thread, language); same fix as
+    ``transforms/code_compressor.py`` (#604).
+    """
     if not _check_tree_sitter():
         raise ImportError("tree-sitter-language-pack not installed")
 
-    with _tree_sitter_lock:
-        if language not in _tree_sitter_parsers:
-            from tree_sitter_language_pack import get_parser
+    cache: dict[str, Any] | None = getattr(_tree_sitter_local, "parsers", None)
+    if cache is None:
+        cache = {}
+        _tree_sitter_local.parsers = cache
 
-            _tree_sitter_parsers[language] = get_parser(language)  # type: ignore[arg-type]
+    if language not in cache:
+        from tree_sitter_language_pack import get_parser
 
-        return _tree_sitter_parsers[language]
+        cache[language] = get_parser(language)  # type: ignore[arg-type]
+
+    return cache[language]
 
 
 # tree-sitter API compatibility. tree-sitter-language-pack switched to a
@@ -105,19 +112,6 @@ def _ts_children(node: Any) -> list[Any]:
     if children is not None and not callable(children):
         return list(children)
     return [node.child(i) for i in range(node.child_count())]
-
-
-class CodeLanguage(Enum):
-    """Supported programming languages."""
-
-    PYTHON = "python"
-    JAVASCRIPT = "javascript"
-    TYPESCRIPT = "typescript"
-    GO = "go"
-    RUST = "rust"
-    JAVA = "java"
-    C = "c"
-    CPP = "cpp"
 
 
 @dataclass
@@ -179,6 +173,15 @@ _STRUCTURAL_NODE_TYPES: dict[str, set[str]] = {
         "interface_declaration",
         "annotation",
     },
+    "perl": {
+        "use_statement",
+        "use_version_statement",
+        "subroutine_declaration_statement",
+        "method_declaration_statement",
+        "package_statement",
+        "class_statement",
+        "role_statement",
+    },
 }
 
 # Regex patterns for fallback detection
@@ -217,6 +220,10 @@ _SIGNATURE_PATTERNS: dict[str, list[re.Pattern[str]]] = {
         re.compile(r"^\s*(public\s+)?(class|interface|enum)\s+\w+", re.MULTILINE),
         re.compile(r"^\s*@\w+(\([^)]*\))?\s*$", re.MULTILINE),
     ],
+    "perl": [
+        re.compile(r"^\s*sub\s+\w+\s*(\([^)]*\))?", re.MULTILINE),
+        re.compile(r"^\s*(package|class|role)\s+[\w:]+", re.MULTILINE),
+    ],
 }
 
 # Body child node types for container definitions (classes, impls,
@@ -236,6 +243,17 @@ _CONTAINER_BODY_TYPES: frozenset[str] = frozenset(
     }
 )
 
+# Language-detection markers for _detect_language
+_LANGUAGE_MARKERS: dict[str, list[str]] = {
+    "python": ["def ", "import ", "from ", "class ", "async def"],
+    "javascript": ["function ", "const ", "let ", "var ", "=>"],
+    "typescript": ["interface ", "type ", ": string", ": number"],
+    "go": ["func ", "package ", "import (", "type "],
+    "rust": ["fn ", "let mut", "impl ", "pub fn", "use "],
+    "java": ["public class", "private ", "protected ", "void "],
+    "perl": ["sub ", "my $", "our $", "package ", "use strict"],
+}
+
 # Import patterns for fallback
 _IMPORT_PATTERNS: dict[str, re.Pattern[str]] = {
     "python": re.compile(r"^\s*(import\s+\w+|from\s+\w+\s+import)", re.MULTILINE),
@@ -244,6 +262,7 @@ _IMPORT_PATTERNS: dict[str, re.Pattern[str]] = {
     "go": re.compile(r'^\s*import\s+(\(|")', re.MULTILINE),
     "rust": re.compile(r"^\s*use\s+\w+", re.MULTILINE),
     "java": re.compile(r"^\s*import\s+[\w.]+;", re.MULTILINE),
+    "perl": re.compile(r"^\s*(use|require)\s+[\w:]+", re.MULTILINE),
 }
 
 
@@ -477,6 +496,13 @@ class CodeStructureHandler(BaseStructureHandler):
 
         visit_node(_ts_root(tree))
 
+        # tree-sitter spans are BYTE offsets into the UTF-8 encoding;
+        # the mask is indexed by CHARACTER. Any non-ASCII character
+        # (docstrings, comments, string literals) shifts every later
+        # span, so convert before masking. Skipped for pure-ASCII
+        # content where the offsets coincide.
+        spans = self._byte_spans_to_char_spans(spans, content)
+
         # Build mask from spans
         mask = self._spans_to_mask(spans, len(content))
 
@@ -553,6 +579,40 @@ class CodeStructureHandler(BaseStructureHandler):
             },
         )
 
+    @staticmethod
+    def _byte_spans_to_char_spans(spans: list[CodeSpan], content: str) -> list[CodeSpan]:
+        """Convert byte-offset spans to character-offset spans.
+
+        tree-sitter reports node positions as byte offsets in the UTF-8
+        encoding. For pure-ASCII content byte == char and the spans are
+        returned unchanged. Otherwise a byte->char table is built once
+        and every span endpoint is remapped.
+        """
+        n_bytes = len(content.encode("utf-8"))
+        if n_bytes == len(content):
+            return spans
+
+        # byte_to_char[b] = index of the character containing byte b;
+        # byte_to_char[n_bytes] = len(content) so exclusive ends map.
+        byte_to_char = [0] * (n_bytes + 1)
+        byte_pos = 0
+        for char_idx, ch in enumerate(content):
+            ch_width = len(ch.encode("utf-8"))
+            for b in range(byte_pos, byte_pos + ch_width):
+                byte_to_char[b] = char_idx
+            byte_pos += ch_width
+        byte_to_char[n_bytes] = len(content)
+
+        return [
+            CodeSpan(
+                start=byte_to_char[min(span.start, n_bytes)],
+                end=byte_to_char[min(span.end, n_bytes)],
+                role=span.role,
+                is_structural=span.is_structural,
+            )
+            for span in spans
+        ]
+
     def _spans_to_mask(self, spans: list[CodeSpan], length: int) -> list[bool]:
         """Convert spans to character-level mask.
 
@@ -567,8 +627,10 @@ class CodeStructureHandler(BaseStructureHandler):
 
         for span in spans:
             if span.is_structural:
-                for i in range(span.start, min(span.end, length)):
-                    mask[i] = True
+                start = min(span.start, length)
+                end = min(span.end, length)
+                if start < end:
+                    mask[start:end] = [True] * (end - start)
 
         return mask
 
@@ -581,18 +643,8 @@ class CodeStructureHandler(BaseStructureHandler):
         Returns:
             Language name (lowercase).
         """
-        # Check for language-specific markers
-        markers = {
-            "python": ["def ", "import ", "from ", "class ", "async def"],
-            "javascript": ["function ", "const ", "let ", "var ", "=>"],
-            "typescript": ["interface ", "type ", ": string", ": number"],
-            "go": ["func ", "package ", "import (", "type "],
-            "rust": ["fn ", "let mut", "impl ", "pub fn", "use "],
-            "java": ["public class", "private ", "protected ", "void "],
-        }
-
         scores: dict[str, int] = {}
-        for lang, patterns in markers.items():
+        for lang, patterns in _LANGUAGE_MARKERS.items():
             scores[lang] = sum(1 for p in patterns if p in content)
 
         if not scores or max(scores.values()) == 0:

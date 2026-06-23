@@ -60,10 +60,22 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 RUN cd /tmp && python -c "from headroom._core import DiffCompressor, SmartCrusher; \
     print(f'build-stage rust core verify OK: {DiffCompressor.__name__}, {SmartCrusher.__name__}')"
 
+# Build the native Rust reverse proxy binary and stage it for the runtime
+# images (issue #976). These images already run "the proxy"; bundling the
+# native `headroom-proxy` binary lets operators front the Python proxy with
+# the Rust SigV4 / live-zone compression path from the same image. The
+# binary is copied out of the cache-mounted target dir into a persistent
+# path so the COPY in the runtime stages can pick it up.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/target \
+    cargo build --release --locked --bin headroom-proxy && \
+    cp target/release/headroom-proxy /usr/local/bin/headroom-proxy
+
 # ---- Runtime stage (python-slim): supports root/nonroot via build arg ----
 FROM python:${PYTHON_VERSION}-slim AS runtime-slim-base
 
 ARG RUNTIME_USER=nonroot
+ARG RUNTIME_HOME=/home/nonroot
 ARG PYTHON_SITE_PACKAGES
 
 RUN apt-get update && \
@@ -72,6 +84,8 @@ RUN apt-get update && \
 
 COPY --from=builder ${PYTHON_SITE_PACKAGES} ${PYTHON_SITE_PACKAGES}
 COPY --from=builder /usr/local/bin/headroom /usr/local/bin/headroom
+# Native Rust reverse proxy binary (issue #976).
+COPY --from=builder /usr/local/bin/headroom-proxy /usr/local/bin/headroom-proxy
 
 RUN mkdir -p /home/nonroot /data && \
     if [ "$RUNTIME_USER" = "nonroot" ]; then \
@@ -84,11 +98,18 @@ RUN mkdir -p /home/nonroot /data && \
     fi
 
 USER ${RUNTIME_USER}
-WORKDIR /home/nonroot
+WORKDIR ${RUNTIME_HOME}
 
 ENV HEADROOM_HOST=0.0.0.0 \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
+
+# Declare ~/.headroom as a volume so Docker (and ACA) can attach persistent
+# storage here.  Bare `docker run` gets an anonymous volume as a fallback so
+# state is never silently written to the ephemeral container layer.
+# RUNTIME_HOME defaults to /home/nonroot (the published image default); pass
+# --build-arg RUNTIME_HOME=/root when building with RUNTIME_USER=root.
+VOLUME ${RUNTIME_HOME}/.headroom
 
 EXPOSE 8787
 
@@ -104,6 +125,8 @@ ARG RUNTIME_USER=nonroot
 ARG PYTHON_SITE_PACKAGES
 
 COPY --from=builder ${PYTHON_SITE_PACKAGES} ${PYTHON_SITE_PACKAGES}
+# Native Rust reverse proxy binary (issue #976).
+COPY --from=builder /usr/local/bin/headroom-proxy /usr/local/bin/headroom-proxy
 
 USER ${RUNTIME_USER}
 WORKDIR /app

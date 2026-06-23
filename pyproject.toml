@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "headroom-ai"
-version = "0.25.0"
+version = "0.27.0"
 description = "The Context Optimization Layer for LLM Applications - Cut costs by 50-90%"
 readme = "README.md"
 license = "Apache-2.0"
@@ -49,7 +49,11 @@ dependencies = [
     # Core: lightweight compression (SmartCrusher, ContentRouter, CCR, TOIN)
     "tiktoken>=0.5.0",            # Tokenizer for all compressors
     "pydantic>=2.0.0",            # Config and data models
-    "litellm>=1.86.2,<2.0",        # Model registry, pricing, and provider support
+    # litellm's own metadata pins requires-python <3.14, and headroom only uses it for
+    # model registry / pricing / non-core providers — all lazily imported and
+    # ImportError-guarded. Marking it 3.14-optional lets headroom install on Python 3.14
+    # (core compression + the Anthropic proxy path never import litellm). See GH #956.
+    "litellm>=1.86.2,<2.0; python_version < '3.14'",  # model registry, pricing, providers (lazy)
     "click>=8.1.0",               # CLI framework
     "rich>=13.0.0",               # Rich terminal output
     "opentelemetry-api>=1.24.0",  # Safe no-op OTEL API for instrumentation
@@ -82,8 +86,14 @@ proxy-prod = [
     "gunicorn>=21.0.0; sys_platform != 'win32'",
 ]
 # AST-based code compression (tree-sitter)
+# NOTE: cap below 1.0. tree-sitter-language-pack 1.x is a breaking rewrite whose
+# get_language()/get_parser() return the pack's own binding types instead of
+# standalone tree_sitter.Language/Parser, so _get_parser() in
+# transforms/code_compressor.py fails and code compression silently no-ops.
+# The 0.x line (>=0.10,<1.0) returns standalone tree_sitter objects as expected.
 code = [
-    "tree-sitter-language-pack>=0.10.0",
+    "tree-sitter-language-pack>=0.10.0,<1.0",
+    "tree-sitter>=0.25.2,<0.26",
 ]
 # ML-based compression with Kompress (ModernBERT).
 # (The legacy [llmlingua] extra was removed in 0.9.x — no live code path used it.
@@ -155,6 +165,11 @@ image = [
 # Report generation
 reports = [
     "jinja2>=3.0.0",
+]
+# Binary spreadsheet ingestion (.xlsx / .xls -> tabular text)
+spreadsheet = [
+    "openpyxl>=3.1.0",      # .xlsx
+    "xlrd>=2.0.1",          # legacy .xls
 ]
 # OpenTelemetry metrics export
 otel = [
@@ -228,7 +243,7 @@ dev = [
     "pre-commit>=3.0.0",
     "openai>=1.0.0",
     "anthropic>=0.18.0",
-    "litellm>=1.86.2,<2.0",
+    "litellm>=1.86.2,<2.0; python_version < '3.14'",  # see core deps note (GH #956)
     "fastapi>=0.100.0",
     "uvicorn>=0.23.0,<1.0",
     "httpx[http2]>=0.24.0",
@@ -241,10 +256,11 @@ dev = [
     "sqlite-vec>=0.1.6",
     "sentence-transformers>=2.2.0,<6.0",
     "numpy>=1.24.0",
+    "openpyxl>=3.1.0",  # exercises spreadsheet_ingest (.xlsx) in the test suite
 ]
 # All optional dependencies (everything you need)
 all = [
-    "headroom-ai[proxy,code,ml,memory,relevance,image,reports,otel,evals,voice,html,benchmark,mcp]",
+    "headroom-ai[proxy,code,ml,memory,relevance,image,reports,otel,evals,voice,html,benchmark,mcp,spreadsheet]",
 ]
 
 [project.scripts]

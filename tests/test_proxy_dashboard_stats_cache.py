@@ -76,7 +76,12 @@ def test_get_rtk_stats_memoizes_subprocess_calls(monkeypatch: pytest.MonkeyPatch
 
     def _fake_run(args, **kwargs):
         calls["run"] += 1
-        assert args == ["/usr/bin/rtk", "gain", "--format", "json"]
+        assert [str(args[0]).replace("\\", "/")] + args[1:] == [
+            "/usr/bin/rtk",
+            "gain",
+            "--format",
+            "json",
+        ]
         summary = totals[min(calls["run"] - 1, len(totals) - 1)]
         return SimpleNamespace(
             returncode=0,
@@ -152,7 +157,13 @@ def test_get_rtk_stats_can_read_project_scoped_gain(monkeypatch: pytest.MonkeyPa
 
     def _fake_run(args, **kwargs):
         calls["run"] += 1
-        assert args == ["/usr/bin/rtk", "gain", "--project", "--format", "json"]
+        assert [str(args[0]).replace("\\", "/")] + args[1:] == [
+            "/usr/bin/rtk",
+            "gain",
+            "--project",
+            "--format",
+            "json",
+        ]
         return SimpleNamespace(
             returncode=0,
             stdout=json.dumps(
@@ -187,7 +198,12 @@ def test_get_rtk_stats_invalid_scope_defaults_to_global(
 
     def _fake_run(args, **kwargs):
         calls["run"] += 1
-        assert args == ["/usr/bin/rtk", "gain", "--format", "json"]
+        assert [str(args[0]).replace("\\", "/")] + args[1:] == [
+            "/usr/bin/rtk",
+            "gain",
+            "--format",
+            "json",
+        ]
         return SimpleNamespace(returncode=0, stdout=json.dumps({"summary": {}}))
 
     mock_warning = MagicMock()
@@ -228,7 +244,11 @@ def test_get_context_tool_stats_reads_lean_ctx_gain(monkeypatch: pytest.MonkeyPa
 
     def _fake_run(args, **kwargs):
         calls["run"] += 1
-        assert args == ["/usr/bin/lean-ctx", "gain", "--json"]
+        assert [str(args[0]).replace("\\", "/")] + args[1:] == [
+            "/usr/bin/lean-ctx",
+            "gain",
+            "--json",
+        ]
         summary = totals[min(calls["run"] - 1, len(totals) - 1)]
         return SimpleNamespace(returncode=0, stdout=json.dumps({"summary": summary}))
 
@@ -549,3 +569,68 @@ def test_dashboard_uses_cached_stats_and_lazy_history_feed_polling() -> None:
     assert "Lean-ctx" in html
     assert "Context Tool" in html
     assert "cliFilteringLabel + ' Filtered'" in html
+
+
+def test_proxy_throughput_in_stats_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify that the /stats endpoint includes a 'throughput' key in the response.
+
+    The server's _compute_throughput closure does a fresh
+    `from headroom.perf.analyzer import ...` on every call, so we patch the
+    names directly on the `headroom.perf.analyzer` module so the local import
+    inside the closure picks up our fakes.
+
+    Skipped locally when headroom._core (Rust extension) is not compiled.
+    """
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    import headroom.perf.analyzer as _analyzer_mod
+
+    try:
+        from headroom.proxy.server import (
+            _throughput_cache,
+            create_app,
+            require_loopback,
+        )
+    except (ImportError, ModuleNotFoundError) as exc:
+        pytest.skip(f"headroom._core not available (Rust extension not compiled): {exc}")
+
+    from headroom.config import ProxyConfig
+
+    # Reset the module-level cache so CI doesn't reuse a stale value
+    _throughput_cache.update({"expires_at": 0.0, "value": None})
+
+    # Patch at the module level so the local import inside _compute_throughput
+    # picks up our stubs instead of the real implementations.
+    monkeypatch.setattr(
+        _analyzer_mod,
+        "parse_log_files",
+        lambda last_n_hours=1.0: _analyzer_mod.PerfReport(),
+    )
+    monkeypatch.setattr(
+        _analyzer_mod,
+        "build_perf_summary",
+        lambda report: {"throughput": {"input_wall_clock": 99.0}},
+    )
+
+    app = create_app(
+        ProxyConfig(
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+            log_requests=False,
+            ccr_inject_tool=False,
+            ccr_handle_responses=False,
+            ccr_context_tracking=False,
+        )
+    )
+    app.dependency_overrides[require_loopback] = lambda: None
+
+    with TestClient(app) as client:
+        response = client.get("/stats")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert "throughput" in payload
+    assert payload["throughput"] == {"input_wall_clock": 99.0}

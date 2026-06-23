@@ -112,6 +112,7 @@ class SessionData:
     timestamp: datetime | None = None
     total_input_tokens: int = 0
     total_output_tokens: int = 0
+    source: str = "main"  # "main" | "subagent" | "workflow" — where this transcript came from
 
     @property
     def failure_count(self) -> int:
@@ -157,6 +158,11 @@ class Recommendation:
     confidence: float = 0.0  # 0-1, based on evidence strength
     evidence_count: int = 0  # Number of failures supporting this
     estimated_tokens_saved: int = 0  # Projected savings if recommendation is followed
+    # Loop weighting (see headroom.learn.loops): set when this recommendation
+    # guards against a detected repeated pattern. Loop guardrails are ranked
+    # above one-off rules because their waste scales with repetition.
+    is_loop_guardrail: bool = False
+    loop_occurrences: int = 0  # Repetitions of the loop this rule guards against
 
 
 @dataclass

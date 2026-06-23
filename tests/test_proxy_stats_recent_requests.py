@@ -69,7 +69,8 @@ def test_stats_refreshes_recent_requests_when_cached() -> None:
         }
     )
 
-    with TestClient(app) as client:
+    # Loopback client/Host: recent_requests is served only to loopback callers.
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)) as client:
         logger.logs = [first_log]
         first_response = client.get("/stats?cached=1")
         assert first_response.status_code == 200
@@ -154,7 +155,10 @@ def test_stats_preserves_default_smart_crusher_compaction_state() -> None:
         rate_limit_enabled=False,
         cost_tracking_enabled=False,
     )
-    client = TestClient(create_app(config))
+    # Loopback client/Host: the `config` block is served only to loopback callers.
+    client = TestClient(
+        create_app(config), base_url="http://127.0.0.1", client=("127.0.0.1", 12345)
+    )
 
     response = client.get("/stats")
 
