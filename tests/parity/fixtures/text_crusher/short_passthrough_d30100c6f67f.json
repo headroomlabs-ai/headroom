@@ -1,0 +1,18 @@
+{
+  "transform": "text_crusher",
+  "label": "short_passthrough",
+  "input": {
+    "content": "one thing. two thing. three thing.",
+    "context": "",
+    "target_ratio": null
+  },
+  "output": {
+    "compressed": "one thing. two thing. three thing.",
+    "original_tokens": 6,
+    "compressed_tokens": 6,
+    "compression_ratio": 1.0,
+    "kept_segments": 3,
+    "total_segments": 3
+  },
+  "input_sha256": "d30100c6f67fdae02d1c9312e9572a85951191111f39233b7aa8a86ea782959b"
+}

@@ -9,6 +9,7 @@ way a user would from the shell.
 
 from __future__ import annotations
 
+import shutil
 import sqlite3
 from pathlib import Path
 from unittest.mock import patch
@@ -111,6 +112,25 @@ class TestStripCodexHeadroomBlocks:
         assert "[mcp_servers.headroom_memory]" not in cleaned
         assert 'model = "gpt-4o"' in cleaned
 
+    def test_preserves_named_mcp_blocks_when_remove_named_mcp_false(self) -> None:
+        content = (
+            "# --- Headroom MCP server: serena ---\n"
+            "[mcp_servers.serena]\n"
+            'command = "uvx"\n'
+            "# --- end Headroom MCP server: serena ---\n\n"
+            f"{wrap_mod._MEMORY_MCP_MARKER}\n"
+            "[mcp_servers.headroom_memory]\n"
+            'command = "python"\n'
+            f"{wrap_mod._MEMORY_MCP_END}\n"
+        )
+
+        cleaned = wrap_mod._strip_codex_headroom_blocks(
+            content, remove_mcp=True, remove_named_mcp=False
+        )
+
+        assert "[mcp_servers.serena]" in cleaned
+        assert "[mcp_servers.headroom_memory]" not in cleaned
+
 
 class TestSnapshotCodexConfig:
     """Tests for ``_snapshot_codex_config_if_unwrapped``."""
@@ -157,6 +177,65 @@ class TestSnapshotCodexConfig:
 
         # Pre-wrap snapshot must never snapshot an already-wrapped file.
         assert not backup_file.exists()
+
+    def test_no_backup_when_config_already_contains_memory_mcp_block(self, tmp_path: Path) -> None:
+        config_file = tmp_path / "config.toml"
+        backup_file = tmp_path / "config.toml.headroom-backup"
+        config_file.write_text(
+            f"{wrap_mod._MEMORY_MCP_MARKER}\n"
+            "[mcp_servers.headroom_memory]\n"
+            'command = "python"\n'
+            'args = ["-m", "headroom.memory.mcp_server", "--user", "codex-user"]\n'
+            f"{wrap_mod._MEMORY_MCP_END}\n"
+        )
+
+        wrap_mod._snapshot_codex_config_if_unwrapped(config_file, backup_file)
+
+        assert not backup_file.exists()
+
+    def test_backup_when_config_contains_named_mcp_marker(self, tmp_path: Path) -> None:
+        config_file = tmp_path / "config.toml"
+        backup_file = tmp_path / "config.toml.headroom-backup"
+        original = (
+            "# --- Headroom MCP server: headroom ---\n"
+            "[mcp_servers.headroom]\n"
+            'command = "headroom"\n'
+            "# --- end Headroom MCP server: headroom ---\n"
+        )
+        config_file.write_text(original)
+
+        wrap_mod._snapshot_codex_config_if_unwrapped(config_file, backup_file)
+
+        assert backup_file.exists()
+        assert backup_file.read_text() == original
+
+
+class TestCodexMemoryMcpConfig:
+    """Tests for the persisted Codex memory MCP block."""
+
+    def test_inject_omits_db_and_replaces_existing_memory_block(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        _set_test_home(monkeypatch, tmp_path)
+        config_file = tmp_path / ".codex" / "config.toml"
+        config_file.parent.mkdir(parents=True)
+        config_file.write_text(
+            '[profiles.default]\nmodel = "gpt-4o"\n\n'
+            f"{wrap_mod._MEMORY_MCP_MARKER}\n"
+            "[mcp_servers.headroom_memory]\n"
+            'command = "python"\n'
+            'args = ["-m", "headroom.memory.mcp_server", "--db", "/tmp/project-a/.headroom/memory.db", "--user", "old-user"]\n'
+            f"{wrap_mod._MEMORY_MCP_END}\n"
+        )
+
+        wrap_mod._inject_memory_mcp_config("codex-user")
+
+        content = config_file.read_text()
+        assert content.count(wrap_mod._MEMORY_MCP_MARKER) == 1
+        assert "[mcp_servers.headroom_memory]" in content
+        assert '"--user", "codex-user"' in content
+        assert "--db" not in content
+        assert 'model = "gpt-4o"' in content
 
 
 class TestInjectAndRestoreRoundTrip:
@@ -311,6 +390,52 @@ class TestInjectAndRestoreRoundTrip:
         cleaned = config_file.read_text()
         assert 'model = "gpt-4o"' in cleaned
         assert "headroom" not in cleaned
+
+    def test_memory_only_wrap_restores_preexisting_named_mcp_block(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        _set_test_home(monkeypatch, tmp_path)
+        config_dir = tmp_path / ".codex"
+        config_dir.mkdir()
+        config_file = config_dir / "config.toml"
+        original = (
+            "# --- Headroom MCP server: headroom ---\n"
+            "[mcp_servers.headroom]\n"
+            'command = "headroom"\n'
+            "# --- end Headroom MCP server: headroom ---\n"
+        )
+        config_file.write_text(original)
+
+        wrap_mod._inject_memory_mcp_config("codex-user")
+
+        status, _ = wrap_mod._restore_codex_provider_config()
+
+        assert status == "restored"
+        assert config_file.read_text() == original
+
+    def test_memory_only_wrap_without_backup_preserves_named_mcp_block(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        _set_test_home(monkeypatch, tmp_path)
+        config_dir = tmp_path / ".codex"
+        config_dir.mkdir()
+        config_file = config_dir / "config.toml"
+        backup_file = config_dir / "config.toml.headroom-backup"
+        original = (
+            "# --- Headroom MCP server: headroom ---\n"
+            "[mcp_servers.headroom]\n"
+            'command = "headroom"\n'
+            "# --- end Headroom MCP server: headroom ---\n"
+        )
+        config_file.write_text(original)
+
+        wrap_mod._inject_memory_mcp_config("codex-user")
+        backup_file.unlink()
+
+        status, _ = wrap_mod._restore_codex_provider_config()
+
+        assert status == "cleaned"
+        assert config_file.read_text() == original
 
     def test_unwrap_handles_malformed_prior_config(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -879,6 +1004,71 @@ def test_wrap_codex_prepare_only_updates_stale_mcp_proxy_url(
     assert "http://127.0.0.1:9000" not in content
 
 
+def test_wrap_codex_memory_prepare_only_uses_local_db_without_persisting_it(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_test_home(monkeypatch, tmp_path)
+    monkeypatch.setenv("USER", "codex-user")
+    project_dir = tmp_path / "project-a"
+    project_dir.mkdir()
+    monkeypatch.chdir(project_dir)
+    backend_paths: list[str] = []
+    imported_users: list[str] = []
+
+    class FakeBackend:
+        async def _ensure_initialized(self) -> None:
+            return None
+
+        async def close(self) -> None:
+            return None
+
+    class FakeClaudeCodeAdapter:
+        def __init__(self, memory_dir: Path) -> None:
+            self.memory_dir = memory_dir
+
+    def fake_build_sync_backend(db_path: str) -> FakeBackend:
+        backend_paths.append(db_path)
+        return FakeBackend()
+
+    async def fake_sync_import(
+        backend: FakeBackend, adapter: FakeClaudeCodeAdapter, user_id: str
+    ) -> int:
+        imported_users.append(user_id)
+        return 0
+
+    with patch("headroom.cli.wrap._ensure_rtk_binary", return_value=None):
+        with patch("headroom.memory.sync._build_sync_backend", side_effect=fake_build_sync_backend):
+            with patch("headroom.memory.sync.sync_import", side_effect=fake_sync_import):
+                with patch(
+                    "headroom.memory.sync_adapters.claude_code.ClaudeCodeAdapter",
+                    FakeClaudeCodeAdapter,
+                ):
+                    with patch(
+                        "headroom.memory.sync_adapters.claude_code.get_claude_memory_dir",
+                        return_value=tmp_path / "claude-memory",
+                    ):
+                        result = runner.invoke(
+                            main,
+                            [
+                                "wrap",
+                                "codex",
+                                "--memory",
+                                "--prepare-only",
+                                "--no-mcp",
+                                "--no-serena",
+                            ],
+                        )
+
+    assert result.exit_code == 0, result.output
+    assert backend_paths == [str(project_dir / ".headroom" / "memory.db")]
+    assert imported_users == ["codex-user"]
+
+    content = (tmp_path / ".codex" / "config.toml").read_text()
+    assert "[mcp_servers.headroom_memory]" in content
+    assert '"--user", "codex-user"' in content
+    assert "--db" not in content
+
+
 def test_wrap_codex_prepare_only_registers_serena_when_uvx_exists(
     runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -966,6 +1156,117 @@ def test_unwrap_codex_no_stop_proxy_leaves_proxy_alone(
         result = runner.invoke(main, ["unwrap", "codex", "--no-stop-proxy"])
 
     assert result.exit_code == 0, result.output
+    stop_proxy.assert_not_called()
+
+
+def test_wrap_codex_memory_prepare_only_unwrap_removes_memory_mcp_without_prior_config(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_test_home(monkeypatch, tmp_path)
+    monkeypatch.setenv("USER", "codex-user")
+    project_dir = tmp_path / "project-a"
+    project_dir.mkdir()
+    monkeypatch.chdir(project_dir)
+
+    class FakeBackend:
+        async def _ensure_initialized(self) -> None:
+            return None
+
+        async def close(self) -> None:
+            return None
+
+    async def fake_sync_import(backend: FakeBackend, adapter: object, user_id: str) -> int:
+        return 0
+
+    with patch("headroom.cli.wrap._ensure_rtk_binary", return_value=None):
+        with patch("headroom.memory.sync._build_sync_backend", return_value=FakeBackend()):
+            with patch("headroom.memory.sync.sync_import", side_effect=fake_sync_import):
+                with patch(
+                    "headroom.memory.sync_adapters.claude_code.ClaudeCodeAdapter",
+                    autospec=True,
+                ):
+                    with patch(
+                        "headroom.memory.sync_adapters.claude_code.get_claude_memory_dir",
+                        return_value=tmp_path / "claude-memory",
+                    ):
+                        wrap_result = runner.invoke(
+                            main,
+                            [
+                                "wrap",
+                                "codex",
+                                "--memory",
+                                "--prepare-only",
+                                "--no-mcp",
+                                "--no-serena",
+                            ],
+                        )
+
+    assert wrap_result.exit_code == 0, wrap_result.output
+    config_file = tmp_path / ".codex" / "config.toml"
+    content = config_file.read_text()
+    assert "[mcp_servers.headroom_memory]" in content
+    assert '"--user", "codex-user"' in content
+
+    with patch("headroom.cli.wrap._stop_local_proxy_for_unwrap") as stop_proxy:
+        unwrap_result = runner.invoke(main, ["unwrap", "codex", "--no-stop-proxy"])
+
+    assert unwrap_result.exit_code == 0, unwrap_result.output
+    assert not config_file.exists()
+    assert not (tmp_path / ".codex" / "config.toml.headroom-backup").exists()
+    stop_proxy.assert_not_called()
+
+
+def test_wrap_codex_memory_launch_failure_unwrap_cleans_memory_only_config(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_test_home(monkeypatch, tmp_path)
+    monkeypatch.setenv("USER", "codex-user")
+    project_dir = tmp_path / "project-a"
+    project_dir.mkdir()
+    monkeypatch.chdir(project_dir)
+
+    class FakeBackend:
+        async def _ensure_initialized(self) -> None:
+            return None
+
+        async def close(self) -> None:
+            return None
+
+    async def fake_sync_import(backend: FakeBackend, adapter: object, user_id: str) -> int:
+        return 0
+
+    def fake_which(cmd: str) -> str | None:
+        return None if cmd == "codex" else shutil.which(cmd)
+
+    with patch("headroom.cli.wrap._ensure_rtk_binary", return_value=None):
+        with patch("headroom.cli.wrap.shutil.which", side_effect=fake_which):
+            with patch("headroom.memory.sync._build_sync_backend", return_value=FakeBackend()):
+                with patch("headroom.memory.sync.sync_import", side_effect=fake_sync_import):
+                    with patch(
+                        "headroom.memory.sync_adapters.claude_code.ClaudeCodeAdapter",
+                        autospec=True,
+                    ):
+                        with patch(
+                            "headroom.memory.sync_adapters.claude_code.get_claude_memory_dir",
+                            return_value=tmp_path / "claude-memory",
+                        ):
+                            wrap_result = runner.invoke(
+                                main,
+                                ["wrap", "codex", "--memory", "--no-mcp", "--no-serena"],
+                            )
+
+    assert wrap_result.exit_code == 1
+    config_file = tmp_path / ".codex" / "config.toml"
+    content = config_file.read_text()
+    assert "[mcp_servers.headroom_memory]" in content
+    assert wrap_mod._CODEX_TOP_LEVEL_MARKER not in content
+
+    with patch("headroom.cli.wrap._stop_local_proxy_for_unwrap") as stop_proxy:
+        unwrap_result = runner.invoke(main, ["unwrap", "codex", "--no-stop-proxy"])
+
+    assert unwrap_result.exit_code == 0, unwrap_result.output
+    assert not config_file.exists()
+    assert not (tmp_path / ".codex" / "config.toml.headroom-backup").exists()
     stop_proxy.assert_not_called()
 
 

@@ -20,7 +20,7 @@ import {
   applyGatewayProviderBaseUrlsInPlace,
   resolveGatewayProviderIds,
 } from "../gateway-config.js";
-import { normalizeAndValidateProxyUrl } from "../proxy-manager.js";
+import { normalizeAndValidateProxyUrl, probeHeadroomProxy } from "../proxy-manager.js";
 import { createHeadroomRetrieveTool } from "../tools/headroom-retrieve.js";
 
 /**
@@ -48,6 +48,8 @@ function headroomPlugin(api: any) {
     debug: (m: string) => logger.debug?.(m),
   });
   const gatewayProviderIds = resolveGatewayProviderIds(config);
+  let validatedConfiguredProxyUrl: string | null = null;
+  let configuredProxyProbePromise: Promise<string | null> | null = null;
 
   const applyGatewayRouting = async (activeProxyUrl: string) => {
     if (gatewayProviderIds.length === 0) {
@@ -71,11 +73,46 @@ function headroomPlugin(api: any) {
     }
   };
 
+  const getConfiguredRoutingProxyUrl = async (): Promise<string | null> => {
+    if (!proxyUrl) {
+      return null;
+    }
+    if (validatedConfiguredProxyUrl === proxyUrl) {
+      return validatedConfiguredProxyUrl;
+    }
+    if (!configuredProxyProbePromise) {
+      configuredProxyProbePromise = probeHeadroomProxy(proxyUrl)
+        .then((probe) => {
+          if (probe.reachable && probe.isHeadroom) {
+            validatedConfiguredProxyUrl = proxyUrl;
+            return proxyUrl;
+          }
+          logger.warn(
+            `[headroom] Skipping upstream gateway routing: configured proxyUrl is not a ready Headroom proxy at ${proxyUrl}` +
+              (probe.reason ? ` (${probe.reason})` : ""),
+          );
+          return null;
+        })
+        .catch((error) => {
+          logger.warn(
+            `[headroom] Skipping upstream gateway routing: failed to probe configured proxyUrl ${proxyUrl}: ${error}`,
+          );
+          return null;
+        })
+        .finally(() => {
+          configuredProxyProbePromise = null;
+        });
+    }
+    return configuredProxyProbePromise;
+  };
+
   const ensureGatewayRouting = async () => {
-    const activeProxyUrl = engine.getProxyUrl();
+    if (gatewayProviderIds.length === 0) {
+      return;
+    }
+    const activeProxyUrl = engine.getProxyUrl() ?? (await getConfiguredRoutingProxyUrl());
     if (!activeProxyUrl) {
       logger.debug?.("[headroom] Deferring upstream gateway routing until proxy is available");
-      engine.ensureProxyStarted();
       return;
     }
     await applyGatewayRouting(activeProxyUrl);
@@ -93,7 +130,7 @@ function headroomPlugin(api: any) {
     const activeProxyUrl = engine.getProxyUrl() ?? proxyUrl;
     if (!activeProxyUrl) return null;
     return createHeadroomRetrieveTool({ proxyUrl: activeProxyUrl });
-  });
+  }, { names: ["headroom_retrieve"] });
 
   api.on("gateway_start", async () => {
     await ensureGatewayRouting();

@@ -13,6 +13,8 @@ from typing import Any
 
 import click
 
+from headroom._subprocess import run
+
 from .main import main
 
 # Default paths
@@ -177,7 +179,7 @@ def mcp_uninstall() -> None:
             capture_output=True,
         )
         if check.returncode == 0:
-            rm = subprocess.run(
+            rm = run(
                 [claude_cli, "mcp", "remove", "headroom", "-s", "user"],
                 capture_output=True,
                 text=True,
@@ -198,7 +200,7 @@ def mcp_uninstall() -> None:
             capture_output=True,
         )
         if cbm_check.returncode == 0:
-            cbm_rm = subprocess.run(
+            cbm_rm = run(
                 [claude_cli, "mcp", "remove", "codebase-memory-mcp", "-s", "user"],
                 capture_output=True,
                 text=True,

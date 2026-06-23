@@ -524,3 +524,74 @@ class TestMistralTokenizer:
         tokenizer = get_tokenizer("codestral")
         MistralTokenizer = get_mistral_tokenizer()
         assert isinstance(tokenizer, MistralTokenizer)
+
+
+class TestLargeToolBlobEstimation:
+    """Oversized tool blobs are token-estimated without serializing them in full."""
+
+    def test_oversized_tool_blob_count_text_is_bounded(self, monkeypatch):
+        """Regression: count_text over a multi-megabyte serialized blob froze the
+        event loop (~seconds). json.dumps itself is cheap; count_text over the
+        whole string is the cost, so its input must stay bounded for oversized
+        blobs.
+        """
+        tok = EstimatingTokenCounter()
+        sizes: list[int] = []
+        real_count_text = tok.count_text
+
+        def spy(text):
+            sizes.append(len(text))
+            return real_count_text(text)
+
+        monkeypatch.setattr(tok, "count_text", spy)
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "content": {"small": "x"}},
+                    {"type": "tool_result", "content": {"data": "A" * 4_000_000}},
+                ],
+            }
+        ]
+        tok.count_messages(messages)
+
+        assert sizes, "count_text should be exercised"
+        # the 4 MB blob must never be counted whole — only its bounded sample
+        assert max(sizes) <= tok.SAMPLE_CHARS + tok.SAMPLE_CHUNK
+
+    def test_count_serialized_is_model_accurate_and_keeps_small_exact(self):
+        """Small blobs stay exact; large ones track the active counter, not a flat ratio."""
+        import json
+
+        tok = EstimatingTokenCounter(chars_per_token=3.5)  # Claude-like ratio
+        small = {"k": "v"}
+        assert tok._count_serialized(small) == tok.count_text(json.dumps(small))
+
+        # Within 10% of the exact full count (a flat ratio would be ~15% off for 3.5).
+        big = {"k": "A" * 200_000}
+        exact = tok.count_text(json.dumps(big))
+        assert abs(tok._count_serialized(big) - exact) / exact < 0.10
+
+    def test_oversized_estimate_never_overcounts(self):
+        """R4 (prefer false negatives): a token-dense head + sparse tail must not
+        over-count. Counting per leaf cannot extrapolate a dense front slice to the
+        whole the way scaling one sample could.
+        """
+        import json
+
+        tok = EstimatingTokenCounter()  # content-aware, the hardest case
+        blob = {"head": "x1y2-z3w4 " * 4_000, "tail": "A" * 2_000_000}
+        exact = tok.count_text(json.dumps(blob))
+        assert tok._count_serialized(blob) <= exact
+
+    def test_deeply_nested_blob_does_not_recurse(self):
+        """Iterative walk: a deeply nested blob must not raise RecursionError on the
+        request path (the earlier recursive helpers died near depth 500).
+        """
+        deep: dict = {}
+        cur = deep
+        for _ in range(2_000):
+            cur["n"] = {}
+            cur = cur["n"]
+        cur["leaf"] = "x" * 60_000
+        assert EstimatingTokenCounter()._count_serialized(deep) >= 0

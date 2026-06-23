@@ -16,6 +16,8 @@ from hashlib import sha1
 from pathlib import Path
 from typing import Any
 
+from headroom._subprocess import run
+
 try:
     import tomllib
 except ModuleNotFoundError:  # Python < 3.11
@@ -604,12 +606,10 @@ def _marketplace_source() -> str:
 
 def _run_checked(command: list[str], *, action: str) -> None:
     logger.debug("subprocess [%s]: %s", action, _command_string(command))
-    result = subprocess.run(
+    result = run(
         command,
         capture_output=True,
         text=True,
-        encoding="utf-8",
-        errors="replace",
     )
     logger.debug(
         "subprocess [%s] exit=%s stdout=%r stderr=%r",

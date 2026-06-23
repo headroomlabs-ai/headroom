@@ -1080,10 +1080,16 @@ class StreamingMixin:
         # window/credit headers — the latter do not contain the ``ratelimit``
         # substring, so without the second clause the Codex CLI's own
         # session/weekly display would stop updating on the streaming path.
+        # We also forward the ``request-id`` family: clients such as Claude Code
+        # record it per transcript turn, and downstream usage/cost tools dedup by
+        # message id + request id. The buffered (non-streaming) path already
+        # forwards every upstream header, so this keeps the two paths symmetric.
         forwarded_headers = {
             k: v
             for k, v in upstream_response.headers.items()
-            if "ratelimit" in k.lower() or k.lower().startswith("x-codex")
+            if "ratelimit" in k.lower()
+            or k.lower().startswith("x-codex")
+            or k.lower() in ("request-id", "anthropic-request-id", "x-request-id")
         }
 
         async def generate():
@@ -1390,6 +1396,21 @@ class StreamingMixin:
                     # Record TTFB on first event
                     if stream_state["ttfb_ms"] is None:
                         stream_state["ttfb_ms"] = (time.time() - start_time) * 1000
+
+                    # Backfill input_tokens on message_start (issue #1132).
+                    # LiteLLM/Bedrock streaming never surfaces prompt tokens
+                    # (only output_tokens, at the end), so the backend emits
+                    # message_start with usage.input_tokens=0. Anthropic clients
+                    # (e.g. Claude Code) read input_tokens from message_start and
+                    # would otherwise report ~0 input for every request. Inject
+                    # the token count Headroom actually sent upstream
+                    # (optimized_tokens) when the backend left it unset/zero, so
+                    # downstream metrics reflect real usage. A non-zero value
+                    # already reported by the backend is preserved untouched.
+                    if event.event_type == "message_start" and not event.raw_sse:
+                        msg_usage = event.data.setdefault("message", {}).setdefault("usage", {})
+                        if not msg_usage.get("input_tokens") and optimized_tokens > 0:
+                            msg_usage["input_tokens"] = optimized_tokens
 
                     # Format as SSE
                     if event.raw_sse:

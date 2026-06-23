@@ -31,6 +31,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
+from headroom._subprocess import run
+
 # Fix Windows cp1252 encoding — box-drawing characters require UTF-8
 if sys.platform == "win32" and hasattr(sys.stdout, "buffer"):
     if sys.stdout.encoding and sys.stdout.encoding.lower().replace("-", "") != "utf8":
@@ -501,12 +503,10 @@ def _setup_lean_ctx_agent(agent: str, verbose: bool = False) -> Path | None:
             # lean-ctx writes project-local files when initialized from a git
             # checkout. Run from a non-project directory so setup is limited to
             # home-scoped agent config such as ~/.codex or ~/.claude.
-            result = subprocess.run(
+            result = run(
                 [str(lean_ctx), "init", "--agent", agent],
                 capture_output=True,
                 text=True,
-                encoding="utf-8",
-                errors="replace",
                 timeout=30,
                 cwd=setup_cwd,
             )
@@ -892,7 +892,7 @@ def _register_cbm_mcp_server(cbm_bin: str) -> None:
         return
 
     # Check if already registered
-    check = subprocess.run(
+    check = run(
         [claude_cli, "mcp", "get", _CBM_MCP_SERVER_NAME],
         capture_output=True,
         text=True,
@@ -900,7 +900,7 @@ def _register_cbm_mcp_server(cbm_bin: str) -> None:
     if check.returncode == 0:
         return  # Already registered
 
-    result = subprocess.run(
+    result = run(
         [claude_cli, "mcp", "add", _CBM_MCP_SERVER_NAME, "-s", "user", "--", cbm_bin],
         capture_output=True,
         text=True,
@@ -948,7 +948,7 @@ def _setup_code_graph(verbose: bool = False) -> bool:
     # Index current project (fast — ~1s for most repos, idempotent)
     project_dir = str(Path.cwd())
     try:
-        result = subprocess.run(
+        result = run(
             [
                 cbm_bin,
                 "cli",
@@ -1080,7 +1080,12 @@ def _codex_config_paths() -> tuple[Path, Path]:
     return config_file, backup_file
 
 
-def _strip_codex_headroom_blocks(content: str, *, remove_mcp: bool = False) -> str:
+def _strip_codex_headroom_blocks(
+    content: str,
+    *,
+    remove_mcp: bool = False,
+    remove_named_mcp: bool = True,
+) -> str:
     """Remove all Headroom-managed blocks from a Codex ``config.toml`` string.
 
     Returns the cleaned content.  Safe to call on content that never contained
@@ -1107,12 +1112,13 @@ def _strip_codex_headroom_blocks(content: str, *, remove_mcp: bool = False) -> s
     if remove_mcp:
         # Remove Headroom-managed MCP blocks written by `wrap codex`.
         content = _remove_marker_span(content, _CODEX_MCP_MARKER, _CODEX_MCP_END)
-        content = re.sub(
-            r"(?ms)^# --- Headroom MCP server: [^\n]+ ---\n.*?"
-            r"^# --- end Headroom MCP server: [^\n]+ ---\n?",
-            "",
-            content,
-        )
+        if remove_named_mcp:
+            content = re.sub(
+                r"(?ms)^# --- Headroom MCP server: [^\n]+ ---\n.*?"
+                r"^# --- end Headroom MCP server: [^\n]+ ---\n?",
+                "",
+                content,
+            )
         content = _remove_marker_span(content, _MEMORY_MCP_MARKER, _MEMORY_MCP_END)
 
     # Strip any leftover top-level keys that older (or crashed) versions of
@@ -1201,6 +1207,17 @@ def _has_redirectable_top_level_key(content: str, key: str) -> bool:
     return pattern.search(content) is not None
 
 
+def _codex_config_has_headroom_markers(content: str) -> bool:
+    """Return whether a Codex config already contains wrap-owned markers."""
+    managed_markers = (
+        _CODEX_TOP_LEVEL_MARKER,
+        _CODEX_END_MARKER,
+        _CODEX_MCP_MARKER,
+        _MEMORY_MCP_MARKER,
+    )
+    return any(marker in content for marker in managed_markers)
+
+
 def _snapshot_codex_config_if_unwrapped(config_file: Path, backup_file: Path) -> None:
     """Snapshot ``config.toml`` to ``backup_file`` before the first injection.
 
@@ -1214,8 +1231,8 @@ def _snapshot_codex_config_if_unwrapped(config_file: Path, backup_file: Path) ->
       *pre-wrap* state, so running wrap repeatedly must not clobber it.
     * If the config file doesn't exist yet, there's nothing to back up; unwrap
       will remove the file entirely instead of restoring a snapshot.
-    * If the config already contains a Headroom marker, a wrap run is already
-      active: do not snapshot the injected state.
+    * If the config already contains any Headroom-managed Codex marker, a wrap
+      run is already active: do not snapshot the injected state.
     """
     if backup_file.exists():
         return
@@ -1225,7 +1242,7 @@ def _snapshot_codex_config_if_unwrapped(config_file: Path, backup_file: Path) ->
         content = config_file.read_text()
     except OSError:
         return
-    if _CODEX_TOP_LEVEL_MARKER in content or _CODEX_END_MARKER in content:
+    if _codex_config_has_headroom_markers(content):
         return
     backup_file.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(config_file, backup_file)
@@ -1469,8 +1486,23 @@ def _restore_codex_provider_config() -> tuple[str, Path]:
     # Case 2: no backup, but config file exists and has markers — strip them.
     if config_file.exists():
         original = config_file.read_text()
-        if _CODEX_TOP_LEVEL_MARKER in original or _CODEX_END_MARKER in original:
-            cleaned = _strip_codex_headroom_blocks(original, remove_mcp=True)
+        if _codex_config_has_headroom_markers(original):
+            # Without a backup, only remove named MCP blocks when this file
+            # also carries wrap-owned provider markers from a full wrap.
+            remove_named_mcp = any(
+                marker in original
+                for marker in (
+                    _CODEX_TOP_LEVEL_MARKER,
+                    _CODEX_END_MARKER,
+                    _CODEX_MCP_MARKER,
+                    _CODEX_MCP_END,
+                )
+            )
+            cleaned = _strip_codex_headroom_blocks(
+                original,
+                remove_mcp=True,
+                remove_named_mcp=remove_named_mcp,
+            )
             if not cleaned.strip():
                 # Nothing left but Headroom content — remove the file entirely
                 # so Codex falls back to its default config.
@@ -1663,7 +1695,35 @@ def _inject_rtk_instructions(file_path: Path, verbose: bool = False) -> bool:
     return True
 
 
-def _inject_memory_mcp_config(db_path: str, user_id: str) -> None:
+def _remove_rtk_instructions(file_path: Path) -> bool:
+    """Remove Headroom's marker-fenced rtk guidance from an instruction file."""
+    if not file_path.exists():
+        return False
+
+    content = file_path.read_text(encoding="utf-8")
+    end_marker = "<!-- /headroom:rtk-instructions -->"
+    start = content.find(_RTK_MARKER)
+    if start < 0:
+        return False
+
+    end = content.find(end_marker, start)
+    if end < 0:
+        return False
+    end += len(end_marker)
+    prefix = content[:start].rstrip()
+    suffix = content[end:].lstrip("\r\n")
+    cleaned = "\n\n".join(part for part in (prefix, suffix) if part)
+    if cleaned:
+        cleaned = cleaned.rstrip() + "\n"
+
+    if cleaned:
+        file_path.write_text(cleaned, encoding="utf-8")
+    else:
+        file_path.unlink()
+    return True
+
+
+def _inject_memory_mcp_config(user_id: str) -> None:
     """Register headroom memory as an MCP server in Codex's config.toml.
 
     Idempotent — replaces existing section if present.
@@ -1676,12 +1736,11 @@ def _inject_memory_mcp_config(db_path: str, user_id: str) -> None:
     # Use forward slashes in TOML paths (works on all platforms, avoids
     # backslash escaping issues on Windows)
     python_bin = sys.executable.replace("\\", "/")
-    db_path_toml = db_path.replace("\\", "/")
     mcp_section = (
         f"\n{_MEMORY_MCP_MARKER}\n"
         f"[mcp_servers.headroom_memory]\n"
         f'command = "{python_bin}"\n'
-        f'args = ["-m", "headroom.memory.mcp_server", "--db", "{db_path_toml}", "--user", "{user_id}"]\n'
+        f'args = ["-m", "headroom.memory.mcp_server", "--user", "{user_id}"]\n'
         f"startup_timeout_sec = 30\n"
         f"tool_timeout_sec = 30\n"
         f"{_MEMORY_MCP_END}\n"
@@ -2347,6 +2406,7 @@ def _ensure_proxy(
                         f"is running stale Headroom {running_version} and could not be restarted."
                     )
                 click.echo(f"  Proxy already running on port {port}")
+                click.echo(f"  Dashboard:    http://127.0.0.1:{port}/dashboard")
                 return None
             if helpers._recover_persistent_proxy(port):
                 return None
@@ -2477,6 +2537,7 @@ def _ensure_proxy(
 
             if not needs_restart:
                 click.echo(f"  Proxy already running on port {port}")
+                click.echo(f"  Dashboard:    http://127.0.0.1:{port}/dashboard")
                 return None
 
         # Start (or restart) the proxy with the requested flags
@@ -2757,14 +2818,12 @@ def _run_checked(
 ) -> subprocess.CompletedProcess[str]:
     """Run subprocess and raise a ClickException with actionable context on failure."""
     try:
-        return subprocess.run(
+        return run(
             cmd,
             cwd=str(cwd) if cwd else None,
             check=True,
             capture_output=True,
             text=True,
-            encoding="utf-8",
-            errors="replace",
         )
     except FileNotFoundError as e:
         raise click.ClickException(f"{action} failed: command not found: {cmd[0]}") from e
@@ -2795,12 +2854,10 @@ def _normalize_openclaw_gateway_provider_ids(provider_ids: tuple[str, ...] | Non
 
 def _read_openclaw_config_value(openclaw_bin: str, path: str) -> Any | None:
     """Read an OpenClaw config value when present, returning None on missing paths."""
-    result = subprocess.run(
+    result = run(
         [openclaw_bin, "config", "get", path],
         capture_output=True,
         text=True,
-        encoding="utf-8",
-        errors="replace",
     )
     if result.returncode != 0:
         return None
@@ -2879,12 +2936,10 @@ def _set_openclaw_context_engine_slot(openclaw_bin: str, engine_id: str) -> None
 
 def _restart_or_start_openclaw_gateway(openclaw_bin: str) -> tuple[str, str]:
     """Restart the gateway when running, otherwise start it."""
-    restart_result = subprocess.run(
+    restart_result = run(
         [openclaw_bin, "gateway", "restart"],
         capture_output=True,
         text=True,
-        encoding="utf-8",
-        errors="replace",
     )
     if restart_result.returncode == 0:
         output = restart_result.stdout.strip() or restart_result.stderr.strip()
@@ -3097,15 +3152,13 @@ def claude(
     # Memory sync BEFORE proxy startup — sync headroom DB ↔ Claude's files
     if memory:
         try:
-            import subprocess as _sp
-
             mem_dir = Path.cwd() / ".headroom"
             mem_dir.mkdir(parents=True, exist_ok=True)
             _sync_db = str(mem_dir / "memory.db")
             _sync_user = os.environ.get("USER", os.environ.get("USERNAME", "default"))
 
             click.echo(f"  Syncing memory (user={_sync_user})...")
-            sync_result = _sp.run(
+            sync_result = run(
                 [
                     sys.executable,
                     "-m",
@@ -3633,6 +3686,26 @@ def copilot(
 
 
 # =============================================================================
+# GitHub Copilot CLI (unwrap)
+# =============================================================================
+
+
+@unwrap.command("copilot")
+@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option("--no-stop-proxy", is_flag=True, help="Do not stop the local Headroom proxy")
+def unwrap_copilot(port: int, no_stop_proxy: bool) -> None:
+    """Undo durable setup from ``headroom wrap copilot``."""
+    instructions = Path.cwd() / ".github" / "copilot-instructions.md"
+    if _remove_rtk_instructions(instructions):
+        click.echo("  Removed Headroom rtk instructions from Copilot.")
+    else:
+        click.echo("  No Headroom rtk instructions found for Copilot.")
+
+    if not no_stop_proxy:
+        _echo_unwrap_proxy_stop_status(_stop_local_proxy_for_unwrap(port), port)
+
+
+# =============================================================================
 # OpenAI Codex CLI
 # =============================================================================
 
@@ -3765,7 +3838,7 @@ def codex(
         mem_user = os.environ.get("USER", os.environ.get("USERNAME", "default"))
 
         # Register MCP server in Codex config
-        _inject_memory_mcp_config(db_path, mem_user)
+        _inject_memory_mcp_config(mem_user)
 
         # Inject memory guidance into project AGENTS.md
         agents_md = Path.cwd() / "AGENTS.md"
@@ -3823,11 +3896,7 @@ def codex(
     # the config file.  Re-inject MCP config after if memory is enabled.
     _inject_codex_provider_config(port)
     if memory:
-        mem_dir = Path.cwd() / ".headroom"
-        _inject_memory_mcp_config(
-            str(mem_dir / "memory.db"),
-            os.environ.get("USER", os.environ.get("USERNAME", "default")),
-        )
+        _inject_memory_mcp_config(os.environ.get("USER", os.environ.get("USERNAME", "default")))
 
     _launch_tool(
         binary=codex_bin,
@@ -4768,13 +4837,11 @@ def openclaw(
         install_cwd = None
 
     click.echo("  Installing OpenClaw plugin with required unsafe-install flag...")
-    install_result = subprocess.run(
+    install_result = run(
         install_cmd,
         cwd=str(install_cwd) if install_cwd else None,
         capture_output=True,
         text=True,
-        encoding="utf-8",
-        errors="replace",
     )
     if install_result.returncode != 0:
         combined_error = "\n".join(
@@ -4943,9 +5010,8 @@ def opencode(
         click.echo("  Setting up memory for OpenCode...")
         mem_dir = Path.cwd() / ".headroom"
         mem_dir.mkdir(parents=True, exist_ok=True)
-        db_path = str(mem_dir / "memory.db")
         mem_user = os.environ.get("USER", os.environ.get("USERNAME", "default"))
-        _inject_memory_mcp_config(db_path, mem_user)
+        _inject_memory_mcp_config(mem_user)
         agents_md = Path.cwd() / "AGENTS.md"
         _inject_memory_agents_md(agents_md)
 
@@ -4968,7 +5034,6 @@ def opencode(
     if memory:
         mem_dir = Path.cwd() / ".headroom"
         _inject_memory_mcp_config(
-            str(mem_dir / "memory.db"),
             os.environ.get("USER", os.environ.get("USERNAME", "default")),
         )
 
