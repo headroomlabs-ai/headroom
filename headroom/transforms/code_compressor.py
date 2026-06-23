@@ -261,7 +261,11 @@ class LangConfig:
 
 _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
     CodeLanguage.PYTHON: LangConfig(
-        import_nodes=frozenset({"import_statement", "import_from_statement"}),
+        # future_import_statement is a distinct tree-sitter node — collect it so
+        # `from __future__` stays a leading import, not trailing code (#1233).
+        import_nodes=frozenset(
+            {"import_statement", "import_from_statement", "future_import_statement"}
+        ),
         function_nodes=frozenset({"function_definition"}),
         class_nodes=frozenset({"class_definition"}),
         type_nodes=frozenset({"type_alias_statement"}),
@@ -1761,15 +1765,23 @@ class CodeAwareCompressor(Transform):
     def _verify_syntax(self, code: str, language: CodeLanguage) -> bool:
         """Verify that code is syntactically valid.
 
-        Checks for both ERROR nodes (parse failures) and MISSING nodes
-        (tokens the parser expected but didn't find).
+        tree-sitter catches grammar errors (ERROR/MISSING nodes); for Python we
+        also run ``compile()``, which catches semantic rules it can't — e.g. a
+        reordered ``from __future__`` parses clean but fails at import (#1233).
         """
         try:
             parser = _get_parser(language.value)
             tree = parser.parse(bytes(code, "utf-8"))
-            return not _has_syntax_issues(tree.root_node)
+            if _has_syntax_issues(tree.root_node):
+                return False
         except Exception:
             return False
+        if language is CodeLanguage.PYTHON:
+            try:
+                compile(code, "<headroom-verify>", "exec")
+            except (SyntaxError, ValueError):
+                return False
+        return True
 
     def _fallback_compress(self, code: str, original_tokens: int) -> CodeCompressionResult:
         """Fall back to Kompress compression."""
