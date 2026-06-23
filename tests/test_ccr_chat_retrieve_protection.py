@@ -28,13 +28,27 @@ def _messages(retrieve_output, other_output):
     """Chat history: an assistant headroom_retrieve call + a normal read_file call."""
     return [
         {"role": "user", "content": "expand the dump"},
-        {"role": "assistant", "tool_calls": [
-            {"id": "call_keep", "type": "function",
-             "function": {"name": "headroom_retrieve", "arguments": '{"hash":"h1"}'}}]},
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "call_keep",
+                    "type": "function",
+                    "function": {"name": "headroom_retrieve", "arguments": '{"hash":"h1"}'},
+                }
+            ],
+        },
         {"role": "tool", "tool_call_id": "call_keep", "content": retrieve_output},
-        {"role": "assistant", "tool_calls": [
-            {"id": "call_other", "type": "function",
-             "function": {"name": "read_file", "arguments": "{}"}}]},
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "call_other",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"},
+                }
+            ],
+        },
         {"role": "tool", "tool_call_id": "call_other", "content": other_output},
     ]
 
@@ -45,9 +59,18 @@ def test_detects_only_headroom_retrieve_call_ids():
 
 
 def test_namespaced_retrieve_name_is_detected():
-    msgs = [{"role": "assistant", "tool_calls": [
-        {"id": "c1", "type": "function",
-         "function": {"name": "mcp__headroom__headroom_retrieve", "arguments": "{}"}}]}]
+    msgs = [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "mcp__headroom__headroom_retrieve", "arguments": "{}"},
+                }
+            ],
+        }
+    ]
     assert _headroom_retrieve_tool_call_ids(msgs) == {"c1"}
 
 
@@ -58,9 +81,10 @@ def test_capture_snapshots_only_retrieve_outputs():
 
 
 def test_capture_is_empty_without_retrieve_calls():
-    assert capture_headroom_retrieve_outputs(
-        [{"role": "tool", "tool_call_id": "x", "content": "y"}]
-    ) == {}
+    assert (
+        capture_headroom_retrieve_outputs([{"role": "tool", "tool_call_id": "x", "content": "y"}])
+        == {}
+    )
 
 
 def test_restore_recovers_byte_identical_original():
