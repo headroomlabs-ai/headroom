@@ -117,6 +117,20 @@ pub fn install_static_token_source(mut state: AppState, bearer: &str) -> AppStat
     state
 }
 
+/// Convenience: POST a minimal recordable Anthropic `/v1/messages` request (the
+/// standard `claude-haiku-4-5` body) and return the response. Callers assert on
+/// `.status()` as needed.
+#[allow(dead_code)]
+pub async fn post_messages(proxy: &ProxyHandle) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("{}/v1/messages", proxy.url()))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"hi"}],"max_tokens":10}"#)
+        .send()
+        .await
+        .expect("POST /v1/messages")
+}
+
 /// Convenience: `GET /stats` on a running proxy and parse the JSON body.
 #[allow(dead_code)]
 pub async fn get_stats(proxy: &ProxyHandle) -> serde_json::Value {

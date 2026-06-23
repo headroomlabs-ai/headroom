@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::{get_stats, start_proxy, start_proxy_with};
+use common::{get_stats, post_messages, start_proxy, start_proxy_with};
 use wiremock::matchers::{method, path as path_matcher};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -56,18 +56,7 @@ async fn stats_records_llm_request_attributed_by_provider() {
     // Recording is gated on the compression master switch; enable it.
     let proxy = start_proxy_with(&upstream.uri(), enable_recording).await;
 
-    let req_body = serde_json::json!({
-        "model": "claude-haiku-4-5",
-        "messages": [{"role": "user", "content": "hi"}],
-        "max_tokens": 10
-    });
-    let resp = reqwest::Client::new()
-        .post(format!("{}/v1/messages", proxy.url()))
-        .header("content-type", "application/json")
-        .body(req_body.to_string())
-        .send()
-        .await
-        .expect("POST /v1/messages");
+    let resp = post_messages(&proxy).await;
     assert_eq!(resp.status(), 200);
 
     let stats = get_stats(&proxy).await;
@@ -170,13 +159,7 @@ async fn stats_folds_in_supplemental_python_blocks() {
 
     // Drive one Rust-native request so the unified store holds real Rust data
     // alongside the folded-in Python block.
-    let resp = reqwest::Client::new()
-        .post(format!("{}/v1/messages", proxy.url()))
-        .header("content-type", "application/json")
-        .body(r#"{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"hi"}],"max_tokens":10}"#)
-        .send()
-        .await
-        .expect("POST /v1/messages");
+    let resp = post_messages(&proxy).await;
     assert_eq!(resp.status(), 200);
 
     let stats = get_stats(&proxy).await;
@@ -223,12 +206,6 @@ async fn stats_persist_across_restart() {
         .mount(&upstream)
         .await;
 
-    let req_body = serde_json::json!({
-        "model": "claude-haiku-4-5",
-        "messages": [{"role": "user", "content": "hi"}],
-        "max_tokens": 10
-    });
-
     // First instance: persists to `path`, records one request, shuts down.
     {
         let p = path.clone();
@@ -237,13 +214,7 @@ async fn stats_persist_across_restart() {
             c.savings_path = Some(p);
         })
         .await;
-        let resp = reqwest::Client::new()
-            .post(format!("{}/v1/messages", proxy.url()))
-            .header("content-type", "application/json")
-            .body(req_body.to_string())
-            .send()
-            .await
-            .expect("POST");
+        let resp = post_messages(&proxy).await;
         assert_eq!(resp.status(), 200);
         proxy.shutdown().await;
     }
@@ -339,18 +310,7 @@ async fn stats_history_endpoint_serves_history_contract() {
     assert_eq!(empty["series"]["daily"].as_array().unwrap().len(), 0);
 
     // Record one request; lifetime should advance and the contract stays valid.
-    let req_body = serde_json::json!({
-        "model": "claude-haiku-4-5",
-        "messages": [{"role": "user", "content": "hi"}],
-        "max_tokens": 10
-    });
-    reqwest::Client::new()
-        .post(format!("{}/v1/messages", proxy.url()))
-        .header("content-type", "application/json")
-        .body(req_body.to_string())
-        .send()
-        .await
-        .expect("POST /v1/messages");
+    post_messages(&proxy).await;
 
     let hist: serde_json::Value = reqwest::Client::new()
         .get(format!("{}/stats-history", proxy.url()))
@@ -379,18 +339,7 @@ async fn stats_counts_failed_when_upstream_returns_5xx() {
         .await;
     let proxy = start_proxy_with(&upstream.uri(), enable_recording).await;
 
-    let req_body = serde_json::json!({
-        "model": "claude-haiku-4-5",
-        "messages": [{"role": "user", "content": "hi"}],
-        "max_tokens": 10
-    });
-    let resp = reqwest::Client::new()
-        .post(format!("{}/v1/messages", proxy.url()))
-        .header("content-type", "application/json")
-        .body(req_body.to_string())
-        .send()
-        .await
-        .expect("POST /v1/messages");
+    let resp = post_messages(&proxy).await;
     assert_eq!(resp.status(), 500);
 
     let stats = get_stats(&proxy).await;
@@ -414,13 +363,7 @@ async fn stats_does_not_count_failed_on_2xx() {
         .await;
     let proxy = start_proxy_with(&upstream.uri(), enable_recording).await;
 
-    reqwest::Client::new()
-        .post(format!("{}/v1/messages", proxy.url()))
-        .header("content-type", "application/json")
-        .body(r#"{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"hi"}],"max_tokens":10}"#)
-        .send()
-        .await
-        .expect("POST /v1/messages");
+    post_messages(&proxy).await;
 
     let stats = get_stats(&proxy).await;
     assert_eq!(stats["requests"]["total"], 1);
@@ -446,13 +389,7 @@ async fn stats_exposes_recent_requests_feed() {
     assert!(empty["recent_requests"].is_array());
     assert_eq!(empty["recent_requests"].as_array().unwrap().len(), 0);
 
-    reqwest::Client::new()
-        .post(format!("{}/v1/messages", proxy.url()))
-        .header("content-type", "application/json")
-        .body(r#"{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"hi"}],"max_tokens":10}"#)
-        .send()
-        .await
-        .expect("POST /v1/messages");
+    post_messages(&proxy).await;
 
     let stats = get_stats(&proxy).await;
     let feed = stats["recent_requests"].as_array().unwrap();
@@ -517,13 +454,7 @@ async fn stats_records_connect_error_as_failed() {
     // dropped silently, so OpenAI/Anthropic outages stay visible in /stats.
     let proxy = start_proxy_with("http://127.0.0.1:1", enable_recording).await;
 
-    let resp = reqwest::Client::new()
-        .post(format!("{}/v1/messages", proxy.url()))
-        .header("content-type", "application/json")
-        .body(r#"{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"hi"}],"max_tokens":10}"#)
-        .send()
-        .await
-        .expect("POST /v1/messages");
+    let resp = post_messages(&proxy).await;
     assert!(resp.status().is_server_error(), "got {}", resp.status());
 
     let stats = get_stats(&proxy).await;
@@ -576,13 +507,7 @@ async fn stats_not_recorded_when_mode_off() {
     })
     .await;
 
-    let resp = reqwest::Client::new()
-        .post(format!("{}/v1/messages", proxy.url()))
-        .header("content-type", "application/json")
-        .body(r#"{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"hi"}],"max_tokens":10}"#)
-        .send()
-        .await
-        .expect("POST /v1/messages");
+    let resp = post_messages(&proxy).await;
     assert_eq!(resp.status(), 200);
 
     let stats = get_stats(&proxy).await;
