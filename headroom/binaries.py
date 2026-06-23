@@ -37,6 +37,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from headroom._subprocess import run
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
@@ -111,7 +113,7 @@ def _is_musl() -> bool:
     which is present on Alpine even when `ldd` is absent.
     """
     try:
-        out = subprocess.run(
+        out = run(
             ["ldd", "--version"],
             capture_output=True,
             text=True,

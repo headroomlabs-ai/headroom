@@ -14,7 +14,6 @@ import json
 import logging
 import os
 import random
-import subprocess
 import threading
 import time
 from collections import OrderedDict
@@ -23,6 +22,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from headroom import paths as _paths
+from headroom._subprocess import run
 
 if TYPE_CHECKING:
     from fastapi import Request
@@ -1181,7 +1181,7 @@ def _read_rtk_lifetime_stats() -> dict[str, Any] | None:
         )
 
     try:
-        result = subprocess.run(
+        result = run(
             _rtk_gain_command(rtk_path, scope),
             capture_output=True,
             text=True,
@@ -1242,7 +1242,7 @@ def _read_lean_ctx_lifetime_stats() -> dict[str, Any] | None:
     base_payload = _context_tool_zero_payload(tool=_CONTEXT_TOOL_LEAN_CTX, installed=True)
 
     try:
-        result = subprocess.run(
+        result = run(
             [str(lean_ctx_path), "gain", "--json"],
             capture_output=True,
             text=True,
