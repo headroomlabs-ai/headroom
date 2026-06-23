@@ -42,6 +42,7 @@ def skip_offline_model_failures(func):
 
     return wrapper
 
+
 # -------------------------------------------------------------------
 # Singleflight under concurrent callers
 # -------------------------------------------------------------------
