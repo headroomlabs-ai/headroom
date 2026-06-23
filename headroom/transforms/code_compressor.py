@@ -261,7 +261,9 @@ class LangConfig:
 
 _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
     CodeLanguage.PYTHON: LangConfig(
-        import_nodes=frozenset({"import_statement", "import_from_statement"}),
+        import_nodes=frozenset(
+            {"future_import_statement", "import_statement", "import_from_statement"}
+        ),
         function_nodes=frozenset({"function_definition"}),
         class_nodes=frozenset({"class_definition"}),
         type_nodes=frozenset({"type_alias_statement"}),
@@ -1660,7 +1662,9 @@ class CodeAwareCompressor(Transform):
                 method_compressed = None
                 for deco_child in child.children:
                     if deco_child.type == "decorator":
-                        decorator_lines.append(_get_node_text(deco_child, code))
+                        deco_start = deco_child.start_point[0]
+                        deco_end = deco_child.end_point[0]
+                        decorator_lines.append("\n".join(code_lines[deco_start : deco_end + 1]))
                     elif deco_child.type in lang_config.function_nodes:
                         method_compressed = self._compress_function_ast(
                             deco_child, code, language, lang_config, body_limits, analysis
@@ -1765,6 +1769,12 @@ class CodeAwareCompressor(Transform):
         (tokens the parser expected but didn't find).
         """
         try:
+            if language == CodeLanguage.PYTHON:
+                import ast
+
+                ast.parse(code)
+                compile(code, "<headroom-compressed>", "exec")
+
             parser = _get_parser(language.value)
             tree = parser.parse(bytes(code, "utf-8"))
             return not _has_syntax_issues(tree.root_node)

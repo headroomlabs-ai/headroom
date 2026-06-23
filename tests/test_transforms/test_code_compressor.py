@@ -9,6 +9,7 @@ Comprehensive tests covering:
 - Edge cases: Empty content, unavailable dependency, fallbacks
 """
 
+import textwrap
 from unittest.mock import patch
 
 import pytest
@@ -851,6 +852,85 @@ def main():
             compile(result.compressed, "<test>", "exec")
         except SyntaxError:
             pytest.fail("Compressed output has invalid Python syntax")
+
+    def test_python_future_import_stays_at_module_start(self):
+        """Compressed Python keeps future imports before executable statements."""
+        config = CodeCompressorConfig(
+            min_tokens_for_compression=10,
+            target_compression_rate=0.2,
+            max_body_lines=3,
+            enable_ccr=False,
+        )
+        compressor = CodeAwareCompressor(config)
+        code = textwrap.dedent(
+            """
+            from __future__ import annotations
+
+            from dataclasses import dataclass
+            from typing import Any, Callable, Iterable
+
+
+            def traced(label: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+                def decorate(fn: Callable[..., Any]) -> Callable[..., Any]:
+                    async def wrapper(*args: Any, **kwargs: Any) -> Any:
+                        return await fn(*args, **kwargs)
+
+                    return wrapper
+
+                return decorate
+
+
+            @dataclass(slots=True)
+            class Event:
+                kind: str
+                payload: dict[str, Any]
+                retries: int = 0
+
+                @property
+                def important(self) -> bool:
+                    return self.kind in {"error", "retry"} or self.retries > 2
+
+
+            class EventRouter:
+                def __init__(self, sinks: dict[str, Callable[[Event], Any]]) -> None:
+                    self.sinks = sinks
+                    self.history: list[tuple[str, bool]] = []
+
+                @traced("route")
+                async def route(self, events: Iterable[Event]) -> list[str]:
+                    accepted: list[str] = []
+                    for event in events:
+                        match event:
+                            case Event(kind="error", payload={"code": code, "message": msg}, retries=r) if r > 1:
+                                destination = "pager"
+                                accepted.append(f"{destination}:{code}:{msg}")
+                            case Event(kind=kind, payload=payload) if (route := payload.get("route")):
+                                destination = str(route)
+                                accepted.append(f"{destination}:{kind}")
+                            case _:
+                                destination = "dead_letter"
+                                accepted.append(destination)
+
+                        self.history.append((destination, event.important))
+
+                    return [item for item in accepted if item]
+            """
+        )
+
+        result = compressor.compress(code, language="python")
+
+        assert result.syntax_valid is True
+        future_import_index = result.compressed.index("from __future__ import annotations")
+        first_executable_index = min(
+            result.compressed.index("@dataclass"),
+            result.compressed.index("def traced"),
+            result.compressed.index("class EventRouter"),
+        )
+        assert future_import_index < first_executable_index
+        try:
+            compile(result.compressed, "<test>", "exec")
+        except SyntaxError as exc:
+            pytest.fail(f"Compressed output has invalid Python syntax: {exc}\n{result.compressed}")
 
     def test_tree_sitter_loaded_after_compression(self):
         """Parser is loaded after compression."""
