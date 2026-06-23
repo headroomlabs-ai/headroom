@@ -100,6 +100,21 @@ def test_get_server_falls_back_to_legacy(tmp_path: Path) -> None:
     assert got.env == {}
 
 
+def test_get_server_reads_claude_config_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cfg = tmp_path / ".claude.json"
+    cfg.write_text(
+        json.dumps({"mcpServers": {"headroom": {"command": "headroom", "args": ["mcp", "serve"]}}})
+    )
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    reg = ClaudeRegistrar(claude_cli=None)
+    got = reg.get_server("headroom")
+    assert got is not None
+    assert got.command == "headroom"
+    assert got.args == ("mcp", "serve")
+
+
 # ----------------------------------------------------------------------
 # register_server() — happy paths
 # ----------------------------------------------------------------------
@@ -167,6 +182,19 @@ def test_register_writes_to_legacy_when_only_legacy_exists(tmp_path: Path) -> No
     data = json.loads(legacy.read_text())
     assert "headroom" in data["mcpServers"]
     # Modern config should NOT have been created.
+    assert not (tmp_path / ".claude" / ".claude.json").exists()
+
+
+def test_register_writes_to_claude_config_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    reg = ClaudeRegistrar(claude_cli=None)
+    result = reg.register_server(_spec())
+    assert result.status == RegisterStatus.REGISTERED
+    cfg = tmp_path / ".claude.json"
+    data = json.loads(cfg.read_text())
+    assert data["mcpServers"]["headroom"]["command"] == "headroom"
     assert not (tmp_path / ".claude" / ".claude.json").exists()
 
 
@@ -293,6 +321,28 @@ def test_unregister_via_file_when_no_cli(tmp_path: Path) -> None:
 def test_unregister_returns_false_when_absent(tmp_path: Path) -> None:
     reg = _make_registrar(tmp_path, cli=None)
     assert reg.unregister_server("headroom") is False
+
+
+def test_unregister_removes_from_claude_config_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cfg = tmp_path / ".claude.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "headroom": {"command": "headroom", "args": ["mcp", "serve"]},
+                    "other": {"command": "other"},
+                }
+            }
+        )
+    )
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    reg = ClaudeRegistrar(claude_cli=None)
+    assert reg.unregister_server("headroom") is True
+    data = json.loads(cfg.read_text())
+    assert "headroom" not in data["mcpServers"]
+    assert "other" in data["mcpServers"]
 
 
 # ----------------------------------------------------------------------

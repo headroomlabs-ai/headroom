@@ -65,3 +65,54 @@ def test_mcp_retrieves_proxy_stored_content(fresh_store) -> None:
 
     assert result.get("source") == "local"
     assert result["original_content"] == original
+
+
+def test_compress_savings_percent_tracks_token_counts(fresh_store) -> None:
+    """``savings_percent`` must be the *removed* percentage derived from the
+    token counts — never the retained percentage. Regression for the inversion
+    where ``(1 - compression_ratio)`` reported a no-op (0% saved) as 100%."""
+    pytest.importorskip("mcp", reason="MCP SDK required")
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+
+    # Repetitive JSON array — the shape the engine actually compresses.
+    content = json.dumps([{"id": i, "status": "ok", "kind": "run"} for i in range(40)])
+    result = server._compress_content(content)
+
+    orig = result["original_tokens"]
+    comp = result["compressed_tokens"]
+    expected = round((1 - comp / orig) * 100, 1) if orig > 0 else 0
+
+    # Reported savings agrees with the token fields (and with tokens_saved).
+    assert result["savings_percent"] == expected
+    assert 0.0 <= result["savings_percent"] <= 100.0
+    if result["tokens_saved"] == 0:
+        assert result["savings_percent"] == 0.0  # not inverted to 100
+    else:
+        assert result["savings_percent"] > 0.0
+
+
+def test_mcp_retrieve_with_nonmatching_query_returns_full_content(fresh_store) -> None:
+    """A query that matches no item above the relevance floor must still return
+    the stored entry (it exists and is unexpired) rather than the "Content not
+    found" error, which is reserved for genuine misses."""
+    pytest.importorskip("mcp", reason="MCP SDK required")
+    original = "the the the the the the the the the the\n" * 5
+    hash_key = get_compression_store().store(original, "<<small>>")
+    # Precondition: the query genuinely matches nothing above the BM25 floor.
+    assert get_compression_store().search(hash_key, "zzqx_nonmatching_token") == []
+
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+    result = asyncio.run(server._retrieve_content(hash_key, query="zzqx_nonmatching_token"))
+
+    assert "error" not in result
+    assert result.get("source") == "local"
+    assert result["original_content"] == original
+    assert result["count"] == 0
+
+
+def test_mcp_retrieve_missing_hash_still_errors(fresh_store) -> None:
+    """A genuinely missing hash must still report "Content not found"."""
+    pytest.importorskip("mcp", reason="MCP SDK required")
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+    result = asyncio.run(server._retrieve_content("nonexistent_hash", query="anything"))
+    assert "Content not found" in result.get("error", "")

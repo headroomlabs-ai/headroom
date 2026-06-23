@@ -20,10 +20,19 @@ import {
   applyGatewayProviderBaseUrlsInPlace,
   resolveGatewayProviderIds,
 } from "../gateway-config.js";
-import { normalizeAndValidateProxyUrl } from "../proxy-manager.js";
+import { normalizeAndValidateProxyUrl, probeHeadroomProxy } from "../proxy-manager.js";
 import { createHeadroomRetrieveTool } from "../tools/headroom-retrieve.js";
 
-export default function headroomPlugin(api: any) {
+/**
+ * OpenClaw 2026.x plugin API requires a `{ register(api) }` object export.
+ * The previous bare-function default export was silently skipped by the loader.
+ * See: https://github.com/chopratejas/headroom/issues/XXX
+ */
+export default {
+  register: headroomPlugin,
+};
+
+function headroomPlugin(api: any) {
   const config = api.config?.plugins?.entries?.headroom?.config ?? {};
   const logger = api.logger ?? console;
   const rawProxyUrl = config.proxyUrl;
@@ -39,6 +48,8 @@ export default function headroomPlugin(api: any) {
     debug: (m: string) => logger.debug?.(m),
   });
   const gatewayProviderIds = resolveGatewayProviderIds(config);
+  let validatedConfiguredProxyUrl: string | null = null;
+  let configuredProxyProbePromise: Promise<string | null> | null = null;
 
   const applyGatewayRouting = async (activeProxyUrl: string) => {
     if (gatewayProviderIds.length === 0) {
@@ -62,11 +73,46 @@ export default function headroomPlugin(api: any) {
     }
   };
 
+  const getConfiguredRoutingProxyUrl = async (): Promise<string | null> => {
+    if (!proxyUrl) {
+      return null;
+    }
+    if (validatedConfiguredProxyUrl === proxyUrl) {
+      return validatedConfiguredProxyUrl;
+    }
+    if (!configuredProxyProbePromise) {
+      configuredProxyProbePromise = probeHeadroomProxy(proxyUrl)
+        .then((probe) => {
+          if (probe.reachable && probe.isHeadroom) {
+            validatedConfiguredProxyUrl = proxyUrl;
+            return proxyUrl;
+          }
+          logger.warn(
+            `[headroom] Skipping upstream gateway routing: configured proxyUrl is not a ready Headroom proxy at ${proxyUrl}` +
+              (probe.reason ? ` (${probe.reason})` : ""),
+          );
+          return null;
+        })
+        .catch((error) => {
+          logger.warn(
+            `[headroom] Skipping upstream gateway routing: failed to probe configured proxyUrl ${proxyUrl}: ${error}`,
+          );
+          return null;
+        })
+        .finally(() => {
+          configuredProxyProbePromise = null;
+        });
+    }
+    return configuredProxyProbePromise;
+  };
+
   const ensureGatewayRouting = async () => {
-    const activeProxyUrl = engine.getProxyUrl();
+    if (gatewayProviderIds.length === 0) {
+      return;
+    }
+    const activeProxyUrl = engine.getProxyUrl() ?? (await getConfiguredRoutingProxyUrl());
     if (!activeProxyUrl) {
       logger.debug?.("[headroom] Deferring upstream gateway routing until proxy is available");
-      engine.ensureProxyStarted();
       return;
     }
     await applyGatewayRouting(activeProxyUrl);
@@ -84,7 +130,7 @@ export default function headroomPlugin(api: any) {
     const activeProxyUrl = engine.getProxyUrl() ?? proxyUrl;
     if (!activeProxyUrl) return null;
     return createHeadroomRetrieveTool({ proxyUrl: activeProxyUrl });
-  });
+  }, { names: ["headroom_retrieve"] });
 
   api.on("gateway_start", async () => {
     await ensureGatewayRouting();

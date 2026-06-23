@@ -24,6 +24,11 @@ JSON_BLOCK_PATTERN = re.compile(r"\{[\s\S]{500,}\}")
 # exit codes) and are not evidence of a re-read.
 REREAD_MIN_TOKENS = 50
 
+# Canonical CCR retrieval-marker shapes. Mirrors the alternation in
+# transforms/compression_units._CCR_MARKER_RE; kept local because the parser
+# is a base module and importing from transforms would create a cycle.
+CCR_RETRIEVAL_MARKER_RE = re.compile(r"Retrieve more: hash=|Retrieve original: hash=|<<ccr:[^>]+>>")
+
 # Repeats this close (in message positions) to the previous serve are
 # polling, not re-reads. Consecutive tool turns sit 2 apart (the
 # assistant tool_use message lies between results); 3 also absorbs a
@@ -336,6 +341,7 @@ def parse_message_to_blocks(
 def parse_messages(
     messages: list[dict[str, Any]],
     tokenizer: Tokenizer,
+    compressed_messages: list[dict[str, Any]] | None = None,
 ) -> tuple[list[Block], dict[str, int], WasteSignals]:
     """
     Parse all messages into blocks with analysis.
@@ -343,6 +349,11 @@ def parse_messages(
     Args:
         messages: List of message dicts.
         tokenizer: Tokenizer instance for token counting.
+        compressed_messages: Optional post-transform copy of the same
+            messages. When provided (and the message count matches), reread
+            waste is additionally attributed: repeats whose first serve was
+            replaced by a CCR retrieval marker count into
+            ``reread_compressed_tokens`` (#899).
 
     Returns:
         Tuple of (blocks, block_breakdown, total_waste_signals)
@@ -374,6 +385,7 @@ def parse_messages(
     for block in all_blocks:
         if block.kind == "tool_result" and block.tokens_est >= REREAD_MIN_TOKENS:
             reread_groups.setdefault(block.content_hash, []).append(block)
+    attribute = compressed_messages is not None and len(compressed_messages) == len(messages)
     for group in reread_groups.values():
         # The message that first served the content is the original; only
         # copies appearing in *later* messages are re-reads. Duplicates
@@ -385,14 +397,34 @@ def parse_messages(
         # repeats advance the baseline without counting, so a long polling
         # chain never accumulates waste.
         prev_index = group[0].source_index
+        counted_tokens = 0
         for block in group:
             if block.source_index == prev_index:
                 continue
             is_polling = block.source_index - prev_index <= REREAD_ADJACENT_GAP
             prev_index = block.source_index
             if not is_polling:
-                total_waste.reread_tokens += block.tokens_est
+                counted_tokens += block.tokens_est
                 counted_results.add(id(block))
+        if not counted_tokens:
+            continue
+        total_waste.reread_tokens += counted_tokens
+        # Over-compression attribution (#899): if the transformed copy of the
+        # first serve carries a CCR retrieval marker and its original text is
+        # gone, the model never saw the full first serve — the repeats are
+        # attributable to compression. Lossless reshaping (no marker) is
+        # deliberately not attributed: the model saw all the data, so the
+        # re-read is agent behavior.
+        if attribute and compressed_messages is not None:
+            first = group[0]
+            transformed_blocks = parse_message_to_blocks(
+                compressed_messages[first.source_index], first.source_index, tokenizer
+            )
+            transformed_text = "\n".join(b.text for b in transformed_blocks)
+            if CCR_RETRIEVAL_MARKER_RE.search(transformed_text) and (
+                first.text not in transformed_text
+            ):
+                total_waste.reread_compressed_tokens += counted_tokens
 
     # Re-issued-call detection: the agent invoking the same tool with the
     # same arguments again is a re-fetch even when the result bytes differ

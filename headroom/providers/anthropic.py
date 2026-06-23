@@ -19,6 +19,7 @@ import importlib.util
 import json
 import logging
 import os
+import re
 import warnings
 from typing import Any, cast
 
@@ -51,17 +52,39 @@ logger = logging.getLogger(__name__)
 # Warning flags
 _FALLBACK_WARNING_SHOWN = False
 _UNKNOWN_MODEL_WARNINGS: set[str] = set()
+_ANSI_ESCAPE_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+_DANGLING_ANSI_STYLE_SUFFIX_RE = re.compile(r"(?:\[[0-9;]*m\])+$")
+
+
+def sanitize_anthropic_model_id(model: str) -> str:
+    """Return an Anthropic model id without terminal styling artifacts."""
+    cleaned = _ANSI_ESCAPE_RE.sub("", str(model)).strip()
+    if cleaned.startswith("claude-"):
+        cleaned = _DANGLING_ANSI_STYLE_SUFFIX_RE.sub("", cleaned)
+    return cleaned
+
+
+def sanitize_anthropic_model_metadata(value: Any) -> Any:
+    """Strip model-id styling artifacts from Anthropic model metadata payloads."""
+    if isinstance(value, list):
+        return [sanitize_anthropic_model_metadata(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+
+    cleaned: dict[str, Any] = {}
+    for key, item in value.items():
+        if key in {"id", "model"} and isinstance(item, str):
+            cleaned[key] = sanitize_anthropic_model_id(item)
+        else:
+            cleaned[key] = sanitize_anthropic_model_metadata(item)
+    return cleaned
 
 
 # Anthropic model context limits
 # All Claude 3+ models have 200K context
 ANTHROPIC_CONTEXT_LIMITS: dict[str, int] = {
-    # Claude 4.7 (Opus 4.7) - 1M context. Claude Code sends the model
-    # name with a `[1m]` suffix to select the 1M tier; both forms are
-    # registered explicitly because the lookup chain does not strip the
-    # tier suffix and LiteLLM does not key on it either.
+    # Claude 4.7 (Opus 4.7) - 1M context
     "claude-opus-4-7": 1000000,
-    "claude-opus-4-7[1m]": 1000000,
     # Claude 4.6 (Opus 4.6) - 1M context
     "claude-opus-4-6": 1000000,
     # Claude 4.5 (Opus 4.5)
@@ -89,10 +112,8 @@ ANTHROPIC_CONTEXT_LIMITS: dict[str, int] = {
 # NOTE: These are ESTIMATES. Always verify against actual Anthropic billing.
 # Last updated: 2025-01-14
 ANTHROPIC_PRICING: dict[str, dict[str, float]] = {
-    # Claude 4.7 (Opus tier pricing) — registered for both the bare
-    # name and the `[1m]` tier-suffixed form Claude Code sends.
+    # Claude 4.7 (Opus tier pricing)
     "claude-opus-4-7": {"input": 15.00, "output": 75.00, "cached_input": 1.50},
-    "claude-opus-4-7[1m]": {"input": 15.00, "output": 75.00, "cached_input": 1.50},
     # Claude 4.6 (Opus tier pricing)
     "claude-opus-4-6": {"input": 15.00, "output": 75.00, "cached_input": 1.50},
     # Claude 4.5 (Opus tier pricing)
@@ -253,11 +274,18 @@ class AnthropicTokenCounter(TokenCounter):
             )
             _FALLBACK_WARNING_SHOWN = True
 
-        # Load tiktoken as fallback
+        # Load tiktoken as fallback — bounded, so a stalled vocab download can't
+        # hang token counting inside a request (tiktoken's downloader has no
+        # network timeout); on timeout we estimate by characters instead (GH #956).
         try:
-            import tiktoken
+            from headroom.tokenizers.tiktoken_counter import (
+                TiktokenLoadError,
+                load_encoding,
+            )
 
-            self._encoding = tiktoken.get_encoding("cl100k_base")
+            self._encoding = load_encoding("cl100k_base")
+        except TiktokenLoadError:
+            self._encoding = None  # count_text() falls back to a character estimate
         except ImportError:
             if not self._use_api:
                 warnings.warn(
@@ -494,6 +522,7 @@ class AnthropicProvider(Provider):
         If a client was provided to the provider, uses the Token Count API.
         Otherwise falls back to tiktoken approximation.
         """
+        model = sanitize_anthropic_model_id(model)
         if model not in self._token_counters:
             self._token_counters[model] = AnthropicTokenCounter(
                 model=model,
@@ -516,6 +545,7 @@ class AnthropicProvider(Provider):
 
         Never raises an exception - uses sensible defaults for unknown models.
         """
+        model = sanitize_anthropic_model_id(model)
         # Check explicit and loaded limits
         if model in self._context_limits:
             return self._context_limits[model]
@@ -577,6 +607,7 @@ class AnthropicProvider(Provider):
 
     def supports_model(self, model: str) -> bool:
         """Check if this provider supports the given model."""
+        model = sanitize_anthropic_model_id(model)
         if model in self._context_limits:
             return True
         # Check prefix matches - support all Claude models
@@ -593,6 +624,7 @@ class AnthropicProvider(Provider):
 
         Tries LiteLLM first for up-to-date pricing, falls back to manual pricing.
         """
+        model = sanitize_anthropic_model_id(model)
         # Try LiteLLM first for cost estimation
         litellm, litellm_get_model_info = _get_litellm_clients()
         if litellm is not None:
@@ -646,6 +678,7 @@ class AnthropicProvider(Provider):
 
     def _get_pricing(self, model: str) -> dict[str, float] | None:
         """Get pricing for a model with fallback logic."""
+        model = sanitize_anthropic_model_id(model)
         # Direct match
         if model in self._pricing:
             return self._pricing[model]

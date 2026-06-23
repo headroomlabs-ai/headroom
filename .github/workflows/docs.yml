@@ -1,6 +1,13 @@
 name: Deploy Documentation
 
 on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - 'wiki/**'
+      - 'mkdocs.yml'
+      - '.github/workflows/docs.yml'
   push:
     branches:
       - main
@@ -11,11 +18,39 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  deploy:
+  validate:
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Cache pip
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-docs-${{ hashFiles('mkdocs.yml') }}
+          restore-keys: ${{ runner.os }}-pip-docs-
+
+      - name: Install dependencies
+        run: pip install mkdocs-material
+
+      - name: Build docs
+        run: mkdocs build
+
+  deploy:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v6
         with:

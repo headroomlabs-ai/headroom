@@ -53,7 +53,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_CCR_TTL_SECONDS = 300
+DEFAULT_CCR_TTL_SECONDS = 1800  # session-scale; override via HEADROOM_CCR_TTL_SECONDS
 CCR_TTL_SECONDS_ENV = "HEADROOM_CCR_TTL_SECONDS"
 
 _RETRIEVAL_LOG_PREVIEW_CHARS = 4096
@@ -123,6 +123,19 @@ def _payload_for_retrieval_log(payload: str) -> dict[str, Any]:
         "payload_truncated": truncated,
         "payload_preview": preview,
     }
+
+
+# Single source of truth for the retrieval-miss message. Actionable by
+# design: the model still has the marker in context (Read markers carry
+# the file path), so tell it how to recover instead of just reporting
+# the miss.
+CCR_MISS_MESSAGE = (
+    "Entry not found or expired. To recover: if the compression marker "
+    "references a file Read, re-read that file (the path is in the "
+    "marker; disk is the source of truth). If it was command output, "
+    "re-run the command. Entries expire after the store TTL "
+    "(default 30 minutes; configurable via HEADROOM_CCR_TTL_SECONDS)."
+)
 
 
 @dataclass
@@ -207,10 +220,13 @@ class CompressionStore:
 
         Args:
             max_entries: Maximum number of entries to store.
-            default_ttl: Default TTL in seconds.
+            default_ttl: Default TTL in seconds (default 30 minutes — session scale).
             enable_feedback: Whether to track retrieval events.
-            backend: Storage backend to use. Defaults to InMemoryBackend.
-                     Custom backends can be passed for persistence (MongoDB, Redis).
+            backend: Storage backend to use. Defaults to InMemoryBackend
+                     when constructed directly; `get_compression_store()`
+                     defaults to SQLiteBackend for restart/multi-worker
+                     safety. Custom backends can be passed for
+                     persistence (MongoDB, Redis).
         """
         # Import here to avoid circular imports
         from .backends import InMemoryBackend
@@ -1189,12 +1205,29 @@ def clear_request_compression_store() -> None:
 def _create_default_ccr_backend() -> CompressionStoreBackend | None:
     """Create a CCR backend from env (e.g. HEADROOM_CCR_BACKEND=redis).
 
-    Loads adapters via setuptools entry point 'headroom.ccr_backend'.
-    Returns None to use default InMemoryBackend.
+    Default (env unset or "sqlite"): SQLiteBackend at
+    ~/.headroom/ccr_store.db — restart-safe and shared across worker
+    processes, which the session-scale 30-minute TTL assumes.
+    "memory" opts back into the in-process dict. Other values load
+    adapters via setuptools entry point 'headroom.ccr_backend'.
+    Returns None to use InMemoryBackend.
     """
     backend_type = (os.environ.get("HEADROOM_CCR_BACKEND") or "").strip().lower()
-    if not backend_type or backend_type == "memory":
+    if backend_type == "memory":
         return None
+    if not backend_type or backend_type == "sqlite":
+        try:
+            from .backends.sqlite import SQLiteBackend
+
+            return SQLiteBackend()
+        except Exception as e:
+            logger.warning(
+                "Failed to initialize SQLite CCR backend (%s); "
+                "falling back to in-memory store. Retrieval will not "
+                "survive proxy restarts.",
+                e,
+            )
+            return None
     try:
         from importlib.metadata import entry_points
 
@@ -1233,7 +1266,7 @@ def get_compression_store(
     Args:
         max_entries: Maximum entries (only used on first call for global store).
         default_ttl: Default TTL (only used on first call for global store).
-            When omitted, HEADROOM_CCR_TTL_SECONDS overrides the 300-second default.
+            When omitted, HEADROOM_CCR_TTL_SECONDS overrides the 1800-second default.
         backend: Custom storage backend (only used on first call for global store).
                  Defaults to InMemoryBackend if not provided; env backend used if backend is None.
 

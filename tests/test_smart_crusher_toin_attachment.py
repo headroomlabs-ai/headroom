@@ -194,6 +194,41 @@ def test_ccr_inject_marker_false_suppresses_markers_in_output(fresh_toin):
     assert "_ccr_dropped" not in result.compressed
 
 
+def test_ccr_inject_marker_false_suppresses_opaque_blob_markers(fresh_toin):
+    """#1091: `inject_retrieval_marker=False` must also suppress the
+    *opaque-blob* CCR markers, not just the row-drop path.
+
+    A long string cell (> opaque_min_bytes) used to be substituted with a
+    `<<ccr:HASH,string,KB>>` marker unconditionally — so no config produced
+    guaranteed-lossless output. This test pins both directions: with markers
+    ON the opaque blob IS replaced by a marker (proving the input genuinely
+    triggers the opaque path), and with markers OFF the blob survives verbatim
+    with no marker."""
+    import json
+
+    from headroom.config import CCRConfig
+
+    # Distinct >256-byte string cells trigger the opaque-blob path.
+    payload = json.dumps(
+        [{"id": i, "name": f"row{i}", "blob": f"sentinel{i}_" + "x" * 400} for i in range(60)]
+    )
+
+    on = SmartCrusher(
+        SmartCrusherConfig(),
+        ccr_config=CCRConfig(enabled=True, inject_retrieval_marker=True),
+    ).crush(payload, query="", bias=1.0)
+    # Sanity: the input really does exercise the opaque-blob path.
+    assert "<<ccr:" in on.compressed, "input should trigger an opaque marker when markers are ON"
+
+    off = SmartCrusher(
+        SmartCrusherConfig(),
+        ccr_config=CCRConfig(enabled=True, inject_retrieval_marker=False),
+    ).crush(payload, query="", bias=1.0)
+    assert "<<ccr:" not in off.compressed, f"expected no opaque marker, got: {off.compressed!r}"
+    # The original blob content must survive verbatim (guaranteed-lossless).
+    assert "sentinel5_" in off.compressed
+
+
 def test_ccr_inject_marker_true_emits_markers_when_lossy(fresh_toin):
     """The opt-in case keeps marker emission on. If the lossy path
     runs (which it should for a sufficiently big crushable payload),

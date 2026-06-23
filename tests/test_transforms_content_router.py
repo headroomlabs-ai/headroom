@@ -25,7 +25,7 @@ def test_compression_cache_handles_hits_skips_evictions_and_clear(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     times = iter([100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 112.0, 112.0])
-    monkeypatch.setattr(content_router_module.time, "time", lambda: next(times))
+    monkeypatch.setattr(content_router_module.time, "monotonic", lambda: next(times))
     monkeypatch.setattr(content_router_module.time, "perf_counter_ns", lambda: 50)
 
     cache = CompressionCache(ttl_seconds=10)
@@ -119,6 +119,11 @@ def test_content_signature_and_detection_helpers(monkeypatch: pytest.MonkeyPatch
     # result; verify _detect_content propagates the content_type
     # tag back as the Python ContentType enum.
     import headroom._core as _core
+
+    # Pin the Rust backend so this test exercises the native delegation
+    # path on every platform (Windows now defaults to the pure-Python
+    # detector — see content_router._resolve_detect_backend).
+    monkeypatch.setenv("HEADROOM_DETECT_BACKEND", "rust")
 
     fake_rust_result = SimpleNamespace(
         content_type="source_code",
@@ -270,6 +275,150 @@ def test_content_router_strategy_and_compress_paths(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(router, "_determine_strategy", lambda content: CompressionStrategy.TEXT)
     assert router.compress("pure") is pure_result
     assert router.compress("   ").strategy_used is CompressionStrategy.PASSTHROUGH
+
+
+def test_force_kompress_bypasses_content_detection(monkeypatch: pytest.MonkeyPatch) -> None:
+    router = ContentRouter()
+    router._runtime_force_kompress = True
+    pure_result = RouterCompressionResult(
+        compressed="pure",
+        original="pure",
+        strategy_used=CompressionStrategy.KOMPRESS,
+    )
+
+    monkeypatch.setattr(
+        content_router_module,
+        "is_mixed_content",
+        lambda content: (_ for _ in ()).throw(AssertionError("mixed detection called")),
+    )
+    monkeypatch.setattr(
+        content_router_module,
+        "_detect_content",
+        lambda content: (_ for _ in ()).throw(AssertionError("content detection called")),
+    )
+    monkeypatch.setattr(router, "_determine_strategy", lambda content: CompressionStrategy.MIXED)
+    monkeypatch.setattr(router, "_compress_pure", lambda *args, **kwargs: pure_result)
+
+    assert router.compress("large tool output") is pure_result
+
+
+def test_normal_compress_path_still_uses_content_detection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    router = ContentRouter()
+    calls = {"mixed": 0, "detect": 0}
+    pure_result = RouterCompressionResult(
+        compressed="pure",
+        original="pure",
+        strategy_used=CompressionStrategy.TEXT,
+    )
+
+    def _fake_mixed(content: str) -> bool:
+        calls["mixed"] += 1
+        return False
+
+    def _fake_detect(content: str) -> DetectionResult:
+        calls["detect"] += 1
+        return DetectionResult(ContentType.PLAIN_TEXT, 1.0, {})
+
+    monkeypatch.setattr(content_router_module, "is_mixed_content", _fake_mixed)
+    monkeypatch.setattr(content_router_module, "_detect_content", _fake_detect)
+    monkeypatch.setattr(router, "_compress_pure", lambda *args, **kwargs: pure_result)
+
+    assert router.compress("plain text") is pure_result
+    assert calls["mixed"] > 0
+    assert calls["detect"] > 0
+
+
+def test_force_kompress_apply_uses_lightweight_detection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeTokenizer:
+        def count_text(self, text: str) -> int:
+            return len(text.split())
+
+    router = ContentRouter(ContentRouterConfig(protect_recent_code=2))
+    content = " ".join(["plain text payload"] * 80)
+
+    monkeypatch.setattr(
+        content_router_module,
+        "_detect_content",
+        lambda content: (_ for _ in ()).throw(AssertionError("content detection called")),
+    )
+    monkeypatch.setattr(
+        content_router_module,
+        "_regex_detect_content_type",
+        lambda content: DetectionResult(ContentType.PLAIN_TEXT, 1.0, {}),
+    )
+    monkeypatch.setattr(
+        router,
+        "compress",
+        lambda content, context="", bias=1.0: RouterCompressionResult(
+            compressed="compressed",
+            original=content,
+            strategy_used=CompressionStrategy.KOMPRESS,
+            routing_log=[
+                RoutingDecision(
+                    content_type=ContentType.PLAIN_TEXT,
+                    strategy=CompressionStrategy.KOMPRESS,
+                    original_tokens=len(content.split()),
+                    compressed_tokens=1,
+                )
+            ],
+        ),
+    )
+
+    result = router.apply(
+        [{"role": "tool", "content": content}],
+        FakeTokenizer(),
+        force_kompress=True,
+        min_tokens_to_compress=10,
+        protect_recent=2,
+    )
+
+    assert result.messages[0]["content"] == "compressed"
+
+
+def test_force_kompress_apply_lightweight_detection_protects_recent_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeTokenizer:
+        def count_text(self, text: str) -> int:
+            return len(text.split())
+
+    router = ContentRouter(ContentRouterConfig(protect_recent_code=2))
+    content = "\n".join(
+        [
+            "def generated_function(value):",
+            "    if value:",
+            "        return str(value)",
+        ]
+        * 40
+    )
+
+    monkeypatch.setattr(
+        content_router_module,
+        "_detect_content",
+        lambda content: (_ for _ in ()).throw(AssertionError("content detection called")),
+    )
+    monkeypatch.setattr(
+        router,
+        "compress",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("recent code should be protected")
+        ),
+    )
+
+    result = router.apply(
+        [{"role": "tool", "content": content}],
+        FakeTokenizer(),
+        force_kompress=True,
+        min_tokens_to_compress=10,
+        protect_recent=2,
+    )
+
+    assert result.messages[0]["content"] == content
+    assert result.transforms_applied == ["router:protected:recent_code"]
 
 
 def test_content_router_mixed_pure_apply_and_toin(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -645,3 +794,71 @@ def test_pinning_skips_already_compressed(monkeypatch: pytest.MonkeyPatch) -> No
     )
     # Already-compressed marker keeps proxy idempotent across turns
     assert result["content"][0]["text"] == pinned
+
+
+def test_detect_backend_env_python_forces_python_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """HEADROOM_DETECT_BACKEND=python forces the pure-Python regex path."""
+    import headroom._core as _core
+
+    monkeypatch.setenv("HEADROOM_DETECT_BACKEND", "python")
+
+    called = []
+
+    def _record(content: str):  # type: ignore[return]
+        called.append(content)
+        raise AssertionError("native must not be called with python backend")
+
+    monkeypatch.setattr(_core, "detect_content_type", _record)
+
+    # Should not raise — native detector must be bypassed entirely.
+    result = _detect_content('[{"id": 1}]')
+    assert result.content_type is ContentType.JSON_ARRAY
+    assert called == [], "native detect_content_type was called despite python backend"
+
+
+def test_detect_backend_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """HEADROOM_DETECT_BACKEND pins the detector on any platform."""
+    resolve = content_router_module._resolve_detect_backend
+
+    monkeypatch.setenv("HEADROOM_DETECT_BACKEND", "python")
+    assert resolve() == "python"
+
+    monkeypatch.setenv("HEADROOM_DETECT_BACKEND", "RUST")  # case-insensitive
+    assert resolve() == "rust"
+
+    # Unrecognized values fall back to the platform default.
+    monkeypatch.setenv("HEADROOM_DETECT_BACKEND", "bogus")
+    monkeypatch.setattr(content_router_module.sys, "platform", "linux")
+    assert resolve() == "rust"
+
+
+def test_detect_backend_defaults_to_python_on_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Windows defaults to the pure-Python detector (native ONNX hang, #845)."""
+    monkeypatch.delenv("HEADROOM_DETECT_BACKEND", raising=False)
+
+    monkeypatch.setattr(content_router_module.sys, "platform", "win32")
+    assert content_router_module._resolve_detect_backend() == "python"
+
+    monkeypatch.setattr(content_router_module.sys, "platform", "linux")
+    assert content_router_module._resolve_detect_backend() == "rust"
+
+
+def test_detect_content_python_backend_skips_native(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The python backend must not touch the native detector at all."""
+    import headroom._core as _core
+
+    monkeypatch.setenv("HEADROOM_DETECT_BACKEND", "python")
+
+    def _boom(_content: str) -> None:
+        raise AssertionError("native detector must not be called")
+
+    monkeypatch.setattr(_core, "detect_content_type", _boom)
+
+    result = _detect_content('[{"id": 1}, {"id": 2}]')
+    assert result.content_type is ContentType.JSON_ARRAY

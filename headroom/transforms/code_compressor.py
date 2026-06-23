@@ -61,16 +61,45 @@ _tree_sitter_local = threading.local()
 
 
 def _check_tree_sitter_available() -> bool:
-    """Check if tree-sitter packages are available."""
+    """Check if tree-sitter is available *and actually parses*.
+
+    The mere presence of ``tree_sitter_language_pack`` is not enough: prior
+    versions of this code green-lit a code path that raised ``TypeError`` at
+    parse time and silently fell back to a lossy stripper.  To stop misleading
+    callers, we now verify an end-to-end parse of a tiny snippet and only
+    return ``True`` if it yields a real AST.
+    """
     global _tree_sitter_available
     if _tree_sitter_available is None:
         try:
-            import tree_sitter_language_pack  # noqa: F401
-
-            _tree_sitter_available = True
-        except ImportError:
+            parser = _get_parser("python")
+            tree = parser.parse(b"def _probe():\n    return 1\n")
+            root = tree.root_node
+            # A real parse yields a non-error root with children.
+            _tree_sitter_available = (
+                root is not None
+                and root.type == "module"
+                and root.child_count > 0
+                and not _has_syntax_issues(root)
+            )
+        except Exception:
             _tree_sitter_available = False
     return _tree_sitter_available
+
+
+def _tree_sitter_importable() -> bool:
+    """Return True if the tree-sitter grammar pack can be imported.
+
+    This only checks importability (cheap, no parse). Use
+    :func:`_check_tree_sitter_available` for the stronger "parsing actually
+    works" guarantee.
+    """
+    try:
+        import tree_sitter_language_pack  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
 
 
 def _get_parser(language: str) -> Any:
@@ -100,7 +129,10 @@ def _get_parser(language: str) -> Any:
         ImportError: If tree-sitter is not installed.
         ValueError: If language is not supported.
     """
-    if not _check_tree_sitter_available():
+    # NOTE: guard on importability (not _check_tree_sitter_available), because
+    # _check_tree_sitter_available now performs a real end-to-end parse via
+    # _get_parser; guarding on it here would recurse.
+    if not _tree_sitter_importable():
         raise ImportError(
             "tree-sitter is not installed. Install with: pip install headroom-ai[code]\n"
             "This adds ~50MB for tree-sitter grammars."
@@ -129,7 +161,7 @@ def _get_parser(language: str) -> Any:
         except Exception as e:
             raise ValueError(
                 f"Language '{language}' is not supported by tree-sitter. "
-                f"Supported: python, javascript, typescript, go, rust, java, c, cpp. "
+                f"Supported: python, javascript, typescript, go, rust, java, c, cpp, perl. "
                 f"Error: {e}"
             ) from e
 
@@ -183,6 +215,7 @@ class CodeLanguage(Enum):
     JAVA = "java"
     C = "c"
     CPP = "cpp"
+    PERL = "perl"
     UNKNOWN = "unknown"
 
 
@@ -316,6 +349,20 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
         comment_prefix="//",
         uses_colon_after_signature=False,
         detection_hints=("#include", "namespace ", "class ", "::"),
+    ),
+    CodeLanguage.PERL: LangConfig(
+        import_nodes=frozenset({"use_statement", "use_version_statement"}),
+        function_nodes=frozenset(
+            {"subroutine_declaration_statement", "method_declaration_statement"}
+        ),
+        class_nodes=frozenset({"package_statement", "class_statement", "role_statement"}),
+        type_nodes=frozenset(),
+        body_node_types=frozenset({"block"}),
+        decorator_node=None,
+        comment_prefix="#",
+        uses_colon_after_signature=False,
+        package_node="package_statement",
+        detection_hints=("sub ", "my ", "our ", "use ", "package "),
     ),
 }
 
@@ -505,6 +552,11 @@ _LANGUAGE_PREFILTER: dict[CodeLanguage, list[re.Pattern[str]]] = {
         re.compile(r"^\s*#include\s*[<\"]", re.MULTILINE),
         re.compile(r"\bnamespace\s+\w+", re.MULTILINE),
         re.compile(r"::\w+", re.MULTILINE),
+    ],
+    CodeLanguage.PERL: [
+        re.compile(r"^\s*(sub|package|use|require)\s+[\w:]+", re.MULTILINE),
+        re.compile(r"^\s*(my|our|local)\s+[\$@%]", re.MULTILINE),
+        re.compile(r"[\$@%]\w+", re.MULTILINE),
     ],
 }
 

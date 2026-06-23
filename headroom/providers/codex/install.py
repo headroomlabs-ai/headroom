@@ -10,6 +10,7 @@ from headroom.install.models import ConfigScope, DeploymentManifest, ManagedMuta
 from headroom.install.paths import codex_config_path
 
 from .runtime import proxy_base_url
+from .threads import retag_to_headroom, retag_to_native
 
 _CODEX_MARKER_START = "# --- Headroom persistent provider ---"
 _CODEX_MARKER_END = "# --- end Headroom persistent provider ---"
@@ -119,6 +120,9 @@ def apply_provider_scope(manifest: DeploymentManifest) -> ManagedMutation | None
     else:
         merged = section + "\n"
     path.write_text(merged, encoding="utf-8")
+    # Pull existing native threads into the headroom-provider menu so Codex's
+    # history list stays whole once it routes through Headroom. Best-effort.
+    retag_to_headroom(path.parent)
     return ManagedMutation(target=ToolTarget.CODEX.value, kind="toml-block", path=str(path))
 
 
@@ -140,3 +144,6 @@ def revert_provider_scope(mutation: ManagedMutation, manifest: DeploymentManifes
     content = _ORPHAN_OPENAI_BASE_URL.sub("", content)
     content = _ORPHAN_HEADROOM_TABLE.sub("", content)
     path.write_text(content.strip() + "\n", encoding="utf-8")
+    # Hand the threads back to the native-provider menu so the full history stays
+    # visible once Codex no longer routes through Headroom. Best-effort.
+    retag_to_native(path.parent)
