@@ -1381,7 +1381,28 @@ class AnthropicHandlerMixin:
                 # Sticky-on tool registration (PR-B7): always inject the
                 # retrieval tool once a session has done CCR, regardless
                 # of whether THIS turn produced compressed content.
-                if inject_tool:
+                #
+                # #1006: if tool injection was deferred (frozen prefix) but
+                # compression just emitted NEW markers this turn, override the
+                # deferral — the agent has no other way to redeem those markers.
+                # The cache miss on this one request is preferable to silent
+                # data loss.  If the session has already done CCR the tool is
+                # already in the client's tool list, so sticky replay is a
+                # no-op and the cache is unaffected.
+                # ponytail: ceiling is one extra cache miss on the first CCR
+                # turn in a frozen-prefix session.
+                _must_inject_for_new_markers = (
+                    not inject_tool
+                    and injector.has_compressed_content
+                )
+                if inject_tool or _must_inject_for_new_markers:
+                    if _must_inject_for_new_markers:
+                        logger.info(
+                            f"[{request_id}] CCR: overriding injection deferral — "
+                            f"new markers emitted but headroom_retrieve unavailable "
+                            f"(frozen_prefix={frozen_message_count}); injecting to "
+                            "prevent unredeemable markers (#1006)"
+                        )
                     from headroom.proxy.helpers import apply_session_sticky_ccr_tool
 
                     tools, ccr_tool_injected = apply_session_sticky_ccr_tool(
