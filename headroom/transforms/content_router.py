@@ -689,6 +689,11 @@ class ContentRouterConfig:
     ccr_inject_marker: bool = True  # Add retrieval markers to compressed content
     smart_crusher_max_items_after_crush: int | None = None
     smart_crusher_with_compaction: bool = True
+    # Strict lossless-only mode for SmartCrusher. None → leave the
+    # crusher config's own value untouched; True/False force it. Wired
+    # from the proxy's `HEADROOM_LOSSLESS_ONLY` env var so a real session
+    # can run marker-free without constructing the crusher by hand.
+    smart_crusher_lossless_only: bool | None = None
 
     # Tag protection: preserve custom/workflow XML tags from text compression.
     # When False (default), entire <custom-tag>content</custom-tag> blocks are
@@ -1872,6 +1877,8 @@ class ContentRouter(Transform):
                     crusher_config.max_items_after_crush = (
                         self.config.smart_crusher_max_items_after_crush
                     )
+                if self.config.smart_crusher_lossless_only is not None:
+                    crusher_config.lossless_only = self.config.smart_crusher_lossless_only
                 self._smart_crusher = SmartCrusher(
                     config=crusher_config,
                     ccr_config=ccr_config,

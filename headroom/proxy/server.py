@@ -632,6 +632,15 @@ class HeadroomProxy(
             # to PASSTHROUGH instead of the default KOMPRESS fallback strategy.
             if config.disable_kompress_fallback:
                 router_config.fallback_strategy = CompressionStrategy.PASSTHROUGH
+        # `HEADROOM_LOSSLESS_ONLY=1` routes SmartCrusher through strict
+        # marker-free mode: lossless tabular compaction still applies, but
+        # any path that would emit a `<<ccr:…>>` marker (row-drop or
+        # opaque-blob offload) leaves the content uncompacted instead — so
+        # the session needs no CCR retrieval round-trips to stay recoverable.
+        if "HEADROOM_LOSSLESS_ONLY" in os.environ:
+            router_config.smart_crusher_lossless_only = _get_env_bool(
+                "HEADROOM_LOSSLESS_ONLY", False
+            )
         # A non-None exclude_tools replaces DEFAULT_EXCLUDE_TOOLS in
         # ContentRouter, so merge rather than assign.
         if config.exclude_tools:
