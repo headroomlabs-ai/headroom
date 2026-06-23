@@ -34,6 +34,7 @@ Pipeline Usage:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -47,7 +48,12 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-from ..config import DEFAULT_EXCLUDE_TOOLS, ReadLifecycleConfig, TransformResult
+from ..config import (
+    DEFAULT_EXCLUDE_TOOLS,
+    ReadLifecycleConfig,
+    TransformResult,
+    is_tool_excluded,
+)
 from ..tokenizer import Tokenizer
 from .base import Transform
 from .content_detector import ContentType, DetectionResult
@@ -58,6 +64,7 @@ logger = logging.getLogger(__name__)
 
 
 _detect_backend_warned = False
+_detect_panic_warned = False
 
 
 def _router_debug_dumps(value: Any) -> str:
@@ -151,11 +158,33 @@ def _detect_content(content: str) -> DetectionResult:
 
     from headroom._core import detect_content_type as _rust_detect
 
-    rust_result = _rust_detect(content)
-    # Rust's `content_type` is the lowercase string tag (e.g.
-    # "json_array"); translate to the Python `ContentType` enum so
-    # downstream mapping keys match.
-    content_type = ContentType(rust_result.content_type)
+    global _detect_panic_warned
+    try:
+        rust_result = _rust_detect(content)
+        # Rust's `content_type` is the lowercase string tag (e.g.
+        # "json_array"); translate to the Python `ContentType` enum so
+        # downstream mapping keys match.
+        content_type = ContentType(rust_result.content_type)
+    except (KeyboardInterrupt, SystemExit, GeneratorExit):
+        raise
+    except BaseException as exc:  # noqa: BLE001
+        # A native Rust panic surfaces as pyo3_runtime.PanicException, which
+        # derives from BaseException — so ``except Exception`` would miss it and
+        # the panic would propagate out as an HTTP 500. Any detector failure
+        # (panic, or an unrecognized content-type tag) degrades to the
+        # pure-Python detector instead of aborting the request. See #1123.
+        # Guard: don't swallow cancellation/control-flow BaseExceptions such
+        # as asyncio.CancelledError — keep them propagating.
+        if isinstance(exc, asyncio.CancelledError):
+            raise
+        if not _detect_panic_warned:
+            _detect_panic_warned = True
+            logger.warning(
+                "Native content detector failed (%s); falling back to pure-Python detection.",
+                type(exc).__name__,
+            )
+        return _regex_detect_content_type(content)
+
     if content_type is ContentType.PLAIN_TEXT:
         regex_result = _regex_detect_content_type(content)
         if regex_result.content_type is not ContentType.PLAIN_TEXT:
@@ -457,6 +486,7 @@ class CompressionStrategy(Enum):
     TEXT = "text"
     DIFF = "diff"
     HTML = "html"
+    TABULAR = "tabular"
     MIXED = "mixed"
     PASSTHROUGH = "passthrough"
 
@@ -577,6 +607,7 @@ class ContentRouterConfig:
         enable_smart_crusher: Enable JSON array compression.
         enable_search_compressor: Enable search result compression.
         enable_log_compressor: Enable build/test log compression.
+        enable_tabular_compressor: Enable CSV/TSV/markdown-table compression.
         enable_image_optimizer: Enable image token optimization.
         prefer_code_aware_for_code: Use CodeAware over Kompress for code.
         mixed_content_threshold: Min distinct types to consider "mixed".
@@ -593,6 +624,7 @@ class ContentRouterConfig:
     enable_smart_crusher: bool = True
     enable_search_compressor: bool = True
     enable_log_compressor: bool = True
+    enable_tabular_compressor: bool = True  # CSV/TSV/markdown tables via SmartCrusher
     enable_html_extractor: bool = True  # HTML content extraction
     enable_image_optimizer: bool = True  # Image token optimization
 
@@ -935,6 +967,7 @@ class ContentRouter(Transform):
         self._log_compressor: Any = None
         self._diff_compressor: Any = None
         self._html_extractor: Any = None
+        self._tabular_compressor: Any = None
         self._kompress: Any = None
 
         # TOIN integration for cross-strategy learning
@@ -1100,15 +1133,18 @@ class ContentRouter(Transform):
                 routing_log=[],
             )
         else:
-            # Determine strategy from content analysis
-            mixed = is_mixed_content(content)
-            detection = _detect_content(content)
+            # Determine strategy from content analysis. When runtime settings
+            # force Kompress, skip the full router detection path so large
+            # proxy payloads do not pay for an unused strategy decision.
             force_kompress = bool(getattr(self, "_runtime_force_kompress", False))
-            strategy = (
-                CompressionStrategy.KOMPRESS
-                if force_kompress
-                else self._determine_strategy(content)
-            )
+            if force_kompress:
+                mixed = False
+                detection = DetectionResult(ContentType.PLAIN_TEXT, 1.0, {})
+                strategy = CompressionStrategy.KOMPRESS
+            else:
+                mixed = is_mixed_content(content)
+                detection = _detect_content(content)
+                strategy = self._determine_strategy(content)
             if debug_enabled:
                 _log_router_debug(
                     "content_router_input",
@@ -1232,6 +1268,7 @@ class ContentRouter(Transform):
             ContentType.BUILD_OUTPUT: CompressionStrategy.LOG,
             ContentType.GIT_DIFF: CompressionStrategy.DIFF,
             ContentType.HTML: CompressionStrategy.HTML,
+            ContentType.TABULAR: CompressionStrategy.TABULAR,
             ContentType.PLAIN_TEXT: CompressionStrategy.TEXT,
         }
 
@@ -1466,6 +1503,18 @@ class ContentRouter(Transform):
                         )
                         decision_reason = "log_compressor"
 
+            elif strategy == CompressionStrategy.TABULAR:
+                if self.config.enable_tabular_compressor:
+                    compressor = self._get_tabular_compressor()
+                    if compressor:
+                        compressor_name = type(compressor).__name__
+                        result = compressor.compress(content, context=context, bias=bias)
+                        compressed, compressed_tokens = (
+                            result.compressed,
+                            len(result.compressed.split()),
+                        )
+                        decision_reason = "tabular_compressor"
+
             elif strategy == CompressionStrategy.DIFF:
                 compressor = self._get_diff_compressor()
                 if compressor:
@@ -1516,6 +1565,7 @@ class ContentRouter(Transform):
             fallback_eligible_strategy = strategy in {
                 CompressionStrategy.SMART_CRUSHER,
                 CompressionStrategy.CODE_AWARE,
+                CompressionStrategy.TABULAR,
             }
             fallback_no_savings = compressed == content or compressed_tokens >= original_tokens
             if fallback_eligible_strategy and fallback_no_savings:
@@ -1663,21 +1713,28 @@ class ContentRouter(Transform):
         compressed: str | None = None
         compressed_tokens: int | None = None
 
-        # Primary: Kompress — downloads from chopratejas/kompress-v2-base on first use
+        # Primary: Kompress. On a cold cache the model is fetched once in the
+        # background (ensure_background_load) instead of blocking this request
+        # thread on a 274MB download that races the compression timeout and
+        # fails open. Until it is cached, route around the deep path.
         if self.config.enable_kompress:
             compressor = self._get_kompress()
             if compressor:
-                try:
-                    result = compressor.compress(
-                        text_to_compress,
-                        context=context,
-                        question=question,
-                        target_ratio=getattr(self, "_runtime_target_ratio", None),
-                    )
-                    compressed = result.compressed
-                    compressed_tokens = result.compressed_tokens
-                except Exception as e:
-                    logger.warning("Kompress failed: %s", e)
+                if not compressor.is_ready():
+                    compressor.ensure_background_load()
+                else:
+                    try:
+                        result = compressor.compress(
+                            text_to_compress,
+                            context=context,
+                            question=question,
+                            target_ratio=getattr(self, "_runtime_target_ratio", None),
+                            allow_download=False,
+                        )
+                        compressed = result.compressed
+                        compressed_tokens = result.compressed_tokens
+                    except Exception as e:
+                        logger.warning("Kompress failed: %s", e)
 
         if compressed is None:
             return content, len(content.split())
@@ -1698,6 +1755,7 @@ class ContentRouter(Transform):
             ContentType.BUILD_OUTPUT: CompressionStrategy.LOG,
             ContentType.GIT_DIFF: CompressionStrategy.DIFF,
             ContentType.HTML: CompressionStrategy.HTML,
+            ContentType.TABULAR: CompressionStrategy.TABULAR,
             ContentType.PLAIN_TEXT: CompressionStrategy.TEXT,
         }
         return mapping.get(content_type, self.config.fallback_strategy)
@@ -1711,6 +1769,7 @@ class ContentRouter(Transform):
             CompressionStrategy.LOG: ContentType.BUILD_OUTPUT,
             CompressionStrategy.DIFF: ContentType.GIT_DIFF,
             CompressionStrategy.HTML: ContentType.HTML,
+            CompressionStrategy.TABULAR: ContentType.TABULAR,
             CompressionStrategy.TEXT: ContentType.PLAIN_TEXT,
             CompressionStrategy.KOMPRESS: ContentType.PLAIN_TEXT,
             CompressionStrategy.PASSTHROUGH: ContentType.PLAIN_TEXT,
@@ -1784,6 +1843,17 @@ class ContentRouter(Transform):
             except ImportError:
                 logger.debug("LogCompressor not available")
         return self._log_compressor
+
+    def _get_tabular_compressor(self) -> Any:
+        """Get TabularCompressor (lazy load)."""
+        if self._tabular_compressor is None:
+            try:
+                from .tabular_ingest import TabularCompressor
+
+                self._tabular_compressor = TabularCompressor()
+            except ImportError:  # pragma: no cover - defensive; tabular_ingest is pure stdlib
+                logger.debug("TabularCompressor not available")
+        return self._tabular_compressor
 
     def _get_diff_compressor(self) -> Any:
         """Get DiffCompressor (lazy load). Rust-only — Python implementation
@@ -2280,7 +2350,9 @@ class ContentRouter(Transform):
             else DEFAULT_EXCLUDE_TOOLS
         )
         excluded_tool_ids = {
-            tool_id for tool_id, name in tool_name_map.items() if name in exclude_tools
+            tool_id
+            for tool_id, name in tool_name_map.items()
+            if is_tool_excluded(name, exclude_tools)
         }
 
         # --- Adaptive parameters based on context pressure ---
@@ -2531,8 +2603,14 @@ class ContentRouter(Transform):
                 route_counts["error_protected"] += 1
                 continue
 
-            # Detect content type for protection decisions
-            detection = _detect_content(content)
+            # Detect content type for protection decisions. Even when the
+            # runtime strategy is forced to Kompress, keep code-protection
+            # checks but use the lightweight regex detector instead of the
+            # full router chain.
+            force_kompress = bool(getattr(self, "_runtime_force_kompress", False))
+            detection = (
+                _regex_detect_content_type(content) if force_kompress else _detect_content(content)
+            )
             is_code = detection.content_type == ContentType.SOURCE_CODE
 
             # Protection 2: Don't compress recent CODE

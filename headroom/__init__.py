@@ -74,7 +74,7 @@ from importlib import import_module
 from typing import Any
 
 from ._version import __version__  # noqa: F401
-from .compress import CompressConfig, CompressResult, compress
+from .compress import CompressConfig, CompressResult, compress, compress_spreadsheet
 
 # Keep a real callable bound for the one-function compression API so
 # `from headroom import compress` is never shadowed by the submodule object.
@@ -165,6 +165,7 @@ __all__ = [
     "EmbedderBackend",
     # One-function compression API
     "compress",
+    "compress_spreadsheet",
     "CompressConfig",
     "CompressResult",
     # Hooks
@@ -261,6 +262,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "reset_otel_metrics": ("headroom.observability", "reset_otel_metrics"),
     # One-function API
     "compress": ("headroom.compress", "compress"),
+    "compress_spreadsheet": ("headroom.compress", "compress_spreadsheet"),
     # Hooks
     "CompressionHooks": ("headroom.hooks", "CompressionHooks"),
     "CompressContext": ("headroom.hooks", "CompressContext"),

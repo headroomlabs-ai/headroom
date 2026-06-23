@@ -19,13 +19,11 @@ class _Handler(OpenAIHandlerMixin):
         self.config = SimpleNamespace()
         self.metrics = None
         self.openai_pipeline = object()
-        self.openai_provider = SimpleNamespace(
-            get_token_counter=lambda _model: _Tokenizer()
-        )
+        self.openai_provider = SimpleNamespace(get_token_counter=lambda _model: _Tokenizer())
 
 
 def _large(label: str) -> str:
-    return (f"{label} line with enough repeated content to pass the router floor\n" * 80)
+    return f"{label} line with enough repeated content to pass the router floor\n" * 80
 
 
 def test_responses_tool_name_map_normalizes_pi_and_mcp_namespaces() -> None:

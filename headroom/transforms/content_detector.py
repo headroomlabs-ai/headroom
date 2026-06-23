@@ -30,6 +30,7 @@ class ContentType(Enum):
     BUILD_OUTPUT = "build"  # Compiler, test, lint logs
     GIT_DIFF = "diff"  # Unified diff format
     HTML = "html"  # Web pages (needs content extraction, not compression)
+    TABULAR = "tabular"  # CSV/TSV, markdown tables, fixed-width tables
     PLAIN_TEXT = "text"  # Fallback
 
 
@@ -46,6 +47,10 @@ class DetectionResult:
 _SEARCH_RESULT_PATTERN = re.compile(
     r"^[^\s:]+:\d+:"  # file:line: format (grep -n style)
 )
+
+# A markdown table separator row, e.g. "| --- | :--: |" or "---|---".
+# Every cell must be dashes with optional alignment colons.
+_MD_SEP_CELL = re.compile(r"^:?-{2,}:?$")
 
 # Bug-fix (2026-04-25): extended to recognize merge-commit headers
 # (`diff --combined <path>`, `diff --cc <path>`) and combined-diff hunk
@@ -159,12 +164,20 @@ def detect_content_type(content: str) -> DetectionResult:
     if log_result and log_result.confidence >= 0.5:
         return log_result
 
-    # 6. Check for source code
+    # 6. Check for tabular data (CSV/TSV, markdown tables). Runs after
+    #    search/log so colon-delimited search output and freeform logs claim
+    #    their content first; tabular requires a consistent multi-column
+    #    delimiter or a markdown header+separator pair.
+    tabular_result = _try_detect_tabular(content)
+    if tabular_result and tabular_result.confidence >= 0.6:
+        return tabular_result
+
+    # 7. Check for source code
     code_result = _try_detect_code(content)
     if code_result and code_result.confidence >= 0.5:
         return code_result
 
-    # 7. Fallback to plain text
+    # 8. Fallback to plain text
     return DetectionResult(ContentType.PLAIN_TEXT, 0.5, {})
 
 
@@ -378,6 +391,102 @@ def _try_detect_log(content: str) -> DetectionResult | None:
             "total_lines": non_empty_lines,
         },
     )
+
+
+def _md_cell_count(row: str) -> int:
+    """Count cells in a markdown table row, ignoring the outer pipes."""
+    return len(row.strip().strip("|").split("|"))
+
+
+def _is_md_separator(row: str) -> bool:
+    """True if `row` is a markdown table separator (e.g. ``| --- | :--: |``)."""
+    cells = [c.strip() for c in row.strip().strip("|").split("|")]
+    cells = [c for c in cells if c != ""]
+    if len(cells) < 2:
+        return False
+    return all(_MD_SEP_CELL.match(c) for c in cells)
+
+
+def _try_detect_markdown_table(lines: list[str]) -> DetectionResult | None:
+    """Detect a markdown table: a piped header row followed by a separator."""
+    for i in range(len(lines) - 1):
+        header, sep = lines[i], lines[i + 1]
+        if "|" in header and _is_md_separator(sep):
+            cols = _md_cell_count(header)
+            if cols >= 2:
+                return DetectionResult(
+                    ContentType.TABULAR,
+                    0.95,
+                    {"format": "markdown", "columns": cols},
+                )
+    return None
+
+
+def _try_detect_delimited(lines: list[str]) -> DetectionResult | None:
+    """Detect CSV/TSV by a delimiter with a consistent per-line column count.
+
+    A stable column count is what separates real tabular data from prose that
+    merely contains commas, and from ``file:line:content`` search output (which
+    has a variable number of colons). Tabs are a stronger signal than commas
+    (they rarely occur in prose), so they need less consistency.
+    """
+    from collections import Counter
+
+    sample = lines[:20]
+    if len(sample) < 3:
+        return None
+
+    best: DetectionResult | None = None
+    for delim, min_consistency in ((",", 0.85), ("\t", 0.7), (";", 0.85), ("|", 0.85)):
+        counts = [row.count(delim) for row in sample]
+        if counts[0] == 0:  # header row must contain the delimiter
+            continue
+        common_count, freq = Counter(counts).most_common(1)[0]
+        if common_count == 0:
+            continue
+        consistency = freq / len(sample)
+        ncols = common_count + 1
+        if ncols < 2 or consistency < min_consistency:
+            continue
+        # Prose guard: prose that merely contains commas ("Hello, friend.")
+        # reads like sentences. Real table rows are short field tuples.
+        if _looks_like_prose(sample, delim):
+            continue
+        confidence = min(0.95, 0.5 + consistency * 0.3 + min(ncols, 5) * 0.03)
+        if best is None or confidence > best.confidence:
+            best = DetectionResult(
+                ContentType.TABULAR,
+                confidence,
+                {"format": "csv", "delimiter": delim, "columns": ncols},
+            )
+    return best
+
+
+def _looks_like_prose(sample: list[str], delim: str) -> bool:
+    """Heuristic: distinguish comma-bearing prose from real CSV rows.
+
+    Prose reads like sentences (ends with ``.!?``) and has wordy cells; CSV
+    rows are short field tuples. Either signal rejects the candidate.
+    """
+    enders = sum(1 for r in sample if r.rstrip().endswith((".", "!", "?")))
+    if enders / len(sample) >= 0.5:
+        return True
+    cells = [c.strip() for r in sample for c in r.split(delim)]
+    avg_words = sum(len(c.split()) for c in cells) / len(cells)
+    return avg_words > 3
+
+
+def _try_detect_tabular(content: str) -> DetectionResult | None:
+    """Detect tabular text: markdown tables first, then delimited CSV/TSV."""
+    lines = [ln for ln in content.split("\n") if ln.strip()][:50]
+    if len(lines) < 3:
+        return None
+
+    md_result = _try_detect_markdown_table(lines)
+    if md_result:
+        return md_result
+
+    return _try_detect_delimited(lines)
 
 
 def _try_detect_code(content: str) -> DetectionResult | None:

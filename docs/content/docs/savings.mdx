@@ -1,0 +1,62 @@
+---
+title: Savings Tracking
+description: Durable, over-time compression savings — cost avoided plus Today / Last 7 days / All time and per-model / per-client breakdowns via `headroom savings`.
+---
+
+`headroom savings` shows how much Headroom has saved you over time — cost avoided, token counts, and breakdowns by model and client. Unlike `headroom_stats` (a single in-memory session snapshot), it reads a **durable ledger** that survives proxy and agent restarts.
+
+## Usage
+
+```bash
+headroom savings            # human-readable summary
+headroom savings --json     # machine-readable report
+headroom savings --days 30  # restrict the lookback/retention window
+headroom savings --reset    # delete the ledger and start fresh
+```
+
+### Example
+
+```text
+Today       ███████████░░░░░  67.9%  saved 19,000 / 28,000 tokens  $0.0850
+Last 7 days ███████████░░░░░  67.1%  saved 47,000 / 70,000 tokens  $0.2250
+All time    ██████████░░░░░░  65.0%  saved 78,000 / 120,000 tokens  $0.2680
+
+Cost avoided per model:
+  claude-opus-4-8          $0.1750
+  gpt-5.5                  $0.0350
+  unknown                  $0.0330
+  claude-haiku-4-5         $0.0250
+
+Savings by client:
+  claude-code              4 calls · 60,000 tokens saved
+  codex                    2 calls · 18,000 tokens saved
+```
+
+## How it works
+
+Every compression appends one line to an **append-only, file-locked event ledger** at `~/.headroom/savings_events.jsonl`, and `headroom savings` aggregates it on read. This design is:
+
+- **Durable** — the ledger is on disk, so totals survive proxy and agent restarts.
+- **Accurate under concurrency** — Headroom's MCP server runs as multiple processes (the main agent plus each subagent), and the proxy is a separate process. An append-only, locked log lets every writer contribute without the lost-update races a single shared mutable file would suffer.
+- **Self-pruning** — events older than the retention window (365 days by default) are dropped on read, and the file is compacted once it grows large.
+
+Both compression paths feed the same ledger:
+
+- **MCP tool** — each `headroom_compress` call records its client (the MCP client name) and tokens saved.
+- **Proxy** — each request records its real upstream model, so cost is priced accurately.
+
+### Cost basis
+
+Cost avoided is the dollar value of the saved **input** tokens. Headroom uses [litellm](https://headroom-docs.vercel.app/docs/litellm) list pricing where the model is known (proxy traffic). MCP-tool compressions don't know the agent's upstream model, so they record `model="unknown"` and fall back to a blended per-token rate rather than reporting `$0`.
+
+## Configuration
+
+| Variable | Purpose |
+| --- | --- |
+| `HEADROOM_SAVINGS_EVENTS_PATH` | Override the ledger location (default `~/.headroom/savings_events.jsonl`). |
+| `HEADROOM_MCP_CLIENT` | Override the client label recorded by the MCP tool path. |
+| `HEADROOM_MCP_MODEL` | Optional model hint so MCP-tool compressions price against a known model instead of the blended fallback. |
+
+<Callout type="info">
+  `headroom savings` is distinct from `headroom_stats` (a per-session, in-memory snapshot) and from the proxy's live `/stats` endpoint (backed by `proxy_savings.json`). The savings ledger is the durable, cross-process source of truth.
+</Callout>

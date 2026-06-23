@@ -424,7 +424,11 @@ def test_ensure_claude_hooks_rewrites_existing_entries(monkeypatch, tmp_path: Pa
     init_cli._ensure_claude_hooks(settings_path, "init-local-demo", 9001)
 
     payload = json.loads(settings_path.read_text(encoding="utf-8"))
-    assert payload["env"] == {"KEEP": "1", "ANTHROPIC_BASE_URL": "http://127.0.0.1:9001"}
+    assert payload["env"] == {
+        "KEEP": "1",
+        "ANTHROPIC_BASE_URL": "http://127.0.0.1:9001",
+        "ENABLE_TOOL_SEARCH": "true",
+    }
     session_entries = payload["hooks"]["SessionStart"]
     assert session_entries[0] == "not-a-dict"
     assert session_entries[1] == {"hooks": "not-a-list"}
