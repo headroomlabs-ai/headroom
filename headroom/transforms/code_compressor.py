@@ -129,7 +129,7 @@ def _get_parser(language: str) -> Any:
         except Exception as e:
             raise ValueError(
                 f"Language '{language}' is not supported by tree-sitter. "
-                f"Supported: python, javascript, typescript, go, rust, java, c, cpp. "
+                f"Supported: python, javascript, typescript, go, rust, java, c, cpp, perl. "
                 f"Error: {e}"
             ) from e
 
@@ -183,6 +183,7 @@ class CodeLanguage(Enum):
     JAVA = "java"
     C = "c"
     CPP = "cpp"
+    PERL = "perl"
     UNKNOWN = "unknown"
 
 
@@ -316,6 +317,20 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
         comment_prefix="//",
         uses_colon_after_signature=False,
         detection_hints=("#include", "namespace ", "class ", "::"),
+    ),
+    CodeLanguage.PERL: LangConfig(
+        import_nodes=frozenset({"use_statement", "use_version_statement"}),
+        function_nodes=frozenset(
+            {"subroutine_declaration_statement", "method_declaration_statement"}
+        ),
+        class_nodes=frozenset({"package_statement", "class_statement", "role_statement"}),
+        type_nodes=frozenset(),
+        body_node_types=frozenset({"block"}),
+        decorator_node=None,
+        comment_prefix="#",
+        uses_colon_after_signature=False,
+        package_node="package_statement",
+        detection_hints=("sub ", "my ", "our ", "use ", "package "),
     ),
 }
 
@@ -505,6 +520,11 @@ _LANGUAGE_PREFILTER: dict[CodeLanguage, list[re.Pattern[str]]] = {
         re.compile(r"^\s*#include\s*[<\"]", re.MULTILINE),
         re.compile(r"\bnamespace\s+\w+", re.MULTILINE),
         re.compile(r"::\w+", re.MULTILINE),
+    ],
+    CodeLanguage.PERL: [
+        re.compile(r"^\s*(sub|package|use|require)\s+[\w:]+", re.MULTILINE),
+        re.compile(r"^\s*(my|our|local)\s+[\$@%]", re.MULTILINE),
+        re.compile(r"[\$@%]\w+", re.MULTILINE),
     ],
 }
 

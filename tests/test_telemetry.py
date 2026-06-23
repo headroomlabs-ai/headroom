@@ -601,7 +601,9 @@ class TestGlobalTelemetryCollector:
         )
 
     def test_headroom_telemetry_on_keeps_collector_enabled(self, monkeypatch):
-        """Sanity check: the explicit on/unset path leaves the collector enabled."""
+        """Sanity check: the explicit opt-in path (HEADROOM_TELEMETRY=on) leaves
+        the collector enabled. Telemetry is off by default, so this requires the
+        user to have turned it on."""
         reset_telemetry_collector()
         monkeypatch.delenv("HEADROOM_TELEMETRY_DISABLED", raising=False)
         monkeypatch.setenv("HEADROOM_TELEMETRY", "on")

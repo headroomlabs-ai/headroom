@@ -25,12 +25,22 @@ from headroom.providers.codex.install import (
 from headroom.providers.copilot.install import (
     build_install_env as _build_copilot_install_env,
 )
+from headroom.providers.cortex_code.install import (
+    build_install_env as _build_cortex_code_install_env,
+)
 from headroom.providers.cursor.install import build_install_env as _build_cursor_install_env
 from headroom.providers.openclaw.install import (
     apply_provider_scope as _apply_openclaw_provider_scope,
 )
 from headroom.providers.openclaw.install import (
     revert_provider_scope as _revert_openclaw_provider_scope,
+)
+from headroom.providers.opencode.install import (
+    apply_provider_scope as _apply_opencode_provider_scope,
+)
+from headroom.providers.opencode.install import build_install_env as _build_opencode_install_env
+from headroom.providers.opencode.install import (
+    revert_provider_scope as _revert_opencode_provider_scope,
 )
 
 _InstallEnvBuilder = Callable[..., dict[str, str]]
@@ -42,13 +52,16 @@ _ENV_BUILDERS: dict[str, _InstallEnvBuilder] = {
     "copilot": _build_copilot_install_env,
     "codex": _build_codex_install_env,
     "aider": _build_aider_install_env,
+    "cortex-code": _build_cortex_code_install_env,
     "cursor": _build_cursor_install_env,
+    "opencode": _build_opencode_install_env,
 }
 
 _PROVIDER_SCOPE_HANDLERS: dict[str, tuple[_ProviderScopeApplier, _ProviderScopeReverter]] = {
     "claude": (_apply_claude_provider_scope, _revert_claude_provider_scope),
     "codex": (_apply_codex_provider_scope, _revert_codex_provider_scope),
     "openclaw": (_apply_openclaw_provider_scope, _revert_openclaw_provider_scope),
+    "opencode": (_apply_opencode_provider_scope, _revert_opencode_provider_scope),
 }
 
 
