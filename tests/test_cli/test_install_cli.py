@@ -132,7 +132,7 @@ def test_install_apply_rejects_provider_scope_targets_without_support() -> None:
     )
 
     assert result.exit_code != 0
-    assert "Provider scope supports only claude, codex, and openclaw" in result.output
+    assert "Provider scope supports only claude, codex, openclaw, and opencode" in result.output
 
 
 def test_install_apply_restores_previous_deployment_after_failed_update(monkeypatch) -> None:

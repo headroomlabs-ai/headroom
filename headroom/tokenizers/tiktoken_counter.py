@@ -234,7 +234,15 @@ class TiktokenCounter(BaseTokenizer):
         """
         if not text:
             return 0
-        return len(self.encoding.encode(text))
+        try:
+            return len(self.encoding.encode(text))
+        except ValueError:
+            # Passthrough content can legitimately contain strings that look
+            # like tiktoken special tokens (e.g. "<|endoftext|>" or FIM markers
+            # in code/tool output). Treat them as ordinary text instead of
+            # raising, which would otherwise abort token counting for the whole
+            # request. Matches AnthropicTokenCounter.count_text.
+            return len(self.encoding.encode(text, disallowed_special=()))
 
     def count_messages(self, messages: list[dict[str, Any]]) -> int:
         """Count tokens in messages using OpenAI's exact formula.
@@ -311,7 +319,13 @@ class TiktokenCounter(BaseTokenizer):
         Returns:
             List of token IDs.
         """
-        return self.encoding.encode(text)
+        try:
+            return self.encoding.encode(text)
+        except ValueError:
+            # See count_text: literal special-token strings in passthrough
+            # content must be encoded as ordinary text, not rejected. The
+            # round-trip through decode() is unaffected.
+            return self.encoding.encode(text, disallowed_special=())
 
     def decode(self, tokens: list[int]) -> str:
         """Decode token IDs to text.

@@ -228,6 +228,7 @@ These variables configure Headroom at runtime. Set them in your shell, `.env` fi
 | `HEADROOM_HOST` | `127.0.0.1` | Host the proxy binds to |
 | `HEADROOM_MODE` | `token` | Default optimization mode: `token` or `cache` |
 | `HEADROOM_TELEMETRY` | `off` (opt-in) | Set to `on` to opt in to anonymous telemetry |
+| `HEADROOM_REQUEST_TIMEOUT` | `300` | Request timeout in seconds |
 
 ### TypeScript SDK
 
@@ -269,6 +270,18 @@ python3 -m pip install --upgrade pip
 Some tests require Rust tooling.
 
 The recommended way to install rust is using `rustup`. You can find the official installation instructions [here](https://rust-lang.org/tools/install/).
+
+## Dashboard
+
+Headroom serves a live savings dashboard while the proxy is running. Open it with:
+
+```bash
+headroom dashboard            # opens http://localhost:8787/dashboard in your browser
+headroom dashboard --no-open  # just print the URL
+```
+
+Or browse to `http://localhost:8787/dashboard` directly (use `--port` / `HEADROOM_PORT` if you
+run the proxy on a different port).
 
 ## Next steps
 

@@ -44,7 +44,7 @@ When using Headroom:
 ### Scope
 
 The following are in scope for security reports:
-- Headroom Python package (`pip install headroom`)
+- Headroom Python package (`pip install headroom-ai`)
 - Headroom proxy server
 - Official integrations (LangChain, MCP)
 

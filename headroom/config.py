@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import fnmatch
+from collections.abc import Iterable
 from dataclasses import InitVar, dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -223,6 +225,28 @@ DEFAULT_EXCLUDE_TOOLS: frozenset[str] = frozenset(
         "edit",
     }
 )
+
+
+def is_tool_excluded(name: str, exclude_tools: Iterable[str]) -> bool:
+    """Return True if ``name`` matches the tool-exclusion set.
+
+    Plain entries match by exact (case-insensitive) name, so the common case
+    stays a set lookup. Entries containing a glob metacharacter (``*``, ``?`` or
+    ``[``) are matched with :func:`fnmatch.fnmatchcase`, letting a single pattern
+    such as ``mcp__*`` cover every tool an MCP server exposes without listing
+    each name (issue #870).
+    """
+    if not exclude_tools:
+        return False
+    if name in exclude_tools or name.lower() in exclude_tools:
+        return True
+    lname = name.lower()
+    return any(
+        fnmatch.fnmatchcase(lname, pat.lower())
+        for pat in exclude_tools
+        if "*" in pat or "?" in pat or "[" in pat
+    )
+
 
 # Tool names recognized as Read/Edit/Write for lifecycle tracking
 _READ_TOOL_NAMES: frozenset[str] = frozenset({"Read", "read"})

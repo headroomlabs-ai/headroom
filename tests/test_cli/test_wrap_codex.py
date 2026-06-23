@@ -761,10 +761,10 @@ def test_start_proxy_uses_separate_session_for_signal_isolation(
 
 
 @pytest.mark.parametrize("agent_type", ["claude", "codex", "cursor"])
-def test_start_proxy_applies_agent_90_defaults(
+def test_start_proxy_does_not_apply_agent_90_defaults(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, agent_type: str
 ) -> None:
-    """Wrapped coding agents should start the proxy with high-savings defaults."""
+    """Wrapped coding agents keep agent-savings opt-in by default."""
     popen_kwargs: dict[str, object] = {}
 
     class FakeProc:
@@ -785,10 +785,10 @@ def test_start_proxy_applies_agent_90_defaults(
 
     env = popen_kwargs["env"]
     assert isinstance(env, dict)
-    assert env["HEADROOM_SAVINGS_PROFILE"] == "agent-90"
-    assert env["HEADROOM_TARGET_RATIO"] == "0.10"
-    assert env["HEADROOM_MAX_ITEMS"] == "8"
-    assert env["HEADROOM_SMART_CRUSHER_COMPACTION"] == "0"
+    assert "HEADROOM_SAVINGS_PROFILE" not in env
+    assert "HEADROOM_TARGET_RATIO" not in env
+    assert "HEADROOM_MAX_ITEMS" not in env
+    assert "HEADROOM_SMART_CRUSHER_COMPACTION" not in env
 
 
 def test_start_proxy_preserves_explicit_savings_overrides(

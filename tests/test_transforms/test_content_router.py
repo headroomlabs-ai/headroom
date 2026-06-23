@@ -681,6 +681,55 @@ class TestExcludeTools:
         assert result.messages[1]["content"] == messages[1]["content"]
         assert "router:excluded:tool" in result.transforms_applied
 
+    def test_glob_exclude_tools(self, tokenizer):
+        """Glob patterns in exclude_tools match by prefix (issue #870)."""
+        config = ContentRouterConfig(
+            min_section_tokens=10,
+            exclude_tools={"mcp__*"},  # One pattern excludes every MCP tool
+        )
+        router = ContentRouter(config)
+
+        messages = [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_mcp_1",
+                        "type": "function",
+                        "function": {
+                            "name": "mcp__build123d__measure",
+                            "arguments": "{}",
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_mcp_1",
+                "content": generate_json_data(50),
+            },
+        ]
+
+        result = router.apply(messages, tokenizer)
+
+        # The MCP tool result matched the glob and was left unchanged.
+        assert result.messages[1]["content"] == messages[1]["content"]
+        assert "router:excluded:tool" in result.transforms_applied
+
+    def test_is_tool_excluded_helper(self):
+        """is_tool_excluded: exact (case-insensitive) and glob matching."""
+        from headroom.config import is_tool_excluded
+
+        # Glob entry covers a whole MCP server; unrelated tools are untouched.
+        assert is_tool_excluded("mcp__build123d__measure", {"mcp__*"})
+        assert not is_tool_excluded("Bash", {"mcp__*"})
+        # Plain entries keep exact, case-insensitive membership.
+        assert is_tool_excluded("Read", {"read"})
+        assert is_tool_excluded("MCP__X", {"mcp__*"})
+        # Empty set never excludes.
+        assert not is_tool_excluded("Read", set())
+
     def test_non_excluded_tools_are_compressed(self, tokenizer):
         """Tools not in exclude_tools set are still compressed."""
         config = ContentRouterConfig(
