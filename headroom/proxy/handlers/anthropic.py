@@ -2695,6 +2695,7 @@ class AnthropicHandlerMixin:
                         context=extract_user_query(messages),
                         frozen_message_count=frozen_message_count,
                         request_id=request_id,
+                        **proxy_pipeline_kwargs(self.config),
                     )
 
                     optimized_messages = result.messages

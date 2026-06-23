@@ -33,7 +33,7 @@ import os
 import sys
 import threading
 import time
-from dataclasses import fields, is_dataclass
+from dataclasses import fields, is_dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -642,18 +642,47 @@ class HeadroomProxy(
         # code/RAG context — see issue #454).
         if profile_kwargs.get("compress_user_messages"):
             router_config.skip_user_messages = False
-        transforms = [
-            CacheAligner(CacheAlignerConfig(enabled=False)),
-            ContentRouter(router_config, observer=self.metrics),
-        ]
+        # Kompress (lossy ML text compression) is resolved per provider. The
+        # global `disable_kompress` above is the baseline for both; a per-
+        # provider override (disable_kompress_{anthropic,openai}) wins when set.
+        # Only `enable_kompress` differs between providers — routing, tool
+        # exclusion, and read-protection are identical — so when both resolve
+        # the same we reuse ONE ContentRouter instance and the Kompress model
+        # still loads once (startup warmup dedupes transforms by id()).
+        base_kompress_disabled = not router_config.enable_kompress
+        anthropic_kompress_disabled = (
+            base_kompress_disabled
+            if config.disable_kompress_anthropic is None
+            else config.disable_kompress_anthropic
+        )
+        openai_kompress_disabled = (
+            base_kompress_disabled
+            if config.disable_kompress_openai is None
+            else config.disable_kompress_openai
+        )
+
+        def _router_config_for(kompress_disabled: bool) -> ContentRouterConfig:
+            if kompress_disabled == base_kompress_disabled:
+                return router_config
+            return replace(router_config, enable_kompress=not kompress_disabled)
+
+        cache_aligner = CacheAligner(CacheAlignerConfig(enabled=False))
+        anthropic_router = ContentRouter(
+            _router_config_for(anthropic_kompress_disabled), observer=self.metrics
+        )
+        openai_router = (
+            anthropic_router
+            if openai_kompress_disabled == anthropic_kompress_disabled
+            else ContentRouter(_router_config_for(openai_kompress_disabled), observer=self.metrics)
+        )
         self._code_aware_status = "lazy" if config.code_aware_enabled else "disabled"
 
         self.anthropic_pipeline = TransformPipeline(
-            transforms=transforms,
+            transforms=[cache_aligner, anthropic_router],
             provider=self.anthropic_provider,
         )
         self.openai_pipeline = TransformPipeline(
-            transforms=transforms,
+            transforms=[cache_aligner, openai_router],
             provider=self.openai_provider,
         )
 
@@ -1159,6 +1188,7 @@ class HeadroomProxy(
             "limits": httpx.Limits(
                 max_connections=self.config.max_connections,
                 max_keepalive_connections=self.config.max_keepalive_connections,
+                keepalive_expiry=self.config.keepalive_expiry,
             ),
             "verify": _ca_bundle if _ca_bundle is not None else True,
         }
@@ -1810,7 +1840,8 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             try:
                 # Startup
                 await proxy.startup()
-                asyncio.create_task(_log_toin_stats_periodically())
+                if config.periodic_toin_stats_enabled:
+                    asyncio.create_task(_log_toin_stats_periodically())
                 if proxy.usage_reporter:
                     await proxy.usage_reporter.start(proxy)
                 if proxy.traffic_learner:
@@ -2037,6 +2068,8 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "cache": config.cache_enabled,
                 "rate_limit": config.rate_limit_enabled,
                 "disable_kompress": config.disable_kompress,
+                "disable_kompress_anthropic": config.disable_kompress_anthropic,
+                "disable_kompress_openai": config.disable_kompress_openai,
                 "memory": config.memory_enabled,
                 "learn": config.traffic_learning_enabled,
                 "code_graph": config.code_graph_watcher,
@@ -3737,9 +3770,13 @@ def _proxy_config_from_env() -> ProxyConfig:
         bedrock_api_url=os.environ.get("BEDROCK_TARGET_API_URL"),
         anyllm_provider=_get_env_str("HEADROOM_ANYLLM_PROVIDER", "openai"),
         disable_kompress=_get_env_bool("HEADROOM_DISABLE_KOMPRESS", False),
+        disable_kompress_anthropic=_get_env_optional_bool("HEADROOM_DISABLE_KOMPRESS_ANTHROPIC"),
+        disable_kompress_openai=_get_env_optional_bool("HEADROOM_DISABLE_KOMPRESS_OPENAI"),
         max_connections=_get_env_int("HEADROOM_MAX_CONNECTIONS", 500),
         max_keepalive_connections=_get_env_int("HEADROOM_MAX_KEEPALIVE", 100),
+        keepalive_expiry=_get_env_float("HEADROOM_KEEPALIVE_EXPIRY", 90.0),
         http2=_get_env_bool("HEADROOM_HTTP2", True),
+        periodic_toin_stats_enabled=_get_env_bool("HEADROOM_PERIODIC_TOIN_STATS", True),
         mode=normalize_proxy_mode(_get_env_str("HEADROOM_MODE", PROXY_MODE_TOKEN)),
     )
 
@@ -3915,6 +3952,14 @@ def _get_env_bool(name: str, default: bool) -> bool:
     return val.lower() in ("true", "1", "yes", "on")
 
 
+def _get_env_optional_bool(name: str) -> bool | None:
+    """Tristate boolean env var: unset/empty -> None, truthy -> True, falsy -> False."""
+    val = os.environ.get(name)
+    if val is None or val == "":
+        return None
+    return val.lower() in ("true", "1", "yes", "on")
+
+
 def _get_env_int(name: str, default: int) -> int:
     """Get integer from environment variable."""
     val = os.environ.get(name)
@@ -3949,7 +3994,8 @@ def _parse_exclude_tools(cli_excludes: str | None) -> set[str]:
     (e.g. "WebSearch,WebFetch"). Each name is added in both original and
     lowercase form for case-insensitive matching, mirroring
     DEFAULT_EXCLUDE_TOOLS. Unset/empty -> empty set (DEFAULT_EXCLUDE_TOOLS
-    used unchanged).
+    used unchanged). Entries may contain glob patterns (e.g. "mcp__*"); see
+    config.is_tool_excluded for the matching semantics.
     """
     raw = ",".join(s for s in (cli_excludes, os.environ.get("HEADROOM_EXCLUDE_TOOLS")) if s)
     names: set[str] = set()
@@ -4065,6 +4111,12 @@ if __name__ == "__main__":
         "--max-keepalive", type=int, default=100, help="Max keepalive connections (default: 100)"
     )
     parser.add_argument(
+        "--keepalive-expiry",
+        type=float,
+        default=90.0,
+        help="Seconds an idle upstream keep-alive connection is kept open (default: 90)",
+    )
+    parser.add_argument(
         "--no-http2",
         action="store_true",
         help="Disable HTTP/2 (enabled by default for better throughput)",
@@ -4114,10 +4166,47 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--disable-kompress-anthropic",
+        dest="disable_kompress_anthropic",
+        action="store_const",
+        const=True,
+        default=None,
+        help=(
+            "Disable Kompress for the Anthropic pipeline only, overriding --disable-kompress. "
+            "Also settable via HEADROOM_DISABLE_KOMPRESS_ANTHROPIC=1."
+        ),
+    )
+    parser.add_argument(
+        "--enable-kompress-anthropic",
+        dest="disable_kompress_anthropic",
+        action="store_const",
+        const=False,
+        help="Force-enable Kompress for the Anthropic pipeline, overriding --disable-kompress.",
+    )
+    parser.add_argument(
+        "--disable-kompress-openai",
+        dest="disable_kompress_openai",
+        action="store_const",
+        const=True,
+        default=None,
+        help=(
+            "Disable Kompress for the OpenAI/Codex pipeline only, overriding --disable-kompress. "
+            "Also settable via HEADROOM_DISABLE_KOMPRESS_OPENAI=1."
+        ),
+    )
+    parser.add_argument(
+        "--enable-kompress-openai",
+        dest="disable_kompress_openai",
+        action="store_const",
+        const=False,
+        help="Force-enable Kompress for the OpenAI/Codex pipeline, overriding --disable-kompress.",
+    )
+    parser.add_argument(
         "--exclude-tools",
         default=None,
         help="Comma-separated tool names whose output is never compressed, "
         "merged with the built-in defaults (e.g., WebSearch,WebFetch). "
+        "Entries may use glob patterns, e.g. 'mcp__*' to exclude every MCP tool. "
         "Also settable via HEADROOM_EXCLUDE_TOOLS env var.",
     )
 
@@ -4170,6 +4259,16 @@ if __name__ == "__main__":
     cache_enabled = env_cache if not args.no_cache else False
     rate_limit_enabled = env_rate_limit if not args.no_rate_limit else False
     disable_kompress = args.disable_kompress or _get_env_bool("HEADROOM_DISABLE_KOMPRESS", False)
+    disable_kompress_anthropic = (
+        args.disable_kompress_anthropic
+        if args.disable_kompress_anthropic is not None
+        else _get_env_optional_bool("HEADROOM_DISABLE_KOMPRESS_ANTHROPIC")
+    )
+    disable_kompress_openai = (
+        args.disable_kompress_openai
+        if args.disable_kompress_openai is not None
+        else _get_env_optional_bool("HEADROOM_DISABLE_KOMPRESS_OPENAI")
+    )
 
     # Set OpenRouter API key from CLI if provided
     if hasattr(args, "openrouter_api_key") and args.openrouter_api_key:
@@ -4213,9 +4312,12 @@ if __name__ == "__main__":
         log_full_messages=args.log_messages or _get_env_bool("HEADROOM_LOG_MESSAGES", False),
         code_aware_enabled=code_aware_enabled,
         disable_kompress=disable_kompress,
+        disable_kompress_anthropic=disable_kompress_anthropic,
+        disable_kompress_openai=disable_kompress_openai,
         # Connection pool settings
         max_connections=_get_env_int("HEADROOM_MAX_CONNECTIONS", args.max_connections),
         max_keepalive_connections=_get_env_int("HEADROOM_MAX_KEEPALIVE", args.max_keepalive),
+        keepalive_expiry=_get_env_float("HEADROOM_KEEPALIVE_EXPIRY", args.keepalive_expiry),
         http2=not args.no_http2 and _get_env_bool("HEADROOM_HTTP2", True),
         tool_profiles=tool_profiles if tool_profiles else None,
         exclude_tools=exclude_tools if exclude_tools else None,

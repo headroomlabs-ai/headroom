@@ -2,21 +2,22 @@
 
 Covers:
 - Returns None when no env var is set
-- Returns a path string when SSL_CERT_FILE points to a valid PEM file
-- Returns a path string when REQUESTS_CA_BUNDLE points to a valid PEM file
+- Returns an ssl.SSLContext when SSL_CERT_FILE points to a valid PEM file
+- Returns an ssl.SSLContext when REQUESTS_CA_BUNDLE points to a valid PEM file
+- Replacement contexts relax OpenSSL VERIFY_X509_STRICT for custom CA bundles
 - Returns an ssl.SSLContext when NODE_EXTRA_CA_CERTS points to a valid PEM file
-- The SSLContext is additive: default/system roots are preserved (#998)
+- The NODE_EXTRA_CA_CERTS SSLContext is additive: default/system roots are preserved (#998)
 - Priority order: SSL_CERT_FILE beats REQUESTS_CA_BUNDLE beats NODE_EXTRA_CA_CERTS
 - Nonexistent paths are skipped (returns None if all paths are missing)
 """
 
 from __future__ import annotations
 
-import os
 import ssl
 
 import pytest
 
+from headroom.proxy import ssl_context
 from headroom.proxy.ssl_context import find_ca_bundle
 
 # Minimal self-signed CA certificate (PEM) used only to verify that
@@ -59,6 +60,19 @@ def _clean_env(monkeypatch):
         monkeypatch.delenv(var, raising=False)
 
 
+class FakeSSLContext:
+    def __init__(self, verify_flags: int = 0) -> None:
+        self.verify_flags = verify_flags
+        self.loaded_cafile: str | None = None
+        self.alpn_protocols: list[str] | None = None
+
+    def load_verify_locations(self, *, cafile: str) -> None:
+        self.loaded_cafile = cafile
+
+    def set_alpn_protocols(self, protocols: list[str]) -> None:
+        self.alpn_protocols = protocols
+
+
 class TestFindCaBundleNoEnvVars:
     def test_returns_none_when_no_env_var_set(self, monkeypatch):
         _clean_env(monkeypatch)
@@ -66,19 +80,37 @@ class TestFindCaBundleNoEnvVars:
 
 
 class TestFindCaBundleWithValidPem:
-    def test_ssl_cert_file_returns_path(self, monkeypatch, ca_pem_file):
+    def test_ssl_cert_file_returns_ssl_context(self, monkeypatch, ca_pem_file):
         _clean_env(monkeypatch)
         monkeypatch.setenv("SSL_CERT_FILE", ca_pem_file)
         ctx = find_ca_bundle()
-        assert isinstance(ctx, str)
-        assert os.path.isfile(ctx)
+        assert isinstance(ctx, ssl.SSLContext)
 
-    def test_requests_ca_bundle_returns_path(self, monkeypatch, ca_pem_file):
+    def test_requests_ca_bundle_returns_ssl_context(self, monkeypatch, ca_pem_file):
         _clean_env(monkeypatch)
         monkeypatch.setenv("REQUESTS_CA_BUNDLE", ca_pem_file)
         ctx = find_ca_bundle()
-        assert isinstance(ctx, str)
-        assert os.path.isfile(ctx)
+        assert isinstance(ctx, ssl.SSLContext)
+
+    def test_replacement_ca_context_relaxes_x509_strict(self, monkeypatch, ca_pem_file):
+        _clean_env(monkeypatch)
+        monkeypatch.setenv("SSL_CERT_FILE", ca_pem_file)
+        strict_flag = 0x20
+        created_context = FakeSSLContext(verify_flags=strict_flag | 0x100)
+
+        def fake_create_default_context(*, cafile: str | None = None):
+            assert cafile == ca_pem_file
+            return created_context
+
+        monkeypatch.setattr(ssl_context.ssl, "VERIFY_X509_STRICT", strict_flag, raising=False)
+        monkeypatch.setattr(ssl_context.ssl, "create_default_context", fake_create_default_context)
+
+        ctx = find_ca_bundle()
+
+        assert ctx is created_context
+        assert created_context.verify_flags & strict_flag == 0
+        assert created_context.verify_flags & 0x100
+        assert created_context.alpn_protocols == ["h2", "http/1.1"]
 
     def test_node_extra_ca_certs_returns_ssl_context(self, monkeypatch, ca_pem_file):
         """NODE_EXTRA_CA_CERTS returns an SSLContext, not a bare path (#998)."""
@@ -103,51 +135,56 @@ class TestFindCaBundlePriority:
     def test_ssl_cert_file_beats_requests_ca_bundle(self, monkeypatch, tmp_path):
         """SSL_CERT_FILE is used first even when REQUESTS_CA_BUNDLE is also set."""
         _clean_env(monkeypatch)
-        # Two distinct files so we can identify which was loaded.
         pem1 = tmp_path / "first.pem"
         pem2 = tmp_path / "second.pem"
         pem1.write_bytes(_SELF_SIGNED_CA_PEM)
         pem2.write_bytes(_SELF_SIGNED_CA_PEM)
-
         monkeypatch.setenv("SSL_CERT_FILE", str(pem1))
         monkeypatch.setenv("REQUESTS_CA_BUNDLE", str(pem2))
+        created_context = FakeSSLContext()
 
-        # Both files are valid; we cannot easily inspect which CA was loaded
-        # into the context, but we can verify the function returns a path
-        # (not None) and that it is tied to SSL_CERT_FILE by temporarily
-        # making REQUESTS_CA_BUNDLE point to a nonexistent path.
-        monkeypatch.setenv("REQUESTS_CA_BUNDLE", "/nonexistent/path.pem")
-        ctx = find_ca_bundle()
-        # SSL_CERT_FILE still valid → should return a path
-        assert isinstance(ctx, str)
-        assert os.path.isfile(ctx)
+        def fake_create_default_context(*, cafile: str | None = None):
+            assert cafile == str(pem1)
+            return created_context
+
+        monkeypatch.setattr(ssl_context.ssl, "create_default_context", fake_create_default_context)
+
+        assert find_ca_bundle() is created_context
 
     def test_ssl_cert_file_beats_node_extra_ca_certs(self, monkeypatch, tmp_path):
         """SSL_CERT_FILE takes precedence over NODE_EXTRA_CA_CERTS."""
         _clean_env(monkeypatch)
         pem = tmp_path / "ca.pem"
         pem.write_bytes(_SELF_SIGNED_CA_PEM)
-
         monkeypatch.setenv("SSL_CERT_FILE", str(pem))
         monkeypatch.setenv("NODE_EXTRA_CA_CERTS", "/nonexistent/node.pem")
+        created_context = FakeSSLContext()
 
-        ctx = find_ca_bundle()
-        assert isinstance(ctx, str)
-        assert os.path.isfile(ctx)
+        def fake_create_default_context(*, cafile: str | None = None):
+            assert cafile == str(pem)
+            return created_context
+
+        monkeypatch.setattr(ssl_context.ssl, "create_default_context", fake_create_default_context)
+
+        assert find_ca_bundle() is created_context
 
     def test_requests_ca_bundle_beats_node_extra_ca_certs(self, monkeypatch, tmp_path):
         """REQUESTS_CA_BUNDLE is used before NODE_EXTRA_CA_CERTS."""
         _clean_env(monkeypatch)
         pem = tmp_path / "ca.pem"
         pem.write_bytes(_SELF_SIGNED_CA_PEM)
-
         monkeypatch.setenv("SSL_CERT_FILE", "/nonexistent/ssl.pem")
         monkeypatch.setenv("REQUESTS_CA_BUNDLE", str(pem))
         monkeypatch.setenv("NODE_EXTRA_CA_CERTS", "/nonexistent/node.pem")
+        created_context = FakeSSLContext()
 
-        ctx = find_ca_bundle()
-        assert isinstance(ctx, str)
-        assert os.path.isfile(ctx)
+        def fake_create_default_context(*, cafile: str | None = None):
+            assert cafile == str(pem)
+            return created_context
+
+        monkeypatch.setattr(ssl_context.ssl, "create_default_context", fake_create_default_context)
+
+        assert find_ca_bundle() is created_context
 
 
 class TestFindCaBundleNonexistentPaths:
@@ -170,4 +207,5 @@ class TestFindCaBundleNonexistentPaths:
         monkeypatch.setenv("REQUESTS_CA_BUNDLE", ca_pem_file)
 
         ctx = find_ca_bundle()
-        assert ctx == ca_pem_file
+
+        assert isinstance(ctx, ssl.SSLContext)

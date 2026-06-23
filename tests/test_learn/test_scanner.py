@@ -164,8 +164,8 @@ class TestGreedyPathDecode:
         result = _greedy_path_decode(tmp_path, [])
         assert result == tmp_path
 
-    def test_empty_parts_returns_none_when_not_exists(self) -> None:
-        result = _greedy_path_decode(Path("/nonexistent/path"), [])
+    def test_empty_parts_returns_none_when_not_exists(self, tmp_path: Path) -> None:
+        result = _greedy_path_decode(tmp_path / "missing", [])
         assert result is None
 
 
