@@ -99,6 +99,9 @@
         html:not(.dark) .text-cyan-200\/80 { color: #0e7490; }
         html:not(.dark) .text-cyan-300\/75 { color: #0891b2; }
         html:not(.dark) .text-violet-300\/75 { color: #7c3aed; }
+        /* Light mode: fix hardcoded dark card backgrounds */
+        .bg-card-alt { background: var(--card-alt-bg); }
+        .hover-bg-surface:hover { background: var(--color-surface); }
     </style>
 </head>
 <body class="text-gray-200 min-h-screen" x-data="dashboard()" x-init="init()">
@@ -269,6 +272,50 @@
                     TTFB <span x-text="((stats.ttfb?.average_ms || 0) / 1000).toFixed(2)"></span>s avg
                 </div>
             </div>
+
+            <!-- Token Throughput -->
+            <div class="bg-surface rounded-lg p-4 border border-border flex flex-col justify-between">
+                <div>
+                    <div class="text-xs text-gray-500 uppercase tracking-wide mb-1.5">Throughput</div>
+                    <div class="flex flex-col gap-1 text-[11px] text-gray-300">
+                        <div class="flex justify-between items-baseline border-b border-border/40 pb-0.5">
+                            <span class="text-gray-500">Input (wall / active p50)</span>
+                            <span class="font-mono text-accent">
+                                <span x-text="(stats.throughput?.rolling?.input_wall_clock || 0).toFixed(1)"></span> /
+                                <span x-text="(stats.throughput?.rolling?.input_active_p50 || 0).toFixed(1)"></span> tok/s
+                            </span>
+                        </div>
+                        <div class="flex justify-between items-baseline border-b border-border/40 pb-0.5" x-show="(stats.throughput?.rolling?.compression_p50 || 0) > 0">
+                            <span class="text-gray-500">Compression (p50 / p95)</span>
+                            <span class="font-mono text-emerald-400">
+                                <span x-text="(stats.throughput?.rolling?.compression_p50 || 0).toFixed(1)"></span> /
+                                <span x-text="(stats.throughput?.rolling?.compression_p95 || 0).toFixed(1)"></span> tok/s
+                            </span>
+                        </div>
+                        <div class="flex justify-between items-baseline border-b border-border/40 pb-0.5">
+                            <span class="text-gray-500">Forward (p50 / p95)</span>
+                            <span class="font-mono text-cyan-400">
+                                <span x-text="(stats.throughput?.rolling?.forward_p50 || 0).toFixed(1)"></span> /
+                                <span x-text="(stats.throughput?.rolling?.forward_p95 || 0).toFixed(1)"></span> tok/s
+                            </span>
+                        </div>
+                        <div class="flex justify-between items-baseline" x-show="(stats.throughput?.rolling?.generation_p50 || 0) > 0">
+                            <span class="text-gray-500">Generation (p50 / p95)</span>
+                            <span class="font-mono text-yellow-400">
+                                <span x-text="(stats.throughput?.rolling?.generation_p50 || 0).toFixed(1)"></span> /
+                                <span x-text="(stats.throughput?.rolling?.generation_p95 || 0).toFixed(1)"></span> tok/s
+                            </span>
+                        </div>
+                    </div>
+                </div>
+                <div class="mt-2 pt-1.5 border-t border-border/40 text-[10px] text-gray-500 flex justify-between items-center">
+                    <span>Current 5m (active p50):</span>
+                    <span class="font-mono text-gray-400">
+                        In: <span x-text="(stats.throughput?.current?.input_active_p50 || 0).toFixed(0)"></span> ·
+                        Fwd: <span x-text="(stats.throughput?.current?.forward_p50 || 0).toFixed(0)"></span> tok/s
+                    </span>
+                </div>
+            </div>
         </div>
 
         <!-- Agent Usage -->
@@ -280,26 +327,26 @@
                 </div>
                 <div class="flex flex-wrap items-center gap-3 text-xs">
                     <span class="text-gray-500" x-text="'Coverage: ' + agentCoverageLabel"></span>
-                    <span class="px-2 py-0.5 rounded border border-border bg-[#141414] font-mono text-gray-400"
+                    <span class="px-2 py-0.5 rounded border border-border bg-card-alt font-mono text-gray-400"
                           x-text="formatNumber(stats.agent_usage?.totals?.requests || 0) + ' requests'"></span>
                 </div>
             </div>
 
             <div class="p-4">
                 <div class="grid grid-cols-1 md:grid-cols-4 gap-3 mb-5">
-                    <div class="rounded-lg border border-border bg-[#141414] p-3">
+                    <div class="rounded-lg border border-border bg-card-alt p-3">
                         <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Before</div>
                         <div class="text-2xl font-light tabular-nums" x-text="formatNumber(stats.agent_usage?.totals?.before_tokens || 0)"></div>
                     </div>
-                    <div class="rounded-lg border border-border bg-[#141414] p-3">
+                    <div class="rounded-lg border border-border bg-card-alt p-3">
                         <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">After</div>
                         <div class="text-2xl font-light tabular-nums text-gray-200" x-text="formatNumber(stats.agent_usage?.totals?.after_tokens || 0)"></div>
                     </div>
-                    <div class="rounded-lg border border-border bg-[#141414] p-3">
+                    <div class="rounded-lg border border-border bg-card-alt p-3">
                         <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Saved</div>
                         <div class="text-2xl font-light tabular-nums text-accent" x-text="formatNumber(stats.agent_usage?.totals?.tokens_saved || 0)"></div>
                     </div>
-                    <div class="rounded-lg border border-border bg-[#141414] p-3">
+                    <div class="rounded-lg border border-border bg-card-alt p-3">
                         <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Savings</div>
                         <div class="text-2xl font-light tabular-nums text-emerald-400" x-text="(stats.agent_usage?.totals?.savings_percent || 0).toFixed(1) + '%'"></div>
                     </div>
@@ -308,7 +355,7 @@
                 <template x-if="agentRows.length > 0">
                     <div class="space-y-3">
                         <template x-for="agent in agentRows" :key="agent.agent">
-                            <div class="rounded-lg border border-border bg-[#141414] p-3">
+                            <div class="rounded-lg border border-border bg-card-alt p-3">
                                 <div class="grid grid-cols-1 gap-3 lg:grid-cols-[minmax(160px,0.9fr)_minmax(260px,1.5fr)_minmax(260px,1.2fr)] lg:items-center">
                                     <div class="min-w-0">
                                         <div class="flex items-center gap-2">
@@ -1032,10 +1079,17 @@
                     <span class="text-xs text-gray-500">Exact tokens saved per model</span>
                 </div>
                 <div class="overflow-x-auto">
-                    <table class="w-full text-sm">
+                    <table class="w-full text-sm" style="table-layout:fixed">
+                        <colgroup>
+                            <col style="width:40%">
+                            <col style="width:12%">
+                            <col style="width:18%">
+                            <col style="width:18%">
+                            <col style="width:12%">
+                        </colgroup>
                         <thead>
-                            <tr class="text-left text-xs text-gray-500 uppercase tracking-wide">
-                                <th class="px-4 py-3 font-medium">Model</th>
+                            <tr class="text-xs text-gray-500 uppercase tracking-wide">
+                                <th class="px-4 py-3 font-medium text-left">Model</th>
                                 <th class="px-4 py-3 font-medium text-right">Requests</th>
                                 <th class="px-4 py-3 font-medium text-right">Tokens Saved</th>
                                 <th class="px-4 py-3 font-medium text-right">Tokens Sent</th>
@@ -1045,14 +1099,14 @@
                         <tbody class="divide-y divide-border">
                             <template x-for="[model, info] in Object.entries(stats.cost?.per_model || {})" :key="model">
                                 <tr class="hover:bg-border/30 transition-colors">
-                                    <td class="px-4 py-3">
+                                    <td class="px-4 py-3 text-left">
                                         <span class="px-2 py-0.5 bg-border rounded text-xs" x-text="truncateModel(model)"></span>
                                     </td>
-                                    <td class="px-4 py-3 text-right font-mono" x-text="info.requests"></td>
-                                    <td class="px-4 py-3 text-right font-mono text-accent" x-text="formatNumber(info.tokens_saved)"></td>
-                                    <td class="px-4 py-3 text-right font-mono" x-text="formatNumber(info.tokens_sent)"></td>
+                                    <td class="px-4 py-3 text-right font-mono tabular-nums" x-text="info.requests"></td>
+                                    <td class="px-4 py-3 text-right font-mono tabular-nums text-accent" x-text="formatNumber(info.tokens_saved)"></td>
+                                    <td class="px-4 py-3 text-right font-mono tabular-nums" x-text="formatNumber(info.tokens_sent)"></td>
                                     <td class="px-4 py-3 text-right">
-                                        <span class="text-accent font-mono" x-text="info.reduction_pct.toFixed(1) + '%'"></span>
+                                        <span class="text-accent font-mono tabular-nums" x-text="info.reduction_pct.toFixed(1) + '%'"></span>
                                     </td>
                                 </tr>
                             </template>
@@ -1063,42 +1117,78 @@
         </template>
 
         <!-- Per-Project Savings Breakdown -->
-        <template x-if="Object.keys(stats.savings?.per_project || {}).length > 0">
-            <div class="bg-surface rounded-lg border border-border overflow-hidden mb-6">
-                <div class="px-4 py-3 border-b border-border flex justify-between items-center">
+        <div class="bg-surface rounded-lg border border-border overflow-hidden mb-6">
+            <div class="px-4 py-3 border-b border-border flex justify-between items-center">
+                <div>
                     <span class="text-sm font-medium text-gray-300">Per-Project Savings</span>
-                    <span class="text-xs text-gray-500">Lifetime totals &mdash; all time</span>
+                    <div class="text-xs text-gray-500 mt-0.5">Lifetime totals — attributed requests only</div>
                 </div>
+                <span class="text-xs text-gray-500 font-mono"
+                      x-text="Object.keys(stats.savings?.per_project || {}).length + ' project(s)'"></span>
+            </div>
+
+            <!-- Empty state: no project data yet -->
+            <template x-if="Object.keys(stats.savings?.per_project || {}).length === 0">
+                <div class="px-4 py-8 text-center">
+                    <div class="text-xs text-gray-500 mb-3">No per-project data yet.</div>
+                    <div class="text-xs text-gray-600 font-mono leading-relaxed">
+                        Add to each project's <span class="text-gray-400">.claude/settings.local.json</span>:<br>
+                        <span class="text-accent">ANTHROPIC_BASE_URL: http://127.0.0.1:8787/p/&lt;project-name&gt;</span>
+                    </div>
+                </div>
+            </template>
+
+            <!-- Project rows -->
+            <template x-if="Object.keys(stats.savings?.per_project || {}).length > 0">
                 <div class="overflow-x-auto">
-                    <table class="w-full text-sm">
+                    <table class="w-full text-sm" style="table-layout:fixed">
+                        <colgroup>
+                            <col style="width:25%">
+                            <col style="width:10%">
+                            <col style="width:15%">
+                            <col style="width:12%">
+                            <col style="width:18%">
+                            <col style="width:20%">
+                        </colgroup>
                         <thead>
-                            <tr class="text-left text-xs text-gray-500 uppercase tracking-wide">
-                                <th class="px-4 py-3 font-medium">Project</th>
+                            <tr class="text-xs text-gray-500 uppercase tracking-wide">
+                                <th class="px-4 py-3 font-medium text-left">Project</th>
                                 <th class="px-4 py-3 font-medium text-right">Requests</th>
                                 <th class="px-4 py-3 font-medium text-right">Tokens Saved</th>
                                 <th class="px-4 py-3 font-medium text-right">Saved $</th>
                                 <th class="px-4 py-3 font-medium text-right">Savings %</th>
+                                <th class="px-4 py-3 font-medium text-right hidden md:table-cell">Last Active</th>
                             </tr>
                         </thead>
                         <tbody class="divide-y divide-border">
                             <template x-for="[project, info] in Object.entries(stats.savings?.per_project || {})" :key="project">
                                 <tr class="hover:bg-border/30 transition-colors">
-                                    <td class="px-4 py-3">
-                                        <span class="px-2 py-0.5 bg-border rounded text-xs" x-text="project"></span>
+                                    <td class="px-4 py-3 text-left">
+                                        <span class="px-2 py-0.5 bg-border rounded text-xs font-mono" x-text="project"></span>
                                     </td>
-                                    <td class="px-4 py-3 text-right font-mono" x-text="info.requests"></td>
-                                    <td class="px-4 py-3 text-right font-mono text-accent" x-text="formatNumber(info.tokens_saved)"></td>
-                                    <td class="px-4 py-3 text-right font-mono text-emerald-400" x-text="'$' + formatCurrency(info.compression_savings_usd || 0)"></td>
+                                    <td class="px-4 py-3 text-right font-mono tabular-nums" x-text="info.requests"></td>
+                                    <td class="px-4 py-3 text-right font-mono tabular-nums text-accent" x-text="formatNumber(info.tokens_saved)"></td>
+                                    <td class="px-4 py-3 text-right font-mono tabular-nums text-emerald-400"
+                                        x-text="'$' + formatCurrency(info.compression_savings_usd || 0)"></td>
                                     <td class="px-4 py-3 text-right">
-                                        <span class="text-accent font-mono" x-text="(info.savings_percent || 0).toFixed(1) + '%'"></span>
+                                        <div class="flex items-center justify-end gap-2">
+                                            <div class="w-16 h-1.5 bg-border rounded-full overflow-hidden">
+                                                <div class="h-full bg-accent rounded-full"
+                                                     :style="'width:' + Math.min(info.savings_percent || 0, 100) + '%'"></div>
+                                            </div>
+                                            <span class="text-accent font-mono tabular-nums text-xs w-10 text-right"
+                                                  x-text="(info.savings_percent || 0).toFixed(1) + '%'"></span>
+                                        </div>
                                     </td>
+                                    <td class="px-4 py-3 text-right text-xs text-gray-500 font-mono hidden md:table-cell"
+                                        x-text="info.last_activity_at ? new Date(info.last_activity_at).toLocaleString() : '—'"></td>
                                 </tr>
                             </template>
                         </tbody>
                     </table>
                 </div>
-            </div>
-        </template>
+            </template>
+        </div>
 
         <!-- Recent Requests Table (with expandable rows) -->
         <div class="bg-surface rounded-lg border border-border overflow-hidden">
@@ -1107,98 +1197,96 @@
                 <span class="text-xs text-gray-500">Last 10 &mdash; click row to expand</span>
             </div>
             <div class="overflow-x-auto">
-                <table class="w-full text-sm">
-                    <thead>
-                        <tr class="text-left text-xs text-gray-500 uppercase tracking-wide">
-                            <th class="px-4 py-3 font-medium w-6"></th>
-                            <th class="px-4 py-3 font-medium">Time</th>
-                            <th class="px-4 py-3 font-medium">Model</th>
-                            <th class="px-4 py-3 font-medium text-right">Input</th>
-                            <th class="px-4 py-3 font-medium text-right">Output</th>
-                            <th class="px-4 py-3 font-medium text-right">Saved</th>
-                            <th class="px-4 py-3 font-medium text-right">Latency</th>
-                        </tr>
-                    </thead>
-                    <tbody class="divide-y divide-border">
+                <div>
+                    <!-- Header -->
+                    <div class="grid text-xs text-gray-500 uppercase tracking-wide border-b border-border"
+                         style="grid-template-columns: 2rem 12fr 22fr 15fr 12fr 10fr 14fr">
+                        <div class="px-2 py-3"></div>
+                        <div class="px-4 py-3 font-medium">Time</div>
+                        <div class="px-4 py-3 font-medium">Model</div>
+                        <div class="px-4 py-3 font-medium text-right">Input</div>
+                        <div class="px-4 py-3 font-medium text-right">Output</div>
+                        <div class="px-4 py-3 font-medium text-right">Saved</div>
+                        <div class="px-4 py-3 font-medium text-right">Latency</div>
+                    </div>
+                    <!-- Data rows -->
+                    <div class="divide-y divide-border">
                         <template x-for="req in (stats.recent_requests || [])" :key="req.request_id">
-                            <tr>
-                                <td colspan="7" class="p-0">
-                                    <div class="cursor-pointer" @click="toggleExpanded(req.request_id)">
-                                        <div class="flex hover:bg-border/30 transition-colors">
-                                            <div class="px-4 py-3 w-6 text-gray-500">
-                                                <span x-text="expandedRows[req.request_id] ? '-' : '+'"></span>
-                                            </div>
-                                            <div class="px-4 py-3 font-mono text-gray-400 flex-1" x-text="formatTime(req.timestamp)"></div>
-                                            <div class="px-4 py-3 flex-1">
-                                                <span class="px-2 py-0.5 bg-border rounded text-xs" x-text="truncateModel(req.model)"></span>
-                                            </div>
-                                            <div class="px-4 py-3 text-right font-mono flex-1" x-text="formatNumber(req.input_tokens_optimized)"></div>
-                                            <div class="px-4 py-3 text-right font-mono flex-1" x-text="formatNumber(req.output_tokens || 0)"></div>
-                                            <div class="px-4 py-3 text-right flex-1">
-                                                <span class="text-accent font-mono" x-text="req.savings_percent.toFixed(0) + '%'"></span>
-                                            </div>
-                                            <div class="px-4 py-3 text-right font-mono text-gray-400 flex-1" x-text="(req.total_latency_ms || 0).toFixed(0) + 'ms'"></div>
+                            <div>
+                                <div class="cursor-pointer" @click="toggleExpanded(req.request_id)">
+                                    <div class="grid hover:bg-border/30 transition-colors"
+                                         style="grid-template-columns: 2rem 12fr 22fr 15fr 12fr 10fr 14fr">
+                                        <div class="px-2 py-3 text-gray-500 flex items-center justify-center">
+                                            <span x-text="expandedRows[req.request_id] ? '-' : '+'"></span>
                                         </div>
+                                        <div class="px-4 py-3 font-mono text-gray-400 truncate" x-text="formatTime(req.timestamp)"></div>
+                                        <div class="px-4 py-3 min-w-0">
+                                            <span class="px-2 py-0.5 bg-border rounded text-xs truncate" x-text="truncateModel(req.model)"></span>
+                                        </div>
+                                        <div class="px-4 py-3 text-right font-mono tabular-nums" x-text="formatNumber(req.input_tokens_optimized)"></div>
+                                        <div class="px-4 py-3 text-right font-mono tabular-nums" x-text="formatNumber(req.output_tokens || 0)"></div>
+                                        <div class="px-4 py-3 text-right">
+                                            <span class="text-accent font-mono tabular-nums" x-text="req.savings_percent.toFixed(0) + '%'"></span>
+                                        </div>
+                                        <div class="px-4 py-3 text-right font-mono tabular-nums text-gray-400" x-text="(req.total_latency_ms || 0).toFixed(0) + 'ms'"></div>
                                     </div>
-                                    <!-- Expanded detail row -->
-                                    <template x-if="expandedRows[req.request_id]">
-                                        <div class="px-8 py-4 border-t border-border" style="background: var(--card-alt-bg);">
-                                            <div class="grid grid-cols-2 lg:grid-cols-4 gap-4 text-xs">
-                                                <div>
-                                                    <div class="text-gray-500 uppercase tracking-wide mb-1">Original Tokens</div>
-                                                    <div class="font-mono" x-text="formatNumber(req.input_tokens_original)"></div>
-                                                </div>
-                                                <div>
-                                                    <div class="text-gray-500 uppercase tracking-wide mb-1">Compressed Tokens</div>
-                                                    <div class="font-mono" x-text="formatNumber(req.input_tokens_optimized)"></div>
-                                                </div>
-                                                <div>
-                                                    <div class="text-gray-500 uppercase tracking-wide mb-1">Tokens Removed</div>
-                                                    <div class="font-mono text-accent" x-text="formatNumber(req.tokens_saved)"></div>
-                                                </div>
-                                                <div>
-                                                    <div class="text-gray-500 uppercase tracking-wide mb-1">Optimization Time</div>
-                                                    <div class="font-mono" x-text="(req.optimization_latency_ms || 0).toFixed(0) + 'ms'"></div>
+                                </div>
+                                <!-- Expanded detail row -->
+                                <template x-if="expandedRows[req.request_id]">
+                                    <div class="px-8 py-4 border-t border-border" style="background: var(--card-alt-bg);">
+                                        <div class="grid grid-cols-2 lg:grid-cols-4 gap-4 text-xs">
+                                            <div>
+                                                <div class="text-gray-500 uppercase tracking-wide mb-1">Original Tokens</div>
+                                                <div class="font-mono" x-text="formatNumber(req.input_tokens_original)"></div>
+                                            </div>
+                                            <div>
+                                                <div class="text-gray-500 uppercase tracking-wide mb-1">Compressed Tokens</div>
+                                                <div class="font-mono" x-text="formatNumber(req.input_tokens_optimized)"></div>
+                                            </div>
+                                            <div>
+                                                <div class="text-gray-500 uppercase tracking-wide mb-1">Tokens Removed</div>
+                                                <div class="font-mono text-accent" x-text="formatNumber(req.tokens_saved)"></div>
+                                            </div>
+                                            <div>
+                                                <div class="text-gray-500 uppercase tracking-wide mb-1">Optimization Time</div>
+                                                <div class="font-mono" x-text="(req.optimization_latency_ms || 0).toFixed(0) + 'ms'"></div>
+                                            </div>
+                                        </div>
+                                        <!-- Transforms Applied -->
+                                        <template x-if="(req.transforms_applied || []).length > 0">
+                                            <div class="mt-3">
+                                                <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Transforms Applied</div>
+                                                <div class="flex flex-wrap gap-1">
+                                                    <template x-for="t in req.transforms_applied" :key="t">
+                                                        <span class="px-2 py-0.5 bg-border rounded text-xs font-mono" x-text="t"></span>
+                                                    </template>
                                                 </div>
                                             </div>
-                                            <!-- Transforms Applied -->
-                                            <template x-if="(req.transforms_applied || []).length > 0">
-                                                <div class="mt-3">
-                                                    <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Transforms Applied</div>
-                                                    <div class="flex flex-wrap gap-1">
-                                                        <template x-for="t in req.transforms_applied" :key="t">
-                                                            <span class="px-2 py-0.5 bg-border rounded text-xs font-mono" x-text="t"></span>
-                                                        </template>
-                                                    </div>
+                                        </template>
+                                        <!-- Waste Signals for this request -->
+                                        <template x-if="req.waste_signals && Object.keys(req.waste_signals).length > 0">
+                                            <div class="mt-3">
+                                                <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Waste Detected</div>
+                                                <div class="flex flex-wrap gap-2">
+                                                    <template x-for="[signal, tokens] in Object.entries(req.waste_signals).filter(([,v]) => v > 0)" :key="signal">
+                                                        <span class="px-2 py-0.5 rounded text-xs font-mono"
+                                                              :class="wasteSignalBadgeColor(signal)"
+                                                              x-text="wasteSignalLabel(signal) + ': ' + formatNumber(tokens)"></span>
+                                                    </template>
                                                 </div>
-                                            </template>
-                                            <!-- Waste Signals for this request -->
-                                            <template x-if="req.waste_signals && Object.keys(req.waste_signals).length > 0">
-                                                <div class="mt-3">
-                                                    <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Waste Detected</div>
-                                                    <div class="flex flex-wrap gap-2">
-                                                        <template x-for="[signal, tokens] in Object.entries(req.waste_signals).filter(([,v]) => v > 0)" :key="signal">
-                                                            <span class="px-2 py-0.5 rounded text-xs font-mono"
-                                                                  :class="wasteSignalBadgeColor(signal)"
-                                                                  x-text="wasteSignalLabel(signal) + ': ' + formatNumber(tokens)"></span>
-                                                        </template>
-                                                    </div>
-                                                </div>
-                                            </template>
-                                        </div>
-                                    </template>
-                                </td>
-                            </tr>
+                                            </div>
+                                        </template>
+                                    </div>
+                                </template>
+                            </div>
                         </template>
                         <template x-if="(stats.recent_requests || []).length === 0">
-                            <tr>
-                                <td colspan="8" class="px-4 py-8 text-center text-gray-500 italic">
-                                    No requests yet. Start using the proxy to see activity here.
-                                </td>
-                            </tr>
+                            <div class="px-4 py-8 text-center text-gray-500 italic">
+                                No requests yet. Start using the proxy to see activity here.
+                            </div>
                         </template>
-                    </tbody>
-                </table>
+                    </div>
+                </div>
             </div>
         </div>
             </div>
@@ -1399,7 +1487,7 @@
                                             <tbody>
                                                 <template x-for="row in historyModelBreakdown" :key="row.model">
                                                     <tr class="border-t border-border text-gray-300 cursor-pointer transition-colors"
-                                                        :class="historySelectedModel === row.model ? 'bg-[#1c1c1c]' : 'hover:bg-[#181818]'"
+                                                        :class="historySelectedModel === row.model ? 'bg-card-alt' : 'hover-bg-surface'"
                                                         @click="toggleHistoryModel(row.model)"
                                                         :title="historySelectedModel === row.model
                                                             ? 'Show all models'

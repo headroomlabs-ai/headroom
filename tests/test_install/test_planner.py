@@ -39,6 +39,7 @@ def test_build_manifest_for_persistent_docker_sets_expected_defaults() -> None:
     assert manifest.health_url == "http://127.0.0.1:8787/readyz"
     assert manifest.base_env["HEADROOM_PORT"] == "8787"
     assert manifest.base_env["HEADROOM_TELEMETRY"] == "off"
+    assert "--no-telemetry" in manifest.proxy_args
     assert manifest.tool_envs["claude"]["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:8787"
     assert manifest.tool_envs["copilot"]["COPILOT_PROVIDER_TYPE"] == "anthropic"
     assert "--memory" in manifest.proxy_args
@@ -62,6 +63,9 @@ def test_build_manifest_uses_provider_slice_env_builders_for_all_supported_targe
         image="ghcr.io/chopratejas/headroom:latest",
     )
 
+    # telemetry_enabled=True must write the explicit opt-in value + flag.
+    assert manifest.base_env["HEADROOM_TELEMETRY"] == "on"
+    assert "--telemetry" in manifest.proxy_args
     assert manifest.tool_envs["claude"]["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:9999"
     assert manifest.tool_envs["codex"]["OPENAI_BASE_URL"] == "http://127.0.0.1:9999/v1"
     assert manifest.tool_envs["aider"] == {

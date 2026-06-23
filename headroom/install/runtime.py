@@ -74,7 +74,7 @@ def _runtime_env(manifest: DeploymentManifest) -> dict[str, str]:
 
 
 def _ensure_host_dirs() -> None:
-    for subdir in (".headroom", ".claude", ".codex", ".gemini"):
+    for subdir in (".headroom", ".claude", ".codex", ".gemini", ".config/opencode"):
         (Path.home() / subdir).mkdir(parents=True, exist_ok=True)
 
 
@@ -120,6 +120,8 @@ def build_runtime_command(manifest: DeploymentManifest) -> list[str]:
         f"{_mount_source(home, '.codex')}:{container_home}/.codex",
         "--volume",
         f"{_mount_source(home, '.gemini')}:{container_home}/.gemini",
+        "--volume",
+        f"{_mount_source(home, '.config/opencode')}:{container_home}/.config/opencode",
     ]
     if not _is_windows():
         getuid = getattr(os, "getuid", None)
@@ -190,7 +192,8 @@ def acquire_runtime_start_lock(profile: str) -> Iterator[bool]:
             import fcntl
 
             try:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl_any = cast(Any, fcntl)
+                fcntl_any.flock(lock_file.fileno(), fcntl_any.LOCK_EX | fcntl_any.LOCK_NB)
                 acquired = True
             except BlockingIOError:
                 yield False
@@ -215,7 +218,8 @@ def acquire_runtime_start_lock(profile: str) -> Iterator[bool]:
                 else:
                     import fcntl
 
-                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                    fcntl_any = cast(Any, fcntl)
+                    fcntl_any.flock(lock_file.fileno(), fcntl_any.LOCK_UN)
 
 
 def run_foreground(manifest: DeploymentManifest) -> int:

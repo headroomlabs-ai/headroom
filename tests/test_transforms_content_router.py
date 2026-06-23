@@ -277,6 +277,150 @@ def test_content_router_strategy_and_compress_paths(monkeypatch: pytest.MonkeyPa
     assert router.compress("   ").strategy_used is CompressionStrategy.PASSTHROUGH
 
 
+def test_force_kompress_bypasses_content_detection(monkeypatch: pytest.MonkeyPatch) -> None:
+    router = ContentRouter()
+    router._runtime_force_kompress = True
+    pure_result = RouterCompressionResult(
+        compressed="pure",
+        original="pure",
+        strategy_used=CompressionStrategy.KOMPRESS,
+    )
+
+    monkeypatch.setattr(
+        content_router_module,
+        "is_mixed_content",
+        lambda content: (_ for _ in ()).throw(AssertionError("mixed detection called")),
+    )
+    monkeypatch.setattr(
+        content_router_module,
+        "_detect_content",
+        lambda content: (_ for _ in ()).throw(AssertionError("content detection called")),
+    )
+    monkeypatch.setattr(router, "_determine_strategy", lambda content: CompressionStrategy.MIXED)
+    monkeypatch.setattr(router, "_compress_pure", lambda *args, **kwargs: pure_result)
+
+    assert router.compress("large tool output") is pure_result
+
+
+def test_normal_compress_path_still_uses_content_detection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    router = ContentRouter()
+    calls = {"mixed": 0, "detect": 0}
+    pure_result = RouterCompressionResult(
+        compressed="pure",
+        original="pure",
+        strategy_used=CompressionStrategy.TEXT,
+    )
+
+    def _fake_mixed(content: str) -> bool:
+        calls["mixed"] += 1
+        return False
+
+    def _fake_detect(content: str) -> DetectionResult:
+        calls["detect"] += 1
+        return DetectionResult(ContentType.PLAIN_TEXT, 1.0, {})
+
+    monkeypatch.setattr(content_router_module, "is_mixed_content", _fake_mixed)
+    monkeypatch.setattr(content_router_module, "_detect_content", _fake_detect)
+    monkeypatch.setattr(router, "_compress_pure", lambda *args, **kwargs: pure_result)
+
+    assert router.compress("plain text") is pure_result
+    assert calls["mixed"] > 0
+    assert calls["detect"] > 0
+
+
+def test_force_kompress_apply_uses_lightweight_detection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeTokenizer:
+        def count_text(self, text: str) -> int:
+            return len(text.split())
+
+    router = ContentRouter(ContentRouterConfig(protect_recent_code=2))
+    content = " ".join(["plain text payload"] * 80)
+
+    monkeypatch.setattr(
+        content_router_module,
+        "_detect_content",
+        lambda content: (_ for _ in ()).throw(AssertionError("content detection called")),
+    )
+    monkeypatch.setattr(
+        content_router_module,
+        "_regex_detect_content_type",
+        lambda content: DetectionResult(ContentType.PLAIN_TEXT, 1.0, {}),
+    )
+    monkeypatch.setattr(
+        router,
+        "compress",
+        lambda content, context="", bias=1.0: RouterCompressionResult(
+            compressed="compressed",
+            original=content,
+            strategy_used=CompressionStrategy.KOMPRESS,
+            routing_log=[
+                RoutingDecision(
+                    content_type=ContentType.PLAIN_TEXT,
+                    strategy=CompressionStrategy.KOMPRESS,
+                    original_tokens=len(content.split()),
+                    compressed_tokens=1,
+                )
+            ],
+        ),
+    )
+
+    result = router.apply(
+        [{"role": "tool", "content": content}],
+        FakeTokenizer(),
+        force_kompress=True,
+        min_tokens_to_compress=10,
+        protect_recent=2,
+    )
+
+    assert result.messages[0]["content"] == "compressed"
+
+
+def test_force_kompress_apply_lightweight_detection_protects_recent_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeTokenizer:
+        def count_text(self, text: str) -> int:
+            return len(text.split())
+
+    router = ContentRouter(ContentRouterConfig(protect_recent_code=2))
+    content = "\n".join(
+        [
+            "def generated_function(value):",
+            "    if value:",
+            "        return str(value)",
+        ]
+        * 40
+    )
+
+    monkeypatch.setattr(
+        content_router_module,
+        "_detect_content",
+        lambda content: (_ for _ in ()).throw(AssertionError("content detection called")),
+    )
+    monkeypatch.setattr(
+        router,
+        "compress",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("recent code should be protected")
+        ),
+    )
+
+    result = router.apply(
+        [{"role": "tool", "content": content}],
+        FakeTokenizer(),
+        force_kompress=True,
+        min_tokens_to_compress=10,
+        protect_recent=2,
+    )
+
+    assert result.messages[0]["content"] == content
+    assert result.transforms_applied == ["router:protected:recent_code"]
+
+
 def test_content_router_mixed_pure_apply_and_toin(monkeypatch: pytest.MonkeyPatch) -> None:
     router = ContentRouter()
     mixed_content = "\n".join(["before", "```python", "print('x')", "```", "after"])

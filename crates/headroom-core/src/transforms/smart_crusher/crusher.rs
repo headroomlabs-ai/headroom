@@ -163,6 +163,13 @@ impl SmartCrusher {
             max_flatten_inner_keys: config.compaction_max_flatten_inner_keys,
             min_buckets: config.compaction_min_buckets,
             max_buckets: config.compaction_max_buckets,
+            // Honor the CCR marker gate for opaque-blob cells too (not just
+            // the row-drop path), so `enable_ccr_marker=false` yields
+            // marker-free, lossless output. Fixes #1091.
+            classify: ClassifyConfig {
+                emit_opaque_markers: config.enable_ccr_marker,
+                ..ClassifyConfig::default()
+            },
             ..CompactConfig::default()
         };
         SmartCrusherBuilder::new(config)
@@ -595,7 +602,12 @@ impl SmartCrusher {
         // 2. Opaque blob: substitute with CCR marker AND stash the
         // original in the store (PR8) so retrieval works. Hash + format
         // identical to walker.rs via the shared helper — zero drift.
-        let cfg = ClassifyConfig::default();
+        // Gated by `enable_ccr_marker` so disabling markers stays lossless
+        // here too (#1091).
+        let cfg = ClassifyConfig {
+            emit_opaque_markers: self.config.enable_ccr_marker,
+            ..ClassifyConfig::default()
+        };
         if let CellClass::Opaque(kind) = classify_cell(&Value::String(s.to_string()), &cfg) {
             let marker = emit_opaque_ccr_marker(s, &kind, self.ccr_store.as_ref());
             let kind_label = opaque_kind_label(&kind);
@@ -660,7 +672,11 @@ impl SmartCrusher {
         // ship it — nothing dropped, no CCR retrieval needed.
         // Otherwise fall through to the lossy path.
         if let Some(stage) = &self.compaction {
-            let (c, rendered) = stage.run(items);
+            // Thread the CCR store so opaque-blob `<<ccr:HASH,...>>` markers
+            // emitted by lossless:table compaction are actually retrievable
+            // (issue #1083); the row-drop lossy path below stores its own
+            // payload separately.
+            let (c, rendered) = stage.run_with_store(items, self.ccr_store.as_ref());
             if c.was_compacted() {
                 let input_bytes = estimate_array_bytes(&item_strings);
                 let savings_ratio = if input_bytes > 0 {

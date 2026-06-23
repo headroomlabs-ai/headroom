@@ -92,6 +92,32 @@ def _selected_context_tool() -> str:
 
 @main.command()
 @click.option(
+    "--port",
+    "-p",
+    default=8787,
+    type=int,
+    envvar="HEADROOM_PORT",
+    help="Proxy port (default: 8787, env: HEADROOM_PORT)",
+)
+@click.option("--no-open", is_flag=True, help="Print the URL instead of opening a browser")
+def dashboard(port: int, no_open: bool) -> None:
+    """Open the Headroom savings dashboard in your browser.
+
+    Requires a running proxy (start one with `headroom proxy` or `headroom wrap ...`).
+    """
+    import webbrowser
+
+    url = f"http://127.0.0.1:{port}/dashboard"
+    click.echo(f"  Dashboard: {url}")
+    if not no_open:
+        try:
+            webbrowser.open(url)
+        except Exception:  # noqa: BLE001 — headless/no browser: URL already printed
+            pass
+
+
+@main.command()
+@click.option(
     "--host",
     default="127.0.0.1",
     envvar="HEADROOM_HOST",
@@ -138,6 +164,14 @@ def _selected_context_tool() -> str:
     help="Maximum upstream keep-alive connections (default: 100, env: HEADROOM_MAX_KEEPALIVE)",
 )
 @click.option(
+    "--keepalive-expiry",
+    "keepalive_expiry",
+    default=90.0,
+    type=click.FloatRange(min=0),
+    envvar="HEADROOM_KEEPALIVE_EXPIRY",
+    help="Seconds an idle upstream keep-alive connection is kept open (default: 90, env: HEADROOM_KEEPALIVE_EXPIRY)",
+)
+@click.option(
     "--mode",
     default=None,
     metavar="[token|cache]",
@@ -162,6 +196,19 @@ def _selected_context_tool() -> str:
         "  cache  — freeze prior turns to maximise provider prefix-cache hit rate.\n"
         "Legacy aliases (token_mode, token_savings, token_headroom, cache_mode, "
         "cost_savings) are still accepted. Env: HEADROOM_MODE."
+    ),
+)
+@click.option(
+    "--target-ratio",
+    type=float,
+    default=None,
+    show_default=True,
+    envvar="HEADROOM_TARGET_RATIO",
+    help=(
+        "Override Kompress keep-ratio for text (prose/code) compression — lower is "
+        "more aggressive (e.g. 0.4 keeps ~40% of tokens). Unset (default): let "
+        "Kompress decide via its own importance threshold (conservative). "
+        "Env: HEADROOM_TARGET_RATIO."
     ),
 )
 @click.option(
@@ -239,6 +286,17 @@ def _selected_context_tool() -> str:
     help=(
         "Maximum upstream retry attempts for connect/read/5xx failures (1–10, default: 3). "
         "Env: HEADROOM_RETRY_MAX_ATTEMPTS."
+    ),
+)
+@click.option(
+    "--request-timeout-seconds",
+    type=int,
+    default=None,
+    envvar="HEADROOM_REQUEST_TIMEOUT",
+    help=(
+        "Request timeout in seconds (default: 300). "
+        "Useful for slow providers (eg local). "
+        "Env: HEADROOM_REQUEST_TIMEOUT."
     ),
 )
 @click.option(
@@ -366,6 +424,26 @@ def _selected_context_tool() -> str:
     help=(
         "Disable Kompress ML compression while keeping structural compression enabled. "
         "Env: HEADROOM_DISABLE_KOMPRESS=1."
+    ),
+)
+@click.option(
+    "--disable-kompress-anthropic/--enable-kompress-anthropic",
+    "disable_kompress_anthropic",
+    default=None,
+    envvar="HEADROOM_DISABLE_KOMPRESS_ANTHROPIC",
+    help=(
+        "Disable (or --enable-) Kompress for the Anthropic pipeline only, overriding "
+        "--disable-kompress. Env: HEADROOM_DISABLE_KOMPRESS_ANTHROPIC=1."
+    ),
+)
+@click.option(
+    "--disable-kompress-openai/--enable-kompress-openai",
+    "disable_kompress_openai",
+    default=None,
+    envvar="HEADROOM_DISABLE_KOMPRESS_OPENAI",
+    help=(
+        "Disable (or --enable-) Kompress for the OpenAI/Codex pipeline only, overriding "
+        "--disable-kompress. Env: HEADROOM_DISABLE_KOMPRESS_OPENAI=1."
     ),
 )
 # Code graph: indexes project + watches files for live reindex via codebase-memory-mcp.
@@ -586,9 +664,14 @@ def _selected_context_tool() -> str:
     ),
 )
 @click.option(
+    "--telemetry",
+    is_flag=True,
+    help="Opt in to anonymous usage telemetry — off by default (env: HEADROOM_TELEMETRY=on)",
+)
+@click.option(
     "--no-telemetry",
     is_flag=True,
-    help="Disable anonymous usage telemetry (env: HEADROOM_TELEMETRY=off)",
+    help="Force anonymous usage telemetry off (already the default; env: HEADROOM_TELEMETRY=off)",
 )
 @click.option(
     "--stateless",
@@ -616,12 +699,14 @@ def _selected_context_tool() -> str:
 def proxy(
     ctx: click.Context,
     mode: str | None,
+    target_ratio: float | None,
     host: str,
     port: int,
     workers: int,
     limit_concurrency: int,
     max_connections: int,
     max_keepalive_connections: int,
+    keepalive_expiry: float,
     intercept_tool_results: bool,
     no_optimize: bool,
     no_cache: bool,
@@ -633,6 +718,7 @@ def proxy(
     no_subscription_tracking: bool,
     subscription_poll_interval: int | None,
     retry_max_attempts: int | None,
+    request_timeout_seconds: int | None,
     connect_timeout_seconds: int | None,
     anthropic_pre_upstream_concurrency: int | None,
     anthropic_pre_upstream_acquire_timeout_seconds: float | None,
@@ -645,6 +731,8 @@ def proxy(
     budget_period: str,
     code_aware_flag: bool | None,
     disable_kompress: bool,
+    disable_kompress_anthropic: bool | None,
+    disable_kompress_openai: bool | None,
     code_graph: bool,
     no_read_lifecycle: bool,
     memory: bool,
@@ -672,6 +760,7 @@ def proxy(
     bedrock_region: str | None,
     bedrock_profile: str | None,
     bedrock_api_url: str | None,
+    telemetry: bool,
     no_telemetry: bool,
     stateless: bool,
     embedding_server: bool,
@@ -769,7 +858,10 @@ def proxy(
         "on",
     )
 
-    # Telemetry opt-out: --no-telemetry flag sets the env var
+    # Telemetry is opt-in (off by default). --telemetry opts in; --no-telemetry
+    # forces it off. If both are passed, the explicit opt-out wins (fail-closed).
+    if telemetry:
+        os.environ["HEADROOM_TELEMETRY"] = "on"
     if no_telemetry:
         os.environ["HEADROOM_TELEMETRY"] = "off"
 
@@ -818,7 +910,7 @@ def proxy(
         tool_profiles=_parse_tool_profiles([]) or None,
         smart_crusher_with_compaction=_get_env_bool_optional("HEADROOM_SMART_CRUSHER_COMPACTION"),
         savings_profile=os.environ.get("HEADROOM_SAVINGS_PROFILE") or None,
-        target_ratio=_get_env_float_optional("HEADROOM_TARGET_RATIO"),
+        target_ratio=target_ratio,
         compress_system_messages=_get_env_bool_optional("HEADROOM_COMPRESS_SYSTEM_MESSAGES"),
         protect_recent=_get_env_int_optional("HEADROOM_PROTECT_RECENT"),
         protect_analysis_context=_get_env_bool_optional("HEADROOM_PROTECT_ANALYSIS_CONTEXT"),
@@ -841,11 +933,15 @@ def proxy(
             subscription_poll_interval if subscription_poll_interval is not None else 300
         ),
         retry_max_attempts=retry_max_attempts if retry_max_attempts is not None else 3,
+        request_timeout_seconds=request_timeout_seconds
+        if request_timeout_seconds is not None and request_timeout_seconds > 0
+        else 300,
         connect_timeout_seconds=connect_timeout_seconds
         if connect_timeout_seconds is not None
         else 10,
         max_connections=max_connections,
         max_keepalive_connections=max_keepalive_connections,
+        keepalive_expiry=keepalive_expiry,
         log_file=None if is_stateless else log_file,
         log_full_messages=log_messages
         or os.environ.get("HEADROOM_LOG_MESSAGES", "").lower() in ("true", "1", "yes", "on"),
@@ -863,6 +959,8 @@ def proxy(
             in ("true", "1", "yes", "on")
         ),
         disable_kompress=disable_kompress,
+        disable_kompress_anthropic=disable_kompress_anthropic,
+        disable_kompress_openai=disable_kompress_openai,
         # Code graph: live file watcher for incremental reindexing
         code_graph_watcher=code_graph,
         # Read lifecycle: ON by default (use --no-read-lifecycle to disable)
@@ -979,14 +1077,17 @@ Memory (Multi-Provider):
 
     from headroom.telemetry.beacon import is_telemetry_enabled
 
-    # Build telemetry section for the startup banner
+    # Build telemetry section for the startup banner. Telemetry is opt-in
+    # (off by default); the disabled line surfaces how to opt in.
     if is_telemetry_enabled():
         telemetry_line = (
-            "  Telemetry:    ENABLED (anonymous aggregate stats)\n"
+            "  Telemetry:    ENABLED (anonymous aggregate stats — you opted in)\n"
             "                Disable: HEADROOM_TELEMETRY=off or headroom proxy --no-telemetry"
         )
     else:
-        telemetry_line = "  Telemetry:    DISABLED"
+        telemetry_line = (
+            "  Telemetry:    DISABLED (opt in: HEADROOM_TELEMETRY=on or headroom proxy --telemetry)"
+        )
 
     # Discover proxy extensions (third-party packages registered via the
     # `headroom.proxy_extension` entry-point group). Surfaced in the banner
@@ -1092,6 +1193,17 @@ Endpoints:
 
 Press Ctrl+C to stop.
 """)
+
+    # Surface an "update available" notice (reads cache only; no network here).
+    # Best-effort: a broken update check must never block proxy startup.
+    try:
+        from headroom.update_check import format_update_notice
+
+        _update_notice = format_update_notice()
+        if _update_notice:
+            click.echo(f"\n{_update_notice}\n")
+    except Exception:  # noqa: BLE001 — banner must never crash startup
+        pass
 
     # -----------------------------------------------------------------------
     # Option E: start embedding server sidecar if requested

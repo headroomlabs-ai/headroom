@@ -1611,7 +1611,7 @@ switch ($args[0]) {
         }
 
         if ($args.Count -lt 2) {
-            Fail 'Usage: headroom wrap <claude|codex|aider|cursor|openclaw> [...]'
+            Fail 'Usage: headroom wrap <claude|codex|aider|cursor|openclaw|opencode> [...]'
         }
 
         $tool = $args[1]
@@ -1623,8 +1623,9 @@ switch ($args[0]) {
             'aider' { }
             'cursor' { }
             'openclaw' { }
+            'opencode' { }
             default {
-                Fail "Docker-native wrapper does not support 'wrap $tool'. Supported targets: claude, codex, aider, cursor, openclaw"
+                Fail "Docker-native wrapper does not support 'wrap $tool'. Supported targets: claude, codex, aider, cursor, openclaw, opencode"
             }
         }
 

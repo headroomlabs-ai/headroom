@@ -154,6 +154,16 @@ class ProxyConfig:
     # CLI: --disable-kompress; env: HEADROOM_DISABLE_KOMPRESS=1.
     disable_kompress: bool = False
 
+    # Per-provider overrides for `disable_kompress`. None inherits the global
+    # value above; True/False force-disable/enable Kompress for that provider's
+    # pipeline only (other compressors and all routing/exclusion are unaffected).
+    # Lets e.g. Anthropic run without lossy text compression while OpenAI/Codex
+    # keeps it. CLI: --disable-kompress-anthropic / --enable-kompress-anthropic
+    # (and -openai); env: HEADROOM_DISABLE_KOMPRESS_ANTHROPIC / _OPENAI
+    # (1 = disable, 0 = enable).
+    disable_kompress_anthropic: bool | None = None
+    disable_kompress_openai: bool | None = None
+
     # Code graph live watcher (triggers incremental reindex on file changes)
     code_graph_watcher: bool = False
 
@@ -236,6 +246,7 @@ class ProxyConfig:
     # Connection pool
     max_connections: int = 500
     max_keepalive_connections: int = 100
+    keepalive_expiry: float = 90.0
     http2: bool = True
 
     # Memory System
@@ -293,6 +304,12 @@ class ProxyConfig:
     subscription_tracking_enabled: bool = True
     subscription_poll_interval_s: int = 300
     subscription_active_window_s: int = 60
+
+    # Periodic TOIN stats logging. Enabled by default for observability, but
+    # operators of long-lived proxies can disable it if TOIN stats collection
+    # causes avoidable memory pressure on their platform.
+    # Env: HEADROOM_PERIODIC_TOIN_STATS=0.
+    periodic_toin_stats_enabled: bool = True
 
     # Stateless mode — disable all filesystem writes for read-only / container deployments
     stateless: bool = False

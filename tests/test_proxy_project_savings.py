@@ -38,6 +38,22 @@ def test_sanitize_project_name_normalizes_and_caps():
     assert sanitize_project_name(42) is None
 
 
+def test_sanitize_project_name_decodes_percent_encoded_non_ascii():
+    """Percent-encoded non-ASCII cwd names (issue #1069) must decode to Unicode."""
+    import urllib.parse
+
+    chinese = "第二大脑共享"
+    encoded = urllib.parse.quote(chinese, safe="-_.() ")
+    assert sanitize_project_name(encoded) == chinese
+
+    mixed = "test-中文-项目"
+    encoded_mixed = urllib.parse.quote(mixed, safe="-_.() ")
+    assert sanitize_project_name(encoded_mixed) == mixed
+
+    # Plain ASCII names must still pass through unchanged.
+    assert sanitize_project_name("my-project") == "my-project"
+
+
 def test_classify_project_reads_header_case_insensitively():
     assert classify_project({"x-headroom-project": "frontend"}) == "frontend"
     assert classify_project({"X-Headroom-Project": " frontend "}) == "frontend"

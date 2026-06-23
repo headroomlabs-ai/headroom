@@ -1299,6 +1299,7 @@ class AnthropicHandlerMixin:
                         )
                 except Exception:  # advisory hint only — must never fail a request
                     pass
+            ccr_workspace_key = ccr_workspace_label = None
             if (
                 self.config.ccr_inject_tool or self.config.ccr_inject_system_instructions
             ) and not _bypass:
@@ -1670,8 +1671,11 @@ class AnthropicHandlerMixin:
             # Update body
             body["messages"] = optimized_messages
             if tools or _original_tools is not None:
-                tools = self._sort_tools_deterministically(tools)
-                body["tools"] = tools
+                sorted_tools = self._sort_tools_deterministically(tools)
+                if sorted_tools != tools:
+                    tools = sorted_tools
+                if tools != _original_tools:
+                    body["tools"] = tools
 
             presend_event = self.pipeline_extensions.emit(
                 PipelineStage.PRE_SEND,
@@ -1689,8 +1693,14 @@ class AnthropicHandlerMixin:
                 optimized_messages = presend_event.messages
                 body["messages"] = optimized_messages
             if presend_event.tools is not None:
-                tools = self._sort_tools_deterministically(presend_event.tools)
-                body["tools"] = tools
+                sorted_tools = self._sort_tools_deterministically(presend_event.tools)
+                if sorted_tools != presend_event.tools:
+                    tools = sorted_tools
+                else:
+                    tools = presend_event.tools
+                if tools or body.get("tools") is not None:
+                    if tools != body.get("tools"):
+                        body["tools"] = tools
             if presend_event.headers is not None:
                 headers = presend_event.headers
             if presend_event.messages is not previous_presend_messages:
@@ -1722,11 +1732,11 @@ class AnthropicHandlerMixin:
                     # conversation is treatment or control. This keeps the A/B
                     # comparison clean AND keeps the prefix cache stable (we
                     # never flip a conversation's system-prompt tail mid-stream).
-                    import os as _os
+                    from headroom.proxy import runtime_env
 
                     _holdout = 0.0
                     try:
-                        _holdout = float(_os.environ.get("HEADROOM_OUTPUT_HOLDOUT", "0") or "0")
+                        _holdout = float(runtime_env.getenv("HEADROOM_OUTPUT_HOLDOUT", "0") or "0")
                     except ValueError:
                         _holdout = 0.0
                     _arm = assign_arm(conversation_key_from_body(body), _holdout)
@@ -2645,9 +2655,11 @@ class AnthropicHandlerMixin:
             custom_id = batch_req.get("custom_id", "")
             params = batch_req.get("params", {})
             canonical_params = dict(params)
-            canonical_tools = canonical_params.get("tools")
-            if canonical_tools is not None:
-                canonical_params["tools"] = self._sort_tools_deterministically(canonical_tools)
+            original_tools = canonical_params.get("tools")
+            if original_tools is not None:
+                sorted_tools = self._sort_tools_deterministically(original_tools)
+                if sorted_tools != original_tools:
+                    canonical_params["tools"] = sorted_tools
             messages = params.get("messages", [])
             original_messages = copy.deepcopy(messages)
             model = params.get("model", "unknown")
@@ -2683,6 +2695,7 @@ class AnthropicHandlerMixin:
                         context=extract_user_query(messages),
                         frozen_message_count=frozen_message_count,
                         request_id=request_id,
+                        **proxy_pipeline_kwargs(self.config),
                     )
 
                     optimized_messages = result.messages
@@ -2724,7 +2737,12 @@ class AnthropicHandlerMixin:
                 # Create compressed batch request
                 compressed_params = {**params, "messages": optimized_messages}
                 if tools is not None:
-                    compressed_params["tools"] = self._sort_tools_deterministically(tools)
+                    sorted_tools = self._sort_tools_deterministically(tools)
+                    if sorted_tools != tools:
+                        tools = sorted_tools
+                    if tools or original_tools is not None:
+                        if tools != original_tools:
+                            compressed_params["tools"] = tools
                 compressed_requests.append(
                     {
                         "custom_id": custom_id,

@@ -45,7 +45,7 @@ FLUSH_DEBOUNCE_SECONDS = 10.0
 
 # Absolute file-path heuristic for anchoring a pattern to a project root.
 # Matches POSIX paths (starts with /) and common Windows drive paths.
-_ABS_PATH_RE = re.compile(r"(?:[A-Za-z]:[\\/]|/)[\w./\\\-]+")
+_ABS_PATH_RE = re.compile(r"(?:[A-Za-z]:[\\/]|/)[\w./\\@\-]+")
 
 # Error-recovery refinement: the Learned: error recovery section is capped,
 # decayed, and re-validated at render time. Other categories are untouched.
