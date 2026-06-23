@@ -28,6 +28,27 @@ def _api_target(proxy: Any, provider_name: str) -> str:
     return cast(str, getattr(proxy, legacy_attr, proxy.provider_runtime.api_target(provider_name)))
 
 
+def _vertex_target_for_location(proxy: Any, location: str) -> str:
+    """Resolve the Vertex upstream host for a request, region-aware.
+
+    The Vertex regional host must match the ``locations/{location}`` in the
+    request path (e.g. a ``europe-west1`` request cannot go to a
+    ``us-central1`` host). The configured target is a single fixed-region host
+    (default ``us-central1``), so unless the operator pinned an explicit
+    non-default upstream (e.g. a private gateway), derive the host from the
+    request's own location. ``global`` maps to the unprefixed host.
+    """
+    from headroom.providers.registry import DEFAULT_VERTEX_API_URL
+
+    configured = _api_target(proxy, "vertex")
+    if configured and configured != DEFAULT_VERTEX_API_URL:
+        # Operator pinned an explicit upstream (gateway / specific host) — honor it.
+        return configured
+    if not location or location == "global":
+        return "https://aiplatform.googleapis.com"
+    return f"https://{location}-aiplatform.googleapis.com"
+
+
 def _select_passthrough_base_url(proxy: Any, headers: dict[str, str]) -> str:
     # Codex CLI subscription mode hits a wide surface under
     # `/backend-api/*` (rate-limit polling, agent identity, JWT
@@ -390,6 +411,63 @@ async def _handle_chatgpt_model_metadata(
         return Response(content=str(exc), status_code=502)
 
 
+async def _handle_chatgpt_codex_images(
+    proxy: Any,
+    request: Request,
+    sub_path: str,
+) -> Response | None:
+    """Forward Codex OAuth image requests to ChatGPT's Codex image backend."""
+    from headroom.proxy.helpers import _strip_internal_headers
+
+    headers = dict(request.headers.items())
+    headers.pop("host", None)
+    headers.pop("accept-encoding", None)
+    headers = _strip_internal_headers(headers)
+    headers, is_chatgpt_auth = _resolve_codex_routing_headers(headers)
+    if not is_chatgpt_auth:
+        return None
+
+    url = f"https://chatgpt.com/backend-api/codex/images/{sub_path}"
+    if request.url.query:
+        url = f"{url}?{request.url.query}"
+
+    body = await request.body()
+    try:
+        client = getattr(proxy, "http_client_h1", None) or getattr(proxy, "http_client", None)
+        if client is None:
+            raise RuntimeError("No HTTP client configured for Codex image forwarding")
+        # OAuth image traffic intentionally skips request-outcome telemetry; no token usage is available here.
+        resp = await client.request(
+            request.method,
+            url,
+            headers=headers,
+            content=body,
+            timeout=120.0,
+        )
+        response_headers = dict(resp.headers)
+        response_headers.pop("content-encoding", None)
+        response_headers.pop("content-length", None)
+        return Response(
+            content=resp.content,
+            status_code=resp.status_code,
+            headers=response_headers,
+        )
+    except Exception as exc:
+        logger.error("Passthrough /v1/images/%s failed: %s", sub_path, exc)
+        return Response(
+            content=json.dumps(
+                {
+                    "error": {
+                        "type": "upstream_error",
+                        "message": "Failed to forward Codex image request",
+                    }
+                }
+            ),
+            status_code=502,
+            media_type="application/json",
+        )
+
+
 def register_provider_routes(app: FastAPI, proxy: Any) -> None:
     """Register provider-specific proxy endpoints."""
 
@@ -644,11 +722,11 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         publisher: str,
         model: str,
     ):
-        del api_version, project, location
+        del api_version, project
         if publisher == "anthropic":
             return await proxy.handle_anthropic_messages(
                 request,
-                _api_target(proxy, "vertex"),
+                _vertex_target_for_location(proxy, location),
                 "vertex:anthropic",
                 model,
             )
@@ -665,11 +743,11 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         publisher: str,
         model: str,
     ):
-        del api_version, project, location
+        del api_version, project
         if publisher == "anthropic":
             return await proxy.handle_anthropic_messages(
                 request,
-                _api_target(proxy, "vertex"),
+                _vertex_target_for_location(proxy, location),
                 "vertex:anthropic",
                 model,
                 True,
@@ -732,10 +810,35 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
 
     @app.post("/v1/images/generations")
     async def openai_images_generations(request: Request):
+        chatgpt_response = await _handle_chatgpt_codex_images(
+            proxy,
+            request,
+            "generations",
+        )
+        if chatgpt_response is not None:
+            return chatgpt_response
+
         return await proxy.handle_passthrough(
             request,
             _api_target(proxy, "openai"),
             "images/generations",
+            "openai",
+        )
+
+    @app.post("/v1/images/edits")
+    async def openai_images_edits(request: Request):
+        chatgpt_response = await _handle_chatgpt_codex_images(
+            proxy,
+            request,
+            "edits",
+        )
+        if chatgpt_response is not None:
+            return chatgpt_response
+
+        return await proxy.handle_passthrough(
+            request,
+            _api_target(proxy, "openai"),
+            "images/edits",
             "openai",
         )
 

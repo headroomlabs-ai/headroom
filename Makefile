@@ -22,6 +22,10 @@ help:
 	@echo "  make lint               - cargo clippy --workspace -- -D warnings"
 	@echo "  make clean              - cargo clean"
 	@echo ""
+	@echo "E2e targets:"
+	@echo "  make build-e2e-wrap     - build the wrap-e2e Docker image"
+	@echo "  make run-e2e-wrap       - build + run the wrap-e2e Docker container"
+	@echo ""
 	@echo "Pre-push verification (run BEFORE git push to catch CI failures locally):"
 	@echo "  make ci-precheck        - run all CI gates (rust + python + commitlint)"
 	@echo "  make ci-precheck-rust   - cargo fmt --check + clippy + test"
@@ -138,3 +142,16 @@ ci-precheck-commitlint:
 
 install-git-hooks:
 	@scripts/install-git-hooks.sh
+
+# ─── E2e Docker targets ────────────────────────────────────────────────────
+#
+# The wrap-e2e Dockerfile uses manylinux_2_28_x86_64 as its builder stage,
+# which only ships amd64 binaries. Pass --platform linux/amd64 explicitly
+# so the build works on Apple Silicon (requires QEMU emulation). On native
+# x86_64 hosts the flag is harmless and matches CI behaviour.
+
+build-e2e-wrap:
+	docker build --platform linux/amd64 -f e2e/wrap/Dockerfile -t headroom-wrap-e2e .
+
+run-e2e-wrap: build-e2e-wrap
+	docker run --rm headroom-wrap-e2e

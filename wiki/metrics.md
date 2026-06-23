@@ -248,7 +248,7 @@ Headroom's managed OTEL exporters are intentionally scoped to Headroom's own ins
 
 Headroom has two separate systems:
 
-- `HEADROOM_TELEMETRY` / `--no-telemetry` controls the privacy-preserving anonymous data-flywheel beacon and TOIN-related aggregate reporting.
+- `HEADROOM_TELEMETRY` / `--telemetry` / `--no-telemetry` controls the privacy-preserving anonymous data-flywheel beacon and TOIN-related aggregate reporting. It is **off by default** (opt-in): set `HEADROOM_TELEMETRY=on` or pass `--telemetry` to enable it.
 - `HEADROOM_OTEL_*` controls operational OTEL metric export.
 
 They are independent by design so you can disable the anonymous beacon while keeping OTEL metrics enabled, or vice versa.

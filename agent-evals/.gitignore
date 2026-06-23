@@ -1,0 +1,24 @@
+# Run artifacts (manifests, journals, trajectories, scorecards)
+runs/
+*.parquet
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Tooling caches
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Secrets — never commit
+.env
+.env.*
