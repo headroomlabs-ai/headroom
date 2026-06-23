@@ -678,6 +678,57 @@ def unload_kompress_model(model_id: str | None = None) -> bool:
     return True
 
 
+# ── Background model download ─────────────────────────────────────────
+#
+# The proxy request path must never block on a cold model download. A first
+# deep-path request would otherwise resolve the 274MB ONNX artifact via an
+# inline hf_hub_download on the request thread, where it races the proxy's
+# compression timeout (HEADROOM_COMPRESSION_TIMEOUT_SECONDS, default 30s). The
+# fetch is cancelled mid-transfer, the blob never finalizes in the HF cache,
+# and every subsequent request re-hangs and fails open. Instead the request
+# path resolves the model cache-only (allow_download=False) and pulls it down
+# once here, in a daemon thread that the compression timeout does not bound.
+
+_download_threads: dict[str, threading.Thread] = {}
+_download_threads_lock = threading.Lock()
+
+
+def _background_download(model_id: str, device: str) -> None:
+    try:
+        logger.info("Kompress: downloading model %s in the background ...", model_id)
+        _load_kompress(model_id, device, allow_download=True)
+        logger.info("Kompress: background model download complete for %s", model_id)
+    except Exception as exc:
+        logger.warning("Kompress: background model download failed for %s: %s", model_id, exc)
+
+
+def ensure_background_download(model_id: str = HF_MODEL_ID, device: str = "auto") -> None:
+    """Start a one-shot background download of the model if it isn't cached.
+
+    Idempotent and non-blocking: at most one download thread runs per model_id,
+    and a finished or failed thread is replaced on the next call so a transient
+    network failure can be retried by a later request. Once the download
+    completes the deep path activates on subsequent requests without ever
+    blocking one on the network.
+    """
+    if model_id in _kompress_cache:
+        return
+    with _download_threads_lock:
+        if model_id in _kompress_cache:
+            return
+        existing = _download_threads.get(model_id)
+        if existing is not None and existing.is_alive():
+            return
+        thread = threading.Thread(
+            target=_background_download,
+            args=(model_id, device),
+            name=f"kompress-download-{model_id.replace('/', '-')}",
+            daemon=True,
+        )
+        _download_threads[model_id] = thread
+        thread.start()
+
+
 # ── Compressor ────────────────────────────────────────────────────────
 
 
@@ -755,6 +806,21 @@ class KompressCompressor(Transform):
         )
         return backend
 
+    def is_ready(self) -> bool:
+        """True if the model is loaded so :meth:`compress` won't touch the network.
+
+        A plain cache-membership check — no lock, no I/O — safe to call on the
+        hot request path to decide whether to run the deep compressor or skip it.
+        """
+        return self.config.model_id in _kompress_cache
+
+    def ensure_background_load(self) -> None:
+        """Kick off a one-shot, non-blocking background download of the model.
+
+        No-op when the model is already cached or a download is already running.
+        """
+        ensure_background_download(self.config.model_id, self.config.device)
+
     def compress(
         self,
         content: str,
@@ -762,6 +828,8 @@ class KompressCompressor(Transform):
         content_type: str | None = None,
         question: str | None = None,
         target_ratio: float | None = None,
+        *,
+        allow_download: bool = True,
     ) -> KompressResult:
         """Compress content using Kompress model.
 
@@ -773,6 +841,11 @@ class KompressCompressor(Transform):
             target_ratio: If None (default), model decides how much to keep using
                 score threshold. If set (e.g. 0.3), forces that keep ratio.
                 The proxy never sets this — only user-facing API does.
+            allow_download: When False, load the model from the local cache only;
+                a cache miss passes through instead of fetching from the network.
+                The proxy sets this False so a cold model never blocks the request
+                thread (see ``ensure_background_download``); direct callers keep
+                the historic auto-download-on-first-use behavior.
 
         Returns:
             KompressResult with compressed text.
@@ -784,7 +857,9 @@ class KompressCompressor(Transform):
             return self._passthrough(content, n_words)
 
         try:
-            model, tokenizer, backend = _load_kompress(self.config.model_id, self.config.device)
+            model, tokenizer, backend = _load_kompress(
+                self.config.model_id, self.config.device, allow_download=allow_download
+            )
             is_onnx = backend == "onnx"
             device_type = _model_device_type(model, backend)
 
@@ -919,6 +994,12 @@ class KompressCompressor(Transform):
 
             return result
 
+        except KompressModelNotCached:
+            logger.debug(
+                "Kompress model %s not cached; passing through without compression",
+                self.config.model_id,
+            )
+            return self._passthrough(content, n_words)
         except Exception as e:
             logger.warning("Kompress compression failed: %s", e)
             return self._passthrough(content, n_words)

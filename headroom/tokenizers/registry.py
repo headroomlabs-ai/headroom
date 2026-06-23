@@ -287,10 +287,24 @@ class TokenizerRegistry:
         return "estimation"
 
     def _create_tiktoken(self, model: str) -> TokenCounter:
-        """Create tiktoken-based tokenizer."""
-        try:
-            from .tiktoken_counter import TiktokenCounter
+        """Create tiktoken-based tokenizer.
 
+        Forces the (bounded) encoding load up front so a stalled vocab download
+        falls back to estimation instead of hanging later inside a request (GH #956).
+        """
+        try:
+            from .tiktoken_counter import (
+                TiktokenCounter,
+                TiktokenLoadError,
+                get_encoding_for_model,
+                load_encoding,
+            )
+
+            try:
+                load_encoding(get_encoding_for_model(model))
+            except TiktokenLoadError as exc:
+                logger.warning("tiktoken unavailable (%s); using estimation.", exc)
+                return EstimatingTokenCounter()
             return TiktokenCounter(model)
         except ImportError:
             logger.warning("tiktoken not installed. Install with: pip install tiktoken")

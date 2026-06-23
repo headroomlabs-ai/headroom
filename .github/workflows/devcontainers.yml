@@ -85,6 +85,22 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # The worktree devcontainer runs the same `uv sync --extra dev` build as
+      # the default validate job, which now pulls transformers 5.x. Copying that
+      # into the venv volume exhausts the GitHub runner's disk ("No space left on
+      # device", see PR #495). Reclaim ~14 GB by stripping preinstalled tools the
+      # build never touches — mirrors the memory-stack job's existing remedy.
+      - name: Free runner disk
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: false
+          swap-storage: false
+
       - name: Create linked worktree
         run: git worktree add "$RUNNER_TEMP/headroom-worktree" HEAD
 

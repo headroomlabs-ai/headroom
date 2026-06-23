@@ -65,3 +65,23 @@ Headroom also forwards Anthropic publisher calls on Vertex:
 The Python proxy preserves caller-supplied Google bearer auth. The native Rust
 proxy path additionally resolves GCP ADC and injects the bearer token for the
 Anthropic publisher route.
+
+## Claude Code with Headroom compression (validated)
+
+To run **Claude Code** against Claude-on-Vertex **with Headroom compressing the
+context**, use the dedicated, tested runbook:
+
+➡️ **[Claude Code + Vertex + Headroom](../docs/claude-code-vertex-headroom.md)**
+
+Short version: run Claude Code in **normal Anthropic mode** (`ANTHROPIC_BASE_URL`
+→ the proxy) and start the proxy with `--backend litellm-vertex_ai --region <loc>
+--code-aware`; Headroom holds the GCP ADC creds and calls Vertex.
+
+> ⚠️ Do **not** put Claude Code into Vertex mode and point `ANTHROPIC_VERTEX_BASE_URL`
+> at the proxy. Claude Code's client-side model probe rejects any non-Google Vertex
+> URL before sending a request ("model … not available on your vertex deployment"),
+> so the proxy is never reached. Use the Anthropic-mode runbook above instead.
+>
+> ⚠️ Two easy-to-miss requirements: `pip install "google-cloud-aiplatform>=1.38"`
+> (LiteLLM `vertex_ai` provider) and the `--code-aware` flag (code compression is
+> off by default). Without them you get a 500 or `tokens_saved: 0`.

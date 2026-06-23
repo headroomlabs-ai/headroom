@@ -853,4 +853,8 @@ class CostTracker:
             "per_model": per_model,
             "cost_with_headroom_usd": round(cost_with_headroom, 4),
             "savings_usd": round(savings_usd, 4),
+            # Budget config passthrough — surfaces in /stats["cost"] so
+            # `headroom doctor` can report whether a budget is set.
+            "budget_limit_usd": self.budget_limit_usd,
+            "budget_period": self.budget_period,
         }
