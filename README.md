@@ -360,6 +360,35 @@ Two runtime assets are fetched over TLS; if they are blocked, trust your corpora
 
 Running with compression disabled (pure gateway) requires neither asset.
 
+#### "Basic Constraints of CA cert not marked critical" (Python 3.13+ strict mode)
+
+A **different** failure from the one above. If TLS fails with:
+
+```
+[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed:
+Basic Constraints of CA cert not marked critical
+```
+
+then the corporate CA *is* found and trusted — adding it to a CA bundle changes nothing.
+Python 3.13 + OpenSSL 3.x enable `VERIFY_X509_STRICT` by default, which enforces RFC 5280
+§4.2.1.9: a CA cert's `basicConstraints` must be marked *critical*. Inspection roots like
+Zscaler set `CA:TRUE` without the critical bit, so the chain is rejected.
+
+Set **`HEADROOM_TLS_STRICT=0`** to clear *only* the strict flag from every TLS context
+Headroom controls — the proxy's httpx upstream client **and** the urllib3/`huggingface_hub`
+path used for model downloads. Chain validation, signature, expiry, and hostname checks all
+stay on; this is strictly narrower than disabling verification.
+
+```bash
+HEADROOM_TLS_STRICT=0 headroom proxy --port 8787
+```
+
+The Rust core's ONNX download (`cdn.pyke.io`) uses a separate TLS stack (rustls / OS trust
+store), unaffected by `HEADROOM_TLS_STRICT`. On Windows the corporate root must be in the
+**machine** certificate store (browsers already trust it there); or pre-provision ONNX
+Runtime with `ORT_STRATEGY=system` + `ORT_LIB_LOCATION=/path/to/onnxruntime` to skip the
+download entirely.
+
 ## headroom learn
 
 <p align="center">
