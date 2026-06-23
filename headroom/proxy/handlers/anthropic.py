@@ -1029,12 +1029,26 @@ class AnthropicHandlerMixin:
                     from headroom.transforms.compression_policy import resolve_policy
 
                     compression_policy = resolve_policy(getattr(request.state, "auth_mode", None))
+                    from headroom.ccr.tool_injection import CCR_TOOL_NAME
+
+                    existing_tool_names = {
+                        tool.get("name") or tool.get("function", {}).get("name")
+                        for tool in (body.get("tools") or [])
+                        if isinstance(tool, dict)
+                    }
+
+                    def should_skip_ccr_request_compression(
+                        current_frozen_message_count: int,
+                    ) -> bool:
+                        # If the tool is already present, CCR stays reversible even on frozen turns.
+                        return (
+                            self.config.ccr_inject_tool
+                            and current_frozen_message_count > 0
+                            and CCR_TOOL_NAME not in existing_tool_names
+                        )
 
                     if is_token_mode(self.config.mode):
                         comp_cache = self._get_compression_cache(session_id)
-
-                        # Zone 1: Swap cached compressed versions into working copy
-                        working_messages = comp_cache.apply_cached(messages)
 
                         # Re-freeze boundary: consecutive stable messages from start.
                         # Safety: never freeze beyond provider-confirmed cached prefix.
@@ -1064,64 +1078,27 @@ class AnthropicHandlerMixin:
                         # Record all tool_results in the verified frozen prefix as stable
                         comp_cache.mark_stable_from_messages(messages, frozen_message_count)
 
-                        # Phase 3 (#1171): off-path deferral gate. On a cold-
-                        # start-large request (frozen=0 + large live zone) the
-                        # synchronous kompress run would blow the 30s budget and
-                        # leak a non-preemptible worker. Forward the cache-
-                        # swapped messages uncompressed NOW and compress off the
-                        # request path; the result lands in the SAME
-                        # CompressionCache and apply_cached swaps it in (live
-                        # zone) on a later turn. Byte-identity holds — see the
-                        # frozen/live invariant; one-time upstream cache miss
-                        # when the compressed form first lands, then stable.
-                        if (
-                            getattr(self, "_background_compression_enabled", False)
-                            and frozen_message_count == 0
-                            and original_tokens >= self._background_compression_min_tokens
-                        ):
-                            # Snapshot refs for the async job. The handler must
-                            # NOT mutate these lists/dicts in-place after this
-                            # point -- the background job reads them on a later
-                            # turn. It doesn't today; keep it that way.
-                            _bg_messages = messages
-                            _bg_working = working_messages
-                            _bg_frozen = frozen_message_count
-                            # Dedup key: the gate only fires at frozen==0 (the
-                            # first in-flight deferral of a session episode), so
-                            # session_id alone is the right granularity -- one
-                            # background job per session in flight -- and avoids
-                            # JSON-serializing the large message list for a key.
-                            accepted = self._background_compressor.enqueue(
-                                session_id,
-                                lambda: self.anthropic_pipeline.apply(
-                                    messages=_bg_working,
-                                    model=model,
-                                    model_limit=context_limit,
-                                    context=extract_user_query(_bg_working),
-                                    frozen_message_count=_bg_frozen,
-                                    biases=biases,
-                                    request_id=request_id,
-                                    compression_policy=compression_policy,
-                                    **proxy_pipeline_kwargs(self.config),
-                                ),
-                                lambda result: comp_cache.update_from_result(
-                                    _bg_messages, result.messages
-                                ),
+                        skip_ccr_request_compression = should_skip_ccr_request_compression(
+                            frozen_message_count
+                        )
+                        if skip_ccr_request_compression:
+                            logger.info(
+                                f"[{request_id}] CCR: skipping request-side compression "
+                                f"(frozen prefix={frozen_message_count}) because tool injection is deferred"
                             )
-                            # Forward uncompressed either way (the request can't
-                            # wait); only CLAIM deferral when the job was actually
-                            # queued. A full-queue drop is visible in telemetry as
-                            # "deferred:dropped" and self-heals on a later turn.
-                            optimized_messages = working_messages
-                            transforms_applied = [
-                                "deferred:background_compression"
-                                if accepted
-                                else "deferred:dropped"
-                            ]
-                            pipeline_timing = {}
+                        if skip_ccr_request_compression:
+                            optimized_messages = messages
+                            optimized_tokens = tokenizer.count_messages(optimized_messages)
                         else:
-                            async with stage_timer.measure("compression_first_stage"):
-                                result = await self._run_compression_in_executor(
+                            # Zone 1: Swap cached compressed versions into working copy
+                            working_messages = comp_cache.apply_cached(messages)
+                            if (
+                                getattr(self, "_background_compression_enabled", False)
+                                and frozen_message_count == 0
+                                and original_tokens >= self._background_compression_min_tokens
+                            ):
+                                accepted = self._background_compressor.enqueue(
+                                    session_id,
                                     lambda: self.anthropic_pipeline.apply(
                                         messages=working_messages,
                                         model=model,
@@ -1133,57 +1110,103 @@ class AnthropicHandlerMixin:
                                         compression_policy=compression_policy,
                                         **proxy_pipeline_kwargs(self.config),
                                     ),
-                                    timeout=COMPRESSION_TIMEOUT_SECONDS,
+                                    lambda bg_result: comp_cache.update_from_result(
+                                        messages, bg_result.messages
+                                    ),
                                 )
+
+                                class _DeferredCompressionResult:
+                                    messages = working_messages
+                                    transforms_applied = [
+                                        "deferred:background_compression"
+                                        if accepted
+                                        else "deferred:dropped"
+                                    ]
+                                    timing = {}
+
+                                result = _DeferredCompressionResult()
+                            else:
+                                async with stage_timer.measure("compression_first_stage"):
+                                    result = await self._run_compression_in_executor(
+                                        lambda: self.anthropic_pipeline.apply(
+                                            messages=working_messages,
+                                            model=model,
+                                            model_limit=context_limit,
+                                            context=extract_user_query(working_messages),
+                                            frozen_message_count=frozen_message_count,
+                                            biases=biases,
+                                            request_id=request_id,
+                                            compression_policy=compression_policy,
+                                            **proxy_pipeline_kwargs(self.config),
+                                        ),
+                                        timeout=COMPRESSION_TIMEOUT_SECONDS,
+                                    )
 
                             # Cache newly compressed messages (index-aligned diff)
                             if result.messages != working_messages:
                                 comp_cache.update_from_result(messages, result.messages)
 
-                            # Always use pipeline result — Zone 1 swaps applied
+                            # Always use pipeline result — Zone 1 swaps are already applied
                             optimized_messages = result.messages
                             transforms_applied = result.transforms_applied
                             pipeline_timing = result.timing
-                        # Issue #327 / Bug 3: pipeline.apply uses the provider-
-                        # side tokenizer (AnthropicProvider tiktoken estimator),
-                        # which counts ~25% higher than the proxy-side
-                        # EstimatingTokenCounter used to set `original_tokens`
-                        # at line 634. Reusing `result.tokens_after` here
-                        # produced an apples-vs-oranges comparison against
-                        # `original_tokens` in the inflation guard below
-                        # (line ~901): even after a real 12% compression the
-                        # provider-tokenizer figure was higher than the proxy-
-                        # tokenizer baseline, triggering a spurious revert.
-                        # Recount optimized_messages with the proxy tokenizer
-                        # so original_tokens vs optimized_tokens is self-
-                        # consistent. The recount cost (~ms on a 50K-token
-                        # request) is paid once per request and is dwarfed by
-                        # the upstream call latency.
-                        optimized_tokens = tokenizer.count_messages(optimized_messages)
+                            # Issue #327 / Bug 3: pipeline.apply uses the provider-
+                            # side tokenizer (AnthropicProvider tiktoken estimator),
+                            # which counts ~25% higher than the proxy-side
+                            # EstimatingTokenCounter used to set `original_tokens`
+                            # at line 634. Reusing `result.tokens_after` here
+                            # produced an apples-vs-oranges comparison against
+                            # `original_tokens` in the inflation guard below
+                            # (line ~901): even after a real 12% compression the
+                            # provider-tokenizer figure was higher than the proxy-
+                            # tokenizer baseline, triggering a spurious revert.
+                            # Recount optimized_messages with the proxy tokenizer
+                            # so original_tokens vs optimized_tokens is self-
+                            # consistent. The recount cost (~ms on a 50K-token
+                            # request) is paid once per request and is dwarfed by
+                            # the upstream call latency.
+                            optimized_tokens = tokenizer.count_messages(optimized_messages)
                     elif not is_cache_mode(self.config.mode):
-                        async with stage_timer.measure("compression_first_stage"):
-                            result = await self._run_compression_in_executor(
-                                lambda: self.anthropic_pipeline.apply(
-                                    messages=messages,
-                                    model=model,
-                                    model_limit=context_limit,
-                                    context=extract_user_query(messages),
-                                    frozen_message_count=frozen_message_count,
-                                    biases=biases,
-                                    request_id=request_id,
-                                    compression_policy=compression_policy,
-                                    **proxy_pipeline_kwargs(self.config),
-                                ),
-                                timeout=COMPRESSION_TIMEOUT_SECONDS,
+                        skip_ccr_request_compression = should_skip_ccr_request_compression(
+                            frozen_message_count
+                        )
+                        if skip_ccr_request_compression:
+                            logger.info(
+                                f"[{request_id}] CCR: skipping request-side compression "
+                                f"(frozen prefix={frozen_message_count}) because tool injection is deferred"
                             )
+                        if not skip_ccr_request_compression:
+                            async with stage_timer.measure("compression_first_stage"):
+                                result = await self._run_compression_in_executor(
+                                    lambda: self.anthropic_pipeline.apply(
+                                        messages=messages,
+                                        model=model,
+                                        model_limit=context_limit,
+                                        context=extract_user_query(messages),
+                                        frozen_message_count=frozen_message_count,
+                                        biases=biases,
+                                        request_id=request_id,
+                                        compression_policy=compression_policy,
+                                        **proxy_pipeline_kwargs(self.config),
+                                    ),
+                                    timeout=COMPRESSION_TIMEOUT_SECONDS,
+                                )
 
-                        if result.messages != messages:
-                            optimized_messages = result.messages
-                            transforms_applied = result.transforms_applied
-                            pipeline_timing = result.timing
-                            original_tokens = result.tokens_before
-                            optimized_tokens = result.tokens_after
+                            if result.messages != messages:
+                                optimized_messages = result.messages
+                                transforms_applied = result.transforms_applied
+                                pipeline_timing = result.timing
+                                original_tokens = result.tokens_before
+                                optimized_tokens = result.tokens_after
                     else:
+                        skip_ccr_request_compression = should_skip_ccr_request_compression(
+                            frozen_message_count
+                        )
+                        if skip_ccr_request_compression:
+                            logger.info(
+                                f"[{request_id}] CCR: skipping request-side compression "
+                                f"(frozen prefix={frozen_message_count}) because tool injection is deferred"
+                            )
                         previous_original_messages = prefix_tracker.get_last_original_messages()
                         previous_forwarded_messages = prefix_tracker.get_last_forwarded_messages()
                         delta = self._extract_cache_stable_delta(
@@ -1194,27 +1217,35 @@ class AnthropicHandlerMixin:
                         if delta is not None:
                             stable_forwarded_prefix, delta_messages = delta
                             if delta_messages:
-                                result = await self._run_compression_in_executor(
-                                    lambda: self.anthropic_pipeline.apply(
-                                        messages=delta_messages,
-                                        model=model,
-                                        model_limit=context_limit,
-                                        context=extract_user_query(delta_messages),
-                                        frozen_message_count=0,
-                                        biases=biases,
-                                        request_id=request_id,
-                                        compression_policy=compression_policy,
-                                        **proxy_pipeline_kwargs(self.config),
-                                    ),
-                                    timeout=COMPRESSION_TIMEOUT_SECONDS,
-                                )
-                                optimized_messages = stable_forwarded_prefix + result.messages
-                                transforms_applied = result.transforms_applied
-                                pipeline_timing = result.timing
-                                optimized_tokens = tokenizer.count_messages(optimized_messages)
+                                if skip_ccr_request_compression:
+                                    optimized_messages = messages
+                                    optimized_tokens = tokenizer.count_messages(optimized_messages)
+                                else:
+                                    result = await self._run_compression_in_executor(
+                                        lambda: self.anthropic_pipeline.apply(
+                                            messages=delta_messages,
+                                            model=model,
+                                            model_limit=context_limit,
+                                            context=extract_user_query(delta_messages),
+                                            frozen_message_count=0,
+                                            biases=biases,
+                                            request_id=request_id,
+                                            compression_policy=compression_policy,
+                                            **proxy_pipeline_kwargs(self.config),
+                                        ),
+                                        timeout=COMPRESSION_TIMEOUT_SECONDS,
+                                    )
+                                    optimized_messages = stable_forwarded_prefix + result.messages
+                                    transforms_applied = result.transforms_applied
+                                    pipeline_timing = result.timing
+                                    optimized_tokens = tokenizer.count_messages(optimized_messages)
                             else:
-                                optimized_messages = stable_forwarded_prefix
-                                optimized_tokens = tokenizer.count_messages(optimized_messages)
+                                if skip_ccr_request_compression:
+                                    optimized_messages = messages
+                                    optimized_tokens = tokenizer.count_messages(optimized_messages)
+                                else:
+                                    optimized_messages = stable_forwarded_prefix
+                                    optimized_tokens = tokenizer.count_messages(optimized_messages)
                         else:
                             # Conservative rule for cache mode:
                             # only replay exact stable message-prefix extensions.
