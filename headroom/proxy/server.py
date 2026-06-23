@@ -1355,6 +1355,25 @@ class HeadroomProxy(
         else:
             logger.info("Memory: DISABLED")
 
+        # Image optimizer: preload the shared ONNX technique router so its
+        # InferenceSession objects (classifier + SigLIP) are built once here
+        # instead of being rebuilt on every image request — the source of the
+        # multi-second per-image latency.
+        if self.config.optimize:
+            self.warmup.image.mark_loading()
+            try:
+                from headroom.models.ml_models import MLModelRegistry
+
+                MLModelRegistry.get_onnx_technique_router(use_siglip=True).preload()
+            except Exception as exc:  # pragma: no cover - best effort
+                self.warmup.image.mark_error(str(exc))
+                logger.warning("Image optimizer: preload failed (startup continues): %s", exc)
+            else:
+                self.warmup.image.mark_loaded()
+                logger.info("Image optimizer: ENABLED (warmed)")
+        else:
+            self.warmup.image.mark_null()
+
         # CCR status
         ccr_features = []
         if self.config.ccr_inject_tool:
@@ -1444,6 +1463,7 @@ class HeadroomProxy(
             released_models = []
             released_models.extend(MLModelRegistry.unload_prefix("technique_router:"))
             released_models.extend(MLModelRegistry.unload_prefix("siglip:"))
+            released_models.extend(MLModelRegistry.unload_prefix("onnx_technique_router:"))
             if released_models:
                 logger.info("Released image optimizer models: %s", ", ".join(released_models))
 

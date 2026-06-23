@@ -438,3 +438,42 @@ class TestOcrRouting:
         # One should contain OCR output
         ocr_blocks = [b for b in text_blocks if "[OCR from image]" in b.get("text", "")]
         assert len(ocr_blocks) >= 1
+
+
+class TestOnnxRouterRegistry:
+    """The ONNX technique router must be a process-wide shared singleton."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_registry(self):
+        from headroom.models.ml_models import MLModelRegistry
+
+        MLModelRegistry.reset()
+        yield
+        MLModelRegistry.reset()
+
+    def test_returns_same_instance(self):
+        """Two calls return the identical router (sessions are not rebuilt)."""
+        from headroom.models.ml_models import MLModelRegistry
+
+        a = MLModelRegistry.get_onnx_technique_router(use_siglip=True)
+        b = MLModelRegistry.get_onnx_technique_router(use_siglip=True)
+        assert a is b
+
+    def test_use_siglip_keys_are_distinct(self):
+        """use_siglip True/False are cached under distinct keys."""
+        from headroom.models.ml_models import MLModelRegistry
+
+        with_siglip = MLModelRegistry.get_onnx_technique_router(use_siglip=True)
+        without_siglip = MLModelRegistry.get_onnx_technique_router(use_siglip=False)
+        assert with_siglip is not without_siglip
+        assert with_siglip.use_siglip is True
+        assert without_siglip.use_siglip is False
+
+    def test_reset_yields_new_instance(self):
+        """After reset(), a fresh instance is built."""
+        from headroom.models.ml_models import MLModelRegistry
+
+        first = MLModelRegistry.get_onnx_technique_router(use_siglip=True)
+        MLModelRegistry.reset()
+        second = MLModelRegistry.get_onnx_technique_router(use_siglip=True)
+        assert first is not second

@@ -675,9 +675,11 @@ class ImageCompressor:
                 confidence = 0.0
         else:
             try:
-                from .onnx_router import OnnxTechniqueRouter
+                from headroom.models.ml_models import MLModelRegistry
 
-                onnx_router = OnnxTechniqueRouter(use_siglip=self.use_siglip)
+                # Reuse the process-wide ONNX router (and its InferenceSession
+                # objects) instead of rebuilding it per image request.
+                onnx_router = MLModelRegistry.get_onnx_technique_router(use_siglip=self.use_siglip)
                 decision = onnx_router.classify(image_data, query)
                 technique = decision.technique
                 confidence = decision.confidence

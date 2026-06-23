@@ -93,6 +93,7 @@ def test_warmup_registry_to_dict_has_expected_keys():
         "code_aware",
         "tree_sitter",
         "smart_crusher",
+        "image",
         "memory_backend",
         "memory_embedder",
     }
@@ -126,6 +127,23 @@ def _stub_pipelines(monkeypatch):
                 "smart_crusher": "ready",
             }
 
+    # Avoid building real ONNX sessions during the image preload — replace the
+    # registry getter with a fake router exposing a no-op preload().
+    class _FakeOnnxRouter:
+        def __init__(self) -> None:
+            self.preloaded = 0
+
+        def preload(self) -> None:
+            self.preloaded += 1
+
+    import headroom.models.ml_models as ml_models_mod
+
+    monkeypatch.setattr(
+        ml_models_mod.MLModelRegistry,
+        "get_onnx_technique_router",
+        classmethod(lambda cls, use_siglip=True: _FakeOnnxRouter()),
+    )
+
     config = ProxyConfig(
         optimize=True,
         cache_enabled=False,
@@ -153,6 +171,7 @@ async def test_startup_runs_shared_transform_once(_stub_pipelines):
         assert proxy.warmup.magika.status == "loaded"
         assert proxy.warmup.code_aware.status == "loaded"
         assert proxy.warmup.smart_crusher.status == "loaded"
+        assert proxy.warmup.image.status == "loaded"
     finally:
         await proxy.shutdown()
 
@@ -184,6 +203,7 @@ async def test_startup_optimize_false_leaves_slots_null():
     try:
         assert called["n"] == 0, "preload must not run when optimize=False"
         assert proxy.warmup.kompress.status == "null"
+        assert proxy.warmup.image.status == "null"
         assert proxy.warmup.memory_backend.status == "null"
         assert proxy.warmup.memory_embedder.status == "null"
     finally:
