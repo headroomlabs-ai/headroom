@@ -527,7 +527,11 @@ def _patch_rtk_hook_absolute_path(rtk_path: Path, hook_script_path: Path | None 
     # whitespace/operators, followed by whitespace or end-of-line), so it
     # won't touch things like "rtkfoo" or "/some/path/rtk" that are already
     # absolute.
-    patched, count = re.subn(r"(?<![\w/-])rtk(?=\s|$)", quoted_path, original)
+    patched, count = re.subn(
+        r"(?<![\w/-])rtk(?=\s|$)",
+        lambda _match: quoted_path,
+        original,
+    )
 
     if count and patched != original:
         hook_script_path.write_text(patched)

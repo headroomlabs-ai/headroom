@@ -21,28 +21,24 @@ from headroom.cli.wrap import _patch_rtk_hook_absolute_path
 def test_patches_bare_rtk_to_absolute_path(tmp_path: Path) -> None:
     hook_script = tmp_path / "rtk-rewrite.sh"
     hook_script.write_text(
-        "#!/bin/sh\n"
-        "if command -v rtk >/dev/null 2>&1; then\n"
-        "    exec rtk rewrite \"$@\"\n"
-        "fi\n"
+        '#!/bin/sh\nif command -v rtk >/dev/null 2>&1; then\n    exec rtk rewrite "$@"\nfi\n'
     )
 
     rtk_path = Path("/home/user/.headroom/bin/rtk")
     changed = _patch_rtk_hook_absolute_path(rtk_path, hook_script)
 
     content = hook_script.read_text()
+    quoted = shlex.quote(str(rtk_path))
+
     assert changed is True
-    assert f"exec {rtk_path} rewrite" in content
+    assert f"exec {quoted} rewrite" in content
 
 
 def test_quotes_path_containing_spaces(tmp_path: Path) -> None:
     """Paths with spaces (e.g. /Users/Alice Smith/...) must be shell-quoted."""
     hook_script = tmp_path / "rtk-rewrite.sh"
     hook_script.write_text(
-        "#!/bin/sh\n"
-        "if command -v rtk >/dev/null 2>&1; then\n"
-        "    exec rtk rewrite \"$@\"\n"
-        "fi\n"
+        '#!/bin/sh\nif command -v rtk >/dev/null 2>&1; then\n    exec rtk rewrite "$@"\nfi\n'
     )
 
     rtk_path = Path("/Users/Alice Smith/.headroom/bin/rtk")
@@ -59,7 +55,7 @@ def test_quotes_path_containing_spaces(tmp_path: Path) -> None:
 
 def test_idempotent_second_run_is_noop(tmp_path: Path) -> None:
     hook_script = tmp_path / "rtk-rewrite.sh"
-    hook_script.write_text("exec rtk rewrite \"$@\"\n")
+    hook_script.write_text('exec rtk rewrite "$@"\n')
 
     rtk_path = Path("/home/user/.headroom/bin/rtk")
 
@@ -87,11 +83,7 @@ def test_missing_hook_script_is_noop(tmp_path: Path) -> None:
 def test_does_not_touch_words_containing_rtk(tmp_path: Path) -> None:
     """Tokens like 'rtkfoo' or an already-absolute '/some/path/rtk' are left alone."""
     hook_script = tmp_path / "rtk-rewrite.sh"
-    original = (
-        "#!/bin/sh\n"
-        "echo rtkfoo\n"
-        "exec /already/absolute/rtk rewrite \"$@\"\n"
-    )
+    original = '#!/bin/sh\necho rtkfoo\nexec /already/absolute/rtk rewrite "$@"\n'
     hook_script.write_text(original)
 
     rtk_path = Path("/home/user/.headroom/bin/rtk")
