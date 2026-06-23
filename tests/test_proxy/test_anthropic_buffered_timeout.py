@@ -45,6 +45,9 @@ class _BufferedPassthroughClient:
     async def get(self, url, headers=None, timeout=None):  # noqa: ANN001
         return await self.request("GET", url, headers=headers, timeout=timeout)
 
+    async def post(self, url, headers=None, content=None, timeout=None):  # noqa: ANN001
+        return await self.request("POST", url, headers=headers, content=content, timeout=timeout)
+
     async def aclose(self) -> None:
         return None
 
@@ -228,6 +231,131 @@ def test_anthropic_batch_results_buffered_timeout_override_reaches_http_client_g
     assert len(http_client.calls) == 1
     assert http_client.calls[0]["method"] == "GET"
     assert isinstance(http_client.calls[0]["timeout"], httpx.Timeout)
+
+
+def test_anthropic_ccr_continuation_uses_buffered_timeout() -> None:
+    config = _make_config()
+    config.ccr_inject_tool = True
+    config.ccr_handle_responses = True
+    app = create_app(config)
+
+    class _CCRHandler:
+        def has_ccr_tool_calls(self, response, provider):  # noqa: ANN001
+            return True
+
+        async def handle_response(  # noqa: ANN001
+            self,
+            response,
+            optimized_messages,
+            tools,
+            api_call_fn,
+            provider,
+        ):
+            return await api_call_fn(
+                optimized_messages
+                + [{"role": "assistant", "content": response.get("content", [])}],
+                tools,
+            )
+
+    with TestClient(app) as client:
+        proxy = client.app.state.proxy
+        _install_prefix_tracker(proxy)
+        proxy.ccr_response_handler = _CCRHandler()
+        http_client = _BufferedPassthroughClient(
+            httpx.Response(200, json=_anthropic_message_response())
+        )
+        proxy.http_client = http_client
+
+        async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
+            return httpx.Response(200, json=_anthropic_message_response())
+
+        proxy._retry_request = _fake_retry  # type: ignore[assignment]
+
+        client.post(
+            "/v1/messages",
+            headers={
+                "x-api-key": "test-key",
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+
+    assert len(http_client.calls) == 1
+    assert http_client.calls[0]["method"] == "POST"
+    assert isinstance(http_client.calls[0]["timeout"], httpx.Timeout)
+
+
+def test_anthropic_memory_continuation_uses_buffered_timeout() -> None:
+    config = _make_config()
+    config.memory_enabled = True
+    app = create_app(config)
+
+    class _MemoryHandler:
+        def __init__(self) -> None:
+            self.config = type(
+                "MemoryConfig",
+                (),
+                {
+                    "inject_context": False,
+                    "inject_tools": False,
+                    "project_root_override": "",
+                },
+            )()
+            self.initialized = False
+            self.backend = None
+
+        def get_beta_headers(self) -> dict[str, str]:
+            return {}
+
+        def has_memory_tool_calls(self, response, provider):  # noqa: ANN001
+            return True
+
+        async def handle_memory_tool_calls(  # noqa: ANN001
+            self,
+            response,
+            user_id,
+            provider,
+            **kwargs,
+        ):
+            return [{"type": "tool_result", "tool_use_id": "mem_1", "content": "memory"}]
+
+    with TestClient(app) as client:
+        proxy = client.app.state.proxy
+        _install_prefix_tracker(proxy)
+        proxy.memory_handler = _MemoryHandler()
+        captured_timeouts: list[httpx.Timeout | None] = []
+
+        async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
+            timeout = kwargs.get("timeout")
+            captured_timeouts.append(timeout)
+            if len(body["messages"]) > 1:
+                _assert_buffered_timeout(timeout)
+            return httpx.Response(200, json=_anthropic_message_response())
+
+        proxy._retry_request = _fake_retry  # type: ignore[assignment]
+
+        client.post(
+            "/v1/messages",
+            headers={
+                "x-api-key": "test-key",
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+                "x-headroom-user-id": "user-1",
+            },
+            json={
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+
+    assert len(captured_timeouts) == 2
+    assert all(isinstance(timeout, httpx.Timeout) for timeout in captured_timeouts)
 
 
 def test_generic_proxy_timeout_defaults_stay_unchanged():

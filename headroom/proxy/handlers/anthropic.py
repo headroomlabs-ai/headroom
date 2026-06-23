@@ -2356,7 +2356,7 @@ class AnthropicHandlerMixin:
                                     url,
                                     content=ccr_outbound_bytes,
                                     headers=ccr_outbound_headers,
-                                    timeout=httpx.Timeout(120.0),  # Override timeout for CCR
+                                    timeout=self._anthropic_buffered_request_timeout(),
                                 )
                                 logger.info(
                                     f"CCR: Got response status={cont_response.status_code}, "
@@ -2458,7 +2458,11 @@ class AnthropicHandlerMixin:
                                     continuation_body["tools"] = tools
 
                                 cont_response = await self._retry_request(
-                                    "POST", url, headers, continuation_body
+                                    "POST",
+                                    url,
+                                    headers,
+                                    continuation_body,
+                                    timeout=self._anthropic_buffered_request_timeout(),
                                 )
 
                                 # Update response with continuation

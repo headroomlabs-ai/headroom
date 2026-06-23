@@ -3822,6 +3822,7 @@ def _proxy_config_from_env() -> ProxyConfig:
         anthropic_buffered_request_timeout_seconds=_get_env_int(
             "HEADROOM_ANTHROPIC_BUFFERED_REQUEST_TIMEOUT_SECONDS",
             600,
+            min_value=1,
         ),
         vertex_api_url=os.environ.get("VERTEX_TARGET_API_URL"),
         backend=_get_env_str("HEADROOM_BACKEND", "anthropic"),
@@ -4028,15 +4029,25 @@ def _get_env_optional_bool(name: str) -> bool | None:
     return val.lower() in ("true", "1", "yes", "on")
 
 
-def _get_env_int(name: str, default: int) -> int:
+def _get_env_int(name: str, default: int, *, min_value: int | None = None) -> int:
     """Get integer from environment variable."""
     val = os.environ.get(name)
     if val is None:
         return default
     try:
-        return int(val)
+        parsed = int(val)
     except ValueError:
         return default
+    if min_value is not None and parsed < min_value:
+        return default
+    return parsed
+
+
+def _positive_int_arg(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be >= 1")
+    return parsed
 
 
 def _get_env_float(name: str, default: float) -> float:
@@ -4129,7 +4140,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--anthropic-buffered-request-timeout-seconds",
-        type=int,
+        type=_positive_int_arg,
         default=600,
         help=(
             "Anthropic buffered read timeout in seconds for non-streaming "
@@ -4376,6 +4387,7 @@ if __name__ == "__main__":
         anthropic_buffered_request_timeout_seconds=_get_env_int(
             "HEADROOM_ANTHROPIC_BUFFERED_REQUEST_TIMEOUT_SECONDS",
             args.anthropic_buffered_request_timeout_seconds,
+            min_value=1,
         ),
         vertex_api_url=_get_env_str("VERTEX_TARGET_API_URL", args.vertex_api_url),
         # Backend settings
