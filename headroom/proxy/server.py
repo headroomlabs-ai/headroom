@@ -132,6 +132,7 @@ from headroom.proxy.helpers import (
     initialize_context_tool_session_baseline,
     is_anthropic_auth,  # noqa: F401
     jitter_delay_ms,
+    retry_after_ms,
 )
 from headroom.proxy.memory_handler import MemoryConfig, MemoryHandler
 
@@ -1641,8 +1642,9 @@ class HeadroomProxy(
                         url, **post_kwargs
                     )
 
-                    # Don't retry client errors (4xx)
-                    if 400 <= response.status_code < 500:
+                    # Don't retry client errors (4xx) — except 429, the most
+                    # retriable status, which carries an authoritative Retry-After (#1221).
+                    if 400 <= response.status_code < 500 and response.status_code != 429:
                         return response
 
                     # Retry server errors (5xx)
@@ -1652,6 +1654,27 @@ class HeadroomProxy(
                             request=response.request,
                             response=response,
                         )
+
+                    # Rate limit (429): retry honoring Retry-After, but return it
+                    # verbatim once exhausted — a clean rate-limit signal beats a 5xx.
+                    if response.status_code == 429:
+                        if (
+                            not self.config.retry_enabled
+                            or attempt >= self.config.retry_max_attempts - 1
+                        ):
+                            return response
+                        delay_ms = retry_after_ms(
+                            response, self.config.retry_max_delay_ms
+                        ) or jitter_delay_ms(
+                            self.config.retry_base_delay_ms,
+                            self.config.retry_max_delay_ms,
+                            attempt,
+                        )
+                        logger.warning(
+                            f"Upstream 429 (attempt {attempt + 1}), retrying in {delay_ms:.0f}ms"
+                        )
+                        await asyncio.sleep(delay_ms / 1000)
+                        continue
 
                     return response
 

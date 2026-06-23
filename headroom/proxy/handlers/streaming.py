@@ -13,7 +13,7 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from headroom.proxy.auth_mode import classify_client
-from headroom.proxy.helpers import jitter_delay_ms
+from headroom.proxy.helpers import jitter_delay_ms, retry_after_ms
 
 if TYPE_CHECKING:
     from fastapi.responses import Response, StreamingResponse
@@ -938,6 +938,29 @@ class StreamingMixin:
                             headers=dict(upstream_response.headers),
                             status_code=upstream_response.status_code,
                         )
+                    # Retry upstream 429s honoring Retry-After — the streaming
+                    # sibling of the _retry_request path (#1221); on exhaustion,
+                    # fall through to forward the 429 to the client.
+                    if (
+                        upstream_response.status_code == 429
+                        and self.config.retry_enabled
+                        and attempt < retry_attempts - 1
+                    ):
+                        delay_with_jitter = retry_after_ms(
+                            upstream_response, self.config.retry_max_delay_ms
+                        ) or jitter_delay_ms(
+                            self.config.retry_base_delay_ms,
+                            self.config.retry_max_delay_ms,
+                            attempt,
+                        )
+                        await upstream_response.aclose()
+                        logger.warning(
+                            f"[{request_id}] Upstream 429 "
+                            f"(attempt {attempt + 1}/{retry_attempts}), "
+                            f"retrying in {delay_with_jitter:.0f}ms"
+                        )
+                        await asyncio.sleep(delay_with_jitter / 1000)
+                        continue
                     break
                 except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
                     last_connect_error = e
