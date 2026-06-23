@@ -750,6 +750,25 @@ class StreamingMixin:
                         next_forwarded.append(_copy.deepcopy(asst_msg))
                         next_original.append(_copy.deepcopy(asst_msg))
 
+            # Cache-miss attribution (#1313), streaming Anthropic path. Mirror
+            # the non-streaming handler: classify BEFORE update_from_response
+            # overwrites the last-turn state the classifier reads. Compare the
+            # prefix we forwarded this turn (`forwarded_messages`, pre-assistant
+            # append) against last turn's.
+            if provider == "anthropic":
+                miss = prefix_tracker.classify_cache_miss(
+                    cache_read_tokens=cache_read_tokens,
+                    current_forwarded_messages=forwarded_messages,
+                )
+                if miss.is_miss:
+                    logger.info(
+                        f"[{request_id}] CACHE-MISS-ATTRIBUTION: reason={miss.reason} "
+                        f"idle={miss.idle_seconds:.0f}s ttl={miss.cache_ttl_seconds}s "
+                        f"expected_cached={miss.expected_cached_tokens:,} "
+                        f"prefix_changed={miss.prefix_changed} ttl_exceeded={miss.ttl_exceeded}"
+                    )
+                    await self.metrics.record_cache_miss_attribution(provider, miss.reason)
+
             prefix_tracker.update_from_response(
                 cache_read_tokens=cache_read_tokens,
                 cache_write_tokens=cache_write_tokens,
