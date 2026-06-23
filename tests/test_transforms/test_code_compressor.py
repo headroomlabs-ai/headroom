@@ -769,6 +769,137 @@ class TestTreeSitterIntegration:
         assert result.language == CodeLanguage.GO
         assert result.compressed  # Some output is produced
 
+    @pytest.mark.parametrize(
+        (
+            "language",
+            "code",
+            "expected_signature",
+            "expected_omitted_lines",
+            "expected_removed_line",
+            "expected_closing",
+        ),
+        [
+            (
+                "javascript",
+                (
+                    "class Calc {\n"
+                    "  compute(x) {\n"
+                    "    let a = x + 1;\n"
+                    "    let b = a * 2;\n"
+                    "    let c = b - 3;\n"
+                    "    return c;\n"
+                    "  }\n"
+                    "}\n"
+                ),
+                "compute(x) {",
+                3,
+                "return c;",
+                "}\n}",
+            ),
+            (
+                "typescript",
+                (
+                    "class Calc {\n"
+                    "  compute(x: number): number {\n"
+                    "    let a = x + 1;\n"
+                    "    let b = a * 2;\n"
+                    "    let c = b - 3;\n"
+                    "    return c;\n"
+                    "  }\n"
+                    "}\n"
+                ),
+                "compute(x: number): number {",
+                3,
+                "return c;",
+                "}\n}",
+            ),
+            (
+                "java",
+                (
+                    "public class Calc {\n"
+                    "    public int compute(int x) {\n"
+                    "        int a = x + 1;\n"
+                    "        int b = a * 2;\n"
+                    "        int c = b - 3;\n"
+                    "        int d = c / 4;\n"
+                    "        int e = d + 5;\n"
+                    "        return e;\n"
+                    "    }\n"
+                    "}\n"
+                ),
+                "public int compute(int x) {",
+                5,
+                "return e;",
+                "}\n}",
+            ),
+            (
+                "cpp",
+                (
+                    "class Calc {\n"
+                    "public:\n"
+                    "    int compute(int x) {\n"
+                    "        int a = x + 1;\n"
+                    "        int b = a * 2;\n"
+                    "        int c = b - 3;\n"
+                    "        int d = c / 4;\n"
+                    "        int e = d + 5;\n"
+                    "        return e;\n"
+                    "    }\n"
+                    "};\n"
+                ),
+                "int compute(int x) {",
+                5,
+                "return e;",
+                "};",
+            ),
+            (
+                "rust",
+                (
+                    "impl Calc {\n"
+                    "    pub fn compute(&self, x: i32) -> i32 {\n"
+                    "        let a = x + 1;\n"
+                    "        let b = a * 2;\n"
+                    "        let c = b - 3;\n"
+                    "        let d = c / 4;\n"
+                    "        let e = d + 5;\n"
+                    "        e\n"
+                    "    }\n"
+                    "}\n"
+                ),
+                "pub fn compute(&self, x: i32) -> i32 {",
+                5,
+                "        e\n",
+                "}\n}",
+            ),
+        ],
+    )
+    def test_compresses_methods_inside_class_member_containers(
+        self,
+        language,
+        code,
+        expected_signature,
+        expected_omitted_lines,
+        expected_removed_line,
+        expected_closing,
+    ):
+        """Class/impl member containers are distinct from executable method bodies."""
+        config = CodeCompressorConfig(
+            min_tokens_for_compression=1,
+            max_body_lines=1,
+            enable_ccr=False,
+        )
+        compressor = CodeAwareCompressor(config)
+
+        result = compressor.compress(code, language=language)
+
+        assert result.language == CodeLanguage(language)
+        assert result.syntax_valid is True
+        assert result.compression_ratio < 1.0
+        assert expected_signature in result.compressed
+        assert f"// [{expected_omitted_lines} lines omitted]" in result.compressed
+        assert expected_removed_line not in result.compressed
+        assert result.compressed.endswith(expected_closing)
+
     def test_imports_preserved(self):
         """Imports are preserved in compressed output."""
         config = CodeCompressorConfig(
