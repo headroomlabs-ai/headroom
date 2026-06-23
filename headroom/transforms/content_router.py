@@ -34,6 +34,7 @@ Pipeline Usage:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -47,7 +48,12 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-from ..config import DEFAULT_EXCLUDE_TOOLS, ReadLifecycleConfig, TransformResult
+from ..config import (
+    DEFAULT_EXCLUDE_TOOLS,
+    ReadLifecycleConfig,
+    TransformResult,
+    is_tool_excluded,
+)
 from ..tokenizer import Tokenizer
 from .base import Transform
 from .content_detector import ContentType, DetectionResult
@@ -58,6 +64,7 @@ logger = logging.getLogger(__name__)
 
 
 _detect_backend_warned = False
+_detect_panic_warned = False
 
 
 def _router_debug_dumps(value: Any) -> str:
@@ -151,11 +158,33 @@ def _detect_content(content: str) -> DetectionResult:
 
     from headroom._core import detect_content_type as _rust_detect
 
-    rust_result = _rust_detect(content)
-    # Rust's `content_type` is the lowercase string tag (e.g.
-    # "json_array"); translate to the Python `ContentType` enum so
-    # downstream mapping keys match.
-    content_type = ContentType(rust_result.content_type)
+    global _detect_panic_warned
+    try:
+        rust_result = _rust_detect(content)
+        # Rust's `content_type` is the lowercase string tag (e.g.
+        # "json_array"); translate to the Python `ContentType` enum so
+        # downstream mapping keys match.
+        content_type = ContentType(rust_result.content_type)
+    except (KeyboardInterrupt, SystemExit, GeneratorExit):
+        raise
+    except BaseException as exc:  # noqa: BLE001
+        # A native Rust panic surfaces as pyo3_runtime.PanicException, which
+        # derives from BaseException — so ``except Exception`` would miss it and
+        # the panic would propagate out as an HTTP 500. Any detector failure
+        # (panic, or an unrecognized content-type tag) degrades to the
+        # pure-Python detector instead of aborting the request. See #1123.
+        # Guard: don't swallow cancellation/control-flow BaseExceptions such
+        # as asyncio.CancelledError — keep them propagating.
+        if isinstance(exc, asyncio.CancelledError):
+            raise
+        if not _detect_panic_warned:
+            _detect_panic_warned = True
+            logger.warning(
+                "Native content detector failed (%s); falling back to pure-Python detection.",
+                type(exc).__name__,
+            )
+        return _regex_detect_content_type(content)
+
     if content_type is ContentType.PLAIN_TEXT:
         regex_result = _regex_detect_content_type(content)
         if regex_result.content_type is not ContentType.PLAIN_TEXT:
@@ -1104,15 +1133,18 @@ class ContentRouter(Transform):
                 routing_log=[],
             )
         else:
-            # Determine strategy from content analysis
-            mixed = is_mixed_content(content)
-            detection = _detect_content(content)
+            # Determine strategy from content analysis. When runtime settings
+            # force Kompress, skip the full router detection path so large
+            # proxy payloads do not pay for an unused strategy decision.
             force_kompress = bool(getattr(self, "_runtime_force_kompress", False))
-            strategy = (
-                CompressionStrategy.KOMPRESS
-                if force_kompress
-                else self._determine_strategy(content)
-            )
+            if force_kompress:
+                mixed = False
+                detection = DetectionResult(ContentType.PLAIN_TEXT, 1.0, {})
+                strategy = CompressionStrategy.KOMPRESS
+            else:
+                mixed = is_mixed_content(content)
+                detection = _detect_content(content)
+                strategy = self._determine_strategy(content)
             if debug_enabled:
                 _log_router_debug(
                     "content_router_input",
@@ -2318,7 +2350,9 @@ class ContentRouter(Transform):
             else DEFAULT_EXCLUDE_TOOLS
         )
         excluded_tool_ids = {
-            tool_id for tool_id, name in tool_name_map.items() if name in exclude_tools
+            tool_id
+            for tool_id, name in tool_name_map.items()
+            if is_tool_excluded(name, exclude_tools)
         }
 
         # --- Adaptive parameters based on context pressure ---
@@ -2569,8 +2603,14 @@ class ContentRouter(Transform):
                 route_counts["error_protected"] += 1
                 continue
 
-            # Detect content type for protection decisions
-            detection = _detect_content(content)
+            # Detect content type for protection decisions. Even when the
+            # runtime strategy is forced to Kompress, keep code-protection
+            # checks but use the lightweight regex detector instead of the
+            # full router chain.
+            force_kompress = bool(getattr(self, "_runtime_force_kompress", False))
+            detection = (
+                _regex_detect_content_type(content) if force_kompress else _detect_content(content)
+            )
             is_code = detection.content_type == ContentType.SOURCE_CODE
 
             # Protection 2: Don't compress recent CODE

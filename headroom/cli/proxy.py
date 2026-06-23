@@ -138,6 +138,14 @@ def _selected_context_tool() -> str:
     help="Maximum upstream keep-alive connections (default: 100, env: HEADROOM_MAX_KEEPALIVE)",
 )
 @click.option(
+    "--keepalive-expiry",
+    "keepalive_expiry",
+    default=90.0,
+    type=click.FloatRange(min=0),
+    envvar="HEADROOM_KEEPALIVE_EXPIRY",
+    help="Seconds an idle upstream keep-alive connection is kept open (default: 90, env: HEADROOM_KEEPALIVE_EXPIRY)",
+)
+@click.option(
     "--mode",
     default=None,
     metavar="[token|cache]",
@@ -252,6 +260,17 @@ def _selected_context_tool() -> str:
     help=(
         "Maximum upstream retry attempts for connect/read/5xx failures (1–10, default: 3). "
         "Env: HEADROOM_RETRY_MAX_ATTEMPTS."
+    ),
+)
+@click.option(
+    "--request-timeout-seconds",
+    type=int,
+    default=None,
+    envvar="HEADROOM_REQUEST_TIMEOUT",
+    help=(
+        "Request timeout in seconds (default: 300). "
+        "Useful for slow providers (eg local). "
+        "Env: HEADROOM_REQUEST_TIMEOUT."
     ),
 )
 @click.option(
@@ -379,6 +398,26 @@ def _selected_context_tool() -> str:
     help=(
         "Disable Kompress ML compression while keeping structural compression enabled. "
         "Env: HEADROOM_DISABLE_KOMPRESS=1."
+    ),
+)
+@click.option(
+    "--disable-kompress-anthropic/--enable-kompress-anthropic",
+    "disable_kompress_anthropic",
+    default=None,
+    envvar="HEADROOM_DISABLE_KOMPRESS_ANTHROPIC",
+    help=(
+        "Disable (or --enable-) Kompress for the Anthropic pipeline only, overriding "
+        "--disable-kompress. Env: HEADROOM_DISABLE_KOMPRESS_ANTHROPIC=1."
+    ),
+)
+@click.option(
+    "--disable-kompress-openai/--enable-kompress-openai",
+    "disable_kompress_openai",
+    default=None,
+    envvar="HEADROOM_DISABLE_KOMPRESS_OPENAI",
+    help=(
+        "Disable (or --enable-) Kompress for the OpenAI/Codex pipeline only, overriding "
+        "--disable-kompress. Env: HEADROOM_DISABLE_KOMPRESS_OPENAI=1."
     ),
 )
 # Code graph: indexes project + watches files for live reindex via codebase-memory-mcp.
@@ -641,6 +680,7 @@ def proxy(
     limit_concurrency: int,
     max_connections: int,
     max_keepalive_connections: int,
+    keepalive_expiry: float,
     intercept_tool_results: bool,
     no_optimize: bool,
     no_cache: bool,
@@ -652,6 +692,7 @@ def proxy(
     no_subscription_tracking: bool,
     subscription_poll_interval: int | None,
     retry_max_attempts: int | None,
+    request_timeout_seconds: int | None,
     connect_timeout_seconds: int | None,
     anthropic_pre_upstream_concurrency: int | None,
     anthropic_pre_upstream_acquire_timeout_seconds: float | None,
@@ -664,6 +705,8 @@ def proxy(
     budget_period: str,
     code_aware_flag: bool | None,
     disable_kompress: bool,
+    disable_kompress_anthropic: bool | None,
+    disable_kompress_openai: bool | None,
     code_graph: bool,
     no_read_lifecycle: bool,
     memory: bool,
@@ -864,11 +907,15 @@ def proxy(
             subscription_poll_interval if subscription_poll_interval is not None else 300
         ),
         retry_max_attempts=retry_max_attempts if retry_max_attempts is not None else 3,
+        request_timeout_seconds=request_timeout_seconds
+        if request_timeout_seconds is not None and request_timeout_seconds > 0
+        else 300,
         connect_timeout_seconds=connect_timeout_seconds
         if connect_timeout_seconds is not None
         else 10,
         max_connections=max_connections,
         max_keepalive_connections=max_keepalive_connections,
+        keepalive_expiry=keepalive_expiry,
         log_file=None if is_stateless else log_file,
         log_full_messages=log_messages
         or os.environ.get("HEADROOM_LOG_MESSAGES", "").lower() in ("true", "1", "yes", "on"),
@@ -886,6 +933,8 @@ def proxy(
             in ("true", "1", "yes", "on")
         ),
         disable_kompress=disable_kompress,
+        disable_kompress_anthropic=disable_kompress_anthropic,
+        disable_kompress_openai=disable_kompress_openai,
         # Code graph: live file watcher for incremental reindexing
         code_graph_watcher=code_graph,
         # Read lifecycle: ON by default (use --no-read-lifecycle to disable)
