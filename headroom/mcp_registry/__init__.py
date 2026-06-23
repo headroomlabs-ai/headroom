@@ -24,14 +24,14 @@ from .install import (
     get_all_registrars,
     install_everywhere,
 )
-from .opencode import OpenCodeRegistrar
+from .opencode import OpencodeRegistrar
 
 __all__ = [
     "DEFAULT_PROXY_URL",
     "ClaudeRegistrar",
     "CodexRegistrar",
     "MCPRegistrar",
-    "OpenCodeRegistrar",
+    "OpencodeRegistrar",
     "RegisterResult",
     "RegisterStatus",
     "ServerSpec",

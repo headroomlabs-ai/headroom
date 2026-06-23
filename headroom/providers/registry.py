@@ -173,6 +173,12 @@ def create_proxy_backend(
 
     normalized_backend = backend if backend.startswith("litellm-") else f"litellm-{backend}"
     provider = normalized_backend.replace("litellm-", "")
+    # `litellm-vertex` is the name in our docs/help, but LiteLLM (and our
+    # provider registry) keys Google Vertex on `vertex_ai`. Without this alias
+    # the provider falls through to a generic pass-through: wrong model prefix
+    # (`vertex/…` instead of `vertex_ai/…`), region dropped, auth mishandled.
+    if provider in ("vertex", "google-vertex", "googlevertex"):
+        provider = "vertex_ai"
     try:
         backend_cls = litellm_backend_cls or _load_litellm_backend()
         instance = cast("Backend", backend_cls(provider=provider, region=bedrock_region))

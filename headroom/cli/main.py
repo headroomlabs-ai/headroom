@@ -28,8 +28,20 @@ def main(ctx: click.Context) -> None:
         headroom proxy              Start the optimization proxy
         headroom memory list        List stored memories
         headroom memory stats       Show memory statistics
+        headroom update             Update Headroom to the latest release
     """
     ctx.ensure_object(dict)
+
+    # Fire a rate-limited, opt-out background check for newer releases so other
+    # surfaces (e.g. the proxy banner) can show an "update available" notice.
+    # Never blocks, never raises; skipped for `update` (it checks explicitly).
+    if ctx.invoked_subcommand != "update":
+        try:
+            from headroom.update_check import maybe_check_async
+
+            maybe_check_async()
+        except Exception:  # noqa: BLE001 — update check must never break the CLI
+            pass
 
 
 # Import subcommands - these register themselves with the main group
@@ -40,6 +52,7 @@ def _register_commands() -> None:
         audit,  # noqa: F401
         capture,  # noqa: F401
         copilot_auth,  # noqa: F401
+        doctor,  # noqa: F401
         evals,  # noqa: F401
         init,  # noqa: F401
         install,  # noqa: F401
@@ -48,7 +61,9 @@ def _register_commands() -> None:
         output_savings,  # noqa: F401
         perf,  # noqa: F401
         proxy,  # noqa: F401
+        savings,  # noqa: F401
         tools,  # noqa: F401
+        update,  # noqa: F401
         wrap,  # noqa: F401
     )
 

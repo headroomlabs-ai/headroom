@@ -34,6 +34,7 @@ Pipeline Usage:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -47,7 +48,12 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-from ..config import DEFAULT_EXCLUDE_TOOLS, ReadLifecycleConfig, TransformResult
+from ..config import (
+    DEFAULT_EXCLUDE_TOOLS,
+    ReadLifecycleConfig,
+    TransformResult,
+    is_tool_excluded,
+)
 from ..tokenizer import Tokenizer
 from .base import Transform
 from .content_detector import ContentType, DetectionResult
@@ -58,6 +64,7 @@ logger = logging.getLogger(__name__)
 
 
 _detect_backend_warned = False
+_detect_panic_warned = False
 
 
 def _router_debug_dumps(value: Any) -> str:
@@ -151,11 +158,33 @@ def _detect_content(content: str) -> DetectionResult:
 
     from headroom._core import detect_content_type as _rust_detect
 
-    rust_result = _rust_detect(content)
-    # Rust's `content_type` is the lowercase string tag (e.g.
-    # "json_array"); translate to the Python `ContentType` enum so
-    # downstream mapping keys match.
-    content_type = ContentType(rust_result.content_type)
+    global _detect_panic_warned
+    try:
+        rust_result = _rust_detect(content)
+        # Rust's `content_type` is the lowercase string tag (e.g.
+        # "json_array"); translate to the Python `ContentType` enum so
+        # downstream mapping keys match.
+        content_type = ContentType(rust_result.content_type)
+    except (KeyboardInterrupt, SystemExit, GeneratorExit):
+        raise
+    except BaseException as exc:  # noqa: BLE001
+        # A native Rust panic surfaces as pyo3_runtime.PanicException, which
+        # derives from BaseException — so ``except Exception`` would miss it and
+        # the panic would propagate out as an HTTP 500. Any detector failure
+        # (panic, or an unrecognized content-type tag) degrades to the
+        # pure-Python detector instead of aborting the request. See #1123.
+        # Guard: don't swallow cancellation/control-flow BaseExceptions such
+        # as asyncio.CancelledError — keep them propagating.
+        if isinstance(exc, asyncio.CancelledError):
+            raise
+        if not _detect_panic_warned:
+            _detect_panic_warned = True
+            logger.warning(
+                "Native content detector failed (%s); falling back to pure-Python detection.",
+                type(exc).__name__,
+            )
+        return _regex_detect_content_type(content)
+
     if content_type is ContentType.PLAIN_TEXT:
         regex_result = _regex_detect_content_type(content)
         if regex_result.content_type is not ContentType.PLAIN_TEXT:
@@ -214,6 +243,45 @@ def _create_content_signature(
         )
     except ImportError:
         return None
+
+
+# #856 P3b: Anthropic prompt-cache entries live in a 5-minute TTL tier (the
+# basis for the 1.25x write multiplier). As a session goes idle the cached
+# suffix approaches lapse, so P_alive — the probability the cache survives to
+# the next turn — decays toward 0. When P_alive hits 0 the net-cost penalty
+# term vanishes and a deep edit near lapse is free to make (the suffix is
+# about to be rebuilt cold anyway). This is the cache TTL, NOT the
+# session-tracker cleanup TTL (``PrefixFreezeConfig.session_ttl_seconds``).
+_NET_COST_CACHE_TTL_SECONDS = 300.0
+
+
+def _net_cost_cache_ttl_seconds() -> float:
+    """Provider cache TTL (seconds) used to decay P_alive from idle time.
+
+    Defaults to Anthropic's 5-minute tier; overridable via
+    ``HEADROOM_NET_COST_CACHE_TTL_SECONDS`` for other providers/tiers. A
+    malformed or non-positive value falls back to the default with a warning
+    rather than producing a divide-by-zero or negative TTL (same posture as
+    the other ``HEADROOM_NET_COST_*`` env guards).
+    """
+    raw = os.environ.get("HEADROOM_NET_COST_CACHE_TTL_SECONDS", "")
+    if not raw:
+        return _NET_COST_CACHE_TTL_SECONDS
+    try:
+        ttl = float(raw)
+    except ValueError:
+        logger.warning(
+            "HEADROOM_NET_COST_CACHE_TTL_SECONDS malformed; using default %s",
+            _NET_COST_CACHE_TTL_SECONDS,
+        )
+        return _NET_COST_CACHE_TTL_SECONDS
+    if not math.isfinite(ttl) or ttl <= 0.0:
+        logger.warning(
+            "HEADROOM_NET_COST_CACHE_TTL_SECONDS invalid; using default %s",
+            _NET_COST_CACHE_TTL_SECONDS,
+        )
+        return _NET_COST_CACHE_TTL_SECONDS
+    return ttl
 
 
 def _gain_bucket(gain: float) -> str:
@@ -418,6 +486,7 @@ class CompressionStrategy(Enum):
     TEXT = "text"
     DIFF = "diff"
     HTML = "html"
+    TABULAR = "tabular"
     MIXED = "mixed"
     PASSTHROUGH = "passthrough"
 
@@ -538,6 +607,7 @@ class ContentRouterConfig:
         enable_smart_crusher: Enable JSON array compression.
         enable_search_compressor: Enable search result compression.
         enable_log_compressor: Enable build/test log compression.
+        enable_tabular_compressor: Enable CSV/TSV/markdown-table compression.
         enable_image_optimizer: Enable image token optimization.
         prefer_code_aware_for_code: Use CodeAware over Kompress for code.
         mixed_content_threshold: Min distinct types to consider "mixed".
@@ -554,6 +624,7 @@ class ContentRouterConfig:
     enable_smart_crusher: bool = True
     enable_search_compressor: bool = True
     enable_log_compressor: bool = True
+    enable_tabular_compressor: bool = True  # CSV/TSV/markdown tables via SmartCrusher
     enable_html_extractor: bool = True  # HTML content extraction
     enable_image_optimizer: bool = True  # Image token optimization
 
@@ -896,6 +967,7 @@ class ContentRouter(Transform):
         self._log_compressor: Any = None
         self._diff_compressor: Any = None
         self._html_extractor: Any = None
+        self._tabular_compressor: Any = None
         self._kompress: Any = None
 
         # TOIN integration for cross-strategy learning
@@ -1061,15 +1133,18 @@ class ContentRouter(Transform):
                 routing_log=[],
             )
         else:
-            # Determine strategy from content analysis
-            mixed = is_mixed_content(content)
-            detection = _detect_content(content)
+            # Determine strategy from content analysis. When runtime settings
+            # force Kompress, skip the full router detection path so large
+            # proxy payloads do not pay for an unused strategy decision.
             force_kompress = bool(getattr(self, "_runtime_force_kompress", False))
-            strategy = (
-                CompressionStrategy.KOMPRESS
-                if force_kompress
-                else self._determine_strategy(content)
-            )
+            if force_kompress:
+                mixed = False
+                detection = DetectionResult(ContentType.PLAIN_TEXT, 1.0, {})
+                strategy = CompressionStrategy.KOMPRESS
+            else:
+                mixed = is_mixed_content(content)
+                detection = _detect_content(content)
+                strategy = self._determine_strategy(content)
             if debug_enabled:
                 _log_router_debug(
                     "content_router_input",
@@ -1193,6 +1268,7 @@ class ContentRouter(Transform):
             ContentType.BUILD_OUTPUT: CompressionStrategy.LOG,
             ContentType.GIT_DIFF: CompressionStrategy.DIFF,
             ContentType.HTML: CompressionStrategy.HTML,
+            ContentType.TABULAR: CompressionStrategy.TABULAR,
             ContentType.PLAIN_TEXT: CompressionStrategy.TEXT,
         }
 
@@ -1427,6 +1503,18 @@ class ContentRouter(Transform):
                         )
                         decision_reason = "log_compressor"
 
+            elif strategy == CompressionStrategy.TABULAR:
+                if self.config.enable_tabular_compressor:
+                    compressor = self._get_tabular_compressor()
+                    if compressor:
+                        compressor_name = type(compressor).__name__
+                        result = compressor.compress(content, context=context, bias=bias)
+                        compressed, compressed_tokens = (
+                            result.compressed,
+                            len(result.compressed.split()),
+                        )
+                        decision_reason = "tabular_compressor"
+
             elif strategy == CompressionStrategy.DIFF:
                 compressor = self._get_diff_compressor()
                 if compressor:
@@ -1477,6 +1565,7 @@ class ContentRouter(Transform):
             fallback_eligible_strategy = strategy in {
                 CompressionStrategy.SMART_CRUSHER,
                 CompressionStrategy.CODE_AWARE,
+                CompressionStrategy.TABULAR,
             }
             fallback_no_savings = compressed == content or compressed_tokens >= original_tokens
             if fallback_eligible_strategy and fallback_no_savings:
@@ -1624,21 +1713,28 @@ class ContentRouter(Transform):
         compressed: str | None = None
         compressed_tokens: int | None = None
 
-        # Primary: Kompress — downloads from chopratejas/kompress-v2-base on first use
+        # Primary: Kompress. On a cold cache the model is fetched once in the
+        # background (ensure_background_load) instead of blocking this request
+        # thread on a 274MB download that races the compression timeout and
+        # fails open. Until it is cached, route around the deep path.
         if self.config.enable_kompress:
             compressor = self._get_kompress()
             if compressor:
-                try:
-                    result = compressor.compress(
-                        text_to_compress,
-                        context=context,
-                        question=question,
-                        target_ratio=getattr(self, "_runtime_target_ratio", None),
-                    )
-                    compressed = result.compressed
-                    compressed_tokens = result.compressed_tokens
-                except Exception as e:
-                    logger.warning("Kompress failed: %s", e)
+                if not compressor.is_ready():
+                    compressor.ensure_background_load()
+                else:
+                    try:
+                        result = compressor.compress(
+                            text_to_compress,
+                            context=context,
+                            question=question,
+                            target_ratio=getattr(self, "_runtime_target_ratio", None),
+                            allow_download=False,
+                        )
+                        compressed = result.compressed
+                        compressed_tokens = result.compressed_tokens
+                    except Exception as e:
+                        logger.warning("Kompress failed: %s", e)
 
         if compressed is None:
             return content, len(content.split())
@@ -1659,6 +1755,7 @@ class ContentRouter(Transform):
             ContentType.BUILD_OUTPUT: CompressionStrategy.LOG,
             ContentType.GIT_DIFF: CompressionStrategy.DIFF,
             ContentType.HTML: CompressionStrategy.HTML,
+            ContentType.TABULAR: CompressionStrategy.TABULAR,
             ContentType.PLAIN_TEXT: CompressionStrategy.TEXT,
         }
         return mapping.get(content_type, self.config.fallback_strategy)
@@ -1672,6 +1769,7 @@ class ContentRouter(Transform):
             CompressionStrategy.LOG: ContentType.BUILD_OUTPUT,
             CompressionStrategy.DIFF: ContentType.GIT_DIFF,
             CompressionStrategy.HTML: ContentType.HTML,
+            CompressionStrategy.TABULAR: ContentType.TABULAR,
             CompressionStrategy.TEXT: ContentType.PLAIN_TEXT,
             CompressionStrategy.KOMPRESS: ContentType.PLAIN_TEXT,
             CompressionStrategy.PASSTHROUGH: ContentType.PLAIN_TEXT,
@@ -1745,6 +1843,17 @@ class ContentRouter(Transform):
             except ImportError:
                 logger.debug("LogCompressor not available")
         return self._log_compressor
+
+    def _get_tabular_compressor(self) -> Any:
+        """Get TabularCompressor (lazy load)."""
+        if self._tabular_compressor is None:
+            try:
+                from .tabular_ingest import TabularCompressor
+
+                self._tabular_compressor = TabularCompressor()
+            except ImportError:  # pragma: no cover - defensive; tabular_ingest is pure stdlib
+                logger.debug("TabularCompressor not available")
+        return self._tabular_compressor
 
     def _get_diff_compressor(self) -> Any:
         """Get DiffCompressor (lazy load). Rust-only — Python implementation
@@ -2029,6 +2138,7 @@ class ContentRouter(Transform):
         route_counts: dict[str, int],
         transforms_applied: list[str],
         batch_state: dict[str, int | None] | None = None,
+        p_alive_override: float | None = None,
     ) -> bool:
         """Break-even gate for one candidate mutation (#856 P2, flag-gated).
 
@@ -2057,6 +2167,18 @@ class ContentRouter(Transform):
         mutated shallower slot. Each batch admission emits the
         ``router:netcost_batch_admit`` marker and the ``netcost_batch_admitted``
         counter for telemetry.
+
+        #856 P3b (idle-timer compaction): ``p_alive_override``, when supplied
+        by the caller, replaces the static ``HEADROOM_NET_COST_P_ALIVE``
+        constant. It is derived in ``apply`` from how long the session has
+        been idle relative to the provider cache TTL
+        (``max(0, 1 − idle_s / ttl)``). As the cached suffix nears lapse
+        P_alive → 0, the ``P_alive·(w−r)·(S+ΔT)`` penalty vanishes, and edits
+        that would lose to a warm suffix become free — the suffix is about to
+        be rebuilt cold regardless. ``None`` preserves the P2 env-constant
+        behaviour. An admit made under a decayed (``< 1.0``) idle P_alive emits
+        the ``router:netcost_idle_compaction`` marker and the
+        ``netcost_idle_admitted`` counter.
         """
         delta_t = max(0, original_tokens - compressed_tokens)
         # Batch reclaim: if a shallower slot was already admitted, its
@@ -2086,23 +2208,32 @@ class ContentRouter(Transform):
             reads = _reads
         except ValueError:
             logger.warning("HEADROOM_NET_COST_EXPECTED_READS malformed; using 10")
-        try:
-            _p_alive = float(os.environ.get("HEADROOM_NET_COST_P_ALIVE", "") or 1.0)
-            if not math.isfinite(_p_alive):
-                raise ValueError("non-finite")
-            p_alive = _p_alive
-        except ValueError:
-            logger.warning("HEADROOM_NET_COST_P_ALIVE malformed; using 1.0")
+        # #856 P3b: an idle-derived override takes precedence over the static
+        # env constant. ``net_mutation_gain`` clamps p_alive to [0, 1]
+        # internally, but clamp here too so the value logged/branched on below
+        # matches what the formula uses.
+        idle_derived = p_alive_override is not None
+        if p_alive_override is not None:
+            p_alive = min(max(p_alive_override, 0.0), 1.0)
+        else:
+            try:
+                _p_alive = float(os.environ.get("HEADROOM_NET_COST_P_ALIVE", "") or 1.0)
+                if not math.isfinite(_p_alive):
+                    raise ValueError("non-finite")
+                p_alive = _p_alive
+            except ValueError:
+                logger.warning("HEADROOM_NET_COST_P_ALIVE malformed; using 1.0")
         gain = float(policy.net_mutation_gain(delta_t, suffix, reads, p_alive))
         allowed = gain > 0.0
         logger.info(
             "NetCostPolicy slot=%d delta_t=%d suffix=%d reads=%.1f p_alive=%.2f "
-            "gain=%.0f batch_reclaim=%s -> %s",
+            "idle_derived=%s gain=%.0f batch_reclaim=%s -> %s",
             slot_idx,
             delta_t,
             suffix,
             reads,
             p_alive,
+            idle_derived,
             gain,
             batch_reclaim,
             "mutate" if allowed else "skip",
@@ -2110,6 +2241,13 @@ class ContentRouter(Transform):
         if allowed:
             route_counts.setdefault("netcost_allowed", 0)
             route_counts["netcost_allowed"] += 1
+            if idle_derived and p_alive < 1.0:
+                # Admitted under an idle-decayed P_alive: the cached suffix is
+                # near TTL lapse, so its invalidation penalty is discounted.
+                # Independent of batch reclaim — both markers may apply.
+                route_counts.setdefault("netcost_idle_admitted", 0)
+                route_counts["netcost_idle_admitted"] += 1
+                transforms_applied.append("router:netcost_idle_compaction")
             if batch_reclaim:
                 # Rode a shallower edit's cache-bust for free — telemetry only;
                 # the floor is unchanged (this slot is deeper than the floor).
@@ -2212,7 +2350,9 @@ class ContentRouter(Transform):
             else DEFAULT_EXCLUDE_TOOLS
         )
         excluded_tool_ids = {
-            tool_id for tool_id, name in tool_name_map.items() if name in exclude_tools
+            tool_id
+            for tool_id, name in tool_name_map.items()
+            if is_tool_excluded(name, exclude_tools)
         }
 
         # --- Adaptive parameters based on context pressure ---
@@ -2313,12 +2453,27 @@ class ContentRouter(Transform):
         # the shallowest slot admitted as a net-positive mutation; once set,
         # deeper candidates charge S=0 (their cache-bust is already paid).
         netcost_batch_state: dict[str, int | None] = {"floor": None}
+        # #856 P3b (idle-timer compaction): if the caller supplies how long the
+        # session has been idle, decay P_alive from it once per request and
+        # pass it to the gate. Absent/malformed → None → the gate keeps the P2
+        # env-constant behaviour. Derived once here (not per slot) — idle is a
+        # per-request property, like frozen_message_count.
+        netcost_p_alive_override: float | None = None
         if netcost_enabled:
             netcost_suffix_tokens = [0] * (num_messages + 1)
             for j in range(num_messages - 1, -1, -1):
                 netcost_suffix_tokens[j] = netcost_suffix_tokens[j + 1] + _netcost_message_tokens(
                     messages[j], tokenizer
                 )
+            idle_seconds = kwargs.get("idle_seconds")
+            if idle_seconds is not None:
+                try:
+                    idle_f = float(idle_seconds)
+                except (TypeError, ValueError):
+                    idle_f = None
+                if idle_f is not None and math.isfinite(idle_f) and idle_f >= 0.0:
+                    ttl = _net_cost_cache_ttl_seconds()
+                    netcost_p_alive_override = max(0.0, 1.0 - idle_f / ttl)
 
         # Tasks: list of (slot_index, content, context, bias, content_key)
         _PendingTask = tuple[int, str, str, float, int]
@@ -2448,8 +2603,14 @@ class ContentRouter(Transform):
                 route_counts["error_protected"] += 1
                 continue
 
-            # Detect content type for protection decisions
-            detection = _detect_content(content)
+            # Detect content type for protection decisions. Even when the
+            # runtime strategy is forced to Kompress, keep code-protection
+            # checks but use the lightweight regex detector instead of the
+            # full router chain.
+            force_kompress = bool(getattr(self, "_runtime_force_kompress", False))
+            detection = (
+                _regex_detect_content_type(content) if force_kompress else _detect_content(content)
+            )
             is_code = detection.content_type == ContentType.SOURCE_CODE
 
             # Protection 2: Don't compress recent CODE
@@ -2486,7 +2647,9 @@ class ContentRouter(Transform):
             # Two-tier compression cache.
             # Tier 1 (skip): known won't-compress → instant skip.
             # Tier 2 (result): known compresses → reuse compressed text.
-            content_key = hash(content)
+            # Key on the runtime target_ratio too: the same content compressed at
+            # a different ratio is a different result, so it must not alias.
+            content_key = hash((content, getattr(self, "_runtime_target_ratio", None)))
 
             # Tier 1: skip set — instant rejection
             if self._cache.is_skipped(content_key):
@@ -2510,6 +2673,7 @@ class ContentRouter(Transform):
                         route_counts=route_counts,
                         transforms_applied=transforms_applied,
                         batch_state=netcost_batch_state,
+                        p_alive_override=netcost_p_alive_override,
                     ):
                         # Net-cost gate: mutation would cost more in cache
                         # invalidation than it saves — leave untouched.
@@ -2592,6 +2756,7 @@ class ContentRouter(Transform):
                         route_counts=route_counts,
                         transforms_applied=transforms_applied,
                         batch_state=netcost_batch_state,
+                        p_alive_override=netcost_p_alive_override,
                     ):
                         result_slots[slot_idx] = message
                         continue
@@ -2649,6 +2814,8 @@ class ContentRouter(Transform):
             parts.append(f"{route_counts['cache_miss']} cache misses")
         if route_counts.get("netcost_batch_admitted"):
             parts.append(f"{route_counts['netcost_batch_admitted']} netcost batch-admitted")
+        if route_counts.get("netcost_idle_admitted"):
+            parts.append(f"{route_counts['netcost_idle_admitted']} netcost idle-admitted")
         cs = self._cache.stats
         if cs["cache_size"] > 0 or cs["cache_skip_size"] > 0:
             parts.append(
@@ -2861,7 +3028,9 @@ class ContentRouter(Transform):
                     # Two-tier compression cache → shared helper
                     compressed_content, was_compressed = self._compress_block_content(
                         content=tool_content,
-                        content_key=hash(tool_content),
+                        content_key=hash(
+                            (tool_content, getattr(self, "_runtime_target_ratio", None))
+                        ),
                         context=context,
                         bias=bias,
                         min_ratio=min_ratio,
@@ -2904,7 +3073,9 @@ class ContentRouter(Transform):
                     # Two-tier compression cache → shared helper
                     compressed_content, _was_compressed = self._compress_block_content(
                         content=text_content,
-                        content_key=hash(text_content),
+                        content_key=hash(
+                            (text_content, getattr(self, "_runtime_target_ratio", None))
+                        ),
                         context=context,
                         bias=1.0,
                         min_ratio=min_ratio,

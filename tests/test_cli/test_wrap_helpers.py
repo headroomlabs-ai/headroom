@@ -522,6 +522,38 @@ class TestApplyProjectHeaderEnv:
 
         assert wrap_mod._project_name_from_cwd() == "vibe-headroom"
 
+    def test_non_ascii_cwd_name_is_percent_encoded(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Non-ASCII directory names must be percent-encoded for HTTP headers."""
+        project_dir = tmp_path / "第二大脑共享"
+        project_dir.mkdir()
+        monkeypatch.chdir(project_dir)
+
+        result = wrap_mod._project_name_from_cwd()
+        assert result is not None
+        # Must be pure ASCII so it's safe in an HTTP header value.
+        result.encode("ascii")
+        # Must round-trip back to the original name via unquote.
+        import urllib.parse
+
+        assert urllib.parse.unquote(result) == "第二大脑共享"
+
+    def test_non_ascii_cwd_header_is_ascii_safe(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """X-Headroom-Project header value must be ASCII when cwd has non-ASCII chars."""
+        project_dir = tmp_path / "test-中文-项目"
+        project_dir.mkdir()
+        monkeypatch.chdir(project_dir)
+
+        env: dict[str, str] = {}
+        wrap_mod._apply_project_header_env(env)
+
+        header_value = env["ANTHROPIC_CUSTOM_HEADERS"]
+        assert header_value.startswith("X-Headroom-Project: ")
+        header_value.encode("ascii")  # raises UnicodeEncodeError if non-ASCII
+
 
 # ---------------------------------------------------------------------------
 # Proxy-client reference counting

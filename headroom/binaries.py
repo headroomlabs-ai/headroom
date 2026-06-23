@@ -143,6 +143,24 @@ def detect_platform() -> PlatformKey:
 # ---------- Cache dir ----------------------------------------------------- #
 
 
+def _is_writable_dir(path: Path) -> bool:
+    try:
+        mode = path.stat().st_mode
+    except OSError:
+        return False
+    return path.is_dir() and bool(mode & 0o222)
+
+
+def _has_writable_existing_parent(path: Path) -> bool:
+    current = path
+    while not current.exists():
+        parent = current.parent
+        if parent == current:
+            return False
+        current = parent
+    return _is_writable_dir(current)
+
+
 def cache_dir() -> Path:
     override = os.environ.get("HEADROOM_BINARIES_CACHE")
     if override:
@@ -218,7 +236,11 @@ def _mirror_url(url: str) -> str:
 def _download(url: str, dest: Path, *, progress: bool = True) -> None:
     if os.environ.get("HEADROOM_BINARIES_OFFLINE"):
         raise OfflineError(f"offline mode (HEADROOM_BINARIES_OFFLINE=1) but fetch required: {url}")
+    if not _has_writable_existing_parent(dest.parent):
+        raise OSError(f"binary cache directory parent is not writable: {dest.parent}")
     dest.parent.mkdir(parents=True, exist_ok=True)
+    if not _is_writable_dir(dest.parent):
+        raise OSError(f"binary cache directory is not writable: {dest.parent}")
     final_url = _mirror_url(url)
     req = urllib.request.Request(final_url, headers={"User-Agent": "headroom-binaries/1"})
     try:
@@ -287,7 +309,11 @@ def _verify_sha256(path: Path, expected: str | None) -> None:
 
 def _extract(archive: Path, member: str, dest: Path) -> None:
     """Extract `member` from archive into `dest` (single-file binary)."""
+    if not _has_writable_existing_parent(dest.parent):
+        raise OSError(f"binary cache directory parent is not writable: {dest.parent}")
     dest.parent.mkdir(parents=True, exist_ok=True)
+    if not _is_writable_dir(dest.parent):
+        raise OSError(f"binary cache directory is not writable: {dest.parent}")
     name = archive.name.lower()
     try:
         if name.endswith(".tar.gz") or name.endswith(".tgz"):
@@ -452,6 +478,8 @@ def resolve(tool: str) -> Path:
 
 
 def ensure_tools(quiet: bool = False) -> dict[str, Path | None]:
+    if not _has_writable_existing_parent(cache_dir()):
+        return {name: which(name) for name in _registry().get("tools", {})}
     """Install every tool in the registry if missing. Safe to call repeatedly.
 
     Called at proxy startup and on first `headroom` CLI invocation so that no
