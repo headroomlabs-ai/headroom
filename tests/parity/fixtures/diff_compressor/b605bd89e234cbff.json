@@ -1,0 +1,26 @@
+{
+  "config": {
+    "always_keep_additions": true,
+    "always_keep_deletions": true,
+    "enable_ccr": true,
+    "max_context_lines": 2,
+    "max_files": 20,
+    "max_hunks_per_file": 10,
+    "min_lines_for_ccr": 50
+  },
+  "input": "diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@ -10,7 +10,7 @@\n unchanged_line_0\n unchanged_line_1\n unchanged_line_2\n unchanged_line_3\n unchanged_line_4\n-    let x = 1;\n+    let x = 2;\n unchanged_after_0\n unchanged_after_1\n unchanged_after_2\n unchanged_after_3\n unchanged_after_4\n# variant 3",
+  "input_sha256": "b605bd89e234cbff8b72d508c791f9ba0d263e929c3f0ad1263431486a8080f0",
+  "output": {
+    "additions": 0,
+    "cache_key": null,
+    "compressed": "diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@ -10,7 +10,7 @@\n unchanged_line_0\n unchanged_line_1\n unchanged_line_2\n unchanged_line_3\n unchanged_line_4\n-    let x = 1;\n+    let x = 2;\n unchanged_after_0\n unchanged_after_1\n unchanged_after_2\n unchanged_after_3\n unchanged_after_4\n# variant 3",
+    "compressed_line_count": 17,
+    "deletions": 0,
+    "files_affected": 0,
+    "hunks_kept": 0,
+    "hunks_removed": 0,
+    "original_line_count": 17
+  },
+  "recorded_at": "2026-04-23T23:51:37.349729+00:00",
+  "transform": "diff_compressor"
+}

@@ -1,0 +1,15 @@
+{
+  "config": {},
+  "input": "import os\nfrom typing import Any\n\n@dataclass\nclass Foo:\n    \"\"\"Docstring.\"\"\"\n    def bar(self):\n        return 42\n\ndef baz():\n    pass\n\nif __name__ == '__main__':\n    baz()\n",
+  "input_sha256": "5e8e1bc29f6c71c5b6523dc65f91a615b15e8bd27d633cbcd54293bbe43b6951",
+  "output": {
+    "confidence": 0.850909090909091,
+    "content_type": "source_code",
+    "metadata": {
+      "language": "python",
+      "pattern_matches": 8
+    }
+  },
+  "recorded_at": "2026-04-28T06:39:34.961138+00:00",
+  "transform": "content_detector"
+}

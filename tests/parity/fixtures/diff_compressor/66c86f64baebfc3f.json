@@ -1,0 +1,26 @@
+{
+  "config": {
+    "always_keep_additions": true,
+    "always_keep_deletions": true,
+    "enable_ccr": true,
+    "max_context_lines": 2,
+    "max_files": 20,
+    "max_hunks_per_file": 10,
+    "min_lines_for_ccr": 50
+  },
+  "input": "diff --cc cc_target.py\nindex abc..def..ghi\n--- a/cc_target.py\n+++ b/cc_target.py\n@@@ -1,3 -1,3 +1,4 @@@\n  ctx\n- removed_p1\n -removed_p2\n++added_in_merge\n  more_ctx\n\n# bugfix:diff-cc",
+  "input_sha256": "66c86f64baebfc3f802ce7a3ff7369889f2551f8895b735a08e0eeee86d7c3d9",
+  "output": {
+    "additions": 0,
+    "cache_key": null,
+    "compressed": "diff --cc cc_target.py\nindex abc..def..ghi\n--- a/cc_target.py\n+++ b/cc_target.py\n@@@ -1,3 -1,3 +1,4 @@@\n  ctx\n- removed_p1\n -removed_p2\n++added_in_merge\n  more_ctx\n\n# bugfix:diff-cc",
+    "compressed_line_count": 12,
+    "deletions": 0,
+    "files_affected": 0,
+    "hunks_kept": 0,
+    "hunks_removed": 0,
+    "original_line_count": 12
+  },
+  "recorded_at": "2026-04-26T04:02:31.295801+00:00",
+  "transform": "diff_compressor"
+}

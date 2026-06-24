@@ -1,0 +1,109 @@
+---
+title: Introduction
+description: Headroom is the context optimization layer for LLM applications. Compress tool outputs, DB results, file reads, and RAG results before they reach the model. Same answers, fraction of the tokens.
+---
+
+<StatsSection />
+
+Headroom compresses everything your AI agent reads -- tool outputs, database results, file reads, RAG retrievals, API responses -- before it reaches the LLM. The model sees less noise, responds faster, and costs less.
+
+## Quick preview
+
+<Tabs groupId="lang" items={['TypeScript', 'Python']}>
+<Tab value="TypeScript">
+```ts twoslash
+import { compress } from 'headroom-ai';
+
+const messages = [
+  { role: 'user' as const, content: 'Analyze these results' },
+];
+
+const result = await compress(messages, { model: 'gpt-4o' });
+console.log(`Saved ${result.tokensSaved} tokens (${(result.compressionRatio * 100).toFixed(0)}%)`);
+```
+</Tab>
+<Tab value="Python">
+```python
+from headroom import compress
+
+result = compress(messages, model="gpt-4o")
+response = client.messages.create(
+    model="gpt-4o",
+    messages=result.messages,
+)
+print(f"Saved {result.tokens_saved} tokens ({result.compression_ratio:.0%})")
+```
+</Tab>
+</Tabs>
+
+## Community stats
+
+<LiveStats />
+
+## What gets compressed
+
+| Content type | What happens | Typical savings |
+|---|---|---|
+| JSON arrays (tool outputs) | Statistical analysis keeps errors, anomalies, boundaries | 70--90% |
+| Source code | AST-aware compression preserves signatures, collapses bodies | 40--70% (opt-in; disabled by default) |
+| Build/test logs | Keeps failures and errors, drops passing noise | 80--95% |
+| Search results | Ranks by relevance, keeps top matches | 60--80% |
+| Plain text | ModernBERT token classification removes redundancy | 30--50% |
+| Git diffs | Preserves change hunks, drops unchanged context | 40--60% |
+| Images | ML router selects optimal resize/quality tradeoff | 40--90% |
+
+## Where Headroom fits
+
+```
+Your Agent / App
+    |
+    |  tool outputs, logs, DB reads, RAG results, file reads, API responses
+    v
+ Headroom  <-- proxy, Python library, TS SDK, or framework integration
+    |
+    v
+ LLM Provider  (OpenAI, Anthropic, Google, Bedrock, 100+ via LiteLLM)
+```
+
+Headroom works as a **transparent proxy** (zero code changes), a **Python function** (`compress()`), a **TypeScript function** (`compress()`), or a **framework integration** (LangChain, Agno, Strands, LiteLLM, Vercel AI SDK, MCP).
+
+## Real-world results
+
+**100 production log entries. One critical error buried at position 67.**
+
+| Metric | Baseline | Headroom |
+|---|---|---|
+| Input tokens | 10,144 | 1,260 |
+| Correct answers | **4/4** | **4/4** |
+
+87.6% fewer tokens. Same answer. The FATAL error was automatically preserved -- not by keyword matching, but by statistical analysis of field variance.
+
+| Scenario | Before | After | Savings |
+|---|---|---|---|
+| Code search (100 results) | 17,765 | 1,408 | **92%** |
+| SRE incident debugging | 65,694 | 5,118 | **92%** |
+| Codebase exploration | 78,502 | 41,254 | **47%** |
+| GitHub issue triage | 54,174 | 14,761 | **73%** |
+
+## Key Features
+
+<KeyFeatures />
+
+## Framework Integrations
+
+<FrameworkIntegrations />
+
+## Nothing is lost
+
+Compressed content goes into the CCR store (Compress-Cache-Retrieve). The LLM gets a `headroom_retrieve` tool and can fetch full originals when it needs more detail. Compression is aggressive but reversible.
+
+## Next steps
+
+<Cards>
+  <Card title="Quickstart" href="/docs/quickstart" />
+  <Card title="Installation" href="/docs/installation" />
+  <Card title="Proxy Server" href="/docs/proxy" />
+  <Card title="Vercel AI SDK" href="/docs/vercel-ai-sdk" />
+  <Card title="LangChain" href="/docs/langchain" />
+  <Card title="How Compression Works" href="/docs/how-compression-works" />
+</Cards>

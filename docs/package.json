@@ -1,0 +1,44 @@
+{
+	"name": "headroom-docs",
+	"version": "0.0.0",
+	"private": true,
+	"scripts": {
+		"build": "next build",
+		"dev": "next dev",
+		"start": "next start",
+		"types:check": "fumadocs-mdx && next typegen && tsc --noEmit",
+		"postinstall": "fumadocs-mdx"
+	},
+	"dependencies": {
+		"@radix-ui/react-slot": "1.3.0",
+		"class-variance-authority": "0.7.1",
+		"clsx": "2.1.1",
+		"dotted-map": "^3.1.0",
+		"fumadocs-core": "16.10.3",
+		"fumadocs-mdx": "15.0.12",
+		"fumadocs-twoslash": "^3.1.3",
+		"fumadocs-typescript": "^4.0.3",
+		"fumadocs-ui": "16.10.3",
+		"headroom-ai": "file:../sdk/typescript",
+		"lucide-react": "^1.7.0",
+		"next": "16.2.6",
+		"react": "^19.2.4",
+		"react-dom": "^19.2.4",
+		"recharts": "^3.8.1",
+		"tailwind-merge": "^3.5.0"
+	},
+	"devDependencies": {
+		"@ai-sdk/openai": "^3.0.51",
+		"@anthropic-ai/sdk": "^0.82.0",
+		"@tailwindcss/postcss": "^4.2.2",
+		"@types/mdx": "^2.0.13",
+		"@types/node": "^25.5.0",
+		"@types/react": "^19.2.14",
+		"@types/react-dom": "^19.2.3",
+		"ai": "^6.0.149",
+		"openai": "^6.33.0",
+		"postcss": "^8.5.13",
+		"tailwindcss": "^4.2.2",
+		"typescript": "^5.9.3"
+	}
+}

@@ -1,0 +1,196 @@
+---
+title: Reversible Compression (CCR)
+description: Compress-Cache-Retrieve architecture that makes compression lossless — the LLM can always get the original data back.
+---
+
+Headroom's CCR (Compress-Cache-Retrieve) architecture makes compression **reversible**. When content is compressed, the original data is cached locally. If the LLM needs the full data, it retrieves it instantly.
+
+<Callout type="info" title="Nothing is ever thrown away">
+  Unlike traditional lossy compression, CCR guarantees that every piece of original data remains accessible. You get 70-90% token savings with zero risk of permanent data loss.
+</Callout>
+
+## The problem with traditional compression
+
+Traditional compression forces a difficult tradeoff:
+
+- **Aggressive compression** risks losing data the LLM needs
+- **Conservative compression** misses out on token savings
+
+CCR eliminates this tradeoff entirely. Compress aggressively, retrieve on demand.
+
+## Architecture
+
+CCR flows through four phases:
+
+```
+TOOL OUTPUT (1000 items)
+  -> SmartCrusher compresses to 20 items
+  -> Original cached with hash=abc123
+  -> Retrieval tool injected into context
+
+LLM PROCESSING
+  Option A: LLM solves task with 20 items -> Done (90% savings)
+  Option B: LLM calls headroom_retrieve(hash=abc123)
+            -> Response Handler returns full data automatically
+```
+
+## Phase 1: Compression Store
+
+When SmartCrusher compresses tool output:
+
+1. The original content is stored in an LRU cache
+2. A hash key is generated for retrieval
+3. A marker is added to the compressed output:
+
+```
+[1000 items compressed to 20. Retrieve more: hash=abc123]
+```
+
+## Phase 2: Tool Injection
+
+Headroom injects a `headroom_retrieve` tool into the LLM's available tools:
+
+```json
+{
+  "name": "headroom_retrieve",
+  "description": "Retrieve original uncompressed data from Headroom cache",
+  "parameters": {
+    "hash": "The hash key from the compression marker",
+    "query": "Optional: search within the cached data"
+  }
+}
+```
+
+The LLM sees this tool alongside your application's tools and can call it whenever the compressed data is insufficient.
+
+## Phase 3: Response Handler
+
+When the LLM calls `headroom_retrieve`:
+
+1. The Response Handler intercepts the tool call
+2. Data is retrieved from the local cache (around 1ms)
+3. The result is added to the conversation
+4. The API call continues automatically
+
+The client never sees CCR tool calls -- they are handled transparently by Headroom.
+
+## Phase 4: Context Tracker
+
+Across multiple turns, the Context Tracker maintains awareness of all compressed content:
+
+1. Remembers what was compressed in earlier turns
+2. Analyzes new queries for relevance to compressed content
+3. Proactively expands relevant data before the LLM asks
+
+```
+Turn 1: User searches for files
+        -> 500 files compressed to 15, cached (hash=abc123)
+        -> LLM answers with 15 files
+
+Turn 5: User asks "What about the auth middleware?"
+        -> Context Tracker detects "auth" may match cached content
+        -> Proactively expands compressed data
+        -> LLM finds auth_middleware.py in the full list
+```
+
+## BM25 search within compressed data
+
+The LLM does not have to retrieve everything. It can search within compressed data using the optional `query` parameter:
+
+```json
+{
+  "name": "headroom_retrieve",
+  "parameters": {
+    "hash": "abc123",
+    "query": "authentication errors"
+  }
+}
+```
+
+This runs a BM25 search over the cached items, returning only the relevant subset instead of the full original payload.
+
+## Retrieving originals
+
+CCR works automatically through the proxy, but you can also retrieve cached data programmatically:
+
+<Tabs groupId="lang" items={['TypeScript', 'Python']}>
+<Tab value="TypeScript">
+```ts twoslash
+import { compress } from "headroom-ai";
+import type { CCRConfig } from "headroom-ai";
+
+// CCR is enabled by default when compressing through the proxy.
+const result = await compress(messages, {
+  model: "gpt-4o",
+});
+
+// Access compressed messages — CCR markers are embedded automatically
+console.log(result.messages);
+
+// CCR configuration options
+const ccrConfig: CCRConfig = {
+  enabled: true,
+  injectTool: true,             // Inject headroom_retrieve tool
+  injectRetrievalMarker: true,  // Add retrieval markers to compressed output
+  feedbackEnabled: true,        // Learn from retrieval patterns
+  storeMaxEntries: 1000,        // Max cached items
+  storeTtlSeconds: 3600,        // Cache TTL
+};
+```
+</Tab>
+<Tab value="Python">
+```python
+from headroom import HeadroomClient, OpenAIProvider
+from openai import OpenAI
+
+client = HeadroomClient(
+    original_client=OpenAI(),
+    provider=OpenAIProvider(),
+    default_mode="optimize",
+)
+
+# CCR happens automatically during chat completions.
+# The LLM calls headroom_retrieve when it needs more data.
+response = client.chat.completions.create(
+    model="gpt-4o",
+    messages=messages,
+)
+
+# CCR is enabled by default in the current proxy path. Use --no-optimize for
+# full passthrough behavior.
+```
+</Tab>
+</Tabs>
+
+## Retention
+
+Proxy CCR originals are kept for 300 seconds by default. For longer autonomous
+agent runs, set `HEADROOM_CCR_TTL_SECONDS` before starting the proxy:
+
+```bash
+HEADROOM_CCR_TTL_SECONDS=7200 headroom proxy
+```
+
+Check the effective setting at `/v1/retrieve/stats` under
+`store.default_ttl_seconds`.
+
+## Message-level CCR
+
+> **Retired:** The "Message-level CCR via IntelligentContext" feature (where `IntelligentContext` would store dropped messages in CCR with a retrieval marker) was part of the `IntelligentContextConfig` API that was removed in 0.9.x. Context management is now handled automatically by the pipeline without a separate configurable IntelligentContext stage. Tool-output CCR via SmartCrusher and ContentRouter remains fully supported.
+
+## CCR-enabled components
+
+| Component | What it compresses | CCR integration |
+|---|---|---|
+| **SmartCrusher** | JSON arrays (tool outputs) | Stores original array, marker includes hash |
+| **ContentRouter** | Code, logs, search results, text | Stores original content by strategy |
+
+## Why CCR matters
+
+| Approach | Risk | Savings |
+|---|---|---|
+| No compression | None | 0% |
+| Traditional compression | Data loss | 70-90% |
+| CCR compression | None (reversible) | 70-90% |
+
+CCR gives you the savings of aggressive compression with zero risk. The LLM can always retrieve the original data if needed.

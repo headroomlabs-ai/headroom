@@ -1,0 +1,150 @@
+---
+title: Benchmarks
+description: Compression performance, accuracy preservation, latency overhead, and real-world production telemetry from 250+ Headroom proxy instances.
+---
+
+Headroom's core promise: compress context without losing accuracy. This page covers compression benchmarks, accuracy evaluations, latency overhead, and production telemetry.
+
+## Compression Performance
+
+Tested on Apple M-series (CPU), Headroom v0.5.18. Each test runs `compress()` on realistic tool outputs.
+
+| Content Type | Original | Compressed | Saved | Ratio | Latency |
+|---|---|---|---|---|---|
+| JSON array (100 items) | 3,163 | 297 | 2,866 | **90.6%** | 1ms |
+| JSON array (500 items) | 9,526 | 1,614 | 7,912 | **83.1%** | 2ms |
+| Shell output (200 lines) | 3,238 | 469 | 2,769 | **85.5%** | 1ms |
+| Build log (200 lines) | 2,412 | 148 | 2,264 | **93.9%** | 1ms |
+| grep results (150 hits) | 2,624 | 2,624 | 0 | 0.0% | &lt;1ms |
+| Python source (~480 lines) | 2,958 | 2,958 | 0 | 0.0% | &lt;1ms |
+| **Total** | **23,921** | **8,110** | **15,811** | **66.1%** | **5ms** |
+
+<Callout type="info" title="Zero compression is intentional">
+grep results and Python source show 0% compression. These are already compact structured formats. SmartCrusher only compresses JSON arrays; code passes through to preserve correctness.
+</Callout>
+
+## Accuracy Benchmarks
+
+### HTML Extraction
+
+**Dataset**: Scrapinghub Article Extraction Benchmark (181 HTML pages with ground truth)
+
+| Metric | Value |
+|---|---|
+| **F1 Score** | 0.919 |
+| **Precision** | 0.879 |
+| **Recall** | 0.982 |
+| **Compression** | 94.9% |
+
+For LLM applications, recall is critical -- 98.2% means nearly all article content is preserved. The slight precision drop (some extra content) does not hurt LLM accuracy.
+
+### JSON Compression (SmartCrusher)
+
+**Test**: 100 production log entries with critical error at position 67. Task: find the error, error code, resolution, and affected count.
+
+| Metric | Baseline | Headroom |
+|---|---|---|
+| Input tokens | 10,144 | 1,260 |
+| Correct answers | 4/4 | **4/4** |
+| Compression | -- | **87.6%** |
+
+SmartCrusher preserves first N items (schema), last N items (recency), all anomalies (errors, warnings), and statistical distribution.
+
+### QA Accuracy Preservation
+
+| Metric | Original HTML | Extracted | Delta |
+|---|---|---|---|
+| F1 Score | 0.85 | 0.87 | +0.02 |
+| Exact Match | 60% | 62% | +2% |
+
+<Callout type="info" title="Extraction can improve accuracy">
+Removing HTML noise sometimes helps LLMs focus on relevant content, leading to slightly higher scores on extraction benchmarks.
+</Callout>
+
+## Latency Overhead
+
+### SDK Compression Latency
+
+Measured per-scenario on Apple M-series (CPU):
+
+| Scenario | Tokens In | Tokens Out | Saved | p50 (ms) | p95 (ms) |
+|----------|-----------|------------|-------|----------|----------|
+| JSON: Search Results (100 items) | 10.2K | 1.5K | 8.7K | 189 | 231 |
+| JSON: Search Results (500 items) | 50.2K | 1.5K | 48.7K | 943 | 955 |
+| JSON: Search Results (1K items) | 100.5K | 1.5K | 99.0K | 2,012 | 2,198 |
+| JSON: API Responses (500 items) | 38.9K | 1.1K | 37.8K | 743 | 776 |
+| JSON: Database Rows (1K rows) | 43.7K | 605 | 43.1K | 961 | 1,104 |
+| JSON: String Array (100 strings) | 1.1K | 231 | 820 | 15 | 15 |
+| JSON: String Array (500 strings) | 4.9K | 233 | 4.6K | 72 | 80 |
+| JSON: Number Array (200 numbers) | 1.2K | 192 | 1.1K | 31 | 62 |
+| JSON: Mixed Array (250 items) | 2.3K | 368 | 1.9K | 38 | 40 |
+
+### Cost-Benefit Analysis
+
+Net latency benefit = LLM time saved from fewer tokens minus compression overhead (at Claude Sonnet pricing, $3.0/MTok):
+
+| Scenario | Compress (ms) | LLM Saved (ms) | Net Benefit | Savings per 1K Requests |
+|----------|---------------|-----------------|-------------|------------------------|
+| JSON: Search Results (100 items) | 189 | 261 | **+72ms** | $26 |
+| JSON: Search Results (500 items) | 943 | 1,461 | **+518ms** | $146 |
+| JSON: Search Results (1K items) | 2,012 | 2,969 | **+957ms** | $297 |
+| JSON: API Responses (500 items) | 743 | 1,134 | **+391ms** | $113 |
+| JSON: Database Rows (1K rows) | 961 | 1,292 | **+331ms** | $129 |
+
+Compression pays for itself in latency for 11 of 12 tested scenarios against Claude Sonnet. Slower and more expensive models (Opus) benefit even more.
+
+### Pipeline Step Timing
+
+| Step | Median | P90 | Description |
+|------|--------|-----|-------------|
+| `pipeline_total` | 16.9ms | 289ms | Full compression pipeline |
+| `content_router` | 11.7ms | 259ms | Content detection + routing |
+| `smart_crusher` | 50.1ms | 50ms | JSON array compression |
+| `text_compressor` | 32.0ms | 576ms | Text compression (Kompress ONNX) |
+| `initial_token_count` | 2.9ms | 16ms | Token counting (tiktoken) |
+
+ContentRouter accounts for 91--98% of pipeline cost on average. CacheAligner and RollingWindow are sub-millisecond.
+
+## Production Telemetry
+
+Real-world data from **50,000+ proxy sessions** across 250+ unique instances (March--April 2026). Collected via anonymous telemetry (opt-in: `HEADROOM_TELEMETRY=on`; telemetry is off by default).
+
+### Proxy Overhead
+
+| Percentile | Latency |
+|---|---|
+| **Median (P50)** | **52ms** |
+| P90 | 309ms |
+| P99 | 4,172ms |
+| Mean | 161ms |
+
+The median 52ms overhead is negligible compared to LLM inference time (typically 2--10 seconds).
+
+### Compression Rate
+
+| Percentile | Compression |
+|---|---|
+| P25 | 4.8% |
+| **Median** | **4.8%** |
+| P75 | 6.9% |
+| Mean | 11.3% |
+
+Median compression is modest because many requests are short conversational turns. Heavy tool-use sessions (file reads, shell output) see 40--80% compression.
+
+### Fleet Summary
+
+| Metric | Value |
+|---|---|
+| Clean instances | 249 |
+| Total tokens saved | 1.4 billion |
+| Total savings | ~$4,000 |
+| OS distribution | Linux 57%, macOS 38%, Windows 5% |
+
+## Reproducing Results
+
+```bash
+git clone https://github.com/chopratejas/headroom.git
+cd headroom
+pip install -e ".[evals,html]"
+pytest tests/test_evals/ -v -s
+```

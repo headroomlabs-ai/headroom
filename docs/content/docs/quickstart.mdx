@@ -1,0 +1,240 @@
+---
+title: Quickstart
+description: Get Headroom running in 5 minutes. Install, compress, and send to your LLM with fewer tokens.
+---
+
+This guide gets you from zero to compressed LLM calls in under 5 minutes.
+
+## 1. Install
+
+<Tabs groupId="lang" items={['TypeScript', 'Python']}>
+<Tab value="TypeScript">
+```bash
+npm install headroom-ai
+```
+</Tab>
+<Tab value="Python">
+```bash
+pip install "headroom-ai[all]"
+```
+</Tab>
+</Tabs>
+
+<Callout type="info" title="TypeScript SDK requires the proxy">
+The TypeScript SDK sends messages to a local Headroom proxy for compression. Start the proxy before using the TS SDK:
+
+```bash
+pip install "headroom-ai[proxy]"
+headroom proxy --port 8787
+```
+
+The proxy runs the compression pipeline (Python) and exposes an HTTP API that the TS SDK calls.
+</Callout>
+
+## 2. Compress messages
+
+<Tabs groupId="lang" items={['TypeScript', 'Python']}>
+<Tab value="TypeScript">
+```ts twoslash
+import { compress } from 'headroom-ai';
+
+const messages = [
+  { role: 'system' as const, content: 'You analyze search results.' },
+  { role: 'user' as const, content: 'Search for Python tutorials.' },
+  {
+    role: 'assistant' as const,
+    content: null,
+    tool_calls: [{
+      id: 'call_1',
+      type: 'function' as const,
+      function: { name: 'search', arguments: '{"q": "python"}' },
+    }],
+  },
+  {
+    role: 'tool' as const,
+    tool_call_id: 'call_1',
+    content: JSON.stringify({
+      results: Array.from({ length: 500 }, (_, i) => ({
+        title: `Result ${i}`,
+        snippet: `Description ${i}`,
+        score: 100 - i,
+      })),
+    }),
+  },
+  { role: 'user' as const, content: 'What are the top 3 results?' },
+];
+
+const result = await compress(messages, {
+  model: 'gpt-4o',
+  baseUrl: 'http://localhost:8787',
+});
+```
+</Tab>
+<Tab value="Python">
+```python
+from headroom import compress
+import json
+
+messages = [
+    {"role": "system", "content": "You analyze search results."},
+    {"role": "user", "content": "Search for Python tutorials."},
+    {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [{
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "search", "arguments": '{"q": "python"}'},
+        }],
+    },
+    {
+        "role": "tool",
+        "tool_call_id": "call_1",
+        "content": json.dumps({
+            "results": [
+                {"title": f"Result {i}", "snippet": f"Description {i}", "score": 100 - i}
+                for i in range(500)
+            ]
+        }),
+    },
+    {"role": "user", "content": "What are the top 3 results?"},
+]
+
+result = compress(messages, model="gpt-4o")
+```
+</Tab>
+</Tabs>
+
+## 3. Send to your LLM
+
+Use the compressed messages exactly like the originals:
+
+<Tabs groupId="lang" items={['TypeScript', 'Python']}>
+<Tab value="TypeScript">
+```ts twoslash
+import OpenAI from 'openai';
+
+const client = new OpenAI();
+
+// result.messages from the previous step
+const messages: any[] = [];
+
+const response = await client.chat.completions.create({
+  model: 'gpt-4o',
+  messages,
+});
+
+console.log(response.choices[0].message.content);
+```
+</Tab>
+<Tab value="Python">
+```python
+from openai import OpenAI
+
+client = OpenAI()
+response = client.chat.completions.create(
+    model="gpt-4o",
+    messages=result.messages,
+)
+
+print(response.choices[0].message.content)
+```
+</Tab>
+</Tabs>
+
+## 4. Check your savings
+
+<Tabs groupId="lang" items={['TypeScript', 'Python']}>
+<Tab value="TypeScript">
+```ts twoslash
+const result = {
+  tokensBefore: 45000,
+  tokensAfter: 4500,
+  tokensSaved: 40500,
+  compressionRatio: 0.9,
+  transformsApplied: ['smart_crusher', 'cache_aligner'],
+  messages: [],
+  ccrHashes: [],
+  compressed: true,
+};
+// ---cut---
+console.log(`Tokens before: ${result.tokensBefore}`);
+console.log(`Tokens after:  ${result.tokensAfter}`);
+console.log(`Tokens saved:  ${result.tokensSaved}`);
+console.log(`Compression:   ${(result.compressionRatio * 100).toFixed(0)}%`);
+console.log(`Transforms:    ${result.transformsApplied.join(', ')}`);
+```
+
+Example output:
+
+```
+Tokens before: 45000
+Tokens after:  4500
+Tokens saved:  40500
+Compression:   90%
+Transforms:    smart_crusher, cache_aligner
+```
+</Tab>
+<Tab value="Python">
+```python
+print(f"Tokens before: {result.tokens_before}")
+print(f"Tokens after:  {result.tokens_after}")
+print(f"Tokens saved:  {result.tokens_saved}")
+print(f"Compression:   {result.compression_ratio:.0%}")
+print(f"Transforms:    {result.transforms_applied}")
+```
+
+Example output:
+
+```
+Tokens before: 45000
+Tokens after:  4500
+Tokens saved:  40500
+Compression:   90%
+Transforms:    ['smart_crusher', 'cache_aligner']
+```
+</Tab>
+</Tabs>
+
+## Alternative: proxy mode (zero code changes)
+
+If you do not want to change any code, run Headroom as a proxy and point your existing client at it:
+
+```bash
+# Start the proxy
+headroom proxy --port 8787
+
+# Point Claude Code at it
+ANTHROPIC_BASE_URL=http://localhost:8787 claude
+
+# Or any OpenAI-compatible client
+OPENAI_BASE_URL=http://localhost:8787/v1 your-app
+```
+
+All requests flow through Headroom automatically. Check savings at any time:
+
+```bash
+curl http://localhost:8787/stats
+# {"requests_total": 42, "tokens_saved_total": 125000, ...}
+```
+
+## What gets compressed
+
+The biggest savings come from tool outputs -- search results, database rows, log files, API responses. Headroom auto-detects the content type and routes it to the best compressor. No configuration needed.
+
+| Content type | Compressor | Typical savings |
+|---|---|---|
+| JSON arrays | SmartCrusher | 70--90% |
+| Source code | CodeCompressor | 40--70% |
+| Build/test logs | LogCompressor | 80--95% |
+| Search results | SearchCompressor | 60--80% |
+| Plain text | Kompress | 30--50% |
+
+## Next steps
+
+<Cards>
+  <Card title="Installation" href="/docs/installation" />
+  <Card title="Proxy Server" href="/docs/proxy" />
+  <Card title="How Compression Works" href="/docs/how-compression-works" />
+  <Card title="Configuration" href="/docs/configuration" />
+</Cards>

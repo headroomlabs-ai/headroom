@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Service Label: Must match the filename -->
+    <key>Label</key>
+    <string>com.headroom.proxy</string>
+
+    <!-- Program to run: REPLACE __HEADROOM_PATH__ with actual headroom location -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HEADROOM_PATH__</string>
+        <string>proxy</string>
+        <string>--host</string>
+        <string>127.0.0.1</string>
+        <string>--port</string>
+        <string>__PORT__</string>
+    </array>
+
+    <!-- Environment Variables -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- Default port: 8787 (can be overridden by install script) -->
+        <key>HEADROOM_PROXY_PORT</key>
+        <string>__PORT__</string>
+
+        <!-- ANTHROPIC_API_KEY should be set in your shell environment -->
+        <!-- or uncomment and set here: -->
+        <!-- <key>ANTHROPIC_API_KEY</key> -->
+        <!-- <string>your-api-key-here</string> -->
+
+        <!-- Optional: Enable LLMLingua compression (requires llmlingua extra) -->
+        <!-- <key>HEADROOM_COMPRESSION_PROVIDER</key> -->
+        <!-- <string>llmlingua</string> -->
+    </dict>
+
+    <!-- Working Directory: REPLACE __HOME__ with user's home directory -->
+    <key>WorkingDirectory</key>
+    <string>__HOME__</string>
+
+    <!-- Standard Output Log: REPLACE __HOME__ with user's home directory -->
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/headroom/proxy.log</string>
+
+    <!-- Standard Error Log: REPLACE __HOME__ with user's home directory -->
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/headroom/proxy-error.log</string>
+
+    <!-- Keep the service running (restart on crash) -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Start the service when the user logs in -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Process Type: Adaptive (allows for background processing) -->
+    <key>ProcessType</key>
+    <string>Adaptive</string>
+
+    <!-- Throttle Interval: Wait 10 seconds between restart attempts -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+</dict>
+</plist>

@@ -1,0 +1,312 @@
+---
+title: Proxy Server
+description: Run the Headroom proxy to compress LLM traffic for any client — Claude Code, Cursor, OpenAI SDK, or custom apps.
+---
+
+The Headroom proxy is a standalone HTTP server that compresses all LLM traffic passing through it. Point any client at the proxy and get automatic context optimization.
+
+## Starting the proxy
+
+```bash
+# Basic usage
+headroom proxy
+
+# Custom host and port
+headroom proxy --host 0.0.0.0 --port 8080
+
+# With logging and budget
+headroom proxy \
+  --log-file /var/log/headroom.jsonl \
+  --budget 100.0
+```
+
+Telemetry is **off by default** (opt-in). Opt in with `HEADROOM_TELEMETRY=on` or `--telemetry`.
+
+## CLI options
+
+### Core
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--host` | `127.0.0.1` | Host to bind to |
+| `--port` | `8787` | Port to bind to |
+| `--workers` | `1` | Number of Uvicorn worker processes |
+| `--limit-concurrency` | `1000` | Maximum concurrent connections before Uvicorn returns 503 |
+| `--max-connections` | `500` | Maximum upstream HTTP connections |
+| `--max-keepalive` | `100` | Maximum upstream keep-alive connections |
+| `--mode` | `token` | Optimization mode: `token` prioritizes compression, `cache` preserves provider prefix-cache stability |
+| `--no-optimize` | `false` | Disable optimization (passthrough mode) |
+| `--no-cache` | `false` | Disable semantic caching |
+| `--no-rate-limit` | `false` | Disable rate limiting |
+| `--log-file` | None | Path to JSONL log file |
+| `--log-messages` | `false` | Store full request/response content for the live feed |
+| `--budget` | None | Daily budget limit in USD |
+| `--openai-api-url` | `https://api.openai.com` | Custom OpenAI API URL |
+| `--anthropic-api-url` | Anthropic default | Custom Anthropic API URL |
+| `--gemini-api-url` | Gemini default | Custom Gemini API URL |
+| `--backend` | `anthropic` | Backend: `anthropic`, `bedrock`, `openrouter`, `anyllm`, or `litellm-<provider>` |
+| `--bedrock-api-url` | None | Bedrock InvokeModel upstream for the `/model/{id}/invoke` passthrough routes (see [Bedrock via a local gateway](#bedrock-via-a-local-gateway)) |
+| `--telemetry` | `false` | Opt in to anonymous telemetry (off by default) |
+| `--no-telemetry` | `false` | Force anonymous telemetry off (already the default) |
+| `--stateless` | `false` | Disable filesystem writes and keep runtime state in memory |
+
+### Context management
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--mode token` | `token` | Prioritize token compression. This is the default. |
+| `--mode cache` | `token` | Preserve prior turns to maximize provider prefix-cache hit rate. |
+| `--intercept-tool-results` | `false` | Opt into tool-result interceptors such as ast-grep Read outlining. |
+| `--no-read-lifecycle` | `false` | Disable stale/superseded Read-output compression. |
+| `--code-aware` / `--no-code-aware` | disabled | Enable or disable AST-based code compression. Requires `headroom-ai[code]`. |
+| `--code-graph` | `false` | Index the current project and watch files via codebase-memory-mcp. |
+
+By default, the proxy uses the shared **ContentRouter** pipeline. It routes text, logs, JSON, code, images, and tool outputs through the currently enabled compressors and preserves reversible CCR markers where applicable.
+
+```bash
+# Maximize compression
+headroom proxy --mode token
+
+# Preserve provider prefix cache stability
+headroom proxy --mode cache
+```
+
+### Optional features
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--memory` | `false` | Enable persistent user memory and provider-appropriate memory tools |
+| `--memory-db-path` | `{cwd}/.headroom/memory.db` | Override the memory SQLite path |
+| `--no-memory-tools` | `false` | Disable automatic memory tool injection |
+| `--no-memory-context` | `false` | Disable automatic memory context injection |
+| `--memory-top-k` | `10` | Number of memories to inject as context |
+| `--learn` | `false` | Enable live traffic learning; implies `--memory` |
+| `--no-learn` | `false` | Explicitly disable traffic learning |
+| `--min-evidence` | `5` | Minimum observations before a learned pattern is persisted |
+| `--codex-wire-debug` | `false` | Write local Codex wire snapshots and matching proxy log traces |
+
+```bash
+headroom proxy --memory
+headroom proxy --learn --min-evidence 3
+headroom proxy --codex-wire-debug
+```
+
+<Callout type="info" title="LLMLingua removed from the proxy CLI">
+The old LLMLingua proxy toggles are no longer part of the CLI. Headroom's proxy compression path uses ContentRouter plus the current built-in compressors, including Kompress where applicable.
+</Callout>
+
+## API endpoints
+
+### `GET /health`
+
+```bash
+curl http://localhost:8787/health
+```
+
+```json
+{
+  "status": "healthy",
+  "optimize": true,
+  "stats": {
+    "total_requests": 42,
+    "tokens_saved": 15000,
+    "savings_percent": 45.2
+  }
+}
+```
+
+### `GET /stats`
+
+Live session statistics plus durable `persistent_savings` totals. Stored at `~/.headroom/proxy_savings.json` (override with `HEADROOM_SAVINGS_PATH`).
+
+```bash
+curl http://localhost:8787/stats
+```
+
+### `GET /stats-history`
+
+Durable history with hourly, daily, weekly, and monthly rollups. Powers the `/dashboard` view.
+
+```bash
+curl http://localhost:8787/stats-history
+curl "http://localhost:8787/stats-history?format=csv&series=weekly"
+```
+
+### `GET /metrics`
+
+Prometheus-format metrics for monitoring.
+
+```bash
+curl http://localhost:8787/metrics
+```
+
+```
+headroom_requests_total{mode="optimize"} 1234
+headroom_tokens_saved_total 5678900
+headroom_compression_ratio_bucket{le="0.5"} 890
+headroom_latency_seconds_bucket{le="0.01"} 800
+headroom_cache_hits_total 456
+```
+
+### `POST /v1/messages`
+
+Anthropic API format. The proxy compresses messages, forwards to Anthropic, and returns the response.
+
+### `POST /v1/chat/completions`
+
+OpenAI API format. The proxy compresses messages, forwards to OpenAI, and returns the response.
+
+### `POST /v1/responses`
+
+OpenAI Responses API format. The proxy compresses `input` payloads where applicable, forwards the request, and returns the response.
+
+For Codex-compatible clients, the proxy also accepts these alias paths and routes them through the same handler:
+- `POST /v1/codex/responses`
+- `POST /backend-api/responses`
+- `POST /backend-api/codex/responses`
+
+Matching WebSocket and subpath aliases are also supported for Codex flows.
+
+### `POST /v1internal:streamGenerateContent`
+
+Google Cloud Code Assist / Antigravity compatibility endpoint used by Pi-style `google-gemini-cli` and `google-antigravity` providers.
+
+The proxy also accepts:
+- `POST /v1/v1internal:streamGenerateContent`
+
+### `POST /v1/compress`
+
+Compression-only endpoint. Compresses messages without calling any LLM. Used by the TypeScript SDK.
+
+**Request:**
+```json
+{
+  "messages": [{ "role": "user", "content": "..." }],
+  "model": "gpt-4o"
+}
+```
+
+**Response:**
+```json
+{
+  "messages": [{ "role": "user", "content": "..." }],
+  "tokens_before": 15000,
+  "tokens_after": 3500,
+  "tokens_saved": 11500,
+  "compression_ratio": 0.23,
+  "transforms_applied": ["router:smart_crusher:0.35"],
+  "ccr_hashes": ["a1b2c3"]
+}
+```
+
+Set `x-headroom-bypass: true` to skip compression.
+
+## Agent wrapping
+
+Use `headroom wrap` to transparently proxy any CLI tool:
+
+```bash
+# Claude Code
+headroom wrap claude
+
+# OpenAI Codex
+headroom wrap codex
+
+# Aider
+headroom wrap aider
+
+# Cursor
+headroom wrap cursor
+```
+
+Or set the base URL manually:
+
+```bash
+# Claude Code
+ANTHROPIC_BASE_URL=http://localhost:8787 claude
+
+# Cursor / any OpenAI-compatible client
+OPENAI_BASE_URL=http://localhost:8787/v1 cursor
+```
+
+## Cloud providers
+
+```bash
+# AWS Bedrock
+headroom proxy --backend bedrock --region us-east-1
+
+# Google Vertex AI
+headroom proxy --backend vertex_ai --region us-central1
+
+# Azure OpenAI
+headroom proxy --backend azure
+
+# OpenRouter (400+ models)
+OPENROUTER_API_KEY=sk-or-... headroom proxy --backend openrouter
+```
+
+### Bedrock via a local gateway
+
+`--backend bedrock` accepts **Anthropic** input (`/v1/messages`) and re-signs to AWS. Some setups are the other way around: the client already speaks **Bedrock** (e.g. Claude Code with `CLAUDE_CODE_USE_BEDROCK=1`, or any AWS SDK pointed at a custom endpoint), sending `POST /model/{id}/invoke` to a local gateway that re-signs and forwards to AWS (LiteLLM, LocalStack, a corporate Bedrock proxy).
+
+`--bedrock-api-url` lets Headroom sit in that chain. It registers passthrough routes for `/model/{id}/invoke` and `/model/{id}/invoke-with-response-stream`, compresses the request body with the same pipeline as `/v1/messages`, and forwards to the gateway:
+
+```bash
+headroom proxy --bedrock-api-url http://127.0.0.1:4000
+# then point the client's Bedrock endpoint at Headroom:
+AWS_ENDPOINT_URL_BEDROCK_RUNTIME=http://127.0.0.1:8787 your-bedrock-client
+```
+
+The routes are registered **only** when `--bedrock-api-url` (or `BEDROCK_TARGET_API_URL`) is set — otherwise Bedrock requests fall through unchanged.
+
+<Callout type="warn">
+Rewriting the request body invalidates the caller's **SigV4** signature (it covers a hash of the body). Point `--bedrock-api-url` at a gateway that re-signs or does not verify the inbound signature — **never raw AWS**, which would reject the request with 403. For direct-to-AWS compression, use `--backend bedrock` (which re-signs). The two are complementary.
+</Callout>
+
+## Environment variables
+
+```bash
+export HEADROOM_HOST=0.0.0.0
+export HEADROOM_PORT=8787
+export HEADROOM_BUDGET=100.0
+
+# Route OpenAI passthrough requests to a custom endpoint
+export OPENAI_TARGET_API_URL=https://custom.openai.endpoint.com
+
+# Route Anthropic passthrough requests to a custom endpoint
+export ANTHROPIC_TARGET_API_URL=https://litellm.company.internal
+
+# Compress Bedrock InvokeModel traffic, forwarding to a re-signing gateway
+export BEDROCK_TARGET_API_URL=http://127.0.0.1:4000
+
+headroom proxy
+```
+
+## Production deployment
+
+### gunicorn
+
+```bash
+pip install gunicorn
+
+gunicorn headroom.proxy.server:app \
+  --workers 4 \
+  --bind 0.0.0.0:8787 \
+  --worker-class uvicorn.workers.UvicornWorker
+```
+
+### Docker
+
+```dockerfile
+FROM python:3.11-slim
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential \
+    && pip install "headroom-ai[proxy]" \
+    && apt-get purge -y build-essential && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/*
+EXPOSE 8787
+CMD ["headroom", "proxy", "--host", "0.0.0.0"]
+```
+
+<Callout type="info" title="Build dependencies">
+`build-essential` is required at install time because `headroom-ai` includes `hnswlib`, a C++ extension compiled from source. It is removed after installation to keep the image slim.
+</Callout>

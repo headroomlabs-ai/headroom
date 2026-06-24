@@ -1,0 +1,12 @@
+{
+  "config": {},
+  "input": "<p>just one tag</p>",
+  "input_sha256": "7e145153192c11a1b2ffc574059deaf3990e1cb6c83f85b6c5ed0a2bfdb93ab5",
+  "output": {
+    "confidence": 0.5,
+    "content_type": "text",
+    "metadata": {}
+  },
+  "recorded_at": "2026-04-28T06:39:34.960430+00:00",
+  "transform": "content_detector"
+}

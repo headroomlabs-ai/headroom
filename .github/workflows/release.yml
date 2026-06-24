@@ -1,0 +1,963 @@
+name: Release
+
+# ─── Package Registry Configuration ────────────────────────────────────────────
+# Edit these constants to change package names, environments, and registries.
+# All values are referenced via ${{ env.VAR }} throughout the workflow.
+env:
+  # PyPI
+  PYPI_PACKAGE: headroom-ai
+  PYPI_ENVIRONMENT: pypi
+
+  # npm (npmjs.org)
+  NPM_REGISTRY_URL: https://registry.npmjs.org
+  NPM_SDK_PACKAGE: headroom-ai
+  NPM_OPENCLAW_PACKAGE: headroom-openclaw
+
+  # GitHub Package Registry
+  GITHUB_PACKAGES_REGISTRY_URL: https://npm.pkg.github.com
+
+  # ─── Safety Gates ──────────────────────────────────────────────────────────────
+  # Set to 'true' to skip a publish target (e.g., when tokens are not configured).
+  # In GitHub: repo Settings → Variables → Actions Variables → New repository variable.
+  # Locally via act: pass -e event.yml or set in .actrc.local (see .actrc.example).
+  PYPI_SKIP: "false"
+  NPM_SKIP: "false"
+  GH_PACKAGES_SKIP: "false"
+
+on:
+  # Triggered when release-please's release PR is merged: the bot
+  # tags the merge commit `vX.Y.Z` and creates a GitHub Release on
+  # that tag, which fires the `release: published` event. Ordinary
+  # pushes to main no longer trigger publishes — that was the old
+  # behavior that burned PyPI's per-project storage quota by
+  # uploading a fresh wheel matrix (~200 MB) per merged fix/feat PR.
+  # See .github/workflows/release-please.yml for the PR-aggregator.
+  release:
+    types: [published]
+  # X2: PR-time release dry-run. Trigger on PRs that touch release-
+  # critical paths so the wheel matrix + smoke-import gate run BEFORE
+  # merge — not after the tag is pushed and main is broken. Path
+  # filter is deliberately narrow: source-only PRs to headroom-core
+  # / headroom-proxy don't change wheel layout, so they don't need
+  # the dry-run. Issues this would have caught: #379 (docker bake
+  # name=), #382 (sdist os-mismatch), #384/#385/#386 (glibc shim
+  # iterations), #387's own shellcheck regression.
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - ".github/workflows/docker.yml"
+      - "crates/headroom-py/**"
+      - "pyproject.toml"
+      - "scripts/verify-versions.py"
+      - "scripts/version-sync.py"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Manual version override"
+        required: false
+      dry_run:
+        description: "Skip publish"
+        type: boolean
+        default: false
+
+concurrency:
+  # Main release runs are namespaced by ref_name and never cancel
+  # (cancel-in-progress: false) — losing a tag-push release mid-flight
+  # would mean PyPI/Docker get partial state. PR dry-runs are
+  # namespaced by PR number and DO cancel: rapid PR pushes shouldn't
+  # spawn N parallel wheel builds, only the latest matters.
+  group: release-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.ref_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  detect-version:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      npm_version: ${{ steps.ver.outputs.npm_version }}
+      canonical: ${{ steps.ver.outputs.canonical }}
+      height: ${{ steps.ver.outputs.height }}
+      bump: ${{ steps.ver.outputs.bump }}
+      previous_tag: ${{ steps.ver.outputs.previous_tag }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      # When fired by release-please's release event, the tag the
+      # bot just published IS the canonical version for this run —
+      # release_version.py's git-log derivation would re-bump it.
+      # workflow_dispatch still honors `inputs.version`; PR dry-runs
+      # leave MANUAL_VER empty and the script computes normally.
+      - name: Resolve MANUAL_VER from trigger
+        id: manualver
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          MANUAL_INPUT: ${{ github.event.inputs.version }}
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            # github.event.release.tag_name is "vX.Y.Z" — strip the
+            # leading "v" so release_version.py's SemVer parser
+            # accepts it.
+            echo "value=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
+          elif [ -n "$MANUAL_INPUT" ]; then
+            echo "value=$MANUAL_INPUT" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Compute semantic version from canonical + release history
+        id: ver
+        run: |
+          python headroom/release_version.py
+        env:
+          MANUAL_VER: ${{ steps.manualver.outputs.value }}
+
+  # Single source of truth for changelog + npm packaging. Wheels are
+  # built per-platform in `build-wheels` below. publish-pypi merges them.
+  build:
+    needs: [detect-version]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+
+      - name: Sync version to package files
+        run: |
+          python scripts/version-sync.py --version ${{ needs.detect-version.outputs.npm_version }}
+
+      - name: Verify package versions are synchronized
+        run: |
+          python scripts/verify-versions.py
+
+      - name: Run changelog generation
+        run: |
+          PREV_TAG="${{ needs.detect-version.outputs.previous_tag }}"
+          if [ -n "$PREV_TAG" ]; then
+            python scripts/changelog-gen.py \
+              --version ${{ needs.detect-version.outputs.version }} \
+              --since "$PREV_TAG"
+          else
+            python scripts/changelog-gen.py \
+              --version ${{ needs.detect-version.outputs.version }}
+          fi
+
+      - name: Verify changelog exists
+        run: |
+          pwd
+          ls -la .changelog.md
+          cat .changelog.md
+
+      - name: Upload changelog artifact
+        run: |
+          if [ -f .changelog.md ]; then
+            echo "File exists, uploading..."
+            ls -la .changelog.md
+            cp .changelog.md /tmp/changelog-backup.md
+          else
+            echo "ERROR: .changelog.md does not exist!"
+            exit 1
+          fi
+        shell: bash
+
+      - name: Upload changelog via action
+        uses: actions/upload-artifact@v7
+        with:
+          name: changelog
+          path: /tmp/changelog-backup.md
+          if-no-files-found: error
+
+      - name: Build npm release packages
+        run: |
+          mkdir -p release-assets
+
+          cd sdk/typescript
+          npm install
+          npm run build
+          npm version ${{ needs.detect-version.outputs.npm_version }} --no-git-tag-version --allow-same-version
+          npm pack --pack-destination ../../release-assets
+
+          cd ../../plugins/openclaw
+          npm install ../../release-assets/headroom-ai-${{ needs.detect-version.outputs.npm_version }}.tgz
+          npm install
+          npm run build
+          npm version ${{ needs.detect-version.outputs.npm_version }} --no-git-tag-version --allow-same-version
+          npm pack --pack-destination ../../release-assets
+
+      - name: Upload release assets artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-assets
+          path: release-assets/
+
+  # Cross-platform wheel matrix. Each entry produces wheels for cp310/11/12/13
+  # in one maturin invocation (PyO3 ABI3 forward-compat handles 3.14+ until
+  # we bump pyo3 past 0.22). The `headroom-ai` wheel contains the entire
+  # Python source under `headroom/` plus the compiled `headroom/_core.so`
+  # — one atomic install via `pip install headroom-ai`.
+  build-wheels:
+    needs: [detect-version, build]
+    # Minimal privilege: this job only checks out source, builds wheels,
+    # and uploads them as artifacts. It doesn't push, write packages, or
+    # mutate releases — `contents: read` is sufficient. Mitigates CodeQL
+    # alert "actions/missing-workflow-permissions" (CWE-275).
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Use manylinux_2_28 explicitly (instead of `auto`, which resolved
+          # to manylinux2014 / CentOS 7 / OpenSSL 1.0.2k — too old for
+          # `openssl-sys 0.9`). manylinux_2_28 is AlmaLinux 8 / glibc 2.28,
+          # the same baseline our e2e Dockerfiles use post-#360. The
+          # `openssl/vendored` Cargo feature (added in headroom-proxy)
+          # compiles OpenSSL from source so the system version doesn't
+          # matter, but pinning the floor keeps us off CentOS 7's ancient
+          # gcc/glibc surface anyway.
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            manylinux: 2_28
+          # Native arm64 runner (`ubuntu-24.04-arm`, GA Jan 2025, free
+          # for public repos) replaces the previous `ubuntu-latest` +
+          # QEMU path. Building inside `manylinux_2_28_aarch64` natively
+          # on an ARM host cuts the aarch64 wheel build from ~50–60 min
+          # (emulated) to ~10 min. Wheel ABI is unchanged — the
+          # `manylinux: 2_28` field still pins the runtime glibc floor;
+          # `cargo tree` regression in tests/test_release_workflows.py
+          # keeps the resolved build graph identical.
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            manylinux: 2_28
+          # NOTE: `macos-15-intel` (x86_64-apple-darwin) is intentionally
+          # NOT in the matrix. `ort-sys 2.0.0-rc.12` (transitive via our
+          # ML compression backend) does not provide prebuilt ONNX Runtime
+          # binaries for `x86_64-apple-darwin`, and building ORT from
+          # source would add CMake + ~5 minutes per build. Apple Silicon
+          # macOS is fully covered below; Intel-mac users install the
+          # platform-independent sdist (also produced by this matrix).
+          # Tracked as a follow-up: switch to `ort-tract` or upstream a
+          # request for x86_64 macOS prebuilts.
+          - os: macos-14
+            target: aarch64-apple-darwin
+            manylinux: ""
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Sync version to pyproject.toml + Cargo.toml
+        shell: bash
+        run: |
+          python scripts/version-sync.py --version ${{ needs.detect-version.outputs.npm_version }}
+
+      - name: Verify package versions are synchronized
+        run: |
+          python scripts/verify-versions.py
+
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist --interpreter python3.10 python3.11 python3.12 python3.13
+          manylinux: ${{ matrix.manylinux }}
+          # No before-script-linux needed: the rustls-everywhere refactor
+          # (PR #371) switched fastembed to `hf-hub-rustls-tls` +
+          # `ort-download-binaries-rustls-tls` features, which removed
+          # `openssl-sys` from our build tree entirely. The wheel build
+          # no longer needs system OpenSSL or any perl modules.
+          # `cargo tree -p headroom-py -i openssl-sys` returns "not
+          # found" — that's the regression gate (see test_release_workflows
+          # ::test_no_openssl_sys_in_wheel_build_tree).
+        env:
+          # PyO3 0.22 supports up to Python 3.13; allow forward-compat
+          # builds for 3.14+ until we bump PyO3 (tracked separately).
+          PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
+
+      # Build sdist exactly once across the matrix. We key the
+      # conditional on `target` only — sdist is platform-independent
+      # so any single matrix row is a fine host. Earlier this
+      # conditional was `matrix.os == 'ubuntu-latest' && matrix.target
+      # == 'x86_64-unknown-linux-gnu'`. PR #376 pinned `os` to
+      # `ubuntu-24.04` (instead of the moving `ubuntu-latest` alias)
+      # and silently broke this `if`, so sdist never built and
+      # `gh release upload release-assets/*.tar.gz` failed with
+      # "no matches found". Keying on `target` decouples the sdist
+      # build from any future `os` rename.
+      - name: Build sdist (linux x86_64 only — sdist is platform-independent)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+
+      - name: Verify sdist license-file metadata matches tarball contents
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          python - <<'PY'
+          # PyPI rejects sdists whose `License-File:` metadata entries
+          # (PEP 639) reference files that aren't physically present
+          # in the tarball: `400 License-File X does not exist in
+          # distribution file ... at <root>/X`. This check catches
+          # that divergence before upload by parsing PKG-INFO's
+          # License-File lines and asserting each one resolves to a
+          # real tarball member. Issue trail: sdist publish broke at
+          # v0.20.16 when the hatch -> maturin migration in 2a91cbb
+          # dropped NOTICE from the sdist `include` list while PEP 639
+          # still emitted it as a License-File. Was masked for ~22
+          # releases by an earlier twine "File already exists" failure
+          # on duplicate wheels; surfaced once PR #412 added
+          # skip-existing.
+          from pathlib import Path
+          import tarfile
+
+          sdists = sorted(Path("dist").glob("*.tar.gz"))
+          if len(sdists) != 1:
+              raise SystemExit(f"expected exactly one sdist in dist/, found {len(sdists)}")
+
+          with tarfile.open(sdists[0], "r:gz") as archive:
+              names = set(archive.getnames())
+              roots = {name.split("/", 1)[0] for name in names if "/" in name}
+              if len(roots) != 1:
+                  raise SystemExit(f"expected one sdist root directory, found {sorted(roots)}")
+              root = roots.pop()
+
+              pkg_info_path = f"{root}/PKG-INFO"
+              member = archive.getmember(pkg_info_path)
+              fh = archive.extractfile(member)
+              if fh is None:
+                  raise SystemExit(f"could not read {pkg_info_path} from {sdists[0].name}")
+              pkg_info = fh.read().decode("utf-8")
+
+          declared = []
+          for line in pkg_info.splitlines():
+              if not line.strip():
+                  break  # headers ended (blank line separator); rest is README body
+              if line.startswith("License-File:"):
+                  declared.append(line.split(":", 1)[1].strip())
+
+          if not declared:
+              raise SystemExit(f"{sdists[0].name} PKG-INFO declares no License-File entries - expected at least LICENSE")
+
+          missing = [name for name in declared if f"{root}/{name}" not in names]
+          if missing:
+              raise SystemExit(
+                  f"{sdists[0].name} declares License-File entries that are missing from the tarball: {missing}. "
+                  f"Add them to `[tool.maturin].include` with `format = \"sdist\"`."
+              )
+
+          print(f"sdist License-File metadata OK ({len(declared)} files, all present): {declared}")
+          PY
+
+      # Audit each Linux wheel's dynamic symbol references against its
+      # declared manylinux glibc floor. Catches the bug class from
+      # issue #355 (#386): a manylinux_2_28 wheel that ends up
+      # referencing `__isoc23_strtoll` (glibc 2.38+) because a
+      # statically-linked C++ dep was compiled with a recent toolchain.
+      # The build host has glibc 2.38 so the link succeeds and CI
+      # passes — but every customer with libc < 2.38 sees
+      # `ImportError: undefined symbol: __isoc23_strtoll` at
+      # `import headroom._core`. The script compares every UND symbol
+      # against the wheel's manylinux tag and fails the release if
+      # any symbol exceeds the floor.
+      - name: Audit wheel glibc symbols (Linux only)
+        if: startsWith(matrix.target, 'x86_64-unknown-linux') || startsWith(matrix.target, 'aarch64-unknown-linux')
+        run: |
+          set -e
+          for whl in dist/*.whl; do
+            python3 scripts/audit_wheel_glibc_symbols.py "$whl"
+          done
+
+      - name: Upload wheels artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: wheels-${{ matrix.os }}-${{ matrix.target }}
+          path: dist/*
+
+  # Aggregator step: merge all wheel artifacts + the npm release assets
+  # into the canonical `dist/` directory for downstream publishing jobs.
+  collect-dist:
+    needs: [build, build-wheels]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Download all wheel artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: wheels-*
+          path: wheels-tmp/
+          merge-multiple: true
+
+      - name: Download release assets
+        uses: actions/download-artifact@v8
+        with:
+          name: release-assets
+          path: release-assets/
+
+      - name: Stage final dist directory
+        run: |
+          mkdir -p dist
+          cp -v wheels-tmp/*.whl wheels-tmp/*.tar.gz dist/ 2>/dev/null || true
+          ls -la dist/
+          # Mirror the wheels into release-assets so create-release uploads them.
+          cp -v dist/*.whl dist/*.tar.gz release-assets/ 2>/dev/null || true
+          ls -la release-assets/
+
+      - name: Upload merged dist artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+
+      - name: Upload merged release-assets artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-assets-merged
+          path: release-assets/
+
+  # ─── Wheel smoke-import gate ───────────────────────────────────────────────
+  # Issue #355's bug class: `manylinux_2_28` wheels that build cleanly,
+  # pass clippy/tests on the build host, pass auditwheel — and then
+  # fail to import on a customer's box because of a runtime symbol
+  # mismatch (#355: `__isoc23_strtoll` from gcc-14 ORT prebuilts;
+  # earlier #371: openssl-sys's C23 wrappers).
+  #
+  # This job spins up a matrix of representative customer environments
+  # — the manylinux floor we promise + common older/newer glibc + macOS
+  # native — and runs the actual `import headroom._core` check the
+  # proxy's `_check_rust_core` does at startup. Failure here BLOCKS
+  # publish-pypi, publish-docker, and create-release. Better to find
+  # a broken wheel here than 8 minutes after `pypa/gh-action-pypi-publish`
+  # has already pushed it to the world.
+  #
+  # See also `scripts/audit_wheel_glibc_symbols.py` (the static-symbol
+  # gate added in PR #384). The audit catches symbol references above
+  # the floor; this smoke matrix catches the dynamic-link failures
+  # that survive the static check (linker order quirks, runtime
+  # dlopen RPATH issues, missing transitive native deps).
+  smoke-import-wheels:
+    needs: [build-wheels]
+    if: github.event.inputs.dry_run != 'true'
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x86_64 — span manylinux floor + customer glibcs.
+          # `quay.io/pypa/manylinux_2_28_x86_64` is the floor we
+          # promise; if the wheel fails here, our manylinux tag is
+          # a lie. `ubuntu:22.04` (glibc 2.35) is the environment
+          # from issue #355's reporter.
+          #
+          # NOTE: `ubuntu:20.04 + python 3.10` was a third entry,
+          # dropped on PR #396 because the deadsnakes PPA install
+          # path stopped reliably provisioning python3.10-venv on
+          # focal once Ubuntu 20.04 hit End of Standard Support
+          # (May 2025). The failure mode was an apt-get error, NOT
+          # a wheel-import error — i.e. the test environment, not
+          # the wheel. Promising the wheel works on glibc 2.31 in
+          # CI now requires either ESM-tier images or pinning a
+          # specific deadsnakes snapshot, neither of which we want
+          # owning. Manylinux 2.28 (glibc 2.28) is still the floor
+          # we promise; ubuntu:22.04 covers the most-reported
+          # customer environment.
+          - { runner: ubuntu-24.04, image: "quay.io/pypa/manylinux_2_28_x86_64", python: "3.11", wheel_target: x86_64-unknown-linux-gnu, wheel_artifact: wheels-ubuntu-24.04-x86_64-unknown-linux-gnu, glibc_label: "2.28-floor" }
+          - { runner: ubuntu-24.04, image: "ubuntu:22.04", python: "3.12", wheel_target: x86_64-unknown-linux-gnu, wheel_artifact: wheels-ubuntu-24.04-x86_64-unknown-linux-gnu, glibc_label: "2.35" }
+          # Linux aarch64 — floor + one customer env. Native arm64
+          # runners (PR #376) host the container.
+          - { runner: ubuntu-24.04-arm, image: "quay.io/pypa/manylinux_2_28_aarch64", python: "3.11", wheel_target: aarch64-unknown-linux-gnu, wheel_artifact: wheels-ubuntu-24.04-arm-aarch64-unknown-linux-gnu, glibc_label: "2.28-floor" }
+          - { runner: ubuntu-24.04-arm, image: "ubuntu:22.04", python: "3.12", wheel_target: aarch64-unknown-linux-gnu, wheel_artifact: wheels-ubuntu-24.04-arm-aarch64-unknown-linux-gnu, glibc_label: "2.35" }
+          # macOS arm64 — runs natively on the host runner; no
+          # container. Apple Silicon is the only macOS target we
+          # ship today (Intel macOS dropped in PR #371 — ort-sys
+          # has no x86_64-apple-darwin prebuilts).
+          - { runner: macos-14, image: "", python: "3.13", wheel_target: aarch64-apple-darwin, wheel_artifact: wheels-macos-14-aarch64-apple-darwin, glibc_label: "" }
+
+    steps:
+      - name: Download wheels artifact for this target
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ matrix.wheel_artifact }}
+          path: dist/
+
+      - name: Stage smoke-import script
+        # The smoke script lives in a host file rather than an inline
+        # heredoc/`-c` invocation. Rationale:
+        #
+        # 1. The Linux job wraps the smoke check in `bash -ec '<long>'`
+        #    where the outer single quote preserves whitespace AND
+        #    forbids any internal single quote (closing it terminates
+        #    the script). A `<<PY ... PY` heredoc inside the inner bash
+        #    inherits the YAML indentation, so the closing `PY` is at
+        #    column 14, never matched (caught post-#387 merge: bash
+        #    "here-document at line 65 delimited by end-of-file").
+        # 2. Switching to `python -c "<f-string>"` solves the heredoc
+        #    indent problem but reintroduces the single-quote nesting
+        #    issue (Python f-strings need quote chars).
+        # 3. A host-side file dodges both: bash heredoc body lives at
+        #    YAML `run: |` level (uniform strip), the docker container
+        #    sees it as a read-only mount, and macOS host runs the
+        #    same script — no quoting drift between paths.
+        run: |
+          cat > "${RUNNER_TEMP}/smoke_import.py" <<'PY'
+          import sys
+          import headroom
+          from headroom._core import hello as _rust_hello
+          print(f"smoke-import OK: python={sys.version_info[:3]} hello={_rust_hello()}")
+          PY
+
+      - name: Smoke-import wheel inside container (Linux)
+        if: matrix.image != ''
+        env:
+          IMAGE: ${{ matrix.image }}
+          PYTHON_VERSION: ${{ matrix.python }}
+          WHEEL_TARGET: ${{ matrix.wheel_target }}
+          GLIBC_LABEL: ${{ matrix.glibc_label }}
+        run: |
+          set -e
+          # The container script intentionally avoids `<<EOF` heredoc
+          # interpolation by passing values via env vars — keeps the
+          # shell quoting straightforward and makes failure modes
+          # easier to debug.
+          docker run --rm \
+            -v "$(pwd)/dist:/wheels:ro" \
+            -v "${RUNNER_TEMP}/smoke_import.py:/smoke_import.py:ro" \
+            -e PYTHON_VERSION="$PYTHON_VERSION" \
+            -e WHEEL_TARGET="$WHEEL_TARGET" \
+            -e GLIBC_LABEL="$GLIBC_LABEL" \
+            "$IMAGE" \
+            bash -ec '
+              set -e
+              echo "=== smoke-import: image=$0 python=$PYTHON_VERSION glibc=$GLIBC_LABEL target=$WHEEL_TARGET ===" "'"$IMAGE"'"
+
+              # Locate a Python interpreter matching the requested
+              # version. manylinux images ship interpreters under
+              # /opt/python/cp{XY}-cp{XY}/bin/; ubuntu/debian images
+              # need an apt-get install.
+              py_tag=cp$(echo "$PYTHON_VERSION" | tr -d .)
+              if [ -d /opt/python ]; then
+                python_bin="/opt/python/${py_tag}-${py_tag}/bin/python"
+                if [ ! -x "$python_bin" ]; then
+                  echo "ERROR: $python_bin missing in $0" "'"$IMAGE"'" >&2
+                  ls -la /opt/python >&2
+                  exit 1
+                fi
+              elif command -v apt-get >/dev/null 2>&1; then
+                export DEBIAN_FRONTEND=noninteractive
+                apt-get update -qq
+                # ubuntu:20.04s default repo only ships 3.8; 3.10 lives
+                # in deadsnakes. Add it on demand. ubuntu:22.04 has
+                # 3.10/3.11 in main and 3.12 via deadsnakes.
+                apt-get install -y -qq --no-install-recommends ca-certificates software-properties-common >/dev/null
+                add-apt-repository -y ppa:deadsnakes/ppa >/dev/null 2>&1 || true
+                apt-get update -qq
+                apt-get install -y -qq --no-install-recommends \
+                  "python$PYTHON_VERSION" \
+                  "python$PYTHON_VERSION-venv" \
+                  "python$PYTHON_VERSION-distutils" >/dev/null 2>&1 \
+                || apt-get install -y -qq --no-install-recommends \
+                  "python$PYTHON_VERSION" \
+                  "python$PYTHON_VERSION-venv" >/dev/null
+                python_bin="python$PYTHON_VERSION"
+              else
+                echo "ERROR: image has neither /opt/python nor apt-get" >&2
+                exit 1
+              fi
+              "$python_bin" --version
+
+              # Print glibc version so failures show what we are
+              # actually testing against.
+              ldd --version | head -1 || true
+
+              # Pick the wheel that matches python version + arch.
+              case "$WHEEL_TARGET" in
+                x86_64-unknown-linux-gnu)  arch_tag=manylinux_2_28_x86_64 ;;
+                aarch64-unknown-linux-gnu) arch_tag=manylinux_2_28_aarch64 ;;
+                *) echo "ERROR: unknown wheel target $WHEEL_TARGET" >&2; exit 1 ;;
+              esac
+              whl=$(find /wheels -maxdepth 1 -type f -name "headroom_ai-*-${py_tag}-${py_tag}-${arch_tag}.whl" -print -quit)
+              if [ -z "$whl" ]; then
+                # No version-specific wheel — fall back to a stable-ABI
+                # (abi3) wheel. A cp3<floor>-abi3 wheel installs on any
+                # CPython >= floor, which is what makes a single wheel
+                # forward-compatible to 3.14+ (Cargo.toml pyo3 abi3-py310).
+                # Pick the abi3 wheel whose floor is <= the interpreter.
+                py_minor=${PYTHON_VERSION#*.}
+                abi3=$(find /wheels -maxdepth 1 -type f -name "headroom_ai-*-abi3-${arch_tag}.whl" -print -quit)
+                if [ -n "$abi3" ]; then
+                  abi3_base=${abi3##*/}
+                  abi3_floor=${abi3_base#*-cp3}
+                  abi3_floor=${abi3_floor%%-*}
+                  case "$abi3_floor" in *[!0-9]*) abi3_floor= ;; esac
+                  if [ -n "$abi3_floor" ] && [ "$abi3_floor" -le "$py_minor" ]; then whl="$abi3"; fi
+                fi
+              fi
+              if [ -z "$whl" ]; then
+                echo "ERROR: no wheel matching python=$PYTHON_VERSION arch=$arch_tag in /wheels/" >&2
+                find /wheels -maxdepth 1 -type f -printf "%f\n" >&2
+                exit 1
+              fi
+              echo "Installing: $whl"
+
+              "$python_bin" -m venv /tmp/venv
+              /tmp/venv/bin/pip install --quiet --upgrade pip
+              /tmp/venv/bin/pip install --quiet "$whl"
+
+              # The actual smoke check — mirrors the proxy
+              # `_check_rust_core` path that fails with exit-78 on
+              # broken wheels. The script is mounted from the host via
+              # `-v ${RUNNER_TEMP}/smoke_import.py:/smoke_import.py:ro`;
+              # see the "Stage smoke-import script" step above for why
+              # an inline heredoc here would not work.
+              /tmp/venv/bin/python /smoke_import.py
+            '
+
+      - name: Smoke-import wheel on macOS host
+        if: matrix.image == ''
+        env:
+          PYTHON_VERSION: ${{ matrix.python }}
+        run: |
+          set -e
+          py_tag=cp$(echo "$PYTHON_VERSION" | tr -d .)
+          # macOS wheels are tagged macosx_*_arm64 (Apple Silicon only).
+          whl=$(find dist -maxdepth 1 -type f -name "headroom_ai-*-${py_tag}-${py_tag}-macosx_*_arm64.whl" -print -quit)
+          if [ -z "$whl" ]; then
+            # Stable-ABI (abi3) fallback — see the Linux path above. A
+            # cp3<floor>-abi3 wheel installs on any CPython >= floor.
+            py_minor=${PYTHON_VERSION#*.}
+            abi3=$(find dist -maxdepth 1 -type f -name "headroom_ai-*-abi3-macosx_*_arm64.whl" -print -quit)
+            if [ -n "$abi3" ]; then
+              abi3_base=${abi3##*/}
+              abi3_floor=${abi3_base#*-cp3}
+              abi3_floor=${abi3_floor%%-*}
+              case "$abi3_floor" in *[!0-9]*) abi3_floor= ;; esac
+              if [ -n "$abi3_floor" ] && [ "$abi3_floor" -le "$py_minor" ]; then whl="$abi3"; fi
+            fi
+          fi
+          if [ -z "$whl" ]; then
+            echo "ERROR: no macOS wheel matching python=$PYTHON_VERSION"
+            find dist -maxdepth 1 -type f -exec basename {} \;
+            exit 1
+          fi
+          echo "Installing: $whl"
+
+          # Use the system python at the requested minor version. The
+          # macos-14 runner image preinstalls multiple Python versions.
+          "python$PYTHON_VERSION" -m venv /tmp/venv
+          /tmp/venv/bin/pip install --quiet --upgrade pip
+          /tmp/venv/bin/pip install --quiet "$whl"
+          # Same staged smoke script as the Linux container path uses,
+          # invoked directly on the macOS host (no docker mount needed).
+          /tmp/venv/bin/python "${RUNNER_TEMP}/smoke_import.py"
+
+  publish-pypi:
+    needs: [collect-dist, smoke-import-wheels]
+    # X2: skip on pull_request — dry-run only verifies build+smoke,
+    # never publishes. The other two predicates remain (workflow_dispatch
+    # dry_run, vars-level skip).
+    if: github.event_name != 'pull_request' && github.event.inputs.dry_run != 'true' && vars.PYPI_SKIP != 'true'
+    environment: pypi  # NOTE: environment name must be a literal; update here if the GitHub environment name changes
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write  # Required for OIDC trusted publishing
+    steps:
+      - name: Download merged dist artifact (sdist + cross-platform wheels)
+        uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish ${{ env.PYPI_PACKAGE }} to PyPI
+        id: pypi-publish
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # Idempotent re-runs: when a wheel filename for the computed
+          # version is already on PyPI (e.g. a previous push to main
+          # already published this version, or this run's computed
+          # semver hasn't bumped past the last release), treat the
+          # existing file as a no-op instead of a hard failure. PyPA's
+          # recommended pattern for release workflows that may run
+          # multiple times against the same version.
+          skip-existing: true
+
+  publish-npm:
+    needs: [detect-version, build]
+    if: github.event_name != 'pull_request' && github.event.inputs.dry_run != 'true' && vars.NPM_SKIP != 'true'
+    runs-on: ubuntu-latest
+    # Publishes to npmjs.org via NPM_TOKEN secret; no GITHUB_TOKEN
+    # write permissions needed.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+          registry-url: ${{ env.NPM_REGISTRY_URL }}
+
+      # No artifact download required: the publish steps below pack and
+      # publish directly from the checked-out source tree (sdk/typescript
+      # and plugins/openclaw) via `npm pack` + `npm publish`. The
+      # `dist` artifact is a Python-distribution aggregate produced by
+      # `collect-dist`; it has no npm content. Earlier versions of
+      # this workflow downloaded it speculatively, which now fails as
+      # "Artifact not found" because publish-npm is not gated on
+      # collect-dist. Removing the dead step is the right fix.
+
+      - name: Publish ${{ env.NPM_SDK_PACKAGE }} (TypeScript SDK) to npmjs.org
+        id: npm-sdk-publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          cd sdk/typescript
+          npm install
+          npm run build
+          npm version ${{ needs.detect-version.outputs.npm_version }} --no-git-tag-version --allow-same-version
+          npm publish --access public
+        continue-on-error: true
+
+      - name: Publish ${{ env.NPM_OPENCLAW_PACKAGE }} to npmjs.org
+        id: npm-openclaw-publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          cd plugins/openclaw
+          npm install
+          npm run build
+          npm version ${{ needs.detect-version.outputs.npm_version }} --no-git-tag-version --allow-same-version
+          npm publish --access public
+        continue-on-error: true
+
+      - name: npm publish notice
+        if: steps.npm-sdk-publish.outcome == 'failure' || steps.npm-openclaw-publish.outcome == 'failure'
+        run: |
+          echo "::notice::One or more npm publishes failed. Set NPM_SKIP=true in repo Variables to skip both npm publishes if tokens are not configured."
+
+  publish-github-packages:
+    needs: [detect-version, build]
+    if: github.event_name != 'pull_request' && github.event.inputs.dry_run != 'true' && vars.GH_PACKAGES_SKIP != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Compute GitHub Packages scope
+        id: gh-scope
+        run: |
+          scope="$(printf '%s' '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          printf 'scope=%s\n' "$scope" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Node.js for GitHub Package Registry
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+          registry-url: ${{ env.GITHUB_PACKAGES_REGISTRY_URL }}
+
+      # No artifact download required: the publish-github-packages flow
+      # below `npm pack`s its own scoped tarball into a workdir and
+      # publishes that. Same reasoning as publish-npm — the speculative
+      # `dist` download was failing "Artifact not found" because this
+      # job is not gated on `collect-dist`.
+
+      - name: Publish ${{ env.NPM_SDK_PACKAGE }} to GitHub Package Registry
+        id: gpr-sdk-publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_PACKAGES_SCOPE: ${{ steps.gh-scope.outputs.scope }}
+        run: |
+          workdir="$(mktemp -d)"
+          assets_dir="$workdir/release-assets"
+          mkdir -p "$assets_dir"
+
+          cp -R sdk/typescript "$workdir/sdk"
+          cd "$workdir/sdk"
+          npm install
+          npm run build
+          npm version ${{ needs.detect-version.outputs.npm_version }} --no-git-tag-version --allow-same-version
+          unscoped_sdk_tarball="$(npm pack --pack-destination "$assets_dir" | tail -n 1)"
+          node <<'EOF'
+          const fs = require("fs");
+          const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+          pkg.name = `@${process.env.GITHUB_PACKAGES_SCOPE}/${pkg.name}`;
+          pkg.publishConfig = {
+            ...(pkg.publishConfig || {}),
+            registry: process.env.GITHUB_PACKAGES_REGISTRY_URL,
+          };
+          fs.writeFileSync("package.json", `${JSON.stringify(pkg, null, 2)}\n`);
+          EOF
+          sdk_tarball="$(npm pack --pack-destination "$assets_dir" | tail -n 1)"
+          printf 'unscoped_sdk_tarball=%s\n' "$assets_dir/$unscoped_sdk_tarball" >> "$GITHUB_OUTPUT"
+          printf 'sdk_tarball=%s\n' "$assets_dir/$sdk_tarball" >> "$GITHUB_OUTPUT"
+          npm publish --access public --registry ${{ env.GITHUB_PACKAGES_REGISTRY_URL }}
+        continue-on-error: true
+
+      - name: Publish ${{ env.NPM_OPENCLAW_PACKAGE }} to GitHub Package Registry
+        id: gpr-openclaw-publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_PACKAGES_SCOPE: ${{ steps.gh-scope.outputs.scope }}
+          SDK_TARBALL: ${{ steps.gpr-sdk-publish.outputs.unscoped_sdk_tarball }}
+        run: |
+          workdir="$(mktemp -d)"
+          cp -R plugins/openclaw "$workdir/openclaw"
+          cd "$workdir/openclaw"
+          node <<'EOF'
+          const fs = require("fs");
+          const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+          pkg.dependencies = pkg.dependencies || {};
+          delete pkg.dependencies["headroom-ai"];
+          fs.writeFileSync("package.json", `${JSON.stringify(pkg, null, 2)}\n`);
+          EOF
+          npm install
+          npm install --no-save "$SDK_TARBALL"
+          npm run build
+          npm version ${{ needs.detect-version.outputs.npm_version }} --no-git-tag-version --allow-same-version
+          node <<'EOF'
+          const fs = require("fs");
+          const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+          const scopedSdk = `@${process.env.GITHUB_PACKAGES_SCOPE}/headroom-ai`;
+          pkg.name = `@${process.env.GITHUB_PACKAGES_SCOPE}/${pkg.name}`;
+          pkg.dependencies = pkg.dependencies || {};
+          delete pkg.dependencies["headroom-ai"];
+          pkg.dependencies[scopedSdk] = `^${pkg.version}`;
+          pkg.publishConfig = {
+            ...(pkg.publishConfig || {}),
+            registry: process.env.GITHUB_PACKAGES_REGISTRY_URL,
+          };
+          fs.writeFileSync("package.json", `${JSON.stringify(pkg, null, 2)}\n`);
+          EOF
+          npm publish --access public --registry ${{ env.GITHUB_PACKAGES_REGISTRY_URL }}
+        continue-on-error: true
+
+      - name: GPR publish notice
+        if: steps.gpr-sdk-publish.outcome == 'failure' || steps.gpr-openclaw-publish.outcome == 'failure'
+        run: |
+          echo "::notice::One or more GitHub Package Registry publishes failed. Check GITHUB_TOKEN permissions and package scope/repository settings. Set GH_PACKAGES_SKIP=true to skip."
+
+  publish-docker:
+    # Wait for the smoke-import gate. The docker images bundle the
+    # same wheels we publish to PyPI; a wheel that can't import
+    # cleanly on the manylinux floor will also fail the docker
+    # image's `pip install` step. Failing here ~3 minutes earlier
+    # than docker-build saves the matrix's wall-clock budget.
+    needs: [detect-version, smoke-import-wheels]
+    if: github.event_name != 'pull_request' && github.event.inputs.dry_run != 'true'
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    uses: ./.github/workflows/docker.yml
+    with:
+      version: ${{ needs.detect-version.outputs.version }}
+      enable_ref_tags: false
+
+  create-release:
+    needs: [detect-version, build, build-wheels, collect-dist, smoke-import-wheels, publish-pypi, publish-npm, publish-github-packages, publish-docker]
+    if: >-
+      ${{
+        always() &&
+        github.event_name != 'pull_request' &&
+        github.event.inputs.dry_run != 'true' &&
+        needs.detect-version.result == 'success' &&
+        needs.build.result == 'success' &&
+        needs.build-wheels.result == 'success' &&
+        needs.collect-dist.result == 'success' &&
+        needs.smoke-import-wheels.result == 'success' &&
+        (vars.PYPI_SKIP == 'true' || needs.publish-pypi.result == 'success')
+      }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Download changelog artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: changelog
+          path: /tmp
+
+      - name: Download merged release assets (npm tarballs + wheels + sdist)
+        uses: actions/download-artifact@v8
+        with:
+          name: release-assets-merged
+          path: release-assets
+
+      - name: Show changelog
+        run: |
+          ls -la /tmp/changelog-backup.md
+          cp /tmp/changelog-backup.md .changelog.md
+          cat .changelog.md
+
+      - name: Show release assets
+        run: |
+          ls -la release-assets
+
+      - name: Create or update GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v${{ needs.detect-version.outputs.version }}"
+          TITLE="Release v${{ needs.detect-version.outputs.version }}"
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            # Release already exists — typically created by
+            # release-please on release-PR merge with an auto-
+            # generated changelog body. Don't overwrite its notes
+            # (--notes-file would clobber them); only sync the
+            # title in case detect-version's canonical form differs
+            # from what the bot set.
+            gh release edit "$TAG" --title "$TITLE"
+          else
+            gh release create "$TAG" --title "$TITLE" --notes-file .changelog.md
+          fi
+
+      - name: Publish ${{ env.PYPI_PACKAGE }} Python distributions to GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v${{ needs.detect-version.outputs.version }}"
+          gh release upload "$TAG" release-assets/*.whl release-assets/*.tar.gz --clobber
+
+      - name: Publish Node package tarballs to GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v${{ needs.detect-version.outputs.version }}"
+          gh release upload "$TAG" release-assets/*.tgz --clobber

@@ -1,0 +1,297 @@
+---
+title: Releases & CI/CD
+description: Automated release pipeline with release-please, semantic versioning, multi-package publishing, and changelog generation.
+---
+
+## Overview
+
+Headroom uses `release-please` to maintain a release PR from conventional commits on `main`. Merging that release PR creates the release tag and GitHub Release, which triggers `.github/workflows/release.yml` to publish all packages, build version-matched Docker images, and attach release assets.
+
+The release workflow also calls `.github/workflows/docker.yml` as a reusable workflow so GHCR images are published in the same release run with the exact same synced version as PyPI, npm, and GitHub release assets.
+
+For the end-to-end visual flow, see [CI/CD Flow Diagrams](/docs/ci-cd-flows).
+
+## Packages & Registries
+
+| Package | Type | Registry | Environment Variable |
+|---------|------|----------|----------------------|
+| `headroom-ai` | Python | PyPI | `PYPI_PACKAGE` |
+| `headroom-ai` | TypeScript SDK | npmjs.org | `NPM_SDK_PACKAGE` |
+| `headroom-openclaw` | TypeScript plugin | npmjs.org | `NPM_OPENCLAW_PACKAGE` |
+| `@{owner}/headroom-ai` | TypeScript SDK | GitHub Package Registry | — |
+| `@{owner}/headroom-openclaw` | TypeScript plugin | GitHub Package Registry | — |
+| `headroom-ai-{version}.tar.gz` / `headroom_ai-{version}-py3-none-any.whl` | Python package distributions | GitHub Release (`{owner}/headroom`) | — |
+| `headroom-ai-{version}.tgz` / `headroom-openclaw-{version}.tgz` | Node release assets | GitHub Release (`{owner}/headroom`) | — |
+| `ghcr.io/{owner}/headroom` | Docker image | GitHub Container Registry | — |
+
+## Version Strategy
+
+Release Please calculates the release version from conventional commits and the release manifest. The release workflow still computes and verifies the version it is about to publish:
+
+1. `.release-please-config.json` defines release-please behavior.
+2. `.release-please-manifest.json` tracks current package versions.
+3. The release PR updates versions and changelog content.
+4. Merging the release PR publishes a GitHub Release tagged `vX.Y.Z`.
+5. `release.yml` uses that tag as the manual version for the publish run.
+
+### Version Files
+
+- `.release-please-config.json` - release-please package configuration
+- `.release-please-manifest.json` - release-please version manifest
+- `pyproject.toml` - `[project].version`
+- `headroom/_version.py` - `__version__`, synced at build time
+- `plugins/openclaw/package.json` - `version`, synced at build time
+- `sdk/typescript/package.json` - `version`, synced at build time
+
+`release.yml` does not commit back to the repo. Version synchronization happens inside the release build workspace.
+
+## Conventional Commits & Semantic Bumping
+
+Release Please analyzes unreleased conventional commits and applies the highest required bump level:
+
+| Commit | Bump |
+|--------|------|
+| `fix:` | patch |
+| `feat:` | minor |
+| Any conventional commit with `!` or any commit with `BREAKING CHANGE` in the body | major |
+| `docs:`, `ci:`, `chore:`, `refactor:` | no release note by default unless configured |
+
+Commits are linted in CI via `commitlint` using `@commitlint/config-conventional`.
+
+The release PR is the place where version and changelog changes are reviewed before publishing.
+
+## Release Workflow
+
+The `release.yml` workflow runs when a GitHub Release is published, which normally happens when the release-please PR is merged. It also supports manual `workflow_dispatch` and PR dry-runs for release-critical workflow/package changes.
+
+```
+detect-version → build → build-wheels → collect-dist → smoke-import-wheels
+                                      ↘ publish-pypi
+                                      ↘ publish-npm
+                                      ↘ publish-github-packages
+                                      ↘ publish-docker
+                                        → create-release
+```
+
+The workflow never commits back to the repo.
+
+### detect-version
+Resolves the release version from the trigger. On `release: published`, it uses the published tag (`vX.Y.Z`) as the manual version for the run. On `workflow_dispatch`, it uses the optional `version` input when provided. PR dry-runs compute a version without publishing.
+
+### build
+1. Syncs version across package files via `scripts/version-sync.py --version {npm_version}`
+2. Verifies package versions with `scripts/verify-versions.py`
+3. Generates the changelog artifact
+4. Builds npm release packages for the TypeScript SDK and OpenClaw plugin
+5. Uploads release asset artifacts for downstream publish jobs
+
+### build-wheels
+Builds the Python wheel matrix for Linux x86_64, Linux arm64, and Apple Silicon macOS, plus one source distribution. Linux wheels are audited for glibc symbol compatibility.
+
+### collect-dist
+Collects the wheel matrix, source distribution, and npm tarballs into the canonical artifacts used by publishing and GitHub Release asset upload.
+
+### smoke-import-wheels
+Installs the built wheels into representative customer environments and imports `headroom._core`. This blocks publishing if a wheel builds successfully but cannot import on its promised platform floor.
+
+### publish-pypi
+Downloads the Python dist artifact and publishes to PyPI via `pypa/gh-action-pypi-publish@release/v1` (trusted publisher).
+
+### publish-npm
+Publishes both TypeScript packages to npmjs.org:
+- `sdk/typescript/` as `headroom-ai`
+- `plugins/openclaw/` as `headroom-openclaw`
+
+### publish-github-packages
+Publishes both Node packages to GitHub Package Registry (`npm.pkg.github.com`) using the current repository owner as the npm scope:
+- `sdk/typescript/` as `@{owner}/headroom-ai`
+- `plugins/openclaw/` as `@{owner}/headroom-openclaw`
+
+### GitHub release assets
+Uploads the built Python distributions and both npm tarballs to the GitHub Release created in the current repository. GitHub Packages does not provide a PyPI-compatible package registry, so the workflow publishes Python wheels and sdists to GitHub as release assets while npm packages go to GitHub Package Registry and Docker images go to GHCR.
+
+### publish-docker
+Calls the reusable Docker workflow to publish GHCR images with the same semantic version and synced package metadata as the rest of the release.
+
+### create-release
+Creates or updates the GitHub Release in the current repo and uploads the built Python distributions and npm tarballs as release assets. PyPI publish is a hard gate unless `PYPI_SKIP=true`, so release notes and assets do not advertise a version that failed to publish to PyPI.
+
+## Configuration
+
+All package names, registry URLs, and environment names are defined as top-level `env` constants:
+
+```yaml
+env:
+  PYPI_PACKAGE: headroom-ai
+  PYPI_ENVIRONMENT: pypi
+  NPM_REGISTRY_URL: https://registry.npmjs.org
+  NPM_SDK_PACKAGE: headroom-ai
+  NPM_OPENCLAW_PACKAGE: headroom-openclaw
+  GITHUB_PACKAGES_REGISTRY_URL: https://npm.pkg.github.com
+```
+
+To rename a package, update the corresponding constant — all references throughout the workflow update automatically.
+
+## Safety Gates
+
+Each publish job requires **both** of the following to be false:
+
+```yaml
+if: github.event.inputs.dry_run != 'true' && vars.PYPI_SKIP != 'true'
+```
+
+To skip a publish target, set the corresponding GitHub Actions variable:
+
+| Variable | Effect |
+|----------|--------|
+| `PYPI_SKIP=true` | Skip PyPI publish |
+| `NPM_SKIP=true` | Skip both npm publishes |
+| `GH_PACKAGES_SKIP=true` | Skip GitHub Package Registry publish |
+
+Set these in: **GitHub repo → Settings → Variables → Actions Variables → New repository variable**.
+
+PyPI publishing is a hard gate for GitHub Releases unless `PYPI_SKIP=true`.
+If the PyPI upload fails, the workflow stops before creating or updating the
+GitHub Release, so release notes cannot advertise a version that was not
+published to PyPI.
+
+Before release artifacts are built, the workflow runs:
+
+```bash
+python scripts/verify-versions.py
+```
+
+That gate fails on cross-package version drift. The sdist build is also checked
+for a top-level `LICENSE` file before any publish job can consume it.
+
+## Workflow Triggers
+
+Release Please runs on pushes to `main` and maintains the release PR:
+
+```yaml
+on:
+  push:
+    branches: [main]
+```
+
+The publish workflow runs when a GitHub Release is published, on PR dry-runs for release-critical paths, and by manual dispatch:
+
+```yaml
+on:
+  release:
+    types: [published]
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - ".github/workflows/docker.yml"
+      - "crates/headroom-py/**"
+      - "pyproject.toml"
+      - "scripts/verify-versions.py"
+      - "scripts/version-sync.py"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Manual version override"
+        required: false
+      dry_run:
+        description: "Skip publish"
+        type: boolean
+        default: false
+```
+- **Normal release:** merge the release-please PR; the bot publishes a GitHub Release, which triggers `release.yml`.
+- **PR dry-run:** release-critical PRs build and smoke-import wheels before merge, but do not publish.
+- **Manual dispatch:** use `version` to override the release version and `dry_run: true` to skip publish steps.
+
+## Local Testing with `act`
+
+### Prerequisites
+
+```bash
+# Install act
+winget install act
+
+# Optional: install actionlint for schema validation
+winget install actionlint
+```
+
+### Dry-run Test
+
+```bash
+act workflow_dispatch -W .github/workflows/release.yml -e .github/act/dry-run.json
+```
+
+This runs the full workflow end-to-end with `dry_run=true`, skipping all publish steps.
+
+### Simulate Release Please
+
+```bash
+act push -W .github/workflows/release-please.yml -e .github/act/push-feat.json
+```
+
+The `push-feat.json` event file simulates a `feat:` commit on `main` so the release-please workflow can be validated locally.
+
+### Simulate a Published Release
+
+```bash
+act release -W .github/workflows/release.yml -e .github/act/release-published.json -n
+```
+
+The `release-published.json` event file simulates the event emitted when the release-please PR is merged.
+
+### Validate the Release and Docker Workflows
+
+```bash
+bash scripts/validate-workflows.sh
+```
+
+This runs `actionlint` plus `act -n` against the release and Docker workflows using the checked-in `.github/act/*.json` event fixtures. CI runs the same script in the `workflow-validation` job so branch changes to release automation are validated before merge.
+
+### Local Secrets
+
+```bash
+cp .env.act.example .env.act
+# Edit .env.act and add your test tokens
+```
+
+`act` automatically reads `.env` and passes values as workflow secrets.
+
+## Workflow Files Reference
+
+| File | Purpose |
+|------|---------|
+| `.github/workflows/release.yml` | Main release pipeline |
+| `.github/workflows/release-please.yml` | Release PR aggregation from conventional commits |
+| `.github/workflows/ci.yml` | CI — lint, test, commitlint |
+| `.github/workflows/publish.yml` | Manual-only PyPI fallback (superseded by `release.yml`) |
+| `.commitlintrc.json` | Conventional commit rules |
+| `scripts/version-sync.py` | Sync version across all packages |
+| `scripts/changelog-gen.py` | Generate changelog from git log |
+| `scripts/verify-versions.py` | Pre-release version alignment check |
+| `.github/act/dry-run.json` | `act` event file for dry-run testing |
+| `.github/act/push-feat.json` | `act` event file for feat commit testing |
+| `.github/act/release-published.json` | `act` event file for release publish simulation |
+| `.github/act/docker-version.json` | `act` event file for Docker workflow validation |
+| `scripts/validate-workflows.sh` | Shared `actionlint` + `act -n` workflow validation script |
+| `.actrc` | Default `act` flags (Ubuntu runner, reuse, quiet) |
+| `.actrc.local.example` | Local `act` override template |
+
+## Required GitHub Secrets
+
+| Secret | Purpose | Where to Get |
+|--------|---------|--------------|
+| `NPM_TOKEN` | Publishing to npmjs.org | npmjs.com → Account → Access Tokens |
+| `GITHUB_TOKEN` | GitHub Package Registry (auto-provided) | Automatically available in GitHub Actions |
+
+The PyPI publish uses trusted publisher OIDC — no secret required, only the `pypi` GitHub Environment must be configured with your PyPI project.
+
+## Release Cadence
+
+Day to day:
+
+1. Merge regular PRs to `main`.
+2. Release Please updates the open release PR when releasable conventional commits land.
+3. Review the release PR changelog and version bump.
+4. Merge the release PR when ready to ship.
+5. Watch `release.yml` publish PyPI, npm, GitHub Packages, Docker, and GitHub Release assets.

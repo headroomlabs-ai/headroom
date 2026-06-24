@@ -1,0 +1,14 @@
+# Default flags for act runs in this repo.
+# See https://github.com/nektos/act#configuration for all options.
+
+# Use Ubuntu runner image for all jobs
+--platform=ubuntu-latest=ghcr.io/catthehacker/ubuntu:runner-latest
+
+# Reuse containers so subsequent runs are faster
+--reuse
+
+# Pull the image in the background if not present
+--pull=true
+
+# Quiet mode (less verbose output)
+--quiet

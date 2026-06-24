@@ -1,0 +1,73 @@
+name: Wrap Native E2E
+
+# Cross-platform smoke tests for the hidden ``headroom wrap ... --prepare-only``
+# flows. These reuse the existing pytest bridge cases so we exercise the real
+# CLI on linux / macos without depending on agent binaries or long-lived proxy
+# processes. Windows will be added once the upstream CRT conflict is resolved
+# (see matrix comment below).
+#
+# This complements the Docker-native wrap e2e by catching host-specific issues
+# such as home-directory layout and filesystem quirks in prepare-only config
+# injection.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "headroom/cli/**"
+      - "headroom/providers/**"
+      - "headroom/rtk/**"
+      - "tests/test_cli/test_wrap_bridge.py"
+      - ".github/actions/headroom-e2e-setup/**"
+      - ".github/workflows/wrap-native-e2e.yml"
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  wrap-native:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        # Windows is excluded today: upstream `esaxx-rs` (transitively from
+        # `tokenizers`) and `ort-sys` (onnxruntime via `fastembed`) link
+        # with conflicting MSVC C runtime libraries (/MT vs /MD), so the
+        # Rust extension cannot build for `win_amd64` until the upstream
+        # CRT conflict is resolved. Re-add `windows-latest` once the wheel
+        # builds cleanly there. Match init-native-e2e.yml so this workflow
+        # doesn't fail during setup before the wrap smoke tests run.
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup
+        uses: ./.github/actions/headroom-e2e-setup
+        with:
+          install-mode: deps-only-proxy
+          python-version: "3.11"
+
+      - name: Install pytest
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --retries 10 --timeout 60 pytest pytest-cov
+
+      - name: Run wrap native bridge tests
+        shell: bash
+        run: |
+          pytest tests/test_cli/test_wrap_bridge.py --cov=headroom --cov-report=xml:coverage-wrap-native.xml --cov-report=term-missing -q
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: ./coverage-wrap-native.xml
+          flags: wrap-native
+          name: wrap-native-${{ matrix.os }}
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false

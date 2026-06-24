@@ -1,0 +1,26 @@
+{
+  "config": {
+    "always_keep_additions": true,
+    "always_keep_deletions": true,
+    "enable_ccr": true,
+    "max_context_lines": 2,
+    "max_files": 20,
+    "max_hunks_per_file": 10,
+    "min_lines_for_ccr": 50
+  },
+  "input": "diff --git a/new.py b/new.py\nnew file mode 100644\n--- /dev/null\n+++ b/new.py\n@@ -0,0 +1,4 @@\n+def hello():\n+    return 'world'\n+\n+x = hello()\n# variant 1",
+  "input_sha256": "649fd65ad35111911ad4d54fa694eac28d9bcbcc9f9fc99e10329f5bbcf20035",
+  "output": {
+    "additions": 0,
+    "cache_key": null,
+    "compressed": "diff --git a/new.py b/new.py\nnew file mode 100644\n--- /dev/null\n+++ b/new.py\n@@ -0,0 +1,4 @@\n+def hello():\n+    return 'world'\n+\n+x = hello()\n# variant 1",
+    "compressed_line_count": 10,
+    "deletions": 0,
+    "files_affected": 0,
+    "hunks_kept": 0,
+    "hunks_removed": 0,
+    "original_line_count": 10
+  },
+  "recorded_at": "2026-04-23T23:51:37.353544+00:00",
+  "transform": "diff_compressor"
+}

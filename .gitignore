@@ -1,0 +1,254 @@
+# fastembed model cache (auto-downloaded ONNX weights, ~30 MB+).
+# Should NEVER be committed — bloats the repo significantly.
+.fastembed_cache/
+**/.fastembed_cache/
+
+# Local Kompress ONNX export artifacts (scripts/export_kompress_v2_onnx.py).
+# Hundreds of MB each — published to HuggingFace, never committed.
+/onnx/
+
+# Private scripts (contain credentials). Allowlist checked-in helpers below.
+scripts/
+!scripts/
+scripts/*
+!scripts/install.sh
+!scripts/install.ps1
+!scripts/version-sync.py
+!scripts/sync-plugin-versions.py
+!scripts/changelog-gen.py
+!scripts/verify-versions.py
+!scripts/pr-governance.py
+!scripts/tests/
+!scripts/README.md
+!scripts/repro_codex_replay.py
+!scripts/eval_output_shaper.py
+!scripts/fixtures/
+!scripts/fixtures/*.json
+!scripts/record_fixtures.py
+!scripts/build_rust_extension.sh
+!scripts/install-git-hooks.sh
+!scripts/smoke_issue_327.py
+!scripts/refresh_model_limits.sh
+!scripts/audit_wheel_glibc_symbols.py
+!scripts/replay_codex_ws_load.py
+!scripts/export_kompress_v2_onnx.py
+
+# Rust / Cargo build artifacts
+/target/
+**/target/
+Cargo.lock.bak
+
+# Swift SDK (separate repo)
+swift/
+
+# Local planning docs (never commit)
+ENTERPRISE_HARDENING.md
+
+# Audit/scan outputs (contain security findings — never commit)
+bandit_result.txt
+pip_audit_result.txt
+ruff_result.txt
+reqs.txt
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+pytest_cache/
+
+# Translations
+*.mo
+*.pot
+
+# Environments
+.env
+.env.*
+!.env.act.example
+!.env.example
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.python-version
+
+# Secrets and API keys - NEVER commit these
+*.pem
+*.key
+secrets.json
+credentials.json
+.secrets
+api_keys.txt
+.anthropic
+.openai
+
+# IDE and editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+*.sublime-project
+*.sublime-workspace
+.spyproject
+.spyderproject
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Thumbnails
+Icon?
+._*
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Linux
+*~
+
+# Local configuration
+local_settings.py
+*.local.py
+*.local.json
+*.local.yaml
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Log files
+*.log
+logs/
+log/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.bak
+*.swp
+
+# Benchmark results (keep framework, not results)
+.benchmarks/
+benchmark_results.json
+benchmark_results/
+
+# DeepEval cache
+.deepeval/
+
+# Headroom specific
+.headroom/
+headroom.db
+headroom_*.db
+*.jsonl
+!tests/fixtures/*.jsonl
+docker/differential-network-capture/captures/
+
+# Documentation build
+docs/_build/
+site/
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Ruff
+.ruff_cache/
+
+# pyright
+pyrightconfig.json
+
+# Editor backup files
+*~
+\#*\#
+.\#*
+
+# Local development configuration
+CLAUDE.md
+
+# Vitals provenance data
+.vitals/
+
+# Superpowers working files (plans, specs, brainstorming)
+# docs/spec/           (lives in git - git-versioned living specification)
+
+# Managed platform (separate private repo)
+headroom-managed/
+
+# Local act testing (never commit test tokens)
+/.env.act
+.actrc.local
+
+# Release metadata artifact
+.releaseetadata
+
+# uv lockfile: regenerated locally; not committed
+uv.lock
+
+# Rust extension `.so` symlinks placed by `scripts/build_rust_extension.sh`
+# into the `headroom/` package dir for local development. The real binary
+# lives in `crates/headroom-py/python/headroom/`; this is the dev overlay
+# that lets `import headroom._core` resolve when the source `headroom/`
+# package shadows the maturin overlay on sys.path.
+/headroom/_core.*.so
+/headroom/_core.so

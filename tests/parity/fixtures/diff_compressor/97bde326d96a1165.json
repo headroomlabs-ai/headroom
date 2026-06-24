@@ -1,0 +1,26 @@
+{
+  "config": {
+    "always_keep_additions": true,
+    "always_keep_deletions": true,
+    "enable_ccr": true,
+    "max_context_lines": 2,
+    "max_files": 20,
+    "max_hunks_per_file": 10,
+    "min_lines_for_ccr": 50
+  },
+  "input": "diff --git a/last.txt b/last.txt\n--- a/last.txt\n+++ b/last.txt\n@@ -1,8 +1,8 @@\n-old_first\n+new_first\n ctx_a\n ctx_b\n ctx_c\n ctx_d\n ctx_e\n ctx_f\n\\ No newline at end of file\n\n# bugfix:no-newline-marker",
+  "input_sha256": "97bde326d96a1165970bc74db5d079198bac8a029c0b6a53940554014aafdeae",
+  "output": {
+    "additions": 0,
+    "cache_key": null,
+    "compressed": "diff --git a/last.txt b/last.txt\n--- a/last.txt\n+++ b/last.txt\n@@ -1,8 +1,8 @@\n-old_first\n+new_first\n ctx_a\n ctx_b\n ctx_c\n ctx_d\n ctx_e\n ctx_f\n\\ No newline at end of file\n\n# bugfix:no-newline-marker",
+    "compressed_line_count": 15,
+    "deletions": 0,
+    "files_affected": 0,
+    "hunks_kept": 0,
+    "hunks_removed": 0,
+    "original_line_count": 15
+  },
+  "recorded_at": "2026-04-25T23:19:00.820141+00:00",
+  "transform": "diff_compressor"
+}

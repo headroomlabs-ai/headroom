@@ -1,0 +1,165 @@
+[package]
+name = "headroom-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core Headroom types and compression transform traits (Rust)."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tiktoken-rs = "0.11"
+# `tokenizers` is the HuggingFace pure-Rust tokenizer crate. Default features
+# pull in `onig` for the BPE pre-tokenizer regex; that vendors oniguruma so it
+# builds without a system dep on macOS/Linux.
+tokenizers = "0.22"
+# `hf-hub` is the HuggingFace Hub client. We use the blocking `ureq` transport
+# with `rustls` (no system OpenSSL dep — keeps the binary static-linkable for
+# AWS deploys). `from_pretrained` is called once at startup, so blocking is
+# fine; if a tokio caller needs it later we can wrap in `spawn_blocking`.
+hf-hub = { version = "0.4", default-features = false, features = ["ureq", "rustls-tls"] }
+# `md5` for the CCR cache_key. Python's compression_store hashes the original
+# diff with MD5 truncated to 24 hex chars; we must match byte-for-byte.
+md-5 = "0.10"
+# `sha2` for `_hash_field_name` in smart_crusher (SHA256 truncated to 16
+# hex chars). Python uses `hashlib.sha256` so we need byte-exact parity.
+sha2 = "0.10"
+# `dashmap` for the CCR storage backend. Concurrent HashMap with sharded
+# locking — distinct keys hashed to different shards never contend, so
+# multi-worker proxy load doesn't queue on a single Mutex. Lock-free
+# reads inside each shard via RwLock semantics.
+dashmap = "6"
+# `regex` is already a transitive dep of tokenizers; depend on it directly so
+# our hunk-header parser and priority-pattern matcher have a stable surface.
+regex = "1"
+# `flate2` for `_validate_with_zlib` in `adaptive_sizer`. Python's adaptive
+# sizing pipeline uses `zlib.compress(..., level=1)` to validate the chosen
+# K against compression-ratio diversity. We use the default `miniz_oxide`
+# backend (pure Rust) which produces DEFLATE output of similar length to
+# CPython's libz at level=1 for typical inputs. The check only triggers on
+# >15% ratio divergence so small per-byte differences don't change the
+# outcome — but if a parity fixture flakes here, swap to
+# `features = ["zlib"]` to link against system libz for byte-equal output.
+flate2 = "1"
+# `fastembed` is the Rust port of the Python fastembed library. Used by
+# `relevance::EmbeddingScorer` for sentence embeddings in semantic relevance
+# scoring. Default features pull in `ort` (ONNX Runtime) with auto-download
+# of the runtime binary; the model file (BAAI/bge-small-en-v1.5, ~30 MB
+# int8-quantized ONNX) auto-downloads from HuggingFace Hub on first use.
+# Same library + same model = byte-equal embeddings between Python and Rust
+# (both call into ONNX Runtime over the identical ONNX file).
+#
+# `default-features = false` + explicit rustls features eliminates the
+# transitive `native-tls` → `openssl-sys` dependency that fastembed's
+# default features pull in (via `hf-hub-native-tls` + `ort-download-
+# binaries-native-tls`). Without this, every wheel-build surface
+# (release matrix, e2e/wrap, e2e/init, devcontainer, ci.yml) needs
+# system OpenSSL + perl modules for openssl-src vendored compile. Using
+# rustls everywhere removes the entire OpenSSL build-deps surface.
+# `magika` is Google's ONNX-backed content classifier (Tier 1 of the
+# Stage-3d ContentRouter detection arch). Bundled standard-model is
+# loaded once per process via `OnceLock` and shared across calls. The
+# crate depends on `ort`, which is already in our dep tree via
+# `fastembed`, so adding it doesn't pull a new ML runtime — both
+# crates share the ONNX Runtime singleton.
+magika = "1"
+# `unidiff` is the Stage-3d Tier-2 diff detector. We use the parser
+# itself as the "is this a diff?" oracle — anything that successfully
+# parses to ≥1 PatchedFile is a diff. The deterministic parser
+# catches diffs Magika may miss (naked hunks without `diff --git`
+# headers, prose-prefixed diffs, truncated outputs). Default features
+# bring `encoding_rs` for non-UTF8 sniffing — we keep them on for
+# compatibility with arbitrary tool outputs.
+unidiff = "0.4"
+# `aho-corasick` powers the Tier-3 KeywordDetector in `signals/`.
+# A single deterministic-finite-automaton scan finds every keyword
+# in a line in O(n + m) — orders of magnitude faster than running N
+# regex .search() calls and harder to misuse. Word-boundary checks
+# happen as a post-filter on the byte offsets the automaton returns.
+# Default features (std, perf-literal) keep the build small.
+aho-corasick = "1"
+# `rayon` powers the pipeline orchestrator's parallel reformat-vs-bloat
+# evaluation: while a worker thread runs the structural reformat passes,
+# another set of threads run the per-offload bloat estimators in parallel.
+# Reformat completion + all bloat estimates need to be ready before the
+# orchestrator can decide which offloads to actually execute, so two-phase
+# join semantics (`rayon::join` + `par_iter`) are exactly what we need.
+rayon = "1"
+# `toml` reads the default pipeline configuration shipped at
+# `config/pipeline.toml`. The defaults embed via `include_str!` so a
+# stock binary needs no external file; production deployments override
+# by loading their own TOML at startup.
+toml = "0.8"
+# `blake3` powers `ccr::compute_key`. BLAKE3 is faster than SHA-256 on
+# every hot path the proxy hits (large diff/log/tool_result payloads)
+# and produces collision-resistant 24-char prefixes for the CCR
+# `<<ccr:HASH>>` marker. Pinning the algorithm + truncation length here
+# keeps Rust and Python in lockstep — Python parses the same 24-char
+# hex via `headroom/ccr/tool_injection.py` regex. Pure-Rust by default,
+# no system dep, no SIMD-feature-gated flag (the crate auto-detects).
+blake3 = "1"
+# `rusqlite` for the SQLite-backed CCR store (the production default).
+# `bundled` builds SQLite from source so deploys do not need a system
+# libsqlite3 — matters for Lambda / container builds where the host
+# image may lag behind. Sub-1 MB binary cost. WAL is enabled at
+# connection-open time (see `ccr/backends/sqlite.rs`); no extra feature
+# flags required.
+rusqlite = { version = "0.32", features = ["bundled"] }
+# `redis` for the optional multi-worker CCR backend. Cfg-gated behind
+# the `redis` feature so deploys that don't need it pay no compile
+# cost. Default features include the sync `Connection` API used in
+# `ccr/backends/redis.rs`; `tokio-comp` would pull `tokio` into the
+# core crate, which we do not want.
+redis = { version = "0.27", optional = true, default-features = false }
+# `http` powers the auth-mode classifier (Phase F PR-F1). The proxy
+# crate already depends on this — pulling it into core lets the
+# classifier live with the other Phase B/F policy primitives without
+# cycling through the proxy crate. Tiny crate (no I/O, just types).
+http = "1"
+
+[target.'cfg(not(windows))'.dependencies]
+fastembed = { version = "5", default-features = false, features = [
+    "hf-hub-rustls-tls",
+    "ort-download-binaries-rustls-tls",
+    "image-models",
+] }
+
+[target.'cfg(windows)'.dependencies]
+# `ort-download-binaries-*` emits DirectML link libs on Windows (`DXCORE`,
+# `DXGI`, `D3D12`, `DirectML`). Users installing `headroom-ai[all]` from
+# sdist often do not have those SDK libs, so load ORT dynamically instead.
+fastembed = { version = "5", default-features = false, features = [
+    "hf-hub-rustls-tls",
+    "ort-load-dynamic",
+    "image-models",
+] }
+
+[features]
+default = []
+# Compile in the Redis CCR backend. Enable for multi-worker deployments
+# that want a shared CCR store with no sticky-session at the LB. The
+# SQLite backend (always compiled) is the production default for
+# single-worker / single-instance setups.
+redis = ["dep:redis"]
+
+[dev-dependencies]
+proptest = "1"
+criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3"
+
+[[bench]]
+name = "tokenizer"
+harness = false
+
+[[bench]]
+name = "ccr_store"
+harness = false
+
+[[bench]]
+name = "auth_mode"
+harness = false

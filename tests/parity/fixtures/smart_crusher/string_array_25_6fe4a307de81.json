@@ -1,0 +1,34 @@
+{
+  "config": {
+    "dedup_identical_items": true,
+    "enabled": true,
+    "factor_out_constants": false,
+    "first_fraction": 0.3,
+    "include_summaries": false,
+    "last_fraction": 0.15,
+    "max_items_after_crush": 15,
+    "min_items_to_analyze": 5,
+    "min_tokens_to_crush": 200,
+    "preserve_change_points": true,
+    "similarity_threshold": 0.8,
+    "toin_confidence_threshold": 0.5,
+    "uniqueness_threshold": 0.1,
+    "use_feedback_hints": true,
+    "variance_threshold": 2.0
+  },
+  "input": {
+    "bias": 1.0,
+    "content": "[\"event 0: something happened at index 0\", \"event 1: something happened at index 1\", \"event 2: something happened at index 2\", \"event 3: something happened at index 3\", \"event 4: something happened at index 4\", \"event 5: something happened at index 5\", \"event 6: something happened at index 6\", \"event 7: something happened at index 7\", \"event 8: something happened at index 8\", \"event 9: something happened at index 9\", \"event 10: something happened at index 10\", \"event 11: something happened at index 11\", \"event 12: something happened at index 12\", \"event 13: something happened at index 13\", \"event 14: something happened at index 14\", \"event 15: something happened at index 15\", \"event 16: something happened at index 16\", \"event 17: something happened at index 17\", \"event 18: something happened at index 18\", \"event 19: something happened at index 19\", \"event 20: something happened at index 20\", \"event 21: something happened at index 21\", \"event 22: something happened at index 22\", \"event 23: something happened at index 23\", \"event 24: something happened at index 24\"]",
+    "query": ""
+  },
+  "input_sha256": "6fe4a307de817df20507df7fc88f0237c203a785c550696abb1f6b8dd413b40e",
+  "label": "string_array_25",
+  "output": {
+    "compressed": "[\"event 0: something happened at index 0\",\"event 1: something happened at index 1\",\"event 2: something happened at index 2\",\"event 3: something happened at index 3\",\"event 4: something happened at index 4\",\"event 6: something happened at index 6\",\"event 8: something happened at index 8\",\"event 10: something happened at index 10\",\"event 12: something happened at index 12\",\"event 14: something happened at index 14\",\"event 16: something happened at index 16\",\"event 18: something happened at index 18\",\"event 20: something happened at index 20\",\"event 23: something happened at index 23\",\"event 24: something happened at index 24\"]",
+    "original": "[\"event 0: something happened at index 0\", \"event 1: something happened at index 1\", \"event 2: something happened at index 2\", \"event 3: something happened at index 3\", \"event 4: something happened at index 4\", \"event 5: something happened at index 5\", \"event 6: something happened at index 6\", \"event 7: something happened at index 7\", \"event 8: something happened at index 8\", \"event 9: something happened at index 9\", \"event 10: something happened at index 10\", \"event 11: something happened at index 11\", \"event 12: something happened at index 12\", \"event 13: something happened at index 13\", \"event 14: something happened at index 14\", \"event 15: something happened at index 15\", \"event 16: something happened at index 16\", \"event 17: something happened at index 17\", \"event 18: something happened at index 18\", \"event 19: something happened at index 19\", \"event 20: something happened at index 20\", \"event 21: something happened at index 21\", \"event 22: something happened at index 22\", \"event 23: something happened at index 23\", \"event 24: something happened at index 24\"]",
+    "strategy": "string:adaptive(25->15)(25->15)",
+    "was_modified": true
+  },
+  "recorded_at": "2026-04-27T06:59:39.928634+00:00",
+  "transform": "smart_crusher"
+}

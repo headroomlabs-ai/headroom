@@ -1,0 +1,15 @@
+{
+  "config": {},
+  "input": "diff --git a/foo.py b/foo.py\nindex abc..def 100644\n--- a/foo.py\n+++ b/foo.py\n@@ -1,3 +1,3 @@\n-old line\n+new line\n unchanged\n",
+  "input_sha256": "552d30c30c2a67939857c22f85696406f1557476912b41d9918031a15364163a",
+  "output": {
+    "confidence": 1.0,
+    "content_type": "diff",
+    "metadata": {
+      "change_lines": 2,
+      "header_matches": 3
+    }
+  },
+  "recorded_at": "2026-04-28T06:39:34.959842+00:00",
+  "transform": "content_detector"
+}

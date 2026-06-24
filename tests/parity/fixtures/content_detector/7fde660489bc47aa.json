@@ -1,0 +1,15 @@
+{
+  "config": {},
+  "input": "[]",
+  "input_sha256": "7fde660489bc47aa12bccf43567d6c386c36670ca5185e8a5f8781ac257f7c7d",
+  "output": {
+    "confidence": 0.8,
+    "content_type": "json_array",
+    "metadata": {
+      "is_dict_array": false,
+      "item_count": 0
+    }
+  },
+  "recorded_at": "2026-04-28T06:39:34.959529+00:00",
+  "transform": "content_detector"
+}

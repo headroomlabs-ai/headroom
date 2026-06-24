@@ -1,0 +1,227 @@
+---
+title: SharedContext
+description: Compressed inter-agent context sharing. Reduce token usage by ~80% when agents hand off to each other.
+---
+
+When agents hand off to each other, context gets replayed in full. SharedContext compresses what moves between agents using Headroom's compression pipeline, typically saving **~80% of tokens** on agent handoffs.
+
+## Quick Start
+
+<Tabs groupId="lang" items={['TypeScript', 'Python']}>
+<Tab value="TypeScript">
+```ts twoslash
+import { SharedContext } from "headroom";
+
+const ctx = new SharedContext();
+
+// Agent A stores large output
+const entry = await ctx.put("research", bigResearchOutput, {
+  agent: "researcher",
+});
+
+// Agent B gets compressed version (~80% smaller)
+const summary = ctx.get("research");
+
+// Agent B needs full details on demand
+const full = ctx.get("research", { full: true });
+```
+</Tab>
+<Tab value="Python">
+```python
+from headroom import SharedContext
+
+ctx = SharedContext()
+
+# Agent A stores large output
+ctx.put("research", big_research_output, agent="researcher")
+
+# Agent B gets compressed version (~80% smaller)
+summary = ctx.get("research")
+
+# Agent B needs full details on demand
+full = ctx.get("research", full=True)
+```
+</Tab>
+</Tabs>
+
+## API
+
+### `put(key, content, agent?)`
+
+Store content under a key. Compresses automatically using Headroom's full pipeline (SmartCrusher for JSON, CodeCompressor for code, Kompress for text).
+
+<Tabs groupId="lang" items={['TypeScript', 'Python']}>
+<Tab value="TypeScript">
+```ts twoslash
+import { SharedContext } from "headroom";
+const ctx = new SharedContext();
+// ---cut---
+const entry = await ctx.put("findings", bigJsonOutput, {
+  agent: "researcher",
+});
+
+entry.originalTokens;   // 20000
+entry.compressedTokens;  // 4000
+entry.savingsPercent;    // 80.0
+entry.transforms;        // ["router:json:0.20"]
+```
+</Tab>
+<Tab value="Python">
+```python
+entry = ctx.put("findings", big_json_output, agent="researcher")
+
+entry.original_tokens     # 20,000
+entry.compressed_tokens   # 4,000
+entry.savings_percent     # 80.0
+entry.transforms          # ["router:json:0.20"]
+```
+</Tab>
+</Tabs>
+
+### `get(key, full?)`
+
+Retrieve content. Returns the compressed version by default, or the original with `full=True`.
+
+<Tabs groupId="lang" items={['TypeScript', 'Python']}>
+<Tab value="TypeScript">
+```ts twoslash
+import { SharedContext } from "headroom";
+const ctx = new SharedContext();
+// ---cut---
+const compressed = ctx.get("findings");                  // 4K tokens
+const original = ctx.get("findings", { full: true });    // 20K tokens
+const missing = ctx.get("nonexistent");                  // null
+```
+</Tab>
+<Tab value="Python">
+```python
+compressed = ctx.get("findings")              # 4K tokens
+original = ctx.get("findings", full=True)     # 20K tokens
+missing = ctx.get("nonexistent")              # None
+```
+</Tab>
+</Tabs>
+
+### `stats()`
+
+Aggregated statistics across all entries.
+
+<Tabs groupId="lang" items={['TypeScript', 'Python']}>
+<Tab value="TypeScript">
+```ts twoslash
+import { SharedContext } from "headroom";
+const ctx = new SharedContext();
+// ---cut---
+const stats = ctx.stats();
+stats.entries;                // 3
+stats.totalOriginalTokens;    // 60000
+stats.totalCompressedTokens;  // 12000
+stats.totalTokensSaved;       // 48000
+stats.savingsPercent;         // 80.0
+```
+</Tab>
+<Tab value="Python">
+```python
+stats = ctx.stats()
+stats.entries                  # 3
+stats.total_original_tokens    # 60000
+stats.total_compressed_tokens  # 12000
+stats.total_tokens_saved       # 48000
+stats.savings_percent          # 80.0
+```
+</Tab>
+</Tabs>
+
+### `keys()` and `clear()`
+
+`keys()` lists all non-expired keys. `clear()` removes all entries.
+
+## Configuration
+
+<Tabs groupId="lang" items={['TypeScript', 'Python']}>
+<Tab value="TypeScript">
+```ts twoslash
+import { SharedContext } from "headroom";
+// ---cut---
+const ctx = new SharedContext({
+  model: "claude-sonnet-4-5-20250929",  // For token counting
+  ttl: 3600,                             // 1 hour (default)
+  maxEntries: 100,                       // Evicts oldest when full
+});
+```
+</Tab>
+<Tab value="Python">
+```python
+ctx = SharedContext(
+    model="claude-sonnet-4-5-20250929",  # For token counting
+    ttl=3600,                             # 1 hour (default)
+    max_entries=100,                       # Evicts oldest when full
+)
+```
+</Tab>
+</Tabs>
+
+Entries expire after `ttl` seconds. When `maxEntries` is reached, the oldest entry is evicted.
+
+## Framework Examples
+
+SharedContext is framework-agnostic. It works anywhere context moves between agents.
+
+### CrewAI
+
+```python
+from headroom import SharedContext
+
+ctx = SharedContext()
+
+# After researcher task completes
+ctx.put("findings", researcher_task.output.raw)
+
+# Coder task gets compressed context
+coder_context = ctx.get("findings")
+```
+
+### LangGraph
+
+```python
+from headroom import SharedContext
+
+ctx = SharedContext()
+
+def researcher_node(state):
+    result = do_research()
+    ctx.put("research", result)
+    return {"research_summary": ctx.get("research")}
+
+def coder_node(state):
+    # Compressed summary in state, full details on demand
+    full = ctx.get("research", full=True)
+    return {"code": write_code(full)}
+```
+
+### OpenAI Agents SDK
+
+```python
+from headroom import SharedContext
+
+ctx = SharedContext()
+
+def compress_handoff(messages):
+    for msg in messages:
+        if len(msg.content) > 1000:
+            ctx.put(msg.id, msg.content)
+            msg.content = ctx.get(msg.id)
+    return messages
+
+handoff(agent=coder, input_filter=compress_handoff)
+```
+
+## How It Works
+
+Under the hood, `put()` calls `headroom.compress()` -- the same pipeline used by the Headroom proxy -- and stores the original in memory. `get()` returns the compressed version. `get(full=True)` returns the original.
+
+The compression pipeline routes content to the best compressor:
+
+- **JSON arrays** -- SmartCrusher (70-95% compression)
+- **Code** -- CodeCompressor (AST-aware)
+- **Text** -- Kompress (ModernBERT-based) or passthrough

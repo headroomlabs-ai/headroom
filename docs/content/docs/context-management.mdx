@@ -1,0 +1,126 @@
+---
+title: Context Management
+description: Intelligent importance-based context management that scores messages by learned patterns, with rolling window fallback and output buffer reservation.
+---
+
+When conversations grow beyond a model's context window, Headroom decides which messages to keep and which to drop. Instead of naively removing the oldest messages, the pipeline scores every message by learned importance and drops the least valuable ones first.
+
+## How It Works
+
+The context management stage analyzes your conversation, assigns an importance score to each message, and removes low-scoring messages until the conversation fits within the token budget.
+
+Dropped messages are not lost -- they are stored in [CCR](/docs/ccr) for on-demand retrieval by the LLM.
+
+```
+100-message conversation (50K tokens) with a 32K budget
+  -> Score each message by importance
+  -> Drop 60 lowest-scoring messages
+  -> Cache dropped messages in CCR (hash=def456)
+  -> Insert marker: "60 messages dropped, retrieve: def456"
+  -> Final context: 40 messages within budget
+```
+
+## Scoring weights
+
+Each message receives a weighted score from six factors:
+
+| Weight | Default | Description |
+|---|---|---|
+| `recency` | 0.20 | Exponential decay from the end of the conversation. Recent messages score higher. |
+| `semantic_similarity` | 0.20 | Embedding cosine similarity to recent context. Messages related to the current topic score higher. |
+| `toin_importance` | 0.25 | TOIN retrieval rate -- messages matching patterns that users frequently retrieve via CCR are scored higher. Learned across all users. |
+| `error_indicator` | 0.15 | TOIN field semantics error detection. Messages containing error patterns (learned, not hardcoded) are preserved. |
+| `forward_reference` | 0.15 | Count of later messages that reference this one. Messages that other messages depend on are kept. |
+| `token_density` | 0.05 | Unique tokens divided by total tokens. Dense, information-rich messages score higher than repetitive ones. |
+
+<Callout type="info" title="No hardcoded patterns">
+  Error detection does not rely on keyword matching like "error" or "fail". Instead, it uses TOIN's learned `field_semantics.inferred_type` to identify error-bearing messages -- this adapts to your specific data patterns across sessions and users.
+</Callout>
+
+Weights are automatically normalized to sum to 1.0, so you can set relative values without worrying about exact proportions.
+
+## Rolling window fallback
+
+If IntelligentContext is disabled or scoring data is unavailable, Headroom falls back to a **rolling window** strategy:
+
+- Drop the oldest messages first
+- Always keep the system prompt
+- Always keep the last N user/assistant turns
+- Drop tool calls and their responses as atomic pairs (no orphaned tool data)
+
+This provides a safe baseline that works without any learned data.
+
+## Protection rules
+
+Headroom enforces several protections to ensure model output quality:
+
+### Output buffer reservation
+
+A configurable number of tokens is reserved for the model's response. The context budget is calculated as:
+
+```
+context_budget = model_context_limit - output_buffer_tokens
+```
+
+This prevents the input from consuming the entire context window and leaving no room for the model to respond.
+
+### System message protection
+
+System messages are never dropped. They contain critical instructions, persona definitions, and tool descriptions that the model needs throughout the conversation.
+
+### Turn protection
+
+The last N user/assistant turns are always preserved, ensuring the model has immediate conversational context. By default, the last 2 turns are protected.
+
+## Configuration
+
+Context management is now automatic. Use per-request overrides to control behavior:
+
+<Tabs groupId="lang" items={['TypeScript', 'Python']}>
+<Tab value="TypeScript">
+```ts twoslash
+import { compress } from "headroom-ai";
+
+const result = await compress(messages, {
+  model: "gpt-4o",
+  tokenBudget: 32000,
+});
+
+console.log(`Compressed: ${result.tokensBefore} -> ${result.tokensAfter}`);
+```
+</Tab>
+<Tab value="Python">
+```python
+from headroom import HeadroomClient, OpenAIProvider
+from openai import OpenAI
+
+client = HeadroomClient(
+    original_client=OpenAI(),
+    provider=OpenAIProvider(),
+    default_mode="optimize",
+)
+
+# Per-request overrides
+response = client.chat.completions.create(
+    model="gpt-4o",
+    messages=messages,
+    headroom_output_buffer_tokens=8000,  # More room for long responses
+    headroom_keep_turns=5,               # Protect last 5 turns
+)
+```
+</Tab>
+</Tabs>
+
+> **Note:** The `IntelligentContextConfig`, `ScoringWeights`, and `RollingWindowConfig` classes were removed in 0.9.x. Context management is now handled automatically inside the pipeline.
+
+## How scoring improves over time
+
+IntelligentContext integrates with TOIN (Tool-Output Intelligence Network) to learn from real usage:
+
+1. Messages are dropped based on current scores
+2. Dropped messages are stored in CCR
+3. If the LLM retrieves a dropped message, TOIN records that pattern
+4. Future conversations score similar message patterns higher
+5. Drop accuracy improves across all users, not just within one session
+
+This feedback loop means the system gets smarter the more it is used. Error messages that users frequently need are automatically preserved, while verbose success messages that nobody retrieves are dropped more aggressively.

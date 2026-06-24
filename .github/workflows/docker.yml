@@ -1,0 +1,428 @@
+name: Docker
+
+on:
+  push:
+    branches: [main]
+  workflow_call:
+    inputs:
+      version:
+        description: "Version to stamp into the image contents and exact image tag"
+        required: false
+        type: string
+      enable_ref_tags:
+        description: "Whether to emit branch/PR ref tags"
+        required: false
+        default: true
+        type: boolean
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to stamp into the image contents and exact image tag"
+        required: false
+  release:
+    types: [published]
+
+env:
+  REGISTRY: ghcr.io
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write # For cosign keyless signing via Sigstore OIDC
+
+jobs:
+  # ─── Per-arch fan-out ──────────────────────────────────────────────────────
+  # Build each variant on its native architecture in parallel:
+  #   linux/amd64 → ubuntu-24.04 (native x86_64)
+  #   linux/arm64 → ubuntu-24.04-arm (native aarch64, GA Jan 2025)
+  #
+  # Pre-#377 we ran a single matrix job per variant on `ubuntu-latest` and
+  # let bake's `platforms = ["linux/amd64", "linux/arm64"]` do multi-arch
+  # via QEMU emulation — ~1h per variant. Native arm64 runners drop QEMU
+  # entirely and cut each variant to ~10 min on each arch in parallel.
+  #
+  # Each per-arch build pushes by digest only (no tags). The
+  # `docker-manifest` job below combines the per-arch digests into the
+  # final multi-arch tagged manifest, which is what users pull by tag.
+  docker-build:
+    runs-on: ${{ matrix.arch.runs_on }}
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - { name: "", bake_target: runtime }
+          - { name: nonroot, bake_target: runtime-nonroot }
+          - { name: code, bake_target: runtime-code }
+          - { name: code-nonroot, bake_target: runtime-code-nonroot }
+          - { name: slim, bake_target: runtime-slim }
+          - { name: slim-nonroot, bake_target: runtime-slim-nonroot }
+          - { name: code-slim, bake_target: runtime-code-slim }
+          - { name: code-slim-nonroot, bake_target: runtime-code-slim-nonroot }
+        arch:
+          - { name: amd64, runs_on: ubuntu-24.04, platform: linux/amd64 }
+          - { name: arm64, runs_on: ubuntu-24.04-arm, platform: linux/arm64 }
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Normalize image name
+        id: image-name
+        run: |
+          image_name="$(printf '%s' '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+          printf 'image_name=%s\n' "$image_name" >> "$GITHUB_OUTPUT"
+
+      - name: Determine image version
+        id: version
+        env:
+          MANUAL_VERSION: ${{ inputs.version || github.event.inputs.version }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          version="${MANUAL_VERSION#v}"
+          if [ -z "$version" ] && [ -n "$RELEASE_TAG" ]; then
+            version="${RELEASE_TAG#v}"
+          fi
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Python
+        if: steps.version.outputs.version != ''
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Sync versioned files for image build
+        if: steps.version.outputs.version != ''
+        run: |
+          python scripts/version-sync.py --version ${{ steps.version.outputs.version }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Labels (not tags) for the per-arch image. Tags belong on the
+      # multi-arch index manifest and are applied in docker-manifest.
+      - name: Extract image labels
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ steps.image-name.outputs.image_name }}
+
+      - name: Build and push by digest (single platform)
+        id: bake
+        uses: docker/bake-action@v7
+        with:
+          files: |
+            ./docker-bake.hcl
+            cwd://${{ steps.meta.outputs.bake-file-labels }}
+          targets: ${{ matrix.variant.bake_target }}
+          push: true
+          # `*.platform` overrides the [amd64,arm64] default in
+          # docker-bake.hcl. `push-by-digest=true,name-canonical=true`
+          # tells buildx to push the per-platform manifest with no tags
+          # — only the digest is recorded — so multiple per-arch builds
+          # can coexist in the registry until the manifest job stitches
+          # them. `name=<registry>/<image>` is REQUIRED here: with no
+          # `bake-file-tags` in scope (tags belong on the manifest, not
+          # per-arch), bake has no way to know the push target without
+          # the explicit `name=`. Removing it surfaces as the
+          # misleading "ERROR: tag is needed when pushing to registry"
+          # — see PR #378 (regression from #376). GHA cache is scoped
+          # per (variant, arch) so the two arches don't fight over the
+          # same cache key.
+          set: |
+            *.platform=${{ matrix.arch.platform }}
+            *.output=type=image,name=${{ env.REGISTRY }}/${{ steps.image-name.outputs.image_name }},push-by-digest=true,name-canonical=true,push=true
+            *.cache-from=type=gha,scope=${{ matrix.variant.name || 'root' }}-${{ matrix.arch.name }}
+            *.cache-to=type=gha,mode=max,scope=${{ matrix.variant.name || 'root' }}-${{ matrix.arch.name }}
+
+      - name: Export digest
+        id: digest
+        env:
+          BAKE_METADATA: ${{ steps.bake.outputs.metadata }}
+        run: |
+          # Bake's metadata is one entry per target; for a single-target
+          # single-platform build it has exactly one digest. Pipe the
+          # JSON through a file (same ARG_MAX rationale as before) and
+          # extract that digest.
+          cat > "${RUNNER_TEMP}/bake_meta.json" <<'__HEADROOM_BAKE_META_EOF__'
+          ${{ steps.bake.outputs.metadata }}
+          __HEADROOM_BAKE_META_EOF__
+          digest="$(jq -r 'to_entries[0].value."containerimage.digest" // empty' \
+              "${RUNNER_TEMP}/bake_meta.json")"
+          if [ -z "$digest" ]; then
+            echo "ERROR: no digest in bake metadata" >&2
+            cat "${RUNNER_TEMP}/bake_meta.json" >&2
+            exit 1
+          fi
+          printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+          # Stage a marker file named after the bare hex digest. The
+          # manifest job downloads all per-arch markers for a variant
+          # and reconstructs `IMAGE@sha256:<digest>` references from
+          # the filenames.
+          mkdir -p "${RUNNER_TEMP}/digests"
+          touch "${RUNNER_TEMP}/digests/${digest#sha256:}"
+
+      # Smoke-test the built image before recording its digest. If the
+      # Python ABI is wrong (e.g. builder Python 3.11 vs distroless
+      # Python 3.13) pydantic_core._pydantic_core fails to dlopen and
+      # the import raises ModuleNotFoundError. Catching it here prevents
+      # a broken digest from reaching the manifest merge job and being
+      # tagged and published. Both python-slim and distroless variants
+      # expose python3 in PATH and honour the image's PYTHONPATH env.
+      - name: Smoke-test image (pydantic_core + headroom._core)
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ steps.image-name.outputs.image_name }}
+          DIGEST: ${{ steps.digest.outputs.digest }}
+          PLATFORM: ${{ matrix.arch.platform }}
+        run: |
+          docker run --rm \
+            --platform "$PLATFORM" \
+            --entrypoint python3 \
+            "${IMAGE}@${DIGEST}" \
+            -c "
+          import pydantic_core
+          from headroom._core import DiffCompressor, SmartCrusher
+          print('smoke-test OK: pydantic_core', pydantic_core.__version__,
+                '| DiffCompressor', DiffCompressor.__name__,
+                '| SmartCrusher', SmartCrusher.__name__)
+          "
+
+      - name: Upload digest marker
+        uses: actions/upload-artifact@v7
+        with:
+          # Variant + arch in the artifact name so the manifest job can
+          # download with `pattern: digests-<variant>-*` to gather all
+          # arches for one variant. `root` substitutes the empty-string
+          # variant since GHA artifact names can't end in a hyphen.
+          name: digests-${{ matrix.variant.name || 'root' }}-${{ matrix.arch.name }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # ─── Per-variant manifest merge ────────────────────────────────────────────
+  # One job per variant, after both arch builds for that variant complete.
+  # `docker buildx imagetools create` stitches the two per-arch digests
+  # into a single multi-arch index manifest, applies the metadata-action
+  # tags, and that manifest is what users pull by `:tag`.
+  docker-manifest:
+    needs: docker-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - { name: "", bake_target: runtime }
+          - { name: nonroot, bake_target: runtime-nonroot }
+          - { name: code, bake_target: runtime-code }
+          - { name: code-nonroot, bake_target: runtime-code-nonroot }
+          - { name: slim, bake_target: runtime-slim }
+          - { name: slim-nonroot, bake_target: runtime-slim-nonroot }
+          - { name: code-slim, bake_target: runtime-code-slim }
+          - { name: code-slim-nonroot, bake_target: runtime-code-slim-nonroot }
+
+    steps:
+      # No `actions/checkout` here: the manifest job only calls
+      # `docker buildx imagetools` against the registry and runs
+      # cosign — neither needs the repo on disk. Skipping checkout
+      # saves a few seconds across 8 parallel manifest jobs.
+      - name: Normalize image name
+        id: image-name
+        run: |
+          image_name="$(printf '%s' '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+          printf 'image_name=%s\n' "$image_name" >> "$GITHUB_OUTPUT"
+
+      - name: Determine image version
+        id: version
+        env:
+          MANUAL_VERSION: ${{ inputs.version || github.event.inputs.version }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          version="${MANUAL_VERSION#v}"
+          if [ -z "$version" ] && [ -n "$RELEASE_TAG" ]; then
+            version="${RELEASE_TAG#v}"
+          fi
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+
+      - name: Compute short SHA
+        id: short-sha
+        run: printf 'sha=%s\n' "${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download per-arch digests for this variant
+        uses: actions/download-artifact@v8
+        with:
+          pattern: digests-${{ matrix.variant.name || 'root' }}-*
+          path: ${{ runner.temp }}/digests
+          merge-multiple: true
+
+      # Same tag rules as the pre-fan-out workflow — preserve every
+      # tag flavor (semver, ref, sha-prefixed, version-suffixed,
+      # bare variant) so existing pull URLs keep working.
+      - name: Extract metadata (variant)
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ steps.image-name.outputs.image_name }}
+          tags: |
+            type=ref,event=branch,enable=${{ inputs.enable_ref_tags != 'false' && github.event_name != 'release' }},suffix=${{ matrix.variant.name != '' && format('-{0}', matrix.variant.name) || '' }}
+            type=ref,event=pr,enable=${{ inputs.enable_ref_tags != 'false' && github.event_name != 'release' }},suffix=${{ matrix.variant.name != '' && format('-{0}', matrix.variant.name) || '' }}
+            type=raw,value=dev,enable=${{ inputs.enable_ref_tags != 'false' && github.event_name == 'push' }},suffix=${{ matrix.variant.name != '' && format('-{0}', matrix.variant.name) || '' }}
+            type=raw,value=${{ steps.version.outputs.version }},enable=${{ steps.version.outputs.version != '' }},suffix=${{ matrix.variant.name != '' && format('-{0}', matrix.variant.name) || '' }}
+            type=raw,value=${{ steps.version.outputs.version }}-${{ steps.short-sha.outputs.sha }},enable=${{ steps.version.outputs.version != '' && matrix.variant.name == '' }}
+            type=raw,value=${{ steps.version.outputs.version }}-${{ matrix.variant.name }}-${{ steps.short-sha.outputs.sha }},enable=${{ steps.version.outputs.version != '' && matrix.variant.name != '' }}
+            type=semver,pattern={{version}},suffix=${{ matrix.variant.name != '' && format('-{0}', matrix.variant.name) || '' }}
+            type=semver,pattern={{major}}.{{minor}},suffix=${{ matrix.variant.name != '' && format('-{0}', matrix.variant.name) || '' }}
+            type=semver,pattern={{major}},suffix=${{ matrix.variant.name != '' && format('-{0}', matrix.variant.name) || '' }}
+            type=sha,format=short,prefix=${{ matrix.variant.name != '' && format('{0}-', matrix.variant.name) || 'sha-' }}
+            type=raw,value=${{ matrix.variant.name }},enable=${{ matrix.variant.name != '' }}
+
+      - name: Create multi-arch manifest
+        id: manifest
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ steps.image-name.outputs.image_name }}
+          DIGEST_DIR: ${{ runner.temp }}/digests
+        run: |
+          # Reconstruct full image references from the digest marker
+          # filenames (each file is named after the bare hex digest
+          # of one per-arch manifest).
+          if ! ls "${DIGEST_DIR}"/* >/dev/null 2>&1; then
+            echo "ERROR: no digests downloaded for variant '${{ matrix.variant.name || 'root' }}'" >&2
+            exit 1
+          fi
+          digest_refs=()
+          for f in "${DIGEST_DIR}"/*; do
+            digest="$(basename "$f")"
+            digest_refs+=("${IMAGE}@sha256:${digest}")
+          done
+
+          # Build `--tag` args from the metadata-action JSON output.
+          # Empty tags array is valid (PR builds without ref-tags
+          # enabled emit nothing); skip manifest creation in that case.
+          tag_args=()
+          while IFS= read -r tag; do
+            [ -n "$tag" ] && tag_args+=("--tag" "$tag")
+          done < <(jq -r '.tags[]?' <<< '${{ steps.meta.outputs.json }}')
+
+          if [ "${#tag_args[@]}" -eq 0 ]; then
+            echo "No tags to apply for variant '${{ matrix.variant.name || 'root' }}'; skipping manifest."
+            exit 0
+          fi
+
+          docker buildx imagetools create \
+            "${tag_args[@]}" \
+            "${digest_refs[@]}"
+
+          # Resolve the index manifest digest of the freshly pushed
+          # multi-arch manifest so cosign can sign it directly. We
+          # ask the registry via `imagetools inspect` and read the
+          # `.manifest.digest` field — that's the registry's own
+          # record of the index digest (no client-side hashing).
+          first_tag="$(jq -r '.tags[0]' <<< '${{ steps.meta.outputs.json }}')"
+          index_digest="$(docker buildx imagetools inspect "${first_tag}" \
+              --format '{{ json . }}' | jq -r '.manifest.digest')"
+          if [ -z "$index_digest" ] || [ "$index_digest" = "null" ]; then
+            echo "ERROR: could not resolve index digest for ${first_tag}" >&2
+            exit 1
+          fi
+          printf 'index_digest=%s\n' "$index_digest" >> "$GITHUB_OUTPUT"
+          printf 'first_tag=%s\n' "$first_tag" >> "$GITHUB_OUTPUT"
+
+      - name: Install cosign
+        if: steps.manifest.outputs.index_digest != ''
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign multi-arch index manifest with cosign
+        if: steps.manifest.outputs.index_digest != ''
+        env:
+          # Same routing as before: keep signature artifacts in a
+          # sibling GHCR package so the main image's version listing
+          # stays clean. Verifiers must export the same
+          # COSIGN_REPOSITORY when running 'cosign verify'. See the
+          # pre-#377 workflow for the GHCR/OCI-1.1 referrers context.
+          COSIGN_REPOSITORY: ${{ env.REGISTRY }}/${{ steps.image-name.outputs.image_name }}-signatures
+          IMAGE: ${{ env.REGISTRY }}/${{ steps.image-name.outputs.image_name }}
+          INDEX_DIGEST: ${{ steps.manifest.outputs.index_digest }}
+        run: |
+          target="${IMAGE}@${INDEX_DIGEST}"
+          echo "Signing ${target} (signatures -> ${COSIGN_REPOSITORY})"
+          for attempt in 1 2 3; do
+            if cosign sign --yes "${target}"; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "ERROR: cosign signing failed after ${attempt} attempts" >&2
+              exit 1
+            fi
+            sleep_for=$((attempt * 10))
+            echo "cosign signing failed on attempt ${attempt}; retrying in ${sleep_for}s" >&2
+            sleep "$sleep_for"
+          done
+
+  promote-latest:
+    # Re-push the :latest tag pointing at the root variant *after* every
+    # variant manifest job has finished, so GHCR's package version
+    # listing (sorted by created_at) shows the root image with :latest
+    # at the top instead of whichever variant happened to finish last.
+    needs: docker-manifest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Normalize image name
+        id: image-name
+        run: |
+          image_name="$(printf '%s' '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+          printf 'image_name=%s\n' "$image_name" >> "$GITHUB_OUTPUT"
+
+      - name: Determine image version
+        id: version
+        env:
+          MANUAL_VERSION: ${{ inputs.version || github.event.inputs.version }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          version="${MANUAL_VERSION#v}"
+          if [ -z "$version" ] && [ -n "$RELEASE_TAG" ]; then
+            version="${RELEASE_TAG#v}"
+          fi
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Re-tag root image as :latest
+        if: steps.version.outputs.version != ''
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ steps.image-name.outputs.image_name }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # Add a unique annotation so the resulting image index manifest gets
+          # a new digest, which makes GHCR record a fresh package version with
+          # current timestamp (otherwise the existing root manifest is reused
+          # and stays where it was in the version listing).
+          promoted_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          docker buildx imagetools create \
+            --annotation "index:io.headroom.promoted-at=${promoted_at}" \
+            --tag "${IMAGE}:latest" \
+            "${IMAGE}:${VERSION}"

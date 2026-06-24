@@ -1,0 +1,65 @@
+## Description
+
+<!-- Briefly explain the change and why it is needed. -->
+
+Closes #
+
+## Type of Change
+
+- [ ] Bug fix (non-breaking change that fixes an issue)
+- [ ] New feature (non-breaking change that adds functionality)
+- [ ] Breaking change (fix or feature that would cause existing functionality to change)
+- [ ] Documentation update
+- [ ] Performance improvement
+- [ ] Code refactoring (no functional changes)
+
+## Changes Made
+
+- 
+
+## Testing
+
+<!-- Check what you actually ran, then paste the real command output below. -->
+
+- [ ] Unit tests pass (`pytest`)
+- [ ] Linting passes (`ruff check .`)
+- [ ] Type checking passes (`mypy headroom`)
+- [ ] New tests added for new functionality
+- [ ] Manual testing performed
+
+### Test Output
+
+```text
+# Paste relevant command output or artifact links here
+```
+
+## Real Behavior Proof
+
+- Environment:
+- Exact command / steps:
+- Observed result:
+- Not tested:
+
+## Review Readiness
+
+- [ ] I have performed a self-review
+- [ ] This PR is ready for human review
+
+## Checklist
+
+- [ ] My code follows the project's style guidelines
+- [ ] I have performed a self-review of my code
+- [ ] I have commented my code, particularly in hard-to-understand areas
+- [ ] I have made corresponding changes to the documentation
+- [ ] My changes generate no new warnings
+- [ ] I have added tests that prove my fix is effective or that my feature works
+- [ ] New and existing unit tests pass locally with my changes
+- [ ] I have updated the CHANGELOG.md if applicable
+
+## Screenshots (if applicable)
+
+Add screenshots to help explain your changes.
+
+## Additional Notes
+
+<!-- Mention any N/A checklist items, tradeoffs, follow-ups, or maintainer context. -->

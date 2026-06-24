@@ -1,0 +1,53 @@
+services:
+  headroom-proxy:
+    build: .
+    command: ["--host", "0.0.0.0"]
+    environment:
+      - HEADROOM_HOST=0.0.0.0
+      # if you want to use a custom OpenAI-compatible API endpoint,
+      # uncomment and set the following line with the desired URL
+      # - OPENAI_TARGET_API_URL=https://api.x.ai
+    ports:
+      - "8787:8787"
+    volumes:
+      - headroom_workspace:/home/nonroot/.headroom
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8787/readyz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    depends_on:
+      - qdrant
+      - neo4j
+
+  # Vector database for semantic search
+  qdrant:
+    image: qdrant/qdrant:v1.17.1
+    ports:
+      - "6333:6333"  # REST API
+      - "6334:6334"  # gRPC
+    volumes:
+      - qdrant_data:/qdrant/storage
+    environment:
+      - QDRANT__SERVICE__GRPC_PORT=6334
+
+  # Graph database for relationships and multi-hop reasoning
+  neo4j:
+    image: neo4j:5.26
+    ports:
+      - "7474:7474"  # HTTP (Browser)
+      - "7687:7687"  # Bolt
+    volumes:
+      - neo4j_data:/data
+    environment:
+      - NEO4J_AUTH=${NEO4J_AUTH:-neo4j/devpassword}
+      - NEO4J_PLUGINS=["apoc"]
+      - NEO4J_apoc_export_file_enabled=true
+      - NEO4J_apoc_import_file_enabled=true
+      - NEO4J_apoc_import_file_use__neo4j__config=true
+
+volumes:
+  headroom_workspace:    # persists proxy_savings, memory.db, session_stats, toin across image updates
+  qdrant_data:
+  neo4j_data:

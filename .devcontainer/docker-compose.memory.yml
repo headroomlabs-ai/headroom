@@ -1,0 +1,42 @@
+services:
+  workspace:
+    build:
+      context: ..
+      dockerfile: .devcontainer/Dockerfile
+    command: sleep infinity
+    environment:
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PYTHONUNBUFFERED: "1"
+      UV_LINK_MODE: copy
+      UV_PROJECT_ENVIRONMENT: /home/vscode/.venvs/headroom-memory
+    volumes:
+      - ..:/workspaces:cached
+      - ../../../../../../../../:/workspaces-host:cached
+      - headroom-venv-memory:/home/vscode/.venvs
+      - headroom-uv-cache:/home/vscode/.cache/uv
+      - headroom-pip-cache:/home/vscode/.cache/pip
+
+  qdrant:
+    image: qdrant/qdrant:v1.17.1
+    volumes:
+      - qdrant-data:/qdrant/storage
+    environment:
+      QDRANT__SERVICE__GRPC_PORT: 6334
+
+  neo4j:
+    image: neo4j:5.15.0
+    volumes:
+      - neo4j-data:/data
+    environment:
+      NEO4J_AUTH: neo4j/password
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_apoc_export_file_enabled: "true"
+      NEO4J_apoc_import_file_enabled: "true"
+      NEO4J_apoc_import_file_use__neo4j__config: "true"
+
+volumes:
+  headroom-venv-memory:
+  headroom-pip-cache:
+  headroom-uv-cache:
+  neo4j-data:
+  qdrant-data:

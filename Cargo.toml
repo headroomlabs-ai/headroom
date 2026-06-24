@@ -1,0 +1,128 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/headroom-core",
+    "crates/headroom-proxy",
+    "crates/headroom-py",
+    "crates/headroom-parity",
+]
+# headroom-py is a Python extension module — it must be built via maturin, not
+# plain cargo (the "extension-module" feature tells pyo3 not to link libpython,
+# which is required for `import` to work). `cargo build --workspace` without
+# explicit members skips it; `cargo test --workspace` still runs its tests
+# because pyo3 can dynamically link here for the cdylib used by tests.
+default-members = [
+    "crates/headroom-core",
+    "crates/headroom-proxy",
+    "crates/headroom-parity",
+]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.80"
+license = "Apache-2.0"
+repository = "https://github.com/chopratejas/headroom"
+authors = ["Headroom Maintainers"]
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+# `preserve_order` makes `serde_json::Value::Object` use IndexMap so JSON
+# parse order is preserved through Value→string→Value round-trips. The
+# smart_crusher port relies on this to match Python's `str(dict)` output,
+# which preserves insertion order; otherwise BTreeMap's sorted-key default
+# would diverge from Python on every multi-key object.
+#
+# `arbitrary_precision` keeps the literal numeric token from the source
+# JSON intact: `Value::Number` becomes a wrapper around the original
+# digit string, so `1.0` does NOT collapse to `1`, and `12345678901234567`
+# does NOT lose precision through f64. Required by Realignment invariant
+# I1 (byte-faithful passthrough on unmutated bytes; see REALIGNMENT/02-
+# architecture.md §2.2) and PR-A4 (see REALIGNMENT/03-phase-A-lockdown.md).
+#
+# `raw_value` exposes `serde_json::value::RawValue`, the unparsed JSON
+# fragment type. Phase B PR-B2 uses this to forward unmodified
+# `messages[*]` entries as exact byte copies — the parser captures the
+# original byte slice, so byte-for-byte round-trips work even with
+# whitespace, key order, or escape preferences the producer chose.
+# Enabled here in Phase A so PR-B2 can land as a pure consumer change.
+serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision", "raw_value"] }
+bytes = "1"
+thiserror = "1"
+# `log` compat: when no tracing subscriber is active (the case inside the
+# headroom-py cdylib), events are re-emitted as `log` records so pyo3-log
+# can forward them to Python's logging. No effect on binaries that install
+# a real subscriber.
+tracing = { version = "0.1", features = ["log"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+axum = "0.7"
+tower = "0.5"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+pyo3 = { version = "0.24", features = ["abi3-py310"] }
+# Forwards Rust `log` records (incl. tracing events via the `log` compat
+# feature above) into Python's `logging` inside the _core extension module.
+pyo3-log = "0.12"
+# Phase D PR-D1: AWS SigV4 signing for native Bedrock InvokeModel route.
+# `aws-sigv4` provides the canonical-request + signing-key implementation;
+# `aws-config` resolves credentials from the standard provider chain
+# (env vars, profiles, IMDS, ECS task role, etc); `aws-credential-types`
+# exposes `Credentials` so the signer accepts whatever the chain returned.
+aws-sigv4 = { version = "1", default-features = false, features = ["sign-http", "http1"] }
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rustls", "rt-tokio", "sso"] }
+aws-credential-types = { version = "1", default-features = false }
+# `Identity` lives in aws-smithy-runtime-api; the SigV4 builder
+# accepts `&Identity`. Pinning the version explicitly avoids a
+# silent semver bump from the transitive dep tree.
+aws-smithy-runtime-api = { version = "1", default-features = false, features = ["client"] }
+# PR-D4: Vertex publisher path uses GCP Application Default Credentials
+# (ADC) → bearer token for the `Authorization: Bearer <token>` header.
+# `gcp_auth` resolves the chain (gcloud user creds, GCE/GKE metadata
+# server, service-account JSON, workload-identity federation) without
+# us baking provider-specific knowledge in. The token source is wrapped
+# in a `TokenSource` trait so tests inject a static-token mock.
+gcp_auth = "0.12"
+
+
+# ── Release profile — wheel size optimization ───────────────────────
+#
+# PyPI imposes a 10 GB cumulative storage limit per project. We hit it
+# at version 0.21.36 (191 versions × ~213 MB/release = 10.00 GB
+# exactly). Recent wheels were ~16-18 MB each, of which ~6.4 MB was
+# pure debug metadata (`.strtab` + `.symtab` ELF sections; uncovered
+# by post-mortem inspection of an actual production wheel).
+#
+# This profile shrinks each Linux wheel from ~18 MB → ~10-11 MB by:
+# * Stripping symbol/string tables (~6.4 MB direct savings)
+# * Link-time optimization across crate boundaries (~5-10% .text
+#   savings via dead-code elim across the workspace)
+# * Single codegen unit (better inlining + dead-code elim, at the
+#   cost of slightly slower release builds)
+#
+# We deliberately do NOT set ``panic = "abort"``. The proxy is a
+# long-lived async process — a single misbehaving request triggering
+# panic-abort would terminate the whole proxy and disconnect every
+# concurrent client. Accept the smaller savings; keep unwind behaviour.
+#
+# Estimated impact: 213 MB/release → ~130 MB/release. Buys ~30+ more
+# release slots within the 10 GB ceiling at the current release
+# cadence. Per-PyPI-version savings AND faster downloads for end
+# users. Tradeoff: release builds take ~30-50% longer due to
+# `codegen-units = 1` + LTO; acceptable for the size win.
+[profile.release]
+strip = "symbols"
+lto = "thin"
+codegen-units = 1
+
+# Fast-to-compile profile for CI test wheels. The shipped wheel uses
+# `release` (lto + codegen-units=1) for runtime/size; CI only needs a working
+# extension, so trade runtime perf for ~parallel, lto-free compilation. Used
+# via `maturin build --profile ci`. Does NOT affect `--release` builds.
+[profile.ci]
+inherits = "release"
+lto = false
+codegen-units = 256
+opt-level = 1
+strip = "none"
+debug = false
+incremental = false

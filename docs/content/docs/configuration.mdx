@@ -1,0 +1,401 @@
+---
+title: Configuration
+description: All configuration options for the Headroom Python and TypeScript SDKs, proxy server, and per-request overrides.
+---
+
+Headroom can be configured via the SDK constructor, proxy command line, environment variables, or per-request overrides.
+
+## CLI Context Tool
+
+`headroom wrap ...` uses RTK for local shell-output filtering by default.
+Set `HEADROOM_CONTEXT_TOOL=lean-ctx` to have wrap commands install or reuse
+`lean-ctx` and run `lean-ctx init --agent <tool>` instead of RTK setup.
+
+```bash
+export HEADROOM_CONTEXT_TOOL=lean-ctx
+headroom wrap claude
+headroom wrap codex --prepare-only
+```
+
+Supported values are `rtk` and `lean-ctx`; unset defaults to `rtk`.
+
+The proxy reads RTK lifetime savings with global scope by default so a shared
+daemon reports savings across the operator's projects. Set
+`HEADROOM_RTK_GAIN_SCOPE=project` to query `rtk gain --project` from the
+proxy process working directory.
+
+## Modes
+
+| Mode | Behavior | Use Case |
+|------|----------|----------|
+| `audit` | Observes and logs, no modifications | Production monitoring, baseline measurement |
+| `optimize` | Applies safe, deterministic transforms | Production optimization |
+| `simulate` | Returns plan without API call | Testing, cost estimation |
+
+## SDK Configuration
+
+<Tabs groupId="lang" items={['TypeScript', 'Python']}>
+<Tab value="TypeScript">
+```ts twoslash
+import { HeadroomClient } from 'headroom-ai';
+
+// Reads from HEADROOM_BASE_URL and HEADROOM_API_KEY automatically
+const client = new HeadroomClient();
+
+// Or configure explicitly
+const explicit = new HeadroomClient({
+  baseUrl: 'http://localhost:8787',
+  apiKey: 'your-api-key',
+  timeout: 30_000,
+  fallback: true,
+  retries: 2,
+});
+```
+</Tab>
+<Tab value="Python">
+```python
+from headroom import HeadroomClient, OpenAIProvider
+from openai import OpenAI
+
+client = HeadroomClient(
+    original_client=OpenAI(),
+    provider=OpenAIProvider(),
+
+    # Mode: "audit" (observe only) or "optimize" (apply transforms)
+    default_mode="optimize",
+
+    # Enable provider-specific cache optimization
+    enable_cache_optimizer=True,
+
+    # Enable query-level semantic caching
+    enable_semantic_cache=False,
+
+    # Override default context limits per model
+    model_context_limits={
+        "gpt-4o": 128000,
+        "gpt-4o-mini": 128000,
+    },
+
+    # Database location (defaults to temp directory)
+    # store_url="sqlite:////absolute/path/to/headroom.db",
+)
+```
+</Tab>
+</Tabs>
+
+## Per-Request Overrides
+
+Override configuration for individual requests:
+
+<Tabs groupId="lang" items={['TypeScript', 'Python']}>
+<Tab value="TypeScript">
+```ts twoslash
+import { compress } from 'headroom-ai';
+
+const result = await compress(messages, {
+  model: 'gpt-4o',
+  tokenBudget: 100_000,
+  timeout: 15_000,
+});
+```
+</Tab>
+<Tab value="Python">
+```python
+response = client.chat.completions.create(
+    model="gpt-4o",
+    messages=[...],
+
+    # Override mode for this request
+    headroom_mode="audit",
+
+    # Reserve more tokens for output
+    headroom_output_buffer_tokens=8000,
+
+    # Keep last N turns (don't compress)
+    headroom_keep_turns=5,
+
+    # Skip compression for specific tools
+    headroom_tool_profiles={
+        "important_tool": {"skip_compression": True}
+    },
+)
+```
+</Tab>
+</Tabs>
+
+## SmartCrusher Configuration
+
+Fine-tune JSON compression behavior:
+
+```python
+from headroom.transforms import SmartCrusherConfig
+
+config = SmartCrusherConfig(
+    # Maximum items to keep after compression
+    max_items_after_crush=15,
+
+    # Minimum tokens before applying compression
+    min_tokens_to_crush=200,
+
+    # Fraction of items always kept from the start/end
+    first_fraction=0.3,
+    last_fraction=0.15,
+
+    # Variance threshold for statistical analysis
+    variance_threshold=2.0,
+)
+```
+
+## CacheAligner Configuration
+
+Control prefix stabilization for provider cache hit rates:
+
+```python
+from headroom.transforms import CacheAlignerConfig
+
+config = CacheAlignerConfig(
+    # Enable/disable cache alignment
+    enabled=True,
+
+    # Patterns to extract from system prompt
+    dynamic_patterns=[
+        r"Today is \w+ \d+, \d{4}",
+        r"Current time: .*",
+    ],
+)
+```
+
+## Context Window Management
+
+Context management is now automatic. Use per-request overrides to control behavior:
+
+```python
+response = client.chat.completions.create(
+    model="gpt-4o",
+    messages=messages,
+    # Reserve tokens for model output
+    headroom_output_buffer_tokens=4000,
+    # Keep last N turns uncompressed
+    headroom_keep_turns=3,
+)
+```
+
+The `RollingWindowConfig`, `IntelligentContextConfig`, and `ScoringWeights` classes were removed in 0.9.x. Context management now happens automatically inside the pipeline.
+
+## Proxy Configuration
+
+### Command Line Options
+
+```bash
+headroom proxy \
+  --port 8787 \              # Port to listen on
+  --host 0.0.0.0 \           # Host to bind to
+  --mode token \             # token compression mode; use cache for prefix-cache stability
+  --budget 10.00 \           # Daily budget limit in USD
+  --log-file headroom.jsonl  # Log file path
+```
+
+### Feature Flags
+
+```bash
+# Disable optimization (passthrough mode)
+headroom proxy --no-optimize
+
+# Disable semantic caching
+headroom proxy --no-cache
+
+# Preserve provider prefix-cache stability instead of maximizing token removal
+headroom proxy --mode cache
+
+# Enable memory and live learning
+headroom proxy --memory
+headroom proxy --learn --min-evidence 3
+```
+
+## Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `HEADROOM_HOST` | Proxy bind host | `127.0.0.1` |
+| `HEADROOM_PORT` | Proxy bind port | `8787` |
+| `HEADROOM_MODE` | Proxy optimization mode: `token` or `cache` | `token` |
+| `HEADROOM_WORKERS` | Uvicorn worker count | `1` |
+| `HEADROOM_LIMIT_CONCURRENCY` | Maximum concurrent connections before 503 | `1000` |
+| `HEADROOM_MAX_CONNECTIONS` | Maximum upstream HTTP connections | `500` |
+| `HEADROOM_MAX_KEEPALIVE` | Maximum upstream keep-alive connections | `100` |
+| `HEADROOM_KEEPALIVE_EXPIRY` | Seconds an idle upstream keep-alive connection is kept open | `90` |
+| `HEADROOM_BUDGET` | Daily budget limit in USD | -- |
+| `HEADROOM_TELEMETRY` | Set to `on` to opt in to anonymous telemetry | `off` (opt-in) |
+| `HEADROOM_STATELESS` | Set to `true` to disable filesystem writes | `false` |
+| `HEADROOM_MODEL_LIMITS` | Custom model config (JSON string or file path) | -- |
+| `HEADROOM_BASE_URL` | Base URL of the Headroom proxy (TypeScript SDK) | `http://localhost:8787` |
+| `HEADROOM_API_KEY` | API key for Headroom Cloud authentication | -- |
+| `HEADROOM_CONFIG_DIR` | Canonical config (read-mostly) root. Derives `models.json` and per-plugin config paths when set. | `~/.headroom/config` |
+| `HEADROOM_WORKSPACE_DIR` | Canonical workspace (read-write state) root. Derives savings, memory DB, logs, TOIN, subscription state, and more when set. | `~/.headroom` |
+| `HEADROOM_SAVINGS_PATH` | Override persistent savings file location. Always wins when set. | derived from `${HEADROOM_WORKSPACE_DIR}` |
+| `HEADROOM_TOIN_PATH` | Override TOIN telemetry file location. Always wins when set. | derived from `${HEADROOM_WORKSPACE_DIR}` |
+| `HEADROOM_SUBSCRIPTION_STATE_PATH` | Override subscription tracker state file. Always wins when set. | derived from `${HEADROOM_WORKSPACE_DIR}` |
+| `HEADROOM_TELEMETRY` | Set to `on` to opt in to anonymous telemetry | `off` |
+| `HEADROOM_PERIODIC_TOIN_STATS` | Controls periodic TOIN stats logging in long-lived proxy workers. Set to `0`, `false`, `off`, or `no` to disable the 5-minute stats loop without disabling TOIN learning or request-time feedback. | `true` |
+| `HEADROOM_MEMORY_INJECTION_MODE` | Memory-context routing mode: `live_zone_tail` (default) or `disabled`. The legacy `system_prompt` mode was retired by PR-A2; supplying it raises. | `live_zone_tail` |
+| `HEADROOM_PROXY_PYTHON_FORWARDER_MODE` | Python forwarder serialization mode. `byte_faithful` (default) forwards original request bytes verbatim when no transform mutated the body and re-serializes canonically only when needed — keeps Anthropic prompt-cache hit-rate intact. `legacy_json_kwarg` is an explicit operator opt-in for emergency rollback to the historical `httpx ... json=body` behavior. NOT a fallback — only flip on explicit operator decision. | `byte_faithful` |
+| `HEADROOM_STRIP_INTERNAL_HEADERS` | Python proxy: whether to strip internal `x-headroom-*` request headers (e.g. `x-headroom-bypass`, `x-headroom-mode`, `x-headroom-user-id`, `x-headroom-stack`, `x-headroom-base-url`) before every upstream forwarder call (PR-A5, fixes P5-49). `enabled` (default) stops fingerprinting / leakage. `disabled` is an explicit operator opt-in for diagnostic shadow tracing — NOT a fallback. Inbound reads of these headers (bypass gating, memory user-id resolution) are unaffected because they read `request.headers` directly. | `enabled` |
+| `HEADROOM_PROXY_STRIP_INTERNAL_HEADERS` | Rust proxy: same policy as `HEADROOM_STRIP_INTERNAL_HEADERS` but for the Rust transparent proxy. Stripping happens inside `build_forward_request_headers` so both HTTP and WebSocket upstream calls are gated by one flag. `enabled` default; `disabled` operator opt-in for diagnostic shadow tracing. Response-side `X-Headroom-*` injection (e.g. `x-headroom-tokens-saved`) is unrelated and stays. | `enabled` |
+| `HEADROOM_EMBEDDER_RUNTIME` | Set to `pytorch_mps` to run the memory embedder via the torch sentence-transformers backend on the Apple GPU (MPS). Only engages when Apple MPS is actually available; otherwise it logs a warning and uses the existing default embedder selection path. `pytorch_mps` is the only accepted value. Requires the `[pytorch-mps]` extra. See [Memory](/docs/memory#embedding-runtime--gpu-offload-apple-silicon). | default embedder selection |
+| `ORT_DYLIB_PATH` | Windows: path to the `onnxruntime.dll` loaded by the Rust core (magika detection, fastembed embeddings). Auto-pinned at `import headroom` to the DLL inside the `onnxruntime` pip package; set it yourself to override. Without a pin the bare Windows DLL search resolves to the Windows ML System32 build (1.17.x on Win11 24H2+), which deadlocks ONNX session init — see [Troubleshooting](/docs/troubleshooting#windows-ml-content-detection-hangs-or-silently-falls-back). | auto-pinned on Windows |
+| `HEADROOM_MAGIKA_INIT_TIMEOUT_SECS` | Upper bound (integer seconds, > 0) on magika's one-time ONNX session init in the Rust detection chain. On timeout the init error is cached and detection uses the non-ML fallback tiers for the rest of the process; a warning is logged. Safety net for environments where the dylib pin above does not apply. | `5` |
+| `HEADROOM_REQUEST_TIMEOUT` | Request timeout in seconds | `300` |
+| `HEADROOM_BETA_HEADER_STICKY` | Controls per-session `anthropic-beta` / `OpenAI-Beta` re-echo. `enabled` (default): the proxy unions beta tokens across turns within a session — if the client sends a token in turn N and omits it in turn N+1, the proxy re-injects it to preserve prefix-cache stability. `disabled`: the client's value is forwarded verbatim with no accumulation. Any other value raises at request time. See [Session Beta Header Tracking](/docs/configuration#session-beta-header-tracking). | `enabled` |
+| `HEADROOM_BETA_TRACKER_MAX_SESSIONS` | LRU capacity of the in-memory session beta tracker. Once full, the oldest session entry is evicted. | `1000` |
+
+### Session Beta Header Tracking
+
+When running as a proxy, Headroom maintains a per-session union of `anthropic-beta` (and `OpenAI-Beta`) tokens via `SessionBetaTracker`. The session key is derived from the `x-headroom-session-id` header if present, otherwise from `md5(model + system_prompt[:500])[:16]` — stable across turns of the same conversation.
+
+**Why:** clients such as Claude Code and Codex CLI may drop a beta token between consecutive turns. Because `anthropic-beta` is part of the request bytes that determine the upstream prefix-cache key, a dropped token would bust the cache mid-conversation. The tracker re-injects any token seen earlier in the session so the cache key stays stable.
+
+**Trade-off:** once the proxy has seen a beta token in a session it will continue re-sending it for the rest of that session, even if the client stops including it. Stopping the token on the client side alone is not sufficient — the proxy re-injects it. Set `HEADROOM_BETA_HEADER_STICKY=disabled` to pass the client's `anthropic-beta` value verbatim and bypass this accumulation.
+
+```bash
+# Disable sticky beta re-echo
+export HEADROOM_BETA_HEADER_STICKY=disabled
+headroom proxy ...
+```
+
+Note: disabling sticky mode may reduce prefix-cache hit rates for clients that legitimately drop-and-re-add beta tokens across turns.
+
+### Filesystem Contract
+
+Headroom resolves every on-disk resource through a two-root model
+(`HEADROOM_CONFIG_DIR` + `HEADROOM_WORKSPACE_DIR`) with additive
+precedence rules: explicit argument > per-resource env var > derived
+from canonical root > default. Every legacy env var continues to work
+unchanged.
+
+See the **[Filesystem Contract](https://github.com/chopratejas/headroom/blob/main/wiki/filesystem-contract.md)**
+page for the full bucket table, plugin-author guidance, and the Docker
+naming overlap note (`HEADROOM_WORKSPACE` is *not* the same as
+`HEADROOM_WORKSPACE_DIR`).
+
+## Custom Model Configuration
+
+Configure context limits and pricing for new or custom models:
+
+```json
+{
+  "anthropic": {
+    "context_limits": {
+      "claude-4-opus-20250301": 200000,
+      "claude-custom-finetune": 128000
+    },
+    "pricing": {
+      "claude-4-opus-20250301": {
+        "input": 15.00,
+        "output": 75.00,
+        "cached_input": 1.50
+      }
+    }
+  },
+  "openai": {
+    "context_limits": {
+      "gpt-5": 256000,
+      "ft:gpt-4o:my-org": 128000
+    }
+  }
+}
+```
+
+Save as `${HEADROOM_CONFIG_DIR}/models.json` (defaults to
+`~/.headroom/config/models.json`), or set `HEADROOM_MODEL_LIMITS` to a
+JSON string or file path. Installs that still have
+`~/.headroom/models.json` (the legacy location) continue to work.
+
+Settings are resolved in this order (later overrides earlier):
+
+1. Built-in defaults
+2. `${HEADROOM_CONFIG_DIR}/models.json` (new canonical location); falls
+   back to `~/.headroom/models.json` (legacy) when the canonical file
+   is absent
+3. `HEADROOM_MODEL_LIMITS` environment variable
+4. SDK constructor arguments
+
+### Pattern-Based Inference
+
+Unknown models are automatically inferred from naming patterns:
+
+| Pattern | Inferred Settings |
+|---------|-------------------|
+| `*opus*` | 200K context, Opus-tier pricing |
+| `*sonnet*` | 200K context, Sonnet-tier pricing |
+| `*haiku*` | 200K context, Haiku-tier pricing |
+| `gpt-4o*` | 128K context, GPT-4o pricing |
+| `o1*`, `o3*` | 200K context, reasoning model pricing |
+
+## Provider-Specific Settings
+
+<Tabs groupId="lang" items={['OpenAI', 'Anthropic', 'Google']}>
+<Tab value="OpenAI">
+```python
+from headroom import OpenAIProvider
+
+provider = OpenAIProvider(
+    enable_prefix_caching=True,
+)
+```
+</Tab>
+<Tab value="Anthropic">
+```python
+from headroom import AnthropicProvider
+
+provider = AnthropicProvider(
+    enable_cache_control=True,
+)
+```
+</Tab>
+<Tab value="Google">
+```python
+from headroom import GoogleProvider
+
+provider = GoogleProvider(
+    enable_context_caching=True,
+)
+```
+</Tab>
+</Tabs>
+
+## Tool Profiles
+
+Skip or customize compression for specific tools:
+
+```python
+response = client.chat.completions.create(
+    model="gpt-4o",
+    messages=messages,
+    headroom_tool_profiles={
+        "important_tool": {"skip_compression": True},
+        "search_tool": {"max_items_after_crush": 25},
+    },
+)
+```
+
+## Configuration Precedence
+
+Settings are applied in this order (later overrides earlier):
+
+1. Default values
+2. Environment variables
+3. SDK constructor arguments
+4. Per-request overrides
+
+## Validation
+
+Validate your configuration at startup:
+
+```python
+result = client.validate_setup()
+
+if not result["valid"]:
+    print("Configuration issues:")
+    for issue in result["issues"]:
+        print(f"  - {issue}")
+```

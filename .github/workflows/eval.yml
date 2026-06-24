@@ -1,0 +1,152 @@
+name: Evaluation Suite
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'  # Weekly on Monday 6am UTC
+  workflow_dispatch:       # Manual trigger
+  pull_request:
+    paths:
+      - 'headroom/transforms/**'
+      - 'headroom/evals/**'
+      - 'headroom/compress.py'
+
+jobs:
+  # Fast smoke test on PRs touching compression code (~$0.05, ~2 min)
+  smoke-test:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-eval-${{ hashFiles('pyproject.toml') }}
+          restore-keys: ${{ runner.os }}-pip-eval-
+
+      # `pip install -e .` invokes maturin (declared in pyproject.toml's
+      # build-system) which calls cargo to compile the Rust extension.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.96.0
+
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: Install dependencies (builds Rust extension via maturin)
+        run: |
+          pip install -e ".[all]"
+          python -c "from headroom._core import SmartCrusher; print('headroom._core OK:', SmartCrusher)"
+
+      - name: Run CCR round-trip (zero cost)
+        run: |
+          python -c "
+          from headroom.evals.runners.compression_only import CompressionOnlyRunner
+          runner = CompressionOnlyRunner()
+          cases = runner.generate_ccr_test_cases(n=50)
+          result = runner.evaluate_ccr_lossless(cases)
+          print(f'CCR Round-trip: {result.passed_cases}/{result.total_cases} passed')
+          assert result.passed, f'CCR failures: {result.errors}'
+          "
+
+      - name: Run tool schema compaction integrity eval (zero cost)
+        run: |
+          python -c "
+          from headroom.evals.runners.compression_only import CompressionOnlyRunner
+          runner = CompressionOnlyRunner()
+          result = runner.evaluate_tool_schema_compaction()
+          print(f'Tool schema compaction: {result.passed_cases}/{result.total_cases} passed, {result.total_tokens_saved} annotation tokens stripped')
+          assert result.passed, f'Schema compaction failures: {result.errors}'
+          "
+
+      # OPENAI_API_KEY is intentionally not set in the public OSS repo
+      # (the secret list is empty). The CCR round-trip step above is the
+      # mandatory gate; this step only runs when an operator has wired
+      # OPENAI_API_KEY as a repo secret (e.g. on a downstream fork). When
+      # missing, emit a loud GitHub `::warning::` annotation so the skip
+      # is visible in the run summary — never a silent pass.
+      - name: Run built-in tool output eval (skipped when OPENAI_API_KEY unset)
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [ -z "${OPENAI_API_KEY}" ]; then
+            echo "::warning title=Smoke eval skipped::OPENAI_API_KEY is not configured for this repo; only the CCR round-trip gate ran. Wire the secret to enable the live OpenAI eval."
+            exit 0
+          fi
+          python -m headroom.evals quick -n 8 --provider openai --model gpt-4o-mini
+
+  # Full Tier 1 suite, weekly or manual (~$3-5, ~30-45 min)
+  weekly-suite:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-eval-${{ hashFiles('pyproject.toml') }}
+          restore-keys: ${{ runner.os }}-pip-eval-
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.96.0
+
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: Install dependencies (builds Rust extension via maturin)
+        run: |
+          pip install -e ".[all]"
+          python -c "from headroom._core import SmartCrusher; print('headroom._core OK')"
+      - name: Run Tier 1 evaluation suite
+        run: |
+          if [ -z "${OPENAI_API_KEY}" ]; then
+            echo "::warning title=Weekly eval skipped::OPENAI_API_KEY is not configured for this repo; skipping the live Tier 1 suite."
+            mkdir -p eval_results
+            printf '%s\n\n%s\n' \
+              '# Weekly Evaluation Skipped' \
+              'OPENAI_API_KEY is not configured for this repository, so the live Tier 1 evaluation suite was skipped.' \
+              > eval_results/skipped.md
+            exit 0
+          fi
+          python -m headroom.evals suite --tier 1 --ci -o eval_results/
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+      # Recall-based fidelity report on the production routing path. Zero cost
+      # (synthetic structured cases -> Rust compressors; no model, no API, no
+      # secrets). Non-blocking: surfaces recall trends weekly without gating.
+      # The blocking per-PR fidelity gate lives in
+      # tests/test_compression_fidelity_regression.py (runs in the [dev] shard).
+      - name: Information-retention recall report (zero cost, non-blocking)
+        run: |
+          python -c "
+          from headroom.evals.runners.compression_only import CompressionOnlyRunner
+          runner = CompressionOnlyRunner()
+          cases = runner.generate_info_retention_cases(n=50)
+          result = runner.evaluate_information_retention(cases)
+          print(f'Information retention: {result.passed_cases}/{result.total_cases} cases >=0.9 recall, avg compression {result.avg_compression_ratio:.1%}')
+          if not result.passed:
+              print(f'::warning title=Fidelity recall::{result.failed_cases} case(s) fell below 0.9 recall: {result.errors[:3]}')
+          "
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: eval-results-${{ github.run_number }}
+          path: eval_results/

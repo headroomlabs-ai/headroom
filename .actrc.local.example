@@ -1,0 +1,15 @@
+# Example local act configuration.
+# Copy this file to .actrc.local and edit for your local environment.
+#
+# cp .actrc.local.example .actrc.local
+#
+# .actrc.local is NOT committed — it overrides .actrc for your machine only.
+
+# Use a specific runner image (uncomment if you have issues with the default)
+# --platform=ubuntu-latest=ghcr.io/catthehacker/ubuntu:runner-latest
+
+# Or use act with a specific container runtime
+# --container-args="--runtime=runc"
+
+# Extra verbose output for debugging (uncomment to see all steps)
+# --verbose

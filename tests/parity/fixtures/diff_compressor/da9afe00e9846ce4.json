@@ -1,0 +1,26 @@
+{
+  "config": {
+    "always_keep_additions": true,
+    "always_keep_deletions": true,
+    "enable_ccr": true,
+    "max_context_lines": 2,
+    "max_files": 20,
+    "max_hunks_per_file": 10,
+    "min_lines_for_ccr": 50
+  },
+  "input": "diff --git a/merge_target.py b/merge_target.py\n--- a/merge_target.py\n+++ b/merge_target.py\n@@@ -1,5 -1,5 +1,6 @@@\n  unchanged_a\n  unchanged_b\n- old_from_branch_1\n -old_from_branch_2\n++new_in_merge\n +new_added_too\n  unchanged_c\n\n# bugfix:combined-diff-3way",
+  "input_sha256": "da9afe00e9846ce4c9da0a08cc37a7444b68ed476b9e2ac86cfa67d6b309903e",
+  "output": {
+    "additions": 0,
+    "cache_key": null,
+    "compressed": "diff --git a/merge_target.py b/merge_target.py\n--- a/merge_target.py\n+++ b/merge_target.py\n@@@ -1,5 -1,5 +1,6 @@@\n  unchanged_a\n  unchanged_b\n- old_from_branch_1\n -old_from_branch_2\n++new_in_merge\n +new_added_too\n  unchanged_c\n\n# bugfix:combined-diff-3way",
+    "compressed_line_count": 13,
+    "deletions": 0,
+    "files_affected": 0,
+    "hunks_kept": 0,
+    "hunks_removed": 0,
+    "original_line_count": 13
+  },
+  "recorded_at": "2026-04-25T23:19:00.819971+00:00",
+  "transform": "diff_compressor"
+}

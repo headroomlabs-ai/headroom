@@ -1,0 +1,665 @@
+---
+title: API Reference
+description: Complete API reference for the Headroom Python and TypeScript SDKs. Core client, configuration types, result types, errors, and utilities.
+---
+
+Complete API reference for the Headroom Python and TypeScript SDKs.
+
+## Core
+
+### HeadroomClient
+
+The main entry point for the Headroom SDK.
+
+<Tabs groupId="lang" items={['TypeScript', 'Python']}>
+<Tab value="TypeScript">
+
+<TypeTable type={{
+  baseUrl: { type: 'string', description: 'Base URL for the Headroom proxy' },
+  apiKey: { type: 'string', description: 'API key for authentication' },
+  timeout: { type: 'number', description: 'Request timeout in milliseconds' },
+  fallback: { type: 'boolean', description: 'Return original messages on failure instead of throwing' },
+  retries: { type: 'number', description: 'Number of retry attempts on failure' },
+}} />
+
+```ts twoslash
+import { HeadroomClient } from 'headroom-ai';
+
+const client = new HeadroomClient({
+  baseUrl: 'http://localhost:8787',
+  apiKey: 'your-api-key',
+  timeout: 30_000,
+  fallback: true,
+  retries: 2,
+});
+```
+
+</Tab>
+<Tab value="Python">
+
+**Constructor Parameters**
+
+<TypeTable type={{
+  original_client: { type: 'OpenAI | Anthropic', description: 'The underlying LLM client', default: 'Required' },
+  provider: { type: 'Provider', description: 'Token counting provider', default: 'Auto-detected' },
+  default_mode: { type: '"audit" | "optimize"', description: 'Default compression mode', default: '"audit"' },
+  store_url: { type: 'str | None', description: 'Storage URL for metrics database', default: 'None' },
+  smart_crusher_config: { type: 'SmartCrusherConfig', description: 'Compression settings', default: 'Default config' },
+  cache_aligner_config: { type: 'CacheAlignerConfig', description: 'Cache alignment settings', default: 'Default config' },
+  enable_cache_optimizer: { type: 'bool', description: 'Enable provider-specific cache optimization', default: 'True' },
+  enable_semantic_cache: { type: 'bool', description: 'Enable query-level semantic caching', default: 'False' },
+  model_context_limits: { type: 'dict[str, int]', description: 'Override context limits per model', default: '{}' },
+}} />
+
+```python
+from headroom import HeadroomClient, OpenAIProvider
+from openai import OpenAI
+
+client = HeadroomClient(
+    original_client=OpenAI(),
+    provider=OpenAIProvider(),
+    default_mode="optimize",
+)
+```
+
+</Tab>
+</Tabs>
+
+### chat.completions.create()
+
+Create a chat completion with optional optimization.
+
+<Tabs groupId="lang" items={['TypeScript', 'Python']}>
+<Tab value="TypeScript">
+
+The TypeScript SDK uses `compress()` to optimize messages before sending them to your LLM client:
+
+```ts twoslash
+import { compress } from 'headroom-ai';
+
+const result = await compress(messages, {
+  model: 'gpt-4o',
+  tokenBudget: 100_000,
+});
+
+// Then pass result.messages to your LLM client
+```
+
+</Tab>
+<Tab value="Python">
+
+Accepts all standard OpenAI/Anthropic parameters plus Headroom-specific overrides:
+
+<TypeTable type={{
+  headroom_mode: { type: '"audit" | "optimize" | "simulate"', description: 'Override mode for this request', default: 'Client default' },
+  headroom_query: { type: 'str', description: 'Query for relevance scoring', default: 'None' },
+  headroom_output_buffer_tokens: { type: 'int', description: 'Reserve tokens for output', default: '4000' },
+  headroom_keep_turns: { type: 'int', description: 'Keep last N turns uncompressed', default: '2' },
+  headroom_tool_profiles: { type: 'dict', description: 'Per-tool compression overrides', default: '{}' },
+}} />
+
+```python
+response = client.chat.completions.create(
+    model="gpt-4o",
+    messages=[...],
+    headroom_mode="optimize",
+    headroom_keep_turns=5,
+    headroom_tool_profiles={
+        "important_tool": {"skip_compression": True},
+    },
+)
+```
+
+</Tab>
+</Tabs>
+
+### chat.completions.simulate()
+
+Preview optimization without making an API call.
+
+```python
+plan = client.chat.completions.simulate(
+    model="gpt-4o",
+    messages=[...],
+)
+
+print(f"Tokens: {plan.tokens_before} -> {plan.tokens_after}")
+print(f"Savings: {plan.savings_percent:.1f}%")
+print(f"Transforms: {plan.transforms_applied}")
+```
+
+**Returns:** `SimulationResult`
+
+### compress() (TypeScript)
+
+Top-level function to compress messages via the Headroom proxy.
+
+<TypeTable type={{
+  model: { type: 'string', description: 'Model name for token counting and context limits' },
+  baseUrl: { type: 'string', description: 'Base URL for the Headroom proxy' },
+  apiKey: { type: 'string', description: 'API key for authentication' },
+  timeout: { type: 'number', description: 'Request timeout in milliseconds' },
+  fallback: { type: 'boolean', description: 'Return original messages on failure instead of throwing' },
+  retries: { type: 'number', description: 'Number of retry attempts on failure' },
+  client: { type: 'HeadroomClientInterface', description: 'Pre-configured client instance to use' },
+  tokenBudget: { type: 'number', description: 'Token budget — compress to fit within this limit' },
+  hooks: { type: 'CompressionHooks', description: 'Compression hooks for pre/post processing' },
+}} />
+
+```ts twoslash
+import { compress } from 'headroom-ai';
+
+const result = await compress(messages, {
+  model: 'gpt-4o',
+  baseUrl: 'http://localhost:8787',
+  timeout: 15_000,
+  fallback: true,
+  retries: 2,
+  tokenBudget: 100_000,
+});
+```
+
+### get_stats()
+
+Quick stats for the current session (no database query).
+
+```python
+stats = client.get_stats()
+# Returns dict with "session", "config", and "transforms" keys
+```
+
+### get_metrics()
+
+Query stored metrics from the database.
+
+```python
+from datetime import datetime, timedelta
+
+metrics = client.get_metrics(
+    start_time=datetime.utcnow() - timedelta(hours=1),
+    limit=100,
+)
+```
+
+### get_summary()
+
+Aggregate statistics across all stored metrics.
+
+```python
+summary = client.get_summary()
+# Returns dict with total_requests, total_tokens_saved,
+# avg_compression_ratio, total_cost_saved_usd
+```
+
+### validate_setup()
+
+Validate that the client is configured correctly.
+
+```python
+result = client.validate_setup()
+if not result["valid"]:
+    for issue in result["issues"]:
+        print(f"  - {issue}")
+```
+
+---
+
+## Configuration
+
+### SmartCrusherConfig
+
+<Tabs groupId="lang" items={['TypeScript', 'Python']}>
+<Tab value="TypeScript">
+
+<TypeTable type={{
+  enabled: { type: 'boolean', description: 'Enable/disable the smart crusher' },
+  minItemsToAnalyze: { type: 'number', description: 'Minimum items before analyzing for compression' },
+  minTokensToCrush: { type: 'number', description: 'Minimum tokens before applying compression' },
+  varianceThreshold: { type: 'number', description: 'Variance threshold for analysis' },
+  uniquenessThreshold: { type: 'number', description: 'Uniqueness threshold for deduplication' },
+  similarityThreshold: { type: 'number', description: 'Similarity threshold for grouping' },
+  maxItemsAfterCrush: { type: 'number', description: 'Maximum items to keep after compression' },
+  preserveChangePoints: { type: 'boolean', description: 'Preserve change points in data' },
+  useFeedbackHints: { type: 'boolean', description: 'Use feedback hints for scoring' },
+  toinConfidenceThreshold: { type: 'number', description: 'TOIN confidence threshold' },
+  relevance: { type: 'RelevanceScorerConfig', description: 'Relevance scoring configuration' },
+  anchor: { type: 'AnchorConfig', description: 'Anchor selection configuration' },
+  dedupIdenticalItems: { type: 'boolean', description: 'Deduplicate identical items' },
+  firstFraction: { type: 'number', description: 'Fraction of items to keep from the start' },
+  lastFraction: { type: 'number', description: 'Fraction of items to keep from the end' },
+}} />
+
+</Tab>
+<Tab value="Python">
+
+<TypeTable type={{
+  min_tokens_to_crush: { type: 'int', description: 'Minimum tokens before applying compression', default: '200' },
+  min_items_to_analyze: { type: 'int', description: 'Minimum items before analyzing for compression', default: '5' },
+  max_items_after_crush: { type: 'int', description: 'Maximum items to keep after compression', default: '15' },
+  variance_threshold: { type: 'float', description: 'Variance threshold for analysis', default: '2.0' },
+  uniqueness_threshold: { type: 'float', description: 'Uniqueness threshold for deduplication', default: '0.1' },
+  similarity_threshold: { type: 'float', description: 'Similarity threshold for grouping', default: '0.8' },
+  preserve_change_points: { type: 'bool', description: 'Preserve significant change points in data', default: 'True' },
+  use_feedback_hints: { type: 'bool', description: 'Use TOIN feedback hints for scoring', default: 'True' },
+  dedup_identical_items: { type: 'bool', description: 'Deduplicate identical items', default: 'True' },
+  first_fraction: { type: 'float', description: 'Fraction of items to keep from the start', default: '0.3' },
+  last_fraction: { type: 'float', description: 'Fraction of items to keep from the end', default: '0.15' },
+}} />
+
+```python
+from headroom import SmartCrusherConfig
+
+config = SmartCrusherConfig(
+    min_tokens_to_crush=200,
+    max_items_after_crush=15,
+    variance_threshold=2.0,
+    preserve_change_points=True,
+)
+```
+
+</Tab>
+</Tabs>
+
+### CacheAlignerConfig
+
+<Tabs groupId="lang" items={['TypeScript', 'Python']}>
+<Tab value="TypeScript">
+
+<TypeTable type={{
+  enabled: { type: 'boolean', description: 'Enable/disable cache alignment' },
+  useDynamicDetector: { type: 'boolean', description: 'Use dynamic content detector' },
+  detectionTiers: { type: '("regex" | "ner" | "semantic")[]', description: 'Detection tiers to apply' },
+  extraDynamicLabels: { type: 'string[]', description: 'Additional labels for dynamic content detection' },
+  entropyThreshold: { type: 'number', description: 'Entropy threshold for dynamic detection' },
+  datePatterns: { type: 'string[]', description: 'Regex patterns for date extraction' },
+  normalizeWhitespace: { type: 'boolean', description: 'Normalize whitespace for stable prefix' },
+  collapseBlankLines: { type: 'boolean', description: 'Collapse consecutive blank lines' },
+  dynamicTailSeparator: { type: 'string', description: 'Separator between static and dynamic content' },
+}} />
+
+</Tab>
+<Tab value="Python">
+
+<TypeTable type={{
+  enabled: { type: 'bool', description: 'Enable/disable cache alignment', default: 'True' },
+  extract_dates: { type: 'bool', description: 'Extract date patterns from system prompt', default: 'True' },
+  normalize_whitespace: { type: 'bool', description: 'Normalize whitespace for stable prefix', default: 'True' },
+  stable_prefix_min_tokens: { type: 'int', description: 'Minimum prefix tokens for caching', default: '100' },
+  dynamic_patterns: { type: 'list[str]', description: 'Regex patterns to extract as dynamic content', default: '[]' },
+}} />
+
+```python
+from headroom import CacheAlignerConfig
+
+config = CacheAlignerConfig(
+    enabled=True,
+    extract_dates=True,
+    normalize_whitespace=True,
+    stable_prefix_min_tokens=100,
+)
+```
+
+</Tab>
+</Tabs>
+
+### RollingWindowConfig
+
+<Tabs groupId="lang" items={['TypeScript', 'Python']}>
+<Tab value="TypeScript">
+
+<TypeTable type={{
+  enabled: { type: 'boolean', description: 'Enable/disable rolling window' },
+  keepSystem: { type: 'boolean', description: 'Never drop system messages' },
+  keepLastTurns: { type: 'number', description: 'Always keep last N turns' },
+  outputBufferTokens: { type: 'number', description: 'Reserve tokens for model output' },
+}} />
+
+</Tab>
+<Tab value="Python">
+
+Context management is now automatic. Headroom handles rolling window behavior internally based on the model's context limit and the `headroom_keep_turns` / `headroom_output_buffer_tokens` per-request overrides. The `RollingWindowConfig`, `IntelligentContextConfig`, and `ScoringWeights` classes no longer exist as public API.
+
+</Tab>
+</Tabs>
+
+### HeadroomConfig
+
+<Tabs groupId="lang" items={['TypeScript', 'Python']}>
+<Tab value="TypeScript">
+
+<TypeTable type={{
+  storeUrl: { type: 'string', description: 'Storage URL for metrics database' },
+  defaultMode: { type: 'HeadroomMode', description: 'Default compression mode' },
+  modelContextLimits: { type: 'Record<string, number>', description: 'Override context limits per model' },
+  toolCrusher: { type: 'ToolCrusherConfig', description: 'Tool crusher configuration' },
+  smartCrusher: { type: 'SmartCrusherConfig', description: 'Smart crusher configuration' },
+  cacheAligner: { type: 'CacheAlignerConfig', description: 'Cache aligner configuration' },
+  rollingWindow: { type: 'RollingWindowConfig', description: 'Rolling window configuration' },
+  cacheOptimizer: { type: 'CacheOptimizerConfig', description: 'Cache optimizer configuration' },
+  ccr: { type: 'CCRConfig', description: 'CCR (Compress-Cache-Retrieve) configuration' },
+  prefixFreeze: { type: 'PrefixFreezeConfig', description: 'Prefix freeze configuration' },
+  contentRouterEnabled: { type: 'boolean', description: 'Enable content-type routing' },
+  generateDiffArtifact: { type: 'boolean', description: 'Generate diff artifacts for debugging' },
+}} />
+
+</Tab>
+<Tab value="Python">
+
+The top-level config object that contains all sub-configurations:
+
+```python
+from headroom import HeadroomConfig
+
+config = HeadroomConfig()
+config.smart_crusher.min_tokens_to_crush = 100
+config.cache_aligner.enabled = True
+# Note: rolling_window was removed in 0.9.x — use headroom_keep_turns per-request instead
+```
+
+</Tab>
+</Tabs>
+
+### RelevanceScorerConfig
+
+<Tabs groupId="lang" items={['TypeScript', 'Python']}>
+<Tab value="TypeScript">
+
+<TypeTable type={{
+  tier: { type: 'RelevanceTier', description: 'Scoring method: "bm25" | "embedding" | "hybrid"' },
+  bm25K1: { type: 'number', description: 'BM25 k1 parameter' },
+  bm25B: { type: 'number', description: 'BM25 b parameter' },
+  embeddingModel: { type: 'string', description: 'Model name for embedding scorer' },
+  hybridAlpha: { type: 'number', description: 'Weight for hybrid scoring (0=embedding, 1=bm25)' },
+  adaptiveAlpha: { type: 'boolean', description: 'Automatically adapt alpha based on query' },
+  relevanceThreshold: { type: 'number', description: 'Minimum relevance score to keep' },
+}} />
+
+</Tab>
+<Tab value="Python">
+
+<TypeTable type={{
+  scorer_type: { type: '"bm25" | "embedding" | "hybrid"', description: 'Scoring method', default: '"bm25"' },
+  embedding_model: { type: 'str | None', description: 'Model name for embedding scorer', default: 'None' },
+  hybrid_alpha: { type: 'float', description: 'Weight for hybrid scoring (0=embedding, 1=bm25)', default: '0.5' },
+}} />
+
+</Tab>
+</Tabs>
+
+---
+
+## Results
+
+### CompressResult (TypeScript)
+
+<TypeTable type={{
+  messages: { type: 'any[]', description: 'Compressed messages in the same format as input' },
+  tokensBefore: { type: 'number', description: 'Token count before compression' },
+  tokensAfter: { type: 'number', description: 'Token count after compression' },
+  tokensSaved: { type: 'number', description: 'Tokens removed by compression' },
+  compressionRatio: { type: 'number', description: 'Ratio of tokens after to tokens before' },
+  transformsApplied: { type: 'string[]', description: 'Names of transforms that were applied' },
+  ccrHashes: { type: 'string[]', description: 'CCR hashes for Compress-Cache-Retrieve' },
+  compressed: { type: 'boolean', description: 'Whether compression was actually applied' },
+}} />
+
+### SimulationResult (Python)
+
+<TypeTable type={{
+  tokens_before: { type: 'int', description: 'Token count before compression' },
+  tokens_after: { type: 'int', description: 'Token count after compression' },
+  tokens_saved: { type: 'int', description: 'Tokens removed by compression' },
+  savings_percent: { type: 'float', description: 'Percentage of tokens saved' },
+  transforms_applied: { type: 'list[str]', description: 'Names of transforms that were applied' },
+  waste_signals: { type: 'WasteSignals', description: 'Detected waste in the request' },
+}} />
+
+### WasteSignals (Python)
+
+<TypeTable type={{
+  json_bloat_tokens: { type: 'int', description: 'Tokens from JSON formatting waste' },
+  html_noise_tokens: { type: 'int', description: 'Tokens from HTML tags and noise' },
+  whitespace_tokens: { type: 'int', description: 'Tokens from excessive whitespace' },
+  dynamic_date_tokens: { type: 'int', description: 'Tokens from dynamic date strings' },
+  repetition_tokens: { type: 'int', description: 'Tokens from repeated content' },
+}} />
+
+### RequestMetrics (Python)
+
+<TypeTable type={{
+  request_id: { type: 'str', description: 'Unique request identifier' },
+  timestamp: { type: 'datetime', description: 'When the request was processed' },
+  model: { type: 'str', description: 'Model name used' },
+  tokens_input_before: { type: 'int', description: 'Input tokens before compression' },
+  tokens_input_after: { type: 'int', description: 'Input tokens after compression' },
+  tokens_output: { type: 'int', description: 'Output tokens from the model' },
+  cost_before: { type: 'float', description: 'Cost before compression (USD)' },
+  cost_after: { type: 'float', description: 'Cost after compression (USD)' },
+  transforms_applied: { type: 'list[str]', description: 'Transforms that were applied' },
+}} />
+
+---
+
+## Providers
+
+### OpenAIProvider
+
+```python
+from headroom import OpenAIProvider
+
+provider = OpenAIProvider(
+    enable_prefix_caching=True,
+)
+
+counter = provider.get_token_counter("gpt-4o")
+tokens = counter.count_text("Hello, world!")
+limit = provider.get_context_limit("gpt-4o")  # 128000
+cost = provider.estimate_cost(input_tokens=1000, output_tokens=500, model="gpt-4o")
+```
+
+### AnthropicProvider
+
+```python
+from headroom import AnthropicProvider
+from anthropic import Anthropic
+
+provider = AnthropicProvider(
+    client=Anthropic(),
+    enable_cache_control=True,
+)
+
+counter = provider.get_token_counter("claude-3-5-sonnet-latest")
+tokens = counter.count_messages(messages)  # Accurate count via API
+```
+
+### GoogleProvider
+
+```python
+from headroom import GoogleProvider
+
+provider = GoogleProvider(
+    enable_context_caching=True,
+)
+```
+
+---
+
+## Relevance Scoring
+
+### create_scorer()
+
+Factory function to create scorers:
+
+```python
+from headroom import create_scorer
+
+# Auto-select best available scorer
+scorer = create_scorer()
+
+# Explicitly choose type
+scorer = create_scorer(scorer_type="hybrid", alpha=0.7)
+```
+
+### BM25Scorer
+
+Fast keyword-based scoring (zero dependencies):
+
+```python
+from headroom import BM25Scorer
+
+scorer = BM25Scorer()
+scores = scorer.score_items(items=["item 1", "item 2"], query="search query")
+```
+
+### EmbeddingScorer
+
+Semantic similarity scoring (requires `headroom-ai[relevance]`):
+
+```python
+from headroom import EmbeddingScorer, embedding_available
+
+if embedding_available():
+    scorer = EmbeddingScorer(model_name="BAAI/bge-small-en-v1.5")
+    scores = scorer.score_items(items, query)
+```
+
+### HybridScorer
+
+Combines BM25 and embeddings:
+
+```python
+from headroom import HybridScorer
+
+scorer = HybridScorer(alpha=0.5)  # 50% BM25, 50% embedding
+scores = scorer.score_items(items, query)
+```
+
+---
+
+## Transforms (Direct Use)
+
+### SmartCrusher
+
+```python
+from headroom import SmartCrusher
+
+crusher = SmartCrusher()
+result = crusher.crush(data={"results": [...]}, query="user query")
+```
+
+### CacheAligner
+
+```python
+from headroom import CacheAligner
+
+aligner = CacheAligner()
+result = aligner.align(messages)
+```
+
+### RollingWindow
+
+```python
+from headroom import RollingWindow
+
+window = RollingWindow(config)
+result = window.apply(messages, max_tokens=100000)
+```
+
+### TransformPipeline
+
+```python
+from headroom import TransformPipeline
+
+pipeline = TransformPipeline([
+    SmartCrusher(),
+    CacheAligner(),
+    RollingWindow(),
+])
+
+result = pipeline.transform(messages)
+```
+
+---
+
+## Errors
+
+<Tabs groupId="lang" items={['TypeScript', 'Python']}>
+<Tab value="TypeScript">
+
+| Exception | Meaning |
+|-----------|---------|
+| `HeadroomError` | Base class for all errors |
+| `HeadroomConnectionError` | Cannot reach proxy |
+| `HeadroomAuthError` | 401 from proxy |
+| `HeadroomCompressError` | Compression failed (includes `statusCode`, `errorType`) |
+| `ConfigurationError` | Invalid configuration |
+| `ProviderError` | Provider issues |
+| `StorageError` | Storage failures |
+| `TokenizationError` | Token counting failed |
+| `CacheError` | Cache operations failed |
+| `ValidationError` | Validation failures |
+| `TransformError` | Transform execution failed |
+
+Use `mapProxyError(status, type, message)` to convert proxy error responses to the correct class.
+
+</Tab>
+<Tab value="Python">
+
+| Exception | Meaning |
+|-----------|---------|
+| `HeadroomError` | Base class for all Headroom errors |
+| `ConfigurationError` | Invalid config values |
+| `ProviderError` | Provider issue (unknown model, etc.) |
+| `StorageError` | Database issue |
+| `CompressionError` | Compression failed (rare) |
+| `ValidationError` | Setup validation failed |
+
+All exceptions include a `details` dict with additional context.
+
+</Tab>
+</Tabs>
+
+---
+
+## Utilities
+
+### Tokenizer
+
+```python
+from headroom import Tokenizer, count_tokens_text, count_tokens_messages
+
+# Quick counting
+tokens = count_tokens_text("Hello, world!", model="gpt-4o")
+
+# With tokenizer instance
+tokenizer = Tokenizer(model="gpt-4o")
+tokens = tokenizer.count_text("Hello")
+tokens = tokenizer.count_messages(messages)
+```
+
+### generate_report()
+
+Generate HTML/Markdown reports from stored metrics:
+
+```python
+from headroom import generate_report
+
+report = generate_report(
+    store_url="sqlite:///headroom.db",
+    format="html",
+    period="day",
+)
+```
+
+---
+
+## TypeScript Message Types
+
+<TypeTable type={{
+  role: { type: '"system" | "user" | "assistant" | "tool"', description: 'The role of the message sender' },
+  content: { type: 'string | ContentPart[] | null', description: 'Message content (string, content parts array, or null for tool-calling assistant messages)' },
+  tool_calls: { type: 'ToolCall[]', description: 'Tool calls made by the assistant (assistant messages only)' },
+  tool_call_id: { type: 'string', description: 'ID of the tool call this message responds to (tool messages only)' },
+}} />
+
+The TypeScript SDK uses the standard OpenAI message format with `SystemMessage`, `UserMessage`, `AssistantMessage`, and `ToolMessage` variants.

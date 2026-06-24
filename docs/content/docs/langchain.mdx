@@ -1,0 +1,188 @@
+---
+title: LangChain
+description: Automatic context compression for LangChain chat models, memory, retrievers, and agents.
+---
+
+Headroom integrates with LangChain to compress context across all LangChain patterns: chat models, memory, retrievers, agents, and streaming.
+
+## Installation
+
+```bash
+pip install "headroom-ai[langchain]"
+```
+
+## Quick start
+
+Wrap any chat model in one line:
+
+```python
+from langchain_openai import ChatOpenAI
+from headroom.integrations import HeadroomChatModel
+
+llm = HeadroomChatModel(ChatOpenAI(model="gpt-4o"))
+
+# Use exactly like before
+response = llm.invoke("Hello!")
+
+# Check savings
+print(llm.get_metrics())
+# {'tokens_saved': 12500, 'savings_percent': 45.2, 'requests': 50}
+```
+
+Works with any provider:
+
+```python
+from langchain_anthropic import ChatAnthropic
+
+llm = HeadroomChatModel(ChatAnthropic(model="claude-sonnet-4-20250514"))
+```
+
+## Memory integration
+
+`HeadroomChatMessageHistory` wraps any chat history with automatic compression. Long conversations stay under your token budget:
+
+```python
+from langchain.memory import ConversationBufferMemory
+from langchain_community.chat_message_histories import ChatMessageHistory
+from headroom.integrations import HeadroomChatMessageHistory
+
+base_history = ChatMessageHistory()
+compressed_history = HeadroomChatMessageHistory(
+    base_history,
+    compress_threshold_tokens=4000,  # Compress when over 4K tokens
+    keep_recent_turns=5,             # Always keep last 5 turns
+)
+
+memory = ConversationBufferMemory(chat_memory=compressed_history)
+```
+
+After usage:
+
+```python
+print(compressed_history.get_compression_stats())
+# {'compression_count': 12, 'total_tokens_saved': 28000}
+```
+
+## Retriever integration
+
+`HeadroomDocumentCompressor` filters retrieved documents by relevance. Retrieve many for recall, keep the best for precision:
+
+```python
+from langchain.retrievers import ContextualCompressionRetriever
+from langchain_community.vectorstores import FAISS
+from headroom.integrations import HeadroomDocumentCompressor
+
+base_retriever = vectorstore.as_retriever(search_kwargs={"k": 50})
+
+compressor = HeadroomDocumentCompressor(
+    max_documents=10,
+    min_relevance=0.3,
+    prefer_diverse=True,  # MMR-style diversity
+)
+
+retriever = ContextualCompressionRetriever(
+    base_compressor=compressor,
+    base_retriever=base_retriever,
+)
+
+# Retrieves 50 docs, returns best 10
+docs = retriever.invoke("What is Python?")
+```
+
+## Agent tool wrapping
+
+`wrap_tools_with_headroom` compresses tool outputs before they re-enter the agent's context:
+
+```python
+from langchain_core.tools import tool
+from headroom.integrations import wrap_tools_with_headroom
+
+@tool
+def search_database(query: str) -> str:
+    """Search the database."""
+    return json.dumps({"results": [...], "total": 1000})
+
+wrapped_tools = wrap_tools_with_headroom(
+    [search_database],
+    min_chars_to_compress=1000,
+)
+
+agent = create_openai_tools_agent(llm, wrapped_tools, prompt)
+executor = AgentExecutor(agent=agent, tools=wrapped_tools)
+```
+
+Per-tool metrics:
+
+```python
+from headroom.integrations import get_tool_metrics
+
+metrics = get_tool_metrics()
+print(metrics.get_summary())
+# {'total_invocations': 25, 'total_compressions': 18, 'total_chars_saved': 450000}
+```
+
+## LangGraph ReAct agent
+
+```python
+from langchain_openai import ChatOpenAI
+from langgraph.prebuilt import create_react_agent
+from headroom.integrations import HeadroomChatModel, wrap_tools_with_headroom
+
+llm = HeadroomChatModel(ChatOpenAI(model="gpt-4o"))
+tools = wrap_tools_with_headroom([search_web, query_database])
+
+agent = create_react_agent(llm, tools)
+result = agent.invoke({
+    "messages": [("user", "Find users who signed up last week")]
+})
+```
+
+## LangGraph custom graph
+
+Insert a compression node between tools and the agent in a custom `StateGraph`:
+
+```python
+from langgraph.graph import StateGraph, MessagesState, START, END
+from headroom.integrations.langchain import create_compress_tool_messages_node
+
+graph = StateGraph(MessagesState)
+graph.add_node("agent", agent_node)
+graph.add_node("tools", tools_node)
+graph.add_node("compress", create_compress_tool_messages_node(
+    min_tokens_to_compress=100,
+))
+
+# Wire: tools -> compress -> agent
+graph.add_edge(START, "agent")
+graph.add_edge("tools", "compress")
+graph.add_edge("compress", "agent")
+```
+
+## Streaming
+
+Full async support:
+
+```python
+# Async invoke
+response = await llm.ainvoke("Hello!")
+
+# Async streaming
+async for chunk in llm.astream("Tell me a story"):
+    print(chunk.content, end="", flush=True)
+```
+
+## Custom configuration
+
+```python
+from headroom import HeadroomConfig, HeadroomMode
+
+config = HeadroomConfig(
+    default_mode=HeadroomMode.OPTIMIZE,
+    smart_crusher_target_ratio=0.3,
+)
+
+llm = HeadroomChatModel(
+    ChatOpenAI(model="gpt-4o"),
+    headroom_config=config,
+)
+```

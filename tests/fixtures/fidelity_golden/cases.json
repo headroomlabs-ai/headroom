@@ -1,0 +1,796 @@
+[
+  {
+    "id": "logs_oom",
+    "question": "Why did the job fail?",
+    "content_type": "json_array",
+    "compress": {
+      "with_compaction": false,
+      "max_items_after_crush": 10
+    },
+    "answer_evidence": [
+      "OOM killed worker 3",
+      "exceeded memory limit"
+    ],
+    "supporting_facts": [
+      "checkpoint saved at step 4500"
+    ],
+    "content": [
+      {
+        "seq": 0,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "heartbeat ping 0"
+      },
+      {
+        "seq": 1,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "heartbeat ping 1"
+      },
+      {
+        "seq": 2,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "heartbeat ping 2"
+      },
+      {
+        "seq": 3,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "heartbeat ping 3"
+      },
+      {
+        "seq": 4,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "heartbeat ping 4"
+      },
+      {
+        "seq": 5,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "heartbeat ping 5"
+      },
+      {
+        "seq": 6,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "heartbeat ping 6"
+      },
+      {
+        "seq": 7,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "heartbeat ping 7"
+      },
+      {
+        "seq": 8,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "heartbeat ping 8"
+      },
+      {
+        "seq": 9,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "checkpoint saved at step 4500"
+      },
+      {
+        "seq": 9,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "heartbeat ping 9"
+      },
+      {
+        "seq": 10,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "heartbeat ping 10"
+      },
+      {
+        "seq": 11,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "heartbeat ping 11"
+      },
+      {
+        "seq": 12,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "heartbeat ping 12"
+      },
+      {
+        "seq": 13,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "heartbeat ping 13"
+      },
+      {
+        "seq": 14,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "heartbeat ping 14"
+      },
+      {
+        "seq": 15,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "heartbeat ping 15"
+      },
+      {
+        "seq": 16,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "heartbeat ping 16"
+      },
+      {
+        "seq": 17,
+        "level": "ERROR",
+        "status": "failed",
+        "msg": "OOM killed worker 3 exceeded memory limit 8GiB"
+      },
+      {
+        "seq": 17,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "heartbeat ping 17"
+      },
+      {
+        "seq": 18,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "heartbeat ping 18"
+      },
+      {
+        "seq": 19,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "heartbeat ping 19"
+      },
+      {
+        "seq": 20,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "heartbeat ping 20"
+      },
+      {
+        "seq": 21,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "heartbeat ping 21"
+      },
+      {
+        "seq": 22,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "heartbeat ping 22"
+      },
+      {
+        "seq": 23,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "heartbeat ping 23"
+      },
+      {
+        "seq": 24,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "heartbeat ping 24"
+      },
+      {
+        "seq": 25,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "heartbeat ping 25"
+      },
+      {
+        "seq": 26,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "heartbeat ping 26"
+      },
+      {
+        "seq": 27,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "heartbeat ping 27"
+      }
+    ]
+  },
+  {
+    "id": "payment_exception",
+    "question": "Which service threw an exception and where?",
+    "content_type": "json_array",
+    "compress": {
+      "with_compaction": false,
+      "max_items_after_crush": 8
+    },
+    "answer_evidence": [
+      "NullPointerException",
+      "PaymentService.charge line 88"
+    ],
+    "supporting_facts": [],
+    "content": [
+      {
+        "seq": 0,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "GET /healthz 200 0"
+      },
+      {
+        "seq": 1,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "GET /healthz 200 1"
+      },
+      {
+        "seq": 2,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "GET /healthz 200 2"
+      },
+      {
+        "seq": 3,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "GET /healthz 200 3"
+      },
+      {
+        "seq": 4,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "GET /healthz 200 4"
+      },
+      {
+        "seq": 5,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "GET /healthz 200 5"
+      },
+      {
+        "seq": 6,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "GET /healthz 200 6"
+      },
+      {
+        "seq": 7,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "GET /healthz 200 7"
+      },
+      {
+        "seq": 8,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "GET /healthz 200 8"
+      },
+      {
+        "seq": 9,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "GET /healthz 200 9"
+      },
+      {
+        "seq": 10,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "GET /healthz 200 10"
+      },
+      {
+        "seq": 11,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "GET /healthz 200 11"
+      },
+      {
+        "seq": 12,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "GET /healthz 200 12"
+      },
+      {
+        "seq": 13,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "GET /healthz 200 13"
+      },
+      {
+        "seq": 14,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "GET /healthz 200 14"
+      },
+      {
+        "seq": 15,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "GET /healthz 200 15"
+      },
+      {
+        "seq": 16,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "GET /healthz 200 16"
+      },
+      {
+        "seq": 17,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "GET /healthz 200 17"
+      },
+      {
+        "seq": 18,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "GET /healthz 200 18"
+      },
+      {
+        "seq": 19,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "GET /healthz 200 19"
+      },
+      {
+        "seq": 20,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "GET /healthz 200 20"
+      },
+      {
+        "seq": 21,
+        "level": "ERROR",
+        "status": "failed",
+        "msg": "exception: NullPointerException at PaymentService.charge line 88"
+      },
+      {
+        "seq": 21,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "GET /healthz 200 21"
+      },
+      {
+        "seq": 22,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "GET /healthz 200 22"
+      },
+      {
+        "seq": 23,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "GET /healthz 200 23"
+      },
+      {
+        "seq": 24,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "GET /healthz 200 24"
+      },
+      {
+        "seq": 25,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "GET /healthz 200 25"
+      },
+      {
+        "seq": 26,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "GET /healthz 200 26"
+      },
+      {
+        "seq": 27,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "GET /healthz 200 27"
+      },
+      {
+        "seq": 28,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "GET /healthz 200 28"
+      },
+      {
+        "seq": 29,
+        "level": "INFO",
+        "status": "ok",
+        "msg": "GET /healthz 200 29"
+      }
+    ]
+  },
+  {
+    "id": "latency_anomaly",
+    "question": "Which region had the latency spike, and how high?",
+    "content_type": "json_array",
+    "compress": {
+      "with_compaction": false,
+      "max_items_after_crush": 8
+    },
+    "answer_evidence": [
+      "us-east-1",
+      "99999"
+    ],
+    "supporting_facts": [],
+    "content": [
+      {
+        "seq": 0,
+        "region": "us-west-2",
+        "latency_ms": 95,
+        "status": "ok"
+      },
+      {
+        "seq": 1,
+        "region": "us-west-2",
+        "latency_ms": 96,
+        "status": "ok"
+      },
+      {
+        "seq": 2,
+        "region": "us-west-2",
+        "latency_ms": 97,
+        "status": "ok"
+      },
+      {
+        "seq": 3,
+        "region": "us-west-2",
+        "latency_ms": 98,
+        "status": "ok"
+      },
+      {
+        "seq": 4,
+        "region": "us-west-2",
+        "latency_ms": 99,
+        "status": "ok"
+      },
+      {
+        "seq": 5,
+        "region": "us-west-2",
+        "latency_ms": 100,
+        "status": "ok"
+      },
+      {
+        "seq": 6,
+        "region": "us-west-2",
+        "latency_ms": 101,
+        "status": "ok"
+      },
+      {
+        "seq": 7,
+        "region": "us-west-2",
+        "latency_ms": 102,
+        "status": "ok"
+      },
+      {
+        "seq": 8,
+        "region": "us-west-2",
+        "latency_ms": 103,
+        "status": "ok"
+      },
+      {
+        "seq": 9,
+        "region": "us-west-2",
+        "latency_ms": 104,
+        "status": "ok"
+      },
+      {
+        "seq": 10,
+        "region": "us-west-2",
+        "latency_ms": 105,
+        "status": "ok"
+      },
+      {
+        "seq": 11,
+        "region": "us-west-2",
+        "latency_ms": 95,
+        "status": "ok"
+      },
+      {
+        "seq": 12,
+        "region": "us-west-2",
+        "latency_ms": 96,
+        "status": "ok"
+      },
+      {
+        "seq": 13,
+        "region": "us-west-2",
+        "latency_ms": 97,
+        "status": "ok"
+      },
+      {
+        "seq": 14,
+        "region": "us-west-2",
+        "latency_ms": 98,
+        "status": "ok"
+      },
+      {
+        "seq": 15,
+        "region": "us-west-2",
+        "latency_ms": 99,
+        "status": "ok"
+      },
+      {
+        "seq": 16,
+        "region": "us-west-2",
+        "latency_ms": 100,
+        "status": "ok"
+      },
+      {
+        "seq": 17,
+        "region": "us-west-2",
+        "latency_ms": 101,
+        "status": "ok"
+      },
+      {
+        "seq": 18,
+        "region": "us-west-2",
+        "latency_ms": 102,
+        "status": "ok"
+      },
+      {
+        "seq": 19,
+        "region": "us-east-1",
+        "latency_ms": 99999,
+        "status": "ok",
+        "note": "latency spike us-east-1"
+      },
+      {
+        "seq": 20,
+        "region": "us-west-2",
+        "latency_ms": 104,
+        "status": "ok"
+      },
+      {
+        "seq": 21,
+        "region": "us-west-2",
+        "latency_ms": 105,
+        "status": "ok"
+      },
+      {
+        "seq": 22,
+        "region": "us-west-2",
+        "latency_ms": 95,
+        "status": "ok"
+      },
+      {
+        "seq": 23,
+        "region": "us-west-2",
+        "latency_ms": 96,
+        "status": "ok"
+      },
+      {
+        "seq": 24,
+        "region": "us-west-2",
+        "latency_ms": 97,
+        "status": "ok"
+      },
+      {
+        "seq": 25,
+        "region": "us-west-2",
+        "latency_ms": 98,
+        "status": "ok"
+      },
+      {
+        "seq": 26,
+        "region": "us-west-2",
+        "latency_ms": 99,
+        "status": "ok"
+      },
+      {
+        "seq": 27,
+        "region": "us-west-2",
+        "latency_ms": 100,
+        "status": "ok"
+      },
+      {
+        "seq": 28,
+        "region": "us-west-2",
+        "latency_ms": 101,
+        "status": "ok"
+      },
+      {
+        "seq": 29,
+        "region": "us-west-2",
+        "latency_ms": 102,
+        "status": "ok"
+      }
+    ]
+  },
+  {
+    "id": "ci_test_failures",
+    "question": "Which test failed and why?",
+    "content_type": "json_array",
+    "compress": {
+      "with_compaction": false,
+      "max_items_after_crush": 9
+    },
+    "answer_evidence": [
+      "test_auth_token_refresh",
+      "expected 200 got 401"
+    ],
+    "supporting_facts": [],
+    "content": [
+      {
+        "seq": 0,
+        "test": "test_module_0",
+        "outcome": "passed",
+        "duration_ms": 5
+      },
+      {
+        "seq": 1,
+        "test": "test_module_1",
+        "outcome": "passed",
+        "duration_ms": 6
+      },
+      {
+        "seq": 2,
+        "test": "test_module_2",
+        "outcome": "passed",
+        "duration_ms": 7
+      },
+      {
+        "seq": 3,
+        "test": "test_module_3",
+        "outcome": "passed",
+        "duration_ms": 8
+      },
+      {
+        "seq": 4,
+        "test": "test_module_4",
+        "outcome": "passed",
+        "duration_ms": 9
+      },
+      {
+        "seq": 5,
+        "test": "test_module_5",
+        "outcome": "passed",
+        "duration_ms": 10
+      },
+      {
+        "seq": 6,
+        "test": "test_module_6",
+        "outcome": "passed",
+        "duration_ms": 11
+      },
+      {
+        "seq": 7,
+        "test": "test_module_7",
+        "outcome": "passed",
+        "duration_ms": 12
+      },
+      {
+        "seq": 8,
+        "test": "test_module_8",
+        "outcome": "passed",
+        "duration_ms": 13
+      },
+      {
+        "seq": 9,
+        "test": "test_module_9",
+        "outcome": "passed",
+        "duration_ms": 14
+      },
+      {
+        "seq": 10,
+        "test": "test_module_10",
+        "outcome": "passed",
+        "duration_ms": 15
+      },
+      {
+        "seq": 11,
+        "test": "test_module_11",
+        "outcome": "passed",
+        "duration_ms": 16
+      },
+      {
+        "seq": 12,
+        "test": "test_auth_token_refresh",
+        "outcome": "failed",
+        "duration_ms": 41,
+        "error": "AssertionError: expected 200 got 401 in test_auth_token_refresh"
+      },
+      {
+        "seq": 13,
+        "test": "test_module_13",
+        "outcome": "passed",
+        "duration_ms": 18
+      },
+      {
+        "seq": 14,
+        "test": "test_module_14",
+        "outcome": "passed",
+        "duration_ms": 19
+      },
+      {
+        "seq": 15,
+        "test": "test_module_15",
+        "outcome": "passed",
+        "duration_ms": 20
+      },
+      {
+        "seq": 16,
+        "test": "test_module_16",
+        "outcome": "passed",
+        "duration_ms": 21
+      },
+      {
+        "seq": 17,
+        "test": "test_module_17",
+        "outcome": "passed",
+        "duration_ms": 22
+      },
+      {
+        "seq": 18,
+        "test": "test_module_18",
+        "outcome": "passed",
+        "duration_ms": 23
+      },
+      {
+        "seq": 19,
+        "test": "test_module_19",
+        "outcome": "passed",
+        "duration_ms": 24
+      },
+      {
+        "seq": 20,
+        "test": "test_module_20",
+        "outcome": "passed",
+        "duration_ms": 25
+      },
+      {
+        "seq": 21,
+        "test": "test_module_21",
+        "outcome": "passed",
+        "duration_ms": 26
+      },
+      {
+        "seq": 22,
+        "test": "test_module_22",
+        "outcome": "passed",
+        "duration_ms": 27
+      },
+      {
+        "seq": 23,
+        "test": "test_module_23",
+        "outcome": "passed",
+        "duration_ms": 28
+      },
+      {
+        "seq": 24,
+        "test": "test_module_24",
+        "outcome": "passed",
+        "duration_ms": 29
+      },
+      {
+        "seq": 25,
+        "test": "test_module_25",
+        "outcome": "passed",
+        "duration_ms": 30
+      },
+      {
+        "seq": 26,
+        "test": "test_module_26",
+        "outcome": "passed",
+        "duration_ms": 31
+      },
+      {
+        "seq": 27,
+        "test": "test_module_27",
+        "outcome": "passed",
+        "duration_ms": 32
+      },
+      {
+        "seq": 28,
+        "test": "test_module_28",
+        "outcome": "passed",
+        "duration_ms": 33
+      },
+      {
+        "seq": 29,
+        "test": "test_module_29",
+        "outcome": "passed",
+        "duration_ms": 34
+      }
+    ]
+  }
+]

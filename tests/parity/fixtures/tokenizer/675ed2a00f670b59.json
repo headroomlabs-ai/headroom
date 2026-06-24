@@ -1,0 +1,8 @@
+{
+  "config": {},
+  "input": "def foo(x):\n    return x + 1\n\nclass Bar:\n    pass\n[[variant 0]]",
+  "input_sha256": "675ed2a00f670b594c21f551f2dbf8ca15da0bcf301bfceb7187f3a3af205609",
+  "output": 22,
+  "recorded_at": "2026-04-23T23:51:37.612786+00:00",
+  "transform": "tokenizer"
+}

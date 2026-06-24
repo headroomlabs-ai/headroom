@@ -1,0 +1,131 @@
+---
+title: Architecture
+description: How Headroom's three-stage compression pipeline works, from message parsing through transform execution to provider cache optimization.
+---
+
+Headroom sits between your application and the LLM provider. It intercepts messages, compresses them intelligently, and forwards the optimized request. The response comes back unchanged.
+
+## High-Level Flow
+
+```
++---------------------------------------------------------------+
+|                       YOUR APPLICATION                        |
++---------------------------------------------------------------+
+                               |
+                               v
++---------------------------------------------------------------+
+|                      HEADROOM CLIENT                          |
+|  +-----------+   +------------+   +---------+                 |
+|  |  ANALYZE  | > |  TRANSFORM | > |  CALL   |                 |
+|  |  (Parser) |   |  (Pipeline)|   |  (API)  |                 |
+|  +-----------+   +------------+   +---------+                 |
+|       |                |                |                     |
+|       v                v                v                     |
+|  Count tokens    Apply compressions   Send to LLM provider   |
+|  Detect waste    Preserve meaning     Log metrics             |
++---------------------------------------------------------------+
+                               |
+                               v
++---------------------------------------------------------------+
+|                  OPENAI / ANTHROPIC / GOOGLE                  |
++---------------------------------------------------------------+
+```
+
+## Entry Points
+
+Headroom can be used in three ways, all feeding into the same pipeline:
+
+| Entry Point | How It Works | Code Changes |
+|-------------|-------------|--------------|
+| **SDK Mode** | Wrap your LLM client with `HeadroomClient` | Minimal -- swap client constructor |
+| **Proxy Mode** | Run `headroom proxy` and point your client at it | Zero -- just change the base URL |
+| **Integrations** | LangChain, Vercel AI SDK, Agno adapters | Framework-specific setup |
+
+## The Transform Pipeline
+
+Messages flow through a sequence of transforms. Each transform is independent, safe to skip, and fails gracefully (returns original content unchanged).
+
+### Stage 1: Cache Aligner
+
+Extracts dynamic content (dates, UUIDs, session tokens) from your system prompt and moves it to the end. This stabilizes the prefix so provider caches (Anthropic `cache_control`, OpenAI prefix caching) can hit on repeated calls.
+
+```
+Before: "You are helpful. Current Date: 2024-12-15"
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+         Changes daily = cache miss every day
+
+After:  "You are helpful."                          [stable prefix]
+        "[Context: Current Date: 2024-12-15]"       [dynamic tail]
+```
+
+Overhead: sub-millisecond.
+
+### Stage 2: Smart Crusher
+
+Analyzes tool output content and compresses it using statistical methods. This is where the bulk of token savings come from.
+
+**What it does:**
+
+1. Parses JSON arrays in tool outputs
+2. Runs field-level statistical analysis (variance, uniqueness, change points)
+3. Selects a representative subset using the Kneedle algorithm on bigram coverage
+4. Preserves errors, anomalies, and distribution boundaries unconditionally
+5. Factors out constant fields shared by all items
+
+**Strategies by content type:**
+
+| Content | Strategy | Typical Savings |
+|---------|----------|-----------------|
+| JSON arrays of dicts | Statistical sampling + anomaly preservation | 83--95% |
+| JSON arrays of strings | Dedup + adaptive sampling | 60--90% |
+| JSON arrays of numbers | Statistical summary + outlier preservation | 70--85% |
+| Build/test logs | Pattern clustering | 85--94% |
+| HTML | Article extraction (trafilatura-based) | ~95% |
+
+**Item retention split:** 30% from array start (schema), 15% from end (recency), 55% by importance score. Error items are always kept regardless of budget.
+
+Overhead: 1--50ms for typical payloads. Scales linearly with input size.
+
+### Stage 3: Context Manager
+
+Ensures the final message array fits within the model's context window.
+
+**Rolling Window** (default): Drops oldest messages first, preserving system prompt and recent turns. Tool calls and their responses are dropped as atomic units.
+
+**Intelligent Context** (advanced): Scores every message on six dimensions (recency, semantic similarity, TOIN importance, error indicators, forward references, token density) and drops the lowest-scored messages first. Dropped messages are stored in CCR for potential retrieval.
+
+Overhead: sub-millisecond for Rolling Window; depends on scoring config for Intelligent Context.
+
+## Provider Cache Optimization
+
+After the pipeline, Headroom applies provider-specific cache hints:
+
+| Provider | Mechanism | Savings |
+|----------|-----------|---------|
+| Anthropic | `cache_control` blocks on stable prefix | Up to 90% on cached tokens |
+| OpenAI | Prefix alignment for automatic caching | Up to 50% on cached tokens |
+| Google | `CachedContent` API | Up to 75% on cached tokens |
+
+## CCR: Compress-Cache-Retrieve
+
+When SmartCrusher compresses a tool output or Intelligent Context drops messages, the original content is stored in a local compression cache. If the LLM needs the full data, it can request retrieval via a `ccr_retrieve` tool call. This makes compression reversible.
+
+```
+Compress:  1000 items  ->  15 items  (stored original in CCR)
+Cache:     Hash-indexed local store (SQLite)
+Retrieve:  LLM calls ccr_retrieve("abc123")  ->  original 1000 items
+```
+
+## TOIN: Tool Output Intelligence Network
+
+TOIN learns compression patterns across sessions and users. When a tool is used repeatedly, TOIN builds up statistics about which fields matter, which items get retrieved, and what compression strategies work best. These learned patterns feed back into SmartCrusher and Intelligent Context scoring.
+
+Cold start: For new tool types, TOIN falls back to statistical heuristics. Patterns build up over time as tools are used.
+
+## What Headroom Does NOT Touch
+
+- **User messages**: Never compressed (the user's intent must be preserved exactly)
+- **System prompts**: Content preserved; only dynamic parts are relocated for caching
+- **Code**: Passes through unchanged unless tree-sitter AST compression is explicitly enabled
+- **Model responses**: Returned unchanged from the provider
+- **Short content**: Tool outputs under 200 tokens pass through (overhead exceeds savings)

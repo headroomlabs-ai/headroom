@@ -1,0 +1,293 @@
+---
+title: Installation
+description: Install Headroom via pip, npm, or Docker. Includes all Python extras, TypeScript setup, Docker image tags, and environment variables.
+---
+
+---
+
+## Install options
+
+**pip** - you're writing Python, or you need the CLI (`headroom proxy`, `wrap`, `mcp`, `learn`, `perf`), regardless of what language your app is in.
+
+**npm** - you're writing TypeScript/Node and want inline `compress()`, SDK wrapping (`withHeadroom`), or Vercel AI SDK middleware.
+
+## Python
+
+Headroom requires **Python 3.10+** and is published as `headroom-ai` on PyPI.
+Current release wheels are built for Python **3.10 through 3.13** on Linux
+(manylinux_2_28 x86_64 / aarch64) and macOS (Apple Silicon). Other targets —
+**Windows** and **Intel macOS** — fall back to building the Rust extension
+from the sdist and need a working native toolchain. If your installer is
+using a newer Python, force a supported interpreter.
+
+### Core package
+
+```bash
+pip install headroom-ai
+```
+
+The core package includes the `compress()` function, SmartCrusher, CacheAligner, and IntelligentContext. No heavy dependencies.
+
+### Extras
+
+Install only what you need, or grab everything with `[all]`:
+
+```bash
+pip install "headroom-ai[all]"
+```
+
+| Extra | What it adds | Install command |
+|---|---|---|
+| `proxy` | Proxy server, MCP tools, HTTP API | `pip install "headroom-ai[proxy]"` |
+| `ml` | Kompress (ModernBERT text compression, requires PyTorch) | `pip install "headroom-ai[ml]"` |
+| `code` | CodeCompressor (tree-sitter AST parsing) | `pip install "headroom-ai[code]"` |
+| `memory` | Persistent memory (hnswlib, sqlite-vec, sentence-transformers) | `pip install "headroom-ai[memory]"` |
+| `relevance` | fastembed-based relevance scoring (BAAI/bge-small-en-v1.5, ONNX) | `pip install "headroom-ai[relevance]"` |
+| `image` | Image compression (Pillow, ONNX runtime, OCR) | `pip install "headroom-ai[image]"` |
+| `reports` | HTML/Markdown report generation (Jinja2) | `pip install "headroom-ai[reports]"` |
+| `otel` | OpenTelemetry exporter (OTLP) | `pip install "headroom-ai[otel]"` |
+| `voice` | Voice/audio support | `pip install "headroom-ai[voice]"` |
+| `mcp` | MCP server tools (`headroom_compress`, `headroom_retrieve`, `headroom_stats`) | `pip install "headroom-ai[mcp]"` |
+| `langchain` | LangChain `HeadroomChatModel` wrapper | `pip install "headroom-ai[langchain]"` |
+| `agno` | Agno `HeadroomAgnoModel` wrapper | `pip install "headroom-ai[agno]"` |
+| `evals` | Evaluation framework (GSM8K, SQuAD, BFCL benchmarks) | `pip install "headroom-ai[evals]"` |
+| `pytorch-mps` | Apple-GPU (MPS) memory-embedder offload — **macOS only**, not in `[all]` (torch + sentence-transformers); opt in with `HEADROOM_EMBEDDER_RUNTIME=pytorch_mps` | `pip install "headroom-ai[pytorch-mps]"` |
+| `all` | Everything above | `pip install "headroom-ai[all]"` |
+
+You can combine extras:
+
+```bash
+pip install "headroom-ai[proxy,langchain,ml]"
+```
+
+### Windows
+
+There are no prebuilt Windows wheels yet, so `pip install headroom-ai`
+(and `uv tool install`, `pipx install`, …) will fall back to building the
+Rust extension from the sdist. The build needs the MSVC toolchain on
+`PATH`. Without it you'll see:
+
+```text
+error: linker `link.exe` not found
+note: please ensure that Visual Studio 2017 or later, or Build Tools for
+Visual Studio were installed with the Visual C++ option
+```
+
+To install the prerequisites:
+
+1. **MSVC toolchain** — install **[Build Tools for Visual Studio](https://visualstudio.microsoft.com/visual-cpp-build-tools/)**
+   and select the *"Desktop development with C++"* workload (this gives
+   you `link.exe`). VS Code on its own is not enough.
+2. **Rust** — install via [rustup](https://rustup.rs/). Choose the
+   `stable-x86_64-pc-windows-msvc` toolchain so Cargo uses the MSVC
+   linker you just installed.
+3. **Open a fresh PowerShell** so the installer's PATH updates take
+   effect, then run the install:
+
+   ```powershell
+   uv tool install --python 3.13 "headroom-ai[all]"
+   # or
+   pip install "headroom-ai[all]"
+   ```
+
+If you'd rather avoid the native toolchain entirely, run Headroom
+through Docker — see the [Docker](#docker) section below. Native
+Windows wheels are tracked in [#636](https://github.com/chopratejas/headroom/issues/636).
+
+### pipx
+
+`pipx` creates one virtual environment per app. If that environment uses an
+unsupported Python version, `pipx` may resolve an older compatible Headroom
+release instead of the newest one.
+
+Use Python 3.13 explicitly:
+
+```bash
+pipx install --python python3.13 "headroom-ai[all]"
+```
+
+For a pinned release:
+
+```bash
+pipx install --python python3.13 "headroom-ai[all]==0.21.4"
+```
+
+Check which Python an existing `pipx` environment uses:
+
+```bash
+pipx list
+```
+
+### Verify the install
+
+```bash
+python -c "import headroom; print(headroom.__version__)"
+```
+
+## TypeScript / Node.js
+
+The TypeScript SDK is published as `headroom-ai` on npm. It requires **Node.js 18+**.
+
+```bash
+npm install headroom-ai
+```
+
+Or with other package managers:
+
+```bash
+pnpm add headroom-ai
+yarn add headroom-ai
+```
+
+<Callout type="info" title="The TS SDK needs a running proxy">
+The TypeScript SDK sends messages to the Headroom proxy over HTTP for compression. The proxy runs the full compression pipeline (Python). Start it before using the SDK:
+
+```bash
+pip install "headroom-ai[proxy]"
+headroom proxy --port 8787
+```
+
+Then point the SDK at it:
+
+```ts
+import { compress } from 'headroom-ai';
+
+const result = await compress(messages, {
+  baseUrl: 'http://localhost:8787',
+});
+```
+</Callout>
+
+### Verify the install
+
+```bash
+node -e "const h = require('headroom-ai'); console.log('headroom-ai loaded')"
+```
+
+## Docker
+
+Pre-built images are published to GitHub Container Registry on every release.
+
+```bash
+docker pull ghcr.io/chopratejas/headroom:latest
+docker run -p 8787:8787 ghcr.io/chopratejas/headroom:latest
+```
+
+<Callout type="info" title="Running Headroom without installing Python or Node?">
+If you want a host `headroom` CLI that keeps Headroom itself inside a container — with mounted state, a one-line installer, and a persistent Docker lifecycle — see [Docker-Native Install](/docs/docker-install).
+</Callout>
+
+### Image tags
+
+| Tag | Extras | Base image | Description |
+|---|---|---|---|
+| `latest` | `proxy` | Debian slim | Default image, runs the proxy |
+| `<version>` | `proxy` | Debian slim | Pinned version |
+| `nonroot` | `proxy` | Debian slim | Runs as non-root user |
+| `code` | `proxy,code` | Debian slim | Includes tree-sitter for code compression |
+| `code-nonroot` | `proxy,code` | Debian slim | Code compression, non-root |
+| `slim` | `proxy` | Distroless | Minimal image, no shell |
+| `slim-nonroot` | `proxy` | Distroless | Minimal, non-root |
+| `code-slim` | `proxy,code` | Distroless | Code compression, minimal |
+| `code-slim-nonroot` | `proxy,code` | Distroless | Code compression, minimal, non-root |
+
+### Build from source
+
+Use Docker Bake for multi-variant builds:
+
+```bash
+# List all targets
+docker buildx bake --list targets
+
+# Build the default runtime image
+docker buildx bake runtime-default
+
+# Build a specific variant with custom registry
+docker buildx bake runtime-code-slim-nonroot \
+  --set '*.tags=my-registry/headroom:code-slim-nonroot'
+```
+
+## Environment variables
+
+These variables configure Headroom at runtime. Set them in your shell, `.env` file, or container environment.
+
+### LLM provider keys
+
+| Variable | Description |
+|---|---|
+| `OPENAI_API_KEY` | OpenAI API key (used when proxying to OpenAI) |
+| `ANTHROPIC_API_KEY` | Anthropic API key (used when proxying to Anthropic) |
+| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | AWS credentials for Bedrock backend |
+| `GOOGLE_APPLICATION_CREDENTIALS` | Google Cloud credentials for Vertex AI backend |
+
+### Proxy configuration
+
+| Variable | Default | Description |
+|---|---|---|
+| `HEADROOM_PORT` | `8787` | Port the proxy listens on |
+| `HEADROOM_HOST` | `127.0.0.1` | Host the proxy binds to |
+| `HEADROOM_MODE` | `token` | Default optimization mode: `token` or `cache` |
+| `HEADROOM_TELEMETRY` | `off` (opt-in) | Set to `on` to opt in to anonymous telemetry |
+| `HEADROOM_REQUEST_TIMEOUT` | `300` | Request timeout in seconds |
+
+### TypeScript SDK
+
+| Variable | Default | Description |
+|---|---|---|
+| `HEADROOM_BASE_URL` | `http://localhost:8787` | Proxy URL for the TypeScript SDK |
+| `HEADROOM_API_KEY` | _(none)_ | API key if the proxy requires auth |
+
+## Troubleshooting
+
+These are common issues faced during initial setup and how to resolve them.
+
+### Python version error
+
+This project requires **Python 3.10+**.
+
+Check your version:
+
+```bash
+python3 --version
+```
+
+If needed (Mac with Homebrew):
+
+```bash
+brew install python@3.11
+```
+
+### Editable install fails (`pip install -e`)
+
+Upgrade pip to the latest version:
+
+```bash
+python3 -m pip install --upgrade pip
+```
+
+### Missing `cargo` (Rust error)
+
+Some tests require Rust tooling.
+
+The recommended way to install rust is using `rustup`. You can find the official installation instructions [here](https://rust-lang.org/tools/install/).
+
+## Dashboard
+
+Headroom serves a live savings dashboard while the proxy is running. Open it with:
+
+```bash
+headroom dashboard            # opens http://localhost:8787/dashboard in your browser
+headroom dashboard --no-open  # just print the URL
+```
+
+Or browse to `http://localhost:8787/dashboard` directly (use `--port` / `HEADROOM_PORT` if you
+run the proxy on a different port).
+
+## Next steps
+
+<Cards>
+  <Card title="Quickstart" href="/docs/quickstart" />
+  <Card title="Proxy Server" href="/docs/proxy" />
+  <Card title="Configuration" href="/docs/configuration" />
+  <Card title="Vercel AI SDK" href="/docs/vercel-ai-sdk" />
+</Cards>

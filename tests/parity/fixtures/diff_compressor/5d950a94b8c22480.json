@@ -1,0 +1,26 @@
+{
+  "config": {
+    "always_keep_additions": true,
+    "always_keep_deletions": true,
+    "enable_ccr": true,
+    "max_context_lines": 2,
+    "max_files": 20,
+    "max_hunks_per_file": 10,
+    "min_lines_for_ccr": 50
+  },
+  "input": "commit 0123456789abcdef\nAuthor: Tester <t@example.com>\nDate:   Mon Apr 25 12:00:00 2026\n\n    msg line 0\n    msg line 1\n    msg line 2\n    msg line 3\n    msg line 4\n    msg line 5\n    msg line 6\n    msg line 7\n    msg line 8\n    msg line 9\n    msg line 10\n    msg line 11\n    msg line 12\n    msg line 13\n    msg line 14\n    msg line 15\n    msg line 16\n    msg line 17\n    msg line 18\n    msg line 19\n    msg line 20\n    msg line 21\n    msg line 22\n    msg line 23\n    msg line 24\n    msg line 25\n    msg line 26\n    msg line 27\n    msg line 28\n    msg line 29\n    msg line 30\n    msg line 31\n    msg line 32\n    msg line 33\n    msg line 34\n    msg line 35\n    msg line 36\n    msg line 37\n    msg line 38\n    msg line 39\n    msg line 40\n    msg line 41\n    msg line 42\n    msg line 43\n    msg line 44\n    msg line 45\n    msg line 46\n    msg line 47\n    msg line 48\n    msg line 49\n    msg line 50\n    msg line 51\n    msg line 52\n    msg line 53\n    msg line 54\n    msg line 55\n    msg line 56\n    msg line 57\n    msg line 58\n    msg line 59\n\ndiff --git a/auth/old_handler.py b/auth/new_handler.py\nsimilarity index 92%\nrename from auth/old_handler.py\nrename to auth/new_handler.py\n--- a/auth/old_handler.py\n+++ b/auth/new_handler.py\n@@ -1,8 +1,8 @@\n import os\n import sys\n-from auth import legacy\n+from auth import modern\n\n def authenticate(user):\n     return user.is_valid()\n\n# bugfix:long-pre-diff",
+  "input_sha256": "5d950a94b8c224808ce16afdb7abc84eecdc94539d829e6113a7fa06be8584c3",
+  "output": {
+    "additions": 1,
+    "cache_key": null,
+    "compressed": "commit 0123456789abcdef\nAuthor: Tester <t@example.com>\nDate:   Mon Apr 25 12:00:00 2026\n\n    msg line 0\n    msg line 1\n    msg line 2\n    msg line 3\n    msg line 4\n    msg line 5\n    msg line 6\n    msg line 7\n    msg line 8\n    msg line 9\n    msg line 10\n    msg line 11\n    msg line 12\n    msg line 13\n    msg line 14\n    msg line 15\n    msg line 16\n    msg line 17\n    msg line 18\n    msg line 19\n    msg line 20\n    msg line 21\n    msg line 22\n    msg line 23\n    msg line 24\n    msg line 25\n    msg line 26\n    msg line 27\n    msg line 28\n    msg line 29\n    msg line 30\n    msg line 31\n    msg line 32\n    msg line 33\n    msg line 34\n    msg line 35\n    msg line 36\n    msg line 37\n    msg line 38\n    msg line 39\n    msg line 40\n    msg line 41\n    msg line 42\n    msg line 43\n    msg line 44\n    msg line 45\n    msg line 46\n    msg line 47\n    msg line 48\n    msg line 49\n    msg line 50\n    msg line 51\n    msg line 52\n    msg line 53\n    msg line 54\n    msg line 55\n    msg line 56\n    msg line 57\n    msg line 58\n    msg line 59\n\ndiff --git a/auth/old_handler.py b/auth/new_handler.py\nsimilarity index 92%\nrename from auth/old_handler.py\nrename to auth/new_handler.py\n--- a/auth/old_handler.py\n+++ b/auth/new_handler.py\n@@ -1,8 +1,8 @@\n import os\n import sys\n-from auth import legacy\n+from auth import modern\n\n def authenticate(user):\n[1 files changed, +1 -1 lines]",
+    "compressed_line_count": 79,
+    "deletions": 1,
+    "files_affected": 1,
+    "hunks_kept": 1,
+    "hunks_removed": 0,
+    "original_line_count": 81
+  },
+  "recorded_at": "2026-04-26T04:02:31.296040+00:00",
+  "transform": "diff_compressor"
+}

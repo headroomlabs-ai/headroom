@@ -1,0 +1,504 @@
+name: CI
+
+# Intelligent + parallel pipeline (cutover from the old 4-version matrix):
+#   changes      — paths-filter; skips heavy work for docs-only changes
+#   build-wheel  — compile the Rust ext ONCE (fast `ci` cargo profile), share via artifact
+#   lint         — ruff + mypy, once
+#   prefetch-model — download the embedding model ONCE (authenticated), warm shared cache
+#   test         — 4 parallel shards (pytest-split), each a fresh runner VM; run offline
+#   test-extras / test-agno / build / commitlint / workflow-validation / *-e2e — preserved
+#
+# Notes: CPU-only torch everywhere (no CUDA stack); test shards run HF_HUB_OFFLINE.
+# Multi-version (3.10/3.11/3.13) coverage on main is a planned follow-up.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - 'wiki/**'
+      - '**/*.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  # Cancel superseded runs on PRs/branches, but never cancel a main build.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  PY_VERSION: "3.12"
+  # CPU-only torch — runners have no GPU; the default CUDA wheels pull ~2.5 GB.
+  PIP_EXTRA_INDEX_URL: https://download.pytorch.org/whl/cpu
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+      e2e: ${{ steps.filter.outputs.e2e }}
+      workflows: ${{ steps.filter.outputs.workflows }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          filters: |
+            code:
+              - 'headroom/**'
+              - 'crates/**'
+              - '**/*.rs'
+              - 'pyproject.toml'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'tests/**'
+              - 'scripts/**'
+            e2e:
+              - 'headroom/**'
+              - 'crates/**'
+              - 'docker/**'
+              - 'Dockerfile'
+              - 'e2e/**'
+              - 'scripts/install*'
+              - 'pyproject.toml'
+            workflows:
+              - '.github/workflows/**'
+
+  lint:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PY_VERSION }}
+      - name: Cache pip
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-lint-${{ hashFiles('pyproject.toml') }}
+          restore-keys: ${{ runner.os }}-pip-lint-
+      - run: python -m pip install --upgrade pip "ruff==0.15.17" "mypy==1.20.2"
+      - name: ruff check
+        run: ruff check .
+      - name: ruff format --check
+        run: ruff format --check .
+      - name: mypy
+        run: mypy headroom --ignore-missing-imports
+
+  build-wheel:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PY_VERSION }}
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+      - name: Build wheel once (fast CI cargo profile)
+        run: |
+          python -m pip install --upgrade pip maturin
+          maturin build --profile ci --out dist --interpreter "python${PY_VERSION}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: headroom-wheel
+          path: dist/*.whl
+          retention-days: 1
+
+  prefetch-model:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PY_VERSION }}
+      - name: Cache HuggingFace model
+        id: hfcache
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/huggingface
+          key: ${{ runner.os }}-models-allMiniLM-v2
+      - name: Fetch all-MiniLM-L6-v2 once (authenticated, resilient)
+        if: steps.hfcache.outputs.cache-hit != 'true'
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_HUB_DISABLE_TELEMETRY: "1"
+        run: |
+          python -m pip install --upgrade pip huggingface_hub
+          for i in 1 2 3 4 5 6; do
+            if python -c "from huggingface_hub import snapshot_download; snapshot_download('sentence-transformers/all-MiniLM-L6-v2')"; then exit 0; fi
+            echo "::warning::model fetch attempt $i failed; backing off"; sleep $((i * 30))
+          done
+          echo "::error::could not fetch all-MiniLM-L6-v2 from HuggingFace"; exit 1
+
+  test:
+    needs: [changes, build-wheel, prefetch-model]
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    env:
+      TRANSFORMERS_OFFLINE: "1"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PY_VERSION }}
+
+      - name: Cache pip
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ env.PY_VERSION }}-${{ hashFiles('pyproject.toml') }}
+          restore-keys: ${{ runner.os }}-pip-${{ env.PY_VERSION }}-
+
+      - name: Restore HuggingFace model cache (warmed by prefetch-model)
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/huggingface
+          key: ${{ runner.os }}-models-allMiniLM-v2
+
+      - name: Download prebuilt wheel
+        uses: actions/download-artifact@v8
+        with:
+          name: headroom-wheel
+          path: dist
+
+      - name: Install (CPU torch + prebuilt wheel + dev deps, no cargo rebuild)
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          WHEEL="$(ls dist/*.whl)"
+          pip install "${WHEEL}[dev]" pytest-split
+          # cwd's ./headroom source tree shadows the installed wheel; copy the
+          # compiled extension in so tests import it (no second cargo build).
+          SITE="$(python -c 'import sysconfig; print(sysconfig.get_path("platlib"))')"
+          cp "${SITE}/headroom/"_core*.so headroom/
+          python -c "from headroom._core import DiffCompressor; print('headroom._core OK')"
+
+      # Coverage upload: without this, codecov only receives reports from
+      # the two native-e2e workflows (3 CLI test files total), so head
+      # coverage reads ~6% and codecov/patch fails for ANY diff not
+      # exercised by those files — a false negative on every PR. The main
+      # suite runs here; its coverage must be what codecov sees.
+      - name: Run test shard ${{ matrix.shard }}/4
+        run: |
+          pytest tests scripts/tests \
+            --splits 4 --group ${{ matrix.shard }} \
+            --cov=headroom --cov-branch \
+            --cov-report=xml:coverage-${{ matrix.shard }}.xml \
+            --cov-report= \
+            --tb=short -q
+
+      - name: Upload coverage shard ${{ matrix.shard }} to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: coverage-${{ matrix.shard }}.xml
+          flags: python
+          name: python-shard-${{ matrix.shard }}
+          # Token is sent so uploads authenticate once the repo is activated on
+          # Codecov. Until then Codecov may 404 ("Repository not found"); either
+          # way, coverage upload is reporting-only and must never fail a build
+          # whose tests pass — so this stays non-blocking.
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
+
+  test-extras:
+    needs: [changes, build-wheel]
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      FASTEMBED_CACHE_PATH: ${{ github.workspace }}/.fastembed-cache
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PY_VERSION }}
+      - name: Cache pip
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-extras-${{ hashFiles('pyproject.toml') }}
+          restore-keys: ${{ runner.os }}-pip-extras-
+      - name: Cache fastembed model
+        uses: actions/cache@v5
+        with:
+          path: ${{ github.workspace }}/.fastembed-cache
+          key: ${{ runner.os }}-fastembed-bge-small-v1
+      - name: Download prebuilt wheel
+        uses: actions/download-artifact@v8
+        with:
+          name: headroom-wheel
+          path: dist
+      - name: Install (CPU torch + wheel[dev,relevance])
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          WHEEL="$(ls dist/*.whl)"
+          pip install "${WHEEL}[dev,relevance]"
+          SITE="$(python -c 'import sysconfig; print(sysconfig.get_path("platlib"))')"
+          cp "${SITE}/headroom/"_core*.so headroom/
+          python -c "from headroom._core import SmartCrusher; print('headroom._core OK')"
+      - name: Pre-fetch fastembed model (authenticated, resilient)
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_HUB_DISABLE_TELEMETRY: "1"
+        run: |
+          for i in 1 2 3 4 5; do
+            if python -c "from fastembed import TextEmbedding; TextEmbedding('BAAI/bge-small-en-v1.5')"; then exit 0; fi
+            echo "::warning::fastembed fetch attempt $i failed; backing off"; sleep $((i * 20))
+          done
+          echo "::error::could not fetch fastembed model from HuggingFace"; exit 1
+      - name: Run relevance tests
+        # Offline so fastembed reads the cache the prefetch step just warmed,
+        # without an unauthenticated cache-validation HEAD that could 429.
+        env:
+          HF_HUB_OFFLINE: "1"
+          TRANSFORMERS_OFFLINE: "1"
+        run: pytest tests/test_relevance.py -v
+
+  test-agno:
+    needs: [changes, build-wheel]
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PY_VERSION }}
+      - name: Download prebuilt wheel
+        uses: actions/download-artifact@v8
+        with:
+          name: headroom-wheel
+          path: dist
+      - name: Install (CPU torch + wheel[dev,agno])
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          WHEEL="$(ls dist/*.whl)"
+          pip install "${WHEEL}[dev,agno]"
+          SITE="$(python -c 'import sysconfig; print(sysconfig.get_path("platlib"))')"
+          cp "${SITE}/headroom/"_core*.so headroom/
+      - name: Run agno tests
+        run: pytest tests/test_integrations/agno/ -v
+
+  test-dashboard-ui:
+    needs: [changes, build-wheel]
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PY_VERSION }}
+      - name: Download prebuilt wheel
+        uses: actions/download-artifact@v8
+        with:
+          name: headroom-wheel
+          path: dist
+      - name: Install (CPU torch + wheel[dev] + playwright)
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          WHEEL="$(ls dist/*.whl)"
+          pip install "${WHEEL}[dev]" playwright
+          SITE="$(python -c 'import sysconfig; print(sysconfig.get_path("platlib"))')"
+          cp "${SITE}/headroom/"_core*.so headroom/
+      - name: Install chromium
+        run: playwright install --with-deps chromium
+      - name: Run dashboard playwright tests
+        # Stub-based dashboard tests only (routes fully mocked, no network).
+        # tests/test_dashboard/test_live_feed.py needs a live proxy on
+        # localhost:8787 and stays excluded; the main shards keep skipping
+        # these via importorskip since playwright is not installed there.
+        env:
+          HEADROOM_PLAYWRIGHT_ARTIFACT_DIR: ${{ runner.temp }}/playwright-artifacts
+        run: pytest tests/test_dashboard_*_playwright.py -v
+      - name: Upload dashboard screenshots
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: dashboard-playwright-artifacts
+          path: ${{ runner.temp }}/playwright-artifacts
+          if-no-files-found: ignore
+          retention-days: 7
+
+  commitlint:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: wagoid/commitlint-github-action@v6
+        with:
+          configFile: .commitlintrc.json
+
+  build:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Cache pip
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-build-${{ hashFiles('pyproject.toml') }}
+          restore-keys: ${{ runner.os }}-pip-build-
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+      # Smoke check that the SHIPPED build (release profile) + sdist are wired
+      # right; release.yml's matrix is what actually publishes to PyPI.
+      - name: Install build tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install 'maturin>=1.5,<2.0' twine
+      - name: Build wheel + sdist
+        run: |
+          maturin sdist --out dist
+          maturin build --release --out dist
+      - name: Check package
+        run: twine check dist/*
+
+  workflow-validation:
+    needs: changes
+    if: needs.changes.outputs.workflows == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - name: Cache actionlint + act
+        id: tools-cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            /usr/local/bin/actionlint
+            /usr/local/bin/act
+          # Key off the workflow file itself: when someone updates the
+          # download URLs to a newer tool version, the hash changes and
+          # the cache busts automatically.
+          key: ${{ runner.os }}-ci-tools-${{ hashFiles('.github/workflows/ci.yml') }}
+
+      - name: Install actionlint
+        if: steps.tools-cache.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash | bash
+          sudo mv ./actionlint /usr/local/bin/actionlint
+
+      - name: Install act
+        if: steps.tools-cache.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/nektos/act/master/install.sh | sudo bash
+          sudo install ./bin/act /usr/local/bin/act
+      - name: Validate workflow files
+        run: bash scripts/validate-workflows.sh
+
+  docker-native-e2e:
+    needs: changes
+    if: needs.changes.outputs.e2e == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Build local Headroom image
+        run: docker build -t headroom-native-e2e:latest .
+      - name: Run Docker-native installer e2e
+        env:
+          HEADROOM_DOCKER_IMAGE: headroom-native-e2e:latest
+        run: bash e2e/docker-native-install.sh
+      - name: Run Docker-native compose smoke test
+        env:
+          HEADROOM_IMAGE: headroom-native-e2e:latest
+          HEADROOM_HOST_HOME: ${{ github.workspace }}
+          HEADROOM_WORKSPACE: ${{ github.workspace }}
+        run: |
+          mkdir -p .headroom .claude .codex .gemini
+          trap 'docker compose -f docker/docker-compose.native.yml down -v' EXIT
+          docker compose -f docker/docker-compose.native.yml up -d proxy
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:8787/readyz >/dev/null; then
+              break
+            fi
+            if [ "$attempt" -eq 30 ]; then
+              docker compose -f docker/docker-compose.native.yml logs proxy
+              exit 1
+            fi
+            sleep 1
+          done
+      - name: Run Docker-native wrap e2e
+        run: |
+          docker build -f e2e/wrap/Dockerfile -t headroom-wrap-e2e .
+          docker run --rm headroom-wrap-e2e
+      - name: Run Docker-native init e2e
+        run: |
+          docker build -f e2e/init/Dockerfile -t headroom-init-e2e .
+          docker run --rm headroom-init-e2e
+
+  windows-native-wrapper:
+    needs: changes
+    if: needs.changes.outputs.e2e == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest
+      - name: Run native installer wrapper tests
+        run: pytest tests/test_install/test_native_installers.py -q
+
+  macos-native-wrapper:
+    needs: changes
+    if: needs.changes.outputs.e2e == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Install bash and test dependencies
+        run: |
+          brew install bash
+          python -m pip install --upgrade pip
+          python -m pip install --retries 10 --timeout 60 pytest
+      - name: Run native installer wrapper tests
+        run: |
+          BASH_PREFIX="$(brew --prefix bash)"
+          export PATH="$BASH_PREFIX/bin:$PATH"
+          pytest tests/test_install/test_native_installers.py -q

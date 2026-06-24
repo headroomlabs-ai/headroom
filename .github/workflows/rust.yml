@@ -1,0 +1,152 @@
+name: rust
+
+on:
+  push:
+    branches: [ main, rust-rewrite ]
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'tests/parity/**'
+      - 'Makefile'
+      - '.github/workflows/rust.yml'
+  pull_request:
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'tests/parity/**'
+      - 'Makefile'
+      - '.github/workflows/rust.yml'
+  schedule:
+    # Nightly parity run at 07:17 UTC (weekdays only). Phase 0 allows failure.
+    - cron: '17 7 * * 1-5'
+
+concurrency:
+  group: rust-${{ github.ref }}
+  cancel-in-progress: true
+
+# Default permissions: read-only. Individual jobs override only what they need.
+# Mitigates CodeQL/CWE-275 (missing-workflow-permissions): the GITHUB_TOKEN
+# defaults to whatever the repo policy is, which can be read-write. Pinning
+# this here means even if the repo default changes, this workflow stays safe.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install stable toolchain
+        # Pin action code to @stable (latest fixes), toolchain version
+        # via input. The @1.95.0 ref shipped action code that errors on
+        # ubuntu-latest with `detected conflict: 'bin/cargo-clippy'`
+        # because the pre-installed runner Rust collides with the
+        # clippy-preview component install.
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+          components: rustfmt, clippy
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+      - name: cargo clippy
+        run: cargo clippy --workspace -- -D warnings
+      - name: cargo test
+        run: cargo test --workspace
+
+  wheels:
+    name: wheels (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            maturin-target: x86_64
+          - os: macos-14
+            target: aarch64-apple-darwin
+            maturin-target: aarch64-apple-darwin
+        # macOS x86_64 (Intel) is NOT in this matrix.
+        # `fastembed` → `ort` → `ort-sys` does not publish prebuilt ONNX
+        # Runtime binaries for `x86_64-apple-darwin`; building from source
+        # in CI is a multi-hour cmake job. Apple Silicon has been the
+        # default macOS target since 2020 and is sufficient for the wheels
+        # we ship. If a customer needs Intel macOS, build from source
+        # locally (the toolchain works; only prebuilt distribution skips
+        # this target).
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - name: "Build wheel (single-wheel architecture builds headroom-ai)"
+        uses: PyO3/maturin-action@v1
+        # Maturin reads `[tool.maturin]` from the root `pyproject.toml`
+        # which points at `crates/headroom-py/Cargo.toml` for the cdylib.
+        # Output is `headroom_ai-<ver>-<py>-<py>-<platform>.whl` containing
+        # both Python source and the compiled `headroom/_core.so`.
+        with:
+          command: build
+          args: --release --out dist
+          target: ${{ matrix.maturin-target }}
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: wheels-${{ matrix.target }}
+          path: dist/*.whl
+
+  audit:
+    name: audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-audit + cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit,cargo-deny
+      - name: cargo audit (soft-fail)
+        continue-on-error: true
+        run: cargo audit
+      - name: cargo deny check licenses
+        continue-on-error: true
+        run: cargo deny check licenses
+
+  parity-nightly:
+    name: parity (nightly, allowed to fail during Phase 0)
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - uses: Swatinem/rust-cache@v2
+      - name: Install deps
+        run: |
+          python -m venv .venv
+          source .venv/bin/activate
+          pip install --upgrade pip
+          pip install maturin
+          pip install -e .
+      - name: Run parity harness
+        run: |
+          source .venv/bin/activate
+          make test-parity

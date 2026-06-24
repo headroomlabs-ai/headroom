@@ -1,0 +1,152 @@
+---
+title: Image Compression
+description: ML-powered image compression that reduces vision model token usage by 40-90% while maintaining answer accuracy.
+---
+
+Vision models charge by the token, and images are expensive. A single 1024x1024 image costs ~765 tokens on OpenAI. Headroom's image compression uses a trained ML router to analyze your query and automatically select the optimal compression technique, saving 40-90% of image tokens.
+
+## How It Works
+
+```
+User uploads image + asks question
+           |
+   [Query Analysis]
+   TrainedRouter (MiniLM from HuggingFace)
+   Classifies: "What animal is this?" -> full_low
+           |
+   [Image Analysis]
+   SigLIP analyzes image properties
+   (has text? complex? fine details?)
+           |
+   [Apply Compression]
+   OpenAI: detail="low"
+   Anthropic: Resize to 512px
+   Google: Resize to 768px
+           |
+   Compressed request to LLM
+```
+
+The router is a fine-tuned MiniLM classifier (`chopratejas/technique-router` on HuggingFace) with 93.7% accuracy across 1,157 training examples.
+
+## Compression Techniques
+
+| Technique | Savings | When Used | Example Query |
+|---|---|---|---|
+| `full_low` | ~87% | General understanding | "What is this?", "Describe the scene" |
+| `preserve` | 0% | Fine details needed | "Count the whiskers", "Read the serial number" |
+| `crop` | 50-90% | Region-specific queries | "What's in the corner?", "Focus on the background" |
+| `transcode` | ~99% | Text extraction | "Read the sign", "Transcribe the document" |
+
+## Quick Start
+
+### With Headroom Proxy (Zero Code Changes)
+
+```bash
+# Start the proxy
+headroom proxy --port 8787
+
+# Connect your client -- images are compressed automatically
+ANTHROPIC_BASE_URL=http://localhost:8787 claude
+```
+
+### With HeadroomClient
+
+```python
+from headroom import HeadroomClient
+
+client = HeadroomClient(provider="openai")
+
+response = client.chat.completions.create(
+    model="gpt-4o",
+    messages=[{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "What animal is this?"},
+            {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}}
+        ]
+    }]
+)
+# Image automatically compressed with detail="low" (87% savings)
+```
+
+### Direct API
+
+```python
+from headroom.image import ImageCompressor
+
+compressor = ImageCompressor()
+
+# Compress images in messages
+compressed_messages = compressor.compress(messages, provider="openai")
+
+# Check savings
+print(f"Saved {compressor.last_savings:.0f}% tokens")
+print(f"Technique: {compressor.last_result.technique.value}")
+```
+
+## Provider Support
+
+The compressor adapts its strategy per provider:
+
+| Provider | Compression Method | Details |
+|---|---|---|
+| **OpenAI** | Sets `detail="low"` | Native detail parameter |
+| **Anthropic** | Resizes to 512px | PIL-based resize |
+| **Google Gemini** | Resizes to 768px | Optimized for Gemini's 768x768 tile system |
+
+### Token Savings by Provider
+
+**OpenAI** (1024x1024 image):
+
+| Technique | Before | After | Savings |
+|---|---|---|---|
+| `full_low` | 765 tokens | 85 tokens | 89% |
+| `preserve` | 765 tokens | 765 tokens | 0% |
+
+**Anthropic** (1024x1024 image):
+
+| Before | After | Savings |
+|---|---|---|
+| ~1,398 tokens | ~349 tokens | 75% |
+
+**Google Gemini** (1536x1536 image):
+
+| Before | After | Savings |
+|---|---|---|
+| 1,032 tokens (4 tiles) | 258 tokens (1 tile) | 75% |
+
+## Configuration
+
+```python
+from headroom.image import ImageCompressor
+
+compressor = ImageCompressor(
+    model_id="chopratejas/technique-router",  # HuggingFace model
+    use_siglip=True,   # Enable image analysis
+    device="cuda",     # Use GPU if available (auto, cuda, cpu, mps)
+)
+```
+
+### Proxy Configuration
+
+```bash
+# Image optimization is part of the ContentRouter path when the optional image
+# dependencies are installed. There are no public proxy CLI image toggles in
+# the current release.
+headroom proxy
+```
+
+## Performance
+
+| Metric | Value |
+|---|---|
+| Router inference | ~10ms (CPU), ~2ms (GPU) |
+| Image resize | ~5-20ms |
+| First request | +2-3s (model download, cached after) |
+| Router accuracy | 93.7% |
+| Model size | ~128MB |
+| GPU memory (SigLIP) | ~400MB |
+
+<Callout type="info" title="Automatic with the proxy">
+  When using the Headroom proxy, image compression happens automatically on every request that contains images. No code changes needed.
+</Callout>

@@ -1,0 +1,173 @@
+---
+title: Code Compression
+description: AST-aware compression that preserves imports, signatures, and types while compressing function bodies. Powered by tree-sitter.
+---
+
+Headroom's CodeAwareCompressor uses tree-sitter to parse source code into an AST, then selectively compresses function bodies while preserving the structural elements that LLMs need -- imports, signatures, type annotations, and error handlers.
+
+## Why AST-Aware Compression?
+
+Naive truncation breaks code. Cutting a function in half leaves invalid syntax that confuses the LLM. CodeAwareCompressor guarantees:
+
+- **Syntax validity** -- output always parses correctly
+- **Structural preservation** -- imports, signatures, types, decorators are kept intact
+- **Lightweight** -- ~50MB (tree-sitter) vs ~1GB for LLMLingua
+
+## Supported Languages
+
+| Tier | Languages | Support Level |
+|---|---|---|
+| Tier 1 | Python, JavaScript, TypeScript | Full AST analysis |
+| Tier 2 | Go, Rust, Java, C, C++ | Function body compression |
+
+## What Gets Preserved vs Compressed
+
+**Always preserved:**
+- Import statements
+- Function and method signatures
+- Class definitions
+- Type annotations
+- Decorators
+- Error handlers (`try`/`except`, `try`/`catch`)
+
+**Compressed:**
+- Function bodies (implementations)
+- Comments (unless configured to preserve)
+- Verbose docstrings (configurable: full, first line, or removed)
+
+## Example
+
+```python
+from headroom.transforms import CodeAwareCompressor
+
+compressor = CodeAwareCompressor()
+
+code = '''
+import os
+from typing import List
+
+def process_items(items: List[str]) -> List[str]:
+    """Process a list of items."""
+    results = []
+    for item in items:
+        if not item:
+            continue
+        processed = item.strip().lower()
+        results.append(processed)
+    return results
+'''
+
+result = compressor.compress(code, language="python")
+print(result.compressed)
+# import os
+# from typing import List
+#
+# def process_items(items: List[str]) -> List[str]:
+#     """Process a list of items."""
+#     results = []
+#     for item in items:
+#     # ... (5 lines compressed)
+#     pass
+
+print(f"Compression: {result.compression_ratio:.0%}")  # ~55%
+print(f"Syntax valid: {result.syntax_valid}")  # True
+```
+
+## Configuration
+
+```python
+from headroom.transforms import CodeAwareCompressor, CodeCompressorConfig, DocstringMode
+
+config = CodeCompressorConfig(
+    preserve_imports=True,              # Always keep imports
+    preserve_signatures=True,           # Always keep function signatures
+    preserve_type_annotations=True,     # Keep type hints
+    preserve_error_handlers=True,       # Keep try/except blocks
+    preserve_decorators=True,           # Keep decorators
+    docstring_mode=DocstringMode.FIRST_LINE,  # FULL, FIRST_LINE, REMOVE
+    target_compression_rate=0.2,        # Keep 20% of tokens
+    max_body_lines=5,                   # Lines to keep per function body
+    min_tokens_for_compression=100,     # Skip small content
+    language_hint=None,                 # Auto-detect if None
+    fallback_to_kompress=True,          # Use Kompress for unknown langs
+)
+
+compressor = CodeAwareCompressor(config)
+result = compressor.compress(code)
+```
+
+### Configuration Options
+
+| Option | Default | Description |
+|---|---|---|
+| `preserve_imports` | `True` | Keep all import statements |
+| `preserve_signatures` | `True` | Keep function/method signatures |
+| `preserve_type_annotations` | `True` | Keep type hints |
+| `preserve_error_handlers` | `True` | Keep try/except blocks |
+| `preserve_decorators` | `True` | Keep decorators |
+| `docstring_mode` | `FIRST_LINE` | How to handle docstrings: `FULL`, `FIRST_LINE`, `REMOVE` |
+| `target_compression_rate` | `0.2` | Fraction of tokens to keep (0.2 = keep 20%) |
+| `max_body_lines` | `5` | Max lines to keep per function body |
+| `min_tokens_for_compression` | `100` | Skip files smaller than this |
+| `language_hint` | `None` | Override language detection |
+| `fallback_to_kompress` | `True` | Use Kompress for unsupported languages |
+
+## Before and After
+
+```python
+# Before (full source file)
+def process_data(items: List[str]) -> Dict[str, int]:
+    """Process items and count occurrences."""
+    result = {}
+    for item in items:
+        item = item.strip().lower()
+        if item in result:
+            result[item] += 1
+        else:
+            result[item] = 1
+    return result
+
+# After (signature preserved, body compressed)
+def process_data(items: List[str]) -> Dict[str, int]:
+    """Process items and count occurrences."""
+    result = {}
+    for item in items:
+    # ... (5 lines compressed)
+    pass
+```
+
+The LLM sees the function's purpose, its input/output types, and the general approach -- enough to reason about the code without needing every implementation line.
+
+## Installation
+
+```bash
+# Install tree-sitter language pack
+pip install "headroom-ai[code]"
+```
+
+## Memory Management
+
+Tree-sitter parsers are lazy-loaded and cached. You can free memory when done:
+
+```python
+from headroom.transforms import is_tree_sitter_available, unload_tree_sitter
+
+# Check if tree-sitter is installed
+print(is_tree_sitter_available())  # True
+
+# Free memory when done
+unload_tree_sitter()
+```
+
+## Performance
+
+| Metric | Value |
+|---|---|
+| Compression | 40-70% token reduction |
+| Speed | ~10-50ms per file |
+| Memory | ~50MB (tree-sitter parsers) |
+| Syntax validity | Guaranteed |
+
+<Callout type="info" title="Automatic routing">
+  When you use the Headroom proxy or call `compress()`, source code is automatically detected and routed to CodeAwareCompressor. Direct usage gives you control over compression settings per language.
+</Callout>

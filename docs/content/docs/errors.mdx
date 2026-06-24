@@ -1,0 +1,276 @@
+---
+title: Error Handling
+description: How to catch and handle Headroom errors in Python and TypeScript. Error hierarchy, proxy error mapping, and safety guarantees.
+---
+
+Headroom provides explicit exceptions for debugging, with a core safety guarantee: **compression failures never break your LLM calls**. If compression fails, the original content passes through unchanged.
+
+## Error Hierarchy
+
+<Tabs groupId="lang" items={['TypeScript', 'Python']}>
+<Tab value="TypeScript">
+
+```
+HeadroomError (base class)
+  +-- HeadroomConnectionError   # Cannot reach proxy
+  +-- HeadroomAuthError         # 401 from proxy
+  +-- HeadroomCompressError     # Compression failed (with statusCode)
+  +-- ConfigurationError        # Invalid configuration
+  +-- ProviderError             # Provider issues
+  +-- StorageError              # Storage failures
+  +-- TokenizationError         # Token counting failed
+  +-- CacheError                # Cache operations failed
+  +-- ValidationError           # Validation failures
+  +-- TransformError            # Transform execution failed
+```
+
+```ts twoslash
+import {
+  HeadroomError,
+  HeadroomConnectionError,
+  HeadroomAuthError,
+  HeadroomCompressError,
+  ConfigurationError,
+  ProviderError,
+  mapProxyError,
+} from 'headroom-ai';
+```
+
+</Tab>
+<Tab value="Python">
+
+```
+HeadroomError (base class)
+  +-- ConfigurationError     # Invalid configuration
+  +-- ProviderError          # Provider issues (unknown model, etc.)
+  +-- StorageError           # Database/storage failures
+  +-- CompressionError       # Compression failures (rare)
+  +-- ValidationError        # Setup validation failures
+```
+
+```python
+from headroom import (
+    HeadroomError,
+    ConfigurationError,
+    ProviderError,
+    StorageError,
+    CompressionError,
+    ValidationError,
+)
+```
+
+</Tab>
+</Tabs>
+
+## Catching Errors
+
+<Tabs groupId="lang" items={['TypeScript', 'Python']}>
+<Tab value="TypeScript">
+
+```ts twoslash
+import { compress, HeadroomConnectionError, HeadroomAuthError, HeadroomCompressError, HeadroomError } from 'headroom-ai';
+
+try {
+  const result = await compress(messages, { model: 'gpt-4o' });
+} catch (e) {
+  if (e instanceof HeadroomConnectionError) {
+    console.error('Cannot reach proxy:', e.message);
+  } else if (e instanceof HeadroomAuthError) {
+    console.error('Auth failed:', e.message);
+  } else if (e instanceof HeadroomCompressError) {
+    console.error(`Compress failed (${e.statusCode}):`, e.message);
+  } else if (e instanceof HeadroomError) {
+    console.error('Headroom error:', e.message, e.details);
+  }
+}
+```
+
+</Tab>
+<Tab value="Python">
+
+```python
+from headroom import (
+    HeadroomClient,
+    HeadroomError,
+    ConfigurationError,
+    StorageError,
+)
+
+try:
+    client = HeadroomClient(...)
+    response = client.chat.completions.create(...)
+
+except ConfigurationError as e:
+    print(f"Config issue: {e}")
+    print(f"Details: {e.details}")
+
+except StorageError as e:
+    print(f"Storage issue: {e}")
+    # Headroom continues to work, just without metrics persistence
+
+except HeadroomError as e:
+    print(f"Headroom error: {e}")
+```
+
+</Tab>
+</Tabs>
+
+## Error Types in Detail
+
+### ConfigurationError
+
+Raised when configuration is invalid.
+
+<Tabs groupId="lang" items={['TypeScript', 'Python']}>
+<Tab value="TypeScript">
+```ts twoslash
+import { ConfigurationError } from 'headroom-ai';
+
+// ConfigurationError is thrown when the proxy returns
+// a configuration_error type in its error response
+```
+</Tab>
+<Tab value="Python">
+```python
+try:
+    client = HeadroomClient(
+        original_client=OpenAI(),
+        provider=OpenAIProvider(),
+        default_mode="invalid_mode",  # Will raise ConfigurationError
+    )
+except ConfigurationError as e:
+    print(f"Config error: {e}")
+    print(f"Field: {e.details.get('field')}")
+```
+</Tab>
+</Tabs>
+
+### ProviderError
+
+Raised for provider-specific issues (unknown model, API error, token counting failure).
+
+```python
+try:
+    response = client.chat.completions.create(
+        model="unknown-model-xyz",
+        messages=[...],
+    )
+except ProviderError as e:
+    print(f"Provider error: {e}")
+    print(f"Provider: {e.details.get('provider')}")
+```
+
+### StorageError
+
+Raised when database operations fail. Storage errors do not affect core functionality -- the application can continue without historical metrics.
+
+```python
+try:
+    metrics = client.get_metrics()
+except StorageError as e:
+    metrics = []  # Continue without historical metrics
+```
+
+### CompressionError
+
+Raised when compression fails (rare). In practice, compression errors are caught internally and the original content passes through unchanged. This exception is only raised in strict mode.
+
+### HeadroomConnectionError (TypeScript)
+
+Raised when the TypeScript SDK cannot connect to the Headroom proxy.
+
+```ts twoslash
+import { compress, HeadroomConnectionError } from 'headroom-ai';
+
+try {
+  await compress(messages, { model: 'gpt-4o' });
+} catch (e) {
+  if (e instanceof HeadroomConnectionError) {
+    console.error('Is the proxy running? Start with: headroom proxy');
+  }
+}
+```
+
+## Proxy Error Mapping
+
+The TypeScript SDK automatically maps proxy error responses to the correct error class:
+
+| HTTP Status | Proxy Error Type | TypeScript Class |
+|-------------|-----------------|-----------------|
+| 401 | -- | `HeadroomAuthError` |
+| 4xx/5xx | `configuration_error` | `ConfigurationError` |
+| 4xx/5xx | `provider_error` | `ProviderError` |
+| 4xx/5xx | `storage_error` | `StorageError` |
+| 4xx/5xx | `tokenization_error` | `TokenizationError` |
+| 4xx/5xx | `validation_error` | `ValidationError` |
+| 4xx/5xx | `transform_error` | `TransformError` |
+| 4xx/5xx | (other) | `HeadroomCompressError` |
+
+The `mapProxyError()` function handles this mapping:
+
+```ts twoslash
+import { mapProxyError } from 'headroom-ai';
+
+const error = mapProxyError(400, 'configuration_error', 'Invalid mode');
+// Returns a ConfigurationError instance
+```
+
+## Error Details
+
+All Headroom exceptions include a `details` dict/object with additional context:
+
+<Tabs groupId="lang" items={['TypeScript', 'Python']}>
+<Tab value="TypeScript">
+```ts twoslash
+import { HeadroomError } from 'headroom-ai';
+
+// HeadroomError.details is Record<string, any> | undefined
+// HeadroomCompressError also has .statusCode and .errorType
+```
+</Tab>
+<Tab value="Python">
+```python
+try:
+    client = HeadroomClient(...)
+except HeadroomError as e:
+    print(f"Error: {e}")
+    print(f"Type: {type(e).__name__}")
+    print(f"Details: {e.details}")
+    # Details might include:
+    # - field: which config field caused the error
+    # - provider: which provider was involved
+    # - model: which model was requested
+    # - original_error: underlying exception
+```
+</Tab>
+</Tabs>
+
+## Safety Guarantee
+
+If compression fails, the original content passes through unchanged. Your LLM calls never fail due to Headroom:
+
+```python
+messages = [
+    {"role": "tool", "content": "malformed json {{{"}
+]
+
+# This will NOT raise an exception
+# The malformed content passes through unchanged
+response = client.chat.completions.create(
+    model="gpt-4o",
+    messages=messages,
+)
+```
+
+## Best Practices
+
+1. **Catch specific exceptions** rather than broad `Exception` to avoid hiding real bugs
+2. **Let StorageError pass** -- storage errors do not affect core compression functionality
+3. **Validate on startup** with `client.validate_setup()` to catch configuration issues early
+4. **Enable logging** at WARNING level to see when compression is skipped
+
+```python
+import logging
+logging.basicConfig(level=logging.WARNING)
+# WARNING:headroom.transforms.smart_crusher:Skipping compression: invalid JSON
+```

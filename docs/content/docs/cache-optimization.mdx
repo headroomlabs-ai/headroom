@@ -1,0 +1,163 @@
+---
+title: Cache Optimization
+description: Stabilize message prefixes for provider KV cache hits and configure provider-specific caching strategies.
+---
+
+LLM providers cache prompt prefixes to avoid reprocessing identical input on repeated calls. Headroom's **CacheAligner** stabilizes your message prefixes so these caches actually hit, and then applies provider-specific strategies to maximize savings.
+
+## How CacheAligner works
+
+System prompts often contain dynamic content -- today's date, session IDs, timestamps -- that changes between requests. Even a single character difference at the start of a prompt invalidates the entire provider cache.
+
+CacheAligner solves this by extracting dynamic content and moving it to the end of the message, keeping the prefix stable:
+
+```
+Before:
+  "You are helpful. Current Date: 2025-04-06"  <- changes daily, no cache hit
+
+After:
+  "You are helpful."                            <- stable prefix, cache hit
+  "[Context: Current Date: 2025-04-06]"         <- dynamic part moved to tail
+```
+
+The prefix stays byte-identical across requests, so the provider's KV cache can reuse previously computed attention states.
+
+## Provider-specific strategies
+
+Each LLM provider implements caching differently. Headroom applies the optimal strategy for each.
+
+### Anthropic
+
+Anthropic supports explicit `cache_control` blocks that mark content as cacheable. Cached input tokens cost **90% less** than regular input tokens.
+
+Headroom automatically inserts `cache_control` breakpoints at the right positions in your messages so that stable prefixes (system prompts, early conversation turns) are cached across requests.
+
+| Metric | Value |
+|---|---|
+| Cache read discount | 90% off input price |
+| Cache write cost | 25% premium on first write |
+| Cache TTL | 5 minutes (extended on hit) |
+
+### OpenAI
+
+OpenAI uses automatic **prefix caching** -- if consecutive requests share the same message prefix, the provider reuses cached KV states. No explicit API markers are needed, but the prefix must be byte-identical.
+
+CacheAligner ensures your prefixes remain stable by extracting dynamic content, which is the key requirement for OpenAI prefix caching to work.
+
+| Metric | Value |
+|---|---|
+| Cache read discount | 50% off input price |
+| Activation | Automatic (prefix match) |
+| Min prefix length | 1024 tokens |
+
+### Google
+
+Google provides the **CachedContent API**, which lets you explicitly cache large context (system instructions, documents, tools) and reference it across requests. Cached tokens cost **75% less**.
+
+Headroom can manage CachedContent lifecycle automatically, creating and refreshing cached content objects as needed.
+
+| Metric | Value |
+|---|---|
+| Cache read discount | 75% off input price |
+| Mechanism | Explicit CachedContent API objects |
+| Min cache size | 32,768 tokens |
+
+## Configuration
+
+<Tabs groupId="lang" items={['TypeScript', 'Python']}>
+<Tab value="TypeScript">
+```ts twoslash
+import { compress } from "headroom-ai";
+import type {
+  CacheAlignerConfig,
+  CacheOptimizerConfig,
+  HeadroomConfig,
+} from "headroom-ai";
+
+// CacheAligner: stabilize prefixes for cache hits
+const cacheAligner: CacheAlignerConfig = {
+  enabled: true,
+  datePatterns: [
+    "Today is \\w+ \\d+, \\d{4}",
+    "Current time: .*",
+  ],
+  normalizeWhitespace: true,
+  collapseBlankLines: true,
+};
+
+// CacheOptimizer: provider-level caching
+const cacheOptimizer: CacheOptimizerConfig = {
+  enabled: true,
+  autoDetectProvider: true,  // Detect Anthropic/OpenAI/Google automatically
+  minCacheableTokens: 1024,
+};
+
+// Full configuration
+const config: HeadroomConfig = {
+  cacheAligner,
+  cacheOptimizer,
+};
+
+// Compress with cache optimization
+const result = await compress(messages, {
+  model: "claude-sonnet-4-20250514",
+  config,
+});
+```
+</Tab>
+<Tab value="Python">
+```python
+from headroom import HeadroomClient, OpenAIProvider, AnthropicProvider, GoogleProvider
+from headroom.transforms import CacheAlignerConfig
+from openai import OpenAI
+
+# CacheAligner configuration
+aligner_config = CacheAlignerConfig(
+    enabled=True,
+    dynamic_patterns=[
+        r"Today is \w+ \d+, \d{4}",
+        r"Current time: .*",
+        r"Session ID: [a-f0-9-]+",
+    ],
+)
+
+# Provider-specific cache settings
+# OpenAI: prefix caching (automatic, just keep prefixes stable)
+client = HeadroomClient(
+    original_client=OpenAI(),
+    provider=OpenAIProvider(enable_prefix_caching=True),
+    enable_cache_optimizer=True,
+)
+
+# Anthropic: cache_control blocks (90% read discount)
+from anthropic import Anthropic
+
+client = HeadroomClient(
+    original_client=Anthropic(),
+    provider=AnthropicProvider(enable_cache_control=True),
+    enable_cache_optimizer=True,
+)
+
+# Google: CachedContent API (75% read discount)
+client = HeadroomClient(
+    original_client=google_client,
+    provider=GoogleProvider(enable_context_caching=True),
+    enable_cache_optimizer=True,
+)
+```
+</Tab>
+</Tabs>
+
+## How savings compound
+
+CacheAligner and provider caching work together with Headroom's compression transforms:
+
+1. **SmartCrusher** reduces token count by 70-90%
+2. **CacheAligner** stabilizes prefixes so provider caches hit
+3. **Provider caching** discounts the remaining input tokens by 50-90%
+
+For example, with Anthropic:
+- 100K input tokens compressed to 20K (80% savings from SmartCrusher)
+- 18K of those 20K hit the cache (90% cache read discount)
+- Effective cost: 2K full-price tokens + 18K at 10% = 3.8K equivalent tokens
+- **Total savings: 96.2%** compared to the original 100K tokens

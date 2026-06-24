@@ -1,0 +1,98 @@
+{
+  "id": "headroom",
+  "kind": "context-engine",
+  "uiHints": {
+    "proxyUrl": {
+      "label": "Proxy URL",
+      "help": "Optional. URL Headroom proxy (example: http://127.0.0.1:8787 or https://headroom.example.com). Configured URLs probe-gated before provider routing. Auto-start opt-in only works local addresses."
+    },
+    "proxyPort": {
+      "label": "Proxy Port",
+      "help": "Default port used for auto-detect/auto-start when proxyUrl is not set (default: 8787)."
+    },
+    "pythonPath": {
+      "label": "Python Path",
+      "help": "Optional explicit python executable for python fallback launcher (for example: python, python3, py, or full path)."
+    },
+    "retryMaxAttempts": {
+      "label": "Retry Max Attempts",
+      "help": "Optional maximum number of upstream retry attempts for connection/read/5xx failures when the plugin auto-starts a local Headroom proxy. Lower values fail faster for interactive chat."
+    },
+    "connectTimeoutSeconds": {
+      "label": "Connect Timeout Seconds",
+      "help": "Optional upstream connection timeout for the auto-started local Headroom proxy. Lower values surface network failures sooner."
+    },
+    "routeCodexViaProxy": {
+      "label": "Route OpenAI Codex Via Headroom",
+      "help": "When enabled, OpenClaw will use the active Headroom proxy as the in-memory upstream base URL for the built-in openai-codex provider so provider traffic flows through Headroom."
+    },
+    "gatewayProviderIds": {
+      "label": "Gateway Provider IDs",
+      "help": "Optional list of OpenClaw provider ids to route through the active Headroom proxy in memory. Friendly aliases codex, claude, copilot, and gemini are also accepted. When set, this overrides the default openai-codex-only routing."
+    }
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "enabled": {
+        "type": "boolean"
+      },
+      "proxyUrl": {
+        "type": "string",
+        "pattern": "^https?:\\/\\/.+(:\\d+)?\\/?$"
+      },
+      "proxyPort": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 65535,
+        "default": 8787
+      },
+      "pythonPath": {
+        "type": "string"
+      },
+      "autoStart": {
+        "type": "boolean",
+        "default": false
+      },
+      "startupTimeoutMs": {
+        "type": "integer",
+        "minimum": 1000,
+        "maximum": 120000,
+        "default": 20000
+      },
+      "retryMaxAttempts": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "connectTimeoutSeconds": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "routeCodexViaProxy": {
+        "type": "boolean",
+        "default": true
+      },
+      "gatewayProviderIds": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "default": []
+      }
+    }
+  },
+  "capabilities": {
+    "network": {
+      "allow": [
+        "http://*:*",
+        "https://*:*"
+      ]
+    }
+  },
+  "contracts": {
+    "tools": [
+      "headroom_retrieve"
+    ]
+  }
+}

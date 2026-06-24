@@ -1,0 +1,64 @@
+{
+  "config": {
+    "collapse_blank_lines": true,
+    "date_patterns": [
+      "Current [Dd]ate:?\\s*\\d{4}-\\d{2}-\\d{2}",
+      "Today is \\w+,?\\s+\\w+ \\d+",
+      "Today's date:?\\s*\\d{4}-\\d{2}-\\d{2}",
+      "\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}"
+    ],
+    "detection_tiers": [
+      "regex"
+    ],
+    "dynamic_tail_separator": "\n\n---\n[Dynamic Context]\n",
+    "enabled": false,
+    "entropy_threshold": 0.7,
+    "extra_dynamic_labels": [],
+    "normalize_whitespace": true,
+    "use_dynamic_detector": true
+  },
+  "input": [
+    {
+      "content": "You are a helpful assistant. The date is 2026-04-23. Request id 16.",
+      "role": "system"
+    },
+    {
+      "content": "Question number 16: what is 2+2?",
+      "role": "user"
+    }
+  ],
+  "input_sha256": "f2b50b3cf76fe6a197f251c3745e78a172846277ca7665b97cd913d6ee243f79",
+  "output": {
+    "cache_metrics": {
+      "prefix_changed": true,
+      "previous_hash": "8a75d8139c10abcf",
+      "stable_prefix_bytes": 57,
+      "stable_prefix_hash": "a63698f1393aaf8d",
+      "stable_prefix_tokens_est": 15
+    },
+    "diff_artifact": null,
+    "markers_inserted": [
+      "stable_prefix_hash:a63698f1393aaf8d"
+    ],
+    "messages": [
+      {
+        "content": "You are a helpful assistant. The date is . Request id 16.\n\n---\n[Dynamic Context]\n2026-04-23",
+        "role": "system"
+      },
+      {
+        "content": "Question number 16: what is 2+2?",
+        "role": "user"
+      }
+    ],
+    "timing": {},
+    "tokens_after": 51,
+    "tokens_before": 47,
+    "transforms_applied": [
+      "cache_align"
+    ],
+    "warnings": [],
+    "waste_signals": null
+  },
+  "recorded_at": "2026-04-23T23:51:37.792923+00:00",
+  "transform": "cache_aligner"
+}

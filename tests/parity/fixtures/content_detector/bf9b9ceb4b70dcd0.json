@@ -1,0 +1,15 @@
+{
+  "config": {},
+  "input": "use std::collections::HashMap;\n\npub struct Foo { id: u32 }\n\nimpl Foo {\n    pub fn new() -> Self { Self { id: 0 } }\n}\n\nfn main() {}\n#[derive(Debug)]\nenum Color { Red, Green }\n",
+  "input_sha256": "bf9b9ceb4b70dcd0a291c57ff0a53690e575f6d2d4273eb9d2a73b7f9beb29db",
+  "output": {
+    "confidence": 0.89,
+    "content_type": "source_code",
+    "metadata": {
+      "language": "rust",
+      "pattern_matches": 7
+    }
+  },
+  "recorded_at": "2026-04-28T06:39:34.961975+00:00",
+  "transform": "content_detector"
+}

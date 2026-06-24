@@ -1,0 +1,8 @@
+{
+  "config": {},
+  "input": "You are a helpful assistant. The date is . Request id 12.",
+  "input_sha256": "ddb0c93fe06909c7270a7381d28cd02fb5a87d3fe3b9744a94ea3f0bad66e61d",
+  "output": 15,
+  "recorded_at": "2026-04-23T23:51:37.783567+00:00",
+  "transform": "tokenizer"
+}

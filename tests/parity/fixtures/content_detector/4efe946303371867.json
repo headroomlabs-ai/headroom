@@ -1,0 +1,12 @@
+{
+  "config": {},
+  "input": "",
+  "input_sha256": "4efe946303371867389009a0144a8ea235bfe9f6e87a9395b0c0453b8e3f99c0",
+  "output": {
+    "confidence": 0.0,
+    "content_type": "text",
+    "metadata": {}
+  },
+  "recorded_at": "2026-04-28T06:39:34.962454+00:00",
+  "transform": "content_detector"
+}

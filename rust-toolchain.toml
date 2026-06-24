@@ -1,0 +1,16 @@
+[toolchain]
+# Pin to a specific stable version so CI and local use the EXACT same
+# compiler. With `channel = "stable"`, CI runners (dtolnay/rust-
+# toolchain@stable) always grab the latest stable while local dev
+# machines run whatever version was last installed — a clippy lint
+# added in a newer stable then breaks CI without firing locally
+# (this happened on 2026-04-27: `unnecessary_sort_by` landed in
+# clippy 1.95 while a dev box had 1.92). Pinning makes "passes
+# locally" = "passes in CI" for every check that depends on the
+# toolchain.
+#
+# Bump procedure: edit the channel string here, run `rustup update`,
+# run `make ci-precheck`, fix any new lints, commit.
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

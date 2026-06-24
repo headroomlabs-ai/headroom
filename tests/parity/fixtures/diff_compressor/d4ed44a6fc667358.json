@@ -1,0 +1,26 @@
+{
+  "config": {
+    "always_keep_additions": true,
+    "always_keep_deletions": true,
+    "enable_ccr": true,
+    "max_context_lines": 2,
+    "max_files": 20,
+    "max_hunks_per_file": 10,
+    "min_lines_for_ccr": 50
+  },
+  "input": "diff --git a/file_0.py b/file_0.py\n--- a/file_0.py\n+++ b/file_0.py\n@@ -1,10 +1,12 @@\n context_0_0\n context_1_0\n context_2_0\n context_3_0\n context_4_0\n-removed_0_0\n-removed_1_0\n-removed_2_0\n+added_0_0\n+added_1_0\n+added_2_0\n+added_3_0\n+added_4_0\n tail_0_0\n tail_1_0\n tail_2_0\n tail_3_0\n tail_4_0\ndiff --git a/file_1.py b/file_1.py\n--- a/file_1.py\n+++ b/file_1.py\n@@ -1,10 +1,12 @@\n context_0_1\n context_1_1\n context_2_1\n context_3_1\n context_4_1\n-removed_0_1\n-removed_1_1\n-removed_2_1\n+added_0_1\n+added_1_1\n+added_2_1\n+added_3_1\n+added_4_1\n tail_0_1\n tail_1_1\n tail_2_1\n tail_3_1\n tail_4_1\ndiff --git a/file_2.py b/file_2.py\n--- a/file_2.py\n+++ b/file_2.py\n@@ -1,10 +1,12 @@\n context_0_2\n context_1_2\n context_2_2\n context_3_2\n context_4_2\n-removed_0_2\n-removed_1_2\n-removed_2_2\n+added_0_2\n+added_1_2\n+added_2_2\n+added_3_2\n+added_4_2\n tail_0_2\n tail_1_2\n tail_2_2\n tail_3_2\n tail_4_2\ndiff --git a/file_3.py b/file_3.py\n--- a/file_3.py\n+++ b/file_3.py\n@@ -1,10 +1,12 @@\n context_0_3\n context_1_3\n context_2_3\n context_3_3\n context_4_3\n-removed_0_3\n-removed_1_3\n-removed_2_3\n+added_0_3\n+added_1_3\n+added_2_3\n+added_3_3\n+added_4_3\n tail_0_3\n tail_1_3\n tail_2_3\n tail_3_3\n tail_4_3\ndiff --git a/file_4.py b/file_4.py\n--- a/file_4.py\n+++ b/file_4.py\n@@ -1,10 +1,12 @@\n context_0_4\n context_1_4\n context_2_4\n context_3_4\n context_4_4\n-removed_0_4\n-removed_1_4\n-removed_2_4\n+added_0_4\n+added_1_4\n+added_2_4\n+added_3_4\n+added_4_4\n tail_0_4\n tail_1_4\n tail_2_4\n tail_3_4\n tail_4_4\ndiff --git a/file_5.py b/file_5.py\n--- a/file_5.py\n+++ b/file_5.py\n@@ -1,10 +1,12 @@\n context_0_5\n context_1_5\n context_2_5\n context_3_5\n context_4_5\n-removed_0_5\n-removed_1_5\n-removed_2_5\n+added_0_5\n+added_1_5\n+added_2_5\n+added_3_5\n+added_4_5\n tail_0_5\n tail_1_5\n tail_2_5\n tail_3_5\n tail_4_5\ndiff --git a/file_6.py b/file_6.py\n--- a/file_6.py\n+++ b/file_6.py\n@@ -1,10 +1,12 @@\n context_0_6\n context_1_6\n context_2_6\n context_3_6\n context_4_6\n-removed_0_6\n-removed_1_6\n-removed_2_6\n+added_0_6\n+added_1_6\n+added_2_6\n+added_3_6\n+added_4_6\n tail_0_6\n tail_1_6\n tail_2_6\n tail_3_6\n tail_4_6\ndiff --git a/file_7.py b/file_7.py\n--- a/file_7.py\n+++ b/file_7.py\n@@ -1,10 +1,12 @@\n context_0_7\n context_1_7\n context_2_7\n context_3_7\n context_4_7\n-removed_0_7\n-removed_1_7\n-removed_2_7\n+added_0_7\n+added_1_7\n+added_2_7\n+added_3_7\n+added_4_7\n tail_0_7\n tail_1_7\n tail_2_7\n tail_3_7\n tail_4_7\n# variant 3",
+  "input_sha256": "d4ed44a6fc66735876898acb5e3b2c54f97e72033bb71eda006acdbbfb8a2e96",
+  "output": {
+    "additions": 40,
+    "cache_key": "706080f4af877cb632f87e1d",
+    "compressed": "diff --git a/file_0.py b/file_0.py\n--- a/file_0.py\n+++ b/file_0.py\n@@ -1,10 +1,12 @@\n context_3_0\n context_4_0\n-removed_0_0\n-removed_1_0\n-removed_2_0\n+added_0_0\n+added_1_0\n+added_2_0\n+added_3_0\n+added_4_0\n tail_0_0\n tail_1_0\ndiff --git a/file_1.py b/file_1.py\n--- a/file_1.py\n+++ b/file_1.py\n@@ -1,10 +1,12 @@\n context_3_1\n context_4_1\n-removed_0_1\n-removed_1_1\n-removed_2_1\n+added_0_1\n+added_1_1\n+added_2_1\n+added_3_1\n+added_4_1\n tail_0_1\n tail_1_1\ndiff --git a/file_2.py b/file_2.py\n--- a/file_2.py\n+++ b/file_2.py\n@@ -1,10 +1,12 @@\n context_3_2\n context_4_2\n-removed_0_2\n-removed_1_2\n-removed_2_2\n+added_0_2\n+added_1_2\n+added_2_2\n+added_3_2\n+added_4_2\n tail_0_2\n tail_1_2\ndiff --git a/file_3.py b/file_3.py\n--- a/file_3.py\n+++ b/file_3.py\n@@ -1,10 +1,12 @@\n context_3_3\n context_4_3\n-removed_0_3\n-removed_1_3\n-removed_2_3\n+added_0_3\n+added_1_3\n+added_2_3\n+added_3_3\n+added_4_3\n tail_0_3\n tail_1_3\ndiff --git a/file_4.py b/file_4.py\n--- a/file_4.py\n+++ b/file_4.py\n@@ -1,10 +1,12 @@\n context_3_4\n context_4_4\n-removed_0_4\n-removed_1_4\n-removed_2_4\n+added_0_4\n+added_1_4\n+added_2_4\n+added_3_4\n+added_4_4\n tail_0_4\n tail_1_4\ndiff --git a/file_5.py b/file_5.py\n--- a/file_5.py\n+++ b/file_5.py\n@@ -1,10 +1,12 @@\n context_3_5\n context_4_5\n-removed_0_5\n-removed_1_5\n-removed_2_5\n+added_0_5\n+added_1_5\n+added_2_5\n+added_3_5\n+added_4_5\n tail_0_5\n tail_1_5\ndiff --git a/file_6.py b/file_6.py\n--- a/file_6.py\n+++ b/file_6.py\n@@ -1,10 +1,12 @@\n context_3_6\n context_4_6\n-removed_0_6\n-removed_1_6\n-removed_2_6\n+added_0_6\n+added_1_6\n+added_2_6\n+added_3_6\n+added_4_6\n tail_0_6\n tail_1_6\ndiff --git a/file_7.py b/file_7.py\n--- a/file_7.py\n+++ b/file_7.py\n@@ -1,10 +1,12 @@\n context_3_7\n context_4_7\n-removed_0_7\n-removed_1_7\n-removed_2_7\n+added_0_7\n+added_1_7\n+added_2_7\n+added_3_7\n+added_4_7\n tail_0_7\n tail_1_7\n[8 files changed, +40 -24 lines]\n[177 lines compressed to 129. Retrieve full diff: hash=706080f4af877cb632f87e1d]",
+    "compressed_line_count": 129,
+    "deletions": 24,
+    "files_affected": 8,
+    "hunks_kept": 8,
+    "hunks_removed": 0,
+    "original_line_count": 177
+  },
+  "recorded_at": "2026-04-23T23:51:37.352883+00:00",
+  "transform": "diff_compressor"
+}

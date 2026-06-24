@@ -1,0 +1,15 @@
+{
+  "config": {},
+  "input": "package com.example;\n\npublic class Foo {\n    @Override\n    public String toString() { return \"foo\"; }\n}\n\nprivate interface Bar {}\nprotected enum Baz { A, B }\n",
+  "input_sha256": "37c86907c057e293385ffaef6c4278a4b903fca82e3d52fb42df601f47010a3d",
+  "output": {
+    "confidence": 0.7857142857142857,
+    "content_type": "source_code",
+    "metadata": {
+      "language": "java",
+      "pattern_matches": 5
+    }
+  },
+  "recorded_at": "2026-04-28T06:39:34.962175+00:00",
+  "transform": "content_detector"
+}

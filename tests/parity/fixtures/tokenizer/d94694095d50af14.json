@@ -1,0 +1,8 @@
+{
+  "config": {},
+  "input": "{\"role\": \"user\", \"content\": \"hi\"}\n[[variant 0]]",
+  "input_sha256": "d94694095d50af149351f14d1473ed010cfb78a1d360037347184f0cc088e6ac",
+  "output": 17,
+  "recorded_at": "2026-04-23T23:51:37.614059+00:00",
+  "transform": "tokenizer"
+}

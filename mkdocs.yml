@@ -1,0 +1,136 @@
+site_name: Headroom
+docs_dir: wiki
+site_description: "The Context Optimization Layer for LLM Applications — compress everything your AI agent reads."
+site_url: https://chopratejas.github.io/headroom
+repo_url: https://github.com/chopratejas/headroom
+repo_name: chopratejas/headroom
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  custom_dir: docs/overrides
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: deep purple
+      accent: amber
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: deep purple
+      accent: amber
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  font:
+    text: Inter
+    code: JetBrains Mono
+  features:
+    - content.code.copy
+    - content.code.annotate
+    - content.tabs.link
+    - navigation.instant
+    - navigation.instant.progress
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - navigation.indexes
+    - search.highlight
+    - search.suggest
+    - search.share
+    - toc.follow
+    - header.autohide
+  icon:
+    repo: fontawesome/brands/github
+    logo: material/layers-outline
+
+plugins:
+  - search
+
+extra_css:
+  - stylesheets/extra.css
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.details
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - pymdownx.tasklist:
+      custom_checkbox: true
+
+nav:
+  - Home: index.md
+  - Getting Started:
+    - Quickstart: quickstart.md
+    - Installation: getting-started.md
+    - Docker-Native Install: docker-install.md
+    - Persistent Installs: persistent-installs.md
+    - Configuration: configuration.md
+  - User Guide:
+    - Proxy Server: proxy.md
+    - Compression Pipeline: compression.md
+    - CCR (Lossless Retrieval): ccr.md
+    - Image Compression: image-compression.md
+    - Memory System: memory.md
+    - Shared Context: shared-context.md
+    - Failure Learning: learn.md
+  - Integrations:
+    - Overview: integration-guide.md
+    - Vertex AI: vertex.md
+    - LangChain: langchain.md
+    - Agno: agno.md
+    - Strands: strands.md
+    - MCP Tools: mcp.md
+  - How It Works:
+    - Architecture: ARCHITECTURE.md
+    - Transforms Pipeline: transforms.md
+    - Text Compression: text-compression.md
+    - LLMLingua: llmlingua.md
+  - Benchmarks:
+    - Accuracy: benchmarks.md
+    - Latency: LATENCY_BENCHMARKS.md
+    - Limitations: LIMITATIONS.md
+  - Reference:
+    - CLI: cli.md
+    - API: api.md
+    - SDK: sdk.md
+    - Differential Network Capture: network-diff-capture.md
+    - Metrics & Observability: metrics.md
+    - Error Codes: errors.md
+    - Troubleshooting: troubleshooting.md
+  - Deployment:
+    - macOS LaunchAgent: macos-deployment.md
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/chopratejas/headroom
+    - icon: fontawesome/brands/python
+      link: https://pypi.org/project/headroom-ai/
+    - icon: fontawesome/brands/discord
+      link: https://discord.gg/yRmaUNpsPJ
+  generator: false

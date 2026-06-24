@@ -1,0 +1,16 @@
+{
+  "config": {},
+  "input": "INFO starting build\nWARN deprecated API used\nERROR compilation failed\nFAILED test_x\nPASSED test_y\n============================================\n",
+  "input_sha256": "628c8985c40adb7d265eac37436ea45a549ba9ed2b10eb47a1fa7b478ce17e77",
+  "output": {
+    "confidence": 0.9500000000000001,
+    "content_type": "build",
+    "metadata": {
+      "error_matches": 3,
+      "pattern_matches": 6,
+      "total_lines": 6
+    }
+  },
+  "recorded_at": "2026-04-28T06:39:34.960715+00:00",
+  "transform": "content_detector"
+}

@@ -1,0 +1,161 @@
+---
+title: How Compression Works
+description: Understand Headroom's three-stage compression pipeline, automatic content routing, and how different content types are compressed.
+---
+
+Headroom automatically detects what kind of content you're sending and routes it to the right compressor. You don't need to configure anything -- just call `compress()` and the pipeline handles the rest.
+
+## The Three-Stage Pipeline
+
+Every request flows through three stages:
+
+```
+┌──────────────┐     ┌────────────────┐
+│ CacheAligner │────>│ ContentRouter  │
+│              │     │                │
+│ Stabilize    │     │ Detect type &  │
+│ prefix for   │     │ route to best  │
+│ cache hits   │     │ compressor     │
+└──────────────┘     └────────────────┘
+```
+
+1. **CacheAligner** extracts dynamic content (dates, user context) from your system prompt so the static prefix stays cacheable across requests.
+2. **ContentRouter** inspects each tool output and routes it to the optimal compressor -- SmartCrusher for JSON arrays, CodeAwareCompressor for source code, LogCompressor for build output, and so on.
+
+## Content Type Detection
+
+The router auto-detects content type by analyzing structure and patterns. No manual hints required.
+
+| Content Type | Detection Signal | Compressor | Typical Savings |
+|---|---|---|---|
+| JSON arrays | Valid JSON with array elements | SmartCrusher | 70-90% |
+| Source code | Syntax patterns, indentation, keywords | CodeAwareCompressor | 40-70% (opt-in; disabled by default) |
+| Search results | `file:line:content` format | SearchCompressor | 80-95% |
+| Build/test logs | Timestamps, log levels, pytest/npm markers | LogCompressor | 85-95% |
+| Diffs | Unified diff format | DiffCompressor | 60-80% |
+| HTML | Tag structure | HTMLCompressor | 50-70% |
+| Plain text | Fallback | TextCompressor | 60-80% |
+
+## Quick Start
+
+<Tabs groupId="lang" items={['TypeScript', 'Python']}>
+<Tab value="TypeScript">
+```ts twoslash
+import { compress } from "headroom-ai";
+
+const messages = [
+  { role: "system" as const, content: "You are a helpful assistant." },
+  { role: "user" as const, content: "Summarize this data" },
+  { role: "tool" as const, content: '{"results": [...]}', tool_call_id: "call_1" },
+];
+
+const result = await compress(messages);
+console.log(`Tokens saved: ${result.tokensSaved}`);
+console.log(`Compression ratio: ${result.compressionRatio}`);
+```
+</Tab>
+<Tab value="Python">
+```python
+from headroom import compress
+
+result = compress(content)
+print(result.compressed)
+print(f"Saved {result.savings_percentage:.0f}% tokens")
+```
+</Tab>
+</Tabs>
+
+## Configuring the Compressor
+
+<Tabs groupId="lang" items={['TypeScript', 'Python']}>
+<Tab value="TypeScript">
+```ts twoslash
+import { compress } from "headroom-ai";
+
+const result = await compress(messages, {
+  model: "gpt-4o",
+  tokenBudget: 50000,
+});
+
+console.log(`Before: ${result.tokensBefore} tokens`);
+console.log(`After: ${result.tokensAfter} tokens`);
+console.log(`Transforms: ${result.transformsApplied.join(", ")}`);
+```
+</Tab>
+<Tab value="Python">
+```python
+# Advanced / Internal API -- prefer `from headroom import compress` for typical use
+from headroom.compression import UniversalCompressor, UniversalCompressorConfig
+
+config = UniversalCompressorConfig(
+    compression_ratio_target=0.5,  # Keep 50% of content
+    use_entropy_preservation=True,  # Preserve UUIDs, hashes
+    use_magika=True,                # ML-based content detection
+    ccr_enabled=True,               # Store originals for retrieval
+)
+
+compressor = UniversalCompressor(config=config)
+result = compressor.compress(content)
+
+print(f"Type: {result.content_type}")
+print(f"Handler: {result.handler_used}")
+print(f"Saved: {result.savings_percentage:.0f}%")
+```
+</Tab>
+</Tabs>
+
+## Structure Preservation
+
+Headroom doesn't blindly truncate. It identifies what matters in each content type and preserves it:
+
+| Content Type | What's Preserved | What's Compressed |
+|---|---|---|
+| **JSON** | Keys, brackets, booleans, nulls, short values, UUIDs | Long string values, whitespace |
+| **Code** | Imports, function signatures, class definitions, types | Function bodies, comments |
+| **Logs** | Timestamps, log levels, error messages, stack traces | Repeated patterns, verbose details |
+| **Text** | High-entropy tokens (IDs, hashes), headers | Low-information content |
+
+## Real Compression Ratios
+
+| Content Type | Compression | Speed | What's Preserved |
+|---|---|---|---|
+| JSON (large arrays) | 70-90% | ~1ms | All keys, structure |
+| Source code (Python) | 50-70% | ~10ms | Signatures, imports |
+| Search results | 80-95% | ~2ms | Relevant matches |
+| Build logs | 85-95% | ~3ms | Errors, stack traces |
+| Plain text | 60-80% | ~5ms | High-entropy tokens |
+
+## Batch Compression
+
+For multiple contents, batch compression is more efficient:
+
+```python
+# Advanced / Internal API -- prefer `from headroom import compress` for typical use
+from headroom.compression import UniversalCompressor
+
+compressor = UniversalCompressor()
+
+contents = [
+    '{"users": [...]}',
+    'def hello(): pass',
+    'Plain text content',
+]
+
+results = compressor.compress_batch(contents)
+
+for result in results:
+    print(f"{result.content_type}: {result.savings_percentage:.0f}% saved")
+```
+
+## What Happens Under the Hood
+
+When you call `compress()`, here is the full sequence:
+
+1. **Content detection** -- Magika (ML-based) or pattern matching identifies the content type
+2. **Structure extraction** -- A handler extracts a structure mask marking what to preserve
+3. **Compression** -- Non-structural content is compressed (SmartCrusher, LLMLingua, or text utilities)
+4. **CCR storage** -- If enabled, the original is stored for retrieval when the LLM needs full context
+
+<Callout type="info" title="Zero-config by default">
+  The pipeline works out of the box with no configuration. All detection, routing, and compression happens automatically. Configuration is available when you need fine-grained control.
+</Callout>

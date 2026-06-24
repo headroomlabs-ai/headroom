@@ -1,0 +1,34 @@
+{
+  "config": {
+    "dedup_identical_items": true,
+    "enabled": true,
+    "factor_out_constants": false,
+    "first_fraction": 0.3,
+    "include_summaries": false,
+    "last_fraction": 0.15,
+    "max_items_after_crush": 15,
+    "min_items_to_analyze": 5,
+    "min_tokens_to_crush": 200,
+    "preserve_change_points": true,
+    "similarity_threshold": 0.8,
+    "toin_confidence_threshold": 0.5,
+    "uniqueness_threshold": 0.1,
+    "use_feedback_hints": true,
+    "variance_threshold": 2.0
+  },
+  "input": {
+    "bias": 1.0,
+    "content": "{\"request_id\": \"req-1\", \"events\": [{\"step\": 0, \"kind\": \"trace\", \"msg\": \"e0\"}, {\"step\": 1, \"kind\": \"trace\", \"msg\": \"e1\"}, {\"step\": 2, \"kind\": \"trace\", \"msg\": \"e2\"}, {\"step\": 3, \"kind\": \"trace\", \"msg\": \"e3\"}, {\"step\": 4, \"kind\": \"trace\", \"msg\": \"e4\"}, {\"step\": 5, \"kind\": \"trace\", \"msg\": \"e5\"}, {\"step\": 6, \"kind\": \"trace\", \"msg\": \"e6\"}, {\"step\": 7, \"kind\": \"trace\", \"msg\": \"e7\"}, {\"step\": 8, \"kind\": \"trace\", \"msg\": \"e8\"}, {\"step\": 9, \"kind\": \"trace\", \"msg\": \"e9\"}, {\"step\": 10, \"kind\": \"trace\", \"msg\": \"e10\"}, {\"step\": 11, \"kind\": \"trace\", \"msg\": \"e11\"}, {\"step\": 12, \"kind\": \"trace\", \"msg\": \"e12\"}, {\"step\": 13, \"kind\": \"trace\", \"msg\": \"e13\"}, {\"step\": 14, \"kind\": \"trace\", \"msg\": \"e14\"}, {\"step\": 15, \"kind\": \"trace\", \"msg\": \"e15\"}, {\"step\": 16, \"kind\": \"trace\", \"msg\": \"e16\"}, {\"step\": 17, \"kind\": \"trace\", \"msg\": \"e17\"}, {\"step\": 18, \"kind\": \"trace\", \"msg\": \"e18\"}, {\"step\": 19, \"kind\": \"trace\", \"msg\": \"e19\"}]}",
+    "query": ""
+  },
+  "input_sha256": "b66d43299ea15229c3fea6607b8fc697e32e72811ce4364c71bc9f64357208f1",
+  "label": "nested_object_with_array",
+  "output": {
+    "compressed": "{\"request_id\":\"req-1\",\"events\":[{\"step\":0,\"kind\":\"trace\",\"msg\":\"e0\"},{\"step\":1,\"kind\":\"trace\",\"msg\":\"e1\"},{\"step\":2,\"kind\":\"trace\",\"msg\":\"e2\"},{\"step\":3,\"kind\":\"trace\",\"msg\":\"e3\"},{\"step\":4,\"kind\":\"trace\",\"msg\":\"e4\"},{\"step\":5,\"kind\":\"trace\",\"msg\":\"e5\"},{\"step\":6,\"kind\":\"trace\",\"msg\":\"e6\"},{\"step\":7,\"kind\":\"trace\",\"msg\":\"e7\"},{\"step\":8,\"kind\":\"trace\",\"msg\":\"e8\"},{\"step\":9,\"kind\":\"trace\",\"msg\":\"e9\"},{\"step\":10,\"kind\":\"trace\",\"msg\":\"e10\"},{\"step\":11,\"kind\":\"trace\",\"msg\":\"e11\"},{\"step\":12,\"kind\":\"trace\",\"msg\":\"e12\"},{\"step\":13,\"kind\":\"trace\",\"msg\":\"e13\"},{\"step\":14,\"kind\":\"trace\",\"msg\":\"e14\"},{\"step\":15,\"kind\":\"trace\",\"msg\":\"e15\"},{\"step\":16,\"kind\":\"trace\",\"msg\":\"e16\"},{\"step\":17,\"kind\":\"trace\",\"msg\":\"e17\"},{\"step\":18,\"kind\":\"trace\",\"msg\":\"e18\"},{\"step\":19,\"kind\":\"trace\",\"msg\":\"e19\"}]}",
+    "original": "{\"request_id\": \"req-1\", \"events\": [{\"step\": 0, \"kind\": \"trace\", \"msg\": \"e0\"}, {\"step\": 1, \"kind\": \"trace\", \"msg\": \"e1\"}, {\"step\": 2, \"kind\": \"trace\", \"msg\": \"e2\"}, {\"step\": 3, \"kind\": \"trace\", \"msg\": \"e3\"}, {\"step\": 4, \"kind\": \"trace\", \"msg\": \"e4\"}, {\"step\": 5, \"kind\": \"trace\", \"msg\": \"e5\"}, {\"step\": 6, \"kind\": \"trace\", \"msg\": \"e6\"}, {\"step\": 7, \"kind\": \"trace\", \"msg\": \"e7\"}, {\"step\": 8, \"kind\": \"trace\", \"msg\": \"e8\"}, {\"step\": 9, \"kind\": \"trace\", \"msg\": \"e9\"}, {\"step\": 10, \"kind\": \"trace\", \"msg\": \"e10\"}, {\"step\": 11, \"kind\": \"trace\", \"msg\": \"e11\"}, {\"step\": 12, \"kind\": \"trace\", \"msg\": \"e12\"}, {\"step\": 13, \"kind\": \"trace\", \"msg\": \"e13\"}, {\"step\": 14, \"kind\": \"trace\", \"msg\": \"e14\"}, {\"step\": 15, \"kind\": \"trace\", \"msg\": \"e15\"}, {\"step\": 16, \"kind\": \"trace\", \"msg\": \"e16\"}, {\"step\": 17, \"kind\": \"trace\", \"msg\": \"e17\"}, {\"step\": 18, \"kind\": \"trace\", \"msg\": \"e18\"}, {\"step\": 19, \"kind\": \"trace\", \"msg\": \"e19\"}]}",
+    "strategy": "skip:unique_entities_no_signal(20->20)",
+    "was_modified": true
+  },
+  "recorded_at": "2026-04-27T06:59:39.935923+00:00",
+  "transform": "smart_crusher"
+}

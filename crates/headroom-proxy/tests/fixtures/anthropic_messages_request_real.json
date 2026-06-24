@@ -1,0 +1,173 @@
+{
+  "model": "claude-3-5-sonnet-20241022",
+  "max_tokens": 4096,
+  "temperature": 1.0,
+  "top_p": 0.95,
+  "top_k": 50,
+  "stop_sequences": ["</search>", "</done>"],
+  "metadata": {
+    "user_id": "user_01HG9X7Z8K2N4P6Q8R0S2T4V6W",
+    "session_id": "sess_8f3a2b1c0d4e5f6a7b8c9d0e1f2a3b4c"
+  },
+  "stream": false,
+  "system": [
+    {
+      "type": "text",
+      "text": "You are a careful research assistant. Use the search tool when needed.",
+      "cache_control": {"type": "ephemeral"}
+    },
+    {
+      "type": "text",
+      "text": "Always cite sources. Never speculate when uncertain.",
+      "cache_control": {"type": "ephemeral", "ttl": "1h"}
+    }
+  ],
+  "tools": [
+    {
+      "name": "search_documents",
+      "description": "Search the document corpus by query string. Returns up to 10 hits.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "Free-text query (max 256 chars). Examples: 'quarterly revenue', '日本語の例'."
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 10,
+            "default": 5,
+            "description": "Max hits to return."
+          },
+          "filters": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "year": {"type": "integer", "minimum": 1900, "maximum": 2100},
+              "tags": {"type": "array", "items": {"type": "string"}},
+              "exact_match": {"type": "boolean", "default": false}
+            }
+          }
+        },
+        "required": ["query"]
+      },
+      "cache_control": {"type": "ephemeral"}
+    },
+    {
+      "name": "fetch_document",
+      "description": "Fetch a document by its stable identifier.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "doc_id": {
+            "type": "string",
+            "pattern": "^doc_[A-Za-z0-9]{16}$",
+            "description": "Document id (e.g. doc_01HG9X7Z8K2N4P6Q)."
+          }
+        },
+        "required": ["doc_id"]
+      }
+    }
+  ],
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Find me the Q3 2024 earnings summary for Acme Corp. Include 日本語 markets if any. Reply 🔥 if found.",
+          "cache_control": {"type": "ephemeral"}
+        }
+      ]
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "thinking",
+          "thinking": "I should call search_documents with 'Acme Corp Q3 2024 earnings'. The user wants Japan-market detail and a 🔥 emoji on success.",
+          "signature": "ErcBCkgIBhABGAIiQO5fJk0wY2J3aDQ4ckZmZE5Ld2lDV3VYV1JlVlVQQUtpa3lXQVdqREZSc1Y3WkRSWjJsdndPbVlEY1ZNUUUSDDNjMjUwYWY5LWFlMmUaDDIwMjQtMTAtMjJUMjAiKjAyOjAuNjQyNDY1ODYzKtQQk19uH0K8MzUvP1ojZ2pP"
+        },
+        {
+          "type": "text",
+          "text": "Searching the corpus now."
+        },
+        {
+          "type": "tool_use",
+          "id": "toolu_01XR8Q9z5w7vT3pK2nJ4hL5m",
+          "name": "search_documents",
+          "input": {
+            "query": "Acme Corp Q3 2024 earnings",
+            "limit": 5,
+            "filters": {"year": 2024, "tags": ["earnings", "quarterly"], "exact_match": false}
+          }
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "toolu_01XR8Q9z5w7vT3pK2nJ4hL5m",
+          "is_error": false,
+          "content": [
+            {
+              "type": "text",
+              "text": "Hit 1: doc_8f3a2b1c0d4e5f6a — Acme Corp Q3 2024 (revenue: 1234567890.12, growth: 0.087, jp_revenue: 98765432109876543, scores: [1e-9, 2.5e10, -3.14159265358979])\nHit 2: doc_a1b2c3d4e5f60718 — Japan market deep dive (日本語コンテンツあり)"
+            }
+          ]
+        },
+        {
+          "type": "text",
+          "text": "Now please fetch the second one and give me a one-sentence summary in Japanese (日本語で)."
+        }
+      ]
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "redacted_thinking",
+          "data": "EsADCkYIBxABGAIiQGtHMHA0QzlpbXJyV2I4QmtuS1JmTjFvUHFwS1NXa1d3Z3FVSlJSc3JKWmhLbDF3WmZmZjJyVTFqUlRYZ0FzSE0SDDk4N2MzMzgyLWFmYjAaDDIwMjQtMTAtMjJUMjAi"
+        },
+        {
+          "type": "tool_use",
+          "id": "toolu_02ZX9R7w8u4tV3pK2nJ4hL5m",
+          "name": "fetch_document",
+          "input": {"doc_id": "doc_a1b2c3d4e5f60718"}
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "toolu_02ZX9R7w8u4tV3pK2nJ4hL5m",
+          "is_error": false,
+          "content": [
+            {
+              "type": "text",
+              "text": "Document doc_a1b2c3d4e5f60718:\n\nAcme Corp の2024年第3四半期レポート: 日本市場の収益は前年比+12.3%で、円安(USD/JPY=149.87)にもかかわらず堅調。詳細表は別途。"
+            },
+            {
+              "type": "image",
+              "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg=="
+              }
+            }
+          ],
+          "cache_control": {"type": "ephemeral"}
+        },
+        {
+          "type": "text",
+          "text": "Final answer please. 🔥"
+        }
+      ]
+    }
+  ]
+}

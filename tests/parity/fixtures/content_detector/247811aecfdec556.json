@@ -1,0 +1,15 @@
+{
+  "config": {},
+  "input": "diff --combined merged.py\nindex aaa..bbb..ccc 100644\n--- a/merged.py\n+++ b/merged.py\n@@@ -1,4 -1,4 +1,5 @@@\n  unchanged\n- branch_a_only\n -branch_b_only\n++merge_added\n",
+  "input_sha256": "247811aecfdec55647a37c088c611f8f093119d95335da3d10aa317455159655",
+  "output": {
+    "confidence": 1.0,
+    "content_type": "diff",
+    "metadata": {
+      "change_lines": 1,
+      "header_matches": 3
+    }
+  },
+  "recorded_at": "2026-04-28T06:39:34.959992+00:00",
+  "transform": "content_detector"
+}

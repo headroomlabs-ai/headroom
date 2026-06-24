@@ -1,0 +1,122 @@
+name: Dev Containers
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".devcontainer/**"
+      - ".github/workflows/devcontainers.yml"
+      - "pyproject.toml"
+      - "uv.lock"
+  pull_request:
+    branches: [main]
+    paths:
+      - ".devcontainer/**"
+      - ".github/workflows/devcontainers.yml"
+      - "pyproject.toml"
+      - "uv.lock"
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default
+            config: .devcontainer/devcontainer.json
+          - name: memory-stack
+            config: .devcontainer/memory-stack/devcontainer.json
+
+    steps:
+      - uses: actions/checkout@v6
+
+      # The memory-stack devcontainer brings up Neo4j + Postgres +
+      # Redis + Qdrant on top of the Docker base. PR #495 surfaced
+      # that the GitHub-hosted runner now ships with too little
+      # headroom for that stack: the runner's diagnostic log writer
+      # hit "No space left on device" mid-smoke-test, killing the
+      # job before `devcontainer exec` could finish. The default
+      # devcontainer is light enough to pass on the same image.
+      #
+      # Reclaim ~14 GB by stripping preinstalled tools none of the
+      # devcontainer paths use (Android SDK, .NET, Haskell). Run
+      # ONLY on memory-stack — the default validate is fast and
+      # benefits from the preinstalled toolcache.
+      - name: Free runner disk (memory-stack only)
+        if: matrix.name == 'memory-stack'
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: false
+          swap-storage: false
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Install Dev Container CLI
+        run: npm install -g @devcontainers/cli@0.85.0
+
+      - name: Start ${{ matrix.name }}
+        run: devcontainer up --workspace-folder . --config ${{ matrix.config }} --remove-existing-container
+
+      - name: Smoke test ${{ matrix.name }}
+        shell: bash
+        run: |
+          if [[ "${{ matrix.name }}" == "memory-stack" ]]; then
+            devcontainer exec --workspace-folder . --config ${{ matrix.config }} bash -lc 'git rev-parse --show-toplevel >/dev/null && uv --version && node --version && gh --version >/dev/null && uv run python -c "import socket; socket.create_connection((\"qdrant\", 6333), 5).close(); socket.create_connection((\"neo4j\", 7687), 5).close(); from mem0 import Memory; from qdrant_client import QdrantClient; import neo4j; import headroom; print(\"memory-stack smoke test passed\")"'
+          else
+            devcontainer exec --workspace-folder . --config ${{ matrix.config }} bash -lc 'git rev-parse --show-toplevel >/dev/null && uv --version && node --version && gh --version >/dev/null && uv run python -c "import headroom; print(\"default smoke test passed\")"'
+          fi
+
+  validate-worktree:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      # The worktree devcontainer runs the same `uv sync --extra dev` build as
+      # the default validate job, which now pulls transformers 5.x. Copying that
+      # into the venv volume exhausts the GitHub runner's disk ("No space left on
+      # device", see PR #495). Reclaim ~14 GB by stripping preinstalled tools the
+      # build never touches — mirrors the memory-stack job's existing remedy.
+      - name: Free runner disk
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: false
+          swap-storage: false
+
+      - name: Create linked worktree
+        run: git worktree add "$RUNNER_TEMP/headroom-worktree" HEAD
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Install Dev Container CLI
+        run: npm install -g @devcontainers/cli@0.85.0
+
+      - name: Start linked worktree devcontainer
+        run: devcontainer up --workspace-folder "$RUNNER_TEMP/headroom-worktree" --config "$RUNNER_TEMP/headroom-worktree/.devcontainer/devcontainer.json" --remove-existing-container
+
+      - name: Smoke test linked worktree
+        run: devcontainer exec --workspace-folder "$RUNNER_TEMP/headroom-worktree" --config "$RUNNER_TEMP/headroom-worktree/.devcontainer/devcontainer.json" bash -lc 'git rev-parse --show-toplevel && uv run python -c "import headroom; print(\"worktree smoke test passed\")"'

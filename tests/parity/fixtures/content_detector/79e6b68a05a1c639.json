@@ -1,0 +1,15 @@
+{
+  "config": {},
+  "input": "src/main.py:42:def process():\nsrc/util.py:13:    return None\nlib/x.py:7:class X:\ntests/test_a.py:3:    assert True",
+  "input_sha256": "79e6b68a05a1c639efba2fe2f3bf8471ea00a04e9dc0a5fb8853cbc94ac6b42a",
+  "output": {
+    "confidence": 1.0,
+    "content_type": "search",
+    "metadata": {
+      "matching_lines": 4,
+      "total_lines": 4
+    }
+  },
+  "recorded_at": "2026-04-28T06:39:34.960560+00:00",
+  "transform": "content_detector"
+}

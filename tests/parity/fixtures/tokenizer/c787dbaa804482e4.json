@@ -1,0 +1,8 @@
+{
+  "config": {},
+  "input": "SELECT id, name FROM users WHERE email LIKE '%@example.com'\n[[variant 0]]",
+  "input_sha256": "c787dbaa804482e4882fa97f0a2309e5799c229df2639224df3ded5660b032aa",
+  "output": 19,
+  "recorded_at": "2026-04-23T23:51:37.612983+00:00",
+  "transform": "tokenizer"
+}

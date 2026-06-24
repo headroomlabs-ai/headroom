@@ -1,0 +1,44 @@
+services:
+  cli:
+    image: ${HEADROOM_IMAGE:-ghcr.io/chopratejas/headroom:latest}
+    entrypoint: ["headroom"]
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
+    environment:
+      HOME: /tmp/headroom-home
+      # Canonical Headroom filesystem contract (issue #175). Forwarded into
+      # the container so the proxy resolves state/config to the bind-mounted
+      # /tmp/headroom-home/.headroom path. HEADROOM_WORKSPACE (above) remains
+      # the Docker bind-mount source and is intentionally different.
+      HEADROOM_WORKSPACE_DIR: /tmp/headroom-home/.headroom
+      HEADROOM_CONFIG_DIR: /tmp/headroom-home/.headroom/config
+    volumes:
+      - ${HEADROOM_WORKSPACE:-.}:/workspace
+      - ${HEADROOM_HOST_HOME:?set HEADROOM_HOST_HOME}/.headroom:/tmp/headroom-home/.headroom
+      - ${HEADROOM_HOST_HOME:?set HEADROOM_HOST_HOME}/.claude:/tmp/headroom-home/.claude
+      - ${HEADROOM_HOST_HOME:?set HEADROOM_HOST_HOME}/.codex:/tmp/headroom-home/.codex
+      - ${HEADROOM_HOST_HOME:?set HEADROOM_HOST_HOME}/.gemini:/tmp/headroom-home/.gemini
+    command: ["--help"]
+
+  proxy:
+    image: ${HEADROOM_IMAGE:-ghcr.io/chopratejas/headroom:latest}
+    entrypoint: ["headroom", "proxy"]
+    working_dir: /workspace
+    restart: unless-stopped
+    environment:
+      HOME: /tmp/headroom-home
+      HEADROOM_HOST: 0.0.0.0
+      # Canonical Headroom filesystem contract (issue #175). See `cli` service
+      # above for rationale.
+      HEADROOM_WORKSPACE_DIR: /tmp/headroom-home/.headroom
+      HEADROOM_CONFIG_DIR: /tmp/headroom-home/.headroom/config
+    ports:
+      - "${HEADROOM_PORT:-8787}:${HEADROOM_PORT:-8787}"
+    volumes:
+      - ${HEADROOM_WORKSPACE:-.}:/workspace
+      - ${HEADROOM_HOST_HOME:?set HEADROOM_HOST_HOME}/.headroom:/tmp/headroom-home/.headroom
+      - ${HEADROOM_HOST_HOME:?set HEADROOM_HOST_HOME}/.claude:/tmp/headroom-home/.claude
+      - ${HEADROOM_HOST_HOME:?set HEADROOM_HOST_HOME}/.codex:/tmp/headroom-home/.codex
+      - ${HEADROOM_HOST_HOME:?set HEADROOM_HOST_HOME}/.gemini:/tmp/headroom-home/.gemini
+    command: ["--host", "0.0.0.0", "--port", "${HEADROOM_PORT:-8787}"]

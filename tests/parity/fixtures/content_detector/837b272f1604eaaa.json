@@ -1,0 +1,15 @@
+{
+  "config": {},
+  "input": "package main\n\nimport \"fmt\"\n\ntype Foo struct { ID int }\n\nfunc (f *Foo) Bar() int { return f.ID }\n\nfunc main() { fmt.Println(\"hi\") }\n",
+  "input_sha256": "837b272f1604eaaadee6f9d33bff0b00d85204cc3ce8ae9c064964d8a432a611",
+  "output": {
+    "confidence": 0.9,
+    "content_type": "source_code",
+    "metadata": {
+      "language": "go",
+      "pattern_matches": 5
+    }
+  },
+  "recorded_at": "2026-04-28T06:39:34.961787+00:00",
+  "transform": "content_detector"
+}

@@ -1,0 +1,457 @@
+---
+title: Troubleshooting
+description: Solutions for common Headroom issues including proxy startup, connection errors, no token savings, high latency, and installation problems.
+---
+
+Solutions for common Headroom issues.
+
+## Proxy Server Issues
+
+### Proxy will not start
+
+**Symptom**: `headroom proxy` fails or hangs.
+
+```bash
+# Check if port is already in use
+lsof -i :8787
+
+# Try a different port
+headroom proxy --port 8788
+
+# Check for missing dependencies
+pip install "headroom-ai[proxy]"
+
+# Run with debug logging
+headroom proxy --log-level debug
+```
+
+### Connection refused when calling proxy
+
+**Symptom**: `curl: (7) Failed to connect to localhost port 8787`
+
+```bash
+# Verify proxy is running
+curl http://localhost:8787/health
+
+# Check if proxy started on a different port
+ps aux | grep headroom
+```
+
+### Proxy returns errors for some requests
+
+**Symptom**: Some requests work, others fail with 502/503.
+
+```bash
+# Check proxy logs for the actual error
+headroom proxy --log-level debug
+
+# Verify API key is set
+echo $OPENAI_API_KEY   # or ANTHROPIC_API_KEY
+
+# Test the underlying API directly
+curl https://api.openai.com/v1/models \
+  -H "Authorization: Bearer $OPENAI_API_KEY"
+```
+
+### Windows: ML content detection hangs or silently falls back
+
+**Symptom**: On Windows 11 24H2+, every proxied request stalls (historically
+`Optimization failed: TimeoutError`), or the first detection in each process
+burns ~5 seconds and compression quality drops because detection runs on the
+non-ML fallback tiers. The proxy log may show
+`magika ONNX session init timed out`.
+
+**Cause**: The Rust core loads ONNX Runtime dynamically. Without
+`ORT_DYLIB_PATH`, the bare Windows DLL search resolves `onnxruntime.dll` to
+`C:\Windows\System32\onnxruntime.dll` — the Windows ML OS component (1.17.x),
+which deadlocks ort session initialization instead of returning an error.
+
+**Fix**: Headroom pins `ORT_DYLIB_PATH` automatically at import time to the
+DLL inside the `onnxruntime` pip package (included in `headroom-ai[proxy]`).
+Confirm in the startup log:
+
+```
+Pinned ORT_DYLIB_PATH to bundled ONNX Runtime: ...\onnxruntime\capi\onnxruntime.dll
+```
+
+If the pin is skipped (library install without `onnxruntime`), either install
+it or point the variable at any modern ONNX Runtime yourself:
+
+```powershell
+pip install onnxruntime
+# or
+$env:ORT_DYLIB_PATH = "C:\path\to\onnxruntime.dll"
+```
+
+`HEADROOM_MAGIKA_INIT_TIMEOUT_SECS` (default `5`) bounds the init as a safety
+net; on timeout detection degrades to non-ML tiers for the process lifetime.
+
+## No Token Savings
+
+**Symptom**: `stats['session']['tokens_saved_total']` is 0.
+
+**Diagnosis**:
+
+```python
+stats = client.get_stats()
+print(f"Mode: {stats['config']['mode']}")          # Should be "optimize"
+print(f"SmartCrusher: {stats['transforms']['smart_crusher_enabled']}")
+```
+
+**Common causes**:
+
+- Mode is `audit` (observation only, no modifications)
+- Messages do not contain tool outputs
+- Tool outputs are below the 200-token threshold
+- Data is not compressible (high uniqueness, code, grep results)
+
+**Solutions**:
+
+<Tabs groupId="lang" items={['TypeScript', 'Python']}>
+<Tab value="TypeScript">
+```ts twoslash
+import { compress } from 'headroom-ai';
+
+// Ensure the proxy is running in optimize mode
+// (default, unless --no-optimize was passed)
+const result = await compress(messages, { model: 'gpt-4o' });
+console.log(`Saved: ${result.tokensSaved} tokens`);
+console.log(`Compressed: ${result.compressed}`);
+```
+</Tab>
+<Tab value="Python">
+```python
+# 1. Ensure mode is "optimize"
+client = HeadroomClient(
+    original_client=OpenAI(),
+    provider=OpenAIProvider(),
+    default_mode="optimize",  # NOT "audit"
+)
+
+# 2. Or override per-request
+response = client.chat.completions.create(
+    model="gpt-4o",
+    messages=messages,
+    headroom_mode="optimize",
+)
+
+# 3. Lower the compression threshold
+config = HeadroomConfig()
+config.smart_crusher.min_tokens_to_crush = 100  # Default is 200
+```
+</Tab>
+</Tabs>
+
+## Claude Code context window is larger through the proxy
+
+**Symptom**: After pointing Claude Code at Headroom (`ANTHROPIC_BASE_URL`), `/context all`
+shows **more** tokens used than a direct session — the "System tools" and "MCP tools"
+lines grow by tens of thousands of tokens, before you send any message.
+
+**Cause**: Claude Code normally defers most tool schemas behind its server-side
+**Tool Search Tool** (it sends only tool *names* and loads full schemas on demand).
+It enables this only when it believes it is talking directly to `api.anthropic.com`.
+The moment `ANTHROPIC_BASE_URL` is a custom host, Claude Code can't assume the endpoint
+supports the feature, so it falls back to **eagerly** materializing every tool schema
+into the local context window. This is a Claude Code client-side decision made before
+the request reaches the proxy — no proxy header can reverse it.
+
+**Solution**: set `ENABLE_TOOL_SEARCH` so Claude Code keeps deferring tools through the
+proxy. The proxy forwards the `tool_reference` blocks correctly, so deferral works
+end-to-end (both streaming and non-streaming, subscription and API-key auth).
+
+```bash
+# Easiest: `headroom wrap claude` sets ENABLE_TOOL_SEARCH=true automatically.
+headroom wrap claude
+
+# Choose the mode (true = always defer, the default; auto / auto:N = defer only
+# when tool definitions exceed N% of the budget; false = off):
+headroom wrap claude --tool-search auto
+
+# Running `claude` manually instead of via wrap? Set it yourself:
+ENABLE_TOOL_SEARCH=true ANTHROPIC_BASE_URL=http://localhost:8787 claude
+```
+
+**Verify (before / after)** with `/context all` in a fresh session, no messages sent:
+
+| Section | Eager (no `ENABLE_TOOL_SEARCH`) | Deferred (`ENABLE_TOOL_SEARCH=true`) |
+| --- | --- | --- |
+| System tools | fully materialized | deferred subset |
+| MCP tools | every tool shows a token cost | `(loaded on-demand)`, 0 tokens |
+
+When deferral is off, the proxy log also prints a one-time hint naming the fix.
+
+See [issue #746](https://github.com/chopratejas/headroom/issues/746) for the full analysis.
+
+## Compression Too Aggressive
+
+**Symptom**: LLM responses are missing information that was in tool outputs.
+
+```python
+# 1. Keep more items
+config = HeadroomConfig()
+config.smart_crusher.max_items_after_crush = 50  # Default: 15
+
+# 2. Skip compression for specific tools
+response = client.chat.completions.create(
+    model="gpt-4o",
+    messages=messages,
+    headroom_tool_profiles={
+        "important_tool": {"skip_compression": True},
+    },
+)
+
+# 3. Disable SmartCrusher entirely
+config.smart_crusher.enabled = False
+```
+
+## High Latency
+
+**Symptom**: Requests take longer than expected.
+
+**Diagnosis**:
+
+```python
+import time
+import logging
+
+logging.basicConfig(level=logging.DEBUG)
+
+start = time.time()
+response = client.chat.completions.create(...)
+print(f"Total time: {time.time() - start:.2f}s")
+```
+
+**Solutions**:
+
+```python
+# 1. Use BM25 instead of embeddings (faster)
+config = HeadroomConfig()
+config.smart_crusher.relevance.tier = "bm25"
+
+# 2. Increase threshold to skip small payloads
+config.smart_crusher.min_tokens_to_crush = 500
+
+# 3. Disable transforms you don't need
+config.cache_aligner.enabled = False
+config.rolling_window.enabled = False
+```
+
+## Installation Issues
+
+### pipx installs an older Headroom version
+
+**Symptom**: PyPI shows a newer `headroom-ai` release, but `pipx install` or
+`pipx upgrade` keeps an older version. A pinned install can also fail with
+`No matching distribution found`.
+
+**Cause**: `pipx` resolves packages inside its app virtual environment. If that
+environment uses a Python version that Headroom does not publish wheels for yet,
+pip may skip newer releases and choose the newest compatible build it can use.
+
+Check the interpreter:
+
+```bash
+pipx list
+```
+
+Install with a supported Python explicitly:
+
+```bash
+pipx install --python python3.13 "headroom-ai[all]"
+```
+
+For a pinned release:
+
+```bash
+pipx install --python python3.13 "headroom-ai[all]==0.21.4"
+```
+
+If you already have Headroom installed under `pipx`, uninstall it first or
+reinstall it with the supported interpreter.
+
+### pip install fails with C++ compilation error
+
+**Symptom**: `RuntimeError: Unsupported compiler -- at least C++11 support is needed!`
+
+```bash
+# Linux / Debian-based (including Docker)
+apt-get install -y build-essential && pip install headroom-ai
+
+# macOS (Xcode command line tools)
+xcode-select --install && pip install headroom-ai
+```
+
+For Docker, install and remove build tools in one layer:
+
+```dockerfile
+FROM python:3.11-slim
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential \
+    && pip install "headroom-ai[proxy]" \
+    && apt-get purge -y build-essential && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/*
+```
+
+### ModuleNotFoundError: No module named 'headroom'
+
+```bash
+# Check it is installed in the right environment
+pip show headroom-ai
+
+# If using virtual environment, ensure it is activated
+source venv/bin/activate
+
+# Reinstall
+pip install --upgrade headroom-ai
+```
+
+### Missing optional dependency
+
+```bash
+# For proxy server
+pip install "headroom-ai[proxy]"
+
+# For embedding-based relevance scoring
+pip install "headroom-ai[relevance]"
+
+# For code compression (tree-sitter)
+pip install "headroom-ai[code]"
+
+# For everything
+pip install "headroom-ai[all]"
+```
+
+## Provider-Specific Issues
+
+### OpenAI: Invalid API key
+
+```python
+import os
+from openai import OpenAI
+
+api_key = os.environ.get("OPENAI_API_KEY")
+if not api_key:
+    raise ValueError("OPENAI_API_KEY not set")
+
+client = HeadroomClient(
+    original_client=OpenAI(api_key=api_key),
+    provider=OpenAIProvider(),
+)
+```
+
+### Anthropic: Authentication error
+
+```python
+import os
+from anthropic import Anthropic
+
+api_key = os.environ.get("ANTHROPIC_API_KEY")
+client = HeadroomClient(
+    original_client=Anthropic(api_key=api_key),
+    provider=AnthropicProvider(),
+)
+```
+
+### Unknown model warnings
+
+```python
+# For custom/fine-tuned models, specify context limit
+client = HeadroomClient(
+    original_client=OpenAI(),
+    provider=OpenAIProvider(),
+    model_context_limits={
+        "ft:gpt-4o-2024-08-06:my-org::abc123": 128000,
+        "my-custom-model": 32000,
+    },
+)
+```
+
+## ValidationError on Setup
+
+```python
+result = client.validate_setup()
+print(result)
+
+# Common issues:
+# {"provider": {"ok": False, "error": "No API key"}}
+#   -> Set OPENAI_API_KEY or pass api_key to OpenAI()
+#
+# {"storage": {"ok": False, "error": "unable to open database"}}
+#   -> Check path permissions, use :memory: for testing
+#
+# {"config": {"ok": False, "error": "Invalid mode"}}
+#   -> Use "audit" or "optimize" only
+```
+
+For testing, use in-memory storage:
+
+```python
+client = HeadroomClient(
+    original_client=OpenAI(),
+    provider=OpenAIProvider(),
+    store_url="sqlite:///:memory:",
+)
+```
+
+## Debugging Techniques
+
+### Enable Full Logging
+
+```python
+import logging
+
+# See everything
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s %(name)s %(levelname)s %(message)s",
+)
+
+# Or just Headroom logs
+logging.getLogger("headroom").setLevel(logging.DEBUG)
+```
+
+### Use Simulation to Inspect Transforms
+
+```python
+plan = client.chat.completions.simulate(
+    model="gpt-4o",
+    messages=messages,
+)
+
+print(f"Tokens: {plan.tokens_before} -> {plan.tokens_after}")
+print(f"Transforms: {plan.transforms_applied}")
+print(f"Waste signals: {plan.waste_signals}")
+
+import json
+print(json.dumps(plan.messages_optimized, indent=2))
+```
+
+### Test Transforms Directly
+
+```python
+from headroom import SmartCrusher, Tokenizer
+from headroom.config import SmartCrusherConfig
+import json
+
+config = SmartCrusherConfig()
+crusher = SmartCrusher(config)
+tokenizer = Tokenizer()
+
+messages = [
+    {
+        "role": "tool",
+        "content": json.dumps({"items": list(range(100))}),
+        "tool_call_id": "1",
+    }
+]
+
+result = crusher.apply(messages, tokenizer)
+print(f"Tokens: {result.tokens_before} -> {result.tokens_after}")
+```
+
+## Getting Help
+
+1. Enable debug logging and check the output
+2. Use `simulate()` to see what transforms would apply
+3. Run `validate_setup()` for configuration issues
+4. File an issue at [github.com/chopratejas/headroom](https://github.com/chopratejas/headroom/issues) with your Headroom version, Python version, provider, debug log output, and minimal reproduction code

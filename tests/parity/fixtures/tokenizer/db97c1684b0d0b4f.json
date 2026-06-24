@@ -1,0 +1,8 @@
+{
+  "config": {},
+  "input": "Lorem ipsum dolor sit amet, consectetur adipiscing elit.\n[[variant 1]]",
+  "input_sha256": "db97c1684b0d0b4fd1f342888e6a2cc8916a05555ce7ab7792f5951390d348fa",
+  "output": 15,
+  "recorded_at": "2026-04-23T23:51:37.615100+00:00",
+  "transform": "tokenizer"
+}

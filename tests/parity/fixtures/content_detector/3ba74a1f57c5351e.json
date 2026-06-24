@@ -1,0 +1,12 @@
+{
+  "config": {},
+  "input": "<div>a</div>\n<span>b</span>\n<script>x()</script>\n<style>y</style>",
+  "input_sha256": "3ba74a1f57c5351ecb47efcfff73080bc3f96a75589b459e20424fe0c715be39",
+  "output": {
+    "confidence": 0.5,
+    "content_type": "text",
+    "metadata": {}
+  },
+  "recorded_at": "2026-04-28T06:39:34.960293+00:00",
+  "transform": "content_detector"
+}

@@ -1,0 +1,143 @@
+---
+title: Limitations
+description: When Headroom helps, when it does not, and what to watch out for. Honest documentation of compression constraints and safety gates.
+---
+
+Headroom is designed to compress LLM context without losing accuracy. This page documents when it helps, when it does not, and the safety gates that prevent harmful compression.
+
+## When Headroom Helps vs. Does Not
+
+| Content Type | Compression | Latency Impact | Best For |
+|---|---|---|---|
+| **JSON: Arrays of dicts** (search results, API responses, DB rows) | 86--100% | Net latency win on Sonnet/Opus | Primary use case |
+| **JSON: Arrays of strings** (file paths, log lines, tags) | 60--90% | Net latency win | String dedup + sampling |
+| **JSON: Arrays of numbers** (metrics, time series) | 70--85% | Net latency win | Statistical summary |
+| **JSON: Mixed-type arrays** | 50--70% | Net latency win | Group-by-type compression |
+| **Structured logs** (as JSON) | 82--95% | Net latency win | Log entries in tool outputs |
+| **Agentic conversations** (25--50 turns) | 56--81% | Break-even to net win | Multi-tool agent sessions |
+| **Plain text** (documentation, articles) | 43--46% | Adds latency (cost savings only) | Cost optimization |
+| **Code** | Passthrough | Minimal overhead | See below |
+| **RAG document contexts** | Passthrough | Minimal overhead | Not compressed |
+
+### Where Headroom Adds the Most Value
+
+- Long agent sessions with accumulated tool outputs (40--80% compression)
+- JSON-heavy workflows -- API responses, database queries (83--94% compression)
+- Build and test output (85--94% compression)
+- Multi-tool agents (60--76% compression across tool results)
+
+### Where Headroom Adds Little Value
+
+- Short conversational exchanges (median 4.8% compression)
+- Code-only sessions (reading/writing files) -- code passes through
+- Single-turn requests with no accumulated context
+
+## What Headroom Does NOT Compress
+
+- **Short messages** (< 300 tokens) -- overhead exceeds savings
+- **Source code** -- passes through unchanged to preserve correctness
+- **grep/search results** -- compact structured format, already minimal
+- **Images** -- counted at fixed token cost (~1,600 tokens), not compressed
+- **System prompts** -- preserved for prefix cache compatibility
+
+## Code Compression
+
+Headroom includes an AST-aware CodeCompressor (tree-sitter, 8 languages) but it is gated behind safety protections that prevent it from firing in most real-world scenarios. This is intentional.
+
+**Why code mostly passes through:**
+
+1. **Word count gate**: Content under 50 words is silently skipped
+2. **Recent code protection** (`protect_recent_code=4`): Code in the last 4 messages is never compressed
+3. **Analysis intent protection** (`protect_analysis_context=True`): If the most recent user message contains keywords like "analyze", "review", "explain", "fix", "debug" -- ALL code in the conversation is protected
+
+**Why this is the right default**: Code is almost always fetched because the user wants to work with it. Compressing function bodies would remove exactly what they need.
+
+**Where code savings come from**: The IntelligentContextManager drops old code messages that are no longer relevant (scoring-based), which is a better strategy than stripping function bodies.
+
+**Override**: Set `protect_analysis_context=False` in `ContentRouterConfig` for aggressive code compression. Requires `headroom-ai[code]` for tree-sitter.
+
+## JSON Compression Constraints
+
+### What Gets Compressed
+
+- Arrays of **dicts**: Full statistical analysis with adaptive K (Kneedle algorithm)
+- Arrays of **strings**: Dedup + adaptive sampling + error preservation
+- Arrays of **numbers**: Statistical summary + outlier/change-point preservation
+- **Mixed-type** arrays: Grouped by type, each group compressed independently
+- **Nested** objects: Recursed into, arrays within are compressed (up to depth 5)
+
+### What Passes Through
+
+- Arrays below 5 items (`min_items_to_analyze`)
+- Content below 200 tokens (`min_tokens_to_crush`)
+- Bool-only arrays
+- JSON objects without array values
+- Malformed JSON (silently passes through, no error)
+
+### Edge Cases
+
+- **NaN/Infinity** in numeric fields: Filtered out before statistics are computed
+- **Nesting depth > 5**: Inner arrays not examined for compression
+- **Mixed-type arrays with small groups**: Groups below `min_items_to_analyze` are kept as-is
+
+## Safety Gates
+
+All compressors follow the same principle: **fail gracefully, return original content unchanged**.
+
+- Invalid JSON passes through (no error raised)
+- AST parse failure falls back to original or LLMLingua
+- Compression that makes output larger returns the original
+- Missing optional dependencies (tree-sitter, LLMLingua) cause a passthrough with warning log
+- Errors are logged at WARNING level and never propagated to callers
+
+<Callout type="info" title="One exception">
+LLMLingua out-of-memory during model loading raises a `RuntimeError`. All other failures are silently handled.
+</Callout>
+
+## Adaptive K: How Item Retention Works
+
+SmartCrusher does not use fixed K values. It uses information-theoretic sizing:
+
+1. **Kneedle algorithm** on bigram coverage curves finds the point where adding more items stops providing new information
+2. **SimHash** fingerprinting detects near-duplicate items
+3. **zlib validation** ensures the subset captures the full set's diversity
+
+The resulting K is split: 30% from array start, 15% from end, 55% for importance-scored items.
+
+**Safety guarantees (additive, never dropped):**
+
+- Error items (containing "error", "exception", "failed", "critical") -- across ALL array types
+- Numeric anomalies (> 2 standard deviations from mean)
+- String length anomalies (> 2 standard deviations from mean length)
+- Change points (sudden shifts in running values)
+
+These are kept even if they exceed the K budget.
+
+## Configuration Tuning
+
+| Parameter | Default | Effect |
+|---|---|---|
+| `min_items_to_analyze` | 5 | Arrays below this pass through |
+| `min_tokens_to_crush` | 200 | Content below this passes through |
+| `max_items_after_crush` | 15 | Upper bound on retained items |
+| `variance_threshold` | 2.0 | Std devs for anomaly detection (lower = more preserved) |
+| `protect_analysis_context` | True | Protect code when user asks about it |
+| `protect_recent_code` | 4 | Messages from end to protect code in |
+| `skip_user_messages` | True | Never compress user messages |
+| `toin_confidence_threshold` | 0.3 | Minimum TOIN confidence to apply hints |
+
+## Provider Interactions
+
+- CacheAligner maximizes Anthropic/OpenAI prefix cache hit rates
+- Token counting uses model-specific tokenizers (tiktoken for OpenAI, calibrated estimation for Anthropic)
+- Compression works with all providers -- no provider-specific limitations
+- Compressed content is valid JSON -- downstream tools and parsers work unchanged
+
+## TOIN Cold Start
+
+The Tool Output Intelligence Network (TOIN) learns compression patterns from usage. For new tool types:
+
+- No learned patterns exist -- falls back to statistical heuristics
+- Confidence below `toin_confidence_threshold` (default 0.3) -- TOIN hints ignored
+- Patterns build up over time as tools are used repeatedly
+- Cross-session learning requires persistence (`TelemetryConfig.storage_path`)

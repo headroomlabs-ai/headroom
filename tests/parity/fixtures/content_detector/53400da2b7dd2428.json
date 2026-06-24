@@ -1,0 +1,15 @@
+{
+  "config": {},
+  "input": "import x from 'y';\nexport const foo = 1;\nfunction bar() { return 42; }\nconst f = async function() {};\nmodule.exports = { foo, bar };\n",
+  "input_sha256": "53400da2b7dd2428c8146088e60779a8d61c2430a2c7c95a6d2b07e83b9b726e",
+  "output": {
+    "confidence": 0.9,
+    "content_type": "source_code",
+    "metadata": {
+      "language": "javascript",
+      "pattern_matches": 5
+    }
+  },
+  "recorded_at": "2026-04-28T06:39:34.961426+00:00",
+  "transform": "content_detector"
+}

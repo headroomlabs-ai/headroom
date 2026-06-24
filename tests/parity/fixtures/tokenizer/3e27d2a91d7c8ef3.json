@@ -1,0 +1,8 @@
+{
+  "config": {},
+  "input": "\ud83d\ude80 unicode \u2728 emoji \u4e2d\u6587 \u0440\u0443\u0441\u0441\u043a\u0438\u0439\n[[variant 1]]",
+  "input_sha256": "3e27d2a91d7c8ef3f140f4a7beedf90e875cdb61e223516b17bf78d3e1b671dc",
+  "output": 14,
+  "recorded_at": "2026-04-23T23:51:37.616864+00:00",
+  "transform": "tokenizer"
+}

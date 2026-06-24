@@ -1,0 +1,430 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "headroom-ai"
+version = "0.27.0"
+description = "The Context Optimization Layer for LLM Applications - Cut costs by 50-90%"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+authors = [
+    { name = "Headroom Contributors" }
+]
+maintainers = [
+    { name = "Headroom Contributors" }
+]
+keywords = [
+    "llm",
+    "openai",
+    "anthropic",
+    "claude",
+    "gpt",
+    "context",
+    "token",
+    "optimization",
+    "compression",
+    "caching",
+    "proxy",
+    "ai",
+    "machine-learning",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+dependencies = [
+    # Core: lightweight compression (SmartCrusher, ContentRouter, CCR, TOIN)
+    "tiktoken>=0.5.0",            # Tokenizer for all compressors
+    "pydantic>=2.0.0",            # Config and data models
+    # litellm's own metadata pins requires-python <3.14, and headroom only uses it for
+    # model registry / pricing / non-core providers — all lazily imported and
+    # ImportError-guarded. Marking it 3.14-optional lets headroom install on Python 3.14
+    # (core compression + the Anthropic proxy path never import litellm). See GH #956.
+    "litellm>=1.86.2,<2.0; python_version < '3.14'",  # model registry, pricing, providers (lazy)
+    "click>=8.1.0",               # CLI framework
+    "rich>=13.0.0",               # Rich terminal output
+    "opentelemetry-api>=1.24.0",  # Safe no-op OTEL API for instrumentation
+    "ast-grep-cli>=0.30.0",       # AST-aware code slicing (CodeCompressor); binary wheel
+    "tomli>=2.0.0; python_version < '3.11'",  # tomllib backport for helper scripts
+]
+
+[project.optional-dependencies]
+# Proxy server (most common install: pip install headroom-ai[proxy])
+proxy = [
+    "fastapi>=0.100.0",
+    "uvicorn>=0.23.0,<1.0",
+    "httpx[http2]>=0.24.0",
+    "openai>=2.14.0",             # OpenAI API format support
+    "mcp>=1.0.0",                 # MCP server (headroom_compress, retrieve, stats)
+    "magika>=0.6.0",              # ML content detection for ContentRouter
+    "zstandard>=0.20.0",          # Decompress zstd request bodies (Codex, etc.)
+    "websockets>=13.0",           # WebSocket proxy for /v1/responses (Codex gpt-5.4+)
+    "onnxruntime>=1.16.0",        # Kompress ONNX INT8 text compression (no torch needed)
+    "transformers>=4.30.0,<6.0",  # Tokenizer only (for Kompress)
+    "watchdog>=4.0.0",            # File watcher for live code graph reindexing (--code-graph)
+    "sqlite-vec>=0.1.6",          # Vector index for memory (--memory). Lightweight, no torch.
+]
+# Production ASGI/WSGI server — Unix-only (gunicorn does not support Windows).
+# Kept separate from [proxy] so that dev, CI, and Windows users are not forced
+# to install a non-functional package.  Production deployments should use:
+#   pip install headroom-ai[proxy,proxy-prod]
+proxy-prod = [
+    "headroom-ai[proxy]",
+    "gunicorn>=21.0.0; sys_platform != 'win32'",
+]
+# AST-based code compression (tree-sitter)
+# NOTE: cap below 1.0. tree-sitter-language-pack 1.x is a breaking rewrite whose
+# get_language()/get_parser() return the pack's own binding types instead of
+# standalone tree_sitter.Language/Parser, so _get_parser() in
+# transforms/code_compressor.py fails and code compression silently no-ops.
+# The 0.x line (>=0.10,<1.0) returns standalone tree_sitter objects as expected.
+code = [
+    "tree-sitter-language-pack>=0.10.0,<1.0",
+    "tree-sitter>=0.25.2,<0.26",
+]
+# ML-based compression with Kompress (ModernBERT).
+# (The legacy [llmlingua] extra was removed in 0.9.x — no live code path used it.
+# Use [ml] for the supported ML compression dependencies.)
+ml = [
+    "torch>=2.0.0",
+    "transformers>=4.30.0,<6.0",
+    # transformers >= 5.x requires huggingface-hub >= 1.5.0,<2.0; pinning
+    # the floor here prevents Kompress from silently falling back to
+    # "unavailable" when a sibling install (e.g. `pip install
+    # strands-agents`) drags huggingface-hub backwards.
+    "huggingface-hub>=1.5.0,<2.0",
+]
+# Memory system (hierarchical memory with vector search)
+memory = [
+    "hnswlib>=0.8.0",
+    "sqlite-vec>=0.1.6",
+    "sentence-transformers>=2.2.0,<6.0",
+]
+# Qdrant + Neo4j memory backend helpers
+memory-stack = [
+    "mem0ai>=1.0.0,<2.0",
+    "qdrant-client>=1.9.0,<2.0",
+    "neo4j>=5.20.0,<7.0",
+]
+# Apple-Silicon GPU (MPS) offload for the memory embedder. Opt in at runtime with
+# HEADROOM_EMBEDDER_RUNTIME=pytorch_mps. macOS-only; intentionally excluded from [all].
+pytorch-mps = [
+    "torch>=2.0.0; sys_platform == 'darwin'",
+    "sentence-transformers>=2.2.0; sys_platform == 'darwin'",
+]
+# Semantic relevance scoring with embeddings.
+# Uses `fastembed` (BAAI/bge-small-en-v1.5 by default — 33M params,
+# 384 dims, ~30 MB int8-quantized ONNX). Same library + model used by
+# the Rust SmartCrusher (`fastembed` crate), giving byte-equal embeddings
+# across the language boundary. Replaced sentence-transformers in
+# Stage 3c.1 — fastembed is faster (~2-3x), smaller (no torch
+# dependency), and outranks all-MiniLM-L6-v2 on MTEB by ~6 points.
+relevance = [
+    "fastembed>=0.4.0",
+    "numpy>=1.24.0",
+]
+# Image compression (ML-based routing + OCR)
+#
+# OCR backend uses ONNX Runtime regardless of Python version. The
+# rapidocr ecosystem split into two flavors after 1.4.x:
+#   * rapidocr-onnxruntime 1.4.x — bundled-ORT package, capped at
+#     Python <3.13 by its requires-python metadata. Drop-in for our
+#     existing v1 tuple-shaped API call.
+#   * rapidocr 3.x — engine-agnostic core, supports Python 3.13+.
+#     Returns a RapidOCROutput dataclass (txts, scores, boxes, ...).
+#     Needs `onnxruntime` installed separately to use the ORT backend.
+#
+# `headroom/image/compressor.py` adapts both API shapes at runtime via
+# a try/except cascade. See issue #372 for context.
+image = [
+    "pillow>=10.0.0",
+    "sentencepiece>=0.1.99",  # Required by SigLIP tokenizer (SiglipTokenizer)
+    # Python 3.6–3.12: keep the proven ORT-bundled package directly.
+    # ~15 MB ONNX models auto-downloaded on first use.
+    "rapidocr-onnxruntime>=1.4.0,<2; python_version<'3.13'",
+    # Python 3.13+: rapidocr-onnxruntime is unavailable (its wheels
+    # declare requires-python<3.13). Use the successor `rapidocr` 3.x
+    # core + `onnxruntime` engine; same ORT backend, just split into
+    # two packages. Total install size and inference speed unchanged.
+    "rapidocr>=3.0,<4; python_version>='3.13'",
+    "onnxruntime>=1.7,<2; python_version>='3.13'",
+]
+# Report generation
+reports = [
+    "jinja2>=3.0.0",
+]
+# Binary spreadsheet ingestion (.xlsx / .xls -> tabular text)
+spreadsheet = [
+    "openpyxl>=3.1.0",      # .xlsx
+    "xlrd>=2.0.1",          # legacy .xls
+]
+# OpenTelemetry metrics export
+otel = [
+    "opentelemetry-sdk>=1.24.0",
+    "opentelemetry-exporter-otlp-proto-http>=1.24.0",
+]
+# any-llm multi-provider backend (requires Python 3.11+)
+anyllm = [
+    "any-llm-sdk>=1.0.0; python_version >= '3.11'",
+]
+# LangChain integration
+langchain = [
+    "langchain-core>=1.3.3,<4.0",
+    "langchain-openai>=1.1.14,<2.0",
+]
+# Agno agent framework integration
+agno = [
+    "agno>=1.0.0",
+]
+# AWS Strands Agents SDK integration
+strands = [
+    "strands-agents>=0.1.0",
+]
+# MCP server for Claude Code integration
+mcp = [
+    "mcp>=1.0.0",
+    "httpx>=0.24.0",
+]
+# Voice filler detection
+voice = [
+    "onnxruntime>=1.16.0",
+    "transformers>=4.30.0,<6.0",
+    "torch>=2.0.0",
+]
+# Voice training (includes voice deps + training extras)
+voice-train = [
+    "headroom-ai[voice]",
+    "datasets>=2.14.0",
+    "accelerate>=0.20.0",
+]
+# Evaluation framework
+evals = [
+    "datasets>=2.14.0",
+    "sentence-transformers>=2.2.0,<6.0",
+    "numpy>=1.24.0",
+    "scikit-learn>=1.3.0",
+    "anthropic>=0.18.0",
+    "openai>=1.0.0",
+]
+# AWS Bedrock backend
+bedrock = [
+    "boto3>=1.28.0",
+]
+# HTML content extraction
+html = [
+    "trafilatura>=1.6.0",
+]
+# Comprehensive LLM benchmarks
+benchmark = [
+    "lm-eval[api]>=0.4.0",
+    "openai>=1.0.0",
+    "anthropic>=0.18.0",
+]
+# Development dependencies
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "pytest-asyncio>=0.21.0",
+    "ruff>=0.1.0",
+    "mypy>=1.0.0",
+    "pre-commit>=3.0.0",
+    "openai>=1.0.0",
+    "anthropic>=0.18.0",
+    "litellm>=1.86.2,<2.0; python_version < '3.14'",  # see core deps note (GH #956)
+    "fastapi>=0.100.0",
+    "uvicorn>=0.23.0,<1.0",
+    "httpx[http2]>=0.24.0",
+    "websockets>=13.0",
+    "opentelemetry-sdk>=1.24.0",
+    "opentelemetry-exporter-otlp-proto-http>=1.24.0",
+    "ollama>=0.4.0",
+    "langchain-ollama>=0.2.0",
+    "hnswlib>=0.8.0",
+    "sqlite-vec>=0.1.6",
+    "sentence-transformers>=2.2.0,<6.0",
+    "numpy>=1.24.0",
+    "openpyxl>=3.1.0",  # exercises spreadsheet_ingest (.xlsx) in the test suite
+]
+# All optional dependencies (everything you need)
+all = [
+    "headroom-ai[proxy,code,ml,memory,relevance,image,reports,otel,evals,voice,html,benchmark,mcp,spreadsheet]",
+]
+
+[project.scripts]
+headroom = "headroom.cli:main"
+
+[project.urls]
+Homepage = "https://headroom-docs.vercel.app"
+Documentation = "https://headroom-docs.vercel.app/docs"
+Repository = "https://github.com/chopratejas/headroom"
+Issues = "https://github.com/chopratejas/headroom/issues"
+Changelog = "https://github.com/chopratejas/headroom/blob/main/CHANGELOG.md"
+# llms.txt convention (llmstxt.org) — point AI agents / LLM crawlers
+# at the auto-generated docs index so they can resolve install paths
+# and entry points without a follow-up fetch.
+"AI / LLM Index" = "https://headroom-docs.vercel.app/llms.txt"
+
+# Maturin builds a single wheel containing both the Python source under
+# `headroom/` AND the compiled Rust extension `headroom/_core.so` (cdylib
+# from `crates/headroom-py`). One `pip install headroom-ai` ships everything
+# atomically — no separate `headroom-core-py` package, no chicken-and-egg,
+# no PIP_FIND_LINKS plumbing. Phase A0's runtime fail-loud check still
+# exists but only fires if someone forces an sdist install on a platform
+# without a wheel and the rust toolchain isn't available to compile it.
+# Pin the project's package index to public PyPI. Without this, `uv lock`
+# inherits the developer's user-level `~/.config/uv/uv.toml` index
+# setting — including private/internal mirrors like
+# `pypi.netflix.net/simple` — and bakes those URLs into uv.lock, which
+# then breaks CI on every public runner that can't reach the mirror.
+# Declaring the index in pyproject.toml makes the project authoritative
+# regardless of who runs `uv lock`.
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple/"
+default = true
+
+[tool.maturin]
+# Where the Python package lives. With `python-source = "."` and the
+# package directory `headroom/` at repo root, maturin includes every file
+# under `headroom/` in the wheel — that picks up the dashboard HTML
+# templates and bundled YAML configs. `LICENSE` and `NOTICE` are listed
+# explicitly because maturin sdists do not get the package-directory
+# treatment wheels do, and PEP 639 auto-discovery emits both files into
+# `License-File:` metadata — PyPI rejects sdists whose declared license
+# files are missing from the tarball with `400 License-File X does not
+# exist in distribution file`.
+include = [
+    { path = "LICENSE", format = "sdist" },
+    { path = "NOTICE", format = "sdist" },
+]
+python-source = "."
+module-name = "headroom._core"
+# The cdylib source lives under `crates/headroom-py`. Maturin invokes
+# `cargo build` with this manifest to produce `_core.cdylib`, then injects
+# the resulting `.so` into the wheel at `headroom/_core.so`.
+manifest-path = "crates/headroom-py/Cargo.toml"
+features = ["extension-module"]
+# Forbid building without the cdylib feature — bare `cargo build` won't
+# produce a usable Python extension. Maturin's default `bindings` is "pyo3"
+# which is correct here (see `crates/headroom-py/src/`).
+bindings = "pyo3"
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "UP",  # pyupgrade
+]
+ignore = [
+    "E501",  # line too long (handled by formatter)
+    "B008",  # do not perform function calls in argument defaults
+    "B905",  # zip without strict parameter
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["headroom"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+ignore_missing_imports = true
+
+# Per-module overrides for modules with dynamic typing patterns
+[[tool.mypy.overrides]]
+module = [
+    "headroom.proxy.server",
+    "headroom.proxy.cost",
+    "headroom.proxy.prometheus_metrics",
+    "headroom.proxy.semantic_cache",
+    "headroom.proxy.rate_limiter",
+    "headroom.proxy.request_logger",
+    "headroom.proxy.helpers",
+    "headroom.integrations.langchain",
+    "headroom.integrations.mcp",
+    "headroom.ccr.mcp_server",
+    "headroom.relevance.embedding",
+    "headroom.reporting.generator",
+]
+disallow_untyped_defs = false
+
+[[tool.mypy.overrides]]
+module = [
+    "headroom.tokenizers.*",
+    "headroom.providers.litellm",
+    "headroom.providers.google",
+]
+disallow_untyped_defs = false
+warn_return_any = false
+
+# Handler mixins use self.* from HeadroomProxy via duck typing — mypy can't resolve these
+[[tool.mypy.overrides]]
+module = ["headroom.proxy.handlers.*"]
+disallow_untyped_defs = false
+ignore_errors = true
+
+# Ignore third-party stubs with syntax errors
+[[tool.mypy.overrides]]
+module = ["mlx.*"]
+ignore_errors = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
+asyncio_mode = "auto"
+filterwarnings = [
+    # pyo3 Unsendable parsers emit an unraisable warning when GC drops them on a
+    # test-teardown thread; this is a test-harness artifact, not a production issue
+    # (production threads are long-lived and drop their parsers on themselves).
+    "ignore::pytest.PytestUnraisableExceptionWarning",
+]
+markers = [
+    "slow: slow tests (model loads, large fixtures)",
+    "real_llm: tests that hit real LLM APIs; skipped unless explicitly enabled",
+    "live: opt-in multi-turn tests that hit real upstream APIs; require provider keys",
+]
+
+[tool.coverage.run]
+source = ["headroom"]
+branch = true
+omit = [
+    "headroom/cli.py",
+    "*/tests/*",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+]

@@ -1,0 +1,26 @@
+{
+  "config": {
+    "always_keep_additions": true,
+    "always_keep_deletions": true,
+    "enable_ccr": true,
+    "max_context_lines": 2,
+    "max_files": 20,
+    "max_hunks_per_file": 10,
+    "min_lines_for_ccr": 50
+  },
+  "input": "commit abc1234567890abcdef\nAuthor: Test <t@example.com>\nDate:   Mon Apr 25 12:00:00 2026\n\n    Refactor: rename and modify auth module\n\ndiff --git a/auth/old_handler.py b/auth/new_handler.py\nsimilarity index 92%\nrename from auth/old_handler.py\nrename to auth/new_handler.py\n--- a/auth/old_handler.py\n+++ b/auth/new_handler.py\n@@ -1,8 +1,8 @@\n import os\n import sys\n-from auth import legacy\n+from auth import modern\n\n def authenticate(user):\n     return user.is_valid()\n\n# bugfix:pre-diff-content",
+  "input_sha256": "88b4d4a7e93014e5331d9b5365e6fc98486ee6f1a2514f0f9d28e854480ff11f",
+  "output": {
+    "additions": 0,
+    "cache_key": null,
+    "compressed": "commit abc1234567890abcdef\nAuthor: Test <t@example.com>\nDate:   Mon Apr 25 12:00:00 2026\n\n    Refactor: rename and modify auth module\n\ndiff --git a/auth/old_handler.py b/auth/new_handler.py\nsimilarity index 92%\nrename from auth/old_handler.py\nrename to auth/new_handler.py\n--- a/auth/old_handler.py\n+++ b/auth/new_handler.py\n@@ -1,8 +1,8 @@\n import os\n import sys\n-from auth import legacy\n+from auth import modern\n\n def authenticate(user):\n     return user.is_valid()\n\n# bugfix:pre-diff-content",
+    "compressed_line_count": 22,
+    "deletions": 0,
+    "files_affected": 0,
+    "hunks_kept": 0,
+    "hunks_removed": 0,
+    "original_line_count": 22
+  },
+  "recorded_at": "2026-04-25T23:19:00.820283+00:00",
+  "transform": "diff_compressor"
+}

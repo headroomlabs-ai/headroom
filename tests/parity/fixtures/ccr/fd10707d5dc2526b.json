@@ -1,0 +1,44 @@
+{
+  "config": {},
+  "input": [
+    {
+      "description": "desc 9",
+      "name": "other_tool_9"
+    }
+  ],
+  "input_sha256": "fd10707d5dc2526ba85fc276a771f799bccbd3fe1d81aab1208aee8a2cf14411",
+  "output": [
+    [
+      {
+        "description": "desc 9",
+        "name": "other_tool_9"
+      },
+      {
+        "function": {
+          "description": "Retrieve original uncompressed content that was compressed to save tokens. Use this when you need more data than what's shown in compressed tool results. The hash is provided in compression markers like [N items compressed... hash=abc123].",
+          "name": "headroom_retrieve",
+          "parameters": {
+            "properties": {
+              "hash": {
+                "description": "Hash key from the compression marker (e.g., 'abc123' from hash=abc123)",
+                "type": "string"
+              },
+              "query": {
+                "description": "Optional search query to filter results. If provided, only returns items matching the query. If omitted, returns all original items.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "hash"
+            ],
+            "type": "object"
+          }
+        },
+        "type": "function"
+      }
+    ],
+    true
+  ],
+  "recorded_at": "2026-04-23T23:51:37.803338+00:00",
+  "transform": "ccr"
+}

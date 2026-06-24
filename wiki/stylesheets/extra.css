@@ -1,0 +1,103 @@
+/* Headroom docs custom styles */
+
+/* Hero section on landing page */
+.md-typeset .hero {
+  text-align: center;
+  padding: 2rem 0 1rem;
+}
+
+.md-typeset .hero h1 {
+  font-size: 2.5rem;
+  font-weight: 700;
+  margin-bottom: 0.5rem;
+}
+
+.md-typeset .hero .tagline {
+  font-size: 1.25rem;
+  color: var(--md-default-fg-color--light);
+  margin-bottom: 1.5rem;
+}
+
+/* Feature grid on landing page */
+.grid-container {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 1rem;
+  margin: 1.5rem 0;
+}
+
+.grid-item {
+  border: 1px solid var(--md-default-fg-color--lightest);
+  border-radius: 0.5rem;
+  padding: 1.25rem;
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+
+.grid-item:hover {
+  border-color: var(--md-accent-fg-color);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+}
+
+.grid-item h3 {
+  margin-top: 0 !important;
+  font-size: 1rem;
+}
+
+.grid-item p {
+  font-size: 0.85rem;
+  color: var(--md-default-fg-color--light);
+  margin-bottom: 0;
+}
+
+/* Tighter code blocks */
+.md-typeset pre > code {
+  font-size: 0.8rem;
+}
+
+/* Stats bar */
+.stats-bar {
+  display: flex;
+  justify-content: center;
+  gap: 3rem;
+  padding: 1rem 0;
+  flex-wrap: wrap;
+}
+
+.stat {
+  text-align: center;
+}
+
+.stat .number {
+  display: block;
+  font-size: 2rem;
+  font-weight: 700;
+  color: var(--md-primary-fg-color);
+}
+
+.stat .label {
+  font-size: 0.8rem;
+  color: var(--md-default-fg-color--light);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+/* Badge row */
+.badges {
+  text-align: center;
+  margin-bottom: 1.5rem;
+}
+
+.badges img {
+  margin: 0 0.15rem;
+}
+
+/* Better admonition for "how it works" */
+.md-typeset .admonition.pipeline,
+.md-typeset details.pipeline {
+  border-color: var(--md-accent-fg-color);
+}
+
+/* Hide title on home page (we use hero instead) */
+.md-typeset h1:first-child {
+  /* keep visible but reduce gap */
+}

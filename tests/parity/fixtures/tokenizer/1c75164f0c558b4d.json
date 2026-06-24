@@ -1,0 +1,8 @@
+{
+  "config": {},
+  "input": "The quick brown fox jumps over the lazy dog.\n[[variant 1]]",
+  "input_sha256": "1c75164f0c558b4dd9b7209d97562eea5033e160d6eda10509b90ba5362bc899",
+  "output": 15,
+  "recorded_at": "2026-04-23T23:51:37.614605+00:00",
+  "transform": "tokenizer"
+}

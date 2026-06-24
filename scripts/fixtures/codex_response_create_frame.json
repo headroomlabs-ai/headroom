@@ -1,0 +1,52 @@
+{
+  "type": "response.create",
+  "response": {
+    "model": "gpt-5.3-codex",
+    "stream": true,
+    "store": false,
+    "parallel_tool_calls": true,
+    "tools": [],
+    "input": [
+      {
+        "type": "message",
+        "role": "system",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "You are Codex, a proxy-aware coding agent. The upstream connection is a WebSocket proxied through a local Headroom process. Keep responses incremental and stream-friendly; the proxy compresses large tool outputs on the way back and expects well-formed response.created / response.output_text.delta / response.completed envelopes."
+          }
+        ]
+      },
+      {
+        "type": "message",
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "We're reproducing a reconnect storm against the local proxy at 127.0.0.1:8787. Open a WebSocket session, send one response.create frame, and stay connected. The goal is not to generate useful output — it's to make sure the proxy's WS lifecycle (accept, upstream connect, relay-task wiring, registry register/deregister) survives N concurrent sessions plus a parallel burst of large /v1/messages POSTs without /livez going dark. Do not expect a real model response; upstream auth will fail and the proxy should gracefully close. Just hold the slot for the storm duration."
+          }
+        ]
+      },
+      {
+        "type": "message",
+        "role": "assistant",
+        "content": [
+          {
+            "type": "output_text",
+            "text": "Acknowledged. I'll keep this session open, avoid generating extra frames, and let the harness measure /livez latency and registry drain time. If the upstream closes with an auth error I'll expect a clean response.completed or error frame from the proxy, not a dangling task."
+          }
+        ]
+      },
+      {
+        "type": "message",
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "Confirm the session. No further work required — the harness is driving."
+          }
+        ]
+      }
+    ]
+  }
+}

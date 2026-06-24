@@ -1,0 +1,16 @@
+{
+  "config": {},
+  "input": "============================= test session starts ==============================\ntests/test_0.py::test_case PASSED\ntests/test_1.py::test_case PASSED\ntests/test_2.py::test_case PASSED\ntests/test_3.py::test_case PASSED\ntests/test_4.py::test_case PASSED\nFAILED tests/test_5.py::test_bad\nTraceback (most recent call last)\n",
+  "input_sha256": "71d648a39e151a72411fe014b2e0820abc922609752d74798d26bf6c99fd2168",
+  "output": {
+    "confidence": 0.5375,
+    "content_type": "build",
+    "metadata": {
+      "error_matches": 1,
+      "pattern_matches": 3,
+      "total_lines": 8
+    }
+  },
+  "recorded_at": "2026-04-28T06:39:34.960922+00:00",
+  "transform": "content_detector"
+}

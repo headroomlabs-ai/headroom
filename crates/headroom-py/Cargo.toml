@@ -1,0 +1,38 @@
+[package]
+name = "headroom-py"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "PyO3 bindings exposing headroom-core to Python as headroom._core."
+# Issue #355: build.rs compiles a glibc-2.38-compat shim
+# (glibc_compat.c) on Linux/glibc only. Without `build = "build.rs"`
+# Cargo skips it. See the script's header comment for rationale.
+build = "build.rs"
+
+[build-dependencies]
+# Compile the C shim into a static library that links into _core.so.
+# `cc` is already transitively in our build graph (used by aws-lc-rs,
+# zstd-sys, ring, etc) so this is not a new cold dep.
+cc = "1"
+
+[lib]
+name = "_core"
+crate-type = ["cdylib"]
+# Disable the default test harness — Rust `cargo test` can't run a cdylib that
+# links against libpython without LD/DYLD setup. Tests for this crate happen
+# on the Python side (via `maturin develop` + pytest/smoke).
+test = false
+doctest = false
+bench = false
+
+[features]
+default = []
+extension-module = ["pyo3/extension-module"]
+
+[dependencies]
+headroom-core = { path = "../headroom-core" }
+pyo3 = { workspace = true }
+pyo3-log = { workspace = true }
+serde_json = { workspace = true }

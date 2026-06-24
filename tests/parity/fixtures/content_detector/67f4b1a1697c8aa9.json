@@ -1,0 +1,15 @@
+{
+  "config": {},
+  "input": "interface User { id: number; name: string; }\ntype Maybe<T> = T | null;\nenum Color { Red, Green, Blue }\nfunction f(x: number): boolean { return x > 0; }\n",
+  "input_sha256": "67f4b1a1697c8aa916e4acb0920a92279bbc35efa3849edc9bc2aa8dcff73fb3",
+  "output": {
+    "confidence": 0.76,
+    "content_type": "source_code",
+    "metadata": {
+      "language": "typescript",
+      "pattern_matches": 3
+    }
+  },
+  "recorded_at": "2026-04-28T06:39:34.961598+00:00",
+  "transform": "content_detector"
+}

@@ -1,0 +1,273 @@
+---
+title: Persistent Memory
+description: Hierarchical, temporal memory for LLM applications. Enable your AI to remember across conversations with intelligent scoping and versioning.
+---
+
+LLMs have two fundamental limitations: context windows overflow with too much history, and every conversation starts from zero. Persistent Memory solves both by extracting key facts, persisting them, and injecting them when relevant.
+
+This is **temporal compression** -- instead of carrying 10,000 tokens of conversation history, carry 100 tokens of extracted memories.
+
+## Quick Start
+
+```python
+from openai import OpenAI
+from headroom import with_memory
+
+# One line -- that's it
+client = with_memory(OpenAI(), user_id="alice")
+
+# Use exactly like normal
+response = client.chat.completions.create(
+    model="gpt-4o",
+    messages=[{"role": "user", "content": "I prefer Python for backend work"}]
+)
+# Memory extracted INLINE -- zero extra latency
+
+# Later, in a new conversation...
+response = client.chat.completions.create(
+    model="gpt-4o",
+    messages=[{"role": "user", "content": "What language should I use?"}]
+)
+# Response uses the Python preference from memory
+```
+
+## How It Works
+
+The `with_memory()` wrapper intercepts every chat completion call:
+
+1. **Inject** -- Semantic search finds relevant memories and prepends them to the user message
+2. **Instruct** -- Adds a memory extraction instruction to the system prompt
+3. **Call** -- Forwards the request to the LLM
+4. **Parse** -- Extracts the `<memory>` block from the response
+5. **Store** -- Saves with embeddings, vector index, and full-text search index
+6. **Return** -- Cleans the response (strips the memory block before returning)
+
+Memory extraction happens **inline** as part of the LLM response. No extra API calls, no extra latency.
+
+## Hierarchical Scoping
+
+Memories exist at four scope levels, from broadest to narrowest:
+
+| Scope | Persists Across | Use Case |
+|-------|-----------------|----------|
+| **User** | All sessions, all time | Long-term preferences, identity |
+| **Session** | Current session only | Current task context |
+| **Agent** | Current agent in session | Agent-specific context |
+| **Turn** | Single turn only | Ephemeral working memory |
+
+```python
+from openai import OpenAI
+from headroom import with_memory
+
+# Session 1: Morning
+client1 = with_memory(
+    OpenAI(),
+    user_id="bob",
+    session_id="morning-session",
+)
+response = client1.chat.completions.create(
+    model="gpt-4o",
+    messages=[{"role": "user", "content": "I prefer Go for performance-critical code"}]
+)
+# Memory stored at USER level (persists across sessions)
+
+# Session 2: Afternoon (different session, same user)
+client2 = with_memory(
+    OpenAI(),
+    user_id="bob",
+    session_id="afternoon-session",
+)
+response = client2.chat.completions.create(
+    model="gpt-4o",
+    messages=[{"role": "user", "content": "What language for my new microservice?"}]
+)
+# Recalls Go preference from morning session
+```
+
+## Memory Categories
+
+Memories are categorized for better organization and retrieval:
+
+| Category | Description | Examples |
+|----------|-------------|----------|
+| `PREFERENCE` | Likes, dislikes, preferred approaches | "Prefers Python", "Likes dark mode" |
+| `FACT` | Identity, role, constraints | "Works at fintech startup", "Senior engineer" |
+| `CONTEXT` | Current goals, ongoing tasks | "Migrating to microservices", "Working on auth" |
+| `ENTITY` | Information about entities | "Project Apollo uses React", "Team lead is Sarah" |
+| `DECISION` | Decisions made | "Chose PostgreSQL over MySQL" |
+| `INSIGHT` | Derived insights | "User tends to prefer typed languages" |
+
+## Memory API
+
+The `with_memory()` wrapper exposes a `.memory` attribute for direct access:
+
+```python
+client = with_memory(OpenAI(), user_id="alice")
+
+# Search memories (semantic)
+results = client.memory.search("python preferences", top_k=5)
+for memory in results:
+    print(f"{memory.content}")
+
+# Add a memory manually
+client.memory.add(
+    "User is a senior engineer",
+    importance=0.9,
+)
+
+# Get all memories for this user
+all_memories = client.memory.get_all()
+
+# Clear all memories
+client.memory.clear()
+
+# Get stats
+stats = client.memory.stats()
+print(f"Total memories: {stats['total']}")
+print(f"By category: {stats['categories']}")
+```
+
+## Temporal Versioning
+
+When facts change, Headroom creates a **supersession chain** that preserves history:
+
+```python
+from headroom.memory import HierarchicalMemory, MemoryCategory
+
+memory = await HierarchicalMemory.create()
+
+# Original fact
+orig = await memory.add(
+    content="User works at Google",
+    user_id="alice",
+    category=MemoryCategory.FACT,
+)
+
+# User changes jobs -- supersede the old memory
+new = await memory.supersede(
+    old_memory_id=orig.id,
+    new_content="User now works at Anthropic",
+)
+
+# Query current state (excludes superseded by default)
+current = await memory.query(MemoryFilter(
+    user_id="alice",
+    include_superseded=False,
+))
+# Returns only "User now works at Anthropic"
+
+# Get the full chain
+chain = await memory.get_history(new.id)
+# [
+#   Memory(content="User works at Google", is_current=False),
+#   Memory(content="User now works at Anthropic", is_current=True),
+# ]
+```
+
+This gives you an audit trail, the ability to debug why the LLM made certain decisions, and rollback if needed.
+
+## Backends
+
+### Embedder Backends
+
+```python
+from headroom.memory import MemoryConfig, EmbedderBackend
+
+# ONNX embeddings (recommended -- fast, free, private; ~30 MB int8-quantized)
+# Note: EmbedderBackend.LOCAL requires PyTorch (~2 GB); use ONNX instead.
+config = MemoryConfig(
+    embedder_backend=EmbedderBackend.ONNX,
+    embedder_model="BAAI/bge-small-en-v1.5",
+)
+
+# OpenAI embeddings (higher quality, costs money)
+config = MemoryConfig(
+    embedder_backend=EmbedderBackend.OPENAI,
+    openai_api_key="sk-...",
+    embedder_model="text-embedding-3-small",
+)
+
+# Ollama embeddings (local server, many models)
+config = MemoryConfig(
+    embedder_backend=EmbedderBackend.OLLAMA,
+    ollama_base_url="http://localhost:11434",
+    embedder_model="nomic-embed-text",
+)
+```
+
+### Embedding Runtime / GPU Offload (Apple Silicon)
+
+By default the proxy's memory embedder runs on the **ONNX CPU** backend -- fast
+and dependency-light, but CPU-only. Under sustained load the embedding step can
+saturate the CPU and make the proxy less responsive.
+
+On Apple Silicon you can opt in to running the embedder on the **Apple GPU
+(MPS)** instead, which offloads that work off the CPU and keeps the proxy
+responsive. Install the extra and set the env var:
+
+```bash
+pip install "headroom-ai[pytorch-mps]"   # also works as [pytorch_mps]
+export HEADROOM_EMBEDDER_RUNTIME=pytorch_mps
+```
+
+When set, the embedder runs via the torch sentence-transformers backend on the
+Apple GPU instead of the default ONNX CPU embedder. Notes:
+
+- **Strictly opt-in.** `pytorch_mps` is the only accepted value; anything else
+  (or unset) keeps the default ONNX CPU embedder. Default behavior is unchanged,
+  and there is no CLI flag -- it is env-var only.
+- **Auto-fallback.** It only activates when Apple MPS is actually available
+  (Apple Silicon + torch). If MPS is unavailable or torch/sentence-transformers
+  is not installed, it logs a warning and uses the existing default embedder
+  selection path: ONNX when available, then the pre-existing local
+  sentence-transformers fallback.
+- **MPS serialization.** torch-MPS is not thread-safe, so the embedder
+  serializes MPS encode calls internally via a single-worker executor. This is
+  automatic -- there is nothing to configure.
+
+### Storage
+
+Storage uses **SQLite** for CRUD and filtering, **HNSW** for vector similarity search, and **FTS5** for full-text keyword search. All embedded -- no external services required.
+
+```python
+config = MemoryConfig(
+    db_path="memory.db",
+    vector_dimension=384,
+    hnsw_ef_construction=200,
+    hnsw_m=16,
+    hnsw_ef_search=50,
+    cache_enabled=True,
+    cache_max_size=1000,
+)
+```
+
+## Provider Compatibility
+
+Memory works with any OpenAI-compatible client:
+
+```python
+from openai import OpenAI
+from headroom import with_memory
+
+# OpenAI
+client = with_memory(OpenAI(), user_id="alice")
+
+# Azure OpenAI
+client = with_memory(
+    OpenAI(base_url="https://your-resource.openai.azure.com/..."),
+    user_id="alice",
+)
+
+# Groq
+from groq import Groq
+client = with_memory(Groq(), user_id="alice")
+```
+
+## Performance
+
+| Operation | Latency | Notes |
+|-----------|---------|-------|
+| Memory injection | &lt;50ms | Local embeddings + HNSW search |
+| Memory extraction | +50-100 tokens | Part of LLM response (inline) |
+| Memory storage | &lt;10ms | SQLite + HNSW + FTS5 indexing |
+| Cache hit | &lt;1ms | LRU cache lookup |

@@ -1,0 +1,57 @@
+name: Publish to PyPI (manual fallback)
+
+# DEPRECATED: This workflow is superseded by release.yml's matrix-based
+# build-and-publish flow. It exists as a manual fallback in case release.yml
+# is broken and a hotfix needs to be pushed without going through the
+# normal tag-driven pipeline. Single-platform; produces only the linux
+# x86_64 wheel + sdist. For full cross-platform release, use release.yml.
+on:
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write  # For trusted publishing
+      contents: write  # For uploading release assets
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.96.0
+
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: Install build tools
+        run: |
+          python -m pip install --upgrade pip 'maturin>=1.5,<2.0' cyclonedx-bom
+
+      - name: Build wheel + sdist
+        run: |
+          maturin sdist --out dist
+          maturin build --release --out dist
+
+      - name: Generate SBOM (CycloneDX)
+        run: |
+          pip install -e ".[proxy]"
+          cyclonedx-py environment \
+            --output-format json \
+            --outfile dist/headroom-sbom.cdx.json
+
+      - name: Upload SBOM to release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist/headroom-sbom.cdx.json
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

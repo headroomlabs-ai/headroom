@@ -1,0 +1,10 @@
+# Revisions listed here are skipped by `git blame --ignore-revs-file`
+# and by GitHub's blame UI. Use for mechanical, repo-wide changes that
+# touch every line of a file but don't change semantics (formatter runs,
+# line-ending normalization, bulk renames applied by codemod, etc.).
+#
+# Configure your local git to auto-pick this up:
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+
+# chore: renormalize line endings to LF
+efd2ac1ca4d88d8f5990259c98b673c603902896

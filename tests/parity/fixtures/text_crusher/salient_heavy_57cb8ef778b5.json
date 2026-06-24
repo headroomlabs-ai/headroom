@@ -1,0 +1,18 @@
+{
+  "transform": "text_crusher",
+  "label": "salient_heavy",
+  "input": {
+    "content": "ERROR connection refused at host 10.0.0.42 after 3 retries.\nThe authentication module validated tokens against auth.registry before forwarding.\nA traceback was logged with code 500 and request_id req-9182.\nJust some generic filler text without any specific identifiers here.\nMore plain filler describing the overall behavior in vague terms.\nWarning: cache hit ratio dropped to 71 percent during the spike.\nAnother unremarkable sentence with no salient tokens at all today.\nThe pipeline.apply call returned 42 kept rows out of 1000 total.",
+    "context": "authentication tokens errors",
+    "target_ratio": 0.4
+  },
+  "output": {
+    "compressed": "The authentication module validated tokens against auth.registry before forwarding.\nAnother unremarkable sentence with no salient tokens at all today.\nThe pipeline.apply call returned 42 kept rows out of 1000 total.",
+    "original_tokens": 80,
+    "compressed_tokens": 30,
+    "compression_ratio": 0.375,
+    "kept_segments": 3,
+    "total_segments": 8
+  },
+  "input_sha256": "57cb8ef778b5c69b199541ebd017a34883e0084343d92ebb54e91773041b4217"
+}

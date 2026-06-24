@@ -1,0 +1,192 @@
+---
+title: Text & Log Compression
+description: Specialized compressors for search results, build logs, diffs, and general text. Each preserves what matters for its content type.
+---
+
+Headroom provides specialized compressors for text-based content that isn't JSON or source code. Each one understands the structure of its content type and preserves what the LLM needs while dropping the noise.
+
+| Compressor | Input Type | What It Preserves | Typical Savings |
+|---|---|---|---|
+| `SearchCompressor` | grep/ripgrep output | Relevant matches, file diversity | 80-95% |
+| `LogCompressor` | Build/test logs | Errors, stack traces, summaries | 85-95% |
+| `DiffCompressor` | Unified diffs | Changed lines, context | 60-80% |
+| `TextCompressor` | General text | Relevant paragraphs, anchors | 60-80% |
+| `KompressCompressor` | General text fallback | Learned token scoring via ONNX | 30-50% |
+
+## SearchCompressor
+
+Compresses search results (grep, ripgrep, ag) while keeping the matches that matter.
+
+```python
+from headroom.transforms import SearchCompressor
+
+search_results = """
+src/utils.py:42:def process_data(items):
+src/utils.py:43:    \"\"\"Process items.\"\"\"
+src/models.py:15:class DataProcessor:
+src/models.py:89:    def process(self, items):
+... hundreds more matches ...
+"""
+
+compressor = SearchCompressor()
+result = compressor.compress(search_results, context="find process")
+
+print(f"Compressed {result.original_match_count} matches to {result.compressed_match_count}")
+print(result.compressed)
+```
+
+**What gets preserved:**
+- Exact query matches (lines containing the search term)
+- High-relevance matches (scored by BM25 similarity)
+- File diversity (results from different files are kept)
+- First/last matches (context from start and end)
+
+### Configuration
+
+```python
+from headroom.transforms import SearchCompressor, SearchCompressorConfig
+
+config = SearchCompressorConfig(
+    max_results=50,                # Keep up to 50 matches
+    preserve_file_diversity=True,  # Ensure different files represented
+    relevance_threshold=0.3,       # Minimum relevance score to keep
+)
+
+compressor = SearchCompressor(config)
+```
+
+## LogCompressor
+
+Compresses build and test output while preserving errors, warnings, and summaries.
+
+```python
+from headroom.transforms import LogCompressor
+
+build_output = """
+===== test session starts =====
+collected 500 items
+tests/test_foo.py::test_1 PASSED
+... hundreds of passed tests ...
+tests/test_bar.py::test_fail FAILED
+AssertionError: expected 5, got 3
+===== 1 failed, 499 passed =====
+"""
+
+compressor = LogCompressor()
+result = compressor.compress(build_output)
+
+print(result.compressed)
+print(f"Compression ratio: {result.compression_ratio:.1%}")
+```
+
+**What gets preserved:**
+- Errors and failures (any line with ERROR, FAILED, Exception)
+- Warnings
+- Full stack traces for debugging
+- Test/build summary lines
+- Section headers (structural markers like `=====`)
+
+**What gets dropped:**
+- Hundreds of `PASSED` lines
+- Verbose success output
+- Repeated patterns
+
+## DiffCompressor
+
+Compresses unified diffs while keeping the actual changes and enough context to understand them.
+
+```python
+from headroom.transforms import DiffCompressor
+
+diff_output = """
+diff --git a/src/main.py b/src/main.py
+--- a/src/main.py
++++ b/src/main.py
+@@ -42,7 +42,7 @@
+ def process(items):
+-    return [x for x in items]
++    return [x.strip() for x in items if x]
+"""
+
+compressor = DiffCompressor()
+result = compressor.compress(diff_output)
+```
+
+## TextCompressor
+
+General-purpose text compression with anchor preservation. Best for documentation, README files, and prose content.
+
+```python
+from headroom.transforms import TextCompressor
+
+long_text = """
+... thousands of lines of documentation ...
+"""
+
+compressor = TextCompressor()
+result = compressor.compress(long_text, context="authentication")
+
+print(result.compressed)
+```
+
+**What gets preserved:**
+- Paragraphs relevant to the context query
+- Headers and section markers
+- Document structure and organization
+
+## Kompress
+
+```python
+from headroom.transforms.kompress_compressor import KompressCompressor
+
+compressor = KompressCompressor()
+result = compressor.compress(long_output)
+
+print(f"Before: {result.original_tokens} tokens")
+print(f"After: {result.compressed_tokens} tokens")
+print(f"Saved: {result.savings_percentage:.1f}%")
+```
+
+<Callout type="info" title="LLMLingua was removed">
+  The old LLMLingua transform and helper functions are no longer exported. Use Kompress and ContentRouter for text compression.
+</Callout>
+
+## Content Type Detection
+
+If you're building your own routing logic, you can use the content type detector directly:
+
+```python
+from headroom.transforms import detect_content_type, ContentType
+
+content = "src/main.py:42:def process():"
+
+detection = detect_content_type(content)
+if detection.content_type == ContentType.SEARCH_RESULTS:
+    result = SearchCompressor().compress(content, context="process")
+elif detection.content_type == ContentType.BUILD_OUTPUT:
+    result = LogCompressor().compress(content)
+elif detection.content_type == ContentType.PLAIN_TEXT:
+    result = TextCompressor().compress(content, context="process")
+```
+
+## When Each Compressor Is Used
+
+The ContentRouter selects the right compressor automatically. Here's when each fires:
+
+| Content Pattern | Compressor | Detection Signal |
+|---|---|---|
+| `file:line:content` lines | SearchCompressor | grep/ripgrep output format |
+| pytest, npm, cargo markers | LogCompressor | Build tool output patterns |
+| `---/+++` and `@@` markers | DiffCompressor | Unified diff format |
+| Prose, documentation | TextCompressor | Fallback for non-structured text |
+| Long plain text | KompressCompressor | ContentRouter fallback |
+
+## Performance
+
+| Compressor | Typical Input | Output | Speed |
+|---|---|---|---|
+| SearchCompressor | 1,000 matches | 30-50 matches | ~2ms |
+| LogCompressor | 5,000 lines | 100-200 lines | ~3ms |
+| DiffCompressor | Large diff | Changed hunks only | ~2ms |
+| TextCompressor | 10,000 chars | 2,000 chars | ~2ms |
+| KompressCompressor | Plain text | 50-70% of original | model-dependent |

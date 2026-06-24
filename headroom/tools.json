@@ -1,0 +1,103 @@
+{
+  "_comment": "Registry of externally fetched CLI tool binaries. Bump versions and SHA256s via the weekly tools-version-check CI job (see .github/workflows/). sha256=null means HTTPS-trust-only (initial bootstrap); the CI job fills real SHAs per release.",
+  "tools": {
+    "difft": {
+      "version": "0.64.0",
+      "binary": "difft",
+      "source": "Wilfred/difftastic",
+      "homepage": "https://difftastic.wilfred.me.uk/",
+      "_comment": "Upstream publishes glibc Linux builds only. The glibc binaries run on musl hosts (Alpine) via compatibility shims, so we point both gnu and musl keys at the same asset and document it here for auditors.",
+      "assets": {
+        "linux-x86_64-gnu": {
+          "url": "https://github.com/Wilfred/difftastic/releases/download/0.64.0/difft-x86_64-unknown-linux-gnu.tar.gz",
+          "member": "difft",
+          "sha256": null
+        },
+        "linux-x86_64-musl": {
+          "url": "https://github.com/Wilfred/difftastic/releases/download/0.64.0/difft-x86_64-unknown-linux-gnu.tar.gz",
+          "member": "difft",
+          "sha256": null,
+          "_comment": "same asset as linux-x86_64-gnu; upstream has no dedicated musl build"
+        },
+        "linux-aarch64-gnu": {
+          "url": "https://github.com/Wilfred/difftastic/releases/download/0.64.0/difft-aarch64-unknown-linux-gnu.tar.gz",
+          "member": "difft",
+          "sha256": null
+        },
+        "linux-aarch64-musl": {
+          "url": "https://github.com/Wilfred/difftastic/releases/download/0.64.0/difft-aarch64-unknown-linux-gnu.tar.gz",
+          "member": "difft",
+          "sha256": null,
+          "_comment": "same asset as linux-aarch64-gnu"
+        },
+        "darwin-x86_64": {
+          "url": "https://github.com/Wilfred/difftastic/releases/download/0.64.0/difft-x86_64-apple-darwin.tar.gz",
+          "member": "difft",
+          "sha256": null
+        },
+        "darwin-aarch64": {
+          "url": "https://github.com/Wilfred/difftastic/releases/download/0.64.0/difft-aarch64-apple-darwin.tar.gz",
+          "member": "difft",
+          "sha256": null
+        },
+        "windows-x86_64": {
+          "url": "https://github.com/Wilfred/difftastic/releases/download/0.64.0/difft-x86_64-pc-windows-msvc.zip",
+          "member": "difft.exe",
+          "sha256": null
+        }
+      }
+    },
+    "scc": {
+      "version": "3.5.0",
+      "binary": "scc",
+      "source": "boyter/scc",
+      "homepage": "https://github.com/boyter/scc",
+      "_comment": "scc is a statically-linked Go binary, so the same asset is used for both libc variants. The duplicated gnu/musl entries are intentional — they document musl support for `headroom tools doctor`.",
+      "assets": {
+        "linux-x86_64-gnu": {
+          "url": "https://github.com/boyter/scc/releases/download/v3.5.0/scc_Linux_x86_64.tar.gz",
+          "member": "scc",
+          "sha256": null
+        },
+        "linux-x86_64-musl": {
+          "url": "https://github.com/boyter/scc/releases/download/v3.5.0/scc_Linux_x86_64.tar.gz",
+          "member": "scc",
+          "sha256": null
+        },
+        "linux-aarch64-gnu": {
+          "url": "https://github.com/boyter/scc/releases/download/v3.5.0/scc_Linux_arm64.tar.gz",
+          "member": "scc",
+          "sha256": null
+        },
+        "linux-aarch64-musl": {
+          "url": "https://github.com/boyter/scc/releases/download/v3.5.0/scc_Linux_arm64.tar.gz",
+          "member": "scc",
+          "sha256": null
+        },
+        "darwin-x86_64": {
+          "url": "https://github.com/boyter/scc/releases/download/v3.5.0/scc_Darwin_x86_64.tar.gz",
+          "member": "scc",
+          "sha256": null
+        },
+        "darwin-aarch64": {
+          "url": "https://github.com/boyter/scc/releases/download/v3.5.0/scc_Darwin_arm64.tar.gz",
+          "member": "scc",
+          "sha256": null
+        },
+        "windows-x86_64": {
+          "url": "https://github.com/boyter/scc/releases/download/v3.5.0/scc_Windows_x86_64.zip",
+          "member": "scc.exe",
+          "sha256": null
+        }
+      }
+    },
+    "ast-grep": {
+      "version": "pypi",
+      "binary": "ast-grep",
+      "source": "ast-grep/ast-grep (PyPI: ast-grep-cli)",
+      "homepage": "https://ast-grep.github.io/",
+      "_comment": "Installed via the ast-grep-cli PyPI wheel; we never fetch from GitHub for this tool. Listed here so `headroom tools doctor` can report it.",
+      "assets": {}
+    }
+  }
+}

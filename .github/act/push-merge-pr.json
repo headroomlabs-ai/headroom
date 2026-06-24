@@ -1,0 +1,11 @@
+{
+  "ref": "refs/heads/main",
+  "head_commit": {
+    "message": "Merge pull request #217 from JerrettDavis/fix/openclaw-local-node-publish\n\nFix OpenClaw GPR package build"
+  },
+  "commits": [
+    {
+      "message": "Merge pull request #217 from JerrettDavis/fix/openclaw-local-node-publish\n\nFix OpenClaw GPR package build"
+    }
+  ]
+}

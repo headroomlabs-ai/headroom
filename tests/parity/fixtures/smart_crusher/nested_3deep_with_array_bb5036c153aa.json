@@ -1,0 +1,34 @@
+{
+  "config": {
+    "dedup_identical_items": true,
+    "enabled": true,
+    "factor_out_constants": false,
+    "first_fraction": 0.3,
+    "include_summaries": false,
+    "last_fraction": 0.15,
+    "max_items_after_crush": 15,
+    "min_items_to_analyze": 5,
+    "min_tokens_to_crush": 200,
+    "preserve_change_points": true,
+    "similarity_threshold": 0.8,
+    "toin_confidence_threshold": 0.5,
+    "uniqueness_threshold": 0.1,
+    "use_feedback_hints": true,
+    "variance_threshold": 2.0
+  },
+  "input": {
+    "bias": 1.0,
+    "content": "{\"a\": {\"b\": {\"events\": [{\"i\": 0, \"kind\": \"deep\", \"v\": \"x0\"}, {\"i\": 1, \"kind\": \"deep\", \"v\": \"x1\"}, {\"i\": 2, \"kind\": \"deep\", \"v\": \"x2\"}, {\"i\": 3, \"kind\": \"deep\", \"v\": \"x3\"}, {\"i\": 4, \"kind\": \"deep\", \"v\": \"x4\"}, {\"i\": 5, \"kind\": \"deep\", \"v\": \"x5\"}, {\"i\": 6, \"kind\": \"deep\", \"v\": \"x6\"}, {\"i\": 7, \"kind\": \"deep\", \"v\": \"x7\"}, {\"i\": 8, \"kind\": \"deep\", \"v\": \"x8\"}, {\"i\": 9, \"kind\": \"deep\", \"v\": \"x9\"}, {\"i\": 10, \"kind\": \"deep\", \"v\": \"x10\"}, {\"i\": 11, \"kind\": \"deep\", \"v\": \"x11\"}, {\"i\": 12, \"kind\": \"deep\", \"v\": \"x12\"}, {\"i\": 13, \"kind\": \"deep\", \"v\": \"x13\"}, {\"i\": 14, \"kind\": \"deep\", \"v\": \"x14\"}]}}}",
+    "query": ""
+  },
+  "input_sha256": "bb5036c153aa8a9e6700b751413952c4753c328cc8bd63986f68c3a5b4fb9cb6",
+  "label": "nested_3deep_with_array",
+  "output": {
+    "compressed": "{\"a\":{\"b\":{\"events\":[{\"i\":0,\"kind\":\"deep\",\"v\":\"x0\"},{\"i\":1,\"kind\":\"deep\",\"v\":\"x1\"},{\"i\":2,\"kind\":\"deep\",\"v\":\"x2\"},{\"i\":3,\"kind\":\"deep\",\"v\":\"x3\"},{\"i\":4,\"kind\":\"deep\",\"v\":\"x4\"},{\"i\":5,\"kind\":\"deep\",\"v\":\"x5\"},{\"i\":6,\"kind\":\"deep\",\"v\":\"x6\"},{\"i\":7,\"kind\":\"deep\",\"v\":\"x7\"},{\"i\":8,\"kind\":\"deep\",\"v\":\"x8\"},{\"i\":9,\"kind\":\"deep\",\"v\":\"x9\"},{\"i\":10,\"kind\":\"deep\",\"v\":\"x10\"},{\"i\":11,\"kind\":\"deep\",\"v\":\"x11\"},{\"i\":12,\"kind\":\"deep\",\"v\":\"x12\"},{\"i\":13,\"kind\":\"deep\",\"v\":\"x13\"},{\"i\":14,\"kind\":\"deep\",\"v\":\"x14\"}]}}}",
+    "original": "{\"a\": {\"b\": {\"events\": [{\"i\": 0, \"kind\": \"deep\", \"v\": \"x0\"}, {\"i\": 1, \"kind\": \"deep\", \"v\": \"x1\"}, {\"i\": 2, \"kind\": \"deep\", \"v\": \"x2\"}, {\"i\": 3, \"kind\": \"deep\", \"v\": \"x3\"}, {\"i\": 4, \"kind\": \"deep\", \"v\": \"x4\"}, {\"i\": 5, \"kind\": \"deep\", \"v\": \"x5\"}, {\"i\": 6, \"kind\": \"deep\", \"v\": \"x6\"}, {\"i\": 7, \"kind\": \"deep\", \"v\": \"x7\"}, {\"i\": 8, \"kind\": \"deep\", \"v\": \"x8\"}, {\"i\": 9, \"kind\": \"deep\", \"v\": \"x9\"}, {\"i\": 10, \"kind\": \"deep\", \"v\": \"x10\"}, {\"i\": 11, \"kind\": \"deep\", \"v\": \"x11\"}, {\"i\": 12, \"kind\": \"deep\", \"v\": \"x12\"}, {\"i\": 13, \"kind\": \"deep\", \"v\": \"x13\"}, {\"i\": 14, \"kind\": \"deep\", \"v\": \"x14\"}]}}}",
+    "strategy": "none:adaptive_at_limit(15->15)",
+    "was_modified": true
+  },
+  "recorded_at": "2026-04-27T06:59:41.857099+00:00",
+  "transform": "smart_crusher"
+}

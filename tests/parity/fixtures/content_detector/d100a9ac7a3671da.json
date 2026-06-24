@@ -1,0 +1,16 @@
+{
+  "config": {},
+  "input": "<!DOCTYPE html>\n<html>\n<head><title>x</title></head>\n<body><div><span>hi</span></div></body>\n</html>",
+  "input_sha256": "d100a9ac7a3671dafbc6666243ba796c0985281868d47921bd1f75506b4d81ce",
+  "output": {
+    "confidence": 1.0,
+    "content_type": "html",
+    "metadata": {
+      "has_doctype": true,
+      "has_html_tag": true,
+      "structural_tags": 2
+    }
+  },
+  "recorded_at": "2026-04-28T06:39:34.960132+00:00",
+  "transform": "content_detector"
+}

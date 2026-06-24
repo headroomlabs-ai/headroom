@@ -1,0 +1,26 @@
+{
+  "config": {
+    "always_keep_additions": true,
+    "always_keep_deletions": true,
+    "enable_ccr": true,
+    "max_context_lines": 2,
+    "max_files": 20,
+    "max_hunks_per_file": 10,
+    "min_lines_for_ccr": 50
+  },
+  "input": "diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -1,3 +1,3 @@\n-x = 1\n+x = 2\n y = 3\n z = 4\n# variant 5",
+  "input_sha256": "d0ba5cae330722be827e591da5644c445cf646db7b4c76a51473cda1165140ba",
+  "output": {
+    "additions": 0,
+    "cache_key": null,
+    "compressed": "diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -1,3 +1,3 @@\n-x = 1\n+x = 2\n y = 3\n z = 4\n# variant 5",
+    "compressed_line_count": 9,
+    "deletions": 0,
+    "files_affected": 0,
+    "hunks_kept": 0,
+    "hunks_removed": 0,
+    "original_line_count": 9
+  },
+  "recorded_at": "2026-04-23T23:51:37.348881+00:00",
+  "transform": "diff_compressor"
+}

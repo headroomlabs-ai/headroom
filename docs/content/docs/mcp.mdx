@@ -1,0 +1,228 @@
+---
+title: MCP Tools
+description: Compression, retrieval, and stats as MCP tools for Claude Code, Cursor, and any MCP-compatible host.
+---
+
+Headroom's MCP server exposes compression, retrieval, and observability as tools that any MCP-compatible AI coding tool can call -- Claude Code, Cursor, Codex, and more. No proxy required.
+
+## Installation
+
+```bash
+# MCP tools only (lightweight)
+pip install "headroom-ai[mcp]"
+
+# Or with the proxy
+pip install "headroom-ai[proxy]"
+```
+
+## Setup for Claude Code
+
+```bash
+# Register with Claude Code (one-time)
+headroom mcp install
+
+# Start Claude Code — it now has headroom tools
+claude
+```
+
+Claude Code can now compress content on demand, retrieve originals, and check session stats.
+
+For automatic compression of **all** traffic, also run the proxy:
+
+```bash
+# Terminal 1
+headroom proxy
+
+# Terminal 2
+ANTHROPIC_BASE_URL=http://127.0.0.1:8787 claude
+```
+
+## Tools
+
+### headroom_compress
+
+Compress content on demand. The LLM calls this when it wants to shrink large content before reasoning over it.
+
+**Parameters:**
+- `content` (required) -- text to compress (files, JSON, logs, search results)
+
+**Returns:**
+- `compressed` -- compressed text
+- `hash` -- key for retrieving the original later
+- `original_tokens` / `compressed_tokens` / `savings_percent`
+- `transforms` -- which compression algorithms were applied
+
+Example flow:
+
+```
+Claude: Let me compress this large output to save context space.
+
+-> headroom_compress(content="[5000 lines of grep results...]")
+
+<- {
+    "compressed": "[key matches with context...]",
+    "hash": "a1b2c3d4e5f6...",
+    "original_tokens": 12000,
+    "compressed_tokens": 3200,
+    "savings_percent": 73.3,
+    "transforms": ["router:search:0.27"]
+   }
+```
+
+The original is stored locally for 1 hour. If the LLM needs the full content later, it calls `headroom_retrieve`.
+
+### headroom_retrieve
+
+Retrieve original uncompressed content by hash.
+
+**Parameters:**
+- `hash` (required) -- hash key from a previous compression
+- `query` (optional) -- search within the original to return only matching items
+
+**Returns:**
+- `original_content` (full retrieval) or `results` (filtered search)
+- `source` -- `"local"` or `"proxy"`
+
+Retrieval checks the local store first, then falls back to the proxy's store. Hashes from either source work transparently.
+
+### headroom_stats
+
+Session compression statistics.
+
+**Returns:**
+- `compressions`, `retrievals`, `tokens_saved`, `savings_percent`
+- `estimated_cost_saved_usd`
+- `recent_events` -- last 10 compression/retrieval events
+- `sub_agents` -- stats from sub-agent MCP instances
+- `combined` -- main + sub-agent totals
+- `proxy` -- request count, cache hits, cost saved (if proxy is running)
+
+Sub-agent stats are aggregated via a shared stats file at `~/.headroom/session_stats.jsonl`.
+
+## CLI commands
+
+```bash
+# Install (registers with Claude Code)
+headroom mcp install
+headroom mcp install --proxy-url http://host:9000  # Custom proxy URL
+headroom mcp install --force                        # Overwrite existing
+
+# Check status
+headroom mcp status
+
+# Uninstall
+headroom mcp uninstall
+
+# Debug mode
+headroom mcp serve --debug
+```
+
+## MCP host configuration
+
+For MCP hosts that let you configure a local stdio server, point them at `headroom mcp serve`. If you also run the proxy, pass the proxy URL explicitly so retrieval and stats come from the intended proxy instance.
+
+```json
+{
+  "mcpServers": {
+    "headroom": {
+      "type": "stdio",
+      "command": "headroom",
+      "args": ["mcp", "serve", "--proxy-url", "http://127.0.0.1:8787"]
+    }
+  }
+}
+```
+
+For multiple proxy instances, register one stdio MCP server per proxy URL:
+
+```json
+{
+  "mcpServers": {
+    "headroom": {
+      "type": "stdio",
+      "command": "headroom",
+      "args": ["mcp", "serve", "--proxy-url", "http://127.0.0.1:8787"]
+    },
+    "headroom-azure": {
+      "type": "stdio",
+      "command": "headroom",
+      "args": ["mcp", "serve", "--proxy-url", "http://127.0.0.1:8788"]
+    }
+  }
+}
+```
+
+Do not assume that a running proxy exposes an HTTP MCP endpoint at `/mcp`. If `http://127.0.0.1:<port>/mcp` returns `404`, use the stdio configuration above.
+
+### `command: "headroom"` fails to start
+
+The configurations above use `"command": "headroom"`, which only works if the `headroom`
+executable is on the PATH your MCP host (Codex, etc.) sees at startup. If you installed Headroom
+into a project virtualenv — for example with `uv add headroom-ai` — the CLI lives only inside
+that venv, and the host fails at launch with:
+
+```text
+MCP client for `headroom` failed to start: MCP startup failed: No such file or directory (os error 2)
+```
+
+Install Headroom so it's globally on PATH — `uv tool install "headroom-ai[mcp]"` (or
+`pipx install "headroom-ai[mcp]"`) — or replace `"headroom"` with the absolute path to the binary
+(`command -v headroom`, or `where headroom` on Windows).
+
+## Cross-tool compatibility
+
+| Tool | MCP Support | Setup |
+|------|-------------|-------|
+| Claude Code | Native | `headroom mcp install` |
+| Cursor | Supported | Add to Cursor MCP settings |
+| Codex | If supported | Configure MCP server |
+| Any MCP host | Yes | Point to `headroom mcp serve` |
+
+## Architecture
+
+### MCP only (no proxy)
+
+The LLM calls `headroom_compress` on demand. Compression happens locally in the MCP process. Originals are stored in a local `CompressionStore` with 1-hour TTL.
+
+### MCP + Proxy (full setup)
+
+The proxy compresses all traffic at the HTTP level (before the LLM sees content). MCP tools operate after the LLM receives content. They handle different data and do not double-compress.
+
+`headroom_retrieve` checks the local store first, then falls back to the proxy's store.
+
+## Troubleshooting
+
+**"MCP SDK not installed"** -- Run `pip install "headroom-ai[mcp]"`.
+
+**"Proxy not running"** -- Start the proxy with `headroom proxy` in another terminal. Only needed for proxy-backed retrieval.
+
+**"Entry not found or expired"** -- Local content expires after 1 hour, proxy content after 5 minutes.
+
+**Claude doesn't see headroom tools** -- Run `headroom mcp status`, restart Claude Code, and verify with `/mcp` inside Claude Code.
+
+### Claude Code `/usage` attributes a large share to `headroom` MCP
+
+Claude Code counts MCP tool calls and MCP tool results as session context. If a
+long-running workflow or a subagent-heavy command calls `headroom_compress`,
+`headroom_retrieve`, or `headroom_stats` many times, `/usage` can show a visible
+share under the `headroom` MCP server even when Headroom is saving tokens inside
+individual tool results.
+
+That number is not a direct "Headroom overhead" bill. It means Claude Code kept
+Headroom MCP interactions in the conversation context. Deep research workflows
+can amplify this because each subagent has its own requests and may keep its own
+MCP results in context.
+
+Use these checks when the MCP share looks high:
+
+- Run `headroom_stats` and compare `tokens_saved` with the number of MCP calls.
+- Use `/compact` after large MCP-backed investigation steps so old MCP tool
+  results stop occupying the active context window.
+- Prefer the proxy path for automatic compression of normal Claude Code traffic:
+  `headroom proxy` plus `ANTHROPIC_BASE_URL=http://127.0.0.1:8787 claude`.
+- Disable the MCP server for sessions where you only want proxy-level
+  compression and do not need on-demand `headroom_compress` or
+  `headroom_retrieve`.
+- For deep research or custom subagent workflows, reduce unnecessary subagent
+  fan-out first; subagent traffic usually dominates the usage picture before
+  MCP overhead does.

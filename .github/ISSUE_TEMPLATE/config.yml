@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Questions & Discussions
+    url: https://github.com/chopratejas/headroom/discussions
+    about: Ask questions and discuss ideas in GitHub Discussions
+  - name: Documentation
+    url: https://headroom-docs.vercel.app/docs
+    about: Check out the documentation for guides and API reference

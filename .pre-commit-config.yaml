@@ -1,0 +1,30 @@
+repos:
+  - repo: local
+    hooks:
+      - id: sync-plugin-versions
+        name: Sync plugin versions
+        entry: python3 scripts/sync-plugin-versions.py
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: commitlint
+        name: Commitlint
+        entry: bash -lc 'npx --yes --package=@commitlint/cli --package=@commitlint/config-conventional -- commitlint --edit "$1" --config .commitlintrc.json' --
+        language: system
+        stages: [commit-msg]
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.9.4
+    hooks:
+      - id: ruff
+        args: [--fix]
+        exclude: ^experiments/
+      - id: ruff-format
+        exclude: ^experiments/
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.14.1
+    hooks:
+      - id: mypy
+        args: [--ignore-missing-imports]
+        exclude: ^experiments/
+        pass_filenames: false
+        entry: mypy headroom

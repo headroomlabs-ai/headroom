@@ -1,0 +1,149 @@
+---
+title: Simulation
+description: Preview compression results without making an LLM call. Use simulation for cost estimation, debugging, and understanding waste signals.
+---
+
+Simulation mode lets you preview what Headroom would do to your messages without sending them to an LLM. This is useful for cost estimation, debugging compression behavior, and understanding where token waste comes from.
+
+## Basic Usage
+
+<Tabs groupId="lang" items={['TypeScript', 'Python']}>
+<Tab value="TypeScript">
+```ts twoslash
+import { compress } from 'headroom-ai';
+
+// compress() returns the same result structure —
+// use it without sending to your LLM to simulate
+const result = await compress(messages, { model: 'gpt-4o' });
+console.log(`Would save: ${result.tokensSaved} tokens`);
+console.log(`Compression ratio: ${(result.compressionRatio * 100).toFixed(1)}%`);
+console.log(`Transforms: ${result.transformsApplied.join(', ')}`);
+```
+</Tab>
+<Tab value="Python">
+```python
+plan = client.chat.completions.simulate(
+    model="gpt-4o",
+    messages=large_conversation,
+)
+
+print(f"Tokens before: {plan.tokens_before}")
+print(f"Tokens after: {plan.tokens_after}")
+print(f"Would save: {plan.tokens_saved} tokens ({plan.savings_percent:.1f}%)")
+print(f"Transforms: {plan.transforms_applied}")
+```
+</Tab>
+</Tabs>
+
+## Waste Signals
+
+Simulation reports where token waste comes from in your messages:
+
+```python
+plan = client.chat.completions.simulate(
+    model="gpt-4o",
+    messages=messages,
+)
+
+waste = plan.waste_signals
+print(f"JSON bloat:     {waste.json_bloat_tokens} tokens")
+print(f"HTML noise:     {waste.html_noise_tokens} tokens")
+print(f"Whitespace:     {waste.whitespace_tokens} tokens")
+print(f"Dynamic dates:  {waste.dynamic_date_tokens} tokens")
+print(f"Repetition:     {waste.repetition_tokens} tokens")
+```
+
+Waste signals help you understand which parts of your input are contributing the most unnecessary tokens.
+
+## Block Breakdown
+
+The parser breaks your conversation into blocks so you can see where tokens are concentrated:
+
+```python
+# Block types: system, user, assistant, tool_call, tool_result, rag
+# The breakdown shows token counts per block type
+```
+
+| Block Kind | Description |
+|-----------|-------------|
+| `system` | System prompt instructions |
+| `user` | User messages |
+| `assistant` | Model responses |
+| `tool_call` | Function call requests |
+| `tool_result` | Tool output (largest source of waste) |
+| `rag` | Retrieved document context |
+
+## Use Cases
+
+### Cost Estimation
+
+Run simulation on a representative sample of your workload to estimate savings before enabling `optimize` mode:
+
+```python
+import json
+
+total_before = 0
+total_after = 0
+
+for messages in sample_conversations:
+    plan = client.chat.completions.simulate(
+        model="gpt-4o",
+        messages=messages,
+    )
+    total_before += plan.tokens_before
+    total_after += plan.tokens_after
+
+savings_pct = (1 - total_after / total_before) * 100
+print(f"Estimated savings: {savings_pct:.1f}%")
+print(f"Tokens saved: {total_before - total_after:,}")
+```
+
+### Debugging Compression
+
+Use simulation to understand why a particular conversation is or is not being compressed:
+
+```python
+plan = client.chat.completions.simulate(
+    model="gpt-4o",
+    messages=messages,
+)
+
+if plan.tokens_saved == 0:
+    print("No compression applied. Possible reasons:")
+    print("- Messages are too short (< 200 tokens per tool output)")
+    print("- No tool outputs with compressible JSON arrays")
+    print("- Content is already compact (code, grep results)")
+else:
+    print(f"Transforms applied: {plan.transforms_applied}")
+    # See the optimized messages
+    print(json.dumps(plan.messages_optimized, indent=2))
+```
+
+### Comparing Configurations
+
+Test different configurations to find the best settings for your workload:
+
+```python
+from headroom import HeadroomClient, OpenAIProvider
+from headroom.transforms import SmartCrusherConfig
+
+configs = [
+    SmartCrusherConfig(max_items_after_crush=10),
+    SmartCrusherConfig(max_items_after_crush=25),
+    SmartCrusherConfig(max_items_after_crush=50),
+]
+
+for config in configs:
+    client = HeadroomClient(
+        original_client=OpenAI(),
+        provider=OpenAIProvider(),
+        smart_crusher_config=config,
+    )
+    plan = client.chat.completions.simulate(model="gpt-4o", messages=messages)
+    print(f"max_items={config.max_items_after_crush}: "
+          f"{plan.tokens_saved} tokens saved ({plan.savings_percent:.1f}%)")
+```
+
+<Callout type="info" title="No API call">
+Simulation never calls the LLM API. It runs the full transform pipeline locally and returns the results, so there is no cost and no latency from the provider.
+</Callout>

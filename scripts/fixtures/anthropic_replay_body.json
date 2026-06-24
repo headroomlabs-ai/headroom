@@ -1,0 +1,133 @@
+{
+  "model": "claude-opus-4-7",
+  "max_tokens": 4096,
+  "stream": true,
+  "system": "You are Claude Code, Anthropic's official CLI for disciplined software engineering. You are helping the operator triage a resilience bug in a Python/FastAPI LLM proxy that handles both Anthropic /v1/messages traffic and OpenAI Codex /v1/responses WebSocket traffic on the same process.\n\nWorking style: Read code with symbolic tools when available; prefer small, reviewable diffs; never bypass compression or add fast paths that skip transforms; keep /livez trivial and IO-free; treat the WebSocket relay lifecycle as load-bearing. When you are uncertain about upstream behavior, instrument first and mitigate second. Multi-agent reconnect storms arrive as a burst of /v1/messages?beta=true POSTs immediately after process restart; these are the failure mode under investigation.\n\nInvariants: compression stays on; /livez must respond under 100ms even during cold-start replay storms; memory-context lookups are wrapped in wait_for with a bounded timeout; upstream WS handshake has retry/open-timeout hardening; debug endpoints are loopback-only.",
+  "tools": [
+    {
+      "name": "read_file",
+      "description": "Read a file from the local filesystem. Returns file contents as a string. Use when you need to inspect exact text of a source file before editing.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {"type": "string", "description": "Absolute file path."},
+          "start_line": {"type": "integer", "description": "Optional 1-indexed start line."},
+          "end_line": {"type": "integer", "description": "Optional inclusive end line."}
+        },
+        "required": ["path"]
+      }
+    },
+    {
+      "name": "search_code",
+      "description": "Search the codebase for a regex pattern. Returns matching file paths and surrounding lines. Prefer over read_file when you don't know the file location yet.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "pattern": {"type": "string"},
+          "glob": {"type": "string", "description": "Optional glob filter, e.g. '**/*.py'."},
+          "max_results": {"type": "integer", "default": 50}
+        },
+        "required": ["pattern"]
+      }
+    },
+    {
+      "name": "run_tests",
+      "description": "Run the pytest suite or a subset. Returns summary output including passed/failed/errored counts and tracebacks for failures.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "expression": {"type": "string", "description": "pytest -k expression."},
+          "paths": {"type": "array", "items": {"type": "string"}, "description": "Specific test files or directories."}
+        }
+      }
+    },
+    {
+      "name": "edit_file",
+      "description": "Apply an exact-string replacement to a file. The old_string must be unique within the file; otherwise use replace_all. Prefer over write_file for modifications.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {"type": "string"},
+          "old_string": {"type": "string"},
+          "new_string": {"type": "string"},
+          "replace_all": {"type": "boolean", "default": false}
+        },
+        "required": ["path", "old_string", "new_string"]
+      }
+    },
+    {
+      "name": "run_command",
+      "description": "Execute a shell command and return stdout, stderr, and exit code. Use for git, build, and verification commands.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "command": {"type": "string"},
+          "timeout_seconds": {"type": "integer", "default": 120}
+        },
+        "required": ["command"]
+      }
+    }
+  ],
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "The shared proxy on 127.0.0.1:8787 started acting like a zombie this morning after a restart. New /livez probes time out, new /v1/responses WebSocket handshakes hang for ~20 seconds before the client gives up, but the existing agent sessions that were already streaming when the restart happened keep working fine. Two of us were connected at the time so there was a reconnect burst of Anthropic /v1/messages?beta=true POSTs carrying multi-turn history (~30 KB each). I suspect the replay storm is interacting badly with cold-start ONNX/embedder loads. Start by reading headroom/proxy/handlers/anthropic.py:handle_anthropic_messages and headroom/proxy/server.py:startup — I want to know whether the Anthropic pre-upstream stages (deep_copy, first compression pass, memory-context lookup) run before or after the Kompress/Magika preload settles, and whether there is any concurrency limit in front of that path. Don't propose a fix yet; just map the stages and tell me where the event loop would plausibly starve."
+        }
+      ]
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "text",
+          "text": "I've read both files. Mapping the pre-upstream stages on the Anthropic path: (1) handle_anthropic_messages reads the raw request bytes, (2) _read_request_json decodes and json.loads — this is synchronous and runs on the event loop thread, (3) a deep copy of the body is taken for logging, (4) the first compression stage fires through anthropic_pipeline.transforms, which on cold start is the moment Kompress ONNX and Magika get lazy-loaded, (5) memory-context lookup runs via MemoryHandler.search_and_format_context inside asyncio.wait_for, (6) only then does the handler reach http_client.stream() for upstream.\n\nStages 3 and 4 are the choke: deep_copy is synchronous Python on 30KB bodies (fine individually, but N concurrent replays mean N deep copies on one event loop), and the first compression stage blocks on Kompress load when the eager preload hasn't finished yet. There is currently no asyncio.Semaphore in front of stages 1-5. /livez does not go through this path, but the event loop is shared — if stages 3-5 hog it long enough, /livez's response coroutine doesn't get scheduled until they yield.\n\nI have not instrumented timings yet. Do you want me to add a StageTimer pass first, or jump straight to proposing a pre-upstream semaphore?"
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Instrument first — that's the whole point of not guessing. Add per-stage timings for read_request_json, deep_copy, compression_first_stage, memory_context, upstream_connect, upstream_first_byte on the Anthropic HTTP path, and accept -> first_client_frame -> upstream_connect -> upstream_first_event -> total_session on the Codex WS path. Both should share a single StageTimer utility, log one structured line per request with request_id + session_id + all stage fields, and emit Prometheus histograms. Don't change any behavior. Once that's in, we can let the harness run and read the real numbers before touching concurrency."
+        }
+      ]
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "tool_use",
+          "id": "toolu_anthropic_replay_01",
+          "name": "search_code",
+          "input": {
+            "pattern": "class PrometheusMetrics",
+            "glob": "headroom/proxy/**/*.py"
+          }
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "toolu_anthropic_replay_01",
+          "content": "headroom/proxy/prometheus_metrics.py:41:class PrometheusMetrics:\n  Holds in-process counters/gauges/histograms plus async record_* helpers. Backend-agnostic; OTLP export is deferred. Pattern: register each histogram once in __init__, update via record_request / record_stage_timings."
+        }
+      ]
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "text",
+          "text": "Plan: create headroom/proxy/stage_timer.py with a StageTimer context manager exposing .measure(stage_name) as both a sync and async context manager, accumulating into a dict[str, float] keyed by stage with millisecond values. Extend PrometheusMetrics with one histogram per stage, keyed by path ('anthropic' | 'codex_ws'). Extend request_logger with a stage_timings field. Then plumb stage_timer through handle_anthropic_messages and handle_openai_responses_ws without changing any existing control flow — the timer is a pure observer. I'll land the util + unit tests first, then thread it through the two handlers in separate commits so the diff stays reviewable."
+        }
+      ]
+    }
+  ]
+}

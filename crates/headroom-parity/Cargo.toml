@@ -1,0 +1,26 @@
+[package]
+name = "headroom-parity"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust-vs-Python parity harness for the Headroom port."
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "parity-run"
+path = "src/bin/parity_run.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+thiserror = { workspace = true }
+headroom-core = { path = "../headroom-core" }
+# NOTE: Phase 0 does not invoke Python from Rust. Phase 1 adds `pyo3` with
+# `auto-initialize` here so comparators can call into the installed
+# `headroom` package directly.

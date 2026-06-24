@@ -1,0 +1,34 @@
+{
+  "config": {
+    "dedup_identical_items": true,
+    "enabled": true,
+    "factor_out_constants": false,
+    "first_fraction": 0.3,
+    "include_summaries": false,
+    "last_fraction": 0.15,
+    "max_items_after_crush": 15,
+    "min_items_to_analyze": 5,
+    "min_tokens_to_crush": 200,
+    "preserve_change_points": true,
+    "similarity_threshold": 0.8,
+    "toin_confidence_threshold": 0.5,
+    "uniqueness_threshold": 0.1,
+    "use_feedback_hints": true,
+    "variance_threshold": 2.0
+  },
+  "input": {
+    "bias": 1.0,
+    "content": "{\"a\": 1, \"b\": 2, \"c\": \"hello\"}",
+    "query": ""
+  },
+  "input_sha256": "801afa36a32c7ed7066e80c8a28fefedbb979918e679b5640803fb5d06ef6fbf",
+  "label": "small_object_passthrough",
+  "output": {
+    "compressed": "{\"a\":1,\"b\":2,\"c\":\"hello\"}",
+    "original": "{\"a\": 1, \"b\": 2, \"c\": \"hello\"}",
+    "strategy": "passthrough",
+    "was_modified": true
+  },
+  "recorded_at": "2026-04-27T06:59:39.895485+00:00",
+  "transform": "smart_crusher"
+}

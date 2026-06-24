@@ -1,0 +1,8 @@
+{
+  "config": {},
+  "input": "a\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\na\nb\nc\n\n[[variant 1]]",
+  "input_sha256": "c2ddce4c6eeb637d12b32653e2ffe1946f3335b0f79be9ff06fbbdb58cc623a8",
+  "output": 605,
+  "recorded_at": "2026-04-23T23:51:37.616571+00:00",
+  "transform": "tokenizer"
+}

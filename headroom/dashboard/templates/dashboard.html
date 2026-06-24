@@ -1,0 +1,2601 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Headroom Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+    <script src="https://unpkg.com/alpinejs@3.13.3/dist/cdn.min.js" defer></script>
+    <script>
+        (function() {
+            const saved = localStorage.getItem('headroom-theme');
+            const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+            if (saved === 'light' || (!saved && !prefersDark)) {
+                document.documentElement.classList.remove('dark');
+            } else {
+                document.documentElement.classList.add('dark');
+            }
+        })();
+    </script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    colors: {
+                        surface: 'var(--color-surface)',
+                        border: 'var(--color-border)',
+                        accent: '#22d3ee',
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        :root {
+            --bg: #f9fafb;
+            --color-surface: #ffffff;
+            --color-border: #e5e7eb;
+            --card-alt-bg: #f3f4f6;
+            --diff-before-header: #fff5f5;
+            --diff-before-body: #fef2f2;
+            --diff-after-header: #f0fdf4;
+            --diff-after-body: #f0fdf4;
+            --ttl-card-bg: linear-gradient(180deg, rgba(34,211,238,0.10), rgba(224,249,253,0.90));
+        }
+        html.dark {
+            --bg: #0f0f0f;
+            --color-surface: #1a1a1a;
+            --color-border: #2a2a2a;
+            --card-alt-bg: #141414;
+            --diff-before-header: #1a0808;
+            --diff-before-body: #120606;
+            --diff-after-header: #081a08;
+            --diff-after-body: #0a120a;
+            --ttl-card-bg: linear-gradient(180deg, rgba(34,211,238,0.10), rgba(12,16,22,0.88));
+        }
+        body { background: var(--bg); }
+        .sparkline { stroke: #22d3ee; stroke-width: 1.5; fill: none; }
+        .sparkline-area { fill: url(#sparkline-gradient); }
+        .trend-line { stroke: #22d3ee; stroke-width: 2; fill: none; }
+        .trend-area { fill: url(#trend-gradient); }
+        @keyframes pulse-subtle { 0%, 100% { opacity: 1; } 50% { opacity: 0.7; } }
+        .pulse-live { animation: pulse-subtle 2s ease-in-out infinite; }
+        #feed-container {
+            height: calc(100vh - 57px);
+            scroll-behavior: smooth;
+        }
+        #feed-virtual-list {
+            position: relative;
+        }
+        .transformation-card { background: var(--card-alt-bg); }
+        .transformation-card:hover { background: var(--color-surface); }
+        .diff-before-header { background: var(--diff-before-header); }
+        .diff-before { background: var(--diff-before-body); }
+        .diff-after-header { background: var(--diff-after-header); }
+        .diff-after { background: var(--diff-after-body); }
+        .ttl-bucket-gradient-card { background: var(--ttl-card-bg); }
+
+        /* Light mode: invert the gray text scale (dark bg grays → light bg grays) */
+        html:not(.dark) body { color: #1f2937; }
+        html:not(.dark) .text-gray-200 { color: #1f2937; }
+        html:not(.dark) .text-gray-300 { color: #374151; }
+        html:not(.dark) .text-gray-400 { color: #6b7280; }
+        html:not(.dark) .text-gray-500 { color: #9ca3af; }
+        html:not(.dark) .text-gray-600 { color: #6b7280; }
+        html:not(.dark) .hover\:text-gray-200:hover { color: #111827; }
+        html:not(.dark) .hover\:text-white:hover { color: #111827; }
+        /* Light mode overrides for dark-specific utility classes */
+        html:not(.dark) .bg-black\/20 { background-color: rgba(0,0,0,0.04); }
+        html:not(.dark) .bg-black\/30 { background-color: rgba(0,0,0,0.06); }
+        html:not(.dark) .border-white\/8 { border-color: rgba(0,0,0,0.10); }
+        html:not(.dark) .ring-white\/5 { --tw-ring-color: rgba(0,0,0,0.08); }
+        html:not(.dark) .border-red-900\/30 { border-color: rgba(239,68,68,0.25); }
+        html:not(.dark) .border-emerald-900\/30 { border-color: rgba(16,185,129,0.25); }
+        /* Light mode: TTL card color adjustments */
+        html:not(.dark) .text-cyan-50 { color: #164e63; }
+        html:not(.dark) .text-violet-50 { color: #4c1d95; }
+        html:not(.dark) .text-cyan-200\/80 { color: #0e7490; }
+        html:not(.dark) .text-cyan-300\/75 { color: #0891b2; }
+        html:not(.dark) .text-violet-300\/75 { color: #7c3aed; }
+        /* Light mode: fix hardcoded dark card backgrounds */
+        .bg-card-alt { background: var(--card-alt-bg); }
+        .hover-bg-surface:hover { background: var(--color-surface); }
+    </style>
+</head>
+<body class="text-gray-200 min-h-screen" x-data="dashboard()" x-init="init()">
+    <!-- Header -->
+    <header class="border-b border-border px-6 py-4 flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+        <div class="flex items-center gap-4">
+            <h1 class="text-xl font-semibold tracking-tight">HEADROOM</h1>
+            <span class="text-xs text-gray-500 font-mono" x-text="'v' + version"></span>
+        </div>
+        <div class="flex flex-col gap-3 md:flex-row md:items-center md:gap-6">
+            <div class="inline-flex rounded-lg border border-border bg-surface p-1">
+                <button class="px-3 py-1.5 text-sm rounded-md transition-colors"
+                        :class="viewMode === 'session' ? 'bg-accent text-black' : 'text-gray-400 hover:text-gray-200'"
+                        @click="setViewMode('session')">
+                    Session
+                </button>
+                <button class="px-3 py-1.5 text-sm rounded-md transition-colors"
+                        :class="viewMode === 'history' ? 'bg-accent text-black' : 'text-gray-400 hover:text-gray-200'"
+                        @click="setViewMode('history')">
+                    Historical
+                </button>
+            </div>
+            <template x-if="stats.anon_telemetry_shipping">
+                <div class="inline-flex items-center gap-1.5 rounded-full border border-amber-500/40 bg-amber-500/10 px-2.5 py-1"
+                     title="Anonymous aggregate telemetry is enabled. Disable with HEADROOM_TELEMETRY=off or --no-telemetry.">
+                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor"
+                         class="w-3 h-3 text-amber-400 shrink-0">
+                        <path fill-rule="evenodd"
+                              d="M6.701 2.25c.577-1 2.02-1 2.598 0l5.196 9a1.5 1.5 0 0 1-1.299 2.25H2.804a1.5 1.5 0 0 1-1.3-2.25l5.197-9ZM8 4a.75.75 0 0 1 .75.75v3a.75.75 0 0 1-1.5 0v-3A.75.75 0 0 1 8 4Zm0 8a1 1 0 1 0 0-2 1 1 0 0 0 0 2Z"
+                              clip-rule="evenodd"/>
+                    </svg>
+                    <span class="text-xs text-amber-400 font-medium">Anon Telemetry</span>
+                </div>
+            </template>
+            <template x-if="stats.config && stats.config.savings_profile">
+                <div class="inline-flex items-center gap-1.5 rounded-full border border-cyan-500/40 bg-cyan-500/10 px-2.5 py-1"
+                     :title="'Current proxy profile: ' + stats.config.savings_profile">
+                    <span class="w-1.5 h-1.5 rounded-full bg-cyan-400"></span>
+                    <span class="text-xs text-cyan-100">
+                        <span x-text="stats.config.savings_profile"></span>
+                        <template x-if="stats.config.target_savings_percent !== null">
+                            <span x-text="' · target ' + stats.config.target_savings_percent + '%'"></span>
+                        </template>
+                    </span>
+                </div>
+            </template>
+            <div class="flex items-center gap-2">
+                <span class="text-xs text-gray-500">Status</span>
+                <span class="flex items-center gap-1.5">
+                    <span class="w-2 h-2 rounded-full pulse-live"
+                          :class="healthy ? 'bg-emerald-400' : 'bg-red-400'"></span>
+                    <span class="text-sm" x-text="healthy ? 'Healthy' : 'Error'"></span>
+                </span>
+            </div>
+            <div class="text-xs text-gray-500">
+                Updated <span x-text="lastUpdate"></span>
+            </div>
+            <button onclick="toggleTheme()" id="theme-toggle"
+                    class="px-3 py-1.5 text-sm rounded-md border border-border bg-surface text-gray-400 hover:text-gray-200 transition-colors"
+                    title="Toggle light/dark mode">
+                <svg class="w-4 h-4 dark:hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z"/>
+                </svg>
+                <svg class="w-4 h-4 hidden dark:block" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z"/>
+                </svg>
+            </button>
+            <button x-show="log_full_messages" id="feed-toggle"
+                    class="px-3 py-1.5 text-sm rounded-md border border-border bg-surface text-gray-300 hover:text-white transition-colors"
+                    @click="toggleFeed()"
+                    :class="feedOpen ? 'bg-accent text-black' : ''">
+                Live Feed
+            </button>
+        </div>
+    </header>
+
+    <main class="p-6 max-w-7xl mx-auto">
+        <template x-if="viewMode === 'session'">
+            <div>
+        <!-- Hero Metrics: Savings $ -> Input Compression -> Output Reduction -> Overhead -->
+        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+            <!-- Savings ($) - proxy compression only, priced at model list rate -->
+            <div class="bg-surface rounded-lg p-4 border border-border">
+                <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Proxy $ Saved</div>
+                <div class="flex items-baseline gap-2">
+                    <span class="text-3xl font-light tabular-nums text-emerald-400" x-text="'$' + formatCurrency(stats.persistent_savings?.lifetime?.compression_savings_usd || 0)"></span>
+                </div>
+                <div class="mt-2 text-xs text-gray-500">
+                    <span x-show="(stats.persistent_savings?.lifetime?.compression_savings_usd || 0) > 0"
+                          x-text="formatNumber(stats.tokens?.proxy_compression_saved || 0) + ' proxy tokens only; ' + cliFilteringLabel + ' excluded from $'"></span>
+                    <span x-show="!((stats.persistent_savings?.lifetime?.compression_savings_usd || 0) > 0)"
+                          x-text="formatNumber(stats.requests?.total || 0) + ' requests processed'"></span>
+                </div>
+            </div>
+
+            <!-- Token Savings (%) -->
+            <div class="bg-surface rounded-lg p-4 border border-border">
+                <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Token Savings</div>
+                <div class="flex items-baseline gap-2">
+                    <span class="text-3xl font-light tabular-nums text-accent" x-text="formatNumber(stats.tokens?.saved || 0)"></span>
+                    <!-- Active compression ratio: savings as a fraction of tokens we
+                         *attempted* to compress (extracted units + tool schema). When
+                         the attempted denominator is missing (backend-routed paths
+                         that don't yet wire per-message live-zone tracking), fall back
+                         to the whole-request ratio so the headline doesn't collapse to
+                         0% while compression is happening (issue #455). -->
+                    <span class="text-sm text-accent" x-text="headlineSavingsPercent.toFixed(1) + '%'" :title="headlineSavingsTitle"></span>
+                </div>
+                <div class="mt-1 text-xs text-gray-500 leading-relaxed">
+                    <span x-text="'Proxy ' + formatNumber(stats.tokens?.proxy_compression_saved || 0) + ' (' + proxyShareOfTotal.toFixed(1) + '%)'"></span>
+                    <span class="mx-1 text-gray-600">/</span>
+                    <span x-text="cliFilteringLabel + ' ' + formatNumber(cliFilteringSaved) + ' (' + cliFilteringShareOfTotal.toFixed(1) + '%)'"></span>
+                </div>
+                <div class="mt-1 text-xs text-gray-600 leading-relaxed">
+                    <span x-text="'Of total wire: ' + (stats.tokens?.savings_percent || 0).toFixed(2) + '%'" title="Savings as fraction of all input tokens including frozen prefix"></span>
+                </div>
+                <div class="mt-2 h-8">
+                    <svg class="w-full h-full" viewBox="0 0 100 32" preserveAspectRatio="none">
+                        <defs>
+                            <linearGradient id="sparkline-gradient" x1="0%" y1="0%" x2="0%" y2="100%">
+                                <stop offset="0%" style="stop-color:#22d3ee;stop-opacity:0.3"/>
+                                <stop offset="100%" style="stop-color:#22d3ee;stop-opacity:0"/>
+                            </linearGradient>
+                        </defs>
+                        <path class="sparkline-area" :d="getSparklineArea(savingsHistory)"></path>
+                        <path class="sparkline" :d="getSparkline(savingsHistory)"></path>
+                    </svg>
+                </div>
+            </div>
+
+            <!-- Output Tokens Saved (counterfactual) -->
+            <div class="bg-surface rounded-lg p-4 border border-border">
+                <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Output Tokens Saved</div>
+                <template x-if="stats.tokens?.output_reduction?.available">
+                    <div>
+                        <div class="flex items-baseline gap-2">
+                            <span class="text-3xl font-light tabular-nums text-accent" x-text="formatNumber(stats.tokens?.output_saved || 0)"></span>
+                            <span class="text-sm text-accent" x-text="(stats.tokens?.output_reduction_percent || 0).toFixed(1) + '%'"></span>
+                        </div>
+                        <div class="mt-1 text-xs text-gray-500 leading-relaxed">
+                            <!-- "measured" = A/B holdout (unbiased); "estimated" = vs learned baseline -->
+                            <span class="uppercase tracking-wide"
+                                  :class="stats.tokens?.output_reduction?.method === 'measured' ? 'text-emerald-400' : 'text-gray-400'"
+                                  x-text="stats.tokens?.output_reduction?.method || ''"></span>
+                            <span x-text="'· 95% CI ' + (stats.tokens?.output_reduction?.ci_low_percent || 0).toFixed(1) + '–' + (stats.tokens?.output_reduction?.ci_high_percent || 0).toFixed(1) + '%'"></span>
+                        </div>
+                        <div class="mt-1 text-xs text-gray-600 leading-relaxed"
+                             x-text="formatNumber(stats.tokens?.output_reduction?.requests || 0) + ' shaped responses · counterfactual'">
+                        </div>
+                    </div>
+                </template>
+                <template x-if="!stats.tokens?.output_reduction?.available">
+                    <div class="mt-1 text-xs text-gray-500 leading-relaxed">
+                        <span class="text-2xl font-light tabular-nums text-gray-600">—</span>
+                        <div class="mt-1">Enable the output shaper (HEADROOM_OUTPUT_SHAPER=1) and run
+                            <code class="text-gray-400">headroom learn --verbosity --apply</code> to start measuring.</div>
+                    </div>
+                </template>
+            </div>
+
+            <!-- Headroom Overhead -->
+            <div class="bg-surface rounded-lg p-4 border border-border">
+                <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Overhead</div>
+                <div class="flex items-baseline gap-2">
+                    <span class="text-3xl font-light tabular-nums" x-text="(stats.overhead?.average_ms || 0).toFixed(0) + 'ms'"></span>
+                </div>
+                <div class="mt-2 text-xs text-gray-500">
+                    TTFB <span x-text="((stats.ttfb?.average_ms || 0) / 1000).toFixed(2)"></span>s avg
+                </div>
+            </div>
+
+            <!-- Token Throughput -->
+            <div class="bg-surface rounded-lg p-4 border border-border flex flex-col justify-between">
+                <div>
+                    <div class="text-xs text-gray-500 uppercase tracking-wide mb-1.5">Throughput</div>
+                    <div class="flex flex-col gap-1 text-[11px] text-gray-300">
+                        <div class="flex justify-between items-baseline border-b border-border/40 pb-0.5">
+                            <span class="text-gray-500">Input (wall / active p50)</span>
+                            <span class="font-mono text-accent">
+                                <span x-text="(stats.throughput?.rolling?.input_wall_clock || 0).toFixed(1)"></span> /
+                                <span x-text="(stats.throughput?.rolling?.input_active_p50 || 0).toFixed(1)"></span> tok/s
+                            </span>
+                        </div>
+                        <div class="flex justify-between items-baseline border-b border-border/40 pb-0.5" x-show="(stats.throughput?.rolling?.compression_p50 || 0) > 0">
+                            <span class="text-gray-500">Compression (p50 / p95)</span>
+                            <span class="font-mono text-emerald-400">
+                                <span x-text="(stats.throughput?.rolling?.compression_p50 || 0).toFixed(1)"></span> /
+                                <span x-text="(stats.throughput?.rolling?.compression_p95 || 0).toFixed(1)"></span> tok/s
+                            </span>
+                        </div>
+                        <div class="flex justify-between items-baseline border-b border-border/40 pb-0.5">
+                            <span class="text-gray-500">Forward (p50 / p95)</span>
+                            <span class="font-mono text-cyan-400">
+                                <span x-text="(stats.throughput?.rolling?.forward_p50 || 0).toFixed(1)"></span> /
+                                <span x-text="(stats.throughput?.rolling?.forward_p95 || 0).toFixed(1)"></span> tok/s
+                            </span>
+                        </div>
+                        <div class="flex justify-between items-baseline" x-show="(stats.throughput?.rolling?.generation_p50 || 0) > 0">
+                            <span class="text-gray-500">Generation (p50 / p95)</span>
+                            <span class="font-mono text-yellow-400">
+                                <span x-text="(stats.throughput?.rolling?.generation_p50 || 0).toFixed(1)"></span> /
+                                <span x-text="(stats.throughput?.rolling?.generation_p95 || 0).toFixed(1)"></span> tok/s
+                            </span>
+                        </div>
+                    </div>
+                </div>
+                <div class="mt-2 pt-1.5 border-t border-border/40 text-[10px] text-gray-500 flex justify-between items-center">
+                    <span>Current 5m (active p50):</span>
+                    <span class="font-mono text-gray-400">
+                        In: <span x-text="(stats.throughput?.current?.input_active_p50 || 0).toFixed(0)"></span> ·
+                        Fwd: <span x-text="(stats.throughput?.current?.forward_p50 || 0).toFixed(0)"></span> tok/s
+                    </span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Agent Usage -->
+        <div class="bg-surface rounded-lg border border-border overflow-hidden mb-6">
+            <div class="px-4 py-3 border-b border-border flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
+                <div>
+                    <div class="text-sm font-medium text-gray-300">Agent Usage</div>
+                    <div class="text-xs text-gray-500">Before and after token usage by detected client</div>
+                </div>
+                <div class="flex flex-wrap items-center gap-3 text-xs">
+                    <span class="text-gray-500" x-text="'Coverage: ' + agentCoverageLabel"></span>
+                    <span class="px-2 py-0.5 rounded border border-border bg-card-alt font-mono text-gray-400"
+                          x-text="formatNumber(stats.agent_usage?.totals?.requests || 0) + ' requests'"></span>
+                </div>
+            </div>
+
+            <div class="p-4">
+                <div class="grid grid-cols-1 md:grid-cols-4 gap-3 mb-5">
+                    <div class="rounded-lg border border-border bg-card-alt p-3">
+                        <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Before</div>
+                        <div class="text-2xl font-light tabular-nums" x-text="formatNumber(stats.agent_usage?.totals?.before_tokens || 0)"></div>
+                    </div>
+                    <div class="rounded-lg border border-border bg-card-alt p-3">
+                        <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">After</div>
+                        <div class="text-2xl font-light tabular-nums text-gray-200" x-text="formatNumber(stats.agent_usage?.totals?.after_tokens || 0)"></div>
+                    </div>
+                    <div class="rounded-lg border border-border bg-card-alt p-3">
+                        <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Saved</div>
+                        <div class="text-2xl font-light tabular-nums text-accent" x-text="formatNumber(stats.agent_usage?.totals?.tokens_saved || 0)"></div>
+                    </div>
+                    <div class="rounded-lg border border-border bg-card-alt p-3">
+                        <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Savings</div>
+                        <div class="text-2xl font-light tabular-nums text-emerald-400" x-text="(stats.agent_usage?.totals?.savings_percent || 0).toFixed(1) + '%'"></div>
+                    </div>
+                </div>
+
+                <template x-if="agentRows.length > 0">
+                    <div class="space-y-3">
+                        <template x-for="agent in agentRows" :key="agent.agent">
+                            <div class="rounded-lg border border-border bg-card-alt p-3">
+                                <div class="grid grid-cols-1 gap-3 lg:grid-cols-[minmax(160px,0.9fr)_minmax(260px,1.5fr)_minmax(260px,1.2fr)] lg:items-center">
+                                    <div class="min-w-0">
+                                        <div class="flex items-center gap-2">
+                                            <span class="h-2.5 w-2.5 rounded-full" :class="agentDotClass(agent.agent)"></span>
+                                            <span class="text-sm font-medium text-gray-200 truncate" x-text="agent.label"></span>
+                                        </div>
+                                        <div class="mt-1 text-xs text-gray-500">
+                                            <span x-text="formatNumber(agent.requests || 0) + ' requests'"></span>
+                                            <span class="mx-1 text-gray-700">/</span>
+                                            <span x-text="agent.source"></span>
+                                        </div>
+                                    </div>
+
+                                    <div>
+                                        <div class="flex items-center justify-between text-xs mb-1">
+                                            <span class="text-gray-500">Token flow</span>
+                                            <span class="font-mono text-emerald-400" x-text="(agent.savings_percent || 0).toFixed(1) + '% saved'"></span>
+                                        </div>
+                                        <div class="h-3 w-full rounded-full bg-border overflow-hidden flex">
+                                            <div class="h-full bg-emerald-500 transition-all duration-500"
+                                                 :style="'width:' + agentSavedWidth(agent) + '%'"></div>
+                                            <div class="h-full bg-accent/60 transition-all duration-500"
+                                                 :style="'width:' + agentAfterWidth(agent) + '%'"></div>
+                                        </div>
+                                        <div class="mt-1 flex flex-wrap gap-3 text-xs text-gray-500">
+                                            <span class="inline-flex items-center gap-1"><span class="h-2 w-2 rounded-full bg-emerald-500"></span>Saved</span>
+                                            <span class="inline-flex items-center gap-1"><span class="h-2 w-2 rounded-full bg-accent/60"></span>Sent</span>
+                                        </div>
+                                    </div>
+
+                                    <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 text-right">
+                                        <div>
+                                            <div class="text-[11px] uppercase tracking-wide text-gray-500">Before</div>
+                                            <div class="font-mono text-sm" x-text="formatNumber(agent.before_tokens || 0)"></div>
+                                        </div>
+                                        <div>
+                                            <div class="text-[11px] uppercase tracking-wide text-gray-500">After</div>
+                                            <div class="font-mono text-sm" x-text="formatNumber(agent.after_tokens || 0)"></div>
+                                        </div>
+                                        <div>
+                                            <div class="text-[11px] uppercase tracking-wide text-gray-500">Saved</div>
+                                            <div class="font-mono text-sm text-accent" x-text="formatNumber(agent.tokens_saved || 0)"></div>
+                                        </div>
+                                        <div>
+                                            <div class="text-[11px] uppercase tracking-wide text-gray-500">Share</div>
+                                            <div class="font-mono text-sm text-gray-300" x-text="(agent.share_of_saved_percent || 0).toFixed(1) + '%'"></div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </template>
+                    </div>
+                </template>
+
+                <template x-if="agentRows.length === 0">
+                    <div class="rounded-lg border border-dashed border-border p-6 text-center text-sm text-gray-500">
+                        Agent usage appears after Cursor, Claude, Codex, or another client sends traffic through this proxy.
+                    </div>
+                </template>
+            </div>
+        </div>
+
+        <!-- Savings Breakdown -->
+        <template x-if="(stats.cost?.savings_usd || 0) > 0 || (stats.cost?.cache_savings_usd || 0) > 0">
+            <div class="bg-surface rounded-lg p-4 border border-border mb-6">
+                <div class="text-sm font-medium text-gray-300 mb-3">Savings Breakdown</div>
+                <div class="flex items-center gap-8">
+                    <div>
+                        <div class="text-xs text-gray-500 mb-1">Compression</div>
+                        <div class="text-2xl font-light tabular-nums text-emerald-400" x-text="'$' + formatCurrency(stats.cost?.compression_savings_usd || 0)"></div>
+                        <div class="text-xs text-gray-500" x-text="formatNumber(stats.tokens?.proxy_compression_saved || 0) + ' proxy tokens removed'"></div>
+                    </div>
+                    <template x-if="(stats.cost?.cache_savings_usd || 0) > 0">
+                        <div>
+                            <div class="text-xs text-gray-500 mb-1">Prefix Cache Discount</div>
+                            <div class="text-2xl font-light tabular-nums text-cyan-400" x-text="'$' + formatCurrency(stats.cost?.cache_savings_usd || 0)"></div>
+                            <div class="text-xs text-gray-500">Provider-native caching</div>
+                        </div>
+                    </template>
+                </div>
+            </div>
+        </template>
+
+        <!-- Anthropic Subscription Window -->
+        <template x-if="stats.subscription_window && stats.subscription_window.latest">
+            <div class="bg-surface rounded-lg p-4 border border-border mb-6">
+                <div class="flex justify-between items-center mb-4">
+                    <div class="text-sm font-medium text-gray-300">Anthropic Subscription Window</div>
+                    <div class="flex items-center gap-2">
+                        <span class="w-2 h-2 rounded-full pulse-live"
+                              :class="stats.subscription_window.last_active_at ? 'bg-emerald-400' : 'bg-gray-600'"></span>
+                        <span class="text-xs text-gray-500" x-text="stats.subscription_window.last_active_at ? 'Active' : 'Idle'"></span>
+                    </div>
+                </div>
+
+                <!-- 5h / 7d progress bars -->
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+                    <!-- 5-hour window -->
+                    <template x-if="stats.subscription_window.latest.five_hour">
+                        <div>
+                            <div class="flex justify-between text-xs mb-1">
+                                <span class="text-gray-400 uppercase tracking-wide">5-Hour Window</span>
+                                <span class="tabular-nums font-mono"
+                                      :class="stats.subscription_window.latest.five_hour.utilization_pct > 80 ? 'text-red-400' : stats.subscription_window.latest.five_hour.utilization_pct > 60 ? 'text-amber-400' : 'text-emerald-400'"
+                                      x-text="(stats.subscription_window.latest.five_hour.utilization_pct || 0).toFixed(1) + '%'"></span>
+                            </div>
+                            <div class="w-full h-3 bg-border rounded-full overflow-hidden">
+                                <div class="h-full rounded-full transition-all duration-500"
+                                     :class="stats.subscription_window.latest.five_hour.utilization_pct > 80 ? 'bg-red-500' : stats.subscription_window.latest.five_hour.utilization_pct > 60 ? 'bg-amber-500' : 'bg-emerald-500'"
+                                     :style="'width: ' + Math.min(stats.subscription_window.latest.five_hour.utilization_pct || 0, 100) + '%'"></div>
+                            </div>
+                            <div class="text-xs text-gray-500 mt-1"
+                                 x-text="'Resets in ' + formatResetTime(stats.subscription_window.latest.five_hour.seconds_to_reset)"></div>
+                        </div>
+                    </template>
+
+                    <!-- 7-day window -->
+                    <template x-if="stats.subscription_window.latest.seven_day">
+                        <div>
+                            <div class="flex justify-between text-xs mb-1">
+                                <span class="text-gray-400 uppercase tracking-wide">7-Day Window</span>
+                                <span class="tabular-nums font-mono"
+                                      :class="stats.subscription_window.latest.seven_day.utilization_pct > 80 ? 'text-red-400' : stats.subscription_window.latest.seven_day.utilization_pct > 60 ? 'text-amber-400' : 'text-emerald-400'"
+                                      x-text="(stats.subscription_window.latest.seven_day.utilization_pct || 0).toFixed(1) + '%'"></span>
+                            </div>
+                            <div class="w-full h-3 bg-border rounded-full overflow-hidden">
+                                <div class="h-full rounded-full transition-all duration-500"
+                                     :class="stats.subscription_window.latest.seven_day.utilization_pct > 80 ? 'bg-red-500' : stats.subscription_window.latest.seven_day.utilization_pct > 60 ? 'bg-amber-500' : 'bg-emerald-500'"
+                                     :style="'width: ' + Math.min(stats.subscription_window.latest.seven_day.utilization_pct || 0, 100) + '%'"></div>
+                            </div>
+                            <div class="text-xs text-gray-500 mt-1"
+                                 x-text="'Resets in ' + formatResetTime(stats.subscription_window.latest.seven_day.seconds_to_reset)"></div>
+                        </div>
+                    </template>
+                </div>
+
+                <!-- Overage / extra usage -->
+                <template x-if="stats.subscription_window.latest.extra_usage && stats.subscription_window.latest.extra_usage.is_enabled">
+                    <div class="border-t border-border pt-3 mb-3">
+                        <div class="flex justify-between text-xs mb-1">
+                            <span class="text-gray-400 uppercase tracking-wide">Extra Usage (Overage)</span>
+                            <span class="text-amber-400 tabular-nums font-mono"
+                                  x-text="'$' + formatCurrency(stats.subscription_window.latest.extra_usage.used_credits_usd || 0) + (stats.subscription_window.latest.extra_usage.monthly_limit_usd ? ' / $' + formatCurrency(stats.subscription_window.latest.extra_usage.monthly_limit_usd) : '')"></span>
+                        </div>
+                        <template x-if="stats.subscription_window.latest.extra_usage.utilization_pct != null">
+                            <div class="w-full h-2 bg-border rounded-full overflow-hidden">
+                                <div class="h-full bg-amber-500 rounded-full transition-all duration-500"
+                                     :style="'width: ' + Math.min(stats.subscription_window.latest.extra_usage.utilization_pct || 0, 100) + '%'"></div>
+                            </div>
+                        </template>
+                    </div>
+                </template>
+
+                <!-- Headroom contribution row -->
+                <template x-if="stats.subscription_window.contribution && stats.subscription_window.contribution.tokens_submitted > 0">
+                    <div class="border-t border-border pt-3">
+                        <div class="text-xs text-gray-400 uppercase tracking-wide mb-2">Headroom Contribution This Window</div>
+                        <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+                            <div>
+                                <div class="text-xs text-gray-500 mb-0.5">Efficiency</div>
+                                <div class="text-lg font-light tabular-nums text-accent"
+                                     x-text="(stats.subscription_window.contribution.efficiency_pct || 0).toFixed(1) + '%'"></div>
+                            </div>
+                            <div>
+                                <div class="text-xs text-gray-500 mb-0.5">Tokens Saved</div>
+                                <div class="text-lg font-light tabular-nums text-emerald-400"
+                                     x-text="formatNumber(stats.subscription_window.contribution.tokens_saved?.total || 0)"></div>
+                            </div>
+                            <div>
+                                <div class="text-xs text-gray-500 mb-0.5">Compression</div>
+                                <div class="text-sm tabular-nums text-gray-300"
+                                     x-text="formatNumber(stats.subscription_window.contribution.tokens_saved?.compression || 0) + ' tok'"></div>
+                            </div>
+                            <div>
+                                <div class="text-xs text-gray-500 mb-0.5">Cache Reads</div>
+                                <div class="text-sm tabular-nums text-cyan-400"
+                                     x-text="formatNumber(stats.subscription_window.contribution.tokens_saved?.cache_reads || 0) + ' tok'"></div>
+                            </div>
+                        </div>
+
+                        <!-- Efficiency bar: tokens submitted vs what would have been sent without headroom -->
+                        <template x-if="stats.subscription_window.contribution.raw_without_headroom > 0">
+                            <div class="mt-3">
+                                <div class="flex justify-between text-xs text-gray-500 mb-1">
+                                    <span>Raw vs Submitted</span>
+                                    <span x-text="formatNumber(stats.subscription_window.contribution.tokens_submitted) + ' / ' + formatNumber(stats.subscription_window.contribution.raw_without_headroom) + ' tokens forwarded'"></span>
+                                </div>
+                                <div class="w-full h-2 bg-border rounded-full overflow-hidden flex">
+                                    <div class="h-full bg-accent rounded-l-full"
+                                         :style="'width: ' + ((stats.subscription_window.contribution.tokens_submitted / stats.subscription_window.contribution.raw_without_headroom) * 100).toFixed(1) + '%'"></div>
+                                </div>
+                                <div class="flex gap-4 mt-1 text-xs text-gray-500">
+                                    <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-accent inline-block"></span>Forwarded to Anthropic</span>
+                                    <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-border inline-block"></span>Saved by Headroom</span>
+                                </div>
+                            </div>
+                        </template>
+                    </div>
+                </template>
+
+                <!-- Discrepancies -->
+                <template x-if="stats.subscription_window.discrepancies && stats.subscription_window.discrepancies.length > 0">
+                    <div class="border-t border-border pt-3 mt-3">
+                        <div class="text-xs text-amber-400 uppercase tracking-wide mb-2">⚠ Anomalies Detected</div>
+                        <template x-for="d in stats.subscription_window.discrepancies" :key="d.kind + d.description">
+                            <div class="text-xs mb-1"
+                                 :class="d.severity === 'alert' ? 'text-red-400' : 'text-amber-400'"
+                                 x-text="d.description"></div>
+                        </template>
+                    </div>
+                </template>
+            </div>
+        </template>
+        <!-- Codex Rate-Limit Window -->
+        <template x-if="stats.codex_rate_limits && stats.codex_rate_limits.primary">
+            <div class="bg-surface rounded-lg p-4 border border-border mb-6">
+                <div class="flex justify-between items-center mb-4">
+                    <div class="text-sm font-medium text-gray-300">OpenAI Codex Rate-Limit Window</div>
+                    <template x-if="stats.codex_rate_limits.limit_name">
+                        <span class="text-xs text-gray-500 font-mono" x-text="stats.codex_rate_limits.limit_name"></span>
+                    </template>
+                </div>
+
+                <!-- Primary / Secondary window grid (mirrors Anthropic 5h/7d layout) -->
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+                    <!-- Primary window -->
+                    <div>
+                        <div class="flex justify-between text-xs mb-1">
+                            <span class="text-gray-400 uppercase tracking-wide">Primary
+                                <template x-if="stats.codex_rate_limits.primary.window_label">
+                                    <span class="text-gray-600 normal-case font-mono ml-1"
+                                          x-text="'(' + stats.codex_rate_limits.primary.window_label + ')'"></span>
+                                </template>
+                            </span>
+                            <span class="tabular-nums font-mono"
+                                  :class="(stats.codex_rate_limits.primary.used_percent||0) > 80 ? 'text-red-400' : (stats.codex_rate_limits.primary.used_percent||0) > 60 ? 'text-amber-400' : 'text-emerald-400'"
+                                  x-text="(stats.codex_rate_limits.primary.used_percent||0).toFixed(1) + '%'"></span>
+                        </div>
+                        <div class="w-full h-3 bg-border rounded-full overflow-hidden">
+                            <div class="h-full rounded-full transition-all duration-500"
+                                 :class="(stats.codex_rate_limits.primary.used_percent||0) > 80 ? 'bg-red-500' : (stats.codex_rate_limits.primary.used_percent||0) > 60 ? 'bg-amber-500' : 'bg-emerald-500'"
+                                 :style="'width: ' + Math.min(stats.codex_rate_limits.primary.used_percent||0, 100) + '%'"></div>
+                        </div>
+                        <template x-if="stats.codex_rate_limits.primary.seconds_until_reset !== null">
+                            <div class="text-xs text-gray-500 mt-1"
+                                 x-text="'Resets in ' + formatResetTime(stats.codex_rate_limits.primary.seconds_until_reset)"></div>
+                        </template>
+                    </div>
+                    <!-- Secondary window -->
+                    <template x-if="stats.codex_rate_limits.secondary">
+                        <div>
+                            <div class="flex justify-between text-xs mb-1">
+                                <span class="text-gray-400 uppercase tracking-wide">Secondary
+                                    <template x-if="stats.codex_rate_limits.secondary.window_label">
+                                        <span class="text-gray-600 normal-case font-mono ml-1"
+                                              x-text="'(' + stats.codex_rate_limits.secondary.window_label + ')'"></span>
+                                    </template>
+                                </span>
+                                <span class="tabular-nums font-mono"
+                                      :class="(stats.codex_rate_limits.secondary.used_percent||0) > 80 ? 'text-red-400' : (stats.codex_rate_limits.secondary.used_percent||0) > 60 ? 'text-amber-400' : 'text-emerald-400'"
+                                      x-text="(stats.codex_rate_limits.secondary.used_percent||0).toFixed(1) + '%'"></span>
+                            </div>
+                            <div class="w-full h-3 bg-border rounded-full overflow-hidden">
+                                <div class="h-full rounded-full transition-all duration-500"
+                                     :class="(stats.codex_rate_limits.secondary.used_percent||0) > 80 ? 'bg-red-500' : (stats.codex_rate_limits.secondary.used_percent||0) > 60 ? 'bg-amber-500' : 'bg-emerald-500'"
+                                     :style="'width: ' + Math.min(stats.codex_rate_limits.secondary.used_percent||0, 100) + '%'"></div>
+                            </div>
+                            <template x-if="stats.codex_rate_limits.secondary.seconds_until_reset !== null">
+                                <div class="text-xs text-gray-500 mt-1"
+                                     x-text="'Resets in ' + formatResetTime(stats.codex_rate_limits.secondary.seconds_until_reset)"></div>
+                            </template>
+                        </div>
+                    </template>
+                </div>
+
+                <!-- Credits section (mirrors Anthropic extra-usage section) -->
+                <template x-if="stats.codex_rate_limits.credits">
+                    <div class="border-t border-border pt-3 mb-3">
+                        <div class="flex justify-between items-center">
+                            <span class="text-xs text-gray-400 uppercase tracking-wide">Credits</span>
+                            <span class="text-sm font-mono font-medium"
+                                  :class="stats.codex_rate_limits.credits.unlimited ? 'text-purple-400' : stats.codex_rate_limits.credits.has_credits ? 'text-emerald-400' : 'text-red-400'"
+                                  x-text="stats.codex_rate_limits.credits.unlimited ? '∞ Unlimited' : stats.codex_rate_limits.credits.balance ? stats.codex_rate_limits.credits.balance : (stats.codex_rate_limits.credits.has_credits ? 'Active' : 'No Credits')"></span>
+                        </div>
+                        <template x-if="stats.codex_rate_limits.credits.balance && !stats.codex_rate_limits.credits.unlimited">
+                            <div class="text-xs text-gray-500 mt-0.5">Pay-as-you-go credits balance</div>
+                        </template>
+                    </div>
+                </template>
+
+                <!-- Promo message -->
+                <template x-if="stats.codex_rate_limits.promo_message">
+                    <div class="mt-2 text-xs text-blue-400 italic"
+                         x-text="stats.codex_rate_limits.promo_message"></div>
+                </template>
+            </div>
+        </template>
+
+        <!-- GitHub Copilot Quota -->
+        <template x-if="stats.copilot_quota && stats.copilot_quota.latest">
+            <div class="bg-surface rounded-lg p-4 border border-border mb-6">
+                <div class="flex justify-between items-center mb-4">
+                    <div class="text-sm font-medium text-gray-300">GitHub Copilot Quota</div>
+                    <div class="flex items-center gap-2">
+                        <template x-if="stats.copilot_quota.latest.copilot_plan">
+                            <span class="text-xs text-gray-500 font-mono capitalize" x-text="stats.copilot_quota.latest.copilot_plan + ' plan'"></span>
+                        </template>
+                        <template x-if="stats.copilot_quota.latest.login">
+                            <span class="text-xs text-gray-400" x-text="'@' + stats.copilot_quota.latest.login"></span>
+                        </template>
+                    </div>
+                </div>
+
+                <!-- Per-category quota grid (3 columns, mirrors Anthropic 5h/7d structure) -->
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
+                    <template x-for="[catKey, catLabel] in [['chat','Chat'],['completions','Completions'],['premium_interactions','Premium']]" :key="catKey">
+                        <template x-if="stats.copilot_quota.latest.categories[catKey]">
+                            <div>
+                                <div class="flex justify-between text-xs mb-1">
+                                    <span class="text-gray-400 uppercase tracking-wide" x-text="catLabel"></span>
+                                    <template x-if="stats.copilot_quota.latest.categories[catKey].unlimited">
+                                        <span class="text-purple-400 font-mono">∞</span>
+                                    </template>
+                                    <template x-if="!stats.copilot_quota.latest.categories[catKey].unlimited">
+                                        <span class="tabular-nums font-mono"
+                                              :class="(stats.copilot_quota.latest.categories[catKey].used_percent||0) > 80 ? 'text-red-400' : (stats.copilot_quota.latest.categories[catKey].used_percent||0) > 50 ? 'text-amber-400' : 'text-emerald-400'"
+                                              x-text="(stats.copilot_quota.latest.categories[catKey].used_percent||0).toFixed(0) + '%'"></span>
+                                    </template>
+                                </div>
+                                <!-- Used / entitlement count (big number like Anthropic window) -->
+                                <template x-if="!stats.copilot_quota.latest.categories[catKey].unlimited">
+                                    <div class="flex items-baseline gap-1 mb-1">
+                                        <span class="text-lg font-light tabular-nums"
+                                              :class="(stats.copilot_quota.latest.categories[catKey].used_percent||0) > 80 ? 'text-red-400' : (stats.copilot_quota.latest.categories[catKey].used_percent||0) > 50 ? 'text-amber-400' : 'text-emerald-400'"
+                                              x-text="stats.copilot_quota.latest.categories[catKey].used ?? '-'"></span>
+                                        <span class="text-xs text-gray-500 font-mono"
+                                              x-text="'/ ' + (stats.copilot_quota.latest.categories[catKey].entitlement ?? '∞')"></span>
+                                        <span class="text-xs text-gray-500 ml-auto font-mono"
+                                              x-text="(stats.copilot_quota.latest.categories[catKey].remaining ?? '') + ' left'"></span>
+                                    </div>
+                                </template>
+                                <template x-if="stats.copilot_quota.latest.categories[catKey].unlimited">
+                                    <div class="text-lg font-light text-purple-400 mb-1">Unlimited</div>
+                                </template>
+                                <!-- Progress bar -->
+                                <template x-if="!stats.copilot_quota.latest.categories[catKey].unlimited">
+                                    <div class="w-full h-3 bg-border rounded-full overflow-hidden">
+                                        <div class="h-full rounded-full transition-all duration-500"
+                                             :class="(stats.copilot_quota.latest.categories[catKey].used_percent||0) > 80 ? 'bg-red-500' : (stats.copilot_quota.latest.categories[catKey].used_percent||0) > 50 ? 'bg-amber-500' : 'bg-emerald-500'"
+                                             :style="'width: ' + Math.min(stats.copilot_quota.latest.categories[catKey].used_percent||0, 100) + '%'"></div>
+                                    </div>
+                                </template>
+                                <!-- Overage info -->
+                                <template x-if="stats.copilot_quota.latest.categories[catKey].overage_count > 0">
+                                    <div class="text-xs text-amber-400 mt-1"
+                                         x-text="stats.copilot_quota.latest.categories[catKey].overage_count + ' overage uses'"></div>
+                                </template>
+                                <div class="mt-1">
+                                    <span class="text-xs"
+                                          :class="stats.copilot_quota.latest.categories[catKey].overage_permitted ? 'text-gray-500' : 'text-gray-600'"
+                                          x-text="stats.copilot_quota.latest.categories[catKey].overage_permitted ? 'Overage allowed' : 'No overage'"></span>
+                                </div>
+                            </div>
+                        </template>
+                    </template>
+                </div>
+
+                <!-- Monthly reset section (mirrors Anthropic extra-usage border section) -->
+                <div class="border-t border-border pt-3">
+                    <div class="flex justify-between text-xs mb-2">
+                        <span class="text-gray-400 uppercase tracking-wide">Monthly Reset</span>
+                        <template x-if="stats.copilot_quota.latest.quota_reset_date_utc">
+                            <span class="text-gray-400 font-mono"
+                                  x-text="formatMonthlyReset(stats.copilot_quota.latest.quota_reset_date_utc)"></span>
+                        </template>
+                    </div>
+                    <template x-if="stats.copilot_quota.latest.quota_reset_date_utc">
+                        <div>
+                            <!-- Month-elapsed bar: filled = time elapsed, empty = time remaining -->
+                            <div class="w-full h-2 bg-border rounded-full overflow-hidden">
+                                <div class="h-full bg-accent/50 rounded-full transition-all duration-500"
+                                     :style="'width: ' + (100 - Math.min(100, Math.max(0, (new Date(stats.copilot_quota.latest.quota_reset_date_utc) - new Date()) / (30 * 86400000) * 100))) + '%'"></div>
+                            </div>
+                            <div class="flex justify-between text-xs text-gray-600 mt-0.5">
+                                <span>Month start</span>
+                                <span x-text="new Date(stats.copilot_quota.latest.quota_reset_date_utc).toLocaleDateString(undefined, {month:'short', day:'numeric'})"></span>
+                            </div>
+                        </div>
+                    </template>
+                </div>
+            </div>
+        </template>
+
+        <template x-if="(stats.prefix_cache?.totals?.requests || 0) > 0">
+            <div class="bg-surface rounded-lg p-4 border border-border mb-6">
+                <div class="flex justify-between items-center mb-3">
+                    <div class="text-sm font-medium text-gray-300">Prefix Cache Impact</div>
+                    <div class="text-xs text-emerald-400 font-mono" x-text="'Net savings: $' + formatCurrency(stats.prefix_cache?.totals?.net_savings_usd || 0)"></div>
+                </div>
+                <!-- Totals row -->
+                <div class="grid grid-cols-2 md:grid-cols-5 gap-4 mb-4">
+                    <div>
+                        <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Cache Reads</div>
+                        <div class="text-2xl font-light tabular-nums text-emerald-400" x-text="formatNumber(stats.prefix_cache?.totals?.cache_read_tokens || 0)"></div>
+                        <div class="text-xs text-emerald-400/70" x-text="'$' + formatCurrency(stats.prefix_cache?.totals?.savings_usd || 0) + ' saved'"></div>
+                    </div>
+                    <div>
+                        <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Cache Writes</div>
+                        <div class="text-2xl font-light tabular-nums text-amber-400" x-text="formatNumber(stats.prefix_cache?.totals?.cache_write_tokens || 0)"></div>
+                        <div class="text-xs text-amber-400/70" x-text="'$' + formatCurrency(stats.prefix_cache?.totals?.write_premium_usd || 0) + ' write premium'"></div>
+                    </div>
+                    <div>
+                        <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Hit Rate</div>
+                        <div class="text-2xl font-light tabular-nums" :class="(stats.prefix_cache?.totals?.hit_rate || 0) > 80 ? 'text-emerald-400' : (stats.prefix_cache?.totals?.hit_rate || 0) > 50 ? 'text-amber-400' : 'text-red-400'" x-text="(stats.prefix_cache?.totals?.hit_rate || 0).toFixed(0) + '%'"></div>
+                        <div class="text-xs text-gray-500" x-text="(stats.prefix_cache?.totals?.hit_requests || 0) + ' / ' + (stats.prefix_cache?.totals?.requests || 0) + ' requests'"></div>
+                    </div>
+                    <div>
+                        <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Cache Busts</div>
+                        <div class="text-2xl font-light tabular-nums" :class="(stats.prefix_cache?.totals?.bust_count || 0) > 5 ? 'text-red-400' : (stats.prefix_cache?.totals?.bust_count || 0) > 0 ? 'text-amber-400' : 'text-emerald-400'" x-text="stats.prefix_cache?.totals?.bust_count || 0"></div>
+                        <div class="text-xs text-gray-500" x-text="formatNumber(stats.prefix_cache?.totals?.bust_write_tokens || 0) + ' tokens re-written'"></div>
+                    </div>
+                    <div>
+                        <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Providers</div>
+                        <div class="text-2xl font-light tabular-nums text-gray-300" x-text="Object.keys(stats.prefix_cache?.by_provider || {}).length"></div>
+                        <div class="text-xs text-gray-500">with cache data</div>
+                    </div>
+                </div>
+                <!-- Cache efficiency bar -->
+                <div>
+                    <div class="flex justify-between text-xs text-gray-500 mb-1">
+                        <span>Cache Efficiency</span>
+                        <span x-text="cacheSavingsPercent + '% of input served from cache'"></span>
+                    </div>
+                    <div class="w-full h-3 bg-border rounded-full overflow-hidden flex">
+                        <div class="h-full bg-emerald-500 transition-all duration-500"
+                             :style="'width: ' + cacheSavingsPercent + '%'"></div>
+                        <div class="h-full bg-amber-500 transition-all duration-500"
+                             :style="'width: ' + cacheWritePercent + '%'"></div>
+                    </div>
+                    <div class="flex gap-4 mt-1 text-xs text-gray-500">
+                        <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-emerald-500 inline-block"></span> Reads (discounted)</span>
+                        <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-amber-500 inline-block"></span> Writes</span>
+                        <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-border inline-block"></span> Uncached</span>
+                    </div>
+                </div>
+                <template x-if="hasObservedTtlBuckets">
+                    <div class="mt-5 border-t border-border pt-4">
+                        <div class="flex items-center justify-between mb-3">
+                            <div>
+                                <div class="text-xs text-gray-500 uppercase tracking-[0.22em]">Observed TTL Buckets</div>
+                                <div class="text-sm text-gray-300 mt-1">Provider-reported cache write mix</div>
+                            </div>
+                            <div class="text-xs text-gray-500 font-mono" x-text="observedTtlWindowLabel"></div>
+                        </div>
+                        <div class="grid grid-cols-1 xl:grid-cols-[1.3fr_0.9fr] gap-4">
+                            <div class="ttl-bucket-gradient-card rounded-2xl border border-cyan-500/20 p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]">
+                        <div class="flex items-start justify-between gap-3">
+                            <div>
+                                <div class="text-[11px] uppercase tracking-[0.22em] text-cyan-300/75">Bucket Mix</div>
+                                <div class="mt-1 text-2xl font-light text-cyan-50">
+                                    <span data-testid="ttl-bucket-mix-1h-total" x-text="formatNumber(stats.prefix_cache?.totals?.cache_write_1h_tokens || 0)"></span>
+                                    <span class="text-sm text-cyan-300/70">1h</span>
+                                    <span class="mx-2 text-cyan-500/60">/</span>
+                                    <span data-testid="ttl-bucket-mix-5m-total" x-text="formatNumber(stats.prefix_cache?.totals?.cache_write_5m_tokens || 0)"></span>
+                                    <span class="text-sm text-cyan-300/70">5m</span>
+                                </div>
+                            </div>
+                            <div data-testid="ttl-bucket-headline" class="rounded-full border border-cyan-400/20 bg-black/20 px-3 py-1 text-[11px] uppercase tracking-[0.18em] text-cyan-200/80" x-text="observedTtlHeadline"></div>
+                                </div>
+                                <div class="mt-4">
+                                    <div class="flex justify-between text-xs text-gray-500 mb-1">
+                                        <span>Observed write-token split</span>
+                                        <span x-text="(stats.prefix_cache?.totals?.observed_ttl_mix?.active_buckets || []).join(' + ')"></span>
+                                    </div>
+                                    <div class="h-3 overflow-hidden rounded-full bg-black/30 ring-1 ring-white/5 flex">
+                                        <div class="h-full bg-cyan-400 transition-all duration-500" :style="'width:' + (stats.prefix_cache?.totals?.observed_ttl_mix?.['1h_pct'] || 0) + '%'"></div>
+                                        <div class="h-full bg-violet-400 transition-all duration-500" :style="'width:' + (stats.prefix_cache?.totals?.observed_ttl_mix?.['5m_pct'] || 0) + '%'"></div>
+                                    </div>
+                                    <div class="mt-2 flex flex-wrap gap-3 text-xs text-gray-400">
+                                        <span class="inline-flex items-center gap-1.5"><span class="inline-block h-2 w-2 rounded-full bg-cyan-400"></span><span data-testid="ttl-bucket-mix-1h-pct" x-text="'1h ' + (stats.prefix_cache?.totals?.observed_ttl_mix?.['1h_pct'] || 0).toFixed(1) + '%'"></span></span>
+                                        <span class="inline-flex items-center gap-1.5"><span class="inline-block h-2 w-2 rounded-full bg-violet-400"></span><span data-testid="ttl-bucket-mix-5m-pct" x-text="'5m ' + (stats.prefix_cache?.totals?.observed_ttl_mix?.['5m_pct'] || 0).toFixed(1) + '%'"></span></span>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-1 gap-3">
+                                <div class="rounded-2xl border border-white/8 bg-black/20 p-4">
+                                    <div class="text-[11px] uppercase tracking-[0.18em] text-cyan-300/75">1h Cache Writes</div>
+                                    <div data-testid="ttl-bucket-1h-value" class="mt-2 text-3xl font-light text-cyan-50" x-text="formatNumber(stats.prefix_cache?.totals?.observed_ttl_buckets?.['1h']?.tokens || 0)"></div>
+                                    <div class="mt-1 text-xs text-gray-500" x-text="formatNumber(stats.prefix_cache?.totals?.observed_ttl_buckets?.['1h']?.requests || 0) + ' requests observed'"></div>
+                                </div>
+                                <div class="rounded-2xl border border-white/8 bg-black/20 p-4">
+                                    <div class="text-[11px] uppercase tracking-[0.18em] text-violet-300/75">5m Cache Writes</div>
+                                    <div data-testid="ttl-bucket-5m-value" class="mt-2 text-3xl font-light text-violet-50" x-text="formatNumber(stats.prefix_cache?.totals?.observed_ttl_buckets?.['5m']?.tokens || 0)"></div>
+                                    <div class="mt-1 text-xs text-gray-500" x-text="formatNumber(stats.prefix_cache?.totals?.observed_ttl_buckets?.['5m']?.requests || 0) + ' requests observed'"></div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </template>
+                <!-- Compression vs cache: net impact of prefix-mutating layers -->
+                <template x-if="hasCompressionVsCache">
+                    <div class="mt-5 border-t border-border pt-4">
+                        <div class="flex items-center justify-between mb-3">
+                            <div>
+                                <div class="text-xs text-gray-500 uppercase tracking-wide">Compression vs Cache</div>
+                                <div class="text-[11px] text-gray-600 mt-0.5">Tokens saved by compression against cached-prefix tokens its mutations invalidated</div>
+                            </div>
+                            <div data-testid="cvc-net-headline" class="rounded-full border bg-black/20 px-3 py-1 text-[11px] uppercase tracking-[0.18em]" :class="compressionVsCacheNet >= 0 ? 'border-emerald-400/20 text-emerald-300/90' : 'border-red-400/25 text-red-300/90'" x-text="compressionVsCacheNet >= 0 ? 'Net positive' : 'Net negative'"></div>
+                        </div>
+                        <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+                            <div class="rounded-2xl border border-white/8 bg-black/20 p-4">
+                                <div class="text-[11px] uppercase tracking-[0.18em] text-emerald-300/75">Saved by Compression</div>
+                                <div data-testid="cvc-saved-value" class="mt-2 text-3xl font-light text-emerald-50" x-text="formatNumber(stats.prefix_cache?.compression_vs_cache?.tokens_saved_by_compression || 0)"></div>
+                                <div class="mt-1 text-xs text-gray-500">tokens removed before send</div>
+                            </div>
+                            <div class="rounded-2xl border border-white/8 bg-black/20 p-4">
+                                <div class="text-[11px] uppercase tracking-[0.18em] text-red-300/75">Lost to Cache Busts</div>
+                                <div data-testid="cvc-bust-value" class="mt-2 text-3xl font-light text-red-50" x-text="formatNumber(stats.prefix_cache?.compression_vs_cache?.tokens_lost_to_cache_bust || 0)"></div>
+                                <div class="mt-1 text-xs text-gray-500" x-text="formatNumber(stats.prefix_cache?.compression_vs_cache?.cache_bust_count || 0) + ' busts observed'"></div>
+                            </div>
+                            <div class="rounded-2xl border border-white/8 bg-black/20 p-4">
+                                <div class="text-[11px] uppercase tracking-[0.18em] text-gray-400">Net</div>
+                                <div data-testid="cvc-net-value" class="mt-2 text-3xl font-light" :class="compressionVsCacheNet >= 0 ? 'text-emerald-400' : 'text-red-400'" x-text="(compressionVsCacheNet >= 0 ? '+' : '-') + formatNumber(Math.abs(compressionVsCacheNet))"></div>
+                                <div class="mt-1 text-xs text-gray-500">saved minus bust losses</div>
+                            </div>
+                            <div class="rounded-2xl border border-white/8 bg-black/20 p-4">
+                                <div class="text-[11px] uppercase tracking-[0.18em] text-cyan-300/75">Prefix Freeze Net</div>
+                                <div data-testid="freeze-net-value" class="mt-2 text-3xl font-light" :class="prefixFreezeNet >= 0 ? 'text-cyan-50' : 'text-red-400'" x-text="(prefixFreezeNet >= 0 ? '+' : '-') + formatNumber(Math.abs(prefixFreezeNet))"></div>
+                                <div class="mt-1 text-xs text-gray-500" x-text="formatNumber(stats.prefix_cache?.prefix_freeze?.busts_avoided || 0) + ' busts avoided, ' + formatNumber(stats.prefix_cache?.prefix_freeze?.compression_foregone_tokens || 0) + ' foregone'"></div>
+                            </div>
+                        </div>
+                    </div>
+                </template>
+                <!-- Per-provider breakdown -->
+                <template x-if="Object.keys(stats.prefix_cache?.by_provider || {}).length > 0">
+                    <div class="mt-4 border-t border-border pt-3">
+                        <div class="text-xs text-gray-500 uppercase tracking-wide mb-2">Per-Provider Breakdown</div>
+                        <div class="space-y-3">
+                            <template x-for="[prov, pc] in Object.entries(stats.prefix_cache?.by_provider || {})" :key="prov">
+                                <div class="flex items-center justify-between">
+                                    <div class="flex items-center gap-3">
+                                        <span class="px-2 py-0.5 bg-border rounded text-xs font-mono" x-text="prov"></span>
+                                        <span class="text-xs text-gray-500" x-text="pc.label"></span>
+                                    </div>
+                                    <div class="flex flex-wrap items-center justify-end gap-4 text-xs font-mono">
+                                        <span class="text-emerald-400" x-text="formatNumber(pc.cache_read_tokens) + ' reads (' + pc.read_discount + ' off)'"></span>
+                                        <template x-if="pc.write_premium !== 'none'">
+                                            <span class="text-amber-400" x-text="formatNumber(pc.cache_write_tokens) + ' writes (+' + pc.write_premium + ')'"></span>
+                                        </template>
+                                        <template x-if="pc.observed_ttl_mix">
+                                            <span class="text-cyan-300" x-text="'TTL 1h ' + (pc.observed_ttl_mix['1h_pct'] || 0).toFixed(1) + '% / 5m ' + (pc.observed_ttl_mix['5m_pct'] || 0).toFixed(1) + '%'"></span>
+                                        </template>
+                                        <span :class="pc.bust_count > 0 ? 'text-red-400' : 'text-gray-500'" x-text="pc.bust_count + ' busts'"></span>
+                                        <span class="text-emerald-400" x-text="'$' + formatCurrency(pc.net_savings_usd)"></span>
+                                    </div>
+                                </div>
+                            </template>
+                        </div>
+                    </div>
+                </template>
+            </div>
+        </template>
+
+        <!-- New: Waste Signal Breakdown + Cumulative Savings Trend -->
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-6">
+            <!-- What Headroom Removed -->
+            <div class="bg-surface rounded-lg p-4 border border-border">
+                <div class="text-sm font-medium mb-4 text-gray-300">What Headroom Removed</div>
+                <template x-if="Object.keys(stats.waste_signals || {}).length > 0">
+                    <div class="space-y-3">
+                        <template x-for="[signal, tokens] in sortedWasteSignals" :key="signal">
+                            <div>
+                                <div class="flex justify-between items-center mb-1">
+                                    <span class="text-sm text-gray-400" x-text="wasteSignalLabel(signal)"></span>
+                                    <span class="font-mono text-sm text-accent" x-text="formatNumber(tokens) + ' tokens'"></span>
+                                </div>
+                                <div class="w-full h-2 bg-border rounded-full overflow-hidden">
+                                    <div class="h-full rounded-full transition-all duration-500"
+                                         :class="wasteSignalColor(signal)"
+                                         :style="'width: ' + getWastePercent(tokens) + '%'"></div>
+                                </div>
+                            </div>
+                        </template>
+                    </div>
+                </template>
+                <template x-if="Object.keys(stats.waste_signals || {}).length === 0">
+                    <div class="text-sm text-gray-500 italic py-8 text-center">
+                        No waste signals detected yet. Data appears after requests are processed.
+                    </div>
+                </template>
+            </div>
+
+            <!-- Cumulative Savings Trend -->
+            <div class="bg-surface rounded-lg p-4 border border-border">
+                <div class="flex justify-between items-center mb-4">
+                    <span class="text-sm font-medium text-gray-300">Savings Over Time</span>
+                    <span class="text-xs text-gray-500 font-mono" x-text="formatNumber(stats.tokens?.saved || 0) + ' tokens total'"></span>
+                </div>
+                <template x-if="(stats.savings_history || []).length >= 2">
+                    <div class="h-32">
+                        <svg class="w-full h-full" viewBox="0 0 200 64" preserveAspectRatio="none">
+                            <defs>
+                                <linearGradient id="trend-gradient" x1="0%" y1="0%" x2="0%" y2="100%">
+                                    <stop offset="0%" style="stop-color:#22d3ee;stop-opacity:0.2"/>
+                                    <stop offset="100%" style="stop-color:#22d3ee;stop-opacity:0"/>
+                                </linearGradient>
+                            </defs>
+                            <path class="trend-area" :d="getTrendArea(stats.savings_history)"></path>
+                            <path class="trend-line" :d="getTrendLine(stats.savings_history)"></path>
+                        </svg>
+                    </div>
+                </template>
+                <template x-if="(stats.savings_history || []).length < 2">
+                    <div class="h-32 flex items-center justify-center text-sm text-gray-500 italic">
+                        Trend data will appear after multiple requests.
+                    </div>
+                </template>
+            </div>
+        </div>
+
+        <!-- Main Grid -->
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-4 mb-6">
+            <!-- Token Usage -->
+            <div class="bg-surface rounded-lg p-4 border border-border">
+                <div class="text-sm font-medium mb-4 text-gray-300">Token Usage</div>
+                <div class="space-y-3">
+                    <div class="flex justify-between items-center">
+                        <span class="text-sm text-gray-400">Before Compression</span>
+                        <span class="font-mono text-sm" x-text="formatNumber(stats.tokens?.total_before_compression || 0)"></span>
+                    </div>
+                    <div class="flex justify-between items-center">
+                        <span class="text-sm text-gray-400" x-text="cliFilteringLabel + ' Filtered'"></span>
+                        <span class="font-mono text-sm text-emerald-400" x-text="formatNumber(cliFilteringSaved)"></span>
+                    </div>
+                    <div class="flex justify-between items-center">
+                        <span class="text-sm text-gray-400">Proxy Removed</span>
+                        <span class="font-mono text-sm text-accent" x-text="formatNumber(stats.tokens?.proxy_compression_saved || 0)"></span>
+                    </div>
+                    <div class="flex justify-between items-center">
+                        <span class="text-sm text-gray-400">After Compression (sent)</span>
+                        <span class="font-mono text-sm" x-text="formatNumber(stats.tokens?.input || 0)"></span>
+                    </div>
+                    <div class="border-t border-border my-2"></div>
+                    <div class="flex justify-between items-center">
+                        <span class="text-sm text-gray-400">Output Tokens</span>
+                        <span class="font-mono text-sm" x-text="formatNumber(stats.tokens?.output || 0)"></span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Providers -->
+            <div class="bg-surface rounded-lg p-4 border border-border">
+                <div class="text-sm font-medium mb-4 text-gray-300">Providers</div>
+                <div class="space-y-2">
+                    <template x-for="(count, provider) in (stats.requests?.by_provider || {})" :key="provider">
+                        <div class="flex justify-between items-center">
+                            <span class="text-sm text-gray-400" x-text="provider"></span>
+                            <div class="flex items-center gap-2">
+                                <div class="w-24 h-1.5 bg-border rounded-full overflow-hidden">
+                                    <div class="h-full bg-accent rounded-full"
+                                         :style="'width: ' + getProviderPercent(count) + '%'"></div>
+                                </div>
+                                <span class="font-mono text-sm w-12 text-right" x-text="formatNumber(count)"></span>
+                            </div>
+                        </div>
+                    </template>
+                    <template x-if="Object.keys(stats.requests?.by_provider || {}).length === 0">
+                        <div class="text-sm text-gray-500 italic">No requests yet</div>
+                    </template>
+                </div>
+            </div>
+
+            <!-- Performance -->
+            <div class="bg-surface rounded-lg p-4 border border-border">
+                <div class="text-sm font-medium mb-4 text-gray-300">Performance</div>
+                <div class="space-y-3">
+                    <div class="flex justify-between items-center">
+                        <span class="text-sm text-gray-400">Headroom Overhead</span>
+                        <span class="font-mono text-sm" x-text="(stats.overhead?.average_ms || 0).toFixed(0) + 'ms avg'"></span>
+                    </div>
+                    <div class="flex justify-between items-center">
+                        <span class="text-sm text-gray-400">Overhead Range</span>
+                        <span class="font-mono text-sm" x-text="(stats.overhead?.min_ms || 0).toFixed(0) + ' - ' + (stats.overhead?.max_ms || 0).toFixed(0) + 'ms'"></span>
+                    </div>
+                    <div class="flex justify-between items-center">
+                        <span class="text-sm text-gray-400">TTFB (upstream)</span>
+                        <span class="font-mono text-sm" x-text="((stats.ttfb?.average_ms || 0) / 1000).toFixed(2) + 's avg'"></span>
+                    </div>
+                    <div class="flex justify-between items-center">
+                        <span class="text-sm text-gray-400">TTFB Range</span>
+                        <span class="font-mono text-sm" x-text="((stats.ttfb?.min_ms || 0) / 1000).toFixed(2) + ' - ' + ((stats.ttfb?.max_ms || 0) / 1000).toFixed(2) + 's'"></span>
+                    </div>
+                    <div class="flex justify-between items-center">
+                        <span class="text-sm text-gray-400">Failed Requests</span>
+                        <span class="font-mono text-sm" x-text="stats.requests?.failed || 0"></span>
+                    </div>
+                    <!-- Per-transform timing breakdown -->
+                    <template x-if="Object.keys(stats.pipeline_timing || {}).length > 0">
+                        <div>
+                            <div class="border-t border-border my-2"></div>
+                            <div class="text-xs text-gray-500 uppercase tracking-wide mb-2">Pipeline Breakdown</div>
+                            <template x-for="[name, t] in Object.entries(stats.pipeline_timing || {})" :key="name">
+                                <div class="flex justify-between items-center mb-1">
+                                    <span class="text-xs text-gray-400 font-mono truncate mr-2" x-text="name"></span>
+                                    <span class="text-xs font-mono whitespace-nowrap"
+                                          :class="t.average_ms > 100 ? 'text-amber-400' : t.average_ms > 50 ? 'text-yellow-400' : 'text-gray-400'"
+                                          x-text="t.average_ms.toFixed(0) + 'ms avg / ' + t.max_ms.toFixed(0) + 'ms max'"></span>
+                                </div>
+                            </template>
+                        </div>
+                    </template>
+                </div>
+            </div>
+        </div>
+
+        <!-- Per-Model Savings Breakdown -->
+        <template x-if="Object.keys(stats.cost?.per_model || {}).length > 0">
+            <div class="bg-surface rounded-lg border border-border overflow-hidden mb-6">
+                <div class="px-4 py-3 border-b border-border flex justify-between items-center">
+                    <span class="text-sm font-medium text-gray-300">Per-Model Token Savings</span>
+                    <span class="text-xs text-gray-500">Exact tokens saved per model</span>
+                </div>
+                <div class="overflow-x-auto">
+                    <table class="w-full text-sm" style="table-layout:fixed">
+                        <colgroup>
+                            <col style="width:40%">
+                            <col style="width:12%">
+                            <col style="width:18%">
+                            <col style="width:18%">
+                            <col style="width:12%">
+                        </colgroup>
+                        <thead>
+                            <tr class="text-xs text-gray-500 uppercase tracking-wide">
+                                <th class="px-4 py-3 font-medium text-left">Model</th>
+                                <th class="px-4 py-3 font-medium text-right">Requests</th>
+                                <th class="px-4 py-3 font-medium text-right">Tokens Saved</th>
+                                <th class="px-4 py-3 font-medium text-right">Tokens Sent</th>
+                                <th class="px-4 py-3 font-medium text-right">Reduction</th>
+                            </tr>
+                        </thead>
+                        <tbody class="divide-y divide-border">
+                            <template x-for="[model, info] in Object.entries(stats.cost?.per_model || {})" :key="model">
+                                <tr class="hover:bg-border/30 transition-colors">
+                                    <td class="px-4 py-3 text-left">
+                                        <span class="px-2 py-0.5 bg-border rounded text-xs" x-text="truncateModel(model)"></span>
+                                    </td>
+                                    <td class="px-4 py-3 text-right font-mono tabular-nums" x-text="info.requests"></td>
+                                    <td class="px-4 py-3 text-right font-mono tabular-nums text-accent" x-text="formatNumber(info.tokens_saved)"></td>
+                                    <td class="px-4 py-3 text-right font-mono tabular-nums" x-text="formatNumber(info.tokens_sent)"></td>
+                                    <td class="px-4 py-3 text-right">
+                                        <span class="text-accent font-mono tabular-nums" x-text="info.reduction_pct.toFixed(1) + '%'"></span>
+                                    </td>
+                                </tr>
+                            </template>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </template>
+
+        <!-- Per-Project Savings Breakdown -->
+        <div class="bg-surface rounded-lg border border-border overflow-hidden mb-6">
+            <div class="px-4 py-3 border-b border-border flex justify-between items-center">
+                <div>
+                    <span class="text-sm font-medium text-gray-300">Per-Project Savings</span>
+                    <div class="text-xs text-gray-500 mt-0.5">Lifetime totals — attributed requests only</div>
+                </div>
+                <span class="text-xs text-gray-500 font-mono"
+                      x-text="Object.keys(stats.savings?.per_project || {}).length + ' project(s)'"></span>
+            </div>
+
+            <!-- Empty state: no project data yet -->
+            <template x-if="Object.keys(stats.savings?.per_project || {}).length === 0">
+                <div class="px-4 py-8 text-center">
+                    <div class="text-xs text-gray-500 mb-3">No per-project data yet.</div>
+                    <div class="text-xs text-gray-600 font-mono leading-relaxed">
+                        Add to each project's <span class="text-gray-400">.claude/settings.local.json</span>:<br>
+                        <span class="text-accent">ANTHROPIC_BASE_URL: http://127.0.0.1:8787/p/&lt;project-name&gt;</span>
+                    </div>
+                </div>
+            </template>
+
+            <!-- Project rows -->
+            <template x-if="Object.keys(stats.savings?.per_project || {}).length > 0">
+                <div class="overflow-x-auto">
+                    <table class="w-full text-sm" style="table-layout:fixed">
+                        <colgroup>
+                            <col style="width:25%">
+                            <col style="width:10%">
+                            <col style="width:15%">
+                            <col style="width:12%">
+                            <col style="width:18%">
+                            <col style="width:20%">
+                        </colgroup>
+                        <thead>
+                            <tr class="text-xs text-gray-500 uppercase tracking-wide">
+                                <th class="px-4 py-3 font-medium text-left">Project</th>
+                                <th class="px-4 py-3 font-medium text-right">Requests</th>
+                                <th class="px-4 py-3 font-medium text-right">Tokens Saved</th>
+                                <th class="px-4 py-3 font-medium text-right">Saved $</th>
+                                <th class="px-4 py-3 font-medium text-right">Savings %</th>
+                                <th class="px-4 py-3 font-medium text-right hidden md:table-cell">Last Active</th>
+                            </tr>
+                        </thead>
+                        <tbody class="divide-y divide-border">
+                            <template x-for="[project, info] in Object.entries(stats.savings?.per_project || {})" :key="project">
+                                <tr class="hover:bg-border/30 transition-colors">
+                                    <td class="px-4 py-3 text-left">
+                                        <span class="px-2 py-0.5 bg-border rounded text-xs font-mono" x-text="project"></span>
+                                    </td>
+                                    <td class="px-4 py-3 text-right font-mono tabular-nums" x-text="info.requests"></td>
+                                    <td class="px-4 py-3 text-right font-mono tabular-nums text-accent" x-text="formatNumber(info.tokens_saved)"></td>
+                                    <td class="px-4 py-3 text-right font-mono tabular-nums text-emerald-400"
+                                        x-text="'$' + formatCurrency(info.compression_savings_usd || 0)"></td>
+                                    <td class="px-4 py-3 text-right">
+                                        <div class="flex items-center justify-end gap-2">
+                                            <div class="w-16 h-1.5 bg-border rounded-full overflow-hidden">
+                                                <div class="h-full bg-accent rounded-full"
+                                                     :style="'width:' + Math.min(info.savings_percent || 0, 100) + '%'"></div>
+                                            </div>
+                                            <span class="text-accent font-mono tabular-nums text-xs w-10 text-right"
+                                                  x-text="(info.savings_percent || 0).toFixed(1) + '%'"></span>
+                                        </div>
+                                    </td>
+                                    <td class="px-4 py-3 text-right text-xs text-gray-500 font-mono hidden md:table-cell"
+                                        x-text="info.last_activity_at ? new Date(info.last_activity_at).toLocaleString() : '—'"></td>
+                                </tr>
+                            </template>
+                        </tbody>
+                    </table>
+                </div>
+            </template>
+        </div>
+
+        <!-- Recent Requests Table (with expandable rows) -->
+        <div class="bg-surface rounded-lg border border-border overflow-hidden">
+            <div class="px-4 py-3 border-b border-border flex justify-between items-center">
+                <span class="text-sm font-medium text-gray-300">Recent Requests</span>
+                <span class="text-xs text-gray-500">Last 10 &mdash; click row to expand</span>
+            </div>
+            <div class="overflow-x-auto">
+                <div>
+                    <!-- Header -->
+                    <div class="grid text-xs text-gray-500 uppercase tracking-wide border-b border-border"
+                         style="grid-template-columns: 2rem 12fr 22fr 15fr 12fr 10fr 14fr">
+                        <div class="px-2 py-3"></div>
+                        <div class="px-4 py-3 font-medium">Time</div>
+                        <div class="px-4 py-3 font-medium">Model</div>
+                        <div class="px-4 py-3 font-medium text-right">Input</div>
+                        <div class="px-4 py-3 font-medium text-right">Output</div>
+                        <div class="px-4 py-3 font-medium text-right">Saved</div>
+                        <div class="px-4 py-3 font-medium text-right">Latency</div>
+                    </div>
+                    <!-- Data rows -->
+                    <div class="divide-y divide-border">
+                        <template x-for="req in (stats.recent_requests || [])" :key="req.request_id">
+                            <div>
+                                <div class="cursor-pointer" @click="toggleExpanded(req.request_id)">
+                                    <div class="grid hover:bg-border/30 transition-colors"
+                                         style="grid-template-columns: 2rem 12fr 22fr 15fr 12fr 10fr 14fr">
+                                        <div class="px-2 py-3 text-gray-500 flex items-center justify-center">
+                                            <span x-text="expandedRows[req.request_id] ? '-' : '+'"></span>
+                                        </div>
+                                        <div class="px-4 py-3 font-mono text-gray-400 truncate" x-text="formatTime(req.timestamp)"></div>
+                                        <div class="px-4 py-3 min-w-0">
+                                            <span class="px-2 py-0.5 bg-border rounded text-xs truncate" x-text="truncateModel(req.model)"></span>
+                                        </div>
+                                        <div class="px-4 py-3 text-right font-mono tabular-nums" x-text="formatNumber(req.input_tokens_optimized)"></div>
+                                        <div class="px-4 py-3 text-right font-mono tabular-nums" x-text="formatNumber(req.output_tokens || 0)"></div>
+                                        <div class="px-4 py-3 text-right">
+                                            <span class="text-accent font-mono tabular-nums" x-text="req.savings_percent.toFixed(0) + '%'"></span>
+                                        </div>
+                                        <div class="px-4 py-3 text-right font-mono tabular-nums text-gray-400" x-text="(req.total_latency_ms || 0).toFixed(0) + 'ms'"></div>
+                                    </div>
+                                </div>
+                                <!-- Expanded detail row -->
+                                <template x-if="expandedRows[req.request_id]">
+                                    <div class="px-8 py-4 border-t border-border" style="background: var(--card-alt-bg);">
+                                        <div class="grid grid-cols-2 lg:grid-cols-4 gap-4 text-xs">
+                                            <div>
+                                                <div class="text-gray-500 uppercase tracking-wide mb-1">Original Tokens</div>
+                                                <div class="font-mono" x-text="formatNumber(req.input_tokens_original)"></div>
+                                            </div>
+                                            <div>
+                                                <div class="text-gray-500 uppercase tracking-wide mb-1">Compressed Tokens</div>
+                                                <div class="font-mono" x-text="formatNumber(req.input_tokens_optimized)"></div>
+                                            </div>
+                                            <div>
+                                                <div class="text-gray-500 uppercase tracking-wide mb-1">Tokens Removed</div>
+                                                <div class="font-mono text-accent" x-text="formatNumber(req.tokens_saved)"></div>
+                                            </div>
+                                            <div>
+                                                <div class="text-gray-500 uppercase tracking-wide mb-1">Optimization Time</div>
+                                                <div class="font-mono" x-text="(req.optimization_latency_ms || 0).toFixed(0) + 'ms'"></div>
+                                            </div>
+                                        </div>
+                                        <!-- Transforms Applied -->
+                                        <template x-if="(req.transforms_applied || []).length > 0">
+                                            <div class="mt-3">
+                                                <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Transforms Applied</div>
+                                                <div class="flex flex-wrap gap-1">
+                                                    <template x-for="t in req.transforms_applied" :key="t">
+                                                        <span class="px-2 py-0.5 bg-border rounded text-xs font-mono" x-text="t"></span>
+                                                    </template>
+                                                </div>
+                                            </div>
+                                        </template>
+                                        <!-- Waste Signals for this request -->
+                                        <template x-if="req.waste_signals && Object.keys(req.waste_signals).length > 0">
+                                            <div class="mt-3">
+                                                <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Waste Detected</div>
+                                                <div class="flex flex-wrap gap-2">
+                                                    <template x-for="[signal, tokens] in Object.entries(req.waste_signals).filter(([,v]) => v > 0)" :key="signal">
+                                                        <span class="px-2 py-0.5 rounded text-xs font-mono"
+                                                              :class="wasteSignalBadgeColor(signal)"
+                                                              x-text="wasteSignalLabel(signal) + ': ' + formatNumber(tokens)"></span>
+                                                    </template>
+                                                </div>
+                                            </div>
+                                        </template>
+                                    </div>
+                                </template>
+                            </div>
+                        </template>
+                        <template x-if="(stats.recent_requests || []).length === 0">
+                            <div class="px-4 py-8 text-center text-gray-500 italic">
+                                No requests yet. Start using the proxy to see activity here.
+                            </div>
+                        </template>
+                    </div>
+                </div>
+            </div>
+        </div>
+            </div>
+        </template>
+
+        <template x-if="viewMode === 'history'">
+            <div>
+                <div class="flex flex-col gap-4 mb-6 lg:flex-row lg:items-center lg:justify-between">
+                    <div>
+                        <div class="text-sm font-medium text-gray-300">Historical Proxy Compression</div>
+                        <div class="text-xs text-gray-500">
+                            Durable local savings history from <span class="font-mono">/stats-history</span>
+                        </div>
+                    </div>
+                    <div class="flex flex-col gap-3 sm:flex-row sm:items-center">
+                        <div class="flex items-center gap-2">
+                            <button class="px-3 py-1.5 text-sm rounded-md border border-border bg-surface text-gray-300 hover:text-white transition-colors"
+                                    @click="downloadHistory('json')">
+                                Export JSON
+                            </button>
+                            <button class="px-3 py-1.5 text-sm rounded-md border border-border bg-surface text-gray-300 hover:text-white transition-colors"
+                                    @click="downloadHistory('csv')">
+                                Export CSV
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-5 gap-4 mb-6">
+                    <div class="bg-surface rounded-lg p-4 border border-border">
+                        <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Lifetime Compression Savings</div>
+                        <div class="flex items-baseline gap-2">
+                            <span class="text-3xl font-light tabular-nums text-emerald-400"
+                                  x-text="'$' + formatCurrency(historyStats.lifetime?.compression_savings_usd || 0)"></span>
+                        </div>
+                        <div class="mt-2 text-xs text-gray-500">
+                            Proxy compression only
+                        </div>
+                    </div>
+
+                    <div class="bg-surface rounded-lg p-4 border border-border">
+                        <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Lifetime Tokens Saved</div>
+                        <div class="flex items-baseline gap-2">
+                            <span class="text-3xl font-light tabular-nums text-accent"
+                                  x-text="formatNumber(historyStats.lifetime?.tokens_saved || 0)"></span>
+                        </div>
+                        <div class="mt-2 text-xs text-gray-500"
+                             x-text="formatNumber((historyStats.history || []).length) + ' recorded checkpoints'"></div>
+                    </div>
+
+                    <div class="bg-surface rounded-lg p-4 border border-border">
+                        <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Active Days</div>
+                        <div class="flex items-baseline gap-2">
+                            <span class="text-3xl font-light tabular-nums"
+                                  x-text="formatNumber((historyStats.series?.daily || []).length)"></span>
+                        </div>
+                        <div class="mt-2 text-xs text-gray-500" x-text="historyWindowLabel"></div>
+                    </div>
+
+                    <div class="bg-surface rounded-lg p-4 border border-border">
+                        <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Average Saved / Day</div>
+                        <div class="flex items-baseline gap-2">
+                            <span class="text-3xl font-light tabular-nums"
+                                  x-text="formatNumber(historyAverageTokensPerDay)"></span>
+                        </div>
+                        <div class="mt-2 text-xs text-gray-500">Based on persisted daily buckets</div>
+                    </div>
+
+                    <div class="bg-surface rounded-lg p-4 border border-border">
+                        <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Average Saved / Week</div>
+                        <div class="flex items-baseline gap-2">
+                            <span class="text-3xl font-light tabular-nums"
+                                  x-text="formatNumber(historyAverageTokensPerWeek)"></span>
+                        </div>
+                        <div class="mt-2 text-xs text-gray-500">Based on persisted weekly buckets</div>
+                    </div>
+                </div>
+
+                <template x-if="hasHistoricalData">
+                    <div>
+                        <div class="grid grid-cols-1 lg:grid-cols-3 gap-4 mb-6">
+                            <div class="bg-surface rounded-lg p-4 border border-border lg:col-span-2">
+                                <div class="flex flex-col gap-3 mb-4 lg:flex-row lg:items-center lg:justify-between">
+                                    <div class="flex items-center gap-3">
+                                        <span class="text-sm font-medium text-gray-300">Historical Savings Trend</span>
+                                        <span class="text-xs text-gray-500 font-mono" x-text="historyTrendLabel"></span>
+                                    </div>
+                                    <div class="flex flex-wrap gap-2 self-start lg:self-auto">
+                                        <div class="inline-flex rounded-lg border border-border p-1" style="background: var(--card-alt-bg);">
+                                            <template x-for="[label, key] in historyGranularityOptions" :key="key">
+                                                <button class="px-3 py-1.5 text-sm rounded-md transition-colors"
+                                                        :class="historyGranularity === key ? 'bg-accent text-black' : 'text-gray-400 hover:text-gray-200'"
+                                                        @click="historyGranularity = key"
+                                                x-text="label"></button>
+                                            </template>
+                                        </div>
+                                        <div class="inline-flex rounded-lg border border-border p-1" style="background: var(--card-alt-bg);">
+                                            <template x-for="[label, key] in historyChartModeOptions" :key="key">
+                                                <button class="px-3 py-1.5 text-sm rounded-md transition-colors"
+                                                        :class="historyChartMode === key ? 'bg-accent text-black' : 'text-gray-400 hover:text-gray-200'"
+                                                        @click="historyChartMode = key"
+                                                x-text="label"></button>
+                                            </template>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="text-xs text-gray-500 mb-4"
+                                     x-text="'Showing ' + formatNumber(historySelectedPointCount) + ' ' + historySelectedSeriesLabel.toLowerCase() + ' points'"></div>
+                                <template x-if="historicalTrend.length >= 2">
+                                    <div class="h-48">
+                                        <svg class="w-full h-full" viewBox="0 0 200 64" preserveAspectRatio="none">
+                                            <defs>
+                                                <linearGradient id="history-trend-gradient" x1="0%" y1="0%" x2="0%" y2="100%">
+                                                    <stop offset="0%" style="stop-color:#22d3ee;stop-opacity:0.2"/>
+                                                    <stop offset="100%" style="stop-color:#22d3ee;stop-opacity:0"/>
+                                                </linearGradient>
+                                            </defs>
+                                            <path :d="historyChartMode === 'tokens' && !historyActiveModel ? getObjectTrendArea(historicalTrend, 'total_tokens_saved') : ''"
+                                                  fill="url(#history-trend-gradient)"></path>
+                                            <path class="trend-line"
+                                                  :d="historyChartMode === 'tokens' && !historyActiveModel ? getObjectTrendLine(historicalTrend, 'total_tokens_saved') : ''"></path>
+                                            <path fill="none" stroke-width="1"
+                                                  :stroke="historyModelColor(0)" :d="historyModelLine(0)"></path>
+                                            <path fill="none" stroke-width="1"
+                                                  :stroke="historyModelColor(1)" :d="historyModelLine(1)"></path>
+                                            <path fill="none" stroke-width="1"
+                                                  :stroke="historyModelColor(2)" :d="historyModelLine(2)"></path>
+                                            <path fill="none" stroke-width="1"
+                                                  :stroke="historyModelColor(3)" :d="historyModelLine(3)"></path>
+                                            <path fill="none" stroke-width="1"
+                                                  :stroke="historyModelColor(4)" :d="historyModelLine(4)"></path>
+                                            <path fill="none" stroke="#22d3ee" stroke-width="1.5"
+                                                  :d="historyCostLine('actual')"></path>
+                                            <path fill="none" stroke="#fbbf24" stroke-width="1.5" stroke-dasharray="3 2"
+                                                  :d="historyCostLine('expected')"></path>
+                                        </svg>
+                                    </div>
+                                </template>
+                                <template x-if="historicalTrend.length < 2">
+                                    <div class="h-48 flex items-center justify-center text-sm text-gray-500 italic">
+                                        Historical trend data will appear after more saved checkpoints in this granularity.
+                                    </div>
+                                </template>
+                                <div class="flex flex-wrap gap-3 mt-3"
+                                     x-show="historyChartMode === 'tokens' && historyGranularity !== 'history' && historyModelChartSeries.length > 0">
+                                    <template x-for="(series, index) in historyModelChartSeries" :key="series.model">
+                                        <button class="flex items-center gap-1.5 text-xs transition-opacity cursor-pointer"
+                                                :class="historyActiveModel && historyActiveModel !== series.model
+                                                    ? 'text-gray-600 opacity-50'
+                                                    : 'text-gray-400 hover:text-gray-200'"
+                                                @click="toggleHistoryModel(series.model)"
+                                                :title="historySelectedModel === series.model
+                                                    ? 'Show all models'
+                                                    : 'Show only this model'">
+                                            <span class="inline-block w-2 h-2 rounded-full"
+                                                  :style="'background:' + historyModelColor(index)"></span>
+                                            <span :class="historySelectedModel === series.model ? 'underline' : ''"
+                                                  x-text="truncateModel(series.model)"></span>
+                                        </button>
+                                    </template>
+                                </div>
+                                <div class="flex flex-wrap gap-4 mt-3" x-show="historyChartMode === 'cost'">
+                                    <span class="flex items-center gap-1.5 text-xs text-gray-400">
+                                        <span class="inline-block w-3 h-0.5" style="background:#22d3ee"></span>
+                                        Actual cost (with Headroom)
+                                    </span>
+                                    <span class="flex items-center gap-1.5 text-xs text-gray-400">
+                                        <span class="inline-block w-3 h-0.5"
+                                              style="background:repeating-linear-gradient(90deg,#fbbf24 0 4px,transparent 4px 7px)"></span>
+                                        Expected cost (without Headroom)
+                                    </span>
+                                </div>
+                            </div>
+
+                            <div class="bg-surface rounded-lg p-4 border border-border">
+                                <div class="flex items-center justify-between mb-4">
+                                    <span class="text-sm font-medium text-gray-300">Per-Model Breakdown</span>
+                                    <span class="text-xs text-gray-500 font-mono"
+                                          x-text="historyModelSourceSeriesLabel + ' buckets'"></span>
+                                </div>
+                                <template x-if="historyModelBreakdown.length === 0">
+                                    <div class="text-sm text-gray-500 italic">
+                                        Per-model attribution appears for checkpoints recorded after upgrading.
+                                    </div>
+                                </template>
+                                <template x-if="historyModelBreakdown.length > 0">
+                                    <div class="overflow-x-auto">
+                                        <table class="w-full text-sm">
+                                            <thead>
+                                                <tr class="text-xs text-gray-500 text-left">
+                                                    <th class="py-2 pr-4 font-medium">Model</th>
+                                                    <th class="py-2 pr-4 font-medium text-right">Tokens saved</th>
+                                                    <th class="py-2 pr-4 font-medium text-right">Cost with Headroom</th>
+                                                    <th class="py-2 pr-4 font-medium text-right">Expected cost without Headroom</th>
+                                                    <th class="py-2 font-medium text-right">Saved</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody>
+                                                <template x-for="row in historyModelBreakdown" :key="row.model">
+                                                    <tr class="border-t border-border text-gray-300 cursor-pointer transition-colors"
+                                                        :class="historySelectedModel === row.model ? 'bg-card-alt' : 'hover-bg-surface'"
+                                                        @click="toggleHistoryModel(row.model)"
+                                                        :title="historySelectedModel === row.model
+                                                            ? 'Show all models'
+                                                            : 'Show only this model in the chart'">
+                                                        <td class="py-2 pr-4 font-mono text-xs"
+                                                            :class="historySelectedModel === row.model ? 'underline' : ''"
+                                                            x-text="truncateModel(row.model)"></td>
+                                                        <td class="py-2 pr-4 text-right tabular-nums" x-text="formatNumber(row.tokens_saved)"></td>
+                                                        <td class="py-2 pr-4 text-right tabular-nums" x-text="'$' + formatCurrency(row.input_cost_usd)"></td>
+                                                        <td class="py-2 pr-4 text-right tabular-nums" x-text="'$' + formatCurrency(row.expected_cost_usd)"></td>
+                                                        <td class="py-2 text-right tabular-nums text-accent" x-text="'$' + formatCurrency(row.savings_usd)"></td>
+                                                    </tr>
+                                                </template>
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                </template>
+                            </div>
+
+                            <div class="bg-surface rounded-lg p-4 border border-border">
+                                <div class="text-sm font-medium mb-4 text-gray-300">Historical Summary</div>
+                                <div class="space-y-3">
+                                    <div class="flex justify-between items-center">
+                                        <span class="text-sm text-gray-400">Latest total</span>
+                                        <span class="font-mono text-sm"
+                                              x-text="formatNumber(historyStats.lifetime?.tokens_saved || 0) + ' tokens'"></span>
+                                    </div>
+                                    <div class="flex justify-between items-center">
+                                        <span class="text-sm text-gray-400">Selected series</span>
+                                        <span class="font-mono text-sm"
+                                              x-text="historySelectedSeriesLabel"></span>
+                                    </div>
+                                    <div class="flex justify-between items-center">
+                                        <span class="text-sm text-gray-400">Selected points</span>
+                                        <span class="font-mono text-sm"
+                                              x-text="formatNumber(historySelectedPointCount)"></span>
+                                    </div>
+                                    <div class="flex justify-between items-center">
+                                        <span class="text-sm text-gray-400">Average / month</span>
+                                        <span class="font-mono text-sm"
+                                              x-text="formatNumber(historyAverageTokensPerMonth) + ' tokens'"></span>
+                                    </div>
+                                    <div class="flex justify-between items-center">
+                                        <span class="text-sm text-gray-400">Retention</span>
+                                        <span class="font-mono text-sm"
+                                              x-text="(historyStats.retention?.max_history_age_days || 0) + 'd / ' + formatNumber(historyStats.retention?.max_history_points || 0)"></span>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="grid grid-cols-1 lg:grid-cols-3 gap-4 mb-6">
+                            <div class="bg-surface rounded-lg p-4 border border-border">
+                                <div class="text-sm font-medium mb-4 text-gray-300">Daily Savings</div>
+                                <template x-if="(historyStats.series?.daily || []).length > 0">
+                                    <div class="space-y-3">
+                                        <template x-for="point in recentDailyHistory" :key="point.timestamp">
+                                            <div class="flex items-center justify-between">
+                                                <div>
+                                                    <div class="text-sm text-gray-300" x-text="formatDate(point.timestamp)"></div>
+                                                    <div class="text-xs text-gray-500"
+                                                         x-text="formatNumber(point.total_tokens_saved) + ' cumulative'"></div>
+                                                </div>
+                                                <div class="text-right">
+                                                    <div class="font-mono text-sm text-accent"
+                                                         x-text="formatNumber(point.tokens_saved) + ' tokens'"></div>
+                                                    <div class="text-xs text-emerald-400"
+                                                         x-text="'$' + formatCurrency(point.compression_savings_usd_delta || 0)"></div>
+                                                </div>
+                                            </div>
+                                        </template>
+                                    </div>
+                                </template>
+                                <template x-if="(historyStats.series?.daily || []).length === 0">
+                                    <div class="text-sm text-gray-500 italic py-8 text-center">
+                                        Daily rollups will appear after persisted history spans at least one checkpoint.
+                                    </div>
+                                </template>
+                            </div>
+
+                            <div class="bg-surface rounded-lg p-4 border border-border">
+                                <div class="text-sm font-medium mb-4 text-gray-300">Weekly Savings</div>
+                                <template x-if="(historyStats.series?.weekly || []).length > 0">
+                                    <div class="space-y-3">
+                                        <template x-for="point in recentWeeklyHistory" :key="point.timestamp">
+                                            <div class="flex items-center justify-between">
+                                                <div>
+                                                    <div class="text-sm text-gray-300" x-text="formatDate(point.timestamp)"></div>
+                                                    <div class="text-xs text-gray-500"
+                                                         x-text="formatNumber(point.total_tokens_saved) + ' cumulative'"></div>
+                                                </div>
+                                                <div class="text-right">
+                                                    <div class="font-mono text-sm text-accent"
+                                                         x-text="formatNumber(point.tokens_saved) + ' tokens'"></div>
+                                                    <div class="text-xs text-emerald-400"
+                                                         x-text="'$' + formatCurrency(point.compression_savings_usd_delta || 0)"></div>
+                                                </div>
+                                            </div>
+                                        </template>
+                                    </div>
+                                </template>
+                                <template x-if="(historyStats.series?.weekly || []).length === 0">
+                                    <div class="text-sm text-gray-500 italic py-8 text-center">
+                                        Weekly rollups will appear after persisted history spans multiple days.
+                                    </div>
+                                </template>
+                            </div>
+
+                            <div class="bg-surface rounded-lg p-4 border border-border">
+                                <div class="text-sm font-medium mb-4 text-gray-300">Monthly Savings</div>
+                                <template x-if="(historyStats.series?.monthly || []).length > 0">
+                                    <div class="space-y-3">
+                                        <template x-for="point in recentMonthlyHistory" :key="point.timestamp">
+                                            <div class="flex items-center justify-between">
+                                                <div>
+                                                    <div class="text-sm text-gray-300" x-text="formatMonth(point.timestamp)"></div>
+                                                    <div class="text-xs text-gray-500"
+                                                         x-text="formatNumber(point.total_tokens_saved) + ' cumulative'"></div>
+                                                </div>
+                                                <div class="text-right">
+                                                    <div class="font-mono text-sm text-accent"
+                                                         x-text="formatNumber(point.tokens_saved) + ' tokens'"></div>
+                                                    <div class="text-xs text-emerald-400"
+                                                         x-text="'$' + formatCurrency(point.compression_savings_usd_delta || 0)"></div>
+                                                </div>
+                                            </div>
+                                        </template>
+                                    </div>
+                                </template>
+                                <template x-if="(historyStats.series?.monthly || []).length === 0">
+                                    <div class="text-sm text-gray-500 italic py-8 text-center">
+                                        Monthly rollups will appear after persisted history spans multiple months.
+                                    </div>
+                                </template>
+                            </div>
+                        </div>
+
+                        <div class="bg-surface rounded-lg p-4 border border-border">
+                            <div class="text-sm font-medium mb-4 text-gray-300">Recent Historical Checkpoints</div>
+                            <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                <template x-for="point in recentHistoricalPoints" :key="point.timestamp">
+                                    <div class="flex items-center justify-between rounded-lg border border-border px-3 py-3">
+                                        <div>
+                                            <div class="text-sm text-gray-300" x-text="formatDateTime(point.timestamp)"></div>
+                                            <div class="text-xs text-gray-500">Cumulative proxy compression savings</div>
+                                        </div>
+                                        <div class="text-right">
+                                            <div class="font-mono text-sm text-accent"
+                                                 x-text="formatNumber(point.total_tokens_saved) + ' tokens'"></div>
+                                            <div class="text-xs text-emerald-400"
+                                                 x-text="'$' + formatCurrency(point.compression_savings_usd || 0)"></div>
+                                        </div>
+                                    </div>
+                                </template>
+                            </div>
+                        </div>
+                    </div>
+                </template>
+
+                <template x-if="!hasHistoricalData">
+                    <div class="bg-surface rounded-lg border border-border p-10 text-center">
+                        <div class="text-lg text-gray-300 mb-2">No persisted savings history yet</div>
+                        <div class="text-sm text-gray-500 max-w-2xl mx-auto">
+                            Historical data is written locally after proxy requests save tokens. Keep using Headroom and this view will fill in automatically across restarts.
+                        </div>
+                    </div>
+                </template>
+            </div>
+        </template>
+
+    </main>
+
+    <!-- Live Feed Sidebar Drawer -->
+    <div x-show="feedOpen"
+         x-transition:enter="transition ease-out duration-300"
+         x-transition:enter-start="translate-x-full"
+         x-transition:enter-end="translate-x-0"
+         x-transition:leave="transition ease-in duration-200"
+         x-transition:leave-start="translate-x-0"
+         x-transition:leave-end="translate-x-full"
+         @click.away="feedOpen = false"
+         class="fixed top-0 right-0 h-full w-[520px] bg-surface border-l border-border z-50 flex flex-col"
+         style="display: none;">
+
+        <!-- Drawer Header -->
+        <div class="flex items-center justify-between px-4 py-3 border-b border-border">
+            <div class="flex items-center gap-3">
+                <span class="text-sm font-medium text-gray-200">Message Transformations</span>
+                <span class="text-xs text-gray-500 font-mono" x-text="transformations.length + ' msgs'"></span>
+            </div>
+            <button @click="feedOpen = false" class="text-gray-500 hover:text-gray-200 transition-colors p-1">
+                <svg xmlns="http://www.w3.org/2000/svg" class="w-5 h-5" viewBox="0 0 16 16" fill="currentColor">
+                    <path d="M2.146 2.854a.5.5 0 1 1 .708-.708L8 7.293l5.146-5.147a.5.5 0 0 1 .708.708L8.707 8l5.147 5.146a.5.5 0 0 1-.708.708L8 8.707l-5.146 5.147a.5.5 0 0 1-.708-.708L7.293 8 2.146 2.854z"/>
+                </svg>
+            </button>
+        </div>
+
+        <!-- New messages indicator -->
+        <div x-show="feedScrolled_ && feedNewCount > 0"
+             @click="scrollToFeedTop()"
+             class="absolute top-16 right-4 px-3 py-2 bg-accent text-black text-sm rounded-lg shadow-lg cursor-pointer z-50 font-medium">
+            <span x-text="feedNewCount"></span> new message<span x-show="feedNewCount > 1">s</span>
+        </div>
+
+        <!-- Drawer Content (virtual scroll container) -->
+        <div class="flex-1 overflow-y-auto" id="feed-container"
+             @scroll="handleFeedScroll()">
+            <div id="feed-virtual-list" class="relative"></div>
+        </div>
+    </div>
+
+    <!-- Footer -->
+    <footer class="border-t border-border px-6 py-4 mt-8">
+        <div class="flex justify-between items-center text-xs text-gray-500">
+            <div>
+                Press <kbd class="px-1.5 py-0.5 bg-border rounded text-gray-400">R</kbd> to refresh
+            </div>
+            <div>
+                <a href="https://headroom-docs.vercel.app/docs" target="_blank" class="hover:text-gray-300 transition-colors">Documentation</a>
+            </div>
+        </div>
+    </footer>
+
+    <script>
+        function dashboard() {
+            return {
+                stats: {},
+                historyStats: {},
+                healthy: true,
+                version: '0.3.0',
+                lastUpdate: 'never',
+                viewMode: 'session',
+                historyGranularity: 'daily',
+                historyChartMode: 'tokens',
+                historySelectedModel: null,
+                requestHistory: [],
+                savingsHistory: [],
+                expandedRows: {},
+                pollInterval: null,
+                statsPollMs: 5000,
+                historyPollMs: 30000,
+                feedPollMs: 5000,
+                lastHistoryFetchMs: 0,
+                lastFeedFetchMs: 0,
+                feedOpen: false,
+                transformations: [],
+                feedScrolled_: false,
+                feedNewCount: 0,
+                feedScrollY: 0,
+                feedItemHeight: 160,
+                feedBuffer: 5,
+                log_full_messages: false,
+
+                async init() {
+                    await this.fetchStats();
+
+                    this.pollInterval = setInterval(() => {
+                        this.pollDashboard();
+                    }, this.statsPollMs);
+
+                    // Keyboard shortcuts
+                    document.addEventListener('keydown', (e) => {
+                        if (e.key === 'r' || e.key === 'R') {
+                            this.pollDashboard(true);
+                        }
+                    });
+                },
+
+                async pollDashboard(force = false) {
+                    if (!force && document.hidden) return;
+
+                    await this.fetchStats();
+
+                    const now = Date.now();
+                    if (this.viewMode === 'history' && (force || now - this.lastHistoryFetchMs >= this.historyPollMs)) {
+                        await this.fetchHistoryStats();
+                    }
+                    if (this.feedOpen && (force || now - this.lastFeedFetchMs >= this.feedPollMs)) {
+                        await this.fetchTransformations();
+                    }
+                },
+
+                async setViewMode(mode) {
+                    this.viewMode = mode;
+                    if (mode === 'history') {
+                        await this.fetchHistoryStats();
+                    }
+                },
+
+                async toggleFeed() {
+                    this.feedOpen = !this.feedOpen;
+                    if (this.feedOpen) {
+                        await this.fetchTransformations();
+                    }
+                },
+
+                async fetchStats() {
+                    try {
+                        const [statsRes, healthRes] = await Promise.all([
+                            fetch('/stats?cached=1'),
+                            fetch('/health')
+                        ]);
+
+                        this.stats = await statsRes.json();
+                        const health = await healthRes.json();
+                        this.healthy = health.status === 'healthy';
+                        this.version = health.version || '0.3.0';
+                        this.log_full_messages = this.stats.log_full_messages || false;
+
+                        // Update history for sparklines
+                        this.requestHistory.push(this.stats.requests?.total || 0);
+                        this.savingsHistory.push(this.stats.tokens?.saved || 0);
+
+                        // Keep last 30 points
+                        if (this.requestHistory.length > 30) this.requestHistory.shift();
+                        if (this.savingsHistory.length > 30) this.savingsHistory.shift();
+
+                        this.lastUpdate = new Date().toLocaleTimeString();
+                    } catch (e) {
+                        console.error('Failed to fetch stats:', e);
+                        this.healthy = false;
+                    }
+                },
+
+                async fetchHistoryStats() {
+                    try {
+                        const response = await fetch('/stats-history');
+                        if (response.ok) {
+                            this.historyStats = await response.json();
+                            this.lastHistoryFetchMs = Date.now();
+                        }
+                    } catch (e) {
+                        console.error('Failed to fetch history stats:', e);
+                    }
+                },
+
+                async fetchTransformations() {
+                    try {
+                        const prevLen = this.transformations.length;
+                        const response = await fetch('/transformations/feed?limit=50');
+                        if (response.ok) {
+                            const data = await response.json();
+                            const newLen = (data.transformations || []).length;
+                            if (this.feedScrolled_ && newLen > prevLen) {
+                                this.feedNewCount = newLen - prevLen;
+                            }
+                            this.transformations = data.transformations || [];
+                            this.log_full_messages = data.log_full_messages ?? this.log_full_messages;
+                            this.lastFeedFetchMs = Date.now();
+                            this.renderTransformations();
+                        }
+                    } catch (e) {
+                        console.error('Failed to fetch transformations:', e);
+                    }
+                },
+
+                scrollToFeedTop() {
+                    const container = document.getElementById('feed-container');
+                    if (container) {
+                        container.scrollTop = 0;
+                        this.feedScrolled_ = false;
+                        this.feedNewCount = 0;
+                        this.renderTransformations();
+                    }
+                },
+
+                handleFeedScroll() {
+                    const container = document.getElementById('feed-container');
+                    if (!container) return;
+
+                    this.feedScrollY = container.scrollTop;
+                    this.feedScrolled_ = container.scrollTop > 50;
+                    this.renderTransformations();
+                },
+
+                renderTransformations() {
+                    const container = document.getElementById('feed-virtual-list');
+                    if (!container) return;
+
+                    const scrollTop = this.feedScrollY;
+                    const viewportHeight = (document.getElementById('feed-container')?.clientHeight || 600);
+
+                    const totalHeight = this.transformations.length * this.feedItemHeight;
+                    container.style.height = totalHeight + 'px';
+
+                    // Calculate visible range with buffer
+                    const startIdx = Math.max(0, Math.floor(scrollTop / this.feedItemHeight) - this.feedBuffer);
+                    const endIdx = Math.min(
+                        this.transformations.length,
+                        Math.ceil((scrollTop + viewportHeight) / this.feedItemHeight) + this.feedBuffer
+                    );
+
+                    const visible = this.transformations.slice(startIdx, endIdx);
+                    const offsetTop = startIdx * this.feedItemHeight;
+
+                    let html = `<div style="position: absolute; top: ${offsetTop}px; width: 100%;">`;
+                    html += visible.map((t, i) => this.renderTransformationCard(t, startIdx + i)).join('');
+                    html += '</div>';
+
+                    container.innerHTML = html;
+                },
+
+                renderTransformationCard(t, idx) {
+                    const msgs = (t.request_messages || []).map(m => m.content || '').join('');
+                    const response = t.response_content || '';
+                    const hasMessages = msgs.length > 0 || response.length > 0;
+                    const before = msgs.substring(0, 2000) + (msgs.length > 2000 ? '\n\n[truncated]' : '');
+                    const after = response.substring(0, 2000) + (response.length > 2000 ? '\n\n[truncated]' : '');
+
+                    const time = t.timestamp ? new Date(t.timestamp).toLocaleTimeString() : '--:--:--';
+                    const model = (t.model || 'unknown').replace(/^(anthropic\.|openai\.)/, '').substring(0, 25);
+                    const tokensSaved = t.tokens_saved || 0;
+                    const savingsPct = ((t.savings_percent || 0)).toFixed(0);
+
+                    const emptyState = '<span class="text-gray-600 italic">Enable HEADROOM_LOG_MESSAGES=true to see content</span>';
+                    const beforeContent = hasMessages ? this.escapeHtml(before) : emptyState;
+                    const afterContent = hasMessages ? this.escapeHtml(after) : emptyState;
+
+                    return `
+                        <div class="transformation-card border-b border-border p-3" data-idx="${idx}" style="height: ${this.feedItemHeight}px; box-sizing: border-box;">
+                            <div class="flex items-center justify-between mb-2">
+                                <div class="flex items-center gap-2 min-w-0">
+                                    <span class="text-xs font-mono text-gray-400 truncate">${this.escapeHtml(model)}</span>
+                                    <span class="text-xs text-gray-600 shrink-0">·</span>
+                                    <span class="text-xs text-emerald-400 shrink-0">${tokensSaved} tok</span>
+                                    <span class="text-xs text-gray-600 shrink-0">(${savingsPct}%)</span>
+                                </div>
+                                <span class="text-xs text-gray-600 shrink-0">${time}</span>
+                            </div>
+                            <div class="grid grid-cols-2 gap-2" style="height: 115px;">
+                                <div class="rounded border border-red-900/30 overflow-hidden flex flex-col">
+                                    <div class="diff-before-header px-2 py-1 border-b border-red-900/30 shrink-0">
+                                        <span class="text-[10px] text-red-400 uppercase tracking-wide font-semibold">Before</span>
+                                    </div>
+                                    <div class="diff-before p-2 font-mono text-[11px] text-gray-300 overflow-auto flex-1"
+                                         >${beforeContent}</div>
+                                </div>
+                                <div class="rounded border border-emerald-900/30 overflow-hidden flex flex-col">
+                                    <div class="diff-after-header px-2 py-1 border-b border-emerald-900/30 shrink-0">
+                                        <span class="text-[10px] text-emerald-400 uppercase tracking-wide font-semibold">After</span>
+                                    </div>
+                                    <div class="diff-after p-2 font-mono text-[11px] text-gray-300 overflow-auto flex-1"
+                                         >${afterContent}</div>
+                                </div>
+                            </div>
+                            ${(t.transforms_applied || []).length > 0 ? `
+                                <div class="flex flex-wrap gap-1 mt-1.5">
+                                    ${t.transforms_applied.slice(0, 4).map(tr => `<span class="text-[9px] px-1.5 py-0.5 bg-border rounded font-mono text-gray-500">${this.escapeHtml(tr)}</span>`).join('')}
+                                    ${t.transforms_applied.length > 4 ? `<span class="text-[9px] text-gray-600">+${t.transforms_applied.length - 4}</span>` : ''}
+                                </div>
+                            ` : ''}
+                        </div>
+                    `;
+                },
+
+                escapeHtml(str) {
+                    const div = document.createElement('div');
+                    div.textContent = str;
+                    return div.innerHTML;
+                },
+
+                // --- Formatting ---
+
+                formatNumber(n) {
+                    if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+                    if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
+                    return n.toString();
+                },
+
+                formatCurrency(n) {
+                    if (n < 0) return '-' + this.formatCurrency(-n);
+                    if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
+                    if (n >= 1) return n.toFixed(2);
+                    if (n >= 0.01) return n.toFixed(3);
+                    if (n > 0) return n.toFixed(4);
+                    return '0.00';
+                },
+
+                formatResetTime(seconds) {
+                    if (seconds == null || seconds <= 0) return 'now';
+                    const h = Math.floor(seconds / 3600);
+                    const m = Math.floor((seconds % 3600) / 60);
+                    if (h > 0) return h + 'h ' + m + 'm';
+                    if (m > 0) return m + 'm ' + Math.floor(seconds % 60) + 's';
+                    return Math.floor(seconds) + 's';
+                },
+
+                formatTime(ts) {
+                    if (!ts) return '-';
+                    const d = new Date(ts);
+                    const now = new Date();
+                    const diff = (now - d) / 1000;
+                    if (diff < 60) return Math.floor(diff) + 's ago';
+                    if (diff < 3600) return Math.floor(diff / 60) + 'm ago';
+                    return d.toLocaleTimeString();
+                },
+
+                formatDate(ts) {
+                    if (!ts) return '-';
+                    return new Date(ts).toLocaleDateString(undefined, {
+                        month: 'short',
+                        day: 'numeric',
+                    });
+                },
+
+                formatMonthlyReset(dateStr) {
+                    if (!dateStr) return '-';
+                    const d = new Date(dateStr);
+                    const days = Math.ceil((d - new Date()) / 86400000);
+                    if (days <= 0) return 'today';
+                    if (days === 1) return 'tomorrow';
+                    return 'in ' + days + ' days (' + d.toLocaleDateString(undefined, {month: 'short', day: 'numeric'}) + ')';
+                },
+
+                formatMonth(ts) {
+                    if (!ts) return '-';
+                    return new Date(ts).toLocaleDateString(undefined, {
+                        month: 'short',
+                        year: 'numeric',
+                    });
+                },
+
+                formatDateTime(ts) {
+                    if (!ts) return '-';
+                    return new Date(ts).toLocaleString(undefined, {
+                        month: 'short',
+                        day: 'numeric',
+                        hour: '2-digit',
+                        minute: '2-digit',
+                    });
+                },
+
+                truncateModel(model) {
+                    if (!model) return '-';
+                    return model.replace(/^(anthropic\.|openai\.|bedrock\/)/, '')
+                               .replace(/-\d{8}$/, '')
+                               .substring(0, 20);
+                },
+
+                // --- Agent Usage ---
+
+                get agentRows() {
+                    return this.stats.agent_usage?.agents || [];
+                },
+
+                get agentCoverageLabel() {
+                    const coverage = this.stats.agent_usage?.coverage || {};
+                    if (coverage.mode === 'request_logs') {
+                        return this.formatNumber(coverage.logged_requests || 0) + ' logged requests';
+                    }
+                    return 'aggregate fallback';
+                },
+
+                agentSavedWidth(agent) {
+                    const before = agent.before_tokens || 0;
+                    if (before <= 0) return 0;
+                    return Math.min(100, Math.max(0, (agent.tokens_saved || 0) / before * 100)).toFixed(1);
+                },
+
+                agentAfterWidth(agent) {
+                    const before = agent.before_tokens || 0;
+                    if (before <= 0) return 0;
+                    return Math.min(100, Math.max(0, (agent.after_tokens || 0) / before * 100)).toFixed(1);
+                },
+
+                agentDotClass(agent) {
+                    const colors = {
+                        'claude-code': 'bg-orange-400',
+                        claude: 'bg-orange-400',
+                        codex: 'bg-emerald-400',
+                        cursor: 'bg-cyan-400',
+                        copilot: 'bg-violet-400',
+                        openai: 'bg-sky-400',
+                        anthropic: 'bg-orange-400',
+                        gemini: 'bg-rose-400',
+                        aider: 'bg-amber-400',
+                        unknown: 'bg-gray-500',
+                    };
+                    return colors[agent] || 'bg-gray-400';
+                },
+
+                // --- Historical View ---
+
+                get historyGranularityOptions() {
+                    return [
+                        ['Daily', 'daily'],
+                        ['Weekly', 'weekly'],
+                        ['Monthly', 'monthly'],
+                        ['Checkpoints', 'history'],
+                    ];
+                },
+
+                get historyChartModeOptions() {
+                    return [
+                        ['Tokens', 'tokens'],
+                        ['Cost', 'cost'],
+                    ];
+                },
+
+                get historyModelSourceSeries() {
+                    // Rollup buckets carrying by_model attribution. Raw checkpoints
+                    // have no by_model, so the checkpoint view falls back to daily.
+                    const key = this.historySelectedSeriesKey === 'history'
+                        ? 'daily'
+                        : this.historySelectedSeriesKey;
+                    return this.historyStats.series?.[key] || [];
+                },
+
+                get historyModelChartSeries() {
+                    const buckets = this.historyModelSourceSeries;
+                    const totals = {};
+                    for (const bucket of buckets) {
+                        for (const [model, entry] of Object.entries(bucket.by_model || {})) {
+                            totals[model] = (totals[model] || 0) + (entry.tokens_saved || 0);
+                        }
+                    }
+                    const topModels = Object.entries(totals)
+                        .filter(([, saved]) => saved > 0)
+                        .sort((a, b) => b[1] - a[1])
+                        .slice(0, 5)
+                        .map(([model]) => model);
+                    // A breakdown-row selection outside the top 5 takes the
+                    // last chart slot so the filter works for every row (the
+                    // template renders a fixed set of line slots).
+                    const selected = this.historySelectedModel;
+                    if (
+                        selected &&
+                        (totals[selected] || 0) > 0 &&
+                        topModels.length > 0 &&
+                        !topModels.includes(selected)
+                    ) {
+                        topModels[topModels.length - 1] = selected;
+                    }
+                    return topModels.map(model => {
+                        let running = 0;
+                        return {
+                            model,
+                            values: buckets.map(bucket => {
+                                running += bucket.by_model?.[model]?.tokens_saved || 0;
+                                return running;
+                            }),
+                        };
+                    });
+                },
+
+                get historyModelBreakdown() {
+                    const totals = {};
+                    for (const bucket of this.historyModelSourceSeries) {
+                        for (const [model, entry] of Object.entries(bucket.by_model || {})) {
+                            const row = totals[model] || (totals[model] = {
+                                model,
+                                tokens_saved: 0,
+                                savings_usd: 0,
+                                input_cost_usd: 0,
+                            });
+                            row.tokens_saved += entry.tokens_saved || 0;
+                            row.savings_usd += entry.compression_savings_usd_delta || 0;
+                            row.input_cost_usd += entry.total_input_cost_usd_delta || 0;
+                        }
+                    }
+                    return Object.values(totals)
+                        .map(row => ({
+                            ...row,
+                            expected_cost_usd: row.input_cost_usd + row.savings_usd,
+                        }))
+                        .sort((a, b) => b.tokens_saved - a.tokens_saved);
+                },
+
+                get historyActiveModel() {
+                    // A model filter only applies while that model is present in
+                    // the charted series; otherwise fall back to showing all.
+                    // Raw checkpoint view plots no per-model lines (they are
+                    // derived from rollup buckets), so the filter must not
+                    // suppress the aggregate line there.
+                    if (this.historySelectedSeriesKey === 'history') return null;
+                    const model = this.historySelectedModel;
+                    if (!model) return null;
+                    return this.historyModelChartSeries.some(series => series.model === model)
+                        ? model
+                        : null;
+                },
+
+                toggleHistoryModel(model) {
+                    this.historySelectedModel = this.historySelectedModel === model ? null : model;
+                },
+
+                get historyCostTrend() {
+                    return this.historicalTrend.map(point => {
+                        const actual = point?.total_input_cost_usd || 0;
+                        const saved = point?.compression_savings_usd || 0;
+                        return { actual, expected: actual + saved };
+                    });
+                },
+
+                historyModelColor(index) {
+                    const palette = ['#a78bfa', '#34d399', '#fbbf24', '#f87171', '#60a5fa'];
+                    return palette[index % palette.length];
+                },
+
+                historyModelLine(index) {
+                    if (this.historyChartMode !== 'tokens') return '';
+                    // Checkpoint view plots raw checkpoints; daily-derived model
+                    // lines would not share its x-axis.
+                    if (this.historySelectedSeriesKey === 'history') return '';
+                    const allSeries = this.historyModelChartSeries;
+                    const series = allSeries[index];
+                    if (!series || series.values.length < 2) return '';
+                    const activeModel = this.historyActiveModel;
+                    if (activeModel && series.model !== activeModel) return '';
+                    // A single filtered model gets its own scale; the full set
+                    // shares one so the lines stay comparable.
+                    const scaleSeries = activeModel ? [series] : allSeries;
+                    const max = Math.max(...scaleSeries.flatMap(s => s.values), 1);
+                    return this.buildTrendPath(series.values, 0, max);
+                },
+
+                historyCostLine(kind) {
+                    if (this.historyChartMode !== 'cost') return '';
+                    const trend = this.historyCostTrend;
+                    if (trend.length < 2) return '';
+                    const all = trend.flatMap(point => [point.actual, point.expected]);
+                    const min = Math.min(...all);
+                    const max = Math.max(...all);
+                    return this.buildTrendPath(trend.map(point => point[kind]), min, max);
+                },
+
+                buildTrendPath(values, min, max) {
+                    if (!values || values.length < 2) return '';
+                    const range = max - min || 1;
+                    const points = values.map((value, index) => {
+                        const x = (index / (values.length - 1)) * 200;
+                        const y = 60 - ((value - min) / range) * 56;
+                        return `${x},${y}`;
+                    });
+                    return 'M' + points.join(' L');
+                },
+
+                get hasHistoricalData() {
+                    return (this.historyStats.history || []).length > 0;
+                },
+
+                get historySelectedSeriesKey() {
+                    return this.historyGranularity === 'history' ? 'history' : this.historyGranularity;
+                },
+
+                get historySelectedSeriesLabel() {
+                    const labels = {
+                        history: 'Checkpoints',
+                        daily: 'Daily',
+                        weekly: 'Weekly',
+                        monthly: 'Monthly',
+                    };
+                    return labels[this.historySelectedSeriesKey] || 'History';
+                },
+
+                get historyModelSourceSeriesLabel() {
+                    // historyModelSourceSeries substitutes the daily rollup
+                    // at raw checkpoint granularity; label what is shown.
+                    return this.historySelectedSeriesKey === 'history'
+                        ? 'Daily'
+                        : this.historySelectedSeriesLabel;
+                },
+
+                get historySelectedPointCount() {
+                    if (this.historySelectedSeriesKey === 'history') {
+                        return (this.historyStats.history || []).length;
+                    }
+                    return (this.historyStats.series?.[this.historySelectedSeriesKey] || []).length;
+                },
+
+                get historicalTrend() {
+                    if (this.historySelectedSeriesKey === 'history') {
+                        return this.historyStats.history || [];
+                    }
+                    return this.historyStats.series?.[this.historySelectedSeriesKey] || [];
+                },
+
+                get historyTrendLabel() {
+                    const labels = {
+                        history: 'Checkpoint history',
+                        daily: 'Daily cumulative savings',
+                        weekly: 'Weekly cumulative savings',
+                        monthly: 'Monthly cumulative savings',
+                    };
+                    return labels[this.historySelectedSeriesKey] || 'Historical savings';
+                },
+
+                get historyWindowLabel() {
+                    const history = this.historyStats.history || [];
+                    if (history.length === 0) return 'Waiting for saved requests';
+                    const first = history[0]?.timestamp;
+                    const last = history[history.length - 1]?.timestamp;
+                    if (!first || !last) return 'Persisted locally';
+                    return this.formatDate(first) + ' to ' + this.formatDate(last);
+                },
+
+                get historyAverageTokensPerDay() {
+                    const daily = this.historyStats.series?.daily || [];
+                    const lifetime = this.historyStats.lifetime?.tokens_saved || 0;
+                    if (daily.length === 0) return 0;
+                    return Math.round(lifetime / daily.length);
+                },
+
+                get historyAverageTokensPerWeek() {
+                    const weekly = this.historyStats.series?.weekly || [];
+                    const lifetime = this.historyStats.lifetime?.tokens_saved || 0;
+                    if (weekly.length === 0) return 0;
+                    return Math.round(lifetime / weekly.length);
+                },
+
+                get historyAverageTokensPerMonth() {
+                    const monthly = this.historyStats.series?.monthly || [];
+                    const lifetime = this.historyStats.lifetime?.tokens_saved || 0;
+                    if (monthly.length === 0) return 0;
+                    return Math.round(lifetime / monthly.length);
+                },
+
+                get recentDailyHistory() {
+                    return [...(this.historyStats.series?.daily || [])].slice(-7).reverse();
+                },
+
+                get recentWeeklyHistory() {
+                    return [...(this.historyStats.series?.weekly || [])].slice(-6).reverse();
+                },
+
+                get recentMonthlyHistory() {
+                    return [...(this.historyStats.series?.monthly || [])].slice(-6).reverse();
+                },
+
+                get recentHistoricalPoints() {
+                    return [...(this.historyStats.history || [])].slice(-8).reverse();
+                },
+
+                async downloadHistory(format = 'json', series = null) {
+                    const selectedSeries = series || this.historySelectedSeriesKey;
+                    const params = new URLSearchParams({ format, series: selectedSeries });
+                    if (format === 'json' && selectedSeries === 'history') {
+                        params.set('history_mode', 'full');
+                    }
+                    const response = await fetch('/stats-history?' + params.toString());
+                    if (!response.ok) throw new Error('Failed to export history');
+
+                    const blob = await response.blob();
+                    const url = window.URL.createObjectURL(blob);
+                    const link = document.createElement('a');
+                    link.href = url;
+                    link.download = `headroom-stats-history-${selectedSeries}.${format}`;
+                    document.body.appendChild(link);
+                    link.click();
+                    link.remove();
+                    window.URL.revokeObjectURL(url);
+                },
+
+                // --- Prefix Cache ---
+
+                get cacheSavingsPercent() {
+                    const t = this.stats.prefix_cache?.totals || {};
+                    const total = (t.cache_read_tokens || 0) + (t.cache_write_tokens || 0);
+                    if (total === 0) return 0;
+                    return Math.round((t.cache_read_tokens || 0) / total * 100);
+                },
+
+                get cacheWritePercent() {
+                    const t = this.stats.prefix_cache?.totals || {};
+                    const total = (t.cache_read_tokens || 0) + (t.cache_write_tokens || 0);
+                    if (total === 0) return 0;
+                    return Math.round((t.cache_write_tokens || 0) / total * 100);
+                },
+
+                get hasObservedTtlBuckets() {
+                    const buckets = this.stats.prefix_cache?.totals?.observed_ttl_buckets || {};
+                    return ((buckets['5m']?.tokens || 0) + (buckets['1h']?.tokens || 0)) > 0;
+                },
+
+                get observedTtlHeadline() {
+                    const mix = this.stats.prefix_cache?.totals?.observed_ttl_mix || {};
+                    const oneHour = mix['1h_pct'] || 0;
+                    const fiveMinute = mix['5m_pct'] || 0;
+                    if (oneHour === fiveMinute) return 'Balanced';
+                    return oneHour > fiveMinute ? '1h leaning' : '5m leaning';
+                },
+
+                get observedTtlWindowLabel() {
+                    const mix = this.stats.prefix_cache?.totals?.observed_ttl_mix || {};
+                    const active = mix.active_buckets || [];
+                    if (!active.length) return 'No TTL bucket data';
+                    return active.length === 1 ? active[0] + ' only' : active.join(' / ');
+                },
+
+                get compressionVsCacheNet() {
+                    const cvc = this.stats.prefix_cache?.compression_vs_cache || {};
+                    return cvc.net_tokens ?? ((cvc.tokens_saved_by_compression || 0) - (cvc.tokens_lost_to_cache_bust || 0));
+                },
+
+                get prefixFreezeNet() {
+                    const pf = this.stats.prefix_cache?.prefix_freeze || {};
+                    return pf.net_benefit_tokens ?? ((pf.tokens_preserved || 0) - (pf.compression_foregone_tokens || 0));
+                },
+
+                get hasCompressionVsCache() {
+                    const cvc = this.stats.prefix_cache?.compression_vs_cache || {};
+                    const pf = this.stats.prefix_cache?.prefix_freeze || {};
+                    return (cvc.tokens_saved_by_compression || 0) > 0
+                        || (cvc.tokens_lost_to_cache_bust || 0) > 0
+                        || (pf.tokens_preserved || 0) > 0
+                        || (pf.compression_foregone_tokens || 0) > 0;
+                },
+
+                // --- Waste Signals ---
+
+                wasteSignalLabel(signal) {
+                    const labels = {
+                        json_bloat: 'JSON Bloat',
+                        html_noise: 'HTML Noise',
+                        base64: 'Base64 Blobs',
+                        whitespace: 'Whitespace',
+                        dynamic_date: 'Dynamic Dates',
+                        repetition: 'Repetition',
+                        reread: 'Re-read Tool Results',
+                        reread_compressed: 'Re-read After Compression',
+                    };
+                    return labels[signal] || signal;
+                },
+
+                wasteSignalColor(signal) {
+                    const colors = {
+                        json_bloat: 'bg-amber-500',
+                        html_noise: 'bg-orange-500',
+                        base64: 'bg-red-500',
+                        whitespace: 'bg-blue-500',
+                        dynamic_date: 'bg-purple-500',
+                        repetition: 'bg-pink-500',
+                        reread: 'bg-teal-500',
+                        reread_compressed: 'bg-rose-500',
+                    };
+                    return colors[signal] || 'bg-gray-500';
+                },
+
+                wasteSignalBadgeColor(signal) {
+                    const colors = {
+                        json_bloat: 'bg-amber-500/20 text-amber-400',
+                        html_noise: 'bg-orange-500/20 text-orange-400',
+                        base64: 'bg-red-500/20 text-red-400',
+                        whitespace: 'bg-blue-500/20 text-blue-400',
+                        dynamic_date: 'bg-purple-500/20 text-purple-400',
+                        repetition: 'bg-pink-500/20 text-pink-400',
+                        reread: 'bg-teal-500/20 text-teal-400',
+                        reread_compressed: 'bg-rose-500/20 text-rose-400',
+                    };
+                    return colors[signal] || 'bg-gray-500/20 text-gray-400';
+                },
+
+                get sortedWasteSignals() {
+                    const signals = this.stats.waste_signals || {};
+                    return Object.entries(signals)
+                        .filter(([, v]) => v > 0)
+                        .sort((a, b) => b[1] - a[1]);
+                },
+
+                getWastePercent(tokens) {
+                    const signals = this.stats.waste_signals || {};
+                    const max = Math.max(...Object.values(signals), 1);
+                    return Math.min((tokens / max) * 100, 100);
+                },
+
+                get compressionTotalBefore() {
+                    return this.stats.tokens?.total_before_compression || 0;
+                },
+
+                get proxyShareOfTotal() {
+                    const total = this.compressionTotalBefore;
+                    if (total <= 0) return 0;
+                    return (this.stats.tokens?.proxy_compression_saved || 0) / total * 100;
+                },
+
+                get cliFilteringLabel() {
+                    const raw = this.stats.savings?.by_layer?.cli_filtering?.label
+                        || this.stats.context_tool?.label
+                        || this.stats.context_tool?.configured
+                        || 'Context Tool';
+                    if (String(raw).toLowerCase() === 'lean-ctx') return 'Lean-ctx';
+                    return String(raw);
+                },
+
+                get cliFilteringSaved() {
+                    return this.stats.tokens?.cli_filtering_saved
+                        ?? this.stats.tokens?.cli_tokens_avoided
+                        ?? this.stats.tokens?.rtk_saved
+                        ?? 0;
+                },
+
+                get cliFilteringShareOfTotal() {
+                    const total = this.compressionTotalBefore;
+                    if (total <= 0) return 0;
+                    return this.cliFilteringSaved / total * 100;
+                },
+
+                // --- Headline savings percent ---
+                //
+                // Active ratio (saved / attempted) is the right metric when we have
+                // a working denominator. Some backend-routed paths don't yet
+                // populate `proxy_attempted_tokens` consistently — in that case
+                // the active number reads 0% even when compression is happening,
+                // so fall back to the whole-request ratio (`proxy_savings_percent`)
+                // instead of showing a misleading zero. Issue #455.
+                get headlineSavingsPercent() {
+                    const attempted = this.stats.tokens?.proxy_attempted_tokens || 0;
+                    const active = this.stats.tokens?.active_savings_percent || 0;
+                    if (attempted > 0 && active > 0) return active;
+                    return this.stats.tokens?.proxy_savings_percent || 0;
+                },
+
+                get headlineSavingsTitle() {
+                    const attempted = this.stats.tokens?.proxy_attempted_tokens || 0;
+                    const active = this.stats.tokens?.active_savings_percent || 0;
+                    if (attempted > 0 && active > 0) {
+                        return 'Of compressible tokens attempted';
+                    }
+                    return 'Of whole pre-compression request (attempted-tokens metric unavailable)';
+                },
+
+                // --- Expandable Rows ---
+
+                toggleExpanded(id) {
+                    this.expandedRows[id] = !this.expandedRows[id];
+                },
+
+                // --- Charts ---
+
+                getProviderPercent(count) {
+                    const total = this.stats.requests?.total || 1;
+                    return Math.min((count / total) * 100, 100);
+                },
+
+                getSparkline(data) {
+                    if (!data || data.length < 2) return '';
+                    const min = Math.min(...data);
+                    const max = Math.max(...data);
+                    const range = max - min || 1;
+
+                    const points = data.map((v, i) => {
+                        const x = (i / (data.length - 1)) * 100;
+                        const y = 32 - ((v - min) / range) * 28;
+                        return `${x},${y}`;
+                    });
+
+                    return 'M' + points.join(' L');
+                },
+
+                getSparklineArea(data) {
+                    if (!data || data.length < 2) return '';
+                    const line = this.getSparkline(data);
+                    if (!line) return '';
+                    return line + ` L100,32 L0,32 Z`;
+                },
+
+                getTrendLine(history) {
+                    if (!history || history.length < 2) return '';
+                    const values = history.map(h => Array.isArray(h) ? h[1] : (h?.total_tokens_saved || 0));
+                    const min = Math.min(...values);
+                    const max = Math.max(...values);
+                    const range = max - min || 1;
+
+                    const points = values.map((v, i) => {
+                        const x = (i / (values.length - 1)) * 200;
+                        const y = 60 - ((v - min) / range) * 56;
+                        return `${x},${y}`;
+                    });
+
+                    return 'M' + points.join(' L');
+                },
+
+                getTrendArea(history) {
+                    if (!history || history.length < 2) return '';
+                    const line = this.getTrendLine(history);
+                    if (!line) return '';
+                    return line + ` L200,64 L0,64 Z`;
+                },
+
+                getObjectTrendLine(history, valueKey) {
+                    if (!history || history.length < 2) return '';
+                    const values = history.map(point => point?.[valueKey] || 0);
+                    const min = Math.min(...values);
+                    const max = Math.max(...values);
+                    const range = max - min || 1;
+
+                    const points = values.map((value, index) => {
+                        const x = (index / (values.length - 1)) * 200;
+                        const y = 60 - ((value - min) / range) * 56;
+                        return `${x},${y}`;
+                    });
+
+                    return 'M' + points.join(' L');
+                },
+
+                getObjectTrendArea(history, valueKey) {
+                    if (!history || history.length < 2) return '';
+                    const line = this.getObjectTrendLine(history, valueKey);
+                    if (!line) return '';
+                    return line + ` L200,64 L0,64 Z`;
+                },
+            };
+        }
+
+        function toggleTheme() {
+            const isDark = document.documentElement.classList.toggle('dark');
+            localStorage.setItem('headroom-theme', isDark ? 'dark' : 'light');
+        }
+    </script>
+</body>
+</html>

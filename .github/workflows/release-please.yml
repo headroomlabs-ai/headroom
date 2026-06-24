@@ -1,0 +1,49 @@
+name: Release Please
+
+# What this does
+# ----------------
+# release-please watches `main` for conventional-commit traffic and
+# maintains a single "Release vX.Y.Z" PR that aggregates everything
+# released since the last tag. Merging that PR is what triggers an
+# actual PyPI / npm / GitHub-Release publish (via release.yml, which
+# fires on the published-release event the bot emits at merge time).
+#
+# This replaces the prior "every push to main is a release" pattern
+# that burned PyPI's per-project storage quota by uploading a fresh
+# wheel matrix (~200 MB) for each merged `fix:` / `feat:` PR.
+#
+# Day-to-day:
+#   - Merge a `fix:` PR into main      -> bot updates the release PR
+#   - Merge a `feat:` PR into main     -> bot bumps minor in release PR
+#   - Merge `ci:` / `docs:` / `chore:` -> no PR change (hidden)
+#   - Ready to ship                    -> merge the release PR
+#                                       (bot tags + emits release event;
+#                                        release.yml does the actual builds + publishes)
+#
+# Config lives in `.release-please-config.json`; current versions
+# tracked in `.release-please-manifest.json`.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  # Serialize bot runs on main so two pushes don't race the
+  # release-PR update. We never cancel mid-flight — losing a manifest
+  # write would mean the next push computes the wrong base version.
+  group: release-please-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: googleapis/release-please-action@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          config-file: .release-please-config.json
+          manifest-file: .release-please-manifest.json

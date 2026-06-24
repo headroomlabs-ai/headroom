@@ -1,0 +1,154 @@
+---
+title: Agno
+description: Automatic context compression for Agno AI agents with model wrapping and observability hooks.
+---
+
+Headroom integrates with [Agno](https://github.com/agno-agi/agno) (formerly Phidata) to compress context for AI agents. Wrap any Agno model for automatic optimization, and use hooks for observability.
+
+## Installation
+
+```bash
+pip install "headroom-ai[agno]" agno
+```
+
+## Quick start
+
+```python
+from agno.agent import Agent
+from agno.models.openai import OpenAIChat
+from headroom.integrations.agno import HeadroomAgnoModel
+
+model = HeadroomAgnoModel(OpenAIChat(id="gpt-4o"))
+agent = Agent(model=model)
+
+response = agent.run("What's the capital of France?")
+
+print(f"Tokens saved: {model.total_tokens_saved}")
+print(model.get_savings_summary())
+# {'total_requests': 1, 'total_tokens_saved': 245, 'average_savings_percent': 12.3}
+```
+
+Works with any Agno provider:
+
+```python
+from agno.models.anthropic import Claude
+from agno.models.google import Gemini
+
+claude_model = HeadroomAgnoModel(Claude(id="claude-sonnet-4-20250514"))
+gemini_model = HeadroomAgnoModel(Gemini(id="gemini-2.0-flash"))
+```
+
+## Observability hooks
+
+Use hooks for detailed tracking without modifying your model:
+
+```python
+from headroom.integrations.agno import (
+    HeadroomAgnoModel,
+    HeadroomPreHook,
+    HeadroomPostHook,
+)
+
+model = HeadroomAgnoModel(OpenAIChat(id="gpt-4o"))
+
+pre_hook = HeadroomPreHook()
+post_hook = HeadroomPostHook(token_alert_threshold=10000)
+
+agent = Agent(
+    model=model,
+    pre_hooks=[pre_hook],
+    post_hooks=[post_hook],
+)
+
+response = agent.run("Analyze this large dataset...")
+
+# Check for alerts
+if post_hook.alerts:
+    print(f"{len(post_hook.alerts)} requests exceeded threshold")
+```
+
+Or use the convenience factory:
+
+```python
+from headroom.integrations.agno import create_headroom_hooks
+
+pre_hook, post_hook = create_headroom_hooks(
+    token_alert_threshold=5000,
+    log_level="DEBUG",
+)
+```
+
+## Tool-heavy agents
+
+Tool outputs (JSON, logs, search results) see the biggest compression gains at 70-90% reduction:
+
+```python
+from agno.tools.duckduckgo import DuckDuckGoTools
+
+model = HeadroomAgnoModel(OpenAIChat(id="gpt-4o"))
+
+agent = Agent(
+    model=model,
+    tools=[DuckDuckGoTools()],
+    show_tool_calls=True,
+)
+
+response = agent.run("Research the latest AI developments")
+print(f"Tokens saved: {model.total_tokens_saved}")
+```
+
+## Async support
+
+```python
+import asyncio
+
+async def process():
+    model = HeadroomAgnoModel(OpenAIChat(id="gpt-4o"))
+
+    response = await model.aresponse(messages)
+
+    async for chunk in model.aresponse_stream(messages):
+        print(chunk, end="", flush=True)
+
+asyncio.run(process())
+```
+
+## Standalone message optimization
+
+Optimize messages without wrapping a model:
+
+```python
+from headroom.integrations.agno import optimize_messages
+
+optimized, metrics = optimize_messages(messages, model="gpt-4o")
+print(f"Tokens saved: {metrics['tokens_saved']}")
+```
+
+## Session management
+
+Reset metrics between sessions:
+
+```python
+model = HeadroomAgnoModel(OpenAIChat(id="gpt-4o"))
+
+# Session 1
+agent.run("First conversation...")
+print(model.get_savings_summary())
+
+# Reset for new session
+model.reset()
+
+# Session 2 starts fresh
+agent.run("Second conversation...")
+```
+
+## Supported providers
+
+| Provider | Agno Model | Auto-Detected |
+|----------|-----------|---------------|
+| OpenAI | `OpenAIChat`, `OpenAILike` | Yes |
+| Anthropic | `Claude`, `AwsBedrock` | Yes |
+| Google | `Gemini`, `VertexAI` | Yes |
+| Groq | `Groq` | Yes |
+| Mistral | `Mistral` | Yes |
+| Ollama | `Ollama` | Yes |

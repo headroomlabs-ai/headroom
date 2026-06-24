@@ -1,0 +1,34 @@
+{
+  "config": {
+    "dedup_identical_items": true,
+    "enabled": true,
+    "factor_out_constants": false,
+    "first_fraction": 0.3,
+    "include_summaries": false,
+    "last_fraction": 0.15,
+    "max_items_after_crush": 15,
+    "min_items_to_analyze": 5,
+    "min_tokens_to_crush": 200,
+    "preserve_change_points": true,
+    "similarity_threshold": 0.8,
+    "toin_confidence_threshold": 0.5,
+    "uniqueness_threshold": 0.1,
+    "use_feedback_hints": true,
+    "variance_threshold": 2.0
+  },
+  "input": {
+    "bias": 1.0,
+    "content": "[null, true, false, null, true, false, null]",
+    "query": ""
+  },
+  "input_sha256": "06d6fd6adcab251afc35de66e5cd54cfc21f15175bb082286cd1255b0f5bd965",
+  "label": "nulls_and_bools",
+  "output": {
+    "compressed": "[null,true,false,null,true,false,null]",
+    "original": "[null, true, false, null, true, false, null]",
+    "strategy": "mixed:passthrough(7->7)",
+    "was_modified": true
+  },
+  "recorded_at": "2026-04-27T06:59:40.029745+00:00",
+  "transform": "smart_crusher"
+}

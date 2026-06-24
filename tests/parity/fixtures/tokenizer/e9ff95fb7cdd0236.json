@@ -1,0 +1,8 @@
+{
+  "config": {},
+  "input": "hello\n[[variant 1]]",
+  "input_sha256": "e9ff95fb7cdd023626aa919c9194975d3a26e95ad0ef2c766ab649bdf9c198f6",
+  "output": 7,
+  "recorded_at": "2026-04-23T23:51:37.614484+00:00",
+  "transform": "tokenizer"
+}

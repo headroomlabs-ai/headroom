@@ -1,0 +1,34 @@
+{
+  "config": {
+    "dedup_identical_items": true,
+    "enabled": true,
+    "factor_out_constants": false,
+    "first_fraction": 0.3,
+    "include_summaries": false,
+    "last_fraction": 0.15,
+    "max_items_after_crush": 15,
+    "min_items_to_analyze": 5,
+    "min_tokens_to_crush": 200,
+    "preserve_change_points": true,
+    "similarity_threshold": 0.8,
+    "toin_confidence_threshold": 0.5,
+    "uniqueness_threshold": 0.1,
+    "use_feedback_hints": true,
+    "variance_threshold": 2.0
+  },
+  "input": {
+    "bias": 1.0,
+    "content": "[{\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}]",
+    "query": ""
+  },
+  "input_sha256": "40a0670dec17ae0f765b640ffea2a78c2f2526c03877dcabf0b6108b608ada8a",
+  "label": "duplicate_dicts_40",
+  "output": {
+    "compressed": "[{\"event\":\"heartbeat\",\"ok\":true},{\"_ccr_dropped\":\"<<ccr:6155f8b8951e 39_rows_offloaded>>\"}]",
+    "original": "[{\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}, {\"event\": \"heartbeat\", \"ok\": true}]",
+    "strategy": "smart_sample(40->1)",
+    "was_modified": true
+  },
+  "recorded_at": "2026-04-27T06:59:40.029276+00:00",
+  "transform": "smart_crusher"
+}

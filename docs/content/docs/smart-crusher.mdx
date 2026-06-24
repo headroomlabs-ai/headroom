@@ -1,0 +1,146 @@
+---
+title: SmartCrusher
+description: Statistical JSON and array compression that keeps important items and drops the rest, achieving 70-90% token reduction.
+---
+
+SmartCrusher is Headroom's compressor for JSON tool outputs. It analyzes arrays statistically, keeps the important items (errors, anomalies, relevant matches), and drops the rest. This is the compressor that fires automatically when ContentRouter detects JSON arrays.
+
+## How It Works
+
+SmartCrusher doesn't blindly truncate arrays. It scores each item across five dimensions:
+
+1. **First/Last items** -- Context for pagination and recency
+2. **Error items** -- 100% preservation of error states (never dropped)
+3. **Anomalies** -- Statistical outliers (> 2 standard deviations from the mean)
+4. **Relevant items** -- Matches to the user's query via BM25/embeddings
+5. **Change points** -- Significant transitions in data
+
+The result: a 1,000-item array becomes ~50 items with all the information the LLM actually needs.
+
+## What Gets Preserved
+
+| Category | Preserved | Why |
+|---|---|---|
+| Errors | 100% | Critical for debugging |
+| First N | 100% | Context and pagination |
+| Last N | 100% | Recency |
+| Anomalies | All | Unusual values matter |
+| Relevant | Top K | Match user's query |
+| Others | Sampled | Statistical representation |
+
+## Quick Start
+
+<Tabs groupId="lang" items={['TypeScript', 'Python']}>
+<Tab value="TypeScript">
+```ts twoslash
+import { compress } from "headroom-ai";
+
+// SmartCrusher fires automatically for JSON tool outputs
+const messages = [
+  { role: "system" as const, content: "You are a helpful assistant." },
+  { role: "user" as const, content: "Find errors in the last 24 hours" },
+  {
+    role: "tool" as const,
+    content: JSON.stringify({ results: new Array(1000).fill({ status: "ok" }) }),
+    tool_call_id: "call_1",
+  },
+];
+
+const result = await compress(messages);
+console.log(`Tokens saved: ${result.tokensSaved}`);
+// SmartCrusher keeps errors, anomalies, and relevant items
+```
+</Tab>
+<Tab value="Python">
+```python
+from headroom import SmartCrusher
+
+crusher = SmartCrusher()
+
+# Before: 1000 search results (45,000 tokens)
+tool_output = {"results": ["...1000 items..."]}
+
+# After: ~50 important items (4,500 tokens) -- 90% reduction
+compressed = crusher.crush(tool_output, query="user's question")
+```
+</Tab>
+</Tabs>
+
+## Configuration
+
+<Tabs groupId="lang" items={['TypeScript', 'Python']}>
+<Tab value="TypeScript">
+```ts twoslash
+import { compress } from "headroom-ai";
+
+// Configure via the Headroom proxy or HeadroomClient
+const result = await compress(messages, {
+  model: "gpt-4o",
+  tokenBudget: 10000, // SmartCrusher will reduce JSON to fit
+});
+
+console.log(`Transforms: ${result.transformsApplied}`);
+// ["smart_crusher", "cache_aligner"]
+```
+</Tab>
+<Tab value="Python">
+```python
+from headroom import SmartCrusher, SmartCrusherConfig
+
+config = SmartCrusherConfig(
+    min_tokens_to_crush=200,      # Only compress if > 200 tokens
+    max_items_after_crush=15,     # Keep at most 15 items
+    first_fraction=0.3,           # Keep first 30% of items
+    last_fraction=0.15,           # Keep last 15% of items
+    variance_threshold=2.0,       # Statistical variance threshold
+    preserve_change_points=True,  # Keep significant transitions
+)
+
+crusher = SmartCrusher(config)
+compressed = crusher.crush(tool_output, query="find payment failures")
+```
+</Tab>
+</Tabs>
+
+## Configuration Options
+
+| Option | Default | Description |
+|---|---|---|
+| `min_tokens_to_crush` | `200` | Only compress arrays with more than this many tokens |
+| `min_items_to_analyze` | `5` | Minimum items before analyzing for compression |
+| `max_items_after_crush` | `15` | Maximum items to keep after compression |
+| `variance_threshold` | `2.0` | Statistical variance threshold for analysis |
+| `uniqueness_threshold` | `0.1` | Uniqueness threshold for deduplication |
+| `similarity_threshold` | `0.8` | Similarity threshold for grouping |
+| `preserve_change_points` | `True` | Preserve significant transitions in data |
+| `first_fraction` | `0.3` | Fraction of items always kept from the start |
+| `last_fraction` | `0.15` | Fraction of items always kept from the end |
+| `dedup_identical_items` | `True` | Deduplicate identical items |
+| `use_feedback_hints` | `True` | Use TOIN feedback hints for scoring |
+
+## Example: Before and After
+
+Consider a tool that returns 1,000 search results:
+
+```python
+# Before compression: 45,000 tokens
+{
+    "results": [
+        {"id": 1, "status": "ok", "message": "Success", "timestamp": "..."},
+        {"id": 2, "status": "ok", "message": "Success", "timestamp": "..."},
+        # ... 995 more "ok" results ...
+        {"id": 998, "status": "error", "message": "Connection timeout", "timestamp": "..."},
+        {"id": 999, "status": "ok", "message": "Success", "timestamp": "..."},
+        {"id": 1000, "status": "ok", "message": "Success", "timestamp": "..."},
+    ]
+}
+
+# After SmartCrusher: 4,500 tokens (90% reduction)
+# Kept: first 3, last 2, the error at id=998, statistical sample
+```
+
+The LLM sees the structure, the error, and a representative sample -- everything it needs to answer "find errors in the last 24 hours" without wading through 1,000 identical success responses.
+
+<Callout type="info" title="Automatic routing">
+  You don't need to call SmartCrusher directly. The ContentRouter detects JSON arrays and routes them to SmartCrusher automatically. Direct usage is available when you want fine-grained control over the configuration.
+</Callout>

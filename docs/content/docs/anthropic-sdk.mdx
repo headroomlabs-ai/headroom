@@ -1,0 +1,127 @@
+---
+title: Anthropic SDK
+description: Auto-compress messages in the Anthropic TypeScript SDK with a single withHeadroom() wrapper.
+---
+
+Headroom wraps the Anthropic TypeScript SDK to automatically compress messages before every `messages.create()` call. All other methods pass through unchanged.
+
+## Installation
+
+```bash
+npm install headroom-ai @anthropic-ai/sdk
+```
+
+<Callout type="info" title="Proxy required">
+The TypeScript SDK sends messages to a local Headroom proxy for compression. Start the proxy before using the SDK:
+
+```bash
+pip install "headroom-ai[proxy]"
+headroom proxy
+```
+</Callout>
+
+## Quick start
+
+```ts twoslash
+import { withHeadroom } from 'headroom-ai/anthropic';
+import Anthropic from '@anthropic-ai/sdk';
+
+const client = withHeadroom(new Anthropic());
+
+const response = await client.messages.create({
+  model: 'claude-sonnet-4-5-20250929',
+  messages: longConversation,
+  max_tokens: 1024,
+});
+```
+
+Every call to `client.messages.create()` compresses messages first. The response format is identical to the unwrapped client.
+
+## How it works
+
+`withHeadroom()` returns a proxy around your Anthropic client that intercepts `messages.create()`:
+
+1. Converts Anthropic-format messages to OpenAI format (the compression engine's native format)
+2. Sends them to the Headroom proxy's `/v1/compress` endpoint
+3. Converts the compressed messages back to Anthropic format
+4. Forwards the request to Anthropic as normal
+
+### Message format conversion
+
+The adapter handles the full Anthropic message format including content blocks:
+
+| Anthropic format | OpenAI format |
+|-----------------|---------------|
+| `{ type: "text", text: "..." }` | `{ role: "user", content: "..." }` |
+| `{ type: "tool_use", id, name, input }` | `{ tool_calls: [{ id, function: { name, arguments } }] }` |
+| `{ type: "tool_result", tool_use_id, content }` | `{ role: "tool", tool_call_id, content }` |
+
+This conversion is lossless. Your request and response behave identically to an unwrapped client.
+
+## Options
+
+Pass compression options as the second argument:
+
+```ts twoslash
+import { withHeadroom } from 'headroom-ai/anthropic';
+import Anthropic from '@anthropic-ai/sdk';
+
+const client = withHeadroom(new Anthropic(), {
+  model: 'claude-sonnet-4-5-20250929',
+  baseUrl: 'http://localhost:8787',
+});
+```
+
+## Streaming
+
+Streaming works normally. Compression happens before the request:
+
+```ts twoslash
+import { withHeadroom } from 'headroom-ai/anthropic';
+import Anthropic from '@anthropic-ai/sdk';
+
+const client = withHeadroom(new Anthropic());
+
+const stream = await client.messages.create({
+  model: 'claude-sonnet-4-5-20250929',
+  messages: longConversation,
+  max_tokens: 1024,
+  stream: true,
+});
+```
+
+## Tool use
+
+Tool results are where compression has the biggest impact. Large JSON payloads from tool calls are compressed automatically:
+
+```ts twoslash
+import { withHeadroom } from 'headroom-ai/anthropic';
+import Anthropic from '@anthropic-ai/sdk';
+
+const client = withHeadroom(new Anthropic());
+
+const response = await client.messages.create({
+  model: 'claude-sonnet-4-5-20250929',
+  max_tokens: 1024,
+  messages: [
+    { role: 'user', content: 'What went wrong?' },
+    {
+      role: 'assistant',
+      content: [
+        { type: 'tool_use', id: 'toolu_1', name: 'get_logs', input: { service: 'api' } },
+      ],
+    },
+    {
+      role: 'user',
+      content: [
+        {
+          type: 'tool_result',
+          tool_use_id: 'toolu_1',
+          content: hugeLogOutput, // Compressed automatically
+        },
+      ],
+    },
+  ],
+  tools: [{ name: 'get_logs', description: 'Get logs', input_schema: { type: 'object', properties: {} } }],
+});
+```

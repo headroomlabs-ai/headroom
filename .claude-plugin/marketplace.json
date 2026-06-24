@@ -1,0 +1,30 @@
+{
+  "name": "headroom-marketplace",
+  "owner": {
+    "name": "Headroom Contributors"
+  },
+  "metadata": {
+    "description": "Headroom marketplace for Claude Code and GitHub Copilot CLI plugins.",
+    "version": "0.22.3"
+  },
+  "plugins": [
+    {
+      "name": "headroom",
+      "source": "./plugins/headroom-agent-hooks",
+      "description": "Headroom startup hooks for Claude Code and GitHub Copilot CLI.",
+      "version": "0.22.3",
+      "author": {
+        "name": "Headroom Contributors",
+        "url": "https://github.com/chopratejas/headroom"
+      },
+      "homepage": "https://github.com/chopratejas/headroom",
+      "repository": "https://github.com/chopratejas/headroom",
+      "keywords": [
+        "headroom",
+        "hooks",
+        "claude-code",
+        "copilot-cli"
+      ]
+    }
+  ]
+}

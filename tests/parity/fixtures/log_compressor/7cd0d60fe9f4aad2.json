@@ -1,0 +1,30 @@
+{
+  "config": {
+    "dedupe_warnings": true,
+    "enable_ccr": true,
+    "error_context_lines": 3,
+    "keep_first_error": true,
+    "keep_last_error": true,
+    "keep_summary_lines": true,
+    "max_errors": 10,
+    "max_stack_traces": 3,
+    "max_total_lines": 100,
+    "max_warnings": 5,
+    "min_lines_for_ccr": 50,
+    "stack_trace_max_lines": 20
+  },
+  "input": "============================= test session starts ==============================\ncollected 42 items\ntests/test_mod_0.py::test_case PASSED [0%]\ntests/test_mod_1.py::test_case PASSED [2%]\ntests/test_mod_2.py::test_case PASSED [4%]\ntests/test_mod_3.py::test_case PASSED [6%]\ntests/test_mod_4.py::test_case PASSED [8%]\ntests/test_mod_5.py::test_case PASSED [10%]\ntests/test_mod_6.py::test_case PASSED [12%]\ntests/test_mod_7.py::test_case PASSED [14%]\ntests/test_mod_8.py::test_case PASSED [16%]\ntests/test_mod_9.py::test_case PASSED [18%]\ntests/test_mod_10.py::test_case PASSED [20%]\ntests/test_mod_11.py::test_case PASSED [22%]\ntests/test_mod_12.py::test_case PASSED [24%]\ntests/test_mod_13.py::test_case PASSED [26%]\ntests/test_mod_14.py::test_case PASSED [28%]\ntests/test_mod_15.py::test_case PASSED [30%]\ntests/test_mod_16.py::test_case PASSED [32%]\ntests/test_mod_17.py::test_case PASSED [34%]\ntests/test_mod_18.py::test_case PASSED [36%]\ntests/test_mod_19.py::test_case PASSED [38%]\ntests/test_mod_20.py::test_case PASSED [40%]\ntests/test_mod_21.py::test_case PASSED [42%]\ntests/test_mod_22.py::test_case PASSED [44%]\ntests/test_mod_23.py::test_case PASSED [46%]\ntests/test_mod_24.py::test_case PASSED [48%]\ntests/test_mod_25.py::test_bad FAILED\n=================================== FAILURES ===================================\n___________________________________ test_bad ___________________________________\n    def test_bad():\n>       assert compute(1, 2) == 4\nE       assert 3 == 4\ntests/test_mod_25.py:17: AssertionError\n=========================== short test summary info ============================\nFAILED tests/test_mod_25.py::test_bad\n1 failed, 25 passed in 0.42s\n# variant 2",
+  "input_sha256": "7cd0d60fe9f4aad2453c28a3614668bed7b5bdfc007074f8b98672b6fbb27622",
+  "output": {
+    "cache_key": null,
+    "compressed": "============================= test session starts ==============================\ncollected 42 items\ntests/test_mod_0.py::test_case PASSED [0%]\ntests/test_mod_1.py::test_case PASSED [2%]\ntests/test_mod_2.py::test_case PASSED [4%]\ntests/test_mod_3.py::test_case PASSED [6%]\ntests/test_mod_4.py::test_case PASSED [8%]\ntests/test_mod_5.py::test_case PASSED [10%]\ntests/test_mod_6.py::test_case PASSED [12%]\ntests/test_mod_7.py::test_case PASSED [14%]\ntests/test_mod_8.py::test_case PASSED [16%]\ntests/test_mod_9.py::test_case PASSED [18%]\ntests/test_mod_10.py::test_case PASSED [20%]\ntests/test_mod_11.py::test_case PASSED [22%]\ntests/test_mod_12.py::test_case PASSED [24%]\ntests/test_mod_13.py::test_case PASSED [26%]\ntests/test_mod_14.py::test_case PASSED [28%]\ntests/test_mod_15.py::test_case PASSED [30%]\ntests/test_mod_16.py::test_case PASSED [32%]\ntests/test_mod_17.py::test_case PASSED [34%]\ntests/test_mod_18.py::test_case PASSED [36%]\ntests/test_mod_19.py::test_case PASSED [38%]\ntests/test_mod_20.py::test_case PASSED [40%]\ntests/test_mod_21.py::test_case PASSED [42%]\ntests/test_mod_22.py::test_case PASSED [44%]\ntests/test_mod_23.py::test_case PASSED [46%]\ntests/test_mod_24.py::test_case PASSED [48%]\ntests/test_mod_25.py::test_bad FAILED\n=================================== FAILURES ===================================\n___________________________________ test_bad ___________________________________\n    def test_bad():\n>       assert compute(1, 2) == 4\nE       assert 3 == 4\ntests/test_mod_25.py:17: AssertionError\n=========================== short test summary info ============================\nFAILED tests/test_mod_25.py::test_bad\n1 failed, 25 passed in 0.42s\n# variant 2",
+    "compressed_line_count": 38,
+    "compression_ratio": 1.0,
+    "format_detected": "generic",
+    "original": "============================= test session starts ==============================\ncollected 42 items\ntests/test_mod_0.py::test_case PASSED [0%]\ntests/test_mod_1.py::test_case PASSED [2%]\ntests/test_mod_2.py::test_case PASSED [4%]\ntests/test_mod_3.py::test_case PASSED [6%]\ntests/test_mod_4.py::test_case PASSED [8%]\ntests/test_mod_5.py::test_case PASSED [10%]\ntests/test_mod_6.py::test_case PASSED [12%]\ntests/test_mod_7.py::test_case PASSED [14%]\ntests/test_mod_8.py::test_case PASSED [16%]\ntests/test_mod_9.py::test_case PASSED [18%]\ntests/test_mod_10.py::test_case PASSED [20%]\ntests/test_mod_11.py::test_case PASSED [22%]\ntests/test_mod_12.py::test_case PASSED [24%]\ntests/test_mod_13.py::test_case PASSED [26%]\ntests/test_mod_14.py::test_case PASSED [28%]\ntests/test_mod_15.py::test_case PASSED [30%]\ntests/test_mod_16.py::test_case PASSED [32%]\ntests/test_mod_17.py::test_case PASSED [34%]\ntests/test_mod_18.py::test_case PASSED [36%]\ntests/test_mod_19.py::test_case PASSED [38%]\ntests/test_mod_20.py::test_case PASSED [40%]\ntests/test_mod_21.py::test_case PASSED [42%]\ntests/test_mod_22.py::test_case PASSED [44%]\ntests/test_mod_23.py::test_case PASSED [46%]\ntests/test_mod_24.py::test_case PASSED [48%]\ntests/test_mod_25.py::test_bad FAILED\n=================================== FAILURES ===================================\n___________________________________ test_bad ___________________________________\n    def test_bad():\n>       assert compute(1, 2) == 4\nE       assert 3 == 4\ntests/test_mod_25.py:17: AssertionError\n=========================== short test summary info ============================\nFAILED tests/test_mod_25.py::test_bad\n1 failed, 25 passed in 0.42s\n# variant 2",
+    "original_line_count": 38,
+    "stats": {}
+  },
+  "recorded_at": "2026-04-23T23:51:37.253497+00:00",
+  "transform": "log_compressor"
+}

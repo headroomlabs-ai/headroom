@@ -1,0 +1,15 @@
+{
+  "config": {},
+  "input": "[{\"id\":1,\"name\":\"a\"},{\"id\":2,\"name\":\"b\"},{\"id\":3,\"name\":\"c\"}]",
+  "input_sha256": "bc4488ce189d1c867e5b600d4691354f94a3f63ecf869ad2bc89344cb2142566",
+  "output": {
+    "confidence": 1.0,
+    "content_type": "json_array",
+    "metadata": {
+      "is_dict_array": true,
+      "item_count": 3
+    }
+  },
+  "recorded_at": "2026-04-28T06:39:34.959161+00:00",
+  "transform": "content_detector"
+}

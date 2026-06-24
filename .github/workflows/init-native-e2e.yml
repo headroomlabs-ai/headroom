@@ -1,0 +1,140 @@
+name: Init Native E2E
+
+# Cross-platform (linux / macos / windows) smoke tests for the per-subcommand
+# ``headroom init -g <target>`` flows. Each matrix cell drops a noop shim for
+# the target agent onto PATH and asserts ``headroom init -g <target>``
+# succeeds, writes the expected settings file, and (for claude/codex) places
+# hooks in the right place.
+#
+# Deliberately scoped to pull_request + push-to-main + workflow_dispatch to
+# avoid bloating CI minutes on every push to every feature branch. The Docker
+# init-e2e.yml still runs on every PR and provides the deeper functional
+# coverage; this workflow exists to catch platform-specific bugs (Windows
+# path separators, macos keychain prompts, PowerShell-vs-bash hook matchers)
+# that the single-platform Docker suite can miss.
+#
+# Extending to other commands (``headroom install``, ``headroom wrap``) is
+# expected to be a near-copy of this file. The shared composite action at
+# ``.github/actions/headroom-e2e-setup`` absorbs the Python + shim setup so
+# each per-command workflow only supplies its matrix and assertion steps.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "headroom/cli/init.py"
+      - "headroom/install/**"
+      - "e2e/_lib/**"
+      - "e2e/init/**"
+      - ".github/actions/headroom-e2e-setup/**"
+      - ".github/workflows/init-native-e2e.yml"
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  init-native:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        # Windows is excluded today: upstream `esaxx-rs` (transitively from
+        # `tokenizers`) and `ort-sys` (onnxruntime via `fastembed`) link
+        # with conflicting MSVC C runtime libraries (/MT vs /MD), so the
+        # Rust extension cannot build for `win_amd64` until the upstream
+        # CRT conflict is resolved. Re-add `windows-latest` once the wheel
+        # builds cleanly there. Tracked in the project plan; not a blocker
+        # for headroom-ai installs on Linux + macOS.
+        os: [ubuntu-latest, macos-latest]
+        target: [claude, codex, copilot, openclaw]
+        exclude:
+          # openclaw delegates to ``headroom wrap openclaw`` which needs a
+          # running OpenClaw CLI; it can't be shimmed cheaply, so it's
+          # covered by the bundled Docker e2e instead.
+          - target: openclaw
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup (shim=${{ matrix.target }})
+        uses: ./.github/actions/headroom-e2e-setup
+        with:
+          install-mode: deps-only-proxy
+          python-version: "3.11"
+          shim-target: ${{ matrix.target }}
+
+      - name: Verify shim is on PATH (POSIX)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          which "${{ matrix.target }}"
+
+      - name: Verify shim is on PATH (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # On Windows the shim is ``<target>.cmd``; Get-Command resolves via
+          # PATHEXT (same as Python's ``shutil.which`` used by headroom init).
+          # Git Bash's ``which`` cannot find ``.cmd`` shims, so we use pwsh.
+          $cmd = Get-Command "${{ matrix.target }}" -ErrorAction Stop
+          Write-Output $cmd.Source
+
+      - name: Run headroom init -g ${{ matrix.target }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          headroom init -g "${{ matrix.target }}"
+
+      - name: Assert settings file (POSIX)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ matrix.target }}" in
+            claude)
+              test -f "$HOME/.claude/settings.json"
+              grep -q "ANTHROPIC_BASE_URL" "$HOME/.claude/settings.json"
+              ;;
+            codex)
+              test -f "$HOME/.codex/config.toml"
+              test -f "$HOME/.codex/hooks.json"
+              grep -q "headroom" "$HOME/.codex/config.toml"
+              ;;
+            copilot)
+              test -f "$HOME/.copilot/config.json"
+              grep -q "SessionStart" "$HOME/.copilot/config.json"
+              ;;
+          esac
+
+      - name: Assert settings file (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $home_ = $env:USERPROFILE
+          switch ("${{ matrix.target }}") {
+            "claude" {
+              $p = Join-Path $home_ ".claude\settings.json"
+              if (-not (Test-Path $p)) { throw "Missing $p" }
+              if (-not ((Get-Content $p -Raw) -match "ANTHROPIC_BASE_URL")) {
+                throw "settings.json missing ANTHROPIC_BASE_URL"
+              }
+            }
+            "codex" {
+              $c = Join-Path $home_ ".codex\config.toml"
+              $h = Join-Path $home_ ".codex\hooks.json"
+              if (-not (Test-Path $c)) { throw "Missing $c" }
+              if (-not (Test-Path $h)) { throw "Missing $h" }
+              if (-not ((Get-Content $c -Raw) -match "headroom")) {
+                throw "config.toml missing headroom provider"
+              }
+            }
+            "copilot" {
+              $p = Join-Path $home_ ".copilot\config.json"
+              if (-not (Test-Path $p)) { throw "Missing $p" }
+              if (-not ((Get-Content $p -Raw) -match "SessionStart")) {
+                throw "copilot config missing SessionStart hooks"
+              }
+            }
+          }

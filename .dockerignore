@@ -1,0 +1,73 @@
+# VCS
+.git
+.github
+.github/*
+!.github/plugin/
+!.github/plugin/**
+.gitignore
+
+# Python artifacts
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+dist/
+build/
+
+# Dev/test tooling
+.pytest_cache
+.coverage
+.mypy_cache
+.ruff_cache
+.pre-commit-config.yaml
+.venv
+venv
+
+# Tests & docs (not needed in image)
+tests/
+docs/
+mkdocs.yml
+CHANGELOG.md
+LICENSE
+NOTICE
+
+# JS/TS artifacts (dashboard, SDK — not part of proxy image)
+apps/
+sdk/
+!sdk/
+!sdk/typescript/
+!sdk/typescript/**
+plugins/
+!plugins/
+!plugins/openclaw/
+!plugins/openclaw/**
+!plugins/headroom-agent-hooks/
+!plugins/headroom-agent-hooks/**
+node_modules/
+*.tgz
+
+# Secrets & local config
+.env
+.env.*
+*.log
+
+# IDE
+.vscode
+.idea
+*.swp
+
+# Docker
+Dockerfile
+docker-compose*.yml
+.dockerignore
+
+# Misc
+.pi-lens/
+.superpowers/
+examples/
+node-compile-cache/
+!e2e/
+!e2e/init/
+!e2e/init/**
+!.claude-plugin/
+!.claude-plugin/**

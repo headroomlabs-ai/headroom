@@ -1,0 +1,30 @@
+{
+  "config": {
+    "dedupe_warnings": true,
+    "enable_ccr": true,
+    "error_context_lines": 3,
+    "keep_first_error": true,
+    "keep_last_error": true,
+    "keep_summary_lines": true,
+    "max_errors": 10,
+    "max_stack_traces": 3,
+    "max_total_lines": 100,
+    "max_warnings": 5,
+    "min_lines_for_ccr": 50,
+    "stack_trace_max_lines": 20
+  },
+  "input": "INFO iteration 0\nERROR error 0\nWARN warn 0\nINFO done 0\n# variant 14",
+  "input_sha256": "65bd6228add102acdba36b90e87b1babc54ca9076563d38c74cdc4803eff6dad",
+  "output": {
+    "cache_key": null,
+    "compressed": "INFO iteration 0\nERROR error 0\nWARN warn 0\nINFO done 0\n# variant 14",
+    "compressed_line_count": 5,
+    "compression_ratio": 1.0,
+    "format_detected": "generic",
+    "original": "INFO iteration 0\nERROR error 0\nWARN warn 0\nINFO done 0\n# variant 14",
+    "original_line_count": 5,
+    "stats": {}
+  },
+  "recorded_at": "2026-04-23T23:51:37.345475+00:00",
+  "transform": "log_compressor"
+}
