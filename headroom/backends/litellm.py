@@ -564,9 +564,24 @@ class LiteLLMBackend(Backend):
                     converted.append(assistant_msg)
                     continue
 
-                # Simple text only
+                # Simple text only.
+                # Preserve cache_control blocks so LiteLLM's Bedrock converse
+                # transformation can inject cachePoint markers (#1345). Only
+                # keep blocks as a list when cache_control is present; otherwise
+                # join to a plain string (backward-compatible for other providers).
                 if text_parts:
-                    converted.append({"role": role, "content": "\n".join(text_parts)})
+                    text_blocks = [b for b in content if isinstance(b, dict) and b.get("type") == "text"]
+                    has_cache_control = any("cache_control" in b for b in text_blocks)
+                    if has_cache_control:
+                        converted.append({
+                            "role": role,
+                            "content": [
+                                {k: v for k, v in b.items() if k in ("type", "text", "cache_control")}
+                                for b in text_blocks
+                            ],
+                        })
+                    else:
+                        converted.append({"role": role, "content": "\n".join(text_parts)})
                 else:
                     converted.append({"role": role, "content": ""})
 
@@ -668,11 +683,21 @@ class LiteLLMBackend(Backend):
                 if isinstance(system, str):
                     kwargs["messages"].insert(0, {"role": "system", "content": system})
                 elif isinstance(system, list):
-                    # Anthropic list format
-                    system_text = " ".join(
-                        s.get("text", "") if isinstance(s, dict) else str(s) for s in system
-                    )
-                    kwargs["messages"].insert(0, {"role": "system", "content": system_text})
+                    # Preserve cache_control on system blocks so LiteLLM's Bedrock
+                    # converse transformation can inject cachePoint markers (#1345).
+                    sys_blocks = [s for s in system if isinstance(s, dict) and s.get("type") == "text"]
+                    has_cache_control = any("cache_control" in s for s in sys_blocks)
+                    if has_cache_control:
+                        kwargs["messages"].insert(0, {
+                            "role": "system",
+                            "content": [
+                                {k: v for k, v in s.items() if k in ("type", "text", "cache_control")}
+                                for s in sys_blocks
+                            ],
+                        })
+                    else:
+                        system_text = " ".join(s.get("text", "") for s in sys_blocks)
+                        kwargs["messages"].insert(0, {"role": "system", "content": system_text})
 
             # Provider-specific region config
             if self.region:
@@ -773,10 +798,19 @@ class LiteLLMBackend(Backend):
                 if isinstance(system, str):
                     kwargs["messages"].insert(0, {"role": "system", "content": system})
                 elif isinstance(system, list):
-                    system_text = " ".join(
-                        s.get("text", "") if isinstance(s, dict) else str(s) for s in system
-                    )
-                    kwargs["messages"].insert(0, {"role": "system", "content": system_text})
+                    sys_blocks = [s for s in system if isinstance(s, dict) and s.get("type") == "text"]
+                    has_cache_control = any("cache_control" in s for s in sys_blocks)
+                    if has_cache_control:
+                        kwargs["messages"].insert(0, {
+                            "role": "system",
+                            "content": [
+                                {k: v for k, v in s.items() if k in ("type", "text", "cache_control")}
+                                for s in sys_blocks
+                            ],
+                        })
+                    else:
+                        system_text = " ".join(s.get("text", "") for s in sys_blocks)
+                        kwargs["messages"].insert(0, {"role": "system", "content": system_text})
 
             # Provider-specific region config
             if self.region:
