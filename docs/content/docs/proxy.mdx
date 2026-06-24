@@ -243,6 +243,12 @@ headroom proxy --backend azure
 
 # OpenRouter (400+ models)
 OPENROUTER_API_KEY=sk-or-... headroom proxy --backend openrouter
+
+# Atlas Cloud (OpenAI-compatible)
+ATLASCLOUD_API_KEY=your-atlas-key \
+OPENAI_TARGET_API_URL=https://api.atlascloud.ai/v1 \
+OPENAI_API_KEY=$ATLASCLOUD_API_KEY \
+headroom proxy
 ```
 
 ### Bedrock via a local gateway

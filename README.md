@@ -203,6 +203,25 @@ shows an **Output Tokens Saved** card next to input compression, labelled
 
 Any OpenAI-compatible client works via `headroom proxy`. MCP-native: `headroom mcp install`.
 
+### Atlas Cloud
+
+Atlas Cloud is an OpenAI-compatible provider. Set `ATLASCLOUD_API_KEY` and use the base URL `https://api.atlascloud.ai/v1`. See the [model list](https://www.atlascloud.ai/models) for available model IDs.
+
+```python
+from headroom.providers import create_atlascloud_provider
+
+# Reads ATLASCLOUD_API_KEY from the environment if api_key is omitted.
+provider = create_atlascloud_provider()
+```
+
+To route the proxy through Atlas Cloud:
+
+```bash
+OPENAI_TARGET_API_URL=https://api.atlascloud.ai/v1 \
+OPENAI_API_KEY=$ATLASCLOUD_API_KEY \
+headroom proxy
+```
+
 ### GitHub Copilot CLI subscription mode
 
 Headroom can route GitHub Copilot CLI subscription traffic through the local proxy:

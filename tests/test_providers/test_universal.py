@@ -13,6 +13,7 @@ from headroom.providers import (
     ModelCapabilities,
     OpenAICompatibleProvider,
     create_anyscale_provider,
+    create_atlascloud_provider,
     create_fireworks_provider,
     create_groq_provider,
     create_litellm_provider,
@@ -364,6 +365,16 @@ class TestProviderFactoryFunctions:
         assert anyscale.name == "anyscale"
         assert anyscale.base_url == "https://api.endpoints.anyscale.com/v1"
         assert anyscale.api_key == "anyscale-key"
+
+    def test_create_atlascloud_provider(self):
+        provider = create_atlascloud_provider(api_key="atlas-key")
+
+        assert provider.name == "atlascloud"
+        assert provider.base_url == "https://api.atlascloud.ai/v1"
+        assert provider.api_key == "atlas-key"
+        assert provider.default_model == "qwen/qwen3-32b"
+        assert provider.get_context_limit("qwen/qwen3-32b") == 131072
+        assert provider.get_context_limit("moonshotai/Kimi-K2-Instruct") == 131072
 
 
 class TestLiteLLMProvider:
