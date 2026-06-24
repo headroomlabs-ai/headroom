@@ -8,6 +8,7 @@ Tests cover:
 """
 
 from datetime import datetime
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -269,6 +270,48 @@ class TestHeadroomAgnoModel:
         assert openai_msgs[0]["role"] == "assistant"
         assert "tool_calls" in openai_msgs[0]
         assert openai_msgs[1]["tool_call_id"] == "call_123"
+
+    def test_convert_messages_normalizes_tool_call_objects(self, mock_agno_model):
+        """Convert object-based tool calls to dicts."""
+        from headroom.integrations.agno import HeadroomAgnoModel
+
+        assistant_msg = MagicMock()
+        assistant_msg.role = "assistant"
+        assistant_msg.content = "I'll call the tool."
+        assistant_msg.tool_calls = [
+            SimpleNamespace(
+                id="call_123",
+                type="function",
+                function=SimpleNamespace(name="dummy_tool", arguments='{"query":"test"}'),
+            )
+        ]
+        assistant_msg.tool_call_id = None
+
+        model = HeadroomAgnoModel(wrapped_model=mock_agno_model)
+        openai_msgs = model._convert_messages_to_openai([assistant_msg])
+
+        assert openai_msgs[0]["tool_calls"] == [
+            {
+                "id": "call_123",
+                "type": "function",
+                "function": {
+                    "name": "dummy_tool",
+                    "arguments": '{"query":"test"}',
+                },
+            }
+        ]
+
+    def test_parse_tool_calls_delegates_to_wrapped_model(self, mock_agno_model):
+        """Delegate streaming tool-call parsing to the wrapped model."""
+        from headroom.integrations.agno import HeadroomAgnoModel
+
+        expected = [{"id": "call_123", "type": "function"}]
+        mock_agno_model.parse_tool_calls = MagicMock(return_value=expected)
+
+        model = HeadroomAgnoModel(wrapped_model=mock_agno_model)
+
+        assert model.parse_tool_calls([MagicMock()]) == expected
+        mock_agno_model.parse_tool_calls.assert_called_once()
 
     def test_response_applies_optimization(self, mock_agno_model, sample_messages):
         """response() applies Headroom optimization."""

@@ -38,6 +38,28 @@ from .providers import get_headroom_provider, get_model_name_from_agno
 logger = logging.getLogger(__name__)
 
 
+def _normalize_tool_calls(tool_calls: list[Any]) -> list[Any]:
+    """Convert tool call objects to plain dicts."""
+    normalized = []
+    for tool_call in tool_calls:
+        if isinstance(tool_call, dict):
+            normalized.append(tool_call)
+            continue
+
+        function = getattr(tool_call, "function", None)
+        normalized.append(
+            {
+                "id": getattr(tool_call, "id", None),
+                "type": getattr(tool_call, "type", "function"),
+                "function": {
+                    "name": getattr(function, "name", None) or "",
+                    "arguments": getattr(function, "arguments", None) or "",
+                },
+            }
+        )
+    return normalized
+
+
 def _check_agno_available() -> None:
     """Raise ImportError if Agno is not installed."""
     if not AGNO_AVAILABLE:
@@ -322,7 +344,7 @@ class HeadroomAgnoModel(Model):  # type: ignore[misc]
 
                 # Handle tool calls
                 if hasattr(msg, "tool_calls") and msg.tool_calls:
-                    entry["tool_calls"] = msg.tool_calls
+                    entry["tool_calls"] = _normalize_tool_calls(msg.tool_calls)
                 # Handle tool call ID for tool responses
                 if hasattr(msg, "tool_call_id") and msg.tool_call_id:
                     entry["tool_call_id"] = msg.tool_call_id
@@ -731,6 +753,12 @@ class HeadroomAgnoModel(Model):  # type: ignore[misc]
         """
         return self.wrapped_model._parse_provider_response_delta(response)
 
+    def parse_tool_calls(self, tool_calls_data: list[Any]) -> list[Any]:
+        """Delegate streaming tool-call assembly to the wrapped model."""
+        if hasattr(self.wrapped_model, "parse_tool_calls"):
+            return self.wrapped_model.parse_tool_calls(tool_calls_data)
+        return tool_calls_data
+
 
 def optimize_messages(
     messages: list[Any],
@@ -774,7 +802,7 @@ def optimize_messages(
         if hasattr(msg, "role") and hasattr(msg, "content"):
             entry: dict[str, Any] = {"role": msg.role, "content": msg.content or ""}
             if hasattr(msg, "tool_calls") and msg.tool_calls:
-                entry["tool_calls"] = msg.tool_calls
+                entry["tool_calls"] = _normalize_tool_calls(msg.tool_calls)
             if hasattr(msg, "tool_call_id") and msg.tool_call_id:
                 entry["tool_call_id"] = msg.tool_call_id
             openai_messages.append(entry)
