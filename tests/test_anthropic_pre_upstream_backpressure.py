@@ -243,13 +243,14 @@ class _DummyAnthropicHandler(AnthropicHandlerMixin):
         request_id: str | None = None,
         forwarder_name: str = "test_dummy",
         path_for_log: str | None = None,
+        timeout=None,
     ):
         # PR-A8 follow-up: A3 added byte-faithful kwargs to the real
         # ``_retry_request`` signature. The dummy stub doesn't need
         # to use them — just accept them so existing tests don't
         # break with TypeError on the new call sites.
         del original_body_bytes, body_mutated, mutation_reasons
-        del request_id, forwarder_name, path_for_log
+        del request_id, forwarder_name, path_for_log, timeout
         if self._raise_during_critical:
             raise RuntimeError("synthetic pre-upstream failure")
         enter = time.perf_counter()

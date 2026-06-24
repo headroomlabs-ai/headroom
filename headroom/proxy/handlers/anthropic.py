@@ -130,6 +130,15 @@ class AnthropicHandlerMixin:
             int(cache_creation.get("ephemeral_1h_input_tokens", 0) or 0),
         )
 
+    def _anthropic_buffered_request_timeout(self) -> httpx.Timeout:
+        """Timeout for buffered Anthropic reads."""
+        return httpx.Timeout(
+            connect=self.config.connect_timeout_seconds,
+            read=self.config.anthropic_buffered_request_timeout_seconds,
+            write=self.config.request_timeout_seconds,
+            pool=self.config.connect_timeout_seconds,
+        )
+
     @classmethod
     def _sort_tools_deterministically(
         cls, tools: list[dict[str, Any]] | None
@@ -2144,6 +2153,7 @@ class AnthropicHandlerMixin:
                             request_id=request_id,
                             forwarder_name="anthropic_messages",
                             path_for_log="/v1/messages",
+                            timeout=self._anthropic_buffered_request_timeout(),
                         )
                     self.pipeline_extensions.emit(
                         PipelineStage.POST_SEND,
@@ -2346,7 +2356,7 @@ class AnthropicHandlerMixin:
                                     url,
                                     content=ccr_outbound_bytes,
                                     headers=ccr_outbound_headers,
-                                    timeout=httpx.Timeout(120.0),  # Override timeout for CCR
+                                    timeout=self._anthropic_buffered_request_timeout(),
                                 )
                                 logger.info(
                                     f"CCR: Got response status={cont_response.status_code}, "
@@ -2448,7 +2458,11 @@ class AnthropicHandlerMixin:
                                     continuation_body["tools"] = tools
 
                                 cont_response = await self._retry_request(
-                                    "POST", url, headers, continuation_body
+                                    "POST",
+                                    url,
+                                    headers,
+                                    continuation_body,
+                                    timeout=self._anthropic_buffered_request_timeout(),
                                 )
 
                                 # Update response with continuation
@@ -2502,6 +2516,35 @@ class AnthropicHandlerMixin:
                     if assistant_message is not None:
                         next_original_messages.append(copy.deepcopy(assistant_message))
                         next_forwarded_messages.append(copy.deepcopy(assistant_message))
+
+                    # Cache-miss attribution (#1313): when this turn expected a
+                    # prompt-cache hit but got cr_tokens == 0, decide whether the
+                    # cache most likely lapsed (idle > provider TTL → suggest a
+                    # longer TTL) or the cacheable prefix changed (content shifted).
+                    # Classify BEFORE update_from_response, which overwrites the
+                    # last-turn state the classifier reads (idle clock, prefix,
+                    # cached-token count). `optimized_messages` is the prefix we
+                    # forwarded this turn; compare it against last turn's.
+                    # `hasattr` guard: some tests inject a SimpleNamespace stub
+                    # tracker that only implements the freeze API, not the full
+                    # PrefixCacheTracker surface.
+                    if hasattr(prefix_tracker, "classify_cache_miss"):
+                        miss = prefix_tracker.classify_cache_miss(
+                            cache_read_tokens=cr_tokens,
+                            current_forwarded_messages=optimized_messages,
+                        )
+                        if miss.is_miss:
+                            logger.info(
+                                f"[{request_id}] CACHE-MISS-ATTRIBUTION: reason={miss.reason} "
+                                f"idle={miss.idle_seconds:.0f}s ttl={miss.cache_ttl_seconds}s "
+                                f"expected_cached={miss.expected_cached_tokens:,} "
+                                f"prefix_changed={miss.prefix_changed} "
+                                f"ttl_exceeded={miss.ttl_exceeded}"
+                            )
+                            await self.metrics.record_cache_miss_attribution(
+                                provider_name, miss.reason
+                            )
+
                     prefix_tracker.update_from_response(
                         cache_read_tokens=cr_tokens,
                         cache_write_tokens=cw_tokens,
@@ -2922,6 +2965,7 @@ class AnthropicHandlerMixin:
                 request_id=request_id,
                 forwarder_name="anthropic_batch",
                 path_for_log="/v1/messages/batches",
+                timeout=self._anthropic_buffered_request_timeout(),
             )
 
             # Batch create: tokens accumulated across all requests in
@@ -3047,6 +3091,7 @@ class AnthropicHandlerMixin:
             url=url,
             headers=headers,
             content=body,
+            timeout=self._anthropic_buffered_request_timeout(),
         )
 
         # Batch passthrough: no compression, no transforms — but we
@@ -3163,7 +3208,11 @@ class AnthropicHandlerMixin:
             request_id=None,
         )
 
-        response = await self.http_client.get(url, headers=headers)  # type: ignore[union-attr]
+        response = await self.http_client.get(  # type: ignore[union-attr]
+            url,
+            headers=headers,
+            timeout=self._anthropic_buffered_request_timeout(),
+        )
 
         if response.status_code != 200:
             # Error - pass through

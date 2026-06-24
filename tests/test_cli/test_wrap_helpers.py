@@ -765,3 +765,27 @@ def test_ensure_proxy_already_running_prints_dashboard_url(
     output = _run_in_click_context(lambda: wrap_mod._ensure_proxy(port, no_proxy=False))
 
     assert f"http://127.0.0.1:{port}/dashboard" in output
+
+
+# ---------------------------------------------------------------------------
+# _resolve_1m_model — 1M context window suffix logic (#1158).
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_1m_model_appends_suffix_to_user_model() -> None:
+    """A model the user already selected via ANTHROPIC_MODEL is preserved, with
+    only the [1m] suffix appended so Claude Code requests the 1M window."""
+    assert wrap_mod._resolve_1m_model("claude-opus-4-1-20250805") == (
+        "claude-opus-4-1-20250805[1m]"
+    )
+
+
+def test_resolve_1m_model_is_idempotent() -> None:
+    """A model that already carries [1m] is returned unchanged (no double suffix)."""
+    assert wrap_mod._resolve_1m_model("claude-opus-4-8[1m]") == "claude-opus-4-8[1m]"
+
+
+def test_resolve_1m_model_falls_back_to_default_when_unset() -> None:
+    """With no model selected, fall back to the default Opus carrying [1m]."""
+    assert wrap_mod._resolve_1m_model(None) == "claude-opus-4-8[1m]"
+    assert wrap_mod._resolve_1m_model("  ") == "claude-opus-4-8[1m]"

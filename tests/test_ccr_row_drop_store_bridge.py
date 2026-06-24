@@ -403,7 +403,7 @@ def test_v1_compress_then_v1_retrieve_resolves_marker_hash() -> None:
     }
 
     try:
-        with TestClient(app) as client:
+        with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)) as client:
             resp = client.post("/v1/compress", json=req)
             assert resp.status_code == 200, resp.text
             body = resp.json()
@@ -481,7 +481,7 @@ def test_v1_retrieve_unknown_hash_still_404() -> None:
     app = create_app(config)
 
     try:
-        with TestClient(app) as client:
+        with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)) as client:
             resp = client.post("/v1/retrieve", json={"hash": "deadbeef0000"})
             assert resp.status_code == 404
     finally:

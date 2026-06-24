@@ -28,7 +28,8 @@ def client():
         cost_tracking_enabled=False,
     )
     app = create_app(config)
-    with TestClient(app) as client:
+    # CCR endpoints are loopback-gated (#1227).
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)) as client:
         yield client
     reset_compression_store()
 
@@ -453,7 +454,8 @@ class TestEndToEndTOINIntegration:
             cost_tracking_enabled=False,
         )
         app = create_app(config)
-        with TestClient(app) as client:
+        # CCR endpoints are loopback-gated (#1227).
+        with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)) as client:
             yield client
         reset_compression_store()
 
