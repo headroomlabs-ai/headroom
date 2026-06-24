@@ -455,6 +455,10 @@ def test_ca_never_written_to_os_trust_store(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Windows falls back to ssl.enum_certificates when no bundle file exists",
+)
 def test_no_system_bundle_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "headroom.proxy.agy_ca._SYSTEM_BUNDLE_CANDIDATES",

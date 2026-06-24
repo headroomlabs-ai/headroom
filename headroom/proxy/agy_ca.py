@@ -252,9 +252,15 @@ def _system_trust_pem() -> tuple[bytes, str]:
     POSIX/macOS read the detected on-disk bundle; Windows enumerates the
     system trust stores via stdlib ``ssl`` (no certifi dependency).
     """
-    if sys.platform == "win32":
-        return _windows_trust_pem(), "windows-cert-store"
-    path = _detect_system_bundle()
+    # Prefer an on-disk bundle on every platform (so a corp-provided file or a
+    # test-injected candidate wins). Windows normally has no such file, so fall
+    # back to enumerating the system cert stores there.
+    try:
+        path = _detect_system_bundle()
+    except RuntimeError:
+        if sys.platform == "win32":
+            return _windows_trust_pem(), "windows-cert-store"
+        raise
     return path.read_bytes(), str(path)
 
 
@@ -271,18 +277,20 @@ def _parse_ca_certs_from_pem(pem_data: bytes) -> list[bytes]:
         if end_idx == -1:
             continue
         pem_block = pem_block[: end_idx + len(end_marker)] + b"\n"
+        # cryptography parses lazily: load_pem_x509_certificate succeeds but
+        # accessing extensions (in _is_ca_cert) can still raise on a real-world
+        # cert with a non-strict-conformant field — e.g. some Windows ROOT-store
+        # certs have a UserNotice explicit_text that rust-asn1 rejects. A trust
+        # builder must skip such a cert, not crash, so the whole load+inspect is
+        # guarded.
         try:
             cert = x509.load_pem_x509_certificate(pem_block)
+            is_ca = _is_ca_cert(cert)
         except Exception:  # noqa: BLE001
             logger.debug("event=pem_parse_skip reason=invalid_cert")
             continue
-        if _is_ca_cert(cert):
+        if is_ca:
             results.append(pem_block)
-        else:
-            logger.debug(
-                "event=corp_ca_filter_drop subject=%s reason=not_ca",
-                cert.subject.rfc4514_string(),
-            )
     return results
 
 
