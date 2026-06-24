@@ -532,6 +532,82 @@ def append_text_to_latest_user_chat_message(
     return messages, 0
 
 
+# Anthropic wire contract: the system prompt lives in the top-level ``system``
+# parameter; a ``role="system"`` entry inside ``messages`` is rejected with a
+# 400 ("messages.0: use the top-level 'system' parameter ..."). ``role`` /
+# ``content`` / ``type`` are bare wire keys used throughout this module; only
+# the load-bearing values are named here.
+_ROLE_SYSTEM = "system"
+_TEXT_BLOCK_TYPE = "text"
+
+
+def _system_message_to_blocks(message: dict[str, Any]) -> list[Any]:
+    """Convert a ``role="system"`` message into Anthropic system content blocks."""
+    content = message.get("content")
+    if isinstance(content, str):
+        return [{"type": _TEXT_BLOCK_TYPE, "text": content}] if content else []
+    if isinstance(content, list):
+        blocks: list[Any] = []
+        for block in content:
+            if isinstance(block, dict):
+                blocks.append(block)
+            elif isinstance(block, str) and block:
+                blocks.append({"type": _TEXT_BLOCK_TYPE, "text": block})
+        return blocks
+    return []
+
+
+def relocate_system_messages_to_top_level(
+    messages: list[dict[str, Any]],
+    system: Any,
+) -> tuple[list[dict[str, Any]], Any, bool]:
+    """Move any ``role="system"`` entries out of ``messages`` into ``system``.
+
+    Anthropic's Messages API rejects a ``system`` role inside ``messages`` with
+    HTTP 400 ("messages.0: use the top-level 'system' parameter for the initial
+    system prompt"). Internal transforms / pipeline extensions can leave a stray
+    system message in the list (e.g. a relocated harness system block during
+    compression). This is the Anthropic forwarder's last line of defense: it
+    guarantees the forwarded body never violates the wire contract, regardless
+    of which transform introduced the entry.
+
+    The relocated content is appended after any existing top-level ``system``
+    so wire order (system prompt, then conversation) is preserved and no content
+    is dropped.
+
+    Returns ``(clean_messages, new_system, changed)``. When no system-role
+    message is present the inputs pass through unchanged (``changed=False``) so
+    the common path is untouched.
+    """
+    system_indices = {
+        i for i, m in enumerate(messages) if isinstance(m, dict) and m.get("role") == _ROLE_SYSTEM
+    }
+    if not system_indices:
+        return messages, system, False
+
+    relocated_blocks: list[Any] = []
+    for i in sorted(system_indices):
+        relocated_blocks.extend(_system_message_to_blocks(messages[i]))
+
+    clean_messages = [m for i, m in enumerate(messages) if i not in system_indices]
+
+    if not relocated_blocks:
+        # System message(s) carried no content — drop the empty entries only.
+        return clean_messages, system, True
+
+    if system is None or system == "" or system == []:
+        new_system: Any = relocated_blocks
+    elif isinstance(system, str):
+        new_system = [{"type": _TEXT_BLOCK_TYPE, "text": system}, *relocated_blocks]
+    elif isinstance(system, list):
+        new_system = [*system, *relocated_blocks]
+    else:
+        # Unexpected shape — wrap rather than drop (safety-first: never lose content).
+        new_system = [system, *relocated_blocks]
+
+    return clean_messages, new_system, True
+
+
 def append_text_to_latest_user_input_item(
     body_input: list[dict[str, Any]],
     context_text: str,

@@ -29,7 +29,7 @@ from headroom.pipeline import PipelineStage, summarize_routing_markers
 from headroom.proxy.auth_mode import classify_auth_mode, classify_client
 from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.forwarded_headers import resolve_client_ip
-from headroom.proxy.helpers import extract_tags
+from headroom.proxy.helpers import extract_tags, relocate_system_messages_to_top_level
 from headroom.proxy.memory_decision import MemoryDecision
 from headroom.proxy.memory_query import MemoryQuery
 from headroom.proxy.outcome import RequestOutcome
@@ -1917,6 +1917,28 @@ class AnthropicHandlerMixin:
                 "total_pre_upstream",
                 (time.perf_counter() - pre_upstream_started_at) * 1000.0,
             )
+
+            # Anthropic wire-contract guard (issue #765). Any transform or
+            # pipeline extension above may have left a ``role="system"`` entry
+            # in ``messages`` (e.g. a harness system block relocated during
+            # compression). Anthropic rejects that with a 400 ("messages.0: use
+            # the top-level 'system' parameter ..."), so relocate it back to the
+            # top-level ``system`` parameter as the last step before forwarding.
+            relocated_messages, relocated_system, system_relocated = (
+                relocate_system_messages_to_top_level(body["messages"], body.get("system"))
+            )
+            if system_relocated:
+                body["messages"] = relocated_messages
+                if relocated_system is None:
+                    body.pop("system", None)
+                else:
+                    body["system"] = relocated_system
+                body_mutation_tracker.mark_mutated("system_role_relocated")
+                logger.warning(
+                    "[%s] Relocated role=system message(s) out of messages[] into the "
+                    "top-level system parameter (Anthropic wire-contract guard, issue #765)",
+                    request_id,
+                )
 
             # Byte-faithful forwarder support (PR-A3, fixes P0-2). At this
             # point body has been through every transform (image, compression,

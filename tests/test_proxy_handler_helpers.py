@@ -17,7 +17,10 @@ from headroom.proxy.handlers.openai import (
     _passthrough_usage_from_json,
     _prefers_http1_passthrough,
 )
-from headroom.proxy.helpers import _headroom_bypass_enabled
+from headroom.proxy.helpers import (
+    _headroom_bypass_enabled,
+    relocate_system_messages_to_top_level,
+)
 from headroom.proxy.server import HeadroomProxy
 
 
@@ -245,6 +248,46 @@ def test_openai_handler_prefix_helpers_cover_edge_cases() -> None:
     )
     assert restored == original
     assert changed == 1
+
+
+def test_relocate_system_messages_moves_stray_system_into_top_level() -> None:
+    # Issue #765: compression relocated the harness system block into
+    # messages[0] as a role="system" entry, which Anthropic rejects with a 400.
+    # The forwarder guard must move it back to the top-level `system` parameter.
+    messages = [
+        {"role": "system", "content": "You are a harness."},
+        {"role": "user", "content": "hi"},
+    ]
+    clean, system, changed = relocate_system_messages_to_top_level(messages, None)
+
+    assert changed is True
+    # No role="system" entry may survive in messages[] — that is the wire-contract violation.
+    assert all(m.get("role") != "system" for m in clean)
+    assert clean == [{"role": "user", "content": "hi"}]
+    # The relocated content lands in the top-level system parameter.
+    assert system == [{"type": "text", "text": "You are a harness."}]
+
+
+def test_relocate_system_messages_appends_to_existing_system() -> None:
+    messages = [
+        {"role": "system", "content": [{"type": "text", "text": "B"}]},
+        {"role": "user", "content": "hi"},
+    ]
+    clean, system, changed = relocate_system_messages_to_top_level(messages, "A")
+
+    assert changed is True
+    assert clean == [{"role": "user", "content": "hi"}]
+    # Existing system first, relocated content after — wire order preserved.
+    assert system == [{"type": "text", "text": "A"}, {"type": "text", "text": "B"}]
+
+
+def test_relocate_system_messages_noop_without_system_entry() -> None:
+    messages = [{"role": "user", "content": "hi"}]
+    clean, system, changed = relocate_system_messages_to_top_level(messages, "A")
+
+    assert changed is False
+    assert clean is messages
+    assert system == "A"
 
 
 def test_headroom_bypass_helper_is_transport_neutral() -> None:
