@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Fixed
+
+* **cli/dashboard:** `headroom dashboard` command was absent in 0.27.0 — restored ([#1306](https://github.com/headroomlabs-ai/headroom/issues/1306)). The command opens the proxy savings dashboard (`http://127.0.0.1:<port>/dashboard`) in your browser. Use `--no-open` to print the URL without opening a browser. Added 4 regression tests to prevent the command from silently disappearing again.
+
 ### Features
 
 * **wrap:** `headroom wrap claude --1m` preserves the 1M context window. Behind a custom `ANTHROPIC_BASE_URL` (the proxy) Claude Code drops the `context-1m` beta header and caps the window at 200k for entitled subscription users; the opt-in flag sets `ANTHROPIC_MODEL=<opus>[1m]` on the launched process so the 1M window activates through Headroom. A model already selected via `ANTHROPIC_MODEL` is preserved (only the `[1m]` suffix is appended) ([#1158](https://github.com/chopratejas/headroom/issues/1158)).
