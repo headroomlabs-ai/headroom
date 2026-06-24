@@ -209,3 +209,30 @@ signals extend that to the user's normal runtime.
 - The Rust proxy port (`crates/headroom-proxy`) gets no `agy` support — **resolved N/A**
   (headroom-30y.11): it carries no `wrap` traffic for any agent, so agy MITM is Python-only by
   design. Documented, not silently dropped.
+
+## Retrieve MCP transport: stdio child, not url-MCP
+
+agy 1.0.10 added `url` support in `mcp_config.json`, allowing an MCP server to be addressed
+by HTTP URL instead of a stdio subprocess. The headroom retrieve server (`AgyRetrieveServer`,
+`headroom/proxy/agy_retrieve.py`) is a **plain-HTTP/REST loopback** server; it does **not**
+implement the MCP-over-HTTP (streamable HTTP) transport. Registering it as a `url`-type entry
+would require adding an MCP-HTTP transport layer to the retrieve server for **zero added
+capability** — the stdio child (`headroom mcp serve`) already satisfies all retrieve use cases,
+and the per-run ephemeral listener is reverted on teardown with no dead pointer left in
+`mcp_config.json`.
+
+**Decision:** keep the retrieve integration as a stdio child; do not add an MCP-HTTP transport
+to `AgyRetrieveServer`. Revisit only if agy deprecates stdio MCP support.
+
+## Cross-platform status
+
+The CA lifecycle and CONNECT terminator code is **Windows-safe** as of the agy hardening
+pass:
+- `_assert_perms` is a no-op on non-POSIX platforms (no `os.chmod`/`stat` crash on Windows).
+- Atomic bundle writes use `os.replace` (cross-platform) rather than POSIX `rename`.
+- No POSIX-only syscall causes a hard crash on Windows.
+
+**Native-Windows E2E CI is not yet enabled.** The `wrap-native-e2e.yml` and
+`install-native-e2e.yml` workflows exclude native-Windows pending an upstream CRT issue.
+The code is safe to run on Windows; it is not yet CI-gated on Windows. Over-claiming
+"Windows fully supported" would be inaccurate.
