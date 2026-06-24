@@ -48,7 +48,7 @@ use std::time::{Instant, SystemTime};
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Extension, Path, State};
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 use bytes::Bytes;
 use futures_util::stream::{self, Stream};
 use futures_util::StreamExt as _;
@@ -86,9 +86,7 @@ const CONVERSE_STREAM_ACTION: &str = "converse-stream";
 /// RAII guard that observes the `bedrock_invoke_latency_seconds`
 /// histogram on drop. Mirrors the [`crate::bedrock::invoke`] guard
 /// — duplicated to avoid a cross-module type dependency for what
-/// is fundamentally a 6-line struct. (When PR-D2 + PR-D3 settle,
-/// the two handlers can share a `bedrock::common::LatencyGuard`
-/// helper; that's a deferred refactor.)
+/// is fundamentally a 6-line struct.
 struct LatencyGuard {
     model: String,
     region: String,
@@ -782,7 +780,13 @@ const SSE_PARSER_QUEUE_DEPTH: usize = 256;
 ///
 /// 3. **Direct Anthropic SSE** (future / test path) — `{"type":
 ///    "message_delta","usage":{"input_tokens":N,...}}` at the top level.
-fn accumulate_stream_usage(data: &[u8], input: &mut u64, output: &mut u64, cache_read: &mut u64) {
+fn accumulate_stream_usage(
+    data: &[u8],
+    input: &mut u64,
+    output: &mut u64,
+    cache_read: &mut u64,
+    cache_write: &mut u64,
+) {
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(data) else {
         return;
     };
@@ -793,6 +797,7 @@ fn accumulate_stream_usage(data: &[u8], input: &mut u64, output: &mut u64, cache
         let it = get("inputTokens");
         let ot = get("outputTokens");
         let cr = get("cacheReadInputTokens");
+        let cw = get("cacheWriteInputTokens");
         if it > 0 {
             *input = it;
         }
@@ -802,10 +807,14 @@ fn accumulate_stream_usage(data: &[u8], input: &mut u64, output: &mut u64, cache
         if cr > 0 {
             *cache_read = cr;
         }
+        if cw > 0 {
+            *cache_write = cw;
+        }
         // Also Anthropic snake_case at top level (format 3 / message_delta)
         let it2 = get("input_tokens");
         let ot2 = get("output_tokens");
         let cr2 = get("cache_read_input_tokens");
+        let cw2 = get("cache_creation_input_tokens");
         if it2 > 0 {
             *input = it2;
         }
@@ -815,17 +824,24 @@ fn accumulate_stream_usage(data: &[u8], input: &mut u64, output: &mut u64, cache
         if cr2 > 0 {
             *cache_read = cr2;
         }
+        if cw2 > 0 {
+            *cache_write = cw2;
+        }
     }
     // message_start has usage nested under .message.usage (Anthropic format)
     if let Some(usage) = v.get("message").and_then(|m| m.get("usage")) {
         let get = |k: &str| usage.get(k).and_then(|t| t.as_u64()).unwrap_or(0);
         let it = get("input_tokens");
         let cr = get("cache_read_input_tokens");
+        let cw = get("cache_creation_input_tokens");
         if it > 0 && *input == 0 {
             *input = it;
         }
         if cr > 0 {
             *cache_read = cr;
+        }
+        if cw > 0 {
+            *cache_write = cw;
         }
     }
 
@@ -836,7 +852,7 @@ fn accumulate_stream_usage(data: &[u8], input: &mut u64, output: &mut u64, cache
         if let Ok(decoded) = STANDARD.decode(b64) {
             // Recurse once — the inner payload is either message_start or
             // message_delta (Anthropic format), handled by format 3 above.
-            accumulate_stream_usage(&decoded, input, output, cache_read);
+            accumulate_stream_usage(&decoded, input, output, cache_read, cache_write);
         }
     }
 }
@@ -857,6 +873,7 @@ async fn run_anthropic_state_machine(
     let mut input_tokens: u64 = 0;
     let mut output_tokens: u64 = 0;
     let mut cache_read_tokens: u64 = 0;
+    let mut cache_write_tokens: u64 = 0;
 
     while let Some(chunk) = rx.recv().await {
         framer.push(&chunk);
@@ -868,6 +885,7 @@ async fn run_anthropic_state_machine(
                         &mut input_tokens,
                         &mut output_tokens,
                         &mut cache_read_tokens,
+                        &mut cache_write_tokens,
                     );
                 }
                 Err(e) => {
@@ -887,6 +905,7 @@ async fn run_anthropic_state_machine(
         input_tokens,
         output_tokens,
         cache_read_tokens,
+        cache_write_tokens,
         "bedrock translated stream: closed"
     );
 
@@ -897,6 +916,7 @@ async fn run_anthropic_state_machine(
         }
         outcome.output_tokens = output_tokens;
         outcome.cache_read_tokens = cache_read_tokens;
+        outcome.cache_write_tokens = cache_write_tokens;
         savings.record_finalized(outcome, failed, started);
     }
 }
@@ -952,8 +972,7 @@ fn finish(status: StatusCode, headers: HeaderMap, body: Body, request_id: &str) 
 /// Same compression-dispatch logic as PR-D1 — duplicated rather than
 /// shared because the streaming handler runs in a slightly different
 /// flow (no body buffering required at the caller, the handler always
-/// owns the bytes). When PR-D3 merges, both arms can converge into a
-/// single helper.
+/// owns the bytes).
 /// Run the live-zone compressor and return the outbound body plus the
 /// pre/post-compression input token counts (`(0, 0)` when nothing compressed),
 /// so the caller can attribute Bedrock streaming savings into the stats store.
@@ -1163,76 +1182,71 @@ mod tests {
 
     #[test]
     fn accumulate_stream_usage_converse_camelcase() {
-        let mut i = 0u64;
-        let mut o = 0u64;
-        let mut c = 0u64;
+        let (mut i, mut o, mut cr, mut cw) = (0u64, 0u64, 0u64, 0u64);
         // Converse-stream metadata event
-        let data = br#"{"usage":{"inputTokens":12,"outputTokens":7,"cacheReadInputTokens":3}}"#;
-        accumulate_stream_usage(data, &mut i, &mut o, &mut c);
+        let data = br#"{"usage":{"inputTokens":12,"outputTokens":7,"cacheReadInputTokens":3,"cacheWriteInputTokens":2}}"#;
+        accumulate_stream_usage(data, &mut i, &mut o, &mut cr, &mut cw);
         assert_eq!(i, 12);
         assert_eq!(o, 7);
-        assert_eq!(c, 3);
+        assert_eq!(cr, 3);
+        assert_eq!(cw, 2);
     }
 
     #[test]
     fn accumulate_stream_usage_anthropic_snake_case() {
-        let mut i = 0u64;
-        let mut o = 0u64;
-        let mut c = 0u64;
+        let (mut i, mut o, mut cr, mut cw) = (0u64, 0u64, 0u64, 0u64);
         // Direct Anthropic SSE: message_delta usage
-        let data = br#"{"type":"message_delta","usage":{"input_tokens":9,"output_tokens":15,"cache_read_input_tokens":0}}"#;
-        accumulate_stream_usage(data, &mut i, &mut o, &mut c);
+        let data = br#"{"type":"message_delta","usage":{"input_tokens":9,"output_tokens":15,"cache_read_input_tokens":0,"cache_creation_input_tokens":4}}"#;
+        accumulate_stream_usage(data, &mut i, &mut o, &mut cr, &mut cw);
         assert_eq!(i, 9);
         assert_eq!(o, 15);
-        assert_eq!(c, 0);
+        assert_eq!(cr, 0);
+        assert_eq!(cw, 4);
     }
 
     #[test]
     fn accumulate_stream_usage_anthropic_message_start() {
-        let mut i = 0u64;
-        let mut o = 0u64;
-        let mut c = 0u64;
+        let (mut i, mut o, mut cr, mut cw) = (0u64, 0u64, 0u64, 0u64);
         // Anthropic SSE message_start carries input_tokens in .message.usage
-        let data = br#"{"type":"message_start","message":{"usage":{"input_tokens":20,"cache_read_input_tokens":5}}}"#;
-        accumulate_stream_usage(data, &mut i, &mut o, &mut c);
+        let data = br#"{"type":"message_start","message":{"usage":{"input_tokens":20,"cache_read_input_tokens":5,"cache_creation_input_tokens":3}}}"#;
+        accumulate_stream_usage(data, &mut i, &mut o, &mut cr, &mut cw);
         assert_eq!(i, 20);
-        assert_eq!(c, 5);
+        assert_eq!(cr, 5);
+        assert_eq!(cw, 3);
     }
 
     #[test]
     fn accumulate_stream_usage_invoke_streaming_base64_wrapped() {
         use base64::Engine as _;
-        let mut i = 0u64;
-        let mut o = 0u64;
-        let mut c = 0u64;
-        // InvokeModel streaming wraps events as {"bytes":"<base64>","p":"..."}
-        let inner = br#"{"usage":{"inputTokens":5,"outputTokens":8}}"#;
-        let b64 = base64::engine::general_purpose::STANDARD.encode(inner);
+        let (mut i, mut o, mut cr, mut cw) = (0u64, 0u64, 0u64, 0u64);
+        // InvokeModel streaming wraps Anthropic-native SSE events in {"bytes":"<base64>"}
+        // Simulate message_start (input tokens) then message_delta (output tokens)
+        let start = br#"{"type":"message_start","message":{"usage":{"input_tokens":9,"cache_read_input_tokens":0}}}"#;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(start);
         let envelope = format!(r#"{{"bytes":"{b64}","p":"abcd"}}"#);
-        accumulate_stream_usage(envelope.as_bytes(), &mut i, &mut o, &mut c);
-        assert_eq!(i, 5);
-        assert_eq!(o, 8);
+        accumulate_stream_usage(envelope.as_bytes(), &mut i, &mut o, &mut cr, &mut cw);
+        assert_eq!(i, 9);
+
+        let delta = br#"{"type":"message_delta","usage":{"output_tokens":15}}"#;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(delta);
+        let envelope = format!(r#"{{"bytes":"{b64}","p":"abcd"}}"#);
+        accumulate_stream_usage(envelope.as_bytes(), &mut i, &mut o, &mut cr, &mut cw);
+        assert_eq!(o, 15);
     }
 
     #[test]
     fn accumulate_stream_usage_noop_on_non_json() {
-        let mut i = 1u64;
-        let mut o = 2u64;
-        let mut c = 3u64;
-        accumulate_stream_usage(b"not json", &mut i, &mut o, &mut c);
-        assert_eq!(i, 1);
-        assert_eq!(o, 2);
-        assert_eq!(c, 3);
+        let (mut i, mut o, mut cr, mut cw) = (1u64, 2u64, 3u64, 4u64);
+        accumulate_stream_usage(b"not json", &mut i, &mut o, &mut cr, &mut cw);
+        assert_eq!((i, o, cr, cw), (1, 2, 3, 4));
     }
 
     #[test]
     fn accumulate_stream_usage_does_not_reset_with_zero_update() {
-        let mut i = 9u64;
-        let mut o = 0u64;
-        let mut c = 0u64;
+        let (mut i, mut o, mut cr, mut cw) = (9u64, 0u64, 0u64, 0u64);
         // A delta event with no usage should leave existing counts alone
         let data = br#"{"type":"content_block_delta","delta":{"type":"text_delta","text":"OK"}}"#;
-        accumulate_stream_usage(data, &mut i, &mut o, &mut c);
+        accumulate_stream_usage(data, &mut i, &mut o, &mut cr, &mut cw);
         assert_eq!(i, 9); // unchanged
     }
 

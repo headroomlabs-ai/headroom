@@ -43,7 +43,7 @@ use std::time::{Instant, SystemTime};
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Extension, Path, State};
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 use bytes::Bytes;
 use http::HeaderName;
 use url::Url;
@@ -601,6 +601,7 @@ fn apply_bedrock_response_usage(
     }
     outcome.output_tokens = get("output_tokens", "outputTokens");
     outcome.cache_read_tokens = get("cache_read_input_tokens", "cacheReadInputTokens");
+    outcome.cache_write_tokens = get("cache_creation_input_tokens", "cacheWriteInputTokens");
 }
 
 #[cfg(test)]

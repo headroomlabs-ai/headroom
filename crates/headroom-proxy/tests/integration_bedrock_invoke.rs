@@ -598,6 +598,48 @@ async fn bedrock_invoke_recorded_in_stats() {
 }
 
 #[tokio::test]
+async fn bedrock_invoke_token_counts_flow_into_stats() {
+    // Verify apply_bedrock_response_usage wires token counts through to /stats
+    // so a regression (wrong outcome instance, missing field) is caught end-to-end.
+    let upstream = MockServer::start().await;
+    let _captured = mount_capture_invoke(
+        &upstream,
+        r#"{"id":"msg_x","content":[],"usage":{"input_tokens":50,"output_tokens":10,"cache_read_input_tokens":5,"cache_creation_input_tokens":2}}"#,
+    )
+    .await;
+    let proxy = bedrock_proxy(&upstream, |c| {
+        c.compression = true;
+        c.compression_mode = headroom_proxy::config::CompressionMode::LiveZone;
+    })
+    .await;
+
+    let body = json!({
+        "anthropic_version": "bedrock-2023-05-31",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 10
+    });
+    let resp = reqwest::Client::new()
+        .post(format!("{}/model/{TEST_MODEL}/invoke", proxy.url()))
+        .header("content-type", "application/json")
+        .body(body.to_string())
+        .send()
+        .await
+        .expect("POST bedrock invoke");
+    assert_eq!(resp.status(), 200);
+
+    let stats = get_stats(&proxy).await;
+    assert_eq!(stats["requests"]["total"], 1);
+    // output_tokens flows into the recent-request feed
+    assert_eq!(stats["recent_requests"][0]["output_tokens"], 10);
+    // cache_read and cache_write tokens land in cost.per_model
+    let per_model = &stats["cost"]["per_model"][TEST_MODEL];
+    assert_eq!(per_model["cache_read_tokens"], 5);
+    assert_eq!(per_model["cache_write_tokens"], 2);
+
+    proxy.shutdown().await;
+}
+
+#[tokio::test]
 async fn bedrock_not_recorded_when_mode_off() {
     // Recording is gated on should_record(): compression on but mode == off is a
     // byte-equal passthrough with zero savings, so the Bedrock lane records nothing
