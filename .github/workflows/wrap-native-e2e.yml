@@ -49,6 +49,7 @@ jobs:
       - name: Setup
         uses: ./.github/actions/headroom-e2e-setup
         with:
+          install-mode: deps-only-proxy
           python-version: "3.11"
 
       - name: Install pytest

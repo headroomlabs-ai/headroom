@@ -48,7 +48,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision", "raw_value"] }
 bytes = "1"
 thiserror = "1"
-tracing = "0.1"
+# `log` compat: when no tracing subscriber is active (the case inside the
+# headroom-py cdylib), events are re-emitted as `log` records so pyo3-log
+# can forward them to Python's logging. No effect on binaries that install
+# a real subscriber.
+tracing = { version = "0.1", features = ["log"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
@@ -56,6 +60,9 @@ axum = "0.7"
 tower = "0.5"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 pyo3 = { version = "0.24", features = ["abi3-py310"] }
+# Forwards Rust `log` records (incl. tracing events via the `log` compat
+# feature above) into Python's `logging` inside the _core extension module.
+pyo3-log = "0.12"
 # Phase D PR-D1: AWS SigV4 signing for native Bedrock InvokeModel route.
 # `aws-sigv4` provides the canonical-request + signing-key implementation;
 # `aws-config` resolves credentials from the standard provider chain

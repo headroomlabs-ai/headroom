@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from headroom import binaries
+from headroom._subprocess import run
 from headroom.proxy import runtime_env
 
 from . import base
@@ -200,7 +201,7 @@ def _run_ast_grep(
     try:
         for pattern in patterns:
             try:
-                completed = subprocess.run(
+                completed = run(
                     [
                         str(exe),
                         "run",

@@ -257,11 +257,15 @@ class LangConfig:
 
     # Quick pre-filter hints for language detection (substrings to check)
     detection_hints: tuple[str, ...] = ()
+    # Optional override for node types that contain class/impl members.
+    class_body_node_types: frozenset[str] | None = None
 
 
 _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
     CodeLanguage.PYTHON: LangConfig(
-        import_nodes=frozenset({"import_statement", "import_from_statement"}),
+        import_nodes=frozenset(
+            {"future_import_statement", "import_statement", "import_from_statement"}
+        ),
         function_nodes=frozenset({"function_definition"}),
         class_nodes=frozenset({"class_definition"}),
         type_nodes=frozenset({"type_alias_statement"}),
@@ -281,6 +285,7 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
         comment_prefix="//",
         uses_colon_after_signature=False,
         detection_hints=("function ", "const ", "let ", "var ", "export ", "require("),
+        class_body_node_types=frozenset({"class_body"}),
     ),
     CodeLanguage.TYPESCRIPT: LangConfig(
         import_nodes=frozenset({"import_statement", "import_declaration"}),
@@ -292,6 +297,7 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
         comment_prefix="//",
         uses_colon_after_signature=False,
         detection_hints=("interface ", "type ", ": string", ": number", ": boolean"),
+        class_body_node_types=frozenset({"class_body"}),
     ),
     CodeLanguage.GO: LangConfig(
         import_nodes=frozenset({"import_declaration"}),
@@ -315,6 +321,7 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
         comment_prefix="//",
         uses_colon_after_signature=False,
         detection_hints=("fn ", "struct ", "impl ", "mod ", "use "),
+        class_body_node_types=frozenset({"declaration_list"}),
     ),
     CodeLanguage.JAVA: LangConfig(
         import_nodes=frozenset({"import_declaration"}),
@@ -327,6 +334,7 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
         uses_colon_after_signature=False,
         package_node="package_declaration",
         detection_hints=("public ", "private ", "protected ", "class ", "interface "),
+        class_body_node_types=frozenset({"class_body"}),
     ),
     CodeLanguage.C: LangConfig(
         import_nodes=frozenset({"preproc_include"}),
@@ -349,6 +357,7 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
         comment_prefix="//",
         uses_colon_after_signature=False,
         detection_hints=("#include", "namespace ", "class ", "::"),
+        class_body_node_types=frozenset({"field_declaration_list"}),
     ),
     CodeLanguage.PERL: LangConfig(
         import_nodes=frozenset({"use_statement", "use_version_statement"}),
@@ -851,7 +860,7 @@ class CodeAwareCompressor(Transform):
         body_line_counts: dict[str, int] = {}
         for qname, node in definitions.items():
             collect_calls_in_function(node, qname)
-            node_text = code[node.start_byte : node.end_byte]
+            node_text = _slice_code_bytes(code, node.start_byte, node.end_byte)
             body_line_counts[qname] = max(1, len(node_text.split("\n")) - 2)
 
         # Reference counts: subtract definition occurrences
@@ -1257,8 +1266,8 @@ class CodeAwareCompressor(Transform):
                             child, code, language, lang_config, body_limits, analysis
                         )
                         # Reconstruct export with compressed inner definition
-                        export_prefix = code[node.start_byte : child.start_byte]
-                        export_suffix = code[child.end_byte : node.end_byte]
+                        export_prefix = _slice_code_bytes(code, node.start_byte, child.start_byte)
+                        export_suffix = _slice_code_bytes(code, child.end_byte, node.end_byte)
                         structure.function_signatures.append(
                             export_prefix + compressed + export_suffix
                         )
@@ -1313,6 +1322,11 @@ class CodeAwareCompressor(Transform):
                 )
                 structure.class_definitions.append(compressed)
                 captured_byte_ranges.append((node.start_byte, node.end_byte))
+                trailing_semicolon = _get_same_line_trailing_semicolon(node)
+                if trailing_semicolon is not None:
+                    captured_byte_ranges.append(
+                        (trailing_semicolon.start_byte, trailing_semicolon.end_byte)
+                    )
                 return
 
             # Type definitions
@@ -1568,7 +1582,7 @@ class CodeAwareCompressor(Transform):
         if signature_lines:
             result_parts.extend(signature_lines)
         else:
-            sig_text = code[node.start_byte : body_node.start_byte].rstrip()
+            sig_text = _slice_code_bytes(code, node.start_byte, body_node.start_byte).rstrip()
             result_parts.append(sig_text)
 
         if opening_brace_line is not None:
@@ -1621,10 +1635,12 @@ class CodeAwareCompressor(Transform):
         node_lines = code_lines[start_row : end_row + 1]
         node_text = "\n".join(node_lines)
 
-        # Find the body node
+        # Find the class/member container. For some languages this is not the
+        # same node type as a function body's executable block.
+        class_body_node_types = lang_config.class_body_node_types or lang_config.body_node_types
         body_node = None
         for child in node.children:
-            if child.type in lang_config.body_node_types:
+            if child.type in class_body_node_types:
                 body_node = child
                 break
 
@@ -1642,6 +1658,9 @@ class CodeAwareCompressor(Transform):
         processed_ranges: list[tuple[int, int]] = []
 
         for child in body_node.children:
+            if not child.is_named:
+                continue
+
             # Use line-based extraction for children too
             child_start = child.start_point[0]
             child_end = child.end_point[0]
@@ -1660,7 +1679,9 @@ class CodeAwareCompressor(Transform):
                 method_compressed = None
                 for deco_child in child.children:
                     if deco_child.type == "decorator":
-                        decorator_lines.append(_get_node_text(deco_child, code))
+                        deco_start = deco_child.start_point[0]
+                        deco_end = deco_child.end_point[0]
+                        decorator_lines.append("\n".join(code_lines[deco_start : deco_end + 1]))
                     elif deco_child.type in lang_config.function_nodes:
                         method_compressed = self._compress_function_ast(
                             deco_child, code, language, lang_config, body_limits, analysis
@@ -1691,17 +1712,23 @@ class CodeAwareCompressor(Transform):
         for part in body_parts:
             result_parts.append(part)
 
-        # Handle closing brace for brace-delimited languages
+        # Handle closing brace for brace-delimited languages. The class body
+        # node ends at the brace, while C++ class_specifier excludes the
+        # trailing semicolon; keeping only the body node span prevents a second
+        # semicolon from being rendered later as top-level code.
         body_end_line = body_node.end_point[0]
         body_end_rel = body_end_line - node_start_line + 1
         after_lines = node_lines[body_end_rel:]
-        if after_lines:
+        if not lang_config.uses_colon_after_signature:
+            if body_end_line != start_row:
+                closing_line = code_lines[body_end_line]
+                closing_text = closing_line[: body_node.end_point[1]]
+                if _get_same_line_trailing_semicolon(node) is not None:
+                    closing_text += ";"
+                if closing_text.strip():
+                    result_parts.append(closing_text)
+        elif after_lines:
             result_parts.extend(after_lines)
-        elif not lang_config.uses_colon_after_signature:
-            # Ensure closing brace
-            last_body_line = node_lines[-1] if node_lines else ""
-            if last_body_line.strip() == "}":
-                result_parts.append(last_body_line)
 
         return "\n".join(result_parts)
 
@@ -1765,6 +1792,12 @@ class CodeAwareCompressor(Transform):
         (tokens the parser expected but didn't find).
         """
         try:
+            if language == CodeLanguage.PYTHON:
+                import ast
+
+                ast.parse(code)
+                compile(code, "<headroom-compressed>", "exec")
+
             parser = _get_parser(language.value)
             tree = parser.parse(bytes(code, "utf-8"))
             return not _has_syntax_issues(tree.root_node)
@@ -1977,9 +2010,26 @@ class CodeAwareCompressor(Transform):
 # =========================================================================
 
 
+def _slice_code_bytes(code: str, start_byte: int, end_byte: int) -> str:
+    """Extract source text using tree-sitter UTF-8 byte offsets."""
+    return code.encode("utf-8")[start_byte:end_byte].decode("utf-8")
+
+
 def _get_node_text(node: Any, code: str) -> str:
     """Extract text from AST node."""
-    return code[node.start_byte : node.end_byte]
+    return _slice_code_bytes(code, node.start_byte, node.end_byte)
+
+
+def _get_same_line_trailing_semicolon(node: Any) -> Any | None:
+    """Return a trailing semicolon sibling that belongs to this declaration."""
+    next_sibling = getattr(node, "next_sibling", None)
+    if (
+        next_sibling is not None
+        and next_sibling.type == ";"
+        and next_sibling.start_point[0] == node.end_point[0]
+    ):
+        return next_sibling
+    return None
 
 
 def _get_definition_name(node: Any) -> str | None:

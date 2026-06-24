@@ -12,6 +12,8 @@ from pathlib import Path
 
 import click
 
+from headroom._subprocess import run
+
 from .models import ArtifactRecord, DeploymentManifest, SupervisorKind
 from .paths import (
     unix_ensure_script_path,
@@ -206,7 +208,11 @@ def install_supervisor(manifest: DeploymentManifest) -> list[ArtifactRecord]:
             cron_path.write_text(content)
             records.append(ArtifactRecord(kind="cron", path=str(cron_path)))
         else:
-            current = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
+            current = run(
+                ["crontab", "-l"],
+                capture_output=True,
+                text=True,
+            )
             existing = current.stdout if current.returncode == 0 else ""
             marker_start = f"# >>> headroom {manifest.profile} >>>"
             marker_end = f"# <<< headroom {manifest.profile} <<<"
@@ -215,7 +221,12 @@ def install_supervisor(manifest: DeploymentManifest) -> list[ArtifactRecord]:
             )
             merged = pattern.sub("", existing).strip()
             new_content = (merged + "\n\n" + content).strip() + "\n"
-            subprocess.run(["crontab", "-"], input=new_content, text=True, check=True)
+            run(
+                ["crontab", "-"],
+                input=new_content,
+                text=True,
+                check=True,
+            )
             records.append(ArtifactRecord(kind="crontab", path=f"user:{manifest.profile}"))
         return records
 
@@ -234,7 +245,11 @@ def install_supervisor(manifest: DeploymentManifest) -> list[ArtifactRecord]:
             and manifest.supervisor_kind == SupervisorKind.SERVICE.value
             else f"gui/{os.getuid()}/{plist_path.stem}"
         )
-        subprocess.run(["launchctl", "bootout", domain], capture_output=True, text=True)
+        run(
+            ["launchctl", "bootout", domain],
+            capture_output=True,
+            text=True,
+        )
         bootstrap_domain = (
             "system"
             if manifest.scope == "system"
@@ -324,7 +339,7 @@ def start_supervisor(manifest: DeploymentManifest) -> None:
         # Fast path: when the job is already bootstrapped (e.g. `start` right
         # after `install apply`, or `start` on a running service), `kickstart`
         # restarts it in place.
-        kick = subprocess.run(
+        kick = run(
             ["launchctl", "kickstart", "-k", f"{domain}/{label}"],
             capture_output=True,
             text=True,
@@ -346,7 +361,7 @@ def start_supervisor(manifest: DeploymentManifest) -> None:
         plist_path = plist_dir / f"{label}.plist"
         last = kick
         for _ in range(_MACOS_BOOTSTRAP_RETRIES):
-            boot = subprocess.run(
+            boot = run(
                 ["launchctl", "bootstrap", domain, str(plist_path)],
                 capture_output=True,
                 text=True,
@@ -385,7 +400,7 @@ def stop_supervisor(manifest: DeploymentManifest) -> None:
         # Any other non-zero result is a real failure (permissions, malformed
         # domain, launchd error) and must surface; otherwise `restart` could
         # report success while a stale job is still running.
-        result = subprocess.run(
+        result = run(
             ["launchctl", "bootout", f"{domain}/{label}"],
             capture_output=True,
             text=True,
@@ -409,7 +424,7 @@ def remove_supervisor(manifest: DeploymentManifest) -> None:
     if sys.platform.startswith("linux"):
         if manifest.supervisor_kind == SupervisorKind.SERVICE.value:
             flags = [] if manifest.scope == "system" else ["--user"]
-            subprocess.run(
+            run(
                 ["systemctl", *flags, "disable", "--now", manifest.service_name],
                 capture_output=True,
                 text=True,
@@ -417,21 +432,32 @@ def remove_supervisor(manifest: DeploymentManifest) -> None:
             unit_path, _ = _linux_service_unit(manifest, unix_run_script_path(manifest.profile))
             if unit_path.exists():
                 unit_path.unlink()
-            subprocess.run(["systemctl", *flags, "daemon-reload"], capture_output=True, text=True)
+            run(
+                ["systemctl", *flags, "daemon-reload"],
+                capture_output=True,
+                text=True,
+            )
             return
         cron_path, _ = _linux_task_spec(manifest, unix_ensure_script_path(manifest.profile))
         if cron_path and cron_path.exists():
             cron_path.unlink()
             return
-        current = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
+        current = run(
+            ["crontab", "-l"],
+            capture_output=True,
+            text=True,
+        )
         if current.returncode != 0:
             return
         marker_start = f"# >>> headroom {manifest.profile} >>>"
         marker_end = f"# <<< headroom {manifest.profile} <<<"
         pattern = re.compile(re.escape(marker_start) + r".*?" + re.escape(marker_end), re.DOTALL)
         content = pattern.sub("", current.stdout).strip()
-        subprocess.run(
-            ["crontab", "-"], input=(content + "\n") if content else "", text=True, check=True
+        run(
+            ["crontab", "-"],
+            input=(content + "\n") if content else "",
+            text=True,
+            check=True,
         )
         return
 
@@ -450,8 +476,10 @@ def remove_supervisor(manifest: DeploymentManifest) -> None:
             and manifest.supervisor_kind == SupervisorKind.SERVICE.value
             else f"gui/{os.getuid()}"
         )
-        subprocess.run(
-            ["launchctl", "bootout", f"{domain}/{label}"], capture_output=True, text=True
+        run(
+            ["launchctl", "bootout", f"{domain}/{label}"],
+            capture_output=True,
+            text=True,
         )
         if plist_path.exists():
             plist_path.unlink()
@@ -459,19 +487,23 @@ def remove_supervisor(manifest: DeploymentManifest) -> None:
 
     if _is_windows():
         if manifest.supervisor_kind == SupervisorKind.SERVICE.value:
-            subprocess.run(
-                ["sc.exe", "stop", manifest.service_name], capture_output=True, text=True
+            run(
+                ["sc.exe", "stop", manifest.service_name],
+                capture_output=True,
+                text=True,
             )
-            subprocess.run(
-                ["sc.exe", "delete", manifest.service_name], capture_output=True, text=True
+            run(
+                ["sc.exe", "delete", manifest.service_name],
+                capture_output=True,
+                text=True,
             )
             return
-        subprocess.run(
+        run(
             ["schtasks", "/Delete", "/TN", f"{manifest.service_name}-startup", "/F"],
             capture_output=True,
             text=True,
         )
-        subprocess.run(
+        run(
             ["schtasks", "/Delete", "/TN", f"{manifest.service_name}-health", "/F"],
             capture_output=True,
             text=True,

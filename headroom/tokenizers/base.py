@@ -55,6 +55,14 @@ class BaseTokenizer(ABC):
     MESSAGE_OVERHEAD = 4
     REPLY_OVERHEAD = 3  # Assistant reply start tokens
 
+    # Oversized-blob token estimation (see _count_serialized). Serializing a blob
+    # is cheap; running count_text over the whole multi-megabyte string is what
+    # blocks the proxy event loop, so a large blob is counted from an even-spread
+    # sample of the serialized string, scaled by length.
+    LARGE_BLOB_CHARS = 50_000  # above this serialized size, sample instead of full count
+    SAMPLE_CHARS = 20_000  # total characters fed to count_text for an oversized blob
+    SAMPLE_CHUNK = 2_000  # size of each evenly-spaced chunk in that sample
+
     @abstractmethod
     def count_text(self, text: str) -> int:
         """Count tokens in a text string. Must be implemented by subclasses."""
@@ -152,10 +160,10 @@ class BaseTokenizer(ABC):
                     if isinstance(content, str):
                         total += self.count_text(content)
                     else:
-                        total += self.count_text(json.dumps(content))
+                        total += self._count_serialized(content)
                 elif part_type == "tool_use":
                     total += self.count_text(part.get("name", ""))
-                    total += self.count_text(json.dumps(part.get("input", {})))
+                    total += self._count_serialized(part.get("input", {}))
                 elif not part_type and "text" in part:
                     # Strands SDK format: {"text": "..."} without "type" field
                     total += self.count_text(part["text"])
@@ -163,7 +171,7 @@ class BaseTokenizer(ABC):
                     # Strands SDK tool_use: {"toolUse": {"name": ..., "input": ...}}
                     tool_use = part["toolUse"]
                     total += self.count_text(tool_use.get("name", ""))
-                    total += self.count_text(json.dumps(tool_use.get("input", {})))
+                    total += self._count_serialized(tool_use.get("input", {}))
                 elif not part_type and "toolResult" in part:
                     # Strands SDK tool_result: {"toolResult": {"content": [...]}}
                     tool_result = part["toolResult"]
@@ -174,7 +182,7 @@ class BaseTokenizer(ABC):
                         # Recurse into nested content blocks
                         total += self._count_content_parts(tr_content)
                     else:
-                        total += self.count_text(json.dumps(tr_content))
+                        total += self._count_serialized(tr_content)
                 elif not part_type and "reasoningContent" in part:
                     # Strands SDK reasoning: {"reasoningContent": {"reasoningText": {"text": "..."}}}
                     # This is actual text — count it precisely.
@@ -218,11 +226,36 @@ class BaseTokenizer(ABC):
                         total += 3200
                 else:
                     # Unknown type - estimate from JSON
-                    total += self.count_text(json.dumps(part))
+                    total += self._count_serialized(part)
             elif isinstance(part, str):
                 total += self.count_text(part)
 
         return total
+
+    def _count_serialized(self, obj: Any) -> int:
+        """Count tokens for a non-string content blob.
+
+        Small blobs are counted exactly. For an oversized one, run ``count_text``
+        over an even-spread sample of the serialized string and scale by length.
+        Serializing is cheap; ``count_text`` over the whole multi-megabyte string
+        is what blocks the request path, so its input is bounded here. The even
+        spread keeps the sample representative (a single slice would skew the scale
+        high), and bounding the count biases the estimate slightly low — the safe
+        direction. Fails open. Mirrors the image and document guards above.
+        """
+        try:
+            s = json.dumps(obj)
+        except Exception:
+            # fail-open: nominal estimate when obj isn't JSON-serializable
+            return self.LARGE_BLOB_CHARS // 4
+        if len(s) <= self.LARGE_BLOB_CHARS:
+            return self.count_text(s)
+        chunks = max(1, self.SAMPLE_CHARS // self.SAMPLE_CHUNK)
+        step = len(s) / chunks
+        sample = "".join(
+            s[int(i * step) : int(i * step) + self.SAMPLE_CHUNK] for i in range(chunks)
+        )
+        return int(self.count_text(sample) * len(s) / len(sample))
 
     @staticmethod
     def _estimate_image_tokens(image_data: dict[str, Any]) -> int:

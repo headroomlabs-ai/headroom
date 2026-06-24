@@ -27,7 +27,9 @@ _DEFAULT_CLOUD_URL = "https://api.headroomlabs.ai"
 class HeadroomCallback:
     """LiteLLM callback that compresses messages before each API call.
 
-    Implements LiteLLM's CustomLogger interface (async_pre_call_hook).
+    Implements the LiteLLM callback hooks looked up by name:
+    ``async_pre_call_hook``, ``async_post_call_success_hook``,
+    ``async_success_handler`` and ``async_failure_handler``.
 
     Two modes:
     - Local (default): Compresses in-process using headroom.compress().

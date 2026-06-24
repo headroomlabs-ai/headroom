@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+from pathlib import Path
 
 import pytest
 
@@ -11,12 +12,15 @@ import pytest
 def _import_callback() -> type:
     # Import the module directly to avoid triggering headroom/integrations/__init__.py
     # which pulls in langchain and the native .so extension.
+    module_path = (
+        Path(__file__).resolve().parents[2]
+        / "headroom"
+        / "integrations"
+        / "litellm_callback.py"
+    )
     spec = importlib.util.spec_from_file_location(
         "headroom.integrations.litellm_callback",
-        __file__.replace(
-            "tests/test_integrations/test_litellm_callback.py",
-            "headroom/integrations/litellm_callback.py",
-        ),
+        module_path,
     )
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
