@@ -22,16 +22,15 @@ headroom unwrap opencode
 ## What `wrap opencode` Does
 
 | Step | What happens |
-|---|---|
 | Proxy | Starts the Headroom proxy unless `--no-proxy` is set |
-| Provider config | Writes a `headroom` provider using `@ai-sdk/openai-compatible` into `opencode.json` and `OPENCODE_CONFIG_CONTENT`, pointing at `http://127.0.0.1:<port>/v1` |
-| Runtime env | Sets `OPENCODE_CONFIG_CONTENT` so OpenCode reads provider, model, plugin, and local MCP config at launch |
+| Provider injection | Writes a `headroom` provider using `@ai-sdk/openai-compatible` into `opencode.json`, pointing at `http://127.0.0.1:<port>/v1` |
+| Runtime env | Sets `OPENCODE_CONFIG_CONTENT` with provider, plugin, and local MCP config so OpenCode picks up Headroom at launch |
 | Provider compatibility | Leaves `OPENAI_BASE_URL` and `ANTHROPIC_BASE_URL` untouched so OpenCode `/connect` providers keep their own routing |
-| Context tool | Injects RTK or `lean-ctx` instructions into `~/.config/opencode/AGENTS.md` and project `AGENTS.md` |
-| MCP setup | Registers Headroom MCP tools through a local stdio server: `headroom_compress`, `headroom_retrieve`, and `headroom_stats` |
-| Serena MCP | Optionally registers Serena code graph tools. Use `--no-serena` to skip it |
-| Backup | Snapshots `opencode.json` to `opencode.json.headroom-backup` before changing it |
-| Launch | Starts the `opencode` binary with the generated config |
+| Context tool | Injects RTK (or `lean-ctx`) instructions into `~/.config/opencode/AGENTS.md` and project `AGENTS.md` |
+| MCP setup | Registers the Headroom MCP server (`headroom_compress`, `headroom_retrieve`, `headroom_stats`) |
+| Serena MCP | Optionally registers Serena code graph tools (`--no-serena` to skip) |
+| Backup | Snapshots `opencode.json` to `opencode.json.headroom-backup` before making any changes |
+| Launch | Starts the `opencode` binary through the proxy |
 
 ## Options
 
@@ -68,9 +67,8 @@ The default model is `headroom/claude-sonnet-4-6`. Change it in `opencode.json` 
 ## Environment Variables
 
 | Variable | Description |
-|---|---|
-| `OPENCODE_CONFIG_CONTENT` | JSON payload with provider, model, plugin, and optional local MCP config injected by `wrap` |
-| `HEADROOM_PROXY_URL` | Proxy URL passed to the native `headroom-opencode` plugin. Defaults to `http://127.0.0.1:8787` inside the plugin |
+| `OPENCODE_CONFIG_CONTENT` | JSON payload with provider, plugin, and optional local MCP config injected by `wrap` |
+| `HEADROOM_PROXY_URL` | Proxy URL passed to Headroom MCP when a non-default port is used, and to the native plugin when configured |
 | `HEADROOM_CONTEXT_TOOL` | Set to `lean-ctx` to use lean-ctx instead of RTK |
 
 ## Failure Learning
@@ -85,7 +83,7 @@ See [Failure Learning](/docs/failure-learning) for details on the learn system.
 
 ## Persistent Installs
 
-`headroom install` supports OpenCode as a target for persistent provider wiring:
+`headroom install` supports OpenCode as a target for persistent provider wiring. Use provider scope when you want Headroom to edit `opencode.json` directly:
 
 ```bash
 headroom install apply --preset persistent-service --scope provider --providers manual --target opencode
@@ -93,7 +91,7 @@ headroom install apply --preset persistent-service --scope provider --providers 
 
 This writes the Headroom provider into `~/.config/opencode/opencode.json` and keeps the proxy running on port 8787.
 
-Provider-only installs do not write Headroom MCP config. MCP tools are added by `headroom wrap opencode` unless `--no-mcp` is set.
+The default user scope only writes shell environment configuration. For OpenCode, direct provider config requires `--scope provider`.
 
 ## Native OpenCode Plugin
 
@@ -111,7 +109,7 @@ export default async function plugin(input) {
 }
 ```
 
-Use this plugin when OpenCode should intercept provider traffic in-process. Use `headroom wrap opencode` when you want the CLI to manage the proxy, config injection, local MCP registration, backups, and unwrap behavior.
+Use this plugin when OpenCode should intercept provider traffic in-process. Use `headroom wrap opencode` when you want the CLI to manage the proxy, config injection, MCP registration, backups, and unwrap behavior.
 
 ## Programmatic Config Helpers
 
@@ -137,8 +135,8 @@ const retrieve = createHeadroomRetrieveTool({
 ## How It Works Under The Hood
 
 1. **Config injection**. The wrapper writes a `provider.headroom` block into `opencode.json`. The provider uses `@ai-sdk/openai-compatible`, which OpenCode supports natively. Model mappings route requests through `http://127.0.0.1:<port>/v1`.
-2. **Runtime config**. `OPENCODE_CONFIG_CONTENT` is set as an env var containing the full provider, model, plugin, and local MCP JSON. OpenCode reads it at startup and merges it with on-disk config.
-3. **MCP tools**. Headroom registers `headroom_compress`, `headroom_retrieve`, and `headroom_stats` through a local stdio MCP server unless `--no-mcp` is set.
+2. **Runtime config**. `OPENCODE_CONFIG_CONTENT` is set as an env var containing provider, plugin, and optional local MCP JSON. OpenCode reads it at startup and merges it with on-disk config.
+3. **MCP tools**. Headroom registers `headroom_compress`, `headroom_retrieve`, and `headroom_stats` through `headroom mcp serve` unless `--no-mcp` is set.
 4. **Native plugin path**. `HeadroomPlugin` installs Headroom transport interception and uses `HEADROOM_PROXY_URL` or `http://127.0.0.1:8787` to reach the proxy.
 5. **Unwrap**. `headroom unwrap opencode` restores `opencode.json` from the pre-wrap backup when present, strips Headroom marker blocks when no backup exists, and unregisters Headroom MCP servers.
 
