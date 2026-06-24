@@ -64,13 +64,25 @@ class StreamingMixin:
 
     @staticmethod
     def _get_session_key(body: dict, session_header: str | None = None) -> str:
-        """Return session identity from an explicit header or a body-derived hash."""
+        """Return session identity from an explicit header or a body-derived hash.
+
+        Fallback mirrors prefix_tracker.compute_session_id: md5(model:system[:500]).
+        """
         if session_header:
             return session_header
         import hashlib
 
-        raw = body.get("model", "") + str(body.get("system", ""))
-        return hashlib.sha256(raw.encode()).hexdigest()[:16]
+        system = body.get("system", "")
+        if isinstance(system, list):
+            for block in system:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    system = block.get("text", "")
+                    break
+            else:
+                system = ""
+        system_content = str(system)[:500]
+        key = f"{body.get('model', '')}:{system_content}"
+        return hashlib.md5(key.encode()).hexdigest()[:16]
 
     def _queue_mid_turn_message(self, session_key: str, body: dict) -> dict:
         """Queue a mid-turn message and return a 202 response."""
@@ -1041,6 +1053,7 @@ class StreamingMixin:
                 yield f"event: error\ndata: {json.dumps(error_event)}\n\n".encode()
 
             self._active_streams.discard(session_key)
+            self._mid_turn_queues.pop(session_key, None)
             return StreamingResponse(_error_gen(), media_type="text/event-stream")
 
         # Capture Codex rate-limit window data from the upstream response
@@ -1139,6 +1152,7 @@ class StreamingMixin:
                 waste_signals=waste_signals,
             )
             self._active_streams.discard(session_key)
+            self._mid_turn_queues.pop(session_key, None)
             return Response(
                 content=error_content,
                 status_code=upstream_response.status_code,
