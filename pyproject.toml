@@ -107,11 +107,22 @@ ml = [
     # strands-agents`) drags huggingface-hub backwards.
     "huggingface-hub>=1.5.0,<2.0",
 ]
-# Memory system (hierarchical memory with vector search)
+# Memory system (hierarchical memory with vector search).
+# hnswlib is intentionally NOT included here: it requires a C++ compiler
+# and has no pre-built wheels for many platforms (Windows, WSL, minimal
+# Linux).  The code falls back to sqlite-vec when hnswlib is absent.
+# Use [memory-hnsw] if you have a compiler and want native HNSW indexing.
+# (see: https://github.com/headroomlabs-ai/headroom/issues/1368)
 memory = [
-    "hnswlib>=0.8.0",
     "sqlite-vec>=0.1.6",
     "sentence-transformers>=2.2.0,<6.0",
+]
+# Native HNSW vector index — requires a C++ compiler (build-essential / Xcode CLT).
+# Provides faster ANN search than sqlite-vec for large memory stores (>100k entries).
+# Gracefully ignored at runtime when hnswlib is not installed.
+memory-hnsw = [
+    "headroom-ai[memory]",
+    "hnswlib>=0.8.0",
 ]
 # Qdrant + Neo4j memory backend helpers
 memory-stack = [
@@ -252,7 +263,8 @@ dev = [
     "opentelemetry-exporter-otlp-proto-http>=1.24.0",
     "ollama>=0.4.0",
     "langchain-ollama>=0.2.0",
-    "hnswlib>=0.8.0",
+    # hnswlib omitted from dev: requires a C++ compiler, absent on many CI runners.
+    # Tests that need HNSW use pytest.importorskip("hnswlib").
     "sqlite-vec>=0.1.6",
     "sentence-transformers>=2.2.0,<6.0",
     "numpy>=1.24.0",

@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Fixed
+
+* **packaging:** move `hnswlib` out of `[memory]` and `[all]` extras into a new `[memory-hnsw]` extra ([#1368](https://github.com/headroomlabs-ai/headroom/issues/1368)). `hnswlib` requires a C++ compiler to build from source and has no pre-built wheels for many targets (Windows, WSL, minimal Linux). Because `[memory]` was included in `[all]`, `pip install headroom-ai[all]` aborted the entire transaction on machines without `build-essential` / Xcode CLT, leaving Headroom uninstalled. The code already handles hnswlib absence gracefully (lazy import in `memory/adapters/__init__.py`; falls back to sqlite-vec). Users who need native HNSW indexing can install `headroom-ai[memory-hnsw]`. Also removed hnswlib from the `[dev]` extra with a comment — CI runners that lack a compiler were affected too.
+
 ### Features
 
 * **wrap:** `headroom wrap claude --1m` preserves the 1M context window. Behind a custom `ANTHROPIC_BASE_URL` (the proxy) Claude Code drops the `context-1m` beta header and caps the window at 200k for entitled subscription users; the opt-in flag sets `ANTHROPIC_MODEL=<opus>[1m]` on the launched process so the 1M window activates through Headroom. A model already selected via `ANTHROPIC_MODEL` is preserved (only the `[1m]` suffix is appended) ([#1158](https://github.com/chopratejas/headroom/issues/1158)).
