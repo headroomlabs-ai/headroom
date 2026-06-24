@@ -584,6 +584,16 @@ class HeadroomProxy(
         HeadroomProxy.GEMINI_API_URL = api_targets.gemini
         HeadroomProxy.CLOUDCODE_API_URL = api_targets.cloudcode
         HeadroomProxy.VERTEX_API_URL = api_targets.vertex
+
+        # Safety guardrail: if the env signals we're running in a MiniMax
+        # profile (MINIMAX_SESSION_TOKEN set) but the resolved Anthropic
+        # upstream points somewhere else, log a loud warning so a
+        # misconfigured LaunchAgent never silently burns Anthropic quota.
+        # This catches the failure mode where someone runs the MiniMax plist
+        # but ANTHROPIC_TARGET_API_URL has been clobbered (or omitted) and
+        # the proxy silently falls back to the literal api.anthropic.com
+        # default.
+        self._check_minimax_upstream_guardrail()
         self.anthropic_provider = self.provider_runtime.pipeline_provider("anthropic")
         self.openai_provider = self.provider_runtime.pipeline_provider("openai")
 
@@ -1072,6 +1082,89 @@ class HeadroomProxy(
         except ValueError:
             return False
         return "agent.minimax.io" in host or "minimax.io" == host
+
+    @staticmethod
+    def _is_minimax_upstream(url: str) -> bool:
+        """True when `url` is ANY MiniMax endpoint (gateway OR direct API).
+
+        Used by the safety guardrail: if the proxy is running in a "MiniMax
+        profile" (signalled by ``ANTHROPIC_TARGET_API_URL`` pointing at a
+        MiniMax host or by ``MINIMAX_SESSION_TOKEN`` being set), and
+        ANTHROPIC_API_URL has drifted to something that isn't a MiniMax
+        host (e.g. the literal api.anthropic.com default), we want to log
+        a loud warning at startup so a misconfigured LaunchAgent never
+        silently starts burning Claude Code quota.
+        """
+        from urllib.parse import urlparse
+
+        try:
+            host = (urlparse(url).hostname or "").lower()
+        except ValueError:
+            return False
+        return ("agent.minimax.io" in host) or (host == "minimax.io") or (
+            host == "api.minimaxi.com"
+        )
+
+    def _is_minimax_upstream_for_self(self, url: str) -> bool:
+        """Instance-method wrapper around _is_minimax_upstream().
+
+        Needed because ``self._is_minimax_upstream(url)`` on a static
+        method passes ``self`` implicitly as the first positional argument,
+        which breaks the URL-host parsing. Callers from instance methods
+        (e.g. ``_check_minimax_upstream_guardrail``) should use this
+        helper instead.
+        """
+        return self._is_minimax_upstream(url)
+
+    def _check_minimax_upstream_guardrail(self) -> None:
+        """Log a loud WARN if the proxy is in a MiniMax profile but the
+        resolved Anthropic upstream isn't a MiniMax host.
+
+        Profile detection: ``ANTHROPIC_TARGET_API_URL`` env var is set AND
+        points at a MiniMax host. That's the marker of a MiniMax-profile
+        plist (e.g. ``com.headroom.minimax-enable``). The fallback marker
+        is ``MINIMAX_SESSION_TOKEN`` for headroom configurations that pass
+        the JWT via env instead of the per-request ``Token:`` header.
+
+        Behaviour:
+          - MiniMax profile + MiniMax upstream  → no log (happy path).
+          - MiniMax profile + non-MiniMax upstream → ERROR-level log
+            with the offending URL. The proxy keeps running so the user
+            can see the warning in logs and fix the plist, but every
+            outbound /v1/messages call will fail with 502 because the
+            wrong upstream returns 401 on the MiniMax JWT.
+          - No MiniMax profile → no log (regular Anthropic-mode proxy).
+        """
+        env_target = os.environ.get("ANTHROPIC_TARGET_API_URL") or ""
+        env_session = os.environ.get("MINIMAX_SESSION_TOKEN") or ""
+        cfg_session = getattr(self.config, "minimax_session_token", None)
+
+        is_minimax_profile = False
+        if env_target and self._is_minimax_upstream_for_self(env_target):
+            is_minimax_profile = True
+        elif env_session or cfg_session:
+            is_minimax_profile = True
+
+        if not is_minimax_profile:
+            return  # regular Anthropic profile — nothing to guard
+
+        upstream = HeadroomProxy.ANTHROPIC_API_URL
+        if self._is_minimax_upstream_for_self(upstream):
+            logger.info(
+                "minimax_guardrail: upstream=%s — MiniMax profile OK",
+                upstream,
+            )
+            return
+
+        logger.error(
+            "minimax_guardrail: ANTHROPIC_API_URL=%s is NOT a MiniMax host, "
+            "but ANTHROPIC_TARGET_API_URL=%s signals a MiniMax profile. "
+            "Check ANTHROPIC_TARGET_API_URL in the LaunchAgent plist — "
+            "it must be agent.minimax.io or api.minimaxi.com. "
+            "Outbound /v1/messages calls will fail with 401/502 until fixed.",
+            upstream,
+            env_target,
+        )
 
     async def _run_compression_in_executor(
         self,

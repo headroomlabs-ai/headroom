@@ -9,7 +9,7 @@ from typing import Any, cast
 from urllib.parse import quote
 
 from fastapi import FastAPI, Request, WebSocket
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import Response
 
 from headroom.proxy.handlers.minimax import MiniMaxHandlerMixin
 from headroom.proxy.handlers.openai import _resolve_codex_routing_headers

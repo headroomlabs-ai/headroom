@@ -6,7 +6,6 @@ import pytest
 from headroom.providers.minimax import (
     MODEL_CONTEXT_LIMITS,
     MODEL_INPUT_COST,
-    MODEL_MAX_OUTPUT,
     MODEL_OUTPUT_COST,
     MiniMaxProvider,
 )

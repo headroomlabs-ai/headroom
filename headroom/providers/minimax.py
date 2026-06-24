@@ -14,7 +14,7 @@ MINIMAX_API_KEY env var) alongside the existing client Authorization header.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from .base import Provider
 
@@ -93,7 +93,7 @@ class MiniMaxProvider(Provider):
 
     name = "minimax"
 
-    def get_token_counter(self, model: str) -> "TokenCounter":
+    def get_token_counter(self, model: str) -> TokenCounter:
         """Return a tiktoken-based token counter for the model."""
         from headroom.providers.anthropic import AnthropicProvider
 

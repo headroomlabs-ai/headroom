@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from fastapi import Request
@@ -78,12 +78,12 @@ class MiniMaxHandlerMixin:
 
     async def handle_minimax_messages(
         self,
-        request: "Request",
+        request: Request,
         upstream_base_url: str | None = None,
         provider_name: str = "minimax",
         model_override: str | None = None,
         force_stream: bool = False,
-    ) -> "Response | StreamingResponse":
+    ) -> Response | StreamingResponse:
         """Handle ``POST /v1/messages`` for MiniMax traffic.
 
         Delegates to :meth:`AnthropicHandlerMixin.handle_anthropic_messages`
