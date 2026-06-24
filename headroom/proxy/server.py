@@ -265,6 +265,8 @@ def _classify_agent_from_log(entry: dict[str, Any]) -> tuple[str, str, str]:
     model = str(entry.get("model") or "").lower()
     if "codex" in model:
         return "codex", _agent_label("codex"), "model"
+    if "minimax" in model or "m2.7" in model or "m3" == model[-2:] or "m2" == model[-2:]:
+        return "minimax", _agent_label("minimax"), "model"
     if "claude" in model:
         return "claude-code", _agent_label("claude-code"), "model"
     if "gemini" in model:
@@ -536,6 +538,7 @@ from headroom.proxy.handlers import (  # noqa: E402
     BatchHandlerMixin,
     BedrockHandlerMixin,
     GeminiHandlerMixin,
+    MiniMaxHandlerMixin,
     OpenAIHandlerMixin,
     StreamingMixin,
 )
@@ -544,6 +547,7 @@ from headroom.proxy.handlers import (  # noqa: E402
 class HeadroomProxy(
     StreamingMixin,
     AnthropicHandlerMixin,
+    MiniMaxHandlerMixin,
     OpenAIHandlerMixin,
     GeminiHandlerMixin,
     BatchHandlerMixin,
@@ -872,6 +876,8 @@ class HeadroomProxy(
             openai_api_url=config.openai_api_url,
             anyllm_backend_cls=AnyLLMBackend,
             litellm_backend_cls=LiteLLMBackend,
+            minimax_api_key=config.minimax_api_key,
+            minimax_api_url=config.minimax_api_url,
         )
 
         # Request counter for IDs
@@ -1050,6 +1056,22 @@ class HeadroomProxy(
                 "memory_enabled": self.config.memory_enabled,
             },
         )
+
+    @staticmethod
+    def _is_minimax_gateway_url(url: str) -> bool:
+        """True when `url` points at the Mavis Code gateway, not the direct
+        MiniMax Anthropic-compatible API.
+
+        Mavis Code gateway: agent.minimax.io/mavis/api/v1/llm/v1
+        Direct MiniMax API: api.minimaxi.com/anthropic
+        """
+        from urllib.parse import urlparse
+
+        try:
+            host = (urlparse(url).hostname or "").lower()
+        except ValueError:
+            return False
+        return "agent.minimax.io" in host or "minimax.io" == host
 
     async def _run_compression_in_executor(
         self,
@@ -1613,6 +1635,38 @@ class HeadroomProxy(
             body_mutated=body_mutated,
         )
         outbound_headers = {**headers, "content-type": "application/json"}
+
+        # MiniMax upstream auth shim.
+        #
+        # Headroom can be routed at two distinct MiniMax surfaces:
+        #   1. Direct Anthropic-compatible API: api.minimaxi.com/anthropic
+        #      Auth: static API key from `sk-cp-…` (subscription).
+        #   2. Mavis Code gateway: agent.minimax.io/mavis/api/v1/llm/v1
+        #      Auth: per-session JWT (`eyJ…`) stored in the local
+        #      Codex/Mavis Agent localStorage (`_token` key).
+        #
+        # When the upstream is the gateway, we must REPLACE the client's
+        # `Authorization: Bearer <whatever>` with the real session JWT,
+        # otherwise the gateway returns 401 `auth failed`. The proxy
+        # reads the JWT from `MINIMAX_SESSION_TOKEN` (env) or
+        # `self.config.minimax_session_token` (ProxyConfig field).
+        #
+        # When the upstream is api.minimaxi.com, we instead inject
+        # `x-api-key: <key>` so the client Bearer can coexist.
+        if self._is_minimax_gateway_url(url):
+            session_token = (
+                os.environ.get("MINIMAX_SESSION_TOKEN")
+                or getattr(self.config, "minimax_session_token", None)
+            )
+            if session_token:
+                outbound_headers["authorization"] = f"Bearer {session_token}"
+                # The gateway doesn't expect x-api-key — only Authorization.
+                outbound_headers.pop("x-api-key", None)
+        else:
+            # Direct MiniMax API (api.minimaxi.com): inject subscription key.
+            minimax_api_key = os.environ.get("MINIMAX_API_KEY") or self.config.minimax_api_key
+            if minimax_api_key:
+                outbound_headers["x-api-key"] = minimax_api_key
 
         log_outbound_request(
             forwarder=forwarder_name,
@@ -3834,6 +3888,8 @@ def _proxy_config_from_env() -> ProxyConfig:
         bedrock_profile=os.environ.get("AWS_PROFILE"),
         bedrock_api_url=os.environ.get("BEDROCK_TARGET_API_URL"),
         anyllm_provider=_get_env_str("HEADROOM_ANYLLM_PROVIDER", "openai"),
+        minimax_api_key=os.environ.get("MINIMAX_API_KEY"),
+        minimax_api_url=os.environ.get("MINIMAX_TARGET_API_URL"),
         disable_kompress=_get_env_bool("HEADROOM_DISABLE_KOMPRESS", False),
         disable_kompress_fallback=_get_env_bool("HEADROOM_DISABLE_KOMPRESS_FALLBACK", False),
         disable_kompress_anthropic=_get_env_optional_bool("HEADROOM_DISABLE_KOMPRESS_ANTHROPIC"),
@@ -4394,6 +4450,8 @@ if __name__ == "__main__":
             min_value=1,
         ),
         vertex_api_url=_get_env_str("VERTEX_TARGET_API_URL", args.vertex_api_url),
+        minimax_api_key=os.environ.get("MINIMAX_API_KEY") or getattr(args, "minimax_api_key", None),
+        minimax_api_url=_get_env_str("MINIMAX_TARGET_API_URL", getattr(args, "minimax_api_url", None)),
         # Backend settings
         backend=_get_env_str("HEADROOM_BACKEND", args.backend),  # type: ignore[arg-type]
         bedrock_region=_get_env_str("HEADROOM_BEDROCK_REGION", args.bedrock_region),

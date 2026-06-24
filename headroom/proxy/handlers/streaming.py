@@ -9,6 +9,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -856,6 +857,33 @@ class StreamingMixin:
             body_mutated=body_mutated,
         )
         outbound_headers = {**headers, "content-type": "application/json"}
+
+        # MiniMax upstream auth shim (streaming path).
+        #
+        # The non-streaming path applies the same shim in
+        # ``HeadroomProxy._retry_request`` (see server.py); for SSE
+        # streaming we duplicate the logic here so the two surfaces
+        # stay consistent. When the upstream is the Mavis Code
+        # gateway, REPLACE the client's Authorization with the per-
+        # session JWT from MINIMAX_SESSION_TOKEN. When it's the
+        # direct Anthropic-compat API, INJECT x-api-key from
+        # MINIMAX_API_KEY.
+        from urllib.parse import urlparse
+
+        try:
+            _host = (urlparse(url).hostname or "").lower()
+        except ValueError:
+            _host = ""
+        if "agent.minimax.io" in _host or _host == "minimax.io":
+            _session_token = os.environ.get("MINIMAX_SESSION_TOKEN")
+            if _session_token:
+                outbound_headers["authorization"] = f"Bearer {_session_token}"
+                outbound_headers.pop("x-api-key", None)
+        else:
+            _api_key = os.environ.get("MINIMAX_API_KEY")
+            if _api_key:
+                outbound_headers["x-api-key"] = _api_key
+
         log_outbound_request(
             forwarder="streaming",
             method="POST",

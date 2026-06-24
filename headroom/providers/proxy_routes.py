@@ -9,8 +9,9 @@ from typing import Any, cast
 from urllib.parse import quote
 
 from fastapi import FastAPI, Request, WebSocket
-from fastapi.responses import Response
+from fastapi.responses import HTMLResponse, Response
 
+from headroom.proxy.handlers.minimax import MiniMaxHandlerMixin
 from headroom.proxy.handlers.openai import _resolve_codex_routing_headers
 
 logger = logging.getLogger("headroom.proxy.routes")
@@ -481,6 +482,19 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
 
     @app.post("/v1/messages")
     async def anthropic_messages(request: Request):
+        # MiniMax traffic uses the Anthropic wire format but is bucketed
+        # under provider="minimax" for cost tracking and dashboard
+        # breakdown. Detect by model name in the request body.
+        try:
+            body_bytes = await request.body()
+            parsed = json.loads(body_bytes or b"{}")
+            model = parsed.get("model", "") if isinstance(parsed, dict) else ""
+        except (json.JSONDecodeError, ValueError):
+            model = ""
+
+        if isinstance(proxy, MiniMaxHandlerMixin) and MiniMaxHandlerMixin._is_minimax_model(model):
+            return await proxy.handle_minimax_messages(request)
+
         return await proxy.handle_anthropic_messages(request)
 
     # AWS Bedrock InvokeModel passthrough. Registered ONLY when an upstream is

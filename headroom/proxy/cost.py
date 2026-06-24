@@ -150,6 +150,7 @@ def build_prefix_cache_stats(
                     or (provider == "openai" and any(p in model_name for p in _openai_prefixes))
                     or (provider == "gemini" and "gemini" in model_name)
                     or (provider == "bedrock" and "claude" in model_name)
+                    or (provider == "minimax" and ("MiniMax-M" in model_name or "minimax-m" in model_name.lower()))
                 )
                 if is_match:
                     price_per_1m = cost_tracker._get_list_price(model_name)
@@ -746,6 +747,19 @@ class CostTracker:
 
     def _get_list_price(self, model: str) -> float | None:
         """Get list input price per 1M tokens for a model."""
+        # MiniMax fallback — covers the wire-format provider that isn't
+        # in the litellm registry. The MiniMaxProvider class already
+        # declares per-million-token pricing; surface it here so the
+        # cache-savings economics have a price to multiply by.
+        try:
+            from headroom.providers.minimax import MODEL_INPUT_COST
+
+            normalised = model.split("/")[-1]
+            if normalised in MODEL_INPUT_COST:
+                return MODEL_INPUT_COST[normalised]
+        except ImportError:
+            pass
+
         litellm = _get_litellm_module()
         if litellm is None:
             return None
@@ -764,7 +778,31 @@ class CostTracker:
 
         Returns (cache_read, cache_write, uncached) per-token costs, or None
         if pricing is unavailable. Uses LiteLLM's native cache pricing data.
+
+        Providers that ship their own pricing (e.g. MiniMax) get a
+        deterministic fallback so cost tracking works on Python 3.14
+        where litellm is not installed.
         """
+        # MiniMax fallback — covers the wire-format provider that isn't
+        # in the litellm registry. The MiniMaxProvider class already
+        # declares per-million-token pricing; convert to per-token here.
+        try:
+            from headroom.providers.minimax import (
+                MODEL_INPUT_COST as _MINIMAX_INPUT,
+                MODEL_OUTPUT_COST as _MINIMAX_OUTPUT,
+            )
+
+            normalised = model.split("/")[-1]
+            if normalised in _MINIMAX_INPUT:
+                # MiniMax M3/M2.x have a 90% cache_read discount and 25%
+                # cache_write premium (matches what the gateway exposes).
+                uncached_per_token = _MINIMAX_INPUT[normalised] / 1_000_000
+                cache_read = uncached_per_token * 0.10
+                cache_write = uncached_per_token * 1.25
+                return (cache_read, cache_write, uncached_per_token)
+        except ImportError:
+            pass
+
         litellm = _get_litellm_module()
         if litellm is None:
             return None
@@ -809,6 +847,7 @@ class CostTracker:
         cost_with_headroom = 0.0
         total_billed_input_tokens = 0
         total_input_tokens = 0
+        per_model_cost: dict[str, float] = {}
         for model in self._tokens_saved_by_model:
             saved = self._tokens_saved_by_model[model]
             sent = self._tokens_sent_by_model.get(model, 0)
@@ -830,6 +869,16 @@ class CostTracker:
                     billed_tokens = sent
                 cost_with_headroom += model_cost
                 total_billed_input_tokens += billed_tokens
+                # Attach cost to the per_model dict so the dashboard
+                # Per-Model table can render a $ column even when the
+                # provider has no litellm registry entry (e.g. MiniMax).
+                per_model_cost[model] = round(model_cost, 6)
+
+        # Surface per-model cost in the per_model dict (rounded to 6
+        # decimal places to match the existing token-cost display precision).
+        for model, cost in per_model_cost.items():
+            if model in per_model:
+                per_model[model]["input_cost_usd"] = cost
 
         # Compression savings: price saved tokens at the model's list input price.
         # This is simple, monotonic, and transparent — each saved token is valued

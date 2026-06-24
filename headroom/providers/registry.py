@@ -14,6 +14,7 @@ from headroom.providers.gemini import DEFAULT_API_URL as DEFAULT_GEMINI_API_URL
 
 DEFAULT_CLOUDCODE_API_URL = "https://cloudcode-pa.googleapis.com"
 DEFAULT_VERTEX_API_URL = "https://us-central1-aiplatform.googleapis.com"
+DEFAULT_MINIMAX_API_URL = "https://api.minimaxi.com/anthropic"
 
 if TYPE_CHECKING:
     from headroom.backends.base import Backend
@@ -32,6 +33,7 @@ class ProviderApiOverrides:
     gemini: str | None = None
     cloudcode: str | None = None
     vertex: str | None = None
+    minimax: str | None = None  # Base URL override for MiniMax backend
 
 
 @dataclass(frozen=True)
@@ -43,6 +45,7 @@ class ProviderApiTargets:
     gemini: str = DEFAULT_GEMINI_API_URL
     cloudcode: str = DEFAULT_CLOUDCODE_API_URL
     vertex: str = DEFAULT_VERTEX_API_URL
+    minimax: str = DEFAULT_MINIMAX_API_URL
 
 
 @dataclass(frozen=True)
@@ -60,6 +63,7 @@ class ProxyProviderRuntime:
             "gemini": self.api_targets.gemini,
             "cloudcode": self.api_targets.cloudcode,
             "vertex": self.api_targets.vertex,
+            "minimax": self.api_targets.minimax,
         }[provider_name]
 
     def pipeline_provider(self, provider_name: str) -> Provider:
@@ -100,6 +104,7 @@ def resolve_api_overrides(
     gemini_api_url: str | None,
     cloudcode_api_url: str | None,
     vertex_api_url: str | None = None,
+    minimax_api_url: str | None = None,
     environ: Mapping[str, str] | None = None,
 ) -> ProviderApiOverrides:
     """Resolve provider API URL overrides from CLI/config inputs and environment."""
@@ -112,6 +117,7 @@ def resolve_api_overrides(
         gemini=gemini_api_url or env.get("GEMINI_TARGET_API_URL"),
         cloudcode=cloudcode_api_url or env.get("CLOUDCODE_TARGET_API_URL"),
         vertex=vertex_api_url or env.get("VERTEX_TARGET_API_URL"),
+        minimax=minimax_api_url or env.get("MINIMAX_TARGET_API_URL"),
     )
 
 
@@ -123,6 +129,7 @@ def resolve_api_targets(overrides: ProviderApiOverrides) -> ProviderApiTargets:
         gemini=_normalize_api_url(overrides.gemini, default=DEFAULT_GEMINI_API_URL),
         cloudcode=_normalize_api_url(overrides.cloudcode, default=DEFAULT_CLOUDCODE_API_URL),
         vertex=_normalize_api_url(overrides.vertex, default=DEFAULT_VERTEX_API_URL),
+        minimax=_normalize_api_url(overrides.minimax, default=DEFAULT_MINIMAX_API_URL),
     )
 
 
@@ -152,10 +159,23 @@ def create_proxy_backend(
     openai_api_url: str | None = None,
     anyllm_backend_cls: Any | None = None,
     litellm_backend_cls: Any | None = None,
+    minimax_api_key: str | None = None,
+    minimax_api_url: str | None = None,
 ) -> Backend | None:
     """Create the optional translated backend for Anthropic proxy requests."""
     if backend == "anthropic":
         return None
+
+    if backend == "minimax":
+        # MiniMax uses the Anthropic-compatible API format natively.
+        # No backend translation needed — just inject the x-api-key header.
+        # The proxy handles this in server.py _retry_request via MINIMAX_API_KEY.
+        logger.info(
+            "MiniMax backend enabled (url=%s, key_set=%s)",
+            minimax_api_url or DEFAULT_MINIMAX_API_URL,
+            bool(minimax_api_key),
+        )
+        return None  # Passthrough — translation not needed
 
     if backend == "anyllm" or backend.startswith("anyllm-"):
         provider = anyllm_provider
@@ -196,6 +216,8 @@ def format_backend_status(*, backend: str, anyllm_provider: str, bedrock_region:
     """Build the human-readable backend status string shown in CLI/server output."""
     if backend == "anthropic":
         return "ANTHROPIC (direct API)"
+    if backend == "minimax":
+        return "MINIMAX (Anthropic-compatible, x-api-key injection)"
     if backend == "anyllm" or backend.startswith("anyllm-"):
         return f"{anyllm_provider.title()} via any-llm"
 

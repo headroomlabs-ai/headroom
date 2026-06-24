@@ -1081,11 +1081,12 @@
                 <div class="overflow-x-auto">
                     <table class="w-full text-sm" style="table-layout:fixed">
                         <colgroup>
-                            <col style="width:40%">
-                            <col style="width:12%">
-                            <col style="width:18%">
-                            <col style="width:18%">
-                            <col style="width:12%">
+                            <col style="width:34%">
+                            <col style="width:10%">
+                            <col style="width:14%">
+                            <col style="width:14%">
+                            <col style="width:14%">
+                            <col style="width:14%">
                         </colgroup>
                         <thead>
                             <tr class="text-xs text-gray-500 uppercase tracking-wide">
@@ -1094,6 +1095,7 @@
                                 <th class="px-4 py-3 font-medium text-right">Tokens Saved</th>
                                 <th class="px-4 py-3 font-medium text-right">Tokens Sent</th>
                                 <th class="px-4 py-3 font-medium text-right">Reduction</th>
+                                <th class="px-4 py-3 font-medium text-right">Cost (USD)</th>
                             </tr>
                         </thead>
                         <tbody class="divide-y divide-border">
@@ -1108,6 +1110,7 @@
                                     <td class="px-4 py-3 text-right">
                                         <span class="text-accent font-mono tabular-nums" x-text="info.reduction_pct.toFixed(1) + '%'"></span>
                                     </td>
+                                    <td class="px-4 py-3 text-right font-mono tabular-nums" x-text="info.input_cost_usd != null ? '$' + formatCurrency(info.input_cost_usd) : '—'"></td>
                                 </tr>
                             </template>
                         </tbody>
