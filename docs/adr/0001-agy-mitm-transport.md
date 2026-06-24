@@ -247,6 +247,11 @@ Platform specifics:
   filesystem**.
 - **Windows / macOS (no `memfd`):** the leaf key is written to a `mkstemp` file and
   unlinked immediately after `load_cert_chain`. On POSIX the file is `0600`; on Windows
-  POSIX mode bits are not enforceable, so the guarantee is "per-user `%TEMP%` + immediate
-  unlink", **not** the Linux "never on disk" invariant. This is a deliberate, documented
-  degradation — the key is briefly on disk on non-Linux platforms.
+  POSIX mode bits are not enforceable, so protection comes from the temp directory's
+  ACL. **Verified** on `windows-latest` via `icacls`: an `hr_leaf_*.pem` mkstemp file in
+  `%LOCALAPPDATA%\Temp` grants Full control only to the owning user, `NT AUTHORITY\SYSTEM`,
+  and `BUILTIN\Administrators` — no `Users`/`Everyone`/`Authenticated Users` entry, i.e.
+  user-scoped, not world-readable (Administrators can read any file on any OS — unavoidable).
+  The guarantee is therefore "owner-only ACL (inherited from `%TEMP%`) + immediate unlink",
+  **not** the Linux "never on disk" invariant. The residual exposure is the brief on-disk
+  window, mitigated by the immediate unlink; this is a deliberate, documented degradation.
