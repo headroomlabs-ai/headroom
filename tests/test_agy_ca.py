@@ -26,6 +26,7 @@ from headroom.proxy.agy_ca import (
     _collect_corporate_ca_pems,
     _is_ca_cert,
     _parse_ca_certs_from_pem,
+    _windows_trust_pem,
     build_combined_bundle,
     ensure_root_ca,
     load_cert_chain_in_memory,
@@ -384,6 +385,41 @@ def test_bundle_contains_corp_ca_but_not_leaf(
     bundle_data = bundle_path2.read_bytes()
     assert corp_ca_pem in bundle_data
     assert leaf_pem not in bundle_data
+
+
+def test_windows_trust_pem_filters_non_ca(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The Windows ssl.enum_certificates path must drop non-CA (leaf) certs.
+
+    ssl.enum_certificates returns every cert in the store including leaf certs;
+    _windows_trust_pem must run them through the CA:TRUE filter so only CA
+    anchors end up in the trust bundle. Mock-driven so it runs on every OS
+    (ssl.enum_certificates does not exist off Windows).
+    """
+    ca_pem = _make_cert(is_ca=True)
+    leaf_pem = _make_cert(is_ca=False)
+    ca_cert = x509.load_pem_x509_certificate(ca_pem)
+    leaf_cert = x509.load_pem_x509_certificate(leaf_pem)
+    ca_der = ca_cert.public_bytes(serialization.Encoding.DER)
+    leaf_der = leaf_cert.public_bytes(serialization.Encoding.DER)
+
+    def fake_enum(store: str) -> list[tuple[bytes, str, bool]]:
+        # Return the CA + leaf only for ROOT; CA store empty (avoid double count).
+        if store == "ROOT":
+            return [(ca_der, "x509_asn", True), (leaf_der, "x509_asn", True)]
+        return []
+
+    monkeypatch.setattr("ssl.enum_certificates", fake_enum, raising=False)
+
+    result = _windows_trust_pem()
+    # Parse EVERY cert block in the raw result (NOT via the CA filter) so a
+    # regression that dropped the internal filter would surface the leaf here.
+    marker = b"-----BEGIN CERTIFICATE-----"
+    present = {
+        x509.load_pem_x509_certificate(marker + block).serial_number
+        for block in result.split(marker)[1:]
+    }
+    assert ca_cert.serial_number in present, "CA anchor must be present"
+    assert leaf_cert.serial_number not in present, "leaf cert must be filtered out"
 
 
 def test_bundle_not_in_os_trust_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

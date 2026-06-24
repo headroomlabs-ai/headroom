@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import socket
 import ssl
 from pathlib import Path
@@ -260,7 +261,14 @@ class AgyDispatchServer:
 
         # Bind a plain TCP socket on loopback then wrap with our SSL context.
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # SO_REUSEADDR means fast TIME_WAIT reuse on POSIX, but on Windows it
+        # lets a second process bind this same loopback port and intercept the
+        # decrypted MITM traffic. Restrict to POSIX; on Windows enforce
+        # exclusive use so a duplicate bind fails loudly.
+        if os.name == "posix":
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        elif hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
         sock.bind((_BIND_HOST, self._port))
 
         async def _connection_handler(

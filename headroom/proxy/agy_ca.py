@@ -230,6 +230,34 @@ def _detect_system_bundle() -> Path:
     )
 
 
+def _windows_trust_pem() -> bytes:
+    """Collect CA:TRUE certs from the Windows system trust stores as PEM bytes.
+
+    Windows has no single on-disk CA bundle file, so ``_SYSTEM_BUNDLE_CANDIDATES``
+    never matches there. ``ssl.enum_certificates`` (Windows-only) enumerates the
+    ROOT and CA stores but returns *all* certs including leaf certs, so the
+    result is run through the same ``_parse_ca_certs_from_pem`` CA:TRUE filter
+    used for corporate bundles — never trust a non-CA cert as an anchor.
+    """
+    pem = b""
+    for store in ("ROOT", "CA"):
+        for der, _enc, _trust in ssl.enum_certificates(store):  # type: ignore[attr-defined,unused-ignore]
+            pem += ssl.DER_cert_to_PEM_cert(der).encode("ascii")
+    return b"".join(_parse_ca_certs_from_pem(pem))
+
+
+def _system_trust_pem() -> tuple[bytes, str]:
+    """Return ``(system trust PEM bytes, source label)`` for this platform.
+
+    POSIX/macOS read the detected on-disk bundle; Windows enumerates the
+    system trust stores via stdlib ``ssl`` (no certifi dependency).
+    """
+    if sys.platform == "win32":
+        return _windows_trust_pem(), "windows-cert-store"
+    path = _detect_system_bundle()
+    return path.read_bytes(), str(path)
+
+
 def _parse_ca_certs_from_pem(pem_data: bytes) -> list[bytes]:
     """Parse a multi-cert PEM file, returning PEM bytes for CA:TRUE certs only."""
     results: list[bytes] = []
@@ -408,8 +436,7 @@ def build_combined_bundle(
 
     _secure_dir(base_dir)
 
-    system_bundle_path = _detect_system_bundle()
-    system_pem = system_bundle_path.read_bytes()
+    system_pem, system_source = _system_trust_pem()
 
     _, ca_cert, _, ca_cert_path = ensure_root_ca(base_dir)
     headroom_pem = ca_cert.public_bytes(serialization.Encoding.PEM)
@@ -432,7 +459,7 @@ def build_combined_bundle(
     logger.info(
         "event=bundle_written path=%s system=%s corp_ca_count=%d",
         bundle_path,
-        system_bundle_path,
+        system_source,
         len(corp_pems),
     )
     return bundle_path

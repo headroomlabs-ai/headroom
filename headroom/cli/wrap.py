@@ -1985,7 +1985,7 @@ def _inject_gemini_md_block(gemini_md: Path, content: str, verbose: bool = False
     block = f"{_AGY_GEMINI_BLOCK_START}\n{content}\n{_AGY_GEMINI_BLOCK_END}"
 
     if gemini_md.exists():
-        existing = gemini_md.read_text()
+        existing = gemini_md.read_text(encoding="utf-8")
         if _AGY_GEMINI_BLOCK_START in existing and _AGY_GEMINI_BLOCK_END in existing:
             # Replace existing block in-place.
             start = existing.index(_AGY_GEMINI_BLOCK_START)
@@ -2001,14 +2001,14 @@ def _inject_gemini_md_block(gemini_md: Path, content: str, verbose: bool = False
                 if verbose:
                     click.echo("  GEMINI.md headroom block already up-to-date")
                 return False
-            gemini_md.write_text(new_text)
+            gemini_md.write_text(new_text, encoding="utf-8")
         else:
             # Append after existing user content.
             sep = "\n\n" if existing.rstrip("\n") else ""
-            gemini_md.write_text(existing.rstrip("\n") + sep + block + "\n")
+            gemini_md.write_text(existing.rstrip("\n") + sep + block + "\n", encoding="utf-8")
     else:
         gemini_md.parent.mkdir(parents=True, exist_ok=True)
-        gemini_md.write_text(block + "\n")
+        gemini_md.write_text(block + "\n", encoding="utf-8")
 
     if verbose:
         click.echo(f"  headroom block injected into {gemini_md}")
@@ -2023,7 +2023,7 @@ def _remove_gemini_md_block(gemini_md: Path, verbose: bool = False) -> bool:
     """
     if not gemini_md.exists():
         return False
-    existing = gemini_md.read_text()
+    existing = gemini_md.read_text(encoding="utf-8")
     if _AGY_GEMINI_BLOCK_START not in existing or _AGY_GEMINI_BLOCK_END not in existing:
         return False
     start = existing.index(_AGY_GEMINI_BLOCK_START)
@@ -2038,7 +2038,7 @@ def _remove_gemini_md_block(gemini_md: Path, verbose: bool = False) -> bool:
         new_text = after
     else:
         new_text = ""
-    gemini_md.write_text(new_text)
+    gemini_md.write_text(new_text, encoding="utf-8")
     if verbose:
         click.echo(f"  headroom block removed from {gemini_md}")
     return True
