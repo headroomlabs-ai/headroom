@@ -904,6 +904,158 @@ class TestCLICompressionOnlyFlags:
         assert captured_config["config"].ccr_inject_marker is False
 
 
+class TestNoCcrMarkerCompressors:
+    """Verify --no-ccr-marker actually suppresses <<ccr:...>> markers
+    from every compressor, not just SmartCrusher (#1022)."""
+
+    def test_content_router_propagates_ccr_inject_marker_false_to_compressors(self):
+        """#1022: ContentRouter must pass enable_ccr=False to compressors
+        when ccr_inject_marker=False. Before the fix, only SmartCrusher
+        received the flag — Search/Log/Diff compressors always got
+        enable_ccr=True (the default)."""
+        from headroom.transforms.content_router import (
+            ContentRouter,
+            ContentRouterConfig,
+        )
+
+        router = ContentRouter(ContentRouterConfig(ccr_inject_marker=False, ccr_enabled=True))
+
+        # search compressor
+        sc = router._get_search_compressor()
+        assert sc is not None
+        assert sc.config.enable_ccr is False, (
+            f"SearchCompressor enable_ccr={sc.config.enable_ccr}, expected False"
+        )
+
+        # log compressor
+        lc = router._get_log_compressor()
+        assert lc is not None
+        assert lc.config.enable_ccr is False, (
+            f"LogCompressor enable_ccr={lc.config.enable_ccr}, expected False"
+        )
+
+        # diff compressor
+        dc = router._get_diff_compressor()
+        assert dc is not None
+        assert dc.config.enable_ccr is False, (
+            f"DiffCompressor enable_ccr={dc.config.enable_ccr}, expected False"
+        )
+
+        # SmartCrusher already works (regression guard)
+        sc2 = router._get_smart_crusher()
+        assert sc2 is not None
+        # SmartCrusher uses inject_retrieval_marker, not enable_ccr
+
+    def test_content_router_default_ccr_inject_marker_true(self):
+        """Default config (ccr_inject_marker=True) should give enable_ccr=True."""
+        from headroom.transforms.content_router import (
+            ContentRouter,
+            ContentRouterConfig,
+        )
+
+        router = ContentRouter(ContentRouterConfig())
+        sc = router._get_search_compressor()
+        assert sc.config.enable_ccr is True
+
+        lc = router._get_log_compressor()
+        assert lc.config.enable_ccr is True
+
+        dc = router._get_diff_compressor()
+        assert dc.config.enable_ccr is True
+
+    def test_search_compressor_suppresses_markers_with_enable_ccr_false(self):
+        """SearchCompressor with enable_ccr=False must not emit <<ccr: markers."""
+        from headroom.transforms.search_compressor import (
+            SearchCompressor,
+            SearchCompressorConfig,
+        )
+
+        compressor = SearchCompressor(
+            SearchCompressorConfig(
+                enable_ccr=False,
+                min_matches_for_ccr=1,
+                context_keywords=["error"],
+            )
+        )
+        content = "\n".join(
+            f"src/file{i}.py:{line}: error: something went wrong here"
+            for i in range(20)
+            for line in range(1, 11)
+        )
+        result = compressor.compress(content)
+        assert "<<ccr:" not in result.compressed, (
+            f"SearchCompressor emitted marker when enable_ccr=False: {result.compressed[:300]!r}"
+        )
+
+    def test_log_compressor_suppresses_markers_with_enable_ccr_false(self):
+        """LogCompressor with enable_ccr=False must not emit <<ccr: markers."""
+        from headroom.transforms.log_compressor import (
+            LogCompressor,
+            LogCompressorConfig,
+        )
+
+        npm_lines = ["npm WARN deprecated x"] * 30 + ["npm ERR! something broke"] * 5
+        content = "\n".join(npm_lines)
+        compressor = LogCompressor(LogCompressorConfig(enable_ccr=False, min_lines_for_ccr=3))
+        result = compressor.compress(content)
+        assert "<<ccr:" not in result.compressed, (
+            f"LogCompressor emitted marker when enable_ccr=False: {result.compressed[:300]!r}"
+        )
+
+    def test_diff_compressor_suppresses_markers_with_enable_ccr_false(self):
+        """DiffCompressor with enable_ccr=False must not emit <<ccr: markers."""
+        from headroom.transforms.diff_compressor import (
+            DiffCompressor,
+            DiffCompressorConfig,
+        )
+
+        compressor = DiffCompressor(DiffCompressorConfig(enable_ccr=False, min_lines_for_ccr=10))
+        diff_lines = []
+        for i in range(30):
+            diff_lines.append(f"diff --git a/src/file{i}.py b/src/file{i}.py")
+            diff_lines.append(f"--- a/src/file{i}.py")
+            diff_lines.append(f"+++ b/src/file{i}.py")
+            for line in range(1, 6):
+                diff_lines.append(f"+added line {line} in file {i}")
+                diff_lines.append(f"-removed line {line} in file {i}")
+        content = "\n".join(diff_lines)
+        result = compressor.compress(content)
+        assert "<<ccr:" not in result.compressed, (
+            f"DiffCompressor emitted marker when enable_ccr=False: {result.compressed[:300]!r}"
+        )
+
+    def test_code_compressor_suppresses_markers_with_enable_ccr_false(self):
+        """CodeAwareCompressor with enable_ccr=False must not emit <<ccr:
+        markers when tree-sitter is available (#1022 coverage gap)."""
+        from headroom.transforms.code_compressor import (
+            CodeAwareCompressor,
+            CodeCompressorConfig,
+            _check_tree_sitter_available,
+        )
+
+        if not _check_tree_sitter_available():
+            pytest.skip("tree-sitter not available in this environment")
+
+        # Code that would compress with tree-sitter (enough to trigger CCR)
+        func_template = (
+            "def func_{i}(x: int) -> int:\n"
+            '    """Docstring for func_{i}."""\n'
+            "    # Line {j}\n"
+            "    result = x + {j}\n"
+            "    result *= 2\n"
+            "    return result\n"
+        )
+        content = "\n".join(func_template.format(i=i, j=j) for i in range(30) for j in range(1, 6))
+
+        compressor = CodeAwareCompressor(
+            CodeCompressorConfig(enable_ccr=False, min_tokens_for_compression=1)
+        )
+        result = compressor.compress(content)
+        assert "<<ccr:" not in result.compressed, (
+            f"CodeAwareCompressor emitted marker when enable_ccr=False: {result.compressed[:300]!r}"
+        )
+
+
 class TestArgparseBackendValidation:
     """Test that the argparse path (python -m headroom.proxy.server) accepts litellm-* backends."""
 
