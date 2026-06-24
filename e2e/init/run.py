@@ -43,12 +43,30 @@ from e2e._lib import (  # noqa: E402
     run_cases,
 )
 from headroom.cli import init as init_cli  # noqa: E402
+from headroom.install.runtime import resolve_headroom_command  # noqa: E402
 
 # ----- helpers reused across cases --------------------------------------------
 
 # Docker image builds the workspace at /workspace; the marketplace source
 # falls back to that repo checkout when a local marketplace manifest is found.
 REPO_ROOT_IN_CONTAINER = Path("/workspace")
+
+
+def _expected_headroom_mcp_call(proxy_url: str) -> list[str]:
+    # Keep the init e2e expectation aligned with the shared MCP runtime contract.
+    return [
+        "mcp",
+        "add",
+        "headroom",
+        "-s",
+        "user",
+        "-e",
+        f"HEADROOM_PROXY_URL={proxy_url}",
+        "--",
+        *resolve_headroom_command(),
+        "mcp",
+        "serve",
+    ]
 
 
 def _read_jsonl(path: Path) -> list[dict[str, object]]:
@@ -114,19 +132,7 @@ def _verify_claude_local(ctx: CaseContext) -> None:
     expected = [
         ["plugin", "marketplace", "add", str(REPO_ROOT_IN_CONTAINER)],
         ["plugin", "install", "headroom@headroom-marketplace", "--scope", "local"],
-        [
-            "mcp",
-            "add",
-            "headroom",
-            "-s",
-            "user",
-            "-e",
-            "HEADROOM_PROXY_URL=http://127.0.0.1:9011",
-            "--",
-            "headroom",
-            "mcp",
-            "serve",
-        ],
+        _expected_headroom_mcp_call("http://127.0.0.1:9011"),
     ]
     if claude_calls != expected:
         raise AssertionError(f"Unexpected Claude install commands: {claude_calls}")
