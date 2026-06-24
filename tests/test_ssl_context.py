@@ -300,8 +300,6 @@ class TestApplyGlobalTlsRelaxation:
             assert ctx.verify_flags & strict_flag == 0
             # Idempotent: second call doesn't re-wrap or error.
             assert apply_global_tls_relaxation() is True
-            assert getattr(
-                u3ssl.create_urllib3_context, "_headroom_strict_relaxed", False
-            )
+            assert getattr(u3ssl.create_urllib3_context, "_headroom_strict_relaxed", False)
         finally:
             u3ssl.create_urllib3_context = original
