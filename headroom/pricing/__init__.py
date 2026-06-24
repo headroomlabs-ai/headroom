@@ -13,6 +13,13 @@ from .anthropic_prices import (
 from .anthropic_prices import (
     LAST_UPDATED as ANTHROPIC_LAST_UPDATED,
 )
+from .deepseek_prices import (
+    DEEPSEEK_PRICES,
+    get_deepseek_registry,
+)
+from .deepseek_prices import (
+    LAST_UPDATED as DEEPSEEK_LAST_UPDATED,
+)
 from .litellm_pricing import (
     LiteLLMModelPricing,
     estimate_cost,
@@ -48,4 +55,8 @@ __all__ = [
     "ANTHROPIC_LAST_UPDATED",
     "ANTHROPIC_PRICES",
     "get_anthropic_registry",
+    # DeepSeek
+    "DEEPSEEK_LAST_UPDATED",
+    "DEEPSEEK_PRICES",
+    "get_deepseek_registry",
 ]

@@ -187,6 +187,13 @@ class SmartCrusherConfig:
     # and KV experiments — KV repeats field names per row, so it clears
     # the gate less often than CSV.
     lossless_min_savings_ratio: float = 0.15
+    # Strict lossless mode. When True, lossless tabular compaction still
+    # applies, but any path that would otherwise emit a CCR marker — the
+    # lossy row-drop sentinel AND opaque-blob offload — leaves the content
+    # uncompacted instead. The output is always marker-free and fully
+    # byte-recoverable: rows are never dropped and opaque cells render
+    # inline. Default False (markers allowed). Mirrors the Rust default.
+    lossless_only: bool = False
 
     # Compaction heuristics (mirror Rust CompactConfig; see
     # crates/headroom-core/src/transforms/smart_crusher/compaction/compactor.rs).
@@ -227,6 +234,7 @@ class SmartCrusher(Transform):
         with_compaction: bool = True,
         observer: Any = None,
         compaction_format: str | None = None,
+        lossless_only: bool | None = None,
     ):
         # Hard import — no Python fallback. If the wheel is missing the
         # caller must build it (scripts/build_rust_extension.sh) or
@@ -242,6 +250,16 @@ class SmartCrusher(Transform):
         cfg = config or SmartCrusherConfig()
         self.config = cfg
         self._with_compaction = with_compaction
+        # Strict lossless mode. An explicit `lossless_only=` kwarg wins
+        # over the config field, so callers can flip it without rebuilding
+        # a whole config. `crush(..., lossless_only=...)` overrides again
+        # per call. getattr fallback: callers may pass the SDK-side
+        # `headroom.config.SmartCrusherConfig`, which also carries it.
+        self._lossless_only = (
+            bool(getattr(cfg, "lossless_only", False))
+            if lossless_only is None
+            else bool(lossless_only)
+        )
         # `observer`: see `headroom.transforms.observability`. The
         # legacy proxy pipeline uses SmartCrusher.apply() directly
         # (no ContentRouter); without an observer here, those
@@ -315,39 +333,46 @@ class SmartCrusher(Transform):
         # Build the Rust crusher with every field from the Python
         # config, plus the relevance_threshold default (0.3) — the
         # Python dataclass doesn't carry that field; it lives on
-        # `RelevanceScorerConfig` instead.
-        rust_cfg = _RustSmartCrusherConfig(
-            enabled=cfg.enabled,
-            min_items_to_analyze=cfg.min_items_to_analyze,
-            min_tokens_to_crush=cfg.min_tokens_to_crush,
-            variance_threshold=cfg.variance_threshold,
-            uniqueness_threshold=cfg.uniqueness_threshold,
-            similarity_threshold=cfg.similarity_threshold,
-            max_items_after_crush=cfg.max_items_after_crush,
-            preserve_change_points=cfg.preserve_change_points,
-            factor_out_constants=cfg.factor_out_constants,
-            include_summaries=cfg.include_summaries,
-            use_feedback_hints=cfg.use_feedback_hints,
-            toin_confidence_threshold=cfg.toin_confidence_threshold,
-            dedup_identical_items=cfg.dedup_identical_items,
-            first_fraction=cfg.first_fraction,
-            last_fraction=cfg.last_fraction,
-            relevance_threshold=0.3,
-            enable_ccr_marker=(
+        # `RelevanceScorerConfig` instead. Kept as a kwargs dict so the
+        # per-call `crush(..., lossless_only=...)` override can rebuild an
+        # alternate crusher with just that one field flipped.
+        self._RustSmartCrusher = _RustSmartCrusher
+        self._RustSmartCrusherConfig = _RustSmartCrusherConfig
+        self._rust_cfg_kwargs = {
+            "enabled": cfg.enabled,
+            "min_items_to_analyze": cfg.min_items_to_analyze,
+            "min_tokens_to_crush": cfg.min_tokens_to_crush,
+            "variance_threshold": cfg.variance_threshold,
+            "uniqueness_threshold": cfg.uniqueness_threshold,
+            "similarity_threshold": cfg.similarity_threshold,
+            "max_items_after_crush": cfg.max_items_after_crush,
+            "preserve_change_points": cfg.preserve_change_points,
+            "factor_out_constants": cfg.factor_out_constants,
+            "include_summaries": cfg.include_summaries,
+            "use_feedback_hints": cfg.use_feedback_hints,
+            "toin_confidence_threshold": cfg.toin_confidence_threshold,
+            "dedup_identical_items": cfg.dedup_identical_items,
+            "first_fraction": cfg.first_fraction,
+            "last_fraction": cfg.last_fraction,
+            "relevance_threshold": 0.3,
+            "enable_ccr_marker": (
                 self._ccr_config.enabled and self._ccr_config.inject_retrieval_marker
             ),
+            "lossless_only": self._lossless_only,
             # getattr fallbacks: callers may pass the structurally-similar
             # `headroom.config.SmartCrusherConfig` (MCP server, SDK) or a
             # pre-existing config object that predates these fields.
-            lossless_min_savings_ratio=getattr(cfg, "lossless_min_savings_ratio", 0.15),
-            compaction_core_field_fraction=getattr(cfg, "compaction_core_field_fraction", 0.8),
-            compaction_heterogeneous_core_ratio=getattr(
+            "lossless_min_savings_ratio": getattr(cfg, "lossless_min_savings_ratio", 0.15),
+            "compaction_core_field_fraction": getattr(cfg, "compaction_core_field_fraction", 0.8),
+            "compaction_heterogeneous_core_ratio": getattr(
                 cfg, "compaction_heterogeneous_core_ratio", 0.6
             ),
-            compaction_max_flatten_inner_keys=getattr(cfg, "compaction_max_flatten_inner_keys", 6),
-            compaction_min_buckets=getattr(cfg, "compaction_min_buckets", 2),
-            compaction_max_buckets=getattr(cfg, "compaction_max_buckets", 8),
-        )
+            "compaction_max_flatten_inner_keys": getattr(
+                cfg, "compaction_max_flatten_inner_keys", 6
+            ),
+            "compaction_min_buckets": getattr(cfg, "compaction_min_buckets", 2),
+            "compaction_max_buckets": getattr(cfg, "compaction_max_buckets", 8),
+        }
         # Default: lossless-first compaction (PR4). Lossless wins for
         # cleanly tabular input where it saves ≥ 30% bytes; otherwise
         # falls through to the lossy path with CCR-Dropped retrieval
@@ -373,24 +398,59 @@ class SmartCrusher(Transform):
                 f"expected one of: {', '.join(_SUPPORTED_COMPACTION_FORMATS)}"
             )
         self._compaction_format = resolved_format if with_compaction else None
-        if not with_compaction:
-            self._rust = _RustSmartCrusher.without_compaction(rust_cfg)
-        elif resolved_format == "csv-schema":
-            # Keep the `new()` constructor for the default path so its
-            # byte-parity coverage stays on the exact production
-            # codepath.
-            self._rust = _RustSmartCrusher(rust_cfg)
-        else:
-            self._rust = _RustSmartCrusher.with_compaction_format(rust_cfg, resolved_format)
+        self._resolved_compaction_format = resolved_format
+        # Cache of Rust crushers keyed by lossless_only, so a per-call
+        # override builds the alternate at most once.
+        self._rust_by_lossless_only: dict[bool, Any] = {}
+        self._rust = self._build_rust(self._lossless_only)
 
-    def crush(self, content: str, query: str = "", bias: float = 1.0) -> CrushResult:
+    def _build_rust(self, lossless_only: bool) -> Any:
+        """Build (and cache) the Rust crusher for a `lossless_only` value."""
+        cached = self._rust_by_lossless_only.get(lossless_only)
+        if cached is not None:
+            return cached
+        kwargs = dict(self._rust_cfg_kwargs)
+        kwargs["lossless_only"] = lossless_only
+        rust_cfg = self._RustSmartCrusherConfig(**kwargs)
+        if not self._with_compaction:
+            rust = self._RustSmartCrusher.without_compaction(rust_cfg)
+        elif self._resolved_compaction_format == "csv-schema":
+            # Keep the `new()` constructor for the default path so its
+            # byte-parity coverage stays on the exact production codepath.
+            rust = self._RustSmartCrusher(rust_cfg)
+        else:
+            rust = self._RustSmartCrusher.with_compaction_format(
+                rust_cfg, self._resolved_compaction_format
+            )
+        self._rust_by_lossless_only[lossless_only] = rust
+        return rust
+
+    def crush(
+        self,
+        content: str,
+        query: str = "",
+        bias: float = 1.0,
+        lossless_only: bool | None = None,
+    ) -> CrushResult:
         """Crush a single JSON content string.
 
         Mirrors the retired Python method. Returns a `CrushResult`
         dataclass so call sites that destructure with `asdict()` keep
         working.
+
+        `lossless_only` overrides the configured strict-lossless mode for
+        this call only. When `True`, the output is guaranteed marker-free
+        and byte-recoverable: lossless tabular compaction still applies,
+        but any path that would need a CCR marker (row-drop or
+        opaque-blob offload) leaves the content uncompacted instead.
+        `None` (default) uses the instance's configured value.
         """
-        r = self._rust.crush(content, query, bias)
+        rust = (
+            self._rust
+            if lossless_only is None or bool(lossless_only) == self._lossless_only
+            else self._build_rust(bool(lossless_only))
+        )
+        r = rust.crush(content, query, bias)
         # Re-attach the TOIN learning loop. The retired Python class
         # recorded compressions into TOIN inline; the Rust port doesn't
         # know about TOIN, and `ContentRouter._record_to_toin` skips
@@ -1017,6 +1077,7 @@ def smart_crush_tool_output(
     config: SmartCrusherConfig | None = None,
     ccr_config: CCRConfig | None = None,
     with_compaction: bool = True,
+    lossless_only: bool | None = None,
 ) -> tuple[str, bool, str]:
     """Compress a single tool output. Returns `(crushed, was_modified, info)`.
 
@@ -1024,6 +1085,14 @@ def smart_crush_tool_output(
     Defaults to the PR4 lossless-first behavior; pass
     `with_compaction=False` to exercise the legacy lossy-only path
     (still useful for retention-property tests).
+
+    `lossless_only=True` forces strict lossless mode: the output is
+    marker-free and byte-recoverable (no row drops, opaque blobs inline).
     """
-    crusher = SmartCrusher(config=config, ccr_config=ccr_config, with_compaction=with_compaction)
+    crusher = SmartCrusher(
+        config=config,
+        ccr_config=ccr_config,
+        with_compaction=with_compaction,
+        lossless_only=lossless_only,
+    )
     return crusher._smart_crush_content(content)

@@ -5,6 +5,10 @@ import time
 import pytest
 
 from headroom.cache.prefix_tracker import (
+    MISS_COLD_START,
+    MISS_PREFIX_CHANGE,
+    MISS_TTL_EXPIRY,
+    MISS_UNKNOWN,
     FreezeStats,
     PrefixCacheTracker,
     PrefixFreezeConfig,
@@ -466,3 +470,103 @@ class TestMultiTurnScenario:
 
         # After a bust with 0 total, freeze should reset
         assert tracker.get_frozen_message_count() == 0
+
+
+class TestClassifyCacheMiss:
+    """Cache-miss attribution (#1313): TTL lapse vs prefix change vs unknown."""
+
+    BASE = [
+        {"role": "system", "content": "x" * 4000},
+        {"role": "user", "content": "hello"},
+    ]
+    CHANGED = [
+        {"role": "system", "content": "DIFFERENT" * 400},
+        {"role": "user", "content": "hello"},
+    ]
+
+    def _warm(self, tracker, messages, read=500, write=500):
+        """Simulate a turn that left `messages` cached."""
+        tracker.update_from_response(
+            cache_read_tokens=read, cache_write_tokens=write, messages=messages
+        )
+
+    def test_cold_start_is_not_a_miss(self):
+        """No prior cached prefix → cold start, is_miss False."""
+        tracker = PrefixCacheTracker("anthropic")
+        result = tracker.classify_cache_miss(0, self.BASE)
+        assert result.is_miss is False
+        assert result.reason == MISS_COLD_START
+
+    def test_cache_read_is_a_hit(self):
+        """A non-zero read on an expected-cached prefix is a hit, not a miss."""
+        tracker = PrefixCacheTracker("anthropic")
+        self._warm(tracker, self.BASE)
+        result = tracker.classify_cache_miss(800, self.BASE)
+        assert result.is_miss is False
+        assert result.reason == "hit"
+
+    def test_ttl_expiry_when_idle_exceeds_ttl(self):
+        """Idle longer than the cache TTL → ttl_expiry."""
+        tracker = PrefixCacheTracker("anthropic")
+        self._warm(tracker, self.BASE)
+        result = tracker.classify_cache_miss(0, self.BASE, idle_seconds=400)
+        assert result.is_miss is True
+        assert result.reason == MISS_TTL_EXPIRY
+        assert result.ttl_exceeded is True
+        assert result.cache_ttl_seconds == 300
+
+    def test_ttl_wins_tie_when_prefix_also_changed(self):
+        """When idle past TTL AND prefix changed, TTL expiry wins (docstring)."""
+        tracker = PrefixCacheTracker("anthropic")
+        self._warm(tracker, self.BASE)
+        result = tracker.classify_cache_miss(0, self.CHANGED, idle_seconds=400)
+        assert result.reason == MISS_TTL_EXPIRY
+        assert result.ttl_exceeded is True
+        assert result.prefix_changed is True
+
+    def test_prefix_change_within_ttl(self):
+        """Within TTL but the forwarded prefix differs → prefix_change."""
+        tracker = PrefixCacheTracker("anthropic")
+        self._warm(tracker, self.BASE)
+        result = tracker.classify_cache_miss(0, self.CHANGED, idle_seconds=10)
+        assert result.is_miss is True
+        assert result.reason == MISS_PREFIX_CHANGE
+        assert result.prefix_changed is True
+        assert result.ttl_exceeded is False
+
+    def test_unknown_when_stable_prefix_within_ttl(self):
+        """Within TTL, prefix unchanged, but still no read → unknown."""
+        tracker = PrefixCacheTracker("anthropic")
+        self._warm(tracker, self.BASE)
+        result = tracker.classify_cache_miss(0, self.BASE, idle_seconds=10)
+        assert result.is_miss is True
+        assert result.reason == MISS_UNKNOWN
+
+    def test_growing_prefix_is_stable(self):
+        """A turn that appends to last turn's forwarded prefix is not a change."""
+        tracker = PrefixCacheTracker("anthropic")
+        self._warm(tracker, self.BASE)
+        grown = self.BASE + [{"role": "assistant", "content": "hi back"}]
+        result = tracker.classify_cache_miss(0, grown, idle_seconds=10)
+        # Prefix preserved (only appended) → not a prefix_change.
+        assert result.prefix_changed is False
+        assert result.reason == MISS_UNKNOWN
+
+    def test_one_hour_ttl_override(self):
+        """cache_ttl_seconds override widens the TTL window (1h breakpoint)."""
+        tracker = PrefixCacheTracker("anthropic", PrefixFreezeConfig(cache_ttl_seconds=3600))
+        self._warm(tracker, self.BASE)
+        # 400s idle is past the 300s default but within 3600s → not TTL expiry.
+        result = tracker.classify_cache_miss(0, self.BASE, idle_seconds=400)
+        assert result.cache_ttl_seconds == 3600
+        assert result.ttl_exceeded is False
+        assert result.reason == MISS_UNKNOWN
+
+    def test_resolved_ttl_falls_back_to_provider_default(self):
+        assert PrefixCacheTracker("anthropic").resolved_cache_ttl_seconds() == 300
+        assert (
+            PrefixCacheTracker(
+                "anthropic", PrefixFreezeConfig(cache_ttl_seconds=3600)
+            ).resolved_cache_ttl_seconds()
+            == 3600
+        )

@@ -80,6 +80,13 @@ pub struct SmartCrusherConfig {
     /// still emit always; they have no Python equivalent and no
     /// production caller has asked for them to be suppressed.
     pub enable_ccr_marker: bool,
+    /// Strict lossless mode. When `true`, lossless tabular compaction
+    /// still applies, but any path that would otherwise need a CCR
+    /// marker — the lossy row-drop sentinel AND opaque-blob offload —
+    /// leaves the content uncompacted instead. The result is always
+    /// marker-free and byte-recoverable: rows are never dropped and
+    /// opaque cells render inline. Default `false` (markers allowed).
+    pub lossless_only: bool,
     /// Compaction heuristic: a field is "core" if it appears in at
     /// least this fraction of rows. Mirrors
     /// `CompactConfig::core_field_fraction`. Default 0.8.
@@ -101,6 +108,22 @@ pub struct SmartCrusherConfig {
     /// means the discriminator is too granular (e.g. an ID column).
     /// Mirrors `CompactConfig::max_buckets`. Default 8.
     pub compaction_max_buckets: usize,
+}
+
+impl SmartCrusherConfig {
+    /// Whether opaque blobs should be offloaded to a `<<ccr:…>>` marker.
+    ///
+    /// Single source of truth for the opaque-marker gate. Markers are
+    /// emitted only when CCR markers are enabled AND strict lossless
+    /// mode is off — `lossless_only` forbids any offload because the
+    /// marker would break the marker-free / byte-recoverable guarantee.
+    /// Both compaction-stage construction (`new` /
+    /// `with_compaction_format`) and the top-level `process_string` path
+    /// derive `ClassifyConfig::emit_opaque_markers` from this method so
+    /// the three call sites can never drift apart.
+    pub fn opaque_markers_enabled(&self) -> bool {
+        self.enable_ccr_marker && !self.lossless_only
+    }
 }
 
 impl Default for SmartCrusherConfig {
@@ -127,6 +150,7 @@ impl Default for SmartCrusherConfig {
             relevance_threshold: 0.3,
             lossless_min_savings_ratio: 0.15,
             enable_ccr_marker: true,
+            lossless_only: false,
             compaction_core_field_fraction: 0.8,
             compaction_heterogeneous_core_ratio: 0.6,
             compaction_max_flatten_inner_keys: 6,
@@ -164,6 +188,7 @@ mod tests {
         assert_eq!(c.relevance_threshold, 0.3);
         assert_eq!(c.lossless_min_savings_ratio, 0.15);
         assert!(c.enable_ccr_marker);
+        assert!(!c.lossless_only);
         assert_eq!(c.compaction_core_field_fraction, 0.8);
         assert_eq!(c.compaction_heterogeneous_core_ratio, 0.6);
         assert_eq!(c.compaction_max_flatten_inner_keys, 6);
