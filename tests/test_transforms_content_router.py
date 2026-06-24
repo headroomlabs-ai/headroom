@@ -354,7 +354,9 @@ def test_force_kompress_apply_uses_lightweight_detection(
         router,
         "compress",
         lambda content, context="", bias=1.0: RouterCompressionResult(
-            compressed="compressed",
+            # CCR marker -> the original was stored and is retrievable, so the
+            # #1307 reversibility gate accepts this lossy KOMPRESS tool result.
+            compressed="compressed <<ccr:tool>>",
             original=content,
             strategy_used=CompressionStrategy.KOMPRESS,
             routing_log=[
@@ -376,7 +378,7 @@ def test_force_kompress_apply_uses_lightweight_detection(
         protect_recent=2,
     )
 
-    assert result.messages[0]["content"] == "compressed"
+    assert result.messages[0]["content"] == "compressed <<ccr:tool>>"
 
 
 def test_force_kompress_apply_lightweight_detection_protects_recent_code(
