@@ -358,6 +358,31 @@ def test_anthropic_memory_continuation_uses_buffered_timeout() -> None:
     assert all(isinstance(timeout, httpx.Timeout) for timeout in captured_timeouts)
 
 
+def test_retry_request_without_override_uses_client_default_timeout():
+    config = _make_config()
+    app = create_app(config)
+    with TestClient(app) as client:
+        proxy = client.app.state.proxy
+        captured: list[dict[str, object]] = []
+
+        async def _spy_post(*args, **kwargs):  # noqa: ANN002, ANN003
+            captured.append(kwargs)
+            return httpx.Response(200, json={"ok": True})
+
+        proxy.http_client.post = _spy_post
+
+        import asyncio
+
+        asyncio.get_event_loop().run_until_complete(
+            proxy._retry_request("POST", "http://test/v1/chat", {}, {"model": "m"})
+        )
+
+    assert len(captured) == 1
+    assert "timeout" not in captured[0], (
+        "_retry_request without an override must not pass timeout=None to httpx"
+    )
+
+
 def test_generic_proxy_timeout_defaults_stay_unchanged():
     app = create_app(ProxyConfig())
     with TestClient(app) as client:

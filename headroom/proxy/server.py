@@ -1625,16 +1625,20 @@ class HeadroomProxy(
             source=source,
         )
 
+        post_kwargs: dict = {"content": outbound_bytes, "headers": outbound_headers}
+        if timeout is not None:
+            post_kwargs["timeout"] = timeout
+
         for attempt in range(self.config.retry_max_attempts):
             try:
                 if stream:
                     # For streaming, we return early - retry happens at higher level
                     return await self.http_client.post(  # type: ignore[union-attr]
-                        url, content=outbound_bytes, headers=outbound_headers, timeout=timeout
+                        url, **post_kwargs
                     )
                 else:
                     response = await self.http_client.post(  # type: ignore[union-attr]
-                        url, content=outbound_bytes, headers=outbound_headers, timeout=timeout
+                        url, **post_kwargs
                     )
 
                     # Don't retry client errors (4xx)
