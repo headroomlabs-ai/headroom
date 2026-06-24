@@ -94,6 +94,46 @@ def test_build_runtime_command_for_docker_matches_wrapper_parity(
     assert "OPENAI_API_KEY" in joined
 
 
+def test_build_runtime_command_for_docker_does_not_duplicate_entrypoint(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The image ENTRYPOINT is already ``["headroom", "proxy"]`` (Dockerfile),
+    so the args appended after the image name must NOT re-add ``headroom proxy``
+    or Docker runs ``headroom proxy headroom proxy ...`` and Click aborts with
+    "Got unexpected extra arguments (headroom proxy)" (issue #833)."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    manifest = DeploymentManifest(
+        profile="default",
+        preset="persistent-docker",
+        runtime_kind="docker",
+        supervisor_kind="none",
+        scope="user",
+        provider_mode="manual",
+        targets=["claude"],
+        port=8787,
+        host="127.0.0.1",
+        backend="anthropic",
+        image="ghcr.io/chopratejas/headroom:latest",
+        base_env={"HEADROOM_PORT": "8787"},
+        proxy_args=["--host", "127.0.0.1", "--port", "8787", "--backend", "anthropic"],
+    )
+
+    command = build_runtime_command(manifest)
+
+    # Everything after the image name is what Docker appends to the ENTRYPOINT.
+    image_idx = command.index(manifest.image)
+    container_args = command[image_idx + 1 :]
+    assert "headroom" not in container_args, (
+        f"container args re-add the ENTRYPOINT — got {container_args}"
+    )
+    assert "proxy" not in container_args, (
+        f"container args re-add the ENTRYPOINT — got {container_args}"
+    )
+    # The container must still bind on all interfaces and keep the real flags.
+    assert container_args[:2] == ["--host", "0.0.0.0"]
+    assert container_args[2:] == ["--port", "8787", "--backend", "anthropic"]
+
+
 def test_resolve_headroom_command_prefers_headroom_binary(monkeypatch) -> None:
     monkeypatch.setattr(
         "shutil.which", lambda name: "/usr/bin/headroom" if name == "headroom" else None

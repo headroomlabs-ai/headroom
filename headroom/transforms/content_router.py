@@ -1848,10 +1848,18 @@ class ContentRouter(Transform):
         """Get CodeAwareCompressor (lazy load)."""
         if self._code_compressor is None:
             try:
-                from .code_compressor import CodeAwareCompressor, _check_tree_sitter_available
+                from .code_compressor import (
+                    CodeAwareCompressor,
+                    CodeCompressorConfig,
+                    _check_tree_sitter_available,
+                )
 
                 if _check_tree_sitter_available():
-                    self._code_compressor = CodeAwareCompressor()
+                    self._code_compressor = CodeAwareCompressor(
+                        CodeCompressorConfig(
+                            enable_ccr=self.config.ccr_inject_marker,
+                        )
+                    )
                 else:
                     logger.debug("tree-sitter not available")
             except ImportError:
@@ -1895,7 +1903,10 @@ class ContentRouter(Transform):
                 from .search_compressor import SearchCompressor, SearchCompressorConfig
 
                 self._search_compressor = SearchCompressor(
-                    SearchCompressorConfig(group_by_file=self.config.search_group_by_file)
+                    SearchCompressorConfig(
+                        group_by_file=self.config.search_group_by_file,
+                        enable_ccr=self.config.ccr_inject_marker,
+                    )
                 )
             except ImportError:
                 logger.debug("SearchCompressor not available")
@@ -1905,9 +1916,11 @@ class ContentRouter(Transform):
         """Get LogCompressor (lazy load)."""
         if self._log_compressor is None:
             try:
-                from .log_compressor import LogCompressor
+                from .log_compressor import LogCompressor, LogCompressorConfig
 
-                self._log_compressor = LogCompressor()
+                self._log_compressor = LogCompressor(
+                    LogCompressorConfig(enable_ccr=self.config.ccr_inject_marker)
+                )
             except ImportError:
                 logger.debug("LogCompressor not available")
         return self._log_compressor
@@ -1944,9 +1957,11 @@ class ContentRouter(Transform):
         retired in Stage 3b. The wheel (`headroom._core`) is a hard import.
         """
         if self._diff_compressor is None:
-            from .diff_compressor import DiffCompressor
+            from .diff_compressor import DiffCompressor, DiffCompressorConfig
 
-            self._diff_compressor = DiffCompressor()
+            self._diff_compressor = DiffCompressor(
+                DiffCompressorConfig(enable_ccr=self.config.ccr_inject_marker)
+            )
         return self._diff_compressor
 
     def _get_html_extractor(self) -> Any:
