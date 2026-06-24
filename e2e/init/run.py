@@ -52,9 +52,10 @@ from headroom.install.runtime import resolve_headroom_command  # noqa: E402
 REPO_ROOT_IN_CONTAINER = Path("/workspace")
 
 
-def _expected_headroom_mcp_call(proxy_url: str) -> list[str]:
-    # Keep the init e2e expectation aligned with the shared MCP runtime contract.
-    return [
+def _expected_headroom_mcp_calls(proxy_url: str) -> list[list[str]]:
+    # The harness restores PATH before assertions, but `headroom init` ran with a
+    # scrubbed PATH where the console-script entrypoint may be unavailable.
+    prefix = [
         "mcp",
         "add",
         "headroom",
@@ -63,10 +64,16 @@ def _expected_headroom_mcp_call(proxy_url: str) -> list[str]:
         "-e",
         f"HEADROOM_PROXY_URL={proxy_url}",
         "--",
-        *resolve_headroom_command(),
-        "mcp",
-        "serve",
     ]
+    variants = [
+        [*prefix, *resolve_headroom_command(), "mcp", "serve"],
+        [*prefix, sys.executable, "-m", "headroom.cli", "mcp", "serve"],
+    ]
+    deduped: list[list[str]] = []
+    for variant in variants:
+        if variant not in deduped:
+            deduped.append(variant)
+    return deduped
 
 
 def _read_jsonl(path: Path) -> list[dict[str, object]]:
@@ -129,12 +136,16 @@ def _verify_claude_local(ctx: CaseContext) -> None:
     # being dead pointers for users who never ran `headroom mcp install`).
     # The `-e HEADROOM_PROXY_URL=…` arg is only emitted when the proxy
     # port differs from the 8787 default; this case uses --port 9011.
-    expected = [
+    expected_prefix = [
         ["plugin", "marketplace", "add", str(REPO_ROOT_IN_CONTAINER)],
         ["plugin", "install", "headroom@headroom-marketplace", "--scope", "local"],
-        _expected_headroom_mcp_call("http://127.0.0.1:9011"),
     ]
-    if claude_calls != expected:
+    expected_mcp_calls = _expected_headroom_mcp_calls("http://127.0.0.1:9011")
+    if (
+        len(claude_calls) != 3
+        or claude_calls[:2] != expected_prefix
+        or claude_calls[2] not in expected_mcp_calls
+    ):
         raise AssertionError(f"Unexpected Claude install commands: {claude_calls}")
 
 
