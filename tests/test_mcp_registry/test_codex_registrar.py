@@ -9,6 +9,7 @@ import pytest
 
 from headroom.mcp_registry.base import RegisterStatus, ServerSpec
 from headroom.mcp_registry.codex import CodexRegistrar
+from headroom.mcp_registry.install import build_headroom_spec
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -31,6 +32,14 @@ def _spec(env: dict[str, str] | None = None) -> ServerSpec:
         args=_RESOLVED_ARGS,
         env=env or {},
     )
+
+
+def _install_spec(monkeypatch: pytest.MonkeyPatch) -> ServerSpec:
+    monkeypatch.setattr(
+        "headroom.mcp_registry.install.resolve_headroom_command",
+        lambda: list(_RESOLVED_COMMAND),
+    )
+    return build_headroom_spec()
 
 
 def _serena_spec() -> ServerSpec:
@@ -140,9 +149,11 @@ def test_get_server_robust_to_unparseable_toml(tmp_path: Path) -> None:
 # ----------------------------------------------------------------------
 
 
-def test_register_creates_config_when_missing(tmp_path: Path) -> None:
+def test_register_creates_config_when_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     reg = _make_registrar(tmp_path)
-    result = reg.register_server(_spec())
+    result = reg.register_server(_install_spec(monkeypatch))
     assert result.status == RegisterStatus.REGISTERED
     cfg = _config_path(tmp_path)
     assert cfg.exists()

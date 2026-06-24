@@ -11,6 +11,7 @@ import pytest
 
 from headroom.mcp_registry.base import RegisterStatus, ServerSpec
 from headroom.mcp_registry.claude import ClaudeRegistrar
+from headroom.mcp_registry.install import build_headroom_spec
 
 _RESOLVED_COMMAND = ("/usr/bin/python", "-m", "headroom.cli")
 _RESOLVED_ARGS = ("-m", "headroom.cli", "mcp", "serve")
@@ -32,6 +33,14 @@ def _spec() -> ServerSpec:
         args=("-m", "headroom.cli", "mcp", "serve"),
         env={},
     )
+
+
+def _install_spec(monkeypatch: pytest.MonkeyPatch) -> ServerSpec:
+    monkeypatch.setattr(
+        "headroom.mcp_registry.install.resolve_headroom_command",
+        lambda: list(_RESOLVED_COMMAND),
+    )
+    return build_headroom_spec()
 
 
 # ----------------------------------------------------------------------
@@ -141,11 +150,13 @@ def test_get_server_reads_claude_config_dir(
 # ----------------------------------------------------------------------
 
 
-def test_register_via_cli_calls_claude_mcp_add(tmp_path: Path) -> None:
+def test_register_via_cli_calls_claude_mcp_add(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     reg = _make_registrar(tmp_path, cli="/usr/local/bin/claude")
     fake_result = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
     with patch("subprocess.run", return_value=fake_result) as run_mock:
-        result = reg.register_server(_spec())
+        result = reg.register_server(_install_spec(monkeypatch))
     assert result.status == RegisterStatus.REGISTERED
     cmds = [call.args[0] for call in run_mock.call_args_list]
     add_cmd = next(c for c in cmds if "add" in c)
