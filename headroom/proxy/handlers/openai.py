@@ -703,19 +703,21 @@ class OpenAIHandlerMixin:
         input_data: Any,
         request_id: str,
     ) -> None:
-        if not self.traffic_learner:
+        traffic_learner = getattr(self, "traffic_learner", None)
+        if not traffic_learner:
             return
         try:
+            memory_handler = getattr(self, "memory_handler", None)
             if (
-                self.traffic_learner._backend is None
-                and self.memory_handler
-                and self.memory_handler.initialized
-                and self.memory_handler.backend
+                traffic_learner._backend is None
+                and memory_handler
+                and memory_handler.initialized
+                and memory_handler.backend
             ):
-                self.traffic_learner.set_backend(self.memory_handler.backend)
+                traffic_learner.set_backend(memory_handler.backend)
 
             for tool_result in _openai_responses_tool_results_for_learning(input_data)[-5:]:
-                await self.traffic_learner.on_tool_result(
+                await traffic_learner.on_tool_result(
                     tool_name=tool_result["tool_name"],
                     tool_input=tool_result["input"],
                     tool_output=tool_result["output"],
@@ -724,7 +726,7 @@ class OpenAIHandlerMixin:
 
             messages = _responses_input_to_waste_messages(instructions, input_data)
             if messages:
-                await self.traffic_learner.on_messages(messages)
+                await traffic_learner.on_messages(messages)
         except Exception as exc:
             logger.debug("[%s] Traffic learner (openai/responses): %s", request_id, exc)
 
