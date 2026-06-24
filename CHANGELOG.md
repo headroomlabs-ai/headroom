@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Fixed
+
+* **transforms/kompress:** skip Kompress (ML lossy) for `role="tool"` messages — fixes ground-truth corruption ([#1307](https://github.com/headroomlabs-ai/headroom/issues/1307)). `tool` role carries verbatim outputs from grep, ls, cat, find, etc.; applying Kompress's ML reconstruction to them fabricated plausible-but-wrong file paths, line numbers, and symbol names that agents acted on as fact. Kompress now applies only to `role="assistant"` messages. Tool outputs remain eligible for structurally-lossless passes (SmartCrusher, SearchCompressor, LogCompressor) that ContentRouter applies before Kompress in the pipeline. Anthropic-format tool results (`role="user"`, `content=[{type:"tool_result"}]`) were already safe — they are lists, not strings, so the existing `isinstance(content, str)` guard passed them through unchanged.
+
 ### Features
 
 * **wrap:** `headroom wrap claude --1m` preserves the 1M context window. Behind a custom `ANTHROPIC_BASE_URL` (the proxy) Claude Code drops the `context-1m` beta header and caps the window at 200k for entitled subscription users; the opt-in flag sets `ANTHROPIC_MODEL=<opus>[1m]` on the launched process so the 1M window activates through Headroom. A model already selected via `ANTHROPIC_MODEL` is preserved (only the `[1m]` suffix is appended) ([#1158](https://github.com/chopratejas/headroom/issues/1158)).

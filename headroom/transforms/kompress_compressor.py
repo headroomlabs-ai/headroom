@@ -1370,9 +1370,20 @@ class KompressCompressor(Transform):
                 transformed.append(message)
                 continue
 
-            # Compress tool outputs and long assistant messages
-            # Model decides how much — no hardcoded ratios
-            if role in ("tool", "assistant"):
+            # Kompress is ML-based and produces lossy reconstructions.
+            # It must NOT run on `tool` role messages: those carry ground-truth
+            # output from real tools (grep, ls, cat, find, …).  A lossy
+            # reconstruction can fabricate file paths, line numbers, or symbol
+            # names that the agent then acts on as fact — corrupting the session.
+            # (see: https://github.com/headroomlabs-ai/headroom/issues/1307)
+            #
+            # Tool outputs are still compressed by SmartCrusher / SearchCompressor
+            # / LogCompressor in ContentRouter (structurally lossless) before
+            # reaching this transform.  Anthropic-format tool results
+            # (role="user", content=[{type:"tool_result", …}]) are already safe:
+            # the `isinstance(content, str)` guard above passes them through
+            # unchanged because their content field is a list, not a string.
+            if role == "assistant":
                 result = self.compress(content)
                 if result.compression_ratio < 0.9:
                     transformed.append({**message, "content": result.compressed})
