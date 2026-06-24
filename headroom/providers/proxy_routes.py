@@ -733,6 +733,33 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         return await vertex_publisher_passthrough(request, publisher, "rawPredict")
 
     @app.post(
+        "/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:rawPredict"
+    )
+    async def vertex_raw_predict_no_version(
+        request: Request,
+        project: str,
+        location: str,
+        publisher: str,
+        model: str,
+    ):
+        # Claude Code omits the /v1 prefix when using ANTHROPIC_VERTEX_BASE_URL.
+        # Prepend it so the upstream Vertex URL is constructed correctly.
+        del project
+        request.scope["path"] = "/v1" + request.scope["path"]
+        if "raw_path" in request.scope:
+            request.scope["raw_path"] = b"/v1" + request.scope["raw_path"]
+        if hasattr(request, "_url"):
+            delattr(request, "_url")
+        if publisher == "anthropic":
+            return await proxy.handle_anthropic_messages(
+                request,
+                _vertex_target_for_location(proxy, location),
+                "vertex:anthropic",
+                model,
+            )
+        return await vertex_publisher_passthrough(request, publisher, "rawPredict")
+
+    @app.post(
         "/{api_version}/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:streamRawPredict"
     )
     async def vertex_stream_raw_predict(
@@ -744,6 +771,34 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         model: str,
     ):
         del api_version, project
+        if publisher == "anthropic":
+            return await proxy.handle_anthropic_messages(
+                request,
+                _vertex_target_for_location(proxy, location),
+                "vertex:anthropic",
+                model,
+                True,
+            )
+        return await vertex_publisher_passthrough(request, publisher, "streamRawPredict")
+
+    @app.post(
+        "/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:streamRawPredict"
+    )
+    async def vertex_stream_raw_predict_no_version(
+        request: Request,
+        project: str,
+        location: str,
+        publisher: str,
+        model: str,
+    ):
+        # Claude Code omits the /v1 prefix when using ANTHROPIC_VERTEX_BASE_URL.
+        # Prepend it so the upstream Vertex URL is constructed correctly.
+        del project
+        request.scope["path"] = "/v1" + request.scope["path"]
+        if "raw_path" in request.scope:
+            request.scope["raw_path"] = b"/v1" + request.scope["raw_path"]
+        if hasattr(request, "_url"):
+            delattr(request, "_url")
         if publisher == "anthropic":
             return await proxy.handle_anthropic_messages(
                 request,
