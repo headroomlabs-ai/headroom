@@ -330,9 +330,7 @@ class HeadroomAgnoModel(Model):  # type: ignore[misc]
                 # (issue #1312). Normalize to OpenAI-format dicts here so
                 # every downstream consumer sees a uniform shape.
                 if hasattr(msg, "tool_calls") and msg.tool_calls:
-                    entry["tool_calls"] = [
-                        _coerce_tool_call_to_dict(tc) for tc in msg.tool_calls
-                    ]
+                    entry["tool_calls"] = [_coerce_tool_call_to_dict(tc) for tc in msg.tool_calls]
                 # Handle tool call ID for tool responses
                 if hasattr(msg, "tool_call_id") and msg.tool_call_id:
                     entry["tool_call_id"] = msg.tool_call_id

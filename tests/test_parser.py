@@ -25,7 +25,6 @@ from headroom.parser import (
     parse_messages,
 )
 
-
 # --- Streaming SDK tool-call objects (issue #1312) ---
 
 
@@ -49,6 +48,7 @@ class _FakeChoiceDeltaToolCall:
         self.index = index
         self.type = "function"
         self.function = _FakeDeltaToolCallFunction(name, arguments)
+
 
 # --- Fixtures ---
 
