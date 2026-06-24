@@ -59,6 +59,13 @@ def test_protect_tool_results_merges_into_exclude_set() -> None:
     assert "Read" in exclude, "Read (built-in default) must still be in exclude_tools"
 
 
+def test_protect_tool_results_disables_age_decay_in_token_mode() -> None:
+    """In token mode, protect_tool_results forces protect_recent_reads_fraction to 0.0
+    so protected tools are never compressed by age-decay."""
+    proxy = _build(protect_tool_results=frozenset({"Bash", "bash"}), mode="token")
+    assert _router(proxy).config.protect_recent_reads_fraction == 0.0
+
+
 # ---------------------------------------------------------------------------
 # Test 2: CSV env var / CLI string parsing
 # ---------------------------------------------------------------------------
