@@ -2680,6 +2680,13 @@ class ContentRouter(Transform):
                 # Look up tool-specific compression bias for OpenAI tool messages
                 tool_name = tool_name_map.get(tool_call_id, "")
                 bias = self._get_tool_bias(tool_name) if tool_name else 1.0
+                # "none" profile: bias=inf sentinel → skip compression for this tool
+                if math.isinf(bias):
+                    result_slots[i] = message
+                    transforms_applied.append("router:protected:tool_profile_none")
+                    route_counts.setdefault("tool_profile_none", 0)
+                    route_counts["tool_profile_none"] += 1
+                    continue
 
             # Protection 1: Never compress user messages (unless overridden)
             if skip_user and role == "user":
@@ -3104,6 +3111,14 @@ class ContentRouter(Transform):
                 # Look up tool-specific compression bias
                 tool_name = (tool_name_map or {}).get(tool_use_id, "")
                 bias = self._get_tool_bias(tool_name) if tool_name else 1.0
+                # "none" profile: bias=inf sentinel → skip compression for this tool
+                if math.isinf(bias):
+                    new_blocks.append(block)
+                    transforms_applied.append("router:protected:tool_profile_none")
+                    if route_counts is not None:
+                        route_counts.setdefault("tool_profile_none", 0)
+                        route_counts["tool_profile_none"] += 1
+                    continue
 
                 tool_content = block.get("content", "")
 
