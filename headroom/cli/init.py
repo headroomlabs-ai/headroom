@@ -42,6 +42,7 @@ from headroom.install.state import load_manifest, save_manifest
 from headroom.install.supervisors import start_supervisor
 from headroom.providers.claude import TOOL_SEARCH_DEFAULT, TOOL_SEARCH_ENV
 from headroom.providers.codex.install import codex_uses_chatgpt_auth
+from headroom.providers.codex.threads import retag_to_headroom
 
 from .main import main
 
@@ -333,6 +334,12 @@ def _ensure_codex_provider(path: Path, port: int) -> None:
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
+    # Codex filters its history menu by the active model_provider, so existing
+    # native threads vanish once we switch to "headroom". Retag them to match the
+    # active provider so the history stays whole (#961), mirroring the install
+    # (providers.codex.install) and wrap (cli.wrap) paths. The revert direction is
+    # handled by `headroom unwrap codex`.
+    retag_to_headroom(path.parent)
 
 
 def _codex_feature_block() -> str:

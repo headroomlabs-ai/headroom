@@ -30,6 +30,18 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Waste-signal detection re-parses the *original* messages for telemetry only
+# (it never changes the compression result). On very large transcripts that
+# extra parse can take tens of seconds and blow the Anthropic compression
+# timeout, making the proxy fail open and discard an already-computed
+# compression (#296). Skip the diagnostic above this size to keep the result
+# on the critical path.
+MAX_WASTE_SIGNAL_DETECTION_TOKENS = 100_000
+
+# A token saving below this is treated as noise — waste-signal detection only
+# runs when compression saved more than this many tokens.
+_MIN_TOKENS_SAVED_FOR_WASTE_SIGNALS = 100
+
 _N = TypeVar("_N", int, float)
 
 
@@ -220,6 +232,9 @@ class TransformPipeline:
         """
         record_metrics = kwargs.pop("record_metrics", True)
         waste_messages = kwargs.pop("waste_messages", None)
+        waste_signal_token_limit = int(
+            kwargs.pop("waste_signal_token_limit", MAX_WASTE_SIGNAL_DETECTION_TOKENS)
+        )
         tokenizer = self._get_tokenizer(model)
         provider_name = self._provider_name()
 
@@ -439,7 +454,21 @@ class TransformPipeline:
             # pass a richer waste_messages list that is parsed instead — it is
             # telemetry-only and never transformed.
             waste_signals: WasteSignals | None = None
-            if tokens_before > tokens_after and (tokens_before - tokens_after) > 100:
+            saved_enough = (
+                tokens_before > tokens_after
+                and (tokens_before - tokens_after) > _MIN_TOKENS_SAVED_FOR_WASTE_SIGNALS
+            )
+            if saved_enough and tokens_before > waste_signal_token_limit:
+                # Telemetry-only re-parse would risk the compression timeout on a
+                # request this large (#296); skip it and keep the result.
+                logger.debug(
+                    "%sSkipping waste-signal detection for %d-token request "
+                    "(limit=%d) to keep the compression result on the critical path",
+                    log_prefix,
+                    tokens_before,
+                    waste_signal_token_limit,
+                )
+            elif saved_enough:
                 try:
                     from ..parser import parse_messages
 

@@ -192,7 +192,7 @@ shows an **Output Tokens Saved** card next to input compression, labelled
 
 | Agent        | `headroom wrap` | Notes                            |
 |--------------|:---------------:|----------------------------------|
-| Claude Code  | ✅              | `--memory` · `--code-graph`      |
+| Claude Code  | ✅              | `--memory` · `--code-graph` · `--1m` |
 | Codex        | ✅              | shares memory with Claude        |
 | Cursor       | ✅              | prints config — paste once       |
 | Aider        | ✅              | starts proxy + launches          |

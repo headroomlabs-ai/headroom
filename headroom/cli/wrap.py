@@ -146,6 +146,29 @@ _TOOL_SEARCH_ENV = TOOL_SEARCH_ENV
 _TOOL_SEARCH_DEFAULT = TOOL_SEARCH_DEFAULT
 _AGENT_SAVINGS_WRAP_AGENTS = {"claude", "codex", "cursor"}
 
+# 1M context window for `wrap claude` (#1158). Claude Code only sends the
+# `context-1m` beta header — unlocking the 1M window for entitled subscription
+# users — when the model id carries the `[1m]` suffix. Behind a custom
+# ANTHROPIC_BASE_URL (the proxy) its `/model` picker selection does not survive,
+# so `--1m` forces the suffix via ANTHROPIC_MODEL on the launched process.
+_ANTHROPIC_MODEL_ENV = "ANTHROPIC_MODEL"
+_CONTEXT_1M_SUFFIX = "[1m]"
+# Only used when no model is otherwise selected (no ANTHROPIC_MODEL set). The
+# current default Opus; the suffix logic preserves any model the user did set.
+_DEFAULT_1M_MODEL = "claude-opus-4-8"
+
+
+def _resolve_1m_model(current: str | None) -> str:
+    """Return the model id that makes Claude Code request the 1M window (#1158).
+
+    Preserves a model the user already selected via ``ANTHROPIC_MODEL`` (only
+    appending the ``[1m]`` suffix when missing); falls back to the default Opus
+    when none is set. Idempotent — a value already ending in ``[1m]`` is
+    returned unchanged.
+    """
+    base = (current or "").strip() or _DEFAULT_1M_MODEL
+    return base if base.endswith(_CONTEXT_1M_SUFFIX) else f"{base}{_CONTEXT_1M_SUFFIX}"
+
 
 def _normalize_tool_search_mode(value: str) -> str:
     """Validate an ``ENABLE_TOOL_SEARCH`` value and return it normalized.
@@ -3086,6 +3109,17 @@ def unwrap() -> None:
     default=None,
     help="Cloud region for Vertex/Bedrock backends (env: HEADROOM_REGION).",
 )
+@click.option(
+    "--1m",
+    "context_1m",
+    is_flag=True,
+    help=(
+        "Preserve the 1M context window. Behind a custom ANTHROPIC_BASE_URL "
+        "Claude Code drops the context-1m beta header and caps at 200k; this "
+        "sets ANTHROPIC_MODEL=<opus>[1m] on the launched process so the 1M "
+        "window activates through the proxy (issue #1158)."
+    ),
+)
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
 @click.option("--prepare-only", is_flag=True, hidden=True)
 @click.argument("claude_args", nargs=-1, type=click.UNPROCESSED)
@@ -3101,6 +3135,7 @@ def claude(
     tool_search: str | None,
     backend: str | None,
     region: str | None,
+    context_1m: bool,
     verbose: bool,
     prepare_only: bool,
     claude_args: tuple,
@@ -3121,6 +3156,7 @@ def claude(
         headroom wrap claude --no-context-tool  # Skip CLI context-tool setup
         headroom wrap claude --no-mcp           # Skip MCP retrieve tool registration
         headroom wrap claude --no-serena        # Skip Serena MCP registration
+        headroom wrap claude --1m               # Preserve the 1M context window
     """
     if prepare_only:
         if not no_rtk:
@@ -3319,6 +3355,16 @@ def claude(
             click.echo(
                 f"  {_TOOL_SEARCH_ENV}={env.get(_TOOL_SEARCH_ENV)} "
                 "(using your existing environment value)"
+            )
+
+        # Issue #1158: opt-in 1M context window. Claude Code only sends the
+        # context-1m beta header when the model id carries the [1m] suffix, so
+        # force it via ANTHROPIC_MODEL on the launched process.
+        if context_1m:
+            env[_ANTHROPIC_MODEL_ENV] = _resolve_1m_model(env.get(_ANTHROPIC_MODEL_ENV))
+            click.echo(
+                f"  {_ANTHROPIC_MODEL_ENV}={env[_ANTHROPIC_MODEL_ENV]} "
+                "(1M context window; issue #1158)"
             )
 
         result = subprocess.run([claude_bin, *claude_args], env=env)
