@@ -169,6 +169,18 @@ def _reject_task_lifecycle(manifest: DeploymentManifest, action: str) -> None:
     help="Force anonymous telemetry off in the runtime (already the default).",
 )
 @click.option(
+    "--no-rate-limit",
+    "no_rate_limit",
+    is_flag=True,
+    default=False,
+    help=(
+        "Disable the proxy's built-in rate limiter (default: 60 req/min). "
+        "Recommended for always-on agentic targets (Claude Code, Codex) that "
+        "burst above the default threshold. The flag is persisted in the "
+        "deployment manifest so reinstalls don't silently reintroduce throttling."
+    ),
+)
+@click.option(
     "--image",
     default="ghcr.io/chopratejas/headroom:latest",
     show_default=True,
@@ -189,6 +201,7 @@ def install_apply(
     memory: bool,
     telemetry: bool,
     no_telemetry: bool,
+    no_rate_limit: bool,
     image: str,
 ) -> None:
     """Install a persistent Headroom deployment."""
@@ -210,6 +223,7 @@ def install_apply(
         proxy_mode=proxy_mode,
         memory_enabled=memory,
         telemetry_enabled=telemetry and not no_telemetry,
+        no_rate_limit=no_rate_limit,
         image=image,
     )
 

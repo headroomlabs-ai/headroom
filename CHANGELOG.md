@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Fixed
+
+* **install/apply:** add `--no-rate-limit` to `headroom install apply`, persisted in `proxy_args` ([#1350](https://github.com/headroomlabs-ai/headroom/issues/1350)). The flag existed on `headroom proxy` but was absent from the installer. Agentic workloads (Claude Code, Codex) bursting above 60 req/min had no way to disable throttling through install, and manual `proxy_args` edits were silently overwritten on reinstall. Flag is now wired CLI → `build_manifest()` → `proxy_args`.
+
 ### Features
 
 * **wrap:** `headroom wrap claude --1m` preserves the 1M context window. Behind a custom `ANTHROPIC_BASE_URL` (the proxy) Claude Code drops the `context-1m` beta header and caps the window at 200k for entitled subscription users; the opt-in flag sets `ANTHROPIC_MODEL=<opus>[1m]` on the launched process so the 1M window activates through Headroom. A model already selected via `ANTHROPIC_MODEL` is preserved (only the `[1m]` suffix is appended) ([#1158](https://github.com/chopratejas/headroom/issues/1158)).
