@@ -116,8 +116,8 @@ pub(crate) fn error_response(
     event: &str,
     msg: &str,
 ) -> axum::response::Response {
-    use axum::response::IntoResponse as _;
     use axum::body::Body;
+    use axum::response::IntoResponse as _;
     let body = serde_json::json!({
         "error": { "type": event, "message": msg }
     })
