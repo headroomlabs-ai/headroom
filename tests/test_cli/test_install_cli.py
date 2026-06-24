@@ -341,3 +341,189 @@ def test_install_agent_run_exits_with_foreground_status(monkeypatch) -> None:
     result = runner.invoke(main, ["install", "agent", "run"])
 
     assert result.exit_code == 7
+
+
+def test_install_agent_ensure_no_spawn_when_lock_not_acquired(monkeypatch) -> None:
+    """Ensure does not spawn a runtime when the start lock is contended."""
+    runner = CliRunner()
+    calls: list[str] = []
+
+    class Manifest:
+        profile = "default"
+        health_url = "http://127.0.0.1:8787/readyz"
+
+    monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: Manifest())
+    monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: False)
+
+    import contextlib
+
+    @contextlib.contextmanager
+    def fake_lock(profile):
+        yield False
+
+    monkeypatch.setattr("headroom.cli.install.acquire_runtime_start_lock", fake_lock)
+    monkeypatch.setattr(
+        "headroom.cli.install.start_detached_agent",
+        lambda profile: calls.append("start_agent"),
+    )
+    monkeypatch.setattr(
+        "headroom.cli.install.start_persistent_docker",
+        lambda manifest: calls.append("start_docker"),
+    )
+
+    result = runner.invoke(main, ["install", "agent", "ensure"])
+    assert result.exit_code == 0, result.output
+    assert "already in progress" in result.output
+    assert calls == []
+
+
+def test_install_agent_ensure_stops_wedged_runtime_before_restart(monkeypatch) -> None:
+    """Ensure stops a wedged runtime (running but not ready) before starting fresh."""
+    runner = CliRunner()
+    calls: list[str] = []
+
+    class Manifest:
+        profile = "default"
+        health_url = "http://127.0.0.1:8787/readyz"
+        preset = "persistent-task"
+        supervisor_kind = "none"
+
+    monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: Manifest())
+    monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: False)
+    monkeypatch.setattr("headroom.cli.install.runtime_status", lambda manifest: "running")
+    monkeypatch.setattr("headroom.cli.install.wait_ready", lambda manifest, timeout_seconds: False)
+    monkeypatch.setattr("headroom.cli.install.stop_runtime", lambda manifest: calls.append("stop"))
+    monkeypatch.setattr(
+        "headroom.cli.install.start_detached_agent",
+        lambda profile: calls.append("start_agent"),
+    )
+    monkeypatch.setattr(
+        "headroom.cli.install.start_persistent_docker",
+        lambda manifest: calls.append("start_docker"),
+    )
+
+    import contextlib
+
+    @contextlib.contextmanager
+    def fake_lock(profile):
+        yield True
+
+    monkeypatch.setattr("headroom.cli.install.acquire_runtime_start_lock", fake_lock)
+    monkeypatch.setattr(
+        "headroom.cli.install._start_deployment", lambda manifest: calls.append("start_deployment")
+    )
+
+    result = runner.invoke(main, ["install", "agent", "ensure"])
+    assert result.exit_code == 0, result.output
+    # stop must come before start_deployment — that's the bug guard.
+    assert calls.index("stop") < calls.index("start_deployment")
+    assert "start_agent" not in calls
+    assert "start_docker" not in calls
+
+
+def test_install_agent_ensure_starts_when_stopped_and_lock_acquired(monkeypatch) -> None:
+    """Ensure starts a runtime when none is running and lock is acquired."""
+    runner = CliRunner()
+    calls: list[str] = []
+
+    class Manifest:
+        profile = "default"
+        health_url = "http://127.0.0.1:8787/readyz"
+        preset = "persistent-task"
+        supervisor_kind = "none"
+
+    monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: Manifest())
+    monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: False)
+    monkeypatch.setattr("headroom.cli.install.runtime_status", lambda manifest: "stopped")
+    monkeypatch.setattr(
+        "headroom.cli.install.start_detached_agent",
+        lambda profile: calls.append("start_agent"),
+    )
+    monkeypatch.setattr(
+        "headroom.cli.install.start_persistent_docker",
+        lambda manifest: calls.append("start_docker"),
+    )
+
+    import contextlib
+
+    @contextlib.contextmanager
+    def fake_lock(profile):
+        yield True
+
+    monkeypatch.setattr("headroom.cli.install.acquire_runtime_start_lock", fake_lock)
+    monkeypatch.setattr("headroom.cli.install.wait_ready", lambda manifest, timeout_seconds: True)
+
+    result = runner.invoke(main, ["install", "agent", "ensure"])
+    assert result.exit_code == 0, result.output
+    assert calls == ["start_agent"]
+
+
+def test_install_agent_ensure_no_duplicate_spawn_after_lock_recheck(monkeypatch) -> None:
+    """Ensure does not spawn if proxy becomes ready between initial probe and lock."""
+    runner = CliRunner()
+    calls: list[str] = []
+
+    class Manifest:
+        profile = "default"
+        health_url = "http://127.0.0.1:8787/readyz"
+
+    # First probe_ready (before lock) returns False, second (after lock) returns True
+    probe_results = iter([False, True])
+    monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: Manifest())
+    monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: next(probe_results))
+
+    monkeypatch.setattr(
+        "headroom.cli.install.start_detached_agent",
+        lambda profile: calls.append("start_agent"),
+    )
+
+    import contextlib
+
+    @contextlib.contextmanager
+    def fake_lock(profile):
+        yield True
+
+    monkeypatch.setattr("headroom.cli.install.acquire_runtime_start_lock", fake_lock)
+
+    result = runner.invoke(main, ["install", "agent", "ensure"])
+    assert result.exit_code == 0, result.output
+    assert "already healthy" in result.output
+    assert calls == []
+
+
+def test_install_agent_ensure_propagates_start_deployment_failure(monkeypatch) -> None:
+    """Ensure must exit non-zero and surface the error when _start_deployment fails.
+
+    Regression for review feedback on PR #1301: the previous implementation wrapped
+    the guarded block in `except Exception` and returned normally, which made
+    a failed ensure indistinguishable from a successful one. Automation callers
+    need a non-zero exit code to detect that the deployment did not come up.
+    """
+    runner = CliRunner()
+
+    class Manifest:
+        profile = "default"
+        health_url = "http://127.0.0.1:8787/readyz"
+        preset = "persistent-task"
+        supervisor_kind = "none"
+
+    monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: Manifest())
+    monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: False)
+    monkeypatch.setattr("headroom.cli.install.runtime_status", lambda manifest: "stopped")
+
+    import contextlib
+
+    @contextlib.contextmanager
+    def fake_lock(profile):
+        yield True
+
+    monkeypatch.setattr("headroom.cli.install.acquire_runtime_start_lock", fake_lock)
+
+    def boom(manifest):
+        raise click.ClickException("simulated start failure")
+
+    monkeypatch.setattr("headroom.cli.install._start_deployment", boom)
+
+    result = runner.invoke(main, ["install", "agent", "ensure"])
+    assert result.exit_code != 0, f"expected non-zero exit, got {result.exit_code}: {result.output}"
+    assert "simulated start failure" in result.output

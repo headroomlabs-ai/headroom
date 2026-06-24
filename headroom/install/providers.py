@@ -7,6 +7,7 @@ import re
 import subprocess
 from pathlib import Path
 
+from headroom._subprocess import run
 from headroom.providers.install_registry import (
     apply_provider_scope_mutations,
     revert_provider_scope_mutation,
@@ -88,7 +89,7 @@ def _apply_windows_env_scope(manifest: DeploymentManifest) -> list[ManagedMutati
     merged = _unix_scope_values(manifest)
     mutations: list[ManagedMutation] = []
     for name, value in merged.items():
-        previous = subprocess.run(
+        previous = run(
             [
                 "powershell",
                 "-NoProfile",

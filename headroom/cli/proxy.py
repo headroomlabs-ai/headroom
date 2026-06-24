@@ -34,6 +34,20 @@ from .main import main
 os.environ.setdefault("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1")
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 
+# Corporate TLS-inspection support (issue #1308). When HEADROOM_TLS_STRICT=0,
+# strip OpenSSL's RFC 5280 strict CA-constraint check from urllib3's context
+# builder *before* huggingface_hub / requests import and cache it — otherwise
+# model downloads (huggingface.co) fail with "Basic Constraints of CA cert not
+# marked critical" behind Zscaler/Netskope on Python 3.13+. The proxy's own
+# httpx upstream client is handled separately in proxy/server.py via
+# build_httpx_verify(). No-op unless the toggle is set.
+try:  # pragma: no cover - exercised via integration, not unit-importable cheaply
+    from headroom.proxy.ssl_context import apply_global_tls_relaxation as _apply_tls_relax
+
+    _apply_tls_relax()
+except Exception:  # never let TLS relaxation wiring break startup
+    pass
+
 # Logger-level suppression: httpx HEAD/GET manifest checks + HF advisory msgs.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
@@ -307,6 +321,17 @@ def dashboard(port: int, no_open: bool) -> None:
     help=(
         "Upstream connection timeout in seconds (1–300, default: 10). "
         "Env: HEADROOM_CONNECT_TIMEOUT_SECONDS."
+    ),
+)
+@click.option(
+    "--anthropic-buffered-request-timeout-seconds",
+    type=click.IntRange(min=1),
+    default=None,
+    envvar="HEADROOM_ANTHROPIC_BUFFERED_REQUEST_TIMEOUT_SECONDS",
+    help=(
+        "Buffered Anthropic read timeout in seconds for non-streaming "
+        "message and batch paths (default: 600). "
+        "Env: HEADROOM_ANTHROPIC_BUFFERED_REQUEST_TIMEOUT_SECONDS."
     ),
 )
 @click.option(
@@ -765,6 +790,7 @@ def proxy(
     retry_max_attempts: int | None,
     request_timeout_seconds: int | None,
     connect_timeout_seconds: int | None,
+    anthropic_buffered_request_timeout_seconds: int | None,
     anthropic_pre_upstream_concurrency: int | None,
     anthropic_pre_upstream_acquire_timeout_seconds: float | None,
     anthropic_pre_upstream_memory_context_timeout_seconds: float | None,
@@ -989,6 +1015,11 @@ def proxy(
         connect_timeout_seconds=connect_timeout_seconds
         if connect_timeout_seconds is not None
         else 10,
+        anthropic_buffered_request_timeout_seconds=(
+            anthropic_buffered_request_timeout_seconds
+            if anthropic_buffered_request_timeout_seconds is not None
+            else 600
+        ),
         max_connections=max_connections,
         max_keepalive_connections=max_keepalive_connections,
         keepalive_expiry=keepalive_expiry,

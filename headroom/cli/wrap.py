@@ -31,6 +31,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
+from headroom._subprocess import run
+
 # Fix Windows cp1252 encoding — box-drawing characters require UTF-8
 if sys.platform == "win32" and hasattr(sys.stdout, "buffer"):
     if sys.stdout.encoding and sys.stdout.encoding.lower().replace("-", "") != "utf8":
@@ -143,6 +145,29 @@ _WRAP_PROXY_TIMEOUT_ML_MODULES = ("torch", "sentence_transformers", "spacy")
 _TOOL_SEARCH_ENV = TOOL_SEARCH_ENV
 _TOOL_SEARCH_DEFAULT = TOOL_SEARCH_DEFAULT
 _AGENT_SAVINGS_WRAP_AGENTS = {"claude", "codex", "cursor"}
+
+# 1M context window for `wrap claude` (#1158). Claude Code only sends the
+# `context-1m` beta header — unlocking the 1M window for entitled subscription
+# users — when the model id carries the `[1m]` suffix. Behind a custom
+# ANTHROPIC_BASE_URL (the proxy) its `/model` picker selection does not survive,
+# so `--1m` forces the suffix via ANTHROPIC_MODEL on the launched process.
+_ANTHROPIC_MODEL_ENV = "ANTHROPIC_MODEL"
+_CONTEXT_1M_SUFFIX = "[1m]"
+# Only used when no model is otherwise selected (no ANTHROPIC_MODEL set). The
+# current default Opus; the suffix logic preserves any model the user did set.
+_DEFAULT_1M_MODEL = "claude-opus-4-8"
+
+
+def _resolve_1m_model(current: str | None) -> str:
+    """Return the model id that makes Claude Code request the 1M window (#1158).
+
+    Preserves a model the user already selected via ``ANTHROPIC_MODEL`` (only
+    appending the ``[1m]`` suffix when missing); falls back to the default Opus
+    when none is set. Idempotent — a value already ending in ``[1m]`` is
+    returned unchanged.
+    """
+    base = (current or "").strip() or _DEFAULT_1M_MODEL
+    return base if base.endswith(_CONTEXT_1M_SUFFIX) else f"{base}{_CONTEXT_1M_SUFFIX}"
 
 
 def _normalize_tool_search_mode(value: str) -> str:
@@ -501,12 +526,10 @@ def _setup_lean_ctx_agent(agent: str, verbose: bool = False) -> Path | None:
             # lean-ctx writes project-local files when initialized from a git
             # checkout. Run from a non-project directory so setup is limited to
             # home-scoped agent config such as ~/.codex or ~/.claude.
-            result = subprocess.run(
+            result = run(
                 [str(lean_ctx), "init", "--agent", agent],
                 capture_output=True,
                 text=True,
-                encoding="utf-8",
-                errors="replace",
                 timeout=30,
                 cwd=setup_cwd,
             )
@@ -892,7 +915,7 @@ def _register_cbm_mcp_server(cbm_bin: str) -> None:
         return
 
     # Check if already registered
-    check = subprocess.run(
+    check = run(
         [claude_cli, "mcp", "get", _CBM_MCP_SERVER_NAME],
         capture_output=True,
         text=True,
@@ -900,7 +923,7 @@ def _register_cbm_mcp_server(cbm_bin: str) -> None:
     if check.returncode == 0:
         return  # Already registered
 
-    result = subprocess.run(
+    result = run(
         [claude_cli, "mcp", "add", _CBM_MCP_SERVER_NAME, "-s", "user", "--", cbm_bin],
         capture_output=True,
         text=True,
@@ -948,7 +971,7 @@ def _setup_code_graph(verbose: bool = False) -> bool:
     # Index current project (fast — ~1s for most repos, idempotent)
     project_dir = str(Path.cwd())
     try:
-        result = subprocess.run(
+        result = run(
             [
                 cbm_bin,
                 "cli",
@@ -2818,14 +2841,12 @@ def _run_checked(
 ) -> subprocess.CompletedProcess[str]:
     """Run subprocess and raise a ClickException with actionable context on failure."""
     try:
-        return subprocess.run(
+        return run(
             cmd,
             cwd=str(cwd) if cwd else None,
             check=True,
             capture_output=True,
             text=True,
-            encoding="utf-8",
-            errors="replace",
         )
     except FileNotFoundError as e:
         raise click.ClickException(f"{action} failed: command not found: {cmd[0]}") from e
@@ -2856,12 +2877,10 @@ def _normalize_openclaw_gateway_provider_ids(provider_ids: tuple[str, ...] | Non
 
 def _read_openclaw_config_value(openclaw_bin: str, path: str) -> Any | None:
     """Read an OpenClaw config value when present, returning None on missing paths."""
-    result = subprocess.run(
+    result = run(
         [openclaw_bin, "config", "get", path],
         capture_output=True,
         text=True,
-        encoding="utf-8",
-        errors="replace",
     )
     if result.returncode != 0:
         return None
@@ -2940,12 +2959,10 @@ def _set_openclaw_context_engine_slot(openclaw_bin: str, engine_id: str) -> None
 
 def _restart_or_start_openclaw_gateway(openclaw_bin: str) -> tuple[str, str]:
     """Restart the gateway when running, otherwise start it."""
-    restart_result = subprocess.run(
+    restart_result = run(
         [openclaw_bin, "gateway", "restart"],
         capture_output=True,
         text=True,
-        encoding="utf-8",
-        errors="replace",
     )
     if restart_result.returncode == 0:
         output = restart_result.stdout.strip() or restart_result.stderr.strip()
@@ -3092,6 +3109,17 @@ def unwrap() -> None:
     default=None,
     help="Cloud region for Vertex/Bedrock backends (env: HEADROOM_REGION).",
 )
+@click.option(
+    "--1m",
+    "context_1m",
+    is_flag=True,
+    help=(
+        "Preserve the 1M context window. Behind a custom ANTHROPIC_BASE_URL "
+        "Claude Code drops the context-1m beta header and caps at 200k; this "
+        "sets ANTHROPIC_MODEL=<opus>[1m] on the launched process so the 1M "
+        "window activates through the proxy (issue #1158)."
+    ),
+)
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
 @click.option("--prepare-only", is_flag=True, hidden=True)
 @click.argument("claude_args", nargs=-1, type=click.UNPROCESSED)
@@ -3107,6 +3135,7 @@ def claude(
     tool_search: str | None,
     backend: str | None,
     region: str | None,
+    context_1m: bool,
     verbose: bool,
     prepare_only: bool,
     claude_args: tuple,
@@ -3127,6 +3156,7 @@ def claude(
         headroom wrap claude --no-context-tool  # Skip CLI context-tool setup
         headroom wrap claude --no-mcp           # Skip MCP retrieve tool registration
         headroom wrap claude --no-serena        # Skip Serena MCP registration
+        headroom wrap claude --1m               # Preserve the 1M context window
     """
     if prepare_only:
         if not no_rtk:
@@ -3158,15 +3188,13 @@ def claude(
     # Memory sync BEFORE proxy startup — sync headroom DB ↔ Claude's files
     if memory:
         try:
-            import subprocess as _sp
-
             mem_dir = Path.cwd() / ".headroom"
             mem_dir.mkdir(parents=True, exist_ok=True)
             _sync_db = str(mem_dir / "memory.db")
             _sync_user = os.environ.get("USER", os.environ.get("USERNAME", "default"))
 
             click.echo(f"  Syncing memory (user={_sync_user})...")
-            sync_result = _sp.run(
+            sync_result = run(
                 [
                     sys.executable,
                     "-m",
@@ -3327,6 +3355,16 @@ def claude(
             click.echo(
                 f"  {_TOOL_SEARCH_ENV}={env.get(_TOOL_SEARCH_ENV)} "
                 "(using your existing environment value)"
+            )
+
+        # Issue #1158: opt-in 1M context window. Claude Code only sends the
+        # context-1m beta header when the model id carries the [1m] suffix, so
+        # force it via ANTHROPIC_MODEL on the launched process.
+        if context_1m:
+            env[_ANTHROPIC_MODEL_ENV] = _resolve_1m_model(env.get(_ANTHROPIC_MODEL_ENV))
+            click.echo(
+                f"  {_ANTHROPIC_MODEL_ENV}={env[_ANTHROPIC_MODEL_ENV]} "
+                "(1M context window; issue #1158)"
             )
 
         result = subprocess.run([claude_bin, *claude_args], env=env)
@@ -4845,13 +4883,11 @@ def openclaw(
         install_cwd = None
 
     click.echo("  Installing OpenClaw plugin with required unsafe-install flag...")
-    install_result = subprocess.run(
+    install_result = run(
         install_cmd,
         cwd=str(install_cwd) if install_cwd else None,
         capture_output=True,
         text=True,
-        encoding="utf-8",
-        errors="replace",
     )
     if install_result.returncode != 0:
         combined_error = "\n".join(

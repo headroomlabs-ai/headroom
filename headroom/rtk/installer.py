@@ -13,6 +13,8 @@ import zipfile
 from pathlib import Path
 from urllib.request import urlopen
 
+from headroom._subprocess import run
+
 from . import RTK_BIN_DIR, RTK_BIN_PATH, RTK_VERSION
 
 logger = logging.getLogger(__name__)
@@ -138,12 +140,10 @@ def download_rtk(version: str | None = None) -> Path:
 
     if _should_verify_target(target):
         try:
-            result = subprocess.run(
+            result = run(
                 [str(target_path), "--version"],
                 capture_output=True,
                 text=True,
-                encoding="utf-8",
-                errors="replace",
                 timeout=5,
             )
             if result.returncode != 0:
@@ -170,12 +170,10 @@ def register_claude_hooks(rtk_path: Path | None = None) -> bool:
     rtk_path = rtk_path or RTK_BIN_PATH
 
     try:
-        result = subprocess.run(
+        result = run(
             [str(rtk_path), "init", "--global", "--auto-patch"],
             capture_output=True,
             text=True,
-            encoding="utf-8",
-            errors="replace",
             timeout=10,
         )
         if result.returncode == 0:

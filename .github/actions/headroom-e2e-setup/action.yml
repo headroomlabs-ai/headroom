@@ -51,6 +51,42 @@ runs:
       with:
         workspaces: ". -> target"
 
+    # macos-latest (macos-15) runners have varying Xcode versions installed.
+    # The Rust cc crate probes the active Xcode for
+    # .../lib/clang/<ver>/lib/darwin/libclang_rt.osx.a.  Some Xcode versions
+    # (notably 16.4 / clang 17 on certain runner images) lack this path.
+    # 1. Find an Xcode whose clang runtime directory actually exists.
+    # 2. If none found, locate libclang_rt.osx and create the expected symlink.
+    - name: Fix clang_rt.osx linker path (macOS)
+      if: runner.os == 'macOS'
+      shell: bash
+      run: |
+        found=
+        for app in /Applications/Xcode_*.app; do
+          [ -d "$app" ] || continue
+          clang_dir=$(ls -d "$app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/"*/lib/darwin 2>/dev/null | head -1)
+          if [ -n "$clang_dir" ]; then
+            sudo xcode-select -s "$app"
+            echo "Selected Xcode: $app (has clang runtime at $clang_dir)"
+            found=1
+            break
+          fi
+        done
+        if [ -z "$found" ]; then
+          rt_lib=$(find /Applications -name "libclang_rt.osx*" 2>/dev/null | head -1)
+          if [ -n "$rt_lib" ]; then
+            xcode_ver=$(xcodebuild -version 2>/dev/null | head -1 | awk '{print $2}')
+            clang_ver=$(clang --version 2>/dev/null | head -1 | grep -oP 'version \K\d+')
+            exp_dir="/Applications/Xcode_${xcode_ver}.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/${clang_ver}/lib/darwin"
+            sudo mkdir -p "$exp_dir"
+            target="$exp_dir/$(basename "$rt_lib")"
+            [ -f "$target" ] || sudo ln -sf "$rt_lib" "$target"
+            echo "Symlinked $rt_lib -> $target"
+          else
+            echo "WARNING: libclang_rt.osx not found anywhere. Build may fail."
+          fi
+        fi
+
     - name: Install headroom (editable, with proxy extras — builds Rust extension)
       if: ${{ inputs.install-mode == 'editable-proxy' }}
       shell: bash
