@@ -132,6 +132,7 @@ from headroom.proxy.helpers import (
     initialize_context_tool_session_baseline,
     is_anthropic_auth,  # noqa: F401
     jitter_delay_ms,
+    retry_after_ms,
 )
 from headroom.proxy.memory_handler import MemoryConfig, MemoryHandler
 
@@ -153,7 +154,7 @@ from headroom.proxy.prometheus_metrics import PrometheusMetrics  # noqa: F401
 from headroom.proxy.rate_limiter import TokenBucketRateLimiter  # noqa: F401
 from headroom.proxy.request_logger import RequestLogger  # noqa: F401
 from headroom.proxy.semantic_cache import SemanticCache  # noqa: F401
-from headroom.proxy.ssl_context import find_ca_bundle
+from headroom.proxy.ssl_context import build_httpx_verify
 from headroom.proxy.warmup import WarmupRegistry
 from headroom.proxy.ws_session_registry import WebSocketSessionRegistry
 from headroom.subscription.base import get_quota_registry, reset_quota_registry
@@ -1226,7 +1227,10 @@ class HeadroomProxy(
             operation="proxy.startup",
             metadata={"port": self.config.port, "host": self.config.host},
         )
-        _ca_bundle = find_ca_bundle()
+        # Resolve TLS verification: a custom CA bundle (corporate PKI) if one
+        # is configured, else a strict-relaxed default context when
+        # HEADROOM_TLS_STRICT=0, else httpx's default strict verification.
+        _verify = build_httpx_verify()
         _client_kwargs: dict[str, Any] = {
             "timeout": httpx.Timeout(
                 connect=self.config.connect_timeout_seconds,
@@ -1239,7 +1243,7 @@ class HeadroomProxy(
                 max_keepalive_connections=self.config.max_keepalive_connections,
                 keepalive_expiry=self.config.keepalive_expiry,
             ),
-            "verify": _ca_bundle if _ca_bundle is not None else True,
+            "verify": _verify,
         }
         self.http_client = httpx.AsyncClient(http2=self.config.http2, **_client_kwargs)
         # Reuse the primary client when HTTP/2 is already off; otherwise keep a
@@ -1581,6 +1585,7 @@ class HeadroomProxy(
         request_id: str | None = None,
         forwarder_name: str = "server",
         path_for_log: str | None = None,
+        timeout: httpx.Timeout | float | None = None,
     ) -> httpx.Response:
         """Make request with retry and exponential backoff.
 
@@ -1624,20 +1629,25 @@ class HeadroomProxy(
             source=source,
         )
 
+        post_kwargs: dict = {"content": outbound_bytes, "headers": outbound_headers}
+        if timeout is not None:
+            post_kwargs["timeout"] = timeout
+
         for attempt in range(self.config.retry_max_attempts):
             try:
                 if stream:
                     # For streaming, we return early - retry happens at higher level
                     return await self.http_client.post(  # type: ignore[union-attr]
-                        url, content=outbound_bytes, headers=outbound_headers
+                        url, **post_kwargs
                     )
                 else:
                     response = await self.http_client.post(  # type: ignore[union-attr]
-                        url, content=outbound_bytes, headers=outbound_headers
+                        url, **post_kwargs
                     )
 
-                    # Don't retry client errors (4xx)
-                    if 400 <= response.status_code < 500:
+                    # Don't retry client errors (4xx) — except 429, the most
+                    # retriable status, which carries an authoritative Retry-After (#1221).
+                    if 400 <= response.status_code < 500 and response.status_code != 429:
                         return response
 
                     # Retry server errors (5xx)
@@ -1647,6 +1657,27 @@ class HeadroomProxy(
                             request=response.request,
                             response=response,
                         )
+
+                    # Rate limit (429): retry honoring Retry-After, but return it
+                    # verbatim once exhausted — a clean rate-limit signal beats a 5xx.
+                    if response.status_code == 429:
+                        if (
+                            not self.config.retry_enabled
+                            or attempt >= self.config.retry_max_attempts - 1
+                        ):
+                            return response
+                        delay_ms = retry_after_ms(
+                            response, self.config.retry_max_delay_ms
+                        ) or jitter_delay_ms(
+                            self.config.retry_base_delay_ms,
+                            self.config.retry_max_delay_ms,
+                            attempt,
+                        )
+                        logger.warning(
+                            f"Upstream 429 (attempt {attempt + 1}), retrying in {delay_ms:.0f}ms"
+                        )
+                        await asyncio.sleep(delay_ms / 1000)
+                        continue
 
                     return response
 
@@ -3273,7 +3304,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         return {"status": "cache disabled"}
 
     # CCR (Compress-Cache-Retrieve) endpoints
-    @app.post("/v1/retrieve")
+    @app.post("/v1/retrieve", dependencies=[Depends(_require_loopback)])
     async def ccr_retrieve(request: Request):
         """Retrieve original content from CCR compression cache.
 
@@ -3336,7 +3367,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 ),
             )
 
-    @app.get("/v1/retrieve/stats")
+    @app.get("/v1/retrieve/stats", dependencies=[Depends(_require_loopback)])
     async def ccr_stats():
         """Get CCR compression store statistics."""
         store = get_compression_store()
@@ -3615,7 +3646,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             status_code=404, detail=f"No TOIN pattern found with hash starting with: {hash_prefix}"
         )
 
-    @app.get("/v1/retrieve/{hash_key}")
+    @app.get("/v1/retrieve/{hash_key}", dependencies=[Depends(_require_loopback)])
     async def ccr_retrieve_get(hash_key: str, query: str | None = None):
         """GET version of CCR retrieve for easier testing."""
         store = get_compression_store()
@@ -3655,7 +3686,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             )
 
     # CCR Tool Call Handler - for agent frameworks to call when LLM uses headroom_retrieve
-    @app.post("/v1/retrieve/tool_call")
+    @app.post("/v1/retrieve/tool_call", dependencies=[Depends(_require_loopback)])
     async def ccr_handle_tool_call(request: Request):
         """Handle a CCR tool call from an LLM response.
 
@@ -3772,7 +3803,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         }
 
     # Compression-only endpoint (for TypeScript SDK and other HTTP clients)
-    @app.post("/v1/compress")
+    @app.post("/v1/compress", dependencies=[Depends(_require_loopback)])
     async def compress_messages(request: Request):
         return await proxy.handle_compress(request)
 
@@ -3818,6 +3849,11 @@ def _proxy_config_from_env() -> ProxyConfig:
         port=_get_env_int("HEADROOM_PORT", 8787),
         openai_api_url=os.environ.get("OPENAI_TARGET_API_URL"),
         anthropic_api_url=os.environ.get("ANTHROPIC_TARGET_API_URL"),
+        anthropic_buffered_request_timeout_seconds=_get_env_int(
+            "HEADROOM_ANTHROPIC_BUFFERED_REQUEST_TIMEOUT_SECONDS",
+            600,
+            min_value=1,
+        ),
         vertex_api_url=os.environ.get("VERTEX_TARGET_API_URL"),
         backend=_get_env_str("HEADROOM_BACKEND", "anthropic"),
         bedrock_region=_get_env_str("HEADROOM_BEDROCK_REGION", "us-west-2"),
@@ -4023,15 +4059,25 @@ def _get_env_optional_bool(name: str) -> bool | None:
     return val.lower() in ("true", "1", "yes", "on")
 
 
-def _get_env_int(name: str, default: int) -> int:
+def _get_env_int(name: str, default: int, *, min_value: int | None = None) -> int:
     """Get integer from environment variable."""
     val = os.environ.get(name)
     if val is None:
         return default
     try:
-        return int(val)
+        parsed = int(val)
     except ValueError:
         return default
+    if min_value is not None and parsed < min_value:
+        return default
+    return parsed
+
+
+def _positive_int_arg(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be >= 1")
+    return parsed
 
 
 def _get_env_float(name: str, default: float) -> float:
@@ -4121,6 +4167,15 @@ if __name__ == "__main__":
     parser.add_argument(
         "--anthropic-api-url",
         help=f"Custom Anthropic API URL (default: {DEFAULT_ANTHROPIC_API_URL})",
+    )
+    parser.add_argument(
+        "--anthropic-buffered-request-timeout-seconds",
+        type=_positive_int_arg,
+        default=600,
+        help=(
+            "Anthropic buffered read timeout in seconds for non-streaming "
+            "message and batch paths (default: 600)"
+        ),
     )
     parser.add_argument(
         "--vertex-api-url",
@@ -4359,6 +4414,11 @@ if __name__ == "__main__":
         port=_get_env_int("HEADROOM_PORT", args.port),
         openai_api_url=_get_env_str("OPENAI_TARGET_API_URL", args.openai_api_url),
         anthropic_api_url=_get_env_str("ANTHROPIC_TARGET_API_URL", args.anthropic_api_url),
+        anthropic_buffered_request_timeout_seconds=_get_env_int(
+            "HEADROOM_ANTHROPIC_BUFFERED_REQUEST_TIMEOUT_SECONDS",
+            args.anthropic_buffered_request_timeout_seconds,
+            min_value=1,
+        ),
         vertex_api_url=_get_env_str("VERTEX_TARGET_API_URL", args.vertex_api_url),
         # Backend settings
         backend=_get_env_str("HEADROOM_BACKEND", args.backend),  # type: ignore[arg-type]

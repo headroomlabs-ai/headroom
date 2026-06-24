@@ -25,6 +25,7 @@ from headroom import paths as _paths
 from headroom._subprocess import run
 
 if TYPE_CHECKING:
+    import httpx
     from fastapi import Request
 
 logger = logging.getLogger("headroom.proxy")
@@ -912,6 +913,31 @@ def jitter_delay_ms(base_ms: int, max_ms: int, attempt: int) -> float:
     """
     capped: float = min(base_ms * (2**attempt), max_ms)
     return capped * (0.5 + random.random())
+
+
+def retry_after_ms(response: httpx.Response, max_ms: int) -> float | None:
+    """Parse an HTTP ``Retry-After`` header into a millisecond delay, capped at ``max_ms``.
+
+    Returns the delay in ms for a numeric ``seconds`` value or an HTTP-date, or
+    ``None`` when the header is absent or unparseable so the caller falls back to
+    exponential backoff. Anthropic sends integer seconds; the HTTP-date branch
+    covers other upstreams. Fails open on any parse error.
+    """
+    value = response.headers.get("retry-after")
+    if not value:
+        return None
+    try:
+        seconds = float(value)
+    except ValueError:
+        try:
+            from datetime import datetime
+            from email.utils import parsedate_to_datetime
+
+            retry_at = parsedate_to_datetime(value)
+            seconds = (retry_at - datetime.now(retry_at.tzinfo)).total_seconds()
+        except (TypeError, ValueError):
+            return None
+    return min(max(seconds, 0.0) * 1000.0, float(max_ms))
 
 
 # Image compression availability (do not retain a global compressor instance)

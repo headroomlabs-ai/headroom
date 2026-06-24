@@ -287,9 +287,50 @@ def build_prefix_cache_stats(
         ],
     }
 
+    # Cache-miss attribution (#1313): why turns that expected a prompt-cache
+    # hit missed instead. Per-provider reason buckets plus an aggregate total,
+    # so the dashboard can show "of N expected-cache misses, X were TTL lapses
+    # vs Y prefix changes" — the signal a user needs to decide 5m vs 1h TTL.
+    _miss_by_provider: dict[str, dict[str, int]] = {}
+    # Holds integer counts AND float percentages (ttl_expiry_pct etc.), so the
+    # value type is float — ints coerce cleanly and the counts stay whole.
+    _miss_totals: dict[str, float] = {
+        "ttl_expiry": 0,
+        "prefix_change": 0,
+        "unknown": 0,
+        "total": 0,
+    }
+    for _provider, _reasons in metrics.cache_miss_attribution_by_provider.items():
+        provider_reasons = {reason: int(count) for reason, count in _reasons.items()}
+        provider_total = sum(provider_reasons.values())
+        if provider_total == 0:
+            continue
+        provider_reasons["total"] = provider_total
+        _miss_by_provider[_provider] = provider_reasons
+        for reason, count in provider_reasons.items():
+            if reason == "total":
+                continue
+            _miss_totals[reason] = _miss_totals.get(reason, 0) + count
+        _miss_totals["total"] += provider_total
+
+    # Share of misses attributable to TTL lapse vs prefix change — the headline
+    # the dashboard renders. Computed against attributed (non-unknown) misses
+    # so an "unknown" bucket doesn't dilute the actionable split.
+    _attributed = _miss_totals["ttl_expiry"] + _miss_totals["prefix_change"]
+    _miss_totals["ttl_expiry_pct"] = (
+        round(_miss_totals["ttl_expiry"] / _attributed * 100, 1) if _attributed > 0 else 0.0
+    )
+    _miss_totals["prefix_change_pct"] = (
+        round(_miss_totals["prefix_change"] / _attributed * 100, 1) if _attributed > 0 else 0.0
+    )
+
     return {
         "by_provider": by_provider,
         "totals": totals,
+        "miss_attribution": {
+            "totals": _miss_totals,
+            "by_provider": _miss_by_provider,
+        },
         "prefix_freeze": {
             "busts_avoided": metrics.prefix_freeze_busts_avoided,
             "tokens_preserved": metrics.prefix_freeze_tokens_preserved,
