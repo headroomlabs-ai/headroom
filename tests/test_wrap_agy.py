@@ -1554,3 +1554,78 @@ class TestAgySessionCompressionSummary:
 
         # No new handlers leaked
         assert logger.handlers == handlers_before
+
+
+# ---------------------------------------------------------------------------
+# WU-s04.3: print-mode purges stale "headroom" retrieve MCP entry
+# ---------------------------------------------------------------------------
+
+
+class TestPrintModePurgesStaleHeadroomEntry:
+    """Print mode must unregister any stale 'headroom' retrieve entry before launch.
+
+    A SIGKILLed interactive session leaves the per-run headroom retrieve MCP
+    entry orphaned in mcp_config.json.  A subsequent ``wrap agy --print`` skips
+    retrieve setup but must still scrub that stale entry — otherwise agy hangs
+    in print mode because ANY registered MCP server causes it to block.
+    """
+
+    def test_print_mode_purges_stale_headroom_entry(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Print mode removes a pre-existing 'headroom' retrieve entry before agy runs."""
+        from headroom.mcp_registry.agy import AgyRegistrar
+        from headroom.mcp_registry.base import ServerSpec
+
+        _stub_agy_mitm_run(tmp_path, monkeypatch, with_uvx=True)
+
+        # Arrange: pre-inject an orphaned headroom entry (simulating a SIGKILLed session).
+        reg = AgyRegistrar(home_dir=tmp_path)
+        stale_spec = ServerSpec(
+            name="headroom",
+            command="headroom",
+            args=("mcp", "serve"),
+            env={"HEADROOM_PROXY_URL": "http://127.0.0.1:9999"},
+        )
+        reg.register_server(stale_spec)
+        assert reg.get_server("headroom") is not None, "pre-condition: stale entry in config"
+
+        # Capture mid-run state to prove the entry is gone BEFORE agy executes.
+        seen: dict[str, object] = {}
+
+        def _capture_run(cmd, *a, **kw):
+            seen["spec"] = AgyRegistrar(home_dir=tmp_path).get_server("headroom")
+            return MagicMock(returncode=0)
+
+        monkeypatch.setattr("subprocess.run", _capture_run)
+
+        runner = CliRunner()
+        result = runner.invoke(
+            _get_main(), ["wrap", "agy", "--", "--print", "hi"], catch_exceptions=False
+        )
+        assert result.exit_code == 0
+        assert seen["spec"] is None, (
+            "stale 'headroom' entry must be removed before agy launches in print mode"
+        )
+        assert AgyRegistrar(home_dir=tmp_path).get_server("headroom") is None
+
+    def test_print_mode_purge_does_not_remove_user_managed_entries(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Print mode only removes the 'headroom' retrieve entry; user entries survive."""
+        from headroom.mcp_registry.agy import AgyRegistrar
+        from headroom.mcp_registry.base import ServerSpec
+
+        _stub_agy_mitm_run(tmp_path, monkeypatch, with_uvx=True)
+
+        reg = AgyRegistrar(home_dir=tmp_path)
+        user_spec = ServerSpec(name="my-tool", command="/opt/my-tool", args=(), env={})
+        reg.register_server(user_spec)
+
+        runner = CliRunner()
+        result = runner.invoke(
+            _get_main(), ["wrap", "agy", "--", "--print", "hi"], catch_exceptions=False
+        )
+        assert result.exit_code == 0
+        survived = AgyRegistrar(home_dir=tmp_path).get_server("my-tool")
+        assert survived is not None, "user-managed entries must not be removed by print-mode purge"

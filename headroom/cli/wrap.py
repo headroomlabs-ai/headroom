@@ -6179,6 +6179,12 @@ def agy(
             retrieve_registered = _setup_headroom_retrieve_mcp_agy(
                 AgyRegistrar(), servers.retrieve_port, verbose=False
             )
+        else:
+            # Print mode: purge any stale "headroom" retrieve entry left by a
+            # previously SIGKILLed interactive session.  agy hangs in print mode
+            # whenever ANY MCP server entry is present, so a dead pointer is a
+            # guaranteed hang.  Idempotent — no-op when the entry is absent.
+            AgyRegistrar().unregister_server("headroom")
 
         # ------------------------------------------------------------------
         # Install signal handlers so the terminator/dispatch are always torn
