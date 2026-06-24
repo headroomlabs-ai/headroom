@@ -583,9 +583,7 @@ async def test_sni_non_allowlisted_rejected(
             original_get_or_mint = _LeafCache.get_or_mint
             call_hostnames: list[str] = []
 
-            def _spy_get_or_mint(
-                self: _LeafCache, host: str, *args: Any, **kwargs: Any
-            ) -> Any:
+            def _spy_get_or_mint(self: _LeafCache, host: str, *args: Any, **kwargs: Any) -> Any:
                 call_hostnames.append(host)
                 return original_get_or_mint(self, host, *args, **kwargs)
 
@@ -730,9 +728,7 @@ async def test_sni_trailing_dot_fqdn_rejected(
 
     # Use a controlled allowlist with only the non-dotted form.
     allowlist = frozenset({"daily-cloudcode-pa.googleapis.com"})
-    async with AgyDispatchServer(
-        ca_key=ca_key, ca_cert=ca_cert, allowlist=allowlist
-    ) as srv:
+    async with AgyDispatchServer(ca_key=ca_key, ca_cert=ca_cert, allowlist=allowlist) as srv:
         _, port = srv.address
         # trailing dot form is not in allowlist — must be rejected
         rejected = not await _try_tls_connect(
@@ -782,6 +778,7 @@ def test_placeholder_host_not_in_default_allowlist() -> None:
 # Tests: post-handshake Host guard (headroom-oqb.1)
 # ---------------------------------------------------------------------------
 
+
 async def _http11_request(
     port: int,
     ca_cert_pem: bytes,
@@ -795,20 +792,13 @@ async def _http11_request(
     ssl_ctx.set_alpn_protocols(["http/1.1"])
     try:
         reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(
-                "127.0.0.1", port, ssl=ssl_ctx, server_hostname=sni_host
-            ),
+            asyncio.open_connection("127.0.0.1", port, ssl=ssl_ctx, server_hostname=sni_host),
             timeout=timeout,
         )
     except (ssl.SSLError, OSError, ConnectionResetError):
         return 0
     try:
-        request = (
-            f"GET / HTTP/1.1\r\n"
-            f"Host: {host_header}\r\n"
-            f"Connection: close\r\n"
-            f"\r\n"
-        ).encode()
+        request = (f"GET / HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\n\r\n").encode()
         writer.write(request)
         await writer.drain()
         status_line = await asyncio.wait_for(reader.readline(), timeout=timeout)
@@ -857,9 +847,7 @@ async def test_host_guard_non_allowlisted_returns_421(
             ca_key=ca_key, ca_cert=ca_cert, allowlist=_CONTROLLED_ALLOWLIST
         ) as srv:
             _, port = srv.address
-            status = await _http11_request(
-                port, ca_cert_pem, _CONTROLLED_HOST, "evil.example.com"
-            )
+            status = await _http11_request(port, ca_cert_pem, _CONTROLLED_HOST, "evil.example.com")
 
     assert status == 421, f"Expected 421 for non-allowlisted Host, got {status}"
     assert send_421_called[0], "Guard must call _send_421 for non-allowlisted Host"
@@ -892,13 +880,10 @@ async def test_host_guard_allowlisted_passes(
             ca_key=ca_key, ca_cert=ca_cert, allowlist=_CONTROLLED_ALLOWLIST
         ) as srv:
             _, port = srv.address
-            status = await _http11_request(
-                port, ca_cert_pem, _CONTROLLED_HOST, _CONTROLLED_HOST
-            )
+            status = await _http11_request(port, ca_cert_pem, _CONTROLLED_HOST, _CONTROLLED_HOST)
 
     assert not send_421_called[0], (
-        f"Guard must NOT refuse the allowlisted Host '{_CONTROLLED_HOST}'; "
-        f"got HTTP status {status}"
+        f"Guard must NOT refuse the allowlisted Host '{_CONTROLLED_HOST}'; got HTTP status {status}"
     )
     assert status != 0, "Expected a valid HTTP response (guard passed request to app)"
 
@@ -964,9 +949,7 @@ async def test_host_guard_mixed_case_host_passes(
         ) as srv:
             _, port = srv.address
             mixed_case = _CONTROLLED_HOST.upper()
-            status = await _http11_request(
-                port, ca_cert_pem, _CONTROLLED_HOST, mixed_case
-            )
+            status = await _http11_request(port, ca_cert_pem, _CONTROLLED_HOST, mixed_case)
 
     assert not send_421_called[0], (
         f"Guard must NOT refuse mixed-case Host (normalized to lower); got HTTP status {status}"
@@ -1049,11 +1032,7 @@ async def test_dispatch_handshake_still_works_via_helper(
             server_hostname=ALLOWLIST_HOST,
         )
         try:
-            request = (
-                f"GET / HTTP/1.1\r\n"
-                f"Host: {ALLOWLIST_HOST}\r\n"
-                f"\r\n"
-            ).encode()
+            request = (f"GET / HTTP/1.1\r\nHost: {ALLOWLIST_HOST}\r\n\r\n").encode()
             conn_writer.write(request)
             await conn_writer.drain()
             response_line = await asyncio.wait_for(conn_reader.readline(), timeout=10.0)

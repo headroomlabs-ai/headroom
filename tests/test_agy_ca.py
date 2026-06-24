@@ -513,12 +513,8 @@ def _make_leaf_pem_pair() -> tuple[bytes, bytes]:
         .serial_number(x509.random_serial_number())
         .not_valid_before(now)
         .not_valid_after(now + datetime.timedelta(hours=72))
-        .add_extension(
-            x509.SubjectAlternativeName([x509.DNSName("leaf.test")]), critical=False
-        )
-        .add_extension(
-            x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=True
-        )
+        .add_extension(x509.SubjectAlternativeName([x509.DNSName("leaf.test")]), critical=False)
+        .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=True)
         .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
         .sign(key, hashes.SHA256())
     )
@@ -735,7 +731,9 @@ def test_load_cert_chain_in_memory_fallback_unlinks_on_load_exception(
     monkeypatch.setattr(_tempfile, "mkstemp", _spy_mkstemp)
 
     # Patch load_cert_chain to always raise.
-    monkeypatch.setattr(ctx, "load_cert_chain", lambda *a, **kw: (_ for _ in ()).throw(ssl.SSLError("injected")))
+    monkeypatch.setattr(
+        ctx, "load_cert_chain", lambda *a, **kw: (_ for _ in ()).throw(ssl.SSLError("injected"))
+    )
 
     with pytest.raises(ssl.SSLError):
         load_cert_chain_in_memory(ctx, cert_pem, key_pem)
@@ -835,7 +833,9 @@ def test_ensure_root_ca_corrupt_key_regenerates(tmp_path: Path) -> None:
     _, cert1, key_path, cert_path = ensure_root_ca(base_dir=tmp_path)
 
     # Overwrite the key with garbage so the parse fails.
-    key_path.write_bytes(b"-----BEGIN RSA PRIVATE KEY-----\nGARBAGE\n-----END RSA PRIVATE KEY-----\n")
+    key_path.write_bytes(
+        b"-----BEGIN RSA PRIVATE KEY-----\nGARBAGE\n-----END RSA PRIVATE KEY-----\n"
+    )
 
     # Must not raise; must produce a fresh (different serial) CA.
     key2, cert2, _, _ = ensure_root_ca(base_dir=tmp_path)
@@ -853,9 +853,7 @@ def test_ensure_root_ca_corrupt_key_regenerates(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_assert_perms_skipped_on_non_posix(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_assert_perms_skipped_on_non_posix(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """On non-POSIX platforms _assert_perms must be a no-op (never raise)."""
     p = tmp_path / "file.bin"
     p.write_bytes(b"x")
@@ -871,9 +869,7 @@ def test_assert_perms_skipped_on_non_posix(
 # ---------------------------------------------------------------------------
 
 
-def test_write_secure_uses_os_replace(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_write_secure_uses_os_replace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """_write_secure must call os.replace instead of Path.rename."""
     import headroom.proxy.agy_ca as _mod
 

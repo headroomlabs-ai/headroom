@@ -1685,9 +1685,7 @@ class TestAgyGracefulFailures:
     # 2. Watchdog: MITM thread death → abort before subprocess, clear message.
     # ------------------------------------------------------------------
 
-    def test_agy_mitm_thread_death_aborts_launch(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_agy_mitm_thread_death_aborts_launch(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """MITM server startup failure → subprocess NOT invoked, clear error message."""
         import headroom.cli.wrap as wrap_mod
 
@@ -1696,7 +1694,9 @@ class TestAgyGracefulFailures:
 
         # Simulate _start_agy_servers failing (e.g. the daemon thread dies).
         def _fail_startup(*a, **kw):
-            raise RuntimeError("agy MITM server startup failed: connection refused on dispatch bind")
+            raise RuntimeError(
+                "agy MITM server startup failed: connection refused on dispatch bind"
+            )
 
         monkeypatch.setattr(wrap_mod, "_start_agy_servers", _fail_startup)
 
@@ -1754,6 +1754,7 @@ class TestAgyGracefulFailures:
         # re-echo the raw OSError.  The word "port" must appear in isolation
         # (i.e., not just as part of "transport").
         import re
+
         assert re.search(r"\bport\b", output), (
             f"Expected 'port' (as a word) in output; got: {output!r}"
         )
@@ -1766,9 +1767,7 @@ class TestAgyGracefulFailures:
     # 4. Terminal/env restore: _stop_agy_servers called in finally on error.
     # ------------------------------------------------------------------
 
-    def test_agy_server_stop_called_on_error_path(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_agy_server_stop_called_on_error_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """_stop_agy_servers is called in the finally block even when startup raises."""
         import headroom.cli.wrap as wrap_mod
 
@@ -1891,12 +1890,8 @@ class TestUnwrapAgyRemovesAllHeadroomConfig:
         assert _AGY_GEMINI_BLOCK_END not in gemini_text, (
             "headroom block END marker must be removed from GEMINI.md"
         )
-        assert "# User Instructions" in gemini_text, (
-            "user content must survive GEMINI.md cleanup"
-        )
-        assert "Keep this." in gemini_text, (
-            "user content body must survive GEMINI.md cleanup"
-        )
+        assert "# User Instructions" in gemini_text, "user content must survive GEMINI.md cleanup"
+        assert "Keep this." in gemini_text, "user content body must survive GEMINI.md cleanup"
 
         # --- Assert: AgyRegistrar entries removed ---
         reg2 = AgyRegistrar(home_dir=tmp_path)
@@ -1912,15 +1907,9 @@ class TestUnwrapAgyRemovesAllHeadroomConfig:
 
         # --- Assert: user-managed entry preserved ---
         survived = reg2.get_server("my-tool")
-        assert survived is not None, (
-            "user-managed 'my-tool' entry must survive unwrap"
-        )
+        assert survived is not None, "user-managed 'my-tool' entry must survive unwrap"
         assert survived.command == "/opt/my-tool"
 
         # --- Assert: CA directory intentionally NOT removed (by design) ---
-        assert ca_dir.exists(), (
-            "unwrap must NOT remove ~/.headroom/ca (shared headroom CA state)"
-        )
-        assert (ca_dir / "ca.crt").exists(), (
-            "CA certificate must remain intact after unwrap"
-        )
+        assert ca_dir.exists(), "unwrap must NOT remove ~/.headroom/ca (shared headroom CA state)"
+        assert (ca_dir / "ca.crt").exists(), "CA certificate must remain intact after unwrap"

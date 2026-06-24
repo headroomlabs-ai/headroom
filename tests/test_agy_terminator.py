@@ -574,9 +574,7 @@ async def test_terminator_no_tmpfile_on_linux(
     try:
         proxy_host, proxy_port = terminator.address
         raw_reader, raw_writer = await asyncio.open_connection(proxy_host, proxy_port)
-        connect_req = (
-            f"CONNECT {ALLOWLIST_HOST}:443 HTTP/1.1\r\nHost: {ALLOWLIST_HOST}:443\r\n\r\n"
-        )
+        connect_req = f"CONNECT {ALLOWLIST_HOST}:443 HTTP/1.1\r\nHost: {ALLOWLIST_HOST}:443\r\n\r\n"
         raw_writer.write(connect_req.encode())
         await raw_writer.drain()
         response = await raw_reader.readline()
@@ -775,9 +773,7 @@ async def test_upstream_proxy_timeout_closes_writer() -> None:
         finally:
             writer.close()
 
-    proxy_server = await asyncio.start_server(
-        _stall_proxy_handler, host="127.0.0.1", port=0
-    )
+    proxy_server = await asyncio.start_server(_stall_proxy_handler, host="127.0.0.1", port=0)
     proxy_addr = proxy_server.sockets[0].getsockname()
     proxy_host, proxy_port = proxy_addr[0], proxy_addr[1]
 
@@ -838,9 +834,7 @@ async def test_blind_tunnel_drain_error_closes_target() -> None:
 
     target_release = asyncio.Event()
 
-    async def _idle_handler(
-        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
-    ) -> None:
+    async def _idle_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
             await target_release.wait()
         except asyncio.CancelledError:
@@ -890,9 +884,7 @@ async def test_blind_tunnel_drain_error_closes_target() -> None:
     client_reader = asyncio.StreamReader()
 
     try:
-        with mock.patch(
-            "headroom.proxy.agy_terminator.asyncio.open_connection", _spy_target_conn
-        ):
+        with mock.patch("headroom.proxy.agy_terminator.asyncio.open_connection", _spy_target_conn):
             try:
                 await _handle_blind_tunnel(
                     client_reader,

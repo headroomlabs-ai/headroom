@@ -193,7 +193,7 @@ def _is_ca_cert(cert: Certificate) -> bool:
     """Return True iff the certificate has basicConstraints CA:TRUE."""
     try:
         bc = cert.extensions.get_extension_for_class(x509.BasicConstraints)
-        return bc.value.ca
+        return bool(bc.value.ca)
     except x509.ExtensionNotFound:
         return False
 
@@ -201,7 +201,7 @@ def _is_ca_cert(cert: Certificate) -> bool:
 def _cert_near_expiry(cert: Certificate) -> bool:
     """Return True if the certificate expires within the regen threshold."""
     threshold = _now_utc() + datetime.timedelta(days=_REGEN_THRESHOLD_DAYS)
-    return cert.not_valid_after_utc <= threshold
+    return bool(cert.not_valid_after_utc <= threshold)
 
 
 # ---------------------------------------------------------------------------

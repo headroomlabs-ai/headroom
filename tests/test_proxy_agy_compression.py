@@ -438,6 +438,10 @@ def test_fail_open_on_compression_pipeline_exception(
     proxy_logger = logging.getLogger("headroom.proxy")
     cap_handler = _CapturingHandler()
     proxy_logger.addHandler(cap_handler)
+    # Pin the emit logger's own level so WARNING records are enabled regardless
+    # of any ancestor level another test left raised (isEnabledFor walks parents).
+    prev_level = proxy_logger.level
+    proxy_logger.setLevel(logging.WARNING)
 
     try:
         with TestClient(create_app(ProxyConfig(optimize=True))) as client:
@@ -454,6 +458,7 @@ def test_fail_open_on_compression_pipeline_exception(
             )
     finally:
         proxy_logger.removeHandler(cap_handler)
+        proxy_logger.setLevel(prev_level)
 
     # Fail-open: must not 500/502; upstream call must proceed.
     assert response.status_code == 200, (
@@ -518,6 +523,10 @@ def test_fail_open_compression_degrades_open(
     proxy_logger = logging.getLogger("headroom.proxy")
     cap_handler = _CapturingHandler()
     proxy_logger.addHandler(cap_handler)
+    # Pin the emit logger's own level so WARNING records are enabled regardless
+    # of any ancestor level another test left raised (isEnabledFor walks parents).
+    prev_level = proxy_logger.level
+    proxy_logger.setLevel(logging.WARNING)
 
     try:
         with TestClient(create_app(ProxyConfig(optimize=True))) as client:
@@ -541,6 +550,7 @@ def test_fail_open_compression_degrades_open(
             )
     finally:
         proxy_logger.removeHandler(cap_handler)
+        proxy_logger.setLevel(prev_level)
 
     # Both requests must degrade open (200).
     assert response1.status_code == 200, (
