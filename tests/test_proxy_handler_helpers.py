@@ -166,6 +166,39 @@ class _AsyncChunks(httpx.AsyncByteStream):
             yield chunk
 
 
+class _IncompleteChunkStream(httpx.AsyncByteStream):
+    def __init__(self, chunks: list[bytes]) -> None:
+        self._chunks = chunks
+
+    async def __aiter__(self):  # noqa: ANN204
+        for chunk in self._chunks:
+            yield chunk
+        raise httpx.RemoteProtocolError(
+            "peer closed connection without sending complete message body "
+            "(incomplete chunked read)"
+        )
+
+
+class _IncompleteChunkClient:
+    def __init__(self, chunks: list[bytes]) -> None:
+        self._chunks = chunks
+
+    def build_request(self, method, url, headers, content):  # noqa: ANN001, ANN201
+        return httpx.Request(method, url, headers=headers, content=content)
+
+    async def send(self, request, stream=False):  # noqa: ANN001, ANN201
+        assert stream is True
+        return httpx.Response(
+            200,
+            request=request,
+            headers={
+                "content-type": "application/json",
+                "transfer-encoding": "chunked",
+            },
+            stream=_IncompleteChunkStream(self._chunks),
+        )
+
+
 class _VertexStreamClient:
     def __init__(self) -> None:
         self.sent_url = ""
@@ -274,6 +307,36 @@ def test_openai_passthrough_connect_timeout_returns_502() -> None:
     payload = json.loads(response.body)
     assert payload["error"]["type"] == "connection_error"
     assert "Failed to connect to upstream API" in payload["error"]["message"]
+
+
+def test_openai_passthrough_tolerates_incomplete_chunked_read_after_body() -> None:
+    handler = object.__new__(OpenAIHandlerMixin)
+    handler.http_client = _IncompleteChunkClient([b'{"data":[', b'{"id":"gpt-test"}]}'])
+    handler.http_client_h1 = None
+
+    response = asyncio.run(
+        handler.handle_passthrough(_PassthroughRequest(), "http://127.0.0.1:8317/v1")
+    )
+
+    assert response.status_code == 200
+    assert json.loads(response.body) == {"data": [{"id": "gpt-test"}]}
+    assert "transfer-encoding" not in response.headers
+    assert "content-length" not in response.headers
+
+
+def test_openai_passthrough_protocol_error_without_body_returns_502() -> None:
+    handler = object.__new__(OpenAIHandlerMixin)
+    handler.http_client = _IncompleteChunkClient([])
+    handler.http_client_h1 = None
+
+    response = asyncio.run(
+        handler.handle_passthrough(_PassthroughRequest(), "http://127.0.0.1:8317/v1")
+    )
+
+    assert response.status_code == 502
+    payload = json.loads(response.body)
+    assert payload["error"]["type"] == "upstream_protocol_error"
+    assert "ended unexpectedly" in payload["error"]["message"]
 
 
 def test_prefers_http1_passthrough_matches_chatgpt_hosts_only() -> None:

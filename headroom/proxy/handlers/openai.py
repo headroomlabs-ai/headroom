@@ -6150,12 +6150,65 @@ class OpenAIHandlerMixin:
         if _prefers_http1_passthrough(base_url):
             passthrough_client = self.http_client_h1 or self.http_client
         try:
-            response = await passthrough_client.request(  # type: ignore[union-attr]
-                method=request.method,
-                url=url,
-                headers=headers,
-                content=body,
-            )
+            if hasattr(passthrough_client, "build_request") and hasattr(passthrough_client, "send"):
+                upstream_request = passthrough_client.build_request(  # type: ignore[union-attr]
+                    request.method,
+                    url,
+                    headers=headers,
+                    content=body,
+                )
+                response = await passthrough_client.send(  # type: ignore[union-attr]
+                    upstream_request,
+                    stream=True,
+                )
+                response_chunks: list[bytes] = []
+                try:
+                    async for chunk in response.aiter_bytes():
+                        response_chunks.append(chunk)
+                except httpx.RemoteProtocolError as e:
+                    if not response_chunks:
+                        logger.warning(
+                            "Passthrough upstream protocol error with no response body: "
+                            "%s %s -> %s: %s",
+                            request.method,
+                            path,
+                            url,
+                            e,
+                        )
+                        return Response(
+                            content=json.dumps(
+                                {
+                                    "error": {
+                                        "type": "upstream_protocol_error",
+                                        "message": (
+                                            f"Upstream API response ended unexpectedly: {e}"
+                                        ),
+                                    }
+                                }
+                            ),
+                            status_code=502,
+                            media_type="application/json",
+                        )
+                    logger.warning(
+                        "Passthrough upstream response ended with an incomplete chunked read "
+                        "after %d bytes; forwarding received body: %s %s -> %s: %s",
+                        sum(len(chunk) for chunk in response_chunks),
+                        request.method,
+                        path,
+                        url,
+                        e,
+                    )
+                finally:
+                    await response.aclose()
+                response_content = b"".join(response_chunks)
+            else:
+                response = await passthrough_client.request(  # type: ignore[union-attr]
+                    method=request.method,
+                    url=url,
+                    headers=headers,
+                    content=body,
+                )
+                response_content = response.content
         except (httpx.ConnectError, httpx.TimeoutException) as e:
             logger.warning(
                 "Passthrough request failed before upstream response: %s %s -> %s: %s",
@@ -6176,18 +6229,38 @@ class OpenAIHandlerMixin:
                 status_code=502,
                 media_type="application/json",
             )
+        except httpx.RemoteProtocolError as e:
+            logger.warning(
+                "Passthrough upstream protocol error before response body: %s %s -> %s: %s",
+                request.method,
+                path,
+                url,
+                e,
+            )
+            return Response(
+                content=json.dumps(
+                    {
+                        "error": {
+                            "type": "upstream_protocol_error",
+                            "message": f"Upstream API response ended unexpectedly: {e}",
+                        }
+                    }
+                ),
+                status_code=502,
+                media_type="application/json",
+            )
 
         # Remove compression headers since httpx already decompressed the response
         response_headers = dict(response.headers)
         response_headers.pop("content-encoding", None)
         response_headers.pop("content-length", None)  # Length changed after decompression
-        response_content = response.content
+        response_headers.pop("transfer-encoding", None)
 
         if provider == "anthropic" and endpoint_name == "models":
             from headroom.providers.anthropic import sanitize_anthropic_model_metadata
 
             try:
-                payload = response.json()
+                payload = json.loads(response_content)
                 sanitized_payload = sanitize_anthropic_model_metadata(payload)
             except (TypeError, ValueError):
                 sanitized_payload = None
@@ -6210,7 +6283,7 @@ class OpenAIHandlerMixin:
             usage: dict[str, int] = {}
             if response.headers.get("content-type", "").lower().startswith("application/json"):
                 try:
-                    usage = _passthrough_usage_from_json(response.json())
+                    usage = _passthrough_usage_from_json(json.loads(response_content))
                 except (json.JSONDecodeError, ValueError, TypeError):
                     usage = {}
             input_tokens = usage.get("input_tokens", 0)
