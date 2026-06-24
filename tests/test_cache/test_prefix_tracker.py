@@ -554,9 +554,7 @@ class TestClassifyCacheMiss:
 
     def test_one_hour_ttl_override(self):
         """cache_ttl_seconds override widens the TTL window (1h breakpoint)."""
-        tracker = PrefixCacheTracker(
-            "anthropic", PrefixFreezeConfig(cache_ttl_seconds=3600)
-        )
+        tracker = PrefixCacheTracker("anthropic", PrefixFreezeConfig(cache_ttl_seconds=3600))
         self._warm(tracker, self.BASE)
         # 400s idle is past the 300s default but within 3600s → not TTL expiry.
         result = tracker.classify_cache_miss(0, self.BASE, idle_seconds=400)

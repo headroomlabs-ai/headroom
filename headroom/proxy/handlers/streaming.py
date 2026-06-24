@@ -755,7 +755,9 @@ class StreamingMixin:
             # overwrites the last-turn state the classifier reads. Compare the
             # prefix we forwarded this turn (`forwarded_messages`, pre-assistant
             # append) against last turn's.
-            if provider == "anthropic":
+            # `hasattr` guard: stub trackers in tests may implement only the
+            # freeze API, not the full PrefixCacheTracker surface.
+            if provider == "anthropic" and hasattr(prefix_tracker, "classify_cache_miss"):
                 miss = prefix_tracker.classify_cache_miss(
                     cache_read_tokens=cache_read_tokens,
                     current_forwarded_messages=forwarded_messages,

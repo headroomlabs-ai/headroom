@@ -2424,20 +2424,25 @@ class AnthropicHandlerMixin:
                     # last-turn state the classifier reads (idle clock, prefix,
                     # cached-token count). `optimized_messages` is the prefix we
                     # forwarded this turn; compare it against last turn's.
-                    miss = prefix_tracker.classify_cache_miss(
-                        cache_read_tokens=cr_tokens,
-                        current_forwarded_messages=optimized_messages,
-                    )
-                    if miss.is_miss:
-                        logger.info(
-                            f"[{request_id}] CACHE-MISS-ATTRIBUTION: reason={miss.reason} "
-                            f"idle={miss.idle_seconds:.0f}s ttl={miss.cache_ttl_seconds}s "
-                            f"expected_cached={miss.expected_cached_tokens:,} "
-                            f"prefix_changed={miss.prefix_changed} ttl_exceeded={miss.ttl_exceeded}"
+                    # `hasattr` guard: some tests inject a SimpleNamespace stub
+                    # tracker that only implements the freeze API, not the full
+                    # PrefixCacheTracker surface.
+                    if hasattr(prefix_tracker, "classify_cache_miss"):
+                        miss = prefix_tracker.classify_cache_miss(
+                            cache_read_tokens=cr_tokens,
+                            current_forwarded_messages=optimized_messages,
                         )
-                        await self.metrics.record_cache_miss_attribution(
-                            provider_name, miss.reason
-                        )
+                        if miss.is_miss:
+                            logger.info(
+                                f"[{request_id}] CACHE-MISS-ATTRIBUTION: reason={miss.reason} "
+                                f"idle={miss.idle_seconds:.0f}s ttl={miss.cache_ttl_seconds}s "
+                                f"expected_cached={miss.expected_cached_tokens:,} "
+                                f"prefix_changed={miss.prefix_changed} "
+                                f"ttl_exceeded={miss.ttl_exceeded}"
+                            )
+                            await self.metrics.record_cache_miss_attribution(
+                                provider_name, miss.reason
+                            )
 
                     prefix_tracker.update_from_response(
                         cache_read_tokens=cr_tokens,
