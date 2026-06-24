@@ -313,15 +313,18 @@ async def _connect_via_upstream_proxy(
     await writer.drain()
 
     # Read response — look for 200 Connection Established.
-    response_line = await asyncio.wait_for(reader.readline(), timeout=_CONNECT_TIMEOUT)
-    if b"200" not in response_line:
+    try:
+        response_line = await asyncio.wait_for(reader.readline(), timeout=_CONNECT_TIMEOUT)
+        if b"200" not in response_line:
+            raise OSError(f"Upstream proxy refused CONNECT: {response_line!r}")
+        # Drain remaining headers.
+        while True:
+            hdr = await asyncio.wait_for(reader.readline(), timeout=_CONNECT_TIMEOUT)
+            if hdr in (b"\r\n", b"\n", b""):
+                break
+    except (OSError, asyncio.TimeoutError):
         writer.close()
-        raise OSError(f"Upstream proxy refused CONNECT: {response_line!r}")
-    # Drain remaining headers.
-    while True:
-        hdr = await asyncio.wait_for(reader.readline(), timeout=_CONNECT_TIMEOUT)
-        if hdr in (b"\r\n", b"\n", b""):
-            break
+        raise
     return reader, writer
 
 
@@ -381,7 +384,9 @@ async def _handle_connect(
         try:
             hdr_bytes = await asyncio.wait_for(client_reader.readline(), timeout=_CONNECT_TIMEOUT)
         except asyncio.TimeoutError:
-            break
+            logger.debug("event=connect_header_timeout peer=%s", peer)
+            client_writer.close()
+            return
         if hdr_bytes in (b"\r\n", b"\n", b""):
             break
         hdr = hdr_bytes.decode("latin-1")
@@ -590,8 +595,12 @@ async def _handle_blind_tunnel(
         client_writer.close()
         return
 
-    client_writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-    await client_writer.drain()
+    try:
+        client_writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        await client_writer.drain()
+    except OSError:
+        target_writer.close()
+        raise
 
     await _blind_splice(client_reader, client_writer, target_reader, target_writer)
 

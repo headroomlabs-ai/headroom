@@ -651,3 +651,266 @@ async def test_terminator_self_terminate_path_works_via_helper(tmp_ca: tuple) ->
         await terminator.stop()
 
     assert dispatch_called[0], "Dispatch callback must have been invoked"
+
+
+# ---------------------------------------------------------------------------
+# Regression: header-drain timeout aborts (no splice)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_connect_header_timeout_aborts(tmp_ca: tuple) -> None:
+    """Client stalls mid-headers after CONNECT line → connection aborted, no splice.
+
+    Verifies defect fix: asyncio.TimeoutError in header drain must close
+    client_writer and return, never proceeding to _handle_mitm/_handle_blind_tunnel.
+    """
+    import unittest.mock as mock
+
+    import headroom.proxy.agy_terminator as _mod
+    from headroom.proxy.agy_terminator import _handle_connect, _LeafCache
+
+    ca_key, ca_cert, _ = tmp_ca
+    leaf_cache = _LeafCache(max_size=4)
+
+    mitm_called = False
+    blind_called = False
+
+    async def _fake_mitm(*args: object, **kwargs: object) -> None:
+        nonlocal mitm_called
+        mitm_called = True
+
+    async def _fake_blind(*args: object, **kwargs: object) -> None:
+        nonlocal blind_called
+        blind_called = True
+
+    # Feed CONNECT line, then nothing — header-drain readline will block.
+    client_reader = asyncio.StreamReader()
+    client_reader.feed_data(b"CONNECT notallowlisted.example.com:443 HTTP/1.1\r\n")
+
+    close_called = False
+
+    class _TrackingWriter:
+        def get_extra_info(self, key: str, default: object = None) -> object:  # noqa: ANN401
+            if key == "peername":
+                return ("127.0.0.1", 1234)
+            return default
+
+        def write(self, data: bytes) -> None:
+            pass
+
+        async def drain(self) -> None:
+            pass
+
+        def close(self) -> None:
+            nonlocal close_called
+            close_called = True
+
+        async def wait_closed(self) -> None:
+            pass
+
+    client_writer = _TrackingWriter()  # type: ignore[assignment]
+
+    # Tiny timeout so the header-drain readline genuinely times out fast.
+    with (
+        mock.patch.object(_mod, "_handle_mitm", _fake_mitm),
+        mock.patch.object(_mod, "_handle_blind_tunnel", _fake_blind),
+        mock.patch.object(_mod, "_CONNECT_TIMEOUT", 0.01),
+    ):
+        await _handle_connect(
+            client_reader,
+            client_writer,  # type: ignore[arg-type]
+            allowlist=frozenset(),
+            leaf_cache=leaf_cache,
+            ca_key=ca_key,
+            ca_cert=ca_cert,
+            dispatch=None,  # type: ignore[arg-type]
+        )
+
+    assert close_called, "client_writer.close() must be called on header timeout"
+    assert not mitm_called, "_handle_mitm must NOT be called on header timeout"
+    assert not blind_called, "_handle_blind_tunnel must NOT be called on header timeout"
+
+
+# ---------------------------------------------------------------------------
+# Regression: upstream proxy header-drain timeout closes upstream writer
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_upstream_proxy_timeout_closes_writer() -> None:
+    """Header-drain readline in _connect_via_upstream_proxy times out → upstream writer closed.
+
+    A fake upstream proxy sends the 200 response line then stalls (never sends
+    the blank-line header terminator).  With a tiny _CONNECT_TIMEOUT the
+    header-drain readline times out and the upstream writer must be closed.
+    """
+    import unittest.mock as mock
+
+    import headroom.proxy.agy_terminator as _mod
+    from headroom.proxy.agy_terminator import _connect_via_upstream_proxy
+
+    closed_writers: list[object] = []
+    # Gate that the proxy releases when it has sent the 200 response.
+    proxy_sent_200 = asyncio.Event()
+    # Gate the proxy waits on so teardown can unblock it cleanly.
+    proxy_release = asyncio.Event()
+
+    async def _stall_proxy_handler(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        """Accept CONNECT, reply 200, then stall without the blank-line terminator."""
+        try:
+            await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=2.0)
+        except (asyncio.IncompleteReadError, asyncio.TimeoutError):
+            pass
+        writer.write(b"HTTP/1.1 200 Connection Established\r\n")
+        await writer.drain()
+        proxy_sent_200.set()
+        # Block until teardown releases us (or until cancelled).
+        try:
+            await proxy_release.wait()
+        except asyncio.CancelledError:
+            pass
+        finally:
+            writer.close()
+
+    proxy_server = await asyncio.start_server(
+        _stall_proxy_handler, host="127.0.0.1", port=0
+    )
+    proxy_addr = proxy_server.sockets[0].getsockname()
+    proxy_host, proxy_port = proxy_addr[0], proxy_addr[1]
+
+    orig_open_conn = asyncio.open_connection
+
+    async def _spy_open_conn(
+        host: str, port: int, **kwargs: object
+    ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        r, w = await orig_open_conn(host, port, **kwargs)
+        orig_close = w.close
+
+        def _tracked_close() -> None:
+            closed_writers.append(w)
+            orig_close()
+
+        w.close = _tracked_close  # type: ignore[method-assign]
+        return r, w
+
+    try:
+        with (
+            mock.patch.object(_mod, "_CONNECT_TIMEOUT", 0.2),
+            mock.patch("headroom.proxy.agy_terminator.asyncio.open_connection", _spy_open_conn),
+        ):
+            try:
+                r, w = await _connect_via_upstream_proxy(
+                    proxy_host, proxy_port, "target.example.com", 443, None
+                )
+                w.close()
+                pytest.fail("Expected asyncio.TimeoutError from stalled header drain")
+            except (asyncio.TimeoutError, OSError):
+                pass  # expected path
+    finally:
+        proxy_release.set()  # unblock any stalled handler
+        proxy_server.close()
+        try:
+            await asyncio.wait_for(proxy_server.wait_closed(), timeout=2.0)
+        except asyncio.TimeoutError:
+            pass
+
+    assert closed_writers, "upstream writer must be closed when header-drain readline times out"
+
+
+# ---------------------------------------------------------------------------
+# Regression: blind tunnel drain error closes target writer
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_blind_tunnel_drain_error_closes_target() -> None:
+    """client_writer.drain() raises before _blind_splice → target_writer is closed.
+
+    Verifies defect fix: if the 200-response drain raises (client disconnected),
+    target_writer must be closed to avoid fd leak.
+    """
+    import unittest.mock as mock
+
+    from headroom.proxy.agy_terminator import _handle_blind_tunnel
+
+    target_release = asyncio.Event()
+
+    async def _idle_handler(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        try:
+            await target_release.wait()
+        except asyncio.CancelledError:
+            pass
+        finally:
+            writer.close()
+
+    target_server = await asyncio.start_server(_idle_handler, host="127.0.0.1", port=0)
+    target_addr = target_server.sockets[0].getsockname()
+    target_host, target_port = target_addr[0], target_addr[1]
+
+    target_writer_closed = False
+    orig_open_conn = asyncio.open_connection
+
+    async def _spy_target_conn(
+        host: str, port: int, **kwargs: object
+    ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        r, w = await orig_open_conn(host, port, **kwargs)
+        orig_close = w.close
+
+        def _tracked_close() -> None:
+            nonlocal target_writer_closed
+            target_writer_closed = True
+            orig_close()
+
+        w.close = _tracked_close  # type: ignore[method-assign]
+        return r, w
+
+    class _DrainFailWriter:
+        """client_writer stub whose drain() always raises ConnectionResetError."""
+
+        def get_extra_info(self, key: str, default: object = None) -> object:  # noqa: ANN401
+            return ("127.0.0.1", 9999) if key == "peername" else default
+
+        def write(self, data: bytes) -> None:
+            pass
+
+        async def drain(self) -> None:
+            raise ConnectionResetError("client gone")
+
+        def close(self) -> None:
+            pass
+
+        async def wait_closed(self) -> None:
+            pass
+
+    client_reader = asyncio.StreamReader()
+
+    try:
+        with mock.patch(
+            "headroom.proxy.agy_terminator.asyncio.open_connection", _spy_target_conn
+        ):
+            try:
+                await _handle_blind_tunnel(
+                    client_reader,
+                    _DrainFailWriter(),  # type: ignore[arg-type]
+                    target_host,
+                    target_port,
+                    None,
+                )
+            except Exception:  # noqa: BLE001
+                pass  # any propagated exception is acceptable
+    finally:
+        target_release.set()
+        target_server.close()
+        try:
+            await asyncio.wait_for(target_server.wait_closed(), timeout=2.0)
+        except asyncio.TimeoutError:
+            pass
+
+    assert target_writer_closed, (
+        "target_writer.close() must be called when client_writer.drain() raises before splice"
+    )
