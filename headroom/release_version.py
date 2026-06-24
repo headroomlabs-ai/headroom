@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import os
 import re
+import subprocess
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from headroom._subprocess import run
 
 SEMVER_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 RELEASE_TAG_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)(?:\.(\d+))?$")
@@ -221,7 +221,7 @@ def get_canonical_version(root: Path) -> str:
 def list_release_tags(root: Path) -> list[str]:
     """List release tags from the local Git checkout."""
 
-    result = run(
+    result = subprocess.run(
         ["git", "tag", "-l", "v*"],
         cwd=root,
         check=True,
@@ -240,7 +240,7 @@ def list_release_commits(root: Path, previous_tag: str) -> list[CommitInfo]:
     else:
         cmd.append("HEAD")
 
-    result = run(
+    result = subprocess.run(
         cmd,
         cwd=root,
         check=True,
@@ -263,7 +263,7 @@ def commit_height_since(root: Path, previous_tag: str) -> str:
     if not previous_tag:
         return "0"
 
-    result = run(
+    result = subprocess.run(
         ["git", "rev-list", f"{previous_tag}..HEAD", "--count"],
         cwd=root,
         check=True,
