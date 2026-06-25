@@ -335,11 +335,18 @@ def test_install_supervisor_darwin_windows_and_unsupported(monkeypatch, tmp_path
         install_supervisor(_manifest(supervisor=SupervisorKind.SERVICE.value))
 
 
+class _LaunchctlResult:
+    def __init__(self, returncode: int = 0, stderr: str = "", stdout: str = "") -> None:
+        self.returncode = returncode
+        self.stderr = stderr
+        self.stdout = stdout
+
+
 def test_start_and_stop_supervisor_darwin_windows_and_none(monkeypatch) -> None:
     calls: list[list[str]] = []
     monkeypatch.setattr(
         "headroom.install.supervisors.subprocess.run",
-        lambda command, **kwargs: calls.append(command),
+        lambda command, **kwargs: calls.append(command) or _LaunchctlResult(0),
     )
     monkeypatch.setattr("headroom.install.supervisors.os.getuid", lambda: 77, raising=False)
 
@@ -349,6 +356,8 @@ def test_start_and_stop_supervisor_darwin_windows_and_none(monkeypatch) -> None:
 
     monkeypatch.setattr("headroom.install.supervisors.sys.platform", "darwin")
     monkeypatch.setattr("headroom.install.supervisors.sys.platform", "darwin")
+    # Warm path: kickstart succeeds (job already bootstrapped), so start does
+    # not fall through to bootstrap.
     start_supervisor(_manifest(supervisor=SupervisorKind.SERVICE.value))
     stop_supervisor(_manifest(supervisor=SupervisorKind.SERVICE.value))
     assert calls == [
@@ -365,6 +374,108 @@ def test_start_and_stop_supervisor_darwin_windows_and_none(monkeypatch) -> None:
         ["sc.exe", "start", "headroom-default"],
         ["sc.exe", "stop", "headroom-default"],
     ]
+
+
+def test_macos_start_bootstraps_when_job_not_registered(monkeypatch, tmp_path: Path) -> None:
+    # Post-`stop`/`restart` state: the job was booted out, so `kickstart` fails
+    # (launchctl 113) and start must bootstrap the plist instead.
+    monkeypatch.setattr("headroom.install.supervisors.sys.platform", "darwin")
+    monkeypatch.setattr("headroom.install.supervisors.os.getuid", lambda: 77, raising=False)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    calls: list[list[str]] = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        if command[1] == "kickstart":
+            return _LaunchctlResult(113, stderr="Could not find service")
+        return _LaunchctlResult(0)
+
+    monkeypatch.setattr("headroom.install.supervisors.subprocess.run", fake_run)
+
+    start_supervisor(_manifest(supervisor=SupervisorKind.SERVICE.value))
+
+    plist_path = tmp_path / "Library" / "LaunchAgents" / "com.headroom.default.plist"
+    assert calls == [
+        ["launchctl", "kickstart", "-k", "gui/77/com.headroom.default"],
+        ["launchctl", "bootstrap", "gui/77", str(plist_path)],
+    ]
+
+
+def test_macos_start_retries_bootstrap_until_launchd_settles(monkeypatch, tmp_path: Path) -> None:
+    # launchd returns EIO (error 5) from bootstrap for a while after a bootout;
+    # start should retry until it succeeds.
+    monkeypatch.setattr("headroom.install.supervisors.sys.platform", "darwin")
+    monkeypatch.setattr("headroom.install.supervisors.os.getuid", lambda: 77, raising=False)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr("headroom.install.supervisors.time.sleep", lambda _s: None)
+    bootstrap_attempts = 0
+
+    def fake_run(command, **kwargs):
+        nonlocal bootstrap_attempts
+        if command[1] == "kickstart":
+            return _LaunchctlResult(113)
+        bootstrap_attempts += 1
+        if bootstrap_attempts < 3:
+            return _LaunchctlResult(5, stderr="Bootstrap failed: 5: Input/output error")
+        return _LaunchctlResult(0)
+
+    monkeypatch.setattr("headroom.install.supervisors.subprocess.run", fake_run)
+
+    start_supervisor(_manifest(supervisor=SupervisorKind.SERVICE.value))
+    assert bootstrap_attempts == 3
+
+
+def test_macos_start_raises_after_bootstrap_keeps_failing(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr("headroom.install.supervisors.sys.platform", "darwin")
+    monkeypatch.setattr("headroom.install.supervisors.os.getuid", lambda: 77, raising=False)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr("headroom.install.supervisors.time.sleep", lambda _s: None)
+    monkeypatch.setattr("headroom.install.supervisors._MACOS_BOOTSTRAP_RETRIES", 3)
+
+    def fake_run(command, **kwargs):
+        if command[1] == "kickstart":
+            return _LaunchctlResult(113)
+        return _LaunchctlResult(5, stderr="Bootstrap failed: 5: Input/output error")
+
+    monkeypatch.setattr("headroom.install.supervisors.subprocess.run", fake_run)
+
+    with pytest.raises(click.ClickException, match="could not start"):
+        start_supervisor(_manifest(supervisor=SupervisorKind.SERVICE.value))
+
+
+def test_macos_stop_tolerates_missing_job(monkeypatch) -> None:
+    # `bootout` of an absent job exits with ESRCH (3); stop must not raise so
+    # that `restart` can proceed to start again.
+    monkeypatch.setattr("headroom.install.supervisors.sys.platform", "darwin")
+    monkeypatch.setattr("headroom.install.supervisors.os.getuid", lambda: 77, raising=False)
+    calls: list[list[str]] = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        assert kwargs.get("check") is not True
+        return _LaunchctlResult(3, stderr="Boot-out failed: 3: No such process")
+
+    monkeypatch.setattr("headroom.install.supervisors.subprocess.run", fake_run)
+
+    stop_supervisor(_manifest(supervisor=SupervisorKind.SERVICE.value))
+    assert calls == [["launchctl", "bootout", "gui/77/com.headroom.default"]]
+
+
+def test_macos_stop_raises_on_non_esrch_failure(monkeypatch) -> None:
+    # A non-3 `bootout` failure (e.g. permissions) is a real error and must
+    # surface — otherwise `restart` could report success with a stale job still
+    # running.
+    monkeypatch.setattr("headroom.install.supervisors.sys.platform", "darwin")
+    monkeypatch.setattr("headroom.install.supervisors.os.getuid", lambda: 77, raising=False)
+    monkeypatch.setattr(
+        "headroom.install.supervisors.subprocess.run",
+        lambda command, **kwargs: _LaunchctlResult(
+            9, stderr="Boot-out failed: 9: Operation not permitted"
+        ),
+    )
+
+    with pytest.raises(click.ClickException, match="bootout failed"):
+        stop_supervisor(_manifest(supervisor=SupervisorKind.SERVICE.value))
 
 
 def test_remove_supervisor_removes_user_crontab_block(monkeypatch) -> None:

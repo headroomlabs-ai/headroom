@@ -739,3 +739,53 @@ class TestProxyClientRefCounting:
 
         # Second unregister is a no-op, not an error.
         wrap_mod._unregister_proxy_client(self.PORT)
+
+
+# ---------------------------------------------------------------------------
+# _ensure_proxy — dashboard URL is surfaced even when the proxy is already up.
+# ---------------------------------------------------------------------------
+
+
+def test_ensure_proxy_already_running_prints_dashboard_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When a healthy proxy is already running, the dashboard URL is printed.
+
+    Regression: the URL was only echoed on the start/restart path, so repeat
+    wraps (the common case) never told the user where the dashboard lives.
+    """
+    port = 1234
+    monkeypatch.setattr(wrap_mod, "_find_persistent_manifest", lambda _p: None)
+    monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _p: True)
+    monkeypatch.setattr(wrap_mod, "_query_proxy_health", lambda _p: {})
+    monkeypatch.setattr(wrap_mod, "_proxy_needs_version_restart", lambda _h: False)
+    monkeypatch.setattr(wrap_mod, "_proxy_health_config", lambda _h: None)
+    monkeypatch.setattr(wrap_mod, "_query_proxy_config", lambda _p: None)
+
+    output = _run_in_click_context(lambda: wrap_mod._ensure_proxy(port, no_proxy=False))
+
+    assert f"http://127.0.0.1:{port}/dashboard" in output
+
+
+# ---------------------------------------------------------------------------
+# _resolve_1m_model — 1M context window suffix logic (#1158).
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_1m_model_appends_suffix_to_user_model() -> None:
+    """A model the user already selected via ANTHROPIC_MODEL is preserved, with
+    only the [1m] suffix appended so Claude Code requests the 1M window."""
+    assert wrap_mod._resolve_1m_model("claude-opus-4-1-20250805") == (
+        "claude-opus-4-1-20250805[1m]"
+    )
+
+
+def test_resolve_1m_model_is_idempotent() -> None:
+    """A model that already carries [1m] is returned unchanged (no double suffix)."""
+    assert wrap_mod._resolve_1m_model("claude-opus-4-8[1m]") == "claude-opus-4-8[1m]"
+
+
+def test_resolve_1m_model_falls_back_to_default_when_unset() -> None:
+    """With no model selected, fall back to the default Opus carrying [1m]."""
+    assert wrap_mod._resolve_1m_model(None) == "claude-opus-4-8[1m]"
+    assert wrap_mod._resolve_1m_model("  ") == "claude-opus-4-8[1m]"

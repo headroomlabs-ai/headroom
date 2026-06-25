@@ -9,6 +9,7 @@ Comprehensive tests covering:
 - Edge cases: Empty content, unavailable dependency, fallbacks
 """
 
+import textwrap
 from unittest.mock import patch
 
 import pytest
@@ -769,6 +770,137 @@ class TestTreeSitterIntegration:
         assert result.language == CodeLanguage.GO
         assert result.compressed  # Some output is produced
 
+    @pytest.mark.parametrize(
+        (
+            "language",
+            "code",
+            "expected_signature",
+            "expected_omitted_lines",
+            "expected_removed_line",
+            "expected_closing",
+        ),
+        [
+            (
+                "javascript",
+                (
+                    "class Calc {\n"
+                    "  compute(x) {\n"
+                    "    let a = x + 1;\n"
+                    "    let b = a * 2;\n"
+                    "    let c = b - 3;\n"
+                    "    return c;\n"
+                    "  }\n"
+                    "}\n"
+                ),
+                "compute(x) {",
+                3,
+                "return c;",
+                "}\n}",
+            ),
+            (
+                "typescript",
+                (
+                    "class Calc {\n"
+                    "  compute(x: number): number {\n"
+                    "    let a = x + 1;\n"
+                    "    let b = a * 2;\n"
+                    "    let c = b - 3;\n"
+                    "    return c;\n"
+                    "  }\n"
+                    "}\n"
+                ),
+                "compute(x: number): number {",
+                3,
+                "return c;",
+                "}\n}",
+            ),
+            (
+                "java",
+                (
+                    "public class Calc {\n"
+                    "    public int compute(int x) {\n"
+                    "        int a = x + 1;\n"
+                    "        int b = a * 2;\n"
+                    "        int c = b - 3;\n"
+                    "        int d = c / 4;\n"
+                    "        int e = d + 5;\n"
+                    "        return e;\n"
+                    "    }\n"
+                    "}\n"
+                ),
+                "public int compute(int x) {",
+                5,
+                "return e;",
+                "}\n}",
+            ),
+            (
+                "cpp",
+                (
+                    "class Calc {\n"
+                    "public:\n"
+                    "    int compute(int x) {\n"
+                    "        int a = x + 1;\n"
+                    "        int b = a * 2;\n"
+                    "        int c = b - 3;\n"
+                    "        int d = c / 4;\n"
+                    "        int e = d + 5;\n"
+                    "        return e;\n"
+                    "    }\n"
+                    "};\n"
+                ),
+                "int compute(int x) {",
+                5,
+                "return e;",
+                "};",
+            ),
+            (
+                "rust",
+                (
+                    "impl Calc {\n"
+                    "    pub fn compute(&self, x: i32) -> i32 {\n"
+                    "        let a = x + 1;\n"
+                    "        let b = a * 2;\n"
+                    "        let c = b - 3;\n"
+                    "        let d = c / 4;\n"
+                    "        let e = d + 5;\n"
+                    "        e\n"
+                    "    }\n"
+                    "}\n"
+                ),
+                "pub fn compute(&self, x: i32) -> i32 {",
+                5,
+                "        e\n",
+                "}\n}",
+            ),
+        ],
+    )
+    def test_compresses_methods_inside_class_member_containers(
+        self,
+        language,
+        code,
+        expected_signature,
+        expected_omitted_lines,
+        expected_removed_line,
+        expected_closing,
+    ):
+        """Class/impl member containers are distinct from executable method bodies."""
+        config = CodeCompressorConfig(
+            min_tokens_for_compression=1,
+            max_body_lines=1,
+            enable_ccr=False,
+        )
+        compressor = CodeAwareCompressor(config)
+
+        result = compressor.compress(code, language=language)
+
+        assert result.language == CodeLanguage(language)
+        assert result.syntax_valid is True
+        assert result.compression_ratio < 1.0
+        assert expected_signature in result.compressed
+        assert f"// [{expected_omitted_lines} lines omitted]" in result.compressed
+        assert expected_removed_line not in result.compressed
+        assert result.compressed.endswith(expected_closing)
+
     def test_imports_preserved(self):
         """Imports are preserved in compressed output."""
         config = CodeCompressorConfig(
@@ -851,6 +983,85 @@ def main():
             compile(result.compressed, "<test>", "exec")
         except SyntaxError:
             pytest.fail("Compressed output has invalid Python syntax")
+
+    def test_python_future_import_stays_at_module_start(self):
+        """Compressed Python keeps future imports before executable statements."""
+        config = CodeCompressorConfig(
+            min_tokens_for_compression=10,
+            target_compression_rate=0.2,
+            max_body_lines=3,
+            enable_ccr=False,
+        )
+        compressor = CodeAwareCompressor(config)
+        code = textwrap.dedent(
+            """
+            from __future__ import annotations
+
+            from dataclasses import dataclass
+            from typing import Any, Callable, Iterable
+
+
+            def traced(label: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+                def decorate(fn: Callable[..., Any]) -> Callable[..., Any]:
+                    async def wrapper(*args: Any, **kwargs: Any) -> Any:
+                        return await fn(*args, **kwargs)
+
+                    return wrapper
+
+                return decorate
+
+
+            @dataclass(slots=True)
+            class Event:
+                kind: str
+                payload: dict[str, Any]
+                retries: int = 0
+
+                @property
+                def important(self) -> bool:
+                    return self.kind in {"error", "retry"} or self.retries > 2
+
+
+            class EventRouter:
+                def __init__(self, sinks: dict[str, Callable[[Event], Any]]) -> None:
+                    self.sinks = sinks
+                    self.history: list[tuple[str, bool]] = []
+
+                @traced("route")
+                async def route(self, events: Iterable[Event]) -> list[str]:
+                    accepted: list[str] = []
+                    for event in events:
+                        match event:
+                            case Event(kind="error", payload={"code": code, "message": msg}, retries=r) if r > 1:
+                                destination = "pager"
+                                accepted.append(f"{destination}:{code}:{msg}")
+                            case Event(kind=kind, payload=payload) if (route := payload.get("route")):
+                                destination = str(route)
+                                accepted.append(f"{destination}:{kind}")
+                            case _:
+                                destination = "dead_letter"
+                                accepted.append(destination)
+
+                        self.history.append((destination, event.important))
+
+                    return [item for item in accepted if item]
+            """
+        )
+
+        result = compressor.compress(code, language="python")
+
+        assert result.syntax_valid is True
+        future_import_index = result.compressed.index("from __future__ import annotations")
+        first_executable_index = min(
+            result.compressed.index("@dataclass"),
+            result.compressed.index("def traced"),
+            result.compressed.index("class EventRouter"),
+        )
+        assert future_import_index < first_executable_index
+        try:
+            compile(result.compressed, "<test>", "exec")
+        except SyntaxError as exc:
+            pytest.fail(f"Compressed output has invalid Python syntax: {exc}\n{result.compressed}")
 
     def test_tree_sitter_loaded_after_compression(self):
         """Parser is loaded after compression."""
@@ -1280,3 +1491,163 @@ function _internalDebug(msg) {
         """semantic_analysis is True by default in config."""
         config = CodeCompressorConfig()
         assert config.semantic_analysis is True
+
+
+# =============================================================================
+# Regression: tree-sitter ABI mismatch (real AST must run, no silent fallback)
+# =============================================================================
+
+
+@pytest.mark.skipif(not TREE_SITTER_INSTALLED, reason="tree-sitter grammar pack not installed")
+class TestRealASTRuns:
+    """Guards against the regression where the code-aware compressor silently
+    fell back to a lossy stripper because ``_get_parser`` built a stock
+    ``tree_sitter.Parser`` and assigned it a foreign grammar-pack ``Language``
+    (raising ``TypeError`` that was swallowed into a fallback).
+    """
+
+    def _compressor(self):
+        return CodeAwareCompressor(
+            CodeCompressorConfig(
+                min_tokens_for_compression=10,
+                enable_ccr=False,
+            )
+        )
+
+    def test_get_parser_returns_stock_node_api(self):
+        """The parser must yield nodes with the stock tree_sitter property API
+        that the tree-walking code relies on (``.type``/``.children``/...)."""
+        from headroom.transforms.code_compressor import _get_parser
+
+        parser = _get_parser("python")
+        tree = parser.parse(b"def foo(x):\n    return x + 1\n")
+        root = tree.root_node
+
+        # Property access (NOT method calls) — the old pack binding exposed
+        # methods like ``.kind()`` which would break every call site.
+        assert root.type == "module"
+        assert root.child_count >= 1
+        assert isinstance(root.children, list)
+
+        func = root.children[0]
+        assert func.type == "function_definition"
+        assert isinstance(func.start_byte, int)
+        assert isinstance(func.end_byte, int)
+        # start_point must be index-able like a (row, col) tuple.
+        assert func.start_point[0] == 0
+        assert b"def foo" in func.text
+
+    def test_check_tree_sitter_available_verifies_real_parse(self):
+        """``_check_tree_sitter_available`` must only return True when an actual
+        parse succeeds — not merely when the package imports."""
+        import headroom.transforms.code_compressor as cc
+
+        cc._tree_sitter_available = None  # reset memoized result
+        assert cc._check_tree_sitter_available() is True
+
+    def test_check_tree_sitter_available_false_when_parse_broken(self):
+        """If parsing raises (e.g. the old foreign-Language bug), availability
+        must report False instead of green-lighting the broken path."""
+        import headroom.transforms.code_compressor as cc
+
+        cc._tree_sitter_available = None
+        with patch.object(cc, "_get_parser", side_effect=TypeError("boom")):
+            assert cc._check_tree_sitter_available() is False
+        cc._tree_sitter_available = None  # reset for other tests
+
+    def test_ast_runs_for_python_no_fallback(self):
+        """A supported language must be compressed via real AST, not the
+        UNKNOWN-language Kompress fallback."""
+        result = self._compressor().compress(_payment_processing_code(), language="python")
+
+        # The fallback path forces language=UNKNOWN and syntax_valid=False.
+        # Real AST keeps the detected language and guarantees valid syntax.
+        assert result.language == CodeLanguage.PYTHON
+        assert result.syntax_valid is True
+        compile(result.compressed, "<test>", "exec")
+
+    def test_ast_preserves_structure_for_python(self):
+        """AST output retains signatures/scopes/imports (unlike the old
+        whitespace garble)."""
+        code = (
+            "import math\n"
+            "\n"
+            "def compute(values):\n"
+            "    total = 0\n"
+            "    for v in values:\n"
+            "        total += v * v\n"
+            "        total -= 1\n"
+            "        total *= 2\n"
+            "        total //= 3\n"
+            "    return math.sqrt(total)\n"
+        )
+        result = self._compressor().compress(code, language="python")
+
+        assert result.language == CodeLanguage.PYTHON
+        assert result.syntax_valid is True
+        # Structure markers survive compression.
+        assert "import math" in result.compressed
+        assert "def compute(values):" in result.compressed
+        # Output is still valid Python.
+        compile(result.compressed, "<test>", "exec")
+
+    def test_get_node_text_uses_utf8_byte_offsets(self):
+        """tree-sitter byte offsets must not be sliced as Python str indexes."""
+        from headroom.transforms.code_compressor import _get_node_text, _get_parser
+
+        code = 'def first():\n    """中文占位"""\n    return 1\n\ndef second():\n    return 2\n'
+        root = _get_parser("python").parse(code.encode("utf-8")).root_node
+        functions = [node for node in root.children if node.type == "function_definition"]
+
+        assert _get_node_text(functions[1], code) == "def second():\n    return 2"
+
+    def test_ast_compresses_python_after_non_ascii_source(self):
+        """CJK/emoji before a later function must not corrupt downstream slices."""
+        compressor = CodeAwareCompressor(
+            CodeCompressorConfig(
+                min_tokens_for_compression=1,
+                max_body_lines=2,
+                enable_ccr=False,
+                semantic_analysis=False,
+            )
+        )
+        code = (
+            "def first():\n"
+            '    """中文占位 with emoji 🔥."""\n'
+            "    return 1\n"
+            "\n"
+            "def second():\n"
+            "    values = []\n"
+            "    for i in range(10):\n"
+            "        values.append(i)\n"
+            "        values.append(i * 2)\n"
+            "        values.append(i * 3)\n"
+            "        values.append(i * 4)\n"
+            "    return sum(values)\n"
+        )
+
+        result = compressor.compress(code, language="python")
+
+        assert result.language == CodeLanguage.PYTHON
+        assert result.syntax_valid is True
+        assert result.compression_ratio < 1.0
+        assert "def second():" in result.compressed
+        assert "中文占位" in result.compressed
+        compile(result.compressed, "<test>", "exec")
+
+    def test_ast_runs_for_rust_no_fallback(self):
+        """A second supported language (Rust) also runs through real AST."""
+        code = (
+            "pub fn add(a: i64, b: i64) -> i64 {\n"
+            "    let mut acc = a;\n"
+            "    acc += b;\n"
+            "    acc -= 0;\n"
+            "    acc\n"
+            "}\n"
+        )
+        result = self._compressor().compress(code, language="rust")
+
+        assert result.language == CodeLanguage.RUST
+        assert result.syntax_valid is True
+        # Signature is preserved verbatim.
+        assert "pub fn add(a: i64, b: i64) -> i64" in result.compressed

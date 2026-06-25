@@ -391,9 +391,15 @@ class HeadroomMCPServer:
         )
         self._stats.record_compression(input_tokens, output_tokens, strategy)
 
-        savings_pct = (
-            round((1 - result.compression_ratio) * 100, 1) if result.compression_ratio < 1.0 else 0
-        )
+        # Percentage of tokens removed. Derive from the same token counts used
+        # for ``tokens_saved`` so all three fields agree — this mirrors the
+        # convention in ``_Stats.record_compression`` above. The previous
+        # ``(1 - result.compression_ratio)`` inverted the value: since
+        # ``compression_ratio`` is already the *saved* fraction (see
+        # ``CompressResult`` in headroom/compress.py — "0.0 = no savings, 1.0 =
+        # 100% removed"), the old expression reported the *retained* percentage,
+        # e.g. a no-op (0% saved) was reported as 100%.
+        savings_pct = round((1 - output_tokens / input_tokens) * 100, 1) if input_tokens > 0 else 0
 
         return {
             "compressed": compressed_content,

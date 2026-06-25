@@ -20,7 +20,8 @@ Usage:
     # Registered in Codex config.toml (done by `headroom wrap codex --memory`):
     [mcp_servers.headroom_memory]
     command = "python"
-    args = ["-m", "headroom.memory.mcp_server", "--db", ".headroom/memory.db"]
+    args = ["-m", "headroom.memory.mcp_server", "--user", "alice"]
+    # When --db is omitted, the server resolves .headroom/memory.db from cwd.
 """
 
 from __future__ import annotations
@@ -344,6 +345,42 @@ async def _run(db_path: str, user_id: str) -> None:
         await server.run(read_stream, write_stream, server.create_initialization_options())
 
 
+def _memory_mcp_startup_context(
+    configured_db: str, cwd: Path, db_flag_present: bool
+) -> dict[str, str | bool]:
+    """Describe the DB path the memory MCP server will try to open."""
+    configured_path = Path(configured_db).expanduser()
+    resolved_path = (
+        configured_path if configured_path.is_absolute() else (cwd / configured_path)
+    ).resolve(strict=False)
+    active_project_db = (cwd / ".headroom" / "memory.db").resolve(strict=False)
+    if not db_flag_present:
+        config_source = "cwd-default"
+        resolution = "dynamic-cwd"
+    else:
+        config_source = "cli-flag"
+        resolution = "static-cli"
+    if resolved_path == active_project_db:
+        storage_scope = "active-project"
+    elif resolved_path.name == "memory.db":
+        storage_scope = "external-memory-db"
+    else:
+        storage_scope = "custom-db-path"
+    path_exists = resolved_path.exists()
+    path_readable = path_exists and os.access(resolved_path, os.R_OK)
+    return {
+        "configured_db": str(configured_path),
+        "resolved_db": str(resolved_path),
+        "config_source": config_source,
+        "cwd": str(cwd),
+        "project_root": str(cwd),
+        "storage_scope": storage_scope,
+        "path_exists": path_exists,
+        "path_readable": path_readable,
+        "resolution": resolution,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Headroom Memory MCP Server")
     parser.add_argument(
@@ -368,6 +405,26 @@ def main() -> None:
         level=logging.INFO,
         stream=sys.stderr,
         format="%(name)s: %(message)s",
+    )
+
+    startup = _memory_mcp_startup_context(
+        configured_db=args.db,
+        cwd=Path.cwd(),
+        db_flag_present=any(arg == "--db" or arg.startswith("--db=") for arg in sys.argv[1:]),
+    )
+    logger.info(
+        "Memory MCP startup: configured_db=%s, resolved_db=%s, config_source=%s, "
+        "cwd=%s, project_root=%s, storage_scope=%s, path_exists=%s, "
+        "path_readable=%s, resolution=%s",
+        startup["configured_db"],
+        startup["resolved_db"],
+        startup["config_source"],
+        startup["cwd"],
+        startup["project_root"],
+        startup["storage_scope"],
+        startup["path_exists"],
+        startup["path_readable"],
+        startup["resolution"],
     )
 
     asyncio.run(_run(args.db, args.user))
