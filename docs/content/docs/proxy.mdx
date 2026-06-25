@@ -203,7 +203,7 @@ Set `x-headroom-bypass: true` to skip compression.
 
 ## Agent wrapping
 
-Use `headroom wrap` to transparently proxy any CLI tool:
+Use `headroom wrap` to launch supported CLI agents through the local proxy:
 
 ```bash
 # Claude Code
@@ -215,18 +215,22 @@ headroom wrap codex
 # Aider
 headroom wrap aider
 
-# Cursor
+# Cursor (starts the proxy and prints settings to paste into Cursor)
 headroom wrap cursor
 ```
 
-Or set the base URL manually:
+Cursor reads model endpoints from its settings UI, so `headroom wrap cursor`
+does not rewrite Cursor configuration or launch the app. After it starts the
+proxy, copy the printed base URL into Cursor's model settings.
+
+For environment-driven clients, you can also set the base URL manually:
 
 ```bash
 # Claude Code
 ANTHROPIC_BASE_URL=http://localhost:8787 claude
 
-# Cursor / any OpenAI-compatible client
-OPENAI_BASE_URL=http://localhost:8787/v1 cursor
+# Any OpenAI-compatible CLI client that reads OPENAI_BASE_URL
+OPENAI_BASE_URL=http://localhost:8787/v1 your-client
 ```
 
 ## Cloud providers
