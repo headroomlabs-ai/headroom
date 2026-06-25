@@ -203,7 +203,7 @@ def register_codebuddy_hooks(rtk_path: Path | None = None) -> bool:
 
     # Try the native --agent codebuddy path first
     try:
-        result = subprocess.run(
+        result = run(
             [str(rtk_path), "init", "--agent", "codebuddy", "--global", "--auto-patch"],
             capture_output=True,
             text=True,

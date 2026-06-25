@@ -12,9 +12,10 @@ from __future__ import annotations
 import json
 import logging
 import shutil
-import subprocess
 from pathlib import Path
 from typing import Any
+
+from headroom._subprocess import run as _sp_run
 
 from .base import MCPRegistrar, RegisterResult, RegisterStatus, ServerSpec
 
@@ -78,7 +79,7 @@ class CodeBuddyRegistrar(MCPRegistrar):
 
     def unregister_server(self, server_name: str) -> bool:
         if self._codebuddy_cli:
-            result = subprocess.run(
+            result = _sp_run(
                 [str(self._codebuddy_cli), "mcp", "remove", server_name, "-s", "user"],
                 capture_output=True,
                 text=True,
@@ -98,7 +99,7 @@ class CodeBuddyRegistrar(MCPRegistrar):
             cmd += ["-e", f"{k}={v}"]
         cmd += ["--", spec.command, *spec.args]
 
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = _sp_run(cmd, capture_output=True, text=True)
         if result.returncode == 0:
             return RegisterResult(
                 RegisterStatus.REGISTERED, "via `codebuddy mcp add` (scope: user)"

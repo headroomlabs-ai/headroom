@@ -3690,7 +3690,7 @@ def codebuddy(
     # Memory sync BEFORE proxy startup
     if memory:
         try:
-            import subprocess as _sp
+            from headroom._subprocess import run as _sp_run
 
             mem_dir = Path.cwd() / ".headroom"
             mem_dir.mkdir(parents=True, exist_ok=True)
@@ -3698,7 +3698,7 @@ def codebuddy(
             _sync_user = os.environ.get("USER", os.environ.get("USERNAME", "default"))
 
             click.echo(f"  Syncing memory (user={_sync_user})...")
-            sync_result = _sp.run(
+            sync_result = _sp_run(
                 [
                     sys.executable,
                     "-m",
