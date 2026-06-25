@@ -33,7 +33,7 @@ def _make_large_output(n: int = 200) -> str:
 
 def _run_async(coro):
     """Helper to run async code in tests."""
-    return asyncio.get_event_loop().run_until_complete(coro)
+    return asyncio.run(coro)
 
 
 # Sample tool functions

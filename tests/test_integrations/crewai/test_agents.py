@@ -9,12 +9,11 @@ Tests cover:
 """
 
 from datetime import datetime
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
 try:
-    from crewai.tools.base_tool import BaseTool
     from crewai.tools.base_tool import tool as crewai_tool
 
     CREWAI_AVAILABLE = True
@@ -22,21 +21,6 @@ except ImportError:
     CREWAI_AVAILABLE = False
 
 pytestmark = pytest.mark.skipif(not CREWAI_AVAILABLE, reason="CrewAI not installed")
-
-
-@pytest.fixture
-def mock_tool():
-    """Create a mock CrewAI tool."""
-    mock = MagicMock(spec=BaseTool)
-    mock.name = "test_tool"
-    mock.description = "A test tool"
-    mock.args_schema = None
-    mock.result_schema = None
-    mock.cache_function = lambda *a, **kw: False
-    mock.result_as_answer = False
-    mock.max_usage_count = None
-    mock.run = MagicMock(return_value="Tool result")
-    return mock
 
 
 def _make_large_output(n: int = 200) -> str:
