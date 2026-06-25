@@ -50,6 +50,19 @@ def test_resolve_provider_type_prefers_explicit_and_env() -> None:
     assert resolve_provider_type("anthropic", "openai") == "openai"
     assert resolve_provider_type(None, "auto", {"HEADROOM_BACKEND": "anthropic"}) == "anthropic"
     assert resolve_provider_type(None, "auto", {"HEADROOM_BACKEND": "anyllm"}) == "openai"
+    assert resolve_provider_type(None, "auto", {"COPILOT_PROVIDER_TYPE": "openai"}) == "openai"
+    assert (
+        resolve_provider_type(None, "auto", {"COPILOT_PROVIDER_TYPE": "anthropic"}) == "anthropic"
+    )
+    # COPILOT_PROVIDER_TYPE overrides HEADROOM_BACKEND when both are set
+    assert (
+        resolve_provider_type(
+            None, "auto", {"COPILOT_PROVIDER_TYPE": "openai", "HEADROOM_BACKEND": "anthropic"}
+        )
+        == "openai"
+    )
+    # Invalid values are ignored, fall through to backend default
+    assert resolve_provider_type(None, "auto", {"COPILOT_PROVIDER_TYPE": "gpt"}) == "anthropic"
 
 
 def test_validate_configuration_accepts_supported_combinations() -> None:

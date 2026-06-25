@@ -22,6 +22,9 @@ def resolve_provider_type(
         return provider_type
 
     env = environ or os.environ
+    explicit = env.get("COPILOT_PROVIDER_TYPE")
+    if explicit in ("anthropic", "openai"):
+        return explicit
     effective_backend = backend or env.get("HEADROOM_BACKEND") or "anthropic"
     return "anthropic" if effective_backend == "anthropic" else "openai"
 
