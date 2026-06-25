@@ -176,7 +176,7 @@ impl AnthropicStreamState {
         if matches!(
             self.status,
             StreamStatus::MessageStop | StreamStatus::Errored
-        ) && name != "error"
+        ) && !matches!(name, "error" | "ping")
         {
             tracing::warn!(
                 event = "sse_event_after_terminal",

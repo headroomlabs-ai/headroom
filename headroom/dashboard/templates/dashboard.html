@@ -2004,6 +2004,7 @@
                 },
 
                 formatCurrency(n) {
+                    n = n ?? 0;
                     if (n < 0) return '-' + this.formatCurrency(-n);
                     if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
                     if (n >= 1) return n.toFixed(2);

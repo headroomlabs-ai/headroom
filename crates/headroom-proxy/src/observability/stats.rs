@@ -329,7 +329,7 @@ impl Bucket {
     /// request count is bumped, no savings, so the bucket can't drift from the
     /// lifetime/session totals which apply the same rule.
     fn apply(&mut self, o: &RequestOutcome, count_savings: bool) {
-        self.requests += 1;
+        self.requests = self.requests.saturating_add(1);
         if !count_savings {
             return;
         }

@@ -167,6 +167,15 @@ impl ResponseState {
                 // failed envelope too — the proxy still wants the
                 // tier dimension on failed responses so dashboards
                 // can attribute failure rate to tiers.
+                // Capture usage too — tokens consumed before the error
+                // are still billed and should be recorded.
+                if let Some(resp) = v.get("response") {
+                    if let Some(usage) = resp.get("usage") {
+                        if !usage.is_null() {
+                            self.usage = Some(usage.clone());
+                        }
+                    }
+                }
                 self.capture_envelope_metadata(&v);
                 Ok(())
             }
