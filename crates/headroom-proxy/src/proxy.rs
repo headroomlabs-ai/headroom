@@ -1726,9 +1726,15 @@ async fn run_sse_state_machine(
                 // Back-fill for uncompressed requests: compression set tokens_before=0
                 // (no savings), but the stream usage gives us the real input count so
                 // total_input_tokens in the store isn't systematically under-counted.
-                if outcome.tokens_before == 0 && state.usage.input_tokens > 0 {
-                    outcome.tokens_before = state.usage.input_tokens;
-                    outcome.tokens_after = state.usage.input_tokens;
+                // For 100% cache-hit requests input_tokens=0 but cache_read_input_tokens=N,
+                // so use the full prompt size (input + cached) as the effective input.
+                let effective_input = state
+                    .usage
+                    .input_tokens
+                    .saturating_add(state.usage.cache_read_input_tokens);
+                if outcome.tokens_before == 0 && effective_input > 0 {
+                    outcome.tokens_before = effective_input;
+                    outcome.tokens_after = effective_input;
                 }
                 let stream_errored =
                     matches!(state.status, crate::sse::anthropic::StreamStatus::Errored);
