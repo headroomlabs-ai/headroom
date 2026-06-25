@@ -270,6 +270,8 @@ _OPENAI_TOOL_SCHEMA_DROP_KEYS = {
     "title",
     "writeOnly",
 }
+# Kept for backward compatibility with evals that import this symbol.
+# The canonical set lives in headroom.proxy.tool_schema_compaction.
 
 
 def _json_byte_len(value: Any) -> int:
@@ -280,45 +282,18 @@ def _compact_openai_tool_schema_value(
     value: Any,
     _parent_key: str | None = None,
 ) -> Any:
-    if isinstance(value, list):
-        return [_compact_openai_tool_schema_value(item, _parent_key) for item in value]
+    # Delegate to shared compaction logic.
+    from headroom.proxy.tool_schema_compaction import compact_tool_schema_value
 
-    if not isinstance(value, dict):
-        return value
-
-    compacted: dict[str, Any] = {}
-    for key, child in value.items():
-        # Don't drop keys that are property *names* inside a JSON Schema
-        # `properties` object — only drop them when they are schema annotations.
-        # e.g. a tool with a field literally named "title" must not be stripped.
-        if _parent_key != "properties" and key in _OPENAI_TOOL_SCHEMA_DROP_KEYS:
-            continue
-
-        if key == "description" and isinstance(child, str):
-            compacted[key] = " ".join(child.split())
-            continue
-
-        compacted[key] = _compact_openai_tool_schema_value(child, key)
-
-    return compacted
+    return compact_tool_schema_value(value, _parent_key)
 
 
 def _compact_openai_responses_tools(
     payload: dict[str, Any],
 ) -> tuple[dict[str, Any], bool, int, int]:
-    tools = payload.get("tools")
-    if not isinstance(tools, list) or not tools:
-        return payload, False, 0, 0
+    from headroom.proxy.tool_schema_compaction import compact_tools
 
-    compacted_tools = _compact_openai_tool_schema_value(tools)
-    before = _json_byte_len(tools)
-    after = _json_byte_len(compacted_tools)
-    if after >= before:
-        return payload, False, before, after
-
-    updated = copy.deepcopy(payload)
-    updated["tools"] = compacted_tools
-    return updated, True, before, after
+    return compact_tools(payload)
 
 
 def _ensure_responses_store_for_memory_tools(

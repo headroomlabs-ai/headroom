@@ -1823,6 +1823,30 @@ class AnthropicHandlerMixin:
                 if tools != _original_tools:
                     body["tools"] = tools
 
+            # Tool schema compaction: strip annotation keys ($schema, title,
+            # examples, etc.) and normalise description whitespace.  Runs
+            # after tools are finalised (sorting, CCR injection) but before
+            # the PRE_SEND pipeline event so extensions see the compacted
+            # schema.  Mirrors the same pass that the OpenAI handler applies.
+            _tools_compaction_started = time.time()
+            try:
+                from headroom.proxy.tool_schema_compaction import compact_tools
+
+                body, _tools_modified, _tools_before_bytes, _tools_after_bytes = compact_tools(body)
+                if _tools_modified:
+                    tools = body["tools"]
+                    _tools_compaction_ms = (time.time() - _tools_compaction_started) * 1000
+                    logger.debug(
+                        "[%s] tool schema compaction: %d -> %d bytes (%.0f%% saved) in %.1fms",
+                        request_id,
+                        _tools_before_bytes,
+                        _tools_after_bytes,
+                        (1 - _tools_after_bytes / max(_tools_before_bytes, 1)) * 100,
+                        _tools_compaction_ms,
+                    )
+            except Exception:
+                _tools_modified = False
+
             presend_event = self.pipeline_extensions.emit(
                 PipelineStage.PRE_SEND,
                 operation="proxy.request",

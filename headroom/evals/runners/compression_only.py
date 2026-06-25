@@ -489,7 +489,7 @@ class CompressionOnlyRunner:
           (no dangling required entry pointing at a stripped property)
         - schema-level annotations ($schema, title at root level) ARE dropped
         """
-        from headroom.proxy.handlers.openai import _compact_openai_responses_tools
+        from headroom.proxy.tool_schema_compaction import compact_tools
 
         if cases is None:
             cases = self.generate_tool_schema_cases()
@@ -512,7 +512,7 @@ class CompressionOnlyRunner:
             total_original += original_bytes
 
             try:
-                compacted, modified, before_bytes, after_bytes = _compact_openai_responses_tools(
+                compacted, modified, before_bytes, after_bytes = compact_tools(
                     payload
                 )
                 total_compressed += after_bytes if modified else original_bytes
