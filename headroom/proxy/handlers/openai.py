@@ -1294,6 +1294,48 @@ class OpenAIHandlerMixin:
                     tools_bytes_saved=tools_before_bytes - tools_after_bytes,
                 )
 
+        # Layer 2: Tool description truncation (opt-in via
+        # HEADROOM_TOOL_DESC_MAX_CHARS).
+        try:
+            from headroom.proxy.tool_schema_compaction import (
+                compact_tool_descriptions,
+                tool_desc_max_chars,
+            )
+
+            _desc_max = tool_desc_max_chars()
+            if _desc_max > 0:
+                _desc_compact_started = time.perf_counter()
+                desc_payload, desc_modified, desc_before, desc_after = (
+                    compact_tool_descriptions(working, _desc_max)
+                )
+                _add_timing("compression_tool_desc_compaction", _desc_compact_started)
+                if desc_modified:
+                    working = desc_payload
+                    modified = True
+                    transforms.append("openai:responses:tool_desc_compaction")
+                    try:
+                        tokenizer = self.openai_provider.get_token_counter(model)
+                        tokens_saved += max(
+                            0,
+                            tokenizer.count_text(_json_debug_dumps(payload.get("tools")))
+                            - tokenizer.count_text(_json_debug_dumps(working.get("tools"))),
+                        )
+                    except Exception:
+                        pass
+                    if debug_enabled:
+                        _log_codex_compression_debug(
+                            "codex_tool_desc_compaction",
+                            request_id=request_id,
+                            pass_id=pass_id,
+                            model=model,
+                            modified=True,
+                            tools_bytes_before=desc_before,
+                            tools_bytes_after=desc_after,
+                            tools_bytes_saved=desc_before - desc_after,
+                        )
+        except Exception:
+            pass
+
         live_units_started = time.perf_counter()
         (
             router_payload,

@@ -281,3 +281,166 @@ class TestCompactTools:
         savings_pct = (1 - after / before) * 100
         # Expect meaningful savings (at least 15% with annotation keys + whitespace)
         assert savings_pct >= 10, f"Expected ≥10% savings, got {savings_pct:.1f}%"
+
+
+# ---------------------------------------------------------------------------
+# Layer 2: compact_tool_descriptions
+# ---------------------------------------------------------------------------
+
+class TestTruncateDescription:
+    """Unit tests for _truncate_description."""
+
+    def test_short_description_unchanged(self) -> None:
+        from headroom.proxy.tool_schema_compaction import _truncate_description
+        assert _truncate_description("Read a file.", 120) == "Read a file."
+
+    def test_first_sentence_preserved(self) -> None:
+        from headroom.proxy.tool_schema_compaction import _truncate_description
+        desc = "Fast and precise code search across ALL GitHub repositories. Best for finding exact symbols."
+        result = _truncate_description(desc, 60)
+        assert result == "Fast and precise code search across ALL GitHub repositories."
+
+    def test_first_sentence_plus_second(self) -> None:
+        from headroom.proxy.tool_schema_compaction import _truncate_description
+        desc = "Read a file. Returns the contents as text."
+        result = _truncate_description(desc, 60)
+        # First sentence is short enough, second fits within 1.5x budget
+        assert "Read a file." in result
+        assert "Returns the contents as text." in result
+
+    def test_long_first_sentence_truncated(self) -> None:
+        from headroom.proxy.tool_schema_compaction import _truncate_description
+        desc = "This is an extremely long description that goes on and on without any sentence boundary"
+        result = _truncate_description(desc, 40)
+        assert len(result) <= 45  # 40 + "…"
+        assert result.endswith("…")
+
+    def test_whitespace_normalised_before_truncation(self) -> None:
+        from headroom.proxy.tool_schema_compaction import _truncate_description
+        desc = "  Search   code.   Very   useful.  "
+        result = _truncate_description(desc, 60)
+        # Whitespace normalised, both sentences fit within 1.5x budget
+        assert result == "Search code. Very useful."
+
+    def test_max_chars_zero_returns_original(self) -> None:
+        from headroom.proxy.tool_schema_compaction import _truncate_description
+        desc = "Any long description that would normally be truncated."
+        result = _truncate_description(desc, 0)
+        # max_chars=0 means disabled, return unchanged
+        assert result == "Any long description that would normally be truncated."
+
+    def test_chinese_description(self) -> None:
+        from headroom.proxy.tool_schema_compaction import _truncate_description
+        desc = "搜索代码仓库中的函数和类。支持正则表达式匹配。"
+        result = _truncate_description(desc, 30)
+        # First Chinese sentence fits
+        assert "搜索代码仓库中的函数和类。" in result
+
+
+class TestCompactToolDescriptions:
+    """Unit tests for compact_tool_descriptions (full payload)."""
+
+    def test_truncates_long_tool_description(self) -> None:
+        from headroom.proxy.tool_schema_compaction import compact_tool_descriptions
+        payload = {
+            "tools": [
+                {
+                    "name": "search_code",
+                    "description": "Fast and precise code search across ALL GitHub repositories using GitHub's native search engine. Best for finding exact symbols, functions, classes, or specific code patterns. Returns ranked results.",
+                    "input_schema": {"type": "object", "properties": {}},
+                },
+            ],
+        }
+        result, modified, before, after = compact_tool_descriptions(payload, max_chars=60)
+        assert modified is True
+        assert after < before
+        tool = result["tools"][0]
+        # First sentence ends at "repositories." (abbrev regex match)
+        # With max_chars=60, first sentence "Fast...repositories." is 60 chars exactly
+        # so it should be preserved. Second sentence may or may not fit in 1.5x budget.
+        assert tool["description"].startswith("Fast and precise code search")
+        assert len(tool["description"]) < len(payload["tools"][0]["description"])
+
+    def test_truncates_nested_param_descriptions(self) -> None:
+        from headroom.proxy.tool_schema_compaction import compact_tool_descriptions
+        payload = {
+            "tools": [
+                {
+                    "name": "t",
+                    "description": "Short.",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "q": {
+                                "type": "string",
+                                "description": "The search query string to find matching code. Supports advanced syntax like OR, NOT, and quoted phrases for exact match.",
+                            },
+                        },
+                    },
+                },
+            ],
+        }
+        result, modified, before, after = compact_tool_descriptions(payload, max_chars=60)
+        assert modified is True
+        param_desc = result["tools"][0]["input_schema"]["properties"]["q"]["description"]
+        assert "The search query string to find matching code." == param_desc
+
+    def test_disabled_when_max_chars_zero(self) -> None:
+        from headroom.proxy.tool_schema_compaction import compact_tool_descriptions
+        payload = {
+            "tools": [
+                {"name": "t", "description": "A" * 500, "input_schema": {"type": "object"}},
+            ],
+        }
+        result, modified, _, _ = compact_tool_descriptions(payload, max_chars=0)
+        assert modified is False
+        assert result is payload
+
+    def test_no_tools_returns_unchanged(self) -> None:
+        from headroom.proxy.tool_schema_compaction import compact_tool_descriptions
+        result, modified, _, _ = compact_tool_descriptions({"model": "x"}, max_chars=120)
+        assert modified is False
+
+    def test_preserves_non_description_fields(self) -> None:
+        from headroom.proxy.tool_schema_compaction import compact_tool_descriptions
+        payload = {
+            "model": "claude-sonnet-4-20250514",
+            "tools": [
+                {
+                    "name": "get_weather",
+                    "description": "Get the current weather for a location. Supports any city worldwide.",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "city": {"type": "string", "description": "The city name to get weather for."},
+                        },
+                    },
+                },
+            ],
+        }
+        result, _, _, _ = compact_tool_descriptions(payload, max_chars=50)
+        assert result["model"] == "claude-sonnet-4-20250514"
+        assert result["tools"][0]["name"] == "get_weather"
+        assert result["tools"][0]["input_schema"]["properties"]["city"]["type"] == "string"
+
+    def test_large_tool_set_savings(self) -> None:
+        """44 GitHub-like tools with verbose descriptions should see significant savings."""
+        from headroom.proxy.tool_schema_compaction import compact_tool_descriptions
+        tools = []
+        for i in range(44):
+            tools.append({
+                "name": f"github_tool_{i}",
+                "description": f"Perform operation {i} on GitHub repositories. This tool supports advanced filtering and pagination for large result sets. Use it for code search, issue management, and PR operations.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "owner": {"type": "string", "description": "Repository owner username or organization name."},
+                        "repo": {"type": "string", "description": "The name of the repository to operate on."},
+                    },
+                },
+            })
+        payload = {"tools": tools}
+        result, modified, before, after = compact_tool_descriptions(payload, max_chars=80)
+        assert modified is True
+        savings_pct = (1 - after / before) * 100
+        assert savings_pct >= 10, f"Expected ≥10% savings, got {savings_pct:.1f}%"

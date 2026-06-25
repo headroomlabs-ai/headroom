@@ -1847,6 +1847,59 @@ class AnthropicHandlerMixin:
             except Exception:
                 _tools_modified = False
 
+            # Layer 2: Tool description truncation (opt-in via
+            # HEADROOM_TOOL_DESC_MAX_CHARS).  Preserves first sentence
+            # of each description so tool selection still works.
+            try:
+                from headroom.proxy.tool_schema_compaction import (
+                    compact_tool_descriptions,
+                    tool_desc_max_chars,
+                )
+
+                _desc_max = tool_desc_max_chars()
+                if _desc_max > 0:
+                    body, _desc_modified, _desc_before, _desc_after = compact_tool_descriptions(body, _desc_max)
+                    if _desc_modified:
+                        tools = body["tools"]
+                        logger.debug(
+                            "[%s] tool description compaction: %d -> %d bytes (%.0f%% saved, max_chars=%d)",
+                            request_id,
+                            _desc_before,
+                            _desc_after,
+                            (1 - _desc_after / max(_desc_before, 1)) * 100,
+                            _desc_max,
+                        )
+            except Exception:
+                _desc_modified = False
+
+            # Layer 3: System prompt compaction (opt-in via
+            # HEADROOM_SYSTEM_COMPACT).  Uses CCR to compress large
+            # system content blocks (CLAUDE.md, rules, hooks, etc.)
+            # while preserving cache_control and short instruction blocks.
+            try:
+                from headroom.proxy.system_compaction import (
+                    compact_system_prompt,
+                    system_compact_enabled,
+                )
+
+                if system_compact_enabled():
+                    body, _sys_modified, _sys_before, _sys_after = compact_system_prompt(
+                        body,
+                        router=self.content_router,
+                        model=model,
+                        request_id=request_id,
+                    )
+                    if _sys_modified:
+                        logger.debug(
+                            "[%s] system prompt compaction: %d -> %d bytes (%.0f%% saved)",
+                            request_id,
+                            _sys_before,
+                            _sys_after,
+                            (1 - _sys_after / max(_sys_before, 1)) * 100,
+                        )
+            except Exception:
+                _sys_modified = False
+
             presend_event = self.pipeline_extensions.emit(
                 PipelineStage.PRE_SEND,
                 operation="proxy.request",
