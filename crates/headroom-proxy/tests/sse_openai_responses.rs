@@ -224,3 +224,23 @@ fn minimal_upstream_response_pr_c4() {
     // machine status. Genuine completion goes through `response.completed`.
     assert_eq!(s.status, StreamStatus::Open);
 }
+
+#[test]
+fn response_failed_captures_usage() {
+    // A failed response can still carry token usage (tokens were consumed
+    // before the error). Verify that usage is captured from the envelope.
+    let mut s = ResponseState::new();
+    let raw = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_f1\",\"model\":\"gpt-5\"}}\n\n",
+        "event: response.failed\n",
+        "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_f1\",\"status\":\"failed\",",
+        "\"error\":{\"code\":\"server_error\"},",
+        "\"usage\":{\"input_tokens\":50,\"output_tokens\":3}}}\n\n",
+    );
+    run(&mut s, raw.as_bytes());
+    assert_eq!(s.status, StreamStatus::Failed);
+    let usage = s.usage.expect("usage must be captured from response.failed envelope");
+    assert_eq!(usage["input_tokens"], 50);
+    assert_eq!(usage["output_tokens"], 3);
+}

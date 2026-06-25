@@ -279,3 +279,26 @@ fn _ref_event() -> headroom_proxy::sse::SseEvent {
         data: Bytes::from_static(b""),
     }
 }
+
+#[test]
+fn ping_after_message_stop_is_silently_accepted() {
+    // Anthropic sometimes sends a trailing `ping` keepalive after
+    // `message_stop`. The terminal-state guard must not drop it with an
+    // error — it is a no-op event and should be accepted without
+    // changing the status.
+    let mut s = AnthropicStreamState::new();
+    let raw = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_ping\",\"model\":\"claude-3-5-sonnet\",\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":7}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+        "event: ping\n",
+        "data: {}\n\n",
+    );
+    run(&mut s, raw.as_bytes());
+    // ping must not revert or corrupt the terminal status
+    assert_eq!(s.status, StreamStatus::MessageStop);
+    assert_eq!(s.usage.output_tokens, 7);
+}
