@@ -729,8 +729,9 @@ class SubscriptionTracker(QuotaTracker):
                 self._state.mark_error("fetch returned None")
             return
 
-        # Read transcript-based window tokens
-        window_tokens = _compute_window_tokens_for_snapshot(snapshot)
+        # Offload off the event loop: this scans every ~/.claude/projects/**/*.jsonl
+        # transcript and json.loads each line, which can take seconds and block /health.
+        window_tokens = await asyncio.to_thread(_compute_window_tokens_for_snapshot, snapshot)
 
         # Detect anomalies
         discrepancies = _detect_discrepancies(snapshot, window_tokens)

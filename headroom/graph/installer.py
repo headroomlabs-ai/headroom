@@ -13,7 +13,7 @@ from urllib.request import urlopen
 
 logger = logging.getLogger(__name__)
 
-CBM_VERSION = "v0.6.0"
+CBM_VERSION = "v0.8.1"
 CBM_REPO = "DeusData/codebase-memory-mcp"
 CBM_BIN_DIR = Path.home() / ".local" / "bin"
 CBM_BIN_NAME = "codebase-memory-mcp"

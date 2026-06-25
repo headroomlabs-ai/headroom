@@ -192,7 +192,7 @@ shows an **Output Tokens Saved** card next to input compression, labelled
 
 | Agent        | `headroom wrap` | Notes                            |
 |--------------|:---------------:|----------------------------------|
-| Claude Code  | ✅              | `--memory` · `--code-graph`      |
+| Claude Code  | ✅              | `--memory` · `--code-graph` · `--1m` |
 | CodeBuddy    | ✅              | Claude Code compatible           |
 | Codex        | ✅              | shares memory with Claude        |
 | Cursor       | ✅              | prints config — paste once       |
@@ -350,7 +350,10 @@ winget install Rustlang.Rustup && rustup default stable
 ```
 
 Restart your shell, then `pip install "headroom-ai[all]"`. A prebuilt wheel avoids the Rust
-build entirely where available: `pip install --only-binary headroom-ai headroom-ai`.
+build entirely where available: `pip install --only-binary headroom-ai headroom-ai`. Prebuilt
+wheels are published for Windows (`win_amd64`), Linux (`x86_64` / `aarch64`), and macOS
+(Apple Silicon), so installs on those platforms never need a local Rust toolchain — the
+Rust-first dance above is only for the platform-independent sdist fallback (e.g. Intel macOS).
 
 Two runtime assets are fetched over TLS; if they are blocked, trust your corporate CA via
 `REQUESTS_CA_BUNDLE` / `SSL_CERT_FILE` / `CURL_CA_BUNDLE`:
@@ -361,6 +364,35 @@ Two runtime assets are fetched over TLS; if they are blocked, trust your corpora
   `HF_HUB_OFFLINE=1`, or set `HF_ENDPOINT` to a trusted mirror.
 
 Running with compression disabled (pure gateway) requires neither asset.
+
+#### "Basic Constraints of CA cert not marked critical" (Python 3.13+ strict mode)
+
+A **different** failure from the one above. If TLS fails with:
+
+```
+[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed:
+Basic Constraints of CA cert not marked critical
+```
+
+then the corporate CA *is* found and trusted — adding it to a CA bundle changes nothing.
+Python 3.13 + OpenSSL 3.x enable `VERIFY_X509_STRICT` by default, which enforces RFC 5280
+§4.2.1.9: a CA cert's `basicConstraints` must be marked *critical*. Inspection roots like
+Zscaler set `CA:TRUE` without the critical bit, so the chain is rejected.
+
+Set **`HEADROOM_TLS_STRICT=0`** to clear *only* the strict flag from every TLS context
+Headroom controls — the proxy's httpx upstream client **and** the urllib3/`huggingface_hub`
+path used for model downloads. Chain validation, signature, expiry, and hostname checks all
+stay on; this is strictly narrower than disabling verification.
+
+```bash
+HEADROOM_TLS_STRICT=0 headroom proxy --port 8787
+```
+
+The Rust core's ONNX download (`cdn.pyke.io`) uses a separate TLS stack (rustls / OS trust
+store), unaffected by `HEADROOM_TLS_STRICT`. On Windows the corporate root must be in the
+**machine** certificate store (browsers already trust it there); or pre-provision ONNX
+Runtime with `ORT_STRATEGY=system` + `ORT_LIB_LOCATION=/path/to/onnxruntime` to skip the
+download entirely.
 
 ## headroom learn
 

@@ -132,6 +132,7 @@ from headroom.proxy.helpers import (
     initialize_context_tool_session_baseline,
     is_anthropic_auth,  # noqa: F401
     jitter_delay_ms,
+    retry_after_ms,
 )
 from headroom.proxy.memory_handler import MemoryConfig, MemoryHandler
 
@@ -153,7 +154,7 @@ from headroom.proxy.prometheus_metrics import PrometheusMetrics  # noqa: F401
 from headroom.proxy.rate_limiter import TokenBucketRateLimiter  # noqa: F401
 from headroom.proxy.request_logger import RequestLogger  # noqa: F401
 from headroom.proxy.semantic_cache import SemanticCache  # noqa: F401
-from headroom.proxy.ssl_context import find_ca_bundle
+from headroom.proxy.ssl_context import build_httpx_verify
 from headroom.proxy.warmup import WarmupRegistry
 from headroom.proxy.ws_session_registry import WebSocketSessionRegistry
 from headroom.subscription.base import get_quota_registry, reset_quota_registry
@@ -692,12 +693,18 @@ class HeadroomProxy(
         )
         self._code_aware_status = "lazy" if config.code_aware_enabled else "disabled"
 
+        _intercept_prefix: list = []
+        if os.environ.get("HEADROOM_INTERCEPT_ENABLED"):
+            from headroom.proxy.interceptors import ToolResultInterceptorTransform
+
+            _intercept_prefix = [ToolResultInterceptorTransform()]
+
         self.anthropic_pipeline = TransformPipeline(
-            transforms=[cache_aligner, anthropic_router],
+            transforms=[*_intercept_prefix, cache_aligner, anthropic_router],
             provider=self.anthropic_provider,
         )
         self.openai_pipeline = TransformPipeline(
-            transforms=[cache_aligner, openai_router],
+            transforms=[*_intercept_prefix, cache_aligner, openai_router],
             provider=self.openai_provider,
         )
 
@@ -1226,7 +1233,10 @@ class HeadroomProxy(
             operation="proxy.startup",
             metadata={"port": self.config.port, "host": self.config.host},
         )
-        _ca_bundle = find_ca_bundle()
+        # Resolve TLS verification: a custom CA bundle (corporate PKI) if one
+        # is configured, else a strict-relaxed default context when
+        # HEADROOM_TLS_STRICT=0, else httpx's default strict verification.
+        _verify = build_httpx_verify()
         _client_kwargs: dict[str, Any] = {
             "timeout": httpx.Timeout(
                 connect=self.config.connect_timeout_seconds,
@@ -1239,7 +1249,7 @@ class HeadroomProxy(
                 max_keepalive_connections=self.config.max_keepalive_connections,
                 keepalive_expiry=self.config.keepalive_expiry,
             ),
-            "verify": _ca_bundle if _ca_bundle is not None else True,
+            "verify": _verify,
         }
         self.http_client = httpx.AsyncClient(http2=self.config.http2, **_client_kwargs)
         # Reuse the primary client when HTTP/2 is already off; otherwise keep a
@@ -1641,8 +1651,9 @@ class HeadroomProxy(
                         url, **post_kwargs
                     )
 
-                    # Don't retry client errors (4xx)
-                    if 400 <= response.status_code < 500:
+                    # Don't retry client errors (4xx) — except 429, the most
+                    # retriable status, which carries an authoritative Retry-After (#1221).
+                    if 400 <= response.status_code < 500 and response.status_code != 429:
                         return response
 
                     # Retry server errors (5xx)
@@ -1652,6 +1663,27 @@ class HeadroomProxy(
                             request=response.request,
                             response=response,
                         )
+
+                    # Rate limit (429): retry honoring Retry-After, but return it
+                    # verbatim once exhausted — a clean rate-limit signal beats a 5xx.
+                    if response.status_code == 429:
+                        if (
+                            not self.config.retry_enabled
+                            or attempt >= self.config.retry_max_attempts - 1
+                        ):
+                            return response
+                        delay_ms = retry_after_ms(
+                            response, self.config.retry_max_delay_ms
+                        ) or jitter_delay_ms(
+                            self.config.retry_base_delay_ms,
+                            self.config.retry_max_delay_ms,
+                            attempt,
+                        )
+                        logger.warning(
+                            f"Upstream 429 (attempt {attempt + 1}), retrying in {delay_ms:.0f}ms"
+                        )
+                        await asyncio.sleep(delay_ms / 1000)
+                        continue
 
                     return response
 
@@ -3278,7 +3310,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         return {"status": "cache disabled"}
 
     # CCR (Compress-Cache-Retrieve) endpoints
-    @app.post("/v1/retrieve")
+    @app.post("/v1/retrieve", dependencies=[Depends(_require_loopback)])
     async def ccr_retrieve(request: Request):
         """Retrieve original content from CCR compression cache.
 
@@ -3341,7 +3373,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 ),
             )
 
-    @app.get("/v1/retrieve/stats")
+    @app.get("/v1/retrieve/stats", dependencies=[Depends(_require_loopback)])
     async def ccr_stats():
         """Get CCR compression store statistics."""
         store = get_compression_store()
@@ -3620,7 +3652,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             status_code=404, detail=f"No TOIN pattern found with hash starting with: {hash_prefix}"
         )
 
-    @app.get("/v1/retrieve/{hash_key}")
+    @app.get("/v1/retrieve/{hash_key}", dependencies=[Depends(_require_loopback)])
     async def ccr_retrieve_get(hash_key: str, query: str | None = None):
         """GET version of CCR retrieve for easier testing."""
         store = get_compression_store()
@@ -3660,7 +3692,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             )
 
     # CCR Tool Call Handler - for agent frameworks to call when LLM uses headroom_retrieve
-    @app.post("/v1/retrieve/tool_call")
+    @app.post("/v1/retrieve/tool_call", dependencies=[Depends(_require_loopback)])
     async def ccr_handle_tool_call(request: Request):
         """Handle a CCR tool call from an LLM response.
 
@@ -3777,7 +3809,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         }
 
     # Compression-only endpoint (for TypeScript SDK and other HTTP clients)
-    @app.post("/v1/compress")
+    @app.post("/v1/compress", dependencies=[Depends(_require_loopback)])
     async def compress_messages(request: Request):
         return await proxy.handle_compress(request)
 

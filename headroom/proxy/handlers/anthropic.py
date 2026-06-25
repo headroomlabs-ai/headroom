@@ -2516,6 +2516,35 @@ class AnthropicHandlerMixin:
                     if assistant_message is not None:
                         next_original_messages.append(copy.deepcopy(assistant_message))
                         next_forwarded_messages.append(copy.deepcopy(assistant_message))
+
+                    # Cache-miss attribution (#1313): when this turn expected a
+                    # prompt-cache hit but got cr_tokens == 0, decide whether the
+                    # cache most likely lapsed (idle > provider TTL → suggest a
+                    # longer TTL) or the cacheable prefix changed (content shifted).
+                    # Classify BEFORE update_from_response, which overwrites the
+                    # last-turn state the classifier reads (idle clock, prefix,
+                    # cached-token count). `optimized_messages` is the prefix we
+                    # forwarded this turn; compare it against last turn's.
+                    # `hasattr` guard: some tests inject a SimpleNamespace stub
+                    # tracker that only implements the freeze API, not the full
+                    # PrefixCacheTracker surface.
+                    if hasattr(prefix_tracker, "classify_cache_miss"):
+                        miss = prefix_tracker.classify_cache_miss(
+                            cache_read_tokens=cr_tokens,
+                            current_forwarded_messages=optimized_messages,
+                        )
+                        if miss.is_miss:
+                            logger.info(
+                                f"[{request_id}] CACHE-MISS-ATTRIBUTION: reason={miss.reason} "
+                                f"idle={miss.idle_seconds:.0f}s ttl={miss.cache_ttl_seconds}s "
+                                f"expected_cached={miss.expected_cached_tokens:,} "
+                                f"prefix_changed={miss.prefix_changed} "
+                                f"ttl_exceeded={miss.ttl_exceeded}"
+                            )
+                            await self.metrics.record_cache_miss_attribution(
+                                provider_name, miss.reason
+                            )
+
                     prefix_tracker.update_from_response(
                         cache_read_tokens=cr_tokens,
                         cache_write_tokens=cw_tokens,
