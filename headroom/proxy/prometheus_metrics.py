@@ -224,6 +224,16 @@ class PrometheusMetrics:
         self.cache_bust_tokens_lost: int = 0
         self.cache_bust_count: int = 0
 
+        # Cache-miss attribution (#1313): when a turn expected a prompt-cache
+        # hit but got none, why? Bucketed by reason so operators can tell a
+        # TTL lapse (idle longer than the cache lifetime → consider a longer
+        # TTL) from a prefix-content change (the cacheable prefix shifted).
+        # Reasons are the MISS_* literals from prefix_tracker. Per provider so
+        # the dashboard can scope; populated by `record_cache_miss_attribution`.
+        self.cache_miss_attribution_by_provider: dict[str, dict[str, int]] = defaultdict(
+            lambda: defaultdict(int)
+        )
+
         # Cumulative savings history (timestamp → cumulative tokens saved)
         self.savings_history: list[tuple[str, int]] = []
         self.savings_tracker = savings_tracker or SavingsTracker()
@@ -328,6 +338,7 @@ class PrometheusMetrics:
             self.prefix_freeze_compression_foregone = 0
             self.cache_bust_tokens_lost = 0
             self.cache_bust_count = 0
+            self.cache_miss_attribution_by_provider.clear()
             self.savings_history = []
 
         with self._stage_timing_lock:
@@ -735,6 +746,18 @@ class PrometheusMetrics:
             self.cache_bust_count += 1
         self._get_otel_metrics().record_proxy_cache_bust(tokens_lost=tokens_lost)
 
+    async def record_cache_miss_attribution(self, provider: str, reason: str) -> None:
+        """Record why a turn that expected a prompt-cache hit missed instead.
+
+        ``reason`` is one of the MISS_* literals produced by
+        ``PrefixCacheTracker.classify_cache_miss`` (``ttl_expiry``,
+        ``prefix_change``, ``unknown``). Cold starts and hits are not recorded
+        — only actual misses against a previously-cached prefix reach here.
+        Bucketed per provider so the dashboard can scope or aggregate.
+        """
+        async with self._lock:
+            self.cache_miss_attribution_by_provider[provider][reason] += 1
+
     # ------------------------------------------------------------------
     # Unit 3: WS session lifecycle gauges / histogram
     # ------------------------------------------------------------------
@@ -976,6 +999,22 @@ class PrometheusMetrics:
                 help_text="Tokens that lost provider cache discount because of compression",
                 value=self.cache_bust_tokens_lost,
             )
+
+            if self.cache_miss_attribution_by_provider:
+                lines.extend(
+                    [
+                        "# HELP headroom_cache_miss_attribution_total Cache misses on an "
+                        "expected-cached prefix, bucketed by reason (ttl_expiry|prefix_change|unknown)",
+                        "# TYPE headroom_cache_miss_attribution_total counter",
+                    ]
+                )
+                for _provider, _reasons in self.cache_miss_attribution_by_provider.items():
+                    for _reason, _count in _reasons.items():
+                        lines.append(
+                            f'headroom_cache_miss_attribution_total{{provider="{_provider}",'
+                            f'reason="{_reason}"}} {_count}'
+                        )
+                lines.append("")
 
             lines.extend(
                 [

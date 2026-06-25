@@ -358,6 +358,29 @@ def test_agent_90_router_uses_ccr_sampling_not_lossless_table() -> None:
     assert crusher._with_compaction is False
 
 
+def test_router_lossless_only_flag_reaches_crusher() -> None:
+    # HEADROOM_LOSSLESS_ONLY=1 sets this field on the proxy router; it
+    # must flow through to the SmartCrusher so a real proxy session runs
+    # strict marker-free mode.
+    router = ContentRouter(ContentRouterConfig(smart_crusher_lossless_only=True))
+
+    crusher = router._get_smart_crusher()
+
+    assert crusher is not None
+    assert crusher._lossless_only is True
+
+
+def test_router_lossless_only_defaults_off() -> None:
+    # Unset (None) must not force the flag — default crushers stay in
+    # the marker-emitting mode.
+    router = ContentRouter(ContentRouterConfig())
+
+    crusher = router._get_smart_crusher()
+
+    assert crusher is not None
+    assert crusher._lossless_only is False
+
+
 def test_agent_90_router_json_tool_output_reaches_target_with_needle() -> None:
     needle = "CRITICAL_NEEDLE_42"
     rows = [

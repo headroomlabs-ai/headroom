@@ -31,6 +31,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
+from headroom._subprocess import run
+
 # Fix Windows cp1252 encoding — box-drawing characters require UTF-8
 if sys.platform == "win32" and hasattr(sys.stdout, "buffer"):
     if sys.stdout.encoding and sys.stdout.encoding.lower().replace("-", "") != "utf8":
@@ -143,6 +145,29 @@ _WRAP_PROXY_TIMEOUT_ML_MODULES = ("torch", "sentence_transformers", "spacy")
 _TOOL_SEARCH_ENV = TOOL_SEARCH_ENV
 _TOOL_SEARCH_DEFAULT = TOOL_SEARCH_DEFAULT
 _AGENT_SAVINGS_WRAP_AGENTS = {"claude", "codex", "cursor"}
+
+# 1M context window for `wrap claude` (#1158). Claude Code only sends the
+# `context-1m` beta header — unlocking the 1M window for entitled subscription
+# users — when the model id carries the `[1m]` suffix. Behind a custom
+# ANTHROPIC_BASE_URL (the proxy) its `/model` picker selection does not survive,
+# so `--1m` forces the suffix via ANTHROPIC_MODEL on the launched process.
+_ANTHROPIC_MODEL_ENV = "ANTHROPIC_MODEL"
+_CONTEXT_1M_SUFFIX = "[1m]"
+# Only used when no model is otherwise selected (no ANTHROPIC_MODEL set). The
+# current default Opus; the suffix logic preserves any model the user did set.
+_DEFAULT_1M_MODEL = "claude-opus-4-8"
+
+
+def _resolve_1m_model(current: str | None) -> str:
+    """Return the model id that makes Claude Code request the 1M window (#1158).
+
+    Preserves a model the user already selected via ``ANTHROPIC_MODEL`` (only
+    appending the ``[1m]`` suffix when missing); falls back to the default Opus
+    when none is set. Idempotent — a value already ending in ``[1m]`` is
+    returned unchanged.
+    """
+    base = (current or "").strip() or _DEFAULT_1M_MODEL
+    return base if base.endswith(_CONTEXT_1M_SUFFIX) else f"{base}{_CONTEXT_1M_SUFFIX}"
 
 
 def _normalize_tool_search_mode(value: str) -> str:
@@ -501,12 +526,10 @@ def _setup_lean_ctx_agent(agent: str, verbose: bool = False) -> Path | None:
             # lean-ctx writes project-local files when initialized from a git
             # checkout. Run from a non-project directory so setup is limited to
             # home-scoped agent config such as ~/.codex or ~/.claude.
-            result = subprocess.run(
+            result = run(
                 [str(lean_ctx), "init", "--agent", agent],
                 capture_output=True,
                 text=True,
-                encoding="utf-8",
-                errors="replace",
                 timeout=30,
                 cwd=setup_cwd,
             )
@@ -892,7 +915,7 @@ def _register_cbm_mcp_server(cbm_bin: str) -> None:
         return
 
     # Check if already registered
-    check = subprocess.run(
+    check = run(
         [claude_cli, "mcp", "get", _CBM_MCP_SERVER_NAME],
         capture_output=True,
         text=True,
@@ -900,7 +923,7 @@ def _register_cbm_mcp_server(cbm_bin: str) -> None:
     if check.returncode == 0:
         return  # Already registered
 
-    result = subprocess.run(
+    result = run(
         [claude_cli, "mcp", "add", _CBM_MCP_SERVER_NAME, "-s", "user", "--", cbm_bin],
         capture_output=True,
         text=True,
@@ -948,7 +971,7 @@ def _setup_code_graph(verbose: bool = False) -> bool:
     # Index current project (fast — ~1s for most repos, idempotent)
     project_dir = str(Path.cwd())
     try:
-        result = subprocess.run(
+        result = run(
             [
                 cbm_bin,
                 "cli",
@@ -1080,7 +1103,12 @@ def _codex_config_paths() -> tuple[Path, Path]:
     return config_file, backup_file
 
 
-def _strip_codex_headroom_blocks(content: str, *, remove_mcp: bool = False) -> str:
+def _strip_codex_headroom_blocks(
+    content: str,
+    *,
+    remove_mcp: bool = False,
+    remove_named_mcp: bool = True,
+) -> str:
     """Remove all Headroom-managed blocks from a Codex ``config.toml`` string.
 
     Returns the cleaned content.  Safe to call on content that never contained
@@ -1107,12 +1135,13 @@ def _strip_codex_headroom_blocks(content: str, *, remove_mcp: bool = False) -> s
     if remove_mcp:
         # Remove Headroom-managed MCP blocks written by `wrap codex`.
         content = _remove_marker_span(content, _CODEX_MCP_MARKER, _CODEX_MCP_END)
-        content = re.sub(
-            r"(?ms)^# --- Headroom MCP server: [^\n]+ ---\n.*?"
-            r"^# --- end Headroom MCP server: [^\n]+ ---\n?",
-            "",
-            content,
-        )
+        if remove_named_mcp:
+            content = re.sub(
+                r"(?ms)^# --- Headroom MCP server: [^\n]+ ---\n.*?"
+                r"^# --- end Headroom MCP server: [^\n]+ ---\n?",
+                "",
+                content,
+            )
         content = _remove_marker_span(content, _MEMORY_MCP_MARKER, _MEMORY_MCP_END)
 
     # Strip any leftover top-level keys that older (or crashed) versions of
@@ -1201,6 +1230,17 @@ def _has_redirectable_top_level_key(content: str, key: str) -> bool:
     return pattern.search(content) is not None
 
 
+def _codex_config_has_headroom_markers(content: str) -> bool:
+    """Return whether a Codex config already contains wrap-owned markers."""
+    managed_markers = (
+        _CODEX_TOP_LEVEL_MARKER,
+        _CODEX_END_MARKER,
+        _CODEX_MCP_MARKER,
+        _MEMORY_MCP_MARKER,
+    )
+    return any(marker in content for marker in managed_markers)
+
+
 def _snapshot_codex_config_if_unwrapped(config_file: Path, backup_file: Path) -> None:
     """Snapshot ``config.toml`` to ``backup_file`` before the first injection.
 
@@ -1214,8 +1254,8 @@ def _snapshot_codex_config_if_unwrapped(config_file: Path, backup_file: Path) ->
       *pre-wrap* state, so running wrap repeatedly must not clobber it.
     * If the config file doesn't exist yet, there's nothing to back up; unwrap
       will remove the file entirely instead of restoring a snapshot.
-    * If the config already contains a Headroom marker, a wrap run is already
-      active: do not snapshot the injected state.
+    * If the config already contains any Headroom-managed Codex marker, a wrap
+      run is already active: do not snapshot the injected state.
     """
     if backup_file.exists():
         return
@@ -1225,7 +1265,7 @@ def _snapshot_codex_config_if_unwrapped(config_file: Path, backup_file: Path) ->
         content = config_file.read_text()
     except OSError:
         return
-    if _CODEX_TOP_LEVEL_MARKER in content or _CODEX_END_MARKER in content:
+    if _codex_config_has_headroom_markers(content):
         return
     backup_file.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(config_file, backup_file)
@@ -1469,8 +1509,23 @@ def _restore_codex_provider_config() -> tuple[str, Path]:
     # Case 2: no backup, but config file exists and has markers — strip them.
     if config_file.exists():
         original = config_file.read_text()
-        if _CODEX_TOP_LEVEL_MARKER in original or _CODEX_END_MARKER in original:
-            cleaned = _strip_codex_headroom_blocks(original, remove_mcp=True)
+        if _codex_config_has_headroom_markers(original):
+            # Without a backup, only remove named MCP blocks when this file
+            # also carries wrap-owned provider markers from a full wrap.
+            remove_named_mcp = any(
+                marker in original
+                for marker in (
+                    _CODEX_TOP_LEVEL_MARKER,
+                    _CODEX_END_MARKER,
+                    _CODEX_MCP_MARKER,
+                    _CODEX_MCP_END,
+                )
+            )
+            cleaned = _strip_codex_headroom_blocks(
+                original,
+                remove_mcp=True,
+                remove_named_mcp=remove_named_mcp,
+            )
             if not cleaned.strip():
                 # Nothing left but Headroom content — remove the file entirely
                 # so Codex falls back to its default config.
@@ -1691,7 +1746,7 @@ def _remove_rtk_instructions(file_path: Path) -> bool:
     return True
 
 
-def _inject_memory_mcp_config(db_path: str, user_id: str) -> None:
+def _inject_memory_mcp_config(user_id: str) -> None:
     """Register headroom memory as an MCP server in Codex's config.toml.
 
     Idempotent — replaces existing section if present.
@@ -1704,12 +1759,11 @@ def _inject_memory_mcp_config(db_path: str, user_id: str) -> None:
     # Use forward slashes in TOML paths (works on all platforms, avoids
     # backslash escaping issues on Windows)
     python_bin = sys.executable.replace("\\", "/")
-    db_path_toml = db_path.replace("\\", "/")
     mcp_section = (
         f"\n{_MEMORY_MCP_MARKER}\n"
         f"[mcp_servers.headroom_memory]\n"
         f'command = "{python_bin}"\n'
-        f'args = ["-m", "headroom.memory.mcp_server", "--db", "{db_path_toml}", "--user", "{user_id}"]\n'
+        f'args = ["-m", "headroom.memory.mcp_server", "--user", "{user_id}"]\n'
         f"startup_timeout_sec = 30\n"
         f"tool_timeout_sec = 30\n"
         f"{_MEMORY_MCP_END}\n"
@@ -2375,6 +2429,7 @@ def _ensure_proxy(
                         f"is running stale Headroom {running_version} and could not be restarted."
                     )
                 click.echo(f"  Proxy already running on port {port}")
+                click.echo(f"  Dashboard:    http://127.0.0.1:{port}/dashboard")
                 return None
             if helpers._recover_persistent_proxy(port):
                 return None
@@ -2505,6 +2560,7 @@ def _ensure_proxy(
 
             if not needs_restart:
                 click.echo(f"  Proxy already running on port {port}")
+                click.echo(f"  Dashboard:    http://127.0.0.1:{port}/dashboard")
                 return None
 
         # Start (or restart) the proxy with the requested flags
@@ -2785,14 +2841,12 @@ def _run_checked(
 ) -> subprocess.CompletedProcess[str]:
     """Run subprocess and raise a ClickException with actionable context on failure."""
     try:
-        return subprocess.run(
+        return run(
             cmd,
             cwd=str(cwd) if cwd else None,
             check=True,
             capture_output=True,
             text=True,
-            encoding="utf-8",
-            errors="replace",
         )
     except FileNotFoundError as e:
         raise click.ClickException(f"{action} failed: command not found: {cmd[0]}") from e
@@ -2823,12 +2877,10 @@ def _normalize_openclaw_gateway_provider_ids(provider_ids: tuple[str, ...] | Non
 
 def _read_openclaw_config_value(openclaw_bin: str, path: str) -> Any | None:
     """Read an OpenClaw config value when present, returning None on missing paths."""
-    result = subprocess.run(
+    result = run(
         [openclaw_bin, "config", "get", path],
         capture_output=True,
         text=True,
-        encoding="utf-8",
-        errors="replace",
     )
     if result.returncode != 0:
         return None
@@ -2907,12 +2959,10 @@ def _set_openclaw_context_engine_slot(openclaw_bin: str, engine_id: str) -> None
 
 def _restart_or_start_openclaw_gateway(openclaw_bin: str) -> tuple[str, str]:
     """Restart the gateway when running, otherwise start it."""
-    restart_result = subprocess.run(
+    restart_result = run(
         [openclaw_bin, "gateway", "restart"],
         capture_output=True,
         text=True,
-        encoding="utf-8",
-        errors="replace",
     )
     if restart_result.returncode == 0:
         output = restart_result.stdout.strip() or restart_result.stderr.strip()
@@ -3059,6 +3109,17 @@ def unwrap() -> None:
     default=None,
     help="Cloud region for Vertex/Bedrock backends (env: HEADROOM_REGION).",
 )
+@click.option(
+    "--1m",
+    "context_1m",
+    is_flag=True,
+    help=(
+        "Preserve the 1M context window. Behind a custom ANTHROPIC_BASE_URL "
+        "Claude Code drops the context-1m beta header and caps at 200k; this "
+        "sets ANTHROPIC_MODEL=<opus>[1m] on the launched process so the 1M "
+        "window activates through the proxy (issue #1158)."
+    ),
+)
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
 @click.option("--prepare-only", is_flag=True, hidden=True)
 @click.argument("claude_args", nargs=-1, type=click.UNPROCESSED)
@@ -3074,6 +3135,7 @@ def claude(
     tool_search: str | None,
     backend: str | None,
     region: str | None,
+    context_1m: bool,
     verbose: bool,
     prepare_only: bool,
     claude_args: tuple,
@@ -3094,6 +3156,7 @@ def claude(
         headroom wrap claude --no-context-tool  # Skip CLI context-tool setup
         headroom wrap claude --no-mcp           # Skip MCP retrieve tool registration
         headroom wrap claude --no-serena        # Skip Serena MCP registration
+        headroom wrap claude --1m               # Preserve the 1M context window
     """
     if prepare_only:
         if not no_rtk:
@@ -3125,15 +3188,13 @@ def claude(
     # Memory sync BEFORE proxy startup — sync headroom DB ↔ Claude's files
     if memory:
         try:
-            import subprocess as _sp
-
             mem_dir = Path.cwd() / ".headroom"
             mem_dir.mkdir(parents=True, exist_ok=True)
             _sync_db = str(mem_dir / "memory.db")
             _sync_user = os.environ.get("USER", os.environ.get("USERNAME", "default"))
 
             click.echo(f"  Syncing memory (user={_sync_user})...")
-            sync_result = _sp.run(
+            sync_result = run(
                 [
                     sys.executable,
                     "-m",
@@ -3294,6 +3355,16 @@ def claude(
             click.echo(
                 f"  {_TOOL_SEARCH_ENV}={env.get(_TOOL_SEARCH_ENV)} "
                 "(using your existing environment value)"
+            )
+
+        # Issue #1158: opt-in 1M context window. Claude Code only sends the
+        # context-1m beta header when the model id carries the [1m] suffix, so
+        # force it via ANTHROPIC_MODEL on the launched process.
+        if context_1m:
+            env[_ANTHROPIC_MODEL_ENV] = _resolve_1m_model(env.get(_ANTHROPIC_MODEL_ENV))
+            click.echo(
+                f"  {_ANTHROPIC_MODEL_ENV}={env[_ANTHROPIC_MODEL_ENV]} "
+                "(1M context window; issue #1158)"
             )
 
         result = subprocess.run([claude_bin, *claude_args], env=env)
@@ -3813,7 +3884,7 @@ def codex(
         mem_user = os.environ.get("USER", os.environ.get("USERNAME", "default"))
 
         # Register MCP server in Codex config
-        _inject_memory_mcp_config(db_path, mem_user)
+        _inject_memory_mcp_config(mem_user)
 
         # Inject memory guidance into project AGENTS.md
         agents_md = Path.cwd() / "AGENTS.md"
@@ -3871,11 +3942,7 @@ def codex(
     # the config file.  Re-inject MCP config after if memory is enabled.
     _inject_codex_provider_config(port)
     if memory:
-        mem_dir = Path.cwd() / ".headroom"
-        _inject_memory_mcp_config(
-            str(mem_dir / "memory.db"),
-            os.environ.get("USER", os.environ.get("USERNAME", "default")),
-        )
+        _inject_memory_mcp_config(os.environ.get("USER", os.environ.get("USERNAME", "default")))
 
     _launch_tool(
         binary=codex_bin,
@@ -4816,13 +4883,11 @@ def openclaw(
         install_cwd = None
 
     click.echo("  Installing OpenClaw plugin with required unsafe-install flag...")
-    install_result = subprocess.run(
+    install_result = run(
         install_cmd,
         cwd=str(install_cwd) if install_cwd else None,
         capture_output=True,
         text=True,
-        encoding="utf-8",
-        errors="replace",
     )
     if install_result.returncode != 0:
         combined_error = "\n".join(
@@ -4991,9 +5056,8 @@ def opencode(
         click.echo("  Setting up memory for OpenCode...")
         mem_dir = Path.cwd() / ".headroom"
         mem_dir.mkdir(parents=True, exist_ok=True)
-        db_path = str(mem_dir / "memory.db")
         mem_user = os.environ.get("USER", os.environ.get("USERNAME", "default"))
-        _inject_memory_mcp_config(db_path, mem_user)
+        _inject_memory_mcp_config(mem_user)
         agents_md = Path.cwd() / "AGENTS.md"
         _inject_memory_agents_md(agents_md)
 
@@ -5016,7 +5080,6 @@ def opencode(
     if memory:
         mem_dir = Path.cwd() / ".headroom"
         _inject_memory_mcp_config(
-            str(mem_dir / "memory.db"),
             os.environ.get("USER", os.environ.get("USERNAME", "default")),
         )
 

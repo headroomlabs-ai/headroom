@@ -14,6 +14,8 @@ import zipfile
 from pathlib import Path
 from urllib.request import urlopen
 
+from headroom._subprocess import run
+
 from . import RTK_BIN_DIR, RTK_BIN_PATH, RTK_VERSION
 
 logger = logging.getLogger(__name__)
@@ -139,12 +141,10 @@ def download_rtk(version: str | None = None) -> Path:
 
     if _should_verify_target(target):
         try:
-            result = subprocess.run(
+            result = run(
                 [str(target_path), "--version"],
                 capture_output=True,
                 text=True,
-                encoding="utf-8",
-                errors="replace",
                 timeout=5,
             )
             if result.returncode != 0:

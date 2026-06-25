@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -176,6 +177,47 @@ async def test_maybe_poll_success_updates_state_and_metrics(
     assert tracker._state.poll_count == 1
     assert metrics_calls[0] == {"persisted": True}
     assert isinstance(metrics_calls[1], dict)
+
+
+@pytest.mark.asyncio
+async def test_maybe_poll_runs_transcript_scan_off_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: the transcript scan must run off the event-loop thread, or a
+    multi-second ~/.claude/projects scan wedges the proxy every poll interval."""
+    monkeypatch.setattr(SubscriptionTracker, "_load_persisted_state", lambda self: None)
+    tracker = SubscriptionTracker()
+    tracker.notify_active("Bearer live-oauth-token")
+
+    snapshot = _make_snapshot()
+
+    async def fetch_snapshot(token: str | None) -> SubscriptionSnapshot:
+        return snapshot
+
+    tracker._client = SimpleNamespace(fetch=fetch_snapshot)
+
+    loop_thread_id = threading.get_ident()
+    seen: dict[str, int] = {}
+
+    def recording_compute(snap: SubscriptionSnapshot) -> WindowTokens:
+        seen["thread_id"] = threading.get_ident()
+        return WindowTokens(input=7)
+
+    monkeypatch.setattr(tracker_module, "_compute_window_tokens_for_snapshot", recording_compute)
+    monkeypatch.setattr(tracker_module, "_detect_discrepancies", lambda snap, tokens: [])
+    monkeypatch.setattr(tracker, "_persist_state", lambda: None)
+    monkeypatch.setitem(
+        sys.modules,
+        "headroom.observability.metrics",
+        SimpleNamespace(
+            get_otel_metrics=lambda: SimpleNamespace(record_subscription_window=lambda state: None)
+        ),
+    )
+
+    await tracker._maybe_poll()
+
+    # The blocking scan ran on a worker thread, not the event-loop thread.
+    assert seen["thread_id"] != loop_thread_id
 
 
 def test_persist_and_load_state_round_trip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

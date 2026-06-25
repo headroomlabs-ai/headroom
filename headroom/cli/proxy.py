@@ -34,6 +34,20 @@ from .main import main
 os.environ.setdefault("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1")
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 
+# Corporate TLS-inspection support (issue #1308). When HEADROOM_TLS_STRICT=0,
+# strip OpenSSL's RFC 5280 strict CA-constraint check from urllib3's context
+# builder *before* huggingface_hub / requests import and cache it — otherwise
+# model downloads (huggingface.co) fail with "Basic Constraints of CA cert not
+# marked critical" behind Zscaler/Netskope on Python 3.13+. The proxy's own
+# httpx upstream client is handled separately in proxy/server.py via
+# build_httpx_verify(). No-op unless the toggle is set.
+try:  # pragma: no cover - exercised via integration, not unit-importable cheaply
+    from headroom.proxy.ssl_context import apply_global_tls_relaxation as _apply_tls_relax
+
+    _apply_tls_relax()
+except Exception:  # never let TLS relaxation wiring break startup
+    pass
+
 # Logger-level suppression: httpx HEAD/GET manifest checks + HF advisory msgs.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
@@ -223,6 +237,20 @@ def dashboard(port: int, no_open: bool) -> None:
 @click.option("--no-cache", is_flag=True, help="Disable semantic caching")
 @click.option("--no-rate-limit", is_flag=True, help="Disable rate limiting")
 @click.option(
+    "--rpm",
+    default=None,
+    type=click.IntRange(min=1),
+    envvar="HEADROOM_RPM",
+    help="Max requests per minute. Env: HEADROOM_RPM. Default: 60.",
+)
+@click.option(
+    "--tpm",
+    default=None,
+    type=click.IntRange(min=1),
+    envvar="HEADROOM_TPM",
+    help="Max tokens per minute. Env: HEADROOM_TPM. Default: 100000.",
+)
+@click.option(
     "--no-ccr-inject-tool",
     is_flag=True,
     envvar="HEADROOM_NO_CCR_INJECT_TOOL",
@@ -307,6 +335,17 @@ def dashboard(port: int, no_open: bool) -> None:
     help=(
         "Upstream connection timeout in seconds (1–300, default: 10). "
         "Env: HEADROOM_CONNECT_TIMEOUT_SECONDS."
+    ),
+)
+@click.option(
+    "--anthropic-buffered-request-timeout-seconds",
+    type=click.IntRange(min=1),
+    default=None,
+    envvar="HEADROOM_ANTHROPIC_BUFFERED_REQUEST_TIMEOUT_SECONDS",
+    help=(
+        "Buffered Anthropic read timeout in seconds for non-streaming "
+        "message and batch paths (default: 600). "
+        "Env: HEADROOM_ANTHROPIC_BUFFERED_REQUEST_TIMEOUT_SECONDS."
     ),
 )
 @click.option(
@@ -756,6 +795,8 @@ def proxy(
     no_optimize: bool,
     no_cache: bool,
     no_rate_limit: bool,
+    rpm: int | None,
+    tpm: int | None,
     no_ccr_inject_tool: bool,
     no_ccr_marker: bool,
     no_ccr_proactive_expansion: bool,
@@ -765,6 +806,7 @@ def proxy(
     retry_max_attempts: int | None,
     request_timeout_seconds: int | None,
     connect_timeout_seconds: int | None,
+    anthropic_buffered_request_timeout_seconds: int | None,
     anthropic_pre_upstream_concurrency: int | None,
     anthropic_pre_upstream_acquire_timeout_seconds: float | None,
     anthropic_pre_upstream_memory_context_timeout_seconds: float | None,
@@ -953,6 +995,8 @@ def proxy(
         optimize=not no_optimize,
         cache_enabled=not no_cache,
         rate_limit_enabled=not no_rate_limit,
+        rate_limit_requests_per_minute=rpm if rpm is not None else 60,
+        rate_limit_tokens_per_minute=tpm if tpm is not None else 100_000,
         compress_user_messages=_get_env_bool("HEADROOM_COMPRESS_USER_MESSAGES", False),
         min_tokens_to_crush=_get_env_int_optional("HEADROOM_MIN_TOKENS") or 500,
         max_items_after_crush=_get_env_int_optional("HEADROOM_MAX_ITEMS") or 50,
@@ -989,6 +1033,11 @@ def proxy(
         connect_timeout_seconds=connect_timeout_seconds
         if connect_timeout_seconds is not None
         else 10,
+        anthropic_buffered_request_timeout_seconds=(
+            anthropic_buffered_request_timeout_seconds
+            if anthropic_buffered_request_timeout_seconds is not None
+            else 600
+        ),
         max_connections=max_connections,
         max_keepalive_connections=max_keepalive_connections,
         keepalive_expiry=keepalive_expiry,
@@ -1273,9 +1322,13 @@ Press Ctrl+C to stop.
 
         import asyncio as _asyncio
 
-        from headroom.memory.adapters.watchdog import EmbeddingServerWatchdog
-
         async def _start_embed_watchdog() -> Any:
+            # Import lazily inside the guarded coroutine. The sidecar module is
+            # optional and may be absent; keeping the import here lets the
+            # try/except below fall back to the per-worker embedder instead of
+            # crashing the proxy at startup with ModuleNotFoundError.
+            from headroom.memory.adapters.watchdog import EmbeddingServerWatchdog
+
             wd = EmbeddingServerWatchdog(socket_path=_embed_socket)
             await wd.start()
             ok = await wd.wait_until_healthy(timeout=30.0)

@@ -856,6 +856,24 @@ class KompressCompressor(Transform):
         if n_words < 10:
             return self._passthrough(content, n_words)
 
+        # Cooperative wall-clock budget (#1171): kompress ONNX inference is
+        # O(tokens) and non-preemptible once the request's asyncio timeout fires,
+        # so one large block can run for minutes holding a worker (the leak ->
+        # executor-saturation -> queue-timeout cascade). Bail at the next chunk
+        # boundary past this budget, keeping the unprocessed tail verbatim. 0
+        # disables. Env HEADROOM_COMPRESSION_DEADLINE_MS overrides (default 20s).
+        # Cached per instance: operator config, read once -- not per compress() call.
+        deadline_s = getattr(self, "_deadline_s", None)
+        if deadline_s is None:
+            try:
+                deadline_s = max(
+                    0.0,
+                    float(os.environ.get("HEADROOM_COMPRESSION_DEADLINE_MS", "20000")) / 1000.0,
+                )
+            except ValueError:
+                deadline_s = 20.0
+            self._deadline_s = deadline_s
+
         try:
             model, tokenizer, backend = _load_kompress(
                 self.config.model_id, self.config.device, allow_download=allow_download
@@ -879,8 +897,23 @@ class KompressCompressor(Transform):
             kept_ids: set[int] = set()
             inference_ms = 0.0
             chunk_count = 0
+            t_deadline = time.perf_counter()
 
             for chunk_start in range(0, n_words, max_chunk_words):
+                if deadline_s and (time.perf_counter() - t_deadline) > deadline_s:
+                    # Keep everything from here on verbatim and stop: a partial
+                    # compression that returns NOW beats a full one that leaks a
+                    # non-preemptible worker for minutes (#1171).
+                    kept_ids.update(range(chunk_start, n_words))
+                    logger.warning(
+                        "Kompress hit %.1fs deadline after %d/%d words (%d chunks done); "
+                        "kept remainder verbatim to free the request thread (#1171)",
+                        deadline_s,
+                        chunk_start,
+                        n_words,
+                        chunk_count,
+                    )
+                    break
                 chunk_count += 1
                 chunk_words = words[chunk_start : chunk_start + max_chunk_words]
 

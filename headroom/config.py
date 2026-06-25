@@ -428,6 +428,14 @@ class SmartCrusherConfig:
     # transforms-level dataclass.
     lossless_min_savings_ratio: float = 0.15
 
+    # Strict lossless mode. When True, lossless tabular compaction still
+    # applies, but any path that would emit a CCR marker (lossy row-drop
+    # OR opaque-blob offload) leaves the content uncompacted instead, so
+    # the output is always marker-free and byte-recoverable. Mirrors the
+    # Rust default. See also `CCRConfig` — with this on, no `<<ccr:…>>`
+    # markers are produced regardless of CCR settings.
+    lossless_only: bool = False
+
     # Compaction heuristics (mirror Rust CompactConfig). A field is "core"
     # if present in at least this fraction of rows; arrays whose key sets
     # are mostly non-core are bucketed by a discriminator instead.

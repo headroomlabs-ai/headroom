@@ -24,6 +24,8 @@ import threading
 import time
 import typing
 
+from headroom._subprocess import Popen, run
+
 from .loops import LoopPattern, apply_loop_weighting, detect_loops, format_loops_for_digest
 from .models import (
     AnalysisResult,
@@ -518,13 +520,11 @@ def _call_cli_llm(digest: str, model: str) -> dict:
         return _call_claude_cli_streaming(cmd, prompt, hard_cap=hard_cap, idle_cap=idle_cap)
 
     try:
-        result = subprocess.run(
+        result = run(
             cmd,
             input=prompt,
             capture_output=True,
             text=True,
-            encoding="utf-8",
-            errors="replace",
             timeout=hard_cap,
         )
     except FileNotFoundError:
@@ -574,14 +574,12 @@ def _call_claude_cli_streaming(
     on Windows too, where ``select`` does not support pipe handles.
     """
     try:
-        proc = subprocess.Popen(
+        proc = Popen(
             cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            encoding="utf-8",
-            errors="replace",
             bufsize=1,  # line-buffered
         )
     except FileNotFoundError:

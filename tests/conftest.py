@@ -14,14 +14,7 @@ from unittest.mock import Mock
 
 import pytest
 
-# Import httpx for timeout handling (will be available since it's a dependency)
-try:
-    import httpx
-
-    HTTPX_AVAILABLE = True
-except ImportError:
-    HTTPX_AVAILABLE = False
-
+from tests._skip_helpers import external_model_skip_reason
 
 # =============================================================================
 # Global test hooks
@@ -30,19 +23,21 @@ except ImportError:
 
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_call(item):
-    """Wrap test execution to catch httpx.ReadTimeout and skip instead of fail.
+    """Wrap test execution to skip transient or offline external model failures.
 
-    This handles flaky network timeouts that occur when:
+    This handles model-loading failures that occur when:
     - HuggingFace Hub is slow during model downloads (sentence-transformers)
+    - Required HuggingFace model files were not restored into the offline CI cache
     - External embedding APIs timeout
     - Network connectivity issues in CI
     """
     outcome = yield
 
-    if HTTPX_AVAILABLE and outcome.excinfo is not None:
+    if outcome.excinfo is not None:
         exc_type, exc_value, exc_tb = outcome.excinfo
-        if isinstance(exc_value, httpx.ReadTimeout):
-            pytest.skip("Skipped due to network timeout (flaky CI)")
+        reason = external_model_skip_reason(exc_value)
+        if reason is not None:
+            pytest.skip(reason)
 
 
 @pytest.fixture(autouse=True)

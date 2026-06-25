@@ -689,6 +689,11 @@ class ContentRouterConfig:
     ccr_inject_marker: bool = True  # Add retrieval markers to compressed content
     smart_crusher_max_items_after_crush: int | None = None
     smart_crusher_with_compaction: bool = True
+    # Strict lossless-only mode for SmartCrusher. None → leave the
+    # crusher config's own value untouched; True/False force it. Wired
+    # from the proxy's `HEADROOM_LOSSLESS_ONLY` env var so a real session
+    # can run marker-free without constructing the crusher by hand.
+    smart_crusher_lossless_only: bool | None = None
 
     # Tag protection: preserve custom/workflow XML tags from text compression.
     # When False (default), entire <custom-tag>content</custom-tag> blocks are
@@ -969,6 +974,27 @@ class ContentRouter(Transform):
         self._html_extractor: Any = None
         self._tabular_compressor: Any = None
         self._kompress: Any = None
+
+        # Phase 0 (#1171): cap the input size handed to kompress (ModernBERT
+        # ONNX). Its inference scales O(tokens) and runs synchronously on the
+        # request thread under the 30s compression budget; above this ceiling we
+        # route to the fast LogCompressor instead so the request path stays
+        # bounded. ~4 chars/token is a cheap proxy (no tokenizer needed; counts
+        # dense JSON/code correctly, unlike word count). 0 disables the gate.
+        try:
+            self._kompress_max_tokens: int = int(
+                os.environ.get("HEADROOM_KOMPRESS_MAX_TOKENS", "50000")
+            )
+        except ValueError:
+            self._kompress_max_tokens = 50000
+        self._kompress_gate_fires: int = 0
+        # Phase 2 (#1171): when enabled, the size-gate routes oversized text to
+        # the fast extractive TextCrusher (real prose savings) instead of the
+        # LogCompressor (~0 savings on prose). Opt-in, default off.
+        self._text_crusher_enabled: bool = os.environ.get(
+            "HEADROOM_TEXT_CRUSHER", ""
+        ).strip().lower() in ("1", "true", "yes", "on")
+        self._text_crusher: Any = None
 
         # TOIN integration for cross-strategy learning
         self._toin: Any = None
@@ -1713,6 +1739,46 @@ class ContentRouter(Transform):
         compressed: str | None = None
         compressed_tokens: int | None = None
 
+        # Phase 0 (#1171): size gate. This is the single ML boundary, so gating
+        # here covers EVERY kompress entry point -- TEXT, KOMPRESS-direct,
+        # CODE_AWARE->KOMPRESS, and the strategy-fallback path all route through
+        # _try_ml_compressor. Kompress ONNX inference is O(tokens) and runs
+        # synchronously on the request thread; on a large/cold context it
+        # exceeds the 30s budget and leaks a non-preemptible worker (#1171).
+        # Above the ceiling, route to the fast LogCompressor (or pass through)
+        # rather than ModernBERT, keeping the request path bounded.
+        if self._kompress_max_tokens > 0 and len(text_to_compress) > self._kompress_max_tokens * 4:
+            self._kompress_gate_fires += 1
+            logger.info(
+                "kompress size-gate fired: ~%d tok (>%d) routed off ML (fire #%d)",
+                len(text_to_compress) // 4,
+                self._kompress_max_tokens,
+                self._kompress_gate_fires,
+            )
+            out = text_to_compress
+            crusher = self._get_text_crusher()
+            if crusher is not None:
+                try:
+                    out = crusher.compress(text_to_compress, context=context or "").compressed
+                except Exception as e:
+                    logger.warning(
+                        "Kompress size-gate -> TextCrusher failed (%s); passing through", e
+                    )
+                    out = text_to_compress
+            elif self.config.enable_log_compressor:
+                lc = self._get_log_compressor()
+                if lc:
+                    try:
+                        out = lc.compress(text_to_compress).compressed
+                    except Exception as e:
+                        logger.warning(
+                            "Kompress size-gate -> LogCompressor failed (%s); passing through", e
+                        )
+                        out = text_to_compress
+            if protected:
+                out = restore_tags(out, protected)
+            return out, len(out.split())
+
         # Primary: Kompress. On a cold cache the model is fetched once in the
         # background (ensure_background_load) instead of blocking this request
         # thread on a 274MB download that races the compression timeout and
@@ -1782,10 +1848,18 @@ class ContentRouter(Transform):
         """Get CodeAwareCompressor (lazy load)."""
         if self._code_compressor is None:
             try:
-                from .code_compressor import CodeAwareCompressor, _check_tree_sitter_available
+                from .code_compressor import (
+                    CodeAwareCompressor,
+                    CodeCompressorConfig,
+                    _check_tree_sitter_available,
+                )
 
                 if _check_tree_sitter_available():
-                    self._code_compressor = CodeAwareCompressor()
+                    self._code_compressor = CodeAwareCompressor(
+                        CodeCompressorConfig(
+                            enable_ccr=self.config.ccr_inject_marker,
+                        )
+                    )
                 else:
                     logger.debug("tree-sitter not available")
             except ImportError:
@@ -1811,6 +1885,8 @@ class ContentRouter(Transform):
                     crusher_config.max_items_after_crush = (
                         self.config.smart_crusher_max_items_after_crush
                     )
+                if self.config.smart_crusher_lossless_only is not None:
+                    crusher_config.lossless_only = self.config.smart_crusher_lossless_only
                 self._smart_crusher = SmartCrusher(
                     config=crusher_config,
                     ccr_config=ccr_config,
@@ -1827,7 +1903,10 @@ class ContentRouter(Transform):
                 from .search_compressor import SearchCompressor, SearchCompressorConfig
 
                 self._search_compressor = SearchCompressor(
-                    SearchCompressorConfig(group_by_file=self.config.search_group_by_file)
+                    SearchCompressorConfig(
+                        group_by_file=self.config.search_group_by_file,
+                        enable_ccr=self.config.ccr_inject_marker,
+                    )
                 )
             except ImportError:
                 logger.debug("SearchCompressor not available")
@@ -1837,12 +1916,30 @@ class ContentRouter(Transform):
         """Get LogCompressor (lazy load)."""
         if self._log_compressor is None:
             try:
-                from .log_compressor import LogCompressor
+                from .log_compressor import LogCompressor, LogCompressorConfig
 
-                self._log_compressor = LogCompressor()
+                self._log_compressor = LogCompressor(
+                    LogCompressorConfig(enable_ccr=self.config.ccr_inject_marker)
+                )
             except ImportError:
                 logger.debug("LogCompressor not available")
         return self._log_compressor
+
+    def _get_text_crusher(self) -> Any:
+        """Get TextCrusher (Phase 2, lazy load). Returns None when disabled, or
+        when the native ``headroom._core`` extension is not built (mirrors the
+        ImportError handling of the other ``_get_*`` compressor getters)."""
+        if not getattr(self, "_text_crusher_enabled", False):
+            return None
+        if self._text_crusher is None:
+            try:
+                from .text_crusher import TextCrusher
+
+                self._text_crusher = TextCrusher()
+            except ImportError:
+                logger.debug("TextCrusher (headroom._core) unavailable; disabling gate route")
+                self._text_crusher_enabled = False
+        return self._text_crusher
 
     def _get_tabular_compressor(self) -> Any:
         """Get TabularCompressor (lazy load)."""
@@ -1860,9 +1957,11 @@ class ContentRouter(Transform):
         retired in Stage 3b. The wheel (`headroom._core`) is a hard import.
         """
         if self._diff_compressor is None:
-            from .diff_compressor import DiffCompressor
+            from .diff_compressor import DiffCompressor, DiffCompressorConfig
 
-            self._diff_compressor = DiffCompressor()
+            self._diff_compressor = DiffCompressor(
+                DiffCompressorConfig(enable_ccr=self.config.ccr_inject_marker)
+            )
         return self._diff_compressor
 
     def _get_html_extractor(self) -> Any:
@@ -1933,6 +2032,25 @@ class ContentRouter(Transform):
         except Exception as e:
             logger.debug("Magika pre-load skipped: %s", e)
             status["magika"] = "skipped"
+
+        # Surface which onnxruntime dylib the Rust detection chain will load.
+        # On Windows `headroom._ort` pins ORT_DYLIB_PATH at import time; an
+        # unset value there means the bare DLL search applies, which lands on
+        # the Windows ML System32 build known to deadlock ort session init
+        # (Win11 24H2+, see headroom/_ort.py).
+        if sys.platform.startswith("win"):
+            ort_dylib = os.environ.get("ORT_DYLIB_PATH")
+            if ort_dylib:
+                logger.info("ORT dylib for Rust detection: %s", ort_dylib)
+                status["ort_dylib"] = ort_dylib
+            else:
+                logger.warning(
+                    "ORT_DYLIB_PATH is unset: Rust ML detection will use the system "
+                    "DLL search, which deadlocks against the Windows ML System32 "
+                    "onnxruntime.dll on Windows 11 24H2+. Install the `onnxruntime` "
+                    "package or set ORT_DYLIB_PATH."
+                )
+                status["ort_dylib"] = "unset"
 
         # 3. CodeAware compressor + common tree-sitter parsers
         if self.config.enable_code_aware:

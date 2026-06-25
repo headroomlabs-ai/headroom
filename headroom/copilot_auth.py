@@ -8,7 +8,6 @@ import hashlib
 import json
 import logging
 import os
-import subprocess
 import time
 from ctypes import wintypes
 from dataclasses import dataclass
@@ -20,6 +19,7 @@ from urllib import request as urllib_request
 from urllib.parse import urlparse
 
 from headroom import paths
+from headroom._subprocess import run
 from headroom.copilot_linux_secret import read_copilot_oauth_token as read_linux_secret_token
 from headroom.copilot_macos_keychain import read_copilot_oauth_token as read_macos_keychain_token
 
@@ -247,12 +247,10 @@ def _read_gh_cli_oauth_token() -> str | None:
         command.extend(["--hostname", host])
 
     try:
-        result = subprocess.run(
+        result = run(
             command,
             capture_output=True,
             text=True,
-            encoding="utf-8",
-            errors="replace",
             check=False,
         )
     except OSError as exc:

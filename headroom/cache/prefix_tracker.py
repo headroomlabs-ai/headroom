@@ -41,6 +41,21 @@ _PROVIDER_WRITE_PENALTY = {
     "bedrock": 0.25,
 }
 
+# Default prompt-cache lifetime per provider, in seconds. Used by
+# `classify_cache_miss` to decide whether a miss is most likely a TTL
+# lapse (idle longer than this) versus a prefix-content change. Anthropic's
+# default ephemeral cache is 5 minutes (matches
+# headroom.cache.anthropic.ANTHROPIC_CACHE_TTL_SECONDS); the others are best-
+# effort defaults and only matter once those providers are wired in. A
+# session that opts into Anthropic's 1h cache breakpoint can override this
+# via the tracker config (see PrefixFreezeConfig.cache_ttl_seconds).
+_PROVIDER_CACHE_TTL_SECONDS = {
+    "anthropic": 300,  # 5 minutes (default ephemeral cache)
+    "openai": 300,  # automatic prefix cache, ~5-10 min; conservative floor
+    "gemini": 300,
+    "bedrock": 300,
+}
+
 
 @dataclass
 class PrefixFreezeConfig:
@@ -50,6 +65,11 @@ class PrefixFreezeConfig:
     min_cached_tokens: int = 1024  # Min cached tokens to activate freeze
     session_ttl_seconds: int = 600  # Session tracker cleanup TTL
     force_compress_threshold: float = 0.5  # Bust cache if compression saves > this fraction
+    # Provider prompt-cache lifetime used by `classify_cache_miss` to tell a
+    # TTL lapse from a prefix change. `None` falls back to the per-provider
+    # default in `_PROVIDER_CACHE_TTL_SECONDS`. Set to 3600 for a session that
+    # uses Anthropic's 1h cache breakpoint so idle-gap attribution stays honest.
+    cache_ttl_seconds: int | None = None
 
 
 @dataclass
@@ -62,6 +82,34 @@ class FreezeStats:
     net_benefit_tokens: int = 0  # tokens_preserved - compression_foregone
     frozen_message_count: int = 0
     turn_number: int = 0
+
+
+# Cache-miss attribution verdicts. `reason` is one of these literals so
+# metrics/dashboard can bucket without re-deriving the logic. See
+# PrefixCacheTracker.classify_cache_miss.
+MISS_TTL_EXPIRY = "ttl_expiry"
+MISS_PREFIX_CHANGE = "prefix_change"
+MISS_COLD_START = "cold_start"  # no prior cached prefix to miss against
+MISS_UNKNOWN = "unknown"  # expected a hit, content stable, idle within TTL
+
+
+@dataclass
+class CacheMissAttribution:
+    """Why a turn that expected a prompt-cache hit missed instead.
+
+    Produced by :meth:`PrefixCacheTracker.classify_cache_miss`. ``is_miss``
+    is False when the turn actually hit cache (or there was nothing to hit),
+    in which case ``reason`` is informational only.
+    """
+
+    is_miss: bool
+    reason: str  # one of the MISS_* literals
+    idle_seconds: float = 0.0
+    cache_ttl_seconds: int = 0
+    expected_cached_tokens: int = 0
+    cache_read_tokens: int = 0
+    prefix_changed: bool = False
+    ttl_exceeded: bool = False
 
 
 class PrefixCacheTracker:
@@ -184,6 +232,114 @@ class PrefixCacheTracker:
 
     def get_last_forwarded_messages(self) -> list[dict[str, Any]]:
         return copy.deepcopy(self._last_forwarded_messages)
+
+    def resolved_cache_ttl_seconds(self) -> int:
+        """Effective prompt-cache lifetime for this session's provider."""
+        if self.config.cache_ttl_seconds is not None:
+            return self.config.cache_ttl_seconds
+        return _PROVIDER_CACHE_TTL_SECONDS.get(self.provider, 300)
+
+    def classify_cache_miss(
+        self,
+        cache_read_tokens: int,
+        current_forwarded_messages: list[dict[str, Any]],
+        idle_seconds: float | None = None,
+    ) -> CacheMissAttribution:
+        """Attribute *this turn's* cache outcome: hit, TTL lapse, or prefix change.
+
+        Call this BEFORE :meth:`update_from_response` — it reads the state
+        captured from the *previous* turn (``_cached_token_count``,
+        ``_last_forwarded_messages``, ``_last_activity``), all of which
+        ``update_from_response`` overwrites.
+
+        Attribution only fires when the previous turn left a cacheable prefix
+        (``_cached_token_count > 0``); the very first warm turn has nothing to
+        miss against, so it is reported as ``cold_start`` with ``is_miss=False``.
+
+        When a hit was expected but ``cache_read_tokens == 0``:
+
+        * If the idle gap since the last turn exceeded the provider cache TTL,
+          the cache entry had already lapsed — ``ttl_expiry``. **TTL wins ties:**
+          once the entry expired, a coincident prefix change is moot (the issue
+          asks "should I move 5m → 1h?", which only the TTL signal answers).
+        * Otherwise, if the forwarded prefix changed versus last turn, the new
+          bytes couldn't match the cached prefix — ``prefix_change``.
+        * If neither signal fires (stable prefix, within TTL) we can't explain
+          it from local state — ``unknown`` (e.g. provider-side eviction).
+
+        A partial read (``0 < cache_read_tokens``) counts as a hit here; the
+        existing model-aware bust detection in PrometheusMetrics already covers
+        partial-invalidation accounting, and double-counting it as a "miss"
+        would muddy the 5m-vs-1h signal this method exists to provide.
+
+        Returns a :class:`CacheMissAttribution`; ``is_miss`` is False for hits
+        and cold starts.
+        """
+        if idle_seconds is None:
+            idle_seconds = self.seconds_since_activity()
+        ttl = self.resolved_cache_ttl_seconds()
+        expected = self._cached_token_count
+
+        # Nothing was cached last turn → cold start, not a miss.
+        if expected <= 0:
+            return CacheMissAttribution(
+                is_miss=False,
+                reason=MISS_COLD_START,
+                idle_seconds=idle_seconds,
+                cache_ttl_seconds=ttl,
+                expected_cached_tokens=expected,
+                cache_read_tokens=cache_read_tokens,
+            )
+
+        # We expected a hit. A non-zero read means the prefix cache worked.
+        if cache_read_tokens > 0:
+            return CacheMissAttribution(
+                is_miss=False,
+                reason="hit",
+                idle_seconds=idle_seconds,
+                cache_ttl_seconds=ttl,
+                expected_cached_tokens=expected,
+                cache_read_tokens=cache_read_tokens,
+            )
+
+        # Full miss on a prefix we expected cached. Attribute it.
+        ttl_exceeded = idle_seconds > ttl
+        prefix_changed = not self._forwarded_prefix_stable(current_forwarded_messages)
+
+        if ttl_exceeded:
+            reason = MISS_TTL_EXPIRY  # TTL wins ties (see docstring)
+        elif prefix_changed:
+            reason = MISS_PREFIX_CHANGE
+        else:
+            reason = MISS_UNKNOWN
+
+        return CacheMissAttribution(
+            is_miss=True,
+            reason=reason,
+            idle_seconds=idle_seconds,
+            cache_ttl_seconds=ttl,
+            expected_cached_tokens=expected,
+            cache_read_tokens=cache_read_tokens,
+            prefix_changed=prefix_changed,
+            ttl_exceeded=ttl_exceeded,
+        )
+
+    def _forwarded_prefix_stable(self, current_forwarded_messages: list[dict[str, Any]]) -> bool:
+        """True if last turn's forwarded prefix is still an exact prefix of this turn's.
+
+        The cached prefix is whatever we forwarded last turn. If those exact
+        messages still lead the current forwarded list, the bytes the provider
+        hashed for its cache key are unchanged, so a miss can't be blamed on
+        content. Anything else (a frozen message rewritten, the prefix
+        reordered, the list now shorter) counts as a prefix change.
+        """
+        prev = self._last_forwarded_messages
+        if not prev:
+            # No recorded prefix to compare — can't claim it changed.
+            return True
+        if len(current_forwarded_messages) < len(prev):
+            return False
+        return current_forwarded_messages[: len(prev)] == prev
 
     def record_bust_avoided(self, tokens_preserved: int, compression_foregone: int) -> None:
         """Record when we chose to preserve cache over compressing."""
