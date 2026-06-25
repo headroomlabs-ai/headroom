@@ -48,8 +48,9 @@ CANONICAL_PIPELINE_STAGES: tuple[PipelineStage, ...] = (
 class PipelineEvent:
     """Event emitted at a canonical pipeline stage.
 
-    Extensions may mutate ``messages``, ``tools``, ``headers``, or ``metadata`` in
-    place, or return a replacement ``PipelineEvent`` from ``on_pipeline_event``.
+    Extensions may mutate ``messages``, ``tools``, ``headers``, ``payload``, or
+    ``metadata`` in place, or return a replacement ``PipelineEvent`` from
+    ``on_pipeline_event``.
     """
 
     stage: PipelineStage
@@ -60,6 +61,7 @@ class PipelineEvent:
     messages: list[dict[str, Any]] | None = None
     tools: list[dict[str, Any]] | None = None
     headers: dict[str, str] | None = None
+    payload: dict[str, Any] | None = None
     response: Any = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -140,6 +142,7 @@ class PipelineExtensionManager:
         messages: list[dict[str, Any]] | None = None,
         tools: list[dict[str, Any]] | None = None,
         headers: dict[str, str] | None = None,
+        payload: dict[str, Any] | None = None,
         response: Any = None,
         metadata: dict[str, Any] | None = None,
     ) -> PipelineEvent:
@@ -154,6 +157,7 @@ class PipelineExtensionManager:
             messages=messages,
             tools=tools,
             headers=headers,
+            payload=payload,
             response=response,
             metadata=metadata or {},
         )

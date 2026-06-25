@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 from typing import Any
 
+from headroom.pipeline import PipelineEvent, PipelineExtensionManager, PipelineStage
 from headroom.proxy.handlers.openai import (
     OpenAIHandlerMixin,
     _compact_openai_responses_tools,
@@ -224,6 +225,91 @@ class _HandlerHarness(OpenAIHandlerMixin):
     def __init__(self, router: ContentRouter):
         self.openai_pipeline: Any = _StubPipeline(router)
         self.openai_provider: Any = _StubProvider()
+        self.pipeline_extensions: Any = PipelineExtensionManager(discover=False)
+
+
+class _RecordingResponsesExtension:
+    def __init__(self) -> None:
+        self.events: list[PipelineEvent] = []
+
+    def on_pipeline_event(self, event: PipelineEvent) -> PipelineEvent:
+        self.events.append(event)
+        if event.payload is not None and event.stage == PipelineStage.INPUT_RECEIVED:
+            event.payload["extension_marker"] = event.stage.value
+        if event.headers is not None and event.stage == PipelineStage.PRE_SEND:
+            event.headers["x-test-extension"] = "seen"
+        return event
+
+
+def test_responses_pipeline_payload_stage_allows_payload_and_header_mutation() -> None:
+    router = ContentRouter(ContentRouterConfig())
+    handler = _HandlerHarness(router)
+    extension = _RecordingResponsesExtension()
+    handler.pipeline_extensions = PipelineExtensionManager(
+        extensions=[extension],
+        discover=False,
+    )
+
+    payload: dict[str, Any] = {
+        "model": "gpt-5.5",
+        "input": [{"type": "function_call_output", "output": "build log"}],
+    }
+    headers = {"authorization": "Bearer test"}
+
+    updated, updated_headers, changed = handler._emit_openai_responses_payload_stage(
+        PipelineStage.INPUT_RECEIVED,
+        request_id="req-responses-ext",
+        model="gpt-5.5",
+        payload=payload,
+        headers=headers,
+        transport="websocket",
+        stream=True,
+        frame_index=2,
+        frame_type="response.create",
+    )
+    updated, updated_headers, presend_changed = handler._emit_openai_responses_payload_stage(
+        PipelineStage.PRE_SEND,
+        request_id="req-responses-ext",
+        model="gpt-5.5",
+        payload=updated,
+        headers=updated_headers,
+        transport="websocket",
+        stream=True,
+        frame_index=2,
+        frame_type="response.create",
+    )
+
+    assert changed is True
+    assert presend_changed is True
+    assert updated["extension_marker"] == "input_received"
+    assert updated_headers == {"authorization": "Bearer test", "x-test-extension": "seen"}
+    assert [event.stage for event in extension.events] == [
+        PipelineStage.INPUT_RECEIVED,
+        PipelineStage.PRE_SEND,
+    ]
+    assert extension.events[0].payload is payload
+    assert extension.events[0].metadata["api_style"] == "responses"
+    assert extension.events[0].metadata["transport"] == "websocket"
+    assert extension.events[0].metadata["frame_index"] == 2
+
+
+def test_responses_pipeline_payload_stage_is_noop_without_extensions() -> None:
+    router = ContentRouter(ContentRouterConfig())
+    handler = _HandlerHarness(router)
+    payload: dict[str, Any] = {"model": "gpt-5.5", "input": "hello"}
+
+    updated, headers, changed = handler._emit_openai_responses_payload_stage(
+        PipelineStage.INPUT_RECEIVED,
+        request_id="req-noop",
+        model="gpt-5.5",
+        payload=payload,
+        transport="http",
+        stream=False,
+    )
+
+    assert updated is payload
+    assert headers is None
+    assert changed is False
 
 
 def test_codex_input_list_payload_reaches_router_without_skip() -> None:

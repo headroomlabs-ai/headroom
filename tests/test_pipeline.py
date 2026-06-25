@@ -86,6 +86,7 @@ def test_pipeline_manager_emit_and_summary(monkeypatch) -> None:
                 messages=event.messages,
                 tools=event.tools,
                 headers=event.headers,
+                payload=event.payload,
                 response=event.response,
                 metadata={**event.metadata, "replaced": True},
             )
@@ -114,12 +115,14 @@ def test_pipeline_manager_emit_and_summary(monkeypatch) -> None:
         provider="openai",
         model="gpt-4o",
         messages=[{"role": "user", "content": "hello"}],
+        payload={"model": "gpt-4o", "input": "hello"},
         metadata={"start": True},
     )
 
     assert hook.seen == ["input_received"]
     assert event.metadata == {"start": True, "hook": True, "replaced": True}
     assert event.request_id == "req-1"
+    assert event.payload == {"model": "gpt-4o", "input": "hello"}
 
     disabled = PipelineExtensionManager(discover=False)
     assert disabled.enabled is False
