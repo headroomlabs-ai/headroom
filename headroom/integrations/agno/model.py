@@ -296,6 +296,41 @@ class HeadroomAgnoModel(Model):  # type: ignore[misc]
         """History of optimization metrics."""
         return self._metrics_history.copy()
 
+    @staticmethod
+    def _normalize_tool_call(tc: Any) -> dict[str, Any]:
+        """Normalize a tool call to a plain dict.
+
+        Handles both dict format and Pydantic model objects that the OpenAI
+        SDK emits during streaming (ChoiceDeltaToolCall, ChatCompletionMessageToolCall).
+        Both headroom's parser and tokenizer call dict methods on tool_call items;
+        passing raw Pydantic models from stream deltas raises AttributeError.
+        """
+        if isinstance(tc, dict):
+            return tc
+        # Pydantic v2 model — use model_dump() for full fidelity
+        if hasattr(tc, "model_dump"):
+            return tc.model_dump()
+        # Pydantic v1 / dataclass
+        if hasattr(tc, "__dict__"):
+            result = {k: v for k, v in vars(tc).items() if not k.startswith("_")}
+            # Normalize nested function object if present
+            func = result.get("function")
+            if func is not None and not isinstance(func, dict):
+                result["function"] = (
+                    func.model_dump() if hasattr(func, "model_dump") else vars(func)
+                )
+            return result
+        # Last resort: reconstruct from known attributes
+        func_obj = getattr(tc, "function", None)
+        return {
+            "id": getattr(tc, "id", None),
+            "type": getattr(tc, "type", "function"),
+            "function": {
+                "name": getattr(func_obj, "name", None) or "",
+                "arguments": getattr(func_obj, "arguments", None) or "",
+            },
+        }
+
     def _convert_messages_to_openai(self, messages: list[Any]) -> list[dict[str, Any]]:
         """Convert Agno messages to OpenAI format for Headroom.
 

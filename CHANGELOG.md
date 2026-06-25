@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Fixed
+
+* **integrations/agno:** fix `AttributeError: 'ChoiceDeltaToolCall' object has no attribute 'get'` during streaming ([#1312](https://github.com/headroomlabs-ai/headroom/issues/1312)). The OpenAI SDK emits `ChoiceDeltaToolCall` Pydantic objects (not dicts) in streaming deltas; `_convert_messages_to_openai` stored them raw, causing headroom's parser and tokenizer to crash on dict method calls. Fix: added `_normalize_tool_call()` static method that coerces any tool_call object to a plain dict (via `model_dump()`, `vars()`, or attribute fallback), applied in `_convert_messages_to_openai` before the message is passed to the compression pipeline.
+
 ### Features
 
 * **wrap:** `headroom wrap claude --1m` preserves the 1M context window. Behind a custom `ANTHROPIC_BASE_URL` (the proxy) Claude Code drops the `context-1m` beta header and caps the window at 200k for entitled subscription users; the opt-in flag sets `ANTHROPIC_MODEL=<opus>[1m]` on the launched process so the 1M window activates through Headroom. A model already selected via `ANTHROPIC_MODEL` is preserved (only the `[1m]` suffix is appended) ([#1158](https://github.com/chopratejas/headroom/issues/1158)).
