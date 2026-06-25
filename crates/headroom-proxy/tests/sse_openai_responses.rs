@@ -240,7 +240,9 @@ fn response_failed_captures_usage() {
     );
     run(&mut s, raw.as_bytes());
     assert_eq!(s.status, StreamStatus::Failed);
-    let usage = s.usage.expect("usage must be captured from response.failed envelope");
+    let usage = s
+        .usage
+        .expect("usage must be captured from response.failed envelope");
     assert_eq!(usage["input_tokens"], 50);
     assert_eq!(usage["output_tokens"], 3);
 }
