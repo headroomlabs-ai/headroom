@@ -1348,6 +1348,53 @@ def test_unwrap_codex_preserves_unrelated_sections(
     assert restored == original
 
 
+def test_unwrap_codex_removes_rtk_block_from_global_agents_md(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`wrap codex` writes the RTK block to $CODEX_HOME/AGENTS.md; `unwrap` must remove it.
+
+    Regression for the durable RTK instructions surviving unwrap, which left a
+    plain `codex` launch still prefixing shell commands with `rtk`.
+    """
+    _set_test_home(monkeypatch, tmp_path)
+    agents_md = tmp_path / ".codex" / "AGENTS.md"
+
+    fake_rtk = tmp_path / "rtk"
+    fake_rtk.write_text("#!/bin/sh\n")
+    with patch("headroom.cli.wrap._ensure_rtk_binary", return_value=fake_rtk):
+        wrap_result = runner.invoke(main, ["wrap", "codex", "--prepare-only", "--port", "8787"])
+    assert wrap_result.exit_code == 0, wrap_result.output
+    assert agents_md.exists()
+    assert wrap_mod._RTK_MARKER in agents_md.read_text()
+
+    unwrap_result = runner.invoke(main, ["unwrap", "codex"])
+    assert unwrap_result.exit_code == 0, unwrap_result.output
+    assert "Removed Headroom rtk instructions from Codex." in unwrap_result.output
+    # The block must be gone — either the file is cleaned or removed entirely
+    # (it held only the Headroom block).
+    assert not agents_md.exists() or wrap_mod._RTK_MARKER not in agents_md.read_text()
+
+
+def test_unwrap_codex_preserves_user_agents_md_content(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """unwrap strips only the marker-fenced RTK block, keeping the user's own AGENTS.md."""
+    _set_test_home(monkeypatch, tmp_path)
+    agents_md = tmp_path / ".codex" / "AGENTS.md"
+    agents_md.parent.mkdir(parents=True)
+    agents_md.write_text("# My Codex instructions\n\nDo the thing.\n")
+    wrap_mod._inject_rtk_instructions(agents_md)
+    assert wrap_mod._RTK_MARKER in agents_md.read_text()
+
+    result = runner.invoke(main, ["unwrap", "codex"])
+    assert result.exit_code == 0, result.output
+
+    remaining = agents_md.read_text()
+    assert wrap_mod._RTK_MARKER not in remaining
+    assert "My Codex instructions" in remaining
+    assert "Do the thing." in remaining
+
+
 # ---------------------------------------------------------------------------
 # Per-project savings: env_http_headers in the injected provider block
 # ---------------------------------------------------------------------------
