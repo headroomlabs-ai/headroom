@@ -693,12 +693,18 @@ class HeadroomProxy(
         )
         self._code_aware_status = "lazy" if config.code_aware_enabled else "disabled"
 
+        _intercept_prefix: list = []
+        if os.environ.get("HEADROOM_INTERCEPT_ENABLED"):
+            from headroom.proxy.interceptors import ToolResultInterceptorTransform
+
+            _intercept_prefix = [ToolResultInterceptorTransform()]
+
         self.anthropic_pipeline = TransformPipeline(
-            transforms=[cache_aligner, anthropic_router],
+            transforms=[*_intercept_prefix, cache_aligner, anthropic_router],
             provider=self.anthropic_provider,
         )
         self.openai_pipeline = TransformPipeline(
-            transforms=[cache_aligner, openai_router],
+            transforms=[*_intercept_prefix, cache_aligner, openai_router],
             provider=self.openai_provider,
         )
 
