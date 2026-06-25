@@ -308,10 +308,10 @@ class _SortedEmptyToolsPreSendExtension:
         return None
 
 
-def _make_no_optimize_app() -> tuple[TestClient, _CapturingTransport]:
-    """Boot a proxy with all transforms disabled and a capturing transport."""
+def _make_anthropic_app(*, optimize: bool) -> tuple[TestClient, _CapturingTransport]:
+    """Boot an Anthropic proxy with a capturing transport."""
     config = ProxyConfig(
-        optimize=False,
+        optimize=optimize,
         cache_enabled=False,
         rate_limit_enabled=False,
         cost_tracking_enabled=False,
@@ -333,6 +333,11 @@ def _make_no_optimize_app() -> tuple[TestClient, _CapturingTransport]:
     proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
 
     return TestClient(app), transport
+
+
+def _make_no_optimize_app() -> tuple[TestClient, _CapturingTransport]:
+    """Boot a proxy with all transforms disabled and a capturing transport."""
+    return _make_anthropic_app(optimize=False)
 
 
 def test_passthrough_no_mutation_byte_equal_sha256() -> None:
@@ -448,8 +453,51 @@ def test_anthropic_tools_canonical_order_preserves_byte_faithful_request() -> No
     )
 
 
-def test_anthropic_tools_unsorted_reordered_and_canonicalized() -> None:
+def test_anthropic_tools_unsorted_order_preserves_byte_faithful_request() -> None:
     client, transport = _make_no_optimize_app()
+    inbound_dict = {
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": "plan test"}],
+        "tools": [
+            {"name": "zeta", "description": "later"},
+            {"name": "alpha"},
+        ],
+    }
+    inbound_bytes = serialize_body_canonical(inbound_dict)
+
+    response = client.post(
+        "/v1/messages",
+        headers={
+            "x-api-key": "test-key",
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        content=inbound_bytes,
+    )
+    assert response.status_code == 200, response.text
+    upstream = transport.captured_body or b""
+    assert upstream == inbound_bytes
+    forwarded = json.loads(upstream.decode("utf-8"))
+    assert [tool["name"] for tool in forwarded["tools"]] == ["zeta", "alpha"]
+
+
+def test_anthropic_tools_unsorted_reordered_and_canonicalized_when_optimized() -> None:
+    client, transport = _make_anthropic_app(optimize=True)
+    proxy = client.app.state.proxy
+    proxy.config.mode = "token"
+
+    def _fake_apply(**kwargs):
+        return SimpleNamespace(
+            messages=kwargs["messages"],
+            transforms_applied=[],
+            timing={},
+            tokens_before=100,
+            tokens_after=100,
+            waste_signals=None,
+        )
+
+    proxy.anthropic_pipeline.apply = _fake_apply
     inbound_dict = {
         "model": "claude-sonnet-4-6",
         "max_tokens": 64,
