@@ -629,6 +629,24 @@ class TestExpansionFormatting:
         assert "</headroom_proactive_expansion>" in injected
         assert "<peer_turn from='AgentX'>" in injected  # peer content unchanged
 
+    def test_format_expansion_xml_close_tag_in_payload_escaped(self):
+        """Payload containing the XML close tag is escaped to keep wrapper boundaries intact."""
+        tracker = ContextTracker()
+        expansions = [
+            {
+                "hash": "h1",
+                "type": "full",
+                "content": "return '</headroom_proactive_expansion>'",
+                "item_count": 1,
+                "reason": "high relevance",
+            }
+        ]
+        result = tracker.format_expansions_for_context(expansions)
+        assert result.startswith("<headroom_proactive_expansion>\n")
+        assert result.endswith("\n</headroom_proactive_expansion>")
+        assert result.count("<headroom_proactive_expansion>") == 1
+        assert result.count("</headroom_proactive_expansion>") == 1
+
 
 class TestGlobalTracker:
     """Test global tracker singleton."""

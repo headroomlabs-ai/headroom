@@ -589,6 +589,8 @@ class ContextTracker:
 
         parts.append("[End Proactive Expansion]")
         body = "\n".join(parts)
+        # Escape any stray close tag in payload to prevent wrapper boundary forgery
+        body = body.replace("</headroom_proactive_expansion>", "<\\/headroom_proactive_expansion>")
         return f"<headroom_proactive_expansion>\n{body}\n</headroom_proactive_expansion>"
 
     def get_tracked_hashes(self) -> list[str]:
