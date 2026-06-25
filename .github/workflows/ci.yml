@@ -58,6 +58,7 @@ jobs:
               - 'Cargo.lock'
               - 'tests/**'
               - 'scripts/**'
+              - '.github/workflows/**'
             e2e:
               - 'headroom/**'
               - 'crates/**'
@@ -187,7 +188,7 @@ jobs:
           python -m pip install --upgrade pip huggingface_hub
           for i in 1 2 3 4 5 6; do
             if python -c "from huggingface_hub import snapshot_download; snapshot_download('sentence-transformers/all-MiniLM-L6-v2')"; then exit 0; fi
-            echo "::warning::fallback model fetch attempt $i failed; backing off"; sleep $((i * 30))
+            if [ "$i" -lt 6 ]; then echo "::warning::fallback model fetch attempt $i failed; backing off"; sleep $((i * 30)); fi
           done
           echo "::error::could not fetch all-MiniLM-L6-v2 from HuggingFace (fallback)"; exit 1
 
