@@ -169,6 +169,25 @@ impl AnthropicStreamState {
             return Ok(());
         };
 
+        // Once terminal, only error events are allowed through to upgrade
+        // the status (Errored > MessageStop). All other events after a
+        // terminal state are dropped — a malformed or retried stream must
+        // not reset the machine back to Open.
+        if matches!(
+            self.status,
+            StreamStatus::MessageStop | StreamStatus::Errored
+        ) && name != "error"
+        {
+            tracing::warn!(
+                event = "sse_event_after_terminal",
+                provider = "anthropic",
+                event_name = name,
+                status = ?self.status,
+                "anthropic event received after terminal status; dropping"
+            );
+            return Ok(());
+        }
+
         match name {
             "ping" => {
                 // Anthropic emits explicit `event: ping` events
