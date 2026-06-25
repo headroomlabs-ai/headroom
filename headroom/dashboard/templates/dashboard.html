@@ -1399,6 +1399,18 @@
                         </div>
                         <div class="mt-2 text-xs text-gray-500">Based on persisted weekly buckets</div>
                     </div>
+
+                    <template x-if="historyStats.cli_filtering">
+                        <div class="bg-surface rounded-lg p-4 border border-border">
+                            <div class="text-xs text-gray-500 uppercase tracking-wide mb-1"
+                                 x-text="(historyStats.cli_filtering?.label || cliFilteringLabel) + ' Lifetime Saved'"></div>
+                            <div class="flex items-baseline gap-2">
+                                <span class="text-3xl font-light tabular-nums text-cyan-400"
+                                      x-text="formatNumber(historyStats.cli_filtering?.lifetime?.tokens_saved || 0)"></span>
+                            </div>
+                            <div class="mt-2 text-xs text-gray-500">CLI output filtering (lifetime)</div>
+                        </div>
+                    </template>
                 </div>
 
                 <template x-if="hasHistoricalData">

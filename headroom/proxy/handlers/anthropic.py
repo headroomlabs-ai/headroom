@@ -1456,13 +1456,12 @@ class AnthropicHandlerMixin:
                         f"(frozen prefix={frozen_message_count}) to preserve cache"
                     )
                     inject_system_instructions = False
-                inject_tool = self.config.ccr_inject_tool
-                if inject_tool and frozen_message_count > 0:
+                configured_inject_tool = self.config.ccr_inject_tool
+                if configured_inject_tool and frozen_message_count > 0:
                     logger.info(
                         f"[{request_id}] CCR: deferring tool injection "
-                        f"(frozen prefix={frozen_message_count}) to preserve cache"
+                        f"(frozen_message_count={frozen_message_count}) to preserve cache"
                     )
-                    inject_tool = False
                 # Scan for compression markers + maybe inject system instructions.
                 # Tool-list injection is handled separately via the sticky helper.
                 injector = CCRToolInjector(
@@ -1477,7 +1476,31 @@ class AnthropicHandlerMixin:
                 # Sticky-on tool registration (PR-B7): always inject the
                 # retrieval tool once a session has done CCR, regardless
                 # of whether THIS turn produced compressed content.
-                if inject_tool:
+                #
+                # #1006: if tool injection was deferred (frozen prefix) but
+                # compression just emitted NEW markers this turn, override the
+                # deferral — the agent has no other way to redeem those markers.
+                # The cache miss on this one request is preferable to silent
+                # data loss.  If the session has already done CCR the tool is
+                # already in the client's tool list, so sticky replay is a
+                # no-op and the cache is unaffected.
+                # ponytail: ceiling is one extra cache miss on the first CCR
+                # turn in a frozen-prefix session.
+                from headroom.proxy.helpers import should_inject_ccr_tool
+
+                should_inject, is_marker_override = should_inject_ccr_tool(
+                    configured_inject_tool=configured_inject_tool,
+                    frozen_message_count=frozen_message_count,
+                    has_compressed_content=injector.has_compressed_content,
+                )
+                if should_inject:
+                    if is_marker_override:
+                        logger.info(
+                            f"[{request_id}] CCR: overriding injection deferral — "
+                            f"new markers emitted but headroom_retrieve unavailable "
+                            f"(frozen_message_count={frozen_message_count}); injecting to "
+                            "prevent unredeemable markers (#1006)"
+                        )
                     from headroom.proxy.helpers import apply_session_sticky_ccr_tool
 
                     tools, ccr_tool_injected = apply_session_sticky_ccr_tool(

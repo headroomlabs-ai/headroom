@@ -3178,7 +3178,15 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         series: Literal["history", "hourly", "daily", "weekly", "monthly"] = "history",
         history_mode: Literal["compact", "full", "none"] = "compact",
     ):
-        """Get durable proxy compression history plus display-session state."""
+        """Get durable proxy compression history plus display-session state.
+
+        The JSON payload also carries a ``cli_filtering`` key with live RTK
+        stats. This is a curated subset (``tool``, ``label``, ``lifetime``,
+        ``session``) tailored to the Historical tab, not the full
+        ``_get_context_tool_stats()`` payload that ``/stats`` exposes. It is
+        ``None`` when RTK is absent or its stats cannot be read, so the tab
+        simply hides the card rather than erroring.
+        """
         if format == "csv":
             filename = f"headroom-stats-history-{series}.csv"
             return Response(
@@ -3187,7 +3195,30 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 headers={"Content-Disposition": f'attachment; filename="{filename}"'},
             )
 
-        return proxy.metrics.savings_tracker.history_response(history_mode=history_mode)
+        history = proxy.metrics.savings_tracker.history_response(history_mode=history_mode)
+
+        # Augment with live RTK/cli-filtering lifetime stats so the Historical
+        # tab can display them.  These live in the context-tool's own stats file
+        # and survive proxy restarts — exactly what the Historical tab needs.
+        # Best-effort: if the RTK stats file can't be read (missing, parse error,
+        # IO), fall back to None so the Historical tab stays available instead of
+        # 500ing. The tab hides the card when cli_filtering is None.
+        try:
+            cli_stats = await asyncio.to_thread(_get_context_tool_stats)
+        except Exception:
+            logger.debug("stats-history: RTK stats unavailable", exc_info=True)
+            cli_stats = None
+        if cli_stats:
+            history["cli_filtering"] = {
+                "tool": str(cli_stats.get("tool", "rtk")),
+                "label": str(cli_stats.get("label", "RTK")),
+                "lifetime": cli_stats.get("lifetime", {}),
+                "session": cli_stats.get("session", {}),
+            }
+        else:
+            history["cli_filtering"] = None
+
+        return history
 
     @app.get("/transformations/feed", dependencies=[Depends(_require_loopback)])
     async def transformations_feed(limit: int = 20):
