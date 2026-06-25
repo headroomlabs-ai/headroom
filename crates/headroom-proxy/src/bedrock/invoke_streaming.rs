@@ -813,7 +813,7 @@ fn do_accumulate(
             *input = it;
         }
         if ot > 0 {
-            *output = ot;
+            *output = ot.max(*output);
         }
         if cr > 0 {
             *cache_read = cr;
@@ -830,7 +830,7 @@ fn do_accumulate(
             *input = it2.max(*input);
         }
         if ot2 > 0 {
-            *output = ot2;
+            *output = ot2.max(*output);
         }
         if cr2 > 0 {
             *cache_read = cr2;
@@ -906,7 +906,11 @@ async fn run_anthropic_state_machine(
                         &mut cache_write_tokens,
                     );
                     if !had_sse_error {
-                        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&ev.data) {
+                        // Check both the SSE event: field and the JSON type field.
+                        if ev.event_name.as_deref() == Some("error") {
+                            had_sse_error = true;
+                        } else if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&ev.data)
+                        {
                             if v.get("type").and_then(|t| t.as_str()) == Some("error") {
                                 had_sse_error = true;
                             }
@@ -919,6 +923,8 @@ async fn run_anthropic_state_machine(
                         error = %e,
                         "bedrock translated stream: sse framer error"
                     );
+                    // A framer error means the stream is corrupt; treat as failed.
+                    had_sse_error = true;
                 }
             }
         }
@@ -1273,6 +1279,38 @@ mod tests {
         let data = br#"{"type":"content_block_delta","delta":{"type":"text_delta","text":"OK"}}"#;
         accumulate_stream_usage(data, &mut i, &mut o, &mut cr, &mut cw);
         assert_eq!(i, 9); // unchanged
+    }
+
+    #[test]
+    fn accumulate_stream_usage_max_guard_preserves_higher_input_from_message_start() {
+        // message_start sets i=20 via .message.usage; a subsequent message_delta that
+        // carries input_tokens=5 (lower) must NOT overwrite the higher value.
+        let (mut i, mut o, mut cr, mut cw) = (0u64, 0u64, 0u64, 0u64);
+        let start = br#"{"type":"message_start","message":{"usage":{"input_tokens":20}}}"#;
+        accumulate_stream_usage(start, &mut i, &mut o, &mut cr, &mut cw);
+        assert_eq!(i, 20);
+        let delta = br#"{"type":"message_delta","usage":{"input_tokens":5,"output_tokens":10}}"#;
+        accumulate_stream_usage(delta, &mut i, &mut o, &mut cr, &mut cw);
+        assert_eq!(i, 20, "higher count from message_start must be preserved");
+        assert_eq!(o, 10);
+    }
+
+    #[test]
+    fn accumulate_stream_usage_depth_guard_stops_double_nested_base64() {
+        use base64::Engine as _;
+        let (mut i, mut o, mut cr, mut cw) = (0u64, 0u64, 0u64, 0u64);
+        // Build a double-nested base64 payload: outer{"bytes": base64(inner{"bytes": base64(payload)})}
+        // The depth guard must stop unwrapping at 1 level, so the inner payload is NOT decoded
+        // and the token counts from the innermost payload are NOT accumulated.
+        let innermost = br#"{"type":"message_start","message":{"usage":{"input_tokens":99}}}"#;
+        let inner_b64 = base64::engine::general_purpose::STANDARD.encode(innermost);
+        let inner_envelope = format!(r#"{{"bytes":"{inner_b64}"}}"#);
+        let outer_b64 = base64::engine::general_purpose::STANDARD.encode(inner_envelope.as_bytes());
+        let outer_envelope = format!(r#"{{"bytes":"{outer_b64}"}}"#);
+        accumulate_stream_usage(outer_envelope.as_bytes(), &mut i, &mut o, &mut cr, &mut cw);
+        // The outer base64 decodes to inner_envelope which itself has a "bytes" key.
+        // depth=1 must stop there — inner_envelope's own "bytes" is not decoded again.
+        assert_eq!(i, 0, "double-nested base64 must not recurse past depth 1");
     }
 
     #[test]

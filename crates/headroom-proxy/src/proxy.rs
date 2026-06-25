@@ -1491,6 +1491,9 @@ enum SseStreamKind {
 
 impl SseStreamKind {
     fn for_request_path(path: &str) -> Self {
+        // Trim a single trailing slash so that clients which append one
+        // (common in URL-building libraries) still get telemetry.
+        let path = path.trim_end_matches('/');
         match path {
             "/v1/messages" => Self::Anthropic,
             "/v1/chat/completions" => Self::OpenAiChat,
@@ -1718,11 +1721,21 @@ async fn run_sse_state_machine(
                 outcome.output_tokens = state.usage.output_tokens;
                 outcome.cache_read_tokens = state.usage.cache_read_input_tokens;
                 outcome.cache_write_tokens = state.usage.cache_creation_input_tokens;
-                savings.record_finalized(outcome, failed, started);
+                // Back-fill for uncompressed requests: compression set tokens_before=0
+                // (no savings), but the stream usage gives us the real input count so
+                // total_input_tokens in the store isn't systematically under-counted.
+                if outcome.tokens_before == 0 && state.usage.input_tokens > 0 {
+                    outcome.tokens_before = state.usage.input_tokens;
+                    outcome.tokens_after = state.usage.input_tokens;
+                }
+                let stream_errored =
+                    matches!(state.status, crate::sse::anthropic::StreamStatus::Errored);
+                savings.record_finalized(outcome, failed || stream_errored, started);
             }
         }
         SseStreamKind::OpenAiChat => {
             let mut state = crate::sse::openai_chat::ChunkState::new();
+            let mut had_sse_error = false;
             while let Some(chunk) = rx.recv().await {
                 framer.push(&chunk);
                 while let Some(ev_result) = framer.next_event() {
@@ -1742,6 +1755,7 @@ async fn run_sse_state_machine(
                                 error = %e,
                                 "sse framer error"
                             );
+                            had_sse_error = true;
                         }
                     }
                 }
@@ -1829,12 +1843,29 @@ async fn run_sse_state_machine(
                         .get("completion_tokens")
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0);
+                    outcome.cache_read_tokens = usage
+                        .get("prompt_tokens_details")
+                        .and_then(|d| d.get("cached_tokens"))
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    // Back-fill for uncompressed requests.
+                    if outcome.tokens_before == 0 {
+                        let pt = usage
+                            .get("prompt_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        if pt > 0 {
+                            outcome.tokens_before = pt;
+                            outcome.tokens_after = pt;
+                        }
+                    }
                 }
-                savings.record_finalized(outcome, failed, started);
+                savings.record_finalized(outcome, failed || had_sse_error, started);
             }
         }
         SseStreamKind::OpenAiResponses => {
             let mut state = crate::sse::openai_responses::ResponseState::new();
+            let mut had_sse_error = false;
             while let Some(chunk) = rx.recv().await {
                 framer.push(&chunk);
                 while let Some(ev_result) = framer.next_event() {
@@ -1854,6 +1885,7 @@ async fn run_sse_state_machine(
                                 error = %e,
                                 "sse framer error"
                             );
+                            had_sse_error = true;
                         }
                     }
                 }
@@ -1963,17 +1995,46 @@ async fn run_sse_state_machine(
                 incomplete_reason = state.incomplete_reason.as_deref().unwrap_or(""),
                 "sse stream closed"
             );
+            // A `response.failed` terminal event is a stream-level error
+            // regardless of the HTTP status (which was 200).
+            let stream_failed = state.terminal_status() == Some("failed");
             if let Some((mut outcome, savings, started, failed)) = deferred {
                 if let Some(usage) = &state.usage {
                     outcome.output_tokens = usage
                         .get("output_tokens")
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0);
+                    outcome.cache_read_tokens = usage
+                        .get("input_tokens_details")
+                        .and_then(|d| d.get("cached_tokens"))
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    // Back-fill for uncompressed requests.
+                    if outcome.tokens_before == 0 {
+                        let it = usage
+                            .get("input_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        if it > 0 {
+                            outcome.tokens_before = it;
+                            outcome.tokens_after = it;
+                        }
+                    }
                 }
+                savings.record_finalized(
+                    outcome,
+                    failed || had_sse_error || stream_failed,
+                    started,
+                );
+            }
+        }
+        SseStreamKind::None => {
+            // Unreachable: only called when !matches!(sse_kind, SseStreamKind::None).
+            // Safety fallback so deferred is never silently dropped if that invariant breaks.
+            if let Some((outcome, savings, started, failed)) = deferred {
                 savings.record_finalized(outcome, failed, started);
             }
         }
-        SseStreamKind::None => {}
     }
 }
 

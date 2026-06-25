@@ -167,7 +167,15 @@ impl RequestOutcome {
         // a consensus fallback when the provider doesn't list the model.
         let price = prices
             .lookup_with_provider(&provider, &model)
-            .unwrap_or_default();
+            .unwrap_or_else(|| {
+                tracing::warn!(
+                    event = "price_lookup_miss",
+                    provider = %provider,
+                    model = %model,
+                    "model not in price book — USD savings will be $0 for this model"
+                );
+                Default::default()
+            });
         Self {
             provider,
             model,
@@ -325,11 +333,11 @@ impl Bucket {
         if !count_savings {
             return;
         }
-        self.tokens_before += o.tokens_before;
-        self.tokens_saved += o.tokens_saved();
-        self.output_tokens += o.output_tokens;
-        self.cache_read_tokens += o.cache_read_tokens;
-        self.cache_write_tokens += o.cache_write_tokens;
+        self.tokens_before = self.tokens_before.saturating_add(o.tokens_before);
+        self.tokens_saved = self.tokens_saved.saturating_add(o.tokens_saved());
+        self.output_tokens = self.output_tokens.saturating_add(o.output_tokens);
+        self.cache_read_tokens = self.cache_read_tokens.saturating_add(o.cache_read_tokens);
+        self.cache_write_tokens = self.cache_write_tokens.saturating_add(o.cache_write_tokens);
         self.compression_savings_usd =
             accumulate(self.compression_savings_usd, o.compression_savings_usd());
         self.cache_savings_usd = accumulate(self.cache_savings_usd, o.cache_savings_usd().max(0.0));
@@ -474,8 +482,8 @@ impl SavingsState {
         self.lifetime.compression_savings_usd =
             accumulate(self.lifetime.compression_savings_usd, comp_usd);
         self.lifetime.cache_savings_usd = accumulate(self.lifetime.cache_savings_usd, cache_usd);
-        self.total_input_tokens += input_tokens;
-        self.total_output_tokens += output_tokens;
+        self.total_input_tokens = self.total_input_tokens.saturating_add(input_tokens);
+        self.total_output_tokens = self.total_output_tokens.saturating_add(output_tokens);
         if failed {
             self.requests_failed += 1;
         }
@@ -1016,6 +1024,7 @@ fn build_stats_json(state: &SavingsState, now: SystemTime, cfg: &StoreConfig) ->
                 "requests": state.lifetime.requests,
                 "tokens_saved": state.lifetime.tokens_saved,
                 "compression_savings_usd": round6(state.lifetime.compression_savings_usd),
+                "cache_savings_usd": round6(state.lifetime.cache_savings_usd),
             },
             "display_session": session_json.clone(),
         },
@@ -1649,6 +1658,19 @@ mod tests {
         assert_eq!(v["tokens"]["active_savings_percent"], 40.0);
         assert_eq!(v["tokens"]["proxy_savings_percent"], 40.0);
         assert_eq!(v["tokens"]["proxy_attempted_tokens"], 1500); // total_before
+    }
+
+    #[test]
+    fn tokens_sent_per_model_uses_compressed_count_not_original() {
+        // tokens_sent must be tokens_after (what we forwarded), not tokens_before (original).
+        // With tokens_before=1000, tokens_saved=400 → tokens_after=600 → tokens_sent=600.
+        let store = SavingsStore::in_memory();
+        store.record(&outcome("anthropic", "claude", 1000, 600), at(T0));
+        let v = store.stats_json(at(T0 + 1));
+        assert_eq!(
+            v["cost"]["per_model"]["claude"]["tokens_sent"], 600,
+            "tokens_sent must equal tokens_after (compressed), not tokens_before (original)"
+        );
     }
 
     #[test]
