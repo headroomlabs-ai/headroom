@@ -119,6 +119,7 @@ def build_manifest(
     memory_enabled: bool,
     telemetry_enabled: bool,
     image: str,
+    no_rate_limit: bool = False,
 ) -> DeploymentManifest:
     """Create a normalized deployment manifest."""
 
@@ -160,6 +161,11 @@ def build_manifest(
         backend,
     ]
     proxy_args.append("--telemetry" if telemetry_enabled else "--no-telemetry")
+    # Agentic CLI targets (Claude Code, Codex) burst well above 60 req/min.
+    # Persist the flag so reinstalls don't silently reintroduce throttling.
+    # (see: https://github.com/headroomlabs-ai/headroom/issues/1350)
+    if no_rate_limit:
+        proxy_args.append("--no-rate-limit")
     if memory_enabled:
         proxy_args.extend(["--memory", "--memory-db-path", str(_paths.memory_db_path())])
     if anyllm_provider:
