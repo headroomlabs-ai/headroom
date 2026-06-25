@@ -18,8 +18,8 @@ import contextlib
 import gc
 import hashlib
 import logging
-import re
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass

@@ -2,9 +2,6 @@
 from __future__ import annotations
 
 import os
-import re
-
-import pytest
 
 from headroom.transforms.kompress_compressor import (
     _KOMPRESS_MUST_KEEP_ENV,
