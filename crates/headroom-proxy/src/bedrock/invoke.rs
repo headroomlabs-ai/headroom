@@ -391,7 +391,25 @@ pub async fn handle_invoke(
     // InvokeModel responses are complete JSON objects (not streams), so
     // buffering doesn't hurt TTFB. The streaming counterpart
     // (`invoke-with-response-stream`) is handled separately.
-    let resp_bytes = upstream_resp.bytes().await.unwrap_or_default();
+    let resp_bytes = match upstream_resp.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(
+                event = "bedrock_invoke_body_read_failed",
+                request_id = %request_id,
+                error = %e,
+                "bedrock invoke: failed to read upstream response body"
+            );
+            if let Some(o) = rec_outcome {
+                state.savings.record_finalized(o, true, rec_start);
+            }
+            return super::error_response(
+                StatusCode::BAD_GATEWAY,
+                "upstream_body_read_failed",
+                &e.to_string(),
+            );
+        }
+    };
 
     // Extract usage from the Bedrock/Anthropic response body and record it.
     if let Some(mut o) = rec_outcome {

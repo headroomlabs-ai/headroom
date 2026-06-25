@@ -945,7 +945,7 @@ fn build_stats_json(state: &SavingsState, now: SystemTime, cfg: &StoreConfig) ->
                 model.clone(),
                 json!({
                     "requests": b.requests,
-                    "tokens_sent": b.tokens_before,
+                    "tokens_sent": b.tokens_before.saturating_sub(b.tokens_saved),
                     "tokens_saved": b.tokens_saved,
                     "output_tokens": b.output_tokens,
                     "cache_read_tokens": b.cache_read_tokens,

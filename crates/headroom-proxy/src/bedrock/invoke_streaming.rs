@@ -787,6 +787,17 @@ fn accumulate_stream_usage(
     cache_read: &mut u64,
     cache_write: &mut u64,
 ) {
+    do_accumulate(data, input, output, cache_read, cache_write, 0);
+}
+
+fn do_accumulate(
+    data: &[u8],
+    input: &mut u64,
+    output: &mut u64,
+    cache_read: &mut u64,
+    cache_write: &mut u64,
+    depth: u8,
+) {
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(data) else {
         return;
     };
@@ -816,7 +827,7 @@ fn accumulate_stream_usage(
         let cr2 = get("cache_read_input_tokens");
         let cw2 = get("cache_creation_input_tokens");
         if it2 > 0 {
-            *input = it2;
+            *input = it2.max(*input);
         }
         if ot2 > 0 {
             *output = ot2;
@@ -846,13 +857,16 @@ fn accumulate_stream_usage(
     }
 
     // --- Format 1: InvokeModel wrapped: {"bytes":"BASE64","p":"..."} ---
-    if let Some(b64) = v.get("bytes").and_then(|b| b.as_str()) {
-        use base64::engine::general_purpose::STANDARD;
-        use base64::Engine as _;
-        if let Ok(decoded) = STANDARD.decode(b64) {
-            // Recurse once — the inner payload is either message_start or
-            // message_delta (Anthropic format), handled by format 3 above.
-            accumulate_stream_usage(&decoded, input, output, cache_read, cache_write);
+    if depth == 0 {
+        if let Some(b64) = v.get("bytes").and_then(|b| b.as_str()) {
+            use base64::engine::general_purpose::STANDARD;
+            use base64::Engine as _;
+            if let Ok(decoded) = STANDARD.decode(b64) {
+                // Decode one level — the inner payload is Anthropic message_start or
+                // message_delta. depth=1 prevents a crafted nested payload from
+                // overflowing the stack.
+                do_accumulate(&decoded, input, output, cache_read, cache_write, 1);
+            }
         }
     }
 }
@@ -874,6 +888,10 @@ async fn run_anthropic_state_machine(
     let mut output_tokens: u64 = 0;
     let mut cache_read_tokens: u64 = 0;
     let mut cache_write_tokens: u64 = 0;
+    // A 200 OK stream can carry an {"type":"error"} SSE event mid-body
+    // (e.g. Anthropic overloaded_error). Capture it so record_finalized
+    // marks the request as failed even though the HTTP status was 2xx.
+    let mut had_sse_error = false;
 
     while let Some(chunk) = rx.recv().await {
         framer.push(&chunk);
@@ -887,9 +905,16 @@ async fn run_anthropic_state_machine(
                         &mut cache_read_tokens,
                         &mut cache_write_tokens,
                     );
+                    if !had_sse_error {
+                        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&ev.data) {
+                            if v.get("type").and_then(|t| t.as_str()) == Some("error") {
+                                had_sse_error = true;
+                            }
+                        }
+                    }
                 }
                 Err(e) => {
-                    tracing::debug!(
+                    tracing::warn!(
                         request_id = %request_id,
                         error = %e,
                         "bedrock translated stream: sse framer error"
@@ -917,7 +942,7 @@ async fn run_anthropic_state_machine(
         outcome.output_tokens = output_tokens;
         outcome.cache_read_tokens = cache_read_tokens;
         outcome.cache_write_tokens = cache_write_tokens;
-        savings.record_finalized(outcome, failed, started);
+        savings.record_finalized(outcome, failed || had_sse_error, started);
     }
 }
 

@@ -1268,14 +1268,18 @@ pub(crate) async fn forward_http(
     let upstream_status = upstream_resp.status();
     let status = StatusCode::from_u16(upstream_status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
 
-    // Record the request now that the upstream status is known: a non-2xx
-    // upstream counts toward `requests.failed`. Only intercepted LLM requests
-    // populated `pending_record`; pure passthrough/streaming requests do not.
-    if let Some(outcome) = pending_record.take() {
-        state
-            .savings
-            .record_finalized(outcome, !upstream_status.is_success(), start);
-    }
+    // For SSE responses, defer record_finalized into the state machine task so
+    // it can populate output_tokens/cache tokens from the stream body.
+    // For non-SSE responses (and pure passthrough), record immediately here.
+    // The SSE kind is determined below; we hold `fwd_deferred` until then.
+    let fwd_deferred = pending_record.take().map(|o| {
+        (
+            o,
+            state.savings.clone(),
+            start,
+            !upstream_status.is_success(),
+        )
+    });
 
     // PR-A8 / P5-57: capture the upstream request id BEFORE we move
     // `upstream_resp.headers()` into the response filter. Anthropic
@@ -1392,9 +1396,19 @@ pub(crate) async fn forward_http(
     let parser_tx = if !matches!(sse_kind, SseStreamKind::None) {
         let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(SSE_PARSER_QUEUE_DEPTH);
         let rid_for_parser = request_id.clone();
-        tokio::spawn(run_sse_state_machine(sse_kind, rx, rid_for_parser));
+        tokio::spawn(run_sse_state_machine(
+            sse_kind,
+            rx,
+            rid_for_parser,
+            fwd_deferred,
+        ));
         Some(tx)
     } else {
+        // Non-SSE: output tokens are unavailable without a body state machine;
+        // record immediately with whatever was captured at compression time.
+        if let Some((outcome, savings, started, failed)) = fwd_deferred {
+            savings.record_finalized(outcome, failed, started);
+        }
         None
     };
     let resp_stream = upstream_resp.bytes_stream().map(move |r| match r {
@@ -1618,10 +1632,18 @@ fn maybe_inject_openai_prompt_cache_key(
 
 /// Drive the per-provider state machine over a stream of byte chunks.
 /// Lives in its own task; the byte path never waits on it.
+type FwdDeferred = Option<(
+    crate::observability::stats::RequestOutcome,
+    Arc<crate::observability::stats::SavingsStore>,
+    std::time::Instant,
+    bool,
+)>;
+
 async fn run_sse_state_machine(
     kind: SseStreamKind,
     mut rx: tokio::sync::mpsc::Receiver<bytes::Bytes>,
     request_id: String,
+    deferred: FwdDeferred,
 ) {
     use crate::sse::framing::SseFramer;
 
@@ -1692,6 +1714,12 @@ async fn run_sse_state_machine(
                 blocks = state.blocks.len(),
                 "sse stream closed"
             );
+            if let Some((mut outcome, savings, started, failed)) = deferred {
+                outcome.output_tokens = state.usage.output_tokens;
+                outcome.cache_read_tokens = state.usage.cache_read_input_tokens;
+                outcome.cache_write_tokens = state.usage.cache_creation_input_tokens;
+                savings.record_finalized(outcome, failed, started);
+            }
         }
         SseStreamKind::OpenAiChat => {
             let mut state = crate::sse::openai_chat::ChunkState::new();
@@ -1795,6 +1823,15 @@ async fn run_sse_state_machine(
                 has_usage = state.usage.is_some(),
                 "sse stream closed"
             );
+            if let Some((mut outcome, savings, started, failed)) = deferred {
+                if let Some(usage) = &state.usage {
+                    outcome.output_tokens = usage
+                        .get("completion_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                }
+                savings.record_finalized(outcome, failed, started);
+            }
         }
         SseStreamKind::OpenAiResponses => {
             let mut state = crate::sse::openai_responses::ResponseState::new();
@@ -1926,6 +1963,15 @@ async fn run_sse_state_machine(
                 incomplete_reason = state.incomplete_reason.as_deref().unwrap_or(""),
                 "sse stream closed"
             );
+            if let Some((mut outcome, savings, started, failed)) = deferred {
+                if let Some(usage) = &state.usage {
+                    outcome.output_tokens = usage
+                        .get("output_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                }
+                savings.record_finalized(outcome, failed, started);
+            }
         }
         SseStreamKind::None => {}
     }

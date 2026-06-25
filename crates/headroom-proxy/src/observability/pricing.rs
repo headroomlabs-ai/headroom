@@ -92,13 +92,9 @@ const MIN_SUBSTRING_MATCH_LEN: usize = 6;
 /// cross-region inference profiles; the base id matches models.dev's
 /// canonical entry (e.g. `global.anthropic.claude-haiku-…` → `anthropic.claude-haiku-…`).
 fn strip_bedrock_region_prefix(id: &str) -> Option<&str> {
-    const PREFIXES: &[&str] = &["global.", "eu.", "us.", "au.", "jp."];
-    for prefix in PREFIXES {
-        if let Some(base) = id.strip_prefix(prefix) {
-            return Some(base);
-        }
-    }
-    None
+    crate::bedrock::vendor::GEO_PREFIXES
+        .iter()
+        .find_map(|p| id.strip_prefix(p))
 }
 
 /// Normalize a model id for lookup: lowercase, fold Vertex's `@`-version

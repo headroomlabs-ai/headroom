@@ -13,7 +13,7 @@
 /// vendor segment. Stripped (once) before vendor resolution. Kept to a
 /// closed, known set so an unrelated `something.anthropic.x` id is not
 /// mistaken for an Anthropic inference profile.
-const GEO_PREFIXES: [&str; 5] = ["eu.", "us.", "au.", "jp.", "global."];
+pub(crate) const GEO_PREFIXES: [&str; 5] = ["eu.", "us.", "au.", "jp.", "global."];
 
 /// Resolve the canonical vendor of a Bedrock model id, stripping a
 /// cross-region inference-profile geo prefix first.
