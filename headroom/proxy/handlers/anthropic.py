@@ -522,6 +522,7 @@ class AnthropicHandlerMixin:
             )
 
         if pre_upstream_sem is not None:
+            _pre_upstream_saturated = False
             _wait_started_at = time.perf_counter()
             _acquire_timeout_seconds = self.config.anthropic_pre_upstream_acquire_timeout_seconds
             try:
@@ -531,7 +532,7 @@ class AnthropicHandlerMixin:
                 )
             except asyncio.TimeoutError:
                 _wait_ms = (time.perf_counter() - _wait_started_at) * 1000.0
-                stage_timer.record("pre_upstream_wait", _wait_ms)
+                _pre_upstream_saturated = True
                 logger.warning(
                     "[%s] Anthropic pre-upstream queue saturated after %.2f ms "
                     "(timeout=%.1fs, session_id=%s)",
@@ -540,21 +541,14 @@ class AnthropicHandlerMixin:
                     _acquire_timeout_seconds,
                     trace_session_id,
                 )
-                await _finalize_pre_upstream()
-                return JSONResponse(
-                    status_code=503,
-                    headers={"Retry-After": str(max(1, int(_acquire_timeout_seconds) + 1))},
-                    content={
-                        "type": "error",
-                        "error": {
-                            "type": "service_unavailable",
-                            "message": (
-                                "Anthropic pre-upstream queue is saturated. Please retry shortly."
-                            ),
-                        },
-                    },
+                logger.info(
+                    "[%s] pre-upstream saturation fail-open; continuing without "
+                    "compression path",
+                    request_id,
                 )
-            _pre_upstream_sem_acquired = True
+            else:
+                _pre_upstream_sem_acquired = True
+                _wait_ms = (time.perf_counter() - _wait_started_at) * 1000.0
             _wait_ms = (time.perf_counter() - _wait_started_at) * 1000.0
             stage_timer.record("pre_upstream_wait", _wait_ms)
             if _wait_ms > 100.0:
@@ -567,6 +561,7 @@ class AnthropicHandlerMixin:
                 )
         else:
             stage_timer.record("pre_upstream_wait", 0.0)
+            _pre_upstream_saturated = False
 
         try:
             # Check request body size
@@ -1011,11 +1006,20 @@ class AnthropicHandlerMixin:
                 messages=messages,
             )
             _decision.apply_to_tags(tags)
+            _skip_compression_for_backpressure = (
+                _pre_upstream_saturated and _decision.should_compress
+            )
+            if _skip_compression_for_backpressure:
+                tags["passthrough_reason"] = "pre_upstream_backpressure"
+                logger.info(
+                    "[%s] Compression skipped: reason=pre_upstream_backpressure",
+                    request_id,
+                )
             if not _decision.should_compress:
                 logger.info(
                     f"[{request_id}] Compression skipped: reason={_decision.passthrough_reason}"
                 )
-            if _decision.should_compress:
+            if _decision.should_compress and not _skip_compression_for_backpressure:
                 try:
                     from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS
 
