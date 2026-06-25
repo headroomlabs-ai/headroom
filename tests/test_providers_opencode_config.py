@@ -9,16 +9,16 @@ import pytest
 
 from headroom.providers.opencode.config import (
     HEADROOM_OPENCODE_PLUGIN,
-    _resolve_plugin_spec,
     _inject_key_into_json,
     _parse_json_loose,
+    _resolve_plugin_spec,
     append_headroom_plugin,
     inject_opencode_provider_config,
     opencode_config_paths,
     remove_headroom_plugin,
     snapshot_opencode_config_if_unwrapped,
-    strip_opencode_runtime_plugin_config,
     strip_opencode_headroom_blocks,
+    strip_opencode_runtime_plugin_config,
 )
 
 

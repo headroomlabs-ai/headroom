@@ -348,7 +348,7 @@ def test_wrap_opencode_port_change_updates_existing_config(
             with patch.object(wrap_mod, "_ensure_rtk_binary", return_value=Path("/tmp/rtk")):
                 runner.invoke(main, ["wrap", "opencode", "--port", "9000", "--no-mcp", "--no-serena"])
                 runner.invoke(main, ["wrap", "opencode", "--port", "9001", "--no-mcp", "--no-serena"])
-    
+
     config_file = tmp_path / ".config" / "opencode" / "opencode.json"
     assert not config_file.exists()
 

@@ -117,9 +117,9 @@ from headroom.providers.opencode.config import (
     _PROVIDER_MARKER_START,
     inject_opencode_provider_config,
     opencode_config_paths,
-    strip_opencode_runtime_plugin_config,
     snapshot_opencode_config_if_unwrapped,
     strip_opencode_headroom_blocks,
+    strip_opencode_runtime_plugin_config,
 )
 from headroom.proxy.project_context import with_project_prefix as _with_project_prefix
 
