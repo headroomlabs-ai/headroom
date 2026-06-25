@@ -24,6 +24,59 @@ from headroom import paths as _paths
 
 logger = logging.getLogger(__name__)
 
+# ── CO₂ estimation ──────────────────────────────────────────────────────────
+# Methodology: EcoLogits v0.8 approach (https://ecologits.ai)
+# Energy per token by model tier (Wh/token):
+#   Large (Claude Sonnet / GPT-4 class): ~0.0003 Wh/token
+#   Default (unknown model): ~0.0002 Wh/token
+# Carbon intensity: 0.4 kg CO₂/kWh (IEA global average 2023)
+# CO₂ per token = energy_wh_per_token × carbon_intensity_kg_per_kwh × 1000 (g/kg) / 1000 (Wh/kWh)
+#               = energy_wh_per_token × 0.4 [g CO₂/token]
+#
+# Conservative bias: we underestimate rather than overestimate.
+
+_CO2_MODEL_WH_PER_TOKEN: dict[str, float] = {
+    # frontier / large models — higher energy
+    "claude-opus": 0.0005,
+    "claude-sonnet": 0.0003,
+    "claude-haiku": 0.00008,
+    "gpt-4": 0.0004,
+    "gpt-4o": 0.0003,
+    "gpt-4o-mini": 0.00008,
+    "o1": 0.0006,
+    "o3": 0.0006,
+    "gemini-1.5-pro": 0.0003,
+    "gemini-1.5-flash": 0.00008,
+}
+_CO2_DEFAULT_WH_PER_TOKEN: float = 0.0002
+_CO2_CARBON_INTENSITY_KG_PER_KWH: float = 0.4  # IEA 2023 global average
+
+
+def estimate_co2_saved_mg(tokens_saved: int, model: str = "") -> float:
+    """Estimate CO₂ saved in milligrams from tokens_saved.
+
+    Returns milligrams (mg) for display; callers may convert to g or kg.
+    Uses EcoLogits energy-per-token estimates × IEA 2023 carbon intensity.
+
+    Args:
+        tokens_saved: Number of input tokens avoided by compression.
+        model: Model identifier string (partial matches are fine).
+
+    Returns:
+        Estimated CO₂ saved in milligrams.
+    """
+    if tokens_saved <= 0:
+        return 0.0
+    model_lower = model.lower()
+    wh_per_token = _CO2_DEFAULT_WH_PER_TOKEN
+    for key, value in _CO2_MODEL_WH_PER_TOKEN.items():
+        if key in model_lower:
+            wh_per_token = value
+            break
+    # g CO₂ per token = wh/token × kg_CO₂/kWh × 1000 g/kg ÷ 1000 Wh/kWh
+    g_per_token = wh_per_token * _CO2_CARBON_INTENSITY_KG_PER_KWH
+    return float(tokens_saved) * g_per_token * 1000  # convert g → mg
+
 HEADROOM_SAVINGS_PATH_ENV_VAR = _paths.HEADROOM_SAVINGS_PATH_ENV
 DEFAULT_SAVINGS_DIR = ".headroom"
 DEFAULT_SAVINGS_FILE = "proxy_savings.json"
@@ -699,9 +752,11 @@ class SavingsTracker:
             result[name] = view
         return result
 
-    def stats_preview(self, recent_points: int = 20) -> dict[str, Any]:
+    def stats_preview(self, recent_points: int = 20, model: str = "") -> dict[str, Any]:
         """Return a compact preview for `/stats`."""
         snapshot = self.snapshot()
+        tokens_saved = _coerce_int(snapshot["lifetime"].get("tokens_saved"))
+        co2_mg = estimate_co2_saved_mg(tokens_saved, model=model)
         return {
             "schema_version": snapshot["schema_version"],
             "storage_path": snapshot["storage_path"],
@@ -713,6 +768,13 @@ class SavingsTracker:
             "retention": snapshot["retention"],
             "projects": snapshot["projects"],
             "projects_limit": DEFAULT_MAX_PROJECTS,
+            "co2": {
+                "tokens_saved": tokens_saved,
+                "co2_saved_mg": round(co2_mg, 3),
+                "co2_saved_g": round(co2_mg / 1000, 6),
+                "methodology": "EcoLogits v0.8 energy model × IEA 2023 global carbon intensity (0.4 kg CO₂/kWh)",
+                "note": "Conservative estimate. Actual savings vary by provider data center region.",
+            },
         }
 
     def history_response(self, history_mode: str = "compact") -> dict[str, Any]:

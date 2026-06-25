@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Features
 
+* **dashboard/co2:** add CO₂ Saved card to the proxy dashboard and `/stats` endpoint. Each compression session now surfaces an estimated carbon footprint reduction alongside token and cost savings. Calculation uses the EcoLogits v0.8 energy-per-token model (per-model Wh/token constants for Claude, GPT-4, Gemini families) multiplied by the IEA 2023 global average carbon intensity (0.4 kg CO₂/kWh), yielding milligrams of CO₂ avoided per compression event. The result auto-scales to mg / g / kg in the dashboard. A `co2` block is added to the `stats_preview()` return and therefore appears in `/stats` JSON for API consumers. Methodology label and conservative-bias note are included in the API response and tooltip.
+
 * **wrap:** `headroom wrap claude --1m` preserves the 1M context window. Behind a custom `ANTHROPIC_BASE_URL` (the proxy) Claude Code drops the `context-1m` beta header and caps the window at 200k for entitled subscription users; the opt-in flag sets `ANTHROPIC_MODEL=<opus>[1m]` on the launched process so the 1M window activates through Headroom. A model already selected via `ANTHROPIC_MODEL` is preserved (only the `[1m]` suffix is appended) ([#1158](https://github.com/chopratejas/headroom/issues/1158)).
 
 ### Changed
