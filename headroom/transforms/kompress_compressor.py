@@ -18,6 +18,7 @@ import contextlib
 import gc
 import hashlib
 import logging
+import re
 import os
 import threading
 import time
@@ -37,6 +38,22 @@ logger = logging.getLogger(__name__)
 
 # Default HuggingFace model ID
 HF_MODEL_ID = "chopratejas/kompress-v2-base"
+
+# Tokens matching this pattern are always kept regardless of model score.
+# Numbers, ALLCAPS identifiers, dotted paths, unix paths, file extensions,
+# CLI flags, and CamelCase names carry semantic meaning that agents cannot
+# reconstruct from context — dropping them degrades reasoning correctness.
+# Disable with HEADROOM_KOMPRESS_MUST_KEEP=0.
+_KOMPRESS_MUST_KEEP_RE = re.compile(
+    r"\d+(\.\d+)?"             # numbers: 42, 3.14, 0x7fff2038
+    r"|[A-Z_]{2,}"             # ALLCAPS: SIGILL, HTTP, EOF, ERROR
+    r"|[a-z_]+\.[a-z_]+"      # dotted.paths: libsystem_kernel.dylib
+    r"|/[a-z/._-]{2,}"        # unix paths: /usr/lib/python3.so
+    r"|\.[a-z]{2,4}\b"        # extensions: .py .so .json
+    r"|--?[a-z][\w-]*"        # flags: --verbose, -n
+    r"|\b[A-Z][a-z]+[A-Z]\w*" # CamelCase: EXC_BAD_INSTRUCTION, IndexError
+)
+_KOMPRESS_MUST_KEEP_ENV = "HEADROOM_KOMPRESS_MUST_KEEP"
 KOMPRESS_BACKEND_ENV = "HEADROOM_KOMPRESS_BACKEND"
 KOMPRESS_ONNX_FILENAME_ENV = "HEADROOM_KOMPRESS_ONNX_FILENAME"
 
@@ -974,6 +991,14 @@ class KompressCompressor(Transform):
                             continue
                         if bool(mask_list[idx]):
                             kept_ids.add(wid + chunk_start)
+
+                # Hard override: always keep must-keep tokens regardless of model score.
+                # Numbers, error names, paths, and flags carry meaning agents cannot
+                # reconstruct from context. Disable via HEADROOM_KOMPRESS_MUST_KEEP=0.
+                if os.environ.get(_KOMPRESS_MUST_KEEP_ENV, "1") != "0":
+                    for word_idx, word in enumerate(chunk_words):
+                        if _KOMPRESS_MUST_KEEP_RE.search(word):
+                            kept_ids.add(word_idx + chunk_start)
 
             if not kept_ids:
                 if inference_ms >= 1000.0:
