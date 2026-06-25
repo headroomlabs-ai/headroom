@@ -706,6 +706,32 @@ class TestProxyClientRefCounting:
 
         assert wrap_mod._live_proxy_clients(self.PORT, exclude_self=True) == []
 
+    def test_prefixed_plugin_marker_counts_as_live_client(self, clients_dir: Path) -> None:
+        """OpenCode plugin markers use a prefixed filename but still count."""
+        live_pid = os.getppid()
+        marker = clients_dir / str(self.PORT) / f"opencode-{live_pid}.json"
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps({"pid": live_pid, "started_at": 0}))
+
+        assert wrap_mod._live_proxy_clients(self.PORT, exclude_self=True) == [live_pid]
+
+    def test_cleanup_leaves_proxy_running_when_prefixed_plugin_marker_alive(
+        self, clients_dir: Path
+    ) -> None:
+        """A live OpenCode plugin marker keeps the shared proxy alive."""
+        wrap_mod._register_proxy_client(self.PORT)
+        other_pid = os.getppid()
+        assert other_pid != os.getpid()
+        marker = clients_dir / str(self.PORT) / f"opencode-{other_pid}.json"
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps({"pid": other_pid, "started_at": 0}))
+
+        proc = _FakeProxyProc()
+        cleanup = wrap_mod._make_cleanup([proc], self.PORT)
+        cleanup()
+
+        assert proc.terminated is False
+
     def test_cleanup_does_not_shell_out_to_pgrep(
         self, clients_dir: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

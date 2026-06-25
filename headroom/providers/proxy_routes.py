@@ -70,6 +70,14 @@ def _select_passthrough_base_url(proxy: Any, headers: dict[str, str]) -> str:
     return _api_target(proxy, provider_name)
 
 
+def _select_openai_base_url(proxy: Any, headers: dict[str, str]) -> str:
+    custom_base = headers.get("x-headroom-base-url", "")
+    if custom_base:
+        normalized = custom_base.rstrip("/")
+        return normalized[:-3] if normalized.endswith("/v1") else normalized
+    return _api_target(proxy, "openai")
+
+
 # Codex ChatGPT-subscription auth doesn't have access to
 # `chatgpt.com/backend-api/models` — that endpoint returns 403 to OAuth
 # bearer tokens (issue #478). Codex polls `/v1/models` every few seconds
@@ -566,7 +574,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         if is_chatgpt_auth:
             url = f"https://chatgpt.com/backend-api/codex/responses/{sub_path}"
         else:
-            url = f"{_api_target(proxy, 'openai')}/v1/responses/{sub_path}"
+            url = f"{_select_openai_base_url(proxy, headers)}/v1/responses/{sub_path}"
 
         if request.url.query:
             url = f"{url}?{request.url.query}"
@@ -765,6 +773,13 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
             return chatgpt_response
 
         provider_name = proxy.provider_runtime.model_metadata_provider(dict(request.headers))
+        if provider_name == "openai":
+            return await proxy.handle_passthrough(
+                request,
+                _select_openai_base_url(proxy, dict(request.headers)),
+                "models",
+                provider_name,
+            )
         return await proxy.handle_passthrough(
             request,
             _api_target(proxy, provider_name),
@@ -783,6 +798,13 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
             return chatgpt_response
 
         provider_name = proxy.provider_runtime.model_metadata_provider(dict(request.headers))
+        if provider_name == "openai":
+            return await proxy.handle_passthrough(
+                request,
+                _select_openai_base_url(proxy, dict(request.headers)),
+                "models",
+                provider_name,
+            )
         return await proxy.handle_passthrough(
             request,
             _api_target(proxy, provider_name),
@@ -794,7 +816,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
     async def openai_embeddings(request: Request):
         return await proxy.handle_passthrough(
             request,
-            _api_target(proxy, "openai"),
+            _select_openai_base_url(proxy, dict(request.headers)),
             "embeddings",
             "openai",
         )
@@ -803,7 +825,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
     async def openai_moderations(request: Request):
         return await proxy.handle_passthrough(
             request,
-            _api_target(proxy, "openai"),
+            _select_openai_base_url(proxy, dict(request.headers)),
             "moderations",
             "openai",
         )
@@ -820,7 +842,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
 
         return await proxy.handle_passthrough(
             request,
-            _api_target(proxy, "openai"),
+            _select_openai_base_url(proxy, dict(request.headers)),
             "images/generations",
             "openai",
         )
@@ -837,7 +859,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
 
         return await proxy.handle_passthrough(
             request,
-            _api_target(proxy, "openai"),
+            _select_openai_base_url(proxy, dict(request.headers)),
             "images/edits",
             "openai",
         )
@@ -846,7 +868,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
     async def openai_audio_transcriptions(request: Request):
         return await proxy.handle_passthrough(
             request,
-            _api_target(proxy, "openai"),
+            _select_openai_base_url(proxy, dict(request.headers)),
             "audio/transcriptions",
             "openai",
         )
@@ -855,7 +877,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
     async def openai_audio_speech(request: Request):
         return await proxy.handle_passthrough(
             request,
-            _api_target(proxy, "openai"),
+            _select_openai_base_url(proxy, dict(request.headers)),
             "audio/speech",
             "openai",
         )

@@ -127,6 +127,13 @@ def test_provider_passthrough_routes_forward_expected_targets(monkeypatch) -> No
             == "https://azure.example/openai"
         )
         assert client.post("/v1/embeddings").json()["provider"] == "openai"
+        assert (
+            client.post(
+                "/v1/embeddings",
+                headers={"x-headroom-base-url": "https://zenmux.ai/api/v1/"},
+            ).json()["base_url"]
+            == "https://zenmux.ai/api"
+        )
         assert client.post("/v1/moderations").json()["sub_path"] == "moderations"
         assert client.post("/v1/images/generations").json()["sub_path"] == "images/generations"
         assert client.post("/v1/images/edits").json()["sub_path"] == "images/edits"
@@ -240,6 +247,12 @@ def test_proxy_route_helpers_prefer_legacy_targets_and_gemini_passthrough() -> N
         "https://legacy.anthropic.test"
     )
     assert proxy_routes._select_passthrough_base_url(proxy, {}) == "https://legacy.anthropic.test"
+    assert (
+        proxy_routes._select_openai_base_url(
+            proxy, {"x-headroom-base-url": "https://zenmux.ai/api/v1/"}
+        )
+        == "https://zenmux.ai/api"
+    )
 
 
 def test_provider_specific_routes_delegate_to_expected_proxy_handlers(monkeypatch) -> None:
@@ -432,6 +445,34 @@ def test_openai_response_subpath_passthrough_uses_openai_target() -> None:
     assert method == "DELETE"
     assert url == "https://api.openai.test/v1/responses/items/resp_123?trace=7"
     assert headers["authorization"] == "Bearer sk-proj-test"
+
+
+def test_openai_response_subpath_passthrough_prefers_custom_upstream_base() -> None:
+    class FakeAsyncClient:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str, dict[str, str]]] = []
+
+        async def request(self, method, url, **kwargs):  # type: ignore[no-untyped-def]
+            self.calls.append((method, url, dict(kwargs.get("headers", {}))))
+            return httpx.Response(200, json={"url": url})
+
+        async def aclose(self) -> None:
+            return None
+
+    with TestClient(_app()) as client:
+        fake = FakeAsyncClient()
+        client.app.state.proxy.http_client = fake
+        response = client.post(
+            "/v1/responses/items/resp_123",
+            json={"model": "gpt-4o"},
+            headers={"x-headroom-base-url": "https://zenmux.ai/api/v1/"},
+        )
+
+    assert response.status_code == 200
+    assert len(fake.calls) == 1
+    method, url, _headers = fake.calls[0]
+    assert method == "POST"
+    assert url == "https://zenmux.ai/api/v1/responses/items/resp_123"
 
 
 def test_openai_response_subpath_aliases_and_chatgpt_auth_use_expected_targets(monkeypatch) -> None:

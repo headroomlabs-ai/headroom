@@ -63,8 +63,8 @@ def test_get_server_returns_spec_when_present(tmp_path: Path) -> None:
     config = {
         "mcp": {
             "headroom": {
-                "type": "remote",
-                "url": "http://127.0.0.1:8787/mcp",
+                "type": "local",
+                "command": ["headroom", "mcp", "serve"],
                 "enabled": True,
             }
         }
@@ -259,8 +259,8 @@ def test_register_server_with_env_vars(tmp_path: Path) -> None:
     registrar.register_server(spec)
 
     data = json.loads((tmp_path / "opencode.json").read_text())
-    assert data["mcp"]["headroom"]["env"] == {"HEADROOM_PROXY_URL": "http://127.0.0.1:9090"}
-
+    assert data["mcp"]["headroom"]["type"] == "local"
+    assert data["mcp"]["headroom"]["environment"] == {"HEADROOM_PROXY_URL": "http://127.0.0.1:9090"}
 
 def test_register_then_re_register_with_different_env_returns_mismatch(tmp_path: Path) -> None:
     """Re-registering with different env returns MISMATCH without force."""
@@ -329,9 +329,9 @@ def test_spec_to_entry_roundtrip() -> None:
         env={"KEY": "VAL"},
     )
     entry = _spec_to_entry(original)
-    assert entry["type"] == "remote"
+    assert entry["type"] == "local"
     assert entry["command"] == ["python", "-m", "server"]
-    assert entry["env"] == {"KEY": "VAL"}
+    assert entry["environment"] == {"KEY": "VAL"}
 
     restored = _entry_to_spec("test", entry)
     assert restored.name == original.name

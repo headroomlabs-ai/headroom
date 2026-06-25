@@ -113,7 +113,11 @@ def _load_tokenizer(tokenizer_name: str):
     Returns:
         Loaded tokenizer, or None if unavailable.
     """
-    from transformers import AutoTokenizer
+    try:
+        from transformers import AutoTokenizer
+    except Exception as e:
+        logger.warning(f"Cannot import transformers for {tokenizer_name}: {e}")
+        return None
 
     try:
         return AutoTokenizer.from_pretrained(

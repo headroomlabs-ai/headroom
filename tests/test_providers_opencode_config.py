@@ -9,14 +9,21 @@ import pytest
 
 from headroom.providers.opencode.config import (
     HEADROOM_OPENCODE_PLUGIN,
+    _resolve_plugin_spec,
     _inject_key_into_json,
     _parse_json_loose,
     append_headroom_plugin,
     inject_opencode_provider_config,
     opencode_config_paths,
+    remove_headroom_plugin,
     snapshot_opencode_config_if_unwrapped,
+    strip_opencode_runtime_plugin_config,
     strip_opencode_headroom_blocks,
 )
+
+
+def _expected_plugin_entry(port: int) -> list[object]:
+    return [[_resolve_plugin_spec(), {"proxyUrl": f"http://127.0.0.1:{port}", "mode": "native-fetch"}]]
 
 
 def _set_test_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -163,8 +170,10 @@ def test_inject_provider_config_creates_file(
     config_file = tmp_path / ".config" / "opencode" / "opencode.json"
     assert config_file.exists()
     config = _parse_json_loose(config_file.read_text())
-    assert config["provider"]["headroom"]["npm"] == "@ai-sdk/openai-compatible"
-    assert "model" not in config  # headroom provider is a transparent pass-through
+    assert config["plugin"] == _expected_plugin_entry(8787)
+    assert "provider" not in config
+    assert "mcp" not in config
+    assert "model" not in config
 
 
 def test_inject_provider_config_idempotent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -174,7 +183,7 @@ def test_inject_provider_config_idempotent(tmp_path: Path, monkeypatch: pytest.M
     inject_opencode_provider_config(port=9999)
     config_file = tmp_path / ".config" / "opencode" / "opencode.json"
     config = _parse_json_loose(config_file.read_text())
-    assert config["provider"]["headroom"]["options"]["baseURL"] == "http://127.0.0.1:9999/v1"
+    assert config["plugin"] == _expected_plugin_entry(9999)
 
 
 # ---------------------------------------------------------------------------
@@ -296,7 +305,7 @@ def test_strip_blocks_handles_only_mcp_markers() -> None:
 def test_inject_provider_config_merges_with_existing_mcp(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """inject_opencode_provider_config merges headroom MCP with existing MCP servers."""
+    """inject_opencode_provider_config leaves unrelated MCP config untouched."""
     _set_test_home(monkeypatch, tmp_path)
     config_file = tmp_path / ".config" / "opencode" / "opencode.json"
     config_file.parent.mkdir(parents=True, exist_ok=True)
@@ -308,7 +317,8 @@ def test_inject_provider_config_merges_with_existing_mcp(
 
     config = json.loads(config_file.read_text())
     assert "existing-server" in config["mcp"]
-    assert "headroom" in config["mcp"]
+    assert "headroom" not in config["mcp"]
+    assert config["plugin"] == _expected_plugin_entry(8787)
 
 
 def test_inject_provider_config_idempotent_with_complex_config(
@@ -333,9 +343,9 @@ def test_inject_provider_config_idempotent_with_complex_config(
 
     config = json.loads(config_file.read_text())
     assert "openai" in config["provider"]
-    assert "headroom" in config["provider"]
     assert "myserver" in config["mcp"]
-    assert "headroom" in config["mcp"]
+    assert "headroom" not in config["mcp"]
+    assert config["plugin"] == _expected_plugin_entry(8787)
 
 
 def test_inject_provider_config_preserves_unrelated_top_level_keys(
@@ -358,9 +368,12 @@ def test_inject_provider_config_preserves_unrelated_top_level_keys(
     inject_opencode_provider_config(port=8787)
 
     config = json.loads(config_file.read_text())
-    assert config["plugin"] == ["some-plugin"]
+    assert config["plugin"] == [
+        "some-plugin",
+        [_resolve_plugin_spec(), {"proxyUrl": "http://127.0.0.1:8787", "mode": "native-fetch"}],
+    ]
     assert config["permission"] == {"bash": {"*": "ask"}}
-    assert "headroom" in config.get("provider", {})
+    assert "provider" not in config or "headroom" not in config.get("provider", {})
 
 
 def test_append_headroom_plugin_adds_plugin_once() -> None:
@@ -369,7 +382,7 @@ def test_append_headroom_plugin_adds_plugin_once() -> None:
     assert append_headroom_plugin(config) is True
     assert append_headroom_plugin(config) is False
 
-    assert config["plugin"] == ["some-plugin", HEADROOM_OPENCODE_PLUGIN]
+    assert config["plugin"] == ["some-plugin", _resolve_plugin_spec()]
 
 
 def test_append_headroom_plugin_preserves_configured_tuple_entry() -> None:
@@ -379,6 +392,69 @@ def test_append_headroom_plugin_preserves_configured_tuple_entry() -> None:
 
     assert append_headroom_plugin(config) is False
     assert config["plugin"] == [[HEADROOM_OPENCODE_PLUGIN, {"proxyUrl": "http://127.0.0.1:8787"}]]
+
+
+def test_remove_headroom_plugin_removes_all_matching_entries() -> None:
+    config: dict[str, object] = {
+        "plugin": [
+            "some-plugin",
+            HEADROOM_OPENCODE_PLUGIN,
+            [_resolve_plugin_spec(), {"proxyUrl": "http://127.0.0.1:8787"}],
+        ]
+    }
+
+    assert remove_headroom_plugin(config) is True
+    assert config["plugin"] == ["some-plugin"]
+
+
+def test_remove_headroom_plugin_preserves_unrelated_opencode_suffix_plugins() -> None:
+    config: dict[str, object] = {
+        "plugin": [
+            "file:///tmp/plugins/opencode",
+            "some-plugin",
+            [_resolve_plugin_spec(), {"proxyUrl": "http://127.0.0.1:8787"}],
+        ]
+    }
+
+    assert remove_headroom_plugin(config) is True
+    assert config["plugin"] == ["file:///tmp/plugins/opencode", "some-plugin"]
+
+
+def test_strip_runtime_plugin_config_preserves_other_keys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _set_test_home(monkeypatch, tmp_path)
+    config_file = tmp_path / ".config" / "opencode" / "opencode.json"
+    config_file.parent.mkdir(parents=True, exist_ok=True)
+    config_file.write_text(
+        json.dumps(
+            {
+                "model": "openai/gpt-4o",
+                "plugin": _expected_plugin_entry(8787),
+                "mcp": {"existing": {"type": "remote", "url": "https://example.com"}},
+            }
+        )
+    )
+
+    assert strip_opencode_runtime_plugin_config(config_file) is True
+
+    config = json.loads(config_file.read_text())
+    assert config == {
+        "model": "openai/gpt-4o",
+        "mcp": {"existing": {"type": "remote", "url": "https://example.com"}},
+    }
+
+
+def test_strip_runtime_plugin_config_deletes_plugin_only_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _set_test_home(monkeypatch, tmp_path)
+    config_file = tmp_path / ".config" / "opencode" / "opencode.json"
+    config_file.parent.mkdir(parents=True, exist_ok=True)
+    config_file.write_text(json.dumps({"plugin": _expected_plugin_entry(8787)}))
+
+    assert strip_opencode_runtime_plugin_config(config_file) is True
+    assert not config_file.exists()
 
 
 def test_inject_provider_config_no_crash_on_unwriteable_dir(
@@ -406,10 +482,10 @@ def test_build_opencode_config_content_without_mcp() -> None:
     from headroom.providers.opencode.runtime import build_opencode_config_content
 
     config = build_opencode_config_content(port=8787, include_mcp=False)
-    assert "provider" in config
+    assert "provider" not in config
     assert "mcp" not in config
     assert "model" not in config
-    assert config["plugin"] == [["headroom-opencode", {"proxyUrl": "http://127.0.0.1:8787/v1"}]]
+    assert config["plugin"] == _expected_plugin_entry(8787)
 
 
 def test_build_launch_env_with_project(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -425,7 +501,8 @@ def test_build_launch_env_with_project(monkeypatch: pytest.MonkeyPatch) -> None:
         include_mcp=False,
     )
     assert env["HEADROOM_PROJECT"] == "test-proj"
-    assert "headroom-opencode" in env["OPENCODE_CONFIG_CONTENT"]
+    payload = json.loads(env["OPENCODE_CONFIG_CONTENT"])
+    assert payload["plugin"] == _expected_plugin_entry(8787)
     assert "OPENAI_BASE_URL" not in env
     assert "ANTHROPIC_BASE_URL" not in env
 
@@ -463,9 +540,9 @@ def test_inject_provider_config_strips_existing_markers(
 
     inject_opencode_provider_config(port=9000)
     first = config_file.read_text()
-    assert "headroom" in first
+    assert _resolve_plugin_spec() in first
 
     inject_opencode_provider_config(port=9001)
     second = config_file.read_text()
-    assert "headroom" in second
-    assert second.count("headroom") == first.count("headroom")
+    assert _resolve_plugin_spec() in second
+    assert second.count(_resolve_plugin_spec()) == first.count(_resolve_plugin_spec())

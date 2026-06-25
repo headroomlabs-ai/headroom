@@ -152,6 +152,35 @@ class TestWsHttpFallback:
         posted = json.loads(captured_kwargs["content"])
         assert posted["stream"] is True
 
+    def test_fallback_prefers_custom_upstream_base_url(self):
+        handler = _make_handler()
+        ws = FakeWebSocket()
+        captured: dict = {}
+
+        class CapturingClient:
+            def stream(self, method, url, **kwargs):
+                captured["method"] = method
+                captured["url"] = url
+                captured.update(kwargs)
+                return FakeStreamResponse(200, ["data: [DONE]\n\n"])
+
+        handler.http_client = CapturingClient()
+
+        body = {"model": "gpt-5.4", "input": "test"}
+        asyncio.run(
+            handler._ws_http_fallback(
+                ws,
+                body,
+                json.dumps(body),
+                {},
+                "req_custom_base",
+                "https://zenmux.ai/api/v1/",
+            )
+        )
+
+        assert captured["method"] == "POST"
+        assert captured["url"] == "https://zenmux.ai/api/v1/responses"
+
     def test_fallback_unwraps_response_create_envelope(self):
         """HTTP fallback should unwrap WS response.create wrapper for HTTP POST."""
         handler = _make_handler()

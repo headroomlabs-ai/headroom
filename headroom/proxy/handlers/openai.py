@@ -617,6 +617,21 @@ def _prefers_http1_passthrough(base_url: str) -> bool:
     return host == "chatgpt.com" or host.endswith(".chatgpt.com")
 
 
+def _resolve_openai_upstream_base_url(headers: dict[str, str], default_base_url: str) -> str:
+    """Resolve an OpenAI-compatible upstream base URL for this request.
+
+    Native OpenAI routes historically pinned to ``OPENAI_API_URL`` and ignored
+    ``x-headroom-base-url``. OpenCode provider-preserving routing for
+    OpenAI-compatible providers needs that override to survive on the native
+    path too, not only the generic passthrough catch-all.
+    """
+    base_url = headers.get("x-headroom-base-url", "").strip() or default_base_url.strip()
+    normalized = base_url.rstrip("/")
+    if normalized.endswith("/v1"):
+        return normalized[:-3]
+    return normalized
+
+
 class OpenAIHandlerMixin:
     """Mixin providing OpenAI API handler methods for HeadroomProxy."""
 
@@ -1617,6 +1632,7 @@ class OpenAIHandlerMixin:
                     compressor.close()
 
         headers = dict(request.headers.items())
+        upstream_base_url = _resolve_openai_upstream_base_url(headers, self.OPENAI_API_URL)
         headers.pop("host", None)
         headers.pop("content-length", None)
         # Strip accept-encoding so httpx negotiates its own encoding.
@@ -2408,7 +2424,7 @@ class OpenAIHandlerMixin:
                 )
 
         # Direct OpenAI API (no backend configured)
-        url = build_copilot_upstream_url(self.OPENAI_API_URL, "/v1/chat/completions")
+        url = build_copilot_upstream_url(upstream_base_url, "/v1/chat/completions")
 
         try:
             if stream:
@@ -2849,6 +2865,9 @@ class OpenAIHandlerMixin:
         if isinstance(input_data, str):
             messages.append({"role": "user", "content": input_data})
 
+        upstream_base_url = _resolve_openai_upstream_base_url(
+            dict(request.headers.items()), self.OPENAI_API_URL
+        )
         headers = dict(request.headers.items())
         headers.pop("host", None)
         headers.pop("content-length", None)
@@ -3149,7 +3168,7 @@ class OpenAIHandlerMixin:
         if is_chatgpt_auth:
             url = "https://chatgpt.com/backend-api/codex/responses"
         else:
-            url = build_copilot_upstream_url(self.OPENAI_API_URL, "/v1/responses")
+            url = build_copilot_upstream_url(upstream_base_url, "/v1/responses")
 
         # The standalone Rust proxy has native /v1/responses item handling,
         # but the default CLI runtime is this Python proxy. Compress the
@@ -3615,6 +3634,7 @@ class OpenAIHandlerMixin:
             headers=ws_headers,
             metadata={"path": _ws_path},
         )
+        upstream_base_url = _resolve_openai_upstream_base_url(ws_headers, self.OPENAI_API_URL)
         # Extract per-request tags from headers up front so the
         # session-end RequestLog can attach them. `_extract_tags` is
         # the same helper the HTTP handlers use; on a WebSocket the
@@ -3686,7 +3706,7 @@ class OpenAIHandlerMixin:
             )
         else:
             # API key auth → route to configured OpenAI API URL
-            base = self.OPENAI_API_URL
+            base = upstream_base_url
             ws_base = base.replace("https://", "wss://").replace("http://", "ws://")
             upstream_url = build_copilot_upstream_url(ws_base, "/v1/responses")
 
@@ -5489,7 +5509,12 @@ class OpenAIHandlerMixin:
                     f"falling back to HTTP POST streaming"
                 )
                 await self._ws_http_fallback(
-                    websocket, body, first_msg_raw, upstream_headers, request_id
+                    websocket,
+                    body,
+                    first_msg_raw,
+                    upstream_headers,
+                    request_id,
+                    upstream_base_url,
                 )
 
             # ── WS session-end metric + RequestLog ──────────────────
@@ -5752,6 +5777,7 @@ class OpenAIHandlerMixin:
         first_msg_raw: str,
         upstream_headers: dict[str, str],
         request_id: str,
+        upstream_base_url: str | None = None,
     ) -> None:
         """Fall back to HTTP POST streaming when upstream WS fails.
 
@@ -5765,7 +5791,10 @@ class OpenAIHandlerMixin:
         if "chatgpt-account-id" in _lower:
             http_url = "https://chatgpt.com/backend-api/codex/responses"
         else:
-            http_url = build_copilot_upstream_url(self.OPENAI_API_URL, "/v1/responses")
+            base_url = _resolve_openai_upstream_base_url(
+                {"x-headroom-base-url": upstream_base_url or ""}, self.OPENAI_API_URL
+            )
+            http_url = build_copilot_upstream_url(base_url, "/v1/responses")
 
         # Build HTTP body from the WS response.create payload.
         # WS messages use {"type": "response.create", "response": {...}} wrapper.
