@@ -42,7 +42,7 @@ import hashlib
 import json
 import math
 from dataclasses import asdict, dataclass, field
-from typing import Any
+from typing import Any, cast
 
 # Coarse input-token buckets. Coarse on purpose: too many strata make
 # per-stratum baselines sparse and noisy. Boundaries in tokens.
@@ -98,8 +98,9 @@ def stratum_key(
 
 
 def _unwrap_response_create_body(body: dict[str, Any]) -> dict[str, Any]:
-    if body.get("type") == "response.create" and isinstance(body.get("response"), dict):
-        return body["response"]
+    response = body.get("response")
+    if body.get("type") == "response.create" and isinstance(response, dict):
+        return cast("dict[str, Any]", response)
     return body
 
 
