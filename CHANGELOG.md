@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (LLMs, loggers, attribution parsers) a machine-readable provenance
   boundary and preventing misattribution in multi-agent threads.
 
+### Security
+
+* **installers:** pin and verify SHA-256 digests for the `rtk`, `lean-ctx`, and `codebase-memory-mcp` release binaries before extraction. These installers fetch prebuilt binaries that `headroom wrap` then *executes* (`rtk` is auto-downloaded as part of normal operation), but previously did so without any integrity check — a tampered or substituted release artifact would have been run silently. Each installer now verifies downloaded bytes against a pinned digest map (`RTK_ASSET_DIGESTS` / `LEAN_CTX_ASSET_DIGESTS` / `CBM_ASSET_DIGESTS`) and aborts on mismatch. Overridden versions / cross-target downloads have no pinned digest and are refused unless the operator opts out with `HEADROOM_RTK_ALLOW_UNVERIFIED` / `HEADROOM_LEAN_CTX_ALLOW_UNVERIFIED` / `HEADROOM_CBM_ALLOW_UNVERIFIED`. Extends the digest-pinning pattern introduced for the tokensave installer to the remaining release-binary installers ([#1407](https://github.com/headroomlabs-ai/headroom/issues/1407)).
+
 ### Changed
 
 * **telemetry:** anonymous usage telemetry is now **opt-in** (off by default) instead of opt-out. Nothing is collected or sent unless you set `HEADROOM_TELEMETRY=on` or pass `--telemetry` to `headroom proxy` / `headroom install apply`. `is_telemetry_enabled()` is fail-closed — only explicit on-values (`on`/`true`/`1`/`yes`/`enable`/`enabled`) enable it; unset, empty, or unrecognized values stay disabled. The existing `--no-telemetry` flag and `HEADROOM_TELEMETRY=off` remain accepted for back-compat, and install manifests now write the `HEADROOM_TELEMETRY` value explicitly so generated deployments are unambiguous.

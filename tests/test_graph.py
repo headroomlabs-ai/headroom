@@ -78,6 +78,9 @@ def test_get_cbm_path_prefers_path_then_install_dir(monkeypatch, tmp_path: Path)
 def test_download_cbm_success_and_verification_paths(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(installer, "CBM_BIN_DIR", tmp_path)
     monkeypatch.setattr(installer, "_detect_platform", lambda: "linux-amd64")
+    # version override (v1.2.3) has no pinned digest; opt out of verification so
+    # this test exercises the extraction/exec paths rather than digest checking.
+    monkeypatch.setenv("HEADROOM_CBM_ALLOW_UNVERIFIED", "1")
     monkeypatch.setattr(
         installer, "urlopen", lambda url, timeout=60: FakeResponse(_build_archive())
     )
@@ -111,10 +114,14 @@ def test_download_cbm_invalid_url_download_failure_and_extract_errors(
 ) -> None:
     monkeypatch.setattr(installer, "CBM_BIN_DIR", tmp_path)
     monkeypatch.setattr(installer, "_detect_platform", lambda: "linux-amd64")
+    # The extract-error cases below feed bytes that cannot match the pinned
+    # digest; use a non-pinned version + opt-out so the failure surfaces at
+    # extraction rather than at the integrity check.
+    monkeypatch.setenv("HEADROOM_CBM_ALLOW_UNVERIFIED", "1")
 
     monkeypatch.setattr(installer, "GITHUB_RELEASE_URL", "ftp://example.test/releases")
     with pytest.raises(RuntimeError, match="Invalid URL"):
-        installer.download_cbm()
+        installer.download_cbm(version="v1.2.3")
 
     monkeypatch.setattr(installer, "GITHUB_RELEASE_URL", "https://example.test/releases")
     monkeypatch.setattr(
@@ -123,7 +130,7 @@ def test_download_cbm_invalid_url_download_failure_and_extract_errors(
         lambda url, timeout=60: (_ for _ in ()).throw(OSError("network down")),
     )
     with pytest.raises(RuntimeError, match="Failed to download codebase-memory-mcp"):
-        installer.download_cbm()
+        installer.download_cbm(version="v1.2.3")
 
     monkeypatch.setattr(
         installer,
@@ -131,11 +138,11 @@ def test_download_cbm_invalid_url_download_failure_and_extract_errors(
         lambda url, timeout=60: FakeResponse(_build_archive("some/other-binary")),
     )
     with pytest.raises(RuntimeError, match="binary not found in archive"):
-        installer.download_cbm()
+        installer.download_cbm(version="v1.2.3")
 
     monkeypatch.setattr(installer, "urlopen", lambda url, timeout=60: FakeResponse(b"not a tar"))
     with pytest.raises(RuntimeError, match="Failed to extract archive"):
-        installer.download_cbm()
+        installer.download_cbm(version="v1.2.3")
 
 
 def test_ensure_cbm_uses_existing_or_returns_none_on_failure(monkeypatch, tmp_path: Path) -> None:

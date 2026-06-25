@@ -1,7 +1,19 @@
-"""Download and install rtk binary from GitHub releases."""
+"""Download and install rtk binary from GitHub releases.
+
+Supply-chain integrity:
+    ``headroom wrap`` auto-downloads and then *executes* this binary, so
+    every pinned release asset is verified against a SHA-256 digest in
+    ``RTK_ASSET_DIGESTS`` below before the archive is unpacked. A mismatch
+    aborts the install rather than running a tampered or substituted
+    artifact. When the version is overridden (``download_rtk(version=...)``)
+    or a cross-target asset is requested (``HEADROOM_RTK_TARGET``) there is
+    no pinned digest, so the download is refused unless the operator opts
+    out via ``HEADROOM_RTK_ALLOW_UNVERIFIED=1``.
+"""
 
 from __future__ import annotations
 
+import hashlib
 import io
 import logging
 import os
@@ -21,6 +33,58 @@ from . import RTK_BIN_DIR, RTK_BIN_PATH, RTK_VERSION
 logger = logging.getLogger(__name__)
 
 GITHUB_RELEASE_URL = "https://github.com/rtk-ai/rtk/releases/download"
+
+#: SHA-256 of each pinned release asset (``RTK_VERSION``), keyed by asset
+#: filename. The binary is downloaded and executed, so its bytes are verified
+#: against this map before extraction. Regenerate when bumping RTK_VERSION:
+#:   gh api repos/rtk-ai/rtk/releases/tags/$RTK_VERSION --jq '.assets[]|"\(.name) \(.digest)"'
+RTK_ASSET_DIGESTS: dict[str, str] = {
+    "rtk-aarch64-apple-darwin.tar.gz": (
+        "f223ca074a0215af002679bc1d34ca92b93e25b3e8ae16aace6e84c06e586802"
+    ),
+    "rtk-x86_64-apple-darwin.tar.gz": (
+        "84121316867613e61925c209607f033b2113bb0ce312c267a79d3e3e8f221e49"
+    ),
+    "rtk-aarch64-unknown-linux-gnu.tar.gz": (
+        "cc2b91c064eb670c097c184913c8fbcb1a943d53d7fe505375e96ba0c5b6459f"
+    ),
+    "rtk-x86_64-unknown-linux-musl.tar.gz": (
+        "34975116da11e09e502501daf758143e0b22ed3a42a10eb67fb693a6270d9e36"
+    ),
+    "rtk-x86_64-pc-windows-msvc.zip": (
+        "f0ec18963581657173bd6a51f5ba012b093823f844db749fec218581af30a568"
+    ),
+}
+
+
+def _verify_asset_digest(filename: str, data: bytes, expected: str | None) -> None:
+    """Verify downloaded bytes against the pinned SHA-256 digest.
+
+    ``expected`` is the pinned digest for this asset, or ``None`` when no
+    digest is pinned (an overridden version or cross-target download). An
+    unpinned asset is refused unless ``HEADROOM_RTK_ALLOW_UNVERIFIED`` is
+    set, so unverified code is never executed by default. Raises
+    ``RuntimeError`` on a digest mismatch or an unpinned-without-opt-out.
+    """
+    if expected is None:
+        if os.environ.get("HEADROOM_RTK_ALLOW_UNVERIFIED"):
+            logger.warning(
+                "rtk asset %s has no pinned digest; installing unverified "
+                "(HEADROOM_RTK_ALLOW_UNVERIFIED is set)",
+                filename,
+            )
+            return
+        raise RuntimeError(
+            f"no pinned SHA-256 digest for rtk asset {filename!r}; refusing to install "
+            "unverified. Set HEADROOM_RTK_ALLOW_UNVERIFIED=1 to override."
+        )
+    actual = hashlib.sha256(data).hexdigest()
+    if actual != expected:
+        raise RuntimeError(
+            f"rtk asset {filename!r} failed integrity check: "
+            f"expected sha256 {expected}, got {actual}"
+        )
+    logger.debug("Verified rtk asset %s (sha256 %s)", filename, actual)
 
 
 def _detect_runtime_target_triple() -> str:
@@ -72,6 +136,19 @@ def _get_download_url(version: str) -> tuple[str, str]:
     return url, ext
 
 
+def _normalize_version(version: str) -> str:
+    """Canonicalize a release version to the ``v``-prefixed tag form.
+
+    The pinned digest map is keyed to ``RTK_VERSION`` (``vX.Y.Z``). Without
+    this, a bare ``X.Y.Z`` for the current release would not equal
+    ``RTK_VERSION``, get treated as a version override, and route the pinned
+    release through the unverified path — letting an operator bypass the digest
+    map by accident. Comparing canonical forms closes that gap.
+    """
+    version = version.strip()
+    return version if version.startswith("v") else f"v{version}"
+
+
 def download_rtk(version: str | None = None) -> Path:
     """Download rtk binary from GitHub releases.
 
@@ -84,7 +161,7 @@ def download_rtk(version: str | None = None) -> Path:
     Raises:
         RuntimeError: If download or extraction fails.
     """
-    version = version or RTK_VERSION
+    version = _normalize_version(version or RTK_VERSION)
     target = _get_target_triple()
     url, ext = _get_download_url(version)
     target_path = RTK_BIN_DIR / _binary_name_for_target(target)
@@ -110,6 +187,11 @@ def download_rtk(version: str | None = None) -> Path:
             raise
     except Exception as e:
         raise RuntimeError(f"Failed to download rtk from {url}: {e}") from e
+
+    # Verify integrity before unpacking — this binary is later executed.
+    filename = f"rtk-{target}.{ext}"
+    expected = RTK_ASSET_DIGESTS.get(filename) if version == RTK_VERSION else None
+    _verify_asset_digest(filename, data, expected)
 
     # Extract binary
     try:

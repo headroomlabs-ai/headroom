@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import tarfile
 import zipfile
@@ -76,6 +77,11 @@ def test_download_lean_ctx_skips_verify_for_non_native_target(monkeypatch, tmp_p
             return archive_bytes
 
     monkeypatch.setenv("HEADROOM_LEAN_CTX_TARGET", "x86_64-apple-darwin")
+    monkeypatch.setitem(
+        installer.LEAN_CTX_ASSET_DIGESTS,
+        "lean-ctx-x86_64-apple-darwin.tar.gz",
+        hashlib.sha256(archive_bytes).hexdigest(),
+    )
 
     with patch.object(installer, "LEAN_CTX_BIN_DIR", tmp_path):
         with patch.object(installer, "urlopen", return_value=_Response()):
@@ -103,6 +109,11 @@ def test_download_lean_ctx_extracts_zip_binary(monkeypatch, tmp_path: Path) -> N
             return archive.getvalue()
 
     monkeypatch.setenv("HEADROOM_LEAN_CTX_TARGET", "x86_64-pc-windows-msvc")
+    monkeypatch.setitem(
+        installer.LEAN_CTX_ASSET_DIGESTS,
+        "lean-ctx-x86_64-pc-windows-msvc.zip",
+        hashlib.sha256(archive.getvalue()).hexdigest(),
+    )
 
     with patch.object(installer, "LEAN_CTX_BIN_DIR", tmp_path):
         with patch.object(installer, "urlopen", return_value=_Response()):
@@ -134,6 +145,12 @@ def test_download_lean_ctx_verifies_native_target(monkeypatch, tmp_path: Path) -
             return archive.getvalue()
 
     run_result = SimpleNamespace(returncode=0, stdout="lean-ctx 3.4.7", stderr="")
+
+    monkeypatch.setitem(
+        installer.LEAN_CTX_ASSET_DIGESTS,
+        "lean-ctx-x86_64-unknown-linux-gnu.tar.gz",
+        hashlib.sha256(archive.getvalue()).hexdigest(),
+    )
 
     with patch.object(installer, "LEAN_CTX_BIN_DIR", tmp_path):
         with patch.object(
