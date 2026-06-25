@@ -816,10 +816,10 @@ fn do_accumulate(
             *output = ot.max(*output);
         }
         if cr > 0 {
-            *cache_read = cr;
+            *cache_read = cr.max(*cache_read);
         }
         if cw > 0 {
-            *cache_write = cw;
+            *cache_write = cw.max(*cache_write);
         }
         // Also Anthropic snake_case at top level (format 3 / message_delta)
         let it2 = get("input_tokens");
@@ -833,10 +833,10 @@ fn do_accumulate(
             *output = ot2.max(*output);
         }
         if cr2 > 0 {
-            *cache_read = cr2;
+            *cache_read = cr2.max(*cache_read);
         }
         if cw2 > 0 {
-            *cache_write = cw2;
+            *cache_write = cw2.max(*cache_write);
         }
     }
     // message_start has usage nested under .message.usage (Anthropic format)
@@ -1293,6 +1293,41 @@ mod tests {
         accumulate_stream_usage(delta, &mut i, &mut o, &mut cr, &mut cw);
         assert_eq!(i, 20, "higher count from message_start must be preserved");
         assert_eq!(o, 10);
+    }
+
+    #[test]
+    fn accumulate_stream_usage_max_guard_preserves_higher_output_from_earlier_event() {
+        // The Converse streaming path can send multiple events with outputTokens;
+        // the max-guard must keep the highest seen value, not be overwritten by a
+        // later lower one.
+        let (mut i, mut o, mut cr, mut cw) = (0u64, 0u64, 0u64, 0u64);
+        // First event: outputTokens = 20 (camelCase Converse format)
+        let first = br#"{"usage":{"outputTokens":20}}"#;
+        accumulate_stream_usage(first, &mut i, &mut o, &mut cr, &mut cw);
+        assert_eq!(o, 20);
+        // Second event: output_tokens = 5 (lower value, must NOT overwrite)
+        let second = br#"{"usage":{"output_tokens":5}}"#;
+        accumulate_stream_usage(second, &mut i, &mut o, &mut cr, &mut cw);
+        assert_eq!(
+            o, 20,
+            "max-guard must preserve the higher output_tokens value"
+        );
+    }
+
+    #[test]
+    fn accumulate_stream_usage_cache_read_uses_max_guard() {
+        // Both camelCase and snake_case paths for cache_read/cache_write must
+        // use max-guard, consistent with input/output handling.
+        let (mut i, mut o, mut cr, mut cw) = (0u64, 0u64, 0u64, 0u64);
+        let first = br#"{"usage":{"cacheReadInputTokens":10,"cacheWriteInputTokens":8}}"#;
+        accumulate_stream_usage(first, &mut i, &mut o, &mut cr, &mut cw);
+        assert_eq!(cr, 10);
+        assert_eq!(cw, 8);
+        // A subsequent lower value must not overwrite.
+        let second = br#"{"usage":{"cache_read_input_tokens":3,"cache_creation_input_tokens":2}}"#;
+        accumulate_stream_usage(second, &mut i, &mut o, &mut cr, &mut cw);
+        assert_eq!(cr, 10, "cache_read max-guard must preserve higher value");
+        assert_eq!(cw, 8, "cache_write max-guard must preserve higher value");
     }
 
     #[test]

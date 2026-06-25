@@ -996,7 +996,7 @@
                     <span class="text-sm font-medium text-gray-300">Savings Over Time</span>
                     <span class="text-xs text-gray-500 font-mono" x-text="formatNumber(stats.tokens?.saved || 0) + ' tokens total'"></span>
                 </div>
-                <template x-if="(stats.savings_history || []).length >= 2">
+                <template x-if="savingsHistory.length >= 2">
                     <div class="h-32">
                         <svg class="w-full h-full" viewBox="0 0 200 64" preserveAspectRatio="none">
                             <defs>
@@ -1005,12 +1005,12 @@
                                     <stop offset="100%" style="stop-color:#22d3ee;stop-opacity:0"/>
                                 </linearGradient>
                             </defs>
-                            <path class="trend-area" :d="getTrendArea(stats.savings_history)"></path>
-                            <path class="trend-line" :d="getTrendLine(stats.savings_history)"></path>
+                            <path class="trend-area" :d="getTrendArea(savingsHistory)"></path>
+                            <path class="trend-line" :d="getTrendLine(savingsHistory)"></path>
                         </svg>
                     </div>
                 </template>
-                <template x-if="(stats.savings_history || []).length < 2">
+                <template x-if="savingsHistory.length < 2">
                     <div class="h-32 flex items-center justify-center text-sm text-gray-500 italic">
                         Trend data will appear after multiple requests.
                     </div>

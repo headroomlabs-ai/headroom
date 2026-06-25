@@ -474,18 +474,18 @@ impl SavingsState {
         let now_iso = to_rfc3339(now);
 
         // Lifetime
-        self.lifetime.requests += 1;
+        self.lifetime.requests = self.lifetime.requests.saturating_add(1);
         if compressed {
-            self.lifetime.requests_compressed += 1;
+            self.lifetime.requests_compressed = self.lifetime.requests_compressed.saturating_add(1);
         }
-        self.lifetime.tokens_saved += saved;
+        self.lifetime.tokens_saved = self.lifetime.tokens_saved.saturating_add(saved);
         self.lifetime.compression_savings_usd =
             accumulate(self.lifetime.compression_savings_usd, comp_usd);
         self.lifetime.cache_savings_usd = accumulate(self.lifetime.cache_savings_usd, cache_usd);
         self.total_input_tokens = self.total_input_tokens.saturating_add(input_tokens);
         self.total_output_tokens = self.total_output_tokens.saturating_add(output_tokens);
         if failed {
-            self.requests_failed += 1;
+            self.requests_failed = self.requests_failed.saturating_add(1);
         }
 
         // Display session (rollover on inactivity)
@@ -496,12 +496,12 @@ impl SavingsState {
             };
         }
         let session = &mut self.display_session;
-        session.requests += 1;
+        session.requests = session.requests.saturating_add(1);
         if compressed {
-            session.requests_compressed += 1;
+            session.requests_compressed = session.requests_compressed.saturating_add(1);
         }
-        session.tokens_saved += saved;
-        session.total_input_tokens += input_tokens;
+        session.tokens_saved = session.tokens_saved.saturating_add(saved);
+        session.total_input_tokens = session.total_input_tokens.saturating_add(input_tokens);
         session.compression_savings_usd = accumulate(session.compression_savings_usd, comp_usd);
         session.cache_savings_usd = accumulate(session.cache_savings_usd, cache_usd);
         session.last_activity_at = Some(now_iso.clone());
@@ -967,8 +967,10 @@ fn build_stats_json(state: &SavingsState, now: SystemTime, cfg: &StoreConfig) ->
         .collect::<serde_json::Map<String, Value>>()
         .into();
 
-    let total_saved_usd =
-        round6(state.lifetime.compression_savings_usd + state.lifetime.cache_savings_usd);
+    let total_saved_usd = round6(accumulate(
+        state.lifetime.compression_savings_usd,
+        state.lifetime.cache_savings_usd,
+    ));
 
     json!({
         "requests": {

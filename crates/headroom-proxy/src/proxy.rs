@@ -1657,6 +1657,7 @@ async fn run_sse_state_machine(
     match kind {
         SseStreamKind::Anthropic => {
             let mut state = crate::sse::anthropic::AnthropicStreamState::new();
+            let mut had_sse_error = false;
             while let Some(chunk) = rx.recv().await {
                 framer.push(&chunk);
                 while let Some(ev_result) = framer.next_event() {
@@ -1676,6 +1677,7 @@ async fn run_sse_state_machine(
                                 error = %e,
                                 "sse framer error"
                             );
+                            had_sse_error = true;
                         }
                     }
                 }
@@ -1730,7 +1732,11 @@ async fn run_sse_state_machine(
                 }
                 let stream_errored =
                     matches!(state.status, crate::sse::anthropic::StreamStatus::Errored);
-                savings.record_finalized(outcome, failed || stream_errored, started);
+                savings.record_finalized(
+                    outcome,
+                    failed || had_sse_error || stream_errored,
+                    started,
+                );
             }
         }
         SseStreamKind::OpenAiChat => {
@@ -2082,6 +2088,46 @@ mod tests {
         let uri: Uri = "/".parse().unwrap();
         let out = build_upstream_url(&base, &uri).unwrap();
         assert_eq!(out.as_str(), "http://up:8080/");
+    }
+
+    // ---- SseStreamKind path matching --------------------------------------- #
+
+    #[test]
+    fn sse_stream_kind_exact_paths() {
+        assert!(matches!(
+            SseStreamKind::for_request_path("/v1/messages"),
+            SseStreamKind::Anthropic
+        ));
+        assert!(matches!(
+            SseStreamKind::for_request_path("/v1/chat/completions"),
+            SseStreamKind::OpenAiChat
+        ));
+        assert!(matches!(
+            SseStreamKind::for_request_path("/v1/responses"),
+            SseStreamKind::OpenAiResponses
+        ));
+        assert!(matches!(
+            SseStreamKind::for_request_path("/v1/unknown"),
+            SseStreamKind::None
+        ));
+    }
+
+    #[test]
+    fn sse_stream_kind_trailing_slash_still_matches() {
+        // URL-building libraries often append a trailing slash; the kind
+        // detector must trim it so telemetry and savings tracking engage.
+        assert!(matches!(
+            SseStreamKind::for_request_path("/v1/messages/"),
+            SseStreamKind::Anthropic
+        ));
+        assert!(matches!(
+            SseStreamKind::for_request_path("/v1/chat/completions/"),
+            SseStreamKind::OpenAiChat
+        ));
+        assert!(matches!(
+            SseStreamKind::for_request_path("/v1/responses/"),
+            SseStreamKind::OpenAiResponses
+        ));
     }
 
     // ---- price book source resolution -------------------------------------- #
