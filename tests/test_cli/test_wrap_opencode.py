@@ -136,6 +136,26 @@ def test_wrap_opencode_prepare_only_injects_config(
     assert config["provider"]["headroom"]["options"]["baseURL"] == "http://127.0.0.1:9000/v1"
 
 
+def test_wrap_opencode_prepare_only_registers_serena_with_agent_context(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    _set_test_home(monkeypatch, tmp_path)
+
+    with patch.object(wrap_mod.shutil, "which", return_value="opencode"):
+        with patch.object(wrap_mod, "_ensure_rtk_binary", return_value=Path("/tmp/rtk")):
+            result = runner.invoke(main, ["wrap", "opencode", "--prepare-only"])
+
+    assert result.exit_code == 0, result.output
+    config_file = tmp_path / ".config" / "opencode" / "opencode.json"
+    config = json.loads(config_file.read_text())
+    serena_command = config["mcp"]["serena"]["command"]
+    assert serena_command[serena_command.index("--context") + 1] == "agent"
+
+
 def test_wrap_opencode_no_mcp_skips_mcp_injection(
     runner: CliRunner,
     tmp_path: Path,
