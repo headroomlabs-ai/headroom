@@ -617,7 +617,9 @@ class TestExpansionFormatting:
         messages = [
             {
                 "role": "user",
-                "content": [{"type": "text", "text": "<peer_turn from='AgentX'>some content</peer_turn>"}],
+                "content": [
+                    {"type": "text", "text": "<peer_turn from='AgentX'>some content</peer_turn>"}
+                ],
             }
         ]
         result = AnthropicHandlerMixin._append_context_to_latest_non_frozen_user_turn(
