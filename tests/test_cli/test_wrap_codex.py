@@ -1349,6 +1349,55 @@ def test_unwrap_codex_preserves_unrelated_sections(
 
 
 # ---------------------------------------------------------------------------
+# unwrap removes the RTK instruction block from $CODEX_HOME/AGENTS.md (#1421)
+# ---------------------------------------------------------------------------
+
+# Abbreviated stand-in for the real RTK block — `_remove_rtk_instructions`
+# matches on the marker fence, not the body, so the body content is irrelevant.
+_RTK_BLOCK = (
+    "<!-- headroom:rtk-instructions -->\n"
+    "# RTK (Rust Token Killer) - Token-Optimized Commands\n"
+    "\n"
+    "When running shell commands, always prefix with `rtk`.\n"
+    "<!-- /headroom:rtk-instructions -->"
+)
+
+
+def test_unwrap_codex_removes_rtk_instructions_preserving_other_content(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_test_home(monkeypatch, tmp_path)
+    agents = tmp_path / ".codex" / "AGENTS.md"
+    agents.parent.mkdir(parents=True)
+    agents.write_text(
+        f"# My Codex notes\n\nKeep this line.\n\n{_RTK_BLOCK}\n",
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(main, ["unwrap", "codex"])
+
+    assert result.exit_code == 0, result.output
+    assert agents.exists()
+    remaining = agents.read_text(encoding="utf-8")
+    assert "headroom:rtk-instructions" not in remaining
+    assert "Keep this line." in remaining
+
+
+def test_unwrap_codex_removes_rtk_only_agents_file(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_test_home(monkeypatch, tmp_path)
+    agents = tmp_path / ".codex" / "AGENTS.md"
+    agents.parent.mkdir(parents=True)
+    agents.write_text(f"{_RTK_BLOCK}\n", encoding="utf-8")
+
+    result = runner.invoke(main, ["unwrap", "codex"])
+
+    assert result.exit_code == 0, result.output
+    assert not agents.exists()
+
+
+# ---------------------------------------------------------------------------
 # Per-project savings: env_http_headers in the injected provider block
 # ---------------------------------------------------------------------------
 
