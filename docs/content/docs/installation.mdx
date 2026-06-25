@@ -26,7 +26,9 @@ using a newer Python, force a supported interpreter.
 pip install headroom-ai
 ```
 
-The core package includes the `compress()` function, SmartCrusher, CacheAligner, and IntelligentContext. No heavy dependencies.
+The core package includes `compress()`, SmartCrusher, CacheAligner, and live-zone ContentRouter compression. No heavy dependencies.
+
+> **Note:** IntelligentContext / RollingWindow (score-based history dropping) were retired in PR-B1. Headroom compresses fresh tool output and new turns only — it does not drop conversation history.
 
 ### Extras
 

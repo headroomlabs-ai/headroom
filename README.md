@@ -271,7 +271,7 @@ Platform support note: macOS auth reuse via Copilot CLI Keychain storage has bee
 - **Kompress-base** — our HuggingFace model, trained on agentic traces.
 - **Image compression** — 40–90% reduction via trained ML router.
 - **CacheAligner** — stabilizes prefixes so Anthropic/OpenAI KV caches actually hit.
-- **IntelligentContext** — score-based context fitting with learned importance.
+- **Live-zone compression** — compresses only new bytes (fresh tool output, latest turn); frozen prefix stays byte-identical so provider cache is not busted. History is never dropped.
 - **CCR** — reversible compression; LLM retrieves originals on demand.
 - **Cross-agent memory** — shared store, agent provenance, auto-dedup.
 - **SharedContext** — compressed context passing across multi-agent workflows.
@@ -286,7 +286,7 @@ Headroom exposes one stable request lifecycle across `compress()`, the SDK, and 
 
 `Setup` → `Pre-Start` → `Post-Start` → `Input Received` → `Input Cached` → `Input Routed` → `Input Compressed` → `Input Remembered` → `Pre-Send` → `Post-Send` → `Response Received`
 
-- **Transforms** do the work: CacheAligner, ContentRouter, SmartCrusher, CodeCompressor, Kompress-base, IntelligentContext / RollingWindow.
+- **Transforms** do the work: CacheAligner → ContentRouter → SmartCrusher / CodeCompressor / Kompress-base (live-zone only; IntelligentContext and RollingWindow were retired in PR-B1).
 - **Pipeline extensions** observe or customize lifecycle stages via `on_pipeline_event(...)`.
 - **Compression hooks** sit alongside the canonical lifecycle as an additional extension seam.
 - **Proxy extensions** remain the server/app integration seam for ASGI middleware, routes, and startup policy.
