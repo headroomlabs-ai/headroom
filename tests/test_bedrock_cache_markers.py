@@ -105,7 +105,7 @@ class TestSystemPromptPreservesCacheControl:
     def test_system_list_without_cache_control_joins_to_string(self) -> None:
         """Baseline: list system without cache_control joined to plain string."""
         import asyncio
-        from unittest.mock import AsyncMock, patch
+        from unittest.mock import patch
 
         backend = _backend()
         body = {
@@ -130,6 +130,13 @@ class TestSystemPromptPreservesCacheControl:
         sys_msg = next(m for m in captured["messages"] if m["role"] == "system")
         assert isinstance(sys_msg["content"], str)
         assert sys_msg["content"] == "be helpful"
+
+    def test_system_list_without_dict_entries_keeps_legacy_stringification(self) -> None:
+        """Non-dict system list entries were stringified before the cache_control fix."""
+        backend = _backend()
+        assert backend._convert_system_for_litellm(["alpha", {"type": "text", "text": "beta"}]) == (
+            "alpha beta"
+        )
 
     def test_system_list_with_cache_control_kept_as_list(self) -> None:
         """System blocks with cache_control must reach LiteLLM as content block list."""
@@ -166,3 +173,25 @@ class TestSystemPromptPreservesCacheControl:
         assert isinstance(sys_msg["content"], list), "cache_control system must stay as list"
         assert sys_msg["content"][0]["cache_control"] == {"type": "ephemeral"}
         assert sys_msg["content"][0]["text"] == "you are a helpful assistant"
+
+    def test_system_list_with_cache_control_preserves_non_dict_entries_as_text_blocks(self) -> None:
+        """Mixed system lists keep non-dict entries when cache_control requires block mode."""
+        backend = _backend()
+        result = backend._convert_system_for_litellm(
+            [
+                "legacy preface",
+                {
+                    "type": "text",
+                    "text": "cache this",
+                    "cache_control": {"type": "ephemeral"},
+                },
+            ]
+        )
+        assert result == [
+            {"type": "text", "text": "legacy preface"},
+            {
+                "type": "text",
+                "text": "cache this",
+                "cache_control": {"type": "ephemeral"},
+            },
+        ]
