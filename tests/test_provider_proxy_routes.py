@@ -173,6 +173,14 @@ def test_provider_passthrough_routes_forward_expected_targets(monkeypatch) -> No
             "model": "claude-3-5-sonnet@20240620",
             "force_stream": False,
         }
+        non_anthropic_raw = client.post(
+            "/projects/p/locations/us-central1/publishers/google/models/gemini-2.0-flash:rawPredict"
+        ).json()
+        assert non_anthropic_raw.get("handler") != "handle_anthropic_messages"
+        non_anthropic_stream = client.post(
+            "/projects/p/locations/us-central1/publishers/google/models/gemini-2.0-flash:streamRawPredict"
+        ).json()
+        assert non_anthropic_stream.get("handler") != "handle_anthropic_messages"
         assert client.post("/v1beta/cachedContents").json()["sub_path"] == "cachedContents"
         assert client.get("/v1beta/cachedContents").json()["sub_path"] == "cachedContents"
         assert client.get("/v1beta/cachedContents/cache-1").json()["sub_path"] == "cachedContents"

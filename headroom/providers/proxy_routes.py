@@ -733,25 +733,22 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         return await vertex_publisher_passthrough(request, publisher, "rawPredict")
 
     @app.post(
-        "/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:rawPredict"
+        "/projects/{project}/locations/{location}/publishers/anthropic/models/{model}:rawPredict"
     )
     async def vertex_raw_predict_no_version(
         request: Request,
         project: str,
         location: str,
-        publisher: str,
         model: str,
     ):
         del project
         target = _vertex_target_for_location(proxy, location).rstrip("/") + "/v1"
-        if publisher == "anthropic":
-            return await proxy.handle_anthropic_messages(
-                request,
-                target,
-                "vertex:anthropic",
-                model,
-            )
-        return await vertex_publisher_passthrough(request, publisher, "rawPredict")
+        return await proxy.handle_anthropic_messages(
+            request,
+            target,
+            "vertex:anthropic",
+            model,
+        )
 
     @app.post(
         "/{api_version}/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:streamRawPredict"
@@ -776,26 +773,23 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         return await vertex_publisher_passthrough(request, publisher, "streamRawPredict")
 
     @app.post(
-        "/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:streamRawPredict"
+        "/projects/{project}/locations/{location}/publishers/anthropic/models/{model}:streamRawPredict"
     )
     async def vertex_stream_raw_predict_no_version(
         request: Request,
         project: str,
         location: str,
-        publisher: str,
         model: str,
     ):
         del project
         target = _vertex_target_for_location(proxy, location).rstrip("/") + "/v1"
-        if publisher == "anthropic":
-            return await proxy.handle_anthropic_messages(
-                request,
-                target,
-                "vertex:anthropic",
-                model,
-                True,
-            )
-        return await vertex_publisher_passthrough(request, publisher, "streamRawPredict")
+        return await proxy.handle_anthropic_messages(
+            request,
+            target,
+            "vertex:anthropic",
+            model,
+            True,
+        )
 
     @app.get("/v1/models")
     async def list_models(request: Request):
