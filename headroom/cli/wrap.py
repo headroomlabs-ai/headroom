@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from headroom._subprocess import run
+from headroom.cli.mem_governor import gate_launch
 
 # Fix Windows cp1252 encoding — box-drawing characters require UTF-8
 if sys.platform == "win32" and hasattr(sys.stdout, "buffer"):
@@ -3366,6 +3367,13 @@ def claude(
                 f"  {_ANTHROPIC_MODEL_ENV}={env[_ANTHROPIC_MODEL_ENV]} "
                 "(1M context window; issue #1158)"
             )
+
+        # Memory-pressure governor: wrap is the single choke point every agent
+        # crosses before spawning the heavy claude + MCP (serena/rust-analyzer)
+        # stack. When the box is already low on RAM, wait for it to recover (or
+        # refuse) so the Nth agent does not tip the host into a global OOM that
+        # kills the desktop. Fail-open when memory cannot be measured.
+        gate_launch(echo=click.echo)
 
         result = subprocess.run([claude_bin, *claude_args], env=env)
         raise SystemExit(result.returncode)
