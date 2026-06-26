@@ -2546,6 +2546,35 @@ def _reset_session_ccr_tracker_for_test() -> None:
         _session_ccr_tracker = None
 
 
+def should_inject_ccr_tool(
+    *,
+    configured_inject_tool: bool,
+    frozen_message_count: int,
+    has_compressed_content: bool,
+) -> tuple[bool, bool]:
+    """Decide whether the ``headroom_retrieve`` tool must be injected this turn.
+
+    This is the decision the Anthropic handler used to inline. It is extracted
+    so the #1006 regression can be pinned at the decision point itself.
+
+    Tool injection is normally deferred when there is a frozen message prefix
+    (``frozen_message_count > 0``) to preserve the prompt cache. But if
+    compression emitted fresh markers this turn, deferring would hand the agent
+    a ``<<ccr:hash>>`` marker with no tool to redeem it — silent data loss. In
+    that case we override the deferral and inject anyway (one cache miss is
+    cheaper than dropped content).
+
+    Returns ``(should_inject, is_marker_override)``. ``is_marker_override`` is
+    True only when injection happens *because* of new markers despite a deferral,
+    so the caller can log the override distinctly.
+    """
+    inject_tool = configured_inject_tool
+    if inject_tool and frozen_message_count > 0:
+        inject_tool = False  # defer to preserve cache
+    is_marker_override = not inject_tool and has_compressed_content
+    return (inject_tool or is_marker_override), is_marker_override
+
+
 def apply_session_sticky_ccr_tool(
     *,
     provider: Literal["anthropic", "openai", "google"],

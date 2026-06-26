@@ -426,15 +426,72 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
     return report
 
 
+def _context_tool_lifetime_savings() -> dict | None:
+    """Lifetime savings from the configured CLI context tool (RTK / lean-ctx).
+
+    ``perf`` reports a windowed view of the proxy's *compression* logs. The CLI
+    context tool (RTK) keeps its own lifetime counter that never lands in
+    ``proxy.log``, so without this it stays invisible in ``headroom perf`` even
+    when it dwarfs proxy-side savings. Lifetime (not session) is the right scope
+    here: ``perf`` is a one-shot CLI, so the proxy-session baseline ``/stats``
+    subtracts is meaningless out of process.
+
+    Best-effort: returns ``None`` when no tool is installed or its stats cannot
+    be read, so the report degrades to proxy-only rather than erroring.
+    """
+    try:
+        from headroom.proxy.helpers import _get_context_tool_stats
+
+        stats = _get_context_tool_stats()
+    except Exception:
+        return None
+    if not stats or not stats.get("installed", False):
+        return None
+    lifetime = stats.get("lifetime") or {}
+    tokens_saved = int(lifetime.get("tokens_saved", 0) or 0)
+    if tokens_saved <= 0:
+        return None
+    return {
+        "tool": str(stats.get("tool", "rtk")),
+        "label": str(stats.get("label", "RTK")),
+        "tokens_saved": tokens_saved,
+        "commands": int(lifetime.get("commands", 0) or 0),
+        "savings_pct": round(float(lifetime.get("savings_pct", 0.0) or 0.0), 1),
+    }
+
+
+def _cli_filtering_report_lines() -> list[str]:
+    """Render the context-tool (RTK) lifetime savings section, or [] if absent."""
+    cli = _context_tool_lifetime_savings()
+    if not cli:
+        return []
+    return [
+        f"{cli['label']} CLI Filtering (lifetime, all-time)",
+        "-" * 40,
+        f"  Tokens saved:  {cli['tokens_saved']:,} ({cli['savings_pct']:.1f}%)",
+        f"  Commands:      {cli['commands']:,}",
+        f"  Note: {cli['label']}'s own lifetime counter — not limited to the --hours window.",
+        "",
+    ]
+
+
 def format_report(report: PerfReport) -> str:
     """Format a PerfReport into a human-readable string."""
     lines: list[str] = []
+    cli_filtering_lines = _cli_filtering_report_lines()
 
     if not report.perf_records and not report.router_records:
-        lines.append("No performance data found in ~/.headroom/logs/")
-        lines.append("")
-        lines.append("Start the proxy to begin collecting data:")
-        lines.append("  headroom proxy")
+        if cli_filtering_lines:
+            # RTK savings are independent of proxy logs — surface them even when
+            # there is no proxy traffic in the window.
+            lines.append("No proxy performance data in ~/.headroom/logs/ for this window.")
+            lines.append("")
+            lines.extend(cli_filtering_lines)
+        else:
+            lines.append("No performance data found in ~/.headroom/logs/")
+            lines.append("")
+            lines.append("Start the proxy to begin collecting data:")
+            lines.append("  headroom proxy")
         return "\n".join(lines)
 
     # Header
@@ -661,6 +718,10 @@ def format_report(report: PerfReport) -> str:
         for i, rec in enumerate(recommendations, 1):
             lines.append(f"  {i}. {rec}")
         lines.append("")
+
+    # CLI context-tool (RTK) lifetime savings — its own counter never reaches
+    # proxy.log, so surface it here or it stays invisible in `headroom perf`.
+    lines.extend(cli_filtering_lines)
 
     # Footer
     lines.append(
@@ -905,6 +966,9 @@ def build_perf_summary(report: PerfReport) -> dict:
         "throughput": calculate_throughput(report),
         "log_files_read": report.log_files_read,
         "total_lines_parsed": report.total_lines_parsed,
+        # RTK/CLI context-tool lifetime savings (its own counter, not in
+        # proxy.log) — None when no tool is installed. Mirrors the text report.
+        "cli_filtering": _context_tool_lifetime_savings(),
     }
 
 
