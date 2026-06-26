@@ -72,6 +72,16 @@ The default model is `headroom/claude-sonnet-4-6`. Change it in `opencode.json` 
 | `HEADROOM_PROXY_URL` | Proxy URL passed to the native `headroom-opencode` plugin. Defaults to `http://127.0.0.1:8787` inside the plugin |
 | `HEADROOM_CONTEXT_TOOL` | Set to `lean-ctx` to use lean-ctx instead of RTK |
 
+## Failure Learning
+
+`headroom learn` supports OpenCode as a scan target. It reads past sessions from `~/.local/share/opencode/opencode.db` and writes corrections to your project's `AGENTS.md`.
+
+```bash
+headroom learn --agent opencode --apply
+```
+
+See [Failure Learning](/docs/failure-learning) for details on the learn system.
+
 ## Persistent Installs
 
 `headroom install` supports OpenCode as a target for persistent provider wiring:
