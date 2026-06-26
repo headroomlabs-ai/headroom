@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Unreleased
 
 ### Bug Fixes
-- **copilot:** respect `COPILOT_PROVIDER_TYPE` env var when resolving provider type. Previously, setting `COPILOT_PROVIDER_TYPE=openai` was ignored and headroom silently resolved to `anthropic`, causing 401 errors against the proxy when using Copilot with OpenAI-compatible backends (e.g., GPT-5.4) ([#1437](https://github.com/headroomlabs-ai/headroom/pull/1437))).
+- **copilot:** respect `COPILOT_PROVIDER_TYPE` env var when resolving provider type. Previously, setting `COPILOT_PROVIDER_TYPE=openai` was ignored and headroom silently resolved to `anthropic`, causing 401 errors against the proxy when using Copilot with OpenAI-compatible backends (e.g., GPT-5.4) ([#1437](https://github.com/headroomlabs-ai/headroom/pull/1437)).
 
 ### Changed
 
