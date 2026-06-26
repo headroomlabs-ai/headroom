@@ -95,6 +95,25 @@ def test_compression_unit_accepts_lossy_tool_output_when_recoverable():
     assert result.compressed == "summary <<ccr:abc123>>"
 
 
+def test_compression_unit_still_compresses_non_shell_tool_output():
+    result = compress_unit_with_router(
+        CompressionUnit(
+            text="alpha beta gamma delta epsilon zeta eta theta",
+            provider="openai",
+            endpoint="responses",
+            role="tool",
+            item_type="function_call_output",
+            min_bytes=1,
+        ),
+        router=Router("summary for tool=0"),
+        tokenizer=TokenCounter(),
+    )
+
+    assert result.modified is True
+    assert result.reason is None
+    assert result.compressed == "summary for tool=0"
+
+
 def test_compression_unit_still_compresses_assistant_text():
     result = compress_unit_with_router(
         CompressionUnit(
