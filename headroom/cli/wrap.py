@@ -100,7 +100,10 @@ from headroom.providers.grok import (
     DEFAULT_API_URL as _GROK_DEFAULT_API_URL,
 )
 from headroom.providers.grok import (
-    build_launch_env as _build_grok_launch_env,
+    HEADROOM_MODEL_ALIAS as _GROK_HEADROOM_MODEL_ALIAS,
+)
+from headroom.providers.grok import (
+    resolve_launch_model as _resolve_grok_launch_model,
 )
 from headroom.providers.mistral_vibe import build_launch_env as _build_mistral_vibe_launch_env
 from headroom.providers.openclaw import (
@@ -1191,6 +1194,133 @@ _CODEX_MCP_END = "# --- end Headroom MCP server ---"
 # if the user had their own `model_provider` / `[model_providers.*]` config
 # before running wrap.
 _CODEX_CONFIG_BACKUP_SUFFIX = ".headroom-backup"
+
+# Grok config injection markers
+_GROK_TOP_LEVEL_MARKER = "# --- Headroom proxy (auto-injected by headroom wrap grok) ---"
+_GROK_END_MARKER = "# --- end Headroom ---"
+_GROK_CONFIG_BACKUP_SUFFIX = ".headroom-backup"
+
+
+def _grok_home_dir() -> Path:
+    """Return Grok Build's config directory."""
+    return Path.home() / ".grok"
+
+
+def _grok_config_paths() -> tuple[Path, Path]:
+    """Return ``(config_file, backup_file)`` for Grok's TOML config."""
+    config_dir = _grok_home_dir()
+    config_file = config_dir / "config.toml"
+    backup_file = config_dir / f"config.toml{_GROK_CONFIG_BACKUP_SUFFIX}"
+    return config_file, backup_file
+
+
+def _strip_grok_headroom_blocks(content: str) -> str:
+    """Remove Headroom-managed model blocks from Grok ``config.toml`` content."""
+
+    while _GROK_TOP_LEVEL_MARKER in content and _GROK_END_MARKER in content:
+        start = content.index(_GROK_TOP_LEVEL_MARKER)
+        end = content.index(_GROK_END_MARKER, start) + len(_GROK_END_MARKER)
+        content = content[:start].rstrip("\n") + "\n" + content[end:].lstrip("\n")
+    content = content.replace(_GROK_TOP_LEVEL_MARKER + "\n", "")
+    content = content.replace(_GROK_END_MARKER + "\n", "")
+    return content.lstrip("\n").rstrip() + "\n" if content.strip() else ""
+
+
+def _snapshot_grok_config_if_unwrapped(config_file: Path, backup_file: Path) -> None:
+    """Snapshot the pre-wrap Grok config once, before the first injection."""
+
+    if backup_file.exists() or not config_file.exists():
+        return
+    try:
+        content = config_file.read_text(encoding="utf-8")
+    except OSError:
+        return
+    if _GROK_TOP_LEVEL_MARKER in content or _GROK_END_MARKER in content:
+        return
+    backup_file.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(config_file, backup_file)
+
+
+def _rewrite_grok_args_for_headroom(grok_args: tuple) -> tuple[tuple[str, ...], str]:
+    """Route Grok through the Headroom alias while preserving other CLI args."""
+
+    requested_model: str | None = None
+    rewritten_args: list[str] = []
+    i = 0
+    while i < len(grok_args):
+        arg = str(grok_args[i])
+        if arg == "-m":
+            if i + 1 < len(grok_args):
+                requested_model = str(grok_args[i + 1])
+                i += 2
+                continue
+        elif arg == "--model":
+            if i + 1 < len(grok_args):
+                requested_model = str(grok_args[i + 1])
+                i += 2
+                continue
+        elif arg.startswith("--model="):
+            requested_model = arg.split("=", 1)[1]
+            i += 1
+            continue
+
+        rewritten_args.append(arg)
+        i += 1
+
+    selected_model = _resolve_grok_launch_model(requested_model)
+    return ("-m", _GROK_HEADROOM_MODEL_ALIAS, *rewritten_args), selected_model
+
+
+def _inject_grok_provider_config(port: int, model_name: str) -> Path:
+    """Inject a Headroom-backed custom model into ``~/.grok/config.toml``."""
+
+    config_file, backup_file = _grok_config_paths()
+    _snapshot_grok_config_if_unwrapped(config_file, backup_file)
+    config_file.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        existing = config_file.read_text(encoding="utf-8") if config_file.exists() else ""
+    except OSError as exc:
+        raise click.ClickException(f"could not read Grok config: {exc}") from exc
+
+    cleaned = _strip_grok_headroom_blocks(existing)
+    injected = (
+        f"{_GROK_TOP_LEVEL_MARKER}\n"
+        f"[model.{_GROK_HEADROOM_MODEL_ALIAS}]\n"
+        f'model = "{model_name}"\n'
+        f'base_url = "http://127.0.0.1:{port}/v1"\n'
+        'name = "Headroom proxy"\n'
+        f"{_GROK_END_MARKER}\n"
+    )
+    updated = f"{cleaned.rstrip()}\n\n{injected}" if cleaned.strip() else injected
+    try:
+        config_file.write_text(updated, encoding="utf-8")
+    except OSError as exc:
+        raise click.ClickException(f"could not write Grok config: {exc}") from exc
+    return config_file
+
+
+def _restore_grok_provider_config() -> tuple[str, Path]:
+    """Undo ``_inject_grok_provider_config`` for the active Grok config file."""
+
+    config_file, backup_file = _grok_config_paths()
+
+    if backup_file.exists():
+        shutil.copy2(backup_file, config_file)
+        backup_file.unlink()
+        return "restored", config_file
+
+    if config_file.exists():
+        original = config_file.read_text(encoding="utf-8")
+        if _GROK_TOP_LEVEL_MARKER in original or _GROK_END_MARKER in original:
+            cleaned = _strip_grok_headroom_blocks(original)
+            if not cleaned.strip():
+                config_file.unlink()
+                return "removed", config_file
+            config_file.write_text(cleaned, encoding="utf-8")
+            return "cleaned", config_file
+
+    return "noop", config_file
 
 
 def _codex_home_dir() -> Path:
@@ -4321,7 +4451,9 @@ def grok(
     """Launch Grok through Headroom proxy.
 
     \b
-    Sets GROK_PROXY_URL to route all API calls through Headroom.
+    Injects a Headroom-backed custom model into ``~/.grok/config.toml`` and
+    launches Grok with that alias, so Grok routes requests through Headroom
+    using its documented config-based model path.
     Sets up the selected CLI context tool so Grok uses token-optimized commands.
     """
     # Setup CLI context tool for grok.
@@ -4346,13 +4478,17 @@ def grok(
         click.echo("Install Grok Build CLI: https://docs.x.ai/build/overview")
         raise SystemExit(1)
 
-    env, env_vars_display = _build_grok_launch_env(
-        port, os.environ, project=_project_name_from_cwd()
-    )
+    grok_launch_args, selected_model = _rewrite_grok_args_for_headroom(grok_args)
+    config_file = _inject_grok_provider_config(port, selected_model)
+    env = dict(os.environ)
+    env_vars_display = [
+        f"{config_file}: model.{_GROK_HEADROOM_MODEL_ALIAS} -> http://127.0.0.1:{port}/v1",
+        f"upstream model = {selected_model}",
+    ]
 
     _launch_tool(
         binary=grok_bin,
-        args=grok_args,
+        args=grok_launch_args,
         env=env,
         port=port,
         no_proxy=no_proxy,
@@ -4372,20 +4508,34 @@ def grok(
 @click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
 @click.option("--no-stop-proxy", is_flag=True, help="Do not stop the local Headroom proxy")
 def unwrap_grok(port: int, no_stop_proxy: bool) -> None:
-    """Remove durable `headroom wrap grok` state.
+    """Remove durable ``headroom wrap grok`` state from Grok's config file.
 
-    `wrap grok` only routes traffic through env vars at launch time, so there is
-    no durable on-disk edit to restore. This no-op preserves that contract and
-    optionally stops the local proxy.
+    Restores a pre-wrap backup when one exists. Otherwise strips the
+    Headroom-managed custom model block in place, or removes the file entirely
+    when it only contained Headroom state.
     """
     click.echo()
     click.echo("  ╔═══════════════════════════════════════════════╗")
     click.echo("  ║           HEADROOM UNWRAP: GROK              ║")
     click.echo("  ╚═══════════════════════════════════════════════╝")
     click.echo()
-    click.echo("  Nothing to undo for `grok`; no durable wrap state is written.")
+
+    try:
+        status, config_file = _restore_grok_provider_config()
+    except OSError as exc:
+        raise click.ClickException(f"could not unwrap Grok config: {exc}") from exc
+
+    if status == "restored":
+        click.echo(f"  Restored prior {config_file} from pre-wrap backup.")
+    elif status == "cleaned":
+        click.echo(f"  Removed Headroom block from {config_file}; other content preserved.")
+    elif status == "removed":
+        click.echo(f"  Removed {config_file} (contained only Headroom-written config).")
+    else:
+        click.echo(f"  Nothing to undo: {config_file} has no Headroom wrap markers.")
+
     click.echo()
-    if not no_stop_proxy:
+    if not no_stop_proxy and status != "noop":
         _echo_unwrap_proxy_stop_status(_stop_local_proxy_for_unwrap(port), port)
     click.echo()
 

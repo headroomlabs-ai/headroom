@@ -5,9 +5,18 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 
-from headroom.providers.codex import proxy_base_url as codex_proxy_base_url
-
 DEFAULT_API_URL = "https://api.x.ai/v1"
+DEFAULT_MODEL = "grok-build-0.1"
+HEADROOM_MODEL_ALIAS = "headroom-grok-proxy"
+
+
+def resolve_launch_model(requested_model: str | None) -> str:
+    """Return the upstream model id the Headroom Grok alias should target."""
+
+    candidate = (requested_model or "").strip()
+    if candidate == HEADROOM_MODEL_ALIAS:
+        return DEFAULT_MODEL
+    return candidate or DEFAULT_MODEL
 
 
 def build_launch_env(
@@ -15,9 +24,12 @@ def build_launch_env(
     environ: Mapping[str, str] | None = None,
     project: str | None = None,
 ) -> tuple[dict[str, str], list[str]]:
-    """Build environment variables for Grok Build CLI through the local proxy."""
+    """Return the Grok launch environment.
+
+    Grok's documented routing surface is ``~/.grok/config.toml`` custom models,
+    not an env-only base-url override, so this helper is intentionally a no-op.
+    """
+
     env = dict(environ or os.environ)
-    grok_proxy_url = codex_proxy_base_url(port)
-    env["GROK_PROXY_URL"] = grok_proxy_url
-    _ = project
-    return env, [f"GROK_PROXY_URL={grok_proxy_url}"]
+    _ = port, project
+    return env, []

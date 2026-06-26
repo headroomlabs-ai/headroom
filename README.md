@@ -197,7 +197,7 @@ shows an **Output Tokens Saved** card next to input compression, labelled
 | Cursor       | Manual setup    | starts proxy and prints base URLs for Cursor settings |
 | Aider        | ✅              | starts proxy + launches          |
 | Copilot CLI  | ✅              | starts proxy + launches          |
-| Grok Build   | ✅              | `GROK_PROXY_URL` -> xAI `/v1`   |
+| Grok Build   | ✅              | injects `~/.grok/config.toml` · starts proxy + launches |
 | OpenClaw     | ✅              | installs as ContextEngine plugin |
 | OpenCode     | ✅              | injects config · starts proxy + launches |
 | Cortex Code  | ✅              | 60–65% savings · library mode   |
