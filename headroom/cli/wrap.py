@@ -2066,7 +2066,7 @@ def _inject_continue_rtk_systemmessage(config_file: Path, verbose: bool = False)
 
 def _resolve_copilot_provider_type(backend: str | None, provider_type: str) -> str:
     """Resolve Copilot BYOK provider type for the current proxy backend."""
-    return _copilot_resolve_provider_type(backend, provider_type)
+    return _copilot_resolve_provider_type(backend, provider_type, environ=os.environ)
 
 
 def _query_proxy_config(port: int) -> dict[str, Any] | None:
