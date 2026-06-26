@@ -186,7 +186,8 @@ def test_wrap_opencode_injects_mcp_by_default(
     env = captured["env"]
     config = json.loads(env["OPENCODE_CONFIG_CONTENT"])
     assert "mcp" in config
-    assert config["mcp"]["headroom"]["type"] == "remote"
+    assert config["mcp"]["headroom"]["type"] == "local"
+    assert config["mcp"]["headroom"]["command"] == ["headroom", "mcp", "serve"]
 
 
 def test_wrap_opencode_injects_rtk_into_agents_md(

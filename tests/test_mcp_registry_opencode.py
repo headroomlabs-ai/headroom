@@ -259,7 +259,7 @@ def test_register_server_with_env_vars(tmp_path: Path) -> None:
     registrar.register_server(spec)
 
     data = json.loads((tmp_path / "opencode.json").read_text())
-    assert data["mcp"]["headroom"]["env"] == {"HEADROOM_PROXY_URL": "http://127.0.0.1:9090"}
+    assert data["mcp"]["headroom"]["environment"] == {"HEADROOM_PROXY_URL": "http://127.0.0.1:9090"}
 
 
 def test_register_then_re_register_with_different_env_returns_mismatch(tmp_path: Path) -> None:
@@ -329,15 +329,51 @@ def test_spec_to_entry_roundtrip() -> None:
         env={"KEY": "VAL"},
     )
     entry = _spec_to_entry(original)
-    assert entry["type"] == "remote"
+    assert entry["type"] == "local"
     assert entry["command"] == ["python", "-m", "server"]
-    assert entry["env"] == {"KEY": "VAL"}
+    assert entry["environment"] == {"KEY": "VAL"}
 
     restored = _entry_to_spec("test", entry)
     assert restored.name == original.name
     assert restored.command == original.command
     assert restored.args == original.args
     assert restored.env == original.env
+
+
+def test_spec_to_entry_no_env_has_no_environment_key() -> None:
+    """_spec_to_entry omits 'environment' key when spec has no env vars."""
+    from headroom.mcp_registry.base import ServerSpec
+
+    spec = ServerSpec(name="headroom", command="headroom", args=("mcp", "serve"))
+    entry = _spec_to_entry(spec)
+    assert entry["type"] == "local"
+    assert "url" not in entry
+    assert "environment" not in entry
+    assert "env" not in entry
+
+
+def test_entry_to_spec_reads_environment_field() -> None:
+    """_entry_to_spec reads the 'environment' field (not legacy 'env')."""
+    entry = {
+        "type": "local",
+        "command": ["headroom", "mcp", "serve"],
+        "environment": {"HEADROOM_PROXY_URL": "http://127.0.0.1:8787"},
+        "enabled": True,
+    }
+    spec = _entry_to_spec("headroom", entry)
+    assert spec.env == {"HEADROOM_PROXY_URL": "http://127.0.0.1:8787"}
+
+
+def test_entry_to_spec_falls_back_to_legacy_env_field() -> None:
+    """_entry_to_spec falls back to 'env' when 'environment' is absent."""
+    entry = {
+        "type": "local",
+        "command": ["headroom", "mcp", "serve"],
+        "env": {"LEGACY_KEY": "value"},
+        "enabled": True,
+    }
+    spec = _entry_to_spec("headroom", entry)
+    assert spec.env == {"LEGACY_KEY": "value"}
 
 
 def test_diff_specs_all_fields() -> None:

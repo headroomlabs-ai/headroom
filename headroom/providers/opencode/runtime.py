@@ -37,10 +37,13 @@ def build_opencode_config_content(
         }
     }
     if include_mcp:
+        # Local stdio MCP: OpenCode launches `headroom mcp serve` as a subprocess.
+        # The proxy port is passed via env so the MCP server routes through it.
         config["mcp"] = {
             "headroom": {
-                "type": "remote",
-                "url": f"http://127.0.0.1:{port}/mcp",
+                "type": "local",
+                "command": ["headroom", "mcp", "serve"],
+                "environment": {"HEADROOM_PROXY_URL": f"http://127.0.0.1:{port}"},
                 "enabled": True,
             }
         }
