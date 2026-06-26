@@ -153,6 +153,7 @@ from headroom.proxy.project_context import (
 from headroom.proxy.prometheus_metrics import PrometheusMetrics  # noqa: F401
 from headroom.proxy.rate_limiter import TokenBucketRateLimiter  # noqa: F401
 from headroom.proxy.request_logger import RequestLogger  # noqa: F401
+from headroom.proxy.savings_tracker import LITELLM_AVAILABLE
 from headroom.proxy.semantic_cache import SemanticCache  # noqa: F401
 from headroom.proxy.ssl_context import build_httpx_verify
 from headroom.proxy.warmup import WarmupRegistry
@@ -646,12 +647,23 @@ class HeadroomProxy(
         # ContentRouter, so merge rather than assign.
         if config.exclude_tools:
             router_config.exclude_tools = set(DEFAULT_EXCLUDE_TOOLS) | config.exclude_tools
+        # protect_tool_results: force-merge named tools into the exclude set
+        # so their results are never lossy-compressed, regardless of mode.
+        if config.protect_tool_results:
+            base = (
+                router_config.exclude_tools
+                if router_config.exclude_tools is not None
+                else set(DEFAULT_EXCLUDE_TOOLS)
+            )
+            router_config.exclude_tools = base | config.protect_tool_results
         # Token mode: allow compression of older excluded-tool results,
         # and emit search results grouped by file (path once per file
         # instead of repeated on every match line).
         if is_token_mode(config.mode):
             router_config.protect_recent_reads_fraction = 0.3
             router_config.search_group_by_file = True
+        if config.protect_tool_results:
+            router_config.protect_recent_reads_fraction = 0.0
         # `--compress-user-messages` flips the router's default skip rule.
         # Off by default for prefix-cache safety; enabled for workloads where
         # user-message content dominates input (OpenAI/Azure chat with pasted
@@ -3015,6 +3027,12 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             },
             "savings_history": m.savings_history[-100:],  # Last 100 data points
             "display_session": display_session,
+            # Whether LiteLLM is importable. Pricing (the "$ Saved" tile) is
+            # derived entirely from LiteLLM's cost tables, and LiteLLM is gated
+            # off on Python >=3.14 in pyproject — so when this is False the
+            # dashboard tells the user to reinstall on 3.13 instead of just
+            # showing $0.00 forever.
+            "litellm_available": LITELLM_AVAILABLE,
             "persistent_savings": persistent_savings,
             "prefix_cache": prefix_cache_stats,
             "cost": _merge_cost_stats(
@@ -4153,6 +4171,19 @@ def _parse_exclude_tools(cli_excludes: str | None) -> set[str]:
     return names
 
 
+def _parse_csv_tools(raw: str | None) -> set[str]:
+    """Parse a bare CSV tool-name string without merging HEADROOM_EXCLUDE_TOOLS."""
+    names: set[str] = set()
+    if not raw:
+        return names
+    for entry in raw.split(","):
+        name = entry.strip()
+        if name:
+            names.add(name)
+            names.add(name.lower())
+    return names
+
+
 def _parse_tool_profiles(cli_profiles: list[str]) -> dict[str, Any]:
     """Parse tool profiles from CLI args and HEADROOM_TOOL_PROFILES env var.
 
@@ -4373,6 +4404,13 @@ if __name__ == "__main__":
         "Entries may use glob patterns, e.g. 'mcp__*' to exclude every MCP tool. "
         "Also settable via HEADROOM_EXCLUDE_TOOLS env var.",
     )
+    parser.add_argument(
+        "--protect-tool-results",
+        default=None,
+        help="Comma-separated tool names whose results are never lossy-compressed, "
+        "merged with the built-in defaults (e.g. Bash,WebFetch). "
+        "Also settable via HEADROOM_PROTECT_TOOL_RESULTS env var.",
+    )
 
     # Caching
     parser.add_argument("--no-cache", action="store_true", help="Disable caching")
@@ -4445,6 +4483,9 @@ if __name__ == "__main__":
     tool_profiles = _parse_tool_profiles(args.tool_profile)
     # Parse extra never-compress tools from CLI and env var
     exclude_tools = _parse_exclude_tools(args.exclude_tools)
+    protect_tool_results = _parse_csv_tools(
+        args.protect_tool_results or os.environ.get("HEADROOM_PROTECT_TOOL_RESULTS")
+    )
 
     config = ProxyConfig(
         host=_get_env_str("HEADROOM_HOST", args.host),
@@ -4500,6 +4541,9 @@ if __name__ == "__main__":
         ),
         tool_profiles=tool_profiles if tool_profiles else None,
         exclude_tools=exclude_tools if exclude_tools else None,
+        protect_tool_results=frozenset(protect_tool_results)
+        if protect_tool_results
+        else frozenset(),
         mode=normalize_proxy_mode(_get_env_str("HEADROOM_MODE", PROXY_MODE_TOKEN)),
         compress_user_messages=args.compress_user_messages
         or _get_env_bool("HEADROOM_COMPRESS_USER_MESSAGES", False),

@@ -113,7 +113,7 @@ def test_wrap_copilot_auto_anthropic_injects_instructions(
     assert result.exit_code == 0, result.output
     instructions = tmp_path / ".github" / "copilot-instructions.md"
     assert instructions.exists()
-    content = instructions.read_text()
+    content = instructions.read_text(encoding="utf-8")
     assert wrap_cli._RTK_MARKER in content
     assert "RTK (Rust Token Killer)" in content
 

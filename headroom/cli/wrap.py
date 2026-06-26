@@ -124,6 +124,23 @@ from headroom.proxy.project_context import with_project_prefix as _with_project_
 
 from .main import main
 
+
+def _read_text(path: Path) -> str:
+    """Read a text file with explicit UTF-8 encoding."""
+    return path.read_text(encoding="utf-8")
+
+
+def _write_text(path: Path, content: str) -> None:
+    """Write a text file with explicit UTF-8 encoding."""
+    path.write_text(content, encoding="utf-8")
+
+
+def _append_text(path: Path, content: str) -> None:
+    """Append to a text file with explicit UTF-8 encoding."""
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(content)
+
+
 _CONTEXT_TOOL_ENV = "HEADROOM_CONTEXT_TOOL"
 _CONTEXT_TOOL_RTK = "rtk"
 _CONTEXT_TOOL_LEAN_CTX = "lean-ctx"
@@ -418,7 +435,7 @@ def _start_proxy(
     timeout_seconds = _resolve_wrap_proxy_timeout_seconds()
     log_path = _get_log_path()
     stdio_log_path = _get_proxy_stdio_log_path()
-    stdio_log_file = open(stdio_log_path, "a")  # noqa: SIM115
+    stdio_log_file = open(stdio_log_path, "a", encoding="utf-8")  # noqa: SIM115
 
     # Ensure proxy subprocess uses UTF-8 (Windows defaults to cp1252)
     proxy_env = os.environ.copy()
@@ -465,7 +482,7 @@ def _start_proxy(
             stdio_log_file.close()
             # Read last few lines of log for error context
             try:
-                tail = stdio_log_path.read_text()[-500:]
+                tail = _read_text(stdio_log_path)[-500:]
             except Exception:
                 tail = "(no log output)"
             raise RuntimeError(f"Proxy exited with code {proc.returncode}: {tail}")
@@ -579,7 +596,7 @@ def _remove_claude_rtk_hooks(settings_path: Path | None = None) -> bool:
         return False
 
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(_read_text(path))
     except (OSError, json.JSONDecodeError):
         return False
     if not isinstance(payload, dict):
@@ -647,7 +664,7 @@ def _remove_claude_rtk_hooks(settings_path: Path | None = None) -> bool:
     if not changed:
         return False
 
-    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    _write_text(path, json.dumps(payload, indent=2) + "\n")
     return True
 
 
@@ -700,7 +717,7 @@ def _write_claude_wrap_base_url(
     payload: dict[str, Any] = {}
     if path.exists():
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload = json.loads(_read_text(path))
         except (OSError, json.JSONDecodeError):
             payload = {}
     if not isinstance(payload, dict):
@@ -711,7 +728,7 @@ def _write_claude_wrap_base_url(
     env_map[key] = proxy_url
     payload["env"] = env_map
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    _write_text(path, json.dumps(payload, indent=2) + "\n")
     return previous
 
 
@@ -732,7 +749,7 @@ def _restore_claude_wrap_base_url(
     if not path.exists():
         return
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(_read_text(path))
     except (OSError, json.JSONDecodeError):
         return
     if not isinstance(payload, dict):
@@ -753,7 +770,7 @@ def _restore_claude_wrap_base_url(
         env_map[key] = previous
         payload["env"] = env_map
     if payload:
-        path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        _write_text(path, json.dumps(payload, indent=2) + "\n")
     else:
         path.unlink(missing_ok=True)
 
@@ -1362,7 +1379,7 @@ def _snapshot_codex_config_if_unwrapped(config_file: Path, backup_file: Path) ->
     if not config_file.exists():
         return
     try:
-        content = config_file.read_text()
+        content = _read_text(config_file)
     except OSError:
         return
     if _codex_config_has_headroom_markers(content):
@@ -1535,7 +1552,7 @@ def _inject_codex_provider_config(port: int) -> None:
         _snapshot_codex_config_if_unwrapped(config_file, backup_file)
 
         if config_file.exists():
-            content = config_file.read_text()
+            content = _read_text(config_file)
             # Remove any prior Headroom-managed blocks before re-injecting so
             # the operation is idempotent and supports port changes.
             content = _strip_codex_headroom_blocks(content)
@@ -1576,7 +1593,7 @@ def _inject_codex_provider_config(port: int) -> None:
                 f"\n{provider_section}"
             )
 
-        config_file.write_text(content)
+        _write_text(config_file, content)
         click.echo(f"  Codex config: injected Headroom provider (WS + HTTP) into {config_file}")
         # Pull existing native threads into the headroom-provider menu so Codex's
         # history list stays whole once it routes through Headroom. Best-effort.
@@ -1608,7 +1625,7 @@ def _restore_codex_provider_config() -> tuple[str, Path]:
 
     # Case 2: no backup, but config file exists and has markers — strip them.
     if config_file.exists():
-        original = config_file.read_text()
+        original = _read_text(config_file)
         if _codex_config_has_headroom_markers(original):
             # Without a backup, only remove named MCP blocks when this file
             # also carries wrap-owned provider markers from a full wrap.
@@ -1631,7 +1648,7 @@ def _restore_codex_provider_config() -> tuple[str, Path]:
                 # so Codex falls back to its default config.
                 config_file.unlink()
                 return "removed", config_file
-            config_file.write_text(cleaned)
+            _write_text(config_file, cleaned)
             return "cleaned", config_file
 
     # Nothing to undo.
@@ -1802,17 +1819,16 @@ def _inject_rtk_instructions(file_path: Path, verbose: bool = False) -> bool:
     Returns True if instructions were written.
     """
     if file_path.exists():
-        existing = file_path.read_text()
+        existing = _read_text(file_path)
         if _RTK_MARKER in existing:
             if verbose:
                 click.echo(f"  rtk instructions already in {file_path.name}")
             return True
         # Append to existing file
-        with open(file_path, "a") as f:
-            f.write("\n\n" + RTK_INSTRUCTIONS_BLOCK)
+        _append_text(file_path, "\n\n" + RTK_INSTRUCTIONS_BLOCK)
     else:
         file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.write_text(RTK_INSTRUCTIONS_BLOCK)
+        _write_text(file_path, RTK_INSTRUCTIONS_BLOCK)
 
     click.echo(f"  rtk instructions injected into {file_path}")
     return True
@@ -1823,7 +1839,7 @@ def _remove_rtk_instructions(file_path: Path) -> bool:
     if not file_path.exists():
         return False
 
-    content = file_path.read_text(encoding="utf-8")
+    content = _read_text(file_path)
     end_marker = "<!-- /headroom:rtk-instructions -->"
     start = content.find(_RTK_MARKER)
     if start < 0:
@@ -1840,7 +1856,7 @@ def _remove_rtk_instructions(file_path: Path) -> bool:
         cleaned = cleaned.rstrip() + "\n"
 
     if cleaned:
-        file_path.write_text(cleaned, encoding="utf-8")
+        _write_text(file_path, cleaned)
     else:
         file_path.unlink()
     return True
@@ -1879,7 +1895,7 @@ def _inject_memory_mcp_config(user_id: str) -> None:
         _snapshot_codex_config_if_unwrapped(config_file, backup_file)
 
         if config_file.exists():
-            content = config_file.read_text()
+            content = _read_text(config_file)
             if _MEMORY_MCP_MARKER in content:
                 start = content.index(_MEMORY_MCP_MARKER)
                 end = content.index(_MEMORY_MCP_END) + len(_MEMORY_MCP_END)
@@ -1889,7 +1905,7 @@ def _inject_memory_mcp_config(user_id: str) -> None:
         else:
             content = mcp_section
 
-        config_file.write_text(content)
+        _write_text(config_file, content)
         click.echo(f"  Memory MCP: registered in {config_file}")
     except Exception as e:
         click.echo(f"  Warning: could not register memory MCP: {e}")
@@ -1913,14 +1929,13 @@ def _inject_memory_agents_md(file_path: Path) -> bool:
     )
 
     if file_path.exists():
-        existing = file_path.read_text()
+        existing = _read_text(file_path)
         if _MEMORY_AGENTS_MARKER in existing:
             return True  # Already injected
-        with open(file_path, "a") as f:
-            f.write("\n\n" + memory_block)
+        _append_text(file_path, "\n\n" + memory_block)
     else:
         file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.write_text(memory_block)
+        _write_text(file_path, memory_block)
 
     click.echo(f"  Memory guidance injected into {file_path.name}")
     return True
@@ -2002,7 +2017,7 @@ def _inject_continue_rtk_systemmessage(config_file: Path, verbose: bool = False)
     """
     if config_file.exists():
         try:
-            content = config_file.read_text()
+            content = _read_text(config_file)
         except OSError as exc:
             click.echo(f"  Warning: could not read {config_file}: {exc}")
             return False
@@ -2055,7 +2070,7 @@ def _inject_continue_rtk_systemmessage(config_file: Path, verbose: bool = False)
 
     if any_changed:
         config_file.parent.mkdir(parents=True, exist_ok=True)
-        config_file.write_text(json.dumps(data, indent=2) + "\n")
+        _write_text(config_file, json.dumps(data, indent=2) + "\n")
         click.echo(f"  rtk instructions injected into {config_file}")
     elif all_ok and verbose:
         # Idempotent re-run with no refusals — nothing to do.
@@ -2748,7 +2763,7 @@ def _register_proxy_client(port: int) -> None:
         ident = _proc_identity(os.getpid())
         if ident is not None:
             payload["start_src"], payload["start_time"] = ident
-        _client_marker_path(port).write_text(json.dumps(payload))
+        _write_text(_client_marker_path(port), json.dumps(payload))
     except OSError:
         pass
 
@@ -2782,7 +2797,7 @@ def _marker_pid_reused(marker: Path, pid: int) -> bool:
     mismatched source) returns ``False`` so a real client is never pruned.
     """
     try:
-        rec = json.loads(marker.read_text())
+        rec = json.loads(_read_text(marker))
     except (OSError, ValueError):
         return False
     src = rec.get("start_src")
@@ -5296,11 +5311,11 @@ def unwrap_opencode(port: int, no_stop_proxy: bool) -> None:
                 f"could not restore OpenCode config from backup: {exc}"
             ) from exc
     elif config_file.exists():
-        content = config_file.read_text()
+        content = _read_text(config_file)
         if _PROVIDER_MARKER_START in content or _MCP_MARKER_START in content:
             cleaned = strip_opencode_headroom_blocks(content)
             if cleaned.strip():
-                config_file.write_text(cleaned + "\n", encoding="utf-8")
+                _write_text(config_file, cleaned + "\n")
                 click.echo(f"  Removed Headroom block from {config_file}; other content preserved.")
                 status = "cleaned"
             else:

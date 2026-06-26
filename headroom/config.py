@@ -210,6 +210,8 @@ class AnchorConfig:
 # Read/Glob/Grep contain exact file contents/search results the agent needs for edits.
 # Write/Edit record what changes were made — compressing them causes duplicate/conflicting edits.
 # Bash is NOT excluded — its outputs (build logs, test output) are ideal compression targets.
+# To protect Bash or other non-excluded tools from lossy compression, use
+# HEADROOM_PROTECT_TOOL_RESULTS=Bash or --protect-tool-results Bash.
 DEFAULT_EXCLUDE_TOOLS: frozenset[str] = frozenset(
     {
         "Read",
