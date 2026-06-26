@@ -866,15 +866,18 @@ def _remove_headroom_installed_serena_mcp(registrar: Any) -> str:
     return "failed"
 
 
-def _disable_serena_mcp(registrar: Any, *, verbose: bool = False) -> None:
-    """Make ``--no-serena`` actively disable Serena, not merely skip adding it.
+def _disable_serena_mcp(
+    registrar: Any, *, verbose: bool = False, reason: str = "--no-serena"
+) -> None:
+    """Actively disable a Headroom-installed Serena entry, not merely skip it.
 
-    Serena is registered by default, so a prior ``headroom wrap`` persists a
-    ``serena`` entry into the agent's MCP config; the agent then keeps
-    launching Serena on startup. Just *skipping* registration on a later
-    ``--no-serena`` run leaves that stale entry in place — so the flag has to
-    remove the entry Headroom installed. A user-managed Serena (absent from
-    our ledger) is reported but left untouched.
+    Serena used to be registered by default, so a prior ``headroom wrap``
+    persists a ``serena`` entry into the agent's MCP config; the agent then
+    keeps launching Serena on startup. Just *skipping* registration on a later
+    run leaves that stale entry in place — so this removes the entry Headroom
+    installed. A user-managed Serena (absent from our ledger) is reported but
+    left untouched. ``reason`` is surfaced in the message: ``--no-serena`` when
+    the user opted out, or a note that tokensave is now the primary compressor.
     """
     if not registrar.detect():
         if verbose:
@@ -883,12 +886,12 @@ def _disable_serena_mcp(registrar: Any, *, verbose: bool = False) -> None:
 
     if registrar.get_server("serena") is None:
         if verbose:
-            click.echo("  Skipping Serena MCP (--no-serena)")
+            click.echo(f"  Skipping Serena MCP ({reason})")
         return
 
     status = _remove_headroom_installed_serena_mcp(registrar)
     if status == "removed":
-        click.echo("  Removed previously-installed Serena MCP (--no-serena)")
+        click.echo(f"  Removed previously-installed Serena MCP ({reason})")
         click.echo(f"    restart {registrar.display_name} if it was already running")
     elif status == "not_headroom_owned":
         click.echo(
@@ -901,122 +904,219 @@ def _disable_serena_mcp(registrar: Any, *, verbose: bool = False) -> None:
         )
 
 
+# =============================================================================
+# tokensave — primary coding-task compressor (Serena is the backup)
+# =============================================================================
+
+
+def _ensure_tokensave_binary(verbose: bool = False) -> Path | None:
+    """Resolve the tokensave binary, fetching the release asset if missing.
+
+    Returns the binary path, or ``None`` when tokensave is unavailable
+    (offline, unsupported platform, or download failure) — the caller then
+    falls back to Serena.
+    """
+    from headroom.graph.tokensave_installer import ensure_tokensave, get_tokensave_path
+
+    existing = get_tokensave_path()
+    if existing:
+        return existing
+
+    click.echo("  tokensave: fetching code-graph binary...")
+    path = ensure_tokensave()
+    if path:
+        click.echo(f"  tokensave: installed at {path}")
+    else:
+        click.echo(
+            "  tokensave: no prebuilt binary available for this platform "
+            "(try 'cargo install tokensave') — falling back to Serena"
+        )
+    return path
+
+
+def _index_tokensave_project(bin_path: Path, *, verbose: bool = False) -> None:
+    """Index the current project into the tokensave graph (non-fatal).
+
+    Runs ``tokensave init`` the first time (creates ``.tokensave/``), then
+    ``tokensave sync`` for incremental updates. tokensave also re-checks
+    staleness on demand, so a failure here is logged but never blocks the
+    wrap — the MCP server still indexes lazily on first query.
+    """
+    project_dir = Path.cwd()
+    subcommand = "sync" if (project_dir / ".tokensave").exists() else "init"
+    try:
+        result = run(
+            [str(bin_path), subcommand],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if result.returncode == 0:
+            click.echo("  Code graph: indexed (tokensave)")
+        elif verbose:
+            click.echo(f"  Code graph: tokensave {subcommand} failed ({result.stderr[:100]})")
+    except subprocess.TimeoutExpired:
+        click.echo("  Code graph: tokensave indexing timed out (will complete on demand)")
+    except Exception as e:
+        if verbose:
+            click.echo(f"  Code graph: tokensave indexing skipped ({e})")
+
+
+def _setup_tokensave_mcp(registrar: Any, *, verbose: bool = False, force: bool = False) -> bool:
+    """Register tokensave MCP with the given agent (idempotent).
+
+    Returns ``True`` when tokensave is available and set up, ``False`` when the
+    binary is unavailable — the caller then falls back to Serena. Mirrors
+    :func:`_setup_serena_mcp`'s ledger-aware migration: a stale
+    Headroom-installed ``tokensave`` entry is force-updated to the current
+    spec, while a user-managed entry is left untouched.
+    """
+    from headroom.mcp_registry import build_tokensave_spec, format_result
+    from headroom.mcp_registry.base import RegisterStatus
+    from headroom.mcp_registry.ledger import headroom_installed_matching, record_install
+
+    if not registrar.detect():
+        if verbose:
+            click.echo(f"  tokensave MCP: {registrar.display_name} not detected — skipping")
+        return False
+
+    bin_path = _ensure_tokensave_binary(verbose=verbose)
+    if bin_path is None:
+        return False
+
+    # Warm the graph so the first query is instant (non-fatal).
+    _index_tokensave_project(bin_path, verbose=verbose)
+
+    spec = build_tokensave_spec(str(bin_path))
+    result = registrar.register_server(spec, force=force)
+
+    # Migrate a stale Headroom-installed entry (e.g. an older binary path or
+    # pinned version), mirroring the Serena migration path. Only force-update
+    # when the ledger proves Headroom installed the entry on disk.
+    if (
+        result.status == RegisterStatus.MISMATCH
+        and not force
+        and headroom_installed_matching(registrar.name, registrar.get_server("tokensave"))
+    ):
+        result = registrar.register_server(spec, force=True)
+        if result.status == RegisterStatus.REGISTERED:
+            click.echo("  tokensave MCP: migrated previously-installed entry to current spec")
+
+    if result.status == RegisterStatus.REGISTERED:
+        record_install(registrar.name, spec)
+
+    line = format_result(
+        registrar.name,
+        result,
+        label="tokensave MCP",
+        verbose=verbose,
+        overwrite_hint="update or remove the existing tokensave MCP entry, then rerun headroom wrap",
+        restart_hint=f"restart {registrar.display_name} if it was already running",
+    )
+    if line is not None:
+        click.echo(line)
+    return True
+
+
+def _remove_headroom_installed_tokensave_mcp(registrar: Any) -> str:
+    """Remove the tokensave MCP entry only if the ledger proves Headroom installed it."""
+    from headroom.mcp_registry.ledger import clear_install, headroom_installed_matching
+
+    current = registrar.get_server("tokensave")
+    if not headroom_installed_matching(registrar.name, current):
+        return "not_headroom_owned"
+    if registrar.unregister_server("tokensave"):
+        clear_install(registrar.name, "tokensave")
+        return "removed"
+    return "failed"
+
+
+def _disable_tokensave_mcp(registrar: Any, *, verbose: bool = False) -> None:
+    """Make ``--no-tokensave`` actively remove a Headroom-installed tokensave entry."""
+    if not registrar.detect():
+        if verbose:
+            click.echo(f"  tokensave MCP: {registrar.display_name} not detected — skipping")
+        return
+
+    if registrar.get_server("tokensave") is None:
+        if verbose:
+            click.echo("  Skipping tokensave MCP (--no-tokensave)")
+        return
+
+    status = _remove_headroom_installed_tokensave_mcp(registrar)
+    if status == "removed":
+        click.echo("  Removed previously-installed tokensave MCP (--no-tokensave)")
+        click.echo(f"    restart {registrar.display_name} if it was already running")
+    elif status == "not_headroom_owned":
+        click.echo(
+            "  tokensave MCP is present but user-managed — leaving it in place "
+            "(--no-tokensave only removes entries Headroom installed)"
+        )
+    else:  # "failed"
+        click.echo(
+            "  tokensave MCP: removal failed — remove the 'tokensave' entry "
+            "from your MCP config manually"
+        )
+
+
+def _setup_coding_compressor(registrar: Any, *, serena_context: str, **kwargs: Any) -> None:
+    """Set up the coding-task compressor: tokensave primary, Serena backup.
+
+    Policy (decided per the integration):
+
+    * ``no_tokensave`` — skip/disable tokensave entirely.
+    * tokensave is set up by default; on success it becomes the primary
+      compressor and any Headroom-installed Serena entry is removed.
+    * Serena is the backup: registered automatically when tokensave is
+      unavailable (unless ``no_serena``), or forced on with ``serena=True``.
+
+    ``kwargs`` carries the boolean flags ``serena``, ``no_serena``,
+    ``no_tokensave`` and the per-agent registrar ``force`` semantics.
+    """
+    serena = bool(kwargs.get("serena"))
+    no_serena = bool(kwargs.get("no_serena"))
+    no_tokensave = bool(kwargs.get("no_tokensave"))
+    force = bool(kwargs.get("force"))
+    verbose = bool(kwargs.get("verbose"))
+
+    tokensave_ok = False
+    if no_tokensave:
+        _disable_tokensave_mcp(registrar, verbose=verbose)
+    else:
+        tokensave_ok = _setup_tokensave_mcp(registrar, verbose=verbose, force=force)
+
+    if serena or (not tokensave_ok and not no_serena):
+        _setup_serena_mcp(registrar, context=serena_context, verbose=verbose, force=force)
+    else:
+        # tokensave is primary (or Serena was explicitly disabled): drop any
+        # Serena entry a prior wrap installed; user-managed entries are kept.
+        reason = (
+            "--no-serena" if no_serena else "tokensave is now the primary code-graph compressor"
+        )
+        _disable_serena_mcp(registrar, verbose=verbose, reason=reason)
+
+
 _CBM_MCP_SERVER_NAME = "codebase-memory-mcp"
 
 
-def _register_cbm_mcp_server(cbm_bin: str) -> None:
-    """Register codebase-memory-mcp as an MCP server in Claude Code.
-
-    Uses ``claude mcp add`` so the tools appear in ``/mcp`` automatically.
-    Idempotent — skips if already registered.
-    """
-    claude_cli = shutil.which("claude")
-    if not claude_cli:
-        return
-
-    # Check if already registered
-    check = run(
-        [claude_cli, "mcp", "get", _CBM_MCP_SERVER_NAME],
-        capture_output=True,
-        text=True,
-    )
-    if check.returncode == 0:
-        return  # Already registered
-
-    result = run(
-        [claude_cli, "mcp", "add", _CBM_MCP_SERVER_NAME, "-s", "user", "--", cbm_bin],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode == 0:
-        click.echo(f"  Code graph: registered {_CBM_MCP_SERVER_NAME} MCP server")
-    else:
-        pass  # Non-critical — tools won't appear in /mcp but graph still works
-
-
 def _setup_code_graph(verbose: bool = False) -> bool:
-    """Ensure codebase-memory-mcp is installed, registered as MCP server, and project is indexed.
+    """Ensure the tokensave code graph is set up and the project indexed.
 
-    codebase-memory-mcp builds a knowledge graph of the codebase using
-    tree-sitter, enabling the LLM to query code structure (call chains,
-    function definitions, impact analysis) instead of reading entire files.
+    tokensave is Headroom's primary code-graph compressor and is normally
+    installed by default (it builds a semantic knowledge graph the LLM can
+    query for call chains, definitions, and impact analysis instead of
+    reading whole files). ``--code-graph`` is kept for backward compatibility
+    and as an explicit "set up the graph and force an index now" switch, even
+    when tokensave registration was otherwise skipped.
 
-    Steps:
-    1. Download the binary if not already present.
-    2. Register as an MCP server in Claude Code (``claude mcp add``).
-    3. Index the current project (fast, idempotent).
-
-    With Claude Code's MCP Tool Search, the 14 graph tools add ~200 tokens
-    overhead per request (not the full ~1,915) — they're lazy-loaded.
-
-    Returns True if graph is ready, False if setup failed.
+    Returns True if the graph is ready, False if tokensave is unavailable.
+    Earlier releases backed this flag with ``codebase-memory-mcp``; that
+    server is no longer installed, and ``headroom unwrap`` still cleans up any
+    legacy ``codebase-memory-mcp`` entry a prior wrap left behind.
     """
-    from headroom.graph.installer import ensure_cbm, get_cbm_path
+    from headroom.mcp_registry import ClaudeRegistrar
 
-    cbm_path = get_cbm_path()
-    if not cbm_path:
-        click.echo("  Code graph: downloading codebase-memory-mcp...")
-        cbm_path = ensure_cbm()
-        if cbm_path:
-            click.echo(f"  Code graph: installed at {cbm_path}")
-        else:
-            click.echo("  Code graph: download failed — skipping")
-            return False
-
-    cbm_bin = str(cbm_path)
-
-    # Register as MCP server so tools appear in /mcp
-    _register_cbm_mcp_server(cbm_bin)
-
-    # Index current project (fast — ~1s for most repos, idempotent)
-    project_dir = str(Path.cwd())
-    try:
-        result = run(
-            [
-                cbm_bin,
-                "cli",
-                "index_repository",
-                json.dumps({"repo_path": project_dir, "mode": "fast"}),
-            ],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        if result.returncode == 0:
-            # Parse node/edge counts from output
-            for line in result.stdout.splitlines():
-                if '"nodes"' in line:
-                    try:
-                        # Parse the JSON response to extract node/edge counts
-                        import re
-
-                        m_nodes = re.search(r'"nodes":(\d+)', line)
-                        m_edges = re.search(r'"edges":(\d+)', line)
-                        if m_nodes and m_edges:
-                            nodes = int(m_nodes.group(1))
-                            edges = int(m_edges.group(1))
-                            click.echo(
-                                f"  Code graph: indexed ({nodes:,} symbols, "
-                                f"{edges:,} relationships)"
-                            )
-                        else:
-                            click.echo("  Code graph: indexed")
-                    except (ValueError, AttributeError):
-                        click.echo("  Code graph: indexed")
-                    return True
-            click.echo("  Code graph: indexed")
-            return True
-        else:
-            if verbose:
-                click.echo(f"  Code graph: indexing failed ({result.stderr[:100]})")
-            return False
-    except subprocess.TimeoutExpired:
-        click.echo("  Code graph: indexing timed out (will complete in background)")
-        return False
-    except Exception as e:
-        if verbose:
-            click.echo(f"  Code graph: setup failed ({e})")
-        return False
+    return _setup_tokensave_mcp(ClaudeRegistrar(), verbose=verbose, force=True)
 
 
 # rtk instructions for tools without hook support (Codex, Cursor, Aider).
@@ -3073,11 +3173,22 @@ def unwrap() -> None:
     is_flag=True,
     help="Skip headroom MCP server registration (compression markers will be unactionable)",
 )
-@click.option("--no-serena", is_flag=True, help="Skip Serena MCP server registration")
+@click.option(
+    "--no-tokensave",
+    is_flag=True,
+    help="Skip the tokensave code-graph MCP server (primary coding-task compressor)",
+)
+@click.option(
+    "--serena",
+    is_flag=True,
+    help="Force the Serena MCP backup compressor on (registered automatically when "
+    "tokensave is unavailable)",
+)
+@click.option("--no-serena", is_flag=True, help="Never register the Serena backup compressor")
 @click.option(
     "--code-graph",
     is_flag=True,
-    help="Enable code graph indexing via codebase-memory-mcp (optional)",
+    help="Force a tokensave code-graph index now (tokensave is the default compressor)",
 )
 @click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
 @click.option(
@@ -3127,6 +3238,8 @@ def claude(
     port: int,
     no_rtk: bool,
     no_mcp: bool,
+    no_tokensave: bool,
+    serena: bool,
     no_serena: bool,
     code_graph: bool,
     no_proxy: bool,
@@ -3152,10 +3265,12 @@ def claude(
         headroom wrap claude --memory           # With persistent memory
         headroom wrap claude --resume <id>      # Resume a session
         headroom wrap claude -- -p              # Claude in print mode
-        headroom wrap claude --code-graph        # With code graph intelligence
+        headroom wrap claude                    # tokensave code graph (primary)
+        headroom wrap claude --no-tokensave     # Skip tokensave; fall back to Serena
+        headroom wrap claude --serena           # Also register the Serena backup
         headroom wrap claude --no-context-tool  # Skip CLI context-tool setup
         headroom wrap claude --no-mcp           # Skip MCP retrieve tool registration
-        headroom wrap claude --no-serena        # Skip Serena MCP registration
+        headroom wrap claude --no-serena        # Never register the Serena backup
         headroom wrap claude --1m               # Preserve the 1M context window
     """
     if prepare_only:
@@ -3285,14 +3400,17 @@ def claude(
         elif verbose:
             click.echo("  Skipping MCP retrieve tool (--no-mcp)")
 
-        if not no_serena:
-            from headroom.mcp_registry import ClaudeRegistrar
+        # Coding-task compressor: tokensave primary, Serena backup.
+        from headroom.mcp_registry import ClaudeRegistrar
 
-            _setup_serena_mcp(ClaudeRegistrar(), context="claude-code", verbose=verbose)
-        else:
-            from headroom.mcp_registry import ClaudeRegistrar
-
-            _disable_serena_mcp(ClaudeRegistrar(), verbose=verbose)
+        _setup_coding_compressor(
+            ClaudeRegistrar(),
+            serena_context="claude-code",
+            serena=serena,
+            no_serena=no_serena,
+            no_tokensave=no_tokensave,
+            verbose=verbose,
+        )
 
         if code_graph:
             _setup_code_graph(verbose=verbose)
@@ -3410,13 +3528,20 @@ def unwrap_claude(
         if registrar.detect():
             removed_headroom = registrar.unregister_server("headroom")
             removed_code_graph = registrar.unregister_server(_CBM_MCP_SERVER_NAME)
+            tokensave_status = _remove_headroom_installed_tokensave_mcp(registrar)
             serena_status = _remove_headroom_installed_serena_mcp(registrar)
             if removed_headroom:
                 click.echo("  Removed Headroom MCP retrieve tool from Claude.")
             else:
                 click.echo("  Headroom MCP retrieve tool was not registered in Claude.")
             if removed_code_graph:
-                click.echo("  Removed code graph MCP server from Claude.")
+                click.echo("  Removed legacy codebase-memory-mcp code graph server from Claude.")
+            if tokensave_status == "removed":
+                click.echo("  Removed Headroom-installed tokensave MCP server from Claude.")
+            elif tokensave_status == "failed":
+                click.echo(
+                    "  tokensave MCP server matched Headroom ledger but could not be removed."
+                )
             if serena_status == "removed":
                 click.echo("  Removed Headroom-installed Serena MCP server from Claude.")
             elif serena_status == "failed":
@@ -3770,11 +3895,22 @@ def unwrap_copilot(port: int, no_stop_proxy: bool) -> None:
     is_flag=True,
     help="Skip headroom MCP server registration (compression markers will be unactionable)",
 )
-@click.option("--no-serena", is_flag=True, help="Skip Serena MCP server registration")
+@click.option(
+    "--no-tokensave",
+    is_flag=True,
+    help="Skip the tokensave code-graph MCP server (primary coding-task compressor)",
+)
+@click.option(
+    "--serena",
+    is_flag=True,
+    help="Force the Serena MCP backup compressor on (registered automatically when "
+    "tokensave is unavailable)",
+)
+@click.option("--no-serena", is_flag=True, help="Never register the Serena backup compressor")
 @click.option(
     "--code-graph",
     is_flag=True,
-    help="Enable code graph indexing via codebase-memory-mcp (optional)",
+    help="Force a tokensave code-graph index now (tokensave is the default compressor)",
 )
 @click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
 @click.option(
@@ -3801,6 +3937,8 @@ def codex(
     port: int,
     no_rtk: bool,
     no_mcp: bool,
+    no_tokensave: bool,
+    serena: bool,
     no_serena: bool,
     code_graph: bool,
     no_proxy: bool,
@@ -3828,7 +3966,9 @@ def codex(
         headroom wrap codex -- "fix the bug"        # Pass prompt to codex
         headroom wrap codex --no-context-tool       # Skip CLI context-tool setup
         headroom wrap codex --no-mcp                # Skip MCP retrieve tool registration
-        headroom wrap codex --no-serena             # Skip Serena MCP registration
+        headroom wrap codex --no-tokensave          # Skip tokensave; fall back to Serena
+        headroom wrap codex --serena                # Also register the Serena backup
+        headroom wrap codex --no-serena             # Never register the Serena backup
         headroom wrap codex --port 9999             # Custom proxy port
         headroom wrap codex --backend anyllm --anyllm-provider groq
     """
@@ -3866,14 +4006,19 @@ def codex(
     elif verbose:
         click.echo("  Skipping MCP retrieve tool (--no-mcp)")
 
-    if not no_serena:
-        from headroom.mcp_registry import CodexRegistrar
+    # Coding-task compressor: tokensave primary, Serena backup. Codex starts
+    # long-lived MCP subprocesses from config.toml, so force re-registration.
+    from headroom.mcp_registry import CodexRegistrar
 
-        _setup_serena_mcp(CodexRegistrar(), context="codex", verbose=verbose, force=True)
-    else:
-        from headroom.mcp_registry import CodexRegistrar
-
-        _disable_serena_mcp(CodexRegistrar(), verbose=verbose)
+    _setup_coding_compressor(
+        CodexRegistrar(),
+        serena_context="codex",
+        serena=serena,
+        no_serena=no_serena,
+        no_tokensave=no_tokensave,
+        verbose=verbose,
+        force=True,
+    )
 
     # Setup memory MCP server for Codex (native tool integration)
     if memory:
@@ -5317,15 +5462,21 @@ def unwrap_codex(port: int, no_stop_proxy: bool) -> None:
             )
         click.echo(f"  Nothing to undo: {config_file} has no Headroom wrap markers.")
 
-    # Serena is written as its own [mcp_servers.serena] table with Headroom
-    # markers, separate from the provider block handled above — a "cleaned"
-    # restore leaves it behind. Remove it explicitly (only if we installed it),
-    # mirroring unwrap_claude. Runs after the restore so a backup-restore that
-    # already dropped Serena makes this a safe no-op.
+    # tokensave and Serena are each written as their own [mcp_servers.<name>]
+    # table with Headroom markers, separate from the provider block handled
+    # above — a "cleaned" restore leaves them behind. Remove them explicitly
+    # (only if we installed them), mirroring unwrap_claude. Runs after the
+    # restore so a backup-restore that already dropped them is a safe no-op.
     from headroom.mcp_registry import CodexRegistrar
 
     codex_registrar = CodexRegistrar()
     if codex_registrar.detect():
+        tokensave_status = _remove_headroom_installed_tokensave_mcp(codex_registrar)
+        if tokensave_status == "removed":
+            click.echo("  Removed Headroom-installed tokensave MCP server from Codex.")
+        elif tokensave_status == "failed":
+            click.echo("  tokensave MCP server matched Headroom ledger but could not be removed.")
+
         serena_status = _remove_headroom_installed_serena_mcp(codex_registrar)
         if serena_status == "removed":
             click.echo("  Removed Headroom-installed Serena MCP server from Codex.")

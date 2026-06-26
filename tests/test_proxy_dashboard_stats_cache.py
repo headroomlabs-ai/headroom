@@ -568,7 +568,8 @@ def test_dashboard_uses_cached_stats_and_lazy_history_feed_polling() -> None:
     assert "rtkShareOfTotal" not in html
     assert "Lean-ctx" in html
     assert "Context Tool" in html
-    assert "cliFilteringLabel + ' Filtered'" in html
+    assert "cliFilteringLabel + ' Filtered (this session)'" in html
+    assert "cliFilteringLabel + ' Filtered (lifetime)'" in html
 
 
 def test_proxy_throughput_in_stats_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -954,3 +954,45 @@ def test_dashboard_includes_history_toggle_and_endpoint(tmp_path, monkeypatch):
         assert "historyModelSourceSeriesLabel + ' buckets'" in html
         # Non-top-5 breakdown rows swap into the last chart slot when selected.
         assert "topModels[topModels.length - 1] = selected;" in html
+
+
+def test_stats_history_includes_cli_filtering(tmp_path, monkeypatch):
+    """The /stats-history response must include cli_filtering (RTK) lifetime stats.
+
+    Before this fix the endpoint returned only proxy compression data; after a
+    restart the Historical tab showed no RTK savings at all.
+    """
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    import headroom.proxy.server as server
+    from headroom.proxy.server import ProxyConfig, create_app
+
+    savings_path = tmp_path / "proxy_savings.json"
+    monkeypatch.setenv("HEADROOM_SAVINGS_PATH", str(savings_path))
+
+    _rtk_lifetime_payload = {
+        "tool": "rtk",
+        "label": "RTK",
+        "tokens_saved": 999,
+        "session": {"tokens_saved": 200, "commands": 5},
+        "lifetime": {"tokens_saved": 999, "commands": 42},
+    }
+    monkeypatch.setattr(server, "_get_context_tool_stats", lambda: _rtk_lifetime_payload)
+
+    config = ProxyConfig(
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        log_requests=False,
+    )
+
+    with TestClient(create_app(config)) as client:
+        response = client.get("/stats-history")
+        assert response.status_code == 200
+        data = response.json()
+
+    assert "cli_filtering" in data, "Historical /stats-history must include cli_filtering"
+    assert data["cli_filtering"] is not None
+    assert data["cli_filtering"]["tool"] == "rtk"
+    assert data["cli_filtering"]["label"] == "RTK"
+    assert data["cli_filtering"]["lifetime"]["tokens_saved"] == 999
