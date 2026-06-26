@@ -15,7 +15,7 @@ def build_launch_env(
 ) -> tuple[dict[str, str], list[str]]:
     """Build environment variables for Grok Build CLI through the local proxy."""
     env = dict(environ or os.environ)
-    grok_proxy_url = f"{codex_proxy_base_url(port)}"
+    grok_proxy_url = codex_proxy_base_url(port)
     env["GROK_PROXY_URL"] = grok_proxy_url
-    del project
+    _ = project
     return env, [f"GROK_PROXY_URL={grok_proxy_url}"]

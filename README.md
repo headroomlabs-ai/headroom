@@ -295,7 +295,7 @@ Headroom exposes one stable request lifecycle across `compress()`, the SDK, and 
 Provider and tool-specific behavior lives under `headroom/providers/` so core orchestration stays focused on lifecycle, sequencing, and policy.
 
 - **CLI/tool slices**: `headroom/providers/claude`, `copilot`, `codex`, `grok`, `openclaw`
-- **Provider runtime slices**: `headroom/providers/claude`, `gemini`, `grok`, plus shared backend/runtime dispatch in `headroom/providers/registry.py`
+- **Provider runtime slices**: `headroom/providers/claude`, `gemini`, and `grok`; shared backend/runtime dispatch stays in `headroom/providers/registry.py`
 - **Core files stay orchestration-first**: `wrap.py`, `client.py`, `cli/proxy.py`, and `proxy/server.py` delegate provider-specific env shaping, API target normalization, backend selection, and transport dispatch.
 
 </details>

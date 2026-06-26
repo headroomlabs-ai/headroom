@@ -3123,7 +3123,7 @@ def wrap() -> None:
     the target tool so all API calls route through Headroom automatically.
 
     \b
-        Supported tools (one Click subcommand per tool):
+    Supported tools (one Click subcommand per tool):
         headroom wrap claude              # Claude Code (Anthropic)
         headroom wrap codex               # OpenAI Codex CLI
         headroom wrap copilot -- --model claude-sonnet-4-20250514
@@ -4262,7 +4262,7 @@ def grok(
             click.echo("  Setting up rtk for grok...")
             rtk_path = _ensure_rtk_binary(verbose=verbose)
             if rtk_path:
-                # Grok reads CONVENTIONS.md from project root
+                # Keep wrapper instructions in the project-root conventions file.
                 conventions = Path.cwd() / "CONVENTIONS.md"
                 _inject_rtk_instructions(conventions, verbose=verbose)
 

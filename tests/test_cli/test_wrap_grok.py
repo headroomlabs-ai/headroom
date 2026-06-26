@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 from click.testing import CliRunner
 
+from headroom.cli import wrap as wrap_mod
 from headroom.cli.main import main
 
 
@@ -64,6 +66,43 @@ def test_wrap_grok_prepare_only_skips_binary_lookup(runner: CliRunner) -> None:
     assert result.exit_code == 0, result.output
     which_mock.assert_not_called()
     launch_mock.assert_not_called()
+
+
+def test_wrap_grok_prepare_only_sets_up_rtk_instructions(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    with (
+        patch.object(wrap_mod, "_selected_context_tool", return_value=wrap_mod._CONTEXT_TOOL_RTK),
+        patch.object(wrap_mod, "_ensure_rtk_binary", return_value="rtk"),
+        patch.object(wrap_mod, "_inject_rtk_instructions") as inject_mock,
+        patch.object(wrap_mod.shutil, "which") as which_mock,
+    ):
+        result = runner.invoke(main, ["wrap", "grok", "--prepare-only"])
+
+    assert result.exit_code == 0, result.output
+    inject_mock.assert_called_once_with(tmp_path / "CONVENTIONS.md", verbose=False)
+    which_mock.assert_not_called()
+
+
+def test_wrap_grok_prepare_only_sets_up_lean_ctx(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    with (
+        patch.object(
+            wrap_mod, "_selected_context_tool", return_value=wrap_mod._CONTEXT_TOOL_LEAN_CTX
+        ),
+        patch.object(wrap_mod, "_setup_lean_ctx_agent") as setup_mock,
+        patch.object(wrap_mod.shutil, "which") as which_mock,
+    ):
+        result = runner.invoke(main, ["wrap", "grok", "--prepare-only"])
+
+    assert result.exit_code == 0, result.output
+    setup_mock.assert_called_once_with("grok", verbose=False)
+    which_mock.assert_not_called()
 
 
 def test_wrap_grok_fails_when_binary_missing(runner: CliRunner) -> None:
