@@ -1,7 +1,7 @@
 name: PR Governance
 
 on:
-  pull_request_target:
+  pull_request:
     types: [opened, edited, reopened, synchronize, ready_for_review, converted_to_draft]
   schedule:
     # Keep labels fresh even when base branches move or checks finish later.

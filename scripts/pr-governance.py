@@ -114,6 +114,7 @@ def has_non_placeholder_bullets(section: str) -> bool:
 def has_test_output(section: str) -> bool:
     for match in CODE_BLOCK_RE.finditer(section):
         content = strip_html_comments(match.group("content")).strip()
+        print("Content:", content)
         if not content:
             continue
         if "paste relevant command output or artifact links here" in content.lower():
@@ -181,6 +182,7 @@ def validate_pull_request(event: dict[str, Any]) -> GovernanceReport:
         problems.append("Check at least one box in `Type of Change`.")
 
     testing_section = sections.get("Testing", "")
+    print("Testing section:", testing_section)
     testing_checked = checked_items(testing_section)
     if testing_section and not testing_checked:
         problems.append("Check at least one verification item in `Testing`.")

@@ -187,12 +187,12 @@
             <div class="bg-surface rounded-lg p-4 border border-border">
                 <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Proxy $ Saved</div>
                 <div class="flex items-baseline gap-2">
-                    <span class="text-3xl font-light tabular-nums text-emerald-400" x-text="'$' + formatCurrency(stats.persistent_savings?.lifetime?.compression_savings_usd || 0)"></span>
+                    <span class="text-3xl font-light tabular-nums text-emerald-400" x-text="'$' + formatCurrency(stats.persistent_savings?.display_session?.compression_savings_usd || 0)"></span>
                 </div>
                 <div class="mt-2 text-xs text-gray-500">
-                    <span x-show="(stats.persistent_savings?.lifetime?.compression_savings_usd || 0) > 0"
+                    <span x-show="(stats.persistent_savings?.display_session?.compression_savings_usd || 0) > 0"
                           x-text="formatNumber(stats.tokens?.proxy_compression_saved || 0) + ' proxy tokens only; ' + cliFilteringLabel + ' excluded from $'"></span>
-                    <span x-show="!((stats.persistent_savings?.lifetime?.compression_savings_usd || 0) > 0)"
+                    <span x-show="!((stats.persistent_savings?.display_session?.compression_savings_usd || 0) > 0)"
                           x-text="formatNumber(stats.requests?.total || 0) + ' requests processed'"></span>
                 </div>
             </div>
