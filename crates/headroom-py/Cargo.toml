@@ -34,4 +34,5 @@ extension-module = ["pyo3/extension-module"]
 [dependencies]
 headroom-core = { path = "../headroom-core" }
 pyo3 = { workspace = true }
+pyo3-log = { workspace = true }
 serde_json = { workspace = true }

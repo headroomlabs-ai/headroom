@@ -213,7 +213,7 @@
                 <div class="mt-1 text-xs text-gray-500 leading-relaxed">
                     <span x-text="'Proxy ' + formatNumber(stats.tokens?.proxy_compression_saved || 0) + ' (' + proxyShareOfTotal.toFixed(1) + '%)'"></span>
                     <span class="mx-1 text-gray-600">/</span>
-                    <span x-text="cliFilteringLabel + ' ' + formatNumber(cliFilteringSaved) + ' (' + cliFilteringShareOfTotal.toFixed(1) + '%)'"></span>
+                    <span x-text="cliFilteringLabel + ' ' + formatNumber(cliFilteringSaved) + ' this session (' + cliFilteringSessionPctDisplay.toFixed(1) + '%)'"></span>
                 </div>
                 <div class="mt-1 text-xs text-gray-600 leading-relaxed">
                     <span x-text="'Of total wire: ' + (stats.tokens?.savings_percent || 0).toFixed(2) + '%'" title="Savings as fraction of all input tokens including frozen prefix"></span>
@@ -889,6 +889,42 @@
                         </div>
                     </div>
                 </template>
+                <!-- Cache miss attribution: why expected-cache turns missed (#1313) -->
+                <template x-if="hasMissAttribution">
+                    <div class="mt-5 border-t border-border pt-4">
+                        <div class="flex items-center justify-between mb-3">
+                            <div>
+                                <div class="text-xs text-gray-500 uppercase tracking-wide">Cache Miss Attribution</div>
+                                <div class="text-[11px] text-gray-600 mt-0.5">Why turns that expected a prompt-cache hit missed — TTL lapse (consider a longer TTL) vs the cacheable prefix changing</div>
+                            </div>
+                            <div data-testid="miss-attr-headline" class="rounded-full border bg-black/20 px-3 py-1 text-[11px] uppercase tracking-[0.18em]"
+                                 :class="(missAttribution.ttl_expiry_pct || 0) >= (missAttribution.prefix_change_pct || 0) ? 'border-violet-400/25 text-violet-300/90' : 'border-amber-400/25 text-amber-300/90'"
+                                 x-text="(missAttribution.ttl_expiry_pct || 0) >= (missAttribution.prefix_change_pct || 0) ? 'Mostly TTL lapse' : 'Mostly prefix change'"></div>
+                        </div>
+                        <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+                            <div class="rounded-2xl border border-white/8 bg-black/20 p-4">
+                                <div class="text-[11px] uppercase tracking-[0.18em] text-violet-300/75">TTL Expiry</div>
+                                <div data-testid="miss-attr-ttl-value" class="mt-2 text-3xl font-light text-violet-50" x-text="formatNumber(missAttribution.ttl_expiry || 0)"></div>
+                                <div class="mt-1 text-xs text-gray-500" x-text="(missAttribution.ttl_expiry_pct || 0).toFixed(1) + '% of attributed — idle past cache TTL'"></div>
+                            </div>
+                            <div class="rounded-2xl border border-white/8 bg-black/20 p-4">
+                                <div class="text-[11px] uppercase tracking-[0.18em] text-amber-300/75">Prefix Change</div>
+                                <div data-testid="miss-attr-prefix-value" class="mt-2 text-3xl font-light text-amber-50" x-text="formatNumber(missAttribution.prefix_change || 0)"></div>
+                                <div class="mt-1 text-xs text-gray-500" x-text="(missAttribution.prefix_change_pct || 0).toFixed(1) + '% of attributed — cached prefix shifted'"></div>
+                            </div>
+                            <div class="rounded-2xl border border-white/8 bg-black/20 p-4">
+                                <div class="text-[11px] uppercase tracking-[0.18em] text-gray-400">Unknown</div>
+                                <div data-testid="miss-attr-unknown-value" class="mt-2 text-3xl font-light text-gray-300" x-text="formatNumber(missAttribution.unknown || 0)"></div>
+                                <div class="mt-1 text-xs text-gray-500">stable prefix, within TTL</div>
+                            </div>
+                            <div class="rounded-2xl border border-white/8 bg-black/20 p-4">
+                                <div class="text-[11px] uppercase tracking-[0.18em] text-gray-400">Total Misses</div>
+                                <div data-testid="miss-attr-total-value" class="mt-2 text-3xl font-light text-gray-100" x-text="formatNumber(missAttribution.total || 0)"></div>
+                                <div class="mt-1 text-xs text-gray-500">expected a cache hit, got none</div>
+                            </div>
+                        </div>
+                    </div>
+                </template>
                 <!-- Per-provider breakdown -->
                 <template x-if="Object.keys(stats.prefix_cache?.by_provider || {}).length > 0">
                     <div class="mt-4 border-t border-border pt-3">
@@ -987,8 +1023,12 @@
                         <span class="font-mono text-sm" x-text="formatNumber(stats.tokens?.total_before_compression || 0)"></span>
                     </div>
                     <div class="flex justify-between items-center">
-                        <span class="text-sm text-gray-400" x-text="cliFilteringLabel + ' Filtered'"></span>
+                        <span class="text-sm text-gray-400" x-text="cliFilteringLabel + ' Filtered (this session)'"></span>
                         <span class="font-mono text-sm text-emerald-400" x-text="formatNumber(cliFilteringSaved)"></span>
+                    </div>
+                    <div class="flex justify-between items-center" x-show="cliFilteringLifetime > 0">
+                        <span class="text-sm text-gray-500" x-text="cliFilteringLabel + ' Filtered (lifetime)'"></span>
+                        <span class="font-mono text-sm text-emerald-400/70" x-text="formatNumber(cliFilteringLifetime)"></span>
                     </div>
                     <div class="flex justify-between items-center">
                         <span class="text-sm text-gray-400">Proxy Removed</span>
@@ -1363,6 +1403,18 @@
                         </div>
                         <div class="mt-2 text-xs text-gray-500">Based on persisted weekly buckets</div>
                     </div>
+
+                    <template x-if="historyStats.cli_filtering">
+                        <div class="bg-surface rounded-lg p-4 border border-border">
+                            <div class="text-xs text-gray-500 uppercase tracking-wide mb-1"
+                                 x-text="(historyStats.cli_filtering?.label || cliFilteringLabel) + ' Lifetime Saved'"></div>
+                            <div class="flex items-baseline gap-2">
+                                <span class="text-3xl font-light tabular-nums text-cyan-400"
+                                      x-text="formatNumber(historyStats.cli_filtering?.lifetime?.tokens_saved || 0)"></span>
+                            </div>
+                            <div class="mt-2 text-xs text-gray-500">CLI output filtering (lifetime)</div>
+                        </div>
+                    </template>
                 </div>
 
                 <template x-if="hasHistoricalData">
@@ -2396,6 +2448,16 @@
                         || (pf.compression_foregone_tokens || 0) > 0;
                 },
 
+                // --- Cache miss attribution (#1313) ---
+
+                get missAttribution() {
+                    return this.stats.prefix_cache?.miss_attribution?.totals || {};
+                },
+
+                get hasMissAttribution() {
+                    return (this.missAttribution.total || 0) > 0;
+                },
+
                 // --- Waste Signals ---
 
                 wasteSignalLabel(signal) {
@@ -2483,6 +2545,15 @@
                     const total = this.compressionTotalBefore;
                     if (total <= 0) return 0;
                     return this.cliFilteringSaved / total * 100;
+                },
+
+                get cliFilteringLifetime() {
+                    return this.stats.savings?.by_layer?.cli_filtering?.lifetime?.tokens_saved ?? 0;
+                },
+
+                get cliFilteringSessionPctDisplay() {
+                    const p = this.stats.savings?.by_layer?.cli_filtering?.session_savings_pct;
+                    return (p === null || p === undefined) ? this.cliFilteringShareOfTotal : p;
                 },
 
                 // --- Headline savings percent ---

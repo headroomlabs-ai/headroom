@@ -8,16 +8,16 @@ This guide will help you get up and running with Headroom in under 5 minutes.
 
 ```bash
 # Core package (minimal dependencies)
-pip install headroom
+pip install headroom-ai
 
 # With proxy server
-pip install headroom[proxy]
+pip install headroom-ai[proxy]
 
 # With semantic relevance (for smarter compression)
-pip install headroom[relevance]
+pip install headroom-ai[relevance]
 
 # Everything
-pip install headroom[all]
+pip install headroom-ai[all]
 ```
 
 **TypeScript / Node.js:**

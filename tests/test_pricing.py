@@ -28,6 +28,15 @@ def test_pricing_public_exports_and_provider_registries() -> None:
         == ANTHROPIC_PRICES["claude-3-5-sonnet-20241022"]
     )
 
+    assert "get_deepseek_registry" in pricing.__all__
+    assert "DEEPSEEK_PRICES" in pricing.__all__
+    deepseek_registry = pricing.get_deepseek_registry()
+    assert deepseek_registry.source_url == "https://api-docs.deepseek.com/quick_start/pricing"
+    flash = deepseek_registry.get_price("deepseek-v4-flash")
+    assert flash is not None
+    assert flash.input_per_1m == 0.14
+    assert flash.output_per_1m == 0.28
+
     openai_registry.prices.pop("gpt-4o")
     anthropic_registry.prices.pop("claude-3-5-sonnet-20241022")
     assert "gpt-4o" in OPENAI_PRICES

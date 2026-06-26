@@ -14,7 +14,6 @@ import json
 import logging
 import os
 import random
-import subprocess
 import threading
 import time
 from collections import OrderedDict
@@ -23,8 +22,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from headroom import paths as _paths
+from headroom._subprocess import run
 
 if TYPE_CHECKING:
+    import httpx
     from fastapi import Request
 
 logger = logging.getLogger("headroom.proxy")
@@ -914,6 +915,31 @@ def jitter_delay_ms(base_ms: int, max_ms: int, attempt: int) -> float:
     return capped * (0.5 + random.random())
 
 
+def retry_after_ms(response: httpx.Response, max_ms: int) -> float | None:
+    """Parse an HTTP ``Retry-After`` header into a millisecond delay, capped at ``max_ms``.
+
+    Returns the delay in ms for a numeric ``seconds`` value or an HTTP-date, or
+    ``None`` when the header is absent or unparseable so the caller falls back to
+    exponential backoff. Anthropic sends integer seconds; the HTTP-date branch
+    covers other upstreams. Fails open on any parse error.
+    """
+    value = response.headers.get("retry-after")
+    if not value:
+        return None
+    try:
+        seconds = float(value)
+    except ValueError:
+        try:
+            from datetime import datetime
+            from email.utils import parsedate_to_datetime
+
+            retry_at = parsedate_to_datetime(value)
+            seconds = (retry_at - datetime.now(retry_at.tzinfo)).total_seconds()
+        except (TypeError, ValueError):
+            return None
+    return min(max(seconds, 0.0) * 1000.0, float(max_ms))
+
+
 # Image compression availability (do not retain a global compressor instance)
 _image_compressor_available: bool | None = None
 
@@ -1181,7 +1207,7 @@ def _read_rtk_lifetime_stats() -> dict[str, Any] | None:
         )
 
     try:
-        result = subprocess.run(
+        result = run(
             _rtk_gain_command(rtk_path, scope),
             capture_output=True,
             text=True,
@@ -1242,7 +1268,7 @@ def _read_lean_ctx_lifetime_stats() -> dict[str, Any] | None:
     base_payload = _context_tool_zero_payload(tool=_CONTEXT_TOOL_LEAN_CTX, installed=True)
 
     try:
-        result = subprocess.run(
+        result = run(
             [str(lean_ctx_path), "gain", "--json"],
             capture_output=True,
             text=True,
@@ -2518,6 +2544,35 @@ def _reset_session_ccr_tracker_for_test() -> None:
     global _session_ccr_tracker
     with _session_ccr_tracker_lock:
         _session_ccr_tracker = None
+
+
+def should_inject_ccr_tool(
+    *,
+    configured_inject_tool: bool,
+    frozen_message_count: int,
+    has_compressed_content: bool,
+) -> tuple[bool, bool]:
+    """Decide whether the ``headroom_retrieve`` tool must be injected this turn.
+
+    This is the decision the Anthropic handler used to inline. It is extracted
+    so the #1006 regression can be pinned at the decision point itself.
+
+    Tool injection is normally deferred when there is a frozen message prefix
+    (``frozen_message_count > 0``) to preserve the prompt cache. But if
+    compression emitted fresh markers this turn, deferring would hand the agent
+    a ``<<ccr:hash>>`` marker with no tool to redeem it — silent data loss. In
+    that case we override the deferral and inject anyway (one cache miss is
+    cheaper than dropped content).
+
+    Returns ``(should_inject, is_marker_override)``. ``is_marker_override`` is
+    True only when injection happens *because* of new markers despite a deferral,
+    so the caller can log the override distinctly.
+    """
+    inject_tool = configured_inject_tool
+    if inject_tool and frozen_message_count > 0:
+        inject_tool = False  # defer to preserve cache
+    is_marker_override = not inject_tool and has_compressed_content
+    return (inject_tool or is_marker_override), is_marker_override
 
 
 def apply_session_sticky_ccr_tool(

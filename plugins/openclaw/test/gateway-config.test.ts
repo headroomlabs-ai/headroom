@@ -228,6 +228,65 @@ describe("applyGatewayProviderBaseUrls", () => {
     expect(result.changed).toBe(false);
     expect((result.config as any).models?.providers?.["github-copilot"]).toBeUndefined();
   });
+
+  it("documents the Gate-D risk: anthropic without an explicit baseUrl routes to the bare proxy origin", () => {
+    const result = applyGatewayProviderBaseUrls({}, "http://127.0.0.1:8787", ["anthropic"]);
+
+    expect(result.changed).toBe(true);
+    expect((result.config as any).models.providers.anthropic).toEqual({
+      baseUrl: "http://127.0.0.1:8787",
+      models: [],
+    });
+  });
+
+  it("documents the multi-provider risk: providers sharing /v1 collapse to the same proxy path", () => {
+    const result = applyGatewayProviderBaseUrls(
+      {
+        models: {
+          providers: {
+            openai: {
+              baseUrl: "https://api.openai.com/v1",
+            },
+            "github-copilot": {
+              baseUrl: "https://api.githubcopilot.com/v1",
+            },
+          },
+        },
+      },
+      "http://127.0.0.1:8787",
+      ["openai", "github-copilot"],
+    );
+
+    expect(result.changed).toBe(true);
+    expect((result.config as any).models.providers.openai.baseUrl).toBe(
+      "http://127.0.0.1:8787/v1",
+    );
+    expect((result.config as any).models.providers["github-copilot"].baseUrl).toBe(
+      "http://127.0.0.1:8787/v1",
+    );
+  });
+
+  it("re-points an already routed provider to a new proxy origin without duplicating paths", () => {
+    const result = applyGatewayProviderBaseUrls(
+      {
+        models: {
+          providers: {
+            "openai-codex": {
+              baseUrl: "http://127.0.0.1:8787/backend-api",
+            },
+          },
+        },
+      },
+      "http://localhost:8787",
+      ["openai-codex"],
+    );
+
+    expect(result.changed).toBe(true);
+    expect((result.config as any).models.providers["openai-codex"]).toEqual({
+      baseUrl: "http://localhost:8787/backend-api",
+      models: [],
+    });
+  });
 });
 
 describe("applyGatewayProviderBaseUrlsInPlace", () => {

@@ -29,7 +29,7 @@ import threading
 import time
 from datetime import timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from headroom import paths as _paths
 from headroom.subscription.base import QuotaTracker
@@ -487,7 +487,8 @@ class SubscriptionTracker(QuotaTracker):
         try:
             lock_path.parent.mkdir(parents=True, exist_ok=True)
             fd = open(lock_path, "w")  # noqa: SIM115
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl_any = cast(Any, fcntl)
+            fcntl_any.flock(fd, fcntl_any.LOCK_EX | fcntl_any.LOCK_NB)
             fd.write(str(os.getpid()))
             fd.flush()
             self._rtk_poll_lock_fd = fd
@@ -517,7 +518,8 @@ class SubscriptionTracker(QuotaTracker):
         try:
             import fcntl
 
-            fcntl.flock(fd, fcntl.LOCK_UN)
+            fcntl_any = cast(Any, fcntl)
+            fcntl_any.flock(fd, fcntl_any.LOCK_UN)
         except Exception:
             pass
         try:
@@ -727,8 +729,9 @@ class SubscriptionTracker(QuotaTracker):
                 self._state.mark_error("fetch returned None")
             return
 
-        # Read transcript-based window tokens
-        window_tokens = _compute_window_tokens_for_snapshot(snapshot)
+        # Offload off the event loop: this scans every ~/.claude/projects/**/*.jsonl
+        # transcript and json.loads each line, which can take seconds and block /health.
+        window_tokens = await asyncio.to_thread(_compute_window_tokens_for_snapshot, snapshot)
 
         # Detect anomalies
         discrepancies = _detect_discrepancies(snapshot, window_tokens)

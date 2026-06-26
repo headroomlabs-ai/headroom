@@ -105,6 +105,7 @@ from headroom.providers.registry import (
 )
 from headroom.proxy import runtime_env
 from headroom.proxy.auth_mode import should_stamp_codex_client
+from headroom.proxy.background_compression import BackgroundCompressor
 
 # =============================================================================
 # Extracted modules (re-exported for backward compatibility)
@@ -131,6 +132,7 @@ from headroom.proxy.helpers import (
     initialize_context_tool_session_baseline,
     is_anthropic_auth,  # noqa: F401
     jitter_delay_ms,
+    retry_after_ms,
 )
 from headroom.proxy.memory_handler import MemoryConfig, MemoryHandler
 
@@ -152,7 +154,7 @@ from headroom.proxy.prometheus_metrics import PrometheusMetrics  # noqa: F401
 from headroom.proxy.rate_limiter import TokenBucketRateLimiter  # noqa: F401
 from headroom.proxy.request_logger import RequestLogger  # noqa: F401
 from headroom.proxy.semantic_cache import SemanticCache  # noqa: F401
-from headroom.proxy.ssl_context import find_ca_bundle
+from headroom.proxy.ssl_context import build_httpx_verify
 from headroom.proxy.warmup import WarmupRegistry
 from headroom.proxy.ws_session_registry import WebSocketSessionRegistry
 from headroom.subscription.base import get_quota_registry, reset_quota_registry
@@ -169,6 +171,7 @@ from headroom.transforms import (
     CacheAligner,
     CodeAwareCompressor,
     CodeCompressorConfig,
+    CompressionStrategy,
     ContentRouter,
     ContentRouterConfig,
     TransformPipeline,
@@ -626,6 +629,19 @@ class HeadroomProxy(
         )
         if config.disable_kompress:
             router_config.enable_kompress = False
+            # Opt-in restore of the legacy behaviour: send fall-through content
+            # to PASSTHROUGH instead of the default KOMPRESS fallback strategy.
+            if config.disable_kompress_fallback:
+                router_config.fallback_strategy = CompressionStrategy.PASSTHROUGH
+        # `HEADROOM_LOSSLESS_ONLY=1` routes SmartCrusher through strict
+        # marker-free mode: lossless tabular compaction still applies, but
+        # any path that would emit a `<<ccr:…>>` marker (row-drop or
+        # opaque-blob offload) leaves the content uncompacted instead — so
+        # the session needs no CCR retrieval round-trips to stay recoverable.
+        if "HEADROOM_LOSSLESS_ONLY" in os.environ:
+            router_config.smart_crusher_lossless_only = _get_env_bool(
+                "HEADROOM_LOSSLESS_ONLY", False
+            )
         # A non-None exclude_tools replaces DEFAULT_EXCLUDE_TOOLS in
         # ContentRouter, so merge rather than assign.
         if config.exclude_tools:
@@ -677,12 +693,18 @@ class HeadroomProxy(
         )
         self._code_aware_status = "lazy" if config.code_aware_enabled else "disabled"
 
+        _intercept_prefix: list = []
+        if os.environ.get("HEADROOM_INTERCEPT_ENABLED"):
+            from headroom.proxy.interceptors import ToolResultInterceptorTransform
+
+            _intercept_prefix = [ToolResultInterceptorTransform()]
+
         self.anthropic_pipeline = TransformPipeline(
-            transforms=[cache_aligner, anthropic_router],
+            transforms=[*_intercept_prefix, cache_aligner, anthropic_router],
             provider=self.anthropic_provider,
         )
         self.openai_pipeline = TransformPipeline(
-            transforms=[cache_aligner, openai_router],
+            transforms=[*_intercept_prefix, cache_aligner, openai_router],
             provider=self.openai_provider,
         )
 
@@ -807,6 +829,28 @@ class HeadroomProxy(
             max_workers=_compression_max,
             thread_name_prefix="headroom-compress",
         )
+        # Phase 3 (#1171): off-path background compression. When enabled, a
+        # cold-start-large request (frozen=0 + large live zone) forwards
+        # uncompressed immediately and enqueues the compression here instead of
+        # blocking the request thread under the 30s budget (which leaks a
+        # non-preemptible worker -> executor saturation -> cascade). Default
+        # off (opt-in), fail-open. Per-process, matching _compression_caches.
+        self._background_compression_enabled: bool = os.environ.get(
+            "HEADROOM_BACKGROUND_COMPRESSION", ""
+        ).strip().lower() in ("1", "true", "yes", "on")
+        try:
+            self._background_compression_min_tokens: int = int(
+                os.environ.get("HEADROOM_BACKGROUND_COMPRESSION_MIN_TOKENS", "50000")
+            )
+        except ValueError:
+            self._background_compression_min_tokens = 50000
+        # Dedicated single thread: no-timeout background jobs never contend with
+        # the request-path executor (Phase 3, #1171). Lazy -- no thread spawns
+        # until the first off-path job is submitted.
+        self._background_compression_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="headroom-bg-compress"
+        )
+        self._background_compressor = BackgroundCompressor(self._run_compression_background)
         # Gauge: currently-running compression tasks. Mutated under
         # ``_compression_metrics_lock`` from worker threads + the asyncio
         # event loop.
@@ -1107,6 +1151,18 @@ class HeadroomProxy(
                     self._compression_queue_timeouts += 1
             raise
 
+    async def _run_compression_background(self, fn):  # noqa: ANN001, ANN201
+        """Run a compression callable on the shared executor with NO request-
+        coupled deadline (Phase 3 off-path, #1171).
+
+        Unlike ``_run_compression_in_executor`` there is no ``asyncio.wait_for``
+        and no leaked-thread accounting: no caller is waiting, so a slow run
+        backs up the background queue rather than starving the request executor.
+        Runs on the dedicated single-thread background executor.
+        """
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self._background_compression_executor, fn)
+
     def _get_compression_cache(self, session_id: str) -> CompressionCache:
         """Get or create a CompressionCache for a session.
 
@@ -1177,7 +1233,10 @@ class HeadroomProxy(
             operation="proxy.startup",
             metadata={"port": self.config.port, "host": self.config.host},
         )
-        _ca_bundle = find_ca_bundle()
+        # Resolve TLS verification: a custom CA bundle (corporate PKI) if one
+        # is configured, else a strict-relaxed default context when
+        # HEADROOM_TLS_STRICT=0, else httpx's default strict verification.
+        _verify = build_httpx_verify()
         _client_kwargs: dict[str, Any] = {
             "timeout": httpx.Timeout(
                 connect=self.config.connect_timeout_seconds,
@@ -1190,7 +1249,7 @@ class HeadroomProxy(
                 max_keepalive_connections=self.config.max_keepalive_connections,
                 keepalive_expiry=self.config.keepalive_expiry,
             ),
-            "verify": _ca_bundle if _ca_bundle is not None else True,
+            "verify": _verify,
         }
         self.http_client = httpx.AsyncClient(http2=self.config.http2, **_client_kwargs)
         # Reuse the primary client when HTTP/2 is already off; otherwise keep a
@@ -1532,6 +1591,7 @@ class HeadroomProxy(
         request_id: str | None = None,
         forwarder_name: str = "server",
         path_for_log: str | None = None,
+        timeout: httpx.Timeout | float | None = None,
     ) -> httpx.Response:
         """Make request with retry and exponential backoff.
 
@@ -1575,20 +1635,25 @@ class HeadroomProxy(
             source=source,
         )
 
+        post_kwargs: dict = {"content": outbound_bytes, "headers": outbound_headers}
+        if timeout is not None:
+            post_kwargs["timeout"] = timeout
+
         for attempt in range(self.config.retry_max_attempts):
             try:
                 if stream:
                     # For streaming, we return early - retry happens at higher level
                     return await self.http_client.post(  # type: ignore[union-attr]
-                        url, content=outbound_bytes, headers=outbound_headers
+                        url, **post_kwargs
                     )
                 else:
                     response = await self.http_client.post(  # type: ignore[union-attr]
-                        url, content=outbound_bytes, headers=outbound_headers
+                        url, **post_kwargs
                     )
 
-                    # Don't retry client errors (4xx)
-                    if 400 <= response.status_code < 500:
+                    # Don't retry client errors (4xx) — except 429, the most
+                    # retriable status, which carries an authoritative Retry-After (#1221).
+                    if 400 <= response.status_code < 500 and response.status_code != 429:
                         return response
 
                     # Retry server errors (5xx)
@@ -1598,6 +1663,27 @@ class HeadroomProxy(
                             request=response.request,
                             response=response,
                         )
+
+                    # Rate limit (429): retry honoring Retry-After, but return it
+                    # verbatim once exhausted — a clean rate-limit signal beats a 5xx.
+                    if response.status_code == 429:
+                        if (
+                            not self.config.retry_enabled
+                            or attempt >= self.config.retry_max_attempts - 1
+                        ):
+                            return response
+                        delay_ms = retry_after_ms(
+                            response, self.config.retry_max_delay_ms
+                        ) or jitter_delay_ms(
+                            self.config.retry_base_delay_ms,
+                            self.config.retry_max_delay_ms,
+                            attempt,
+                        )
+                        logger.warning(
+                            f"Upstream 429 (attempt {attempt + 1}), retrying in {delay_ms:.0f}ms"
+                        )
+                        await asyncio.sleep(delay_ms / 1000)
+                        continue
 
                     return response
 
@@ -1846,6 +1932,8 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     await proxy.usage_reporter.start(proxy)
                 if proxy.traffic_learner:
                     await proxy.traffic_learner.start()
+                if proxy._background_compression_enabled:
+                    await proxy._background_compressor.start()
 
                 # Only start beacon if we acquire the lock (first worker wins)
                 _beacon_is_owner[0] = _try_acquire_beacon_lock()
@@ -1880,6 +1968,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 await proxy.usage_reporter.stop()
             if proxy.traffic_learner:
                 await proxy.traffic_learner.stop()
+            if proxy._background_compression_enabled:
+                await proxy._background_compressor.stop()
+            proxy._background_compression_executor.shutdown(wait=False)
             if proxy.code_graph_watcher:
                 proxy.code_graph_watcher.stop()
             await proxy.shutdown()
@@ -2068,6 +2159,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "cache": config.cache_enabled,
                 "rate_limit": config.rate_limit_enabled,
                 "disable_kompress": config.disable_kompress,
+                "disable_kompress_fallback": config.disable_kompress_fallback,
                 "disable_kompress_anthropic": config.disable_kompress_anthropic,
                 "disable_kompress_openai": config.disable_kompress_openai,
                 "memory": config.memory_enabled,
@@ -3086,7 +3178,15 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         series: Literal["history", "hourly", "daily", "weekly", "monthly"] = "history",
         history_mode: Literal["compact", "full", "none"] = "compact",
     ):
-        """Get durable proxy compression history plus display-session state."""
+        """Get durable proxy compression history plus display-session state.
+
+        The JSON payload also carries a ``cli_filtering`` key with live RTK
+        stats. This is a curated subset (``tool``, ``label``, ``lifetime``,
+        ``session``) tailored to the Historical tab, not the full
+        ``_get_context_tool_stats()`` payload that ``/stats`` exposes. It is
+        ``None`` when RTK is absent or its stats cannot be read, so the tab
+        simply hides the card rather than erroring.
+        """
         if format == "csv":
             filename = f"headroom-stats-history-{series}.csv"
             return Response(
@@ -3095,7 +3195,30 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 headers={"Content-Disposition": f'attachment; filename="{filename}"'},
             )
 
-        return proxy.metrics.savings_tracker.history_response(history_mode=history_mode)
+        history = proxy.metrics.savings_tracker.history_response(history_mode=history_mode)
+
+        # Augment with live RTK/cli-filtering lifetime stats so the Historical
+        # tab can display them.  These live in the context-tool's own stats file
+        # and survive proxy restarts — exactly what the Historical tab needs.
+        # Best-effort: if the RTK stats file can't be read (missing, parse error,
+        # IO), fall back to None so the Historical tab stays available instead of
+        # 500ing. The tab hides the card when cli_filtering is None.
+        try:
+            cli_stats = await asyncio.to_thread(_get_context_tool_stats)
+        except Exception:
+            logger.debug("stats-history: RTK stats unavailable", exc_info=True)
+            cli_stats = None
+        if cli_stats:
+            history["cli_filtering"] = {
+                "tool": str(cli_stats.get("tool", "rtk")),
+                "label": str(cli_stats.get("label", "RTK")),
+                "lifetime": cli_stats.get("lifetime", {}),
+                "session": cli_stats.get("session", {}),
+            }
+        else:
+            history["cli_filtering"] = None
+
+        return history
 
     @app.get("/transformations/feed", dependencies=[Depends(_require_loopback)])
     async def transformations_feed(limit: int = 20):
@@ -3218,7 +3341,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         return {"status": "cache disabled"}
 
     # CCR (Compress-Cache-Retrieve) endpoints
-    @app.post("/v1/retrieve")
+    @app.post("/v1/retrieve", dependencies=[Depends(_require_loopback)])
     async def ccr_retrieve(request: Request):
         """Retrieve original content from CCR compression cache.
 
@@ -3281,7 +3404,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 ),
             )
 
-    @app.get("/v1/retrieve/stats")
+    @app.get("/v1/retrieve/stats", dependencies=[Depends(_require_loopback)])
     async def ccr_stats():
         """Get CCR compression store statistics."""
         store = get_compression_store()
@@ -3560,7 +3683,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             status_code=404, detail=f"No TOIN pattern found with hash starting with: {hash_prefix}"
         )
 
-    @app.get("/v1/retrieve/{hash_key}")
+    @app.get("/v1/retrieve/{hash_key}", dependencies=[Depends(_require_loopback)])
     async def ccr_retrieve_get(hash_key: str, query: str | None = None):
         """GET version of CCR retrieve for easier testing."""
         store = get_compression_store()
@@ -3600,7 +3723,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             )
 
     # CCR Tool Call Handler - for agent frameworks to call when LLM uses headroom_retrieve
-    @app.post("/v1/retrieve/tool_call")
+    @app.post("/v1/retrieve/tool_call", dependencies=[Depends(_require_loopback)])
     async def ccr_handle_tool_call(request: Request):
         """Handle a CCR tool call from an LLM response.
 
@@ -3717,7 +3840,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         }
 
     # Compression-only endpoint (for TypeScript SDK and other HTTP clients)
-    @app.post("/v1/compress")
+    @app.post("/v1/compress", dependencies=[Depends(_require_loopback)])
     async def compress_messages(request: Request):
         return await proxy.handle_compress(request)
 
@@ -3763,6 +3886,11 @@ def _proxy_config_from_env() -> ProxyConfig:
         port=_get_env_int("HEADROOM_PORT", 8787),
         openai_api_url=os.environ.get("OPENAI_TARGET_API_URL"),
         anthropic_api_url=os.environ.get("ANTHROPIC_TARGET_API_URL"),
+        anthropic_buffered_request_timeout_seconds=_get_env_int(
+            "HEADROOM_ANTHROPIC_BUFFERED_REQUEST_TIMEOUT_SECONDS",
+            600,
+            min_value=1,
+        ),
         vertex_api_url=os.environ.get("VERTEX_TARGET_API_URL"),
         backend=_get_env_str("HEADROOM_BACKEND", "anthropic"),
         bedrock_region=_get_env_str("HEADROOM_BEDROCK_REGION", "us-west-2"),
@@ -3770,6 +3898,7 @@ def _proxy_config_from_env() -> ProxyConfig:
         bedrock_api_url=os.environ.get("BEDROCK_TARGET_API_URL"),
         anyllm_provider=_get_env_str("HEADROOM_ANYLLM_PROVIDER", "openai"),
         disable_kompress=_get_env_bool("HEADROOM_DISABLE_KOMPRESS", False),
+        disable_kompress_fallback=_get_env_bool("HEADROOM_DISABLE_KOMPRESS_FALLBACK", False),
         disable_kompress_anthropic=_get_env_optional_bool("HEADROOM_DISABLE_KOMPRESS_ANTHROPIC"),
         disable_kompress_openai=_get_env_optional_bool("HEADROOM_DISABLE_KOMPRESS_OPENAI"),
         max_connections=_get_env_int("HEADROOM_MAX_CONNECTIONS", 500),
@@ -3778,6 +3907,12 @@ def _proxy_config_from_env() -> ProxyConfig:
         http2=_get_env_bool("HEADROOM_HTTP2", True),
         periodic_toin_stats_enabled=_get_env_bool("HEADROOM_PERIODIC_TOIN_STATS", True),
         mode=normalize_proxy_mode(_get_env_str("HEADROOM_MODE", PROXY_MODE_TOKEN)),
+        read_maturation=_get_env_bool("HEADROOM_READ_MATURATION", False),
+        read_maturation_quiesce_turns=_get_env_int("HEADROOM_READ_MATURATION_QUIESCE_TURNS", 5),
+        read_maturation_max_hold_turns=_get_env_int("HEADROOM_READ_MATURATION_MAX_HOLD_TURNS", 25),
+        read_maturation_min_size_bytes=_get_env_int(
+            "HEADROOM_READ_MATURATION_MIN_SIZE_BYTES", 2048
+        ),
     )
 
 
@@ -3911,7 +4046,8 @@ def run_server(
         else:
             logger.warning(
                 "Headroom is running with workers=%d. The in-memory CCR store, "
-                "compression cache, prefix tracker, TOIN state, and CostTracker are all "
+                "compression cache (incl. off-path background compression), prefix "
+                "tracker, TOIN state, and CostTracker are all "
                 "per-process; multi-worker deployments produce silent CCR retrieval "
                 "failures, avoidable cache busts, and an unstable dashboard 'Proxy $ Saved' "
                 "hero tile (each /stats poll hits a different worker's partial total) when "
@@ -3960,15 +4096,25 @@ def _get_env_optional_bool(name: str) -> bool | None:
     return val.lower() in ("true", "1", "yes", "on")
 
 
-def _get_env_int(name: str, default: int) -> int:
+def _get_env_int(name: str, default: int, *, min_value: int | None = None) -> int:
     """Get integer from environment variable."""
     val = os.environ.get(name)
     if val is None:
         return default
     try:
-        return int(val)
+        parsed = int(val)
     except ValueError:
         return default
+    if min_value is not None and parsed < min_value:
+        return default
+    return parsed
+
+
+def _positive_int_arg(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be >= 1")
+    return parsed
 
 
 def _get_env_float(name: str, default: float) -> float:
@@ -3994,7 +4140,8 @@ def _parse_exclude_tools(cli_excludes: str | None) -> set[str]:
     (e.g. "WebSearch,WebFetch"). Each name is added in both original and
     lowercase form for case-insensitive matching, mirroring
     DEFAULT_EXCLUDE_TOOLS. Unset/empty -> empty set (DEFAULT_EXCLUDE_TOOLS
-    used unchanged).
+    used unchanged). Entries may contain glob patterns (e.g. "mcp__*"); see
+    config.is_tool_excluded for the matching semantics.
     """
     raw = ",".join(s for s in (cli_excludes, os.environ.get("HEADROOM_EXCLUDE_TOOLS")) if s)
     names: set[str] = set()
@@ -4057,6 +4204,15 @@ if __name__ == "__main__":
     parser.add_argument(
         "--anthropic-api-url",
         help=f"Custom Anthropic API URL (default: {DEFAULT_ANTHROPIC_API_URL})",
+    )
+    parser.add_argument(
+        "--anthropic-buffered-request-timeout-seconds",
+        type=_positive_int_arg,
+        default=600,
+        help=(
+            "Anthropic buffered read timeout in seconds for non-streaming "
+            "message and batch paths (default: 600)"
+        ),
     )
     parser.add_argument(
         "--vertex-api-url",
@@ -4165,6 +4321,15 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--disable-kompress-fallback",
+        action="store_true",
+        help=(
+            "With --disable-kompress, route fall-through content to PASSTHROUGH instead of "
+            "the default KOMPRESS fallback (restores legacy --disable-kompress behaviour). "
+            "Also settable via HEADROOM_DISABLE_KOMPRESS_FALLBACK=1."
+        ),
+    )
+    parser.add_argument(
         "--disable-kompress-anthropic",
         dest="disable_kompress_anthropic",
         action="store_const",
@@ -4205,6 +4370,7 @@ if __name__ == "__main__":
         default=None,
         help="Comma-separated tool names whose output is never compressed, "
         "merged with the built-in defaults (e.g., WebSearch,WebFetch). "
+        "Entries may use glob patterns, e.g. 'mcp__*' to exclude every MCP tool. "
         "Also settable via HEADROOM_EXCLUDE_TOOLS env var.",
     )
 
@@ -4257,6 +4423,9 @@ if __name__ == "__main__":
     cache_enabled = env_cache if not args.no_cache else False
     rate_limit_enabled = env_rate_limit if not args.no_rate_limit else False
     disable_kompress = args.disable_kompress or _get_env_bool("HEADROOM_DISABLE_KOMPRESS", False)
+    disable_kompress_fallback = args.disable_kompress_fallback or _get_env_bool(
+        "HEADROOM_DISABLE_KOMPRESS_FALLBACK", False
+    )
     disable_kompress_anthropic = (
         args.disable_kompress_anthropic
         if args.disable_kompress_anthropic is not None
@@ -4282,6 +4451,11 @@ if __name__ == "__main__":
         port=_get_env_int("HEADROOM_PORT", args.port),
         openai_api_url=_get_env_str("OPENAI_TARGET_API_URL", args.openai_api_url),
         anthropic_api_url=_get_env_str("ANTHROPIC_TARGET_API_URL", args.anthropic_api_url),
+        anthropic_buffered_request_timeout_seconds=_get_env_int(
+            "HEADROOM_ANTHROPIC_BUFFERED_REQUEST_TIMEOUT_SECONDS",
+            args.anthropic_buffered_request_timeout_seconds,
+            min_value=1,
+        ),
         vertex_api_url=_get_env_str("VERTEX_TARGET_API_URL", args.vertex_api_url),
         # Backend settings
         backend=_get_env_str("HEADROOM_BACKEND", args.backend),  # type: ignore[arg-type]
@@ -4310,6 +4484,7 @@ if __name__ == "__main__":
         log_full_messages=args.log_messages or _get_env_bool("HEADROOM_LOG_MESSAGES", False),
         code_aware_enabled=code_aware_enabled,
         disable_kompress=disable_kompress,
+        disable_kompress_fallback=disable_kompress_fallback,
         disable_kompress_anthropic=disable_kompress_anthropic,
         disable_kompress_openai=disable_kompress_openai,
         # Connection pool settings
@@ -4317,6 +4492,12 @@ if __name__ == "__main__":
         max_keepalive_connections=_get_env_int("HEADROOM_MAX_KEEPALIVE", args.max_keepalive),
         keepalive_expiry=_get_env_float("HEADROOM_KEEPALIVE_EXPIRY", args.keepalive_expiry),
         http2=not args.no_http2 and _get_env_bool("HEADROOM_HTTP2", True),
+        read_maturation=_get_env_bool("HEADROOM_READ_MATURATION", False),
+        read_maturation_quiesce_turns=_get_env_int("HEADROOM_READ_MATURATION_QUIESCE_TURNS", 5),
+        read_maturation_max_hold_turns=_get_env_int("HEADROOM_READ_MATURATION_MAX_HOLD_TURNS", 25),
+        read_maturation_min_size_bytes=_get_env_int(
+            "HEADROOM_READ_MATURATION_MIN_SIZE_BYTES", 2048
+        ),
         tool_profiles=tool_profiles if tool_profiles else None,
         exclude_tools=exclude_tools if exclude_tools else None,
         mode=normalize_proxy_mode(_get_env_str("HEADROOM_MODE", PROXY_MODE_TOKEN)),

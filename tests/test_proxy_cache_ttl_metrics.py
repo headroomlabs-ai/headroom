@@ -250,3 +250,72 @@ def test_stats_endpoint_reports_langfuse_configuration(monkeypatch: pytest.Monke
     assert langfuse["enabled"] is True
     assert langfuse["service_name"] == "headroom-proxy"
     assert langfuse["endpoint"] == "https://cloud.langfuse.com/api/public/otel/v1/traces"
+
+
+# --- Cache-miss attribution (#1313) ---
+
+
+def test_record_cache_miss_attribution_buckets_by_provider_and_reason() -> None:
+    metrics = PrometheusMetrics()
+    asyncio.run(metrics.record_cache_miss_attribution("anthropic", "ttl_expiry"))
+    asyncio.run(metrics.record_cache_miss_attribution("anthropic", "ttl_expiry"))
+    asyncio.run(metrics.record_cache_miss_attribution("anthropic", "prefix_change"))
+    asyncio.run(metrics.record_cache_miss_attribution("anthropic", "unknown"))
+
+    buckets = metrics.cache_miss_attribution_by_provider["anthropic"]
+    assert buckets["ttl_expiry"] == 2
+    assert buckets["prefix_change"] == 1
+    assert buckets["unknown"] == 1
+
+
+def test_prefix_cache_stats_include_miss_attribution() -> None:
+    metrics = PrometheusMetrics()
+    asyncio.run(metrics.record_cache_miss_attribution("anthropic", "ttl_expiry"))
+    asyncio.run(metrics.record_cache_miss_attribution("anthropic", "ttl_expiry"))
+    asyncio.run(metrics.record_cache_miss_attribution("anthropic", "prefix_change"))
+    asyncio.run(metrics.record_cache_miss_attribution("anthropic", "unknown"))
+
+    stats = build_prefix_cache_stats(metrics, None)
+    ma = stats["miss_attribution"]
+
+    assert ma["totals"]["ttl_expiry"] == 2
+    assert ma["totals"]["prefix_change"] == 1
+    assert ma["totals"]["unknown"] == 1
+    assert ma["totals"]["total"] == 4
+    # Percentages are over attributed (non-unknown) misses: 2 / 3, 1 / 3.
+    assert ma["totals"]["ttl_expiry_pct"] == 66.7
+    assert ma["totals"]["prefix_change_pct"] == 33.3
+    assert ma["by_provider"]["anthropic"]["total"] == 4
+
+
+def test_prefix_cache_stats_miss_attribution_empty_when_no_misses() -> None:
+    metrics = PrometheusMetrics()
+    stats = build_prefix_cache_stats(metrics, None)
+    ma = stats["miss_attribution"]
+    assert ma["totals"]["total"] == 0
+    assert ma["totals"]["ttl_expiry_pct"] == 0.0
+    assert ma["by_provider"] == {}
+
+
+def test_prometheus_export_includes_miss_attribution() -> None:
+    metrics = PrometheusMetrics()
+    asyncio.run(metrics.record_cache_miss_attribution("anthropic", "ttl_expiry"))
+    asyncio.run(metrics.record_cache_miss_attribution("anthropic", "prefix_change"))
+
+    exported = asyncio.run(metrics.export())
+
+    assert (
+        'headroom_cache_miss_attribution_total{provider="anthropic",reason="ttl_expiry"} 1'
+        in exported
+    )
+    assert (
+        'headroom_cache_miss_attribution_total{provider="anthropic",reason="prefix_change"} 1'
+        in exported
+    )
+
+
+def test_reset_runtime_clears_miss_attribution() -> None:
+    metrics = PrometheusMetrics()
+    asyncio.run(metrics.record_cache_miss_attribution("anthropic", "ttl_expiry"))
+    asyncio.run(metrics.reset_runtime())
+    assert dict(metrics.cache_miss_attribution_by_provider) == {}

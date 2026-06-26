@@ -35,6 +35,7 @@ use std::time::Duration;
 
 use magika::Session;
 use thiserror::Error;
+use tracing;
 
 use crate::transforms::content_detector::ContentType;
 
@@ -75,15 +76,19 @@ static MAGIKA_SESSION: OnceLock<Mutex<Result<Session, String>>> = OnceLock::new(
 /// Default cap on magika ONNX session init.
 ///
 /// On some platforms `Session::new()` can hang indefinitely instead of
-/// returning an error. Observed on Windows, where magika's transitive
-/// `ort` takes a DirectML / binary path on first init (fastembed is
-/// Windows-gated to `ort-load-dynamic` in `Cargo.toml` for the same
-/// reason, but magika carries its own `ort`). A hang — unlike an `Err` —
-/// is not caught by the tiered fallback in [`crate::transforms::detection`],
-/// so it stalls the entire compression pipeline until the proxy's own
-/// 30s+ timeout fires on every request. Bounding init converts that hang
-/// into the already-handled `Err` path. Override with
-/// `HEADROOM_MAGIKA_INIT_TIMEOUT_SECS`.
+/// returning an error. Root-caused on Windows: with `ort-load-dynamic`
+/// (Windows-gated in `Cargo.toml`), the bare `LoadLibrary("onnxruntime.dll")`
+/// search resolves to `C:\Windows\System32\onnxruntime.dll` — the Windows ML
+/// OS component (1.17.x on Win11 24H2+) — and initializing an ort 2.x
+/// session against it deadlocks at 0% CPU rather than erroring. A hang —
+/// unlike an `Err` — is not caught by the tiered fallback in
+/// [`crate::transforms::detection`], so it stalls the entire compression
+/// pipeline until the proxy's own 30s+ timeout fires on every request.
+///
+/// The real fix is `headroom/_ort.py`, which pins `ORT_DYLIB_PATH` to the
+/// pip-installed `onnxruntime` DLL before this crate can load ort. This
+/// timeout remains as the safety net for unpinned embedders of the crate.
+/// Override with `HEADROOM_MAGIKA_INIT_TIMEOUT_SECS`.
 const MAGIKA_INIT_TIMEOUT_SECS_DEFAULT: u64 = 5;
 
 fn magika_init_timeout() -> Duration {
@@ -112,15 +117,27 @@ fn session() -> &'static Mutex<Result<Session, String>> {
                 let _ = tx.send(Session::new().map_err(|e| e.to_string()));
             });
         if let Err(e) = spawned {
+            tracing::warn!("magika init thread spawn failed: {e}");
             return Mutex::new(Err(format!("magika init thread spawn failed: {e}")));
         }
         match rx.recv_timeout(timeout) {
             Ok(res) => Mutex::new(res),
-            Err(_) => Mutex::new(Err(format!(
-                "magika session init exceeded {}s timeout; \
-                 using non-ML detection tiers",
-                timeout.as_secs()
-            ))),
+            Err(_) => {
+                let ort_dylib = std::env::var("ORT_DYLIB_PATH").ok();
+                tracing::warn!(
+                    timeout_secs = timeout.as_secs(),
+                    ort_dylib_path = ort_dylib.as_deref(),
+                    "magika ONNX session init timed out; detection falls back to \
+                     non-ML tiers for this process. On Windows an unset \
+                     ORT_DYLIB_PATH usually means the WinML System32 \
+                     onnxruntime.dll was picked up (deadlocks ort init)."
+                );
+                Mutex::new(Err(format!(
+                    "magika session init exceeded {}s timeout; \
+                     using non-ML detection tiers",
+                    timeout.as_secs()
+                )))
+            }
         }
     })
 }

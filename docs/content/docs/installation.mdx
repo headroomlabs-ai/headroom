@@ -271,6 +271,18 @@ Some tests require Rust tooling.
 
 The recommended way to install rust is using `rustup`. You can find the official installation instructions [here](https://rust-lang.org/tools/install/).
 
+## Dashboard
+
+Headroom serves a live savings dashboard while the proxy is running. Open it with:
+
+```bash
+headroom dashboard            # opens http://localhost:8787/dashboard in your browser
+headroom dashboard --no-open  # just print the URL
+```
+
+Or browse to `http://localhost:8787/dashboard` directly (use `--port` / `HEADROOM_PORT` if you
+run the proxy on a different port).
+
 ## Next steps
 
 <Cards>

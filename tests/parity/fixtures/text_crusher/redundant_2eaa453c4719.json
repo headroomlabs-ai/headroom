@@ -1,0 +1,18 @@
+{
+  "transform": "text_crusher",
+  "label": "redundant",
+  "input": {
+    "content": "The quick brown fox jumps over the very lazy dog every single morning.\nThe quick brown fox jumps over the very lazy dog every single morning.\nThe quick brown fox jumps over the very lazy dog every single morning.\nThe quick brown fox jumps over the very lazy dog every single morning.\nThe quick brown fox jumps over the very lazy dog every single morning.\nThe quick brown fox jumps over the very lazy dog every single morning.\nThe quick brown fox jumps over the very lazy dog every single morning.\nThe quick brown fox jumps over the very lazy dog every single morning.\nThe quick brown fox jumps over the very lazy dog every single morning.\nThe quick brown fox jumps over the very lazy dog every single morning.\nA distinct fact about subsystem 0 is recorded plainly here.\nA distinct fact about subsystem 1 is recorded plainly here.\nA distinct fact about subsystem 2 is recorded plainly here.\nA distinct fact about subsystem 3 is recorded plainly here.\nA distinct fact about subsystem 4 is recorded plainly here.\nA distinct fact about subsystem 5 is recorded plainly here.\nA distinct fact about subsystem 6 is recorded plainly here.\nA distinct fact about subsystem 7 is recorded plainly here.",
+    "context": "",
+    "target_ratio": 0.9
+  },
+  "output": {
+    "compressed": "The quick brown fox jumps over the very lazy dog every single morning.\nA distinct fact about subsystem 0 is recorded plainly here.\nA distinct fact about subsystem 1 is recorded plainly here.\nA distinct fact about subsystem 2 is recorded plainly here.\nA distinct fact about subsystem 3 is recorded plainly here.\nA distinct fact about subsystem 4 is recorded plainly here.\nA distinct fact about subsystem 5 is recorded plainly here.\nA distinct fact about subsystem 6 is recorded plainly here.\nA distinct fact about subsystem 7 is recorded plainly here.",
+    "original_tokens": 210,
+    "compressed_tokens": 93,
+    "compression_ratio": 0.44285714285714284,
+    "kept_segments": 9,
+    "total_segments": 18
+  },
+  "input_sha256": "2eaa453c47191d4687669467586834d66ab14aedbbe6ee12d01487dbd0922960"
+}
