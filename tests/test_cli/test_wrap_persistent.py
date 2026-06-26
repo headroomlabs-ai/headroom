@@ -368,6 +368,73 @@ def test_ensure_proxy_rejects_persistent_proxy_with_incompatible_openai_target(
         wrap_cli._ensure_proxy(8787, False, openai_api_url="https://api.x.ai/v1")
 
 
+def test_ensure_proxy_restarts_ephemeral_proxy_for_anthropic_api_url_mismatch(monkeypatch) -> None:
+    calls: list[object] = []
+    health = {
+        "version": wrap_cli._HEADROOM_VERSION,
+        "runtime": {"websocket_sessions": {"active_sessions": 0, "active_relay_tasks": 0}},
+        "config": {
+            "pid": "12345",
+            "memory": False,
+            "learn": False,
+            "code_graph": False,
+            "anthropic_api_url": "https://api.anthropic.com",
+        },
+    }
+
+    monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: None)
+    monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: len(calls) == 0)
+    monkeypatch.setattr(wrap_cli, "_query_proxy_health", lambda port: health)
+    monkeypatch.setattr(wrap_cli, "_port_bind_error", lambda port: None)
+    monkeypatch.setattr(
+        wrap_cli,
+        "_kill_proxy_by_pid",
+        lambda pid, port: calls.append(("kill", pid, port)) or True,
+    )
+    monkeypatch.setattr(
+        wrap_cli,
+        "_start_proxy",
+        lambda *args, **kwargs: calls.append(("start", args, kwargs)),
+    )
+
+    result = wrap_cli._ensure_proxy(
+        8787,
+        False,
+        anthropic_api_url="https://anthropic.foundry.example/v1",
+    )
+
+    assert result is None
+    assert calls[0] == ("kill", 12345, 8787)
+    assert calls[1][0] == "start"
+    assert calls[1][2]["anthropic_api_url"] == "https://anthropic.foundry.example/v1"
+
+
+def test_ensure_proxy_rejects_anthropic_target_mismatch_when_other_wrapper_attached(
+    monkeypatch,
+) -> None:
+    health = {
+        "version": wrap_cli._HEADROOM_VERSION,
+        "runtime": {"websocket_sessions": {"active_sessions": 0, "active_relay_tasks": 0}},
+        "config": {
+            "pid": "12345",
+            "memory": False,
+            "learn": False,
+            "code_graph": False,
+            "anthropic_api_url": "https://api.anthropic.com",
+        },
+    }
+
+    monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: None)
+    monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: True)
+    monkeypatch.setattr(wrap_cli, "_query_proxy_health", lambda port: health)
+    monkeypatch.setattr(wrap_cli, "_live_proxy_clients", lambda *a, **kw: [999])
+
+    with pytest.raises(click.ClickException, match="cannot be reused"):
+        wrap_cli._ensure_proxy(
+            8787, False, anthropic_api_url="https://anthropic.foundry.example/v1"
+        )
+
+
 def test_ensure_proxy_reuses_agent_proxy_without_savings_profile(monkeypatch) -> None:
     health = {
         "version": wrap_cli._HEADROOM_VERSION,
