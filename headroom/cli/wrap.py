@@ -1802,17 +1802,21 @@ def _inject_rtk_instructions(file_path: Path, verbose: bool = False) -> bool:
     Returns True if instructions were written.
     """
     if file_path.exists():
-        existing = file_path.read_text()
+        # User-authored instruction file (AGENTS.md, .copilot_instructions,
+        # .cursorrules, ...) — read as UTF-8 with replacement so a typographic
+        # quote / em-dash (or a stray legacy byte) can't crash on a cp1252
+        # (Windows) locale, where the default open() codec is not UTF-8.
+        existing = file_path.read_text(encoding="utf-8", errors="replace")
         if _RTK_MARKER in existing:
             if verbose:
                 click.echo(f"  rtk instructions already in {file_path.name}")
             return True
         # Append to existing file
-        with open(file_path, "a") as f:
+        with open(file_path, "a", encoding="utf-8") as f:
             f.write("\n\n" + RTK_INSTRUCTIONS_BLOCK)
     else:
         file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.write_text(RTK_INSTRUCTIONS_BLOCK)
+        file_path.write_text(RTK_INSTRUCTIONS_BLOCK, encoding="utf-8")
 
     click.echo(f"  rtk instructions injected into {file_path}")
     return True
@@ -1913,14 +1917,16 @@ def _inject_memory_agents_md(file_path: Path) -> bool:
     )
 
     if file_path.exists():
-        existing = file_path.read_text()
+        # See _inject_rtk_instructions: read the user's AGENTS.md as UTF-8 with
+        # replacement so non-ASCII prose can't crash on a cp1252 locale.
+        existing = file_path.read_text(encoding="utf-8", errors="replace")
         if _MEMORY_AGENTS_MARKER in existing:
             return True  # Already injected
-        with open(file_path, "a") as f:
+        with open(file_path, "a", encoding="utf-8") as f:
             f.write("\n\n" + memory_block)
     else:
         file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.write_text(memory_block)
+        file_path.write_text(memory_block, encoding="utf-8")
 
     click.echo(f"  Memory guidance injected into {file_path.name}")
     return True
