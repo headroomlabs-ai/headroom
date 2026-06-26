@@ -910,7 +910,13 @@ def _install_headroom_mcp_for_targets(*, targets: list[str], port: int) -> None:
 
 @main.group(invoke_without_command=True)
 @click.option("-g", "--global", "global_scope", is_flag=True, help="Install for the current user.")
-@click.option("--port", default=8787, type=int, show_default=True, help="Headroom proxy port.")
+@click.option(
+    "--port",
+    default=8787,
+    type=click.IntRange(1, 65535),
+    show_default=True,
+    help="Headroom proxy port.",
+)
 @click.option("--backend", default="anthropic", show_default=True, help="Proxy backend.")
 @click.option("--anyllm-provider", default=None, help="Provider for any-llm backends.")
 @click.option("--region", default=None, help="Cloud region for Bedrock / Vertex style backends.")

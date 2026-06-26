@@ -163,7 +163,12 @@ def _reject_task_lifecycle(manifest: DeploymentManifest, action: str) -> None:
 )
 @click.option("--profile", default="default", show_default=True, help="Deployment profile name.")
 @click.option(
-    "--port", "-p", default=8787, type=int, show_default=True, help="Persistent proxy port."
+    "--port",
+    "-p",
+    default=8787,
+    type=click.IntRange(1, 65535),
+    show_default=True,
+    help="Persistent proxy port.",
 )
 @click.option(
     "--backend",

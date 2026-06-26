@@ -245,7 +245,13 @@ def memory(ctx: click.Context) -> None:
 
 @memory.command("list")
 @db_path_option
-@click.option("--limit", "-n", type=int, default=50, help="Maximum number of memories to show.")
+@click.option(
+    "--limit",
+    "-n",
+    type=click.IntRange(min=1),
+    default=50,
+    help="Maximum number of memories to show.",
+)
 @click.option("--session", "-s", "session_id", type=str, help="Filter by session ID.")
 @click.option(
     "--scope",

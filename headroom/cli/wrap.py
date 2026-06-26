@@ -3060,7 +3060,9 @@ def unwrap() -> None:
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
-@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
 @click.option(
     "--no-context-tool",
     "--no-rtk",
@@ -3386,7 +3388,9 @@ def claude(
 
 
 @unwrap.command("claude")
-@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
 @click.option("--no-stop-proxy", is_flag=True, help="Do not stop the local Headroom proxy")
 @click.option("--keep-mcp", is_flag=True, help="Keep Headroom MCP registrations")
 @click.option("--keep-rtk", is_flag=True, help="Keep rtk Claude hooks")
@@ -3450,7 +3454,9 @@ def unwrap_claude(
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
-@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
 @click.option(
     "--no-context-tool",
     "--no-rtk",
@@ -3737,7 +3743,9 @@ def copilot(
 
 
 @unwrap.command("copilot")
-@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
 @click.option("--no-stop-proxy", is_flag=True, help="Do not stop the local Headroom proxy")
 def unwrap_copilot(port: int, no_stop_proxy: bool) -> None:
     """Undo durable setup from ``headroom wrap copilot``."""
@@ -3757,7 +3765,9 @@ def unwrap_copilot(port: int, no_stop_proxy: bool) -> None:
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
-@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
 @click.option(
     "--no-context-tool",
     "--no-rtk",
@@ -3968,7 +3978,9 @@ def codex(
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
-@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
 @click.option(
     "--no-context-tool",
     "--no-rtk",
@@ -4070,7 +4082,9 @@ def aider(
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
-@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
 @click.option(
     "--no-context-tool",
     "--no-rtk",
@@ -4147,7 +4161,9 @@ def vibe(
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
-@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
 @click.option(
     "--no-context-tool",
     "--no-rtk",
@@ -4231,7 +4247,9 @@ def cursor(
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
-@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
 @click.option(
     "--no-context-tool",
     "--no-rtk",
@@ -4331,7 +4349,9 @@ def cline(
 
 
 @wrap.command("continue", context_settings={"ignore_unknown_options": True})
-@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
 @click.option(
     "--no-context-tool",
     "--no-rtk",
@@ -4453,7 +4473,9 @@ def continue_dev(
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
-@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
 @click.option(
     "--no-context-tool",
     "--no-rtk",
@@ -4576,7 +4598,9 @@ def goose(
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
-@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
 @click.option(
     "--no-context-tool",
     "--no-rtk",
@@ -4739,7 +4763,9 @@ def openhands(
     is_flag=True,
     help="Install by copying plugin path instead of using --link",
 )
-@click.option("--proxy-port", default=8787, type=int, help="Headroom proxy port")
+@click.option(
+    "--proxy-port", default=8787, type=click.IntRange(1, 65535), help="Headroom proxy port"
+)
 @click.option("--startup-timeout-ms", default=20000, type=int, help="Proxy startup timeout")
 @click.option(
     "--gateway-provider-id",
@@ -4953,7 +4979,9 @@ def openclaw(
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
-@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
 @click.option(
     "--no-context-tool",
     "--no-rtk",
@@ -5115,7 +5143,9 @@ def _opencode_home_dir() -> Path:
 
 
 @unwrap.command("opencode")
-@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
 @click.option("--no-stop-proxy", is_flag=True, help="Do not stop the local Headroom proxy")
 def unwrap_opencode(port: int, no_stop_proxy: bool) -> None:
     """Undo ``headroom wrap opencode`` edits to the active OpenCode config file.
@@ -5191,7 +5221,9 @@ def unwrap_opencode(port: int, no_stop_proxy: bool) -> None:
 
 
 @unwrap.command("openclaw")
-@click.option("--proxy-port", default=8787, type=int, help="Headroom proxy port")
+@click.option(
+    "--proxy-port", default=8787, type=click.IntRange(1, 65535), help="Headroom proxy port"
+)
 @click.option("--no-stop-proxy", is_flag=True, help="Do not stop the local Headroom proxy")
 @click.option("--no-restart", is_flag=True, help="Do not restart OpenClaw gateway at the end")
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
@@ -5270,7 +5302,9 @@ def unwrap_openclaw(
 
 
 @unwrap.command("codex")
-@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
 @click.option("--no-stop-proxy", is_flag=True, help="Do not stop the local Headroom proxy")
 def unwrap_codex(port: int, no_stop_proxy: bool) -> None:
     """Undo ``headroom wrap codex`` edits to the active Codex config file.

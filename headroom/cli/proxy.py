@@ -119,7 +119,7 @@ def _selected_context_tool() -> str:
     "--port",
     "-p",
     default=8787,
-    type=int,
+    type=click.IntRange(1, 65535),
     envvar="HEADROOM_PORT",
     help="Proxy port (default: 8787, env: HEADROOM_PORT)",
 )
@@ -151,7 +151,7 @@ def dashboard(port: int, no_open: bool) -> None:
     "--port",
     "-p",
     default=8787,
-    type=int,
+    type=click.IntRange(1, 65535),
     envvar="HEADROOM_PORT",
     help="Port to bind to (default: 8787, env: HEADROOM_PORT)",
 )
@@ -536,7 +536,7 @@ def dashboard(port: int, no_open: bool) -> None:
 )
 @click.option(
     "--read-maturation-quiesce-turns",
-    type=int,
+    type=click.IntRange(min=1),
     default=5,
     show_default=True,
     envvar="HEADROOM_READ_MATURATION_QUIESCE_TURNS",
@@ -544,7 +544,7 @@ def dashboard(port: int, no_open: bool) -> None:
 )
 @click.option(
     "--read-maturation-max-hold-turns",
-    type=int,
+    type=click.IntRange(min=1),
     default=25,
     show_default=True,
     envvar="HEADROOM_READ_MATURATION_MAX_HOLD_TURNS",
@@ -552,7 +552,7 @@ def dashboard(port: int, no_open: bool) -> None:
 )
 @click.option(
     "--read-maturation-min-size-bytes",
-    type=int,
+    type=click.IntRange(min=0),
     default=2048,
     show_default=True,
     envvar="HEADROOM_READ_MATURATION_MIN_SIZE_BYTES",
@@ -651,7 +651,7 @@ def dashboard(port: int, no_open: bool) -> None:
 )
 @click.option(
     "--memory-qdrant-port",
-    type=int,
+    type=click.IntRange(1, 65535),
     default=None,
     help=(
         "Qdrant port for the qdrant-neo4j backend (default: 6333, also reads HEADROOM_QDRANT_PORT)"
@@ -677,7 +677,7 @@ def dashboard(port: int, no_open: bool) -> None:
 )
 @click.option(
     "--min-evidence",
-    type=int,
+    type=click.IntRange(min=1),
     default=None,
     envvar="HEADROOM_MIN_EVIDENCE",
     help=(

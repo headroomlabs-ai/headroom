@@ -101,7 +101,7 @@ Use 'auto' (default) to scan all detected agents."""
 @click.option(
     "--workers",
     "-j",
-    type=int,
+    type=click.IntRange(min=1),
     default=None,
     help="Parallel workers for session scanning. "
     "Default: auto (min of CPU count, 8). Use 1 for serial.",

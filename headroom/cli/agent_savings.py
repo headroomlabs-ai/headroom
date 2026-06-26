@@ -35,10 +35,10 @@ from .main import main
 )
 @click.option(
     "--hours",
-    type=float,
+    type=click.FloatRange(min=0),
     default=24.0,
     show_default=True,
-    help="Hours of proxy logs to inspect with --check-perf.",
+    help="Hours of proxy logs to inspect with --check-perf (0 = all data).",
 )
 @click.option(
     "--accuracy-report",
