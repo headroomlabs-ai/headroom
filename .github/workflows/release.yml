@@ -821,7 +821,7 @@ jobs:
           npm run build
           npm version ${{ needs.detect-version.outputs.npm_version }} --no-git-tag-version --allow-same-version
           npm publish --access public
-        continue-on-error: true
+        # No continue-on-error: same reasoning as the SDK publish step.
 
       - name: Publish ${{ env.NPM_OPENCLAW_PACKAGE }} to npmjs.org
         id: npm-openclaw-publish
@@ -833,7 +833,10 @@ jobs:
           npm run build
           npm version ${{ needs.detect-version.outputs.npm_version }} --no-git-tag-version --allow-same-version
           npm publish --access public
-        continue-on-error: true
+        # No continue-on-error: failures here must be visible — when
+        # NPM_TOKEN is invalid or missing, the job fails and alerts the
+        # maintainer instead of silently skipping npm publishes for
+        # five consecutive releases.
 
       - name: npm publish notice
         if: steps.npm-sdk-publish.outcome == 'failure' || steps.npm-openclaw-publish.outcome == 'failure'
@@ -900,7 +903,8 @@ jobs:
           printf 'unscoped_sdk_tarball=%s\n' "$assets_dir/$unscoped_sdk_tarball" >> "$GITHUB_OUTPUT"
           printf 'sdk_tarball=%s\n' "$assets_dir/$sdk_tarball" >> "$GITHUB_OUTPUT"
           npm publish --access public --registry ${{ env.GITHUB_PACKAGES_REGISTRY_URL }}
-        continue-on-error: true
+        # No continue-on-error: GITHUB_TOKEN publish failures should
+        # surface immediately, not be swallowed.
 
       - name: Publish ${{ env.NPM_OPENCLAW_PACKAGE }} to GitHub Package Registry
         id: gpr-openclaw-publish
@@ -938,7 +942,7 @@ jobs:
           fs.writeFileSync("package.json", `${JSON.stringify(pkg, null, 2)}\n`);
           EOF
           npm publish --access public --registry ${{ env.GITHUB_PACKAGES_REGISTRY_URL }}
-        continue-on-error: true
+        # No continue-on-error: same reasoning.
 
       - name: GPR publish notice
         if: steps.gpr-sdk-publish.outcome == 'failure' || steps.gpr-openclaw-publish.outcome == 'failure'

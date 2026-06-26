@@ -72,4 +72,8 @@ jobs:
         run: pip install mkdocs-material
 
       - name: Build and deploy
-        run: mkdocs gh-deploy --force
+        # Docs are deployed via Vercel (headroom-docs.vercel.app).
+        # GitHub Pages is not enabled for this repository, so
+        # mkdocs gh-deploy would push to an unread gh-pages branch.
+        # To re-enable GitHub Pages, restore: run: mkdocs gh-deploy --force
+        run: echo 'Docs deployed via Vercel; skipping mkdocs gh-deploy.'
