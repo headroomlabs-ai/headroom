@@ -5,12 +5,14 @@ from __future__ import annotations
 from headroom.proxy.output_savings import (
     BaselineModel,
     SavingsLedger,
+    SavingsRecorder,
     assign_arm,
     conversation_key_from_body,
     echo_ratio,
     input_bucket,
     model_family,
     stratum_key,
+    stratum_label,
 )
 
 # ---------------------------------------------------------------------------
@@ -285,3 +287,110 @@ class TestEchoRatio:
 
     def test_short_output_returns_zero(self):
         assert echo_ratio("a b", "a b c d e f g h", n=8) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# recorder baseline reload (learn-while-running)
+# ---------------------------------------------------------------------------
+
+
+class TestRecorderBaselineReload:
+    """The recorder must pick up a baseline that ``learn --verbosity --apply``
+    writes while the proxy is already running, and a flush must never overwrite
+    that learned baseline with the recorder's own empty in-memory copy."""
+
+    @staticmethod
+    def _key() -> str:
+        return stratum_key(
+            turn_kind="code",
+            input_tokens=8000,
+            model="claude-opus-4-8",
+            has_tools=True,
+        )
+
+    def test_adopts_baseline_learned_after_start(self, tmp_path):
+        path = str(tmp_path / "output_savings.json")
+        key = self._key()
+
+        recorder = SavingsRecorder(path, flush_every=1)
+        for output_tokens in (200, 210, 190):
+            recorder.record_from_labels([stratum_label("treatment", key)], output_tokens)
+
+        # No baseline to compare against yet, so there is nothing to estimate.
+        assert recorder.estimate().n_requests == 0
+
+        # Simulate `learn --verbosity --apply` writing a baseline to the same
+        # file while the recorder is live (no restart).
+        learned = SavingsLedger.load(path)
+        for output_tokens in (400, 420, 380, 410):
+            learned.baseline.observe(key, output_tokens)
+        learned.save(path)
+
+        estimate = recorder.estimate()
+        assert estimate.n_requests > 0
+        assert estimate.kind == "estimated"
+        assert estimate.tokens_saved > 0
+
+    def test_flush_does_not_clobber_learned_baseline(self, tmp_path):
+        path = str(tmp_path / "output_savings.json")
+        key = self._key()
+
+        # Recorder starts before any baseline exists, so its in-memory baseline
+        # is empty.
+        recorder = SavingsRecorder(path, flush_every=1)
+
+        learned = SavingsLedger.load(path)
+        for output_tokens in (400, 420, 380, 410):
+            learned.baseline.observe(key, output_tokens)
+        learned.save(path)
+        assert SavingsLedger.load(path).baseline.total_samples == 4
+
+        recorder.record_from_labels([stratum_label("treatment", key)], 200)
+        recorder.flush()
+
+        # The flush must keep the learned baseline rather than writing the empty
+        # in-memory one over it.
+        assert SavingsLedger.load(path).baseline.total_samples == 4
+
+    def test_does_not_downgrade_to_empty_disk_baseline(self, tmp_path):
+        path = str(tmp_path / "output_savings.json")
+        key = self._key()
+
+        # Recorder already holds a learned baseline in memory.
+        recorder = SavingsRecorder(path, flush_every=1)
+        recorder._ledger.baseline.observe(key, 400)
+        recorder._ledger.baseline.observe(key, 420)
+        assert recorder._ledger.baseline.total_samples == 2
+
+        # A stale/empty file on disk must not erase a baseline we already hold.
+        SavingsLedger().save(path)
+        recorder.flush()
+
+        assert recorder._ledger.baseline.total_samples == 2
+
+    def test_relearn_with_same_sample_count_is_adopted(self, tmp_path):
+        path = str(tmp_path / "output_savings.json")
+        key = self._key()
+
+        recorder = SavingsRecorder(path, flush_every=1)
+        for output_tokens in (200, 210, 190):
+            recorder.record_from_labels([stratum_label("treatment", key)], output_tokens)
+
+        # First learn writes a baseline; the recorder adopts it.
+        first = SavingsLedger.load(path)
+        for output_tokens in (400, 400, 400, 400):
+            first.baseline.observe(key, output_tokens)
+        first.save(path)
+        baseline_tokens_v1 = recorder.estimate().baseline_tokens
+        assert baseline_tokens_v1 > 0
+
+        # Re-running learn replaces the baseline in place with the SAME number of
+        # samples but different values. A sample-count guard would miss this; the
+        # recorder must still pick the new baseline up.
+        relearned = SavingsLedger.load(path)
+        relearned.baseline = BaselineModel()
+        for output_tokens in (800, 800, 800, 800):
+            relearned.baseline.observe(key, output_tokens)
+        relearned.save(path)
+
+        assert recorder.estimate().baseline_tokens > baseline_tokens_v1

@@ -192,8 +192,15 @@
                 <div class="mt-2 text-xs text-gray-500">
                     <span x-show="(stats.persistent_savings?.lifetime?.compression_savings_usd || 0) > 0"
                           x-text="formatNumber(stats.tokens?.proxy_compression_saved || 0) + ' proxy tokens only; ' + cliFilteringLabel + ' excluded from $'"></span>
-                    <span x-show="!((stats.persistent_savings?.lifetime?.compression_savings_usd || 0) > 0)"
+                    <span x-show="!((stats.persistent_savings?.lifetime?.compression_savings_usd || 0) > 0) && stats.litellm_available !== false"
                           x-text="formatNumber(stats.requests?.total || 0) + ' requests processed'"></span>
+                    <!-- Pricing is LiteLLM-only. LiteLLM currently can't install on
+                         newer Python (e.g. 3.14+); state the fact, not the version,
+                         so the hint stays correct if that changes. -->
+                    <span x-show="!((stats.persistent_savings?.lifetime?.compression_savings_usd || 0) > 0) && stats.litellm_available === false">
+                        Cost pricing needs LiteLLM, which isn't installed in this environment. If you're on a Python version LiteLLM doesn't support yet, reinstall Headroom on Python 3.13:
+                        <code class="text-gray-400">pipx reinstall headroom-ai --python python3.13</code>
+                    </span>
                 </div>
             </div>
 

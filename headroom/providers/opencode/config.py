@@ -12,6 +12,7 @@ from typing import Any
 import click
 
 from headroom.install.paths import opencode_config_path
+from headroom.mcp_registry.install import DEFAULT_PROXY_URL
 
 # Headroom-managed JSON marker comments for idempotent block injection.
 _PROVIDER_MARKER_START = "// --- Headroom proxy provider ---"
@@ -98,12 +99,16 @@ def _render_provider_block(port: int) -> str:
 
 def _render_mcp_block(port: int) -> str:
     """Render a Headroom MCP block as a JSON comment-wrapped snippet."""
+    proxy_url = f"http://127.0.0.1:{port}"
+    mcp_entry: dict[str, Any] = {
+        "type": "local",
+        "command": ["headroom", "mcp", "serve"],
+        "enabled": True,
+    }
+    if proxy_url != DEFAULT_PROXY_URL:
+        mcp_entry["environment"] = {"HEADROOM_PROXY_URL": proxy_url}
     mcp = {
-        "headroom": {
-            "type": "remote",
-            "url": f"http://127.0.0.1:{port}/mcp",
-            "enabled": True,
-        }
+        "headroom": mcp_entry,
     }
     lines = [
         _MCP_MARKER_START,
@@ -192,7 +197,7 @@ def inject_opencode_provider_config(port: int) -> None:
             data = {}
 
         # Strip any prior Headroom-managed blocks before re-injecting.
-        if _PROVIDER_MARKER_START in content:
+        if _PROVIDER_MARKER_START in content or _MCP_MARKER_START in content:
             content = strip_opencode_headroom_blocks(content)
             data = _parse_json_loose(content)
 
@@ -205,16 +210,6 @@ def inject_opencode_provider_config(port: int) -> None:
             }
         }
         data = _inject_key_into_json(data, "provider", provider)
-
-        # Inject MCP if not already present.
-        mcp = {
-            "headroom": {
-                "type": "remote",
-                "url": f"http://127.0.0.1:{port}/mcp",
-                "enabled": True,
-            }
-        }
-        data = _inject_key_into_json(data, "mcp", mcp)
 
         # Write back as formatted JSON (opencode uses standard JSON with comments).
         output = json.dumps(data, indent=2) + "\n"

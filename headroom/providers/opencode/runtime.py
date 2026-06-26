@@ -6,6 +6,8 @@ import json
 import os
 from collections.abc import Mapping
 
+from headroom.mcp_registry.install import DEFAULT_PROXY_URL
+
 from .config import HEADROOM_OPENCODE_PLUGIN
 
 
@@ -37,12 +39,16 @@ def build_opencode_config_content(
         }
     }
     if include_mcp:
+        proxy_url = f"http://127.0.0.1:{port}"
+        mcp_entry: dict[str, object] = {
+            "type": "local",
+            "command": ["headroom", "mcp", "serve"],
+            "enabled": True,
+        }
+        if proxy_url != DEFAULT_PROXY_URL:
+            mcp_entry["environment"] = {"HEADROOM_PROXY_URL": proxy_url}
         config["mcp"] = {
-            "headroom": {
-                "type": "remote",
-                "url": f"http://127.0.0.1:{port}/mcp",
-                "enabled": True,
-            }
+            "headroom": mcp_entry,
         }
     if include_plugin:
         config["plugin"] = [[HEADROOM_OPENCODE_PLUGIN, {"proxyUrl": base_url}]]

@@ -63,8 +63,8 @@ def test_get_server_returns_spec_when_present(tmp_path: Path) -> None:
     config = {
         "mcp": {
             "headroom": {
-                "type": "remote",
-                "url": "http://127.0.0.1:8787/mcp",
+                "type": "local",
+                "command": ["headroom", "mcp", "serve"],
                 "enabled": True,
             }
         }
@@ -74,6 +74,8 @@ def test_get_server_returns_spec_when_present(tmp_path: Path) -> None:
     spec = registrar.get_server("headroom")
     assert spec is not None
     assert spec.name == "headroom"
+    assert spec.command == "headroom"
+    assert spec.args == ("mcp", "serve")
 
 
 def test_register_server_creates_config_when_missing(tmp_path: Path) -> None:
@@ -86,6 +88,12 @@ def test_register_server_creates_config_when_missing(tmp_path: Path) -> None:
     assert result.status == RegisterStatus.REGISTERED
     config_path = tmp_path / "opencode.json"
     assert config_path.exists()
+    data = json.loads(config_path.read_text())
+    assert data["mcp"]["headroom"] == {
+        "type": "local",
+        "command": ["headroom", "mcp", "serve"],
+        "enabled": True,
+    }
 
 
 def test_register_server_idempotent(tmp_path: Path) -> None:
@@ -259,7 +267,7 @@ def test_register_server_with_env_vars(tmp_path: Path) -> None:
     registrar.register_server(spec)
 
     data = json.loads((tmp_path / "opencode.json").read_text())
-    assert data["mcp"]["headroom"]["env"] == {"HEADROOM_PROXY_URL": "http://127.0.0.1:9090"}
+    assert data["mcp"]["headroom"]["environment"] == {"HEADROOM_PROXY_URL": "http://127.0.0.1:9090"}
 
 
 def test_register_then_re_register_with_different_env_returns_mismatch(tmp_path: Path) -> None:
@@ -306,6 +314,30 @@ def test_entry_to_spec_command_as_string() -> None:
     assert spec.args == ()
 
 
+def test_entry_to_spec_reads_opencode_environment() -> None:
+    """_entry_to_spec reads OpenCode's environment map."""
+    entry = {
+        "type": "local",
+        "command": ["headroom", "mcp", "serve"],
+        "enabled": True,
+        "environment": {"HEADROOM_PROXY_URL": "http://127.0.0.1:9090"},
+    }
+    spec = _entry_to_spec("headroom", entry)
+    assert spec.env == {"HEADROOM_PROXY_URL": "http://127.0.0.1:9090"}
+
+
+def test_entry_to_spec_reads_legacy_env() -> None:
+    """_entry_to_spec keeps compatibility with previously written env maps."""
+    entry = {
+        "type": "local",
+        "command": ["headroom", "mcp", "serve"],
+        "enabled": True,
+        "env": {"HEADROOM_PROXY_URL": "http://127.0.0.1:9090"},
+    }
+    spec = _entry_to_spec("headroom", entry)
+    assert spec.env == {"HEADROOM_PROXY_URL": "http://127.0.0.1:9090"}
+
+
 def test_entry_to_spec_no_command() -> None:
     """_entry_to_spec handles an entry without a 'command' key."""
     entry: dict[str, Any] = {
@@ -329,9 +361,9 @@ def test_spec_to_entry_roundtrip() -> None:
         env={"KEY": "VAL"},
     )
     entry = _spec_to_entry(original)
-    assert entry["type"] == "remote"
+    assert entry["type"] == "local"
     assert entry["command"] == ["python", "-m", "server"]
-    assert entry["env"] == {"KEY": "VAL"}
+    assert entry["environment"] == {"KEY": "VAL"}
 
     restored = _entry_to_spec("test", entry)
     assert restored.name == original.name

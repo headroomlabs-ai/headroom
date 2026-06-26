@@ -63,7 +63,7 @@ def _entry_to_spec(name: str, entry: dict[str, Any]) -> ServerSpec:
     else:
         command = str(command_value) if command_value else ""
         args = ()
-    env_value = entry.get("env", {})
+    env_value = entry.get("environment", entry.get("env", {}))
     env: dict[str, str] = {}
     if isinstance(env_value, dict):
         env = {str(k): str(v) for k, v in env_value.items()}
@@ -72,16 +72,12 @@ def _entry_to_spec(name: str, entry: dict[str, Any]) -> ServerSpec:
 
 def _spec_to_entry(spec: ServerSpec) -> dict[str, Any]:
     entry: dict[str, Any] = {
-        "type": "remote",
-        "url": "",
+        "type": "local",
+        "command": [spec.command, *spec.args],
         "enabled": True,
     }
-    if spec.args:
-        entry["command"] = [spec.command, *spec.args]
-    else:
-        entry["command"] = spec.command
     if spec.env:
-        entry["env"] = dict(spec.env)
+        entry["environment"] = dict(spec.env)
     return entry
 
 

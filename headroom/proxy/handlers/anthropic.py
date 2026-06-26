@@ -2140,6 +2140,15 @@ class AnthropicHandlerMixin:
                         metadata={"path": pipeline_path, "stream": True},
                     )
                     await _finalize_pre_upstream()
+                    session_key = self._get_session_key(
+                        body,
+                        session_header=request.headers.get("x-headroom-session-id"),
+                    )
+                    if session_key in self._active_streams:
+                        from fastapi.responses import JSONResponse
+
+                        queued = self._queue_mid_turn_message(session_key, body)
+                        return JSONResponse(content=queued, status_code=202)
                     return await self._stream_response(
                         url,
                         headers,
@@ -2162,6 +2171,7 @@ class AnthropicHandlerMixin:
                         mutation_reasons=body_mutation_tracker.reasons,
                         memory_request_ctx=memory_request_ctx,
                         outcome_provider=provider_name,
+                        session_key=session_key,
                     )
                 else:
                     async with stage_timer.measure("upstream_connect"):
