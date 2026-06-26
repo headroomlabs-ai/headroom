@@ -1,5 +1,5 @@
 """Grok-specific provider helpers."""
 
-from .runtime import build_launch_env
+from .runtime import DEFAULT_API_URL, build_launch_env
 
-__all__ = ["build_launch_env"]
+__all__ = ["DEFAULT_API_URL", "build_launch_env"]

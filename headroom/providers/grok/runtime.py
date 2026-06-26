@@ -7,6 +7,8 @@ from collections.abc import Mapping
 
 from headroom.providers.codex import proxy_base_url as codex_proxy_base_url
 
+DEFAULT_API_URL = "https://api.x.ai/v1"
+
 
 def build_launch_env(
     port: int,

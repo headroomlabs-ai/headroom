@@ -10,6 +10,7 @@ from click.testing import CliRunner
 
 from headroom.cli import wrap as wrap_mod
 from headroom.cli.main import main
+from headroom.providers.grok import DEFAULT_API_URL
 
 
 @pytest.fixture
@@ -54,6 +55,7 @@ def test_wrap_grok_uses_verified_launch_contract(runner: CliRunner) -> None:
     assert captured["agent_type"] == "grok"
     assert captured["args"] == ("--model", "grok-beta")
     assert captured["env_vars_display"] == ["GROK_PROXY_URL=http://127.0.0.1:8787/v1"]
+    assert captured["openai_api_url"] == DEFAULT_API_URL
 
 
 def test_wrap_grok_prepare_only_skips_binary_lookup(runner: CliRunner) -> None:

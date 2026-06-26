@@ -96,7 +96,12 @@ from headroom.providers.copilot import (
     validate_configuration as _validate_copilot_configuration,
 )
 from headroom.providers.cursor import render_setup_lines as _render_cursor_setup_lines
-from headroom.providers.grok import build_launch_env as _build_grok_launch_env
+from headroom.providers.grok import (
+    DEFAULT_API_URL as _GROK_DEFAULT_API_URL,
+)
+from headroom.providers.grok import (
+    build_launch_env as _build_grok_launch_env,
+)
 from headroom.providers.mistral_vibe import build_launch_env as _build_mistral_vibe_launch_env
 from headroom.providers.openclaw import (
     build_plugin_entry as _build_openclaw_plugin_entry_impl,
@@ -4293,6 +4298,7 @@ def grok(
         backend=backend,
         anyllm_provider=anyllm_provider,
         region=region,
+        openai_api_url=_GROK_DEFAULT_API_URL,
     )
 
 
