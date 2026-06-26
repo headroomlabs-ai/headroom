@@ -58,6 +58,7 @@ jobs:
               - 'Cargo.lock'
               - 'tests/**'
               - 'scripts/**'
+              - '.github/workflows/**'
             e2e:
               - 'headroom/**'
               - 'crates/**'
@@ -170,10 +171,26 @@ jobs:
           restore-keys: ${{ runner.os }}-pip-${{ env.PY_VERSION }}-
 
       - name: Restore HuggingFace model cache (warmed by prefetch-model)
+        id: restore-hfcache
         uses: actions/cache@v5
         with:
           path: ~/.cache/huggingface
           key: ${{ runner.os }}-models-allMiniLM-v2
+
+      - name: Fallback model download if cache missed
+        if: steps.restore-hfcache.outputs.cache-hit != 'true'
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_HUB_DISABLE_TELEMETRY: "1"
+          TRANSFORMERS_OFFLINE: "0"
+          HF_HUB_OFFLINE: "0"
+        run: |
+          python -m pip install --upgrade pip huggingface_hub
+          for i in 1 2 3 4 5 6; do
+            if python -c "from huggingface_hub import snapshot_download; snapshot_download('sentence-transformers/all-MiniLM-L6-v2')"; then exit 0; fi
+            if [ "$i" -lt 6 ]; then echo "::warning::fallback model fetch attempt $i failed; backing off"; sleep $((i * 30)); fi
+          done
+          echo "::error::could not fetch all-MiniLM-L6-v2 from HuggingFace (fallback)"; exit 1
 
       - name: Download prebuilt wheel
         uses: actions/download-artifact@v8
