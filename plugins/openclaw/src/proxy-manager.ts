@@ -11,6 +11,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import os from "os";
 
 export interface ProxyManagerConfig {
   proxyUrl?: string;
@@ -263,9 +264,9 @@ export class ProxyManager {
       checkUseShell: false,
     });
 
-// 4) uv tool install path (~/.local/bin/headroom)
+    // 4) uv tool install path (~/.local/bin/headroom)
     const uvBin = join(
-      process.env["HOME"] ?? "",
+      os.homedir(),
       ".local", "bin", "headroom"
     );
     if (existsSync(uvBin)) {
