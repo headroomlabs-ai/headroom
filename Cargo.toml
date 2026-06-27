@@ -58,7 +58,7 @@ clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 axum = "0.7"
 tower = "0.5"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 pyo3 = { version = "0.24", features = ["abi3-py310"] }
 # Forwards Rust `log` records (incl. tracing events via the `log` compat
 # feature above) into Python's `logging` inside the _core extension module.

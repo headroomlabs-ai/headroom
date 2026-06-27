@@ -155,7 +155,7 @@ from headroom.proxy.rate_limiter import TokenBucketRateLimiter  # noqa: F401
 from headroom.proxy.request_logger import RequestLogger  # noqa: F401
 from headroom.proxy.savings_tracker import LITELLM_AVAILABLE
 from headroom.proxy.semantic_cache import SemanticCache  # noqa: F401
-from headroom.proxy.ssl_context import build_httpx_verify
+from headroom.proxy.ssl_context import build_httpx_verify, find_system_proxy
 from headroom.proxy.warmup import WarmupRegistry
 from headroom.proxy.ws_session_registry import WebSocketSessionRegistry
 from headroom.subscription.base import get_quota_registry, reset_quota_registry
@@ -1263,6 +1263,9 @@ class HeadroomProxy(
             ),
             "verify": _verify,
         }
+        _sys_proxy = find_system_proxy()
+        if _sys_proxy:
+            _client_kwargs["proxy"] = _sys_proxy
         self.http_client = httpx.AsyncClient(http2=self.config.http2, **_client_kwargs)
         # Reuse the primary client when HTTP/2 is already off; otherwise keep a
         # dedicated HTTP/1.1 client for ChatGPT passthrough.

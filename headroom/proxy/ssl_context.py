@@ -35,6 +35,8 @@ import logging
 import os
 import ssl
 from typing import Any, cast
+import urllib.parse
+import urllib.request
 
 logger = logging.getLogger("headroom.proxy")
 
@@ -239,3 +241,22 @@ def apply_global_tls_relaxation() -> bool:
     _u3ssl.create_urllib3_context = _relaxed_create_urllib3_context  # type: ignore[assignment]
     logger.info("event=ssl_x509_strict_disabled reason=urllib3_global_patch")
     return True
+
+
+def find_system_proxy() -> str | None:
+    """Return a proxy URL from system settings, including macOS System Preferences.
+
+    httpx trust_env=True reads HTTPS_PROXY env vars but not the macOS
+    System Configuration proxy (System Settings → Network → Proxies).
+    urllib.request.getproxies() reads both; we only use it when the env
+    vars aren't set to avoid double-proxying.
+    """
+    if os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy"):
+        return None  # ponytail: trust_env already handles this path
+    proxies = urllib.request.getproxies()
+    url = proxies.get("https") or proxies.get("http")
+    if url:
+        parsed = urllib.parse.urlparse(url)
+        safe = parsed._replace(netloc=parsed.hostname + (f":{parsed.port}" if parsed.port else ""))
+        logger.info("event=system_proxy_detected url=%s", safe.geturl())
+    return url
