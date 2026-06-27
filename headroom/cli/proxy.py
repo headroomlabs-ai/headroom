@@ -930,6 +930,20 @@ def proxy(
     # for capabilities the user hasn't asked for. The TransformPipeline reads
     # this env var at construction time.
     if intercept_tool_results:
+        from headroom.rollout import current_rollout
+
+        rollout = current_rollout(os.environ)
+        if not rollout.is_available("tool_result_interceptors"):
+            click.secho(
+                "error: --intercept-tool-results is not available in the current "
+                f"release channel ({rollout.channel.value}). Set "
+                "HEADROOM_RELEASE_CHANNEL=canary to dogfood it, or use "
+                "HEADROOM_UNSAFE_ALLOW_UNSTABLE_FEATURES=1 for emergency override.",
+                fg="red",
+                err=True,
+            )
+            sys.exit(1)
+
         from headroom.binaries import ensure_tools
 
         resolved_tools = ensure_tools()

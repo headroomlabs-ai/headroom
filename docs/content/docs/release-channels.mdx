@@ -1,0 +1,63 @@
+---
+title: Release Channels
+description: How Headroom gates new behavior through stable, beta, canary, and dev channels.
+---
+
+Headroom gates risky behavior through release channels before it can become
+default behavior for stable users.
+
+| Channel | Purpose |
+|---------|---------|
+| `stable` | Default. Only features that have completed their bake period should run here. |
+| `beta` | Opt-in preview for features with passing automated coverage and limited production exposure. |
+| `canary` | Early dogfood for new behavior that still needs validation. |
+| `dev` | Local development and maintainer-only experiments. |
+
+Set the channel with:
+
+```bash
+export HEADROOM_RELEASE_CHANNEL=canary
+```
+
+Feature requests use the same channel gate:
+
+```bash
+export HEADROOM_RELEASE_CHANNEL=canary
+export HEADROOM_FEATURES=tool_result_interceptors
+headroom proxy --intercept-tool-results
+```
+
+`HEADROOM_DISABLE_FEATURES` always wins over defaults and explicit feature
+requests:
+
+```bash
+export HEADROOM_DISABLE_FEATURES=native_bedrock,openai_responses_streaming
+```
+
+For emergency mitigation only, operators can bypass channel eligibility with:
+
+```bash
+export HEADROOM_UNSAFE_ALLOW_UNSTABLE_FEATURES=1
+```
+
+That override is intentionally loud: Rust proxy startup logs the active channel,
+enabled feature list, disabled feature list, and override state.
+
+## Contribution Policy
+
+New functionality that could change user-visible behavior should add a named
+feature to the rollout registry instead of reading a bespoke environment
+variable directly from implementation code.
+
+The expected pattern is:
+
+1. Define the feature in the Python and/or Rust rollout registry.
+2. Resolve the feature once in the composition root.
+3. Pass concrete implementations or configuration into lower-level code.
+4. Add tests for the default-off path, enabled path, disable override, and the
+   release-channel boundary.
+5. Promote the feature by changing its registry channel/default after bake time,
+   without in-file implementation swaps.
+
+Legacy per-feature environment variables may remain as compatibility aliases,
+but they still obey the release-channel gate.

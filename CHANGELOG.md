@@ -8,21 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
-<<<<<<< pr/503-proactive-expansion-xml-tag
 ### Fixed
 - Proactive expansion blocks injected into user turns are now wrapped in
   `<headroom_proactive_expansion>` XML tags, giving downstream consumers
   (LLMs, loggers, attribution parsers) a machine-readable provenance
   boundary and preventing misattribution in multi-agent threads.
 
-=======
->>>>>>> main
 ### Changed
 
 * **telemetry:** anonymous usage telemetry is now **opt-in** (off by default) instead of opt-out. Nothing is collected or sent unless you set `HEADROOM_TELEMETRY=on` or pass `--telemetry` to `headroom proxy` / `headroom install apply`. `is_telemetry_enabled()` is fail-closed — only explicit on-values (`on`/`true`/`1`/`yes`/`enable`/`enabled`) enable it; unset, empty, or unrecognized values stay disabled. The existing `--no-telemetry` flag and `HEADROOM_TELEMETRY=off` remain accepted for back-compat, and install manifests now write the `HEADROOM_TELEMETRY` value explicitly so generated deployments are unambiguous.
 
 ### Features
 
+* **rollout:** add release-channel gated feature flags for Python and Rust composition roots. `HEADROOM_RELEASE_CHANNEL` now bounds feature eligibility (`stable`, `beta`, `canary`, `dev`), `HEADROOM_FEATURES` requests named features, `HEADROOM_DISABLE_FEATURES` wins over every enable path, and `HEADROOM_UNSAFE_ALLOW_UNSTABLE_FEATURES` exists as a logged break-glass override. The Python transform pipeline now gates tool-result interceptors through this policy, and the Rust proxy resolves rollout-managed native feature booleans during config construction.
 * **wrap:** `headroom wrap claude --1m` preserves the 1M context window. Behind a custom `ANTHROPIC_BASE_URL` (the proxy) Claude Code drops the `context-1m` beta header and caps the window at 200k for entitled subscription users; the opt-in flag sets `ANTHROPIC_MODEL=<opus>[1m]` on the launched process so the 1M window activates through Headroom. A model already selected via `ANTHROPIC_MODEL` is preserved (only the `[1m]` suffix is appended) ([#1158](https://github.com/chopratejas/headroom/issues/1158)).
 * **learn:** weight loops in `headroom learn`. A new loop detector (`headroom/learn/loops.py`) recognizes repeated tool-call patterns — including RTK re-fetch loops, where RTK's output truncation makes the agent re-run larger-limit variants of a *successful* command — collapses output-limit variants to one signature, measures the wasted tokens, surfaces loops as a highest-priority digest section, and weights loop guardrails above one-off rules by their measured waste. Previously loops had no special weight and a no-failure re-fetch loop was skipped entirely. Adds an RTK-loop eval (`benchmarks/rtk_loop_learn_eval.py`) that reproduces a loop, runs it through Learn, and asserts the generated guardrail ranks first and prevents re-triggering.
 * **learn:** write per-project learnings to the personal, gitignored `CLAUDE.local.md` by default instead of the team-shared `CLAUDE.md`, matching Claude Code's memory convention so machine-specific paths and tool-discovery byproducts no longer pollute the shared file. Adds a `--target` flag to override the destination (e.g. `--target CLAUDE.md` to opt back into the shared file, or any custom path), and auto-migrates a stale learned-patterns block out of an existing `CLAUDE.md` into `CLAUDE.local.md` with a warning ([#1072](https://github.com/chopratejas/headroom/issues/1072)).
@@ -45,12 +43,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 * **proxy:** stop discarding a finished compression on very large requests. After the transform pipeline completed, a telemetry-only waste-signal re-parse of the *original* messages ran on the critical path; on huge Claude Code transcripts (~400k tokens) that parse could exceed the Anthropic compression timeout, so the proxy failed open and forwarded the uncompressed request despite "Pipeline complete" logging real savings (`tokens_saved: 0`, `transforms_applied: []`, ~31s latency). Waste-signal detection is now skipped above `MAX_WASTE_SIGNAL_DETECTION_TOKENS` (100k) so the compression result stays on the critical path ([#296](https://github.com/chopratejas/headroom/issues/296)).
 * **codex:** retag existing Codex threads when `headroom init` injects the `headroom` provider, so Codex Desktop history stays visible. Codex filters its sidebar/search by the active `model_provider`; the init path set `model_provider = "headroom"` without retagging, so existing native `openai` threads disappeared from the menu (data was never deleted, only hidden). `_ensure_codex_provider` now reconciles thread tags openai→headroom, matching what the install and `wrap` paths already do; `headroom unwrap codex` handles the revert direction ([#961](https://github.com/chopratejas/headroom/issues/961)).
 * **install:** stop duplicating the container ENTRYPOINT in the `persistent-docker` runtime command. The published image already runs `headroom proxy` as its ENTRYPOINT, but `build_runtime_command` re-added `headroom proxy` after the image name, so the container ran `headroom proxy headroom proxy --host 0.0.0.0 …` and Click aborted with "Got unexpected extra arguments (headroom proxy)" — the deployment never became ready and rollback left nothing running. The runtime command now appends only the proxy flags ([#833](https://github.com/chopratejas/headroom/issues/833)).
-<<<<<<< fix/gemini-offload
 * **gemini:** run compression off the asyncio event loop. The Gemini handlers (`generateContent`, Cloud Code stream, `countTokens`) ran the CPU-bound compression pipeline (Magika detection plus ML compression) synchronously on the loop, stalling every concurrent request for the duration of each Gemini request's compression. They now offload it via the shared compression executor, matching the existing OpenAI and Anthropic paths.
-=======
 * **proxy:** queue mid-turn user messages on non-Bedrock streaming path instead of silently dropping them — closes [#902](https://github.com/headroomlabs-ai/headroom/issues/902).
 * **proxy:** add `--protect-tool-results` / `HEADROOM_PROTECT_TOOL_RESULTS` to prevent lossy compression of exact-output tool results (e.g. `Bash cat`/`grep` results) — closes [#1307](https://github.com/headroomlabs-ai/headroom/issues/1307).
->>>>>>> main
 * **cli:** add `--rpm`/`--tpm` and `HEADROOM_RPM`/`HEADROOM_TPM` to the Click proxy command for rate-limit parity with the legacy CLI -- closes [#1350](https://github.com/headroomlabs-ai/headroom/issues/1350) (Problem 1).
 * **proxy:** register `ToolResultInterceptorTransform` in explicit transforms list when `HEADROOM_INTERCEPT_ENABLED` is set — closes [#829](https://github.com/headroomlabs-ai/headroom/issues/829).
 * **opencode:** write Headroom MCP config as a local stdio server instead of a remote `/mcp` URL, keep provider-only installs from adding MCP config, and allow `install apply --target opencode` ([#1380](https://github.com/headroomlabs-ai/headroom/issues/1380)).

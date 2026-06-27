@@ -1,6 +1,7 @@
 //! Configuration for the proxy: CLI flags + env vars.
 
 use clap::{Parser, ValueEnum};
+use headroom_core::rollout::{Feature, Rollout};
 use std::net::SocketAddr;
 use std::time::Duration;
 use url::Url;
@@ -188,6 +189,42 @@ impl CompressionMode {
     about = "Headroom transparent reverse proxy"
 )]
 pub struct CliArgs {
+    /// Release channel that bounds which rollout-managed features may run.
+    ///
+    /// `stable` admits only features that have completed bake time. `beta` and
+    /// `canary` admit progressively newer features. `dev` is for local work.
+    /// Explicit feature requests still cannot cross this boundary unless the
+    /// unsafe override is set.
+    #[arg(
+        long = "release-channel",
+        env = "HEADROOM_RELEASE_CHANNEL",
+        default_value = "stable"
+    )]
+    pub release_channel: String,
+
+    /// Comma-separated rollout features to request explicitly.
+    #[arg(long = "features", env = "HEADROOM_FEATURES", default_value = "")]
+    pub features: String,
+
+    /// Comma-separated rollout features to force off. Disable wins over defaults
+    /// and explicit enable requests.
+    #[arg(
+        long = "disable-features",
+        env = "HEADROOM_DISABLE_FEATURES",
+        default_value = ""
+    )]
+    pub disable_features: String,
+
+    /// Break-glass override that allows unstable features below their channel.
+    /// Intended only for emergency mitigation and should be visible in logs.
+    #[arg(
+        long = "unsafe-allow-unstable-features",
+        env = "HEADROOM_UNSAFE_ALLOW_UNSTABLE_FEATURES",
+        default_value_t = false,
+        action = clap::ArgAction::Set,
+    )]
+    pub unsafe_allow_unstable_features: bool,
+
     /// Address the proxy listens on (e.g. 0.0.0.0:8787).
     #[arg(long, env = "HEADROOM_PROXY_LISTEN", default_value = "0.0.0.0:8787")]
     pub listen: SocketAddr,
@@ -484,6 +521,8 @@ fn parse_bytes(s: &str) -> Result<u64, String> {
 /// Resolved configuration used by the running server.
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// Runtime rollout state resolved from CLI/env.
+    pub rollout: Rollout,
     pub listen: SocketAddr,
     pub upstream: Url,
     pub upstream_timeout: Duration,
@@ -555,6 +594,12 @@ pub struct Config {
 
 impl Config {
     pub fn from_cli(args: CliArgs) -> Self {
+        let rollout = Rollout::from_parts(
+            &args.release_channel,
+            &args.features,
+            &args.disable_features,
+            args.unsafe_allow_unstable_features,
+        );
         let rewrite_host = if args.no_rewrite_host {
             false
         } else {
@@ -564,6 +609,7 @@ impl Config {
             .compression_max_body_bytes
             .unwrap_or(args.max_body_bytes);
         Self {
+            rollout: rollout.clone(),
             listen: args.listen,
             upstream: args.upstream,
             upstream_timeout: args.upstream_timeout,
@@ -578,9 +624,13 @@ impl Config {
             cache_control_auto_frozen: args.cache_control_auto_frozen,
             auth_mode_policy_enforcement: args.auth_mode_policy_enforcement,
             strip_internal_headers: args.strip_internal_headers,
-            enable_responses_streaming: args.enable_responses_streaming,
+            enable_responses_streaming: rollout.is_enabled(
+                Feature::OpenAiResponsesStreaming,
+                args.enable_responses_streaming,
+            ),
             enable_conversations_passthrough: args.enable_conversations_passthrough,
-            enable_bedrock_native: args.enable_bedrock_native,
+            enable_bedrock_native: rollout
+                .is_enabled(Feature::NativeBedrock, args.enable_bedrock_native),
             bedrock_region: args.bedrock_region,
             bedrock_endpoint: args.bedrock_endpoint,
             aws_profile: args.aws_profile,
@@ -594,6 +644,7 @@ impl Config {
     /// production-default behaviour so existing tests stay unchanged.
     pub fn for_test(upstream: Url) -> Self {
         Self {
+            rollout: Rollout::default(),
             listen: "127.0.0.1:0".parse().unwrap(),
             upstream,
             upstream_timeout: Duration::from_secs(60),

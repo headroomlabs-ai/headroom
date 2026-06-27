@@ -19,6 +19,7 @@ from ..config import (
     WasteSignals,
 )
 from ..observability import get_headroom_tracer, get_otel_metrics
+from ..rollout import feature_enabled
 from ..tokenizer import Tokenizer
 from ..utils import deep_copy_messages
 from .base import Transform
@@ -116,14 +117,12 @@ class TransformPipeline:
 
         # 0. Tool-result interceptors (ast-grep Read outline, etc.) run first
         # so downstream compressors operate on the already-shrunk content.
-        # OPT-IN: enable via HeadroomConfig.intercept_tool_results, or for
-        # non-config callers (CLI / SDK / tests) the env var
-        # HEADROOM_INTERCEPT_ENABLED=1. Off by default while this ships — lets
-        # users try it and compare before we make it the default.
-        import os as _os
-
-        if getattr(self.config, "intercept_tool_results", False) or _os.environ.get(
-            "HEADROOM_INTERCEPT_ENABLED"
+        # Rollout-managed: callers may request interceptors through typed config
+        # or the legacy env var, but the feature still has to be eligible in the
+        # active release channel.
+        if feature_enabled(
+            "tool_result_interceptors",
+            explicit=getattr(self.config, "intercept_tool_results", False),
         ):
             from headroom.proxy.interceptors import ToolResultInterceptorTransform
 

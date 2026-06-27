@@ -28,6 +28,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         max_body_bytes = config.max_body_bytes,
         rewrite_host = config.rewrite_host,
         graceful_shutdown_timeout_s = config.graceful_shutdown_timeout.as_secs(),
+        release_channel = config.rollout.channel.as_str(),
+        rollout_features_enabled = ?config.rollout.enabled,
+        rollout_features_disabled = ?config.rollout.disabled,
+        unsafe_allow_unstable_features = config.rollout.unsafe_allow_unstable,
         "headroom-proxy starting"
     );
 

@@ -40,6 +40,11 @@ Closes #
 - Observed result:
 - Not tested:
 
+## Rollout Safety
+
+- Release channel / feature flag impact:
+- Rollback path:
+
 ## Review Readiness
 
 - [ ] I have performed a self-review

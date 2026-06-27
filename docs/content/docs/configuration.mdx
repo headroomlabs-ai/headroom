@@ -5,6 +5,21 @@ description: All configuration options for the Headroom Python and TypeScript SD
 
 Headroom can be configured via the SDK constructor, proxy command line, environment variables, or per-request overrides.
 
+## Release Channels
+
+Headroom uses release channels to keep new behavior out of stable installs until
+it has baked through the right path.
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `HEADROOM_RELEASE_CHANNEL` | `stable` | Selects `stable`, `beta`, `canary`, or `dev`. |
+| `HEADROOM_FEATURES` | unset | Comma-separated feature names to request explicitly. |
+| `HEADROOM_DISABLE_FEATURES` | unset | Comma-separated feature names to force off. Disable wins over every enable path. |
+| `HEADROOM_UNSAFE_ALLOW_UNSTABLE_FEATURES` | unset | Break-glass override for emergency mitigation only. |
+
+See [Release Channels](/docs/release-channels) for the rollout policy and
+contributor rules.
+
 ## CLI Context Tool
 
 `headroom wrap ...` uses RTK for local shell-output filtering by default.
