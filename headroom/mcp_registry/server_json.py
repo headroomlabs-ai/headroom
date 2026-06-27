@@ -56,9 +56,10 @@ def _build_runtime_contract() -> tuple[str, tuple[str, str]]:
     spec = build_headroom_spec()
     if spec.name != "headroom":
         raise ValueError(f"unexpected MCP server name: {spec.name}")
-    if spec.args[-2:] != ("mcp", "serve"):
+    runtime_tail = spec.args[-2:]
+    if runtime_tail != ("mcp", "serve"):
         raise ValueError(f"unexpected MCP launch tail: {spec.args}")
-    return spec.name, spec.args[-2:]
+    return spec.name, (runtime_tail[0], runtime_tail[1])
 
 
 def _build_mcp_package_spec(metadata: ProjectMetadata) -> str:
