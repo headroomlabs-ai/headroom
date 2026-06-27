@@ -781,6 +781,18 @@ try:
 except ValueError:
     COMPRESSION_TIMEOUT_SECONDS = 30.0
 
+# Eager startup preload timeout in seconds. The preload (compressor/parser models,
+# cache-only, allow_download=False) runs off the event loop during startup; this
+# bound only fires on a true hang or an uncatchable native stall so the proxy still
+# binds its port instead of never opening (GH #790). Override via
+# HEADROOM_EAGER_PRELOAD_TIMEOUT_SECONDS. Falls back to 120 on an unparseable value.
+try:
+    EAGER_PRELOAD_TIMEOUT_SECONDS = float(
+        os.environ.get("HEADROOM_EAGER_PRELOAD_TIMEOUT_SECONDS", "120")
+    )
+except ValueError:
+    EAGER_PRELOAD_TIMEOUT_SECONDS = 120.0
+
 # Maximum compression cache sessions (prevents unbounded memory growth)
 MAX_COMPRESSION_CACHE_SESSIONS = 500
 

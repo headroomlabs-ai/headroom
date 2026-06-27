@@ -120,6 +120,7 @@ from headroom.proxy.cost import (
 )
 from headroom.proxy.helpers import (
     COMPRESSION_TIMEOUT_SECONDS,  # noqa: F401
+    EAGER_PRELOAD_TIMEOUT_SECONDS,
     MAX_COMPRESSION_CACHE_SESSIONS,  # noqa: F401
     MAX_MESSAGE_ARRAY_LENGTH,  # noqa: F401
     MAX_REQUEST_BODY_SIZE,  # noqa: F401
@@ -1238,6 +1239,44 @@ class HeadroomProxy(
                 return "available"  # Available but not enabled
             return "disabled"
 
+    def _eager_preload_transforms(self) -> tuple[dict[str, str], list[dict[str, str]]]:
+        """Eagerly load every compressor/parser/detector once (dedup by ``id()``).
+
+        Pure load: returns the merged ``eager_status`` plus the per-transform
+        status dicts for the caller to merge into ``self.warmup`` on the main
+        thread (``WarmupRegistry`` is not written off-thread). This runs via
+        ``asyncio.to_thread`` so a slow or hung native model load cannot keep
+        startup from binding the port (#790).
+        """
+        eager_status: dict[str, str] = {}
+        transform_statuses: list[dict[str, str]] = []
+        seen_transform_ids: set[int] = set()
+        for pipeline in (self.anthropic_pipeline, self.openai_pipeline):
+            for transform in pipeline.transforms:
+                if id(transform) in seen_transform_ids:
+                    continue
+                seen_transform_ids.add(id(transform))
+                if not hasattr(transform, "eager_load_compressors"):
+                    continue
+                try:
+                    transform_status = transform.eager_load_compressors()
+                except Exception as exc:
+                    logger.warning(
+                        "Eager preload failed for %s: %s",
+                        type(transform).__name__,
+                        exc,
+                    )
+                    continue
+                if not isinstance(transform_status, dict):
+                    continue
+                # Merge: later writers win only if the key wasn't set. Preload a
+                # transform ONCE — if another pipeline also has
+                # ``eager_load_compressors`` it contributes only new keys.
+                for key, value in transform_status.items():
+                    eager_status.setdefault(key, value)
+                transform_statuses.append(transform_status)
+        return eager_status, transform_statuses
+
     async def startup(self):
         """Initialize async resources."""
         self.pipeline_extensions.emit(
@@ -1324,32 +1363,31 @@ class HeadroomProxy(
 
         if self.config.optimize:
             logger.info("Pre-loading compressors and parsers...")
-            seen_transform_ids: set[int] = set()
-            pipelines = (self.anthropic_pipeline, self.openai_pipeline)
-            for pipeline in pipelines:
-                for transform in pipeline.transforms:
-                    if id(transform) in seen_transform_ids:
-                        continue
-                    seen_transform_ids.add(id(transform))
-                    if not hasattr(transform, "eager_load_compressors"):
-                        continue
-                    try:
-                        transform_status = transform.eager_load_compressors()
-                    except Exception as exc:
-                        logger.warning(
-                            "Eager preload failed for %s: %s",
-                            type(transform).__name__,
-                            exc,
-                        )
-                        continue
-                    if not isinstance(transform_status, dict):
-                        continue
-                    # Merge: later writers win only if the key wasn't set.
-                    # Preload a transform ONCE — if another pipeline also has
-                    # ``eager_load_compressors`` it contributes only new keys.
-                    for key, value in transform_status.items():
-                        eager_status.setdefault(key, value)
-                    self.warmup.merge_transform_status(transform_status)
+            # Run the preload OFF the event loop with a bound. The loop body
+            # already swallows per-transform Exceptions, so the only thing that
+            # can still block ASGI lifespan startup (and therefore the socket
+            # bind) is a hang or an uncatchable native stall during a model load
+            # on Windows — the "never opens its port" failure in #790. Capping it
+            # means startup always returns and uvicorn binds; on timeout the
+            # transforms simply fall back to lazy loading on first use.
+            transform_statuses: list[dict[str, str]] = []
+            try:
+                eager_status, transform_statuses = await asyncio.wait_for(
+                    asyncio.to_thread(self._eager_preload_transforms),
+                    timeout=EAGER_PRELOAD_TIMEOUT_SECONDS,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Eager preload exceeded %.0fs or failed (%s); continuing so "
+                    "the proxy still binds — transforms load lazily on first use.",
+                    EAGER_PRELOAD_TIMEOUT_SECONDS,
+                    exc,
+                )
+                eager_status, transform_statuses = {}, []
+            # Merge warmup status on the main thread (WarmupRegistry is not
+            # written off-thread).
+            for transform_status in transform_statuses:
+                self.warmup.merge_transform_status(transform_status)
 
         # Update internal status from eager loading results
         if eager_status.get("kompress") == "enabled":
