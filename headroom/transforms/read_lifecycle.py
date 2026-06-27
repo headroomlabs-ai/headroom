@@ -485,6 +485,7 @@ class ReadLifecycleManager:
                     tool_name="Read",
                     tool_call_id=classification.tool_call_id,
                     compression_strategy=f"read_lifecycle:{classification.state.value}",
+                    explicit_hash=ccr_hash,
                 )
             except Exception as e:  # noqa: BLE001 - storage failure must not break the request
                 logger.warning(
