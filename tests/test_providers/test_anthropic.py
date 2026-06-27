@@ -142,3 +142,13 @@ class TestAnthropicCostEstimation:
             "output": 15.00,
             "cached_input": 0.30,
         }
+
+    def test_current_haiku_tier_pricing(self, anthropic_provider):
+        # Haiku 4.5 (current Haiku tier, verified 2026-06-27): $1/MTok input,
+        # $5/MTok output, cache read = 0.1x input ($0.10). Was previously stored
+        # with Haiku 3.5 rates ($0.80/$4/$0.08).
+        assert anthropic_provider._get_pricing("claude-haiku-4-5-20251001") == {
+            "input": 1.00,
+            "output": 5.00,
+            "cached_input": 0.10,
+        }
