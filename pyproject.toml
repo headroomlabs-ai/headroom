@@ -115,7 +115,7 @@ memory = [
 ]
 # Qdrant + Neo4j memory backend helpers
 memory-stack = [
-    "mem0ai>=1.0.0,<2.0",
+    "mem0ai>=1.0.0,<3.0",
     "qdrant-client>=1.9.0,<2.0",
     "neo4j>=5.20.0,<7.0",
 ]
