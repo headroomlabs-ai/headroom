@@ -69,6 +69,14 @@ proxy = [
     "httpx[http2]>=0.24.0",
     "openai>=2.14.0",             # OpenAI API format support
     "mcp>=1.0.0",                 # MCP server (headroom_compress, retrieve, stats)
+    # LiteLLM's proxy/MCP auth stack imports proxy.common_utils.http_parsing_utils,
+    # which hard-imports orjson at module import time. Headroom depends on plain
+    # litellm (not litellm[proxy]), so we need to carry this proxy-only dependency
+    # explicitly or /mcp can fail at runtime in published proxy images.
+    # TODO: Revisit the dependency boundary here. Headroom's proxy extra manually
+    # mirrors part of LiteLLM's proxy/runtime dependency set, which can drift as
+    # LiteLLM adds new proxy-only imports.
+    "orjson>=3.11.6,<4.0",
     "magika>=0.6.0",              # ML content detection for ContentRouter
     "zstandard>=0.20.0",          # Decompress zstd request bodies (Codex, etc.)
     "websockets>=13.0",           # WebSocket proxy for /v1/responses (Codex gpt-5.4+)
