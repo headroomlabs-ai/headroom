@@ -37,10 +37,12 @@ def _resolve_command(spec: ServerSpec) -> ServerSpec:
     """
     if spec.command != "headroom":
         return spec
-    candidate = Path(sys.executable).with_name("headroom")
+    # On Windows the console script is ``headroom.exe``; elsewhere ``headroom``.
+    exe_name = "headroom.exe" if os.name == "nt" else "headroom"
+    candidate = Path(sys.executable).with_name(exe_name)
     if not candidate.exists():
         argv0 = Path(sys.argv[0])
-        if argv0.name == "headroom" and argv0.exists():
+        if argv0.stem == "headroom" and argv0.exists():
             candidate = argv0.resolve()
         else:
             which = shutil.which("headroom")

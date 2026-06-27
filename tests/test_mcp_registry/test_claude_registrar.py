@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import types
 from pathlib import Path
 from unittest.mock import patch
 
@@ -35,6 +36,41 @@ def _spec() -> ServerSpec:
         args=("mcp", "serve"),
         env={},
     )
+
+
+# ----------------------------------------------------------------------
+# _resolve_command()
+# ----------------------------------------------------------------------
+
+
+def test_resolve_command_uses_sibling_of_interpreter(monkeypatch, tmp_path: Path) -> None:
+    bin_dir = tmp_path / "venv" / "bin"
+    bin_dir.mkdir(parents=True)
+    (bin_dir / "headroom").write_text("#!/bin/sh\n")
+    monkeypatch.setattr("headroom.mcp_registry.claude.os.name", "posix")
+    monkeypatch.setattr("sys.executable", str(bin_dir / "python"))
+    spec = _resolve_command(_spec())
+    assert spec.command == str(bin_dir / "headroom")
+
+
+def test_resolve_command_windows_exe_suffix(monkeypatch, tmp_path: Path) -> None:
+    scripts = tmp_path / "Scripts"
+    scripts.mkdir()
+    (scripts / "headroom.exe").write_text("")
+    # Swap only the module's os reference so the resolver sees name="nt" while
+    # pathlib keeps the host flavour (real os.name="nt" would make Path build a
+    # WindowsPath, which cannot be instantiated on a POSIX test host).
+    monkeypatch.setattr(
+        "headroom.mcp_registry.claude.os", types.SimpleNamespace(name="nt")
+    )
+    monkeypatch.setattr("sys.executable", str(scripts / "python.exe"))
+    spec = _resolve_command(_spec())
+    assert spec.command == str(scripts / "headroom.exe")
+
+
+def test_resolve_command_leaves_non_headroom_untouched() -> None:
+    spec = ServerSpec(name="other", command="uvx", args=("x",))
+    assert _resolve_command(spec) is spec
 
 
 # ----------------------------------------------------------------------
