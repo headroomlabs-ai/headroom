@@ -3997,6 +3997,7 @@ def _prepare_codex_wrap_state(
     no_serena: bool,
     memory: bool,
     verbose: bool,
+    rtk_home: Path | None = None,
 ) -> None:
     """Prepare the active Codex home for a wrap or prepare-only invocation."""
     # Snapshot Codex config.toml BEFORE any wrap-time mutation so
@@ -4018,7 +4019,7 @@ def _prepare_codex_wrap_state(
             rtk_path = _ensure_rtk_binary(verbose=verbose)
             if rtk_path:
                 # Keep RTK guidance local to the user's Codex configuration.
-                global_agents = _codex_home_dir() / "AGENTS.md"
+                global_agents = (rtk_home or _codex_home_dir()) / "AGENTS.md"
                 _inject_rtk_instructions(global_agents, verbose=verbose)
 
     # Register headroom MCP server in Codex config.toml so Codex can
@@ -4137,6 +4138,7 @@ def _run_codex_wrap(
         click.echo("Install Codex CLI: npm install -g @openai/codex")
         raise SystemExit(1)
 
+    active_codex_home = _codex_home_dir()
     with _codex_session_home_overlay() as session_codex_home:
         _prepare_codex_wrap_state(
             port=port,
@@ -4147,6 +4149,7 @@ def _run_codex_wrap(
             no_serena=no_serena,
             memory=memory,
             verbose=verbose,
+            rtk_home=active_codex_home,
         )
 
         env, env_vars_display = _build_codex_launch_env(port, os.environ)

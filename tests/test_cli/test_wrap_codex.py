@@ -993,6 +993,41 @@ def test_wrap_codex_injects_rtk_globally_without_changing_project_agents(
     assert wrap_mod._RTK_MARKER.encode() in global_agents.read_bytes()
 
 
+def test_wrap_codex_launch_injects_rtk_globally_without_changing_project_agents(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_test_home(monkeypatch, tmp_path)
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    project_agents = project_dir / "AGENTS.md"
+    original = "# Project instructions\n\nUse the repository conventions.\n"
+    project_agents.write_text(original, encoding="utf-8")
+    original_bytes = project_agents.read_bytes()
+    monkeypatch.chdir(project_dir)
+
+    with patch("headroom.cli.wrap._ensure_rtk_binary", return_value=tmp_path / "rtk"):
+        with patch(
+            "headroom.cli.wrap.shutil.which",
+            side_effect=lambda cmd: "/fake/codex" if cmd == "codex" else None,
+        ):
+            with patch("headroom.cli.wrap._launch_tool"):
+                result = runner.invoke(
+                    main,
+                    [
+                        "wrap",
+                        "codex",
+                        "--no-mcp",
+                        "--no-serena",
+                        "--no-tokensave",
+                    ],
+                )
+
+    assert result.exit_code == 0, result.output
+    assert project_agents.read_bytes() == original_bytes
+    global_agents = tmp_path / ".codex" / "AGENTS.md"
+    assert wrap_mod._RTK_MARKER.encode() in global_agents.read_bytes()
+
+
 def test_unwrap_codex_without_codex_home_warns_on_ambiguous_noop(
     runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
