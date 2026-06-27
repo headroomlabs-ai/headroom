@@ -48,8 +48,9 @@ use unidiff::PatchSet;
 /// real change content?
 ///
 /// Empty input is **not** a diff (returns `false`) — saves a parser
-/// call. Otherwise we hand off to [`PatchSet::parse`] and check that
-/// the result has at least one file with at least one hunk.
+/// call. Inputs must also have a real unified-diff source/target/hunk
+/// shape before we hand off to [`PatchSet::parse`]. This keeps shell
+/// traces like `+++ test.sh` from being treated as diff headers.
 ///
 /// Why "at least one hunk" instead of "parsed without error":
 /// `unidiff::PatchSet::parse` returns `Ok(())` even on plain text
@@ -57,20 +58,74 @@ use unidiff::PatchSet;
 /// passthrough through the diff compressor — a silent regression.
 /// The explicit hunk check makes the contract honest.
 pub fn is_diff(content: &str) -> bool {
-    if content.is_empty() {
+    if content.is_empty() || !looks_like_unified_diff(content) {
         return false;
     }
 
-    let mut patch = PatchSet::new();
-    if patch.parse(content).is_err() {
-        return false;
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut patch = PatchSet::new();
+        if patch.parse(content).is_err() {
+            return false;
+        }
+
+        // `PatchSet::is_empty()` covers "found zero files"; the inner
+        // loop covers "found a file but with zero hunks" (e.g. mode-only
+        // changes). For diff-compressor routing we want at least one
+        // hunk — that's where the actual line-level change content lives.
+        !patch.is_empty() && patch.files().iter().any(|f| !f.is_empty())
+    }))
+    .unwrap_or(false)
+}
+
+fn looks_like_unified_diff(content: &str) -> bool {
+    let mut saw_source_header = false;
+    let mut saw_target_header = false;
+
+    for line in content.lines() {
+        if line.starts_with("--- ") {
+            saw_source_header = true;
+            saw_target_header = false;
+            continue;
+        }
+
+        if saw_source_header && line.starts_with("+++ ") {
+            saw_target_header = true;
+            continue;
+        }
+
+        if saw_target_header && is_unified_hunk_header(line) {
+            return true;
+        }
     }
 
-    // `PatchSet::is_empty()` covers "found zero files"; the inner
-    // loop covers "found a file but with zero hunks" (e.g. mode-only
-    // changes). For diff-compressor routing we want at least one
-    // hunk — that's where the actual line-level change content lives.
-    !patch.is_empty() && patch.files().iter().any(|f| !f.is_empty())
+    false
+}
+
+fn is_unified_hunk_header(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("@@ -") else {
+        return false;
+    };
+    let Some((source_range, rest)) = rest.split_once(" +") else {
+        return false;
+    };
+    let Some((target_range, suffix)) = rest.split_once(" @@") else {
+        return false;
+    };
+
+    is_hunk_range(source_range)
+        && is_hunk_range(target_range)
+        && (suffix.is_empty() || suffix.starts_with(' '))
+}
+
+fn is_hunk_range(range: &str) -> bool {
+    let Some((start, length)) = range.split_once(',') else {
+        return !range.is_empty() && range.chars().all(|c| c.is_ascii_digit());
+    };
+
+    !start.is_empty()
+        && !length.is_empty()
+        && start.chars().all(|c| c.is_ascii_digit())
+        && length.chars().all(|c| c.is_ascii_digit())
 }
 
 /// [`ContentType`]-typed wrapper. Returns `Some(ContentType::GitDiff)`
@@ -114,6 +169,20 @@ mod tests {
     fn source_code_is_not_a_diff() {
         let py = "def foo():\n    return 42\n\nclass Bar:\n    pass\n";
         assert!(!is_diff(py));
+    }
+
+    #[test]
+    fn bash_xtrace_target_header_is_not_a_diff() {
+        assert!(!is_diff("+++ test.sh"));
+        assert_eq!(detect_diff("+++ test.sh"), None);
+    }
+
+    #[test]
+    fn bash_xtrace_output_is_not_a_diff() {
+        let output = "+ set -euo pipefail\n\
+                      +++ dirname test.sh\n\
+                      ++ cd scripts/..\n";
+        assert!(!is_diff(output));
     }
 
     #[test]
