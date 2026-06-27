@@ -36,6 +36,29 @@ def test_save_and_load_manifest_round_trip(monkeypatch, tmp_path: Path) -> None:
     assert loaded.artifacts[0].kind == "script"
 
 
+def test_load_manifest_ignores_corrupt_payload(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    # Simulate a crash mid-write: a truncated/garbage manifest left on disk.
+    profile_dir = tmp_path / ".headroom" / "deploy" / "default"
+    profile_dir.mkdir(parents=True)
+    (profile_dir / "manifest.json").write_text("{not json", encoding="utf-8")
+
+    # Must recover (return None), not raise — parity with list_manifests.
+    assert load_manifest("default") is None
+
+
+def test_save_manifest_writes_atomically(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    save_manifest(_manifest())
+
+    # No leftover temp file from the atomic write; only the manifest itself.
+    profile_dir = tmp_path / ".headroom" / "deploy" / "default"
+    assert sorted(p.name for p in profile_dir.iterdir()) == ["manifest.json"]
+    # And the persisted manifest still round-trips.
+    assert load_manifest("default") is not None
+
+
 def test_list_manifests_ignores_invalid_payloads(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     valid = _manifest()
