@@ -4043,6 +4043,11 @@ def run_server(
 
     app_target: Any
     uvicorn_kwargs: dict[str, Any] = {}
+    if sys.platform == "win32":
+        # ProactorEventLoop can close the listening socket on transient
+        # AcceptEx failures (for example WinError 64 from keep-alive RSTs).
+        # The selector loop keeps accept errors scoped to the connection.
+        uvicorn_kwargs["loop"] = "asyncio:SelectorEventLoop"
     if workers > 1:
         # CompressionCache and PrefixTracker are always per-worker instance vars.
         # Python CompressionStore defaults to InMemoryBackend (per-process), so
