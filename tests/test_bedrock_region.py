@@ -13,6 +13,7 @@ importorskip_no_env_leak("litellm")
 
 from headroom.backends.litellm import (  # noqa: E402  (must follow importorskip)
     LiteLLMBackend,
+    _apply_anthropic_beta,
     _bedrock_profiles_cache,
     _bedrock_region_prefix,
     _build_bedrock_fallback_map,
@@ -352,3 +353,40 @@ class TestNormalizeBedrockProfileId:
         assert _normalize_bedrock_profile_id("claude-sonnet-4-20250514") == (
             "claude-sonnet-4-20250514"
         )
+
+
+# =============================================================================
+# anthropic-beta header forwarding (e.g. 1M context window)
+# =============================================================================
+
+
+class TestApplyAnthropicBeta:
+    """The client's ``anthropic-beta`` header must reach the LiteLLM call.
+
+    LiteLLM's Bedrock converse transform reads beta features (notably
+    ``context-1m-2025-08-07``) from a ``headers`` kwarg; without forwarding,
+    the 1M window silently caps at 200k.
+    """
+
+    def test_forwards_beta(self):
+        kwargs: dict = {}
+        _apply_anthropic_beta(kwargs, {"anthropic-beta": "context-1m-2025-08-07"})
+        assert kwargs["headers"]["anthropic-beta"] == "context-1m-2025-08-07"
+
+    def test_no_beta_is_noop(self):
+        kwargs: dict = {}
+        _apply_anthropic_beta(kwargs, {})
+        assert "headers" not in kwargs
+
+    def test_preserves_existing_headers(self):
+        kwargs: dict = {"headers": {"x-existing": "1"}}
+        _apply_anthropic_beta(kwargs, {"anthropic-beta": "context-1m-2025-08-07"})
+        assert kwargs["headers"] == {
+            "x-existing": "1",
+            "anthropic-beta": "context-1m-2025-08-07",
+        }
+
+    def test_titlecase_header_key(self):
+        kwargs: dict = {}
+        _apply_anthropic_beta(kwargs, {"Anthropic-Beta": "context-1m-2025-08-07"})
+        assert kwargs["headers"]["anthropic-beta"] == "context-1m-2025-08-07"

@@ -383,6 +383,20 @@ def _parse_tool_arguments(arguments: Any) -> Any:
     return arguments
 
 
+def _apply_anthropic_beta(kwargs: dict[str, Any], headers: dict[str, str]) -> None:
+    """Forward the client's ``anthropic-beta`` header into the LiteLLM call.
+
+    Without this, beta features negotiated by the client (notably the 1M
+    context window ``context-1m-2025-08-07``) never reach the upstream — the
+    Bedrock converse transform reads them from a ``headers`` kwarg, and
+    LiteLLM otherwise drops them. LiteLLM filters betas the provider does not
+    support, so passing the raw value through is safe.
+    """
+    beta = headers.get("anthropic-beta") or headers.get("Anthropic-Beta")
+    if beta:
+        kwargs.setdefault("headers", {})["anthropic-beta"] = beta
+
+
 class LiteLLMBackend(Backend):
     """Backend using LiteLLM for multi-provider support.
 
@@ -695,6 +709,7 @@ class LiteLLMBackend(Backend):
             logger.debug(f"LiteLLM request: model={litellm_model}")
 
             # Make the call
+            _apply_anthropic_beta(kwargs, headers)
             response = await acompletion(**kwargs)
 
             # Convert to Anthropic format
@@ -817,6 +832,7 @@ class LiteLLMBackend(Backend):
             )
 
             # Stream content — blocks emitted dynamically based on response
+            _apply_anthropic_beta(kwargs, headers)
             response = await acompletion(**kwargs)
             output_tokens = 0
             current_block_index = -1
@@ -1023,6 +1039,7 @@ class LiteLLMBackend(Backend):
             logger.debug(f"LiteLLM OpenAI request: model={litellm_model}")
 
             # Make the call
+            _apply_anthropic_beta(kwargs, headers)
             response = await acompletion(**kwargs)
 
             # Build the usage block. LiteLLM normalizes prompt-cache stats from
@@ -1195,6 +1212,7 @@ class LiteLLMBackend(Backend):
                 elif headers.get("x-api-key"):
                     kwargs["api_key"] = headers["x-api-key"]
 
+            _apply_anthropic_beta(kwargs, headers)
             response = await acompletion(**kwargs)
 
             async for chunk in response:
