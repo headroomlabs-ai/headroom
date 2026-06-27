@@ -940,6 +940,50 @@ def retry_after_ms(response: httpx.Response, max_ms: int) -> float | None:
     return min(max(seconds, 0.0) * 1000.0, float(max_ms))
 
 
+async def request_with_transient_retry(
+    client: httpx.AsyncClient,
+    *,
+    request_id: str | None = None,
+    max_retries: int = 1,
+    **request_kwargs: Any,
+) -> httpx.Response:
+    """Issue a buffered httpx request, retrying once on a transient close.
+
+    ``httpx.RemoteProtocolError`` ("peer closed connection without sending
+    complete message body (incomplete chunked read)") is raised when an
+    upstream closes a pooled keep-alive connection that httpx then reuses for
+    the next request. A direct ``curl`` never hits this because it opens a
+    fresh connection per call; Headroom reuses pooled connections, so the
+    first request issued on a stale connection fails even though the upstream
+    is healthy (it answers a fresh connection with 200). Retrying opens a new
+    connection and succeeds, mirroring curl's behaviour. See GH #1112.
+
+    Only ``httpx.RemoteProtocolError`` is retried — the specific stale
+    keep-alive symptom; every other exception (``ConnectError``, timeouts,
+    HTTP status errors) propagates immediately so existing handling is
+    unchanged. Use this for buffered (non-streaming) requests only: a streamed
+    response cannot be safely replayed once bytes have reached the client.
+    """
+    import httpx
+
+    attempt = 0
+    while True:
+        try:
+            return await client.request(**request_kwargs)
+        except httpx.RemoteProtocolError as exc:
+            if attempt >= max_retries:
+                raise
+            attempt += 1
+            logger.warning(
+                "Upstream closed connection mid-response (%s); retrying on a "
+                "fresh connection (attempt %d/%d)%s",
+                exc,
+                attempt,
+                max_retries,
+                f" [{request_id}]" if request_id else "",
+            )
+
+
 # Image compression availability (do not retain a global compressor instance)
 _image_compressor_available: bool | None = None
 
