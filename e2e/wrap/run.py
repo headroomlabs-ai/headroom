@@ -287,6 +287,7 @@ def create_shims(shim_dir: Path) -> None:
                     "OPENAI_BASE_URL",
                     "OPENAI_API_BASE",
                     "ANTHROPIC_BASE_URL",
+                    "CODEX_HOME",
                     "OPENCODE_CONFIG_CONTENT",
                 )
                 if os.environ.get(key) is not None
