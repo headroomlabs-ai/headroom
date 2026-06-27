@@ -820,9 +820,7 @@ def test_codex_session_home_overlay_seeds_active_home_and_cleans_up(
         seeded_auth = (session_home / "auth.json").read_text(encoding="utf-8")
         assert seeded_config == original_config
         assert seeded_auth == original_auth
-        (session_home / "config.toml").write_text(
-            'model_provider = "headroom"\n', encoding="utf-8"
-        )
+        (session_home / "config.toml").write_text('model_provider = "headroom"\n', encoding="utf-8")
         assert config_file.read_text(encoding="utf-8") == original_config
 
     assert not session_home.exists()
