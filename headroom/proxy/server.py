@@ -124,6 +124,7 @@ from headroom.proxy.helpers import (
     MAX_MESSAGE_ARRAY_LENGTH,  # noqa: F401
     MAX_REQUEST_BODY_SIZE,  # noqa: F401
     MAX_SSE_BUFFER_SIZE,  # noqa: F401
+    RETRYABLE_OVERLOAD_STATUSES,
     _get_context_tool_stats,
     _get_image_compressor,  # noqa: F401
     _get_rtk_stats,  # noqa: F401
@@ -1663,22 +1664,11 @@ class HeadroomProxy(
                         url, **post_kwargs
                     )
 
-                    # Don't retry client errors (4xx) — except 429, the most
-                    # retriable status, which carries an authoritative Retry-After (#1221).
-                    if 400 <= response.status_code < 500 and response.status_code != 429:
-                        return response
-
-                    # Retry server errors (5xx)
-                    if response.status_code >= 500:
-                        raise httpx.HTTPStatusError(
-                            f"Server error: {response.status_code}",
-                            request=response.request,
-                            response=response,
-                        )
-
-                    # Rate limit (429): retry honoring Retry-After, but return it
-                    # verbatim once exhausted — a clean rate-limit signal beats a 5xx.
-                    if response.status_code == 429:
+                    # Transient overloads (429 rate-limit, 529 overloaded):
+                    # retry honoring Retry-After, but return verbatim once
+                    # exhausted — a clean overload signal beats a synthesized 5xx
+                    # (extends #1221 to 529, Anthropic's overloaded_error).
+                    if response.status_code in RETRYABLE_OVERLOAD_STATUSES:
                         if (
                             not self.config.retry_enabled
                             or attempt >= self.config.retry_max_attempts - 1
@@ -1692,10 +1682,23 @@ class HeadroomProxy(
                             attempt,
                         )
                         logger.warning(
-                            f"Upstream 429 (attempt {attempt + 1}), retrying in {delay_ms:.0f}ms"
+                            f"Upstream {response.status_code} (attempt {attempt + 1}), "
+                            f"retrying in {delay_ms:.0f}ms"
                         )
                         await asyncio.sleep(delay_ms / 1000)
                         continue
+
+                    # Don't retry other client errors (4xx)
+                    if 400 <= response.status_code < 500:
+                        return response
+
+                    # Retry other server errors (5xx)
+                    if response.status_code >= 500:
+                        raise httpx.HTTPStatusError(
+                            f"Server error: {response.status_code}",
+                            request=response.request,
+                            response=response,
+                        )
 
                     return response
 

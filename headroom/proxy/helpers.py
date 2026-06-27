@@ -940,6 +940,14 @@ def retry_after_ms(response: httpx.Response, max_ms: int) -> float | None:
     return min(max(seconds, 0.0) * 1000.0, float(max_ms))
 
 
+# Transient upstream statuses worth retrying with backoff: 429 (rate limit) and
+# 529 (Anthropic ``overloaded_error``). Both mean "the server is temporarily
+# limiting/overloaded — try again shortly", unlike other 4xx which signal a
+# problem with the request itself. Single source of truth so the streaming and
+# non-streaming forwarders agree on what is retriable.
+RETRYABLE_OVERLOAD_STATUSES: frozenset[int] = frozenset({429, 529})
+
+
 # Image compression availability (do not retain a global compressor instance)
 _image_compressor_available: bool | None = None
 
