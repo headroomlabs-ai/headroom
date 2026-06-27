@@ -80,6 +80,10 @@ class TestAnthropicModelLimits:
     def test_get_context_limit_claude_opus_4_8(self, anthropic_provider):
         assert anthropic_provider.get_context_limit("claude-opus-4-8") == 1000000
 
+    def test_get_context_limit_claude_sonnet_4_6(self, anthropic_provider):
+        # Sonnet 4.6 ships with the 1M context window (long-context pricing tier).
+        assert anthropic_provider.get_context_limit("claude-sonnet-4-6") == 1000000
+
     def test_supports_model_known(self, anthropic_provider):
         assert anthropic_provider.supports_model("claude-3-5-sonnet-20241022")
 
@@ -114,12 +118,27 @@ class TestAnthropicCostEstimation:
             anthropic_provider._get_pricing("claude-opus-4-7")
         )
 
-    @pytest.mark.parametrize("model", ["claude-opus-4-6", "claude-opus-4-7", "claude-opus-4-8"])
+    @pytest.mark.parametrize(
+        "model",
+        ["claude-opus-4-5-20251101", "claude-opus-4-6", "claude-opus-4-7", "claude-opus-4-8"],
+    )
     def test_current_opus_tier_pricing(self, anthropic_provider, model):
-        # Opus 4.6–4.8 share the same current-tier rates per anthropic.com/pricing
+        # Opus 4.5–4.8 share the same current-tier rates per anthropic.com/pricing
         # (verified 2026-06-27): $5/MTok input, $25/MTok output, cache read = 0.1x input ($0.50).
         assert anthropic_provider._get_pricing(model) == {
             "input": 5.00,
             "output": 25.00,
             "cached_input": 0.50,
+        }
+
+    @pytest.mark.parametrize(
+        "model", ["claude-sonnet-4-5", "claude-sonnet-4-6", "claude-sonnet-4-20250514"]
+    )
+    def test_current_sonnet_tier_pricing(self, anthropic_provider, model):
+        # Sonnet 4 / 4.5 / 4.6 all sit at the current Sonnet tier per anthropic.com/pricing
+        # (verified 2026-06-27): $3/MTok input, $15/MTok output, cache read = 0.1x input ($0.30).
+        assert anthropic_provider._get_pricing(model) == {
+            "input": 3.00,
+            "output": 15.00,
+            "cached_input": 0.30,
         }
