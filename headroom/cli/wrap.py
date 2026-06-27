@@ -98,6 +98,15 @@ from headroom.providers.copilot import (
     validate_configuration as _validate_copilot_configuration,
 )
 from headroom.providers.cursor import render_setup_lines as _render_cursor_setup_lines
+from headroom.providers.grok import (
+    DEFAULT_API_URL as _GROK_DEFAULT_API_URL,
+)
+from headroom.providers.grok import (
+    HEADROOM_MODEL_ALIAS as _GROK_HEADROOM_MODEL_ALIAS,
+)
+from headroom.providers.grok import (
+    resolve_launch_model as _resolve_grok_launch_model,
+)
 from headroom.providers.mistral_vibe import build_launch_env as _build_mistral_vibe_launch_env
 from headroom.providers.openclaw import (
     build_plugin_entry as _build_openclaw_plugin_entry_impl,
@@ -1260,6 +1269,164 @@ _CODEX_MCP_END = "# --- end Headroom MCP server ---"
 # if the user had their own `model_provider` / `[model_providers.*]` config
 # before running wrap.
 _CODEX_CONFIG_BACKUP_SUFFIX = ".headroom-backup"
+
+# Grok config injection markers
+_GROK_TOP_LEVEL_MARKER = "# --- Headroom proxy (auto-injected by headroom wrap grok) ---"
+_GROK_END_MARKER = "# --- end Headroom ---"
+_GROK_CONFIG_BACKUP_SUFFIX = ".headroom-backup"
+
+
+def _grok_home_dir() -> Path:
+    """Return Grok Build's config directory."""
+    return Path.home() / ".grok"
+
+
+def _grok_config_paths() -> tuple[Path, Path]:
+    """Return ``(config_file, backup_file)`` for Grok's TOML config."""
+    config_dir = _grok_home_dir()
+    config_file = config_dir / "config.toml"
+    backup_file = config_dir / f"config.toml{_GROK_CONFIG_BACKUP_SUFFIX}"
+    return config_file, backup_file
+
+
+def _strip_grok_headroom_blocks(content: str) -> str:
+    """Remove Headroom-managed model blocks from Grok ``config.toml`` content."""
+
+    while _GROK_TOP_LEVEL_MARKER in content and _GROK_END_MARKER in content:
+        start = content.index(_GROK_TOP_LEVEL_MARKER)
+        end = content.index(_GROK_END_MARKER, start) + len(_GROK_END_MARKER)
+        content = content[:start].rstrip("\n") + "\n" + content[end:].lstrip("\n")
+    content = content.replace(_GROK_TOP_LEVEL_MARKER + "\n", "")
+    content = content.replace(_GROK_END_MARKER + "\n", "")
+    return content.lstrip("\n").rstrip() + "\n" if content.strip() else ""
+
+
+def _snapshot_grok_config_if_unwrapped(config_file: Path, backup_file: Path) -> None:
+    """Snapshot the pre-wrap Grok config once, before the first injection."""
+
+    if backup_file.exists() or not config_file.exists():
+        return
+    try:
+        content = config_file.read_text(encoding="utf-8")
+    except OSError:
+        return
+    if _GROK_TOP_LEVEL_MARKER in content or _GROK_END_MARKER in content:
+        return
+    backup_file.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(config_file, backup_file)
+
+
+def _rewrite_grok_args_for_headroom(grok_args: tuple) -> tuple[tuple[str, ...], str | None]:
+    """Route Grok through the Headroom alias while preserving other CLI args."""
+
+    requested_model: str | None = None
+    rewritten_args: list[str] = []
+    i = 0
+    while i < len(grok_args):
+        arg = str(grok_args[i])
+        if arg == "-m":
+            if i + 1 < len(grok_args):
+                requested_model = str(grok_args[i + 1])
+                i += 2
+                continue
+        elif arg == "--model":
+            if i + 1 < len(grok_args):
+                requested_model = str(grok_args[i + 1])
+                i += 2
+                continue
+        elif arg.startswith("--model="):
+            requested_model = arg.split("=", 1)[1]
+            i += 1
+            continue
+
+        rewritten_args.append(arg)
+        i += 1
+
+    return ("--model", _GROK_HEADROOM_MODEL_ALIAS, *rewritten_args), requested_model
+
+
+def _resolve_grok_requested_model(config_content: str, requested_model: str | None) -> str:
+    """Resolve a Grok CLI model flag to the upstream xAI model id."""
+
+    requested = (requested_model or "").strip()
+    if not requested or requested == _GROK_HEADROOM_MODEL_ALIAS:
+        return _resolve_grok_launch_model(requested)
+
+    target_header = f"[model.{requested}]"
+    in_target = False
+    for raw_line in config_content.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            if line == target_header:
+                in_target = True
+                continue
+            if in_target:
+                break
+            continue
+        if in_target:
+            key, _, value = line.partition("=")
+            if key.strip() != "model":
+                continue
+            candidate = value.split("#", 1)[0].strip()
+            if len(candidate) >= 2 and candidate[0] == candidate[-1] and candidate[0] in {'"', "'"}:
+                return _resolve_grok_launch_model(candidate[1:-1].strip())
+            break
+
+    return _resolve_grok_launch_model(requested)
+
+
+def _inject_grok_provider_config(port: int, model_name: str) -> Path:
+    """Inject a Headroom-backed custom model into ``~/.grok/config.toml``."""
+
+    config_file, backup_file = _grok_config_paths()
+    _snapshot_grok_config_if_unwrapped(config_file, backup_file)
+    config_file.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        existing = config_file.read_text(encoding="utf-8") if config_file.exists() else ""
+    except OSError as exc:
+        raise click.ClickException(f"could not read Grok config: {exc}") from exc
+
+    cleaned = _strip_grok_headroom_blocks(existing)
+    injected = (
+        f"{_GROK_TOP_LEVEL_MARKER}\n"
+        f"[model.{_GROK_HEADROOM_MODEL_ALIAS}]\n"
+        f'model = "{model_name}"\n'
+        f'base_url = "http://127.0.0.1:{port}/v1"\n'
+        'name = "Headroom proxy"\n'
+        f"{_GROK_END_MARKER}\n"
+    )
+    updated = f"{cleaned.rstrip()}\n\n{injected}" if cleaned.strip() else injected
+    try:
+        config_file.write_text(updated, encoding="utf-8")
+    except OSError as exc:
+        raise click.ClickException(f"could not write Grok config: {exc}") from exc
+    return config_file
+
+
+def _restore_grok_provider_config() -> tuple[str, Path]:
+    """Undo ``_inject_grok_provider_config`` for the active Grok config file."""
+
+    config_file, backup_file = _grok_config_paths()
+
+    if backup_file.exists():
+        shutil.copy2(backup_file, config_file)
+        backup_file.unlink()
+        return "restored", config_file
+
+    if config_file.exists():
+        original = config_file.read_text(encoding="utf-8")
+        if _GROK_TOP_LEVEL_MARKER in original or _GROK_END_MARKER in original:
+            cleaned = _strip_grok_headroom_blocks(original)
+            if not cleaned.strip():
+                config_file.unlink()
+                return "removed", config_file
+            config_file.write_text(cleaned, encoding="utf-8")
+            return "cleaned", config_file
+
+    return "noop", config_file
 
 
 def _codex_home_dir() -> Path:
@@ -2576,6 +2743,34 @@ def _ensure_proxy(
 
             if probe_ready(manifest.health_url):
                 health_payload = helpers._query_proxy_health(port)
+                running_config = helpers._proxy_health_config(health_payload)
+                if running_config is None:
+                    running_config = helpers._query_proxy_config(port)
+                incompatible_targets = []
+                if running_config is not None:
+                    if openai_api_url:
+                        running_openai_url = _normalize_proxy_api_url(
+                            running_config.get("openai_api_url")
+                        )
+                        requested_openai_url = _normalize_proxy_api_url(openai_api_url)
+                        if running_openai_url != requested_openai_url:
+                            incompatible_targets.append("openai-api-url")
+                    if anthropic_api_url:
+                        running_anthropic_url = _normalize_proxy_api_url(
+                            running_config.get("anthropic_api_url")
+                        )
+                        requested_anthropic_url = _normalize_proxy_api_url(anthropic_api_url)
+                        if running_anthropic_url != requested_anthropic_url:
+                            incompatible_targets.append("anthropic-api-url")
+                if incompatible_targets:
+                    flags_str = ", ".join(
+                        f"--{flag.replace('_', '-')}" for flag in incompatible_targets
+                    )
+                    raise click.ClickException(
+                        f"Persistent deployment '{manifest.profile}' on port {port} is "
+                        f"incompatible with requested {flags_str}. Use a different port or "
+                        "stop the persistent proxy before wrapping this client."
+                    )
                 if helpers._proxy_needs_version_restart(health_payload):
                     running_version = helpers._proxy_version(health_payload) or "unknown"
                     active_sessions = helpers._proxy_active_session_count(health_payload)
@@ -2622,12 +2817,42 @@ def _ensure_proxy(
             running_config = helpers._proxy_health_config(health_payload)
             if running_config is None:
                 running_config = helpers._query_proxy_config(port)
+            target_mismatch_flags = []
+            if running_config is not None:
+                if openai_api_url:
+                    running_openai_url = _normalize_proxy_api_url(
+                        running_config.get("openai_api_url")
+                    )
+                    requested_openai_url = _normalize_proxy_api_url(openai_api_url)
+                    if running_openai_url != requested_openai_url:
+                        target_mismatch_flags.append("openai-api-url")
+                if anthropic_api_url:
+                    running_anthropic_url = _normalize_proxy_api_url(
+                        running_config.get("anthropic_api_url")
+                    )
+                    requested_anthropic_url = _normalize_proxy_api_url(anthropic_api_url)
+                    if running_anthropic_url != requested_anthropic_url:
+                        target_mismatch_flags.append("anthropic-api-url")
 
             if helpers._proxy_needs_version_restart(health_payload):
                 running_version = helpers._proxy_version(health_payload) or "unknown"
                 active_sessions = helpers._proxy_active_session_count(health_payload)
                 other_wrappers = helpers._live_proxy_clients(port, exclude_self=True)
                 if active_sessions > 0 or other_wrappers:
+                    if target_mismatch_flags:
+                        flags_str = ", ".join(
+                            f"--{flag.replace('_', '-')}" for flag in target_mismatch_flags
+                        )
+                        detail = (
+                            f"{active_sessions} active session(s)"
+                            if active_sessions > 0
+                            else f"{len(other_wrappers)} other wrapper(s)"
+                        )
+                        raise click.ClickException(
+                            f"Proxy on port {port} is missing {flags_str} and cannot be reused "
+                            f"because {detail} are attached. Use a different port or stop the "
+                            "existing proxy before wrapping this client."
+                        )
                     # active_sessions only counts Codex WebSocket relay; the
                     # marker list also covers HTTP wrap clients. Either means a
                     # live session is attached, so don't restart the shared
@@ -2665,7 +2890,7 @@ def _ensure_proxy(
                 needs_restart = True
 
             if running_config is not None:
-                missing = []
+                missing = list(target_mismatch_flags)
                 if memory and not running_config.get("memory"):
                     missing.append("memory")
                 if learn and not running_config.get("learn"):
@@ -2678,19 +2903,27 @@ def _ensure_proxy(
                     and running_config.get("savings_profile") != expected_savings_profile
                 ):
                     missing.append("savings-profile")
-                if openai_api_url:
-                    running_openai_url = _normalize_proxy_api_url(
-                        running_config.get("openai_api_url")
-                    )
-                    requested_openai_url = _normalize_proxy_api_url(openai_api_url)
-                    if running_openai_url != requested_openai_url:
-                        missing.append("openai-api-url")
 
                 if missing:
                     flags_str = ", ".join(
                         f if f.startswith("--") else f"--{f.replace('_', '-')}" for f in missing
                     )
+                    active_sessions = helpers._proxy_active_session_count(health_payload)
+                    has_target_mismatch = any(
+                        flag in {"openai-api-url", "anthropic-api-url"} for flag in missing
+                    )
                     other_wrappers = helpers._live_proxy_clients(port, exclude_self=True)
+                    if has_target_mismatch and (other_wrappers or active_sessions > 0):
+                        detail = (
+                            f"{active_sessions} active session(s)"
+                            if active_sessions > 0
+                            else f"{len(other_wrappers)} other wrapper(s)"
+                        )
+                        raise click.ClickException(
+                            f"Proxy on port {port} is missing {flags_str} and cannot be reused "
+                            f"because {detail} are attached. Use a different port or stop the "
+                            "existing proxy before wrapping this client."
+                        )
                     if other_wrappers:
                         # Another wrapper is attached to this proxy; restarting it
                         # to add flags would drop their in-flight requests. Reuse
@@ -3211,6 +3444,7 @@ def wrap() -> None:
         headroom wrap codex               # OpenAI Codex CLI
         headroom wrap copilot -- --model claude-sonnet-4-20250514
         headroom wrap aider               # Aider
+        headroom wrap grok                # Grok Build CLI
         headroom wrap vibe                # Mistral Vibe
         headroom wrap cursor              # Cursor (prints config instructions)
         headroom wrap cline               # Cline (VS Code; prints config instructions)
@@ -4291,6 +4525,137 @@ def aider(
         anyllm_provider=anyllm_provider,
         region=region,
     )
+
+
+# =============================================================================
+# Grok Build CLI
+# =============================================================================
+
+
+@wrap.command(context_settings={"ignore_unknown_options": True})
+@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--no-context-tool",
+    "--no-rtk",
+    "no_rtk",
+    is_flag=True,
+    help="Skip CLI context-tool setup",
+)
+@click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
+@click.option("--learn", is_flag=True, help="Enable live traffic learning")
+@click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
+@click.option("--backend", default=None, help="API backend for the proxy")
+@click.option("--anyllm-provider", default=None, help="Provider for any-llm backend")
+@click.option("--region", default=None, help="Cloud region for Bedrock/Vertex")
+@click.option("--verbose", "-v", is_flag=True, help="Verbose output")
+@click.option("--prepare-only", is_flag=True, hidden=True)
+@click.argument("grok_args", nargs=-1, type=click.UNPROCESSED)
+def grok(
+    port: int,
+    no_rtk: bool,
+    no_proxy: bool,
+    learn: bool,
+    memory: bool,
+    backend: str | None,
+    anyllm_provider: str | None,
+    region: str | None,
+    verbose: bool,
+    prepare_only: bool,
+    grok_args: tuple,
+) -> None:
+    """Launch Grok through Headroom proxy.
+
+    \b
+    Injects a Headroom-backed custom model into ``~/.grok/config.toml`` and
+    launches Grok with that alias, so Grok routes requests through Headroom
+    using its documented config-based model path.
+    Sets up the selected CLI context tool so Grok uses token-optimized commands.
+    """
+    # Setup CLI context tool for grok.
+    if not no_rtk:
+        if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
+            click.echo("  Setting up lean-ctx for grok...")
+            _setup_lean_ctx_agent("grok", verbose=verbose)
+        else:
+            click.echo("  Setting up rtk for grok...")
+            rtk_path = _ensure_rtk_binary(verbose=verbose)
+            if rtk_path:
+                # Keep wrapper instructions in the project-root conventions file.
+                conventions = Path.cwd() / "CONVENTIONS.md"
+                _inject_rtk_instructions(conventions, verbose=verbose)
+
+    if prepare_only:
+        return
+
+    grok_bin = shutil.which("grok")
+    if not grok_bin:
+        click.echo("Error: 'grok' not found in PATH.")
+        click.echo("Install Grok Build CLI: https://docs.x.ai/build/overview")
+        raise SystemExit(1)
+
+    grok_launch_args, requested_model = _rewrite_grok_args_for_headroom(grok_args)
+    config_file, _ = _grok_config_paths()
+    existing_config = config_file.read_text(encoding="utf-8") if config_file.exists() else ""
+    selected_model = _resolve_grok_requested_model(existing_config, requested_model)
+    config_file = _inject_grok_provider_config(port, selected_model)
+    env = dict(os.environ)
+    env_vars_display = [
+        f"{config_file}: model.{_GROK_HEADROOM_MODEL_ALIAS} -> http://127.0.0.1:{port}/v1",
+        f"upstream model = {selected_model}",
+    ]
+
+    _launch_tool(
+        binary=grok_bin,
+        args=grok_launch_args,
+        env=env,
+        port=port,
+        no_proxy=no_proxy,
+        tool_label="GROK",
+        env_vars_display=env_vars_display,
+        learn=learn,
+        memory=memory,
+        agent_type="grok",
+        backend=backend,
+        anyllm_provider=anyllm_provider,
+        region=region,
+        openai_api_url=_GROK_DEFAULT_API_URL,
+    )
+
+
+@unwrap.command("grok")
+@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option("--no-stop-proxy", is_flag=True, help="Do not stop the local Headroom proxy")
+def unwrap_grok(port: int, no_stop_proxy: bool) -> None:
+    """Remove durable ``headroom wrap grok`` state from Grok's config file.
+
+    Restores a pre-wrap backup when one exists. Otherwise strips the
+    Headroom-managed custom model block in place, or removes the file entirely
+    when it only contained Headroom state.
+    """
+    click.echo()
+    click.echo("  ╔═══════════════════════════════════════════════╗")
+    click.echo("  ║           HEADROOM UNWRAP: GROK              ║")
+    click.echo("  ╚═══════════════════════════════════════════════╝")
+    click.echo()
+
+    try:
+        status, config_file = _restore_grok_provider_config()
+    except OSError as exc:
+        raise click.ClickException(f"could not unwrap Grok config: {exc}") from exc
+
+    if status == "restored":
+        click.echo(f"  Restored prior {config_file} from pre-wrap backup.")
+    elif status == "cleaned":
+        click.echo(f"  Removed Headroom block from {config_file}; other content preserved.")
+    elif status == "removed":
+        click.echo(f"  Removed {config_file} (contained only Headroom-written config).")
+    else:
+        click.echo(f"  Nothing to undo: {config_file} has no Headroom wrap markers.")
+
+    click.echo()
+    if not no_stop_proxy and status != "noop":
+        _echo_unwrap_proxy_stop_status(_stop_local_proxy_for_unwrap(port), port)
+    click.echo()
 
 
 # =============================================================================
