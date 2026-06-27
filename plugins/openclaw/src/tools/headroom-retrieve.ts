@@ -17,11 +17,7 @@ export function createHeadroomRetrieveTool(config: RetrieveToolConfig) {
 
   return {
     name: "headroom_retrieve",
-    description:
-      "Retrieve original uncompressed content that was compressed to save tokens. " +
-      "Trust kept rows unless you have a concrete gap. Retrieve when you need raw, original, " +
-      "or complete content, or when a targeted follow-up cannot be answered from the kept summary. " +
-      "The hash is provided in compression markers like [N items compressed... hash=abc123].",
+    description: "Retrieve original uncompressed content that was compressed to save tokens. Trust kept rows unless you have a concrete gap. Retrieve when you need raw, original, or complete content, or when a targeted follow-up cannot be answered from the kept summary. The hash is provided in compression markers like [N items compressed... hash=abc123].",
     parameters: {
       type: "object" as const,
       properties: {
@@ -31,7 +27,8 @@ export function createHeadroomRetrieveTool(config: RetrieveToolConfig) {
         },
         query: {
           type: "string",
-          description: "Optional targeted search query for a concrete gap. Use it when the kept summary cannot answer a specific follow-up. If omitted, returns all original items.",
+          description:
+            "Optional targeted search query for a concrete gap. Use it when the kept summary cannot answer a specific follow-up. If omitted, returns all original items.",
         },
       },
       required: ["hash"],
@@ -66,7 +63,7 @@ export function createHeadroomRetrieveTool(config: RetrieveToolConfig) {
       } catch (error) {
         return JSON.stringify({
           error: `Retrieval failed: ${error}`,
-          hint: "The compressed content may have expired (default TTL: 5 minutes)",
+          hint: "The compressed content may have expired under the current proxy TTL.",
         });
       }
     },

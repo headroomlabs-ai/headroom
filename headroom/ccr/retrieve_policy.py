@@ -76,6 +76,13 @@ def render_retrieve_cli_workflow_steps() -> str:
     )
 
 
+def render_retrieve_runtime_prompt_hint() -> str:
+    return (
+        "Trust kept rows unless you have a concrete gap. Use headroom_retrieve when "
+        "you need raw, original, complete, or targeted follow-up content."
+    )
+
+
 def render_retrieve_system_instructions(hashes: list[str], tool_name: str) -> str:
     hash_list = ", ".join(hashes) if len(hashes) <= 5 else f"{', '.join(hashes[:5])} ..."
     return f"""
