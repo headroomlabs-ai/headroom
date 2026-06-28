@@ -354,86 +354,6 @@ class TestRelevanceCalculation:
         assert recommendations[0].relevance_score > 0.3
 
 
-class TestExpansionTypeDetection:
-    """Test determination of expansion type (full vs search)."""
-
-    def test_full_expansion_high_relevance(self):
-        """High relevance triggers full expansion."""
-        tracker = ContextTracker()
-
-        context = CompressedContext(
-            hash_key="test",
-            turn_number=1,
-            timestamp=time.time(),
-            tool_name="Bash",
-            original_item_count=50,
-            compressed_item_count=5,
-            query_context="find files",
-            sample_content="auth.py, middleware.py",
-            workspace_key="ws-test",
-        )
-
-        expand_full, search_query = tracker._determine_expansion_type(
-            query="authentication middleware",
-            context=context,
-            relevance=0.8,  # High relevance
-        )
-
-        assert expand_full is True
-        assert search_query is None
-
-    def test_full_expansion_small_count(self):
-        """Small original item count triggers full expansion."""
-        tracker = ContextTracker()
-
-        context = CompressedContext(
-            hash_key="test",
-            turn_number=1,
-            timestamp=time.time(),
-            tool_name="Bash",
-            original_item_count=30,  # Small
-            compressed_item_count=5,
-            query_context="find files",
-            sample_content="file.py",
-            workspace_key="ws-test",
-        )
-
-        expand_full, search_query = tracker._determine_expansion_type(
-            query="some query",
-            context=context,
-            relevance=0.4,
-        )
-
-        assert expand_full is True
-
-    def test_search_expansion_large_count(self):
-        """Large original count with specific keywords triggers search."""
-        tracker = ContextTracker()
-
-        context = CompressedContext(
-            hash_key="test",
-            turn_number=1,
-            timestamp=time.time(),
-            tool_name="Bash",
-            original_item_count=500,  # Large
-            compressed_item_count=20,
-            query_context="find all files",
-            sample_content="many files...",
-            workspace_key="ws-test",
-        )
-
-        expand_full, search_query = tracker._determine_expansion_type(
-            query="find authentication middleware handler",
-            context=context,
-            relevance=0.4,  # Medium relevance
-        )
-
-        # Should use search for large datasets
-        if not expand_full:
-            assert search_query is not None
-            assert "authentication" in search_query or "middleware" in search_query
-
-
 class TestExpansionExecution:
     """Test execution of expansion recommendations."""
 
@@ -463,7 +383,6 @@ class TestExpansionExecution:
                 hash_key=hash_key,
                 reason="relevant to query",
                 relevance_score=0.8,
-                expand_full=True,
             )
         ]
 
@@ -473,39 +392,6 @@ class TestExpansionExecution:
         assert results[0]["type"] == "full"
         assert results[0]["item_count"] == 100
 
-    def test_execute_search_expansion(self):
-        """Execute search expansion."""
-        store = get_compression_store()
-        items = [
-            {"id": 1, "content": "authentication code"},
-            {"id": 2, "content": "database operations"},
-            {"id": 3, "content": "authentication middleware"},
-        ]
-        original = json.dumps(items)
-
-        hash_key = store.store(
-            original=original,
-            compressed="[]",
-            original_item_count=3,
-        )
-
-        tracker = ContextTracker()
-        recommendations = [
-            ExpansionRecommendation(
-                hash_key=hash_key,
-                reason="relevant to query",
-                relevance_score=0.5,
-                expand_full=False,
-                search_query="authentication",
-            )
-        ]
-
-        results = tracker.execute_expansions(recommendations)
-
-        assert len(results) == 1
-        assert results[0]["type"] == "search"
-        assert results[0]["query"] == "authentication"
-
     def test_execute_nonexistent_hash(self):
         """Handle expansion of nonexistent hash gracefully."""
         tracker = ContextTracker()
@@ -514,7 +400,6 @@ class TestExpansionExecution:
                 hash_key="nonexistent123",
                 reason="test",
                 relevance_score=0.5,
-                expand_full=True,
             )
         ]
 
@@ -546,25 +431,8 @@ class TestExpansionFormatting:
         assert "[Proactive Context Expansion" in formatted
         assert "Expanded from earlier" in formatted
         assert '[{"id": 1}, {"id": 2}]' in formatted
-
-    def test_format_search_expansion(self):
-        """Format search expansion for LLM context."""
-        tracker = ContextTracker()
-
-        expansions = [
-            {
-                "hash": "def456",
-                "type": "search",
-                "query": "authentication",
-                "content": [{"id": 1, "content": "auth"}],
-                "item_count": 1,
-                "reason": "matched query",
-            }
-        ]
-
-        formatted = tracker.format_expansions_for_context(expansions)
-
-        assert "Search results for 'authentication'" in formatted
+        assert formatted.startswith("<headroom_proactive_expansion>\n")
+        assert formatted.endswith("\n</headroom_proactive_expansion>")
 
     def test_format_empty_expansions(self):
         """Empty expansions return empty string."""
@@ -573,6 +441,77 @@ class TestExpansionFormatting:
         formatted = tracker.format_expansions_for_context([])
 
         assert formatted == ""
+
+    def test_format_expansion_xml_wrapper(self):
+        """Expansion output is wrapped in machine-readable XML provenance tag."""
+        tracker = ContextTracker()
+        expansions = [
+            {
+                "hash": "h1",
+                "type": "full",
+                "content": "expanded content",
+                "item_count": 1,
+                "reason": "high relevance",
+            }
+        ]
+        result = tracker.format_expansions_for_context(expansions)
+        assert result.startswith("<headroom_proactive_expansion>\n")
+        assert result.endswith("\n</headroom_proactive_expansion>")
+        assert "[Proactive Context Expansion" in result
+        assert result.count("[End Proactive Expansion]") == 1
+
+    def test_proactive_expansion_identifiable_after_injection(self):
+        """Injected expansion carries XML provenance tag after full injection chain."""
+        from headroom.ccr.context_tracker import ContextTracker
+        from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
+
+        tracker = ContextTracker()
+        expansions = [
+            {
+                "hash": "h1",
+                "type": "full",
+                "content": "expanded context",
+                "item_count": 1,
+                "reason": "high relevance",
+            }
+        ]
+        expansion_text = tracker.format_expansions_for_context(expansions)
+
+        # Simulate a user turn that contains peer_turn markup
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "<peer_turn from='AgentX'>some content</peer_turn>"}
+                ],
+            }
+        ]
+        result = AnthropicHandlerMixin._append_context_to_latest_non_frozen_user_turn(
+            messages, expansion_text, frozen_message_count=0
+        )
+        injected = result[0]["content"][0]["text"]
+        # Headroom-injected content is identifiable by XML tag, distinct from peer content
+        assert "<headroom_proactive_expansion>" in injected
+        assert "</headroom_proactive_expansion>" in injected
+        assert "<peer_turn from='AgentX'>" in injected  # peer content unchanged
+
+    def test_format_expansion_xml_close_tag_in_payload_escaped(self):
+        """Payload containing the XML close tag is escaped to keep wrapper boundaries intact."""
+        tracker = ContextTracker()
+        expansions = [
+            {
+                "hash": "h1",
+                "type": "full",
+                "content": "return '</headroom_proactive_expansion>'",
+                "item_count": 1,
+                "reason": "high relevance",
+            }
+        ]
+        result = tracker.format_expansions_for_context(expansions)
+        assert result.startswith("<headroom_proactive_expansion>\n")
+        assert result.endswith("\n</headroom_proactive_expansion>")
+        assert result.count("<headroom_proactive_expansion>") == 1
+        assert result.count("</headroom_proactive_expansion>") == 1
 
 
 class TestGlobalTracker:
@@ -668,30 +607,19 @@ class TestCompressedContextDataClass:
 class TestExpansionRecommendationDataClass:
     """Test ExpansionRecommendation dataclass."""
 
-    def test_full_expansion_recommendation(self):
-        """Create full expansion recommendation."""
+    def test_expansion_recommendation(self):
+        """Create an expansion recommendation (retrieval is always full)."""
         rec = ExpansionRecommendation(
             hash_key="abc123",
             reason="high relevance",
             relevance_score=0.9,
-            expand_full=True,
         )
 
-        assert rec.expand_full is True
-        assert rec.search_query is None
-
-    def test_search_expansion_recommendation(self):
-        """Create search expansion recommendation."""
-        rec = ExpansionRecommendation(
-            hash_key="def456",
-            reason="partial match",
-            relevance_score=0.5,
-            expand_full=False,
-            search_query="authentication",
-        )
-
-        assert rec.expand_full is False
-        assert rec.search_query == "authentication"
+        assert rec.hash_key == "abc123"
+        assert rec.relevance_score == 0.9
+        # Partial/search expansion fields no longer exist.
+        assert not hasattr(rec, "expand_full")
+        assert not hasattr(rec, "search_query")
 
 
 class TestContextTrackerStats:

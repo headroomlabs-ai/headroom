@@ -53,11 +53,14 @@ headroom proxy --no-optimize
 # Disable semantic caching
 headroom proxy --no-cache
 
-# Disable CCR response handling
-headroom proxy --no-ccr-responses
+# Disable CCR tool injection
+headroom proxy --no-ccr-inject-tool
 
-# Disable proactive expansion
-headroom proxy --no-ccr-expansion
+# Disable CCR retrieval markers
+headroom proxy --no-ccr-marker
+
+# Disable proactive CCR expansion
+headroom proxy --no-ccr-proactive-expansion
 
 # (The earlier --llmlingua flag was retired in 0.9.x and replaced by
 # Kompress (ModernBERT). See `wiki/transforms.md` for the current
@@ -507,8 +510,8 @@ The TypeScript SDK is configured via environment variables or constructor option
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `HEADROOM_BASE_URL` | Base URL of the Headroom proxy or cloud API | `http://localhost:8787` |
-| `HEADROOM_API_KEY` | API key for Headroom Cloud authentication | - |
+| `HEADROOM_BASE_URL` | Base URL of the Headroom proxy | `http://localhost:8787` |
+| `HEADROOM_API_KEY` | Optional API key for authenticated Headroom endpoints | - |
 
 ### Usage
 

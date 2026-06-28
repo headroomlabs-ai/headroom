@@ -97,7 +97,11 @@ fn build_crush_array_dict<'py>(
 /// Defaults match Python; constructor accepts every field as a kwarg with
 /// the same name and type as the Python dataclass for drop-in
 /// compatibility.
-#[pyclass(name = "DiffCompressorConfig", module = "headroom._core")]
+#[pyclass(
+    name = "DiffCompressorConfig",
+    module = "headroom._core",
+    from_py_object
+)]
 #[derive(Clone)]
 struct PyDiffCompressorConfig {
     inner: DiffCompressorConfig,
@@ -417,7 +421,7 @@ impl PyDiffCompressor {
     fn compress(&self, py: Python<'_>, content: &str, context: &str) -> PyDiffCompressionResult {
         let content = content.to_string();
         let context = context.to_string();
-        let inner = py.allow_threads(|| self.inner.compress(&content, &context));
+        let inner = py.detach(|| self.inner.compress(&content, &context));
         PyDiffCompressionResult { inner }
     }
 
@@ -434,8 +438,7 @@ impl PyDiffCompressor {
     ) -> (PyDiffCompressionResult, PyDiffCompressorStats) {
         let content = content.to_string();
         let context = context.to_string();
-        let (result, stats) =
-            py.allow_threads(|| self.inner.compress_with_stats(&content, &context));
+        let (result, stats) = py.detach(|| self.inner.compress_with_stats(&content, &context));
         (
             PyDiffCompressionResult { inner: result },
             PyDiffCompressorStats { inner: stats },
@@ -449,7 +452,7 @@ impl PyDiffCompressor {
 /// Defaults match Python's dataclass byte-for-byte. The constructor
 /// accepts every field as a kwarg with the same name and type so the
 /// Python shim can pass `SmartCrusherConfig(**asdict(py_cfg))`.
-#[pyclass(name = "SmartCrusherConfig", module = "headroom._core")]
+#[pyclass(name = "SmartCrusherConfig", module = "headroom._core", from_py_object)]
 #[derive(Clone)]
 struct PySmartCrusherConfig {
     inner: RustSmartCrusherConfig,
@@ -761,7 +764,7 @@ impl PySmartCrusher {
     fn crush(&self, py: Python<'_>, content: &str, query: &str, bias: f64) -> PyCrushResult {
         let content = content.to_string();
         let query = query.to_string();
-        let inner = py.allow_threads(|| self.inner.crush(&content, &query, bias));
+        let inner = py.detach(|| self.inner.crush(&content, &query, bias));
         PyCrushResult { inner }
     }
 
@@ -780,7 +783,7 @@ impl PySmartCrusher {
     ) -> (String, bool, String) {
         let content = content.to_string();
         let query = query.to_string();
-        py.allow_threads(|| self.inner.smart_crush_content(&content, &query, bias))
+        py.detach(|| self.inner.smart_crush_content(&content, &query, bias))
     }
 
     /// Crush a JSON array directly and return the structured result.
@@ -813,7 +816,7 @@ impl PySmartCrusher {
         let items_json = items_json.to_string();
         let query = query.to_string();
         let (kept_json, ccr_hash, dropped_summary, strategy_info, compacted, compaction_kind) = py
-            .allow_threads(|| {
+            .detach(|| {
                 let parsed: serde_json::Value = serde_json::from_str(&items_json)
                     .unwrap_or_else(|e| panic!("items_json must be JSON: {e}"));
                 let items = match parsed {
@@ -860,7 +863,7 @@ impl PySmartCrusher {
         // Heavy: JSON parse + recursive walker + tabular compaction +
         // re-serialize. None of it touches Python; release the GIL.
         let doc_json = doc_json.to_string();
-        py.allow_threads(|| {
+        py.detach(|| {
             let parsed: serde_json::Value = serde_json::from_str(&doc_json)
                 .unwrap_or_else(|e| panic!("doc_json must be JSON: {e}"));
             let mut dc = DocumentCompactor::new().with_config(CompactConfig {
@@ -913,7 +916,7 @@ impl PySmartCrusher {
 /// `content_type` is exposed as the lowercase string tag (e.g.
 /// `"json_array"`). The Python wrapper translates it back into the
 /// `ContentType` enum so the call-site looks identical.
-#[pyclass(name = "DetectionResult", module = "headroom._core")]
+#[pyclass(name = "DetectionResult", module = "headroom._core", from_py_object)]
 #[derive(Clone)]
 struct PyDetectionResult {
     inner: RustDetectionResult,
@@ -994,7 +997,7 @@ impl PyDetectionResult {
 #[pyfunction]
 fn detect_content_type(py: Python<'_>, content: &str) -> PyDetectionResult {
     let owned = content.to_string();
-    let content_type = py.allow_threads(move || rust_detect_chain(&owned));
+    let content_type = py.detach(move || rust_detect_chain(&owned));
     PyDetectionResult {
         inner: RustDetectionResult {
             content_type,
@@ -1009,7 +1012,7 @@ fn detect_content_type(py: Python<'_>, content: &str) -> PyDetectionResult {
 #[pyfunction]
 fn is_json_array_of_dicts(py: Python<'_>, content: &str) -> bool {
     let owned = content.to_string();
-    py.allow_threads(move || rust_is_json_array_of_dicts(&owned))
+    py.detach(move || rust_is_json_array_of_dicts(&owned))
 }
 
 // Suppress unused-import warning when ContentType isn't referenced
@@ -1118,7 +1121,11 @@ fn keyword_registry_snapshot(py: Python<'_>) -> Py<PyDict> {
 // store. This avoids dragging a second CCR backend into Rust before the
 // Phase 3g pipeline formalization owns CCR end-to-end.
 
-#[pyclass(name = "SearchCompressorConfig", module = "headroom._core")]
+#[pyclass(
+    name = "SearchCompressorConfig",
+    module = "headroom._core",
+    from_py_object
+)]
 #[derive(Clone)]
 struct PySearchCompressorConfig {
     inner: RustSearchConfig,
@@ -1274,7 +1281,7 @@ impl PySearchCompressor {
         // wants persistence beyond the request lifecycle.
         let owned = content.to_string();
         let owned_ctx = context.to_string();
-        let (result, stats) = py.allow_threads(move || {
+        let (result, stats) = py.detach(move || {
             let store = headroom_core::ccr::InMemoryCcrStore::new();
             let (r, s) = self
                 .inner
@@ -1312,7 +1319,11 @@ fn parse_search_lines(content: &str) -> Vec<(String, u64, String)> {
 // pattern as search_compressor: Rust emits a `cache_key`, Python shim
 // writes the original to the production `CompressionStore`.
 
-#[pyclass(name = "LogCompressorConfig", module = "headroom._core")]
+#[pyclass(
+    name = "LogCompressorConfig",
+    module = "headroom._core",
+    from_py_object
+)]
 #[derive(Clone)]
 struct PyLogCompressorConfig {
     inner: RustLogConfig,
@@ -1461,7 +1472,7 @@ impl PyLogCompressor {
     #[pyo3(signature = (content, bias = 1.0))]
     fn compress(&self, py: Python<'_>, content: &str, bias: f64) -> PyLogCompressionResult {
         let owned = content.to_string();
-        let (result, stats) = py.allow_threads(move || {
+        let (result, stats) = py.detach(move || {
             let store = headroom_core::ccr::InMemoryCcrStore::new();
             let (r, s) = self.inner.compress_with_store(&owned, bias, Some(&store));
             (r, s)
@@ -1510,7 +1521,7 @@ fn protect_tags(
     compress_tagged_content: bool,
 ) -> (String, Vec<(String, String)>) {
     let owned = text.to_string();
-    py.allow_threads(move || {
+    py.detach(move || {
         let (cleaned, blocks, _stats) = rust_protect_tags(&owned, compress_tagged_content);
         (cleaned, blocks)
     })
@@ -1521,7 +1532,7 @@ fn protect_tags(
 #[pyfunction]
 fn restore_tags(py: Python<'_>, text: &str, blocks: Vec<(String, String)>) -> String {
     let owned = text.to_string();
-    py.allow_threads(move || rust_restore_tags(&owned, &blocks))
+    py.detach(move || rust_restore_tags(&owned, &blocks))
 }
 
 /// Case-insensitive HTML5 tag check. The Python shim uses this to
@@ -1643,7 +1654,7 @@ fn compress_openai_responses_live_zone(
 
 // --- TextCrusher (Phase 2, #1171): fast extractive prose compressor ---
 
-#[pyclass(name = "TextCrusherConfig", module = "headroom._core")]
+#[pyclass(name = "TextCrusherConfig", module = "headroom._core", from_py_object)]
 #[derive(Clone)]
 struct PyTextCrusherConfig {
     inner: RustTextCrusherConfig,
@@ -1775,7 +1786,7 @@ impl PyTextCrusher {
     ) -> PyTextCrusherResult {
         let content = content.to_string();
         let context = context.to_string();
-        let inner = py.allow_threads(|| self.inner.compress(&content, &context, target_ratio));
+        let inner = py.detach(|| self.inner.compress(&content, &context, target_ratio));
         PyTextCrusherResult { inner }
     }
 }

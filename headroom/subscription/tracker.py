@@ -124,6 +124,15 @@ _ON_DEMAND_POLL_TIMEOUT_S = 2.0
 _FIVE_HOUR_WINDOW = timedelta(hours=5)
 _SEVEN_DAY_WINDOW = timedelta(days=7)
 
+# A genuine 5-hour-window rollover advances ``five_hour.resets_at`` by ~5 hours.
+# The usage API, however, reports ``resets_at`` with second-level jitter — it has
+# been observed flapping between e.g. ``01:59:59Z`` and ``02:00:00Z`` on
+# consecutive polls within the *same* window. A bare ``!=`` comparison therefore
+# misfires on essentially every poll, zeroing the contribution counters every
+# poll interval instead of once per window. Only treat a *forward* jump larger
+# than this threshold as a real rollover (jitter is sub-second; a rollover is hours).
+_ROLLOVER_MIN_ADVANCE = timedelta(minutes=1)
+
 # Surge pricing threshold: if actual utilization is >N% higher than expected,
 # flag it as a potential surge pricing event.
 _SURGE_THRESHOLD_PCT = 15.0
@@ -770,7 +779,7 @@ class SubscriptionTracker(QuotaTracker):
         if (
             prev_resets_at is not None
             and curr_resets_at is not None
-            and curr_resets_at != prev_resets_at
+            and curr_resets_at - prev_resets_at > _ROLLOVER_MIN_ADVANCE
         ):
             logger.info("5h window rolled over; resetting headroom contribution counters")
             self._state.contribution = HeadroomContribution()

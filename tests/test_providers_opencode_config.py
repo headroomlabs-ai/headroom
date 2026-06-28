@@ -164,6 +164,7 @@ def test_inject_provider_config_creates_file(
     assert config_file.exists()
     config = _parse_json_loose(config_file.read_text())
     assert config["provider"]["headroom"]["npm"] == "@ai-sdk/openai-compatible"
+    assert "mcp" not in config
     assert "model" not in config  # headroom provider is a transparent pass-through
 
 
@@ -293,10 +294,10 @@ def test_strip_blocks_handles_only_mcp_markers() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_inject_provider_config_merges_with_existing_mcp(
+def test_inject_provider_config_preserves_existing_mcp(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """inject_opencode_provider_config merges headroom MCP with existing MCP servers."""
+    """inject_opencode_provider_config preserves MCP without adding headroom."""
     _set_test_home(monkeypatch, tmp_path)
     config_file = tmp_path / ".config" / "opencode" / "opencode.json"
     config_file.parent.mkdir(parents=True, exist_ok=True)
@@ -308,7 +309,7 @@ def test_inject_provider_config_merges_with_existing_mcp(
 
     config = json.loads(config_file.read_text())
     assert "existing-server" in config["mcp"]
-    assert "headroom" in config["mcp"]
+    assert "headroom" not in config["mcp"]
 
 
 def test_inject_provider_config_idempotent_with_complex_config(
@@ -335,7 +336,7 @@ def test_inject_provider_config_idempotent_with_complex_config(
     assert "openai" in config["provider"]
     assert "headroom" in config["provider"]
     assert "myserver" in config["mcp"]
-    assert "headroom" in config["mcp"]
+    assert "headroom" not in config["mcp"]
 
 
 def test_inject_provider_config_preserves_unrelated_top_level_keys(
@@ -410,6 +411,18 @@ def test_build_opencode_config_content_without_mcp() -> None:
     assert "mcp" not in config
     assert "model" not in config
     assert config["plugin"] == [["headroom-opencode", {"proxyUrl": "http://127.0.0.1:8787/v1"}]]
+
+
+def test_build_opencode_config_content_with_mcp_uses_local_stdio() -> None:
+    from headroom.providers.opencode.runtime import build_opencode_config_content
+
+    config = build_opencode_config_content(port=9000, include_mcp=True)
+    assert config["mcp"]["headroom"] == {
+        "type": "local",
+        "command": ["headroom", "mcp", "serve"],
+        "enabled": True,
+        "environment": {"HEADROOM_PROXY_URL": "http://127.0.0.1:9000"},
+    }
 
 
 def test_build_launch_env_with_project(monkeypatch: pytest.MonkeyPatch) -> None:

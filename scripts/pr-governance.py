@@ -261,6 +261,24 @@ def validate_pull_request(event: dict[str, Any]) -> GovernanceReport:
     )
 
 
+def validate_pull_request_body(event: dict[str, Any], body: str | None = None) -> GovernanceReport:
+    """Validate a PR event, optionally replacing the event payload body.
+
+    GitHub reruns use the original event payload. That makes a governance rerun
+    keep validating an old PR body even after maintainers fix the live body.
+    The workflow fetches the current body via the API and passes it here so the
+    check reflects what reviewers see on the PR page.
+    """
+    if body is None:
+        return validate_pull_request(event)
+
+    event_copy = dict(event)
+    pull_request = dict(event["pull_request"])
+    pull_request["body"] = body
+    event_copy["pull_request"] = pull_request
+    return validate_pull_request(event_copy)
+
+
 def emit_outputs(report: GovernanceReport) -> None:
     output_path = os.environ.get("GITHUB_OUTPUT")
     lines = [
@@ -284,13 +302,24 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--event", type=Path, required=True, help="Path to the GitHub event payload JSON."
     )
+    parser.add_argument(
+        "--body-file",
+        type=Path,
+        help=(
+            "Optional file containing the current PR body. Use this in GitHub Actions "
+            "so reruns validate the live PR body instead of the stale event payload."
+        ),
+    )
     parser.add_argument("--report", type=Path, required=True, help="Path to write the JSON report.")
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
-    report = validate_pull_request(load_event(args.event))
+    body_override = (
+        args.body_file.read_text(encoding="utf-8") if args.body_file is not None else None
+    )
+    report = validate_pull_request_body(load_event(args.event), body_override)
     args.report.write_text(json.dumps(report.to_dict(), indent=2), encoding="utf-8")
     emit_outputs(report)
     return 0

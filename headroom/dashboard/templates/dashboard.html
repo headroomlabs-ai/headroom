@@ -192,8 +192,15 @@
                 <div class="mt-2 text-xs text-gray-500">
                     <span x-show="(stats.persistent_savings?.lifetime?.compression_savings_usd || 0) > 0"
                           x-text="formatNumber(stats.tokens?.proxy_compression_saved || 0) + ' proxy tokens only; ' + cliFilteringLabel + ' excluded from $'"></span>
-                    <span x-show="!((stats.persistent_savings?.lifetime?.compression_savings_usd || 0) > 0)"
+                    <span x-show="!((stats.persistent_savings?.lifetime?.compression_savings_usd || 0) > 0) && stats.litellm_available !== false"
                           x-text="formatNumber(stats.requests?.total || 0) + ' requests processed'"></span>
+                    <!-- Pricing is LiteLLM-only. LiteLLM currently can't install on
+                         newer Python (e.g. 3.14+); state the fact, not the version,
+                         so the hint stays correct if that changes. -->
+                    <span x-show="!((stats.persistent_savings?.lifetime?.compression_savings_usd || 0) > 0) && stats.litellm_available === false">
+                        Cost pricing needs LiteLLM, which isn't installed in this environment. If you're on a Python version LiteLLM doesn't support yet, reinstall Headroom on Python 3.13:
+                        <code class="text-gray-400">pipx reinstall headroom-ai --python python3.13</code>
+                    </span>
                 </div>
             </div>
 
@@ -213,7 +220,7 @@
                 <div class="mt-1 text-xs text-gray-500 leading-relaxed">
                     <span x-text="'Proxy ' + formatNumber(stats.tokens?.proxy_compression_saved || 0) + ' (' + proxyShareOfTotal.toFixed(1) + '%)'"></span>
                     <span class="mx-1 text-gray-600">/</span>
-                    <span x-text="cliFilteringLabel + ' ' + formatNumber(cliFilteringSaved) + ' (' + cliFilteringShareOfTotal.toFixed(1) + '%)'"></span>
+                    <span x-text="cliFilteringLabel + ' ' + formatNumber(cliFilteringSaved) + ' this session (' + cliFilteringSessionPctDisplay.toFixed(1) + '%)'"></span>
                 </div>
                 <div class="mt-1 text-xs text-gray-600 leading-relaxed">
                     <span x-text="'Of total wire: ' + (stats.tokens?.savings_percent || 0).toFixed(2) + '%'" title="Savings as fraction of all input tokens including frozen prefix"></span>
@@ -1023,8 +1030,12 @@
                         <span class="font-mono text-sm" x-text="formatNumber(stats.tokens?.total_before_compression || 0)"></span>
                     </div>
                     <div class="flex justify-between items-center">
-                        <span class="text-sm text-gray-400" x-text="cliFilteringLabel + ' Filtered'"></span>
+                        <span class="text-sm text-gray-400" x-text="cliFilteringLabel + ' Filtered (this session)'"></span>
                         <span class="font-mono text-sm text-emerald-400" x-text="formatNumber(cliFilteringSaved)"></span>
+                    </div>
+                    <div class="flex justify-between items-center" x-show="cliFilteringLifetime > 0">
+                        <span class="text-sm text-gray-500" x-text="cliFilteringLabel + ' Filtered (lifetime)'"></span>
+                        <span class="font-mono text-sm text-emerald-400/70" x-text="formatNumber(cliFilteringLifetime)"></span>
                     </div>
                     <div class="flex justify-between items-center">
                         <span class="text-sm text-gray-400">Proxy Removed</span>
@@ -2541,6 +2552,15 @@
                     const total = this.compressionTotalBefore;
                     if (total <= 0) return 0;
                     return this.cliFilteringSaved / total * 100;
+                },
+
+                get cliFilteringLifetime() {
+                    return this.stats.savings?.by_layer?.cli_filtering?.lifetime?.tokens_saved ?? 0;
+                },
+
+                get cliFilteringSessionPctDisplay() {
+                    const p = this.stats.savings?.by_layer?.cli_filtering?.session_savings_pct;
+                    return (p === null || p === undefined) ? this.cliFilteringShareOfTotal : p;
                 },
 
                 // --- Headline savings percent ---

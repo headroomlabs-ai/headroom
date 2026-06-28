@@ -59,10 +59,10 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 axum = "0.7"
 tower = "0.5"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-pyo3 = { version = "0.24", features = ["abi3-py310"] }
+pyo3 = { version = "0.29", features = ["abi3-py310"] }
 # Forwards Rust `log` records (incl. tracing events via the `log` compat
 # feature above) into Python's `logging` inside the _core extension module.
-pyo3-log = "0.12"
+pyo3-log = "0.13"
 # Phase D PR-D1: AWS SigV4 signing for native Bedrock InvokeModel route.
 # `aws-sigv4` provides the canonical-request + signing-key implementation;
 # `aws-config` resolves credentials from the standard provider chain

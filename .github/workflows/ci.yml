@@ -210,6 +210,13 @@ jobs:
           cp "${SITE}/headroom/"_core*.so headroom/
           python -c "from headroom._core import DiffCompressor; print('headroom._core OK')"
 
+      - name: Verify offline HuggingFace model cache
+        env:
+          HF_HUB_OFFLINE: "1"
+          TRANSFORMERS_OFFLINE: "1"
+          HF_HUB_DISABLE_TELEMETRY: "1"
+        run: python scripts/ci/verify_hf_model_cache.py
+
       # Coverage upload: without this, codecov only receives reports from
       # the two native-e2e workflows (3 CLI test files total), so head
       # coverage reads ~6% and codecov/patch fails for ANY diff not

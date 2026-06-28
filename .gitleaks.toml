@@ -1,0 +1,27 @@
+# gitleaks configuration — extends the tuned default ruleset and allowlists
+# paths that contain hashes/identifiers (not real secrets) to avoid false
+# positives. Used by the Security workflow's secret-scan job.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Non-secret artifacts: SBOMs, lockfiles, vendored hashes, test/benchmark fixtures, and verified example values."
+paths = [
+  '''sbom/.*''',
+  '''.*\.lock$''',
+  '''.*package-lock\.json$''',
+  '''pnpm-lock\.yaml$''',
+  # Test / benchmark / parity trees use synthetic JWTs and API keys by design.
+  '''(^|/)tests/''',
+  '''(^|/)benchmarks/''',
+  '''crates/.*/(tests|benches)/''',
+]
+# Verified non-secret strings that appear in production source. Kept narrow
+# (exact tokens) so a genuine secret in these files would still be caught.
+regexes = [
+  '''eyJhbGciOiJIUzI1NiIs''',   # example JWT header prefix in a docstring (headroom/config.py)
+  '''sk-ant-dummy''',           # documented placeholder key in the CLI banner (headroom/cli/proxy.py)
+  '''ANTHROPIC_API_KEY=''',     # env-var NAME shown in CLI help text (headroom/cli/proxy.py)
+  '''Iv1\.b507a08c87ecfe98''',  # GitHub Copilot PUBLIC OAuth client_id (not a secret)
+]

@@ -12,6 +12,7 @@ from typing import Any
 
 import click
 
+from .. import fsutil
 from ..memory.adapters.sqlite import SQLiteMemoryStore
 from ..memory.models import Memory, ScopeLevel
 from ..memory.ports import MemoryFilter
@@ -30,14 +31,33 @@ from ._utils.parsers import parse_duration
 from .main import main
 
 
+def _default_db_path() -> str:
+    """Resolve the memory DB the proxy/install actually use.
+
+    Prefer the project-scoped store the proxy writes when run inside a project
+    (``./.headroom/memory.db``); otherwise fall back to the global workspace
+    store (``~/.headroom/memory.db``). The previous bare ``headroom_memory.db``
+    default pointed at neither, so ``headroom memory list`` silently read an
+    empty/legacy DB.
+    """
+    project_db = Path.cwd() / ".headroom" / "memory.db"
+    if project_db.exists():
+        return str(project_db)
+    from ..paths import memory_db_path
+
+    return str(memory_db_path())
+
+
 def db_path_option(fn: Any) -> Any:
     """Shared --db-path option for memory commands."""
     return click.option(
         "--db-path",
         type=click.Path(),
-        default="headroom_memory.db",
-        help="Path to the memory database file.",
-        show_default=True,
+        default=_default_db_path,
+        help="Path to the memory database file. Defaults to the project store "
+        "(./.headroom/memory.db) if present, else the global store "
+        "(~/.headroom/memory.db).",
+        show_default="project store if present, else global store",
     )(fn)
 
 
@@ -245,7 +265,13 @@ def memory(ctx: click.Context) -> None:
 
 @memory.command("list")
 @db_path_option
-@click.option("--limit", "-n", type=int, default=50, help="Maximum number of memories to show.")
+@click.option(
+    "--limit",
+    "-n",
+    type=click.IntRange(min=1),
+    default=50,
+    help="Maximum number of memories to show.",
+)
 @click.option("--session", "-s", "session_id", type=str, help="Filter by session ID.")
 @click.option(
     "--scope",
@@ -283,8 +309,29 @@ def list_memories(
 
     try:
         if search_query:
-            # Use text search
-            memories = _search_content(store, search_query, limit=limit)
+            # Content search is a SQL LIKE that ignores structured filters; apply
+            # --scope/--session/--since to the results so combining them with
+            # --search isn't a silent no-op. Fetch a generous set before
+            # filtering (so the limit isn't consumed by rows we'll drop), then
+            # truncate to the requested limit.
+            has_filters = bool(scope or session_id or since_duration)
+            memories = _search_content(
+                store, search_query, limit=max(limit, 1000) if has_filters else limit
+            )
+            if scope:
+                memories = [m for m in memories if get_scope_label(m) == scope.upper()]
+            if session_id:
+                memories = [m for m in memories if m.session_id == session_id]
+            if since_duration:
+                duration = parse_duration(since_duration)
+                cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - duration
+                memories = [
+                    m
+                    for m in memories
+                    if (m.created_at.replace(tzinfo=None) if m.created_at.tzinfo else m.created_at)
+                    >= cutoff
+                ]
+            memories = memories[:limit]
         else:
             # Build filter
             filter_kwargs: dict[str, Any] = {
@@ -828,7 +875,7 @@ def export_memories(ctx: click.Context, db_path: str, output: str | None) -> Non
 
         if output:
             output_path = Path(output)
-            output_path.write_text(json_output)
+            fsutil.write_text(output_path, json_output)
             print_success(f"Exported {len(memories)} memory(ies) to {output_path}")
         else:
             click.echo(json_output)
@@ -858,7 +905,7 @@ def import_memories(ctx: click.Context, db_path: str, file: str, force: bool) ->
 
     try:
         # Read and parse file
-        content = file_path.read_text()
+        content = fsutil.read_text(file_path)
         memories_data = json.loads(content)
 
         if not isinstance(memories_data, list):

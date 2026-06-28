@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import pytest
 
 from headroom.models import (
@@ -87,6 +89,31 @@ class TestModelRegistry:
         info = ModelRegistry.get("gpt-4o-new-version")
         assert info is not None
         assert info.name == "gpt-4o"
+
+    def test_resolve_future_google_family_fallback(self):
+        """Resolve should return provider-scoped fallbacks for plausible future models."""
+        with patch("headroom.models.registry.get_model_pricing", return_value=None):
+            info = ModelRegistry.resolve("gemini-3-pro-preview", provider="google")
+
+        assert info is not None
+        assert info.provider == "google"
+        assert info.context_window == 1000000
+        assert info.tokenizer_backend == "google"
+
+    def test_resolve_google_litellm_prefixed_family_fallback(self):
+        """Resolve should support LiteLLM-style Gemini provider prefixes."""
+        with patch("headroom.models.registry.get_model_pricing", return_value=None):
+            info = ModelRegistry.resolve("gemini/gemini-3-pro-preview", provider="google")
+
+        assert info is not None
+        assert info.provider == "google"
+        assert info.context_window == 1000000
+        assert info.tokenizer_backend == "google"
+
+    def test_resolve_does_not_claim_unrelated_models_for_google(self):
+        """Provider-scoped resolution should not mask unrelated model catalogs."""
+        assert ModelRegistry.resolve("not-a-google-model", provider="google") is None
+        assert ModelRegistry.resolve("gpt-4o", provider="google") is None
 
     def test_register_custom_model(self):
         """Test registering custom model."""

@@ -102,23 +102,15 @@ Legacy values (`token_headroom`, `cost_savings`) are still accepted as aliases.
 
 ### Context Management Options
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--no-intelligent-context` | `false` | Disable IntelligentContextManager (fall back to RollingWindow) |
-| `--no-intelligent-scoring` | `false` | Disable multi-factor importance scoring (use position-based) |
-| `--no-compress-first` | `false` | Disable trying deeper compression before dropping messages |
+Context management in the proxy is handled automatically by the compression pipeline. CCR (Compress-Cache-Retrieve) ensures that when content is compressed or messages are dropped, the original data remains accessible for the LLM to retrieve on demand. See [CCR documentation](ccr.md) for details.
 
-By default, the proxy uses **IntelligentContextManager** which scores messages by multiple factors (recency, semantic similarity, TOIN-learned patterns, error indicators, forward references) and drops lowest-scored messages first. This is smarter than simple age-based truncation.
+Key CCR-related proxy flags:
 
-**CCR Integration:** When messages are dropped, they're stored in CCR so the LLM can retrieve them if needed. The inserted marker includes the CCR reference. Drops are also recorded to TOIN, so the system learns which message patterns are important across all users.
-
-```bash
-# Use legacy RollingWindow (drops oldest first)
-headroom proxy --no-intelligent-context
-
-# Disable semantic scoring (faster, but less intelligent)
-headroom proxy --no-intelligent-scoring
-```
+| Option | Description |
+|--------|-------------|
+| `--no-ccr-inject-tool` | Do not inject the `headroom_retrieve` tool into the LLM's available tools |
+| `--no-ccr-marker` | Do not add retrieval markers to compressed output |
+| `--no-ccr-proactive-expansion` | Disable proactive context expansion before the LLM asks |
 
 ### ML Compression — RETIRED `--llmlingua` flag
 

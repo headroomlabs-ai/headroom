@@ -22,7 +22,7 @@ headroom proxy --port 8788
 pip install "headroom-ai[proxy]"
 
 # Run with debug logging
-headroom proxy --log-level debug
+headroom proxy --log-file ~/.headroom/logs/proxy.jsonl --log-messages
 ```
 
 ### Connection refused when calling proxy
@@ -43,7 +43,7 @@ ps aux | grep headroom
 
 ```bash
 # Check proxy logs for the actual error
-headroom proxy --log-level debug
+headroom proxy --log-file ~/.headroom/logs/proxy.jsonl --log-messages
 
 # Verify API key is set
 echo $OPENAI_API_KEY   # or ANTHROPIC_API_KEY

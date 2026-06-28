@@ -60,6 +60,7 @@ def test_apply_provider_scope_creates_config(
 
     config = json.loads(config_file.read_text())
     assert config["provider"]["headroom"]["options"]["baseURL"] == "http://127.0.0.1:8787/v1"
+    assert "mcp" not in config
 
 
 def test_apply_provider_scope_skips_when_scope_is_not_provider(
