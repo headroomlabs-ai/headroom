@@ -20,7 +20,6 @@ Example:
 
 from __future__ import annotations
 
-import json
 import logging
 import re
 import time
@@ -66,8 +65,6 @@ class ExpansionRecommendation:
     hash_key: str
     reason: str
     relevance_score: float
-    expand_full: bool = True  # True = expand all, False = search only
-    search_query: str | None = None
 
 
 @dataclass
@@ -256,18 +253,11 @@ class ContextTracker:
             relevance *= age_factor
 
             if relevance >= self.config.relevance_threshold:
-                # Determine if full expansion or search
-                expand_full, search_query = self._determine_expansion_type(
-                    query, context, relevance
-                )
-
                 recommendations.append(
                     ExpansionRecommendation(
                         hash_key=hash_key,
                         reason=self._generate_reason(query, context, relevance),
                         relevance_score=relevance,
-                        expand_full=expand_full,
-                        search_query=search_query,
                     )
                 )
 
@@ -436,39 +426,6 @@ class ContextTracker:
 
         return [w for w in words if w not in stop_words and len(w) >= 2]
 
-    def _determine_expansion_type(
-        self,
-        query: str,
-        context: CompressedContext,
-        relevance: float,
-    ) -> tuple[bool, str | None]:
-        """Determine whether to do full expansion or search.
-
-        Returns:
-            Tuple of (expand_full, search_query)
-        """
-        # High relevance + small original count = full expansion
-        if relevance > 0.6 or context.original_item_count <= 50:
-            return True, None
-
-        # Extract specific search terms from query
-        keywords = self._extract_keywords(query.lower())
-
-        # Filter to most specific keywords (longer, less common)
-        specific_keywords = [
-            k
-            for k in keywords
-            if len(k) >= 4 and k not in {"file", "code", "show", "find", "list", "what"}
-        ]
-
-        if specific_keywords:
-            # Use top keywords as search query
-            search_query = " ".join(specific_keywords[:3])
-            return False, search_query
-
-        # Default to full expansion if we can't form a good search
-        return True, None
-
     def _generate_reason(
         self,
         query: str,
@@ -509,39 +466,23 @@ class ContextTracker:
 
         for rec in recommendations:
             try:
-                if rec.expand_full:
-                    entry = store.retrieve(rec.hash_key)
-                    if entry:
-                        results.append(
-                            {
-                                "hash": rec.hash_key,
-                                "type": "full",
-                                "content": entry.original_content,
-                                "item_count": entry.original_item_count,
-                                "reason": rec.reason,
-                            }
-                        )
-                        logger.info(
-                            f"CCR Tracker: Proactively expanded {rec.hash_key} "
-                            f"({entry.original_item_count} items)"
-                        )
-                else:
-                    search_results = store.search(rec.hash_key, rec.search_query or "")
-                    if search_results:
-                        results.append(
-                            {
-                                "hash": rec.hash_key,
-                                "type": "search",
-                                "query": rec.search_query,
-                                "content": search_results,
-                                "item_count": len(search_results),
-                                "reason": rec.reason,
-                            }
-                        )
-                        logger.info(
-                            f"CCR Tracker: Proactive search in {rec.hash_key} "
-                            f"for '{rec.search_query}' ({len(search_results)} results)"
-                        )
+                # Retrieval is by hash: proactive expansion always restores the
+                # full original content (no partial/search expansion).
+                entry = store.retrieve(rec.hash_key)
+                if entry:
+                    results.append(
+                        {
+                            "hash": rec.hash_key,
+                            "type": "full",
+                            "content": entry.original_content,
+                            "item_count": entry.original_item_count,
+                            "reason": rec.reason,
+                        }
+                    )
+                    logger.info(
+                        f"CCR Tracker: Proactively expanded {rec.hash_key} "
+                        f"({entry.original_item_count} items)"
+                    )
             except Exception as e:
                 logger.warning(f"CCR Tracker: Failed to expand {rec.hash_key}: {e}")
 
@@ -577,15 +518,9 @@ class ContextTracker:
         parts = [header]
 
         for exp in expansions:
-            if exp["type"] == "full":
-                parts.append(f"\n--- Expanded from earlier ({exp['reason']}) ---")
-                parts.append(exp["content"])
-            else:
-                parts.append(f"\n--- Search results for '{exp['query']}' ({exp['reason']}) ---")
-                if isinstance(exp["content"], list):
-                    parts.append(json.dumps(exp["content"], indent=2))
-                else:
-                    parts.append(str(exp["content"]))
+            # Expansions are always full (retrieval is by hash).
+            parts.append(f"\n--- Expanded from earlier ({exp['reason']}) ---")
+            parts.append(exp["content"])
 
         parts.append("[End Proactive Expansion]")
         body = "\n".join(parts)

@@ -43,6 +43,7 @@ if sys.platform == "win32" and hasattr(sys.stdout, "buffer"):
 
 import click
 
+from headroom import fsutil
 from headroom._version import __version__ as _HEADROOM_VERSION
 from headroom.agent_savings import (
     apply_agent_savings_env_defaults,
@@ -128,19 +129,18 @@ from .main import main
 
 
 def _read_text(path: Path) -> str:
-    """Read a text file with explicit UTF-8 encoding."""
-    return path.read_text(encoding="utf-8")
+    """Read a text file as UTF-8, falling back to the system locale encoding."""
+    return fsutil.read_text(path)
 
 
 def _write_text(path: Path, content: str) -> None:
-    """Write a text file with explicit UTF-8 encoding."""
-    path.write_text(content, encoding="utf-8")
+    """Write a text file as UTF-8 without translating line endings (preserves CRLF)."""
+    fsutil.write_text(path, content)
 
 
 def _append_text(path: Path, content: str) -> None:
-    """Append to a text file with explicit UTF-8 encoding."""
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(content)
+    """Append to a text file as UTF-8 without translating line endings."""
+    fsutil.append_text(path, content)
 
 
 _CONTEXT_TOOL_ENV = "HEADROOM_CONTEXT_TOOL"
@@ -556,7 +556,7 @@ def _patch_rtk_hook_absolute_path(rtk_path: Path, hook_script_path: Path | None 
     if not hook_script_path.exists():
         return False
 
-    original = hook_script_path.read_text()
+    original = _read_text(hook_script_path)
 
     # Quote the absolute path safely for POSIX shells. This matters because
     # paths containing spaces or other shell-special characters (e.g.
@@ -576,7 +576,7 @@ def _patch_rtk_hook_absolute_path(rtk_path: Path, hook_script_path: Path | None 
     )
 
     if count and patched != original:
-        hook_script_path.write_text(patched)
+        _write_text(hook_script_path, patched)
         return True
 
     return False

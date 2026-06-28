@@ -1121,6 +1121,9 @@ def proxy(
         disable_kompress_fallback=disable_kompress_fallback,
         disable_kompress_anthropic=disable_kompress_anthropic,
         disable_kompress_openai=disable_kompress_openai,
+        # Optional inbound auth token + air-gap switch (env-driven).
+        proxy_token=os.environ.get("HEADROOM_PROXY_TOKEN") or None,
+        offline=_get_env_bool("HEADROOM_OFFLINE", False),
         # Code graph: live file watcher for incremental reindexing
         code_graph_watcher=code_graph,
         # Read lifecycle: ON by default (use --no-read-lifecycle to disable)
@@ -1281,6 +1284,26 @@ Memory (Multi-Provider):
             f"(available: {','.join(_ext_available)})"
         )
 
+    # Security posture line: inbound auth token + air-gap mode, and a loud
+    # flag for the open-bind case (non-loopback host with no token).
+    from headroom.proxy.loopback_guard import is_loopback_host
+
+    _auth_on = bool(config.proxy_token or os.environ.get("HEADROOM_PROXY_TOKEN"))
+    if config.offline:
+        _security_status = "OFFLINE (all egress disabled)" + (
+            " · inbound token REQUIRED (non-loopback)" if _auth_on else ""
+        )
+    elif _auth_on:
+        _security_status = "inbound token REQUIRED for non-loopback callers"
+    elif not is_loopback_host(config.host):
+        _security_status = (
+            "WARNING non-loopback bind with NO token — /v1/* is UNAUTHENTICATED "
+            "(set HEADROOM_PROXY_TOKEN)"
+        )
+    else:
+        _security_status = "loopback-only (no inbound token)"
+    security_line = f"  Security:     {_security_status}"
+
     # Code-aware status line — same logic the inner banner uses, surfaced here
     # so the click-CLI banner is a complete picture (avoids the dual-banner
     # confusion this branch retired).
@@ -1334,6 +1357,7 @@ Starting proxy server...
 {code_aware_line}
 {context_tool_line}
 {extensions_line}
+{security_line}
 {stateless_line}{telemetry_line}
 {backend_section}{tuning_section}
 

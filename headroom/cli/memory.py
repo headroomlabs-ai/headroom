@@ -12,6 +12,7 @@ from typing import Any
 
 import click
 
+from .. import fsutil
 from ..memory.adapters.sqlite import SQLiteMemoryStore
 from ..memory.models import Memory, ScopeLevel
 from ..memory.ports import MemoryFilter
@@ -874,7 +875,7 @@ def export_memories(ctx: click.Context, db_path: str, output: str | None) -> Non
 
         if output:
             output_path = Path(output)
-            output_path.write_text(json_output)
+            fsutil.write_text(output_path, json_output)
             print_success(f"Exported {len(memories)} memory(ies) to {output_path}")
         else:
             click.echo(json_output)
@@ -904,7 +905,7 @@ def import_memories(ctx: click.Context, db_path: str, file: str, force: bool) ->
 
     try:
         # Read and parse file
-        content = file_path.read_text()
+        content = fsutil.read_text(file_path)
         memories_data = json.loads(content)
 
         if not isinstance(memories_data, list):

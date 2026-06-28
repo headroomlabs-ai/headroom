@@ -342,6 +342,18 @@ class ProxyConfig:
     # Stateless mode — disable all filesystem writes for read-only / container deployments
     stateless: bool = False
 
+    # Optional inbound auth. When set, non-loopback requests to the data-plane
+    # routes must present this token (``Authorization: Bearer <token>`` or the
+    # ``X-Headroom-Proxy-Token`` header). Loopback callers are exempt. Closes the
+    # gap where a container bound to 0.0.0.0 exposes unauthenticated /v1/* routes
+    # to the pod network. Env: HEADROOM_PROXY_TOKEN.
+    proxy_token: str | None = None
+
+    # Air-gap master switch — hard-disable ALL outbound network egress
+    # (telemetry beacon, update check, license/usage reporter, HuggingFace model
+    # downloads) for fully offline / regulated deployments. Env: HEADROOM_OFFLINE=1.
+    offline: bool = False
+
     # Unit 4: Bounded pre-upstream concurrency for Anthropic replay storms.
     #
     # Caps the number of simultaneous requests allowed to run the

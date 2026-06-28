@@ -359,3 +359,40 @@ def test_round_trip(tmp_path: Path, spec: ServerSpec) -> None:
     assert got.command == spec.command
     assert got.args == spec.args
     assert got.env == spec.env
+
+
+# ---------------------------------------------------------------------------
+# #733 — encoding / line-ending safety on GBK / CRLF Windows configs
+# ---------------------------------------------------------------------------
+
+
+def test_register_does_not_double_crlf(tmp_path: Path) -> None:
+    """A pre-existing CRLF config must not gain ``\\r\\r\\n`` after register."""
+    import tomllib
+
+    cfg = _config_path(tmp_path)
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_bytes(b'model = "gpt-5"\r\nworkers = 1\r\n')
+
+    result = _make_registrar(tmp_path).register_server(_spec())
+
+    assert result.status == RegisterStatus.REGISTERED
+    raw = cfg.read_bytes()
+    assert b"\r\r\n" not in raw
+    tomllib.loads(raw.decode("utf-8"))  # still valid TOML
+
+
+def test_register_preserves_non_ascii_values(tmp_path: Path) -> None:
+    """A config with non-ASCII (Chinese) values survives register and stays parseable."""
+    import tomllib
+
+    cfg = _config_path(tmp_path)
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text('model = "gpt-5"\nproject = "比赛/机器人"\n', encoding="utf-8")
+
+    result = _make_registrar(tmp_path).register_server(_spec())
+
+    assert result.status == RegisterStatus.REGISTERED
+    data = tomllib.loads(cfg.read_text(encoding="utf-8"))
+    assert data["project"] == "比赛/机器人"
+    assert "headroom" in data.get("mcp_servers", {})

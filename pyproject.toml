@@ -107,11 +107,21 @@ ml = [
     # strands-agents`) drags huggingface-hub backwards.
     "huggingface-hub>=1.5.0,<2.0",
 ]
-# Memory system (hierarchical memory with vector search)
+# Memory system (hierarchical memory with vector search).
+# Uses the pure-Python sqlite-vec backend by default (VectorBackend.AUTO ->
+# SQLITE_VEC), so no C++ toolchain is required. The optional HNSW backend lives
+# in the [vector] extra below; installing it here would make `[all]` (which pulls
+# [memory]) fail on any machine without a compiler — see #1368.
 memory = [
-    "hnswlib>=0.8.0",
     "sqlite-vec>=0.1.6",
     "sentence-transformers>=2.2.0,<6.0",
+]
+# Optional HNSW vector backend. Needs a C++ toolchain to build hnswlib, so it is
+# kept out of [memory] and [all]; opt in with `pip install headroom-ai[vector]`
+# and select it via MemoryConfig(vector_backend=VectorBackend.HNSW). The default
+# sqlite-vec backend needs no compiler.
+vector = [
+    "hnswlib>=0.8.0",
 ]
 # Qdrant + Neo4j memory backend helpers
 memory-stack = [

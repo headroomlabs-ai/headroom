@@ -40,3 +40,35 @@ updates:
         update-types:
           - "minor"
           - "patch"
+
+  # Rust dependency updates (cargo workspace: crates/*)
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "deps"
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
+
+  # npm dependency updates (TS SDK, plugins, docs site)
+  - package-ecosystem: npm
+    directories:
+      - "/sdk/typescript"
+      - "/plugins/openclaw"
+      - "/plugins/opencode"
+      - "/docs"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "deps"
+    open-pull-requests-limit: 5
+    groups:
+      npm-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"

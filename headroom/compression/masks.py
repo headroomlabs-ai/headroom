@@ -12,8 +12,16 @@ The mask is content-agnostic - it's just a boolean array aligned to tokens.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+
+# Minimum word length for entropy-based secret preservation. Normalized Shannon
+# entropy alone cannot tell a 40-char API key from an 8-char diverse word, so a
+# length floor carries that signal. Matches the entropy-detection floor used by
+# secret scanners (trufflehog, detect-secrets); see
+# compute_entropy_mask_for_content.
+SECRET_ENTROPY_MIN_LENGTH = 20
 
 
 @dataclass
@@ -342,4 +350,57 @@ def compute_entropy_mask(
         tokens=tokens,
         mask=mask,
         metadata={"source": "entropy", "threshold": threshold},
+    )
+
+
+def compute_entropy_mask_for_content(
+    content: str,
+    threshold: float = 0.85,
+    min_token_length: int = SECRET_ENTROPY_MIN_LENGTH,
+) -> StructureMask:
+    """Create a character-indexed mask preserving high-entropy *words*.
+
+    Unlike :func:`compute_entropy_mask`, which scores whatever token sequence
+    it is handed, this scans ``content`` for whitespace-delimited words and
+    marks the character ranges of high-entropy words (API keys, OAuth tokens,
+    UUIDs, hashes, private keys) for preservation. The returned mask is aligned
+    to ``list(content)``, so it can be unioned with a character-level structure
+    mask.
+
+    This exists because character-level tokenization (``list(content)``) yields
+    single-character tokens that never reach ``min_token_length`` — which makes
+    :func:`compute_entropy_mask` a silent no-op on plain text, defeating the
+    purpose of entropy preservation. Mapping word-level scores back to character
+    positions restores it.
+
+    The default ``min_token_length`` is a length floor, not a magic number:
+    *normalized* Shannon entropy rates short but character-diverse English words
+    (e.g. "detailed") nearly as high as a real secret, so length is the signal
+    that separates the two. ``SECRET_ENTROPY_MIN_LENGTH`` matches the entropy
+    floor used by secret scanners (trufflehog, detect-secrets); shorter
+    high-entropy strings would over-preserve ordinary prose and defeat
+    compression.
+
+    Args:
+        content: Raw content to scan.
+        threshold: Entropy threshold (0.0-1.0). Higher = more selective.
+        min_token_length: Only score words this long or longer.
+
+    Returns:
+        StructureMask aligned to ``list(content)`` with high-entropy word
+        spans marked for preservation.
+    """
+    mask = [False] * len(content)
+    for match in re.finditer(r"\S+", content):
+        word = match.group()
+        if len(word) < min_token_length:
+            continue
+        if EntropyScore.compute(word, threshold).should_preserve:
+            for i in range(match.start(), match.end()):
+                mask[i] = True
+
+    return StructureMask(
+        tokens=list(content),
+        mask=mask,
+        metadata={"source": "entropy", "threshold": threshold, "granularity": "word"},
     )

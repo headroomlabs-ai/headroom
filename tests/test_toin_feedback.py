@@ -73,13 +73,12 @@ def test_kompress_ccr_retrieval_updates_toin():
     entry = store.retrieve(hash_key)
     assert entry is not None
     assert entry.tool_signature_hash is not None
-
-    results = store.search(hash_key, "HEADROOM", score_threshold=0.0)
-    assert results
+    # Retrieval is by hash and returns the full original content.
+    assert "HEADROOM" in entry.original_content
 
     stats = get_toin().get_stats()
     assert stats["total_compressions"] == 1
-    assert stats["total_retrievals"] == 2
+    assert stats["total_retrievals"] == 1
 
 
 @pytest.mark.skip(reason="PR-B5: observations counter and request-time hint API retired")
@@ -218,7 +217,7 @@ class TestCCRFeedbackExtraction:
                     "type": "tool_use",
                     "id": "toolu_123",
                     "name": "headroom_retrieve",
-                    "input": {"hash": "abc123def456", "query": "error fields"},
+                    "input": {"hash": "abc123def456"},
                 },
             ]
         }
@@ -236,7 +235,6 @@ class TestCCRFeedbackExtraction:
 
         assert len(retrieve_calls) == 1
         assert retrieve_calls[0]["hash"] == "abc123def456"
-        assert retrieve_calls[0]["query"] == "error fields"
 
     def test_ignore_non_retrieve_tool_calls(self):
         """Should ignore tool_use blocks that are not headroom_retrieve."""
@@ -252,7 +250,7 @@ class TestCCRFeedbackExtraction:
                     "type": "tool_use",
                     "id": "toolu_789",
                     "name": "headroom_retrieve",
-                    "input": {"hash": "xyz789", "query": None},
+                    "input": {"hash": "xyz789"},
                 },
             ]
         }
@@ -313,8 +311,12 @@ class TestCCRFeedbackExtraction:
 class TestStreamingFeedbackIntegration:
     """Bug 2: Full feedback loop — streaming headroom_retrieve reaches TOIN."""
 
-    def test_record_ccr_feedback_calls_store_search(self):
-        """_record_ccr_feedback_from_response should call store.search for queries."""
+    def test_record_ccr_feedback_calls_store_retrieve(self):
+        """_record_ccr_feedback_from_response calls store.retrieve by hash.
+
+        Retrieval is by hash only — any legacy ``query`` in the tool input is
+        ignored, and the full content is fetched for the feedback side effect.
+        """
         from headroom.proxy.server import HeadroomProxy
 
         response = {
@@ -340,10 +342,11 @@ class TestStreamingFeedbackIntegration:
 
             proxy._record_ccr_feedback_from_response(response, "anthropic", "req-test-001")
 
-        mock_store.search.assert_called_once_with("feedbackhash1", "error details")
+        mock_store.retrieve.assert_called_once_with("feedbackhash1")
+        mock_store.search.assert_not_called()
 
     def test_record_ccr_feedback_calls_store_retrieve_no_query(self):
-        """_record_ccr_feedback_from_response should call store.retrieve when no query."""
+        """_record_ccr_feedback_from_response calls store.retrieve by hash."""
         from headroom.proxy.server import HeadroomProxy
 
         response = {
@@ -368,7 +371,7 @@ class TestStreamingFeedbackIntegration:
 
             proxy._record_ccr_feedback_from_response(response, "anthropic", "req-test-002")
 
-        mock_store.retrieve.assert_called_once_with("feedbackhash2", query=None)
+        mock_store.retrieve.assert_called_once_with("feedbackhash2")
 
     def test_record_ccr_feedback_handles_store_exception(self):
         """_record_ccr_feedback_from_response should not raise on store errors."""
@@ -380,13 +383,13 @@ class TestStreamingFeedbackIntegration:
                     "type": "tool_use",
                     "id": "toolu_003",
                     "name": "headroom_retrieve",
-                    "input": {"hash": "feedbackhash3", "query": "test"},
+                    "input": {"hash": "feedbackhash3"},
                 },
             ]
         }
 
         mock_store = MagicMock()
-        mock_store.search.side_effect = RuntimeError("store unavailable")
+        mock_store.retrieve.side_effect = RuntimeError("store unavailable")
         with patch(
             "headroom.cache.compression_store.get_compression_store",
             return_value=mock_store,
@@ -417,7 +420,7 @@ class TestParseSSEToolUse:
             "\n"
             'data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_abc","name":"headroom_retrieve"}}\n'
             "\n"
-            'data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\\"hash\\": \\"abc123\\", \\"query\\": \\"error\\"}"}}\n'
+            'data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\\"hash\\": \\"abc123\\"}"}}\n'
             "\n"
             'data: {"type":"content_block_stop","index":1}\n'
             "\n"
@@ -439,7 +442,6 @@ class TestParseSSEToolUse:
         assert tool_block["name"] == "headroom_retrieve"
         assert tool_block["id"] == "toolu_abc"
         assert tool_block["input"]["hash"] == "abc123"
-        assert tool_block["input"]["query"] == "error"
 
     def test_parse_sse_non_anthropic_returns_none(self):
         """Non-anthropic provider should return None."""

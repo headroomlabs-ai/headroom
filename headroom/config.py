@@ -488,7 +488,7 @@ class CCRConfig:
     1. COMPRESS: SmartCrusher compresses array from 1000 to 20 items
     2. CACHE: Original 1000 items stored in CompressionStore
     3. INJECT: Marker added to tell LLM how to retrieve more
-    4. RETRIEVE: If LLM needs more, it calls headroom_retrieve(hash, query)
+    4. RETRIEVE: If LLM needs more, it calls headroom_retrieve(hash) to get the full original back
 
     Benefits:
     - Zero-risk compression: worst case = LLM retrieves what it needs

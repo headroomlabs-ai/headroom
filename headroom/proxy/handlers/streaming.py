@@ -13,7 +13,11 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from headroom.proxy.auth_mode import classify_client
-from headroom.proxy.helpers import jitter_delay_ms, retry_after_ms
+from headroom.proxy.helpers import (
+    RETRYABLE_OVERLOAD_STATUSES,
+    jitter_delay_ms,
+    retry_after_ms,
+)
 
 if TYPE_CHECKING:
     from fastapi.responses import Response, StreamingResponse
@@ -588,24 +592,17 @@ class StreamingMixin:
 
             input_data = block.get("input", {})
             hash_key = input_data.get("hash")
-            query = input_data.get("query")
 
             if not hash_key:
                 continue
 
-            logger.info(
-                f"[{request_id}] CCR Feedback: Recording retrieval "
-                f"hash={hash_key[:8]}... query={query!r}"
-            )
+            logger.info(f"[{request_id}] CCR Feedback: Recording retrieval hash={hash_key[:8]}...")
 
-            # Call store.retrieve()/search() for the side effect of triggering
-            # the feedback chain: _log_retrieval -> process_pending_feedback
+            # Call store.retrieve() for the side effect of triggering the
+            # feedback chain: _log_retrieval -> process_pending_feedback
             # -> toin.record_retrieval(). We discard the returned content.
             try:
-                if query:
-                    store.search(hash_key, query)
-                else:
-                    store.retrieve(hash_key, query=None)
+                store.retrieve(hash_key)
             except Exception as e:
                 logger.debug(f"[{request_id}] CCR Feedback recording failed: {e}")
 
@@ -670,19 +667,15 @@ class StreamingMixin:
             if not isinstance(input_data, dict):
                 continue
             hash_key = input_data.get("hash")
-            query = input_data.get("query")
             if not hash_key:
                 continue
 
             logger.info(
                 f"[{request_id}] CCR Feedback (openai stream): Recording retrieval "
-                f"hash={hash_key[:8]}... query={query!r}"
+                f"hash={hash_key[:8]}..."
             )
             try:
-                if query:
-                    store.search(hash_key, query)
-                else:
-                    store.retrieve(hash_key, query=None)
+                store.retrieve(hash_key)
             except Exception as e:
                 logger.debug(f"[{request_id}] CCR Feedback (openai stream) failed: {e}")
 
@@ -1008,11 +1001,12 @@ class StreamingMixin:
                             headers=dict(upstream_response.headers),
                             status_code=upstream_response.status_code,
                         )
-                    # Retry upstream 429s honoring Retry-After — the streaming
-                    # sibling of the _retry_request path (#1221); on exhaustion,
-                    # fall through to forward the 429 to the client.
+                    # Retry transient overloads (429 rate-limit, 529 overloaded)
+                    # honoring Retry-After — the streaming sibling of the
+                    # _retry_request path (#1221); on exhaustion, fall through to
+                    # forward the status to the client.
                     if (
-                        upstream_response.status_code == 429
+                        upstream_response.status_code in RETRYABLE_OVERLOAD_STATUSES
                         and self.config.retry_enabled
                         and attempt < retry_attempts - 1
                     ):
@@ -1025,7 +1019,7 @@ class StreamingMixin:
                         )
                         await upstream_response.aclose()
                         logger.warning(
-                            f"[{request_id}] Upstream 429 "
+                            f"[{request_id}] Upstream {upstream_response.status_code} "
                             f"(attempt {attempt + 1}/{retry_attempts}), "
                             f"retrying in {delay_with_jitter:.0f}ms"
                         )

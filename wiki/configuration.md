@@ -510,8 +510,8 @@ The TypeScript SDK is configured via environment variables or constructor option
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `HEADROOM_BASE_URL` | Base URL of the Headroom proxy or cloud API | `http://localhost:8787` |
-| `HEADROOM_API_KEY` | API key for Headroom Cloud authentication | - |
+| `HEADROOM_BASE_URL` | Base URL of the Headroom proxy | `http://localhost:8787` |
+| `HEADROOM_API_KEY` | Optional API key for authenticated Headroom endpoints | - |
 
 ### Usage
 

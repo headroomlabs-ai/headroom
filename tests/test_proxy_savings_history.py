@@ -219,6 +219,41 @@ def test_record_compression_savings_skips_empty_updates_and_normalizes_timestamp
     assert persisted["history"][-1]["timestamp"] == "2026-03-27T12:34:00Z"
 
 
+def test_stateless_savings_tracker_writes_nothing(tmp_path):
+    """In stateless mode the tracker updates in-memory counters but never
+    touches the filesystem — no proxy_savings.json is created."""
+    path = tmp_path / "proxy_savings.json"
+    tracker = SavingsTracker(path=str(path), stateless=True)
+
+    # Both write paths that would normally persist a checkpoint:
+    assert tracker.record_compression_savings(model="gpt-4o", tokens_saved=4096) is True
+    tracker.record_request(
+        model="gpt-4o",
+        input_tokens=8192,
+        tokens_saved=4096,
+        timestamp="2026-03-27T09:00:00Z",
+    )
+
+    # Nothing written to disk...
+    assert not path.exists()
+    # ...but live in-memory counters still reflect the activity.
+    assert tracker.snapshot()["lifetime"]["tokens_saved"] >= 4096
+
+
+def test_non_stateless_savings_tracker_still_persists(tmp_path):
+    """Control: default (stateless=False) behavior is unchanged — it persists."""
+    path = tmp_path / "proxy_savings.json"
+    tracker = SavingsTracker(path=str(path))
+
+    tracker.record_request(
+        model="gpt-4o",
+        input_tokens=8192,
+        tokens_saved=4096,
+        timestamp="2026-03-27T09:00:00Z",
+    )
+    assert path.exists()
+
+
 def test_savings_tracker_save_does_not_flock_target_inode_before_replace(tmp_path, monkeypatch):
     path = tmp_path / "proxy_savings.json"
     tracker = SavingsTracker(path=str(path))
