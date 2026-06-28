@@ -62,6 +62,14 @@ Headroom injects a `headroom_retrieve` tool into the LLM's available tools:
 
 The LLM sees this tool alongside your application's tools and can call it whenever the compressed data is insufficient.
 
+## When not to retrieve
+
+Trust kept rows unless you have a concrete gap.
+
+- Retrieve when the user explicitly asks for raw, original, full, exact, or omitted content.
+- Retrieve when you have a targeted follow-up that the kept summary cannot answer.
+- Do not retrieve just because the user asked you to be thorough, careful, or to double-check.
+
 ## Phase 3: Response Handler
 
 When the LLM calls `headroom_retrieve`:

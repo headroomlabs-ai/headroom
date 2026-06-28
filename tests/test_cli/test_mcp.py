@@ -261,6 +261,16 @@ class TestMCPServeCommand:
         assert "debug" in result.output
 
 
+class TestMCPHelpText:
+    def test_group_help_mentions_concrete_gap_rule(self):
+        runner = CliRunner()
+        result = runner.invoke(main, ["mcp", "--help"])
+
+        assert result.exit_code == 0
+        assert "concrete gap" in result.output
+        assert "headroom_retrieve" in result.output
+
+
 @pytest.mark.skipif(not MCP_AVAILABLE, reason="MCP SDK not installed")
 class TestMCPServerInitialization:
     """Test actual MCP server creation.

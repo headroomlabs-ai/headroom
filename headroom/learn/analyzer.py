@@ -25,6 +25,11 @@ import time
 import typing
 
 from headroom._subprocess import Popen, run
+from headroom.ccr.retrieve_policy import (
+    LEARN_SECTION,
+    classify_retrieve_need,
+    render_learn_recommendation,
+)
 
 from .loops import LoopPattern, apply_loop_weighting, detect_loops, format_loops_for_digest
 from .models import (
@@ -152,6 +157,7 @@ class SessionAnalyzer:
         """Analyze sessions and produce recommendations via LLM."""
         all_calls = [tc for s in sessions for tc in s.tool_calls]
         failed_calls = [tc for tc in all_calls if tc.is_error]
+        deterministic_recs = _build_ccr_retrieve_recommendations(sessions)
 
         result = AnalysisResult(
             project=project,
@@ -166,7 +172,12 @@ class SessionAnalyzer:
         # waste pattern whenever a session has no failures and no events.
         loops = detect_loops(sessions)
 
-        if not failed_calls and not loops and not any(s.events for s in sessions):
+        if (
+            not failed_calls
+            and not loops
+            and not any(s.events for s in sessions)
+            and not deterministic_recs
+        ):
             return result
 
         # Build compact digest of all sessions, leading with detected loops.
@@ -178,13 +189,13 @@ class SessionAnalyzer:
         # Call LLM for analysis
         try:
             raw = _call_llm(digest, model)
-            result.recommendations = _parse_llm_response(raw)
+            llm_recs = _parse_llm_response(raw)
             # Weight loop guardrails above one-off rules using MEASURED waste.
-            apply_loop_weighting(result.recommendations, loops)
-            result.recommendations.sort(key=lambda r: r.estimated_tokens_saved, reverse=True)
+            apply_loop_weighting(llm_recs, loops)
+            result.recommendations = _merge_recommendations(llm_recs, deterministic_recs)
         except Exception as e:
             logger.warning("LLM analysis failed: %s", e)
-            # Return result with stats but no recommendations
+            result.recommendations = deterministic_recs
 
         return result
 
@@ -808,6 +819,62 @@ def _safe_int(val: object) -> int:
         except (ValueError, TypeError):
             return 0
     return 0
+
+
+def _build_ccr_retrieve_recommendations(sessions: list[SessionData]) -> list[Recommendation]:
+    evidence = 0
+
+    for session in sessions:
+        last_user_text = ""
+        for event in sorted(session.events, key=lambda current: current.msg_index):
+            if event.type == "user_message" and event.text.strip():
+                last_user_text = event.text
+                continue
+
+            if event.type != "tool_call" or event.tool_call is None:
+                continue
+
+            tool_call = event.tool_call
+            if tool_call.name != "headroom_retrieve":
+                continue
+
+            query = tool_call.input_data.get("query")
+            if not isinstance(query, str):
+                query = None
+
+            assessment = classify_retrieve_need(last_user_text, query=query)
+            if assessment.is_redundant:
+                evidence += 1
+
+    if evidence == 0:
+        return []
+
+    return [
+        Recommendation(
+            target=RecommendationTarget.CONTEXT_FILE,
+            section=LEARN_SECTION,
+            content=render_learn_recommendation(),
+            confidence=0.95,
+            evidence_count=evidence,
+            estimated_tokens_saved=max(1200, evidence * 1200),
+        )
+    ]
+
+
+def _merge_recommendations(
+    llm_recommendations: list[Recommendation],
+    deterministic_recommendations: list[Recommendation],
+) -> list[Recommendation]:
+    merged: dict[tuple[RecommendationTarget, str], Recommendation] = {
+        (rec.target, rec.section): rec for rec in llm_recommendations
+    }
+    for rec in deterministic_recommendations:
+        merged[(rec.target, rec.section)] = rec
+    return sorted(
+        merged.values(),
+        key=lambda rec: rec.estimated_tokens_saved,
+        reverse=True,
+    )
 
 
 # =============================================================================

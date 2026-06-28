@@ -54,6 +54,7 @@ The canonical, always-current documentation index lives at the docs site below. 
 - [Persistent memory](https://headroom-docs.vercel.app/docs/memory): Per-project SQLite + HNSW vector store. No cross-project bleed (GH #462).
 - [SharedContext](https://headroom-docs.vercel.app/docs/shared-context): Compressed inter-agent context handoffs.
 - [Failure learning](https://headroom-docs.vercel.app/docs/failure-learning): Offline analysis writes corrections to `CLAUDE.local.md` (default, gitignored) or `CLAUDE.md` (shared) / `AGENTS.md` / `GEMINI.md`.
+- [CCR retrieve literacy skill](https://github.com/headroomlabs-ai/headroom/blob/main/headroom/skills/ccr-literacy/SKILL.md): Trust kept rows unless you have a concrete gap. Call `headroom_retrieve` only when you need raw, original, complete, or targeted follow-up data.
 
 ## Operations
 
