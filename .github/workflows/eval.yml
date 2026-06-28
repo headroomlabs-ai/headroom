@@ -32,7 +32,7 @@ jobs:
       # `pip install -e .` invokes maturin (declared in pyproject.toml's
       # build-system) which calls cargo to compile the Rust extension.
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.96.0
+        uses: dtolnay/rust-toolchain@1.100.0
 
       - name: Cache cargo registry + build
         uses: Swatinem/rust-cache@v2
@@ -100,7 +100,7 @@ jobs:
           restore-keys: ${{ runner.os }}-pip-eval-
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.96.0
+        uses: dtolnay/rust-toolchain@1.100.0
 
       - name: Cache cargo registry + build
         uses: Swatinem/rust-cache@v2
