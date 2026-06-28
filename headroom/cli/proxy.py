@@ -83,12 +83,22 @@ def _get_env_bool_optional(name: str) -> bool | None:
 
 def _get_env_int_optional(name: str) -> int | None:
     val = os.environ.get(name)
-    return int(val) if val is not None and val != "" else None
+    if val is None or val == "":
+        return None
+    try:
+        return int(val)
+    except ValueError:
+        raise click.ClickException(f"{name} must be an integer, got {val!r}") from None
 
 
 def _get_env_float_optional(name: str) -> float | None:
     val = os.environ.get(name)
-    return float(val) if val is not None and val != "" else None
+    if val is None or val == "":
+        return None
+    try:
+        return float(val)
+    except ValueError:
+        raise click.ClickException(f"{name} must be a number, got {val!r}") from None
 
 
 def _selected_context_tool() -> str:
@@ -109,7 +119,7 @@ def _selected_context_tool() -> str:
     "--port",
     "-p",
     default=8787,
-    type=int,
+    type=click.IntRange(1, 65535),
     envvar="HEADROOM_PORT",
     help="Proxy port (default: 8787, env: HEADROOM_PORT)",
 )
@@ -141,7 +151,7 @@ def dashboard(port: int, no_open: bool) -> None:
     "--port",
     "-p",
     default=8787,
-    type=int,
+    type=click.IntRange(1, 65535),
     envvar="HEADROOM_PORT",
     help="Port to bind to (default: 8787, env: HEADROOM_PORT)",
 )
@@ -547,7 +557,7 @@ def dashboard(port: int, no_open: bool) -> None:
 )
 @click.option(
     "--read-maturation-quiesce-turns",
-    type=int,
+    type=click.IntRange(min=1),
     default=5,
     show_default=True,
     envvar="HEADROOM_READ_MATURATION_QUIESCE_TURNS",
@@ -555,7 +565,7 @@ def dashboard(port: int, no_open: bool) -> None:
 )
 @click.option(
     "--read-maturation-max-hold-turns",
-    type=int,
+    type=click.IntRange(min=1),
     default=25,
     show_default=True,
     envvar="HEADROOM_READ_MATURATION_MAX_HOLD_TURNS",
@@ -563,7 +573,7 @@ def dashboard(port: int, no_open: bool) -> None:
 )
 @click.option(
     "--read-maturation-min-size-bytes",
-    type=int,
+    type=click.IntRange(min=0),
     default=2048,
     show_default=True,
     envvar="HEADROOM_READ_MATURATION_MIN_SIZE_BYTES",
@@ -662,7 +672,7 @@ def dashboard(port: int, no_open: bool) -> None:
 )
 @click.option(
     "--memory-qdrant-port",
-    type=int,
+    type=click.IntRange(1, 65535),
     default=None,
     help=(
         "Qdrant port for the qdrant-neo4j backend (default: 6333, also reads HEADROOM_QDRANT_PORT)"
@@ -688,7 +698,7 @@ def dashboard(port: int, no_open: bool) -> None:
 )
 @click.option(
     "--min-evidence",
-    type=int,
+    type=click.IntRange(min=1),
     default=None,
     envvar="HEADROOM_MIN_EVIDENCE",
     help=(
@@ -920,6 +930,28 @@ def proxy(
         click.secho(
             "Warning: both --learn and --no-learn were specified; --no-learn takes precedence "
             "and traffic learning will be disabled.",
+            fg="yellow",
+            err=True,
+        )
+
+    # Warn on contradictory / no-op flag combinations. The resolved value still
+    # applies; the warning just prevents a silently-ignored flag.
+    if no_rate_limit and (rpm is not None or tpm is not None):
+        click.secho(
+            "Warning: --rpm/--tpm have no effect because --no-rate-limit disables rate limiting.",
+            fg="yellow",
+            err=True,
+        )
+    if no_optimize and target_ratio is not None:
+        click.secho(
+            "Warning: --target-ratio has no effect because --no-optimize disables compression.",
+            fg="yellow",
+            err=True,
+        )
+    if telemetry and no_telemetry:
+        click.secho(
+            "Warning: both --telemetry and --no-telemetry were specified; --no-telemetry "
+            "takes precedence and telemetry will be disabled.",
             fg="yellow",
             err=True,
         )
@@ -1258,8 +1290,8 @@ Memory (Multi-Provider):
     context_tool_line = f"  Context Tool: {_selected_context_tool()}"
 
     # Performance tuning section — only shown when at least one tuning var is active.
-    _stable_turn = int(os.environ.get("HEADROOM_COMPRESSION_STABLE_AFTER_TURN", "0"))
-    _stale_turns = int(os.environ.get("HEADROOM_STALE_READ_COMPRESS_AFTER_TURNS", "0"))
+    _stable_turn = _get_env_int_optional("HEADROOM_COMPRESSION_STABLE_AFTER_TURN") or 0
+    _stale_turns = _get_env_int_optional("HEADROOM_STALE_READ_COMPRESS_AFTER_TURNS") or 0
     _embed_socket = os.environ.get("HEADROOM_EMBEDDING_SERVER_SOCKET") or (
         embedding_server and (embedding_server_socket or f"/tmp/headroom-embed-{port}.sock")
     )

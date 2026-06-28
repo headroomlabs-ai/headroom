@@ -37,7 +37,7 @@ headroom unwrap opencode
 
 ```bash
 headroom wrap opencode \
-  --port 8787 \            # Proxy port. Defaults to a random available port
+  --port 8787 \            # Proxy port (default: 8787)
   --no-rtk \               # Skip RTK context tool injection
   --no-mcp \               # Skip Headroom MCP registration
   --no-serena \            # Skip Serena code graph MCP
@@ -45,7 +45,7 @@ headroom wrap opencode \
   --no-proxy \             # Use an existing proxy instead of starting one
   --learn \                # Enable memory and live learning
   --memory \               # Enable persistent memory
-  --backend anthropic \    # Backend: anthropic, openai, anyllm
+  --backend anthropic \    # Backend: anthropic, anyllm, litellm-<provider>
   --anyllm-provider ... \  # AnyLLM provider selection
   --region ... \           # Provider region
   -- <opencode args>       # Arguments passed to the opencode binary

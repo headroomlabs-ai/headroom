@@ -99,7 +99,7 @@ code = [
 # (The legacy [llmlingua] extra was removed in 0.9.x — no live code path used it.
 # Use [ml] for the supported ML compression dependencies.)
 ml = [
-    "torch>=2.0.0",
+    "torch>=2.12.1",
     "transformers>=4.30.0,<6.0",
     # transformers >= 5.x requires huggingface-hub >= 1.5.0,<2.0; pinning
     # the floor here prevents Kompress from silently falling back to
@@ -115,14 +115,14 @@ memory = [
 ]
 # Qdrant + Neo4j memory backend helpers
 memory-stack = [
-    "mem0ai>=1.0.0,<2.0",
+    "mem0ai>=2.0.0,<3.0",
     "qdrant-client>=1.9.0,<2.0",
     "neo4j>=5.20.0,<7.0",
 ]
 # Apple-Silicon GPU (MPS) offload for the memory embedder. Opt in at runtime with
 # HEADROOM_EMBEDDER_RUNTIME=pytorch_mps. macOS-only; intentionally excluded from [all].
 pytorch-mps = [
-    "torch>=2.0.0; sys_platform == 'darwin'",
+    "torch>=2.12.1; sys_platform == 'darwin'",
     "sentence-transformers>=2.2.0; sys_platform == 'darwin'",
 ]
 # Semantic relevance scoring with embeddings.
@@ -202,7 +202,7 @@ mcp = [
 voice = [
     "onnxruntime>=1.16.0",
     "transformers>=4.30.0,<6.0",
-    "torch>=2.0.0",
+    "torch>=2.12.1",
 ]
 # Voice training (includes voice deps + training extras)
 voice-train = [
@@ -259,8 +259,18 @@ dev = [
     "openpyxl>=3.1.0",  # exercises spreadsheet_ingest (.xlsx) in the test suite
 ]
 # All optional dependencies (everything you need)
+#
+# `benchmark` is deliberately EXCLUDED from `[all]`. It installs the
+# EleutherAI lm-evaluation-harness (lm-eval), which headroom invokes as an
+# external subprocess (`python -m lm_eval`) — it is never imported as a
+# library, so it is not a true runtime dependency. lm-eval pulls two
+# transitive deps with unpatchable High CVEs (sqlitedict CVE-2024-35515,
+# nltk CVE-2026-54293 via rouge-score), neither of which has an upstream
+# fix. Keeping `benchmark` out of `[all]` means `pip install
+# headroom-ai[all]` is CVE-free; researchers who need the accuracy harness
+# opt in explicitly with `pip install headroom-ai[benchmark]`.
 all = [
-    "headroom-ai[proxy,code,ml,memory,relevance,image,reports,otel,evals,voice,html,benchmark,mcp,spreadsheet]",
+    "headroom-ai[proxy,code,ml,memory,relevance,image,reports,otel,evals,voice,html,mcp,spreadsheet]",
 ]
 
 [project.scripts]
@@ -284,6 +294,21 @@ Changelog = "https://github.com/chopratejas/headroom/blob/main/CHANGELOG.md"
 # no PIP_FIND_LINKS plumbing. Phase A0's runtime fail-loud check still
 # exists but only fires if someone forces an sdist install on a platform
 # without a wheel and the rust toolchain isn't available to compile it.
+# Constrain transitive dependencies that have CVEs requiring minimum versions.
+# These packages don't appear as direct headroom deps but are pulled in
+# transitively; the floor pins below ensure uv resolves to patched versions.
+[tool.uv]
+constraint-dependencies = [
+    # GHSA-5239-wwwm-4pmq (Low) — transitive via rich; fix at 2.20.0
+    "pygments>=2.20.0",
+    # GHSA-4xgf-cpjx-pc3j (Medium) — transitive via mcp; fix at 2.14.2
+    "pydantic-settings>=2.14.2",
+    # GHSA-mv93-w799-cj2w + 4 others (High) — transitive via lm-eval; fix at 3.1.50
+    "gitpython>=3.1.50",
+    # GHSA-f4xh-w4cj-qxq8 (High) — transitive via langchain-core; fix at 0.8.18
+    "langsmith>=0.9.0",
+]
+
 # Pin the project's package index to public PyPI. Without this, `uv lock`
 # inherits the developer's user-level `~/.config/uv/uv.toml` index
 # setting — including private/internal mirrors like

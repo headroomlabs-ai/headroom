@@ -48,10 +48,10 @@ Headroom compresses everything your AI agent reads — tool outputs, logs, RAG c
 
 - **Library** — `compress(messages)` in Python or TypeScript, inline in any app
 - **Proxy** — `headroom proxy --port 8787`, zero code changes, any language
-- **Agent wrap** — `headroom wrap claude|codex|aider|copilot|opencode` in one command; Cursor prints manual proxy settings to paste into the app
+- **Agent wrap** — `headroom wrap claude|codex|copilot|cursor|aider|opencode|cline|continue|goose|openhands|openclaw|vibe` in one command; undo with `headroom unwrap <tool>`
 - **MCP server** — `headroom_compress`, `headroom_retrieve`, `headroom_stats` for any MCP client
 - **Cross-agent memory** — shared store across Claude, Codex, Gemini, auto-dedup
-- **`headroom learn`** — mines failed sessions, writes corrections to `CLAUDE.md` / `AGENTS.md`
+- **`headroom learn`** — mines failed sessions, writes corrections to `CLAUDE.local.md` (default, gitignored) or `CLAUDE.md` / `AGENTS.md` / `GEMINI.md`
 - **Output token reduction** — trims what the model *writes back* (not just what you send): drops ceremony/restated code and skips deep "thinking" on routine steps. See [Output token reduction](#output-token-reduction-cut-what-the-model-writes-back).
 - **Reversible (CCR)** — originals are cached for retrieval on demand
 
@@ -96,7 +96,8 @@ headroom wrap claude                    # wrap a coding agent
 headroom proxy --port 8787              # drop-in proxy, zero code changes
 # or: from headroom import compress      # inline library
 
-# 3 — See the savings
+# 3 — Verify setup and see the savings
+headroom doctor                         # health check — confirms routing is working
 headroom perf
 headroom dashboard                      # live savings dashboard (proxy must be running)
 ```
@@ -192,16 +193,22 @@ shows an **Output Tokens Saved** card next to input compression, labelled
 
 | Agent        | `headroom wrap` | Notes                            |
 |--------------|:---------------:|----------------------------------|
-| Claude Code  | ✅              | `--memory` · `--code-graph` · `--1m` |
+| Claude Code  | ✅              | `--memory` · `--code-graph` · `--1m` · `--tool-search` |
 | Codex        | ✅              | shares memory with Claude        |
 | Cursor       | Manual setup    | starts proxy and prints base URLs for Cursor settings |
 | Aider        | ✅              | starts proxy + launches          |
 | Copilot CLI  | ✅              | starts proxy + launches          |
 | OpenClaw     | ✅              | installs as ContextEngine plugin |
 | OpenCode     | ✅              | injects config · starts proxy + launches |
+| Cline        | ✅              | starts proxy + injects config    |
+| Continue     | ✅              | starts proxy + injects config    |
+| Goose        | ✅              | starts proxy + launches          |
+| OpenHands    | ✅              | starts proxy + launches          |
+| Mistral Vibe | ✅              | starts proxy + launches          |
 | Cortex Code  | ✅              | 60–65% savings · library mode   |
 
 Any OpenAI-compatible client works via `headroom proxy`. MCP-native: `headroom mcp install`.
+Undo durable wrapping with `headroom unwrap <tool>` (supports: `claude`, `copilot`, `codex`, `opencode`, `openclaw`).
 
 ### GitHub Copilot CLI subscription mode
 
@@ -309,6 +316,8 @@ docker pull ghcr.io/chopratejas/headroom:latest
 
 Granular extras: `[proxy]`, `[mcp]`, `[ml]` (Kompress-base), `[code]`, `[memory]`, `[relevance]`, `[image]`, `[agno]`, `[langchain]`, `[evals]`, `[pytorch-mps]` (Apple-GPU memory-embedder offload — set `HEADROOM_EMBEDDER_RUNTIME=pytorch_mps`). Requires **Python 3.10+**.
 
+> **Note**: `[all]` covers the core stack but excludes framework adapters. Install them separately: `pip install "headroom-ai[langchain]"` (also `[agno]`, `[strands]`, `[anyllm]`, `[bedrock]`).
+
 Using `pipx`? Choose a supported interpreter explicitly:
 
 ```bash
@@ -401,7 +410,7 @@ download entirely.
   <img src="headroom_learn.gif" alt="headroom learn in action" width="720">
 </p>
 
-`headroom learn` — mines failed sessions, writes corrections to `CLAUDE.md` / `AGENTS.md` / `GEMINI.md`.
+`headroom learn` — mines failed sessions, writes corrections to `CLAUDE.local.md` (default, gitignored; use `--target CLAUDE.md` for the shared team file) / `AGENTS.md` / `GEMINI.md`.
 
 ## Documentation
 
@@ -413,6 +422,7 @@ download entirely.
 | [Memory](https://headroom-docs.vercel.app/docs/memory)                        | [Cache optimization](https://headroom-docs.vercel.app/docs/cache-optimization)     |
 | [Failure learning](https://headroom-docs.vercel.app/docs/failure-learning)    | [Benchmarks](https://headroom-docs.vercel.app/docs/benchmarks)                    |
 | [Configuration](https://headroom-docs.vercel.app/docs/configuration)          | [Limitations](https://headroom-docs.vercel.app/docs/limitations)                  |
+| [Persistent installs](https://headroom-docs.vercel.app/docs/persistent-installs) (`headroom init` / `headroom install apply`) | [Savings analytics](https://headroom-docs.vercel.app/docs/savings) (`headroom savings` / `headroom perf` / `headroom doctor`) |
 
 ## Compared to
 

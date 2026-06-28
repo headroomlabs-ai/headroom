@@ -287,6 +287,10 @@ def mcp_status() -> None:
             click.echo("                Run: headroom proxy")
         except httpx.TimeoutException:
             click.echo("Proxy Status:   ✗ Timeout")
+        except httpx.HTTPError as e:
+            # Catch the rest (InvalidURL, UnsupportedProtocol, ProtocolError, …)
+            # so a malformed configured HEADROOM_PROXY_URL can't crash `status`.
+            click.echo(f"Proxy Status:   ✗ Unreachable ({proxy_url}: {e})")
     except ImportError:
         click.echo("Proxy Status:   ? (httpx not installed)")
 

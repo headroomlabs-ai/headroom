@@ -210,6 +210,10 @@ class PerfReport:
     oldest_kept_ts: str | None = None
     newest_kept_ts: str | None = None
     records_filtered_out: int = 0
+    # True when no time cutoff was applied (--hours 0, or a value so large it
+    # overflows datetime arithmetic). The header says "all data" instead of a
+    # misleading "last 0h".
+    window_all_data: bool = False
 
 
 # Log timestamps are emitted by Python's `logging` formatter as
@@ -249,7 +253,17 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
     if not log_dir.exists():
         return report
 
-    cutoff = datetime.now() - timedelta(hours=last_n_hours) if last_n_hours > 0 else None
+    # A huge --hours value (e.g. 1e9) overflows datetime arithmetic. Since
+    # "look back a billion hours" is effectively "all data", treat overflow as
+    # no cutoff rather than crashing with a raw OverflowError traceback.
+    if last_n_hours > 0:
+        try:
+            cutoff: datetime | None = datetime.now() - timedelta(hours=last_n_hours)
+        except OverflowError:
+            cutoff = None
+    else:
+        cutoff = None
+    report.window_all_data = cutoff is None
 
     def _within_window(ts_str: str | None) -> bool:
         # Fail-open: records without a parseable timestamp are kept. The
@@ -498,14 +512,15 @@ def format_report(report: PerfReport) -> str:
     lines.append("Headroom Performance Report")
     lines.append("=" * 60)
     if report.requested_hours is not None:
+        window_label = "all data" if report.window_all_data else f"last {report.requested_hours:g}h"
         if report.oldest_kept_ts and report.newest_kept_ts:
             window_str = (
-                f"Window: last {report.requested_hours:g}h "
+                f"Window: {window_label} "
                 f"(actual data: {report.oldest_kept_ts[:19]} → "
                 f"{report.newest_kept_ts[:19]})"
             )
         else:
-            window_str = f"Window: last {report.requested_hours:g}h (no records found in window)"
+            window_str = f"Window: {window_label} (no records found in window)"
         lines.append(window_str)
         if report.records_filtered_out > 0:
             lines.append(

@@ -164,7 +164,7 @@ response = client.chat.completions.create(
 
 ## Retention
 
-Proxy CCR originals are kept for 300 seconds by default. For longer autonomous
+Proxy CCR originals are kept for 1800 seconds (30 minutes) by default. For longer autonomous
 agent runs, set `HEADROOM_CCR_TTL_SECONDS` before starting the proxy:
 
 ```bash

@@ -544,6 +544,39 @@ from headroom.proxy.handlers import (  # noqa: E402
 )
 
 
+def _apply_stateless_persistence(config: ProxyConfig) -> None:
+    """When the proxy runs stateless, force global persisters to in-memory so no
+    files are written to the workspace.
+
+    Covers TOIN (the always-on serving writer): it keeps learning patterns
+    in-memory but never reads or writes ``toin.json``. An empty ``storage_path``
+    makes the backend ``None``, which no-ops load/save/auto-save. The savings
+    subsystem is handled separately via ``PrometheusMetrics(stateless=...)``.
+
+    Note: setting ``HEADROOM_TOIN_BACKEND=none`` is NOT sufficient on its own —
+    ``ToolIntelligenceNetwork`` falls back to ``config.storage_path`` when no
+    backend is passed, so we must clear the path explicitly here.
+
+    Concurrency: ``stateless`` is a per-process flag (set once at ``headroom
+    proxy`` launch), never a per-request/per-session value — every session a
+    process serves shares it, and two proxies with different settings run as
+    separate OS processes with independent TOIN singletons. In the rare case
+    where two HeadroomProxy instances with different ``stateless`` settings live
+    in ONE process (e.g. tests), this fails closed: the reset forces the
+    process-global TOIN in-memory, so a stateless proxy never persists (the safe
+    direction). A co-resident stateful proxy would then also stop persisting
+    TOIN — acceptable, since not-writing can never leak data.
+    """
+    if not getattr(config, "stateless", False):
+        return
+    from headroom.telemetry.toin import TOINConfig, get_toin, reset_toin
+
+    # Reset first so this wins regardless of whether the singleton was already
+    # created with a filesystem backend earlier in the process.
+    reset_toin()
+    get_toin(TOINConfig(storage_path=""))
+
+
 class HeadroomProxy(
     StreamingMixin,
     AnthropicHandlerMixin,
@@ -563,6 +596,13 @@ class HeadroomProxy(
     def __init__(self, config: ProxyConfig):
         self.config = config
         self.config.mode = normalize_proxy_mode(self.config.mode)
+        # Record process-wide stateless mode so module-level persisters
+        # (output-savings recorder, etc.) can skip workspace writes.
+        from headroom import paths as _hr_paths
+
+        _hr_paths.set_process_stateless(config.stateless)
+        # Stateless: keep TOIN learning in-memory; never touch toin.json.
+        _apply_stateless_persistence(self.config)
         pipeline_extensions = list(config.pipeline_extensions or [])
         probe_recorder = probe_recorder_from_env()
         if probe_recorder is not None:
@@ -600,7 +640,7 @@ class HeadroomProxy(
             if config.cost_tracking_enabled
             else None
         )
-        self.metrics = PrometheusMetrics(cost_tracker=self.cost_tracker)
+        self.metrics = PrometheusMetrics(cost_tracker=self.cost_tracker, stateless=config.stateless)
 
         # Initialize transforms based on routing mode.
         #
@@ -940,7 +980,16 @@ class HeadroomProxy(
 
         # Memory Handler (persistent user memory)
         self.memory_handler: MemoryHandler | None = None
-        if config.memory_enabled:
+        if config.memory_enabled and config.stateless:
+            # Persistent memory writes a SQLite DB + markdown files to disk,
+            # which stateless mode forbids. Memory is cross-session learning and
+            # is contradictory with an ephemeral/read-only deployment, so we
+            # disable it rather than persist. Run without --stateless to use it.
+            logger.warning(
+                "Memory is disabled in stateless mode (it persists to disk). "
+                "Run without --stateless to enable persistent memory."
+            )
+        elif config.memory_enabled:
             # Resolve memory DB path: empty → project-scoped default
             _mem_db_path = config.memory_db_path
             if not _mem_db_path:

@@ -24,13 +24,17 @@ daemon reports savings across the operator's projects. Set
 `HEADROOM_RTK_GAIN_SCOPE=project` to query `rtk gain --project` from the
 proxy process working directory.
 
-## Modes
+## SDK Modes (`default_mode` / `headroom_mode`)
+
+These modes apply to SDK usage via `HeadroomClient(default_mode=...)` or per-request `headroom_mode=...`. They are **not** the same as the proxy `--mode` flag.
 
 | Mode | Behavior | Use Case |
 |------|----------|----------|
 | `audit` | Observes and logs, no modifications | Production monitoring, baseline measurement |
 | `optimize` | Applies safe, deterministic transforms | Production optimization |
 | `simulate` | Returns plan without API call | Testing, cost estimation |
+
+> **Proxy `--mode` is a separate axis**: `headroom proxy --mode token` (maximize compression) or `--mode cache` (freeze prior turns for prefix-cache stability). The proxy does not accept `audit`, `optimize`, or `simulate`.
 
 ## SDK Configuration
 
@@ -354,7 +358,7 @@ provider = AnthropicProvider(
 </Tab>
 <Tab value="Google">
 ```python
-from headroom import GoogleProvider
+from headroom.providers import GoogleProvider
 
 provider = GoogleProvider(
     enable_context_caching=True,

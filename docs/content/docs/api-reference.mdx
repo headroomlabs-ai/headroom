@@ -281,7 +281,7 @@ config = SmartCrusherConfig(
 <Tab value="Python">
 
 <TypeTable type={{
-  enabled: { type: 'bool', description: 'Enable/disable cache alignment', default: 'True' },
+  enabled: { type: 'bool', description: 'Enable/disable cache alignment (off by default)', default: 'False' },
   extract_dates: { type: 'bool', description: 'Extract date patterns from system prompt', default: 'True' },
   normalize_whitespace: { type: 'bool', description: 'Normalize whitespace for stable prefix', default: 'True' },
   stable_prefix_min_tokens: { type: 'int', description: 'Minimum prefix tokens for caching', default: '100' },
@@ -475,7 +475,7 @@ tokens = counter.count_messages(messages)  # Accurate count via API
 ### GoogleProvider
 
 ```python
-from headroom import GoogleProvider
+from headroom.providers import GoogleProvider
 
 provider = GoogleProvider(
     enable_context_caching=True,

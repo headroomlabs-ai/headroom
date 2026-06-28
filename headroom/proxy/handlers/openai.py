@@ -53,6 +53,7 @@ from headroom.proxy.auth_mode import (
 )
 from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.cost import _summarize_transforms, header_safe_transforms
+from headroom.proxy.handlers._debug_dump import _debug_dump_mode, _redact_debug_value
 from headroom.proxy.outcome import RequestOutcome
 from headroom.proxy.project_context import classify_project, set_current_project
 
@@ -2578,57 +2579,75 @@ class OpenAIHandlerMixin:
                         f"stream={stream}"
                     )
 
-                    try:
-                        from headroom import paths as _hr_paths
+                    # Diagnostic dump — OFF by default (can contain cleartext
+                    # prompt/tool/system content). Opt in via HEADROOM_DEBUG_DUMP
+                    # (=1 redacted, =full with content); never in stateless mode.
+                    dump_mode = _debug_dump_mode(self.config)
+                    if dump_mode != "off":
+                        try:
+                            from headroom import paths as _hr_paths
 
-                        debug_dir = _hr_paths.debug_400_dir()
-                        debug_dir.mkdir(parents=True, exist_ok=True)
-                        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                        debug_file = debug_dir / f"{ts}_{request_id}.json"
+                            debug_dir = _hr_paths.debug_400_dir()
+                            debug_dir.mkdir(parents=True, exist_ok=True)
+                            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                            debug_file = debug_dir / f"{ts}_{request_id}.json"
 
-                        safe_headers = {}
-                        for k, v in headers.items():
-                            if k.lower() in ("x-api-key", "authorization"):
-                                safe_headers[k] = v[:12] + "..." if v else ""
-                            else:
-                                safe_headers[k] = v
+                            safe_headers = {}
+                            for k, v in headers.items():
+                                if k.lower() in ("x-api-key", "authorization"):
+                                    safe_headers[k] = v[:12] + "..." if v else ""
+                                else:
+                                    safe_headers[k] = v
 
-                        debug_payload = {
-                            "request_id": request_id,
-                            "timestamp": datetime.now().isoformat(),
-                            "status_code": response.status_code,
-                            "error_response": err_body,
-                            "model": model,
-                            "stream": stream,
-                            "headers": safe_headers,
-                            "compression": {
-                                "was_compressed": bool(transforms_applied),
-                                "transforms": transforms_applied,
-                                "original_tokens": original_tokens,
-                                "optimized_tokens": optimized_tokens,
-                                "tokens_saved": tokens_saved,
-                                "compression_failed": _compression_failed,
-                            },
-                            "tools_sent": body.get("tools"),
-                            "tool_count": len(body.get("tools") or []),
-                            "original_tool_count": len(_original_tools or []),
-                            "messages_sent": body.get("messages"),
-                            "message_count": len(body.get("messages", [])),
-                            "original_messages": (
+                            redact = dump_mode == "redacted"
+                            messages_sent = body.get("messages")
+                            original_dump: Any = (
                                 original_messages
                                 if original_messages is not body.get("messages")
                                 else "__same_as_sent__"
-                            ),
-                            "original_message_count": len(original_messages),
-                            "system_prompt": body.get("system"),
-                        }
+                            )
+                            tools_sent = body.get("tools")
+                            system_prompt = body.get("system")
+                            if redact:
+                                messages_sent = _redact_debug_value(messages_sent)
+                                if original_dump != "__same_as_sent__":
+                                    original_dump = _redact_debug_value(original_dump)
+                                tools_sent = _redact_debug_value(tools_sent)
+                                system_prompt = _redact_debug_value(system_prompt)
 
-                        with open(debug_file, "w") as f:
-                            json.dump(debug_payload, f, indent=2, default=str)
+                            debug_payload = {
+                                "request_id": request_id,
+                                "timestamp": datetime.now().isoformat(),
+                                "dump_mode": dump_mode,
+                                "status_code": response.status_code,
+                                "error_response": err_body,
+                                "model": model,
+                                "stream": stream,
+                                "headers": safe_headers,
+                                "compression": {
+                                    "was_compressed": bool(transforms_applied),
+                                    "transforms": transforms_applied,
+                                    "original_tokens": original_tokens,
+                                    "optimized_tokens": optimized_tokens,
+                                    "tokens_saved": tokens_saved,
+                                    "compression_failed": _compression_failed,
+                                },
+                                "tools_sent": tools_sent,
+                                "tool_count": len(body.get("tools") or []),
+                                "original_tool_count": len(_original_tools or []),
+                                "messages_sent": messages_sent,
+                                "message_count": len(body.get("messages", [])),
+                                "original_messages": original_dump,
+                                "original_message_count": len(original_messages),
+                                "system_prompt": system_prompt,
+                            }
 
-                        logger.warning(f"[{request_id}] Full debug dump: {debug_file}")
-                    except Exception as dump_err:
-                        logger.error(f"[{request_id}] Failed to write debug dump: {dump_err}")
+                            with open(debug_file, "w") as f:
+                                json.dump(debug_payload, f, indent=2, default=str)
+
+                            logger.warning(f"[{request_id}] Debug dump ({dump_mode}): {debug_file}")
+                        except Exception as dump_err:
+                            logger.error(f"[{request_id}] Failed to write debug dump: {dump_err}")
 
                 total_latency = (time.time() - start_time) * 1000
 
