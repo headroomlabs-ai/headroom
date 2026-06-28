@@ -1,0 +1,15 @@
+# gitleaks configuration — extends the tuned default ruleset and allowlists
+# paths that contain hashes/identifiers (not real secrets) to avoid false
+# positives. Used by the Security workflow's secret-scan job.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Non-secret artifacts: SBOMs, lockfiles, and vendored hashes."
+paths = [
+  '''sbom/.*''',
+  '''.*\.lock$''',
+  '''.*package-lock\.json$''',
+  '''pnpm-lock\.yaml$''',
+]

@@ -83,6 +83,11 @@ jobs:
           category: "/language:${{ matrix.language }}"
 
   # ---- Secret scanning -------------------------------------------------
+  # Uses the gitleaks BINARY (MIT-licensed, no key) instead of
+  # gitleaks-action, which requires a paid GITLEAKS_LICENSE for organization
+  # repos. On PRs we scan only the PR's commits so pre-existing history can't
+  # block a PR; on push/schedule we scan the working tree. Config + allowlist
+  # live in .gitleaks.toml at the repo root (auto-loaded).
   secret-scan:
     name: Secret scan (gitleaks)
     runs-on: ubuntu-latest
@@ -90,10 +95,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # Full history so the scan covers the whole branch, not just the tip.
           fetch-depth: 0
 
-      - name: Run gitleaks
-        uses: gitleaks/gitleaks-action@v2
+      - name: Install gitleaks
+        run: |
+          version=8.18.4
+          curl -sSfL \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${version}/gitleaks_${version}_linux_x64.tar.gz" \
+            -o /tmp/gitleaks.tar.gz
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          sudo install /tmp/gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+
+      - name: Scan for secrets
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ -n "$BASE_SHA" ]; then
+            echo "Scanning PR commits ${BASE_SHA}..HEAD"
+            gitleaks detect --source . --log-opts="${BASE_SHA}..HEAD" --redact --no-banner
+          else
+            echo "Scanning working tree"
+            gitleaks detect --source . --no-git --redact --no-banner
+          fi
