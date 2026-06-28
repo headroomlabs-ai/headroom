@@ -543,6 +543,39 @@ from headroom.proxy.handlers import (  # noqa: E402
 )
 
 
+def _apply_stateless_persistence(config: ProxyConfig) -> None:
+    """When the proxy runs stateless, force global persisters to in-memory so no
+    files are written to the workspace.
+
+    Covers TOIN (the always-on serving writer): it keeps learning patterns
+    in-memory but never reads or writes ``toin.json``. An empty ``storage_path``
+    makes the backend ``None``, which no-ops load/save/auto-save. The savings
+    subsystem is handled separately via ``PrometheusMetrics(stateless=...)``.
+
+    Note: setting ``HEADROOM_TOIN_BACKEND=none`` is NOT sufficient on its own —
+    ``ToolIntelligenceNetwork`` falls back to ``config.storage_path`` when no
+    backend is passed, so we must clear the path explicitly here.
+
+    Concurrency: ``stateless`` is a per-process flag (set once at ``headroom
+    proxy`` launch), never a per-request/per-session value — every session a
+    process serves shares it, and two proxies with different settings run as
+    separate OS processes with independent TOIN singletons. In the rare case
+    where two HeadroomProxy instances with different ``stateless`` settings live
+    in ONE process (e.g. tests), this fails closed: the reset forces the
+    process-global TOIN in-memory, so a stateless proxy never persists (the safe
+    direction). A co-resident stateful proxy would then also stop persisting
+    TOIN — acceptable, since not-writing can never leak data.
+    """
+    if not getattr(config, "stateless", False):
+        return
+    from headroom.telemetry.toin import TOINConfig, get_toin, reset_toin
+
+    # Reset first so this wins regardless of whether the singleton was already
+    # created with a filesystem backend earlier in the process.
+    reset_toin()
+    get_toin(TOINConfig(storage_path=""))
+
+
 class HeadroomProxy(
     StreamingMixin,
     AnthropicHandlerMixin,
@@ -562,6 +595,13 @@ class HeadroomProxy(
     def __init__(self, config: ProxyConfig):
         self.config = config
         self.config.mode = normalize_proxy_mode(self.config.mode)
+        # Record process-wide stateless mode so module-level persisters
+        # (output-savings recorder, etc.) can skip workspace writes.
+        from headroom import paths as _hr_paths
+
+        _hr_paths.set_process_stateless(config.stateless)
+        # Stateless: keep TOIN learning in-memory; never touch toin.json.
+        _apply_stateless_persistence(self.config)
         pipeline_extensions = list(config.pipeline_extensions or [])
         probe_recorder = probe_recorder_from_env()
         if probe_recorder is not None:
@@ -599,7 +639,7 @@ class HeadroomProxy(
             if config.cost_tracking_enabled
             else None
         )
-        self.metrics = PrometheusMetrics(cost_tracker=self.cost_tracker)
+        self.metrics = PrometheusMetrics(cost_tracker=self.cost_tracker, stateless=config.stateless)
 
         # Initialize transforms based on routing mode.
         #
@@ -939,7 +979,16 @@ class HeadroomProxy(
 
         # Memory Handler (persistent user memory)
         self.memory_handler: MemoryHandler | None = None
-        if config.memory_enabled:
+        if config.memory_enabled and config.stateless:
+            # Persistent memory writes a SQLite DB + markdown files to disk,
+            # which stateless mode forbids. Memory is cross-session learning and
+            # is contradictory with an ephemeral/read-only deployment, so we
+            # disable it rather than persist. Run without --stateless to use it.
+            logger.warning(
+                "Memory is disabled in stateless mode (it persists to disk). "
+                "Run without --stateless to enable persistent memory."
+            )
+        elif config.memory_enabled:
             # Resolve memory DB path: empty → project-scoped default
             _mem_db_path = config.memory_db_path
             if not _mem_db_path:
@@ -1470,15 +1519,18 @@ class HeadroomProxy(
                 "(set GITHUB_TOKEN or GITHUB_COPILOT_GITHUB_TOKEN to enable)"
             )
 
-        # Log anonymous telemetry status so operators can see it in the log stream
+        # Log local telemetry status so operators can see it in the log stream.
+        # Nothing is sent externally — telemetry is collected locally only (the
+        # anonymous telemetry beacon was removed); operational metrics export
+        # only to your own OTEL collector via HEADROOM_OTEL_METRICS_*.
         if is_telemetry_enabled():
             logger.info(
-                "Anonymous telemetry: ENABLED (aggregate stats only — no prompts or content). "
-                "Opt out: HEADROOM_TELEMETRY=off or --no-telemetry"
+                "Local telemetry: ENABLED (aggregate stats, local only — nothing sent "
+                "externally). Opt out: HEADROOM_TELEMETRY=off or --no-telemetry"
             )
         else:
             logger.info(
-                "Anonymous telemetry: DISABLED (off by default — opt in: "
+                "Local telemetry: DISABLED (off by default — opt in: "
                 "HEADROOM_TELEMETRY=on or --telemetry)"
             )
 
@@ -1852,21 +1904,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             set_upstream=_set_anthropic_upstream,
         )
 
-    # Telemetry beacon (anonymous aggregate stats).
-    # With uvicorn workers > 1, each worker runs the lifespan independently.
-    # We must ensure only ONE beacon runs across all workers — otherwise each
-    # worker creates its own beacon, spamming the telemetry table with N rows
-    # per cycle instead of 1 (all reading the same /stats from the same port).
-    #
-    # Strategy: use a file lock to ensure only the first worker starts the
-    # beacon. Other workers see the lock and skip.
-    from headroom.telemetry.beacon import TelemetryBeacon
-
-    _beacon = TelemetryBeacon(
-        port=config.port if hasattr(config, "port") else 8787,
-        sdk=os.environ.get("HEADROOM_SDK", "proxy").strip() or "proxy",
-        backend=config.backend if hasattr(config, "backend") else "anthropic",
-    )
+    # Single-worker-owner lock. With uvicorn workers > 1, each worker runs the
+    # lifespan independently. A file lock elects ONE owner worker so that
+    # single-instance background tasks (currently the cc-switch reconciler) run
+    # once across all workers instead of N times.
     from headroom import paths as _hr_paths
 
     _beacon_lock_path = _hr_paths.beacon_lock_path(config.port)
@@ -1947,19 +1988,14 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 if proxy._background_compression_enabled:
                     await proxy._background_compressor.start()
 
-                # Only start beacon if we acquire the lock (first worker wins)
+                # Elect the single owner worker (first worker wins the lock).
                 _beacon_is_owner[0] = _try_acquire_beacon_lock()
-                if _beacon_is_owner[0]:
-                    await _beacon.start()
-                else:
-                    logger.debug("Beacon: skipping (another worker owns the lock)")
 
-                # Only the beacon-lock owner runs the reconciler. With
-                # uvicorn workers > 1 each worker runs this lifespan; without
-                # this guard every worker would watch + rewrite settings.json
-                # concurrently and each process would hold its own
-                # HeadroomProxy.ANTHROPIC_API_URL, so workers could disagree on
-                # the upstream. Single-owner mirrors the beacon's reasoning.
+                # Only the owner worker runs the reconciler. With uvicorn
+                # workers > 1 each worker runs this lifespan; without this guard
+                # every worker would watch + rewrite settings.json concurrently
+                # and each process would hold its own HeadroomProxy.ANTHROPIC_API_URL,
+                # so workers could disagree on the upstream.
                 if _cc_reconciler is not None and _beacon_is_owner[0]:
                     await _cc_reconciler.start()
 
@@ -1974,7 +2010,6 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             if _cc_reconciler is not None:
                 await _cc_reconciler.stop()
             if _beacon_is_owner[0]:
-                await _beacon.stop()
                 _release_beacon_lock()
             if proxy.usage_reporter:
                 await proxy.usage_reporter.stop()
@@ -3048,7 +3083,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "ccr_retrievals": compression_stats.get("total_retrievals", 0),
             },
             "compression_cache": compression_cache_stats,
-            "anon_telemetry_shipping": is_telemetry_enabled(),
+            # Always False: the anonymous telemetry beacon was removed, so no
+            # telemetry is ever shipped externally (local collection only).
+            "anon_telemetry_shipping": False,
             "telemetry": {
                 "enabled": telemetry_stats.get("enabled", False),
                 "total_compressions": telemetry_stats.get("total_compressions", 0),

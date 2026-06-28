@@ -95,6 +95,35 @@ def _env(name: str) -> str:
     return os.environ.get(name, "").strip()
 
 
+# ---------------------------------------------------------------------------
+# Process-wide stateless flag
+# ---------------------------------------------------------------------------
+# Stateless mode forbids writes to the workspace. Many persisters are
+# module-level singletons reached without a config object, so the proxy records
+# the mode here once at startup and writers consult ``process_is_stateless()``.
+
+_PROCESS_STATELESS: bool = False
+
+
+def set_process_stateless(value: bool) -> None:
+    """Record process-wide stateless mode (set once at proxy startup)."""
+
+    global _PROCESS_STATELESS
+    _PROCESS_STATELESS = bool(value)
+
+
+def process_is_stateless() -> bool:
+    """True when the process must not write to the workspace.
+
+    True if ``set_process_stateless(True)`` was called OR the ``HEADROOM_STATELESS``
+    environment variable is set, so non-proxy entrypoints honor it too.
+    """
+
+    if _PROCESS_STATELESS:
+        return True
+    return _env("HEADROOM_STATELESS").lower() in ("1", "true", "yes", "on")
+
+
 def _resolve(explicit: str | os.PathLike[str] | None, env_var: str, derived: Path) -> Path:
     """Apply the standard precedence: explicit > env > derived.
 
@@ -364,6 +393,8 @@ __all__ = [
     "HEADROOM_SAVINGS_EVENTS_PATH_ENV",
     "HEADROOM_TOIN_PATH_ENV",
     "HEADROOM_SUBSCRIPTION_STATE_PATH_ENV",
+    "set_process_stateless",
+    "process_is_stateless",
     "config_dir",
     "workspace_dir",
     "ensure_config_dir",
