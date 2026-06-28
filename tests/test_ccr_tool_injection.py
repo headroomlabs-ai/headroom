@@ -23,8 +23,7 @@ class TestCCRToolDefinition:
         assert "input_schema" in tool
         assert tool["input_schema"]["type"] == "object"
         assert "hash" in tool["input_schema"]["properties"]
-        # Retrieval is by hash only — no query/search parameter.
-        assert "query" not in tool["input_schema"]["properties"]
+        assert "query" in tool["input_schema"]["properties"]
         assert tool["input_schema"]["required"] == ["hash"]
 
     def test_openai_format(self):
@@ -35,6 +34,7 @@ class TestCCRToolDefinition:
         assert tool["function"]["name"] == CCR_TOOL_NAME
         assert "description" in tool["function"]
         assert "parameters" in tool["function"]
+        assert "query" in tool["function"]["parameters"]["properties"]
         assert tool["function"]["parameters"]["required"] == ["hash"]
 
     def test_google_format(self):
@@ -43,6 +43,7 @@ class TestCCRToolDefinition:
 
         assert tool["name"] == CCR_TOOL_NAME
         assert "parameters" in tool
+        assert "query" in tool["parameters"]["properties"]
         assert tool["parameters"]["required"] == ["hash"]
 
 
