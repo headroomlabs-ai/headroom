@@ -1,0 +1,343 @@
+{
+  "args": {
+    "start_proxy": true,
+    "proxy_url": "http://localhost:8788",
+    "port": 8797,
+    "no_kompress": false,
+    "target_ratio": null,
+    "source": "local",
+    "repo": "chopratejas/headroom-datasets",
+    "model": null,
+    "sonnet_sample": 0,
+    "judge_model": "claude-sonnet-4-6",
+    "judge_votes": 1,
+    "categories": "rag_search,code_agent",
+    "limit": null
+  },
+  "records": [
+    {
+      "id": "code_agent_001",
+      "category": "code_agent",
+      "model": "claude-haiku-4-5-20251001",
+      "baseline": {
+        "in": 9705,
+        "out": 109,
+        "latency": 1.99,
+        "cost": 0.01025,
+        "correct": true,
+        "score": 1.0,
+        "needle": true,
+        "reasoning": "The answer correctly identifies both required values: the buggy function 'paginate_orders' and the SERVICE_TAG 'svc-03e8-tag'.",
+        "answer": "Based on my analysis:\n\n**Buggy function:** `paginate_orders`\n\n**SERVICE_TAG:** `svc-03e8-tag`\n\nThe off-by-one bug is on the last line of `paginate_orders` where `end = start + page_size + 1` should be"
+      },
+      "headroom": {
+        "in": 4840,
+        "out": 101,
+        "latency": 25.6,
+        "cost": 0.00534,
+        "correct": true,
+        "score": 1.0,
+        "needle": true,
+        "reasoning": "The answer correctly identifies both required values: the buggy function 'paginate_orders' and the SERVICE_TAG 'svc-03e8-tag'.",
+        "answer": "Based on the test output and the file content:\n\n**Buggy function:** `paginate_orders`\n\n**SERVICE_TAG:** `svc-03e8-tag`\n\nThe bug is in the `paginate_orders` function at the line `end = start + page_siz"
+      }
+    },
+    {
+      "id": "code_agent_002",
+      "category": "code_agent",
+      "model": "claude-haiku-4-5-20251001",
+      "baseline": {
+        "in": 12095,
+        "out": 114,
+        "latency": 1.88,
+        "cost": 0.01266,
+        "correct": true,
+        "score": 1.0,
+        "needle": true,
+        "reasoning": "The answer correctly identifies both required values: the buggy function 'paginate_invoices' and the SERVICE_TAG 'svc-03e9-tag'.",
+        "answer": "Based on the code review and test results:\n\n**Buggy function:** `paginate_invoices`\n\n**SERVICE_TAG:** `svc-03e9-tag`\n\nThe bug is on line 40 of `src/pipeline.py` where `end = start + page_size + 1` sho"
+      },
+      "headroom": {
+        "in": 5730,
+        "out": 47,
+        "latency": 23.24,
+        "cost": 0.00596,
+        "correct": true,
+        "score": 1.0,
+        "needle": true,
+        "reasoning": "The answer correctly identifies both required values: the function 'paginate_invoices' and the SERVICE_TAG 'svc-03e9-tag'.",
+        "answer": "Based on the test output and file content:\n\n**Function with the off-by-one bug:** `paginate_invoices`\n\n**SERVICE_TAG:** `svc-03e9-tag`"
+      }
+    },
+    {
+      "id": "code_agent_003",
+      "category": "code_agent",
+      "model": "claude-haiku-4-5-20251001",
+      "baseline": {
+        "in": 14484,
+        "out": 139,
+        "latency": 1.99,
+        "cost": 0.01518,
+        "correct": true,
+        "score": 1.0,
+        "needle": true,
+        "reasoning": "The answer correctly identifies both required values: the buggy function is 'paginate_ledger' and the SERVICE_TAG is 'svc-03ea-tag'.",
+        "answer": "Based on the test results and code inspection:\n\n**Buggy function:** `paginate_ledger`\n\n**SERVICE_TAG:** `svc-03ea-tag`\n\nThe bug is on line 327 of `src/pipeline.py`:\n```python\nend = start + page_size +"
+      },
+      "headroom": {
+        "in": 6566,
+        "out": 88,
+        "latency": 29.76,
+        "cost": 0.00701,
+        "correct": true,
+        "score": 1.0,
+        "needle": true,
+        "reasoning": "The answer correctly identifies both required values: the buggy function 'paginate_ledger' and the SERVICE_TAG 'svc-03ea-tag'.",
+        "answer": "Based on the test output and the file content:\n\n**Buggy function:** `paginate_ledger`\n\n**SERVICE_TAG:** `\"svc-03ea-tag\"`\n\nThe bug is in the `paginate_ledger` function where the slice uses `end = start"
+      }
+    },
+    {
+      "id": "code_agent_004",
+      "category": "code_agent",
+      "model": "claude-haiku-4-5-20251001",
+      "baseline": {
+        "in": 16862,
+        "out": 138,
+        "latency": 2.09,
+        "cost": 0.01755,
+        "correct": true,
+        "score": 1.0,
+        "needle": true,
+        "reasoning": "The answer correctly identifies both required values: the buggy function 'paginate_quotes' and the SERVICE_TAG 'svc-03eb-tag'.",
+        "answer": "Based on my analysis:\n\n**Buggy function:** `paginate_quotes`\n\n**SERVICE_TAG:** `svc-03eb-tag`\n\nThe off-by-one bug is on line 40 of `src/pipeline.py` in the `paginate_quotes` function, where `end = sta"
+      },
+      "headroom": {
+        "in": 6869,
+        "out": 66,
+        "latency": 28.22,
+        "cost": 0.0072,
+        "correct": true,
+        "score": 1.0,
+        "needle": true,
+        "reasoning": "The answer correctly identifies both required values: the buggy function 'paginate_quotes' and the SERVICE_TAG 'svc-03eb-tag'.",
+        "answer": "Based on the test output, the buggy function is **`paginate_quotes`** (with the off-by-one error: `end = start + page_size + 1`).\n\nThe SERVICE_TAG value from the module is **`svc-03eb-tag`**."
+      }
+    },
+    {
+      "id": "code_agent_005",
+      "category": "code_agent",
+      "model": "claude-haiku-4-5-20251001",
+      "baseline": {
+        "in": 19252,
+        "out": 118,
+        "latency": 1.83,
+        "cost": 0.01984,
+        "correct": true,
+        "score": 1.0,
+        "needle": true,
+        "reasoning": "The answer correctly identifies both required values: the buggy function 'paginate_batches' and the SERVICE_TAG 'svc-03ec-tag'.",
+        "answer": "Based on my analysis:\n\n**Buggy function:** `paginate_batches`\n\n**SERVICE_TAG:** `svc-03ec-tag`\n\nThe bug is in the `paginate_batches` function at line 419 where `end = start + page_size + 1` should be "
+      },
+      "headroom": {
+        "in": 19415,
+        "out": 115,
+        "latency": 32.57,
+        "cost": 0.01999,
+        "correct": true,
+        "score": 1.0,
+        "needle": true,
+        "reasoning": "The answer correctly identifies both required values: the function 'paginate_batches' and the SERVICE_TAG 'svc-03ec-tag'.",
+        "answer": "Based on the code analysis and test results:\n\n**Function with the off-by-one bug:** `paginate_batches`\n\n**SERVICE_TAG:** `svc-03ec-tag`\n\nThe bug is in the `paginate_batches` function at line 1649 wher"
+      }
+    },
+    {
+      "id": "code_agent_006",
+      "category": "code_agent",
+      "model": "claude-haiku-4-5-20251001",
+      "baseline": {
+        "in": 21636,
+        "out": 130,
+        "latency": 2.94,
+        "cost": 0.02229,
+        "correct": true,
+        "score": 1.0,
+        "needle": true,
+        "reasoning": "The answer correctly identifies both required values: the buggy function 'paginate_shipments' and the SERVICE_TAG 'svc-03ed-tag'.",
+        "answer": "Based on the test output and code review:\n\n**Buggy function:** `paginate_shipments`\n\n**SERVICE_TAG:** `svc-03ed-tag`\n\nThe bug is in the `paginate_shipments` function at the line:\n```python\nend = start"
+      },
+      "headroom": {
+        "in": 21799,
+        "out": 153,
+        "latency": 33.33,
+        "cost": 0.02256,
+        "correct": true,
+        "score": 1.0,
+        "needle": true,
+        "reasoning": "The answer correctly identifies both required values: the buggy function is 'paginate_shipments' and the SERVICE_TAG is 'svc-03ed-tag'.",
+        "answer": "Based on my analysis:\n\n**Buggy function:** `paginate_shipments`\n\n**SERVICE_TAG:** `svc-03ed-tag`\n\nThe off-by-one bug is in the `paginate_shipments` function at the line:\n```python\nend = start + page_s"
+      }
+    },
+    {
+      "id": "rag_search_001",
+      "category": "rag_search",
+      "model": "claude-haiku-4-5-20251001",
+      "baseline": {
+        "in": 8232,
+        "out": 50,
+        "latency": 2.45,
+        "cost": 0.00848,
+        "correct": true,
+        "score": 1.0,
+        "needle": true,
+        "reasoning": "The answer correctly states both required values: the production signing token HDRM-004000-KEY and the rotation interval of 90 days.",
+        "answer": "Based on the search results from the rotation policy documentation, here are the exact values:\n\n**Current production signing token:** `HDRM-004000-KEY`\n\n**Service token rotation interval:** `90 days`"
+      },
+      "headroom": {
+        "in": 8395,
+        "out": 60,
+        "latency": 32.17,
+        "cost": 0.00869,
+        "correct": true,
+        "score": 1.0,
+        "needle": true,
+        "reasoning": "The answer correctly states both required values: the production signing token HDRM-004000-KEY and the 90-day rotation interval for service tokens.",
+        "answer": "Based on the internal documentation I found, here are the exact values from the \"Internal API: rotation policy for service tokens\" section:\n\n**Current production signing token:** `HDRM-004000-KEY`\n\n**"
+      }
+    },
+    {
+      "id": "rag_search_002",
+      "category": "rag_search",
+      "model": "claude-haiku-4-5-20251001",
+      "baseline": {
+        "in": 10889,
+        "out": 70,
+        "latency": 1.75,
+        "cost": 0.01124,
+        "correct": true,
+        "score": 1.0,
+        "needle": true,
+        "reasoning": "The answer correctly states both required values: the production signing token HDRM-004001-KEY and the rotation interval of 90 days.",
+        "answer": "Based on the documentation I found, here are the exact values from the rotation policy document:\n\n**Current production signing token:** `HDRM-004001-KEY`\n\n**Rotation interval:** `90 days`\n\nThe policy "
+      },
+      "headroom": {
+        "in": 11052,
+        "out": 52,
+        "latency": 31.73,
+        "cost": 0.01131,
+        "correct": true,
+        "score": 1.0,
+        "needle": true,
+        "reasoning": "The answer correctly states both required values: the production signing token HDRM-004001-KEY and the 90-day rotation interval.",
+        "answer": "Based on the search results from the \"Internal API: rotation policy for service tokens\" documentation:\n\n**Current production signing token:** `HDRM-004001-KEY`\n\n**Service token rotation interval:** Ev"
+      }
+    },
+    {
+      "id": "rag_search_003",
+      "category": "rag_search",
+      "model": "claude-haiku-4-5-20251001",
+      "baseline": {
+        "in": 13525,
+        "out": 51,
+        "latency": 1.84,
+        "cost": 0.01378,
+        "correct": true,
+        "score": 1.0,
+        "needle": true,
+        "reasoning": "The answer correctly states both required values: the production signing token HDRM-004002-KEY and the 90-day rotation interval for service tokens.",
+        "answer": "Based on the search results from the rotation-policy documentation, here are the exact values:\n\n**Current production signing token:** `HDRM-004002-KEY`\n\n**Service token rotation interval:** `90 days`"
+      },
+      "headroom": {
+        "in": 13688,
+        "out": 50,
+        "latency": 31.93,
+        "cost": 0.01394,
+        "correct": true,
+        "score": 1.0,
+        "needle": true,
+        "reasoning": "The answer correctly states both required values: the production signing token HDRM-004002-KEY and the rotation interval of 90 days.",
+        "answer": "Based on the search results, here are the exact values from the rotation policy document:\n\n**Current production signing token:** `HDRM-004002-KEY`\n\n**Service token rotation interval:** `90 days`"
+      }
+    },
+    {
+      "id": "rag_search_004",
+      "category": "rag_search",
+      "model": "claude-haiku-4-5-20251001",
+      "baseline": {
+        "in": 18037,
+        "out": 54,
+        "latency": 1.63,
+        "cost": 0.01831,
+        "correct": true,
+        "score": 1.0,
+        "needle": true,
+        "reasoning": "The answer correctly states both required values: the production signing token HDRM-004003-KEY and the 90-day rotation interval for service tokens.",
+        "answer": "Based on the search results from the internal documentation, here are the exact values from the rotation policy document:\n\n**Current production signing token:** `HDRM-004003-KEY`\n\n**Service token rota"
+      },
+      "headroom": {
+        "in": 18200,
+        "out": 58,
+        "latency": 32.02,
+        "cost": 0.01849,
+        "correct": true,
+        "score": 1.0,
+        "needle": true,
+        "reasoning": "The answer correctly states both required values: the production signing token HDRM-004003-KEY and the 90-day rotation interval for service tokens.",
+        "answer": "Based on the search results, here are the exact values from the \"Internal API: rotation policy for service tokens\" document:\n\n**Current production signing token:** `HDRM-004003-KEY`\n\n**Service token r"
+      }
+    },
+    {
+      "id": "rag_search_005",
+      "category": "rag_search",
+      "model": "claude-haiku-4-5-20251001",
+      "baseline": {
+        "in": 20382,
+        "out": 58,
+        "latency": 1.72,
+        "cost": 0.02067,
+        "correct": true,
+        "score": 1.0,
+        "needle": true,
+        "reasoning": "The answer correctly states both required values: the production signing token HDRM-004004-KEY and the rotation interval of 90 days.",
+        "answer": "Based on the search results from the \"Internal API: rotation policy for service tokens\" document, here are the exact values:\n\n**Current production signing token:** `HDRM-004004-KEY`\n\n**Service token r"
+      },
+      "headroom": {
+        "in": 20545,
+        "out": 58,
+        "latency": 31.89,
+        "cost": 0.02083,
+        "correct": true,
+        "score": 1.0,
+        "needle": true,
+        "reasoning": "The answer correctly states both required values: the production signing token HDRM-004004-KEY and the rotation interval of 90 days.",
+        "answer": "Based on the search results, here are the exact values from the \"Internal API: rotation policy for service tokens\" document:\n\n**Current production signing token:** `HDRM-004004-KEY`\n\n**Service token r"
+      }
+    },
+    {
+      "id": "rag_search_006",
+      "category": "rag_search",
+      "model": "claude-haiku-4-5-20251001",
+      "baseline": {
+        "in": 23085,
+        "out": 55,
+        "latency": 2.23,
+        "cost": 0.02336,
+        "correct": true,
+        "score": 1.0,
+        "needle": true,
+        "reasoning": "The answer correctly states both required values: the production signing token HDRM-004005-KEY and the 90-day rotation interval for service tokens.",
+        "answer": "Based on the search results, here are the exact values from the \"Internal API: rotation policy for service tokens\" documentation:\n\n**Current production signing token:** HDRM-004005-KEY\n\n**Service toke"
+      },
+      "headroom": {
+        "in": 23248,
+        "out": 57,
+        "latency": 31.88,
+        "cost": 0.02353,
+        "correct": true,
+        "score": 1.0,
+        "needle": true,
+        "reasoning": "The answer correctly states both required values: the production signing token HDRM-004005-KEY and the rotation interval of 90 days.",
+        "answer": "Based on the search results, I found the relevant information in the \"Internal API: rotation policy for service tokens\" document:\n\n**Current production signing token:** `HDRM-004005-KEY`\n\n**Rotation i"
+      }
+    }
+  ]
+}

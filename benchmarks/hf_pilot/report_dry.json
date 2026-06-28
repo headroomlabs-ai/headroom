@@ -1,0 +1,957 @@
+{
+  "args": {
+    "live": false,
+    "dry_run": true,
+    "source": "local",
+    "repo": "chopratejas/headroom-pilot",
+    "model": null,
+    "sonnet_sample": 0,
+    "categories": null,
+    "limit": null,
+    "no_kompress": false
+  },
+  "records": [
+    {
+      "id": "code_agent_001",
+      "category": "code_agent",
+      "model": "claude-haiku-4-5-20251001",
+      "modes": {
+        "raw": {
+          "est_input_tokens": 7579,
+          "needle_in_prompt": true
+        },
+        "headroom": {
+          "est_input_tokens": 7579,
+          "needle_in_prompt": true,
+          "tokens_before": 7579,
+          "tokens_after": 7579,
+          "pct_saved": 0.0,
+          "transforms": [
+            "router:noop"
+          ]
+        },
+        "headroom_kompress": {
+          "est_input_tokens": 7579,
+          "needle_in_prompt": true,
+          "tokens_before": 7579,
+          "tokens_after": 7579,
+          "pct_saved": 0.0,
+          "transforms": [
+            "router:noop"
+          ]
+        }
+      }
+    },
+    {
+      "id": "code_agent_002",
+      "category": "code_agent",
+      "model": "claude-haiku-4-5-20251001",
+      "modes": {
+        "raw": {
+          "est_input_tokens": 9595,
+          "needle_in_prompt": true
+        },
+        "headroom": {
+          "est_input_tokens": 9595,
+          "needle_in_prompt": true,
+          "tokens_before": 9595,
+          "tokens_after": 9595,
+          "pct_saved": 0.0,
+          "transforms": [
+            "router:noop"
+          ]
+        },
+        "headroom_kompress": {
+          "est_input_tokens": 9595,
+          "needle_in_prompt": true,
+          "tokens_before": 9595,
+          "tokens_after": 9595,
+          "pct_saved": 0.0,
+          "transforms": [
+            "router:noop"
+          ]
+        }
+      }
+    },
+    {
+      "id": "code_agent_003",
+      "category": "code_agent",
+      "model": "claude-haiku-4-5-20251001",
+      "modes": {
+        "raw": {
+          "est_input_tokens": 11609,
+          "needle_in_prompt": true
+        },
+        "headroom": {
+          "est_input_tokens": 11609,
+          "needle_in_prompt": true,
+          "tokens_before": 11609,
+          "tokens_after": 11609,
+          "pct_saved": 0.0,
+          "transforms": [
+            "router:noop"
+          ]
+        },
+        "headroom_kompress": {
+          "est_input_tokens": 11609,
+          "needle_in_prompt": true,
+          "tokens_before": 11609,
+          "tokens_after": 11609,
+          "pct_saved": 0.0,
+          "transforms": [
+            "router:noop"
+          ]
+        }
+      }
+    },
+    {
+      "id": "code_agent_004",
+      "category": "code_agent",
+      "model": "claude-haiku-4-5-20251001",
+      "modes": {
+        "raw": {
+          "est_input_tokens": 13641,
+          "needle_in_prompt": true
+        },
+        "headroom": {
+          "est_input_tokens": 13268,
+          "needle_in_prompt": true,
+          "tokens_before": 13641,
+          "tokens_after": 13268,
+          "pct_saved": 2.7,
+          "transforms": [
+            "router:tool_result:log"
+          ]
+        },
+        "headroom_kompress": {
+          "est_input_tokens": 13268,
+          "needle_in_prompt": true,
+          "tokens_before": 13641,
+          "tokens_after": 13268,
+          "pct_saved": 2.7,
+          "transforms": [
+            "router:tool_result:log"
+          ]
+        }
+      }
+    },
+    {
+      "id": "code_agent_005",
+      "category": "code_agent",
+      "model": "claude-haiku-4-5-20251001",
+      "modes": {
+        "raw": {
+          "est_input_tokens": 15681,
+          "needle_in_prompt": true
+        },
+        "headroom": {
+          "est_input_tokens": 15259,
+          "needle_in_prompt": true,
+          "tokens_before": 15681,
+          "tokens_after": 15259,
+          "pct_saved": 2.7,
+          "transforms": [
+            "router:tool_result:log"
+          ]
+        },
+        "headroom_kompress": {
+          "est_input_tokens": 15259,
+          "needle_in_prompt": true,
+          "tokens_before": 15681,
+          "tokens_after": 15259,
+          "pct_saved": 2.7,
+          "transforms": [
+            "router:tool_result:log"
+          ]
+        }
+      }
+    },
+    {
+      "id": "code_agent_006",
+      "category": "code_agent",
+      "model": "claude-haiku-4-5-20251001",
+      "modes": {
+        "raw": {
+          "est_input_tokens": 17719,
+          "needle_in_prompt": true
+        },
+        "headroom": {
+          "est_input_tokens": 17245,
+          "needle_in_prompt": true,
+          "tokens_before": 17719,
+          "tokens_after": 17245,
+          "pct_saved": 2.7,
+          "transforms": [
+            "router:tool_result:log"
+          ]
+        },
+        "headroom_kompress": {
+          "est_input_tokens": 17245,
+          "needle_in_prompt": true,
+          "tokens_before": 17719,
+          "tokens_after": 17245,
+          "pct_saved": 2.7,
+          "transforms": [
+            "router:tool_result:log"
+          ]
+        }
+      }
+    },
+    {
+      "id": "json_data_001",
+      "category": "json_data",
+      "model": "claude-haiku-4-5-20251001",
+      "modes": {
+        "raw": {
+          "est_input_tokens": 7059,
+          "needle_in_prompt": true
+        },
+        "headroom": {
+          "est_input_tokens": 2683,
+          "needle_in_prompt": true,
+          "tokens_before": 7059,
+          "tokens_after": 2683,
+          "pct_saved": 62.0,
+          "transforms": [
+            "router:tool_result:smart_crusher"
+          ]
+        },
+        "headroom_kompress": {
+          "est_input_tokens": 2683,
+          "needle_in_prompt": true,
+          "tokens_before": 7059,
+          "tokens_after": 2683,
+          "pct_saved": 62.0,
+          "transforms": [
+            "router:tool_result:smart_crusher"
+          ]
+        }
+      }
+    },
+    {
+      "id": "json_data_002",
+      "category": "json_data",
+      "model": "claude-haiku-4-5-20251001",
+      "modes": {
+        "raw": {
+          "est_input_tokens": 17616,
+          "needle_in_prompt": true
+        },
+        "headroom": {
+          "est_input_tokens": 6168,
+          "needle_in_prompt": true,
+          "tokens_before": 17616,
+          "tokens_after": 6168,
+          "pct_saved": 65.0,
+          "transforms": [
+            "router:tool_result:smart_crusher"
+          ]
+        },
+        "headroom_kompress": {
+          "est_input_tokens": 6168,
+          "needle_in_prompt": true,
+          "tokens_before": 17616,
+          "tokens_after": 6168,
+          "pct_saved": 65.0,
+          "transforms": [
+            "router:tool_result:smart_crusher"
+          ]
+        }
+      }
+    },
+    {
+      "id": "json_data_003",
+      "category": "json_data",
+      "model": "claude-haiku-4-5-20251001",
+      "modes": {
+        "raw": {
+          "est_input_tokens": 14065,
+          "needle_in_prompt": true
+        },
+        "headroom": {
+          "est_input_tokens": 5287,
+          "needle_in_prompt": true,
+          "tokens_before": 14065,
+          "tokens_after": 5287,
+          "pct_saved": 62.4,
+          "transforms": [
+            "router:tool_result:smart_crusher"
+          ]
+        },
+        "headroom_kompress": {
+          "est_input_tokens": 5287,
+          "needle_in_prompt": true,
+          "tokens_before": 14065,
+          "tokens_after": 5287,
+          "pct_saved": 62.4,
+          "transforms": [
+            "router:tool_result:smart_crusher"
+          ]
+        }
+      }
+    },
+    {
+      "id": "json_data_004",
+      "category": "json_data",
+      "model": "claude-haiku-4-5-20251001",
+      "modes": {
+        "raw": {
+          "est_input_tokens": 29353,
+          "needle_in_prompt": true
+        },
+        "headroom": {
+          "est_input_tokens": 10072,
+          "needle_in_prompt": true,
+          "tokens_before": 29353,
+          "tokens_after": 10072,
+          "pct_saved": 65.7,
+          "transforms": [
+            "router:tool_result:smart_crusher"
+          ]
+        },
+        "headroom_kompress": {
+          "est_input_tokens": 10072,
+          "needle_in_prompt": true,
+          "tokens_before": 29353,
+          "tokens_after": 10072,
+          "pct_saved": 65.7,
+          "transforms": [
+            "router:tool_result:smart_crusher"
+          ]
+        }
+      }
+    },
+    {
+      "id": "json_data_005",
+      "category": "json_data",
+      "model": "claude-haiku-4-5-20251001",
+      "modes": {
+        "raw": {
+          "est_input_tokens": 21069,
+          "needle_in_prompt": true
+        },
+        "headroom": {
+          "est_input_tokens": 7903,
+          "needle_in_prompt": true,
+          "tokens_before": 21069,
+          "tokens_after": 7903,
+          "pct_saved": 62.5,
+          "transforms": [
+            "router:tool_result:smart_crusher"
+          ]
+        },
+        "headroom_kompress": {
+          "est_input_tokens": 7903,
+          "needle_in_prompt": true,
+          "tokens_before": 21069,
+          "tokens_after": 7903,
+          "pct_saved": 62.5,
+          "transforms": [
+            "router:tool_result:smart_crusher"
+          ]
+        }
+      }
+    },
+    {
+      "id": "json_data_006",
+      "category": "json_data",
+      "model": "claude-haiku-4-5-20251001",
+      "modes": {
+        "raw": {
+          "est_input_tokens": 40742,
+          "needle_in_prompt": true
+        },
+        "headroom": {
+          "est_input_tokens": 13849,
+          "needle_in_prompt": true,
+          "tokens_before": 40742,
+          "tokens_after": 13849,
+          "pct_saved": 66.0,
+          "transforms": [
+            "router:tool_result:smart_crusher"
+          ]
+        },
+        "headroom_kompress": {
+          "est_input_tokens": 13849,
+          "needle_in_prompt": true,
+          "tokens_before": 40742,
+          "tokens_after": 13849,
+          "pct_saved": 66.0,
+          "transforms": [
+            "router:tool_result:smart_crusher"
+          ]
+        }
+      }
+    },
+    {
+      "id": "logs_001",
+      "category": "logs",
+      "model": "claude-haiku-4-5-20251001",
+      "modes": {
+        "raw": {
+          "est_input_tokens": 30493,
+          "needle_in_prompt": true
+        },
+        "headroom": {
+          "est_input_tokens": 15384,
+          "needle_in_prompt": true,
+          "tokens_before": 30493,
+          "tokens_after": 15384,
+          "pct_saved": 49.5,
+          "transforms": [
+            "router:tool_result:mixed"
+          ]
+        },
+        "headroom_kompress": {
+          "est_input_tokens": 15384,
+          "needle_in_prompt": true,
+          "tokens_before": 30493,
+          "tokens_after": 15384,
+          "pct_saved": 49.5,
+          "transforms": [
+            "router:tool_result:mixed"
+          ]
+        }
+      }
+    },
+    {
+      "id": "logs_002",
+      "category": "logs",
+      "model": "claude-haiku-4-5-20251001",
+      "modes": {
+        "raw": {
+          "est_input_tokens": 48834,
+          "needle_in_prompt": true
+        },
+        "headroom": {
+          "est_input_tokens": 24368,
+          "needle_in_prompt": true,
+          "tokens_before": 48834,
+          "tokens_after": 24368,
+          "pct_saved": 50.1,
+          "transforms": [
+            "router:tool_result:mixed"
+          ]
+        },
+        "headroom_kompress": {
+          "est_input_tokens": 24368,
+          "needle_in_prompt": true,
+          "tokens_before": 48834,
+          "tokens_after": 24368,
+          "pct_saved": 50.1,
+          "transforms": [
+            "router:tool_result:mixed"
+          ]
+        }
+      }
+    },
+    {
+      "id": "logs_003",
+      "category": "logs",
+      "model": "claude-haiku-4-5-20251001",
+      "modes": {
+        "raw": {
+          "est_input_tokens": 67271,
+          "needle_in_prompt": true
+        },
+        "headroom": {
+          "est_input_tokens": 33452,
+          "needle_in_prompt": true,
+          "tokens_before": 67271,
+          "tokens_after": 33452,
+          "pct_saved": 50.3,
+          "transforms": [
+            "router:tool_result:mixed"
+          ]
+        },
+        "headroom_kompress": {
+          "est_input_tokens": 33452,
+          "needle_in_prompt": true,
+          "tokens_before": 67271,
+          "tokens_after": 33452,
+          "pct_saved": 50.3,
+          "transforms": [
+            "router:tool_result:mixed"
+          ]
+        }
+      }
+    },
+    {
+      "id": "logs_004",
+      "category": "logs",
+      "model": "claude-haiku-4-5-20251001",
+      "modes": {
+        "raw": {
+          "est_input_tokens": 85699,
+          "needle_in_prompt": true
+        },
+        "headroom": {
+          "est_input_tokens": 42522,
+          "needle_in_prompt": true,
+          "tokens_before": 85699,
+          "tokens_after": 42522,
+          "pct_saved": 50.4,
+          "transforms": [
+            "router:tool_result:mixed"
+          ]
+        },
+        "headroom_kompress": {
+          "est_input_tokens": 42522,
+          "needle_in_prompt": true,
+          "tokens_before": 85699,
+          "tokens_after": 42522,
+          "pct_saved": 50.4,
+          "transforms": [
+            "router:tool_result:mixed"
+          ]
+        }
+      }
+    },
+    {
+      "id": "logs_005",
+      "category": "logs",
+      "model": "claude-haiku-4-5-20251001",
+      "modes": {
+        "raw": {
+          "est_input_tokens": 104076,
+          "needle_in_prompt": true
+        },
+        "headroom": {
+          "est_input_tokens": 51541,
+          "needle_in_prompt": true,
+          "tokens_before": 104076,
+          "tokens_after": 51541,
+          "pct_saved": 50.5,
+          "transforms": [
+            "router:tool_result:mixed"
+          ]
+        },
+        "headroom_kompress": {
+          "est_input_tokens": 51541,
+          "needle_in_prompt": true,
+          "tokens_before": 104076,
+          "tokens_after": 51541,
+          "pct_saved": 50.5,
+          "transforms": [
+            "router:tool_result:mixed"
+          ]
+        }
+      }
+    },
+    {
+      "id": "logs_006",
+      "category": "logs",
+      "model": "claude-haiku-4-5-20251001",
+      "modes": {
+        "raw": {
+          "est_input_tokens": 122382,
+          "needle_in_prompt": true
+        },
+        "headroom": {
+          "est_input_tokens": 60494,
+          "needle_in_prompt": true,
+          "tokens_before": 122382,
+          "tokens_after": 60494,
+          "pct_saved": 50.6,
+          "transforms": [
+            "router:tool_result:mixed"
+          ]
+        },
+        "headroom_kompress": {
+          "est_input_tokens": 60494,
+          "needle_in_prompt": true,
+          "tokens_before": 122382,
+          "tokens_after": 60494,
+          "pct_saved": 50.6,
+          "transforms": [
+            "router:tool_result:mixed"
+          ]
+        }
+      }
+    },
+    {
+      "id": "rag_search_001",
+      "category": "rag_search",
+      "model": "claude-haiku-4-5-20251001",
+      "modes": {
+        "raw": {
+          "est_input_tokens": 9305,
+          "needle_in_prompt": true
+        },
+        "headroom": {
+          "est_input_tokens": 9305,
+          "needle_in_prompt": true,
+          "tokens_before": 9305,
+          "tokens_after": 9305,
+          "pct_saved": 0.0,
+          "transforms": [
+            "router:noop"
+          ]
+        },
+        "headroom_kompress": {
+          "est_input_tokens": 9305,
+          "needle_in_prompt": true,
+          "tokens_before": 9305,
+          "tokens_after": 9305,
+          "pct_saved": 0.0,
+          "transforms": [
+            "router:noop"
+          ]
+        }
+      }
+    },
+    {
+      "id": "rag_search_002",
+      "category": "rag_search",
+      "model": "claude-haiku-4-5-20251001",
+      "modes": {
+        "raw": {
+          "est_input_tokens": 13213,
+          "needle_in_prompt": true
+        },
+        "headroom": {
+          "est_input_tokens": 13213,
+          "needle_in_prompt": true,
+          "tokens_before": 13213,
+          "tokens_after": 13213,
+          "pct_saved": 0.0,
+          "transforms": [
+            "router:noop"
+          ]
+        },
+        "headroom_kompress": {
+          "est_input_tokens": 13213,
+          "needle_in_prompt": true,
+          "tokens_before": 13213,
+          "tokens_after": 13213,
+          "pct_saved": 0.0,
+          "transforms": [
+            "router:noop"
+          ]
+        }
+      }
+    },
+    {
+      "id": "rag_search_003",
+      "category": "rag_search",
+      "model": "claude-haiku-4-5-20251001",
+      "modes": {
+        "raw": {
+          "est_input_tokens": 16772,
+          "needle_in_prompt": true
+        },
+        "headroom": {
+          "est_input_tokens": 16772,
+          "needle_in_prompt": true,
+          "tokens_before": 16772,
+          "tokens_after": 16772,
+          "pct_saved": 0.0,
+          "transforms": [
+            "router:noop"
+          ]
+        },
+        "headroom_kompress": {
+          "est_input_tokens": 16772,
+          "needle_in_prompt": true,
+          "tokens_before": 16772,
+          "tokens_after": 16772,
+          "pct_saved": 0.0,
+          "transforms": [
+            "router:noop"
+          ]
+        }
+      }
+    },
+    {
+      "id": "rag_search_004",
+      "category": "rag_search",
+      "model": "claude-haiku-4-5-20251001",
+      "modes": {
+        "raw": {
+          "est_input_tokens": 23015,
+          "needle_in_prompt": true
+        },
+        "headroom": {
+          "est_input_tokens": 23015,
+          "needle_in_prompt": true,
+          "tokens_before": 23015,
+          "tokens_after": 23015,
+          "pct_saved": 0.0,
+          "transforms": [
+            "router:noop"
+          ]
+        },
+        "headroom_kompress": {
+          "est_input_tokens": 23015,
+          "needle_in_prompt": true,
+          "tokens_before": 23015,
+          "tokens_after": 23015,
+          "pct_saved": 0.0,
+          "transforms": [
+            "router:noop"
+          ]
+        }
+      }
+    },
+    {
+      "id": "rag_search_005",
+      "category": "rag_search",
+      "model": "claude-haiku-4-5-20251001",
+      "modes": {
+        "raw": {
+          "est_input_tokens": 26322,
+          "needle_in_prompt": true
+        },
+        "headroom": {
+          "est_input_tokens": 26322,
+          "needle_in_prompt": true,
+          "tokens_before": 26322,
+          "tokens_after": 26322,
+          "pct_saved": 0.0,
+          "transforms": [
+            "router:noop"
+          ]
+        },
+        "headroom_kompress": {
+          "est_input_tokens": 26322,
+          "needle_in_prompt": true,
+          "tokens_before": 26322,
+          "tokens_after": 26322,
+          "pct_saved": 0.0,
+          "transforms": [
+            "router:noop"
+          ]
+        }
+      }
+    },
+    {
+      "id": "rag_search_006",
+      "category": "rag_search",
+      "model": "claude-haiku-4-5-20251001",
+      "modes": {
+        "raw": {
+          "est_input_tokens": 30106,
+          "needle_in_prompt": true
+        },
+        "headroom": {
+          "est_input_tokens": 30106,
+          "needle_in_prompt": true,
+          "tokens_before": 30106,
+          "tokens_after": 30106,
+          "pct_saved": 0.0,
+          "transforms": [
+            "router:noop"
+          ]
+        },
+        "headroom_kompress": {
+          "est_input_tokens": 30106,
+          "needle_in_prompt": true,
+          "tokens_before": 30106,
+          "tokens_after": 30106,
+          "pct_saved": 0.0,
+          "transforms": [
+            "router:noop"
+          ]
+        }
+      }
+    },
+    {
+      "id": "agentic_loop_001",
+      "category": "agentic_loop",
+      "model": "claude-haiku-4-5-20251001",
+      "modes": {
+        "raw": {
+          "est_input_tokens": 36764,
+          "needle_in_prompt": true
+        },
+        "headroom": {
+          "est_input_tokens": 21278,
+          "needle_in_prompt": true,
+          "tokens_before": 36764,
+          "tokens_after": 21278,
+          "pct_saved": 42.1,
+          "transforms": [
+            "router:tool_result:mixed",
+            "router:tool_result:smart_crusher"
+          ]
+        },
+        "headroom_kompress": {
+          "est_input_tokens": 21278,
+          "needle_in_prompt": true,
+          "tokens_before": 36764,
+          "tokens_after": 21278,
+          "pct_saved": 42.1,
+          "transforms": [
+            "router:tool_result:mixed",
+            "router:tool_result:smart_crusher"
+          ]
+        }
+      }
+    },
+    {
+      "id": "agentic_loop_002",
+      "category": "agentic_loop",
+      "model": "claude-haiku-4-5-20251001",
+      "modes": {
+        "raw": {
+          "est_input_tokens": 51757,
+          "needle_in_prompt": true
+        },
+        "headroom": {
+          "est_input_tokens": 29265,
+          "needle_in_prompt": true,
+          "tokens_before": 51757,
+          "tokens_after": 29265,
+          "pct_saved": 43.5,
+          "transforms": [
+            "router:tool_result:mixed",
+            "router:tool_result:smart_crusher"
+          ]
+        },
+        "headroom_kompress": {
+          "est_input_tokens": 29265,
+          "needle_in_prompt": true,
+          "tokens_before": 51757,
+          "tokens_after": 29265,
+          "pct_saved": 43.5,
+          "transforms": [
+            "router:tool_result:mixed",
+            "router:tool_result:smart_crusher"
+          ]
+        }
+      }
+    },
+    {
+      "id": "agentic_loop_003",
+      "category": "agentic_loop",
+      "model": "claude-haiku-4-5-20251001",
+      "modes": {
+        "raw": {
+          "est_input_tokens": 65675,
+          "needle_in_prompt": true
+        },
+        "headroom": {
+          "est_input_tokens": 36176,
+          "needle_in_prompt": true,
+          "tokens_before": 65675,
+          "tokens_after": 36176,
+          "pct_saved": 44.9,
+          "transforms": [
+            "router:tool_result:mixed",
+            "router:tool_result:smart_crusher"
+          ]
+        },
+        "headroom_kompress": {
+          "est_input_tokens": 36176,
+          "needle_in_prompt": true,
+          "tokens_before": 65675,
+          "tokens_after": 36176,
+          "pct_saved": 44.9,
+          "transforms": [
+            "router:tool_result:mixed",
+            "router:tool_result:smart_crusher"
+          ]
+        }
+      }
+    },
+    {
+      "id": "agentic_loop_004",
+      "category": "agentic_loop",
+      "model": "claude-haiku-4-5-20251001",
+      "modes": {
+        "raw": {
+          "est_input_tokens": 85012,
+          "needle_in_prompt": true
+        },
+        "headroom": {
+          "est_input_tokens": 48505,
+          "needle_in_prompt": true,
+          "tokens_before": 85012,
+          "tokens_after": 48505,
+          "pct_saved": 42.9,
+          "transforms": [
+            "router:tool_result:mixed",
+            "router:tool_result:smart_crusher"
+          ]
+        },
+        "headroom_kompress": {
+          "est_input_tokens": 48505,
+          "needle_in_prompt": true,
+          "tokens_before": 85012,
+          "tokens_after": 48505,
+          "pct_saved": 42.9,
+          "transforms": [
+            "router:tool_result:mixed",
+            "router:tool_result:smart_crusher"
+          ]
+        }
+      }
+    },
+    {
+      "id": "agentic_loop_005",
+      "category": "agentic_loop",
+      "model": "claude-haiku-4-5-20251001",
+      "modes": {
+        "raw": {
+          "est_input_tokens": 100907,
+          "needle_in_prompt": true
+        },
+        "headroom": {
+          "est_input_tokens": 57386,
+          "needle_in_prompt": true,
+          "tokens_before": 100907,
+          "tokens_after": 57386,
+          "pct_saved": 43.1,
+          "transforms": [
+            "router:tool_result:mixed",
+            "router:tool_result:smart_crusher"
+          ]
+        },
+        "headroom_kompress": {
+          "est_input_tokens": 57386,
+          "needle_in_prompt": true,
+          "tokens_before": 100907,
+          "tokens_after": 57386,
+          "pct_saved": 43.1,
+          "transforms": [
+            "router:tool_result:mixed",
+            "router:tool_result:smart_crusher"
+          ]
+        }
+      }
+    },
+    {
+      "id": "agentic_loop_006",
+      "category": "agentic_loop",
+      "model": "claude-haiku-4-5-20251001",
+      "modes": {
+        "raw": {
+          "est_input_tokens": 115820,
+          "needle_in_prompt": true
+        },
+        "headroom": {
+          "est_input_tokens": 65291,
+          "needle_in_prompt": true,
+          "tokens_before": 115820,
+          "tokens_after": 65291,
+          "pct_saved": 43.6,
+          "transforms": [
+            "router:tool_result:mixed",
+            "router:tool_result:smart_crusher"
+          ]
+        },
+        "headroom_kompress": {
+          "est_input_tokens": 65291,
+          "needle_in_prompt": true,
+          "tokens_before": 115820,
+          "tokens_after": 65291,
+          "pct_saved": 43.6,
+          "transforms": [
+            "router:tool_result:mixed",
+            "router:tool_result:smart_crusher"
+          ]
+        }
+      }
+    }
+  ]
+}
