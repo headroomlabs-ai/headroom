@@ -19,6 +19,8 @@ import importlib.util
 import io
 import json
 import os
+import re
+import shlex
 import shutil
 import signal
 import socket
@@ -41,6 +43,7 @@ if sys.platform == "win32" and hasattr(sys.stdout, "buffer"):
 
 import click
 
+from headroom import fsutil
 from headroom._version import __version__ as _HEADROOM_VERSION
 from headroom.agent_savings import (
     apply_agent_savings_env_defaults,
@@ -123,6 +126,22 @@ from headroom.providers.opencode.config import (
 from headroom.proxy.project_context import with_project_prefix as _with_project_prefix
 
 from .main import main
+
+
+def _read_text(path: Path) -> str:
+    """Read a text file as UTF-8, falling back to the system locale encoding."""
+    return fsutil.read_text(path)
+
+
+def _write_text(path: Path, content: str) -> None:
+    """Write a text file as UTF-8 without translating line endings (preserves CRLF)."""
+    fsutil.write_text(path, content)
+
+
+def _append_text(path: Path, content: str) -> None:
+    """Append to a text file as UTF-8 without translating line endings."""
+    fsutil.append_text(path, content)
+
 
 _CONTEXT_TOOL_ENV = "HEADROOM_CONTEXT_TOOL"
 _CONTEXT_TOOL_RTK = "rtk"
@@ -418,7 +437,7 @@ def _start_proxy(
     timeout_seconds = _resolve_wrap_proxy_timeout_seconds()
     log_path = _get_log_path()
     stdio_log_path = _get_proxy_stdio_log_path()
-    stdio_log_file = open(stdio_log_path, "a")  # noqa: SIM115
+    stdio_log_file = open(stdio_log_path, "a", encoding="utf-8")  # noqa: SIM115
 
     # Ensure proxy subprocess uses UTF-8 (Windows defaults to cp1252)
     proxy_env = os.environ.copy()
@@ -465,7 +484,7 @@ def _start_proxy(
             stdio_log_file.close()
             # Read last few lines of log for error context
             try:
-                tail = stdio_log_path.read_text()[-500:]
+                tail = _read_text(stdio_log_path)[-500:]
             except Exception:
                 tail = "(no log output)"
             raise RuntimeError(f"Proxy exited with code {proc.returncode}: {tail}")
@@ -501,10 +520,66 @@ def _setup_rtk(verbose: bool = False) -> Path | None:
     if register_claude_hooks(rtk_path):
         if verbose:
             click.echo("  rtk hooks registered in Claude Code")
+        try:
+            patched = _patch_rtk_hook_absolute_path(rtk_path)
+            if patched and verbose:
+                click.echo("  rtk hook script patched to use absolute path")
+        except Exception as e:
+            if verbose:
+                click.echo(f"  rtk hook absolute-path patch skipped: {e}")
     else:
         click.echo("  rtk hook registration failed — continuing without it")
 
     return rtk_path
+
+
+def _patch_rtk_hook_absolute_path(rtk_path: Path, hook_script_path: Path | None = None) -> bool:
+    """Rewrite bare ``rtk`` invocations in the generated Claude hook script
+    to use the absolute path to the RTK binary Headroom manages.
+
+    ``rtk init --global --auto-patch`` writes ``~/.claude/hooks/rtk-rewrite.sh``
+    with a bare ``rtk`` command that depends on PATH lookup. Since
+    ``~/.headroom/bin`` (where Headroom installs rtk) is not automatically
+    added to PATH, that lookup fails and the hook silently does nothing.
+
+    This rewrites bare ``rtk`` command tokens to the absolute, shell-quoted
+    path of the rtk binary so the hook works regardless of PATH.
+
+    Idempotent: only rewrites bare ``rtk`` tokens (not paths that already
+    point elsewhere), and only writes the file back if content changed.
+
+    Returns True if the hook script was modified.
+    """
+    if hook_script_path is None:
+        hook_script_path = Path.home() / ".claude" / "hooks" / "rtk-rewrite.sh"
+
+    if not hook_script_path.exists():
+        return False
+
+    original = _read_text(hook_script_path)
+
+    # Quote the absolute path safely for POSIX shells. This matters because
+    # paths containing spaces or other shell-special characters (e.g.
+    # "/Users/Alice Smith/.headroom/bin/rtk") must be quoted, or the
+    # generated script will break when the shell splits on whitespace.
+    quoted_path = shlex.quote(str(rtk_path))
+
+    # Replace bare `rtk` command tokens with the quoted absolute path.
+    # Matches `rtk` as a standalone word (preceded by start-of-line or
+    # whitespace/operators, followed by whitespace or end-of-line), so it
+    # won't touch things like "rtkfoo" or "/some/path/rtk" that are already
+    # absolute.
+    patched, count = re.subn(
+        r"(?<![\w/-])rtk(?=\s|$)",
+        lambda _match: quoted_path,
+        original,
+    )
+
+    if count and patched != original:
+        _write_text(hook_script_path, patched)
+        return True
+
+    return False
 
 
 def _setup_lean_ctx_agent(agent: str, verbose: bool = False) -> Path | None:
@@ -579,7 +654,7 @@ def _remove_claude_rtk_hooks(settings_path: Path | None = None) -> bool:
         return False
 
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(_read_text(path))
     except (OSError, json.JSONDecodeError):
         return False
     if not isinstance(payload, dict):
@@ -647,7 +722,7 @@ def _remove_claude_rtk_hooks(settings_path: Path | None = None) -> bool:
     if not changed:
         return False
 
-    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    _write_text(path, json.dumps(payload, indent=2) + "\n")
     return True
 
 
@@ -700,7 +775,7 @@ def _write_claude_wrap_base_url(
     payload: dict[str, Any] = {}
     if path.exists():
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload = json.loads(_read_text(path))
         except (OSError, json.JSONDecodeError):
             payload = {}
     if not isinstance(payload, dict):
@@ -711,7 +786,7 @@ def _write_claude_wrap_base_url(
     env_map[key] = proxy_url
     payload["env"] = env_map
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    _write_text(path, json.dumps(payload, indent=2) + "\n")
     return previous
 
 
@@ -732,7 +807,7 @@ def _restore_claude_wrap_base_url(
     if not path.exists():
         return
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(_read_text(path))
     except (OSError, json.JSONDecodeError):
         return
     if not isinstance(payload, dict):
@@ -753,7 +828,7 @@ def _restore_claude_wrap_base_url(
         env_map[key] = previous
         payload["env"] = env_map
     if payload:
-        path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        _write_text(path, json.dumps(payload, indent=2) + "\n")
     else:
         path.unlink(missing_ok=True)
 
@@ -1362,7 +1437,7 @@ def _snapshot_codex_config_if_unwrapped(config_file: Path, backup_file: Path) ->
     if not config_file.exists():
         return
     try:
-        content = config_file.read_text()
+        content = _read_text(config_file)
     except OSError:
         return
     if _codex_config_has_headroom_markers(content):
@@ -1535,7 +1610,7 @@ def _inject_codex_provider_config(port: int) -> None:
         _snapshot_codex_config_if_unwrapped(config_file, backup_file)
 
         if config_file.exists():
-            content = config_file.read_text()
+            content = _read_text(config_file)
             # Remove any prior Headroom-managed blocks before re-injecting so
             # the operation is idempotent and supports port changes.
             content = _strip_codex_headroom_blocks(content)
@@ -1576,7 +1651,7 @@ def _inject_codex_provider_config(port: int) -> None:
                 f"\n{provider_section}"
             )
 
-        config_file.write_text(content)
+        _write_text(config_file, content)
         click.echo(f"  Codex config: injected Headroom provider (WS + HTTP) into {config_file}")
         # Pull existing native threads into the headroom-provider menu so Codex's
         # history list stays whole once it routes through Headroom. Best-effort.
@@ -1608,7 +1683,7 @@ def _restore_codex_provider_config() -> tuple[str, Path]:
 
     # Case 2: no backup, but config file exists and has markers — strip them.
     if config_file.exists():
-        original = config_file.read_text()
+        original = _read_text(config_file)
         if _codex_config_has_headroom_markers(original):
             # Without a backup, only remove named MCP blocks when this file
             # also carries wrap-owned provider markers from a full wrap.
@@ -1631,7 +1706,7 @@ def _restore_codex_provider_config() -> tuple[str, Path]:
                 # so Codex falls back to its default config.
                 config_file.unlink()
                 return "removed", config_file
-            config_file.write_text(cleaned)
+            _write_text(config_file, cleaned)
             return "cleaned", config_file
 
     # Nothing to undo.
@@ -1802,17 +1877,16 @@ def _inject_rtk_instructions(file_path: Path, verbose: bool = False) -> bool:
     Returns True if instructions were written.
     """
     if file_path.exists():
-        existing = file_path.read_text()
+        existing = _read_text(file_path)
         if _RTK_MARKER in existing:
             if verbose:
                 click.echo(f"  rtk instructions already in {file_path.name}")
             return True
         # Append to existing file
-        with open(file_path, "a") as f:
-            f.write("\n\n" + RTK_INSTRUCTIONS_BLOCK)
+        _append_text(file_path, "\n\n" + RTK_INSTRUCTIONS_BLOCK)
     else:
         file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.write_text(RTK_INSTRUCTIONS_BLOCK)
+        _write_text(file_path, RTK_INSTRUCTIONS_BLOCK)
 
     click.echo(f"  rtk instructions injected into {file_path}")
     return True
@@ -1823,7 +1897,7 @@ def _remove_rtk_instructions(file_path: Path) -> bool:
     if not file_path.exists():
         return False
 
-    content = file_path.read_text(encoding="utf-8")
+    content = _read_text(file_path)
     end_marker = "<!-- /headroom:rtk-instructions -->"
     start = content.find(_RTK_MARKER)
     if start < 0:
@@ -1840,7 +1914,7 @@ def _remove_rtk_instructions(file_path: Path) -> bool:
         cleaned = cleaned.rstrip() + "\n"
 
     if cleaned:
-        file_path.write_text(cleaned, encoding="utf-8")
+        _write_text(file_path, cleaned)
     else:
         file_path.unlink()
     return True
@@ -1879,7 +1953,7 @@ def _inject_memory_mcp_config(user_id: str) -> None:
         _snapshot_codex_config_if_unwrapped(config_file, backup_file)
 
         if config_file.exists():
-            content = config_file.read_text()
+            content = _read_text(config_file)
             if _MEMORY_MCP_MARKER in content:
                 start = content.index(_MEMORY_MCP_MARKER)
                 end = content.index(_MEMORY_MCP_END) + len(_MEMORY_MCP_END)
@@ -1889,7 +1963,7 @@ def _inject_memory_mcp_config(user_id: str) -> None:
         else:
             content = mcp_section
 
-        config_file.write_text(content)
+        _write_text(config_file, content)
         click.echo(f"  Memory MCP: registered in {config_file}")
     except Exception as e:
         click.echo(f"  Warning: could not register memory MCP: {e}")
@@ -1913,14 +1987,13 @@ def _inject_memory_agents_md(file_path: Path) -> bool:
     )
 
     if file_path.exists():
-        existing = file_path.read_text()
+        existing = _read_text(file_path)
         if _MEMORY_AGENTS_MARKER in existing:
             return True  # Already injected
-        with open(file_path, "a") as f:
-            f.write("\n\n" + memory_block)
+        _append_text(file_path, "\n\n" + memory_block)
     else:
         file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.write_text(memory_block)
+        _write_text(file_path, memory_block)
 
     click.echo(f"  Memory guidance injected into {file_path.name}")
     return True
@@ -2002,7 +2075,7 @@ def _inject_continue_rtk_systemmessage(config_file: Path, verbose: bool = False)
     """
     if config_file.exists():
         try:
-            content = config_file.read_text()
+            content = _read_text(config_file)
         except OSError as exc:
             click.echo(f"  Warning: could not read {config_file}: {exc}")
             return False
@@ -2055,7 +2128,7 @@ def _inject_continue_rtk_systemmessage(config_file: Path, verbose: bool = False)
 
     if any_changed:
         config_file.parent.mkdir(parents=True, exist_ok=True)
-        config_file.write_text(json.dumps(data, indent=2) + "\n")
+        _write_text(config_file, json.dumps(data, indent=2) + "\n")
         click.echo(f"  rtk instructions injected into {config_file}")
     elif all_ok and verbose:
         # Idempotent re-run with no refusals — nothing to do.
@@ -2496,6 +2569,13 @@ def _ensure_proxy(
 ) -> subprocess.Popen | None:
     """Start or verify proxy. Returns process handle if we started it."""
     helpers = _live_wrap_module()
+    # --no-proxy reuses an already-running proxy, so backend/region/provider
+    # flags (which only apply when we start one) would be silently dropped.
+    if no_proxy and (backend or anyllm_provider or region):
+        click.echo(
+            "  Warning: --backend/--region/--anyllm-provider have no effect with --no-proxy "
+            "(reusing the existing proxy)."
+        )
     if not no_proxy:
         manifest = helpers._find_persistent_manifest(port)
         if manifest is not None:
@@ -2748,7 +2828,7 @@ def _register_proxy_client(port: int) -> None:
         ident = _proc_identity(os.getpid())
         if ident is not None:
             payload["start_src"], payload["start_time"] = ident
-        _client_marker_path(port).write_text(json.dumps(payload))
+        _write_text(_client_marker_path(port), json.dumps(payload))
     except OSError:
         pass
 
@@ -2763,13 +2843,24 @@ def _unregister_proxy_client(port: int) -> None:
 
 def _pid_alive(pid: int) -> bool:
     """Return True if ``pid`` names a live process."""
+    if pid <= 0:
+        return False  # non-positive PIDs are never valid client markers
+    try:
+        import psutil  # type: ignore[import-untyped]  # optional dep, already used elsewhere
+
+        return bool(psutil.pid_exists(pid))
+    except Exception:
+        pass
     try:
         os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
     except PermissionError:
         return True  # exists but owned by another user
-    except OSError:
+    except (ProcessLookupError, OSError, SystemError):
+        # On Windows, os.kill against a stale/invalid PID can fail with WinError
+        # 87 ("The parameter is incorrect"); CPython sometimes surfaces this as a
+        # SystemError rather than an OSError. SystemError is not an OSError
+        # subclass, so a bare `except OSError` lets it escape and crash cleanup(),
+        # leaving the shared proxy running.
         return False
     return True
 
@@ -2782,7 +2873,7 @@ def _marker_pid_reused(marker: Path, pid: int) -> bool:
     mismatched source) returns ``False`` so a real client is never pruned.
     """
     try:
-        rec = json.loads(marker.read_text())
+        rec = json.loads(_read_text(marker))
     except (OSError, ValueError):
         return False
     src = rec.get("start_src")
@@ -3160,7 +3251,9 @@ def unwrap() -> None:
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
-@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
 @click.option(
     "--no-context-tool",
     "--no-rtk",
@@ -3504,7 +3597,9 @@ def claude(
 
 
 @unwrap.command("claude")
-@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
 @click.option("--no-stop-proxy", is_flag=True, help="Do not stop the local Headroom proxy")
 @click.option("--keep-mcp", is_flag=True, help="Keep Headroom MCP registrations")
 @click.option("--keep-rtk", is_flag=True, help="Keep rtk Claude hooks")
@@ -3575,7 +3670,9 @@ def unwrap_claude(
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
-@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
 @click.option(
     "--no-context-tool",
     "--no-rtk",
@@ -3862,7 +3959,9 @@ def copilot(
 
 
 @unwrap.command("copilot")
-@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
 @click.option("--no-stop-proxy", is_flag=True, help="Do not stop the local Headroom proxy")
 def unwrap_copilot(port: int, no_stop_proxy: bool) -> None:
     """Undo durable setup from ``headroom wrap copilot``."""
@@ -3882,7 +3981,9 @@ def unwrap_copilot(port: int, no_stop_proxy: bool) -> None:
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
-@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
 @click.option(
     "--no-context-tool",
     "--no-rtk",
@@ -4113,7 +4214,9 @@ def codex(
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
-@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
 @click.option(
     "--no-context-tool",
     "--no-rtk",
@@ -4215,7 +4318,9 @@ def aider(
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
-@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
 @click.option(
     "--no-context-tool",
     "--no-rtk",
@@ -4292,7 +4397,9 @@ def vibe(
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
-@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
 @click.option(
     "--no-context-tool",
     "--no-rtk",
@@ -4376,7 +4483,9 @@ def cursor(
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
-@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
 @click.option(
     "--no-context-tool",
     "--no-rtk",
@@ -4476,7 +4585,9 @@ def cline(
 
 
 @wrap.command("continue", context_settings={"ignore_unknown_options": True})
-@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
 @click.option(
     "--no-context-tool",
     "--no-rtk",
@@ -4598,7 +4709,9 @@ def continue_dev(
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
-@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
 @click.option(
     "--no-context-tool",
     "--no-rtk",
@@ -4721,7 +4834,9 @@ def goose(
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
-@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
 @click.option(
     "--no-context-tool",
     "--no-rtk",
@@ -4884,7 +4999,9 @@ def openhands(
     is_flag=True,
     help="Install by copying plugin path instead of using --link",
 )
-@click.option("--proxy-port", default=8787, type=int, help="Headroom proxy port")
+@click.option(
+    "--proxy-port", default=8787, type=click.IntRange(1, 65535), help="Headroom proxy port"
+)
 @click.option("--startup-timeout-ms", default=20000, type=int, help="Proxy startup timeout")
 @click.option(
     "--gateway-provider-id",
@@ -5098,7 +5215,9 @@ def openclaw(
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
-@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
 @click.option(
     "--no-context-tool",
     "--no-rtk",
@@ -5260,7 +5379,9 @@ def _opencode_home_dir() -> Path:
 
 
 @unwrap.command("opencode")
-@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
 @click.option("--no-stop-proxy", is_flag=True, help="Do not stop the local Headroom proxy")
 def unwrap_opencode(port: int, no_stop_proxy: bool) -> None:
     """Undo ``headroom wrap opencode`` edits to the active OpenCode config file.
@@ -5296,11 +5417,11 @@ def unwrap_opencode(port: int, no_stop_proxy: bool) -> None:
                 f"could not restore OpenCode config from backup: {exc}"
             ) from exc
     elif config_file.exists():
-        content = config_file.read_text()
+        content = _read_text(config_file)
         if _PROVIDER_MARKER_START in content or _MCP_MARKER_START in content:
             cleaned = strip_opencode_headroom_blocks(content)
             if cleaned.strip():
-                config_file.write_text(cleaned + "\n", encoding="utf-8")
+                _write_text(config_file, cleaned + "\n")
                 click.echo(f"  Removed Headroom block from {config_file}; other content preserved.")
                 status = "cleaned"
             else:
@@ -5336,7 +5457,9 @@ def unwrap_opencode(port: int, no_stop_proxy: bool) -> None:
 
 
 @unwrap.command("openclaw")
-@click.option("--proxy-port", default=8787, type=int, help="Headroom proxy port")
+@click.option(
+    "--proxy-port", default=8787, type=click.IntRange(1, 65535), help="Headroom proxy port"
+)
 @click.option("--no-stop-proxy", is_flag=True, help="Do not stop the local Headroom proxy")
 @click.option("--no-restart", is_flag=True, help="Do not restart OpenClaw gateway at the end")
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
@@ -5415,7 +5538,9 @@ def unwrap_openclaw(
 
 
 @unwrap.command("codex")
-@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
 @click.option("--no-stop-proxy", is_flag=True, help="Do not stop the local Headroom proxy")
 def unwrap_codex(port: int, no_stop_proxy: bool) -> None:
     """Undo ``headroom wrap codex`` edits to the active Codex config file.

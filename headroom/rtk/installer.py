@@ -76,7 +76,7 @@ def download_rtk(version: str | None = None) -> Path:
     """Download rtk binary from GitHub releases.
 
     Args:
-        version: Version to download (e.g., "v0.28.2"). Defaults to pinned version.
+        version: Version to download (e.g., "v0.42.4"). Defaults to pinned version.
 
     Returns:
         Path to the installed binary.

@@ -14,6 +14,8 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from headroom.cache.backends import InMemoryBackend
+from headroom.cache.compression_store import get_compression_store, reset_compression_store
 from headroom.proxy.server import ProxyConfig, create_app
 
 GATED = [
@@ -42,6 +44,18 @@ def _loopback_client() -> TestClient:
     # A real loopback peer + a loopback Host header — passes both guard gates
     # (client-IP check and the DNS-rebinding Host-header check).
     return TestClient(_make_app(), base_url="http://127.0.0.1", client=("127.0.0.1", 12345))
+
+
+def _seed_ccr_entry() -> str:
+    reset_compression_store()
+    store = get_compression_store(backend=InMemoryBackend())
+    return store.store(
+        "seeded-ccr-content",
+        "<<ccr:seeded>>",
+        original_tokens=3,
+        compressed_tokens=1,
+        tool_name="seeded-test",
+    )
 
 
 @pytest.mark.parametrize("method,path", GATED)
@@ -74,6 +88,20 @@ CCR_GATED = [
 def test_ccr_non_loopback_gets_404(method: str, path: str) -> None:
     resp = TestClient(_make_app()).request(method, path, json={})
     assert resp.status_code == 404, resp.text
+
+
+def test_ccr_retrieve_hash_route_blocks_valid_hash_for_non_loopback() -> None:
+    ccr_hash = _seed_ccr_entry()
+    try:
+        loopback = _loopback_client()
+        loopback_resp = loopback.get(f"/v1/retrieve/{ccr_hash}")
+        assert loopback_resp.status_code == 200, loopback_resp.text
+        assert loopback_resp.json()["original_content"] == "seeded-ccr-content"
+
+        network_resp = TestClient(_make_app()).get(f"/v1/retrieve/{ccr_hash}")
+        assert network_resp.status_code == 404, network_resp.text
+    finally:
+        reset_compression_store()
 
 
 def test_dns_rebinding_host_header_rejected() -> None:

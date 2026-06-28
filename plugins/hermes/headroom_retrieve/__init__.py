@@ -27,10 +27,9 @@ HEADROOM_RETRIEVE_SCHEMA = {
         "to cat/read them. When you see one in a tool result or in "
         "conversation history, call this tool with the hash (the hex string "
         "after 'hash=' or 'ccr:') to read the full original content instead "
-        "of guessing or re-running the command. For very large results, pass "
-        "the optional 'query' to filter to the relevant parts (BM25 search). "
-        "Content expires after a TTL — if expired, re-run the original "
-        "command instead."
+        "of guessing or re-running the command. Retrieval is by hash and "
+        "always returns the complete original content. Content expires after "
+        "a TTL — if expired, re-run the original command instead."
     ),
     "parameters": {
         "type": "object",
@@ -38,10 +37,6 @@ HEADROOM_RETRIEVE_SCHEMA = {
             "hash": {
                 "type": "string",
                 "description": "Hash from the compression marker, e.g. 'abc123' from '[... hash=abc123]' or '<<ccr:abc123>>'",
-            },
-            "query": {
-                "type": "string",
-                "description": "Optional search query to filter large results to relevant items",
             },
         },
         "required": ["hash"],
@@ -61,9 +56,6 @@ def _handle_headroom_retrieve(args: dict, **kw) -> str:
         )
 
     payload: dict = {"hash": hash_key}
-    query = str(args.get("query") or "").strip()
-    if query:
-        payload["query"] = query
 
     try:
         resp = httpx.post(f"{_PROXY_URL}/v1/retrieve", json=payload, timeout=15)

@@ -52,7 +52,7 @@ def test_download_rtk_skips_verify_for_non_native_target(monkeypatch, tmp_path: 
     with patch.object(installer, "RTK_BIN_DIR", tmp_path):
         with patch.object(installer, "urlopen", return_value=_Response()):
             with patch.object(installer.subprocess, "run") as subprocess_run:
-                installed_path = installer.download_rtk("v0.28.2")
+                installed_path = installer.download_rtk("v0.42.4")
 
     assert installed_path == tmp_path / "rtk"
     assert installed_path.exists()

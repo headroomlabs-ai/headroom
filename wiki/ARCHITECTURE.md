@@ -578,7 +578,7 @@ class CompressionEntry:
 - Thread-safe in-memory storage
 - TTL-based expiration (default 5 minutes)
 - LRU-style eviction when capacity reached
-- Built-in BM25 search within cached content
+- Hash-keyed retrieval that always returns the full original content
 
 **Usage:**
 ```python
@@ -593,11 +593,8 @@ hash_key = store.store(
     tool_name="search_api",
 )
 
-# Retrieve later
+# Retrieve later (by hash; always returns the full original content)
 entry = store.retrieve(hash_key)
-
-# Or search within cached content
-results = store.search(hash_key, "user query")
 ```
 
 ---
@@ -609,33 +606,24 @@ results = store.search(hash_key, "user query")
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/v1/retrieve` | POST | Retrieve original content by hash |
-| `/v1/retrieve?query=X` | POST | Search within cached content |
+| `/v1/retrieve/{hash}` | GET | Retrieve original content by hash |
+
+Retrieval is by hash only — it always returns the full original content.
 
 **Retrieval Request:**
 ```json
 {
-    "hash": "abc123def456...",
-    "query": "find errors"     // Optional: search within
+    "hash": "abc123def456..."
 }
 ```
 
-**Response (full retrieval):**
+**Response:**
 ```json
 {
     "hash": "abc123def456...",
     "original_content": "[{...}, {...}, ...]",
     "original_item_count": 1000,
     "tool_name": "search_api"
-}
-```
-
-**Response (search):**
-```json
-{
-    "hash": "abc123def456...",
-    "query": "find errors",
-    "results": [{...}, {...}, ...],
-    "count": 15
 }
 ```
 
@@ -664,9 +652,9 @@ When running as MCP server, Headroom exposes retrieval as a tool:
     "inputSchema": {
         "type": "object",
         "properties": {
-            "hash": {"type": "string"},
-            "query": {"type": "string"}
-        }
+            "hash": {"type": "string"}
+        },
+        "required": ["hash"]
     }
 }
 ```
@@ -701,10 +689,10 @@ class ToolPattern:
     tool_name: str
     total_compressions: int      # Times we compressed this tool
     total_retrievals: int        # Times LLM asked for more
-    full_retrievals: int         # Retrieved everything
-    search_retrievals: int       # Used search query
-    common_queries: dict[str, int]   # Query frequency
-    queried_fields: dict[str, int]   # Fields mentioned in queries
+    full_retrievals: int         # Retrieved everything (all retrievals — hash-only)
+    search_retrievals: int       # Legacy; always 0 (retrieval is hash-only, no search)
+    common_queries: dict[str, int]   # Legacy query-pattern frequency (no longer populated)
+    queried_fields: dict[str, int]   # Legacy queried-field frequency (no longer populated)
 ```
 
 **Key Metrics:**
@@ -786,11 +774,10 @@ if self.config.use_feedback_hints and tool_name:
 │     └─ Contains: tool_use(headroom_retrieve, hash=abc123)       │
 │                                                                   │
 │  2. Handler detects CCR tool call                                │
-│     └─ Extracts hash and optional query                         │
+│     └─ Extracts hash                                             │
 │                                                                   │
 │  3. Handler executes retrieval                                   │
-│     └─ Full retrieval: store.retrieve(hash)                     │
-│     └─ Search: store.search(hash, query)                        │
+│     └─ By hash: store.retrieve(hash) → full original content    │
 │                                                                   │
 │  4. Handler continues conversation                               │
 │     └─ Adds tool result to messages                             │
@@ -810,7 +797,6 @@ if self.config.use_feedback_hints and tool_name:
 class CCRToolCall:
     tool_call_id: str      # For matching response
     hash_key: str          # CCR hash to retrieve
-    query: str | None      # Optional search query
 
 @dataclass
 class CCRToolResult:
@@ -818,7 +804,6 @@ class CCRToolResult:
     content: str           # Retrieved data as JSON
     success: bool
     items_retrieved: int
-    was_search: bool       # True if search, False if full retrieval
 
 class CCRResponseHandler:
     async def handle_response(
@@ -897,8 +882,7 @@ class ExpansionRecommendation:
     hash_key: str
     reason: str                # Human-readable explanation
     relevance_score: float     # 0-1, higher = more relevant
-    expand_full: bool          # True = full retrieval
-    search_query: str | None   # If expand_full=False
+    # Expansion always restores the full original content (retrieval is by hash).
 
 class ContextTracker:
     def track_compression(self, hash_key, turn_number, ...):

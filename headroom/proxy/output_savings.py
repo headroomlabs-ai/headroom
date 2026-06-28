@@ -451,8 +451,40 @@ class SavingsRecorder:
             return True
         return False
 
-    def _flush_locked(self) -> None:
+    def _reload_baseline_locked(self) -> None:
+        """Adopt the on-disk baseline written by ``learn --verbosity --apply``.
+
+        ``learn`` rewrites the baseline in place in the same file a running proxy
+        holds open, while the recorder only ever appends treatment/control
+        samples and never touches the baseline. Without re-reading it, two things
+        break: (1) a baseline learned while the proxy is up never takes effect
+        until a restart, so treatment lookups all miss (``m == 0``) and the
+        output-reduction tile stays at "—"; and (2) our periodic flush would
+        write our in-memory (empty) baseline straight over the one ``learn`` just
+        persisted.
+
+        Adopt the disk baseline whenever it carries samples and differs from
+        ours. Comparing content (not just sample count) means a re-learn with the
+        same number of samples still takes effect, and the empty-disk guard keeps
+        a truncated file from wiping a baseline we already hold."""
         try:
+            disk = SavingsLedger.load(self._path)
+        except OSError:
+            return
+        if disk.baseline.total_samples == 0:
+            return
+        if disk.baseline.to_dict() != self._ledger.baseline.to_dict():
+            self._ledger.baseline = disk.baseline
+
+    def _flush_locked(self) -> None:
+        from ..paths import process_is_stateless
+
+        if process_is_stateless():
+            # Stateless: keep the in-memory ledger but never write to disk.
+            self._since_flush = 0
+            return
+        try:
+            self._reload_baseline_locked()
             self._ledger.save(self._path)
             self._since_flush = 0
         except OSError:
@@ -464,6 +496,7 @@ class SavingsRecorder:
 
     def estimate(self) -> SavingsEstimate:
         with self._lock:
+            self._reload_baseline_locked()
             return self._ledger.best_estimate()
 
 

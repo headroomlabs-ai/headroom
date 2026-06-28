@@ -245,13 +245,8 @@ _ANTHROPIC_CCR_TOOL_SNAPSHOT_BYTES = (
     b'"properties":{'
     b'"hash":{"type":"string",'
     b'"description":"Hash key from the compression marker '
-    b"(e.g., 'abc123' from hash=abc123)\"},"
-    b'"query":{"type":"string",'
-    b'"description":"Optional search query to filter results. '
-    b"If provided, only returns items matching the query. "
-    b'If omitted, returns all original items."}'
-    b"},"
-    b'"required":["hash"]}}'
+    b"(e.g., 'abc123' from hash=abc123)\"}"
+    b'},"required":["hash"]}}'
 )
 
 _OPENAI_CCR_TOOL_SNAPSHOT_BYTES = (
@@ -265,13 +260,8 @@ _OPENAI_CCR_TOOL_SNAPSHOT_BYTES = (
     b'"properties":{'
     b'"hash":{"type":"string",'
     b'"description":"Hash key from the compression marker '
-    b"(e.g., 'abc123' from hash=abc123)\"},"
-    b'"query":{"type":"string",'
-    b'"description":"Optional search query to filter results. '
-    b"If provided, only returns items matching the query. "
-    b'If omitted, returns all original items."}'
-    b"},"
-    b'"required":["hash"]}}}'
+    b"(e.g., 'abc123' from hash=abc123)\"}"
+    b'},"required":["hash"]}}}'
 )
 
 

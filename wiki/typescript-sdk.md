@@ -8,7 +8,7 @@ The Headroom TypeScript SDK lets any JavaScript or TypeScript application compre
 npm install headroom-ai
 ```
 
-Requires a running [Headroom proxy](proxy.md) or Headroom Cloud API key.
+Requires a running [Headroom proxy](proxy.md).
 
 ## Quick Start
 
@@ -56,7 +56,7 @@ import { compress } from 'headroom-ai';
 const result = await compress(messages, {
   model: 'gpt-4o',                      // model name (for token counting)
   baseUrl: 'http://localhost:8787',      // proxy URL (default)
-  apiKey: 'hr_...',                      // Headroom Cloud key
+  apiKey: 'your-api-key',                // optional, for authenticated endpoints
   timeout: 30000,                        // ms (default)
   fallback: true,                        // return uncompressed if proxy down (default)
   retries: 1,                            // retry on transient errors (default)
@@ -77,8 +77,8 @@ Messages use standard OpenAI chat format: `{ role, content, tool_calls?, tool_ca
 
 Instead of passing options, set environment variables:
 
-- `HEADROOM_BASE_URL` — proxy or cloud URL (default: `http://localhost:8787`)
-- `HEADROOM_API_KEY` — Headroom Cloud API key
+- `HEADROOM_BASE_URL` — proxy URL (default: `http://localhost:8787`)
+- `HEADROOM_API_KEY` — optional API key for authenticated endpoints
 
 ## Reusable Client
 
@@ -89,7 +89,7 @@ import { HeadroomClient } from 'headroom-ai';
 
 const client = new HeadroomClient({
   baseUrl: 'http://localhost:8787',
-  apiKey: 'hr_...',
+  apiKey: 'your-api-key',
 });
 
 const r1 = await client.compress(messages1, { model: 'gpt-4o' });

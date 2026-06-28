@@ -31,7 +31,6 @@ class CCRToolCall:
 
     tool_call_id: str
     hash_key: str
-    query: str | None = None
 
 
 @dataclass
@@ -42,7 +41,6 @@ class CCRToolResult:
     content: str
     success: bool
     items_retrieved: int = 0
-    was_search: bool = False
 
 
 @dataclass
@@ -166,7 +164,7 @@ class CCRResponseHandler:
         other_calls = []
 
         for tc in all_tool_calls:
-            hash_key, query = parse_tool_call(tc, provider)
+            hash_key = parse_tool_call(tc, provider)
 
             if hash_key is not None:
                 # This is a CCR tool call - extract tool_call_id based on provider
@@ -181,7 +179,6 @@ class CCRResponseHandler:
                     CCRToolCall(
                         tool_call_id=tool_call_id,
                         hash_key=hash_key,
-                        query=query,
                     )
                 )
             else:
@@ -224,15 +221,14 @@ class CCRResponseHandler:
                     success=False,
                 )
 
-            if ccr_call.query:
-                # Search within compressed content
-                results = store.search(ccr_call.hash_key, ccr_call.query)
+            # Retrieval is by hash: always return the full original content.
+            entry = store.retrieve(ccr_call.hash_key)
+            if entry:
                 content = json.dumps(
                     {
                         "hash": ccr_call.hash_key,
-                        "query": ccr_call.query,
-                        "results": results,
-                        "count": len(results),
+                        "original_content": entry.original_content,
+                        "original_item_count": entry.original_item_count,
                     },
                     indent=2,
                 )
@@ -240,48 +236,28 @@ class CCRResponseHandler:
                     tool_call_id=ccr_call.tool_call_id,
                     content=content,
                     success=True,
-                    items_retrieved=len(results),
-                    was_search=True,
+                    items_retrieved=entry.original_item_count,
                 )
-            else:
-                # Full retrieval
-                entry = store.retrieve(ccr_call.hash_key)
-                if entry:
-                    content = json.dumps(
-                        {
-                            "hash": ccr_call.hash_key,
-                            "original_content": entry.original_content,
-                            "original_item_count": entry.original_item_count,
-                        },
-                        indent=2,
-                    )
-                    return CCRToolResult(
-                        tool_call_id=ccr_call.tool_call_id,
-                        content=content,
-                        success=True,
-                        items_retrieved=entry.original_item_count,
-                        was_search=False,
-                    )
-                else:
-                    miss_status = (
-                        get_status(ccr_call.hash_key, clean_expired=True)
-                        if callable(get_status)
-                        else {"hash": ccr_call.hash_key, "status": "missing"}
-                    )
-                    content = json.dumps(
-                        {
-                            "error": format_retrieval_miss_detail(miss_status),
-                            "hash": ccr_call.hash_key,
-                            "status": miss_status["status"],
-                            "ttl_seconds": miss_status.get("ttl_seconds"),
-                        },
-                        indent=2,
-                    )
-                    return CCRToolResult(
-                        tool_call_id=ccr_call.tool_call_id,
-                        content=content,
-                        success=False,
-                    )
+
+            miss_status = (
+                get_status(ccr_call.hash_key, clean_expired=True)
+                if callable(get_status)
+                else {"hash": ccr_call.hash_key, "status": "missing"}
+            )
+            content = json.dumps(
+                {
+                    "error": format_retrieval_miss_detail(miss_status),
+                    "hash": ccr_call.hash_key,
+                    "status": miss_status["status"],
+                    "ttl_seconds": miss_status.get("ttl_seconds"),
+                },
+                indent=2,
+            )
+            return CCRToolResult(
+                tool_call_id=ccr_call.tool_call_id,
+                content=content,
+                success=False,
+            )
 
         except Exception as e:
             logger.error(f"CCR retrieval failed for {ccr_call.hash_key}: {e}")
@@ -485,10 +461,8 @@ class CCRResponseHandler:
 
             # Log retrieval stats
             total_items = sum(r.items_retrieved for r in results)
-            searches = sum(1 for r in results if r.was_search)
             logger.debug(
-                f"CCR: Retrieved {total_items} items "
-                f"({searches} searches, {len(results) - searches} full)"
+                f"CCR: Retrieved {total_items} items across {len(results)} full retrieval(s)"
             )
 
             # Build continuation messages

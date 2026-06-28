@@ -55,8 +55,7 @@ Headroom injects a `headroom_retrieve` tool into the LLM's available tools:
   "name": "headroom_retrieve",
   "description": "Retrieve original uncompressed data from Headroom cache",
   "parameters": {
-    "hash": "The hash key from the compression marker",
-    "query": "Optional: search within the cached data"
+    "hash": "The hash key from the compression marker"
   }
 }
 ```
@@ -128,7 +127,7 @@ Full content available via ccr_retrieve tool with reference 'def456'.]
 |---------|-------------|
 | **Automatic Response Handling** | When LLM calls `headroom_retrieve`, the proxy handles it automatically |
 | **Multi-Turn Context Tracking** | Tracks compressed content across turns, proactively expands when relevant |
-| **BM25 Search** | LLM can search within compressed data: `headroom_retrieve(hash, query="errors")` |
+| **Hash-Keyed Retrieval** | `headroom_retrieve(hash)` always returns the full original content |
 | **Feedback Learning** | Learns from retrieval patterns to improve future compression |
 
 ## Configuration

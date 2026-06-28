@@ -65,7 +65,6 @@ const retrieve = createHeadroomRetrieveTool({
 
 const result = await retrieve.execute({
   hash: "0123456789abcdef01234567",
-  query: "needle",
 });
 ```
 

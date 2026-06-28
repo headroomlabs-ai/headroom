@@ -295,12 +295,12 @@ class TestUserCountMergeLogic:
 
 
 # =============================================================================
-# CRITICAL #4: _get_entry_for_search returns reference not copy
+# CRITICAL #4: retrieve() returns reference not copy
 # =============================================================================
 
 
-class TestGetEntryForSearchRaceCondition:
-    """CRITICAL: _get_entry_for_search returns reference to internal entry.
+class TestRetrieveRaceCondition:
+    """CRITICAL: retrieve() must not return a reference to the internal entry.
 
     The entry can be modified or evicted by another thread after the lock
     is released but before the caller uses it, causing race conditions.
@@ -321,8 +321,8 @@ class TestGetEntryForSearchRaceCondition:
             tool_name="test_tool",
         )
 
-        # Get entry via _get_entry_for_search
-        entry1 = store._get_entry_for_search(hash_key)
+        # Get entry via retrieve()
+        entry1 = store.retrieve(hash_key)
         assert entry1 is not None
 
         # Modify the returned entry
@@ -330,7 +330,7 @@ class TestGetEntryForSearchRaceCondition:
         entry1.retrieval_count = 999
 
         # Get entry again - should NOT reflect our modifications
-        entry2 = store._get_entry_for_search(hash_key)
+        entry2 = store.retrieve(hash_key)
 
         # AFTER FIX: entry2 should be a fresh copy, not affected by entry1 modifications
         # Currently this may fail because we return a reference
@@ -354,7 +354,7 @@ class TestGetEntryForSearchRaceCondition:
 
         def reader():
             for _ in range(50):
-                entry = store._get_entry_for_search(hash_key, "query")
+                entry = store.retrieve(hash_key)
                 if entry:
                     # Simulate work with the entry
                     try:
@@ -368,7 +368,7 @@ class TestGetEntryForSearchRaceCondition:
         def modifier():
             for _ in range(50):
                 # Try to mess with internal state
-                entry = store._get_entry_for_search(hash_key)
+                entry = store.retrieve(hash_key)
                 if entry:
                     entry.search_queries.clear()  # Shouldn't affect other readers
                 time.sleep(0.001)
@@ -677,19 +677,15 @@ class TestCriticalFixesIntegration:
             strategy="TOP_N",
         )
 
-        # 4. Simulate retrieval
+        # 4. Simulate retrieval (by hash — returns the full original content)
         entry = store.retrieve(hash_key)
         assert entry is not None
         assert entry.original_item_count == 100
 
-        # 5. Search within cached data
-        store.search(hash_key, "item_50")
-        # Should find the item even though it was compressed away
-
-        # 6. Get recommendation from TOIN
+        # 5. Get recommendation from TOIN
         toin.get_recommendation(sig, "find item_50")
 
-        # 7. Verify stats are consistent
+        # 6. Verify stats are consistent
         toin_stats = toin.get_stats()
         store_stats = store.get_stats()
         feedback_stats = feedback.get_stats()
@@ -925,9 +921,10 @@ class TestCompressionStoreHighPriorityFixes:
             compressed='[{"id": 1}]',
         )
 
-        # Trigger many searches with different queries
+        # Trigger many retrievals with different queries (query is recorded
+        # for access tracking even though retrieval itself is by hash).
         for i in range(50):
-            store.search(hash_key, f"unique_query_{i}")
+            store.retrieve(hash_key, query=f"unique_query_{i}")
 
         with store._lock:
             entry = store._backend.get(hash_key)
