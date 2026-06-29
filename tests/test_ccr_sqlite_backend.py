@@ -212,6 +212,56 @@ class TestDefaults:
         assert backend is not None
         assert backend.get_stats()["backend_type"] == "sqlite"
 
+    def test_workspace_dir(self, monkeypatch, tmp_path):
+        from headroom.cache.compression_store import _create_default_ccr_backend
+
+        workspace = tmp_path / "workspace"
+        fake_home = tmp_path / "fake_home"
+
+        monkeypatch.delenv("HEADROOM_CCR_BACKEND", raising=False)
+        monkeypatch.delenv("HEADROOM_CCR_SQLITE_PATH", raising=False)
+        monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(workspace))
+        monkeypatch.setenv("HOME", str(fake_home))
+        monkeypatch.setenv("USERPROFILE", str(fake_home))
+
+        backend = _create_default_ccr_backend()
+        assert backend is not None
+        assert str(backend._path) == str(workspace / "ccr_store.db")
+
+    def test_sqlite_path_env_wins(self, monkeypatch, tmp_path):
+        from headroom.cache.compression_store import _create_default_ccr_backend
+
+        workspace = tmp_path / "workspace"
+        sqlite_path = tmp_path / "sqlite_override.db"
+
+        monkeypatch.delenv("HEADROOM_CCR_BACKEND", raising=False)
+        monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(workspace))
+        monkeypatch.setenv("HEADROOM_CCR_SQLITE_PATH", str(sqlite_path))
+        backend = _create_default_ccr_backend()
+
+        assert backend is not None
+        assert str(backend._path) == str(sqlite_path)
+
+    def test_home_fallback(self, monkeypatch, tmp_path):
+        from headroom.cache.compression_store import _create_default_ccr_backend
+
+        fake_home = tmp_path / "fake_home"
+
+        monkeypatch.delenv("HEADROOM_CCR_BACKEND", raising=False)
+        monkeypatch.delenv("HEADROOM_CCR_SQLITE_PATH", raising=False)
+        monkeypatch.delenv("HEADROOM_WORKSPACE_DIR", raising=False)
+        monkeypatch.setenv("HOME", str(fake_home))
+        monkeypatch.setenv("USERPROFILE", str(fake_home))
+
+        backend = _create_default_ccr_backend()
+        assert backend is not None
+        assert str(backend._path) == str(fake_home / ".headroom" / "ccr_store.db")
+
+    def test_explicit_db_path(self, tmp_path):
+        explicit = tmp_path / "explicit.db"
+        backend = SQLiteBackend(explicit)
+        assert backend._path == explicit
+
     def test_memory_opt_out(self, monkeypatch):
         from headroom.cache.compression_store import _create_default_ccr_backend
 
