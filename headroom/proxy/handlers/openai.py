@@ -69,6 +69,7 @@ _OPENAI_RESPONSES_UNIT_EXECUTOR_LOCK = threading.RLock()
 _OPENAI_RESPONSES_UNIT_EXECUTOR: ThreadPoolExecutor | None = None
 _WS_ALLOWED_ORIGINS_ENV = "HEADROOM_WS_ORIGINS"
 _CORS_ALLOWED_ORIGINS_ENV = "HEADROOM_CORS_ORIGINS"
+_CODEX_RESPONSES_LITE_HEADER = "x-openai-internal-codex-responses-lite"
 
 
 def _header_get(headers: dict[str, str], name: str) -> str | None:
@@ -3780,6 +3781,12 @@ class OpenAIHandlerMixin:
         )
 
         upstream_headers, is_chatgpt_auth = _resolve_codex_routing_headers(upstream_headers)
+        # OpenAI rejects newer Codex models when this client-only lite header leaks upstream.
+        upstream_headers = {
+            key: value
+            for key, value in upstream_headers.items()
+            if key.lower() != _CODEX_RESPONSES_LITE_HEADER
+        }
         _lower_headers = {k.lower(): v for k, v in upstream_headers.items()}
 
         # Build upstream WebSocket URL based on auth mode
