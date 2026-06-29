@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Unreleased
 
 ### Fixed
+- `--backend bedrock` now fails fast with an actionable error when temporary
+  AWS credentials (`AWS_SESSION_TOKEN`) are used but botocore is not installed
+  (e.g. the slim default Docker image). litellm's session-token auth path
+  imports botocore, so the missing dependency previously surfaced only at
+  request time as a misleading `authentication_error: No module named
+  'botocore'`. The proxy now tells the user to install the `bedrock` extra up
+  front ([#1551](https://github.com/headroomlabs-ai/headroom/issues/1551)).
 - Proactive expansion blocks injected into user turns are now wrapped in
   `<headroom_proactive_expansion>` XML tags, giving downstream consumers
   (LLMs, loggers, attribution parsers) a machine-readable provenance
