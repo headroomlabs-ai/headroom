@@ -15,6 +15,7 @@ from headroom.providers.anthropic import (
 from headroom.providers.anthropic import (
     _load_custom_model_config as anthropic_load_config,
 )
+from headroom.providers.google import GeminiTokenCounter, GoogleProvider
 from headroom.providers.openai import (
     OpenAIProvider,
     _infer_model_family,
@@ -22,6 +23,47 @@ from headroom.providers.openai import (
 from headroom.providers.openai import (
     _load_custom_model_config as openai_load_config,
 )
+
+
+class TestGoogleModelFallback:
+    """Tests for Google provider model fallback."""
+
+    def test_future_gemini_model_uses_registry_family_fallback(self):
+        """Future Gemini models should not hard-fail token counting."""
+        provider = GoogleProvider()
+
+        with patch("headroom.models.registry.get_model_pricing", return_value=None):
+            assert provider.supports_model("gemini-3-pro-preview")
+            assert provider.get_context_limit("gemini-3-pro-preview") == 1000000
+            assert isinstance(
+                provider.get_token_counter("gemini-3-pro-preview"),
+                GeminiTokenCounter,
+            )
+
+    def test_litellm_prefixed_gemini_model_uses_registry_family_fallback(self):
+        """LiteLLM-style Gemini ids should resolve through the Google provider."""
+        provider = GoogleProvider()
+
+        with patch("headroom.models.registry.get_model_pricing", return_value=None):
+            assert provider.supports_model("gemini/gemini-3-pro-preview")
+            assert provider.get_context_limit("gemini/gemini-3-pro-preview") == 1000000
+
+    def test_google_legacy_context_limits_are_preserved(self):
+        """Moving lookup through ModelRegistry must keep legacy Gemini limits."""
+        provider = GoogleProvider()
+
+        with patch("headroom.models.registry.get_model_pricing", return_value=None):
+            assert provider.get_context_limit("gemini-1.5-pro-latest") == 2000000
+            assert provider.get_context_limit("gemini-1.0-pro") == 32768
+
+    def test_unknown_non_gemini_model_still_rejected(self):
+        """The Google provider should not claim unrelated unknown models."""
+        provider = GoogleProvider()
+
+        assert not provider.supports_model("not-a-google-model")
+        assert not provider.supports_model("gpt-4o")
+        with pytest.raises(ValueError):
+            provider.get_token_counter("not-a-google-model")
 
 
 class TestAnthropicModelFallback:

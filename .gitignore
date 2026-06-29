@@ -118,6 +118,9 @@ env.bak/
 venv.bak/
 .python-version
 
+# Node.js dependencies (never commit vendored deps)
+node_modules/
+
 # Secrets and API keys - NEVER commit these
 *.pem
 *.key
@@ -229,10 +232,7 @@ CLAUDE.md
 # Vitals provenance data
 .vitals/
 
-# Superpowers working files (plans, specs, brainstorming)
-# docs/spec/           (lives in git - git-versioned living specification)
-
-# Managed platform (separate private repo)
+# Separate private repos — never commit here
 headroom-managed/
 
 # Local act testing (never commit test tokens)

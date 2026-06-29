@@ -15,10 +15,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+import tomllib
 from click.testing import CliRunner
 
 from headroom.cli import wrap as wrap_mod
 from headroom.cli.main import main
+from headroom.mcp_registry.install import build_headroom_spec
 
 
 def _set_test_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -1010,9 +1012,13 @@ def test_wrap_codex_prepare_only_updates_stale_mcp_proxy_url(
 
     assert result.exit_code == 0, result.output
     content = config_file.read_text(encoding="utf-8")
+    parsed = tomllib.loads(content)
+    expected = build_headroom_spec()
+    headroom_mcp = parsed["mcp_servers"]["headroom"]
     assert "[mcp_servers.headroom]" in content
-    assert 'command = "headroom"' in content
-    assert 'args = ["mcp", "serve"]' in content
+    assert headroom_mcp["command"] == expected.command
+    assert headroom_mcp["args"] == list(expected.args)
+    assert "env" not in headroom_mcp or "HEADROOM_PROXY_URL" not in headroom_mcp["env"]
     assert "http://127.0.0.1:9000" not in content
 
 

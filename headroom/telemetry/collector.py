@@ -744,8 +744,9 @@ def get_telemetry_collector(
     if _telemetry_collector is None:
         with _collector_lock:
             if _telemetry_collector is None:
-                # Honour HEADROOM_TELEMETRY (the documented opt-out var,
-                # also used by the Supabase beacon at telemetry/beacon.py).
+                # Honour HEADROOM_TELEMETRY (the documented opt-out var; see
+                # the predicate in telemetry/beacon.py). Collection is local
+                # only — nothing is sent externally.
                 # Pre-#390 this only checked HEADROOM_TELEMETRY_DISABLED,
                 # so users who set HEADROOM_TELEMETRY=off (the value in
                 # the docs) still saw /v1/telemetry report enabled=true.

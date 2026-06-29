@@ -254,83 +254,21 @@ no longer resolves; use `[ml]` instead.
 
 ---
 
-#### Transform 5: Rolling Window
+#### Context Management: Live-Zone-Only Compression
 
-**Problem:** Even after compression, you might exceed the model's context limit.
+**Approach:** Headroom never drops messages from conversation history, and it does not do position-based or score-based context management. Context management is handled automatically inside the pipeline by compressing only the **live zone** — the newest content blocks (the latest user message and the latest tool result / tool output).
 
-```python
-# Model limit: 128K tokens
-# Your messages: 150K tokens
-# Need to drop 22K tokens
-
-# Rolling Window drops OLDEST messages first:
-# - Keeps system prompt (always)
-# - Keeps last 2 turns (always)
-# - Drops old tool calls + their responses as atomic units
+```
+# The cache hot zone is NEVER mutated:
+# - System prompt
+# - Tool definitions
+# - Older conversation turns
+#
+# Only the newest content blocks are compressed (type-aware),
+# and every compression is reversible via CCR.
 ```
 
-**Safety rule:** If we drop a tool CALL, we MUST drop its RESPONSE too (or vice versa). Otherwise the model sees orphaned data.
-
----
-
-#### Transform 6: Intelligent Context Manager (Advanced)
-
-**Problem:** Rolling Window drops by position (oldest first), but position doesn't equal importance.
-
-```python
-# Scenario: Error at turn 3, verbose success at turn 10
-# Rolling Window: Drops turn 3 error (oldest first)
-# Intelligent Context: Keeps turn 3 error (high TOIN error score)
-```
-
-**The Solution:** Multi-factor importance scoring using TOIN-learned patterns:
-
-```python
-# Message scores (all learned, no hardcodes):
-scores = {
-    "recency": 0.20,           # Exponential decay from end
-    "semantic_similarity": 0.20,  # Embedding similarity to recent context
-    "toin_importance": 0.25,   # TOIN retrieval_rate (high = important)
-    "error_indicator": 0.15,   # TOIN field_semantics.inferred_type
-    "forward_reference": 0.15, # Referenced by later messages
-    "token_density": 0.05,     # Unique tokens / total tokens
-}
-
-# Drops lowest-scored messages first
-# Preserves critical errors even if old
-```
-
-**Key principle:** No hardcoded patterns. Error detection uses TOIN's learned `field_semantics.inferred_type == "error_indicator"`, not keyword matching like "error" or "fail".
-
-**TOIN + CCR Integration:**
-
-IntelligentContext is a **message-level compressor** — just like SmartCrusher compresses items in an array, IntelligentContext "compresses" messages in a conversation. This means full CCR integration:
-
-```python
-# When messages are dropped:
-# 1. Store dropped messages in CCR for potential retrieval
-ccr_ref = store.store(
-    original=json.dumps(dropped_messages),
-    compressed="[60 messages dropped]",
-    tool_name="intelligent_context_drop",
-)
-
-# 2. Record drop to TOIN for cross-user learning
-toin.record_compression(
-    tool_signature=message_signature,  # Pattern of roles, tools, errors
-    original_count=len(dropped_messages),
-    compressed_count=1,  # The marker
-    strategy="intelligent_context_drop",
-)
-
-# 3. Insert marker with CCR reference
-marker = f"[Earlier context compressed: 60 messages dropped. Retrieve: {ccr_ref}]"
-```
-
-**The feedback loop:**
-- If users retrieve dropped messages via CCR, TOIN learns those patterns are important
-- Future drops of similar message patterns get higher importance scores
-- The system gets smarter across all users, not just within one session
+**Why this matters:** Leaving the hot zone untouched preserves provider prompt caching (e.g. Claude's cached-prefix read discount). Because only the newest blocks change, earlier turns stay byte-stable across requests and keep hitting the KV cache. Compression is type-aware (handled by ContentRouter and its compressors) and fully reversible — the LLM can call `headroom_retrieve` to restore any compressed block.
 
 ---
 
@@ -578,7 +516,7 @@ class CompressionEntry:
 - Thread-safe in-memory storage
 - TTL-based expiration (default 5 minutes)
 - LRU-style eviction when capacity reached
-- Built-in BM25 search within cached content
+- Hash-keyed retrieval that always returns the full original content
 
 **Usage:**
 ```python
@@ -593,11 +531,8 @@ hash_key = store.store(
     tool_name="search_api",
 )
 
-# Retrieve later
+# Retrieve later (by hash; always returns the full original content)
 entry = store.retrieve(hash_key)
-
-# Or search within cached content
-results = store.search(hash_key, "user query")
 ```
 
 ---
@@ -609,33 +544,24 @@ results = store.search(hash_key, "user query")
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/v1/retrieve` | POST | Retrieve original content by hash |
-| `/v1/retrieve?query=X` | POST | Search within cached content |
+| `/v1/retrieve/{hash}` | GET | Retrieve original content by hash |
+
+Retrieval is by hash only — it always returns the full original content.
 
 **Retrieval Request:**
 ```json
 {
-    "hash": "abc123def456...",
-    "query": "find errors"     // Optional: search within
+    "hash": "abc123def456..."
 }
 ```
 
-**Response (full retrieval):**
+**Response:**
 ```json
 {
     "hash": "abc123def456...",
     "original_content": "[{...}, {...}, ...]",
     "original_item_count": 1000,
     "tool_name": "search_api"
-}
-```
-
-**Response (search):**
-```json
-{
-    "hash": "abc123def456...",
-    "query": "find errors",
-    "results": [{...}, {...}, ...],
-    "count": 15
 }
 ```
 
@@ -664,9 +590,9 @@ When running as MCP server, Headroom exposes retrieval as a tool:
     "inputSchema": {
         "type": "object",
         "properties": {
-            "hash": {"type": "string"},
-            "query": {"type": "string"}
-        }
+            "hash": {"type": "string"}
+        },
+        "required": ["hash"]
     }
 }
 ```
@@ -701,10 +627,10 @@ class ToolPattern:
     tool_name: str
     total_compressions: int      # Times we compressed this tool
     total_retrievals: int        # Times LLM asked for more
-    full_retrievals: int         # Retrieved everything
-    search_retrievals: int       # Used search query
-    common_queries: dict[str, int]   # Query frequency
-    queried_fields: dict[str, int]   # Fields mentioned in queries
+    full_retrievals: int         # Retrieved everything (all retrievals — hash-only)
+    search_retrievals: int       # Legacy; always 0 (retrieval is hash-only, no search)
+    common_queries: dict[str, int]   # Legacy query-pattern frequency (no longer populated)
+    queried_fields: dict[str, int]   # Legacy queried-field frequency (no longer populated)
 ```
 
 **Key Metrics:**
@@ -786,11 +712,10 @@ if self.config.use_feedback_hints and tool_name:
 │     └─ Contains: tool_use(headroom_retrieve, hash=abc123)       │
 │                                                                   │
 │  2. Handler detects CCR tool call                                │
-│     └─ Extracts hash and optional query                         │
+│     └─ Extracts hash                                             │
 │                                                                   │
 │  3. Handler executes retrieval                                   │
-│     └─ Full retrieval: store.retrieve(hash)                     │
-│     └─ Search: store.search(hash, query)                        │
+│     └─ By hash: store.retrieve(hash) → full original content    │
 │                                                                   │
 │  4. Handler continues conversation                               │
 │     └─ Adds tool result to messages                             │
@@ -810,7 +735,6 @@ if self.config.use_feedback_hints and tool_name:
 class CCRToolCall:
     tool_call_id: str      # For matching response
     hash_key: str          # CCR hash to retrieve
-    query: str | None      # Optional search query
 
 @dataclass
 class CCRToolResult:
@@ -818,7 +742,6 @@ class CCRToolResult:
     content: str           # Retrieved data as JSON
     success: bool
     items_retrieved: int
-    was_search: bool       # True if search, False if full retrieval
 
 class CCRResponseHandler:
     async def handle_response(
@@ -897,8 +820,7 @@ class ExpansionRecommendation:
     hash_key: str
     reason: str                # Human-readable explanation
     relevance_score: float     # 0-1, higher = more relevant
-    expand_full: bool          # True = full retrieval
-    search_query: str | None   # If expand_full=False
+    # Expansion always restores the full original content (retrieval is by hash).
 
 class ContextTracker:
     def track_compression(self, hash_key, turn_number, ...):
@@ -1063,12 +985,11 @@ headroom/
 │   ├── base.py              # Transform protocol
 │   ├── pipeline.py          # Orchestrates all transforms
 │   ├── cache_aligner.py     # Date extraction for caching
-│   ├── tool_crusher.py      # Naive compression (disabled)
 │   ├── smart_crusher.py     # Statistical compression (default)
-│   ├── rolling_window.py    # Token limit enforcement (position-based)
-│   ├── intelligent_context.py  # Semantic context management (score-based)
-│   ├── scoring.py           # Message importance scoring
-│   └── (legacy llmlingua_compressor.py removed — see [ml] extra for Kompress)
+│   ├── code_compressor.py   # AST-aware code compression (tree-sitter)
+│   └── (legacy llmlingua_compressor.py removed — see [ml] extra for Kompress;
+│        rolling_window.py / intelligent_context.py / scoring.py / tool_crusher.py
+│        removed — context management is now live-zone-only)
 │
 ├── cache/               # CCR Architecture - Caching & Storage
 │   ├── compression_store.py    # Phase 1: Store original content
@@ -1133,8 +1054,7 @@ This means:
 - Audit mode for testing before optimizing
 
 ### 4. Smart by Default
-- SmartCrusher enabled (statistical analysis)
-- ToolCrusher disabled (naive rules)
+- SmartCrusher enabled (statistical, content-aware analysis — not naive rules)
 - Conservative settings that preserve important data
 
 ---

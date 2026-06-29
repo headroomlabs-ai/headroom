@@ -319,6 +319,15 @@ def test_install_apply_uses_docker_runtime_for_persistent_docker(monkeypatch) ->
     monkeypatch.setattr(
         "headroom.cli.install.wait_ready", lambda deployment, timeout_seconds=45: True
     )
+    # _start_deployment guards the persistent-docker preset with
+    # `shutil.which("docker")`. Fake docker as present so the test exercises the
+    # runtime-selection path itself rather than the host's docker install —
+    # otherwise it passes on dev machines with Docker but fails on CI runners
+    # (e.g. macos-latest) that have no docker on PATH.
+    monkeypatch.setattr(
+        "headroom.cli.install.shutil.which",
+        lambda name, *args, **kwargs: "/usr/local/bin/docker" if name == "docker" else None,
+    )
 
     result = runner.invoke(main, ["install", "apply", "--preset", "persistent-docker"])
 

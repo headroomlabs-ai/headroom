@@ -8,7 +8,7 @@
                   The context compression layer for AI agents
 </pre></div>
 
-<p align="center"><strong>60–95% fewer tokens · library · proxy · MCP · 6 algorithms · local-first · reversible</strong></p>
+<p align="center"><strong>60–95% fewer tokens · library · proxy · MCP · content-aware compressors · local-first · reversible</strong></p>
 
 <p align="center">
   <a href="https://github.com/chopratejas/headroom/actions/workflows/ci.yml"><img src="https://github.com/chopratejas/headroom/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
@@ -26,8 +26,7 @@
   <a href="#proof">Proof</a> ·
   <a href="#agent-compatibility-matrix">Agents</a> ·
   <a href="https://discord.gg/yRmaUNpsPJ">Discord</a> ·
-  <a href="llms.txt">llms.txt</a> ·
-  <a href="ENTERPRISE.md">Enterprise</a>
+  <a href="llms.txt">llms.txt</a>
 </p>
 
 <p align="center"><sub>
@@ -48,10 +47,10 @@ Headroom compresses everything your AI agent reads — tool outputs, logs, RAG c
 
 - **Library** — `compress(messages)` in Python or TypeScript, inline in any app
 - **Proxy** — `headroom proxy --port 8787`, zero code changes, any language
-- **Agent wrap** — `headroom wrap claude|codex|aider|copilot|opencode` in one command; Cursor prints manual proxy settings to paste into the app
+- **Agent wrap** — `headroom wrap claude|codex|copilot|cursor|aider|opencode|cline|continue|goose|openhands|openclaw|vibe` in one command; undo with `headroom unwrap <tool>`
 - **MCP server** — `headroom_compress`, `headroom_retrieve`, `headroom_stats` for any MCP client
 - **Cross-agent memory** — shared store across Claude, Codex, Gemini, auto-dedup
-- **`headroom learn`** — mines failed sessions, writes corrections to `CLAUDE.md` / `AGENTS.md`
+- **`headroom learn`** — mines failed sessions, writes corrections to `CLAUDE.local.md` (default, gitignored) or `CLAUDE.md` / `AGENTS.md` / `GEMINI.md`
 - **Output token reduction** — trims what the model *writes back* (not just what you send): drops ceremony/restated code and skips deep "thinking" on routine steps. See [Output token reduction](#output-token-reduction-cut-what-the-model-writes-back).
 - **Reversible (CCR)** — originals are cached for retrieval on demand
 
@@ -68,7 +67,7 @@ Headroom compresses everything your AI agent reads — tool outputs, logs, RAG c
     │  CacheAligner  →  ContentRouter  →  CCR            │
     │                    ├─ SmartCrusher   (JSON)        │
     │                    ├─ CodeCompressor (AST)         │
-    │                    └─ Kompress-base  (text, HF)    │
+    │                    └─ Kompress-v2-base (text, HF)  │
     │                                                    │
     │  Cross-agent memory  ·  headroom learn  ·  MCP     │
     └────────────────────────────────────────────────────┘
@@ -78,7 +77,7 @@ Headroom compresses everything your AI agent reads — tool outputs, logs, RAG c
 ```
 
 - **ContentRouter** — detects content type, selects the right compressor
-- **SmartCrusher / CodeCompressor / Kompress-base** — compress JSON, AST, or prose
+- **SmartCrusher / CodeCompressor / Kompress-v2-base** — compress JSON, AST, or prose
 - **CacheAligner** — stabilizes prefixes so provider KV caches actually hit
 - **CCR** — stores originals locally; LLM calls `headroom_retrieve` if it needs them
 
@@ -96,12 +95,13 @@ headroom wrap claude                    # wrap a coding agent
 headroom proxy --port 8787              # drop-in proxy, zero code changes
 # or: from headroom import compress      # inline library
 
-# 3 — See the savings
+# 3 — Verify setup and see the savings
+headroom doctor                         # health check — confirms routing is working
 headroom perf
 headroom dashboard                      # live savings dashboard (proxy must be running)
 ```
 
-Granular extras: `[proxy]`, `[mcp]`, `[ml]`, `[code]`, `[memory]`, `[relevance]`, `[image]`, `[agno]`, `[langchain]`, `[evals]`, `[pytorch-mps]` (Apple-GPU memory-embedder offload — set `HEADROOM_EMBEDDER_RUNTIME=pytorch_mps`). Requires **Python 3.10+**.
+Granular extras: `[proxy]`, `[mcp]`, `[ml]`, `[code]`, `[memory]`, `[vector]` (optional HNSW backend — needs a C++ toolchain, not in `[all]`), `[relevance]`, `[image]`, `[agno]`, `[langchain]`, `[evals]`, `[pytorch-mps]` (Apple-GPU memory-embedder offload — set `HEADROOM_EMBEDDER_RUNTIME=pytorch_mps`). Requires **Python 3.10+**.
 
 ## Proof
 
@@ -180,7 +180,7 @@ unshaped as a control group: `export HEADROOM_OUTPUT_HOLDOUT=0.1`. The dashboard
 shows an **Output Tokens Saved** card next to input compression, labelled
 `measured` or `estimated` with the confidence band.
 
-→ Full write-up incl. the measurement methodology: [`docs/proposals/output-token-reduction.md`](docs/proposals/output-token-reduction.md)
+→ Full write-up incl. the measurement methodology: [Output token reduction](https://headroom-docs.vercel.app/docs/savings)
 
 <a href="https://www.star-history.com/?repos=chopratejas%2Fheadroom&type=date&legend=top-left">
  <picture>
@@ -192,16 +192,22 @@ shows an **Output Tokens Saved** card next to input compression, labelled
 
 | Agent        | `headroom wrap` | Notes                            |
 |--------------|:---------------:|----------------------------------|
-| Claude Code  | ✅              | `--memory` · `--code-graph` · `--1m` |
+| Claude Code  | ✅              | `--memory` · `--code-graph` · `--1m` · `--tool-search` |
 | Codex        | ✅              | shares memory with Claude        |
 | Cursor       | Manual setup    | starts proxy and prints base URLs for Cursor settings |
 | Aider        | ✅              | starts proxy + launches          |
 | Copilot CLI  | ✅              | starts proxy + launches          |
 | OpenClaw     | ✅              | installs as ContextEngine plugin |
 | OpenCode     | ✅              | injects config · starts proxy + launches |
-| Cortex Code  | ✅              | 60–65% savings · library mode   |
+| Cline        | ✅              | starts proxy + injects config    |
+| Continue     | ✅              | starts proxy + injects config    |
+| Goose        | ✅              | starts proxy + launches          |
+| OpenHands    | ✅              | starts proxy + launches          |
+| Mistral Vibe | ✅              | starts proxy + launches          |
+| Cortex Code  | Library only    | 60–65% savings (library mode; no `wrap`) |
 
 Any OpenAI-compatible client works via `headroom proxy`. MCP-native: `headroom mcp install`.
+Undo durable wrapping with `headroom unwrap <tool>` (supports: `claude`, `copilot`, `codex`, `opencode`, `openclaw`).
 
 ### GitHub Copilot CLI subscription mode
 
@@ -267,11 +273,10 @@ Platform support note: macOS auth reuse via Copilot CLI Keychain storage has bee
 <summary><b>What's inside</b></summary>
 
 - **SmartCrusher** — universal JSON: arrays of dicts, nested objects, mixed types.
-- **CodeCompressor** — AST-aware for Python, JS, Go, Rust, Java, C++.
-- **Kompress-base** — our HuggingFace model, trained on agentic traces.
+- **CodeCompressor** — AST-aware for Python, JS/TS, Go, Rust, Java, C/C++, Perl.
+- **Kompress-v2-base** — our HuggingFace model, trained on agentic traces.
 - **Image compression** — 40–90% reduction via trained ML router.
 - **CacheAligner** — stabilizes prefixes so Anthropic/OpenAI KV caches actually hit.
-- **IntelligentContext** — score-based context fitting with learned importance.
 - **CCR** — reversible compression; LLM retrieves originals on demand.
 - **Cross-agent memory** — shared store, agent provenance, auto-dedup.
 - **SharedContext** — compressed context passing across multi-agent workflows.
@@ -286,7 +291,7 @@ Headroom exposes one stable request lifecycle across `compress()`, the SDK, and 
 
 `Setup` → `Pre-Start` → `Post-Start` → `Input Received` → `Input Cached` → `Input Routed` → `Input Compressed` → `Input Remembered` → `Pre-Send` → `Post-Send` → `Response Received`
 
-- **Transforms** do the work: CacheAligner, ContentRouter, SmartCrusher, CodeCompressor, Kompress-base, IntelligentContext / RollingWindow.
+- **Transforms** do the work: CacheAligner, ContentRouter, SmartCrusher, CodeCompressor, Kompress-v2-base.
 - **Pipeline extensions** observe or customize lifecycle stages via `on_pipeline_event(...)`.
 - **Compression hooks** sit alongside the canonical lifecycle as an additional extension seam.
 - **Proxy extensions** remain the server/app integration seam for ASGI middleware, routes, and startup policy.
@@ -299,6 +304,18 @@ Provider and tool-specific behavior lives under `headroom/providers/` so core or
 
 </details>
 
+## Headroom for teams
+
+Headroom OSS is built for **individual developers**: run `headroom proxy` or `headroom wrap` on your laptop and start cutting tokens in minutes — free, local-first, your data never leaves your machine.
+
+Running it across a **whole engineering org** is a different job: a shared, always-on deployment; centralized config and version rollout; org-wide savings dashboards; SSO and access controls; air-gapped / VPC installs; and someone to call when it matters. That's what we help companies with — self-hosted with support, or fully managed.
+
+**If your team is spending real money on LLM tokens** — Claude Code, Codex, Cursor, or agents running in CI — **and you want those savings across everyone, not just one laptop:**
+
+→ Email **[hello@headroomlabs.ai](mailto:hello@headroomlabs.ai)** with your stack and rough monthly LLM spend, and we'll help you roll Headroom out across your organization.
+
+Everything in this repo stays open source (Apache 2.0). The managed offering is simply for teams that would rather have it deployed, supported, and scaled for them.
+
 ## Install
 
 ```bash
@@ -307,7 +324,9 @@ npm install headroom-ai                 # TypeScript / Node
 docker pull ghcr.io/chopratejas/headroom:latest
 ```
 
-Granular extras: `[proxy]`, `[mcp]`, `[ml]` (Kompress-base), `[code]`, `[memory]`, `[relevance]`, `[image]`, `[agno]`, `[langchain]`, `[evals]`, `[pytorch-mps]` (Apple-GPU memory-embedder offload — set `HEADROOM_EMBEDDER_RUNTIME=pytorch_mps`). Requires **Python 3.10+**.
+Granular extras: `[proxy]`, `[mcp]`, `[ml]` (Kompress-v2-base), `[code]`, `[memory]`, `[vector]` (optional HNSW backend — needs a C++ toolchain, not in `[all]`), `[relevance]`, `[image]`, `[agno]`, `[langchain]`, `[evals]`, `[pytorch-mps]` (Apple-GPU memory-embedder offload — set `HEADROOM_EMBEDDER_RUNTIME=pytorch_mps`). Requires **Python 3.10+**.
+
+> **Note**: `[all]` covers the core stack but excludes framework adapters. Install them separately: `pip install "headroom-ai[langchain]"` (also `[agno]`, `[strands]`, `[anyllm]`, `[bedrock]`).
 
 Using `pipx`? Choose a supported interpreter explicitly:
 
@@ -401,7 +420,7 @@ download entirely.
   <img src="headroom_learn.gif" alt="headroom learn in action" width="720">
 </p>
 
-`headroom learn` — mines failed sessions, writes corrections to `CLAUDE.md` / `AGENTS.md` / `GEMINI.md`.
+`headroom learn` — mines failed sessions, writes corrections to `CLAUDE.local.md` (default, gitignored; use `--target CLAUDE.md` for the shared team file) / `AGENTS.md` / `GEMINI.md`.
 
 ## Documentation
 
@@ -413,6 +432,7 @@ download entirely.
 | [Memory](https://headroom-docs.vercel.app/docs/memory)                        | [Cache optimization](https://headroom-docs.vercel.app/docs/cache-optimization)     |
 | [Failure learning](https://headroom-docs.vercel.app/docs/failure-learning)    | [Benchmarks](https://headroom-docs.vercel.app/docs/benchmarks)                    |
 | [Configuration](https://headroom-docs.vercel.app/docs/configuration)          | [Limitations](https://headroom-docs.vercel.app/docs/limitations)                  |
+| [Persistent installs](https://headroom-docs.vercel.app/docs/persistent-installs) (`headroom init` / `headroom install apply`) | [Savings analytics](https://headroom-docs.vercel.app/docs/savings) (`headroom savings` / `headroom perf` / `headroom doctor`) |
 
 ## Compared to
 

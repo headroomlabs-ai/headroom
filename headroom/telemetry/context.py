@@ -27,7 +27,7 @@ _KNOWN_WRAP_AGENTS = frozenset(
 
 # Stack slugs must start with a letter and contain only [a-z0-9_], max 64 chars.
 # Applied at every ingress (env var, HTTP header, stats aggregation) so downstream
-# sinks (Prometheus labels, Supabase column, JSONB payload) see a bounded vocabulary.
+# sinks (Prometheus labels, OTEL attributes) see a bounded vocabulary.
 _STACK_SLUG_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 
 # Cardinality cap on the per-process requests_by_stack dict. Protects the
@@ -44,7 +44,7 @@ def normalize_stack(raw: str | None) -> str | None:
     else ``None``. All external stack identifiers (env var, HTTP header, stats
     keys) must pass through this function — it is the single chokepoint that
     bounds cardinality and rejects garbage before it reaches Prometheus or the
-    Supabase telemetry row.
+    OTEL metrics layer.
     """
 
     if not raw:

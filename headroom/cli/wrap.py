@@ -43,6 +43,7 @@ if sys.platform == "win32" and hasattr(sys.stdout, "buffer"):
 
 import click
 
+from headroom import fsutil
 from headroom._version import __version__ as _HEADROOM_VERSION
 from headroom.agent_savings import (
     apply_agent_savings_env_defaults,
@@ -128,19 +129,18 @@ from .main import main
 
 
 def _read_text(path: Path) -> str:
-    """Read a text file with explicit UTF-8 encoding."""
-    return path.read_text(encoding="utf-8")
+    """Read a text file as UTF-8, falling back to the system locale encoding."""
+    return fsutil.read_text(path)
 
 
 def _write_text(path: Path, content: str) -> None:
-    """Write a text file with explicit UTF-8 encoding."""
-    path.write_text(content, encoding="utf-8")
+    """Write a text file as UTF-8 without translating line endings (preserves CRLF)."""
+    fsutil.write_text(path, content)
 
 
 def _append_text(path: Path, content: str) -> None:
-    """Append to a text file with explicit UTF-8 encoding."""
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(content)
+    """Append to a text file as UTF-8 without translating line endings."""
+    fsutil.append_text(path, content)
 
 
 _CONTEXT_TOOL_ENV = "HEADROOM_CONTEXT_TOOL"
@@ -556,7 +556,7 @@ def _patch_rtk_hook_absolute_path(rtk_path: Path, hook_script_path: Path | None 
     if not hook_script_path.exists():
         return False
 
-    original = hook_script_path.read_text()
+    original = _read_text(hook_script_path)
 
     # Quote the absolute path safely for POSIX shells. This matters because
     # paths containing spaces or other shell-special characters (e.g.
@@ -576,7 +576,7 @@ def _patch_rtk_hook_absolute_path(rtk_path: Path, hook_script_path: Path | None 
     )
 
     if count and patched != original:
-        hook_script_path.write_text(patched)
+        _write_text(hook_script_path, patched)
         return True
 
     return False
@@ -2569,6 +2569,13 @@ def _ensure_proxy(
 ) -> subprocess.Popen | None:
     """Start or verify proxy. Returns process handle if we started it."""
     helpers = _live_wrap_module()
+    # --no-proxy reuses an already-running proxy, so backend/region/provider
+    # flags (which only apply when we start one) would be silently dropped.
+    if no_proxy and (backend or anyllm_provider or region):
+        click.echo(
+            "  Warning: --backend/--region/--anyllm-provider have no effect with --no-proxy "
+            "(reusing the existing proxy)."
+        )
     if not no_proxy:
         manifest = helpers._find_persistent_manifest(port)
         if manifest is not None:
@@ -2601,15 +2608,100 @@ def _ensure_proxy(
                         f"Persistent deployment '{manifest.profile}' on port {port} "
                         f"is running stale Headroom {running_version} and could not be restarted."
                     )
-                click.echo(f"  Proxy already running on port {port}")
-                click.echo(f"  Dashboard:    http://127.0.0.1:{port}/dashboard")
-                return None
-            if helpers._recover_persistent_proxy(port):
-                return None
-            if helpers._check_proxy(port):
-                raise click.ClickException(
-                    f"Persistent deployment '{manifest.profile}' on port {port} is not healthy."
-                )
+                # Check if the running proxy has the features we need.
+                # Without this, a persistent deployment started for one use case
+                # (e.g. --backend anthropic) would be silently reused for another
+                # (e.g. --subscription --provider-type openai) causing auth failures.
+                running_config = helpers._proxy_health_config(health_payload)
+                if running_config is None:
+                    running_config = helpers._query_proxy_config(port)
+                if running_config is not None:
+                    missing = []
+                    if memory and not running_config.get("memory"):
+                        missing.append("memory")
+                    if learn and not running_config.get("learn"):
+                        missing.append("learn")
+                    if code_graph and not running_config.get("code_graph"):
+                        missing.append("code_graph")
+                    if openai_api_url:
+                        running_openai_url = _normalize_proxy_api_url(
+                            running_config.get("openai_api_url")
+                        )
+                        requested_openai_url = _normalize_proxy_api_url(openai_api_url)
+                        if running_openai_url != requested_openai_url:
+                            missing.append("openai-api-url")
+                    if not missing:
+                        click.echo(f"  Proxy already running on port {port}")
+                        click.echo(f"  Dashboard:    http://127.0.0.1:{port}/dashboard")
+                        return None
+                # Features mismatch or config unavailable — fall through to
+                # the non-persistent path which handles proxy restart.
+            else:
+                if helpers._recover_persistent_proxy(port):
+                    # If the caller requested feature-sensitive config (e.g.
+                    # openai_api_url for Copilot subscription), continue into
+                    # the shared running-proxy checks below so mismatch-driven
+                    # restart logic can run. For plain recover-only calls,
+                    # preserve the historical fast return.
+                    if not any((memory, learn, code_graph, openai_api_url)):
+                        return None
+                    if not helpers._check_proxy(port):
+                        return None
+
+                    # A freshly recovered persistent proxy may not expose
+                    # a full config payload yet. In feature-sensitive flows
+                    # (e.g. Copilot subscription), treat missing or mismatched
+                    # config as restart-required and refresh the persistent
+                    # deployment directly instead of silently reusing it.
+                    health_payload = helpers._query_proxy_health(port)
+                    running_config = helpers._proxy_health_config(health_payload)
+                    if running_config is None:
+                        running_config = helpers._query_proxy_config(port)
+
+                    if running_config is None:
+                        click.echo(
+                            f"  Recovered persistent deployment '{manifest.profile}' "
+                            "did not expose config; restarting with requested features..."
+                        )
+                        if helpers._restart_persistent_proxy(manifest, port):
+                            return None
+                        raise click.ClickException(
+                            f"Persistent deployment '{manifest.profile}' on port {port} "
+                            "could not be restarted after recovery."
+                        )
+
+                    missing = []
+                    if memory and not running_config.get("memory"):
+                        missing.append("memory")
+                    if learn and not running_config.get("learn"):
+                        missing.append("learn")
+                    if code_graph and not running_config.get("code_graph"):
+                        missing.append("code-graph")
+                    if openai_api_url:
+                        running_openai_url = _normalize_proxy_api_url(
+                            running_config.get("openai_api_url")
+                        )
+                        requested_openai_url = _normalize_proxy_api_url(openai_api_url)
+                        if running_openai_url != requested_openai_url:
+                            missing.append("openai-api-url")
+
+                    if missing:
+                        flags_str = ", ".join(f"--{f}" for f in missing)
+                        click.echo(
+                            f"  Recovered persistent deployment '{manifest.profile}' is missing: "
+                            f"{flags_str}; restarting..."
+                        )
+                        if helpers._restart_persistent_proxy(manifest, port):
+                            return None
+                        raise click.ClickException(
+                            f"Persistent deployment '{manifest.profile}' on port {port} "
+                            "could not be restarted with requested features."
+                        )
+                    return None
+                elif helpers._check_proxy(port):
+                    raise click.ClickException(
+                        f"Persistent deployment '{manifest.profile}' on port {port} is not healthy."
+                    )
             click.echo(
                 f"  Warning: persistent deployment '{manifest.profile}' on port {port} "
                 "is stale; starting a fresh proxy instead."
@@ -2836,13 +2928,24 @@ def _unregister_proxy_client(port: int) -> None:
 
 def _pid_alive(pid: int) -> bool:
     """Return True if ``pid`` names a live process."""
+    if pid <= 0:
+        return False  # non-positive PIDs are never valid client markers
+    try:
+        import psutil  # type: ignore[import-untyped]  # optional dep, already used elsewhere
+
+        return bool(psutil.pid_exists(pid))
+    except Exception:
+        pass
     try:
         os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
     except PermissionError:
         return True  # exists but owned by another user
-    except OSError:
+    except (ProcessLookupError, OSError, SystemError):
+        # On Windows, os.kill against a stale/invalid PID can fail with WinError
+        # 87 ("The parameter is incorrect"); CPython sometimes surfaces this as a
+        # SystemError rather than an OSError. SystemError is not an OSError
+        # subclass, so a bare `except OSError` lets it escape and crash cleanup(),
+        # leaving the shared proxy running.
         return False
     return True
 
@@ -3233,7 +3336,9 @@ def unwrap() -> None:
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
-@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
 @click.option(
     "--no-context-tool",
     "--no-rtk",
@@ -3577,7 +3682,9 @@ def claude(
 
 
 @unwrap.command("claude")
-@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
 @click.option("--no-stop-proxy", is_flag=True, help="Do not stop the local Headroom proxy")
 @click.option("--keep-mcp", is_flag=True, help="Keep Headroom MCP registrations")
 @click.option("--keep-rtk", is_flag=True, help="Keep rtk Claude hooks")
@@ -3648,7 +3755,9 @@ def unwrap_claude(
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
-@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
 @click.option(
     "--no-context-tool",
     "--no-rtk",
@@ -3935,7 +4044,9 @@ def copilot(
 
 
 @unwrap.command("copilot")
-@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
 @click.option("--no-stop-proxy", is_flag=True, help="Do not stop the local Headroom proxy")
 def unwrap_copilot(port: int, no_stop_proxy: bool) -> None:
     """Undo durable setup from ``headroom wrap copilot``."""
@@ -3955,7 +4066,9 @@ def unwrap_copilot(port: int, no_stop_proxy: bool) -> None:
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
-@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
 @click.option(
     "--no-context-tool",
     "--no-rtk",
@@ -4186,7 +4299,9 @@ def codex(
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
-@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
 @click.option(
     "--no-context-tool",
     "--no-rtk",
@@ -4288,7 +4403,9 @@ def aider(
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
-@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
 @click.option(
     "--no-context-tool",
     "--no-rtk",
@@ -4365,7 +4482,9 @@ def vibe(
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
-@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
 @click.option(
     "--no-context-tool",
     "--no-rtk",
@@ -4449,7 +4568,9 @@ def cursor(
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
-@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
 @click.option(
     "--no-context-tool",
     "--no-rtk",
@@ -4549,7 +4670,9 @@ def cline(
 
 
 @wrap.command("continue", context_settings={"ignore_unknown_options": True})
-@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
 @click.option(
     "--no-context-tool",
     "--no-rtk",
@@ -4671,7 +4794,9 @@ def continue_dev(
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
-@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
 @click.option(
     "--no-context-tool",
     "--no-rtk",
@@ -4794,7 +4919,9 @@ def goose(
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
-@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
 @click.option(
     "--no-context-tool",
     "--no-rtk",
@@ -4957,7 +5084,9 @@ def openhands(
     is_flag=True,
     help="Install by copying plugin path instead of using --link",
 )
-@click.option("--proxy-port", default=8787, type=int, help="Headroom proxy port")
+@click.option(
+    "--proxy-port", default=8787, type=click.IntRange(1, 65535), help="Headroom proxy port"
+)
 @click.option("--startup-timeout-ms", default=20000, type=int, help="Proxy startup timeout")
 @click.option(
     "--gateway-provider-id",
@@ -5171,7 +5300,9 @@ def openclaw(
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
-@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
 @click.option(
     "--no-context-tool",
     "--no-rtk",
@@ -5333,7 +5464,9 @@ def _opencode_home_dir() -> Path:
 
 
 @unwrap.command("opencode")
-@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
 @click.option("--no-stop-proxy", is_flag=True, help="Do not stop the local Headroom proxy")
 def unwrap_opencode(port: int, no_stop_proxy: bool) -> None:
     """Undo ``headroom wrap opencode`` edits to the active OpenCode config file.
@@ -5409,7 +5542,9 @@ def unwrap_opencode(port: int, no_stop_proxy: bool) -> None:
 
 
 @unwrap.command("openclaw")
-@click.option("--proxy-port", default=8787, type=int, help="Headroom proxy port")
+@click.option(
+    "--proxy-port", default=8787, type=click.IntRange(1, 65535), help="Headroom proxy port"
+)
 @click.option("--no-stop-proxy", is_flag=True, help="Do not stop the local Headroom proxy")
 @click.option("--no-restart", is_flag=True, help="Do not restart OpenClaw gateway at the end")
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
@@ -5488,7 +5623,9 @@ def unwrap_openclaw(
 
 
 @unwrap.command("codex")
-@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
 @click.option("--no-stop-proxy", is_flag=True, help="Do not stop the local Headroom proxy")
 def unwrap_codex(port: int, no_stop_proxy: bool) -> None:
     """Undo ``headroom wrap codex`` edits to the active Codex config file.

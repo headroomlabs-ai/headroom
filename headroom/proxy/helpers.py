@@ -781,6 +781,18 @@ try:
 except ValueError:
     COMPRESSION_TIMEOUT_SECONDS = 30.0
 
+# Eager startup preload timeout in seconds. The preload (compressor/parser models,
+# cache-only, allow_download=False) runs off the event loop during startup; this
+# bound only fires on a true hang or an uncatchable native stall so the proxy still
+# binds its port instead of never opening (GH #790). Override via
+# HEADROOM_EAGER_PRELOAD_TIMEOUT_SECONDS. Falls back to 120 on an unparseable value.
+try:
+    EAGER_PRELOAD_TIMEOUT_SECONDS = float(
+        os.environ.get("HEADROOM_EAGER_PRELOAD_TIMEOUT_SECONDS", "120")
+    )
+except ValueError:
+    EAGER_PRELOAD_TIMEOUT_SECONDS = 120.0
+
 # Maximum compression cache sessions (prevents unbounded memory growth)
 MAX_COMPRESSION_CACHE_SESSIONS = 500
 
@@ -938,6 +950,14 @@ def retry_after_ms(response: httpx.Response, max_ms: int) -> float | None:
         except (TypeError, ValueError):
             return None
     return min(max(seconds, 0.0) * 1000.0, float(max_ms))
+
+
+# Transient upstream statuses worth retrying with backoff: 429 (rate limit) and
+# 529 (Anthropic ``overloaded_error``). Both mean "the server is temporarily
+# limiting/overloaded — try again shortly", unlike other 4xx which signal a
+# problem with the request itself. Single source of truth so the streaming and
+# non-streaming forwarders agree on what is retriable.
+RETRYABLE_OVERLOAD_STATUSES: frozenset[int] = frozenset({429, 529})
 
 
 # Image compression availability (do not retain a global compressor instance)

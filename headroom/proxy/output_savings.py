@@ -477,6 +477,12 @@ class SavingsRecorder:
             self._ledger.baseline = disk.baseline
 
     def _flush_locked(self) -> None:
+        from ..paths import process_is_stateless
+
+        if process_is_stateless():
+            # Stateless: keep the in-memory ledger but never write to disk.
+            self._since_flush = 0
+            return
         try:
             self._reload_baseline_locked()
             self._ledger.save(self._path)

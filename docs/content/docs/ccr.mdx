@@ -55,8 +55,7 @@ Headroom injects a `headroom_retrieve` tool into the LLM's available tools:
   "name": "headroom_retrieve",
   "description": "Retrieve original uncompressed data from Headroom cache",
   "parameters": {
-    "hash": "The hash key from the compression marker",
-    "query": "Optional: search within the cached data"
+    "hash": "The hash key from the compression marker"
   }
 }
 ```
@@ -92,22 +91,6 @@ Turn 5: User asks "What about the auth middleware?"
         -> Proactively expands compressed data
         -> LLM finds auth_middleware.py in the full list
 ```
-
-## BM25 search within compressed data
-
-The LLM does not have to retrieve everything. It can search within compressed data using the optional `query` parameter:
-
-```json
-{
-  "name": "headroom_retrieve",
-  "parameters": {
-    "hash": "abc123",
-    "query": "authentication errors"
-  }
-}
-```
-
-This runs a BM25 search over the cached items, returning only the relevant subset instead of the full original payload.
 
 ## Retrieving originals
 
@@ -164,7 +147,7 @@ response = client.chat.completions.create(
 
 ## Retention
 
-Proxy CCR originals are kept for 300 seconds by default. For longer autonomous
+Proxy CCR originals are kept for 1800 seconds (30 minutes) by default. For longer autonomous
 agent runs, set `HEADROOM_CCR_TTL_SECONDS` before starting the proxy:
 
 ```bash
@@ -176,7 +159,7 @@ Check the effective setting at `/v1/retrieve/stats` under
 
 ## Message-level CCR
 
-> **Retired:** The "Message-level CCR via IntelligentContext" feature (where `IntelligentContext` would store dropped messages in CCR with a retrieval marker) was part of the `IntelligentContextConfig` API that was removed in 0.9.x. Context management is now handled automatically by the pipeline without a separate configurable IntelligentContext stage. Tool-output CCR via SmartCrusher and ContentRouter remains fully supported.
+> **Retired:** The "Message-level CCR via IntelligentContext" feature (where `IntelligentContext` would store dropped messages in CCR with a retrieval marker) was part of the `IntelligentContextConfig` API that has since been removed. Context management is now handled automatically by the pipeline without a separate configurable IntelligentContext stage. Tool-output CCR via SmartCrusher and ContentRouter remains fully supported.
 
 ## CCR-enabled components
 

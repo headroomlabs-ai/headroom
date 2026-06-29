@@ -11,9 +11,9 @@ strategy. These tests exist so the next regression of that shape
 fails the suite the day it lands instead of waiting on an audit.
 
 The counters live ONLY as in-process state on the metrics instance;
-they are deliberately NOT exported through the Prometheus scrape or
-OTel surface, because the metric→Supabase pipeline treats each
-metric name as a column and we cannot add new columns. CI-level
+they are deliberately NOT exported as new Prometheus metric names
+(to avoid unbounded metric-series growth) — they remain observable
+via /stats. CI-level
 observability via these tests is enough to catch silent regressions;
 production export waits on a non-column-adding pipeline.
 
@@ -342,11 +342,11 @@ def test_prometheus_metrics_accumulates_codex_ws_unit_and_frame_counters():
 
 def test_prometheus_export_does_not_leak_per_strategy_metrics():
     """Per-strategy state is tracked in-process only. The Prometheus
-    scrape output deliberately must NOT emit new metric names — the
-    metric→Supabase pipeline treats each metric name as a column, and
-    we cannot add new columns. This test guards that constraint: if a
-    future change adds the metric to the scrape, this fails and forces
-    a conscious decision."""
+    scrape output deliberately must NOT emit new metric names (to avoid
+    unbounded metric-series growth); the state stays observable via
+    /stats. This test guards that constraint: if a future change adds
+    the metric to the scrape, this fails and forces a conscious
+    decision."""
     import asyncio
 
     from headroom.proxy.prometheus_metrics import PrometheusMetrics

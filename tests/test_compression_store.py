@@ -103,33 +103,6 @@ def test_retrieve_log_redacts_secret_payload_values():
     assert "Authorization: [REDACTED]" in events[0]["payload_preview"]
 
 
-def test_search_logs_retrieved_payload_preview():
-    store = CompressionStore(enable_feedback=False)
-    items = [
-        {"id": 1, "text": "alpha target"},
-        {"id": 2, "text": "beta other"},
-    ]
-    hash_key = store.store(
-        original=json.dumps(items),
-        compressed="[]",
-        original_item_count=2,
-        compressed_item_count=0,
-        tool_name="search_tool",
-    )
-
-    with _capture_headroom_retrieve_events() as events:
-        results = store.search(hash_key, "alpha", score_threshold=0.0)
-
-    assert results
-    assert len(events) == 1
-    assert events[0]["hash"] == hash_key
-    assert events[0]["retrieval_type"] == "search"
-    assert events[0]["query"] == "alpha"
-    assert events[0]["payload_preview"] == json.dumps(results, ensure_ascii=False)
-    assert events[0]["payload_preview_chars"] == len(json.dumps(results, ensure_ascii=False))
-    assert events[0]["payload_truncated"] is False
-
-
 def test_global_store_uses_env_default_ttl(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv(CCR_TTL_SECONDS_ENV, "7200")
 
@@ -653,18 +626,6 @@ class TestCompressionStoreTTL:
 
         assert store_with_short_ttl.get_metadata(hash_key) is None
 
-    def test_search_returns_empty_for_expired(self, store_with_short_ttl: CompressionStore):
-        """search returns empty list for expired entries."""
-        hash_key = store_with_short_ttl.store(
-            original=json.dumps([{"id": 1, "name": "test"}]),
-            compressed="[]",
-        )
-
-        time.sleep(1.1)
-
-        results = store_with_short_ttl.search(hash_key, "test")
-        assert results == []
-
     def test_exists_clean_expired_false_does_not_delete(
         self, store_with_short_ttl: CompressionStore
     ):
@@ -892,122 +853,6 @@ class TestCompressionStoreMetadata:
 # =============================================================================
 # Search Tests
 # =============================================================================
-
-
-class TestCompressionStoreSearch:
-    """Tests for CompressionStore search functionality."""
-
-    def test_search_with_bm25_returns_matches(self, store: CompressionStore):
-        """search() uses BM25 to find matching items."""
-        items = [
-            {"id": 1, "content": "Python programming language"},
-            {"id": 2, "content": "JavaScript web development"},
-            {"id": 3, "content": "Python data science pandas"},
-            {"id": 4, "content": "Java enterprise applications"},
-            {"id": 5, "content": "Python machine learning tensorflow"},
-        ]
-
-        hash_key = store.store(
-            original=json.dumps(items),
-            compressed=json.dumps(items[:2]),
-        )
-
-        results = store.search(hash_key, "Python programming")
-
-        assert len(results) >= 1
-        result_ids = [r["id"] for r in results]
-        assert 1 in result_ids  # "Python programming language" should match
-
-    def test_search_respects_max_results(self, store: CompressionStore):
-        """search() respects max_results parameter."""
-        items = [{"id": i, "content": f"item {i}"} for i in range(50)]
-        hash_key = store.store(original=json.dumps(items), compressed="[]")
-
-        results = store.search(hash_key, "item", max_results=5)
-
-        assert len(results) <= 5
-
-    def test_search_respects_score_threshold(self, store: CompressionStore):
-        """search() filters by score threshold."""
-        items = [
-            {"id": 1, "content": "exact match query term"},
-            {"id": 2, "content": "completely unrelated content xyz"},
-        ]
-        hash_key = store.store(original=json.dumps(items), compressed="[]")
-
-        # High threshold should filter low-scoring items
-        results = store.search(hash_key, "exact match query", score_threshold=0.5)
-
-        # Should return the exact match, filter the unrelated
-        if results:
-            assert any("exact match" in str(r) for r in results)
-
-    def test_search_nonexistent_returns_empty(self, store: CompressionStore):
-        """search() returns empty list for nonexistent hash."""
-        results = store.search("nonexistent", "query")
-        assert results == []
-
-    def test_search_invalid_json_returns_empty(self, store: CompressionStore):
-        """search() handles invalid JSON gracefully."""
-        hash_key = store.store(original="not valid json", compressed="[]")
-        results = store.search(hash_key, "query")
-        assert results == []
-
-    def test_search_plain_text_returns_matching_chunks(self, store: CompressionStore):
-        """search() can find content in Kompress-style plain-text originals."""
-        original = (
-            "The OpenAI handler contains def _compress_openai_responses_payload "
-            "for Responses API live-zone compression. Other text is irrelevant."
-        )
-        hash_key = store.store(original=original, compressed="compressed")
-
-        results = store.search(hash_key, "def _compress_openai_responses_payload")
-
-        assert len(results) == 1
-        assert results[0]["type"] == "text"
-        assert "_compress_openai_responses_payload" in results[0]["text"]
-
-    def test_search_json_object_returns_matching_leaf(self, store: CompressionStore):
-        """search() can find values inside JSON objects, not only arrays."""
-        original = json.dumps(
-            {
-                "module": {
-                    "name": "openai",
-                    "function": "_compress_openai_responses_payload",
-                }
-            }
-        )
-        hash_key = store.store(original=original, compressed="{}")
-
-        results = store.search(hash_key, "_compress_openai_responses_payload")
-
-        assert len(results) == 1
-        assert results[0]["path"] == "module.function"
-        assert results[0]["value"] == "_compress_openai_responses_payload"
-
-    def test_search_non_array_returns_empty(self, store: CompressionStore):
-        """search() returns empty for JSON objects without matching leaves."""
-        hash_key = store.store(original=json.dumps({"key": "value"}), compressed="{}")
-        results = store.search(hash_key, "query")
-        assert results == []
-
-    def test_search_empty_array_returns_empty(self, store: CompressionStore):
-        """search() returns empty for empty array."""
-        hash_key = store.store(original="[]", compressed="[]")
-        results = store.search(hash_key, "query")
-        assert results == []
-
-    def test_search_logs_retrieval_event(self, store: CompressionStore):
-        """search() logs retrieval event with search type."""
-        items = [{"id": 1, "content": "test"}]
-        hash_key = store.store(original=json.dumps(items), compressed="[]")
-
-        store.search(hash_key, "test query")
-
-        events = store.get_retrieval_events()
-        search_events = [e for e in events if e.retrieval_type == "search"]
-        assert len(search_events) >= 1
-        assert search_events[-1].query == "test query"
 
 
 # =============================================================================
@@ -1383,7 +1228,7 @@ class TestRetrievalEvent:
             total_items=100,
             tool_name="search_api",
             timestamp=time.time(),
-            retrieval_type="search",
+            retrieval_type="full",
             tool_signature_hash="sig_123",
         )
 
@@ -1392,7 +1237,7 @@ class TestRetrievalEvent:
         assert event.items_retrieved == 5
         assert event.total_items == 100
         assert event.tool_name == "search_api"
-        assert event.retrieval_type == "search"
+        assert event.retrieval_type == "full"
         assert event.tool_signature_hash == "sig_123"
 
     def test_retrieval_event_default_signature_hash(self):

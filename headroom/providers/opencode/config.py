@@ -11,6 +11,7 @@ from typing import Any
 
 import click
 
+from headroom import fsutil
 from headroom.install.paths import opencode_config_path
 from headroom.mcp_registry.install import DEFAULT_PROXY_URL
 
@@ -58,7 +59,7 @@ def snapshot_opencode_config_if_unwrapped(config_file: Path, backup_file: Path) 
     if not config_file.exists():
         return
     try:
-        content = config_file.read_text()
+        content = fsutil.read_text(config_file)
     except OSError:
         return
     if _PROVIDER_MARKER_START in content or _MCP_MARKER_START in content:
@@ -190,7 +191,7 @@ def inject_opencode_provider_config(port: int) -> None:
         snapshot_opencode_config_if_unwrapped(config_file, backup_file)
 
         if config_file.exists():
-            content = config_file.read_text()
+            content = fsutil.read_text(config_file)
             data = _parse_json_loose(content)
         else:
             content = ""

@@ -165,11 +165,11 @@ class TestCCRToolCallParsing:
         assert len(ccr_calls) == 1
         assert ccr_calls[0].tool_call_id == "tool_123"
         assert ccr_calls[0].hash_key == "abc123def456abc123def456"
-        assert ccr_calls[0].query is None
+        assert not hasattr(ccr_calls[0], "query")
         assert len(other_calls) == 0
 
-    def test_parse_anthropic_search_retrieval(self):
-        """Parse search retrieval call from Anthropic format."""
+    def test_parse_anthropic_retrieval_ignores_query(self):
+        """Retrieval parses the hash; any legacy ``query`` input is ignored."""
         handler = CCRResponseHandler()
 
         response = {
@@ -187,7 +187,7 @@ class TestCCRToolCallParsing:
 
         assert len(ccr_calls) == 1
         assert ccr_calls[0].hash_key == "def456abc123def456abc123"
-        assert ccr_calls[0].query == "authentication error"
+        assert not hasattr(ccr_calls[0], "query")
 
     def test_parse_mixed_tool_calls(self):
         """Parse response with both CCR and other tool calls."""
@@ -247,17 +247,15 @@ class TestCCRRetrievalExecution:
 
         assert result.success
         assert result.items_retrieved == 100
-        assert not result.was_search
 
         # Check content structure
         content = json.loads(result.content)
         assert content["hash"] == hash_key
         assert "original_content" in content
 
-    def test_search_retrieval_success(self):
-        """Successfully search within cached content."""
+    def test_retrieval_returns_full_content_for_cached_hash(self):
+        """Retrieval always returns the full original content (never empty)."""
         store = get_compression_store()
-        # Use items with more searchable content
         items = [
             {"id": 1, "text": "Python programming language tutorial"},
             {"id": 2, "text": "JavaScript web development framework"},
@@ -276,18 +274,17 @@ class TestCCRRetrievalExecution:
         )
 
         handler = CCRResponseHandler()
-        # Use a more specific query
-        call = CCRToolCall(tool_call_id="test_id", hash_key=hash_key, query="Python programming")
+        call = CCRToolCall(tool_call_id="test_id", hash_key=hash_key)
 
         result = handler._execute_retrieval(call)
 
         assert result.success
-        assert result.was_search
+        assert result.items_retrieved == 5
 
         content = json.loads(result.content)
-        assert content["query"] == "Python programming"
-        # The search should return results (may be 0 depending on BM25 behavior)
-        assert "results" in content
+        assert content["hash"] == hash_key
+        # Full content is always returned — the complete original round-trips.
+        assert json.loads(content["original_content"]) == items
 
     def test_retrieval_nonexistent_hash(self):
         """Handle retrieval of nonexistent hash."""
@@ -651,17 +648,7 @@ class TestCCRToolCallDataClass:
 
         assert call.tool_call_id == "test_123"
         assert call.hash_key == "abc123"
-        assert call.query is None
-
-    def test_search_retrieval_call(self):
-        """Create search retrieval call."""
-        call = CCRToolCall(
-            tool_call_id="test_456",
-            hash_key="def456",
-            query="authentication",
-        )
-
-        assert call.query == "authentication"
+        assert not hasattr(call, "query")
 
 
 class TestCCRToolResultDataClass:
@@ -674,24 +661,11 @@ class TestCCRToolResultDataClass:
             content='{"data": "content"}',
             success=True,
             items_retrieved=50,
-            was_search=False,
         )
 
         assert result.success
         assert result.items_retrieved == 50
-        assert not result.was_search
-
-    def test_search_result(self):
-        """Create search result."""
-        result = CCRToolResult(
-            tool_call_id="test_456",
-            content='{"results": []}',
-            success=True,
-            items_retrieved=5,
-            was_search=True,
-        )
-
-        assert result.was_search
+        assert not hasattr(result, "was_search")
 
     def test_failed_result(self):
         """Create failed result."""

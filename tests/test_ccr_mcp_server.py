@@ -61,7 +61,7 @@ def test_mcp_retrieves_proxy_stored_content(fresh_store) -> None:
     hash_key = get_compression_store().store(original, '{"compressed": true}')
 
     server = mcp_server.HeadroomMCPServer(check_proxy=False)
-    result = asyncio.run(server._retrieve_content(hash_key, query=None))
+    result = asyncio.run(server._retrieve_content(hash_key))
 
     assert result.get("source") == "local"
     assert result["original_content"] == original
@@ -91,26 +91,22 @@ def test_compress_savings_percent_tracks_token_counts(fresh_store) -> None:
         assert result["savings_percent"] > 0.0
 
 
-def test_mcp_retrieve_with_nonmatching_query_returns_full_content(fresh_store) -> None:
-    """A query that matches no item above the relevance floor must still return
-    the stored entry (it exists and is unexpired) rather than the "Content not
-    found" error, which is reserved for genuine misses."""
+def test_mcp_retrieve_returns_full_content(fresh_store) -> None:
+    """Retrieval is by hash: a stored, unexpired entry always returns its full
+    original content (never empty, never a spurious "not found")."""
     original = "the the the the the the the the the the\n" * 5
     hash_key = get_compression_store().store(original, "<<small>>")
-    # Precondition: the query genuinely matches nothing above the BM25 floor.
-    assert get_compression_store().search(hash_key, "zzqx_nonmatching_token") == []
 
     server = mcp_server.HeadroomMCPServer(check_proxy=False)
-    result = asyncio.run(server._retrieve_content(hash_key, query="zzqx_nonmatching_token"))
+    result = asyncio.run(server._retrieve_content(hash_key))
 
     assert "error" not in result
     assert result.get("source") == "local"
     assert result["original_content"] == original
-    assert result["count"] == 0
 
 
 def test_mcp_retrieve_missing_hash_still_errors(fresh_store) -> None:
     """A genuinely missing hash must still report "Content not found"."""
     server = mcp_server.HeadroomMCPServer(check_proxy=False)
-    result = asyncio.run(server._retrieve_content("nonexistent_hash", query="anything"))
+    result = asyncio.run(server._retrieve_content("nonexistent_hash"))
     assert "Content not found" in result.get("error", "")

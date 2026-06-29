@@ -24,13 +24,17 @@ daemon reports savings across the operator's projects. Set
 `HEADROOM_RTK_GAIN_SCOPE=project` to query `rtk gain --project` from the
 proxy process working directory.
 
-## Modes
+## SDK Modes (`default_mode` / `headroom_mode`)
+
+These modes apply to SDK usage via `HeadroomClient(default_mode=...)` or per-request `headroom_mode=...`. They are **not** the same as the proxy `--mode` flag.
 
 | Mode | Behavior | Use Case |
 |------|----------|----------|
 | `audit` | Observes and logs, no modifications | Production monitoring, baseline measurement |
 | `optimize` | Applies safe, deterministic transforms | Production optimization |
 | `simulate` | Returns plan without API call | Testing, cost estimation |
+
+> **Proxy `--mode` is a separate axis**: `headroom proxy --mode token` (maximize compression) or `--mode cache` (freeze prior turns for prefix-cache stability). The proxy does not accept `audit`, `optimize`, or `simulate`.
 
 ## SDK Configuration
 
@@ -180,7 +184,7 @@ response = client.chat.completions.create(
 )
 ```
 
-The `RollingWindowConfig`, `IntelligentContextConfig`, and `ScoringWeights` classes were removed in 0.9.x. Context management now happens automatically inside the pipeline.
+The `RollingWindowConfig`, `IntelligentContextConfig`, and `ScoringWeights` classes are no longer part of Headroom. Context management now happens automatically inside the pipeline (live-zone-only compression).
 
 ## Proxy Configuration
 
@@ -229,7 +233,7 @@ headroom proxy --learn --min-evidence 3
 | `HEADROOM_STATELESS` | Set to `true` to disable filesystem writes | `false` |
 | `HEADROOM_MODEL_LIMITS` | Custom model config (JSON string or file path) | -- |
 | `HEADROOM_BASE_URL` | Base URL of the Headroom proxy (TypeScript SDK) | `http://localhost:8787` |
-| `HEADROOM_API_KEY` | API key for Headroom Cloud authentication | -- |
+| `HEADROOM_API_KEY` | Optional API key for authenticated Headroom endpoints (TypeScript SDK) | -- |
 | `HEADROOM_CONFIG_DIR` | Canonical config (read-mostly) root. Derives `models.json` and per-plugin config paths when set. | `~/.headroom/config` |
 | `HEADROOM_WORKSPACE_DIR` | Canonical workspace (read-write state) root. Derives savings, memory DB, logs, TOIN, subscription state, and more when set. | `~/.headroom` |
 | `HEADROOM_SAVINGS_PATH` | Override persistent savings file location. Always wins when set. | derived from `${HEADROOM_WORKSPACE_DIR}` |
@@ -354,7 +358,7 @@ provider = AnthropicProvider(
 </Tab>
 <Tab value="Google">
 ```python
-from headroom import GoogleProvider
+from headroom.providers import GoogleProvider
 
 provider = GoogleProvider(
     enable_context_caching=True,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -95,6 +96,46 @@ def test_validate_pull_request_accepts_crlf_test_output_code_block() -> None:
 
     assert report.valid is True
     assert report.problems == []
+
+
+def test_validate_pull_request_body_override_uses_live_body() -> None:
+    module = _load_module()
+    stale_event_body = ""
+
+    report = module.validate_pull_request_body(_event(stale_event_body), VALID_BODY)
+
+    assert report.valid is True
+    assert report.ready_for_review is True
+    assert report.problems == []
+
+
+def test_cli_body_file_override_uses_live_body(tmp_path: Path, monkeypatch) -> None:
+    module = _load_module()
+    event_path = tmp_path / "event.json"
+    body_path = tmp_path / "body.md"
+    report_path = tmp_path / "report.json"
+    event_path.write_text(
+        json.dumps(_event("")),
+        encoding="utf-8",
+    )
+    body_path.write_text(VALID_BODY, encoding="utf-8")
+    monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
+
+    exit_code = module.main(
+        [
+            "--event",
+            str(event_path),
+            "--body-file",
+            str(body_path),
+            "--report",
+            str(report_path),
+        ]
+    )
+
+    assert exit_code == 0
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["valid"] is True
+    assert report["ready_for_review"] is True
 
 
 def test_validate_pull_request_allows_draft_without_ready_checkboxes() -> None:
