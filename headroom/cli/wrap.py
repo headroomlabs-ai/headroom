@@ -2410,11 +2410,11 @@ def _kill_proxy_by_pid(pid: int, port: int) -> bool:
     """
     try:
         os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass  # Already gone
     except PermissionError:
         click.echo(f"  Warning: No permission to kill proxy PID {pid}")
         return False
+    except (ProcessLookupError, OSError, SystemError):
+        pass  # Already gone or stale PID (WinError 87 → SystemError)
 
     # Wait for port to free (up to 5 seconds)
     for _ in range(50):
@@ -2426,7 +2426,7 @@ def _kill_proxy_by_pid(pid: int, port: int) -> bool:
     try:
         _kill_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
         os.kill(pid, _kill_signal)
-    except (ProcessLookupError, PermissionError):
+    except (ProcessLookupError, PermissionError, OSError, SystemError):
         pass
 
     for _ in range(20):

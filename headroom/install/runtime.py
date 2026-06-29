@@ -275,7 +275,9 @@ def start_detached_agent(profile: str) -> subprocess.Popen[str]:
         )
     else:
         kwargs["start_new_session"] = True
-    return subprocess.Popen(command, **kwargs)
+    proc = subprocess.Popen(command, **kwargs)
+    log_file.close()
+    return proc
 
 
 def start_persistent_docker(manifest: DeploymentManifest) -> None:
@@ -353,6 +355,6 @@ def runtime_status(manifest: DeploymentManifest) -> str:
         return "stopped"
     try:
         os.kill(pid, 0)
-    except OSError:
+    except (OSError, SystemError):
         return "stopped"
     return "running"
