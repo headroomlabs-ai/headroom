@@ -544,3 +544,57 @@ def test_runtime_status_reads_container_and_pid_state(monkeypatch, tmp_path: Pat
         backend="anthropic",
     )
     assert runtime_status(python_manifest) == "running"
+
+
+# ---------------------------------------------------------------------------
+# Tests for SystemError handling (Issue B: Windows PID probe)
+# ---------------------------------------------------------------------------
+
+
+def test_stop_runtime_catches_system_error_on_windows(monkeypatch, tmp_path: Path) -> None:
+    """os.kill raising SystemError during stop_runtime must not crash."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    python_manifest = DeploymentManifest(
+        profile="default",
+        preset="persistent-service",
+        runtime_kind="python",
+        supervisor_kind="service",
+        scope="user",
+        provider_mode="manual",
+        targets=[],
+        port=8787,
+        host="127.0.0.1",
+        backend="anthropic",
+    )
+    _write_pid("default", 999)
+    monkeypatch.setattr(
+        "headroom.install.runtime.os.kill",
+        lambda pid, sig: (_ for _ in ()).throw(SystemError("WinError 87")),
+    )
+    stop_runtime(python_manifest)
+    assert _read_pid("default") is None
+
+
+def test_runtime_status_catches_system_error_on_windows(monkeypatch, tmp_path: Path) -> None:
+    """os.kill raising SystemError during runtime_status must return 'stopped'."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    pid_file = tmp_path / ".headroom" / "deploy" / "default" / "runner.pid"
+    pid_file.parent.mkdir(parents=True)
+    pid_file.write_text("999", encoding="utf-8")
+    monkeypatch.setattr(
+        "headroom.install.runtime.os.kill",
+        lambda pid, sig: (_ for _ in ()).throw(SystemError("WinError 87")),
+    )
+    python_manifest = DeploymentManifest(
+        profile="default",
+        preset="persistent-service",
+        runtime_kind="python",
+        supervisor_kind="service",
+        scope="user",
+        provider_mode="manual",
+        targets=[],
+        port=8787,
+        host="127.0.0.1",
+        backend="anthropic",
+    )
+    assert runtime_status(python_manifest) == "stopped"

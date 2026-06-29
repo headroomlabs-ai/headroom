@@ -323,7 +323,7 @@ def stop_runtime(manifest: DeploymentManifest) -> None:
         return
     try:
         os.kill(pid, signal.SIGTERM)
-    except OSError:
+    except (OSError, SystemError):
         pass
     _clear_pid(manifest.profile)
 
