@@ -5394,7 +5394,12 @@ def opencode(
     if not no_serena:
         from headroom.mcp_registry import OpencodeRegistrar
 
-        _setup_serena_mcp(OpencodeRegistrar(), context="opencode", verbose=verbose, force=True)
+        # Serena has no "opencode" context — passing one makes
+        # `serena start-mcp-server --context opencode` abort with
+        # FileNotFoundError, so the whole `wrap opencode` flow fails to
+        # start (#1549). Fall back to Serena's generic "agent" context,
+        # which is valid for any coding agent without a dedicated context.
+        _setup_serena_mcp(OpencodeRegistrar(), context="agent", verbose=verbose, force=True)
     else:
         from headroom.mcp_registry import OpencodeRegistrar
 

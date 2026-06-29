@@ -69,6 +69,37 @@ def test_wrap_opencode_sets_config_content_env(
     assert captured["args"] == ("--model", "gpt-4o")
 
 
+def test_wrap_opencode_uses_valid_serena_context(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`wrap opencode` must hand Serena a real context (#1549).
+
+    Serena ships no "opencode" context, so passing one makes
+    `serena start-mcp-server --context opencode` abort with
+    FileNotFoundError and the whole wrap fails to start. The wrap must use
+    a valid generic context instead.
+    """
+    monkeypatch.chdir(tmp_path)
+    _set_test_home(monkeypatch, tmp_path)
+
+    captured: dict[str, object] = {}
+
+    def fake_setup_serena(registrar, *, context, verbose=False, force=False):  # noqa: ANN001
+        captured["context"] = context
+
+    with patch.object(wrap_mod.shutil, "which", return_value="opencode"):
+        with patch.object(wrap_mod, "_launch_tool"):
+            with patch.object(wrap_mod, "_ensure_rtk_binary", return_value=Path("/tmp/rtk")):
+                with patch.object(wrap_mod, "_setup_serena_mcp", side_effect=fake_setup_serena):
+                    result = runner.invoke(main, ["wrap", "opencode", "--port", "9000", "--no-mcp"])
+
+    assert result.exit_code == 0, result.output
+    assert captured.get("context") == "agent"
+    assert captured["context"] != "opencode"
+
+
 def test_wrap_opencode_does_not_add_base_url_env_vars(
     runner: CliRunner,
     tmp_path: Path,

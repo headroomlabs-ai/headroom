@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Unreleased
 
 ### Fixed
+- `headroom wrap opencode` no longer fails to start Serena. It passed
+  `--context opencode` to `serena start-mcp-server`, but Serena ships no
+  `opencode` context, so Serena aborted with `FileNotFoundError: Context
+  opencode not found`. The wrap now uses Serena's generic `agent` context
+  ([#1549](https://github.com/headroomlabs-ai/headroom/issues/1549)).
 - Proactive expansion blocks injected into user turns are now wrapped in
   `<headroom_proactive_expansion>` XML tags, giving downstream consumers
   (LLMs, loggers, attribution parsers) a machine-readable provenance
