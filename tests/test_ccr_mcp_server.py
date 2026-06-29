@@ -124,9 +124,7 @@ def test_mcp_retrieve_query_records_feedback_and_returns_full_content(fresh_stor
     )
 
     server = mcp_server.HeadroomMCPServer(check_proxy=False)
-    content = asyncio.run(
-        server._handle_retrieve({"hash": hash_key, "query": "auth middleware"})
-    )
+    content = asyncio.run(server._handle_retrieve({"hash": hash_key, "query": "auth middleware"}))
 
     result = json.loads(content[0].kwargs["text"])
     assert result["original_content"] == original
