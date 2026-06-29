@@ -183,6 +183,7 @@ async def run_test(token: str, host: str) -> int:
     )
     if not _wait_for_proxy(_PROXY_PORT):
         proxy_proc.terminate()
+        proxy_proc.wait(timeout=5)
         proxy_log.close()
         print("FAILED — proxy did not start")
         return 1

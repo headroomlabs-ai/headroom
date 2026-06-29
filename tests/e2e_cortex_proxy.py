@@ -242,6 +242,8 @@ def main() -> int:
     )
     if not _wait_for_proxy(_PROXY_PORT):
         proxy_proc.send_signal(signal.SIGTERM)
+        proxy_proc.wait(timeout=5)
+        proxy_log.close()
         print("FAILED")
         return 1
     print("OK")
