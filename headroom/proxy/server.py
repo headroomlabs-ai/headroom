@@ -2769,8 +2769,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "savings_percent": log.get("savings_percent"),
                 # Per-request billed-cost estimate so tooling (e.g. claude-hud)
                 # can attribute cost to a Claude Code session by summing over
-                # turn_id / time window (issue #1079). None when pricing is
-                # unavailable — never a fabricated number.
+                # turn_id / time window (issue #1079). Best-effort: it does NOT
+                # apply cache-read/cache-write discounts because recent_requests
+                # does not retain a per-request cache breakdown, so treat it as a
+                # list-price billed estimate. null = unknown (pricing
+                # unavailable), never a fabricated number.
                 "cost_usd": request_cost_usd(proxy.cost_tracker, log),
                 "optimization_latency_ms": log.get("optimization_latency_ms"),
                 "total_latency_ms": log.get("total_latency_ms"),

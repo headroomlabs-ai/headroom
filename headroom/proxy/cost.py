@@ -362,8 +362,10 @@ def request_cost_usd(cost_tracker: CostTracker | None, log: Mapping[str, Any]) -
 
     Prices the request the provider actually billed: the post-compression
     ``input_tokens_optimized`` plus ``output_tokens``, via the existing
-    ``CostTracker.estimate_cost`` (LiteLLM list price). No per-request cache
-    breakdown is recorded, so cache discounts are not applied here.
+    ``CostTracker.estimate_cost`` (LiteLLM list price). Best-effort: it does NOT
+    apply cache-read/cache-write discounts, because ``recent_requests`` does not
+    retain a per-request cache breakdown — treat the value as a list-price billed
+    estimate, not an exact bill.
 
     Returns ``None`` — never a fabricated number — when cost tracking is
     disabled, the entry lacks a model / input tokens, or pricing is unavailable,
