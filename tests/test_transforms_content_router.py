@@ -21,6 +21,19 @@ from headroom.transforms.content_router import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _reset_detect_module_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the module-level detect flags from leaking across tests.
+
+    The circuit breaker (#575) is process-wide, so a test that trips it would
+    otherwise force later tests onto the pure-Python path. ``monkeypatch.setattr``
+    zeroes each flag for the test and auto-restores it afterward.
+    """
+    monkeypatch.setattr(content_router_module, "_detect_native_unhealthy", False)
+    monkeypatch.setattr(content_router_module, "_detect_backend_warned", False)
+    monkeypatch.setattr(content_router_module, "_detect_panic_warned", False)
+
+
 def test_compression_cache_handles_hits_skips_evictions_and_clear(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -944,3 +957,35 @@ def test_detect_content_watchdog_uses_native_result_on_windows(
 
     result = _detect_content("def main(): pass")
     assert result.content_type is ContentType.SOURCE_CODE
+
+
+def test_detect_content_circuit_breaker_skips_native_after_hang(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After one watchdog timeout, native detection is disabled process-wide (#575)."""
+    import threading as _threading
+
+    import headroom._core as _core
+
+    monkeypatch.setenv("HEADROOM_DETECT_BACKEND", "rust")
+    monkeypatch.setattr(content_router_module.sys, "platform", "win32")
+    monkeypatch.setenv("HEADROOM_DETECT_TIMEOUT_SECS", "0.1")
+
+    release = _threading.Event()
+    calls = 0
+
+    def _hang(_content: str):
+        nonlocal calls
+        calls += 1
+        release.wait()  # park with GIL released, like the real WaitOnAddress hang
+        return SimpleNamespace(content_type="plain_text", confidence=1.0, metadata={})
+
+    monkeypatch.setattr(_core, "detect_content_type", _hang)
+    try:
+        first = _detect_content('[{"id": 1}]')
+        second = _detect_content('[{"id": 2}]')
+        assert first.content_type is ContentType.JSON_ARRAY
+        assert second.content_type is ContentType.JSON_ARRAY
+        assert calls == 1  # breaker tripped: native entered once, 2nd call skipped it
+    finally:
+        release.set()  # let the lone daemon worker finish

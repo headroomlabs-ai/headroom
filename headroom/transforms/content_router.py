@@ -67,6 +67,7 @@ logger = logging.getLogger(__name__)
 
 _detect_backend_warned = False
 _detect_panic_warned = False
+_detect_native_unhealthy = False  # circuit breaker: native detect hung once (#575)
 
 
 def _router_debug_dumps(value: Any) -> str:
@@ -199,7 +200,7 @@ def _detect_content(content: str) -> DetectionResult:
     only consumed `.content_type` from it; the strategy mapping in
     `_strategy_from_detection` keys off that field alone.
     """
-    global _detect_backend_warned
+    global _detect_backend_warned, _detect_panic_warned, _detect_native_unhealthy
 
     backend = _resolve_detect_backend()
     if backend == "python":
@@ -212,9 +213,14 @@ def _detect_content(content: str) -> DetectionResult:
             )
         return _regex_detect_content_type(content)
 
+    if _detect_native_unhealthy:
+        # Circuit breaker (#575): the native detector hung once under the
+        # watchdog; every later call would wait the full budget and strand
+        # another stuck daemon thread, so route straight to pure-Python.
+        return _regex_detect_content_type(content)
+
     from headroom._core import detect_content_type as _rust_detect
 
-    global _detect_panic_warned
     try:
         if sys.platform == "win32":
             # Windows is the only platform where the native detector can deadlock
@@ -240,7 +246,17 @@ def _detect_content(content: str) -> DetectionResult:
         # as asyncio.CancelledError — keep them propagating.
         if isinstance(exc, asyncio.CancelledError):
             raise
-        if not _detect_panic_warned:
+        if isinstance(exc, TimeoutError):
+            # Watchdog tripped: the native detector hung (#575). Disable it
+            # process-wide so later calls don't each wait the full budget and
+            # strand another daemon thread in the wedged native call.
+            _detect_native_unhealthy = True
+            logger.warning(
+                "Native content detector hung (%s); disabling it for this process "
+                "and using pure-Python detection.",
+                exc,
+            )
+        elif not _detect_panic_warned:
             _detect_panic_warned = True
             logger.warning(
                 "Native content detector failed (%s); falling back to pure-Python detection.",
