@@ -473,28 +473,34 @@ def _start_proxy(
     # Wait for proxy to be ready.
     # ML components (Kompress, Magika, Tree-sitter) load synchronously before
     # uvicorn binds the port. On slower machines this can take 20-30 seconds.
-    for _i in range(timeout_seconds):
-        time.sleep(1)
-        if _check_proxy(port):
-            click.echo(f"  Logs: {log_path}")
-            stdio_log_file.close()
-            return proc
-        # Check if process died
-        if proc.poll() is not None:
-            stdio_log_file.close()
-            # Read last few lines of log for error context
-            try:
-                tail = _read_text(stdio_log_path)[-500:]
-            except Exception:
-                tail = "(no log output)"
-            raise RuntimeError(f"Proxy exited with code {proc.returncode}: {tail}")
+    #
+    # try/finally guarantees the parent closes its copy of the stdio log fd on
+    # every exit path. The subprocess has inherited the descriptor, so the
+    # parent's copy is dead weight; if _check_proxy() raised mid-loop the
+    # per-branch close()s here were skipped, leaking one fd (and pinning the log
+    # file open) per `headroom wrap` invocation.
+    try:
+        for _i in range(timeout_seconds):
+            time.sleep(1)
+            if _check_proxy(port):
+                click.echo(f"  Logs: {log_path}")
+                return proc
+            # Check if process died
+            if proc.poll() is not None:
+                # Read last few lines of log for error context
+                try:
+                    tail = _read_text(stdio_log_path)[-500:]
+                except Exception:
+                    tail = "(no log output)"
+                raise RuntimeError(f"Proxy exited with code {proc.returncode}: {tail}")
 
-    proc.kill()
-    stdio_log_file.close()
-    raise RuntimeError(
-        f"Proxy failed to start on port {port} within {timeout_seconds} seconds. "
-        f"Set {_WRAP_PROXY_TIMEOUT_ENV} to a larger number of seconds for slow startup."
-    )
+        proc.kill()
+        raise RuntimeError(
+            f"Proxy failed to start on port {port} within {timeout_seconds} seconds. "
+            f"Set {_WRAP_PROXY_TIMEOUT_ENV} to a larger number of seconds for slow startup."
+        )
+    finally:
+        stdio_log_file.close()
 
 
 def _setup_rtk(verbose: bool = False) -> Path | None:

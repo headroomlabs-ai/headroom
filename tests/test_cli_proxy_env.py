@@ -196,6 +196,54 @@ class TestCLIWrapProxyTimeout:
         assert wrap_mod._WRAP_PROXY_TIMEOUT_ENV in message
         assert fake_proc.killed is True
 
+    def test_start_proxy_closes_stdio_log_when_check_proxy_raises(self, monkeypatch, tmp_path):
+        """If `_check_proxy` raises mid-readiness-loop, the parent must still
+        close its copy of the stdio log fd instead of leaking it (#1555)."""
+        fake_proc = _FakeProxyProcess()
+        captured: dict[str, object] = {}
+
+        monkeypatch.setenv(wrap_mod._WRAP_PROXY_TIMEOUT_ENV, "3")
+        monkeypatch.setattr(wrap_mod, "_get_log_path", lambda: tmp_path / "proxy.log")
+        monkeypatch.setattr(wrap_mod.time, "sleep", lambda _seconds: None)
+
+        def exploding_check(_port):
+            raise ValueError("probe blew up")
+
+        monkeypatch.setattr(wrap_mod, "_check_proxy", exploding_check)
+
+        def fake_popen(*args, **kwargs):  # noqa: ANN002, ANN003
+            captured["stdout"] = kwargs["stdout"]
+            return fake_proc
+
+        monkeypatch.setattr(wrap_mod.subprocess, "Popen", fake_popen)
+
+        with pytest.raises(ValueError, match="probe blew up"):
+            wrap_mod._start_proxy(8787, agent_type="codex")
+
+        assert captured["stdout"].closed is True
+
+    def test_start_proxy_closes_stdio_log_on_success(self, monkeypatch, tmp_path):
+        """The success path closes the parent's stdio log fd (regression)."""
+        fake_proc = _FakeProxyProcess()
+        captured: dict[str, object] = {}
+
+        monkeypatch.delenv(wrap_mod._WRAP_PROXY_TIMEOUT_ENV, raising=False)
+        monkeypatch.setattr(wrap_mod, "_ml_wrap_extras_detected", lambda: False)
+        monkeypatch.setattr(wrap_mod, "_get_log_path", lambda: tmp_path / "proxy.log")
+        monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: True)
+        monkeypatch.setattr(wrap_mod.time, "sleep", lambda _seconds: None)
+
+        def fake_popen(*args, **kwargs):  # noqa: ANN002, ANN003
+            captured["stdout"] = kwargs["stdout"]
+            return fake_proc
+
+        monkeypatch.setattr(wrap_mod.subprocess, "Popen", fake_popen)
+
+        proc = wrap_mod._start_proxy(8787, agent_type="codex")
+
+        assert proc is fake_proc
+        assert captured["stdout"].closed is True
+
 
 class TestCLIProxyEnvVars:
     """Test that the CLI proxy command reads API URL env vars."""
