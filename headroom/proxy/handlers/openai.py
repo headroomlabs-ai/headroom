@@ -471,7 +471,7 @@ def _ensure_responses_store_for_memory_tools(
     return False
 
 
-def _allow_responses_memory_tools(*, is_chatgpt_auth: bool) -> bool:
+def _allow_responses_memory_tools(is_chatgpt_auth: bool) -> bool:
     # ChatGPT Codex rejects Responses payloads unless store=false. The
     # transparent memory-tool continuation flow needs stored responses, so keep
     # it on the regular API path only.
@@ -3089,9 +3089,7 @@ class OpenAIHandlerMixin:
             client = "codex"
         if _ensure_chatgpt_responses_store_false(body, is_chatgpt_auth=is_chatgpt_auth):
             logger.info(f"[{request_id}] Responses: forced store=false for ChatGPT auth")
-        responses_memory_tools_allowed = _allow_responses_memory_tools(
-            is_chatgpt_auth=is_chatgpt_auth
-        )
+        responses_memory_tools_allowed = _allow_responses_memory_tools(is_chatgpt_auth)
 
         # PR-A6 (P5-50, preps P0-6): session-sticky `OpenAI-Beta` merge
         # for /v1/responses. Compute a session_id off the same store the
@@ -3336,8 +3334,7 @@ class OpenAIHandlerMixin:
                     existing_tools=resp_tools,
                     memory_tools_to_inject=memory_tool_defs_responses,
                     inject_this_turn=bool(
-                        self.memory_handler.config.inject_tools
-                        and responses_memory_tools_allowed
+                        self.memory_handler.config.inject_tools and responses_memory_tools_allowed
                     ),
                 )
                 if mem_tools_injected:
@@ -3942,9 +3939,7 @@ class OpenAIHandlerMixin:
             for key, value in upstream_headers.items()
             if key.lower() != _CODEX_RESPONSES_LITE_HEADER
         }
-        ws_memory_tools_allowed = _allow_responses_memory_tools(
-            is_chatgpt_auth=is_chatgpt_auth
-        )
+        ws_memory_tools_allowed = _allow_responses_memory_tools(is_chatgpt_auth)
         _lower_headers = {k.lower(): v for k, v in upstream_headers.items()}
 
         # Build upstream WebSocket URL based on auth mode
@@ -4287,9 +4282,7 @@ class OpenAIHandlerMixin:
                     is_chatgpt_auth=is_chatgpt_auth,
                 ):
                     first_msg_raw = json.dumps(body)
-                    logger.info(
-                        f"[{request_id}] WS Responses: forced store=false for ChatGPT auth"
-                    )
+                    logger.info(f"[{request_id}] WS Responses: forced store=false for ChatGPT auth")
             ws_input_tokens_total = 0
             ws_output_tokens_total = 0
             ws_cache_read_tokens_total = 0
@@ -4938,8 +4931,7 @@ class OpenAIHandlerMixin:
                         if store_forced:
                             raw_after_store = json.dumps(parsed_frame)
                             logger.info(
-                                "[%s] WS Responses: forced store=false for ChatGPT auth "
-                                "frame=%d",
+                                "[%s] WS Responses: forced store=false for ChatGPT auth frame=%d",
                                 request_id,
                                 frame_index,
                             )
