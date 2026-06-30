@@ -49,11 +49,24 @@ _PURGE_INTERVAL = 60.0
 
 
 def default_db_path() -> Path:
-    """Resolve the database path (env override or ~/.headroom/)."""
+    """Resolve the database path.
+
+    Precedence (matches the canonical filesystem contract in
+    ``headroom.paths``): the per-resource ``HEADROOM_CCR_SQLITE_PATH``
+    override wins, then the path is derived from
+    ``HEADROOM_WORKSPACE_DIR`` (via :func:`headroom.paths.workspace_dir`),
+    falling back to ``~/.headroom/ccr_store.db``.
+
+    Routing the fallback through ``paths.workspace_dir()`` keeps the CCR
+    store inside the workspace so a single ``HEADROOM_WORKSPACE_DIR``
+    override relocates every persistent file Headroom writes.
+    """
+    from headroom import paths
+
     env = os.environ.get("HEADROOM_CCR_SQLITE_PATH", "").strip()
     if env:
         return Path(env).expanduser()
-    return Path.home() / ".headroom" / "ccr_store.db"
+    return paths.workspace_dir() / "ccr_store.db"
 
 
 class SQLiteBackend:

@@ -13,7 +13,7 @@ import time
 
 import pytest
 
-from headroom.cache.backends.sqlite import SQLiteBackend
+from headroom.cache.backends.sqlite import SQLiteBackend, default_db_path
 from headroom.cache.compression_store import CompressionEntry, CompressionStore
 
 
@@ -192,6 +192,51 @@ class TestMultiWorkerSafety:
         SQLiteBackend(db_path)
         mode = db_path.stat().st_mode & 0o777
         assert mode == 0o600
+
+
+class TestDefaultDbPath:
+    """`default_db_path()` must obey the canonical filesystem contract:
+    per-resource override > HEADROOM_WORKSPACE_DIR > ~/.headroom."""
+
+    def test_workspace_dir_relocates_ccr_store(self, monkeypatch, tmp_path):
+        """Regression for the CCR store ignoring HEADROOM_WORKSPACE_DIR.
+
+        Before the fix this returned ~/.headroom/ccr_store.db even with the
+        workspace redirected, so ~/.headroom/ got created behind the user's
+        back.
+        """
+        monkeypatch.delenv("HEADROOM_CCR_SQLITE_PATH", raising=False)
+        monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path))
+
+        assert default_db_path() == tmp_path / "ccr_store.db"
+
+    def test_explicit_env_override_wins_over_workspace(self, monkeypatch, tmp_path):
+        """The per-resource override keeps top precedence (#191 rules)."""
+        override = tmp_path / "custom" / "store.db"
+        monkeypatch.setenv("HEADROOM_CCR_SQLITE_PATH", str(override))
+        monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path / "ws"))
+
+        assert default_db_path() == override
+
+    def test_default_falls_back_to_home(self, monkeypatch):
+        """With neither env var set, the historical default is preserved."""
+        monkeypatch.delenv("HEADROOM_CCR_SQLITE_PATH", raising=False)
+        monkeypatch.delenv("HEADROOM_WORKSPACE_DIR", raising=False)
+
+        from pathlib import Path
+
+        assert default_db_path() == Path.home() / ".headroom" / "ccr_store.db"
+
+    def test_backend_writes_under_workspace_dir(self, monkeypatch, tmp_path):
+        """End-to-end: a default-constructed backend lands its file inside
+        the redirected workspace, not ~/.headroom."""
+        monkeypatch.delenv("HEADROOM_CCR_SQLITE_PATH", raising=False)
+        monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path))
+
+        backend = SQLiteBackend()
+        backend.set("h1", make_entry())
+
+        assert (tmp_path / "ccr_store.db").exists()
 
 
 class TestDefaults:
