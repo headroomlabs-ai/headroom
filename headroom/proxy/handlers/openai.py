@@ -748,6 +748,7 @@ class OpenAIHandlerMixin:
         frame_index: int | None = None,
         frame_type: str | None = None,
         metadata: dict[str, Any] | None = None,
+        bypass: bool = False,
     ) -> tuple[dict[str, Any], dict[str, str] | None, bool]:
         """Emit canonical pipeline events for OpenAI Responses payloads.
 
@@ -755,8 +756,12 @@ class OpenAIHandlerMixin:
         pipeline extensions. The Responses API is payload-native instead, so
         extensions need the whole mutable Responses payload to inspect or
         rewrite ``input`` items such as ``function_call_output`` before the
-        built-in Responses compressor runs.
+        built-in Responses compressor runs. Explicit bypass is a full passthrough
+        contract, so payload extensions must not observe or mutate the payload.
         """
+
+        if bypass:
+            return payload, headers, False
 
         manager = getattr(self, "pipeline_extensions", None)
         if manager is None or not getattr(manager, "enabled", False):
@@ -2967,6 +2972,13 @@ class OpenAIHandlerMixin:
                 },
             )
 
+        _bypass = self._headroom_bypass_enabled(request.headers)
+        if _bypass:
+            logger.info(
+                "[%s] Responses passthrough reason=bypass_header mutation=disabled",
+                request_id,
+            )
+
         model = body.get("model", "unknown")
         stream = body.get("stream", False)
         body, _, _ = self._emit_openai_responses_payload_stage(
@@ -2976,15 +2988,10 @@ class OpenAIHandlerMixin:
             payload=body,
             transport="http",
             stream=bool(stream),
+            bypass=_bypass,
         )
         model = body.get("model", model)
         stream = body.get("stream", stream)
-        _bypass = self._headroom_bypass_enabled(request.headers)
-        if _bypass:
-            logger.info(
-                "[%s] Responses passthrough reason=bypass_header mutation=disabled",
-                request_id,
-            )
 
         from headroom.proxy.helpers import capture_codex_wire_debug
 
@@ -3427,6 +3434,7 @@ class OpenAIHandlerMixin:
                     "attempted_input_tokens": attempted_input_tokens,
                     "transforms_applied": transforms_applied,
                 },
+                bypass=_bypass,
             )
 
         body, headers, _ = self._emit_openai_responses_payload_stage(
@@ -3441,6 +3449,7 @@ class OpenAIHandlerMixin:
                 "tokens_saved": tokens_saved,
                 "transforms_applied": transforms_applied,
             },
+            bypass=_bypass,
         )
         headers = headers or {}
 
@@ -4271,6 +4280,7 @@ class OpenAIHandlerMixin:
                             stream=True,
                             frame_index=1,
                             frame_type=str(body.get("type") or "response.create"),
+                            bypass=_ws_bypass,
                         )
                     )
                     if _first_pipeline_changed:

@@ -27,7 +27,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from headroom.pipeline import PipelineStage
+from headroom.pipeline import PipelineEvent, PipelineExtensionManager, PipelineStage
 from headroom.proxy.helpers import (
     BodyMutationTracker,
     append_text_to_latest_user_chat_message,
@@ -773,6 +773,68 @@ def test_openai_chat_memory_disabled_mode_no_op(
     sent = captured["body"]
     assert isinstance(sent, dict)
     assert sent["messages"][1]["content"] == "hi"
+
+
+def test_openai_responses_bypass_skips_payload_extensions() -> None:
+    """Bypass is a full passthrough: payload extensions must not rewrite Responses."""
+    config = ProxyConfig(
+        optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+        log_requests=False,
+        ccr_inject_tool=False,
+        ccr_handle_responses=False,
+        ccr_context_tracking=False,
+        image_optimize=False,
+    )
+    app = create_app(config)
+    proxy = app.state.proxy
+
+    class MutatingResponsesExtension:
+        def __init__(self) -> None:
+            self.events: list[PipelineEvent] = []
+
+        def on_pipeline_event(self, event: PipelineEvent) -> PipelineEvent:
+            self.events.append(event)
+            if event.payload is not None:
+                event.payload["extension_marker"] = event.stage.value
+            return event
+
+    extension = MutatingResponsesExtension()
+    proxy.pipeline_extensions = PipelineExtensionManager(extensions=[extension], discover=False)
+
+    captured: dict[str, object] = {}
+
+    async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
+        captured["body"] = body
+        return httpx.Response(
+            200,
+            json={
+                "id": "resp_1",
+                "object": "response",
+                "model": "gpt-5.5",
+                "output": [],
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+        )
+
+    proxy._retry_request = _fake_retry
+    client = TestClient(app)
+
+    inbound = {"model": "gpt-5.5", "input": "do not touch me", "stream": False}
+    resp = client.post(
+        "/v1/responses",
+        headers={
+            "authorization": "Bearer sk-test",
+            "x-headroom-bypass": "true",
+        },
+        json=inbound,
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert captured["body"] == inbound
+    assert extension.events == []
 
 
 # ---------------------------------------------------------------------------
