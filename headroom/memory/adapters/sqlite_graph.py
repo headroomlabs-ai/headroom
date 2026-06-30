@@ -653,6 +653,23 @@ class SQLiteGraphStore:
                 )
                 return [self._row_to_entity(row) for row in cursor]
 
+    async def get_relationships_for_user(self, user_id: str) -> list[Relationship]:
+        """Get all relationships for a user.
+
+        Args:
+            user_id: The user ID to get relationships for.
+
+        Returns:
+            List of all relationships belonging to the user.
+        """
+        with self._lock:
+            with self._get_conn() as conn:
+                cursor = conn.execute(
+                    "SELECT * FROM relationships WHERE user_id = ?",
+                    (user_id,),
+                )
+                return [self._row_to_relationship(row) for row in cursor]
+
     async def clear(self) -> None:
         """Clear all data from the store."""
         with self._lock:

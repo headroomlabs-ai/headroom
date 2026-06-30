@@ -13,6 +13,15 @@ from typing import Any
 import click
 
 from ..memory.adapters.sqlite import SQLiteMemoryStore
+from ..memory.adapters.sqlite_graph import SQLiteGraphStore
+from ..memory.knowledge_worker import (
+    build_context_snapshot,
+    build_knowledge_worker_graph,
+    build_memory_audit,
+    derive_graph_db_path,
+    filter_memories,
+    load_memories,
+)
 from ..memory.models import Memory, ScopeLevel
 from ..memory.ports import MemoryFilter
 from ._utils.formatting import (
@@ -44,6 +53,14 @@ def db_path_option(fn: Any) -> Any:
 def get_store(db_path: str) -> SQLiteMemoryStore:
     """Get a SQLiteMemoryStore instance."""
     return SQLiteMemoryStore(db_path)
+
+
+def get_graph_store(db_path: str, graph_db_path: str | None = None) -> SQLiteGraphStore | None:
+    """Get a SQLiteGraphStore instance if a graph DB exists."""
+    path = Path(graph_db_path).expanduser() if graph_db_path else derive_graph_db_path(db_path)
+    if not path.exists():
+        return None
+    return SQLiteGraphStore(path)
 
 
 def get_scope_label(memory: Memory) -> str:
@@ -238,6 +255,8 @@ def memory(ctx: click.Context) -> None:
         headroom memory prune --older-than 30d   Delete memories older than 30 days
         headroom memory purge --confirm          Delete ALL memories
         headroom memory export --output file.json  Export all memories to JSON
+        headroom memory export --format knowledge-worker --scope project
+        headroom memory audit --output audit.json  Audit provenance and weak claims
         headroom memory import file.json         Import memories from JSON
     """
     pass
@@ -809,32 +828,215 @@ def purge_memories(ctx: click.Context, db_path: str, confirm_flag: bool) -> None
     type=click.Path(),
     help="Output file path. If not specified, outputs to stdout.",
 )
+@click.option(
+    "--format",
+    "export_format",
+    type=click.Choice(["backup", "knowledge-worker", "context"], case_sensitive=False),
+    default="backup",
+    show_default=True,
+    help="Export format: legacy backup JSON, knowledge-worker graph JSON, or compact context Markdown.",
+)
+@click.option(
+    "--scope",
+    type=click.Choice(["global", "project", "session"], case_sensitive=False),
+    default="global",
+    show_default=True,
+    help="Scope for knowledge-worker/context exports.",
+)
+@click.option("--session", "session_id", type=str, help="Session ID when --scope=session.")
+@click.option(
+    "--project",
+    type=str,
+    help="Project key/display name when exporting from a global DB with project metadata.",
+)
+@click.option("--user", "user_id", type=str, help="Filter export to a user ID.")
+@click.option(
+    "--graph-db-path",
+    type=click.Path(),
+    help="Path to the graph database. Defaults to <memory_db>_graph.db.",
+)
+@click.option(
+    "--include-superseded",
+    is_flag=True,
+    help="Include superseded memories in scoped exports.",
+)
+@click.option(
+    "--max-ideas",
+    type=int,
+    default=20,
+    show_default=True,
+    help="Maximum idea count for --format=context.",
+)
 @click.pass_context
-def export_memories(ctx: click.Context, db_path: str, output: str | None) -> None:
-    """Export all memories to JSON.
+def export_memories(
+    ctx: click.Context,
+    db_path: str,
+    output: str | None,
+    export_format: str,
+    scope: str,
+    session_id: str | None,
+    project: str | None,
+    user_id: str | None,
+    graph_db_path: str | None,
+    include_superseded: bool,
+    max_ideas: int,
+) -> None:
+    """Export memories to legacy JSON, knowledge-worker graph JSON, or context Markdown.
 
     \b
     Examples:
         headroom memory export                       Output to stdout
         headroom memory export --output backup.json  Save to file
         headroom memory export -o backup.json        Save to file (short form)
+        headroom memory export --format knowledge-worker --scope project -o graph.json
+        headroom memory export --format context --scope session --session abc -o context.md
     """
     store = get_store(db_path)
 
     try:
-        memories = _export_all(store)
-
-        json_output = json.dumps(memories, indent=2, default=str)
+        fmt = export_format.lower()
+        if (
+            fmt == "backup"
+            and scope.lower() == "global"
+            and not any([session_id, project, user_id, graph_db_path, include_superseded])
+        ):
+            memories = _export_all(store)
+            rendered = json.dumps(memories, indent=2, default=str)
+            count_label = f"{len(memories)} memory(ies)"
+        elif fmt == "backup":
+            memories = asyncio.run(load_memories(store, include_superseded=include_superseded))
+            scoped = filter_memories(
+                memories,
+                scope=scope,
+                session_id=session_id,
+                project=project,
+                user_id=user_id,
+            )
+            rendered = json.dumps([memory.to_dict() for memory in scoped], indent=2, default=str)
+            count_label = f"{len(scoped)} memory(ies)"
+        else:
+            graph_store = get_graph_store(db_path, graph_db_path)
+            graph = asyncio.run(
+                build_knowledge_worker_graph(
+                    store,
+                    graph_store=graph_store,
+                    scope=scope,
+                    session_id=session_id,
+                    project=project,
+                    user_id=user_id,
+                    include_superseded=include_superseded,
+                )
+            )
+            if fmt == "context":
+                rendered = build_context_snapshot(graph, max_ideas=max_ideas)
+            else:
+                rendered = json.dumps(graph, indent=2, default=str)
+            count_label = f"{graph.get('_meta', {}).get('memory_count', 0)} memory(ies)"
 
         if output:
             output_path = Path(output)
-            output_path.write_text(json_output)
-            print_success(f"Exported {len(memories)} memory(ies) to {output_path}")
+            output_path.write_text(rendered, encoding="utf-8")
+            print_success(f"Exported {count_label} to {output_path}")
         else:
-            click.echo(json_output)
+            click.echo(rendered)
 
     except Exception as e:
         print_error(f"Failed to export memories: {e}")
+        sys.exit(1)
+
+
+@memory.command("audit")
+@db_path_option
+@click.option(
+    "--output",
+    "-o",
+    type=click.Path(),
+    help="Output audit JSON path. If not specified, outputs to stdout.",
+)
+@click.option(
+    "--scope",
+    type=click.Choice(["global", "project", "session"], case_sensitive=False),
+    default="global",
+    show_default=True,
+    help="Scope to audit.",
+)
+@click.option("--session", "session_id", type=str, help="Session ID when --scope=session.")
+@click.option(
+    "--project",
+    type=str,
+    help="Project key/display name when auditing a global DB with project metadata.",
+)
+@click.option("--user", "user_id", type=str, help="Filter audit to a user ID.")
+@click.option(
+    "--graph-db-path",
+    type=click.Path(),
+    help="Path to the graph database. Defaults to <memory_db>_graph.db.",
+)
+@click.option(
+    "--graph-output",
+    type=click.Path(),
+    help="Also write the knowledge-worker graph JSON used for the audit.",
+)
+@click.option(
+    "--include-superseded",
+    is_flag=True,
+    help="Include superseded memories in the audit.",
+)
+@click.option("--limit", type=int, default=25, show_default=True, help="Maximum ranked items.")
+@click.pass_context
+def audit_memories(
+    ctx: click.Context,
+    db_path: str,
+    output: str | None,
+    scope: str,
+    session_id: str | None,
+    project: str | None,
+    user_id: str | None,
+    graph_db_path: str | None,
+    graph_output: str | None,
+    include_superseded: bool,
+    limit: int,
+) -> None:
+    """Audit memory provenance, confidence, and review queues.
+
+    \b
+    Examples:
+        headroom memory audit --output audit.json
+        headroom memory audit --scope project --graph-output graph.json
+        headroom memory audit --scope session --session abc
+    """
+    store = get_store(db_path)
+
+    try:
+        graph_store = get_graph_store(db_path, graph_db_path)
+        graph = asyncio.run(
+            build_knowledge_worker_graph(
+                store,
+                graph_store=graph_store,
+                scope=scope,
+                session_id=session_id,
+                project=project,
+                user_id=user_id,
+                include_superseded=include_superseded,
+            )
+        )
+        audit = build_memory_audit(graph, limit=limit)
+        rendered = json.dumps(audit, indent=2, default=str)
+
+        if graph_output:
+            graph_path = Path(graph_output)
+            graph_path.write_text(json.dumps(graph, indent=2, default=str), encoding="utf-8")
+            print_success(f"Wrote knowledge-worker graph to {graph_path}")
+
+        if output:
+            output_path = Path(output)
+            output_path.write_text(rendered, encoding="utf-8")
+            print_success(f"Wrote memory audit to {output_path}")
+        else:
+            click.echo(rendered)
+
+    except Exception as e:
+        print_error(f"Failed to audit memories: {e}")
         sys.exit(1)
 
 

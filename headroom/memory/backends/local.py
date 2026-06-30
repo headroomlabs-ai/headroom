@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -30,6 +31,67 @@ if TYPE_CHECKING:
     from headroom.memory.core import HierarchicalMemory
 
 logger = logging.getLogger(__name__)
+
+
+def _confidence_from_importance(importance: float) -> str:
+    """Map Headroom's numeric importance score to audit confidence labels."""
+
+    if importance >= 0.8:
+        return "high"
+    if importance >= 0.4:
+        return "medium"
+    return "low"
+
+
+def _scope_label(
+    session_id: str | None,
+    agent_id: str | None,
+    turn_id: str | None,
+) -> str:
+    """Return the memory hierarchy label for provenance metadata."""
+
+    if turn_id is not None:
+        return "turn"
+    if agent_id is not None:
+        return "agent"
+    if session_id is not None:
+        return "session"
+    return "user"
+
+
+def _enrich_memory_metadata(
+    metadata: dict[str, Any] | None,
+    *,
+    content: str,
+    importance: float,
+    user_id: str,
+    session_id: str | None,
+    agent_id: str | None,
+    turn_id: str | None,
+) -> dict[str, Any]:
+    """Attach provenance fields needed for audit/export workflows."""
+
+    enriched = dict(metadata or {})
+    scope = _scope_label(session_id, agent_id, turn_id)
+    enriched.setdefault("source_text", content)
+    enriched.setdefault("source_excerpt", content[:1000])
+    enriched.setdefault("confidence", _confidence_from_importance(importance))
+    enriched.setdefault(
+        "promotion_rationale",
+        "Saved through Headroom memory with user/agent-selected importance.",
+    )
+    enriched.setdefault("promoted_at_utc", datetime.now(timezone.utc).isoformat())
+    enriched.setdefault("scope", scope)
+    enriched.setdefault(
+        "scope_details",
+        {
+            "user_id": user_id,
+            "session_id": session_id,
+            "agent_id": agent_id,
+            "turn_id": turn_id,
+        },
+    )
+    return enriched
 
 
 @dataclass
@@ -266,8 +328,18 @@ class LocalBackend:
                     }
                 )
 
-        # Prepare base metadata
-        base_metadata = metadata or {}
+        # Prepare base metadata with audit/export provenance. The caller can
+        # override any field when it has a richer source chunk or rationale.
+        provided_metadata = metadata or {}
+        base_metadata = _enrich_memory_metadata(
+            provided_metadata,
+            content=content,
+            importance=importance,
+            user_id=user_id,
+            session_id=session_id,
+            agent_id=agent_id,
+            turn_id=turn_id,
+        )
         if has_pre_extraction:
             base_metadata["_pre_extracted"] = True
             if facts:
@@ -280,6 +352,8 @@ class LocalBackend:
             # Store each fact as a separate memory (like DirectMem0Adapter)
             for i, fact in enumerate(facts):
                 fact_metadata = {**base_metadata, "_fact_index": i}
+                if "source_excerpt" not in provided_metadata and "excerpt" not in provided_metadata:
+                    fact_metadata["source_excerpt"] = fact[:1000]
                 memory = await self._hierarchical_memory.add(
                     content=fact,
                     user_id=user_id,
@@ -311,6 +385,12 @@ class LocalBackend:
         # Add entities to graph
         if all_entity_names:
             entity_id_map: dict[str, str] = {}
+            graph_metadata = {
+                "source_memory_id": primary_memory.id,
+                "confidence": primary_memory.metadata.get("confidence", "medium"),
+                "source_excerpt": primary_memory.metadata.get("source_excerpt", ""),
+                "promotion_rationale": primary_memory.metadata.get("promotion_rationale", ""),
+            }
 
             for entity_name in all_entity_names:
                 # Check if entity already exists
@@ -325,7 +405,7 @@ class LocalBackend:
                         user_id=user_id,
                         name=entity_name,
                         entity_type=entity_type,
-                        metadata={"source_memory_id": primary_memory.id},
+                        metadata=dict(graph_metadata),
                     )
                     await self._graph.add_entity(entity)
                     entity_id_map[entity_name.lower()] = entity.id
@@ -347,7 +427,7 @@ class LocalBackend:
                             source_id=source_id,
                             target_id=target_id,
                             relation_type=rel_type,
-                            metadata={"source_memory_id": primary_memory.id},
+                            metadata=dict(graph_metadata),
                         )
                         await self._graph.add_relationship(relationship)
 

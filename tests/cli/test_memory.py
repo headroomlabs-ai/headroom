@@ -13,6 +13,7 @@ from click.testing import CliRunner
 
 from headroom.cli.main import main
 from headroom.memory.adapters.sqlite import SQLiteMemoryStore
+from headroom.memory.backends.local import _enrich_memory_metadata
 from headroom.memory.models import Memory
 
 
@@ -391,6 +392,73 @@ class TestMemoryExportImport:
             data = json.load(f)
         assert len(data) == 6
 
+    def test_export_knowledge_worker_scoped_to_session(
+        self, runner: CliRunner, populated_db: str
+    ) -> None:
+        """Knowledge-worker export emits provenance graph JSON for a session."""
+        result = runner.invoke(
+            main,
+            [
+                "memory",
+                "export",
+                "--db-path",
+                populated_db,
+                "--format",
+                "knowledge-worker",
+                "--scope",
+                "session",
+                "--session",
+                "session-123",
+            ],
+        )
+
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["_meta"]["schema_version"] == "headroom-knowledge-worker/v1"
+        assert data["_meta"]["memory_count"] == 5
+        assert any(node["type"] == "source" for node in data["nodes"].values())
+        assert any(edge["type"] == "MENTIONED_IN" for edge in data["edges"])
+        rendered = json.dumps(data)
+        assert "Working on authentication feature" in rendered
+        assert "User prefers TypeScript over JavaScript" not in rendered
+
+    def test_export_context_format(self, runner: CliRunner, populated_db: str) -> None:
+        """Context export emits a compact Markdown handoff."""
+        result = runner.invoke(
+            main,
+            [
+                "memory",
+                "export",
+                "--db-path",
+                populated_db,
+                "--format",
+                "context",
+                "--scope",
+                "session",
+                "--session",
+                "session-123",
+            ],
+        )
+
+        assert result.exit_code == 0
+        assert "# Headroom Memory Context" in result.output
+        assert "Working on authentication feature" in result.output
+
+    def test_memory_audit_outputs_weak_claim_queue(
+        self, runner: CliRunner, populated_db: str
+    ) -> None:
+        """Audit output includes provenance coverage and a review queue."""
+        result = runner.invoke(
+            main,
+            ["memory", "audit", "--db-path", populated_db, "--scope", "global"],
+        )
+
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["schema_version"] == "headroom-memory-audit/v1"
+        assert data["provenance_coverage"]["node_coverage"] == 1.0
+        assert data["ranked"]["weak_claim_queue"]
+
     def test_import_from_file(self, runner: CliRunner, temp_db: str, tmp_path: Path) -> None:
         """Import memories from file."""
         # Create import file
@@ -470,3 +538,49 @@ class TestMemoryHelp:
         assert "--limit" in result.output
         assert "--scope" in result.output
         assert "--since" in result.output
+
+
+class TestMemoryProvenanceMetadata:
+    """Tests for save-time provenance enrichment."""
+
+    def test_enrich_memory_metadata_adds_audit_fields(self) -> None:
+        """Promotion metadata includes provenance, confidence, reason, and scope."""
+        metadata = _enrich_memory_metadata(
+            {"created_via": "tool_call"},
+            content="User prefers local-first memory.",
+            importance=0.9,
+            user_id="alice",
+            session_id="session-1",
+            agent_id=None,
+            turn_id=None,
+        )
+
+        assert metadata["source_text"] == "User prefers local-first memory."
+        assert metadata["source_excerpt"] == "User prefers local-first memory."
+        assert metadata["confidence"] == "high"
+        assert metadata["promotion_rationale"]
+        assert metadata["promoted_at_utc"]
+        assert metadata["scope"] == "session"
+        assert metadata["scope_details"]["session_id"] == "session-1"
+
+    def test_enrich_memory_metadata_preserves_caller_provenance(self) -> None:
+        """Caller-supplied richer provenance should not be overwritten."""
+        metadata = _enrich_memory_metadata(
+            {
+                "source_text": "Full source note",
+                "source_excerpt": "literal quote",
+                "confidence": "low",
+                "promotion_rationale": "manual review",
+            },
+            content="Derived claim",
+            importance=0.9,
+            user_id="alice",
+            session_id=None,
+            agent_id=None,
+            turn_id=None,
+        )
+
+        assert metadata["source_text"] == "Full source note"
+        assert metadata["source_excerpt"] == "literal quote"
+        assert metadata["confidence"] == "low"
+        assert metadata["promotion_rationale"] == "manual review"

@@ -199,6 +199,31 @@ class TestSQLiteGraphStoreRelationshipOperations:
         assert rels[0].properties == {"since": "2020"}
 
     @pytest.mark.asyncio
+    async def test_get_relationships_for_user(self, store_with_entities):
+        """Test listing all relationships scoped to a user."""
+        store, alice, bob, charlie = store_with_entities
+
+        rel1 = Relationship(
+            user_id="user1",
+            source_id=alice.id,
+            target_id=bob.id,
+            relation_type="knows",
+        )
+        rel2 = Relationship(
+            user_id="user1",
+            source_id=bob.id,
+            target_id=charlie.id,
+            relation_type="works_with",
+        )
+
+        await store.add_relationship(rel1)
+        await store.add_relationship(rel2)
+
+        user_relationships = await store.get_relationships_for_user("user1")
+        assert {rel.id for rel in user_relationships} == {rel1.id, rel2.id}
+        assert await store.get_relationships_for_user("missing-user") == []
+
+    @pytest.mark.asyncio
     async def test_get_relationships_by_direction(self, store_with_entities):
         """Test getting relationships by direction."""
         store, alice, bob, charlie = store_with_entities
