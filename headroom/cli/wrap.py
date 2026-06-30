@@ -56,8 +56,11 @@ from headroom.copilot_auth import (
 )
 from headroom.providers.aider import build_launch_env as _build_aider_launch_env
 from headroom.providers.claude import (
+    REMOTE_CONTROL_BASE_URL_ENV,
     TOOL_SEARCH_DEFAULT,
     TOOL_SEARCH_ENV,
+    is_custom_anthropic_base_url,
+    remote_control_gate_message,
 )
 from headroom.providers.claude import (
     proxy_base_url as _claude_proxy_base_url,
@@ -3741,6 +3744,8 @@ def claude(
             )
         else:
             click.echo(f"  ANTHROPIC_BASE_URL={proxy_url}")
+            if is_custom_anthropic_base_url(proxy_url):
+                click.echo(f"  {remote_control_gate_message(REMOTE_CONTROL_BASE_URL_ENV)}")
         if claude_args:
             click.echo(f"  Extra args: {' '.join(claude_args)}")
         _print_telemetry_notice()

@@ -26,6 +26,11 @@ from headroom.install.health import probe_json
 from headroom.install.paths import claude_settings_path, codex_config_path
 from headroom.install.state import list_manifests
 from headroom.paths import savings_path
+from headroom.providers.claude import (
+    REMOTE_CONTROL_BASE_URL_ENV,
+    is_custom_anthropic_base_url,
+    remote_control_gate_message,
+)
 
 from .main import get_version, main
 
@@ -146,6 +151,41 @@ def check_claude_routing(settings_path: Path, port: int) -> CheckResult:
             hint="wrap it: headroom wrap claude",
         )
     return _classify_routing_url(name, base_url, port, source=str(settings_path))
+
+
+def check_claude_remote_control_gate(
+    settings_path: Path, environ: Mapping[str, str]
+) -> CheckResult | None:
+    """Warn once when Claude custom-base routing hides Remote Control."""
+    name = "claude remote control"
+    settings_base_url = ""
+    if settings_path.exists():
+        try:
+            payload = json.loads(settings_path.read_text(encoding="utf-8"))
+            env_block = payload.get("env")
+            if isinstance(env_block, dict):
+                settings_base_url = str(env_block.get("ANTHROPIC_BASE_URL", "") or "")
+        except (OSError, ValueError):
+            settings_base_url = ""
+    if is_custom_anthropic_base_url(settings_base_url):
+        remote_message = remote_control_gate_message(f"{REMOTE_CONTROL_BASE_URL_ENV} from settings")
+        return CheckResult(
+            name=name,
+            status=WARN,
+            summary=remote_message,
+            hint=remote_message,
+        )
+
+    env_base_url = environ.get("ANTHROPIC_BASE_URL", "")
+    if is_custom_anthropic_base_url(env_base_url):
+        remote_message = remote_control_gate_message(f"{REMOTE_CONTROL_BASE_URL_ENV} in shell")
+        return CheckResult(
+            name=name,
+            status=WARN,
+            summary=remote_message,
+            hint=remote_message,
+        )
+    return None
 
 
 def check_codex_routing(config_path: Path, port: int) -> CheckResult:
@@ -384,6 +424,9 @@ def doctor(port: int, emit_json: bool) -> None:
         check_savings(stats, savings_path()),
         check_budget(stats),
     ]
+    remote_control_gate_check = check_claude_remote_control_gate(claude_settings_path(), os.environ)
+    if remote_control_gate_check is not None:
+        checks.append(remote_control_gate_check)
     deployments = check_deployments(list_manifests())
     if deployments is not None:
         checks.append(deployments)
