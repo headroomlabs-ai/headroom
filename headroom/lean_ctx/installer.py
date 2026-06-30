@@ -1,7 +1,19 @@
-"""Download and install lean-ctx binary from GitHub releases."""
+"""Download and install lean-ctx binary from GitHub releases.
+
+Supply-chain integrity:
+    Headroom downloads and then executes this binary, so every pinned
+    release asset is verified against a SHA-256 digest in
+    ``LEAN_CTX_ASSET_DIGESTS`` below before the archive is unpacked. A
+    mismatch aborts the install rather than running a tampered or
+    substituted artifact. When the version is overridden or a cross-target
+    asset is requested (``HEADROOM_LEAN_CTX_TARGET`` / ``LEAN_CTX_TARGET``)
+    there is no pinned digest, so the download is refused unless the
+    operator opts out via ``HEADROOM_LEAN_CTX_ALLOW_UNVERIFIED=1``.
+"""
 
 from __future__ import annotations
 
+import hashlib
 import io
 import logging
 import os
@@ -20,6 +32,65 @@ from . import LEAN_CTX_BIN_DIR, LEAN_CTX_VERSION
 logger = logging.getLogger(__name__)
 
 GITHUB_RELEASE_URL = "https://github.com/yvgude/lean-ctx/releases/download"
+
+#: SHA-256 of each pinned release asset (``LEAN_CTX_VERSION``), keyed by asset
+#: filename. The binary is downloaded and executed, so its bytes are verified
+#: against this map before extraction. Regenerate when bumping LEAN_CTX_VERSION:
+#:   gh api repos/yvgude/lean-ctx/releases/tags/$LEAN_CTX_VERSION \
+#:     --jq '.assets[]|"\(.name) \(.digest)"'
+LEAN_CTX_ASSET_DIGESTS: dict[str, str] = {
+    "lean-ctx-aarch64-apple-darwin.tar.gz": (
+        "c4db95966f80ab47aadfca296d0f95937085cf601833f0288eeec8b9f02872cd"
+    ),
+    "lean-ctx-x86_64-apple-darwin.tar.gz": (
+        "9d55d9ed24d3b3726c16eea3cc16255538f286a880531b7fa90e7fb00361e2e2"
+    ),
+    "lean-ctx-aarch64-unknown-linux-gnu.tar.gz": (
+        "72435a42bb33afc3d3cd5a62426955c6488192826a3a84d57e26f587740534d9"
+    ),
+    "lean-ctx-aarch64-unknown-linux-musl.tar.gz": (
+        "be68c45ebb19e30ae6fc4713ec56f148ef2dfa08669b2db4abe57706e625c0e8"
+    ),
+    "lean-ctx-x86_64-unknown-linux-gnu.tar.gz": (
+        "ec405e643a4c4cb3e7fdd2818801f11a6d0209cbcfe0ce085df1d62335a5053b"
+    ),
+    "lean-ctx-x86_64-unknown-linux-musl.tar.gz": (
+        "d2cb70294044a04edc32b7bb9ba2e81f826c042db4840226058d2bd4941e0034"
+    ),
+    "lean-ctx-x86_64-pc-windows-msvc.zip": (
+        "57ff7ff936228828ffc94e0803e1727c5ad03d92791283614406b7e4f66706b0"
+    ),
+}
+
+
+def _verify_asset_digest(filename: str, data: bytes, expected: str | None) -> None:
+    """Verify downloaded bytes against the pinned SHA-256 digest.
+
+    ``expected`` is the pinned digest for this asset, or ``None`` when no
+    digest is pinned (an overridden version or cross-target download). An
+    unpinned asset is refused unless ``HEADROOM_LEAN_CTX_ALLOW_UNVERIFIED``
+    is set, so unverified code is never executed by default. Raises
+    ``RuntimeError`` on a digest mismatch or an unpinned-without-opt-out.
+    """
+    if expected is None:
+        if os.environ.get("HEADROOM_LEAN_CTX_ALLOW_UNVERIFIED"):
+            logger.warning(
+                "lean-ctx asset %s has no pinned digest; installing unverified "
+                "(HEADROOM_LEAN_CTX_ALLOW_UNVERIFIED is set)",
+                filename,
+            )
+            return
+        raise RuntimeError(
+            f"no pinned SHA-256 digest for lean-ctx asset {filename!r}; refusing to install "
+            "unverified. Set HEADROOM_LEAN_CTX_ALLOW_UNVERIFIED=1 to override."
+        )
+    actual = hashlib.sha256(data).hexdigest()
+    if actual != expected:
+        raise RuntimeError(
+            f"lean-ctx asset {filename!r} failed integrity check: "
+            f"expected sha256 {expected}, got {actual}"
+        )
+    logger.debug("Verified lean-ctx asset %s (sha256 %s)", filename, actual)
 
 
 def _detect_runtime_target_triple() -> str:
@@ -87,9 +158,21 @@ def _get_download_url(version: str) -> tuple[str, str]:
     return url, ext
 
 
+def _normalize_version(version: str) -> str:
+    """Canonicalize a release version to the ``v``-prefixed tag form.
+
+    The pinned digest map is keyed to ``LEAN_CTX_VERSION`` (``vX.Y.Z``).
+    Comparing canonical forms stops a bare ``X.Y.Z`` for the current release
+    from being treated as a version override and routed through the unverified
+    path.
+    """
+    version = version.strip()
+    return version if version.startswith("v") else f"v{version}"
+
+
 def download_lean_ctx(version: str | None = None) -> Path:
     """Download lean-ctx binary from GitHub releases."""
-    version = version or LEAN_CTX_VERSION
+    version = _normalize_version(version or LEAN_CTX_VERSION)
     target = _get_target_triple()
     url, ext = _get_download_url(version)
     target_path = LEAN_CTX_BIN_DIR / _binary_name_for_target(target)
@@ -113,6 +196,11 @@ def download_lean_ctx(version: str | None = None) -> Path:
             raise
     except Exception as e:
         raise RuntimeError(f"Failed to download lean-ctx from {url}: {e}") from e
+
+    # Verify integrity before unpacking — this binary is later executed.
+    filename = f"lean-ctx-{target}.{ext}"
+    expected = LEAN_CTX_ASSET_DIGESTS.get(filename) if version == LEAN_CTX_VERSION else None
+    _verify_asset_digest(filename, data, expected)
 
     try:
         if ext == "tar.gz":

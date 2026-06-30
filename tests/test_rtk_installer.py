@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import stat
 import tarfile
@@ -48,6 +49,11 @@ def test_download_rtk_skips_verify_for_non_native_target(monkeypatch, tmp_path: 
             return archive_bytes
 
     monkeypatch.setenv("HEADROOM_RTK_TARGET", "x86_64-apple-darwin")
+    monkeypatch.setitem(
+        installer.RTK_ASSET_DIGESTS,
+        "rtk-x86_64-apple-darwin.tar.gz",
+        hashlib.sha256(archive_bytes).hexdigest(),
+    )
 
     with patch.object(installer, "RTK_BIN_DIR", tmp_path):
         with patch.object(installer, "urlopen", return_value=_Response()):
