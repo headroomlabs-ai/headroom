@@ -275,7 +275,15 @@ def start_detached_agent(profile: str) -> subprocess.Popen[str]:
         )
     else:
         kwargs["start_new_session"] = True
-    return subprocess.Popen(command, **kwargs)
+    try:
+        proc = subprocess.Popen(command, **kwargs)
+    finally:
+        # The child has inherited the log file descriptor, so the parent's
+        # copy is dead weight. Closing it (even when Popen raises) avoids
+        # leaking one fd per `headroom install start` and lets the log file
+        # be rotated. Wrapped in try/finally so a Popen failure can't leak.
+        log_file.close()
+    return proc
 
 
 def start_persistent_docker(manifest: DeploymentManifest) -> None:
