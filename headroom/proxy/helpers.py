@@ -653,6 +653,68 @@ def get_sse_event_max_bytes() -> int:
     return value
 
 
+# Well-known OpenAI-compatible upstreams, matched by host against the
+# configured ``--openai-api-url``. Used only to label the dashboard/stats
+# display provider — the internal provider key stays ``openai`` so pricing
+# and request formatting are unaffected (issue #1533).
+_OPENAI_COMPATIBLE_HOSTS: tuple[tuple[str, str], ...] = (
+    ("openrouter.ai", "OpenRouter"),
+    ("api.groq.com", "Groq"),
+    ("api.together.xyz", "Together AI"),
+    ("api.fireworks.ai", "Fireworks AI"),
+    ("api.deepseek.com", "DeepSeek"),
+    ("api.mistral.ai", "Mistral"),
+    ("api.perplexity.ai", "Perplexity"),
+    ("openai.azure.com", "Azure OpenAI"),
+    ("api.openai.com", "OpenAI"),
+)
+
+
+def classify_openai_upstream(url: str | None) -> str | None:
+    """Map a custom ``--openai-api-url`` to a well-known provider display name.
+
+    Matches the URL host against :data:`_OPENAI_COMPATIBLE_HOSTS` (exact or
+    subdomain). Returns ``None`` when no URL is set or the host is unrecognized
+    (callers then fall back to an explicit ``--provider-name`` or the raw
+    ``openai`` label).
+    """
+    if not url:
+        return None
+    from urllib.parse import urlparse
+
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except (ValueError, TypeError):
+        return None
+    if not host:
+        return None
+    for needle, name in _OPENAI_COMPATIBLE_HOSTS:
+        if host == needle or host.endswith("." + needle):
+            return name
+    return None
+
+
+def resolve_display_provider(
+    raw_provider: str | None,
+    *,
+    openai_api_url: str | None = None,
+    provider_name: str | None = None,
+) -> str:
+    """Resolve the dashboard display provider for a logged request.
+
+    Only requests whose internal provider is ``openai`` are reclassified;
+    Anthropic/Bedrock/Gemini keep their own labels. This affects the display
+    label only — pricing and request formatting still key on ``openai``.
+    Precedence: explicit ``--provider-name`` > host detection > raw provider.
+    """
+    raw = (raw_provider or "").strip()
+    if raw.lower() != "openai":
+        return raw or "unknown"
+    if provider_name:
+        return provider_name
+    return classify_openai_upstream(openai_api_url) or raw
+
+
 # Body-too-large status code (PR-A8 / P5-59). Default 413 (RFC 7231 §6.5.11).
 # Configurable via HEADROOM_PROXY_BODY_TOO_LARGE_STATUS for operators who need
 # to override (no expected production use; documentation knob).

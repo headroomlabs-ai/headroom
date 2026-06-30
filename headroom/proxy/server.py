@@ -137,6 +137,7 @@ from headroom.proxy.helpers import (
     initialize_context_tool_session_baseline,
     is_anthropic_auth,  # noqa: F401
     jitter_delay_ms,
+    resolve_display_provider,
     retry_after_ms,
 )
 from headroom.proxy.loopback_guard import is_loopback_host
@@ -283,6 +284,23 @@ def _classify_agent_from_log(entry: dict[str, Any]) -> tuple[str, str, str]:
         return key, _agent_label(key), "provider"
 
     return "unknown", _agent_label("unknown"), "unknown"
+
+
+def _remap_provider_counts(counts: dict[str, int], config: ProxyConfig) -> dict[str, int]:
+    """Relabel ``openai`` upstream counts with the configured display provider.
+
+    Display only — the stored metrics key stays ``openai`` (issue #1533).
+    Collisions (none today) are summed defensively.
+    """
+    out: dict[str, int] = {}
+    for provider, count in counts.items():
+        display = resolve_display_provider(
+            provider,
+            openai_api_url=config.openai_api_url,
+            provider_name=config.provider_name,
+        )
+        out[display] = out.get(display, 0) + int(count)
+    return out
 
 
 def _build_agent_usage_summary(
@@ -2759,7 +2777,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             {
                 "request_id": log.get("request_id"),
                 "timestamp": log.get("timestamp"),
-                "provider": log.get("provider"),
+                "provider": resolve_display_provider(
+                    log.get("provider"),
+                    openai_api_url=proxy.config.openai_api_url,
+                    provider_name=proxy.config.provider_name,
+                ),
                 "model": log.get("model"),
                 "input_tokens_original": log.get("input_tokens_original"),
                 "input_tokens_optimized": log.get("input_tokens_optimized"),
@@ -2953,7 +2975,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         recent_request_payload = _build_recent_request_payload()
         agent_usage = _build_agent_usage_summary(
             recent_request_logs,
-            requests_by_provider=dict(m.requests_by_provider),
+            requests_by_provider=_remap_provider_counts(dict(m.requests_by_provider), proxy.config),
             requests_by_model=dict(m.requests_by_model),
             global_before_tokens=proxy_total_before_compression,
             global_after_tokens=m.tokens_input_total,
@@ -3057,7 +3079,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "cached": m.requests_cached,
                 "rate_limited": m.requests_rate_limited,
                 "failed": m.requests_failed,
-                "by_provider": dict(m.requests_by_provider),
+                "by_provider": _remap_provider_counts(dict(m.requests_by_provider), proxy.config),
                 "by_model": dict(m.requests_by_model),
                 "by_stack": dict(m.requests_by_stack),
             },
@@ -3453,7 +3475,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     {
                         "request_id": log.get("request_id"),
                         "timestamp": log.get("timestamp"),
-                        "provider": log.get("provider"),
+                        "provider": resolve_display_provider(
+                            log.get("provider"),
+                            openai_api_url=proxy.config.openai_api_url,
+                            provider_name=proxy.config.provider_name,
+                        ),
                         "model": log.get("model"),
                         "input_tokens_original": log.get("input_tokens_original"),
                         "input_tokens_optimized": log.get("input_tokens_optimized"),

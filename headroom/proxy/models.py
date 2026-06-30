@@ -99,6 +99,10 @@ class ProxyConfig:
     port: int = 8787
     anthropic_api_url: str | None = None  # Custom Anthropic API URL override
     openai_api_url: str | None = None  # Custom OpenAI API URL override
+    # Display label for the OpenAI-compatible upstream (dashboard/stats only).
+    # Overrides hostname detection from ``openai_api_url``; the internal
+    # provider stays ``openai`` so pricing/format keys are unaffected.
+    provider_name: str | None = None
     gemini_api_url: str | None = None  # Custom Gemini API URL override
     cloudcode_api_url: str | None = None  # Custom Cloud Code Assist API URL override
     vertex_api_url: str | None = None  # Custom Vertex AI regional API URL override
