@@ -179,6 +179,35 @@ def _clear_pid(profile: str) -> None:
         path.unlink()
 
 
+def _pid_alive(pid: int) -> bool:
+    """Return True if ``pid`` names a live process, without killing it.
+
+    Windows-safe liveness probe. ``os.kill(pid, 0)`` is NOT a no-op on
+    Windows — for a signal other than ``CTRL_C_EVENT``/``CTRL_BREAK_EVENT``
+    CPython calls ``TerminateProcess``, so a "liveness check" against a live
+    detached proxy would actually terminate it, and against a stale PID it can
+    fail with ``WinError 87`` surfaced as ``SystemError`` (not ``OSError``),
+    crashing the caller. ``psutil.pid_exists`` checks existence without
+    signalling; the ``os.kill`` fallback (POSIX-only in practice) catches
+    ``SystemError`` too. Mirrors ``headroom.cli.wrap._pid_alive`` (#1315).
+    """
+    if pid <= 0:
+        return False
+    try:
+        import psutil  # type: ignore[import-untyped]  # optional dep, used elsewhere
+
+        return bool(psutil.pid_exists(pid))
+    except Exception:
+        pass
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True  # exists but owned by another user
+    except (ProcessLookupError, OSError, SystemError):
+        return False
+    return True
+
+
 @contextmanager
 def acquire_runtime_start_lock(profile: str) -> Iterator[bool]:
     """Try to hold the profile-local runtime start lock."""
@@ -351,8 +380,4 @@ def runtime_status(manifest: DeploymentManifest) -> str:
     pid = _read_pid(manifest.profile)
     if pid is None:
         return "stopped"
-    try:
-        os.kill(pid, 0)
-    except OSError:
-        return "stopped"
-    return "running"
+    return "running" if _pid_alive(pid) else "stopped"
