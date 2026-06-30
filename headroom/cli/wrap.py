@@ -4128,6 +4128,69 @@ def codex(
                 global_agents = _codex_home_dir() / "AGENTS.md"
                 _inject_rtk_instructions(global_agents, verbose=verbose)
 
+    # --prepare-only: only update Codex config, do NOT start proxy.
+    # MCP/memory/provider config are all config-file writes — they don't
+    # need a running proxy.  Use the raw requested port (no health check,
+    # no port fallback) since the user will run the full command later.
+    if prepare_only:
+        if not no_mcp:
+            from headroom.mcp_registry import CodexRegistrar
+
+            _setup_headroom_mcp(CodexRegistrar(), port, verbose=verbose, force=True)
+        elif verbose:
+            click.echo("  Skipping MCP retrieve tool (--no-mcp)")
+
+        from headroom.mcp_registry import CodexRegistrar
+
+        _setup_coding_compressor(
+            CodexRegistrar(),
+            serena_context="codex",
+            serena=serena,
+            no_serena=no_serena,
+            no_tokensave=no_tokensave,
+            verbose=verbose,
+            force=True,
+        )
+
+        if memory:
+            click.echo("  Setting up memory for Codex...")
+            mem_dir = Path.cwd() / ".headroom"
+            mem_dir.mkdir(parents=True, exist_ok=True)
+            db_path = str(mem_dir / "memory.db")
+            mem_user = os.environ.get("USER", os.environ.get("USERNAME", "default"))
+            _inject_memory_mcp_config(mem_user)
+            agents_md = Path.cwd() / "AGENTS.md"
+            _inject_memory_agents_md(agents_md)
+
+            # Sync Claude's memories → DB so MCP search finds them
+            try:
+                import asyncio
+
+                from headroom.memory.sync import _build_sync_backend, sync_import
+                from headroom.memory.sync_adapters.claude_code import (
+                    ClaudeCodeAdapter,
+                    get_claude_memory_dir,
+                )
+
+                claude_memory_dir = get_claude_memory_dir()
+
+                async def _import_claude_memories() -> int:
+                    backend = _build_sync_backend(db_path)
+                    await backend._ensure_initialized()
+                    adapter = ClaudeCodeAdapter(claude_memory_dir)
+                    count = await sync_import(backend, adapter, mem_user)
+                    await backend.close()
+                    return count
+
+                imported = asyncio.run(_import_claude_memories())
+                if imported:
+                    click.echo(f"  Memory: imported {imported} memories from Claude")
+            except Exception as e:
+                click.echo(f"  Warning: Claude memory import failed: {e}")
+
+        _inject_codex_provider_config(port)
+        return
+
     # Let _ensure_proxy decide the port (same contract as other wrappers).
     # We call it here so the resolved actual_port is available for
     # MCP registration, provider config, and launch-env building below.
@@ -4209,10 +4272,6 @@ def codex(
                 click.echo(f"  Memory: imported {imported} memories from Claude")
         except Exception as e:
             click.echo(f"  Warning: Claude memory import failed: {e}")
-
-    if prepare_only:
-        _inject_codex_provider_config(actual_port)
-        return
 
     codex_bin = shutil.which("codex")
     if not codex_bin:
