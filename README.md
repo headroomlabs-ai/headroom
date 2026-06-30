@@ -91,11 +91,16 @@ pip install "headroom-ai[all]"          # Python
 npm install headroom-ai                 # Node / TypeScript
 
 # 2 — Pick your mode
-headroom wrap claude                    # wrap a coding agent
+headroom wrap claude                    # wrap a coding agent - stored in agent config
 headroom proxy --port 8787              # drop-in proxy, zero code changes
 # or: from headroom import compress      # inline library
 
-# 3 — Verify setup and see the savings
+# 3 - Install compress server to start on every boot
+# (otherwise after system restart coding agent will still
+# be wrapped, but there will be no visible savings)
+headroom install apply
+
+# 4 — Verify setup and see the savings
 headroom doctor                         # health check — confirms routing is working
 headroom perf
 headroom dashboard                      # live savings dashboard (proxy must be running)
