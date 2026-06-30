@@ -999,11 +999,18 @@ class AnthropicHandlerMixin:
             )
             _image_decision.apply_to_tags(tags)
             if _image_decision.should_compress and not is_cache_mode(self.config.mode):
+                from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS
+
                 compressor = None
                 try:
                     compressor = _get_image_compressor()
                     if compressor and compressor.has_images(messages):
-                        messages = compressor.compress(messages, provider="anthropic")
+                        # Offload CPU-bound image compression onto the bounded
+                        # executor (same as text compression); inline blocked the loop.
+                        messages = await self._run_compression_in_executor(
+                            lambda: compressor.compress(messages, provider="anthropic"),
+                            timeout=COMPRESSION_TIMEOUT_SECONDS,
+                        )
                         body_mutation_tracker.mark_mutated("image_compression")
                         if compressor.last_result:
                             logger.info(
@@ -1012,6 +1019,10 @@ class AnthropicHandlerMixin:
                                 f"{compressor.last_result.original_tokens} -> "
                                 f"{compressor.last_result.compressed_tokens} tokens)"
                             )
+                except Exception as e:
+                    # Image compression is best-effort — fail open on timeout/error and
+                    # forward the original messages, matching the text path.
+                    logger.warning(f"Image compression failed: {type(e).__name__}: {e}")
                 finally:
                     if compressor and hasattr(compressor, "close"):
                         compressor.close()

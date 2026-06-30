@@ -1731,7 +1731,12 @@ class OpenAIHandlerMixin:
             try:
                 compressor = _get_image_compressor()
                 if compressor and compressor.has_images(messages):
-                    messages = compressor.compress(messages, provider="openai")
+                    # Offload CPU-bound image compression onto the bounded
+                    # executor (same as text compression); inline blocked the loop.
+                    messages = await self._run_compression_in_executor(
+                        lambda: compressor.compress(messages, provider="openai"),
+                        timeout=COMPRESSION_TIMEOUT_SECONDS,
+                    )
                     if compressor.last_result:
                         logger.info(
                             f"[{request_id}] Image: {compressor.last_result.technique.value} "
@@ -1739,6 +1744,10 @@ class OpenAIHandlerMixin:
                             f"{compressor.last_result.original_tokens} → "
                             f"{compressor.last_result.compressed_tokens} tokens)"
                         )
+            except Exception as e:
+                # Image compression is best-effort — fail open on timeout/error and
+                # forward the original messages, matching the text path.
+                logger.warning(f"[{request_id}] Image compression failed: {type(e).__name__}: {e}")
             finally:
                 if compressor and hasattr(compressor, "close"):
                     compressor.close()
