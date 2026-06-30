@@ -275,9 +275,10 @@ def start_detached_agent(profile: str) -> subprocess.Popen[str]:
         )
     else:
         kwargs["start_new_session"] = True
-    proc = subprocess.Popen(command, **kwargs)
-    log_file.close()
-    return proc
+    try:
+        return subprocess.Popen(command, **kwargs)
+    finally:
+        log_file.close()
 
 
 def start_persistent_docker(manifest: DeploymentManifest) -> None:

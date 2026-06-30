@@ -6,6 +6,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from headroom.install.models import DeploymentManifest, InstallPreset
 from headroom.install.runtime import (
     _clear_pid,
@@ -598,3 +600,39 @@ def test_runtime_status_catches_system_error_on_windows(monkeypatch, tmp_path: P
         backend="anthropic",
     )
     assert runtime_status(python_manifest) == "stopped"
+
+
+# ---------------------------------------------------------------------------
+# Tests for start_detached_agent fd-leak on Popen failure
+# ---------------------------------------------------------------------------
+
+
+def test_start_detached_agent_closes_log_file_on_popen_failure(monkeypatch, tmp_path: Path) -> None:
+    """If Popen raises, the log fd must still be closed (no fd leak)."""
+    log_file = tmp_path / "agent.log"
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    opened_files: list = []
+
+    real_open = open
+
+    def tracking_open(path, *args, **kwargs):
+        f = real_open(path, *args, **kwargs)
+        if str(path) == str(log_file):
+            opened_files.append(f)
+        return f
+
+    monkeypatch.setattr("builtins.open", tracking_open)
+    monkeypatch.setattr("headroom.install.runtime.log_path", lambda profile: log_file)
+    monkeypatch.setattr(
+        "headroom.install.runtime.resolve_headroom_command", lambda: ["headroom"]
+    )
+    monkeypatch.setattr(
+        "headroom.install.runtime.subprocess.Popen",
+        lambda *a, **kw: (_ for _ in ()).throw(OSError("boom")),
+    )
+
+    with pytest.raises(OSError, match="boom"):
+        start_detached_agent("demo")
+
+    assert len(opened_files) == 1
+    assert opened_files[0].closed
