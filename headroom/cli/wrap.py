@@ -462,39 +462,39 @@ def _start_proxy(
         if openai_api_url:
             proxy_env["GITHUB_COPILOT_API_URL"] = openai_api_url
 
-    proc = subprocess.Popen(
-        cmd,
-        stdout=stdio_log_file,
-        stderr=stdio_log_file,
-        env=proxy_env,
-        start_new_session=os.name == "posix",
-    )
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=stdio_log_file,
+            stderr=stdio_log_file,
+            env=proxy_env,
+            start_new_session=os.name == "posix",
+        )
 
-    # Wait for proxy to be ready.
-    # ML components (Kompress, Magika, Tree-sitter) load synchronously before
-    # uvicorn binds the port. On slower machines this can take 20-30 seconds.
-    for _i in range(timeout_seconds):
-        time.sleep(1)
-        if _check_proxy(port):
-            click.echo(f"  Logs: {log_path}")
-            stdio_log_file.close()
-            return proc
-        # Check if process died
-        if proc.poll() is not None:
-            stdio_log_file.close()
-            # Read last few lines of log for error context
-            try:
-                tail = _read_text(stdio_log_path)[-500:]
-            except Exception:
-                tail = "(no log output)"
-            raise RuntimeError(f"Proxy exited with code {proc.returncode}: {tail}")
+        # Wait for proxy to be ready.
+        # ML components (Kompress, Magika, Tree-sitter) load synchronously before
+        # uvicorn binds the port. On slower machines this can take 20-30 seconds.
+        for _i in range(timeout_seconds):
+            time.sleep(1)
+            if _check_proxy(port):
+                click.echo(f"  Logs: {log_path}")
+                return proc
+            # Check if process died
+            if proc.poll() is not None:
+                # Read last few lines of log for error context
+                try:
+                    tail = _read_text(stdio_log_path)[-500:]
+                except Exception:
+                    tail = "(no log output)"
+                raise RuntimeError(f"Proxy exited with code {proc.returncode}: {tail}")
 
-    proc.kill()
-    stdio_log_file.close()
-    raise RuntimeError(
-        f"Proxy failed to start on port {port} within {timeout_seconds} seconds. "
-        f"Set {_WRAP_PROXY_TIMEOUT_ENV} to a larger number of seconds for slow startup."
-    )
+        proc.kill()
+        raise RuntimeError(
+            f"Proxy failed to start on port {port} within {timeout_seconds} seconds. "
+            f"Set {_WRAP_PROXY_TIMEOUT_ENV} to a larger number of seconds for slow startup."
+        )
+    finally:
+        stdio_log_file.close()
 
 
 def _setup_rtk(verbose: bool = False) -> Path | None:
