@@ -502,40 +502,43 @@ def _start_proxy(
         "start_new_session": os.name == "posix",
         "creationflags": creationflags,
     }
+    # Close the parent's copy of the stdio log handle on every exit path,
+    # including when BOTH spawn attempts raise. The child keeps its own
+    # inherited duplicate, so closing here never starves the proxy's logging.
     try:
-        proc = subprocess.Popen(cmd, **popen_kwargs)
-    except OSError:
-        # The launcher's Job object forbids breakaway. Retry without that flag;
-        # CREATE_NO_WINDOW still spares the proxy from console-close events.
-        if sys.platform == "win32":
-            popen_kwargs["creationflags"] = creationflags & ~_CREATE_BREAKAWAY_FROM_JOB
-        proc = subprocess.Popen(cmd, **popen_kwargs)
+        try:
+            proc = subprocess.Popen(cmd, **popen_kwargs)
+        except OSError:
+            # The launcher's Job object forbids breakaway. Retry without that flag;
+            # CREATE_NO_WINDOW still spares the proxy from console-close events.
+            if sys.platform == "win32":
+                popen_kwargs["creationflags"] = creationflags & ~_CREATE_BREAKAWAY_FROM_JOB
+            proc = subprocess.Popen(cmd, **popen_kwargs)
 
-    # Wait for proxy to be ready.
-    # ML components (Kompress, Magika, Tree-sitter) load synchronously before
-    # uvicorn binds the port. On slower machines this can take 20-30 seconds.
-    for _i in range(timeout_seconds):
-        time.sleep(1)
-        if _check_proxy(port):
-            click.echo(f"  Logs: {log_path}")
-            stdio_log_file.close()
-            return proc
-        # Check if process died
-        if proc.poll() is not None:
-            stdio_log_file.close()
-            # Read last few lines of log for error context
-            try:
-                tail = _read_text(stdio_log_path)[-500:]
-            except Exception:
-                tail = "(no log output)"
-            raise RuntimeError(f"Proxy exited with code {proc.returncode}: {tail}")
+        # Wait for proxy to be ready.
+        # ML components (Kompress, Magika, Tree-sitter) load synchronously before
+        # uvicorn binds the port. On slower machines this can take 20-30 seconds.
+        for _i in range(timeout_seconds):
+            time.sleep(1)
+            if _check_proxy(port):
+                click.echo(f"  Logs: {log_path}")
+                return proc
+            # Check if process died
+            if proc.poll() is not None:
+                # Read last few lines of log for error context
+                try:
+                    tail = _read_text(stdio_log_path)[-500:]
+                except Exception:
+                    tail = "(no log output)"
+                raise RuntimeError(f"Proxy exited with code {proc.returncode}: {tail}")
 
-    proc.kill()
-    stdio_log_file.close()
-    raise RuntimeError(
-        f"Proxy failed to start on port {port} within {timeout_seconds} seconds. "
-        f"Set {_WRAP_PROXY_TIMEOUT_ENV} to a larger number of seconds for slow startup."
-    )
+        proc.kill()
+        raise RuntimeError(
+            f"Proxy failed to start on port {port} within {timeout_seconds} seconds. "
+            f"Set {_WRAP_PROXY_TIMEOUT_ENV} to a larger number of seconds for slow startup."
+        )
+    finally:
+        stdio_log_file.close()
 
 
 def _setup_rtk(verbose: bool = False) -> Path | None:
