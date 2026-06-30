@@ -23,7 +23,9 @@ def client(monkeypatch):
         cost_tracking_enabled=False,
     )
     app = create_app(config)
-    with TestClient(app) as test_client:
+    # Loopback client/Host: /health serves the `config` block only to loopback
+    # callers (network callers get the /readyz-shape body, no config).
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)) as test_client:
         yield test_client
 
 
@@ -105,7 +107,7 @@ def test_health_reports_agent_savings_config():
     )
     app = create_app(config)
 
-    with TestClient(app) as client:
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)) as client:
         response = client.get("/health")
 
     assert response.status_code == 200

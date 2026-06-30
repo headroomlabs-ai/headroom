@@ -287,9 +287,50 @@ def build_prefix_cache_stats(
         ],
     }
 
+    # Cache-miss attribution (#1313): why turns that expected a prompt-cache
+    # hit missed instead. Per-provider reason buckets plus an aggregate total,
+    # so the dashboard can show "of N expected-cache misses, X were TTL lapses
+    # vs Y prefix changes" — the signal a user needs to decide 5m vs 1h TTL.
+    _miss_by_provider: dict[str, dict[str, int]] = {}
+    # Holds integer counts AND float percentages (ttl_expiry_pct etc.), so the
+    # value type is float — ints coerce cleanly and the counts stay whole.
+    _miss_totals: dict[str, float] = {
+        "ttl_expiry": 0,
+        "prefix_change": 0,
+        "unknown": 0,
+        "total": 0,
+    }
+    for _provider, _reasons in metrics.cache_miss_attribution_by_provider.items():
+        provider_reasons = {reason: int(count) for reason, count in _reasons.items()}
+        provider_total = sum(provider_reasons.values())
+        if provider_total == 0:
+            continue
+        provider_reasons["total"] = provider_total
+        _miss_by_provider[_provider] = provider_reasons
+        for reason, count in provider_reasons.items():
+            if reason == "total":
+                continue
+            _miss_totals[reason] = _miss_totals.get(reason, 0) + count
+        _miss_totals["total"] += provider_total
+
+    # Share of misses attributable to TTL lapse vs prefix change — the headline
+    # the dashboard renders. Computed against attributed (non-unknown) misses
+    # so an "unknown" bucket doesn't dilute the actionable split.
+    _attributed = _miss_totals["ttl_expiry"] + _miss_totals["prefix_change"]
+    _miss_totals["ttl_expiry_pct"] = (
+        round(_miss_totals["ttl_expiry"] / _attributed * 100, 1) if _attributed > 0 else 0.0
+    )
+    _miss_totals["prefix_change_pct"] = (
+        round(_miss_totals["prefix_change"] / _attributed * 100, 1) if _attributed > 0 else 0.0
+    )
+
     return {
         "by_provider": by_provider,
         "totals": totals,
+        "miss_attribution": {
+            "totals": _miss_totals,
+            "by_provider": _miss_by_provider,
+        },
         "prefix_freeze": {
             "busts_avoided": metrics.prefix_freeze_busts_avoided,
             "tokens_preserved": metrics.prefix_freeze_tokens_preserved,
@@ -556,7 +597,10 @@ class CostTracker:
     """
 
     MAX_COST_ENTRIES = 100_000
-    COST_RETENTION_HOURS = 24
+    # Used by _prune_old_costs(), called from record_tokens() on every request.
+    # Must be >= the longest budget_period (monthly = up to 31 days), otherwise
+    # get_period_cost() undercounts and check_budget() silently under-enforces.
+    COST_RETENTION_HOURS = 744  # 31 days
 
     def __init__(self, budget_limit_usd: float | None = None, budget_period: str = "daily"):
         self.budget_limit_usd = budget_limit_usd
@@ -667,8 +711,9 @@ class CostTracker:
         cache_write_5m_tokens: int = 0,
         cache_write_1h_tokens: int = 0,
         uncached_tokens: int = 0,
+        output_tokens: int = 0,
     ):
-        """Record token counts per model.
+        """Record token counts per model and accumulate request cost for budget enforcement.
 
         Args:
             model: Model name.
@@ -677,6 +722,7 @@ class CostTracker:
             cache_read_tokens: Cache read tokens from API response usage.
             cache_write_tokens: Cache write tokens from API response usage.
             uncached_tokens: Non-cached input tokens from API response usage.
+            output_tokens: Output tokens from API response usage.
         """
         self._tokens_saved_by_model[model] = (
             self._tokens_saved_by_model.get(model, 0) + tokens_saved
@@ -698,6 +744,24 @@ class CostTracker:
         self._api_uncached_by_model[model] = (
             self._api_uncached_by_model.get(model, 0) + uncached_tokens
         )
+
+        # Populate _costs so check_budget() has real data to enforce against.
+        # When the call site had no API usage breakdown (all cache/uncached
+        # fields are 0), fall back to tokens_sent so input cost isn't
+        # silently dropped from the budget.
+        input_tokens = uncached_tokens
+        if not (uncached_tokens or cache_read_tokens or cache_write_tokens):
+            input_tokens = tokens_sent
+        cost = self.estimate_cost(
+            model=model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_read_tokens=cache_read_tokens,
+            cache_write_tokens=cache_write_tokens,
+        )
+        if cost is not None:
+            self._costs.append((datetime.now(), cost))
+            self._prune_old_costs()
 
     def get_period_cost(self) -> float:
         """Get cost for current budget period."""
@@ -830,4 +894,8 @@ class CostTracker:
             "per_model": per_model,
             "cost_with_headroom_usd": round(cost_with_headroom, 4),
             "savings_usd": round(savings_usd, 4),
+            # Budget config passthrough — surfaces in /stats["cost"] so
+            # `headroom doctor` can report whether a budget is set.
+            "budget_limit_usd": self.budget_limit_usd,
+            "budget_period": self.budget_period,
         }

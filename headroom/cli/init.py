@@ -16,6 +16,8 @@ from hashlib import sha1
 from pathlib import Path
 from typing import Any
 
+from headroom._subprocess import run
+
 try:
     import tomllib
 except ModuleNotFoundError:  # Python < 3.11
@@ -36,9 +38,11 @@ from headroom.install.runtime import (
     stop_runtime,
     wait_ready,
 )
-from headroom.install.state import load_manifest, save_manifest
+from headroom.install.state import ManifestError, load_manifest, save_manifest
 from headroom.install.supervisors import start_supervisor
+from headroom.providers.claude import TOOL_SEARCH_DEFAULT, TOOL_SEARCH_ENV
 from headroom.providers.codex.install import codex_uses_chatgpt_auth
+from headroom.providers.codex.threads import retag_to_headroom
 
 from .main import main
 
@@ -161,6 +165,12 @@ def _ensure_claude_hooks(path: Path, profile: str, port: int) -> None:
     payload = _json_file(path)
     env_map = dict(payload.get("env") or {}) if isinstance(payload.get("env"), dict) else {}
     env_map["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{port}"
+    # GH #746: with a custom ANTHROPIC_BASE_URL and ENABLE_TOOL_SEARCH unset,
+    # Claude Code stops deferring MCP/system tool schemas and materializes them
+    # all into its context window — overflowing it (breaks sub-agent spawns,
+    # forces constant compaction). Keep deferral on; respect a user-set value.
+    # Shares the TOOL_SEARCH_* constants with `wrap` and `install`.
+    env_map.setdefault(TOOL_SEARCH_ENV, TOOL_SEARCH_DEFAULT)
     payload["env"] = env_map
 
     hooks = dict(payload.get("hooks") or {}) if isinstance(payload.get("hooks"), dict) else {}
@@ -324,6 +334,12 @@ def _ensure_codex_provider(path: Path, port: int) -> None:
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
+    # Codex filters its history menu by the active model_provider, so existing
+    # native threads vanish once we switch to "headroom". Retag them to match the
+    # active provider so the history stays whole (#961), mirroring the install
+    # (providers.codex.install) and wrap (cli.wrap) paths. The revert direction is
+    # handled by `headroom unwrap codex`.
+    retag_to_headroom(path.parent)
 
 
 def _codex_feature_block() -> str:
@@ -504,7 +520,12 @@ def _ensure_runtime_manifest(
     memory: bool,
 ) -> str:
     profile = _runtime_profile(global_scope)
-    existing = load_manifest(profile)
+    try:
+        existing = load_manifest(profile)
+    except ManifestError as e:
+        # Recover from a corrupt manifest by overwriting it rather than crashing.
+        click.echo(f"Warning: {e}; overwriting.")
+        existing = None
     merged_targets = sorted(set(existing.targets if existing else []).union(targets))
     manifest = build_manifest(
         profile=profile,
@@ -597,12 +618,10 @@ def _marketplace_source() -> str:
 
 def _run_checked(command: list[str], *, action: str) -> None:
     logger.debug("subprocess [%s]: %s", action, _command_string(command))
-    result = subprocess.run(
+    result = run(
         command,
         capture_output=True,
         text=True,
-        encoding="utf-8",
-        errors="replace",
     )
     logger.debug(
         "subprocess [%s] exit=%s stdout=%r stderr=%r",
@@ -674,7 +693,11 @@ def _suppress_hook_output() -> Iterator[None]:
 
 
 def _ensure_profile_running(profile: str) -> None:
-    manifest = load_manifest(profile)
+    # Best-effort hook path: a corrupt manifest must not crash the session.
+    try:
+        manifest = load_manifest(profile)
+    except ManifestError:
+        return
     if manifest is None:
         return
     with _suppress_hook_output():
@@ -887,7 +910,13 @@ def _install_headroom_mcp_for_targets(*, targets: list[str], port: int) -> None:
 
 @main.group(invoke_without_command=True)
 @click.option("-g", "--global", "global_scope", is_flag=True, help="Install for the current user.")
-@click.option("--port", default=8787, type=int, show_default=True, help="Headroom proxy port.")
+@click.option(
+    "--port",
+    default=8787,
+    type=click.IntRange(1, 65535),
+    show_default=True,
+    help="Headroom proxy port.",
+)
 @click.option("--backend", default="anthropic", show_default=True, help="Proxy backend.")
 @click.option("--anyllm-provider", default=None, help="Provider for any-llm backends.")
 @click.option("--region", default=None, help="Cloud region for Bedrock / Vertex style backends.")
@@ -924,6 +953,11 @@ def init(
         memory,
         ctx.invoked_subcommand,
     )
+    if anyllm_provider and backend != "anyllm":
+        click.echo(
+            f"Warning: --anyllm-provider is ignored unless --backend anyllm "
+            f"(got --backend {backend})."
+        )
     if ctx.invoked_subcommand is not None:
         ctx.obj = {
             "global_scope": global_scope,
@@ -1027,14 +1061,22 @@ def init_hook() -> None:
 def init_hook_ensure(profile: str | None, marker: str | None) -> None:
     """Best-effort ensure used by installed agent hooks."""
     del marker
+
+    def _has_manifest(name: str) -> bool:
+        # Best-effort: a corrupt manifest must not crash the session-start hook.
+        try:
+            return load_manifest(name) is not None
+        except ManifestError:
+            return False
+
     profiles: list[str] = []
     if profile:
         profiles.append(profile)
     else:
         local_profile = _local_profile()
-        if load_manifest(local_profile) is not None:
+        if _has_manifest(local_profile):
             profiles.append(local_profile)
-        elif load_manifest(_GLOBAL_PROFILE) is not None:
+        elif _has_manifest(_GLOBAL_PROFILE):
             profiles.append(_GLOBAL_PROFILE)
     for name in profiles:
         _ensure_profile_running(name)

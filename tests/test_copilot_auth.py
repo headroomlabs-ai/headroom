@@ -250,6 +250,42 @@ def test_resolve_subscription_exchange_uses_cloud_enterprise_advertised_api(
     assert copilot_auth._token_exchange_url() == "https://api.github.com/copilot_internal/v2/token"
 
 
+def test_api_url_from_exchange_payload_rejects_non_copilot_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("GITHUB_COPILOT_API_URL", raising=False)
+    monkeypatch.delenv("GITHUB_COPILOT_ENTERPRISE_URL", raising=False)
+    monkeypatch.delenv("GITHUB_COPILOT_ENTERPRISE_DOMAIN", raising=False)
+    monkeypatch.setattr(
+        copilot_auth,
+        "_fetch_copilot_user_info",
+        lambda _token: {"endpoints": {"api": "https://api.business.githubcopilot.com"}},
+    )
+
+    resolved = copilot_auth._api_url_from_exchange_payload(
+        {"endpoints": {"api": "https://api.openai.com/v1"}},
+        oauth_token="gho-oauth",
+    )
+
+    assert resolved == "https://api.business.githubcopilot.com"
+
+
+def test_api_url_from_exchange_payload_rejects_non_copilot_host_without_user_info(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("GITHUB_COPILOT_API_URL", raising=False)
+    monkeypatch.delenv("GITHUB_COPILOT_ENTERPRISE_URL", raising=False)
+    monkeypatch.delenv("GITHUB_COPILOT_ENTERPRISE_DOMAIN", raising=False)
+    monkeypatch.setattr(copilot_auth, "_fetch_copilot_user_info", lambda _token: None)
+
+    resolved = copilot_auth._api_url_from_exchange_payload(
+        {"endpoints": {"api": "https://api.openai.com/v1"}},
+        oauth_token="gho-oauth",
+    )
+
+    assert resolved == copilot_auth.DEFAULT_API_URL
+
+
 def test_enterprise_domain_routes_token_exchange_and_user_info_together(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -446,7 +482,7 @@ def test_read_gh_cli_oauth_token_uses_hostname(monkeypatch: pytest.MonkeyPatch) 
         return CompletedProcess()
 
     monkeypatch.setenv("GITHUB_COPILOT_HOST", "example.ghe.com")
-    monkeypatch.setattr(copilot_auth.subprocess, "run", fake_run)
+    monkeypatch.setattr(copilot_auth, "run", fake_run)
 
     assert copilot_auth._read_gh_cli_oauth_token() == "gho-gh-cli"
     assert calls == [["gh", "auth", "token", "--hostname", "example.ghe.com"]]
@@ -458,7 +494,7 @@ def test_read_gh_cli_oauth_token_returns_none_when_invocation_fails(
     def fake_run(*args: object, **kwargs: object) -> None:  # noqa: ANN002, ANN003
         raise OSError("gh missing")
 
-    monkeypatch.setattr(copilot_auth.subprocess, "run", fake_run)
+    monkeypatch.setattr(copilot_auth, "run", fake_run)
 
     assert copilot_auth._read_gh_cli_oauth_token() is None
 
@@ -467,7 +503,7 @@ def test_read_gh_cli_oauth_token_returns_none_for_nonzero_exit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        copilot_auth.subprocess,
+        copilot_auth,
         "run",
         lambda *args, **kwargs: SimpleNamespace(returncode=1, stdout="ignored"),
     )
@@ -479,7 +515,7 @@ def test_read_gh_cli_oauth_token_returns_none_for_blank_stdout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        copilot_auth.subprocess,
+        copilot_auth,
         "run",
         lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=" \n"),
     )

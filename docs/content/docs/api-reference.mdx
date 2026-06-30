@@ -281,7 +281,7 @@ config = SmartCrusherConfig(
 <Tab value="Python">
 
 <TypeTable type={{
-  enabled: { type: 'bool', description: 'Enable/disable cache alignment', default: 'True' },
+  enabled: { type: 'bool', description: 'Enable/disable cache alignment (off by default)', default: 'False' },
   extract_dates: { type: 'bool', description: 'Extract date patterns from system prompt', default: 'True' },
   normalize_whitespace: { type: 'bool', description: 'Normalize whitespace for stable prefix', default: 'True' },
   stable_prefix_min_tokens: { type: 'int', description: 'Minimum prefix tokens for caching', default: '100' },
@@ -302,25 +302,9 @@ config = CacheAlignerConfig(
 </Tab>
 </Tabs>
 
-### RollingWindowConfig
+### Context management
 
-<Tabs groupId="lang" items={['TypeScript', 'Python']}>
-<Tab value="TypeScript">
-
-<TypeTable type={{
-  enabled: { type: 'boolean', description: 'Enable/disable rolling window' },
-  keepSystem: { type: 'boolean', description: 'Never drop system messages' },
-  keepLastTurns: { type: 'number', description: 'Always keep last N turns' },
-  outputBufferTokens: { type: 'number', description: 'Reserve tokens for model output' },
-}} />
-
-</Tab>
-<Tab value="Python">
-
-Context management is now automatic. Headroom handles rolling window behavior internally based on the model's context limit and the `headroom_keep_turns` / `headroom_output_buffer_tokens` per-request overrides. The `RollingWindowConfig`, `IntelligentContextConfig`, and `ScoringWeights` classes no longer exist as public API.
-
-</Tab>
-</Tabs>
+Context management is now handled automatically inside the pipeline (live-zone-only compression). Headroom never drops messages from the conversation history; it compresses only the newest content blocks (latest user message, latest tool result) and keeps the cache hot zone — system prompt, tools, and older turns — untouched. Use the `headroom_keep_turns` / `headroom_output_buffer_tokens` per-request overrides to tune behavior. The `RollingWindowConfig`, `IntelligentContextConfig`, and `ScoringWeights` classes are no longer part of Headroom.
 
 ### HeadroomConfig
 
@@ -331,10 +315,8 @@ Context management is now automatic. Headroom handles rolling window behavior in
   storeUrl: { type: 'string', description: 'Storage URL for metrics database' },
   defaultMode: { type: 'HeadroomMode', description: 'Default compression mode' },
   modelContextLimits: { type: 'Record<string, number>', description: 'Override context limits per model' },
-  toolCrusher: { type: 'ToolCrusherConfig', description: 'Tool crusher configuration' },
   smartCrusher: { type: 'SmartCrusherConfig', description: 'Smart crusher configuration' },
   cacheAligner: { type: 'CacheAlignerConfig', description: 'Cache aligner configuration' },
-  rollingWindow: { type: 'RollingWindowConfig', description: 'Rolling window configuration' },
   cacheOptimizer: { type: 'CacheOptimizerConfig', description: 'Cache optimizer configuration' },
   ccr: { type: 'CCRConfig', description: 'CCR (Compress-Cache-Retrieve) configuration' },
   prefixFreeze: { type: 'PrefixFreezeConfig', description: 'Prefix freeze configuration' },
@@ -353,7 +335,7 @@ from headroom import HeadroomConfig
 config = HeadroomConfig()
 config.smart_crusher.min_tokens_to_crush = 100
 config.cache_aligner.enabled = True
-# Note: rolling_window was removed in 0.9.x — use headroom_keep_turns per-request instead
+# Note: rolling_window has been removed — use headroom_keep_turns per-request instead
 ```
 
 </Tab>
@@ -475,7 +457,7 @@ tokens = counter.count_messages(messages)  # Accurate count via API
 ### GoogleProvider
 
 ```python
-from headroom import GoogleProvider
+from headroom.providers import GoogleProvider
 
 provider = GoogleProvider(
     enable_context_caching=True,
@@ -556,15 +538,6 @@ aligner = CacheAligner()
 result = aligner.align(messages)
 ```
 
-### RollingWindow
-
-```python
-from headroom import RollingWindow
-
-window = RollingWindow(config)
-result = window.apply(messages, max_tokens=100000)
-```
-
 ### TransformPipeline
 
 ```python
@@ -573,7 +546,6 @@ from headroom import TransformPipeline
 pipeline = TransformPipeline([
     SmartCrusher(),
     CacheAligner(),
-    RollingWindow(),
 ])
 
 result = pipeline.transform(messages)

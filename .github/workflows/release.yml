@@ -259,6 +259,19 @@ jobs:
           - os: macos-14
             target: aarch64-apple-darwin
             manylinux: ""
+          # Windows x86_64. `windows-latest` ships the MSVC toolchain and
+          # `maturin-action` provisions the Rust toolchain, so users no
+          # longer need a local Rust install to `pip install headroom-ai`
+          # on Windows (issue #1328 — sdist build was failing in sandboxed
+          # / air-gapped environments that can't reach static.rust-lang.org
+          # or crates.io). `manylinux` is meaningless on Windows (that tag
+          # is Linux-only) — leave it empty. The ONNX Runtime story is
+          # already handled: `crates/headroom-core/Cargo.toml` selects
+          # `ort-load-dynamic` under `cfg(windows)`, so the wheel does not
+          # bundle/link DirectML SDK libs and loads ORT at runtime instead.
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            manylinux: ""
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
@@ -499,6 +512,13 @@ jobs:
           # ship today (Intel macOS dropped in PR #371 — ort-sys
           # has no x86_64-apple-darwin prebuilts).
           - { runner: macos-14, image: "", python: "3.13", wheel_target: aarch64-apple-darwin, wheel_artifact: wheels-macos-14-aarch64-apple-darwin, glibc_label: "" }
+          # Windows x86_64 — runs natively on the host runner; no
+          # container. `image: ""` routes this row past the Linux docker
+          # path; a dedicated PowerShell step below installs + imports the
+          # wheel (venv layout differs: Scripts\ not bin/). This is the
+          # gate that issue #1328's win_amd64 wheel must clear before
+          # publish.
+          - { runner: windows-latest, image: "", python: "3.12", wheel_target: x86_64-pc-windows-msvc, wheel_artifact: wheels-windows-latest-x86_64-pc-windows-msvc, glibc_label: "" }
 
     steps:
       - name: Download wheels artifact for this target
@@ -506,6 +526,17 @@ jobs:
         with:
           name: ${{ matrix.wheel_artifact }}
           path: dist/
+
+      # Windows is the only host-runner row that can't rely on a
+      # preinstalled interpreter at the exact requested minor (the Linux
+      # rows install inside their container; the macOS runner ships
+      # multiple Pythons). Provision it explicitly so the requested minor
+      # is on PATH as `python` for the smoke step below.
+      - name: Set up Python (Windows host)
+        if: matrix.image == '' && runner.os == 'Windows'
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
 
       - name: Stage smoke-import script
         # The smoke script lives in a host file rather than an inline
@@ -525,6 +556,12 @@ jobs:
         #    YAML `run: |` level (uniform strip), the docker container
         #    sees it as a read-only mount, and macOS host runs the
         #    same script — no quoting drift between paths.
+        #
+        # `shell: bash` is explicit because the Windows runner defaults to
+        # pwsh, which can't run this heredoc. GitHub-hosted windows-latest
+        # ships Git Bash, and `${RUNNER_TEMP}` resolves there too — the
+        # Windows smoke step below reads the same file via `$env:RUNNER_TEMP`.
+        shell: bash
         run: |
           cat > "${RUNNER_TEMP}/smoke_import.py" <<'PY'
           import sys
@@ -640,7 +677,7 @@ jobs:
             '
 
       - name: Smoke-import wheel on macOS host
-        if: matrix.image == ''
+        if: matrix.image == '' && runner.os == 'macOS'
         env:
           PYTHON_VERSION: ${{ matrix.python }}
         run: |
@@ -677,6 +714,45 @@ jobs:
           # invoked directly on the macOS host (no docker mount needed).
           /tmp/venv/bin/python "${RUNNER_TEMP}/smoke_import.py"
 
+      - name: Smoke-import wheel on Windows host
+        if: matrix.image == '' && runner.os == 'Windows'
+        shell: pwsh
+        env:
+          PYTHON_VERSION: ${{ matrix.python }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $pyTag = "cp" + ($env:PYTHON_VERSION -replace '\.','')
+          # Windows wheels are tagged win_amd64. Prefer a version-specific
+          # cp3XY wheel; fall back to a stable-ABI (abi3) wheel whose floor
+          # is <= the interpreter minor — same selection logic as the Linux
+          # and macOS paths, just expressed in PowerShell.
+          $whl = Get-ChildItem -Path dist -Filter "headroom_ai-*-$pyTag-$pyTag-win_amd64.whl" -File |
+                 Select-Object -First 1
+          if (-not $whl) {
+            $pyMinor = [int]($env:PYTHON_VERSION -split '\.')[1]
+            $abi3 = Get-ChildItem -Path dist -Filter "headroom_ai-*-abi3-win_amd64.whl" -File |
+                    Where-Object {
+                      if ($_.Name -match '-cp3(\d+)-abi3-') { [int]$Matches[1] -le $pyMinor } else { $false }
+                    } | Select-Object -First 1
+            if ($abi3) { $whl = $abi3 }
+          }
+          if (-not $whl) {
+            Write-Error "no Windows wheel matching python=$env:PYTHON_VERSION (win_amd64)"
+            Get-ChildItem -Path dist -File | ForEach-Object { $_.Name }
+            exit 1
+          }
+          Write-Host "Installing: $($whl.FullName)"
+
+          # `actions/setup-python` (above) put the requested minor on PATH
+          # as `python`, so use it directly. The venv exposes the
+          # interpreter under Scripts\python.exe (not bin/), which is why
+          # Windows needs its own step rather than reusing the macOS path.
+          python -m venv venv
+          venv\Scripts\python.exe -m pip install --quiet --upgrade pip
+          venv\Scripts\python.exe -m pip install --quiet "$($whl.FullName)"
+          # Same staged smoke script as the other host/container paths.
+          venv\Scripts\python.exe "$env:RUNNER_TEMP\smoke_import.py"
+
   publish-pypi:
     needs: [collect-dist, smoke-import-wheels]
     # X2: skip on pull_request — dry-run only verifies build+smoke,
@@ -696,7 +772,7 @@ jobs:
 
       - name: Publish ${{ env.PYPI_PACKAGE }} to PyPI
         id: pypi-publish
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@v1.13.0
         with:
           # Idempotent re-runs: when a wheel filename for the computed
           # version is already on PyPI (e.g. a previous push to main

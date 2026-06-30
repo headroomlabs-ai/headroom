@@ -424,7 +424,11 @@ def test_ensure_claude_hooks_rewrites_existing_entries(monkeypatch, tmp_path: Pa
     init_cli._ensure_claude_hooks(settings_path, "init-local-demo", 9001)
 
     payload = json.loads(settings_path.read_text(encoding="utf-8"))
-    assert payload["env"] == {"KEEP": "1", "ANTHROPIC_BASE_URL": "http://127.0.0.1:9001"}
+    assert payload["env"] == {
+        "KEEP": "1",
+        "ANTHROPIC_BASE_URL": "http://127.0.0.1:9001",
+        "ENABLE_TOOL_SEARCH": "true",
+    }
     session_entries = payload["hooks"]["SessionStart"]
     assert session_entries[0] == "not-a-dict"
     assert session_entries[1] == {"hooks": "not-a-list"}
@@ -1398,6 +1402,48 @@ def test_init_codex_writes_openai_base_url(monkeypatch, tmp_path: Path) -> None:
     assert "requires_openai_auth" not in content, (
         f"requires_openai_auth must not appear in init codex config:\n{content}"
     )
+
+
+def test_init_codex_provider_retags_existing_threads(monkeypatch, tmp_path: Path) -> None:
+    """`headroom init` injects `model_provider = "headroom"` for Codex, which
+    Codex Desktop filters its history menu by. Without retagging, existing native
+    `openai` threads vanish from the sidebar/search (#961). `_ensure_codex_provider`
+    must retag existing threads openai->headroom so the history stays visible —
+    the same reconciliation the install and wrap paths already perform."""
+    import sqlite3
+
+    init_cli, _ = _load_init_module(monkeypatch)
+
+    codex_home = tmp_path / ".codex"
+    config_path = codex_home / "config.toml"
+    # Codex Desktop reads <codex_home>/sqlite/state_5.sqlite.
+    db = codex_home / "sqlite" / "state_5.sqlite"
+    db.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db))
+    try:
+        conn.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, model_provider TEXT NOT NULL)")
+        conn.executemany(
+            "INSERT INTO threads (id, model_provider) VALUES (?, ?)",
+            [("t1", "openai"), ("t2", "openai"), ("t3", "anthropic")],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    init_cli._ensure_codex_provider(config_path, 8787)
+
+    conn = sqlite3.connect(str(db))
+    try:
+        counts = dict(
+            conn.execute("SELECT model_provider, COUNT(*) FROM threads GROUP BY model_provider")
+        )
+    finally:
+        conn.close()
+    # Native threads now live under the active headroom provider (stay visible);
+    # third-party providers are left untouched.
+    assert counts.get("headroom") == 2, f"existing openai threads not retagged: {counts}"
+    assert counts.get("openai", 0) == 0, f"openai threads still hidden: {counts}"
+    assert counts.get("anthropic") == 1, f"third-party provider must be left alone: {counts}"
 
 
 def test_init_codex_strip_removes_openai_base_url(monkeypatch, tmp_path: Path) -> None:

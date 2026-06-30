@@ -14,7 +14,6 @@ import json
 import logging
 import os
 import random
-import subprocess
 import threading
 import time
 from collections import OrderedDict
@@ -23,8 +22,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from headroom import paths as _paths
+from headroom._subprocess import run
 
 if TYPE_CHECKING:
+    import httpx
     from fastapi import Request
 
 logger = logging.getLogger("headroom.proxy")
@@ -592,6 +593,10 @@ def append_text_to_latest_user_input_item(
 _CONTEXT_TOOL_ENV = "HEADROOM_CONTEXT_TOOL"
 _CONTEXT_TOOL_RTK = "rtk"
 _CONTEXT_TOOL_LEAN_CTX = "lean-ctx"
+_RTK_GAIN_SCOPE_ENV = "HEADROOM_RTK_GAIN_SCOPE"
+_RTK_GAIN_SCOPE_GLOBAL = "global"
+_RTK_GAIN_SCOPE_PROJECT = "project"
+_RTK_GAIN_SCOPES = {_RTK_GAIN_SCOPE_GLOBAL, _RTK_GAIN_SCOPE_PROJECT}
 
 RTK_STATS_CACHE_TTL_SECONDS = float(os.environ.get("HEADROOM_CONTEXT_TOOL_STATS_TTL_SECONDS", "60"))
 CONTEXT_TOOL_STATS_CACHE_TTL_SECONDS = RTK_STATS_CACHE_TTL_SECONDS
@@ -766,8 +771,27 @@ def parse_sse_events_from_byte_buffer(
 # Maximum message array length (prevents DoS from deeply nested payloads)
 MAX_MESSAGE_ARRAY_LENGTH = 10000
 
-# Compression pipeline timeout in seconds
-COMPRESSION_TIMEOUT_SECONDS = 30
+# Compression pipeline timeout in seconds. Override via the
+# HEADROOM_COMPRESSION_TIMEOUT_SECONDS env var for slow CPUs or long Claude Code
+# conversations (GH #946). Falls back to 30 on an unparseable value.
+try:
+    COMPRESSION_TIMEOUT_SECONDS = float(
+        os.environ.get("HEADROOM_COMPRESSION_TIMEOUT_SECONDS", "30")
+    )
+except ValueError:
+    COMPRESSION_TIMEOUT_SECONDS = 30.0
+
+# Eager startup preload timeout in seconds. The preload (compressor/parser models,
+# cache-only, allow_download=False) runs off the event loop during startup; this
+# bound only fires on a true hang or an uncatchable native stall so the proxy still
+# binds its port instead of never opening (GH #790). Override via
+# HEADROOM_EAGER_PRELOAD_TIMEOUT_SECONDS. Falls back to 120 on an unparseable value.
+try:
+    EAGER_PRELOAD_TIMEOUT_SECONDS = float(
+        os.environ.get("HEADROOM_EAGER_PRELOAD_TIMEOUT_SECONDS", "120")
+    )
+except ValueError:
+    EAGER_PRELOAD_TIMEOUT_SECONDS = 120.0
 
 # Maximum compression cache sessions (prevents unbounded memory growth)
 MAX_COMPRESSION_CACHE_SESSIONS = 500
@@ -903,6 +927,39 @@ def jitter_delay_ms(base_ms: int, max_ms: int, attempt: int) -> float:
     return capped * (0.5 + random.random())
 
 
+def retry_after_ms(response: httpx.Response, max_ms: int) -> float | None:
+    """Parse an HTTP ``Retry-After`` header into a millisecond delay, capped at ``max_ms``.
+
+    Returns the delay in ms for a numeric ``seconds`` value or an HTTP-date, or
+    ``None`` when the header is absent or unparseable so the caller falls back to
+    exponential backoff. Anthropic sends integer seconds; the HTTP-date branch
+    covers other upstreams. Fails open on any parse error.
+    """
+    value = response.headers.get("retry-after")
+    if not value:
+        return None
+    try:
+        seconds = float(value)
+    except ValueError:
+        try:
+            from datetime import datetime
+            from email.utils import parsedate_to_datetime
+
+            retry_at = parsedate_to_datetime(value)
+            seconds = (retry_at - datetime.now(retry_at.tzinfo)).total_seconds()
+        except (TypeError, ValueError):
+            return None
+    return min(max(seconds, 0.0) * 1000.0, float(max_ms))
+
+
+# Transient upstream statuses worth retrying with backoff: 429 (rate limit) and
+# 529 (Anthropic ``overloaded_error``). Both mean "the server is temporarily
+# limiting/overloaded — try again shortly", unlike other 4xx which signal a
+# problem with the request itself. Single source of truth so the streaming and
+# non-streaming forwarders agree on what is retriable.
+RETRYABLE_OVERLOAD_STATUSES: frozenset[int] = frozenset({429, 529})
+
+
 # Image compression availability (do not retain a global compressor instance)
 _image_compressor_available: bool | None = None
 
@@ -988,6 +1045,36 @@ def _context_tool_label(tool: str) -> str:
     return "RTK"
 
 
+def _context_tool_default_scope(tool: str) -> str:
+    if tool == _CONTEXT_TOOL_LEAN_CTX:
+        return "local"
+    return _RTK_GAIN_SCOPE_GLOBAL
+
+
+def _rtk_gain_scope() -> str:
+    raw = os.environ.get(_RTK_GAIN_SCOPE_ENV, "").strip().lower()
+    if not raw:
+        return _RTK_GAIN_SCOPE_GLOBAL
+    if raw in _RTK_GAIN_SCOPES:
+        return raw
+
+    logger.warning(
+        "event=rtk_gain_scope_invalid env=%s value=%r default=%s",
+        _RTK_GAIN_SCOPE_ENV,
+        raw,
+        _RTK_GAIN_SCOPE_GLOBAL,
+    )
+    return _RTK_GAIN_SCOPE_GLOBAL
+
+
+def _rtk_gain_command(rtk_path: Any, scope: str) -> list[str]:
+    command = [str(rtk_path), "gain"]
+    if scope == _RTK_GAIN_SCOPE_PROJECT:
+        command.append("--project")
+    command.extend(["--format", "json"])
+    return command
+
+
 def _coerce_int(value: Any, default: int = 0) -> int:
     try:
         return int(value or 0)
@@ -1013,6 +1100,7 @@ def _context_tool_summary_payload(
     *,
     tool: str,
     installed: bool,
+    scope: str | None = None,
     summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Normalize RTK/lean-ctx lifetime gain output into one schema.
@@ -1085,7 +1173,7 @@ def _context_tool_summary_payload(
         "tool": tool,
         "label": _context_tool_label(tool),
         "installed": installed,
-        "scope": "project" if tool == _CONTEXT_TOOL_RTK else "local",
+        "scope": scope or _context_tool_default_scope(tool),
         "total_commands": _coerce_int(
             _first_value(
                 summary,
@@ -1110,30 +1198,37 @@ def _context_tool_summary_payload(
     }
 
 
+def _context_tool_zero_payload(
+    *,
+    tool: str,
+    installed: bool,
+    scope: str | None = None,
+) -> dict[str, Any]:
+    return _context_tool_summary_payload(
+        tool=tool,
+        installed=installed,
+        scope=scope,
+        summary={},
+    )
+
+
 def _read_rtk_lifetime_stats() -> dict[str, Any] | None:
-    """Read rtk's current project-level lifetime stats."""
+    """Read rtk's lifetime stats using the configured gain scope."""
 
     from headroom.rtk import get_rtk_path
 
+    scope = _rtk_gain_scope()
     rtk_path = get_rtk_path()
     if not rtk_path:
-        return {
-            "tool": _CONTEXT_TOOL_RTK,
-            "label": _context_tool_label(_CONTEXT_TOOL_RTK),
-            "installed": False,
-            "scope": "project",
-            "total_commands": 0,
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "tokens_saved": 0,
-            "avg_savings_pct": 0.0,
-            "lifetime_avg_savings_pct": 0.0,
-            "total_time_ms": 0,
-        }
+        return _context_tool_zero_payload(
+            tool=_CONTEXT_TOOL_RTK,
+            installed=False,
+            scope=scope,
+        )
 
     try:
-        result = subprocess.run(
-            [str(rtk_path), "gain", "--project", "--format", "json"],
+        result = run(
+            _rtk_gain_command(rtk_path, scope),
             capture_output=True,
             text=True,
             timeout=5,
@@ -1144,6 +1239,7 @@ def _read_rtk_lifetime_stats() -> dict[str, Any] | None:
             payload = _context_tool_summary_payload(
                 tool=_CONTEXT_TOOL_RTK,
                 installed=True,
+                scope=scope,
                 summary=summary if isinstance(summary, dict) else {},
             )
         else:
@@ -1157,19 +1253,11 @@ def _read_rtk_lifetime_stats() -> dict[str, Any] | None:
                 result.returncode,
                 stderr_excerpt,
             )
-            return {
-                "tool": _CONTEXT_TOOL_RTK,
-                "label": _context_tool_label(_CONTEXT_TOOL_RTK),
-                "installed": True,
-                "scope": "project",
-                "total_commands": 0,
-                "input_tokens": 0,
-                "output_tokens": 0,
-                "tokens_saved": 0,
-                "avg_savings_pct": 0.0,
-                "lifetime_avg_savings_pct": 0.0,
-                "total_time_ms": 0,
-            }
+            return _context_tool_zero_payload(
+                tool=_CONTEXT_TOOL_RTK,
+                installed=True,
+                scope=scope,
+            )
     except Exception as exc:
         # PR-G2 remediation (H2): log the exception path too. Reason is the
         # exception class name (without payload — RTK exceptions can carry
@@ -1179,19 +1267,11 @@ def _read_rtk_lifetime_stats() -> dict[str, Any] | None:
             type(exc).__name__,
             exc,
         )
-        return {
-            "tool": _CONTEXT_TOOL_RTK,
-            "label": _context_tool_label(_CONTEXT_TOOL_RTK),
-            "installed": True,
-            "scope": "project",
-            "total_commands": 0,
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "tokens_saved": 0,
-            "avg_savings_pct": 0.0,
-            "lifetime_avg_savings_pct": 0.0,
-            "total_time_ms": 0,
-        }
+        return _context_tool_zero_payload(
+            tool=_CONTEXT_TOOL_RTK,
+            installed=True,
+            scope=scope,
+        )
 
     return payload
 
@@ -1203,36 +1283,12 @@ def _read_lean_ctx_lifetime_stats() -> dict[str, Any] | None:
 
     lean_ctx_path = get_lean_ctx_path()
     if not lean_ctx_path:
-        return {
-            "tool": _CONTEXT_TOOL_LEAN_CTX,
-            "label": _context_tool_label(_CONTEXT_TOOL_LEAN_CTX),
-            "installed": False,
-            "scope": "local",
-            "total_commands": 0,
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "tokens_saved": 0,
-            "avg_savings_pct": 0.0,
-            "lifetime_avg_savings_pct": 0.0,
-            "total_time_ms": 0,
-        }
+        return _context_tool_zero_payload(tool=_CONTEXT_TOOL_LEAN_CTX, installed=False)
 
-    base_payload = {
-        "tool": _CONTEXT_TOOL_LEAN_CTX,
-        "label": _context_tool_label(_CONTEXT_TOOL_LEAN_CTX),
-        "installed": True,
-        "scope": "local",
-        "total_commands": 0,
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "tokens_saved": 0,
-        "avg_savings_pct": 0.0,
-        "lifetime_avg_savings_pct": 0.0,
-        "total_time_ms": 0,
-    }
+    base_payload = _context_tool_zero_payload(tool=_CONTEXT_TOOL_LEAN_CTX, installed=True)
 
     try:
-        result = subprocess.run(
+        result = run(
             [str(lean_ctx_path), "gain", "--json"],
             capture_output=True,
             text=True,
@@ -2508,6 +2564,35 @@ def _reset_session_ccr_tracker_for_test() -> None:
     global _session_ccr_tracker
     with _session_ccr_tracker_lock:
         _session_ccr_tracker = None
+
+
+def should_inject_ccr_tool(
+    *,
+    configured_inject_tool: bool,
+    frozen_message_count: int,
+    has_compressed_content: bool,
+) -> tuple[bool, bool]:
+    """Decide whether the ``headroom_retrieve`` tool must be injected this turn.
+
+    This is the decision the Anthropic handler used to inline. It is extracted
+    so the #1006 regression can be pinned at the decision point itself.
+
+    Tool injection is normally deferred when there is a frozen message prefix
+    (``frozen_message_count > 0``) to preserve the prompt cache. But if
+    compression emitted fresh markers this turn, deferring would hand the agent
+    a ``<<ccr:hash>>`` marker with no tool to redeem it — silent data loss. In
+    that case we override the deferral and inject anyway (one cache miss is
+    cheaper than dropped content).
+
+    Returns ``(should_inject, is_marker_override)``. ``is_marker_override`` is
+    True only when injection happens *because* of new markers despite a deferral,
+    so the caller can log the override distinctly.
+    """
+    inject_tool = configured_inject_tool
+    if inject_tool and frozen_message_count > 0:
+        inject_tool = False  # defer to preserve cache
+    is_marker_override = not inject_tool and has_compressed_content
+    return (inject_tool or is_marker_override), is_marker_override
 
 
 def apply_session_sticky_ccr_tool(

@@ -12,10 +12,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
-import subprocess
 from pathlib import Path
 from typing import Any
+
+from headroom._subprocess import run
 
 from .base import MCPRegistrar, RegisterResult, RegisterStatus, ServerSpec
 
@@ -33,17 +35,20 @@ class ClaudeRegistrar(MCPRegistrar):
         *,
         claude_cli: str | None | object = ...,
         home_dir: Path | None = None,
+        config_dir: Path | None = None,
     ) -> None:
         """Allow overrides for testing.
 
         ``claude_cli`` defaults to :func:`shutil.which` lookup. Pass
         ``None`` to force the file-based fallback path. Pass an explicit
-        path to point at a specific binary.
+        path to point at a specific binary. ``CLAUDE_CONFIG_DIR`` is honored
+        for real user sessions; ``home_dir`` keeps tests isolated from the
+        caller's environment unless ``config_dir`` is passed explicitly.
         """
         home = home_dir if home_dir is not None else Path.home()
-        self._claude_dir = home / ".claude"
-        self._modern_config = home / ".claude" / ".claude.json"
-        self._legacy_config = home / ".claude" / "mcp.json"
+        self._claude_dir = _resolve_claude_config_dir(home, config_dir, honor_env=home_dir is None)
+        self._modern_config = self._claude_dir / ".claude.json"
+        self._legacy_config = self._claude_dir / "mcp.json"
         if claude_cli is ...:
             self._claude_cli = shutil.which("claude")
         else:
@@ -87,7 +92,7 @@ class ClaudeRegistrar(MCPRegistrar):
 
     def unregister_server(self, server_name: str) -> bool:
         if self._claude_cli:
-            result = subprocess.run(
+            result = run(
                 [str(self._claude_cli), "mcp", "remove", server_name, "-s", "user"],
                 capture_output=True,
                 text=True,
@@ -112,7 +117,11 @@ class ClaudeRegistrar(MCPRegistrar):
             cmd += ["-e", f"{k}={v}"]
         cmd += ["--", spec.command, *spec.args]
 
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = run(
+            cmd,
+            capture_output=True,
+            text=True,
+        )
         if result.returncode == 0:
             return RegisterResult(RegisterStatus.REGISTERED, "via `claude mcp add` (scope: user)")
         # CLI failed — try the file fallback rather than giving up.
@@ -184,12 +193,27 @@ class ClaudeRegistrar(MCPRegistrar):
 # ----------------------------------------------------------------------
 
 
+def _resolve_claude_config_dir(
+    home: Path,
+    config_dir: Path | None,
+    *,
+    honor_env: bool,
+) -> Path:
+    if config_dir is not None:
+        return config_dir
+    if honor_env:
+        env_dir = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
+        if env_dir:
+            return Path(env_dir).expanduser()
+    return home / ".claude"
+
+
 def _read_json(path: Path) -> dict[str, Any]:
     """Read a JSON file, returning empty dict if absent or unparseable."""
     if not path.exists():
         return {}
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             data = json.load(f)
     except (OSError, json.JSONDecodeError):
         return {}
@@ -200,7 +224,7 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 def _write_json(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
         f.write("\n")
 

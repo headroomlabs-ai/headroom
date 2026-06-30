@@ -333,6 +333,18 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     from headroom.proxy.models import RequestLog
     from headroom.proxy.project_context import get_current_project
 
+    # Output-shaping savings ledger (counterfactual estimator). The shaper
+    # tags each request's (arm, stratum) onto ``transforms_applied``; feed the
+    # observed output tokens to the recorder so it can produce an honest
+    # reduction estimate. Best-effort: never let bookkeeping break a response.
+    if any(str(t).startswith("output_shaper:") for t in outcome.transforms_applied):
+        try:
+            from headroom.proxy.output_savings import get_recorder
+
+            get_recorder().record_from_labels(outcome.transforms_applied, outcome.output_tokens)
+        except Exception:  # pragma: no cover - defensive
+            pass
+
     # Project attribution: explicit outcome field wins, else the value the
     # HTTP middleware / WS accept captured from ``X-Headroom-Project``.
     project = outcome.project or get_current_project()
@@ -357,6 +369,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         uncached_input_tokens=outcome.uncached_input_tokens,
         attempted_input_tokens=outcome.attempted_input_tokens,
         project=project,
+        client=outcome.client,
     )
 
     # 2. Cost tracker (optional).
@@ -371,6 +384,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
             cache_write_5m_tokens=outcome.cache_write_5m_tokens,
             cache_write_1h_tokens=outcome.cache_write_1h_tokens,
             uncached_tokens=outcome.uncached_input_tokens,
+            output_tokens=outcome.output_tokens,
         )
 
     # 3. Per-request log (optional). The ``client`` outcome field is
@@ -421,6 +435,9 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         f"cache_read={outcome.cache_read_tokens} cache_write={outcome.cache_write_tokens} "
         f"cache_hit_pct={outcome.cache_hit_pct} "
         f"opt_ms={outcome.overhead_ms:.0f} "
+        f"total_ms={outcome.total_latency_ms:.0f} "
+        f"tok_out={outcome.output_tokens} "
+        f"ttfb_ms={outcome.ttfb_ms:.0f} "
         f"transforms={_summarize_transforms(list(outcome.transforms_applied))}"
         f"{client_part}"
     )

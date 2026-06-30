@@ -26,7 +26,8 @@ def client():
         cost_tracking_enabled=False,
     )
     app = create_app(config)
-    with TestClient(app) as c:
+    # /v1/compress is loopback-gated (#1227).
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)) as c:
         yield c
 
 
@@ -40,7 +41,8 @@ def client_no_optimize():
         cost_tracking_enabled=False,
     )
     app = create_app(config)
-    with TestClient(app) as c:
+    # /v1/compress is loopback-gated (#1227).
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)) as c:
         yield c
 
 
@@ -248,3 +250,75 @@ class TestCompressEndpointCompression:
         assert data["tokens_before"] >= 0
         assert data["tokens_after"] >= 0
         assert isinstance(data["transforms_applied"], list)
+
+
+class TestCompressEndpointDoesNotBlockLoop:
+    """/v1/compress must offload to the compression executor so a slow/large
+    payload cannot freeze the single event loop (#718)."""
+
+    async def test_compress_does_not_block_liveness(self, monkeypatch):
+        import asyncio
+        import threading
+        from types import SimpleNamespace
+
+        import httpx
+
+        config = ProxyConfig(
+            optimize=True,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+        )
+        app = create_app(config)
+        proxy = app.state.proxy
+
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocking_apply(**kwargs):
+            # Stand in for a large CPU-bound compression: blocks its worker until
+            # released. If this ran inline on the loop (the bug), the loop would
+            # be frozen and /livez below could not be served.
+            entered.set()
+            release.wait(timeout=10)
+            return SimpleNamespace(
+                messages=kwargs["messages"],
+                tokens_before=10,
+                tokens_after=5,
+                transforms_applied=[],
+                transforms_summary={},
+                markers_inserted=[],
+            )
+
+        monkeypatch.setattr(proxy.openai_pipeline, "apply", blocking_apply)
+
+        # /v1/compress is loopback-gated (#1227) — present as 127.0.0.1.
+        transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 12345))
+        async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as client:
+            compress = asyncio.create_task(
+                client.post(
+                    "/v1/compress",
+                    json={
+                        "messages": [{"role": "user", "content": "hello world"}],
+                        "model": "gpt-4",
+                    },
+                )
+            )
+            # Wait until the compression is actually in flight (running in the
+            # executor thread), then prove the loop is still responsive.
+            for _ in range(200):
+                if entered.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            assert entered.is_set(), "compression never started"
+
+            livez = await asyncio.wait_for(client.get("/livez"), timeout=5)
+            assert livez.status_code == 200
+            assert livez.json()["alive"] is True
+            # The compression is still blocked — /livez was served concurrently.
+            assert not compress.done()
+
+            release.set()
+            resp = await asyncio.wait_for(compress, timeout=5)
+            assert resp.status_code == 200
+            assert resp.json()["tokens_saved"] == 5

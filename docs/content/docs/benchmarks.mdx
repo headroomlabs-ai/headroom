@@ -103,11 +103,11 @@ Compression pays for itself in latency for 11 of 12 tested scenarios against Cla
 | `text_compressor` | 32.0ms | 576ms | Text compression (Kompress ONNX) |
 | `initial_token_count` | 2.9ms | 16ms | Token counting (tiktoken) |
 
-ContentRouter accounts for 91--98% of pipeline cost on average. CacheAligner and RollingWindow are sub-millisecond.
+ContentRouter accounts for 91--98% of pipeline cost on average. CacheAligner is sub-millisecond.
 
 ## Production Telemetry
 
-Real-world data from **50,000+ proxy sessions** across 250+ unique instances (March--April 2026). Collected via anonymous telemetry (opt-out: `HEADROOM_TELEMETRY=off`).
+Real-world data from **50,000+ proxy sessions** across 250+ unique instances (March--April 2026). Collected via anonymous telemetry (opt-in: `HEADROOM_TELEMETRY=on`; telemetry is off by default).
 
 ### Proxy Overhead
 

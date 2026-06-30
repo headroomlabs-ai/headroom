@@ -13,9 +13,18 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, cast
 
+from headroom._subprocess import run
+
 from .health import probe_ready
 from .models import DeploymentManifest, InstallPreset, RuntimeKind
 from .paths import log_path, pid_path, profile_root
+
+# Inside the container the proxy must listen on every interface so the
+# host-side published port (127.0.0.1:<port>) can reach it.
+CONTAINER_BIND_HOST = "0.0.0.0"  # noqa: S104 — container-internal bind, published only on 127.0.0.1
+# proxy_args always starts with the host flag/value pair (see planner.py); we
+# drop it and substitute CONTAINER_BIND_HOST for the in-container bind.
+_PROXY_ARGS_HOST_PAIR_LEN = 2
 
 PASSTHROUGH_ENV_PREFIXES = (
     "HEADROOM_",
@@ -36,7 +45,6 @@ PASSTHROUGH_ENV_PREFIXES = (
     "OLLAMA_",
     "LITELLM_",
     "OTEL_",
-    "SUPABASE_",
     "QDRANT_",
     "NEO4J_",
     "LANGSMITH_",
@@ -74,7 +82,7 @@ def _runtime_env(manifest: DeploymentManifest) -> dict[str, str]:
 
 
 def _ensure_host_dirs() -> None:
-    for subdir in (".headroom", ".claude", ".codex", ".gemini"):
+    for subdir in (".headroom", ".claude", ".codex", ".gemini", ".config/opencode"):
         (Path.home() / subdir).mkdir(parents=True, exist_ok=True)
 
 
@@ -120,6 +128,8 @@ def build_runtime_command(manifest: DeploymentManifest) -> list[str]:
         f"{_mount_source(home, '.codex')}:{container_home}/.codex",
         "--volume",
         f"{_mount_source(home, '.gemini')}:{container_home}/.gemini",
+        "--volume",
+        f"{_mount_source(home, '.config/opencode')}:{container_home}/.config/opencode",
     ]
     if not _is_windows():
         getuid = getattr(os, "getuid", None)
@@ -132,14 +142,16 @@ def build_runtime_command(manifest: DeploymentManifest) -> list[str]:
     for name in sorted(os.environ):
         if name.startswith(PASSTHROUGH_ENV_PREFIXES):
             command.extend(["--env", name])
+    # The image ENTRYPOINT already runs `headroom proxy` (see Dockerfile), so
+    # the args appended after the image name are only the proxy flags — never
+    # `headroom proxy` again, or Docker would run `headroom proxy headroom
+    # proxy ...` and Click aborts on the extra arguments (issue #833).
     command.extend(
         [
             manifest.image,
-            "headroom",
-            "proxy",
             "--host",
-            "0.0.0.0",
-            *manifest.proxy_args[2:],
+            CONTAINER_BIND_HOST,
+            *manifest.proxy_args[_PROXY_ARGS_HOST_PAIR_LEN:],
         ]
     )
     return command
@@ -190,7 +202,8 @@ def acquire_runtime_start_lock(profile: str) -> Iterator[bool]:
             import fcntl
 
             try:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl_any = cast(Any, fcntl)
+                fcntl_any.flock(lock_file.fileno(), fcntl_any.LOCK_EX | fcntl_any.LOCK_NB)
                 acquired = True
             except BlockingIOError:
                 yield False
@@ -215,7 +228,8 @@ def acquire_runtime_start_lock(profile: str) -> Iterator[bool]:
                 else:
                     import fcntl
 
-                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                    fcntl_any = cast(Any, fcntl)
+                    fcntl_any.flock(lock_file.fileno(), fcntl_any.LOCK_UN)
 
 
 def run_foreground(manifest: DeploymentManifest) -> int:
@@ -278,7 +292,11 @@ def start_persistent_docker(manifest: DeploymentManifest) -> None:
         manifest.container_name,
         *command[5:],  # drop initial `docker run --rm --name ...`
     ]
-    subprocess.run(["docker", "rm", "-f", manifest.container_name], capture_output=True, text=True)
+    run(
+        ["docker", "rm", "-f", manifest.container_name],
+        capture_output=True,
+        text=True,
+    )
     subprocess.run(docker_cmd, check=True)
 
 
@@ -286,9 +304,15 @@ def stop_runtime(manifest: DeploymentManifest) -> None:
     """Stop the raw runtime for the deployment."""
 
     if manifest.preset == InstallPreset.PERSISTENT_DOCKER.value:
-        subprocess.run(["docker", "stop", manifest.container_name], capture_output=True, text=True)
-        subprocess.run(
-            ["docker", "rm", "-f", manifest.container_name], capture_output=True, text=True
+        run(
+            ["docker", "stop", manifest.container_name],
+            capture_output=True,
+            text=True,
+        )
+        run(
+            ["docker", "rm", "-f", manifest.container_name],
+            capture_output=True,
+            text=True,
         )
         return
 
@@ -316,8 +340,10 @@ def runtime_status(manifest: DeploymentManifest) -> str:
     """Return a short status string for the deployment runtime."""
 
     if manifest.preset == InstallPreset.PERSISTENT_DOCKER.value:
-        result = subprocess.run(
-            ["docker", "ps", "--format", "{{.Names}}"], capture_output=True, text=True
+        result = run(
+            ["docker", "ps", "--format", "{{.Names}}"],
+            capture_output=True,
+            text=True,
         )
         if manifest.container_name in result.stdout.splitlines():
             return "running"

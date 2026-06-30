@@ -9,6 +9,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from headroom._subprocess import run
+
 logger = logging.getLogger(__name__)
 
 
@@ -102,12 +104,10 @@ def _candidate_security_commands(
 
 def _run_security_lookup(command: list[str]) -> str | None:
     try:
-        result = subprocess.run(
+        result = run(
             command,
             capture_output=True,
             text=True,
-            encoding="utf-8",
-            errors="replace",
             check=False,
             timeout=5,
         )

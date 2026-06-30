@@ -2,20 +2,28 @@
 
 Covers:
 - Returns None when no env var is set
-- Returns a path string when SSL_CERT_FILE points to a valid PEM file
-- Returns a path string when REQUESTS_CA_BUNDLE points to a valid PEM file
-- Returns a path string when NODE_EXTRA_CA_CERTS points to a valid PEM file
+- Returns an ssl.SSLContext when SSL_CERT_FILE points to a valid PEM file
+- Returns an ssl.SSLContext when REQUESTS_CA_BUNDLE points to a valid PEM file
+- Replacement contexts relax OpenSSL VERIFY_X509_STRICT for custom CA bundles
+- Returns an ssl.SSLContext when NODE_EXTRA_CA_CERTS points to a valid PEM file
+- The NODE_EXTRA_CA_CERTS SSLContext is additive: default/system roots are preserved (#998)
 - Priority order: SSL_CERT_FILE beats REQUESTS_CA_BUNDLE beats NODE_EXTRA_CA_CERTS
 - Nonexistent paths are skipped (returns None if all paths are missing)
 """
 
 from __future__ import annotations
 
-import os
+import ssl
 
 import pytest
 
-from headroom.proxy.ssl_context import find_ca_bundle
+from headroom.proxy import ssl_context
+from headroom.proxy.ssl_context import (
+    apply_global_tls_relaxation,
+    build_httpx_verify,
+    find_ca_bundle,
+    tls_strict_disabled,
+)
 
 # Minimal self-signed CA certificate (PEM) used only to verify that
 # load_verify_locations accepts the file.  Generated offline; never used
@@ -52,9 +60,27 @@ def ca_pem_file(tmp_path):
 
 
 def _clean_env(monkeypatch):
-    """Remove all three CA-bundle env vars so tests start from a clean state."""
-    for var in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "NODE_EXTRA_CA_CERTS"):
+    """Remove all CA-bundle env vars + the strict toggle for a clean state."""
+    for var in (
+        "SSL_CERT_FILE",
+        "REQUESTS_CA_BUNDLE",
+        "NODE_EXTRA_CA_CERTS",
+        "HEADROOM_TLS_STRICT",
+    ):
         monkeypatch.delenv(var, raising=False)
+
+
+class FakeSSLContext:
+    def __init__(self, verify_flags: int = 0) -> None:
+        self.verify_flags = verify_flags
+        self.loaded_cafile: str | None = None
+        self.alpn_protocols: list[str] | None = None
+
+    def load_verify_locations(self, *, cafile: str) -> None:
+        self.loaded_cafile = cafile
+
+    def set_alpn_protocols(self, protocols: list[str]) -> None:
+        self.alpn_protocols = protocols
 
 
 class TestFindCaBundleNoEnvVars:
@@ -64,77 +90,111 @@ class TestFindCaBundleNoEnvVars:
 
 
 class TestFindCaBundleWithValidPem:
-    def test_ssl_cert_file_returns_path(self, monkeypatch, ca_pem_file):
+    def test_ssl_cert_file_returns_ssl_context(self, monkeypatch, ca_pem_file):
         _clean_env(monkeypatch)
         monkeypatch.setenv("SSL_CERT_FILE", ca_pem_file)
         ctx = find_ca_bundle()
-        assert isinstance(ctx, str)
-        assert os.path.isfile(ctx)
+        assert isinstance(ctx, ssl.SSLContext)
 
-    def test_requests_ca_bundle_returns_path(self, monkeypatch, ca_pem_file):
+    def test_requests_ca_bundle_returns_ssl_context(self, monkeypatch, ca_pem_file):
         _clean_env(monkeypatch)
         monkeypatch.setenv("REQUESTS_CA_BUNDLE", ca_pem_file)
         ctx = find_ca_bundle()
-        assert isinstance(ctx, str)
-        assert os.path.isfile(ctx)
+        assert isinstance(ctx, ssl.SSLContext)
 
-    def test_node_extra_ca_certs_returns_path(self, monkeypatch, ca_pem_file):
+    def test_replacement_ca_context_relaxes_x509_strict(self, monkeypatch, ca_pem_file):
+        _clean_env(monkeypatch)
+        monkeypatch.setenv("SSL_CERT_FILE", ca_pem_file)
+        strict_flag = 0x20
+        created_context = FakeSSLContext(verify_flags=strict_flag | 0x100)
+
+        def fake_create_default_context(*, cafile: str | None = None):
+            assert cafile == ca_pem_file
+            return created_context
+
+        monkeypatch.setattr(ssl_context.ssl, "VERIFY_X509_STRICT", strict_flag, raising=False)
+        monkeypatch.setattr(ssl_context.ssl, "create_default_context", fake_create_default_context)
+
+        ctx = find_ca_bundle()
+
+        assert ctx is created_context
+        assert created_context.verify_flags & strict_flag == 0
+        assert created_context.verify_flags & 0x100
+        assert created_context.alpn_protocols == ["h2", "http/1.1"]
+
+    def test_node_extra_ca_certs_returns_ssl_context(self, monkeypatch, ca_pem_file):
+        """NODE_EXTRA_CA_CERTS returns an SSLContext, not a bare path (#998)."""
         _clean_env(monkeypatch)
         monkeypatch.setenv("NODE_EXTRA_CA_CERTS", ca_pem_file)
         ctx = find_ca_bundle()
-        assert isinstance(ctx, str)
-        assert os.path.isfile(ctx)
+        assert isinstance(ctx, ssl.SSLContext)
+
+    def test_node_extra_ca_certs_is_additive(self, monkeypatch, ca_pem_file):
+        """The SSLContext must contain default/system roots plus the extra cert (#998)."""
+        _clean_env(monkeypatch)
+        monkeypatch.setenv("NODE_EXTRA_CA_CERTS", ca_pem_file)
+        ctx = find_ca_bundle()
+        assert isinstance(ctx, ssl.SSLContext)
+        stats = ctx.cert_store_stats()
+        # The default trust store has dozens of CAs; if only the test cert
+        # were loaded (replacement), x509_ca would be 1.
+        assert stats["x509_ca"] > 1
 
 
 class TestFindCaBundlePriority:
     def test_ssl_cert_file_beats_requests_ca_bundle(self, monkeypatch, tmp_path):
         """SSL_CERT_FILE is used first even when REQUESTS_CA_BUNDLE is also set."""
         _clean_env(monkeypatch)
-        # Two distinct files so we can identify which was loaded.
         pem1 = tmp_path / "first.pem"
         pem2 = tmp_path / "second.pem"
         pem1.write_bytes(_SELF_SIGNED_CA_PEM)
         pem2.write_bytes(_SELF_SIGNED_CA_PEM)
-
         monkeypatch.setenv("SSL_CERT_FILE", str(pem1))
         monkeypatch.setenv("REQUESTS_CA_BUNDLE", str(pem2))
+        created_context = FakeSSLContext()
 
-        # Both files are valid; we cannot easily inspect which CA was loaded
-        # into the context, but we can verify the function returns a path
-        # (not None) and that it is tied to SSL_CERT_FILE by temporarily
-        # making REQUESTS_CA_BUNDLE point to a nonexistent path.
-        monkeypatch.setenv("REQUESTS_CA_BUNDLE", "/nonexistent/path.pem")
-        ctx = find_ca_bundle()
-        # SSL_CERT_FILE still valid → should return a path
-        assert isinstance(ctx, str)
-        assert os.path.isfile(ctx)
+        def fake_create_default_context(*, cafile: str | None = None):
+            assert cafile == str(pem1)
+            return created_context
+
+        monkeypatch.setattr(ssl_context.ssl, "create_default_context", fake_create_default_context)
+
+        assert find_ca_bundle() is created_context
 
     def test_ssl_cert_file_beats_node_extra_ca_certs(self, monkeypatch, tmp_path):
         """SSL_CERT_FILE takes precedence over NODE_EXTRA_CA_CERTS."""
         _clean_env(monkeypatch)
         pem = tmp_path / "ca.pem"
         pem.write_bytes(_SELF_SIGNED_CA_PEM)
-
         monkeypatch.setenv("SSL_CERT_FILE", str(pem))
         monkeypatch.setenv("NODE_EXTRA_CA_CERTS", "/nonexistent/node.pem")
+        created_context = FakeSSLContext()
 
-        ctx = find_ca_bundle()
-        assert isinstance(ctx, str)
-        assert os.path.isfile(ctx)
+        def fake_create_default_context(*, cafile: str | None = None):
+            assert cafile == str(pem)
+            return created_context
+
+        monkeypatch.setattr(ssl_context.ssl, "create_default_context", fake_create_default_context)
+
+        assert find_ca_bundle() is created_context
 
     def test_requests_ca_bundle_beats_node_extra_ca_certs(self, monkeypatch, tmp_path):
         """REQUESTS_CA_BUNDLE is used before NODE_EXTRA_CA_CERTS."""
         _clean_env(monkeypatch)
         pem = tmp_path / "ca.pem"
         pem.write_bytes(_SELF_SIGNED_CA_PEM)
-
         monkeypatch.setenv("SSL_CERT_FILE", "/nonexistent/ssl.pem")
         monkeypatch.setenv("REQUESTS_CA_BUNDLE", str(pem))
         monkeypatch.setenv("NODE_EXTRA_CA_CERTS", "/nonexistent/node.pem")
+        created_context = FakeSSLContext()
 
-        ctx = find_ca_bundle()
-        assert isinstance(ctx, str)
-        assert os.path.isfile(ctx)
+        def fake_create_default_context(*, cafile: str | None = None):
+            assert cafile == str(pem)
+            return created_context
+
+        monkeypatch.setattr(ssl_context.ssl, "create_default_context", fake_create_default_context)
+
+        assert find_ca_bundle() is created_context
 
 
 class TestFindCaBundleNonexistentPaths:
@@ -157,4 +217,89 @@ class TestFindCaBundleNonexistentPaths:
         monkeypatch.setenv("REQUESTS_CA_BUNDLE", ca_pem_file)
 
         ctx = find_ca_bundle()
-        assert ctx == ca_pem_file
+
+        assert isinstance(ctx, ssl.SSLContext)
+
+
+# ---------------------------------------------------------------------------
+# HEADROOM_TLS_STRICT toggle (issue #1308): corporate TLS-inspection roots
+# (Zscaler, Netskope) set CA:TRUE without the critical bit, which Python 3.13
+# + OpenSSL 3.x reject under VERIFY_X509_STRICT. A CA bundle can't fix that —
+# the cert is found, the strict check fails. The toggle clears only the strict
+# flag, on both the httpx upstream path and the urllib3/huggingface path.
+# ---------------------------------------------------------------------------
+
+
+class TestTlsStrictDisabled:
+    @pytest.mark.parametrize("val", ["0", "false", "FALSE", "No", "off", "  off  "])
+    def test_off_values_disable_strict(self, monkeypatch, val):
+        _clean_env(monkeypatch)
+        monkeypatch.setenv("HEADROOM_TLS_STRICT", val)
+        assert tls_strict_disabled() is True
+
+    @pytest.mark.parametrize("val", ["1", "true", "yes", "on", "", "strict", "00"])
+    def test_other_values_keep_strict(self, monkeypatch, val):
+        _clean_env(monkeypatch)
+        monkeypatch.setenv("HEADROOM_TLS_STRICT", val)
+        assert tls_strict_disabled() is False
+
+    def test_unset_keeps_strict(self, monkeypatch):
+        _clean_env(monkeypatch)
+        assert tls_strict_disabled() is False
+
+
+class TestBuildHttpxVerify:
+    def test_default_returns_true(self, monkeypatch):
+        """No CA bundle, strict on → httpx's own default verification."""
+        _clean_env(monkeypatch)
+        assert build_httpx_verify() is True
+
+    def test_toggle_off_returns_relaxed_context(self, monkeypatch):
+        """No CA bundle, strict OFF → default trust store with strict cleared."""
+        _clean_env(monkeypatch)
+        monkeypatch.setenv("HEADROOM_TLS_STRICT", "0")
+        ctx = build_httpx_verify()
+        assert isinstance(ctx, ssl.SSLContext)
+        strict_flag = getattr(ssl, "VERIFY_X509_STRICT", 0)
+        if strict_flag:
+            assert ctx.verify_flags & strict_flag == 0
+        # Still a real verifying context — NOT verify=False.
+        assert ctx.verify_mode == ssl.CERT_REQUIRED
+        # Default trust store retained (additive, not a 1-cert replacement).
+        assert ctx.cert_store_stats()["x509_ca"] > 1
+
+    def test_custom_ca_takes_precedence_over_toggle(self, monkeypatch, ca_pem_file):
+        """A configured CA bundle wins; the result is that bundle's context."""
+        _clean_env(monkeypatch)
+        monkeypatch.setenv("SSL_CERT_FILE", ca_pem_file)
+        monkeypatch.setenv("HEADROOM_TLS_STRICT", "0")
+        ctx = build_httpx_verify()
+        assert isinstance(ctx, ssl.SSLContext)
+        # Replacement bundle → only the single test CA is trusted.
+        assert ctx.cert_store_stats()["x509_ca"] == 1
+
+
+class TestApplyGlobalTlsRelaxation:
+    def test_noop_when_strict_on(self, monkeypatch):
+        _clean_env(monkeypatch)
+        assert apply_global_tls_relaxation() is False
+
+    def test_patches_urllib3_when_toggle_off(self, monkeypatch):
+        _clean_env(monkeypatch)
+        monkeypatch.setenv("HEADROOM_TLS_STRICT", "0")
+        strict_flag = getattr(ssl, "VERIFY_X509_STRICT", 0)
+        if not strict_flag:
+            pytest.skip("VERIFY_X509_STRICT unavailable on this OpenSSL build")
+
+        import urllib3.util.ssl_ as u3ssl
+
+        original = u3ssl.create_urllib3_context
+        try:
+            assert apply_global_tls_relaxation() is True
+            ctx = u3ssl.create_urllib3_context()
+            assert ctx.verify_flags & strict_flag == 0
+            # Idempotent: second call doesn't re-wrap or error.
+            assert apply_global_tls_relaxation() is True
+            assert getattr(u3ssl.create_urllib3_context, "_headroom_strict_relaxed", False)
+        finally:
+            u3ssl.create_urllib3_context = original

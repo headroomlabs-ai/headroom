@@ -16,6 +16,10 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - 'wiki/**'
+      - '**/*.md'
   workflow_dispatch:
 
 permissions:
@@ -54,7 +58,7 @@ jobs:
               - 'Cargo.lock'
               - 'tests/**'
               - 'scripts/**'
-              - '.github/workflows/ci.yml'
+              - '.github/workflows/**'
             e2e:
               - 'headroom/**'
               - 'crates/**'
@@ -82,7 +86,7 @@ jobs:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-lint-${{ hashFiles('pyproject.toml') }}
           restore-keys: ${{ runner.os }}-pip-lint-
-      - run: python -m pip install --upgrade pip ruff mypy
+      - run: python -m pip install --upgrade pip "ruff==0.15.17" "mypy==1.20.2"
       - name: ruff check
         run: ruff check .
       - name: ruff format --check
@@ -152,7 +156,6 @@ jobs:
       matrix:
         shard: [1, 2, 3, 4]
     env:
-      HF_HUB_OFFLINE: "1"
       TRANSFORMERS_OFFLINE: "1"
     steps:
       - uses: actions/checkout@v6
@@ -168,10 +171,26 @@ jobs:
           restore-keys: ${{ runner.os }}-pip-${{ env.PY_VERSION }}-
 
       - name: Restore HuggingFace model cache (warmed by prefetch-model)
+        id: restore-hfcache
         uses: actions/cache@v5
         with:
           path: ~/.cache/huggingface
           key: ${{ runner.os }}-models-allMiniLM-v2
+
+      - name: Fallback model download if cache missed
+        if: steps.restore-hfcache.outputs.cache-hit != 'true'
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_HUB_DISABLE_TELEMETRY: "1"
+          TRANSFORMERS_OFFLINE: "0"
+          HF_HUB_OFFLINE: "0"
+        run: |
+          python -m pip install --upgrade pip huggingface_hub
+          for i in 1 2 3 4 5 6; do
+            if python -c "from huggingface_hub import snapshot_download; snapshot_download('sentence-transformers/all-MiniLM-L6-v2')"; then exit 0; fi
+            if [ "$i" -lt 6 ]; then echo "::warning::fallback model fetch attempt $i failed; backing off"; sleep $((i * 30)); fi
+          done
+          echo "::error::could not fetch all-MiniLM-L6-v2 from HuggingFace (fallback)"; exit 1
 
       - name: Download prebuilt wheel
         uses: actions/download-artifact@v8
@@ -191,6 +210,18 @@ jobs:
           cp "${SITE}/headroom/"_core*.so headroom/
           python -c "from headroom._core import DiffCompressor; print('headroom._core OK')"
 
+      - name: Verify offline HuggingFace model cache
+        env:
+          HF_HUB_OFFLINE: "1"
+          TRANSFORMERS_OFFLINE: "1"
+          HF_HUB_DISABLE_TELEMETRY: "1"
+        run: python scripts/ci/verify_hf_model_cache.py
+
+      # Coverage upload: without this, codecov only receives reports from
+      # the two native-e2e workflows (3 CLI test files total), so head
+      # coverage reads ~6% and codecov/patch fails for ANY diff not
+      # exercised by those files — a false negative on every PR. The main
+      # suite runs here; its coverage must be what codecov sees.
       - name: Run test shard ${{ matrix.shard }}/4
         run: |
           pytest tests scripts/tests \
@@ -206,7 +237,12 @@ jobs:
           files: coverage-${{ matrix.shard }}.xml
           flags: python
           name: python-shard-${{ matrix.shard }}
-          fail_ci_if_error: true
+          # Token is sent so uploads authenticate once the repo is activated on
+          # Codecov. Until then Codecov may 404 ("Repository not found"); either
+          # way, coverage upload is reporting-only and must never fail a build
+          # whose tests pass — so this stays non-blocking.
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
 
   test-extras:
     needs: [changes, build-wheel]

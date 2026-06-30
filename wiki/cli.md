@@ -245,6 +245,7 @@ headroom proxy --mode cache
 | `--no-cache` | off | Disable semantic caching |
 | `--no-rate-limit` | off | Disable rate limiting |
 | `--retry-max-attempts` | runtime default `3` | Maximum upstream retry attempts |
+| `--request-timeout-seconds` | runtime default `300` | Request timeout in seconds |
 | `--connect-timeout-seconds` | runtime default `10` | Upstream connection timeout |
 | `--anthropic-pre-upstream-concurrency` | auto `max(2, min(8, cpu_count))` | Cap simultaneous pre-upstream work on `/v1/messages` (body read, deep copy, first compression stage, memory-context lookup, upstream connect). `0` or negative disables (unbounded); any positive integer is honoured verbatim. Prevents cold-start replay storms from starving `/livez`, `/readyz`, and new Codex WS opens. |
 | `--anthropic-pre-upstream-acquire-timeout-seconds` | `15.0` | Fail fast when the Anthropic pre-upstream queue is saturated. Requests that wait longer return `503` with `Retry-After` instead of parking indefinitely. |
@@ -254,9 +255,9 @@ headroom proxy --mode cache
 | `--no-code-aware` | off | Disable AST-aware code compression |
 | `--code-aware` | off | Enable code-aware compression in the proxy (env: HEADROOM_CODE_AWARE_ENABLED) |
 | `--no-read-lifecycle` | off | Disable stale/superseded read compression |
-| `--no-intelligent-context` | off | Disable intelligent context manager |
-| `--no-intelligent-scoring` | off | Disable multi-factor importance scoring |
-| `--no-compress-first` | off | Disable deep compression before dropping messages |
+| `--no-ccr-inject-tool` | off | Disable injecting the `headroom_retrieve` tool |
+| `--no-ccr-marker` | off | Disable adding retrieval markers to compressed output |
+| `--no-ccr-proactive-expansion` | off | Disable proactive CCR context expansion |
 | `--memory` | off | Enable persistent user memory |
 | `--memory-db-path` | `""` | Override memory DB path (help text: `{cwd}/.headroom/memory.db`) |
 | `--no-memory-tools` | off | Disable automatic memory tool injection |
@@ -272,12 +273,13 @@ headroom proxy --mode cache
 | `--region` | `us-west-2` | Cloud region for Bedrock / Vertex / related backends |
 | `--bedrock-region` | unset | Deprecated Bedrock region override |
 | `--bedrock-profile` | unset | AWS profile name for Bedrock |
-| `--no-telemetry` | off | Disable anonymous usage telemetry |
+| `--telemetry` | off | Opt in to anonymous usage telemetry (off by default) |
+| `--no-telemetry` | off | Force anonymous usage telemetry off (already the default) |
 
 Notes:
 
 - `--learn` implies memory unless `--no-learn` is also set.
-- Proxy startup can also read environment variables such as `HEADROOM_HOST`, `HEADROOM_PORT`, `HEADROOM_BUDGET`, `HEADROOM_MODE`, `HEADROOM_ANYLLM_PROVIDER`, `HEADROOM_ANTHROPIC_PRE_UPSTREAM_CONCURRENCY`, `HEADROOM_ANTHROPIC_PRE_UPSTREAM_ACQUIRE_TIMEOUT_SECONDS`, `HEADROOM_ANTHROPIC_PRE_UPSTREAM_MEMORY_CONTEXT_TIMEOUT_SECONDS`, `ANTHROPIC_TARGET_API_URL`, `OPENAI_TARGET_API_URL`, and `GEMINI_TARGET_API_URL`. CLI flags take precedence over environment variables.
+- Proxy startup can also read environment variables such as `HEADROOM_HOST`, `HEADROOM_PORT`, `HEADROOM_BUDGET`, `HEADROOM_MODE`, `HEADROOM_ANYLLM_PROVIDER`, `HEADROOM_ANTHROPIC_PRE_UPSTREAM_CONCURRENCY`, `HEADROOM_ANTHROPIC_PRE_UPSTREAM_ACQUIRE_TIMEOUT_SECONDS`, `HEADROOM_REQUEST_TIMEOUT`, `HEADROOM_ANTHROPIC_PRE_UPSTREAM_MEMORY_CONTEXT_TIMEOUT_SECONDS`, `ANTHROPIC_TARGET_API_URL`, `OPENAI_TARGET_API_URL`, and `GEMINI_TARGET_API_URL`. CLI flags take precedence over environment variables.
 - The default Anthropic pre-upstream cap is intentionally conservative for CPU/ONNX-heavy work. Larger containers may want to raise it after checking the resolved runtime values on `/readyz` or `/debug/warmup`.
 
 See also: [Proxy Server](proxy.md), [Configuration](configuration.md)
@@ -404,7 +406,7 @@ headroom memory list -q "budget"
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--db-path` | `headroom_memory.db` | Memory database path |
+| `--db-path` | `./.headroom/memory.db` if present, else `~/.headroom/memory.db` | Memory database path |
 | `--limit`, `-n` | `50` | Maximum memories to show |
 | `--session`, `-s` | unset | Filter by session ID |
 | `--scope` | unset | `USER`, `SESSION`, `AGENT`, or `TURN` |
@@ -421,7 +423,7 @@ headroom memory show 1234abcd --json
 | Argument / option | Default | Meaning |
 |---|---|---|
 | `memory_id` | required | Full or partial memory ID |
-| `--db-path` | `headroom_memory.db` | Memory database path |
+| `--db-path` | `./.headroom/memory.db` if present, else `~/.headroom/memory.db` | Memory database path |
 | `--json` | off | Emit raw JSON |
 
 ### `headroom memory stats`
@@ -432,7 +434,7 @@ headroom memory stats
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--db-path` | `headroom_memory.db` | Memory database path |
+| `--db-path` | `./.headroom/memory.db` if present, else `~/.headroom/memory.db` | Memory database path |
 
 ### `headroom memory edit <memory_id>`
 
@@ -444,7 +446,7 @@ headroom memory edit 1234abcd --importance 0.9
 | Argument / option | Default | Meaning |
 |---|---|---|
 | `memory_id` | required | Full or partial memory ID |
-| `--db-path` | `headroom_memory.db` | Memory database path |
+| `--db-path` | `./.headroom/memory.db` if present, else `~/.headroom/memory.db` | Memory database path |
 | `--content`, `-c` | unset | New memory content |
 | `--importance`, `-i` | unset | New importance score (`0.0` to `1.0`) |
 
@@ -460,7 +462,7 @@ headroom memory delete 1234abcd --force
 | Argument / option | Default | Meaning |
 |---|---|---|
 | `memory_ids...` | required | One or more memory IDs |
-| `--db-path` | `headroom_memory.db` | Memory database path |
+| `--db-path` | `./.headroom/memory.db` if present, else `~/.headroom/memory.db` | Memory database path |
 | `--force`, `-f` | off | Skip confirmation |
 
 ### `headroom memory prune`
@@ -472,7 +474,7 @@ headroom memory prune --scope SESSION --force
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--db-path` | `headroom_memory.db` | Memory database path |
+| `--db-path` | `./.headroom/memory.db` if present, else `~/.headroom/memory.db` | Memory database path |
 | `--older-than` | unset | Age threshold |
 | `--scope` | unset | Scope filter: `USER`, `SESSION`, `AGENT`, `TURN` |
 | `--low-importance` | unset | Importance cutoff |
@@ -490,7 +492,7 @@ headroom memory purge --confirm
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--db-path` | `headroom_memory.db` | Memory database path |
+| `--db-path` | `./.headroom/memory.db` if present, else `~/.headroom/memory.db` | Memory database path |
 | `--confirm` | off | Required confirmation flag |
 
 ### `headroom memory export`
@@ -502,7 +504,7 @@ headroom memory export --output export.json
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--db-path` | `headroom_memory.db` | Memory database path |
+| `--db-path` | `./.headroom/memory.db` if present, else `~/.headroom/memory.db` | Memory database path |
 | `--output`, `-o` | stdout | Output path |
 
 ### `headroom memory import <file>`
@@ -515,7 +517,7 @@ headroom memory import export.json --force
 | Argument / option | Default | Meaning |
 |---|---|---|
 | `file` | required | JSON file containing exported memories |
-| `--db-path` | `headroom_memory.db` | Memory database path |
+| `--db-path` | `./.headroom/memory.db` if present, else `~/.headroom/memory.db` | Memory database path |
 | `--force`, `-f` | off | Skip confirmation |
 
 The import expects a JSON array. Malformed entries are skipped.
@@ -603,7 +605,10 @@ Options:
                                   backends.
   --mode TEXT                     Proxy optimization mode.  [default: token]
   --memory                        Enable persistent memory in the proxy runtime.
-  --no-telemetry                  Disable anonymous telemetry in the runtime.
+  --telemetry                     Opt in to anonymous telemetry in the runtime
+                                  (off by default).
+  --no-telemetry                  Force anonymous telemetry off in the runtime
+                                  (already the default).
   --image TEXT                    Docker image to use when runtime=docker or
                                   preset=persistent-docker.  [default:
                                   ghcr.io/chopratejas/headroom:latest]
@@ -632,7 +637,8 @@ headroom install apply --preset persistent-docker --scope user
 | `--region` | unset | Cloud region override |
 | `--mode` | `token` | Proxy optimization mode |
 | `--memory` | off | Enable persistent memory in the managed runtime |
-| `--no-telemetry` | off | Disable anonymous telemetry |
+| `--telemetry` | off | Opt in to anonymous telemetry (off by default) |
+| `--no-telemetry` | off | Force anonymous telemetry off (already the default) |
 | `--image` | `ghcr.io/chopratejas/headroom:latest` | Docker image for Docker-backed installs |
 
 `apply` stores a manifest under

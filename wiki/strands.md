@@ -160,7 +160,7 @@ HeadroomStrandsModel.stream()
 Provider API (Bedrock, etc.)
 ```
 
-The model wrapper uses Headroom's full pipeline (CacheAligner → ContentRouter → IntelligentContext). The hook provider uses SmartCrusher directly for fast JSON compression of individual tool results.
+The model wrapper uses Headroom's full pipeline (CacheAligner → ContentRouter). The hook provider uses SmartCrusher directly for fast JSON compression of individual tool results.
 
 ---
 

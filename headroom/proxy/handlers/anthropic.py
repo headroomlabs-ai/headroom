@@ -29,6 +29,7 @@ from headroom.pipeline import PipelineStage, summarize_routing_markers
 from headroom.proxy.auth_mode import classify_auth_mode, classify_client
 from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.forwarded_headers import resolve_client_ip
+from headroom.proxy.handlers._debug_dump import _debug_dump_mode, _redact_debug_value
 from headroom.proxy.helpers import extract_tags
 from headroom.proxy.memory_decision import MemoryDecision
 from headroom.proxy.memory_query import MemoryQuery
@@ -130,6 +131,15 @@ class AnthropicHandlerMixin:
             int(cache_creation.get("ephemeral_1h_input_tokens", 0) or 0),
         )
 
+    def _anthropic_buffered_request_timeout(self) -> httpx.Timeout:
+        """Timeout for buffered Anthropic reads."""
+        return httpx.Timeout(
+            connect=self.config.connect_timeout_seconds,
+            read=self.config.anthropic_buffered_request_timeout_seconds,
+            write=self.config.request_timeout_seconds,
+            pool=self.config.connect_timeout_seconds,
+        )
+
     @classmethod
     def _sort_tools_deterministically(
         cls, tools: list[dict[str, Any]] | None
@@ -138,6 +148,18 @@ class AnthropicHandlerMixin:
         if not tools:
             return tools
         return sorted(tools, key=cls._tool_sort_key)
+
+    @classmethod
+    def _tools_for_forwarding(
+        cls,
+        tools: list[dict[str, Any]] | None,
+        *,
+        preserve_order: bool,
+    ) -> list[dict[str, Any]] | None:
+        """Return upstream tools, preserving client order for passthrough requests."""
+        if preserve_order:
+            return tools
+        return cls._sort_tools_deterministically(tools)
 
     @staticmethod
     def _compress_latest_user_turn_images_cache_safe(
@@ -653,6 +675,7 @@ class AnthropicHandlerMixin:
                 request.headers.get("x-headroom-bypass", "").lower() == "true"
                 or request.headers.get("x-headroom-mode", "").lower() == "passthrough"
             )
+            preserve_tool_order = _bypass or not self.config.optimize
             if _bypass:
                 logger.info(f"[{request_id}] Bypass: skipping compression (header)")
 
@@ -1029,12 +1052,28 @@ class AnthropicHandlerMixin:
                     from headroom.transforms.compression_policy import resolve_policy
 
                     compression_policy = resolve_policy(getattr(request.state, "auth_mode", None))
+                    from headroom.ccr.tool_injection import CCR_TOOL_NAME
+
+                    existing_tool_names = {
+                        tool.get("name") or tool.get("function", {}).get("name")
+                        for tool in (body.get("tools") or [])
+                        if isinstance(tool, dict)
+                    }
+
+                    def should_skip_ccr_request_compression(
+                        current_frozen_message_count: int,
+                    ) -> bool:
+                        if is_token_mode(self.config.mode):
+                            return False
+                        # If the tool is already present, CCR stays reversible even on frozen turns.
+                        return (
+                            self.config.ccr_inject_tool
+                            and current_frozen_message_count > 0
+                            and CCR_TOOL_NAME not in existing_tool_names
+                        )
 
                     if is_token_mode(self.config.mode):
                         comp_cache = self._get_compression_cache(session_id)
-
-                        # Zone 1: Swap cached compressed versions into working copy
-                        working_messages = comp_cache.apply_cached(messages)
 
                         # Re-freeze boundary: consecutive stable messages from start.
                         # Safety: never freeze beyond provider-confirmed cached prefix.
@@ -1064,70 +1103,135 @@ class AnthropicHandlerMixin:
                         # Record all tool_results in the verified frozen prefix as stable
                         comp_cache.mark_stable_from_messages(messages, frozen_message_count)
 
-                        async with stage_timer.measure("compression_first_stage"):
-                            result = await self._run_compression_in_executor(
-                                lambda: self.anthropic_pipeline.apply(
-                                    messages=working_messages,
-                                    model=model,
-                                    model_limit=context_limit,
-                                    context=extract_user_query(working_messages),
-                                    frozen_message_count=frozen_message_count,
-                                    biases=biases,
-                                    request_id=request_id,
-                                    compression_policy=compression_policy,
-                                    **proxy_pipeline_kwargs(self.config),
-                                ),
-                                timeout=COMPRESSION_TIMEOUT_SECONDS,
+                        skip_ccr_request_compression = should_skip_ccr_request_compression(
+                            frozen_message_count
+                        )
+                        if skip_ccr_request_compression:
+                            logger.info(
+                                f"[{request_id}] CCR: skipping request-side compression "
+                                f"(frozen prefix={frozen_message_count}) because tool injection is deferred"
                             )
+                        if skip_ccr_request_compression:
+                            optimized_messages = messages
+                            optimized_tokens = tokenizer.count_messages(optimized_messages)
+                        else:
+                            # Zone 1: Swap cached compressed versions into working copy
+                            working_messages = comp_cache.apply_cached(messages)
+                            if (
+                                getattr(self, "_background_compression_enabled", False)
+                                and frozen_message_count == 0
+                                and original_tokens >= self._background_compression_min_tokens
+                            ):
+                                accepted = self._background_compressor.enqueue(
+                                    session_id,
+                                    lambda: self.anthropic_pipeline.apply(
+                                        messages=working_messages,
+                                        model=model,
+                                        model_limit=context_limit,
+                                        context=extract_user_query(working_messages),
+                                        frozen_message_count=frozen_message_count,
+                                        biases=biases,
+                                        request_id=request_id,
+                                        compression_policy=compression_policy,
+                                        **proxy_pipeline_kwargs(self.config),
+                                    ),
+                                    lambda bg_result: comp_cache.update_from_result(
+                                        messages, bg_result.messages
+                                    ),
+                                )
 
-                        # Cache newly compressed messages (index-aligned diff)
-                        if result.messages != working_messages:
-                            comp_cache.update_from_result(messages, result.messages)
+                                class _DeferredCompressionResult:
+                                    messages = working_messages
+                                    transforms_applied = [
+                                        "deferred:background_compression"
+                                        if accepted
+                                        else "deferred:dropped"
+                                    ]
+                                    timing = {}
 
-                        # Always use pipeline result — Zone 1 swaps are already applied
-                        optimized_messages = result.messages
-                        transforms_applied = result.transforms_applied
-                        pipeline_timing = result.timing
-                        # Issue #327 / Bug 3: pipeline.apply uses the provider-
-                        # side tokenizer (AnthropicProvider tiktoken estimator),
-                        # which counts ~25% higher than the proxy-side
-                        # EstimatingTokenCounter used to set `original_tokens`
-                        # at line 634. Reusing `result.tokens_after` here
-                        # produced an apples-vs-oranges comparison against
-                        # `original_tokens` in the inflation guard below
-                        # (line ~901): even after a real 12% compression the
-                        # provider-tokenizer figure was higher than the proxy-
-                        # tokenizer baseline, triggering a spurious revert.
-                        # Recount optimized_messages with the proxy tokenizer
-                        # so original_tokens vs optimized_tokens is self-
-                        # consistent. The recount cost (~ms on a 50K-token
-                        # request) is paid once per request and is dwarfed by
-                        # the upstream call latency.
-                        optimized_tokens = tokenizer.count_messages(optimized_messages)
-                    elif not is_cache_mode(self.config.mode):
-                        async with stage_timer.measure("compression_first_stage"):
-                            result = await self._run_compression_in_executor(
-                                lambda: self.anthropic_pipeline.apply(
-                                    messages=messages,
-                                    model=model,
-                                    model_limit=context_limit,
-                                    context=extract_user_query(messages),
-                                    frozen_message_count=frozen_message_count,
-                                    biases=biases,
-                                    request_id=request_id,
-                                    compression_policy=compression_policy,
-                                    **proxy_pipeline_kwargs(self.config),
-                                ),
-                                timeout=COMPRESSION_TIMEOUT_SECONDS,
-                            )
+                                result = _DeferredCompressionResult()
+                            else:
+                                async with stage_timer.measure("compression_first_stage"):
+                                    result = await self._run_compression_in_executor(
+                                        lambda: self.anthropic_pipeline.apply(
+                                            messages=working_messages,
+                                            model=model,
+                                            model_limit=context_limit,
+                                            context=extract_user_query(working_messages),
+                                            frozen_message_count=frozen_message_count,
+                                            biases=biases,
+                                            request_id=request_id,
+                                            compression_policy=compression_policy,
+                                            **proxy_pipeline_kwargs(self.config),
+                                        ),
+                                        timeout=COMPRESSION_TIMEOUT_SECONDS,
+                                    )
 
-                        if result.messages != messages:
+                            # Cache newly compressed messages (index-aligned diff)
+                            if result.messages != working_messages:
+                                comp_cache.update_from_result(messages, result.messages)
+
+                            # Always use pipeline result — Zone 1 swaps are already applied
                             optimized_messages = result.messages
                             transforms_applied = result.transforms_applied
                             pipeline_timing = result.timing
-                            original_tokens = result.tokens_before
-                            optimized_tokens = result.tokens_after
+                            # Issue #327 / Bug 3: pipeline.apply uses the provider-
+                            # side tokenizer (AnthropicProvider tiktoken estimator),
+                            # which counts ~25% higher than the proxy-side
+                            # EstimatingTokenCounter used to set `original_tokens`
+                            # at line 634. Reusing `result.tokens_after` here
+                            # produced an apples-vs-oranges comparison against
+                            # `original_tokens` in the inflation guard below
+                            # (line ~901): even after a real 12% compression the
+                            # provider-tokenizer figure was higher than the proxy-
+                            # tokenizer baseline, triggering a spurious revert.
+                            # Recount optimized_messages with the proxy tokenizer
+                            # so original_tokens vs optimized_tokens is self-
+                            # consistent. The recount cost (~ms on a 50K-token
+                            # request) is paid once per request and is dwarfed by
+                            # the upstream call latency.
+                            optimized_tokens = tokenizer.count_messages(optimized_messages)
+                    elif not is_cache_mode(self.config.mode):
+                        skip_ccr_request_compression = should_skip_ccr_request_compression(
+                            frozen_message_count
+                        )
+                        if skip_ccr_request_compression:
+                            logger.info(
+                                f"[{request_id}] CCR: skipping request-side compression "
+                                f"(frozen prefix={frozen_message_count}) because tool injection is deferred"
+                            )
+                        if not skip_ccr_request_compression:
+                            async with stage_timer.measure("compression_first_stage"):
+                                result = await self._run_compression_in_executor(
+                                    lambda: self.anthropic_pipeline.apply(
+                                        messages=messages,
+                                        model=model,
+                                        model_limit=context_limit,
+                                        context=extract_user_query(messages),
+                                        frozen_message_count=frozen_message_count,
+                                        biases=biases,
+                                        request_id=request_id,
+                                        compression_policy=compression_policy,
+                                        **proxy_pipeline_kwargs(self.config),
+                                    ),
+                                    timeout=COMPRESSION_TIMEOUT_SECONDS,
+                                )
+
+                            if result.messages != messages:
+                                optimized_messages = result.messages
+                                transforms_applied = result.transforms_applied
+                                pipeline_timing = result.timing
+                                original_tokens = result.tokens_before
+                                optimized_tokens = result.tokens_after
                     else:
+                        skip_ccr_request_compression = should_skip_ccr_request_compression(
+                            frozen_message_count
+                        )
+                        if skip_ccr_request_compression:
+                            logger.info(
+                                f"[{request_id}] CCR: skipping request-side compression "
+                                f"(frozen prefix={frozen_message_count}) because tool injection is deferred"
+                            )
                         previous_original_messages = prefix_tracker.get_last_original_messages()
                         previous_forwarded_messages = prefix_tracker.get_last_forwarded_messages()
                         delta = self._extract_cache_stable_delta(
@@ -1138,27 +1242,35 @@ class AnthropicHandlerMixin:
                         if delta is not None:
                             stable_forwarded_prefix, delta_messages = delta
                             if delta_messages:
-                                result = await self._run_compression_in_executor(
-                                    lambda: self.anthropic_pipeline.apply(
-                                        messages=delta_messages,
-                                        model=model,
-                                        model_limit=context_limit,
-                                        context=extract_user_query(delta_messages),
-                                        frozen_message_count=0,
-                                        biases=biases,
-                                        request_id=request_id,
-                                        compression_policy=compression_policy,
-                                        **proxy_pipeline_kwargs(self.config),
-                                    ),
-                                    timeout=COMPRESSION_TIMEOUT_SECONDS,
-                                )
-                                optimized_messages = stable_forwarded_prefix + result.messages
-                                transforms_applied = result.transforms_applied
-                                pipeline_timing = result.timing
-                                optimized_tokens = tokenizer.count_messages(optimized_messages)
+                                if skip_ccr_request_compression:
+                                    optimized_messages = messages
+                                    optimized_tokens = tokenizer.count_messages(optimized_messages)
+                                else:
+                                    result = await self._run_compression_in_executor(
+                                        lambda: self.anthropic_pipeline.apply(
+                                            messages=delta_messages,
+                                            model=model,
+                                            model_limit=context_limit,
+                                            context=extract_user_query(delta_messages),
+                                            frozen_message_count=0,
+                                            biases=biases,
+                                            request_id=request_id,
+                                            compression_policy=compression_policy,
+                                            **proxy_pipeline_kwargs(self.config),
+                                        ),
+                                        timeout=COMPRESSION_TIMEOUT_SECONDS,
+                                    )
+                                    optimized_messages = stable_forwarded_prefix + result.messages
+                                    transforms_applied = result.transforms_applied
+                                    pipeline_timing = result.timing
+                                    optimized_tokens = tokenizer.count_messages(optimized_messages)
                             else:
-                                optimized_messages = stable_forwarded_prefix
-                                optimized_tokens = tokenizer.count_messages(optimized_messages)
+                                if skip_ccr_request_compression:
+                                    optimized_messages = messages
+                                    optimized_tokens = tokenizer.count_messages(optimized_messages)
+                                else:
+                                    optimized_messages = stable_forwarded_prefix
+                                    optimized_tokens = tokenizer.count_messages(optimized_messages)
                         else:
                             # Conservative rule for cache mode:
                             # only replay exact stable message-prefix extensions.
@@ -1234,6 +1346,56 @@ class AnthropicHandlerMixin:
                     optimized_tokens = tokenizer.count_messages(optimized_messages)
                     tokens_saved = max(0, original_tokens - optimized_tokens)
 
+            # Mechanism B: activity-based read maturation (flag-gated,
+            # default off). Runs after compression so read_lifecycle
+            # markers are respected, and before body assembly so the
+            # held-Read breakpoint relocation lands in the forwarded
+            # request. Session state (matured markers) rides on the
+            # prefix tracker — same affinity and TTL cleanup as the
+            # freeze state. Advisory: must never fail the request.
+            if self.config.read_maturation and not _bypass:
+                try:
+                    from headroom.config import ReadMaturationConfig
+                    from headroom.transforms.read_maturation import (
+                        ReadMaturationManager,
+                        relocate_cache_breakpoint,
+                    )
+
+                    maturation_mgr = prefix_tracker.read_maturation_manager
+                    if maturation_mgr is None:
+                        maturation_mgr = ReadMaturationManager(
+                            ReadMaturationConfig(
+                                enabled=True,
+                                quiesce_turns=self.config.read_maturation_quiesce_turns,
+                                max_hold_turns=self.config.read_maturation_max_hold_turns,
+                                min_size_bytes=self.config.read_maturation_min_size_bytes,
+                            ),
+                            compression_store=get_compression_store(),
+                        )
+                        prefix_tracker.read_maturation_manager = maturation_mgr
+                    maturation = maturation_mgr.apply(
+                        optimized_messages,
+                        frozen_message_count=frozen_message_count,
+                    )
+                    if maturation.replacements_applied or maturation.holding_msg_indices:
+                        optimized_messages = relocate_cache_breakpoint(
+                            maturation.messages,
+                            maturation.holding_msg_indices,
+                        )
+                        optimized_tokens = tokenizer.count_messages(optimized_messages)
+                        tokens_saved = max(0, original_tokens - optimized_tokens)
+                        if maturation.newly_matured:
+                            transforms_applied.append(f"read_maturation:{maturation.newly_matured}")
+                        logger.debug(
+                            f"[{request_id}] read_maturation: "
+                            f"holding={len(maturation.holding_msg_indices)} "
+                            f"matured={maturation.newly_matured} "
+                            f"replayed={maturation.replacements_applied} "
+                            f"bytes_saved={maturation.bytes_saved}"
+                        )
+                except Exception as e:
+                    logger.warning(f"[{request_id}] read maturation failed: {e}")
+
             # Hook: post_compress — let hooks observe compression results
             if self.config.hooks and tokens_saved > 0:
                 from headroom.hooks import CompressEvent
@@ -1299,6 +1461,7 @@ class AnthropicHandlerMixin:
                         )
                 except Exception:  # advisory hint only — must never fail a request
                     pass
+            ccr_workspace_key = ccr_workspace_label = None
             if (
                 self.config.ccr_inject_tool or self.config.ccr_inject_system_instructions
             ) and not _bypass:
@@ -1309,13 +1472,12 @@ class AnthropicHandlerMixin:
                         f"(frozen prefix={frozen_message_count}) to preserve cache"
                     )
                     inject_system_instructions = False
-                inject_tool = self.config.ccr_inject_tool
-                if inject_tool and frozen_message_count > 0:
+                configured_inject_tool = self.config.ccr_inject_tool
+                if configured_inject_tool and frozen_message_count > 0:
                     logger.info(
                         f"[{request_id}] CCR: deferring tool injection "
-                        f"(frozen prefix={frozen_message_count}) to preserve cache"
+                        f"(frozen_message_count={frozen_message_count}) to preserve cache"
                     )
-                    inject_tool = False
                 # Scan for compression markers + maybe inject system instructions.
                 # Tool-list injection is handled separately via the sticky helper.
                 injector = CCRToolInjector(
@@ -1330,7 +1492,31 @@ class AnthropicHandlerMixin:
                 # Sticky-on tool registration (PR-B7): always inject the
                 # retrieval tool once a session has done CCR, regardless
                 # of whether THIS turn produced compressed content.
-                if inject_tool:
+                #
+                # #1006: if tool injection was deferred (frozen prefix) but
+                # compression just emitted NEW markers this turn, override the
+                # deferral — the agent has no other way to redeem those markers.
+                # The cache miss on this one request is preferable to silent
+                # data loss.  If the session has already done CCR the tool is
+                # already in the client's tool list, so sticky replay is a
+                # no-op and the cache is unaffected.
+                # ponytail: ceiling is one extra cache miss on the first CCR
+                # turn in a frozen-prefix session.
+                from headroom.proxy.helpers import should_inject_ccr_tool
+
+                should_inject, is_marker_override = should_inject_ccr_tool(
+                    configured_inject_tool=configured_inject_tool,
+                    frozen_message_count=frozen_message_count,
+                    has_compressed_content=injector.has_compressed_content,
+                )
+                if should_inject:
+                    if is_marker_override:
+                        logger.info(
+                            f"[{request_id}] CCR: overriding injection deferral — "
+                            f"new markers emitted but headroom_retrieve unavailable "
+                            f"(frozen_message_count={frozen_message_count}); injecting to "
+                            "prevent unredeemable markers (#1006)"
+                        )
                     from headroom.proxy.helpers import apply_session_sticky_ccr_tool
 
                     tools, ccr_tool_injected = apply_session_sticky_ccr_tool(
@@ -1670,8 +1856,14 @@ class AnthropicHandlerMixin:
             # Update body
             body["messages"] = optimized_messages
             if tools or _original_tools is not None:
-                tools = self._sort_tools_deterministically(tools)
-                body["tools"] = tools
+                forwarded_tools = self._tools_for_forwarding(
+                    tools,
+                    preserve_order=preserve_tool_order,
+                )
+                if forwarded_tools != tools:
+                    tools = forwarded_tools
+                if tools != _original_tools:
+                    body["tools"] = tools
 
             presend_event = self.pipeline_extensions.emit(
                 PipelineStage.PRE_SEND,
@@ -1689,13 +1881,76 @@ class AnthropicHandlerMixin:
                 optimized_messages = presend_event.messages
                 body["messages"] = optimized_messages
             if presend_event.tools is not None:
-                tools = self._sort_tools_deterministically(presend_event.tools)
-                body["tools"] = tools
+                tools = self._tools_for_forwarding(
+                    presend_event.tools,
+                    preserve_order=preserve_tool_order,
+                )
+                if tools or body.get("tools") is not None:
+                    if tools != body.get("tools"):
+                        body["tools"] = tools
             if presend_event.headers is not None:
                 headers = presend_event.headers
             if presend_event.messages is not previous_presend_messages:
                 optimized_tokens = tokenizer.count_messages(body["messages"])
                 tokens_saved = max(0, original_tokens - optimized_tokens)
+
+            # Output shaping (opt-in via HEADROOM_OUTPUT_SHAPER): verbosity
+            # steering appended to the system-prompt tail + effort routing on
+            # mechanical tool_result continuations. Runs after every other
+            # body mutation so the turn classifier sees the final messages,
+            # and respects the same bypass header as compression.
+            if not _bypass:
+                from headroom.proxy.output_savings import (
+                    assign_arm,
+                    conversation_key_from_body,
+                    stratum_key,
+                    stratum_label,
+                )
+                from headroom.proxy.output_shaper import (
+                    OutputShaperSettings,
+                    classify_turn,
+                    resolve_verbosity_level,
+                    shape_request,
+                )
+
+                _shaper_settings = OutputShaperSettings.from_env()
+                if _shaper_settings.enabled:
+                    # Conversation-stable holdout assignment: a whole
+                    # conversation is treatment or control. This keeps the A/B
+                    # comparison clean AND keeps the prefix cache stable (we
+                    # never flip a conversation's system-prompt tail mid-stream).
+                    from headroom.proxy import runtime_env
+
+                    _holdout = 0.0
+                    try:
+                        _holdout = float(runtime_env.getenv("HEADROOM_OUTPUT_HOLDOUT", "0") or "0")
+                    except ValueError:
+                        _holdout = 0.0
+                    _arm = assign_arm(conversation_key_from_body(body), _holdout)
+
+                    # Stratum from request features observable now (mirrors the
+                    # offline baseline so live and learned strata line up).
+                    _turn_kind = classify_turn(body.get("messages", [])).value
+                    _stratum = stratum_key(
+                        turn_kind=_turn_kind,
+                        input_tokens=original_tokens,
+                        model=model,
+                        has_tools=bool(body.get("tools")),
+                    )
+                    # Carry (arm, stratum) on the existing label channel so the
+                    # outcome funnel can feed the savings ledger from any path.
+                    transforms_applied.append(stratum_label(_arm, _stratum))
+
+                    if _arm == "treatment":
+                        _level, _src = resolve_verbosity_level(_shaper_settings)
+                        shape_result = shape_request(body, _shaper_settings, level_override=_level)
+                        if shape_result.changed:
+                            body_mutation_tracker.mark_mutated("output_shaper")
+                            transforms_applied.extend(shape_result.labels or [])
+                            logger.info(
+                                f"[{request_id}] OutputShaper(L{_level}/{_src}): "
+                                f"{shape_result.labels}"
+                            )
 
             # Unit 2: mark end of pre-upstream phase. Everything after this
             # point is upstream I/O or post-response bookkeeping.
@@ -1903,6 +2158,15 @@ class AnthropicHandlerMixin:
                         metadata={"path": pipeline_path, "stream": True},
                     )
                     await _finalize_pre_upstream()
+                    session_key = self._get_session_key(
+                        body,
+                        session_header=request.headers.get("x-headroom-session-id"),
+                    )
+                    if session_key in self._active_streams:
+                        from fastapi.responses import JSONResponse
+
+                        queued = self._queue_mid_turn_message(session_key, body)
+                        return JSONResponse(content=queued, status_code=202)
                     return await self._stream_response(
                         url,
                         headers,
@@ -1925,6 +2189,7 @@ class AnthropicHandlerMixin:
                         mutation_reasons=body_mutation_tracker.reasons,
                         memory_request_ctx=memory_request_ctx,
                         outcome_provider=provider_name,
+                        session_key=session_key,
                     )
                 else:
                     async with stage_timer.measure("upstream_connect"):
@@ -1939,6 +2204,7 @@ class AnthropicHandlerMixin:
                             request_id=request_id,
                             forwarder_name="anthropic_messages",
                             path_for_log="/v1/messages",
+                            timeout=self._anthropic_buffered_request_timeout(),
                         )
                     self.pipeline_extensions.emit(
                         PipelineStage.POST_SEND,
@@ -2004,59 +2270,84 @@ class AnthropicHandlerMixin:
                             f"stream={stream}"
                         )
 
-                        # Dump full request details to debug file
-                        try:
-                            from headroom import paths as _hr_paths
+                        # Diagnostic dump of the full upstream-error request.
+                        # OFF by default: it can contain cleartext prompt / tool /
+                        # system content. Opt in with HEADROOM_DEBUG_DUMP=1
+                        # (redacted: structure + lengths only) or =full (content).
+                        # Never written in stateless mode.
+                        dump_mode = _debug_dump_mode(self.config)
+                        if dump_mode != "off":
+                            try:
+                                from headroom import paths as _hr_paths
 
-                            debug_dir = _hr_paths.debug_400_dir()
-                            debug_dir.mkdir(parents=True, exist_ok=True)
-                            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                            debug_file = debug_dir / f"{ts}_{request_id}.json"
+                                debug_dir = _hr_paths.debug_400_dir()
+                                debug_dir.mkdir(parents=True, exist_ok=True)
+                                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                                debug_file = debug_dir / f"{ts}_{request_id}.json"
 
-                            # Sanitize headers (redact API keys)
-                            safe_headers = {}
-                            for k, v in headers.items():
-                                if k.lower() in ("x-api-key", "authorization"):
-                                    safe_headers[k] = v[:12] + "..." if v else ""
-                                else:
-                                    safe_headers[k] = v
+                                # Sanitize headers (redact API keys)
+                                safe_headers = {}
+                                for k, v in headers.items():
+                                    if k.lower() in ("x-api-key", "authorization"):
+                                        safe_headers[k] = v[:12] + "..." if v else ""
+                                    else:
+                                        safe_headers[k] = v
 
-                            debug_payload = {
-                                "request_id": request_id,
-                                "timestamp": datetime.now().isoformat(),
-                                "status_code": response.status_code,
-                                "error_response": err_body,
-                                "model": model,
-                                "stream": stream,
-                                "headers": safe_headers,
-                                "compression": {
-                                    "was_compressed": bool(transforms_applied),
-                                    "transforms": transforms_applied,
-                                    "original_tokens": original_tokens,
-                                    "optimized_tokens": optimized_tokens,
-                                    "tokens_saved": tokens_saved,
-                                    "compression_failed": _compression_failed,
-                                },
-                                "tools_sent": body.get("tools"),
-                                "tool_count": len(body.get("tools") or []),
-                                "original_tool_count": len(_original_tools or []),
-                                "messages_sent": body.get("messages"),
-                                "message_count": len(body.get("messages", [])),
-                                "original_messages": (
+                                # In redacted mode, elide prompt/tool/system
+                                # content but keep structure, roles, and lengths.
+                                redact = dump_mode == "redacted"
+                                messages_sent = body.get("messages")
+                                original_dump: Any = (
                                     original_messages
                                     if original_messages is not body.get("messages")
                                     else "__same_as_sent__"
-                                ),
-                                "original_message_count": len(original_messages),
-                                "system_prompt": body.get("system"),
-                            }
+                                )
+                                tools_sent = body.get("tools")
+                                system_prompt = body.get("system")
+                                if redact:
+                                    messages_sent = _redact_debug_value(messages_sent)
+                                    if original_dump != "__same_as_sent__":
+                                        original_dump = _redact_debug_value(original_dump)
+                                    tools_sent = _redact_debug_value(tools_sent)
+                                    system_prompt = _redact_debug_value(system_prompt)
 
-                            with open(debug_file, "w") as f:
-                                json.dump(debug_payload, f, indent=2, default=str)
+                                debug_payload = {
+                                    "request_id": request_id,
+                                    "timestamp": datetime.now().isoformat(),
+                                    "dump_mode": dump_mode,
+                                    "status_code": response.status_code,
+                                    "error_response": err_body,
+                                    "model": model,
+                                    "stream": stream,
+                                    "headers": safe_headers,
+                                    "compression": {
+                                        "was_compressed": bool(transforms_applied),
+                                        "transforms": transforms_applied,
+                                        "original_tokens": original_tokens,
+                                        "optimized_tokens": optimized_tokens,
+                                        "tokens_saved": tokens_saved,
+                                        "compression_failed": _compression_failed,
+                                    },
+                                    "tools_sent": tools_sent,
+                                    "tool_count": len(body.get("tools") or []),
+                                    "original_tool_count": len(_original_tools or []),
+                                    "messages_sent": messages_sent,
+                                    "message_count": len(body.get("messages", [])),
+                                    "original_messages": original_dump,
+                                    "original_message_count": len(original_messages),
+                                    "system_prompt": system_prompt,
+                                }
 
-                            logger.warning(f"[{request_id}] Full debug dump: {debug_file}")
-                        except Exception as dump_err:
-                            logger.error(f"[{request_id}] Failed to write debug dump: {dump_err}")
+                                with open(debug_file, "w") as f:
+                                    json.dump(debug_payload, f, indent=2, default=str)
+
+                                logger.warning(
+                                    f"[{request_id}] Debug dump ({dump_mode}): {debug_file}"
+                                )
+                            except Exception as dump_err:
+                                logger.error(
+                                    f"[{request_id}] Failed to write debug dump: {dump_err}"
+                                )
 
                     # Parse response for CCR handling
                     resp_json = None
@@ -2141,7 +2432,7 @@ class AnthropicHandlerMixin:
                                     url,
                                     content=ccr_outbound_bytes,
                                     headers=ccr_outbound_headers,
-                                    timeout=httpx.Timeout(120.0),  # Override timeout for CCR
+                                    timeout=self._anthropic_buffered_request_timeout(),
                                 )
                                 logger.info(
                                     f"CCR: Got response status={cont_response.status_code}, "
@@ -2243,7 +2534,11 @@ class AnthropicHandlerMixin:
                                     continuation_body["tools"] = tools
 
                                 cont_response = await self._retry_request(
-                                    "POST", url, headers, continuation_body
+                                    "POST",
+                                    url,
+                                    headers,
+                                    continuation_body,
+                                    timeout=self._anthropic_buffered_request_timeout(),
                                 )
 
                                 # Update response with continuation
@@ -2297,6 +2592,35 @@ class AnthropicHandlerMixin:
                     if assistant_message is not None:
                         next_original_messages.append(copy.deepcopy(assistant_message))
                         next_forwarded_messages.append(copy.deepcopy(assistant_message))
+
+                    # Cache-miss attribution (#1313): when this turn expected a
+                    # prompt-cache hit but got cr_tokens == 0, decide whether the
+                    # cache most likely lapsed (idle > provider TTL → suggest a
+                    # longer TTL) or the cacheable prefix changed (content shifted).
+                    # Classify BEFORE update_from_response, which overwrites the
+                    # last-turn state the classifier reads (idle clock, prefix,
+                    # cached-token count). `optimized_messages` is the prefix we
+                    # forwarded this turn; compare it against last turn's.
+                    # `hasattr` guard: some tests inject a SimpleNamespace stub
+                    # tracker that only implements the freeze API, not the full
+                    # PrefixCacheTracker surface.
+                    if hasattr(prefix_tracker, "classify_cache_miss"):
+                        miss = prefix_tracker.classify_cache_miss(
+                            cache_read_tokens=cr_tokens,
+                            current_forwarded_messages=optimized_messages,
+                        )
+                        if miss.is_miss:
+                            logger.info(
+                                f"[{request_id}] CACHE-MISS-ATTRIBUTION: reason={miss.reason} "
+                                f"idle={miss.idle_seconds:.0f}s ttl={miss.cache_ttl_seconds}s "
+                                f"expected_cached={miss.expected_cached_tokens:,} "
+                                f"prefix_changed={miss.prefix_changed} "
+                                f"ttl_exceeded={miss.ttl_exceeded}"
+                            )
+                            await self.metrics.record_cache_miss_attribution(
+                                provider_name, miss.reason
+                            )
+
                     prefix_tracker.update_from_response(
                         cache_read_tokens=cr_tokens,
                         cache_write_tokens=cw_tokens,
@@ -2587,9 +2911,7 @@ class AnthropicHandlerMixin:
             custom_id = batch_req.get("custom_id", "")
             params = batch_req.get("params", {})
             canonical_params = dict(params)
-            canonical_tools = canonical_params.get("tools")
-            if canonical_tools is not None:
-                canonical_params["tools"] = self._sort_tools_deterministically(canonical_tools)
+            original_tools = canonical_params.get("tools")
             messages = params.get("messages", [])
             original_messages = copy.deepcopy(messages)
             model = params.get("model", "unknown")
@@ -2603,6 +2925,11 @@ class AnthropicHandlerMixin:
                     }
                 )
                 continue
+
+            if original_tools is not None:
+                sorted_tools = self._sort_tools_deterministically(original_tools)
+                if sorted_tools != original_tools:
+                    canonical_params["tools"] = sorted_tools
 
             # Apply optimization
             original_tokens = 0  # Initialize before try to prevent UnboundLocalError
@@ -2625,6 +2952,7 @@ class AnthropicHandlerMixin:
                         context=extract_user_query(messages),
                         frozen_message_count=frozen_message_count,
                         request_id=request_id,
+                        **proxy_pipeline_kwargs(self.config),
                     )
 
                     optimized_messages = result.messages
@@ -2666,7 +2994,12 @@ class AnthropicHandlerMixin:
                 # Create compressed batch request
                 compressed_params = {**params, "messages": optimized_messages}
                 if tools is not None:
-                    compressed_params["tools"] = self._sort_tools_deterministically(tools)
+                    sorted_tools = self._sort_tools_deterministically(tools)
+                    if sorted_tools != tools:
+                        tools = sorted_tools
+                    if tools or original_tools is not None:
+                        if tools != original_tools:
+                            compressed_params["tools"] = tools
                 compressed_requests.append(
                     {
                         "custom_id": custom_id,
@@ -2709,6 +3042,7 @@ class AnthropicHandlerMixin:
                 request_id=request_id,
                 forwarder_name="anthropic_batch",
                 path_for_log="/v1/messages/batches",
+                timeout=self._anthropic_buffered_request_timeout(),
             )
 
             # Batch create: tokens accumulated across all requests in
@@ -2834,6 +3168,7 @@ class AnthropicHandlerMixin:
             url=url,
             headers=headers,
             content=body,
+            timeout=self._anthropic_buffered_request_timeout(),
         )
 
         # Batch passthrough: no compression, no transforms — but we
@@ -2950,7 +3285,11 @@ class AnthropicHandlerMixin:
             request_id=None,
         )
 
-        response = await self.http_client.get(url, headers=headers)  # type: ignore[union-attr]
+        response = await self.http_client.get(  # type: ignore[union-attr]
+            url,
+            headers=headers,
+            timeout=self._anthropic_buffered_request_timeout(),
+        )
 
         if response.status_code != 200:
             # Error - pass through

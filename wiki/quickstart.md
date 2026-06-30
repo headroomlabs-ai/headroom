@@ -319,7 +319,7 @@ response = client.chat.completions.create(
 
 ## Next Steps
 
-- **[Configuration Reference](api.md)** - All configuration options
+- **[Configuration Reference](configuration.md)** - All configuration options
 - **[Transform Reference](transforms.md)** - How each transform works
 - **[Troubleshooting](troubleshooting.md)** - Common issues and solutions
 - **[Examples](../examples/)** - More complete examples

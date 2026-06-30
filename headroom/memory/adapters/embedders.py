@@ -31,6 +31,7 @@ if TYPE_CHECKING:
 # We operate in an authenticated-optional mode; warnings are not actionable.
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 os.environ.setdefault("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1")
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 warnings.filterwarnings("ignore", category=UserWarning, module="huggingface_hub")
 # Also silence the huggingface_hub logger which emits rate-limit advisory messages.
 logging.getLogger("huggingface_hub").setLevel(logging.ERROR)

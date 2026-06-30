@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from headroom.observability import HeadroomOtelMetrics
     from headroom.proxy.cost import CostTracker
 
+from headroom import savings_ledger
 from headroom.observability import get_otel_metrics
 from headroom.proxy.savings_tracker import SavingsTracker
 
@@ -67,7 +68,11 @@ class PrometheusMetrics:
         savings_tracker: SavingsTracker | None = None,
         cost_tracker: CostTracker | None = None,
         otel_metrics: HeadroomOtelMetrics | None = None,
+        stateless: bool = False,
     ):
+        # Stateless mode: keep live in-memory metrics but never write the
+        # durable savings files (proxy_savings.json, savings_events.jsonl).
+        self._stateless = stateless
         self.requests_total = 0
         self.requests_by_provider: dict[str, int] = defaultdict(int)
         self.requests_by_model: dict[str, int] = defaultdict(int)
@@ -223,9 +228,19 @@ class PrometheusMetrics:
         self.cache_bust_tokens_lost: int = 0
         self.cache_bust_count: int = 0
 
+        # Cache-miss attribution (#1313): when a turn expected a prompt-cache
+        # hit but got none, why? Bucketed by reason so operators can tell a
+        # TTL lapse (idle longer than the cache lifetime → consider a longer
+        # TTL) from a prefix-content change (the cacheable prefix shifted).
+        # Reasons are the MISS_* literals from prefix_tracker. Per provider so
+        # the dashboard can scope; populated by `record_cache_miss_attribution`.
+        self.cache_miss_attribution_by_provider: dict[str, dict[str, int]] = defaultdict(
+            lambda: defaultdict(int)
+        )
+
         # Cumulative savings history (timestamp → cumulative tokens saved)
         self.savings_history: list[tuple[str, int]] = []
-        self.savings_tracker = savings_tracker or SavingsTracker()
+        self.savings_tracker = savings_tracker or SavingsTracker(stateless=stateless)
         self.cost_tracker = cost_tracker
         tracker_lifetime = self.savings_tracker.snapshot()["lifetime"]
         self._savings_tracker_input_tokens_offset = max(
@@ -327,6 +342,7 @@ class PrometheusMetrics:
             self.prefix_freeze_compression_foregone = 0
             self.cache_bust_tokens_lost = 0
             self.cache_bust_count = 0
+            self.cache_miss_attribution_by_provider.clear()
             self.savings_history = []
 
         with self._stage_timing_lock:
@@ -563,6 +579,7 @@ class PrometheusMetrics:
         uncached_input_tokens: int = 0,
         attempted_input_tokens: int = 0,
         project: str | None = None,
+        client: str | None = None,
     ):
         """Record metrics for a request."""
         async with self._lock:
@@ -658,6 +675,21 @@ class PrometheusMetrics:
                 total_input_cost_usd=total_input_cost_usd,
             )
 
+            # Also append to the durable, multi-process savings ledger so
+            # `headroom savings` reflects proxy traffic alongside MCP-tool usage.
+            # The real upstream model means litellm prices it accurately. The
+            # client is the harness classified from the User-Agent / X-Client
+            # (claude-code, codex, cursor, ...); it falls back to "proxy" only
+            # when the harness is unidentified.
+            if tokens_saved > 0 and not self._stateless:
+                savings_ledger.record_savings_event(
+                    tokens_before=input_tokens,
+                    tokens_after=max(input_tokens - tokens_saved, 0),
+                    model=model,
+                    client=client or "proxy",
+                    source="proxy",
+                )
+
         self._get_otel_metrics().record_proxy_request(
             provider=provider,
             model=model,
@@ -717,6 +749,18 @@ class PrometheusMetrics:
             self.cache_bust_tokens_lost += tokens_lost
             self.cache_bust_count += 1
         self._get_otel_metrics().record_proxy_cache_bust(tokens_lost=tokens_lost)
+
+    async def record_cache_miss_attribution(self, provider: str, reason: str) -> None:
+        """Record why a turn that expected a prompt-cache hit missed instead.
+
+        ``reason`` is one of the MISS_* literals produced by
+        ``PrefixCacheTracker.classify_cache_miss`` (``ttl_expiry``,
+        ``prefix_change``, ``unknown``). Cold starts and hits are not recorded
+        — only actual misses against a previously-cached prefix reach here.
+        Bucketed per provider so the dashboard can scope or aggregate.
+        """
+        async with self._lock:
+            self.cache_miss_attribution_by_provider[provider][reason] += 1
 
     # ------------------------------------------------------------------
     # Unit 3: WS session lifecycle gauges / histogram
@@ -856,11 +900,9 @@ class PrometheusMetrics:
             # internally on `self.compressions_by_strategy` and
             # `self.tokens_saved_by_strategy` (populated by
             # `record_compression`) but **deliberately not exported
-            # here**. The proxy's metric→Supabase pipeline treats
-            # each metric name as a column, and we cannot add new
-            # columns. The state is still observable for tests +
-            # programmatic introspection; if/when a non-column-
-            # adding export path exists, surface it there.
+            # here** as individual Prometheus series. The state is
+            # still observable via /stats + tests + programmatic
+            # introspection.
             _append_metric(
                 lines,
                 name="headroom_latency_ms_sum",
@@ -959,6 +1001,22 @@ class PrometheusMetrics:
                 help_text="Tokens that lost provider cache discount because of compression",
                 value=self.cache_bust_tokens_lost,
             )
+
+            if self.cache_miss_attribution_by_provider:
+                lines.extend(
+                    [
+                        "# HELP headroom_cache_miss_attribution_total Cache misses on an "
+                        "expected-cached prefix, bucketed by reason (ttl_expiry|prefix_change|unknown)",
+                        "# TYPE headroom_cache_miss_attribution_total counter",
+                    ]
+                )
+                for _provider, _reasons in self.cache_miss_attribution_by_provider.items():
+                    for _reason, _count in _reasons.items():
+                        lines.append(
+                            f'headroom_cache_miss_attribution_total{{provider="{_provider}",'
+                            f'reason="{_reason}"}} {_count}'
+                        )
+                lines.append("")
 
             lines.extend(
                 [

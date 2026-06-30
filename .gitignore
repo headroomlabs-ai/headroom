@@ -21,6 +21,7 @@ scripts/*
 !scripts/tests/
 !scripts/README.md
 !scripts/repro_codex_replay.py
+!scripts/eval_output_shaper.py
 !scripts/fixtures/
 !scripts/fixtures/*.json
 !scripts/record_fixtures.py
@@ -116,6 +117,9 @@ ENV/
 env.bak/
 venv.bak/
 .python-version
+
+# Node.js dependencies (never commit vendored deps)
+node_modules/
 
 # Secrets and API keys - NEVER commit these
 *.pem
@@ -228,10 +232,7 @@ CLAUDE.md
 # Vitals provenance data
 .vitals/
 
-# Superpowers working files (plans, specs, brainstorming)
-# docs/spec/           (lives in git - git-versioned living specification)
-
-# Managed platform (separate private repo)
+# Separate private repos — never commit here
 headroom-managed/
 
 # Local act testing (never commit test tokens)
@@ -251,3 +252,4 @@ uv.lock
 # package shadows the maturin overlay on sys.path.
 /headroom/_core.*.so
 /headroom/_core.so
+.tokensave

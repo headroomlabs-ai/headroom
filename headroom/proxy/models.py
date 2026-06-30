@@ -107,6 +107,14 @@ class ProxyConfig:
     backend: str = "anthropic"
     bedrock_region: str = "us-west-2"
     bedrock_profile: str | None = None
+    # Custom upstream for the Bedrock InvokeModel passthrough routes
+    # (`/model/{id}/invoke[-with-response-stream]`). When set, those routes are
+    # registered and compress the request body before forwarding here. Point it
+    # at a re-signing gateway (LiteLLM, LocalStack, a corporate Bedrock
+    # proxy) — NOT raw AWS, since rewriting the body invalidates the caller's
+    # SigV4 signature. Leave unset (default) to keep `--backend bedrock`'s
+    # direct-to-AWS, re-signing behavior unchanged.
+    bedrock_api_url: str | None = None
     anyllm_provider: str = "openai"
 
     # Optimization mode: "token" (rewrite for max compression) or
@@ -146,6 +154,23 @@ class ProxyConfig:
     # CLI: --disable-kompress; env: HEADROOM_DISABLE_KOMPRESS=1.
     disable_kompress: bool = False
 
+    # With disable_kompress, route fall-through content to PASSTHROUGH instead
+    # of the default KOMPRESS fallback strategy. Restores the legacy
+    # --disable-kompress behaviour for callers that relied on it. No effect
+    # unless disable_kompress is also set.
+    # CLI: --disable-kompress-fallback; env: HEADROOM_DISABLE_KOMPRESS_FALLBACK=1.
+    disable_kompress_fallback: bool = False
+
+    # Per-provider overrides for `disable_kompress`. None inherits the global
+    # value above; True/False force-disable/enable Kompress for that provider's
+    # pipeline only (other compressors and all routing/exclusion are unaffected).
+    # Lets e.g. Anthropic run without lossy text compression while OpenAI/Codex
+    # keeps it. CLI: --disable-kompress-anthropic / --enable-kompress-anthropic
+    # (and -openai); env: HEADROOM_DISABLE_KOMPRESS_ANTHROPIC / _OPENAI
+    # (1 = disable, 0 = enable).
+    disable_kompress_anthropic: bool | None = None
+    disable_kompress_openai: bool | None = None
+
     # Code graph live watcher (triggers incremental reindex on file changes)
     code_graph_watcher: bool = False
 
@@ -173,8 +198,26 @@ class ProxyConfig:
     # CLI: --exclude-tools <name1,name2>; env: HEADROOM_EXCLUDE_TOOLS=<name1,name2>
     exclude_tools: set[str] | None = None
 
+    # Tool names whose results must never be lossy-compressed (e.g. Bash, WebFetch).
+    # Merged into exclude_tools before ContentRouter processes the conversation.
+    # CLI: --protect-tool-results <name1,name2>; env: HEADROOM_PROTECT_TOOL_RESULTS=<name1,name2>
+    protect_tool_results: frozenset[str] = field(default_factory=frozenset)
+
     # Read lifecycle management
     read_lifecycle: bool = True
+
+    # Mechanism B: activity-based read maturation (hold fresh Reads out of
+    # the provider prefix cache; compress once their file quiesces).
+    # Experimental — default off. CLI: --read-maturation;
+    # env: HEADROOM_READ_MATURATION=1
+    read_maturation: bool = False
+    # Read-maturation tuning (only meaningful when read_maturation=True).
+    # Defaults mirror ReadMaturationConfig. CLI: --read-maturation-quiesce-turns,
+    # --read-maturation-max-hold-turns, --read-maturation-min-size-bytes;
+    # env: HEADROOM_READ_MATURATION_QUIESCE_TURNS / _MAX_HOLD_TURNS / _MIN_SIZE_BYTES.
+    read_maturation_quiesce_turns: int = 5
+    read_maturation_max_hold_turns: int = 25
+    read_maturation_min_size_bytes: int = 2048
 
     # Deprecated compatibility argument. ContentRouter is always active in
     # the Python proxy; accepting this avoids breaking old config constructors
@@ -224,10 +267,14 @@ class ProxyConfig:
     # Timeouts
     request_timeout_seconds: int = 300
     connect_timeout_seconds: int = 10
+    # Anthropic buffered reads can legitimately run longer than the generic
+    # proxy request cap. Keep the generic timeout unchanged elsewhere.
+    anthropic_buffered_request_timeout_seconds: int = 600
 
     # Connection pool
     max_connections: int = 500
     max_keepalive_connections: int = 100
+    keepalive_expiry: float = 90.0
     http2: bool = True
 
     # Memory System
@@ -286,8 +333,26 @@ class ProxyConfig:
     subscription_poll_interval_s: int = 300
     subscription_active_window_s: int = 60
 
+    # Periodic TOIN stats logging. Enabled by default for observability, but
+    # operators of long-lived proxies can disable it if TOIN stats collection
+    # causes avoidable memory pressure on their platform.
+    # Env: HEADROOM_PERIODIC_TOIN_STATS=0.
+    periodic_toin_stats_enabled: bool = True
+
     # Stateless mode — disable all filesystem writes for read-only / container deployments
     stateless: bool = False
+
+    # Optional inbound auth. When set, non-loopback requests to the data-plane
+    # routes must present this token (``Authorization: Bearer <token>`` or the
+    # ``X-Headroom-Proxy-Token`` header). Loopback callers are exempt. Closes the
+    # gap where a container bound to 0.0.0.0 exposes unauthenticated /v1/* routes
+    # to the pod network. Env: HEADROOM_PROXY_TOKEN.
+    proxy_token: str | None = None
+
+    # Air-gap master switch — hard-disable ALL outbound network egress
+    # (telemetry beacon, update check, license/usage reporter, HuggingFace model
+    # downloads) for fully offline / regulated deployments. Env: HEADROOM_OFFLINE=1.
+    offline: bool = False
 
     # Unit 4: Bounded pre-upstream concurrency for Anthropic replay storms.
     #

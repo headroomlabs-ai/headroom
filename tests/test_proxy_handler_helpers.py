@@ -194,10 +194,11 @@ class _RetryThenSuccessClient:
     def __init__(self) -> None:
         self.attempts = 0
 
-    async def post(self, url, content, headers):  # noqa: ANN001, ANN201
+    async def post(self, url, content, headers, timeout=None):  # noqa: ANN001, ANN201
         self.attempts += 1
         if self.attempts == 1:
             raise httpx.ConnectTimeout("connect timed out")
+        del timeout
         request = httpx.Request("POST", url, headers=headers, content=content)
         return httpx.Response(200, request=request, content=b"{}")
 
@@ -569,6 +570,15 @@ def test_anthropic_tool_sort_and_context_append_helpers() -> None:
         "tool",
     ]
     assert AnthropicHandlerMixin._sort_tools_deterministically(None) is None
+    assert AnthropicHandlerMixin._tools_for_forwarding(tools, preserve_order=True) == tools
+    assert [
+        AnthropicHandlerMixin._tool_sort_key(tool)[0]
+        for tool in AnthropicHandlerMixin._tools_for_forwarding(tools, preserve_order=False) or []
+    ] == [
+        "alpha",
+        "beta",
+        "tool",
+    ]
     assert (
         AnthropicHandlerMixin._append_context_to_latest_non_frozen_user_turn(
             [], "ctx", frozen_message_count=0

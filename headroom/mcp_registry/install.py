@@ -4,9 +4,12 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
+from headroom.install.runtime import resolve_headroom_command
+
 from .base import MCPRegistrar, RegisterResult, RegisterStatus, ServerSpec
 from .claude import ClaudeRegistrar
 from .codex import CodexRegistrar
+from .opencode import OpencodeRegistrar
 
 #: Default proxy URL used when none is given.
 DEFAULT_PROXY_URL = "http://127.0.0.1:8787"
@@ -17,7 +20,7 @@ def get_all_registrars() -> list[MCPRegistrar]:
 
     The list grows as we add adapters for Cursor, Continue, Cline, etc.
     """
-    return [ClaudeRegistrar(), CodexRegistrar()]
+    return [ClaudeRegistrar(), CodexRegistrar(), OpencodeRegistrar()]
 
 
 def build_headroom_spec(proxy_url: str = DEFAULT_PROXY_URL) -> ServerSpec:
@@ -29,16 +32,28 @@ def build_headroom_spec(proxy_url: str = DEFAULT_PROXY_URL) -> ServerSpec:
     env: dict[str, str] = {}
     if proxy_url and proxy_url != DEFAULT_PROXY_URL:
         env["HEADROOM_PROXY_URL"] = proxy_url
+    command = resolve_headroom_command()
     return ServerSpec(
         name="headroom",
-        command="headroom",
-        args=("mcp", "serve"),
+        command=command[0],
+        args=(*command[1:], "mcp", "serve"),
         env=env,
     )
 
 
 def build_serena_spec(context: str) -> ServerSpec:
-    """Construct the canonical Serena MCP server spec for an agent context."""
+    """Construct the canonical Serena MCP server spec for an agent context.
+
+    ``--open-web-dashboard False`` suppresses Serena's browser popup on
+    startup. Headroom installs Serena by default, so without this flag every
+    wrapped session opens the Serena dashboard tab even for users who never
+    opted into Serena or created a ``~/.serena/serena_config.yml``. The flag
+    overrides Serena's own config at startup (it sets
+    ``web_dashboard_open_on_launch=False``), so it works regardless of the
+    user's local config. The dashboard backend still runs and remains
+    reachable at http://localhost:24282/dashboard/ for anyone who wants it —
+    only the automatic browser-open is disabled.
+    """
     return ServerSpec(
         name="serena",
         command="uvx",
@@ -50,7 +65,25 @@ def build_serena_spec(context: str) -> ServerSpec:
             "--project-from-cwd",
             "--context",
             context,
+            "--open-web-dashboard",
+            "False",
         ),
+    )
+
+
+def build_tokensave_spec(binary: str = "tokensave") -> ServerSpec:
+    """Construct the canonical tokensave MCP server spec.
+
+    tokensave (https://github.com/aovestdipaperino/tokensave) is the primary
+    coding-task compressor — a local semantic code-graph server launched as
+    ``tokensave serve`` over stdio. ``binary`` is the command the agent runs;
+    pass an absolute path when tokensave was fetched to ``~/.local/bin`` and
+    is not on the agent's PATH, or leave the default when it is on PATH.
+    """
+    return ServerSpec(
+        name="tokensave",
+        command=binary,
+        args=("serve",),
     )
 
 

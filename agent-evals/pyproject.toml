@@ -1,0 +1,79 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agent-evals"
+version = "0.0.1"
+description = "End-to-end accuracy A/B framework: coding-agent benchmarks WITH vs WITHOUT Headroom compression"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+dependencies = [
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+    "httpx>=0.24.0",
+    "numpy>=1.24.0",
+    "click>=8.1.0",
+    "rich>=13.0.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+# Dev/test toolchain (the agent-evals gate). Pure Python, no heavy benchmark deps.
+dev = [
+    "pytest>=7.4",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.4",
+    "mypy>=1.8",
+    "types-PyYAML",
+]
+# Statistics (Phase 1+): paired bootstrap, TOST, Wilson, power.
+stats = ["scipy>=1.10", "statsmodels>=0.14", "pandas>=2.0"]
+# Rigorous mixed-effects estimator (Phase 2).
+glmm = ["bambi>=0.13"]
+# Layer-2 fidelity probes (Phase 2).
+fidelity = ["rouge-score>=0.1.2", "bert-score>=0.3.13", "sentence-transformers>=2.2.0,<6.0"]
+# Heavy benchmark graders — kept OUT of the default install so they never bloat anything.
+swebench = ["swebench>=2.0", "docker>=7.0"]
+aider = ["aider-chat>=0.50"]
+
+[project.scripts]
+agent-evals = "agent_evals.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agent_evals"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "C4", "UP"]
+ignore = ["E501", "B008", "B905"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["agent_evals"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.mypy]
+python_version = "3.10"
+warn_unused_configs = true
+disallow_untyped_defs = true
+ignore_missing_imports = true
+files = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
+asyncio_mode = "auto"
+markers = [
+    "slow: slow tests (subprocess spawns, large fixtures)",
+    "real_llm: tests that hit real LLM APIs; skipped unless keys present",
+    "live: opt-in tests that spawn a real headroom proxy / hit upstreams; require keys",
+]

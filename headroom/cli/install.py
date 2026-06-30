@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import shutil
+import subprocess
 from copy import deepcopy
 
 import click
@@ -18,6 +20,7 @@ from headroom.install.models import (
 from headroom.install.planner import build_manifest
 from headroom.install.providers import apply_mutations, revert_mutations
 from headroom.install.runtime import (
+    acquire_runtime_start_lock,
     run_foreground,
     runtime_status,
     start_detached_agent,
@@ -25,7 +28,12 @@ from headroom.install.runtime import (
     stop_runtime,
     wait_ready,
 )
-from headroom.install.state import delete_manifest, load_manifest, save_manifest
+from headroom.install.state import (
+    ManifestError,
+    delete_manifest,
+    load_manifest,
+    save_manifest,
+)
 from headroom.install.supervisors import (
     install_supervisor,
     remove_supervisor,
@@ -42,19 +50,35 @@ def install() -> None:
 
 
 def _require_manifest(profile: str) -> DeploymentManifest:
-    manifest = load_manifest(profile)
+    try:
+        manifest = load_manifest(profile)
+    except ManifestError as e:
+        raise click.ClickException(str(e)) from None
     if manifest is None:
         raise click.ClickException(f"No deployment profile named '{profile}' is installed.")
     return manifest
 
 
 def _start_deployment(manifest: DeploymentManifest) -> None:
-    if manifest.preset == InstallPreset.PERSISTENT_DOCKER.value:
-        start_persistent_docker(manifest)
-    elif manifest.supervisor_kind == SupervisorKind.SERVICE.value:
-        start_supervisor(manifest)
-    else:
-        start_detached_agent(manifest.profile)
+    if manifest.preset == InstallPreset.PERSISTENT_DOCKER.value and shutil.which("docker") is None:
+        raise click.ClickException(
+            "Docker is required for this deployment but 'docker' was not found on PATH."
+        )
+    try:
+        if manifest.preset == InstallPreset.PERSISTENT_DOCKER.value:
+            start_persistent_docker(manifest)
+        elif manifest.supervisor_kind == SupervisorKind.SERVICE.value:
+            start_supervisor(manifest)
+        else:
+            start_detached_agent(manifest.profile)
+    except FileNotFoundError as e:
+        # A required external binary (docker, launchctl, systemctl) is missing.
+        raise click.ClickException(f"Cannot start deployment '{manifest.profile}': {e}") from None
+    except subprocess.CalledProcessError as e:
+        raise click.ClickException(
+            f"Cannot start deployment '{manifest.profile}': command failed "
+            f"({' '.join(map(str, e.cmd)) if isinstance(e.cmd, (list, tuple)) else e.cmd})"
+        ) from None
 
     if not wait_ready(manifest, timeout_seconds=45):
         raise click.ClickException(
@@ -134,12 +158,17 @@ def _reject_task_lifecycle(manifest: DeploymentManifest, action: str) -> None:
     "--target",
     "targets",
     multiple=True,
-    type=click.Choice(["claude", "copilot", "codex", "aider", "cursor", "openclaw"]),
+    type=click.Choice(["claude", "copilot", "codex", "aider", "cursor", "openclaw", "opencode"]),
     help="Tool target to configure when --providers manual is used.",
 )
 @click.option("--profile", default="default", show_default=True, help="Deployment profile name.")
 @click.option(
-    "--port", "-p", default=8787, type=int, show_default=True, help="Persistent proxy port."
+    "--port",
+    "-p",
+    default=8787,
+    type=click.IntRange(1, 65535),
+    show_default=True,
+    help="Persistent proxy port.",
 )
 @click.option(
     "--backend",
@@ -157,7 +186,16 @@ def _reject_task_lifecycle(manifest: DeploymentManifest, action: str) -> None:
     "--mode", "proxy_mode", default="token", show_default=True, help="Proxy optimization mode."
 )
 @click.option("--memory", is_flag=True, help="Enable persistent memory in the proxy runtime.")
-@click.option("--no-telemetry", is_flag=True, help="Disable anonymous telemetry in the runtime.")
+@click.option(
+    "--telemetry",
+    is_flag=True,
+    help="Opt in to anonymous telemetry in the runtime (off by default).",
+)
+@click.option(
+    "--no-telemetry",
+    is_flag=True,
+    help="Force anonymous telemetry off in the runtime (already the default).",
+)
 @click.option(
     "--image",
     default="ghcr.io/chopratejas/headroom:latest",
@@ -177,10 +215,17 @@ def install_apply(
     region: str | None,
     proxy_mode: str,
     memory: bool,
+    telemetry: bool,
     no_telemetry: bool,
     image: str,
 ) -> None:
     """Install a persistent Headroom deployment."""
+
+    if anyllm_provider and backend != "anyllm":
+        click.echo(
+            f"Warning: --anyllm-provider is ignored unless --backend anyllm "
+            f"(got --backend {backend})."
+        )
 
     if preset == InstallPreset.PERSISTENT_DOCKER.value:
         runtime = RuntimeKind.DOCKER.value
@@ -198,11 +243,16 @@ def install_apply(
         region=region,
         proxy_mode=proxy_mode,
         memory_enabled=memory,
-        telemetry_enabled=not no_telemetry,
+        telemetry_enabled=telemetry and not no_telemetry,
         image=image,
     )
 
-    existing = load_manifest(profile)
+    try:
+        existing = load_manifest(profile)
+    except ManifestError as e:
+        # A corrupt existing manifest shouldn't block a fresh apply; overwrite it.
+        click.echo(f"Warning: {e}; overwriting.")
+        existing = None
     if existing is not None:
         click.echo(f"Updating existing deployment profile '{profile}'...")
         _remove_deployment(existing)
@@ -212,12 +262,16 @@ def install_apply(
         manifest.artifacts = install_supervisor(manifest)
         save_manifest(manifest)
         _start_deployment(manifest)
-    except Exception:
+    except Exception as exc:
         _remove_deployment(manifest)
         if existing is not None:
             click.echo(f"Restoring previous deployment '{profile}'...")
             _restore_deployment(existing)
-        raise
+        # Surface non-Click errors (OSError, CalledProcessError, …) as a clean
+        # message rather than a raw traceback; Click errors pass through as-is.
+        if isinstance(exc, (click.ClickException, click.Abort)):
+            raise
+        raise click.ClickException(f"Failed to install deployment '{profile}': {exc}") from exc
 
     click.echo(
         f"Installed persistent deployment '{profile}' "
@@ -320,6 +374,9 @@ def install_agent_run(profile: str) -> None:
     raise SystemExit(run_foreground(manifest))
 
 
+_STARTUP_READY_TIMEOUT_SECONDS = 15
+
+
 @install_agent.command("ensure")
 @click.option("--profile", default="default", show_default=True, help="Deployment profile name.")
 def install_agent_ensure(profile: str) -> None:
@@ -329,5 +386,21 @@ def install_agent_ensure(profile: str) -> None:
     if probe_ready(manifest.health_url):
         click.echo(f"Deployment '{profile}' is already healthy.")
         return
-    _start_deployment(manifest)
+    with acquire_runtime_start_lock(manifest.profile) as acquired:
+        if not acquired:
+            click.echo(f"Deployment '{profile}' start is already in progress.")
+            return
+        # Double-check after acquiring the lock — another ensure may have
+        # started the runtime while we waited for the lock.
+        if probe_ready(manifest.health_url):
+            click.echo(f"Deployment '{profile}' is already healthy.")
+            return
+        if runtime_status(manifest) == "running":
+            # Runtime exists but isn't ready yet — give it a grace period
+            # before deciding it's wedged and restarting.
+            if wait_ready(manifest, timeout_seconds=_STARTUP_READY_TIMEOUT_SECONDS):
+                click.echo(f"Deployment '{profile}' is healthy.")
+                return
+            stop_runtime(manifest)
+        _start_deployment(manifest)
     click.echo(f"Deployment '{profile}' is healthy.")

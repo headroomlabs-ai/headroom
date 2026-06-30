@@ -36,7 +36,7 @@ OPENAI_BASE_URL=http://localhost:8787/v1 your-app
 
 `headroom wrap copilot` uses Copilot CLI's BYOK provider settings under the hood. In `provider-type=auto`, it chooses Headroom's Anthropic route for the default proxy backend and the OpenAI-compatible `/v1` route for translated backends such as `anyllm` and LiteLLM.
 
-Anonymous aggregate telemetry is enabled by default. Opt out with `HEADROOM_TELEMETRY=off` or `headroom proxy --no-telemetry`. Downstream apps can set `HEADROOM_SDK=headroom-app` to override the anonymous telemetry `sdk` label; the default remains `proxy`.
+Anonymous aggregate telemetry is **off by default** (opt-in). Opt in with `HEADROOM_TELEMETRY=on` or `headroom proxy --telemetry`. Downstream apps can set `HEADROOM_SDK=headroom-app` to override the anonymous telemetry `sdk` label; the default remains `proxy`.
 
 Operational OTEL metrics are configured separately and are **off by default**. Install `headroom-ai[proxy,otel]` and set:
 
@@ -102,23 +102,15 @@ Legacy values (`token_headroom`, `cost_savings`) are still accepted as aliases.
 
 ### Context Management Options
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--no-intelligent-context` | `false` | Disable IntelligentContextManager (fall back to RollingWindow) |
-| `--no-intelligent-scoring` | `false` | Disable multi-factor importance scoring (use position-based) |
-| `--no-compress-first` | `false` | Disable trying deeper compression before dropping messages |
+Context management in the proxy is handled automatically by the compression pipeline. CCR (Compress-Cache-Retrieve) ensures that when content is compressed or messages are dropped, the original data remains accessible for the LLM to retrieve on demand. See [CCR documentation](ccr.md) for details.
 
-By default, the proxy uses **IntelligentContextManager** which scores messages by multiple factors (recency, semantic similarity, TOIN-learned patterns, error indicators, forward references) and drops lowest-scored messages first. This is smarter than simple age-based truncation.
+Key CCR-related proxy flags:
 
-**CCR Integration:** When messages are dropped, they're stored in CCR so the LLM can retrieve them if needed. The inserted marker includes the CCR reference. Drops are also recorded to TOIN, so the system learns which message patterns are important across all users.
-
-```bash
-# Use legacy RollingWindow (drops oldest first)
-headroom proxy --no-intelligent-context
-
-# Disable semantic scoring (faster, but less intelligent)
-headroom proxy --no-intelligent-scoring
-```
+| Option | Description |
+|--------|-------------|
+| `--no-ccr-inject-tool` | Do not inject the `headroom_retrieve` tool into the LLM's available tools |
+| `--no-ccr-marker` | Do not add retrieval markers to compressed output |
+| `--no-ccr-proactive-expansion` | Disable proactive context expansion before the LLM asks |
 
 ### ML Compression — RETIRED `--llmlingua` flag
 

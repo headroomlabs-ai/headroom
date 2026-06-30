@@ -29,8 +29,8 @@ plan = client.chat.completions.simulate(
 
 print(f"Tokens before: {plan.tokens_before}")
 print(f"Tokens after: {plan.tokens_after}")
-print(f"Would save: {plan.tokens_saved} tokens ({plan.savings_percent:.1f}%)")
-print(f"Transforms: {plan.transforms_applied}")
+print(f"Would save: {plan.tokens_saved} tokens ({plan.tokens_saved/plan.tokens_before*100:.1f}%)")
+print(f"Transforms: {plan.transforms}")
 ```
 </Tab>
 </Tabs>
@@ -114,7 +114,7 @@ if plan.tokens_saved == 0:
     print("- No tool outputs with compressible JSON arrays")
     print("- Content is already compact (code, grep results)")
 else:
-    print(f"Transforms applied: {plan.transforms_applied}")
+    print(f"Transforms applied: {plan.transforms}")
     # See the optimized messages
     print(json.dumps(plan.messages_optimized, indent=2))
 ```
@@ -141,7 +141,7 @@ for config in configs:
     )
     plan = client.chat.completions.simulate(model="gpt-4o", messages=messages)
     print(f"max_items={config.max_items_after_crush}: "
-          f"{plan.tokens_saved} tokens saved ({plan.savings_percent:.1f}%)")
+          f"{plan.tokens_saved} tokens saved ({plan.tokens_saved/plan.tokens_before*100:.1f}%)")
 ```
 
 <Callout type="info" title="No API call">

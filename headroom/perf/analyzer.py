@@ -48,6 +48,11 @@ _TOIN_RE = re.compile(
     r"(?P<retrievals>\d+) retrievals, (?P<rate>[\d.]+)% retrieval rate"
 )
 
+# Matches structured stage timing logs: [hr_...] STAGE_TIMINGS {"event": "stage_timings", ...}
+_STAGE_TIMINGS_RE = re.compile(
+    r"^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d+) .* \[(?P<rid>[^\]]+)\] STAGE_TIMINGS (?P<payload>.+)$"
+)
+
 
 # ---------------------------------------------------------------------------
 # Cache-aware pricing via LiteLLM
@@ -145,6 +150,10 @@ class PerfRecord:
     cache_hit_pct: int = 0
     optimization_ms: float = 0
     transforms: list[str] = field(default_factory=list)
+    total_ms: float = 0.0
+    tokens_out: int = 0
+    ttfb_ms: float = 0.0
+    stages: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -201,6 +210,10 @@ class PerfReport:
     oldest_kept_ts: str | None = None
     newest_kept_ts: str | None = None
     records_filtered_out: int = 0
+    # True when no time cutoff was applied (--hours 0, or a value so large it
+    # overflows datetime arithmetic). The header says "all data" instead of a
+    # misleading "last 0h".
+    window_all_data: bool = False
 
 
 # Log timestamps are emitted by Python's `logging` formatter as
@@ -234,12 +247,23 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
     """
     report = PerfReport()
     report.requested_hours = last_n_hours
+    stages_by_rid: dict[str, dict[str, float]] = {}
 
     log_dir = _paths.log_dir() if os.environ.get("HEADROOM_WORKSPACE_DIR") else LOG_DIR
     if not log_dir.exists():
         return report
 
-    cutoff = datetime.now() - timedelta(hours=last_n_hours) if last_n_hours > 0 else None
+    # A huge --hours value (e.g. 1e9) overflows datetime arithmetic. Since
+    # "look back a billion hours" is effectively "all data", treat overflow as
+    # no cutoff rather than crashing with a raw OverflowError traceback.
+    if last_n_hours > 0:
+        try:
+            cutoff: datetime | None = datetime.now() - timedelta(hours=last_n_hours)
+        except OverflowError:
+            cutoff = None
+    else:
+        cutoff = None
+    report.window_all_data = cutoff is None
 
     def _within_window(ts_str: str | None) -> bool:
         # Fail-open: records without a parseable timestamp are kept. The
@@ -269,6 +293,27 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
                 for line in f:
                     report.total_lines_parsed += 1
                     line = line.rstrip()
+
+                    # STAGE_TIMINGS lines
+                    m_stage = _STAGE_TIMINGS_RE.match(line)
+                    if m_stage:
+                        ts = m_stage.group("ts")
+                        if not _within_window(ts):
+                            report.records_filtered_out += 1
+                            continue
+                        _track_window(ts)
+                        rid = m_stage.group("rid")
+                        try:
+                            import json
+
+                            payload = json.loads(m_stage.group("payload"))
+                            stages = payload.get("stages", {})
+                            stages_by_rid[rid] = {
+                                k: float(v) for k, v in stages.items() if v is not None
+                            }
+                        except Exception:
+                            pass
+                        continue
 
                     # PERF lines (richest data)
                     m = _PERF_RE.match(line)
@@ -310,6 +355,10 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
                                 cache_hit_pct=int(kv.get("cache_hit_pct", 0)),
                                 optimization_ms=float(kv.get("opt_ms", 0)),
                                 transforms=transforms,
+                                total_ms=float(kv.get("total_ms", 0)),
+                                tokens_out=int(kv.get("tok_out", 0)),
+                                ttfb_ms=float(kv.get("ttfb_ms", 0)),
+                                stages=stages_by_rid.get(m.group("rid"), {}),
                             )
                         )
                         continue
@@ -391,29 +440,87 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
     return report
 
 
+def _context_tool_lifetime_savings() -> dict | None:
+    """Lifetime savings from the configured CLI context tool (RTK / lean-ctx).
+
+    ``perf`` reports a windowed view of the proxy's *compression* logs. The CLI
+    context tool (RTK) keeps its own lifetime counter that never lands in
+    ``proxy.log``, so without this it stays invisible in ``headroom perf`` even
+    when it dwarfs proxy-side savings. Lifetime (not session) is the right scope
+    here: ``perf`` is a one-shot CLI, so the proxy-session baseline ``/stats``
+    subtracts is meaningless out of process.
+
+    Best-effort: returns ``None`` when no tool is installed or its stats cannot
+    be read, so the report degrades to proxy-only rather than erroring.
+    """
+    try:
+        from headroom.proxy.helpers import _get_context_tool_stats
+
+        stats = _get_context_tool_stats()
+    except Exception:
+        return None
+    if not stats or not stats.get("installed", False):
+        return None
+    lifetime = stats.get("lifetime") or {}
+    tokens_saved = int(lifetime.get("tokens_saved", 0) or 0)
+    if tokens_saved <= 0:
+        return None
+    return {
+        "tool": str(stats.get("tool", "rtk")),
+        "label": str(stats.get("label", "RTK")),
+        "tokens_saved": tokens_saved,
+        "commands": int(lifetime.get("commands", 0) or 0),
+        "savings_pct": round(float(lifetime.get("savings_pct", 0.0) or 0.0), 1),
+    }
+
+
+def _cli_filtering_report_lines() -> list[str]:
+    """Render the context-tool (RTK) lifetime savings section, or [] if absent."""
+    cli = _context_tool_lifetime_savings()
+    if not cli:
+        return []
+    return [
+        f"{cli['label']} CLI Filtering (lifetime, all-time)",
+        "-" * 40,
+        f"  Tokens saved:  {cli['tokens_saved']:,} ({cli['savings_pct']:.1f}%)",
+        f"  Commands:      {cli['commands']:,}",
+        f"  Note: {cli['label']}'s own lifetime counter — not limited to the --hours window.",
+        "",
+    ]
+
+
 def format_report(report: PerfReport) -> str:
     """Format a PerfReport into a human-readable string."""
     lines: list[str] = []
+    cli_filtering_lines = _cli_filtering_report_lines()
 
     if not report.perf_records and not report.router_records:
-        lines.append("No performance data found in ~/.headroom/logs/")
-        lines.append("")
-        lines.append("Start the proxy to begin collecting data:")
-        lines.append("  headroom proxy")
+        if cli_filtering_lines:
+            # RTK savings are independent of proxy logs — surface them even when
+            # there is no proxy traffic in the window.
+            lines.append("No proxy performance data in ~/.headroom/logs/ for this window.")
+            lines.append("")
+            lines.extend(cli_filtering_lines)
+        else:
+            lines.append("No performance data found in ~/.headroom/logs/")
+            lines.append("")
+            lines.append("Start the proxy to begin collecting data:")
+            lines.append("  headroom proxy")
         return "\n".join(lines)
 
     # Header
     lines.append("Headroom Performance Report")
     lines.append("=" * 60)
     if report.requested_hours is not None:
+        window_label = "all data" if report.window_all_data else f"last {report.requested_hours:g}h"
         if report.oldest_kept_ts and report.newest_kept_ts:
             window_str = (
-                f"Window: last {report.requested_hours:g}h "
+                f"Window: {window_label} "
                 f"(actual data: {report.oldest_kept_ts[:19]} → "
                 f"{report.newest_kept_ts[:19]})"
             )
         else:
-            window_str = f"Window: last {report.requested_hours:g}h (no records found in window)"
+            window_str = f"Window: {window_label} (no records found in window)"
         lines.append(window_str)
         if report.records_filtered_out > 0:
             lines.append(
@@ -512,6 +619,37 @@ def format_report(report: PerfReport) -> str:
                 lines.append(f"  >500ms:   {len(slow)} requests")
             lines.append("")
 
+        # Throughput
+        tp = calculate_throughput(report)
+        rolling = tp["rolling"]
+        current = tp["current"]
+        if rolling["input_wall_clock"] > 0 or rolling["input_active_p50"] > 0:
+            lines.append("Throughput")
+            lines.append("-" * 40)
+            lines.append(
+                f"  Input (wall-clock):   {rolling['input_wall_clock']:.1f} tok/s"
+                f" (current: {current['input_wall_clock']:.1f} tok/s)"
+            )
+            lines.append(
+                f"  Input (active p50/95): {rolling['input_active_p50']:.1f} / {rolling['input_active_p95']:.1f} tok/s"
+                f" (current: {current['input_active_p50']:.1f} / {current['input_active_p95']:.1f} tok/s)"
+            )
+            if rolling["compression_p50"] > 0:
+                lines.append(
+                    f"  Compression (p50/95):  {rolling['compression_p50']:.1f} / {rolling['compression_p95']:.1f} tok/s"
+                    f" (current: {current['compression_p50']:.1f} / {current['compression_p95']:.1f} tok/s)"
+                )
+            lines.append(
+                f"  Forward (p50/95):      {rolling['forward_p50']:.1f} / {rolling['forward_p95']:.1f} tok/s"
+                f" (current: {current['forward_p50']:.1f} / {current['forward_p95']:.1f} tok/s)"
+            )
+            if rolling["generation_p50"] > 0:
+                lines.append(
+                    f"  Generation (p50/95):   {rolling['generation_p50']:.1f} / {rolling['generation_p95']:.1f} tok/s"
+                    f" (current: {current['generation_p50']:.1f} / {current['generation_p95']:.1f} tok/s)"
+                )
+            lines.append("")
+
         # Conversation size distribution
         msg_counts = [r.num_messages for r in records if r.num_messages > 0]
         if msg_counts:
@@ -596,6 +734,10 @@ def format_report(report: PerfReport) -> str:
             lines.append(f"  {i}. {rec}")
         lines.append("")
 
+    # CLI context-tool (RTK) lifetime savings — its own counter never reaches
+    # proxy.log, so surface it here or it stays invisible in `headroom perf`.
+    lines.extend(cli_filtering_lines)
+
     # Footer
     lines.append(
         f"Log files: {report.log_files_read} | Lines parsed: {report.total_lines_parsed:,}"
@@ -632,12 +774,134 @@ PERF_RECORD_FIELDS = [
     "cache_hit_pct",
     "optimization_ms",
     "transforms",
+    "total_ms",
+    "tokens_out",
+    "ttfb_ms",
+    "stages",
 ]
 
 
 def _pct(saved: int, before: int) -> float:
     """Reduction percentage, rounded to 1dp, guarding divide-by-zero."""
     return round(saved / before * 100, 1) if before > 0 else 0.0
+
+
+def _percentile(data: list[float], pct: float) -> float:
+    if not data:
+        return 0.0
+    sorted_data = sorted(data)
+    index = (len(sorted_data) - 1) * pct
+    lower = int(index)
+    upper = lower + 1
+    weight = index - lower
+    if upper < len(sorted_data):
+        return sorted_data[lower] * (1.0 - weight) + sorted_data[upper] * weight
+    return sorted_data[lower]
+
+
+def calculate_throughput(report: PerfReport) -> dict:
+    records = report.perf_records
+    parsed_records = []
+    for r in records:
+        ts = _parse_log_ts(r.timestamp)
+        if ts:
+            parsed_records.append((r, ts))
+
+    if not parsed_records:
+        empty = {
+            "input_wall_clock": 0.0,
+            "input_active_p50": 0.0,
+            "input_active_p95": 0.0,
+            "compression_p50": 0.0,
+            "compression_p95": 0.0,
+            "forward_p50": 0.0,
+            "forward_p95": 0.0,
+            "generation_p50": 0.0,
+            "generation_p95": 0.0,
+        }
+        return {"rolling": empty.copy(), "current": empty.copy()}
+
+    # Calculate window from PERF timestamps to prevent dilution from other log lines
+    perf_timestamps = [pair[1] for pair in parsed_records]
+    oldest = min(perf_timestamps)
+    newest = max(perf_timestamps)
+    window_seconds = max(1.0, (newest - oldest).total_seconds())
+
+    rolling = _calculate_throughput_stats(records, window_seconds)
+
+    # 5-minute window calculations
+    current_records = []
+    current_window_seconds = 0.0
+    cutoff_5m = newest - timedelta(minutes=5)
+    current_pairs = [pair for pair in parsed_records if pair[1] >= cutoff_5m]
+    if current_pairs:
+        current_records = [pair[0] for pair in current_pairs]
+        cur_oldest = min(pair[1] for pair in current_pairs)
+        current_window_seconds = max(1.0, (newest - cur_oldest).total_seconds())
+
+    current = _calculate_throughput_stats(current_records, current_window_seconds)
+
+    return {"rolling": rolling, "current": current}
+
+
+def _calculate_throughput_stats(records: list[PerfRecord], window_seconds: float) -> dict:
+    if not records:
+        return {
+            "input_wall_clock": 0.0,
+            "input_active_p50": 0.0,
+            "input_active_p95": 0.0,
+            "compression_p50": 0.0,
+            "compression_p95": 0.0,
+            "forward_p50": 0.0,
+            "forward_p95": 0.0,
+            "generation_p50": 0.0,
+            "generation_p95": 0.0,
+        }
+
+    # 1. Input Wall-Clock
+    total_tokens_before = sum(r.tokens_before for r in records)
+    input_wall = total_tokens_before / window_seconds if window_seconds > 0 else 0.0
+
+    # 2. Input Active
+    input_active_rates = []
+    for r in records:
+        if r.total_ms > 0:
+            input_active_rates.append(r.tokens_before / (r.total_ms / 1000.0))
+
+    # 3. Compression
+    compression_rates = []
+    for r in records:
+        duration_ms = r.stages.get("compression_first_stage") or r.stages.get("compression")
+        if duration_ms is not None and duration_ms > 0:
+            compression_rates.append(r.tokens_before / (duration_ms / 1000.0))
+
+    # 4. Effective Forward
+    forward_rates = []
+    for r in records:
+        if r.total_ms > 0:
+            forward_rates.append(r.tokens_after / (r.total_ms / 1000.0))
+
+    # 5. Output / Generation (Approximate generation throughput)
+    generation_rates = []
+    for r in records:
+        if r.tokens_out > 0:
+            duration_ms = r.total_ms
+            if r.ttfb_ms > 0 and r.total_ms > r.ttfb_ms:
+                duration_ms = r.total_ms - r.ttfb_ms
+            if duration_ms > 0:
+                generation_rates.append(r.tokens_out / (duration_ms / 1000.0))
+
+    return {
+        "input_wall_clock": round(input_wall, 2),
+        "input_active_p50": round(_percentile(input_active_rates, 0.5), 2),
+        "input_active_p95": round(_percentile(input_active_rates, 0.95), 2),
+        "compression_p50": round(_percentile(compression_rates, 0.5), 2),
+        "compression_p95": round(_percentile(compression_rates, 0.95), 2),
+        "forward_p50": round(_percentile(forward_rates, 0.5), 2),
+        "forward_p95": round(_percentile(forward_rates, 0.95), 2),
+        "generation_p50": round(_percentile(generation_rates, 0.5), 2),
+        "generation_p95": round(_percentile(generation_rates, 0.95), 2),
+    }
 
 
 def build_perf_summary(report: PerfReport) -> dict:
@@ -714,8 +978,12 @@ def build_perf_summary(report: PerfReport) -> dict:
         "cache_hit_pct": cache_hit_pct,
         "by_model": by_model,
         "by_transform": by_transform,
+        "throughput": calculate_throughput(report),
         "log_files_read": report.log_files_read,
         "total_lines_parsed": report.total_lines_parsed,
+        # RTK/CLI context-tool lifetime savings (its own counter, not in
+        # proxy.log) — None when no tool is installed. Mirrors the text report.
+        "cli_filtering": _context_tool_lifetime_savings(),
     }
 
 

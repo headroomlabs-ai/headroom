@@ -9,7 +9,9 @@ from headroom.cache.compression_store import (
     get_compression_store,
     reset_compression_store,
 )
-from headroom.ccr import mcp_server
+from tests._mcp_stub import import_module_with_mcp_stub
+
+mcp_server = import_module_with_mcp_stub("headroom.ccr.mcp_server")
 
 
 def test_shared_stats_work_without_fcntl(monkeypatch, tmp_path) -> None:
@@ -47,7 +49,6 @@ def fresh_store():
 
 def test_mcp_uses_shared_singleton_store(fresh_store) -> None:
     """MCP's store is the global singleton, not a private instance."""
-    pytest.importorskip("mcp", reason="MCP SDK required")
     server = mcp_server.HeadroomMCPServer(check_proxy=False)
     assert server._get_local_store() is get_compression_store()
 
@@ -56,12 +57,147 @@ def test_mcp_retrieves_proxy_stored_content(fresh_store) -> None:
     """Content stored via the singleton (as the proxy does) is retrievable
     through MCP's local-store path. The HTTP fallback is disabled so this
     passes only via the shared store."""
-    pytest.importorskip("mcp", reason="MCP SDK required")
     original = '{"some": "original proxy-compressed content"}'
     hash_key = get_compression_store().store(original, '{"compressed": true}')
 
     server = mcp_server.HeadroomMCPServer(check_proxy=False)
-    result = asyncio.run(server._retrieve_content(hash_key, query=None))
+    result = asyncio.run(server._retrieve_content(hash_key))
 
     assert result.get("source") == "local"
     assert result["original_content"] == original
+
+
+def test_compress_savings_percent_tracks_token_counts(fresh_store) -> None:
+    """``savings_percent`` must be the *removed* percentage derived from the
+    token counts — never the retained percentage. Regression for the inversion
+    where ``(1 - compression_ratio)`` reported a no-op (0% saved) as 100%."""
+    pytest.importorskip("mcp", reason="MCP SDK required")
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+
+    # Repetitive JSON array — the shape the engine actually compresses.
+    content = json.dumps([{"id": i, "status": "ok", "kind": "run"} for i in range(40)])
+    result = server._compress_content(content)
+
+    orig = result["original_tokens"]
+    comp = result["compressed_tokens"]
+    expected = round((1 - comp / orig) * 100, 1) if orig > 0 else 0
+
+    # Reported savings agrees with the token fields (and with tokens_saved).
+    assert result["savings_percent"] == expected
+    assert 0.0 <= result["savings_percent"] <= 100.0
+    if result["tokens_saved"] == 0:
+        assert result["savings_percent"] == 0.0  # not inverted to 100
+    else:
+        assert result["savings_percent"] > 0.0
+
+
+def test_mcp_retrieve_returns_full_content(fresh_store) -> None:
+    """Retrieval is by hash: a stored, unexpired entry always returns its full
+    original content (never empty, never a spurious "not found")."""
+    original = "the the the the the the the the the the\n" * 5
+    hash_key = get_compression_store().store(original, "<<small>>")
+
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+    result = asyncio.run(server._retrieve_content(hash_key))
+
+    assert "error" not in result
+    assert result.get("source") == "local"
+    assert result["original_content"] == original
+
+
+def test_mcp_retrieve_missing_hash_still_errors(fresh_store) -> None:
+    """A genuinely missing hash must still report "Content not found"."""
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+    result = asyncio.run(server._retrieve_content("nonexistent_hash"))
+    assert "Content not found" in result.get("error", "")
+
+
+def test_handle_stats_session_output_is_window_scoped() -> None:
+    """window-scoped stats output should be explicitly labeled after this change."""
+
+    async def fetch_stats() -> dict[str, object]:
+        return {
+            "summary": {
+                "mode": "token",
+                "api_requests": 3,
+                "compression": {},
+            }
+        }
+
+    server = mcp_server.HeadroomMCPServer(check_proxy=True)
+    server._fetch_full_proxy_stats = fetch_stats
+    response = asyncio.run(server._handle_stats())
+    text = response[0].kwargs["text"]
+
+    assert "Headroom Window-Scoped Session Summary" in text
+    assert "Headroom Session Summary" not in text
+
+
+def test_handle_stats_includes_lifetime_totals_from_persistent_savings() -> None:
+    """Lifetime savings are appended from /stats persistent_savings.lifetime."""
+
+    async def fetch_stats() -> dict[str, object]:
+        return {
+            "summary": {
+                "mode": "token",
+                "api_requests": 3,
+                "compression": {},
+            },
+            "persistent_savings": {
+                "lifetime": {"tokens_saved": 12345, "compression_savings_usd": 7.25}
+            },
+        }
+
+    server = mcp_server.HeadroomMCPServer(check_proxy=True)
+    server._fetch_full_proxy_stats = fetch_stats
+    response = asyncio.run(server._handle_stats())
+    text = response[0].kwargs["text"]
+
+    assert "Lifetime Savings:" in text
+    assert "Tokens saved: 12,345" in text
+    assert "Compression savings: $7.25" in text
+
+
+def test_handle_stats_falls_back_gracefully_without_persistent_lifetime() -> None:
+    """Missing lifetime data should still return a valid session summary."""
+
+    async def fetch_stats() -> dict[str, object]:
+        return {
+            "summary": {
+                "mode": "token",
+                "api_requests": 3,
+                "compression": {},
+            },
+            "persistent_savings": {"lifetime": None},
+        }
+
+    server = mcp_server.HeadroomMCPServer(check_proxy=True)
+    server._fetch_full_proxy_stats = fetch_stats
+    response = asyncio.run(server._handle_stats())
+    text = response[0].kwargs["text"]
+
+    assert "Headroom Window-Scoped Session Summary" in text
+    assert "Lifetime Savings:" not in text
+
+
+def test_handle_stats_shows_zero_lifetime_totals_when_present() -> None:
+    """A present lifetime payload should still render explicit zero totals."""
+
+    async def fetch_stats() -> dict[str, object]:
+        return {
+            "summary": {
+                "mode": "token",
+                "api_requests": 3,
+                "compression": {},
+            },
+            "persistent_savings": {"lifetime": {"tokens_saved": 0, "compression_savings_usd": 0.0}},
+        }
+
+    server = mcp_server.HeadroomMCPServer(check_proxy=True)
+    server._fetch_full_proxy_stats = fetch_stats
+    response = asyncio.run(server._handle_stats())
+    text = response[0].kwargs["text"]
+
+    assert "Lifetime Savings:" in text
+    assert "Tokens saved: 0" in text
+    assert "Compression savings: $0.00" in text

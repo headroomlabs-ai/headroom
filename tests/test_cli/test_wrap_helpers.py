@@ -522,6 +522,38 @@ class TestApplyProjectHeaderEnv:
 
         assert wrap_mod._project_name_from_cwd() == "vibe-headroom"
 
+    def test_non_ascii_cwd_name_is_percent_encoded(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Non-ASCII directory names must be percent-encoded for HTTP headers."""
+        project_dir = tmp_path / "第二大脑共享"
+        project_dir.mkdir()
+        monkeypatch.chdir(project_dir)
+
+        result = wrap_mod._project_name_from_cwd()
+        assert result is not None
+        # Must be pure ASCII so it's safe in an HTTP header value.
+        result.encode("ascii")
+        # Must round-trip back to the original name via unquote.
+        import urllib.parse
+
+        assert urllib.parse.unquote(result) == "第二大脑共享"
+
+    def test_non_ascii_cwd_header_is_ascii_safe(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """X-Headroom-Project header value must be ASCII when cwd has non-ASCII chars."""
+        project_dir = tmp_path / "test-中文-项目"
+        project_dir.mkdir()
+        monkeypatch.chdir(project_dir)
+
+        env: dict[str, str] = {}
+        wrap_mod._apply_project_header_env(env)
+
+        header_value = env["ANTHROPIC_CUSTOM_HEADERS"]
+        assert header_value.startswith("X-Headroom-Project: ")
+        header_value.encode("ascii")  # raises UnicodeEncodeError if non-ASCII
+
 
 # ---------------------------------------------------------------------------
 # Proxy-client reference counting
@@ -707,3 +739,53 @@ class TestProxyClientRefCounting:
 
         # Second unregister is a no-op, not an error.
         wrap_mod._unregister_proxy_client(self.PORT)
+
+
+# ---------------------------------------------------------------------------
+# _ensure_proxy — dashboard URL is surfaced even when the proxy is already up.
+# ---------------------------------------------------------------------------
+
+
+def test_ensure_proxy_already_running_prints_dashboard_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When a healthy proxy is already running, the dashboard URL is printed.
+
+    Regression: the URL was only echoed on the start/restart path, so repeat
+    wraps (the common case) never told the user where the dashboard lives.
+    """
+    port = 1234
+    monkeypatch.setattr(wrap_mod, "_find_persistent_manifest", lambda _p: None)
+    monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _p: True)
+    monkeypatch.setattr(wrap_mod, "_query_proxy_health", lambda _p: {})
+    monkeypatch.setattr(wrap_mod, "_proxy_needs_version_restart", lambda _h: False)
+    monkeypatch.setattr(wrap_mod, "_proxy_health_config", lambda _h: None)
+    monkeypatch.setattr(wrap_mod, "_query_proxy_config", lambda _p: None)
+
+    output = _run_in_click_context(lambda: wrap_mod._ensure_proxy(port, no_proxy=False))
+
+    assert f"http://127.0.0.1:{port}/dashboard" in output
+
+
+# ---------------------------------------------------------------------------
+# _resolve_1m_model — 1M context window suffix logic (#1158).
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_1m_model_appends_suffix_to_user_model() -> None:
+    """A model the user already selected via ANTHROPIC_MODEL is preserved, with
+    only the [1m] suffix appended so Claude Code requests the 1M window."""
+    assert wrap_mod._resolve_1m_model("claude-opus-4-1-20250805") == (
+        "claude-opus-4-1-20250805[1m]"
+    )
+
+
+def test_resolve_1m_model_is_idempotent() -> None:
+    """A model that already carries [1m] is returned unchanged (no double suffix)."""
+    assert wrap_mod._resolve_1m_model("claude-opus-4-8[1m]") == "claude-opus-4-8[1m]"
+
+
+def test_resolve_1m_model_falls_back_to_default_when_unset() -> None:
+    """With no model selected, fall back to the default Opus carrying [1m]."""
+    assert wrap_mod._resolve_1m_model(None) == "claude-opus-4-8[1m]"
+    assert wrap_mod._resolve_1m_model("  ") == "claude-opus-4-8[1m]"

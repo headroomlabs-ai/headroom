@@ -30,7 +30,7 @@ Headroom includes an AST-aware CodeCompressor (tree-sitter, 8 languages) but it'
 
 **Why this is the right default**: Code is almost always fetched because the user wants to work with it. Compressing function bodies would remove exactly what they need. LLMs like Claude are excellent at navigating large code files without compression.
 
-**Where code savings come from**: The IntelligentContextManager drops old code messages that are no longer relevant (scoring-based), which is a better strategy than stripping function bodies from active code.
+**Where code savings come from**: Headroom does not strip function bodies from active code or drop old code messages. Code savings come from compressing the newest content blocks (live-zone-only compression) when they are not protected, leaving the conversation history intact.
 
 **Override**: Set `protect_analysis_context=False` in `ContentRouterConfig` for aggressive code compression. Requires `headroom-ai[code]` for tree-sitter.
 
@@ -119,7 +119,7 @@ The Tool Output Intelligence Network (TOIN) learns compression patterns from usa
 ## Performance Characteristics
 
 - **ContentRouter** accounts for 91-98% of pipeline cost — it does the actual compression work
-- **CacheAligner** and **RollingWindow** are sub-millisecond
+- **CacheAligner** is sub-millisecond
 - Scaling is roughly **linear** with input size
 - Full benchmark data: [LATENCY_BENCHMARKS.md](LATENCY_BENCHMARKS.md)
 

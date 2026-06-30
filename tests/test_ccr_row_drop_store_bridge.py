@@ -368,12 +368,18 @@ def test_v1_compress_then_v1_retrieve_resolves_marker_hash() -> None:
     # Build a payload similar to the issue's reproducer — 200 items
     # with enough variation to trigger the lossy path. The Rust
     # crusher's adaptive_k will keep ~15 and drop the rest.
+    #
+    # The blob is unique-per-item and long relative to the key names so
+    # the lossless Table/CSV path (which wins by stripping repeated keys
+    # when it saves >= lossless_min_savings_ratio) cannot clear the bar —
+    # this test exists to exercise the LOSSY row-drop path and its
+    # Rust -> Python CCR store bridge.
     items = [
         {
             "id": i,
             "score": 0.99 if i % 30 == 0 else 0.6,
             "msg": f"Result {i:03d}{' error' if i % 30 == 0 else ' ok'}",
-            "blob": "x" * 80,
+            "blob": f"payload-{i:04d}-" + "".join(chr(97 + (i * 7 + j) % 26) for j in range(240)),
         }
         for i in range(200)
     ]
@@ -397,7 +403,7 @@ def test_v1_compress_then_v1_retrieve_resolves_marker_hash() -> None:
     }
 
     try:
-        with TestClient(app) as client:
+        with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)) as client:
             resp = client.post("/v1/compress", json=req)
             assert resp.status_code == 200, resp.text
             body = resp.json()
@@ -475,7 +481,7 @@ def test_v1_retrieve_unknown_hash_still_404() -> None:
     app = create_app(config)
 
     try:
-        with TestClient(app) as client:
+        with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)) as client:
             resp = client.post("/v1/retrieve", json={"hash": "deadbeef0000"})
             assert resp.status_code == 404
     finally:

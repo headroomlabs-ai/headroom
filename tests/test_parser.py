@@ -15,6 +15,7 @@ from unittest.mock import Mock
 import pytest
 
 from headroom.parser import (
+    _coerce_tool_call_to_dict,
     compute_hash,
     detect_waste_signals,
     find_tool_units,
@@ -23,6 +24,31 @@ from headroom.parser import (
     parse_message_to_blocks,
     parse_messages,
 )
+
+# --- Streaming SDK tool-call objects (issue #1312) ---
+
+
+class _FakeDeltaToolCallFunction:
+    """Mimics openai.types...ChoiceDeltaToolCallFunction: attribute access,
+    no `.get()`."""
+
+    def __init__(self, name: str, arguments: str) -> None:
+        self.name = name
+        self.arguments = arguments
+
+
+class _FakeChoiceDeltaToolCall:
+    """Mimics the OpenAI SDK streaming tool-call object that the Agno
+    wrapper surfaces. It is a Pydantic-style model — attribute access only,
+    crucially with NO `.get()` — which is exactly what triggered issue
+    #1312 (`'ChoiceDeltaToolCall' object has no attribute 'get'`)."""
+
+    def __init__(self, id: str, name: str, arguments: str, index: int = 0) -> None:
+        self.id = id
+        self.index = index
+        self.type = "function"
+        self.function = _FakeDeltaToolCallFunction(name, arguments)
+
 
 # --- Fixtures ---
 
@@ -361,6 +387,70 @@ class TestParseMessageToBlocks:
         """Token count is estimated."""
         blocks = parse_message_to_blocks(user_message, 0, mock_tokenizer)
         assert blocks[0].tokens_est > 0
+
+
+class TestStreamingToolCallObjects:
+    """Regression coverage for issue #1312: streaming integrations (Agno
+    over OpenAILike) can hand the parser raw OpenAI SDK `ChoiceDeltaToolCall`
+    objects instead of OpenAI-format dicts. The parser called `.get()` on
+    them and crashed the whole agent run with
+    `'ChoiceDeltaToolCall' object has no attribute 'get'`. Both the parser
+    call sites must now tolerate attribute-style tool-call objects."""
+
+    def test_coerce_dict_is_passthrough_identity(self):
+        d = {"id": "call_1", "function": {"name": "f", "arguments": "{}"}}
+        # A dict must be returned untouched (same object) — no needless copy.
+        assert _coerce_tool_call_to_dict(d) is d
+
+    def test_coerce_sdk_object_flattens_to_openai_dict(self):
+        tc = _FakeChoiceDeltaToolCall("call_1", "search", '{"q": "x"}')
+        out = _coerce_tool_call_to_dict(tc)
+        assert out == {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "search", "arguments": '{"q": "x"}'},
+        }
+
+    def test_coerce_object_with_dict_function(self):
+        # Some providers nest a dict `function` on an attribute-style object.
+        class _TC:
+            id = "call_2"
+            type = "function"
+            function = {"name": "g", "arguments": "1"}
+
+        out = _coerce_tool_call_to_dict(_TC())
+        assert out["function"] == {"name": "g", "arguments": "1"}
+
+    def test_coerce_none_degrades_to_empty_dict(self):
+        assert _coerce_tool_call_to_dict(None) == {}
+
+    def test_parse_message_to_blocks_with_sdk_tool_call(self, mock_tokenizer):
+        """The original crash site: parsing an assistant message whose
+        tool_calls are SDK objects must produce a tool_call block, not
+        raise AttributeError."""
+        tc = _FakeChoiceDeltaToolCall("call_abc", "dummy_tool", '{"query": "test"}')
+        msg = {"role": "assistant", "content": "", "tool_calls": [tc]}
+
+        blocks = parse_message_to_blocks(msg, 0, mock_tokenizer)
+
+        tool_call_blocks = [b for b in blocks if b.kind == "tool_call"]
+        assert len(tool_call_blocks) == 1
+        assert tool_call_blocks[0].flags.get("tool_call_id") == "call_abc"
+        assert tool_call_blocks[0].flags.get("function_name") == "dummy_tool"
+        assert "dummy_tool" in tool_call_blocks[0].text
+
+    def test_find_tool_units_with_sdk_tool_call(self):
+        """The second `.get()` site: find_tool_units must still pair an
+        SDK-object tool_call with its tool response message."""
+        tc = _FakeChoiceDeltaToolCall("call_abc", "dummy_tool", "{}")
+        messages = [
+            {"role": "assistant", "content": "", "tool_calls": [tc]},
+            {"role": "tool", "content": "result", "tool_call_id": "call_abc"},
+        ]
+
+        units = find_tool_units(messages)
+
+        assert units == [(0, [1])]
 
 
 # --- TestParseMessages ---

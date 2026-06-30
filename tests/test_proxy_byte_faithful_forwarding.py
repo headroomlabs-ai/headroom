@@ -25,11 +25,9 @@ from unittest.mock import AsyncMock
 
 import httpx
 import pytest
-
-pytest.importorskip("fastapi")
-
 from fastapi.testclient import TestClient
 
+from headroom.pipeline import PipelineStage
 from headroom.proxy.helpers import (
     BodyMutationTracker,
     append_text_to_latest_user_chat_message,
@@ -39,6 +37,8 @@ from headroom.proxy.helpers import (
     serialize_body_canonical,
 )
 from headroom.proxy.server import ProxyConfig, create_app
+
+pytest.importorskip("fastapi")
 
 # ---------------------------------------------------------------------------
 # Unit tests for serializer + tracker
@@ -301,10 +301,17 @@ class _FakePrefixTracker:
         return None
 
 
-def _make_no_optimize_app() -> tuple[TestClient, _CapturingTransport]:
-    """Boot a proxy with all transforms disabled and a capturing transport."""
+class _SortedEmptyToolsPreSendExtension:
+    def on_pipeline_event(self, event):  # noqa: ANN001
+        if event.stage is PipelineStage.PRE_SEND:
+            event.tools = []
+        return None
+
+
+def _make_anthropic_app(*, optimize: bool) -> tuple[TestClient, _CapturingTransport]:
+    """Boot an Anthropic proxy with a capturing transport."""
     config = ProxyConfig(
-        optimize=False,
+        optimize=optimize,
         cache_enabled=False,
         rate_limit_enabled=False,
         cost_tracking_enabled=False,
@@ -326,6 +333,11 @@ def _make_no_optimize_app() -> tuple[TestClient, _CapturingTransport]:
     proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
 
     return TestClient(app), transport
+
+
+def _make_no_optimize_app() -> tuple[TestClient, _CapturingTransport]:
+    """Boot a proxy with all transforms disabled and a capturing transport."""
+    return _make_anthropic_app(optimize=False)
 
 
 def test_passthrough_no_mutation_byte_equal_sha256() -> None:
@@ -409,6 +421,187 @@ def test_compression_off_numeric_precision_preserved() -> None:
     upstream = transport.captured_body or b""
     # Unmutated → byte-faithful: exact bytes preserved.
     assert upstream == inbound_bytes
+
+
+# Forward coverage only; the PRE_SEND case below is the base-fails proof for this fix.
+def test_anthropic_tools_canonical_order_preserves_byte_faithful_request() -> None:
+    client, transport = _make_no_optimize_app()
+    inbound_dict = {
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": "plan test"}],
+        "tools": [
+            {"name": "alpha"},
+            {"name": "zeta", "description": "later"},
+        ],
+    }
+    inbound_bytes = serialize_body_canonical(inbound_dict)
+
+    response = client.post(
+        "/v1/messages",
+        headers={
+            "x-api-key": "test-key",
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        content=inbound_bytes,
+    )
+    assert response.status_code == 200, response.text
+    upstream = transport.captured_body or b""
+    assert upstream == inbound_bytes, (
+        f"Expected byte-faithful passthrough for canonical tools; upstream={upstream!r}"
+    )
+
+
+def test_anthropic_tools_unsorted_order_preserves_byte_faithful_request() -> None:
+    client, transport = _make_no_optimize_app()
+    inbound_dict = {
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": "plan test"}],
+        "tools": [
+            {"name": "zeta", "description": "later"},
+            {"name": "alpha"},
+        ],
+    }
+    inbound_bytes = serialize_body_canonical(inbound_dict)
+
+    response = client.post(
+        "/v1/messages",
+        headers={
+            "x-api-key": "test-key",
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        content=inbound_bytes,
+    )
+    assert response.status_code == 200, response.text
+    upstream = transport.captured_body or b""
+    assert upstream == inbound_bytes
+    forwarded = json.loads(upstream.decode("utf-8"))
+    assert [tool["name"] for tool in forwarded["tools"]] == ["zeta", "alpha"]
+
+
+def test_anthropic_tools_unsorted_reordered_and_canonicalized_when_optimized() -> None:
+    client, transport = _make_anthropic_app(optimize=True)
+    proxy = client.app.state.proxy
+    proxy.config.mode = "token"
+
+    def _fake_apply(**kwargs):
+        return SimpleNamespace(
+            messages=kwargs["messages"],
+            transforms_applied=[],
+            timing={},
+            tokens_before=100,
+            tokens_after=100,
+            waste_signals=None,
+        )
+
+    proxy.anthropic_pipeline.apply = _fake_apply
+    inbound_dict = {
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": "plan test"}],
+        "tools": [
+            {"name": "zeta", "description": "later"},
+            {"name": "alpha"},
+        ],
+    }
+    expected_dict = {
+        **inbound_dict,
+        "tools": [
+            inbound_dict["tools"][1],
+            inbound_dict["tools"][0],
+        ],
+    }
+    inbound_bytes = serialize_body_canonical(inbound_dict)
+    expected_bytes = serialize_body_canonical(expected_dict)
+
+    response = client.post(
+        "/v1/messages",
+        headers={
+            "x-api-key": "test-key",
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        content=inbound_bytes,
+    )
+    assert response.status_code == 200, response.text
+    upstream = transport.captured_body or b""
+    assert upstream == expected_bytes
+    assert upstream != inbound_bytes
+
+
+def test_anthropic_presend_sorted_empty_tools_keeps_body_unmutated() -> None:
+    inbound_dict = {
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": "plan test"}],
+    }
+    inbound_bytes = serialize_body_canonical(inbound_dict)
+
+    config = ProxyConfig(
+        optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+        log_requests=False,
+        ccr_inject_tool=False,
+        ccr_handle_responses=False,
+        ccr_context_tracking=False,
+        image_optimize=False,
+        pipeline_extensions=[_SortedEmptyToolsPreSendExtension()],
+        discover_pipeline_extensions=False,
+    )
+    app = create_app(config)
+    client = TestClient(app)
+
+    captured: dict[str, object] = {}
+
+    async def _fake_retry(
+        method: str,  # noqa: ARG001
+        url: str,  # noqa: ARG001
+        headers: dict[str, str],  # noqa: ARG001
+        body: dict[str, object],  # noqa: ARG001
+        body_mutated: bool,
+        mutation_reasons: list[str],
+        **kwargs: object,  # noqa: ANN003
+    ) -> httpx.Response:  # noqa: ANN201
+        captured["body_mutated"] = body_mutated
+        captured["mutation_reasons"] = mutation_reasons
+        captured["body"] = body
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "ok"}],
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 3,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                },
+            },
+        )
+
+    app.state.proxy._retry_request = _fake_retry  # type: ignore[assignment]
+    response = client.post(
+        "/v1/messages",
+        headers={
+            "x-api-key": "test-key",
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        content=inbound_bytes,
+    )
+    assert response.status_code == 200, response.text
+    assert captured["body_mutated"] is False
+    assert captured["mutation_reasons"] == []
+    forwarded = captured["body"]
+    assert isinstance(forwarded, dict)
+    assert "tools" not in forwarded
 
 
 def test_legacy_json_kwarg_mode_yields_drifted_bytes(

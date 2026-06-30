@@ -13,6 +13,7 @@ import logging
 import os
 import tempfile
 import threading
+import urllib.parse
 from csv import DictWriter
 from datetime import datetime, timedelta, timezone
 from io import StringIO
@@ -313,9 +314,12 @@ def sanitize_project_name(value: Any) -> str | None:
 
     Strips control characters, trims whitespace, and caps length so a
     misbehaving client cannot bloat the persisted state or the dashboard.
+    Percent-encoded values (from non-ASCII cwd names) are decoded first so
+    the stored project name matches the original directory name.
     """
     if not isinstance(value, str):
         return None
+    value = urllib.parse.unquote(value)
     cleaned = "".join(ch for ch in value if ch.isprintable()).strip()
     if not cleaned:
         return None
@@ -412,7 +416,12 @@ class SavingsTracker:
         max_history_age_days: int = DEFAULT_MAX_HISTORY_AGE_DAYS,
         max_response_history_points: int = DEFAULT_MAX_RESPONSE_HISTORY_POINTS,
         display_session_inactivity_minutes: int = (DEFAULT_DISPLAY_SESSION_INACTIVITY_MINUTES),
+        stateless: bool = False,
     ) -> None:
+        # In stateless mode the tracker keeps live counters in memory but never
+        # writes proxy_savings.json (honors HeadroomConfig.stateless, which
+        # disables all filesystem writes for read-only / container deployments).
+        self._stateless = stateless
         self._path = Path(path or get_default_savings_storage_path())
         self._max_history_points = max_history_points
         self._max_history_age_days = max_history_age_days
@@ -974,6 +983,9 @@ class SavingsTracker:
         return compacted
 
     def _save_locked(self) -> None:
+        if self._stateless:
+            # Stateless mode: live counters stay in memory; nothing is persisted.
+            return
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             payload = {

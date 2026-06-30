@@ -29,7 +29,7 @@ import threading
 import time
 from datetime import timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from headroom import paths as _paths
 from headroom.subscription.base import QuotaTracker
@@ -123,6 +123,15 @@ _ON_DEMAND_POLL_TIMEOUT_S = 2.0
 # defines exactly one 5-hour and one 7-day window.
 _FIVE_HOUR_WINDOW = timedelta(hours=5)
 _SEVEN_DAY_WINDOW = timedelta(days=7)
+
+# A genuine 5-hour-window rollover advances ``five_hour.resets_at`` by ~5 hours.
+# The usage API, however, reports ``resets_at`` with second-level jitter — it has
+# been observed flapping between e.g. ``01:59:59Z`` and ``02:00:00Z`` on
+# consecutive polls within the *same* window. A bare ``!=`` comparison therefore
+# misfires on essentially every poll, zeroing the contribution counters every
+# poll interval instead of once per window. Only treat a *forward* jump larger
+# than this threshold as a real rollover (jitter is sub-second; a rollover is hours).
+_ROLLOVER_MIN_ADVANCE = timedelta(minutes=1)
 
 # Surge pricing threshold: if actual utilization is >N% higher than expected,
 # flag it as a potential surge pricing event.
@@ -487,7 +496,8 @@ class SubscriptionTracker(QuotaTracker):
         try:
             lock_path.parent.mkdir(parents=True, exist_ok=True)
             fd = open(lock_path, "w")  # noqa: SIM115
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl_any = cast(Any, fcntl)
+            fcntl_any.flock(fd, fcntl_any.LOCK_EX | fcntl_any.LOCK_NB)
             fd.write(str(os.getpid()))
             fd.flush()
             self._rtk_poll_lock_fd = fd
@@ -517,7 +527,8 @@ class SubscriptionTracker(QuotaTracker):
         try:
             import fcntl
 
-            fcntl.flock(fd, fcntl.LOCK_UN)
+            fcntl_any = cast(Any, fcntl)
+            fcntl_any.flock(fd, fcntl_any.LOCK_UN)
         except Exception:
             pass
         try:
@@ -727,8 +738,9 @@ class SubscriptionTracker(QuotaTracker):
                 self._state.mark_error("fetch returned None")
             return
 
-        # Read transcript-based window tokens
-        window_tokens = _compute_window_tokens_for_snapshot(snapshot)
+        # Offload off the event loop: this scans every ~/.claude/projects/**/*.jsonl
+        # transcript and json.loads each line, which can take seconds and block /health.
+        window_tokens = await asyncio.to_thread(_compute_window_tokens_for_snapshot, snapshot)
 
         # Detect anomalies
         discrepancies = _detect_discrepancies(snapshot, window_tokens)
@@ -767,7 +779,7 @@ class SubscriptionTracker(QuotaTracker):
         if (
             prev_resets_at is not None
             and curr_resets_at is not None
-            and curr_resets_at != prev_resets_at
+            and curr_resets_at - prev_resets_at > _ROLLOVER_MIN_ADVANCE
         ):
             logger.info("5h window rolled over; resetting headroom contribution counters")
             self._state.contribution = HeadroomContribution()

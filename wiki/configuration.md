@@ -53,11 +53,14 @@ headroom proxy --no-optimize
 # Disable semantic caching
 headroom proxy --no-cache
 
-# Disable CCR response handling
-headroom proxy --no-ccr-responses
+# Disable CCR tool injection
+headroom proxy --no-ccr-inject-tool
 
-# Disable proactive expansion
-headroom proxy --no-ccr-expansion
+# Disable CCR retrieval markers
+headroom proxy --no-ccr-marker
+
+# Disable proactive CCR expansion
+headroom proxy --no-ccr-proactive-expansion
 
 # (The earlier --llmlingua flag was retired in 0.9.x and replaced by
 # Kompress (ModernBERT). See `wiki/transforms.md` for the current
@@ -197,107 +200,21 @@ config = CacheAlignerConfig(
 )
 ```
 
-## Rolling Window Configuration
+## Context Management
 
-Control context window management:
+Context management is handled automatically inside the pipeline
+(live-zone-only compression) — there is nothing to configure. Headroom
+**never** drops messages from the conversation history and does not do
+position-based or score-based context management. It compresses only the
+newest content blocks (the latest user message and the latest tool result /
+tool output), type-aware and reversible via CCR. The cache hot zone — system
+prompt, tools, and older turns — is never mutated, which preserves provider
+prompt caching.
 
-```python
-from headroom.transforms import RollingWindowConfig
-
-config = RollingWindowConfig(
-    # Minimum turns to always keep
-    min_keep_turns=3,
-
-    # Reserve tokens for output
-    output_buffer_tokens=4000,
-
-    # Drop oldest tool outputs first
-    prefer_drop_tool_outputs=True,
-)
-```
-
-## Intelligent Context Manager Configuration
-
-For semantic-aware context management with importance scoring:
-
-```python
-from headroom.config import IntelligentContextConfig, ScoringWeights
-
-# Customize scoring weights (must sum to 1.0, or will be normalized)
-weights = ScoringWeights(
-    recency=0.20,              # Newer messages score higher
-    semantic_similarity=0.20,  # Similarity to recent context
-    toin_importance=0.25,      # TOIN-learned retrieval patterns
-    error_indicator=0.15,      # TOIN-learned error field types
-    forward_reference=0.15,    # Messages referenced by later messages
-    token_density=0.05,        # Information density
-)
-
-config = IntelligentContextConfig(
-    # Enable/disable the manager
-    enabled=True,
-
-    # Protection settings
-    keep_system=True,           # Never drop system messages
-    keep_last_turns=2,          # Protect last N user turns
-
-    # Token budget
-    output_buffer_tokens=4000,  # Reserve for model output
-
-    # Scoring settings
-    use_importance_scoring=True,    # Use semantic scoring (vs position-only)
-    scoring_weights=weights,        # Custom weights
-    toin_integration=True,          # Use TOIN patterns if available
-    recency_decay_rate=0.1,         # Exponential decay lambda
-
-    # Strategy thresholds
-    compress_threshold=0.1,     # Try compression first if <10% over budget
-)
-```
-
-### CCR Integration
-
-When IntelligentContext drops messages, they're stored in CCR for potential retrieval:
-
-```python
-from headroom.telemetry import get_toin
-
-# Pass TOIN for bidirectional integration
-toin = get_toin()
-manager = IntelligentContextManager(config=config, toin=toin)
-
-# Dropped messages are:
-# 1. Stored in CCR (so LLM can retrieve if needed)
-# 2. Recorded to TOIN (so it learns which patterns matter)
-# 3. Marked with CCR reference in the inserted message
-```
-
-The marker inserted when messages are dropped includes the CCR reference:
-```
-[Earlier context compressed: 14 message(s) dropped by importance scoring.
-Full content available via ccr_retrieve tool with reference 'abc123def456'.]
-```
-
-### Scoring Weights
-
-The `ScoringWeights` class controls how messages are scored:
-
-| Weight | Default | Description |
-|--------|---------|-------------|
-| `recency` | 0.20 | Exponential decay from conversation end |
-| `semantic_similarity` | 0.20 | Embedding cosine similarity to recent context |
-| `toin_importance` | 0.25 | TOIN retrieval_rate (high retrieval = important) |
-| `error_indicator` | 0.15 | TOIN field_semantics error detection |
-| `forward_reference` | 0.15 | Count of later messages referencing this one |
-| `token_density` | 0.05 | Unique tokens / total tokens |
-
-Weights are automatically normalized to sum to 1.0:
-
-```python
-weights = ScoringWeights(recency=1.0, toin_importance=1.0)
-normalized = weights.normalized()
-# recency=0.5, toin_importance=0.5, others=0.0
-```
+> The earlier `RollingWindowConfig`, `IntelligentContextConfig`, and
+> `ScoringWeights` configuration classes (and the position-/score-based
+> context managers they configured) have been removed and are no longer part
+> of Headroom.
 
 ## Environment Variables
 
@@ -312,6 +229,24 @@ Some settings can be configured via environment variables:
 | `HEADROOM_TOIN_PATH` | Full path to the TOIN telemetry JSON file. Always wins when set. | derived from `${HEADROOM_WORKSPACE_DIR}` |
 | `HEADROOM_SUBSCRIPTION_STATE_PATH` | Full path to the subscription tracker state. Always wins when set. | derived from `${HEADROOM_WORKSPACE_DIR}` |
 | `HEADROOM_EMBEDDER_RUNTIME` | Set to `pytorch_mps` to run the memory embedder via the torch sentence-transformers backend on the Apple GPU (MPS). Only engages when Apple MPS is actually available; otherwise it logs a warning and uses the existing default embedder selection path. `pytorch_mps` is the only accepted value. Requires the `[pytorch-mps]` extra. See [Memory](memory.md#embedding-runtime--gpu-offload-apple-silicon). | default embedder selection |
+| `HEADROOM_BETA_HEADER_STICKY` | Controls per-session `anthropic-beta` / `OpenAI-Beta` re-echo. `enabled` (default): the proxy unions beta tokens across turns within a session — if the client sends a token in turn N and omits it in turn N+1, the proxy re-injects it to preserve prefix-cache stability. `disabled`: the client's value is forwarded verbatim with no accumulation. Any other value raises at request time. See [Session Beta Header Tracking](#session-beta-header-tracking). | `enabled` |
+| `HEADROOM_BETA_TRACKER_MAX_SESSIONS` | LRU capacity of the in-memory session beta tracker. Once full, the oldest session entry is evicted. | `1000` |
+
+## Session Beta Header Tracking
+
+When running as a proxy, Headroom maintains a per-session union of `anthropic-beta` (and `OpenAI-Beta`) tokens via `SessionBetaTracker`. The session key is derived from the `x-headroom-session-id` header if present, otherwise from `md5(model + system_prompt[:500])[:16]` — stable across turns of the same conversation.
+
+**Why:** clients such as Claude Code and Codex CLI may drop a beta token between consecutive turns. Because `anthropic-beta` is part of the request bytes that determine the upstream prefix-cache key, a dropped token would bust the cache mid-conversation. The tracker re-injects any token seen earlier in the session so the cache key stays stable.
+
+**Trade-off:** once the proxy has seen a beta token in a session it will continue re-sending it for the rest of that session, even if the client stops including it. Stopping the token on the client side alone is not sufficient — the proxy re-injects it. Set `HEADROOM_BETA_HEADER_STICKY=disabled` to pass the client's `anthropic-beta` value verbatim and bypass this accumulation.
+
+```bash
+# Disable sticky beta re-echo
+export HEADROOM_BETA_HEADER_STICKY=disabled
+headroom proxy ...
+```
+
+Note: disabling sticky mode may reduce prefix-cache hit rates for clients that legitimately drop-and-re-add beta tokens across turns.
 
 ## Filesystem Contract
 
@@ -489,8 +424,8 @@ The TypeScript SDK is configured via environment variables or constructor option
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `HEADROOM_BASE_URL` | Base URL of the Headroom proxy or cloud API | `http://localhost:8787` |
-| `HEADROOM_API_KEY` | API key for Headroom Cloud authentication | - |
+| `HEADROOM_BASE_URL` | Base URL of the Headroom proxy | `http://localhost:8787` |
+| `HEADROOM_API_KEY` | Optional API key for authenticated Headroom endpoints | - |
 
 ### Usage
 
