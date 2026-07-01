@@ -903,11 +903,22 @@ class HeadroomProxy(
             )
         except ValueError:
             self._background_compression_min_tokens = 50000
-        # Dedicated single thread: no-timeout background jobs never contend with
+        # Dedicated background pool: no-timeout background jobs never contend with
         # the request-path executor (Phase 3, #1171). Lazy -- no thread spawns
-        # until the first off-path job is submitted.
+        # until the first off-path job is submitted. Sized 1 by default (the
+        # off-path jobs are serialized so a burst of concurrent cold-starts
+        # drains one at a time); raise via HEADROOM_BACKGROUND_COMPRESSION_WORKERS
+        # to drain the cold-start queue faster under sustained multi-session load.
+        # Keep it small (2-3): these workers run CPU-bound Kompress in parallel,
+        # so a wide pool reintroduces the CPU contention the off-path design avoids.
+        try:
+            _bg_workers = int(os.environ.get("HEADROOM_BACKGROUND_COMPRESSION_WORKERS", "1"))
+        except ValueError:
+            _bg_workers = 1
+        self._background_compression_workers: int = max(1, _bg_workers)
         self._background_compression_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="headroom-bg-compress"
+            max_workers=self._background_compression_workers,
+            thread_name_prefix="headroom-bg-compress",
         )
         self._background_compressor = BackgroundCompressor(self._run_compression_background)
         # Gauge: currently-running compression tasks. Mutated under
