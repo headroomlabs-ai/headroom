@@ -1512,7 +1512,7 @@ wheels = [
 
 [[package]]
 name = "headroom-ai"
-version = "0.27.0"
+version = "0.28.0"
 source = { editable = "." }
 dependencies = [
     { name = "ast-grep-cli" },
@@ -1534,7 +1534,6 @@ all = [
     { name = "datasets" },
     { name = "fastapi" },
     { name = "fastembed" },
-    { name = "hnswlib" },
     { name = "httpx", extra = ["http2"] },
     { name = "huggingface-hub" },
     { name = "jinja2" },
@@ -1638,7 +1637,6 @@ mcp = [
     { name = "mcp" },
 ]
 memory = [
-    { name = "hnswlib" },
     { name = "sentence-transformers" },
     { name = "sqlite-vec" },
 ]
@@ -1706,6 +1704,9 @@ spreadsheet = [
 strands = [
     { name = "strands-agents" },
 ]
+vector = [
+    { name = "hnswlib" },
+]
 voice = [
     { name = "onnxruntime", version = "1.23.2", source = { registry = "https://pypi.org/simple/" }, marker = "python_full_version < '3.14'" },
     { name = "onnxruntime", version = "1.26.0", source = { registry = "https://pypi.org/simple/" }, marker = "python_full_version >= '3.14'" },
@@ -1743,7 +1744,7 @@ requires-dist = [
     { name = "headroom-ai", extras = ["proxy", "code", "ml", "memory", "relevance", "image", "reports", "otel", "evals", "voice", "html", "mcp", "spreadsheet"], marker = "extra == 'all'" },
     { name = "headroom-ai", extras = ["voice"], marker = "extra == 'voice-train'" },
     { name = "hnswlib", marker = "extra == 'dev'", specifier = ">=0.8.0" },
-    { name = "hnswlib", marker = "extra == 'memory'", specifier = ">=0.8.0" },
+    { name = "hnswlib", marker = "extra == 'vector'", specifier = ">=0.8.0" },
     { name = "httpx", marker = "extra == 'mcp'", specifier = ">=0.24.0" },
     { name = "httpx", extras = ["http2"], marker = "extra == 'dev'", specifier = ">=0.24.0" },
     { name = "httpx", extras = ["http2"], marker = "extra == 'proxy'", specifier = ">=0.24.0" },
@@ -1819,7 +1820,7 @@ requires-dist = [
     { name = "xlrd", marker = "extra == 'spreadsheet'", specifier = ">=2.0.1" },
     { name = "zstandard", marker = "extra == 'proxy'", specifier = ">=0.20.0" },
 ]
-provides-extras = ["proxy", "proxy-prod", "code", "ml", "memory", "memory-stack", "pytorch-mps", "relevance", "image", "reports", "spreadsheet", "otel", "anyllm", "langchain", "agno", "strands", "mcp", "voice", "voice-train", "evals", "bedrock", "html", "benchmark", "dev", "all"]
+provides-extras = ["proxy", "proxy-prod", "code", "ml", "memory", "vector", "memory-stack", "pytorch-mps", "relevance", "image", "reports", "spreadsheet", "otel", "anyllm", "langchain", "agno", "strands", "mcp", "voice", "voice-train", "evals", "bedrock", "html", "benchmark", "dev", "all"]
 
 [[package]]
 name = "hf-xet"

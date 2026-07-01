@@ -418,6 +418,18 @@ def dashboard(port: int, no_open: bool) -> None:
     ),
 )
 @click.option(
+    "--compression-max-workers",
+    type=int,
+    default=None,
+    envvar="HEADROOM_COMPRESSION_MAX_WORKERS",
+    help=(
+        "Bound the dedicated compression threadpool (CPU-bound Kompress work). "
+        "Default (unset): min(32, (cpu_count or 1) * 4). Lower it to reduce CPU "
+        "oversubscription under concurrent sessions; a value < 1 is clamped to 1. "
+        "Env: HEADROOM_COMPRESSION_MAX_WORKERS."
+    ),
+)
+@click.option(
     "--log-file",
     default=None,
     envvar="HEADROOM_LOG_FILE",
@@ -843,6 +855,7 @@ def proxy(
     anthropic_pre_upstream_concurrency: int | None,
     anthropic_pre_upstream_acquire_timeout_seconds: float | None,
     anthropic_pre_upstream_memory_context_timeout_seconds: float | None,
+    compression_max_workers: int | None,
     log_file: str | None,
     log_messages: bool,
     codex_wire_debug: bool,
@@ -1167,6 +1180,7 @@ def proxy(
         # Precedence: CLI > env > auto-compute (click's ``envvar``
         # handles the env-var fallback).
         anthropic_pre_upstream_concurrency=anthropic_pre_upstream_concurrency,
+        compression_max_workers=compression_max_workers,
         anthropic_pre_upstream_acquire_timeout_seconds=(
             anthropic_pre_upstream_acquire_timeout_seconds
             if anthropic_pre_upstream_acquire_timeout_seconds is not None

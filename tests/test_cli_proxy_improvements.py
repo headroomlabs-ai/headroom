@@ -448,3 +448,34 @@ class TestHelpTextCompleteness:
         result = runner.invoke(main, ["proxy", "--mode", "bogus_mode_xyz"])
         assert result.exit_code != 0
         assert "invalid" in result.output.lower() or "choice" in result.output.lower()
+
+
+class TestCompressionMaxWorkers:
+    """--compression-max-workers / HEADROOM_COMPRESSION_MAX_WORKERS must reach ProxyConfig.
+
+    Regression: the field was documented in ProxyConfig and consumed by the
+    server, but the CLI never defined the option or passed it through, so it
+    was permanently None (always resolving to the min(32, cpu*4) default).
+    """
+
+    def test_flag_reaches_config(self, runner: CliRunner, mock_run_server: dict) -> None:
+        result = runner.invoke(
+            main, ["proxy", "--compression-max-workers", "3"], catch_exceptions=False
+        )
+        assert result.exit_code == 0, result.output
+        assert mock_run_server["config"].compression_max_workers == 3
+
+    def test_env_reaches_config(self, runner: CliRunner, mock_run_server: dict) -> None:
+        result = runner.invoke(
+            main,
+            ["proxy"],
+            env={"HEADROOM_COMPRESSION_MAX_WORKERS": "5"},
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0, result.output
+        assert mock_run_server["config"].compression_max_workers == 5
+
+    def test_default_is_none(self, runner: CliRunner, mock_run_server: dict) -> None:
+        result = runner.invoke(main, ["proxy"], catch_exceptions=False)
+        assert result.exit_code == 0, result.output
+        assert mock_run_server["config"].compression_max_workers is None
