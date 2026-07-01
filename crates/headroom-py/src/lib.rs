@@ -866,6 +866,10 @@ impl PySmartCrusher {
         py.detach(|| {
             let parsed: serde_json::Value = serde_json::from_str(&doc_json)
                 .unwrap_or_else(|e| panic!("doc_json must be JSON: {e}"));
+            // Honor the crusher's CCR gate on the document-walker path: the
+            // DocumentCompactor defaults to emit_opaque_markers=true, so without
+            // this it would replace long string cells with <<ccr:>> markers even
+            // when the caller disabled CCR.
             let mut dc = DocumentCompactor::new().with_config(CompactConfig {
                 classify: ClassifyConfig {
                     emit_opaque_markers: self.inner.config.opaque_markers_enabled(),

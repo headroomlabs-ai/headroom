@@ -69,8 +69,9 @@ from .utils import extract_user_query as _extract_user_query
 logger = logging.getLogger(__name__)
 
 
-# Lazy-initialized singleton pipeline
+# Lazy-initialized singleton pipelines (default + agent regime)
 _pipeline = None
+_agent_pipeline = None
 _pipeline_lock = threading.Lock()
 
 
@@ -137,6 +138,26 @@ class CompressConfig:
     savings_profile: str | None = None
     """Named high-savings profile, e.g. 'agent-90' for Codex/Claude/Cursor."""
 
+    # Regime
+    mode: str | None = None
+    """Compression regime.
+
+    - ``None`` (default): the original behavior — content-aware compression that
+      may use CCR removal (replace-with-marker + retrieve later). Best for a
+      *proxy* compressing conversation history the model has moved past.
+    - ``"agent"``: live-agent mode for compressing tool results an agent will
+      *read back*. Lossless densification only — no CCR/removal, no ML text
+      compression — so it is deterministic and prompt-cache-safe (the same tool
+      output densifies to identical bytes every turn, keeping the cached prefix
+      stable). Forces :attr:`verify_lossless`, so output is never lossy: any
+      message that cannot be proven to round-trip is reverted to its original.
+      Use :func:`densify` as the shorthand."""
+
+    verify_lossless: bool = False
+    """Round-trip each compressed message and revert any that is not provably
+    lossless (keeps the original for that message). Forced on when
+    ``mode='agent'``. Sets :attr:`CompressResult.lossless`."""
+
 
 @dataclass
 class CompressResult:
@@ -157,6 +178,14 @@ class CompressResult:
     tokens_saved: int = 0
     compression_ratio: float = 0.0
     transforms_applied: list[str] = field(default_factory=list)
+    lossless: bool | None = None
+    """Whether the output is provably lossless. ``True``/``False`` when
+    verification ran (``mode='agent'`` or ``verify_lossless=True``); ``None``
+    when not checked. ``False`` means a removal marker survived but the message
+    could not be reverted (should not happen in ``mode='agent'``)."""
+    reverted_messages: int = 0
+    """Messages reverted to their original form because their compression could
+    not be verified lossless. Only meaningful when verification ran."""
 
 
 def compress(
@@ -212,7 +241,16 @@ def compress(
         cfg = replace(cfg)
         apply_agent_savings_profile(cfg, cfg.savings_profile)
 
-    pipeline = _get_pipeline()
+    agent_mode = cfg.mode == "agent"
+    if agent_mode:
+        # Live-agent regime: densify losslessly, never remove. Disable the ML
+        # text compressor so only deterministic, query-independent lossless
+        # transforms run (keeps the cached prefix stable across turns).
+        cfg.kompress_model = "disabled"
+        cfg.verify_lossless = True
+        pipeline = _get_agent_pipeline()
+    else:
+        pipeline = _get_pipeline()
     pipeline_extensions = PipelineExtensionManager(hooks=hooks, discover=False)
 
     try:
@@ -238,6 +276,11 @@ def compress(
         # relevance.  Without this, SmartCrusher selects items by statistics
         # alone (position, anomaly) and may drop relevant content.
         context = _extract_user_query(messages)
+
+        # Snapshot the pipeline input so lossless verification can compare each
+        # message against its pre-compression form and revert any that did not
+        # round-trip (mode='agent' / verify_lossless).
+        original_messages = messages
 
         result = pipeline.apply(
             messages=messages,
@@ -275,6 +318,8 @@ def compress(
                 tokens_saved=0,
                 compression_ratio=0.0,
                 transforms_applied=["inflation_guard:reverted"],
+                # Reverting to the originals is trivially lossless.
+                lossless=True if cfg.verify_lossless else None,
             )
 
         routing_markers = summarize_routing_markers(result.transforms_applied)
@@ -306,6 +351,25 @@ def compress(
         if compressed_event.messages is not None:
             compressed_messages = compressed_event.messages
 
+        # Value-factoring (agent mode): hoist repeated low-cardinality column
+        # values out of densified rows (e.g. file paths in search results).
+        # Lossless + reversible; applied before verification so the round-trip
+        # check validates it too.
+        if agent_mode:
+            compressed_messages = _apply_value_factoring(compressed_messages)
+
+        # Lossless verification: round-trip every compressed message and revert
+        # any that is not provably lossless. Guarantees the output is never
+        # lossy even if a transform slips a removal marker through.
+        lossless: bool | None = None
+        reverted = 0
+        if cfg.verify_lossless:
+            compressed_messages, reverted, lossless = _verify_and_revert(
+                original_messages, compressed_messages
+            )
+            if reverted:
+                tokens_after = _recount_tokens(pipeline, model, compressed_messages)
+
         tokens_saved = tokens_before - tokens_after
         ratio = tokens_saved / tokens_before if tokens_before > 0 else 0.0
 
@@ -331,6 +395,8 @@ def compress(
             tokens_saved=tokens_saved,
             compression_ratio=ratio,
             transforms_applied=result.transforms_applied,
+            lossless=lossless,
+            reverted_messages=reverted,
         )
 
     except Exception as e:
@@ -382,6 +448,39 @@ def compress_spreadsheet(
     return compress(messages, model=model, model_limit=model_limit, **kwargs)
 
 
+def densify(
+    messages: list[dict[str, Any]],
+    model: str = "claude-sonnet-4-5-20250929",
+    model_limit: int = 200000,
+    **kwargs: Any,
+) -> CompressResult:
+    """Lossless, prompt-cache-safe compression for live agents.
+
+    Shorthand for ``compress(messages, mode="agent")``: densifies tool outputs
+    an agent will read back, with **no removal** (no CCR markers, no dropped
+    rows, no ML text compression) and a **verified losslessness guarantee** —
+    any message that cannot be proven to round-trip is reverted to its original.
+    Because only deterministic, query-independent transforms run, the same tool
+    output densifies to identical bytes every turn, so a provider prompt-cache
+    prefix stays stable across the agent loop.
+
+    Inspect :attr:`CompressResult.lossless` (always ``True`` here) and
+    :attr:`CompressResult.reverted_messages` to see how many messages could not
+    be densified losslessly.
+
+    Args:
+        messages: Messages in Anthropic or OpenAI format.
+        model: Model name (token counting / context limit).
+        model_limit: Model context window size in tokens.
+        **kwargs: Forwarded to :func:`compress` (e.g. ``protect_recent``).
+
+    Returns:
+        CompressResult with losslessly densified messages.
+    """
+    kwargs["mode"] = "agent"
+    return compress(messages, model=model, model_limit=model_limit, **kwargs)
+
+
 def _get_pipeline() -> Any:
     """Get or create the singleton compression pipeline."""
     global _pipeline
@@ -404,3 +503,169 @@ def _get_pipeline() -> Any:
         _pipeline = TransformPipeline()
         logger.debug("Headroom compression pipeline initialized")
         return _pipeline
+
+
+def _get_agent_pipeline() -> Any:
+    """Get or create the singleton live-agent pipeline (lossless densify only).
+
+    A ContentRouter with CCR removal and the ML text compressor disabled, so it
+    only runs deterministic, query-independent lossless transforms (SmartCrusher
+    densification, diff compaction). No CacheAligner stage — agent callers pass
+    the full message list each turn and rely on densification determinism for
+    prompt-cache stability.
+    """
+    global _agent_pipeline
+
+    if _agent_pipeline is not None:
+        return _agent_pipeline
+
+    with _pipeline_lock:
+        if _agent_pipeline is not None:
+            return _agent_pipeline
+
+        from headroom.transforms import TransformPipeline
+        from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
+
+        router = ContentRouter(
+            ContentRouterConfig(
+                ccr_enabled=False,  # never remove content the agent will read
+                ccr_inject_marker=False,  # → emit_opaque_markers off in the engine
+                enable_kompress=False,  # lossless only: no ML text compression
+                smart_crusher_with_compaction=True,  # lossless-first densification
+            )
+        )
+        _agent_pipeline = TransformPipeline(transforms=[router])
+        logger.debug("Headroom agent (densify-only) pipeline initialized")
+        return _agent_pipeline
+
+
+def _recount_tokens(pipeline: Any, model: str, messages: list[dict[str, Any]]) -> int:
+    """Recount tokens over ``messages`` using the pipeline's tokenizer.
+
+    Mirrors how the pipeline counts (``count_text(str(content))`` per message)
+    so a post-verification revert produces a consistent ``tokens_after``.
+    """
+    try:
+        tokenizer = pipeline._get_tokenizer(model)
+        return sum(tokenizer.count_text(str(m.get("content", ""))) for m in messages)
+    except Exception:  # pragma: no cover - tokenizer failure is non-fatal
+        return sum(len(str(m.get("content", ""))) // 4 for m in messages)
+
+
+def _apply_value_factoring(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Dictionary-encode low-cardinality columns in every densified string leaf.
+
+    Walks message content and runs :func:`factor_values` on any densified block
+    (no-op for non-densified or already-factored strings). Returns a new list;
+    inputs are not mutated.
+    """
+    from .transforms.compaction_codec import factor_values, is_compacted
+
+    def walk(node: Any) -> Any:
+        if isinstance(node, str):
+            return factor_values(node) if is_compacted(node) else node
+        if isinstance(node, list):
+            return [walk(x) for x in node]
+        if isinstance(node, dict):
+            return {k: walk(v) for k, v in node.items()}
+        return node
+
+    return [walk(m) for m in messages]
+
+
+def _verify_and_revert(
+    original: list[dict[str, Any]],
+    compressed: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int, bool]:
+    """Revert any compressed message that is not provably lossless.
+
+    Compares each compressed message to its original. A message is kept only if
+    it is unchanged, or every string value it changed is a densified block that
+    round-trips back to the original (and carries no removal marker). Anything
+    unverifiable is reverted to the original — so the result is never lossy.
+
+    Returns ``(messages, num_reverted, lossless)`` where ``lossless`` is True
+    when the final message list contains no surviving removal markers.
+    """
+    from .transforms.compaction_codec import contains_removal_marker
+
+    if len(original) != len(compressed):
+        # Structure changed unexpectedly — fall back to the originals.
+        return list(original), len(compressed), True
+
+    out: list[dict[str, Any]] = []
+    reverted = 0
+    for orig, comp in zip(original, compressed):
+        if orig == comp or _message_is_lossless(orig, comp):
+            out.append(comp)
+        else:
+            out.append(orig)
+            reverted += 1
+
+    lossless = not any(contains_removal_marker(str(m.get("content", ""))) for m in out)
+    return out, reverted, lossless
+
+
+def _message_is_lossless(orig: dict[str, Any], comp: dict[str, Any]) -> bool:
+    """True if ``comp`` is a lossless densification of ``orig``.
+
+    Walks both messages in parallel collecting (original, compressed) string
+    pairs at matching positions; each changed pair must be a densified block
+    that expands back to the original JSON. Any structural divergence or
+    unverifiable change returns False (caller reverts).
+    """
+    pairs: list[tuple[str, str]] = []
+    if not _collect_string_pairs(orig, comp, pairs):
+        return False
+    return all(_string_pair_is_lossless(o, c) for o, c in pairs)
+
+
+def _collect_string_pairs(orig: Any, comp: Any, pairs: list[tuple[str, str]]) -> bool:
+    """Collect aligned string leaves from two parallel structures.
+
+    Returns False if the structures diverge in shape (different types, lengths,
+    or dict keys) — a shape we cannot verify and must conservatively revert.
+    """
+    if isinstance(orig, str) and isinstance(comp, str):
+        if orig != comp:
+            pairs.append((orig, comp))
+        return True
+    if isinstance(orig, dict) and isinstance(comp, dict):
+        if orig.keys() != comp.keys():
+            return False
+        return all(_collect_string_pairs(orig[k], comp[k], pairs) for k in orig)
+    if isinstance(orig, list) and isinstance(comp, list):
+        if len(orig) != len(comp):
+            return False
+        return all(_collect_string_pairs(o, c, pairs) for o, c in zip(orig, comp))
+    # Scalars (int/float/bool/None) must match exactly; transforms only touch
+    # strings, so a changed non-string is unexpected.
+    return bool(orig == comp)
+
+
+def _string_pair_is_lossless(original: str, compressed: str) -> bool:
+    """True if ``compressed`` densifies ``original`` reversibly.
+
+    ``original`` is expected to be a JSON array string; ``compressed`` is the
+    densified block. Lossless iff it carries no removal marker and expands back
+    to the same parsed JSON.
+    """
+    import json as _json
+
+    from .transforms.compaction_codec import (
+        contains_removal_marker,
+        expand_compacted,
+        is_compacted,
+    )
+
+    if contains_removal_marker(compressed):
+        return False
+    if not is_compacted(compressed):
+        return False
+    decoded = expand_compacted(compressed)
+    if decoded is None:
+        return False
+    try:
+        return bool(_json.loads(original) == decoded)
+    except (ValueError, TypeError):
+        return False

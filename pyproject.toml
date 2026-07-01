@@ -46,24 +46,36 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    # Core: lightweight compression (SmartCrusher, ContentRouter, CCR, TOIN)
+    # Core: everything lossless densification (compress / densify) needs and
+    # nothing it doesn't. The densifier is Rust-backed (bundled in the wheel),
+    # so the only Python runtime deps are the tokenizer, config models, and CLI
+    # chrome. litellm (provider metadata) and ast-grep-cli (the proxy's code
+    # interceptor binary) were moved to extras — neither is imported by the
+    # compress()/densify() path, so they were dead weight for library users.
     "tiktoken>=0.5.0",            # Tokenizer for all compressors
     "pydantic>=2.0.0",            # Config and data models
-    # litellm's own metadata pins requires-python <3.14, and headroom only uses it for
-    # model registry / pricing / non-core providers — all lazily imported and
-    # ImportError-guarded. Marking it 3.14-optional lets headroom install on Python 3.14
-    # (core compression + the Anthropic proxy path never import litellm). See GH #956.
-    "litellm>=1.86.2,<2.0; python_version < '3.14'",  # model registry, pricing, providers (lazy)
     "click>=8.1.0",               # CLI framework
     "rich>=13.0.0",               # Rich terminal output
     "opentelemetry-api>=1.24.0",  # Safe no-op OTEL API for instrumentation
-    "ast-grep-cli>=0.30.0",       # AST-aware code slicing (CodeCompressor); binary wheel
     "tomli>=2.0.0; python_version < '3.11'",  # tomllib backport for helper scripts
 ]
 
 [project.optional-dependencies]
+# Lossless densification only — the minimal footprint. Explicit alias for the
+# base install (`pip install headroom-ai[lite]`): compress() / densify() run
+# Rust-backed lossless densification with no provider, ML, or interceptor deps.
+lite = []
+# Model registry / pricing / non-core provider routing (litellm). Lazily
+# imported and ImportError-guarded throughout the library; needed only for
+# pricing lookups, non-Anthropic provider metadata, and the eval runners.
+# Pinned <3.14 because litellm's own metadata caps requires-python there
+# (the core compression + Anthropic proxy path never import it). See GH #956.
+providers = [
+    "litellm>=1.86.2,<2.0; python_version < '3.14'",
+]
 # Proxy server (most common install: pip install headroom-ai[proxy])
 proxy = [
+    "headroom-ai[providers]",     # proxy uses litellm for provider/pricing metadata
     "fastapi>=0.100.0",
     "uvicorn>=0.23.0,<1.0",
     "httpx[http2]>=0.24.0",
@@ -76,6 +88,7 @@ proxy = [
     "transformers>=4.30.0,<6.0",  # Tokenizer only (for Kompress)
     "watchdog>=4.0.0",            # File watcher for live code graph reindexing (--code-graph)
     "sqlite-vec>=0.1.6",          # Vector index for memory (--memory). Lightweight, no torch.
+    "ast-grep-cli>=0.30.0",       # AST Read-outline interceptor (opt-in); binary wheel
 ]
 # Production ASGI/WSGI server — Unix-only (gunicorn does not support Windows).
 # Kept separate from [proxy] so that dev, CI, and Windows users are not forced
