@@ -96,6 +96,48 @@ def test_register_server_creates_config_when_missing(tmp_path: Path) -> None:
     }
 
 
+@pytest.mark.parametrize("contents", ["not json", "{", '{"theme": }', "[]"])
+def test_register_server_preserves_malformed_config(tmp_path: Path, contents: str) -> None:
+    """Registering must NOT clobber an existing but unparseable opencode.json.
+
+    The file holds theme/model/provider and other MCP servers; before the fix a
+    malformed file was read as {} and rewritten with only {"mcp": ...}."""
+    from headroom.mcp_registry.base import ServerSpec
+
+    config_path = tmp_path / "opencode.json"
+    config_path.write_text(contents, encoding="utf-8")
+    registrar = _registrar(tmp_path)
+
+    spec = ServerSpec(name="headroom", command="headroom", args=("mcp", "serve"))
+    result = registrar.register_server(spec)
+
+    assert result.status == RegisterStatus.FAILED
+    assert "not valid JSON" in result.detail
+    assert config_path.read_text(encoding="utf-8") == contents
+
+
+def test_register_server_preserves_other_keys(tmp_path: Path) -> None:
+    """The happy path merges: theme/model and an existing MCP server survive."""
+    from headroom.mcp_registry.base import ServerSpec
+
+    config_path = tmp_path / "opencode.json"
+    _write_json(
+        config_path,
+        {"theme": "dark", "model": "anthropic/claude", "mcp": {"other": {"type": "local"}}},
+    )
+    registrar = _registrar(tmp_path)
+
+    spec = ServerSpec(name="headroom", command="headroom", args=("mcp", "serve"))
+    result = registrar.register_server(spec)
+
+    assert result.status == RegisterStatus.REGISTERED
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    assert data["theme"] == "dark"
+    assert data["model"] == "anthropic/claude"
+    assert data["mcp"]["other"] == {"type": "local"}
+    assert "headroom" in data["mcp"]
+
+
 def test_register_server_idempotent(tmp_path: Path) -> None:
     """register_server is a no-op when the same spec is already present."""
     registrar = _registrar(tmp_path)

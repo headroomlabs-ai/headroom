@@ -35,7 +35,13 @@ def _opencode_config_path() -> Path:
 
 
 def _read_json(path: Path) -> dict[str, Any]:
-    """Read a JSON file, returning empty dict if absent or unparseable."""
+    """Read a JSON file, returning empty dict if absent or unparseable.
+
+    Safe for READ-ONLY callers only. Do NOT use before a full-file rewrite:
+    an unparseable existing file returns ``{}`` here, and writing that back
+    would destroy the user's other config. Use :func:`_read_json_for_write`
+    on the write path instead.
+    """
     if not path.exists():
         return {}
     try:
@@ -45,6 +51,37 @@ def _read_json(path: Path) -> dict[str, Any]:
         return {}
     if not isinstance(data, dict):
         return {}
+    return data
+
+
+class _MalformedConfigError(Exception):
+    """The target config file exists but is not a parseable JSON object.
+
+    Raised on the write path so we refuse to clobber a config we can't safely
+    merge into, rather than silently overwriting the user's other settings.
+    """
+
+
+def _read_json_for_write(path: Path) -> dict[str, Any]:
+    """Read a JSON object for a subsequent full-file rewrite.
+
+    Returns ``{}`` only when the file is absent or empty (safe to start fresh).
+    If the file exists with content but does not parse as a JSON object, raise
+    :class:`_MalformedConfigError` so the caller aborts instead of overwriting
+    unrelated user config — ``opencode.json`` holds ``theme``/``model``/
+    ``provider``/other MCP servers alongside the ``mcp`` block.
+    """
+    if not path.exists():
+        return {}
+    raw = path.read_text(encoding="utf-8")  # OSError propagates to the caller
+    if not raw.strip():
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise _MalformedConfigError(str(exc)) from exc
+    if not isinstance(data, dict):
+        raise _MalformedConfigError("top-level JSON is not an object")
     return data
 
 
@@ -164,13 +201,21 @@ class OpencodeRegistrar(MCPRegistrar):
     def _write_entry(self, spec: ServerSpec) -> RegisterResult:
         try:
             self._config_path.parent.mkdir(parents=True, exist_ok=True)
-            data = _read_json(self._config_path)
+            data = _read_json_for_write(self._config_path)
             mcp = data.setdefault("mcp", {})
             if not isinstance(mcp, dict):
                 mcp = {}
                 data["mcp"] = mcp
             mcp[spec.name] = _spec_to_entry(spec)
             _write_json(self._config_path, data)
+        except _MalformedConfigError as exc:
+            # Refuse to overwrite: opencode.json holds theme/model/provider and
+            # other MCP servers that a blind rewrite would wipe.
+            return RegisterResult(
+                RegisterStatus.FAILED,
+                f"{self._config_path} exists but is not valid JSON ({exc}); "
+                "refusing to overwrite. Fix or remove the file, then re-run.",
+            )
         except OSError as exc:
             return RegisterResult(
                 RegisterStatus.FAILED, f"could not write {self._config_path}: {exc}"
