@@ -144,7 +144,7 @@ class VerbosityProfile:
     @classmethod
     def load(cls, path: Path) -> VerbosityProfile | None:
         try:
-            d = json.loads(Path(path).read_text())
+            d = json.loads(Path(path).read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError, ValueError):
             return None
         return cls(
@@ -208,7 +208,7 @@ def _parse_session(path: Path) -> tuple[list[_Response], list[_HumanMsg], bool]:
     recent_context: list[str] = []
 
     try:
-        lines = path.read_text().splitlines()
+        lines = path.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeDecodeError):
         return [], [], False
 
@@ -282,7 +282,7 @@ def _ordered_events(path: Path) -> list[tuple[float | None, str, _Response | _Hu
     """
     out: list[tuple[float | None, str, Any]] = []
     try:
-        lines = path.read_text().splitlines()
+        lines = path.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeDecodeError):
         return out
     responses, humans, _ = _parse_session(path)

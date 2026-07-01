@@ -659,6 +659,26 @@ class TestCallCliLlm:
         cmd = popen.call_args[0][0]
         assert cmd == ["claude", "-p", "--output-format", "stream-json", "--verbose"]
 
+    def test_claude_cli_windows_falls_back_to_cmd_shim(self):
+        stdout = [_result_event('{"context_file_rules": [], "memory_file_rules": []}')]
+        popen = _fake_claude_popen(stdout_lines=stdout)
+        calls: list[list[str]] = []
+
+        def _side_effect(*args, **kwargs):
+            cmd = args[0]
+            calls.append(cmd)
+            if len(calls) == 1:
+                raise FileNotFoundError
+            return popen.side_effect(*args, **kwargs)
+
+        with patch("headroom.learn.analyzer.os.name", "nt"):
+            with patch("headroom.learn.analyzer.subprocess.Popen", side_effect=_side_effect):
+                result = _call_cli_llm("test digest", "claude-cli")
+
+        assert result == {"context_file_rules": [], "memory_file_rules": []}
+        assert calls[0][0] == "claude"
+        assert calls[1][0] == "claude.cmd"
+
     def test_claude_cli_parses_fenced_result(self):
         stdout = [
             _result_event('```json\n{"context_file_rules": [], "memory_file_rules": []}\n```'),

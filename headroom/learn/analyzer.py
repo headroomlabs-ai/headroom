@@ -233,7 +233,7 @@ def _build_digest(project: ProjectInfo, sessions: list[SessionData]) -> str:
     lines: list[str] = []
 
     # Project header
-    lines.append(f"Project: {project.name} ({project.project_path})")
+    lines.append(f"Project: {project.name} ({project.project_path.as_posix()})")
     total_calls = sum(len(s.tool_calls) for s in sessions)
     total_failures = sum(s.failure_count for s in sessions)
     total_tokens_in = sum(s.total_input_tokens for s in sessions)
@@ -534,16 +534,31 @@ def _call_claude_cli_streaming(
     Threads (rather than ``select``) drain stdout/stderr so the watchdog works
     on Windows too, where ``select`` does not support pipe handles.
     """
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,  # line-buffered
-        )
-    except FileNotFoundError:
+    candidate_cmds = [cmd]
+    if os.name == "nt":
+        binary = cmd[0]
+        for suffix in (".cmd", ".exe", ".bat"):
+            fallback = binary if binary.lower().endswith(suffix) else f"{binary}{suffix}"
+            if fallback != binary:
+                candidate_cmds.append([fallback, *cmd[1:]])
+
+    proc = None
+    for candidate in candidate_cmds:
+        try:
+            proc = subprocess.Popen(
+                candidate,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,  # line-buffered
+            )
+            break
+        except FileNotFoundError:
+            if os.name != "nt":
+                break
+
+    if proc is None:
         raise RuntimeError(
             f"`{cmd[0]}` not found in PATH. Install it or use a different backend "
             "with --model <litellm-model-name>."
