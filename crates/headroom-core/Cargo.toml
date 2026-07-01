@@ -94,7 +94,7 @@ rayon = "1"
 # `config/pipeline.toml`. The defaults embed via `include_str!` so a
 # stock binary needs no external file; production deployments override
 # by loading their own TOML at startup.
-toml = "0.8"
+toml = "1.1"
 # `blake3` powers `ccr::compute_key`. BLAKE3 is faster than SHA-256 on
 # every hot path the proxy hits (large diff/log/tool_result payloads)
 # and produces collision-resistant 24-char prefixes for the CCR
