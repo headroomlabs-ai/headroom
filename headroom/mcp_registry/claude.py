@@ -150,10 +150,18 @@ class ClaudeRegistrar(MCPRegistrar):
 
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
-            config = _read_json(target)
+            config = _read_json_for_write(target)
             servers = config.setdefault("mcpServers", {})
             servers[spec.name] = _spec_to_entry(spec)
             _write_json(target, config)
+        except _MalformedConfigError as exc:
+            # Refuse to overwrite: the file holds unrelated Claude state
+            # (projects, oauthAccount, history) that a blind rewrite would wipe.
+            return RegisterResult(
+                RegisterStatus.FAILED,
+                f"{target} exists but is not valid JSON ({exc}); refusing to overwrite. "
+                "Fix or remove the file, then re-run.",
+            )
         except OSError as exc:
             return RegisterResult(RegisterStatus.FAILED, f"could not write {target}: {exc}")
         return RegisterResult(RegisterStatus.REGISTERED, f"wrote to {target}")
@@ -209,7 +217,13 @@ def _resolve_claude_config_dir(
 
 
 def _read_json(path: Path) -> dict[str, Any]:
-    """Read a JSON file, returning empty dict if absent or unparseable."""
+    """Read a JSON file, returning empty dict if absent or unparseable.
+
+    Safe for READ-ONLY callers. Do NOT use before a full-file rewrite: an
+    unparseable existing file returns ``{}`` here, and writing that back would
+    destroy the user's other config. Use :func:`_read_json_for_write` on the
+    write path instead.
+    """
     if not path.exists():
         return {}
     try:
@@ -219,6 +233,37 @@ def _read_json(path: Path) -> dict[str, Any]:
         return {}
     if not isinstance(data, dict):
         return {}
+    return data
+
+
+class _MalformedConfigError(Exception):
+    """The target config file exists but is not a parseable JSON object.
+
+    Raised on the write path so we refuse to clobber a file we can't safely
+    merge into, rather than silently overwriting the user's state.
+    """
+
+
+def _read_json_for_write(path: Path) -> dict[str, Any]:
+    """Read a JSON object for a subsequent full-file rewrite.
+
+    Returns ``{}`` only when the file is absent or empty (safe to start fresh).
+    If the file exists with content but does not parse as a JSON object, raise
+    :class:`_MalformedConfigError` so the caller aborts instead of overwriting
+    unrelated user config (e.g. ``~/.claude/.claude.json`` holds ``projects``,
+    ``oauthAccount``, and session history alongside ``mcpServers``).
+    """
+    if not path.exists():
+        return {}
+    raw = path.read_text(encoding="utf-8")  # OSError propagates to the caller
+    if not raw.strip():
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise _MalformedConfigError(str(exc)) from exc
+    if not isinstance(data, dict):
+        raise _MalformedConfigError("top-level JSON is not an object")
     return data
 
 
