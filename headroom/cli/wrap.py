@@ -99,6 +99,7 @@ from headroom.providers.copilot import (
     validate_configuration as _validate_copilot_configuration,
 )
 from headroom.providers.cursor import render_setup_lines as _render_cursor_setup_lines
+from headroom.providers.kimi import build_launch_env as _build_kimi_launch_env
 from headroom.providers.mistral_vibe import build_launch_env as _build_mistral_vibe_launch_env
 from headroom.providers.openclaw import (
     build_plugin_entry as _build_openclaw_plugin_entry_impl,
@@ -4620,6 +4621,91 @@ def vibe(
         agent_type="vibe",
         code_graph=code_graph,
         openai_api_url="https://api.mistral.ai",
+    )
+
+
+# =============================================================================
+# Kimi CLI
+# =============================================================================
+
+
+@wrap.command(context_settings={"ignore_unknown_options": True})
+@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--no-context-tool",
+    "--no-rtk",
+    "no_rtk",
+    is_flag=True,
+    help="Skip CLI context-tool setup (no effect for kimi)",
+)
+@click.option(
+    "--code-graph",
+    is_flag=True,
+    help="Enable code graph indexing via codebase-memory-mcp (optional)",
+)
+@click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
+@click.option("--learn", is_flag=True, help="Enable live traffic learning")
+@click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
+@click.option("--verbose", "-v", is_flag=True, help="Verbose output")
+@click.option(
+    "--kimi-api-url",
+    default="https://api.kimi.com/coding/v1",
+    help="Upstream Kimi coding endpoint (default: https://api.kimi.com/coding/v1)",
+)
+@click.option("--prepare-only", is_flag=True, hidden=True)
+@click.argument("kimi_args", nargs=-1, type=click.UNPROCESSED)
+def kimi(
+    port: int,
+    no_rtk: bool,
+    code_graph: bool,
+    no_proxy: bool,
+    learn: bool,
+    memory: bool,
+    verbose: bool,
+    kimi_api_url: str,
+    prepare_only: bool,
+    kimi_args: tuple,
+) -> None:
+    """Launch Kimi CLI through Headroom proxy.
+
+    \b
+    Sets KIMI_BASE_URL to route Kimi's OpenAI-compatible /chat/completions
+    traffic through Headroom. Kimi's own OAuth bearer is forwarded upstream,
+    so no extra login is required — run `kimi` once to authenticate first.
+
+    \b
+    Examples:
+        headroom wrap kimi                         # Start proxy + kimi
+        headroom wrap kimi -- -m kimi-for-coding   # Pass args to kimi
+        headroom wrap kimi --port 9999             # Custom proxy port
+        headroom wrap kimi --kimi-api-url https://api.moonshot.ai/v1
+    """
+    if prepare_only:
+        return
+
+    kimi_bin = shutil.which("kimi") or shutil.which("kimi-cli")
+    if not kimi_bin:
+        click.echo("Error: 'kimi' (or 'kimi-cli') not found in PATH.")
+        click.echo("Install Kimi CLI: https://github.com/MoonshotAI/kimi-cli")
+        raise SystemExit(1)
+
+    env, env_vars_display = _build_kimi_launch_env(
+        port, os.environ, project=_project_name_from_cwd()
+    )
+
+    _launch_tool(
+        binary=kimi_bin,
+        args=kimi_args,
+        env=env,
+        port=port,
+        no_proxy=no_proxy,
+        tool_label="KIMI",
+        env_vars_display=env_vars_display,
+        learn=learn,
+        memory=memory,
+        agent_type="kimi",
+        code_graph=code_graph,
+        openai_api_url=kimi_api_url,
     )
 
 
