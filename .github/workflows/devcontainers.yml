@@ -30,7 +30,7 @@ jobs:
             config: .devcontainer/memory-stack/devcontainer.json
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       # The memory-stack devcontainer brings up Neo4j + Postgres +
       # Redis + Qdrant on top of the Docker base. PR #495 surfaced
@@ -83,7 +83,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       # The worktree devcontainer runs the same `uv sync --extra dev` build as
       # the default validate job, which now pulls transformers 5.x. Copying that

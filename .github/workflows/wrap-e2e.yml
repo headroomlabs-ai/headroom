@@ -32,7 +32,7 @@ jobs:
     timeout-minutes: 45
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Build wrap e2e image
         run: docker build -f e2e/wrap/Dockerfile -t headroom-wrap-e2e .

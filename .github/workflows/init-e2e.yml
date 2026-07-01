@@ -33,7 +33,7 @@ jobs:
     timeout-minutes: 45
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Build init e2e image
         run: docker build -f e2e/init/Dockerfile -t headroom-init-e2e .

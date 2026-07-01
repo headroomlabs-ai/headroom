@@ -64,7 +64,7 @@ jobs:
           - { name: arm64, runs_on: ubuntu-24.04-arm, platform: linux/arm64 }
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Normalize image name
         id: image-name
