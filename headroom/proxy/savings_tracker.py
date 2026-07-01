@@ -217,13 +217,17 @@ def _estimate_input_cost_usd(
     otherwise falls back to list-price input tokens.
     """
     total_input_tokens = _coerce_int(input_tokens)
-    litellm = _get_litellm_module()
-    if total_input_tokens <= 0 or litellm is None:
-        return 0.0
-
     cache_read = _coerce_int(cache_read_tokens)
     cache_write = _coerce_int(cache_write_tokens)
     uncached = _coerce_int(uncached_input_tokens)
+    litellm = _get_litellm_module()
+    # Gate on tokens actually sent. Providers like Anthropic report cache
+    # reads/writes separately from `input_tokens` (the uncached portion), so a
+    # fully prefix-cached request has input_tokens == 0 while cache_read > 0.
+    # Bailing on `input_tokens <= 0` alone dropped the real cache-read cost,
+    # leaving days with compression savings but zero recorded spend.
+    if total_input_tokens + cache_read + cache_write + uncached <= 0 or litellm is None:
+        return 0.0
 
     try:
         resolved = _resolve_litellm_model(model)

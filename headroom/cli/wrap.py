@@ -388,6 +388,8 @@ def _start_proxy(
     region: str | None = None,
     openai_api_url: str | None = None,
     anthropic_api_url: str | None = None,
+    vertex_api_url: str | None = None,
+    clear_vertex_api_url: bool = False,
     copilot_api_token: str | None = None,
 ) -> subprocess.Popen:
     """Start Headroom proxy as a background subprocess.
@@ -434,6 +436,9 @@ def _start_proxy(
     if anthropic_api_url:
         cmd.extend(["--anthropic-api-url", anthropic_api_url])
 
+    if vertex_api_url:
+        cmd.extend(["--vertex-api-url", vertex_api_url])
+
     timeout_seconds = _resolve_wrap_proxy_timeout_seconds()
     log_path = _get_log_path()
     stdio_log_path = _get_proxy_stdio_log_path()
@@ -453,6 +458,10 @@ def _start_proxy(
         proxy_env["OPENAI_TARGET_API_URL"] = openai_api_url
     if anthropic_api_url:
         proxy_env["ANTHROPIC_TARGET_API_URL"] = anthropic_api_url
+    if clear_vertex_api_url:
+        proxy_env.pop("VERTEX_TARGET_API_URL", None)
+    if vertex_api_url:
+        proxy_env["VERTEX_TARGET_API_URL"] = vertex_api_url
     # Pin the wrapper-validated Copilot token for this proxy instance only.
     # Injected into the subprocess env here (not the parent's os.environ) so it
     # never leaks into shared state. The proxy's CopilotTokenProvider honours
@@ -462,39 +471,83 @@ def _start_proxy(
         if openai_api_url:
             proxy_env["GITHUB_COPILOT_API_URL"] = openai_api_url
 
-    proc = subprocess.Popen(
-        cmd,
-        stdout=stdio_log_file,
-        stderr=stdio_log_file,
-        env=proxy_env,
-        start_new_session=os.name == "posix",
-    )
+    # Detach the proxy from the launching console on Windows so an ungraceful
+    # close of the owning agent (closing the terminal window, taskkill, or a
+    # crash) cannot tree-kill the shared proxy out from under other live
+    # clients. Without this the proxy stays in the owner's console + Job
+    # object; closing that window terminates the whole tree, bypassing the
+    # marker-based reference counting in ``_make_cleanup`` and breaking every
+    # other ``headroom wrap`` instance routed through the same port.
+    #   CREATE_NO_WINDOW         — give the proxy its OWN, invisible console.
+    #                              A separate console means the parent's
+    #                              CTRL_CLOSE_EVENT never reaches it, and no
+    #                              stray console window pops up. DETACHED_PROCESS
+    #                              also isolates the console, but for a console
+    #                              subsystem exe (python.exe) it leaves the proxy
+    #                              consoleless and Windows surfaces a visible
+    #                              console window — closing that window killed
+    #                              the proxy, defeating the whole point.
+    #   CREATE_NEW_PROCESS_GROUP — isolate from the parent's Ctrl-C
+    #   CREATE_BREAKAWAY_FROM_JOB— survive Job kill-on-close (Windows Terminal,
+    #                              VS Code integrated terminal, conhost)
+    # CREATE_NO_WINDOW / DETACHED_PROCESS / CREATE_NEW_CONSOLE are mutually
+    # exclusive — pick exactly one. On POSIX, ``start_new_session`` already
+    # detaches via setsid(). ``sys.platform == "win32"`` (not ``os.name ==
+    # "nt"``) so mypy narrows the platform and resolves the Windows-only
+    # ``subprocess`` constants below.
+    _CREATE_BREAKAWAY_FROM_JOB = 0x01000000
+    creationflags = 0
+    if sys.platform == "win32":
+        creationflags = (
+            subprocess.CREATE_NO_WINDOW
+            | subprocess.CREATE_NEW_PROCESS_GROUP
+            | _CREATE_BREAKAWAY_FROM_JOB
+        )
 
-    # Wait for proxy to be ready.
-    # ML components (Kompress, Magika, Tree-sitter) load synchronously before
-    # uvicorn binds the port. On slower machines this can take 20-30 seconds.
-    for _i in range(timeout_seconds):
-        time.sleep(1)
-        if _check_proxy(port):
-            click.echo(f"  Logs: {log_path}")
-            stdio_log_file.close()
-            return proc
-        # Check if process died
-        if proc.poll() is not None:
-            stdio_log_file.close()
-            # Read last few lines of log for error context
-            try:
-                tail = _read_text(stdio_log_path)[-500:]
-            except Exception:
-                tail = "(no log output)"
-            raise RuntimeError(f"Proxy exited with code {proc.returncode}: {tail}")
+    popen_kwargs: dict[str, Any] = {
+        "stdout": stdio_log_file,
+        "stderr": stdio_log_file,
+        "env": proxy_env,
+        "start_new_session": os.name == "posix",
+        "creationflags": creationflags,
+    }
+    # Close the parent's copy of the stdio log handle on every exit path,
+    # including when BOTH spawn attempts raise. The child keeps its own
+    # inherited duplicate, so closing here never starves the proxy's logging.
+    try:
+        try:
+            proc = subprocess.Popen(cmd, **popen_kwargs)
+        except OSError:
+            # The launcher's Job object forbids breakaway. Retry without that flag;
+            # CREATE_NO_WINDOW still spares the proxy from console-close events.
+            if sys.platform == "win32":
+                popen_kwargs["creationflags"] = creationflags & ~_CREATE_BREAKAWAY_FROM_JOB
+            proc = subprocess.Popen(cmd, **popen_kwargs)
 
-    proc.kill()
-    stdio_log_file.close()
-    raise RuntimeError(
-        f"Proxy failed to start on port {port} within {timeout_seconds} seconds. "
-        f"Set {_WRAP_PROXY_TIMEOUT_ENV} to a larger number of seconds for slow startup."
-    )
+        # Wait for proxy to be ready.
+        # ML components (Kompress, Magika, Tree-sitter) load synchronously before
+        # uvicorn binds the port. On slower machines this can take 20-30 seconds.
+        for _i in range(timeout_seconds):
+            time.sleep(1)
+            if _check_proxy(port):
+                click.echo(f"  Logs: {log_path}")
+                return proc
+            # Check if process died
+            if proc.poll() is not None:
+                # Read last few lines of log for error context
+                try:
+                    tail = _read_text(stdio_log_path)[-500:]
+                except Exception:
+                    tail = "(no log output)"
+                raise RuntimeError(f"Proxy exited with code {proc.returncode}: {tail}")
+
+        proc.kill()
+        raise RuntimeError(
+            f"Proxy failed to start on port {port} within {timeout_seconds} seconds. "
+            f"Set {_WRAP_PROXY_TIMEOUT_ENV} to a larger number of seconds for slow startup."
+        )
+    finally:
+        stdio_log_file.close()
 
 
 def _setup_rtk(verbose: bool = False) -> Path | None:
@@ -754,22 +807,55 @@ def _foundry_proxy_url(proxy_url: str) -> str:
     return proxy_url.rstrip("/") + "/anthropic"
 
 
+def _vertex_target_api_url_from_claude_env(proxy_url: str) -> str | None:
+    """Return the Vertex upstream that the proxy should use for Claude Code."""
+    explicit_target = os.environ.get("VERTEX_TARGET_API_URL", "").strip()
+    if explicit_target:
+        return (
+            None
+            if _normalize_proxy_api_url(explicit_target) == _normalize_proxy_api_url(proxy_url)
+            else explicit_target
+        )
+
+    vertex_url = os.environ.get("ANTHROPIC_VERTEX_BASE_URL", "").strip()
+    if not vertex_url:
+        return None
+
+    from headroom.providers.registry import DEFAULT_VERTEX_API_URL
+
+    normalized_vertex_url = _normalize_proxy_api_url(vertex_url)
+    if normalized_vertex_url == _normalize_proxy_api_url(DEFAULT_VERTEX_API_URL):
+        return None
+    if normalized_vertex_url == _normalize_proxy_api_url(proxy_url):
+        return None
+    return vertex_url
+
+
+def _claude_wrap_base_url_env_key(*, foundry_mode: bool = False, vertex_mode: bool = False) -> str:
+    if vertex_mode:
+        return "ANTHROPIC_VERTEX_BASE_URL"
+    if foundry_mode:
+        return "ANTHROPIC_FOUNDRY_BASE_URL"
+    return "ANTHROPIC_BASE_URL"
+
+
 def _write_claude_wrap_base_url(
     proxy_url: str,
     *,
     foundry_mode: bool = False,
+    vertex_mode: bool = False,
     settings_path: Path | None = None,
 ) -> str | None:
     """Persist proxy URL into project-local settings env key for daemon child inheritance.
 
     Claude Code's cc-daemon pre-forks conversation workers using spawn (not
     fork), so those workers read settings.json fresh rather than inheriting
-    the daemon's environment.  Writing env.ANTHROPIC_BASE_URL into the
-    project-local settings file (.claude/settings.local.json in cwd) ensures
-    every new conversation — including those started after the initial launch —
-    routes through the Headroom proxy without touching the global user settings
-    file or affecting sessions in other projects.  Returns the previous value
-    so the caller can restore it on exit (issue #951).
+    the daemon's environment.  Writing the mode-specific Claude base URL env
+    key into the project-local settings file (.claude/settings.local.json in
+    cwd) ensures every new conversation — including those started after the
+    initial launch — routes through the Headroom proxy without touching the
+    global user settings file or affecting sessions in other projects. Returns
+    the previous value so the caller can restore it on exit (issue #951).
     """
     path = settings_path or (Path.cwd() / ".claude" / "settings.local.json")
     payload: dict[str, Any] = {}
@@ -781,7 +867,7 @@ def _write_claude_wrap_base_url(
     if not isinstance(payload, dict):
         payload = {}
     env_map = dict(payload.get("env") or {}) if isinstance(payload.get("env"), dict) else {}
-    key = "ANTHROPIC_FOUNDRY_BASE_URL" if foundry_mode else "ANTHROPIC_BASE_URL"
+    key = _claude_wrap_base_url_env_key(foundry_mode=foundry_mode, vertex_mode=vertex_mode)
     previous = env_map.get(key)
     env_map[key] = proxy_url
     payload["env"] = env_map
@@ -794,6 +880,7 @@ def _restore_claude_wrap_base_url(
     previous: str | None,
     *,
     foundry_mode: bool = False,
+    vertex_mode: bool = False,
     settings_path: Path | None = None,
 ) -> None:
     """Restore (or remove) the env key written by _write_claude_wrap_base_url.
@@ -815,7 +902,7 @@ def _restore_claude_wrap_base_url(
     env_map = payload.get("env")
     if not isinstance(env_map, dict):
         return
-    key = "ANTHROPIC_FOUNDRY_BASE_URL" if foundry_mode else "ANTHROPIC_BASE_URL"
+    key = _claude_wrap_base_url_env_key(foundry_mode=foundry_mode, vertex_mode=vertex_mode)
     if previous is None:
         if key not in env_map:
             return
@@ -1350,6 +1437,20 @@ def _strip_codex_headroom_blocks(
 _REDIRECTABLE_KEYS: tuple[str, ...] = ("model_provider", "openai_base_url")
 
 
+def _strip_existing_codex_headroom_provider_table(content: str) -> str:
+    """Remove a pre-existing ``[model_providers.headroom]`` table before wrap."""
+    if "[model_providers.headroom]" not in content:
+        return content
+
+    import re  # local import to match surrounding helper convention
+
+    provider_table = re.compile(
+        r"(?ms)^[ \t]*\[model_providers\.headroom\][^\n]*\n.*?(?=^[ \t]*\[|\Z)"
+    )
+    content = provider_table.sub("", content)
+    return content.lstrip("\n").rstrip() + "\n" if content.strip() else ""
+
+
 def _redirect_existing_top_level_keys(content: str, port: int) -> str:
     """Rewrite user-defined top-level keys so wrap does not create duplicates.
 
@@ -1614,6 +1715,7 @@ def _inject_codex_provider_config(port: int) -> None:
             # Remove any prior Headroom-managed blocks before re-injecting so
             # the operation is idempotent and supports port changes.
             content = _strip_codex_headroom_blocks(content)
+            content = _strip_existing_codex_headroom_provider_table(content)
 
             # Bare top-level keys must precede any [section] in TOML, and
             # TOML rejects duplicate top-level keys.  Rewrite any existing
@@ -2565,6 +2667,8 @@ def _ensure_proxy(
     region: str | None = None,
     openai_api_url: str | None = None,
     anthropic_api_url: str | None = None,
+    vertex_api_url: str | None = None,
+    clear_vertex_api_url: bool = False,
     copilot_api_token: str | None = None,
 ) -> subprocess.Popen | None:
     """Start or verify proxy. Returns process handle if we started it."""
@@ -2777,6 +2881,13 @@ def _ensure_proxy(
                     requested_openai_url = _normalize_proxy_api_url(openai_api_url)
                     if running_openai_url != requested_openai_url:
                         missing.append("openai-api-url")
+                if vertex_api_url or clear_vertex_api_url:
+                    running_vertex_url = _normalize_proxy_api_url(
+                        running_config.get("vertex_api_url")
+                    )
+                    requested_vertex_url = _normalize_proxy_api_url(vertex_api_url)
+                    if running_vertex_url != requested_vertex_url:
+                        missing.append("vertex-api-url")
 
                 if missing:
                     flags_str = ", ".join(
@@ -2850,6 +2961,8 @@ def _ensure_proxy(
                     region=region,
                     openai_api_url=openai_api_url,
                     anthropic_api_url=anthropic_api_url,
+                    vertex_api_url=vertex_api_url,
+                    clear_vertex_api_url=clear_vertex_api_url,
                     copilot_api_token=copilot_api_token,
                 ),
             )
@@ -2862,6 +2975,23 @@ def _ensure_proxy(
     else:
         if not helpers._check_proxy(port):
             click.echo(f"  Warning: No proxy detected on port {port}")
+        elif vertex_api_url or clear_vertex_api_url:
+            health_payload = helpers._query_proxy_health(port)
+            running_config = helpers._proxy_health_config(health_payload)
+            if running_config is None:
+                running_config = helpers._query_proxy_config(port)
+            running_vertex_url = (
+                _normalize_proxy_api_url(running_config.get("vertex_api_url"))
+                if running_config is not None
+                else None
+            )
+            requested_vertex_url = _normalize_proxy_api_url(vertex_api_url)
+            if running_vertex_url != requested_vertex_url:
+                click.echo(
+                    "  Warning: --no-proxy is set, but the running proxy does not "
+                    "advertise the requested Vertex target. Requests may still go "
+                    "to the proxy's existing Vertex upstream."
+                )
         return None
 
 
@@ -3473,6 +3603,7 @@ def claude(
     proxy_holder: list[subprocess.Popen | None] = [None]
     _saved_base_url: list[str | None] = [None]  # previous settings.json value for restore
     _settings_foundry: list[bool] = [False]
+    _settings_vertex: list[bool] = [False]
     cleanup = _make_cleanup(proxy_holder, port)
     _register_proxy_client(port)
     signal.signal(signal.SIGINT, _ignore_child_sigint)
@@ -3547,6 +3678,8 @@ def claude(
         # location) using Claude Code's own ADC token — no API key, no creds held
         # by Headroom. This is the turnkey Vertex compression path.
         use_vertex = bool(os.environ.get("CLAUDE_CODE_USE_VERTEX"))
+        proxy_url = _claude_proxy_base_url(port)
+        vertex_upstream = _vertex_target_api_url_from_claude_env(proxy_url) if use_vertex else None
 
         proxy_holder[0] = _ensure_proxy(
             port,
@@ -3558,6 +3691,8 @@ def claude(
             backend=backend,
             region=region,
             anthropic_api_url=foundry_upstream,
+            vertex_api_url=vertex_upstream,
+            clear_vertex_api_url=use_vertex and vertex_upstream is None,
         )
         _push_runtime_env(port, no_proxy)
 
@@ -3593,7 +3728,6 @@ def claude(
         if code_graph:
             _setup_code_graph(verbose=verbose)
 
-        proxy_url = _claude_proxy_base_url(port)
         click.echo()
         click.echo("  Launching Claude Code (API routed through Headroom)...")
         if use_vertex:
@@ -3629,10 +3763,18 @@ def claude(
         # Issue #951: write to settings.json so daemon-spawned conversation
         # workers (which read settings.json fresh rather than inheriting the
         # daemon's environment) also route through Headroom.
-        _settings_foundry[0] = bool(foundry_upstream)
+        _settings_vertex[0] = bool(use_vertex)
+        _settings_foundry[0] = bool(foundry_upstream) and not _settings_vertex[0]
         _saved_base_url[0] = _write_claude_wrap_base_url(
-            _foundry_proxy_url(proxy_url) if _settings_foundry[0] else proxy_url,
+            (
+                _foundry_proxy_url(proxy_url)
+                if _settings_foundry[0]
+                else env["ANTHROPIC_VERTEX_BASE_URL"]
+                if _settings_vertex[0]
+                else proxy_url
+            ),
             foundry_mode=_settings_foundry[0],
+            vertex_mode=_settings_vertex[0],
         )
 
         # Per-project savings attribution: tag every request with the launch
@@ -3672,7 +3814,11 @@ def claude(
         click.echo(f"  Error: {e}")
         raise SystemExit(1) from e
     finally:
-        _restore_claude_wrap_base_url(_saved_base_url[0], foundry_mode=_settings_foundry[0])
+        _restore_claude_wrap_base_url(
+            _saved_base_url[0],
+            foundry_mode=_settings_foundry[0],
+            vertex_mode=_settings_vertex[0],
+        )
         cleanup()
 
 
@@ -3741,6 +3887,7 @@ def unwrap_claude(
 
     _restore_claude_wrap_base_url(None)
     _restore_claude_wrap_base_url(None, foundry_mode=True)
+    _restore_claude_wrap_base_url(None, vertex_mode=True)
 
     click.echo()
     click.echo("✓ Claude is no longer durably wrapped by Headroom.")

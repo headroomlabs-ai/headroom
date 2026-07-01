@@ -192,7 +192,7 @@ class _DummyOpenAIHandler(OpenAIHandlerMixin):
     def _extract_tags(self, headers: dict[str, str]) -> dict[str, str]:
         return {}
 
-    async def _retry_request(self, method: str, url: str, headers: dict, body: dict):
+    async def _retry_request(self, method: str, url: str, headers: dict, body: dict, **kwargs):
         self.captured_request = (method, url, headers, body)
         return _ResponseStub()
 

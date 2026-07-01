@@ -523,8 +523,32 @@ class StreamingMixin:
                         "input": {},
                     },
                 }
+            elif block.get("type") == "thinking":
+                content_block = {
+                    "type": "thinking",
+                    "thinking": "",
+                }
+                if "signature" in block:
+                    content_block["signature"] = block["signature"]
+                block_start = {
+                    "type": "content_block_start",
+                    "index": idx,
+                    "content_block": content_block,
+                }
+            elif block.get("type") == "redacted_thinking":
+                block_start = {
+                    "type": "content_block_start",
+                    "index": idx,
+                    "content_block": {
+                        "type": "redacted_thinking",
+                        "data": block.get("data", ""),
+                    },
+                }
             else:
-                continue
+                raise ValueError(
+                    f"Unsupported Anthropic content block type for SSE conversion: "
+                    f"{block.get('type')!r}"
+                )
 
             events.append(
                 f"event: content_block_start\ndata: {json.dumps(block_start)}\n\n".encode()
@@ -538,6 +562,15 @@ class StreamingMixin:
                     "delta": {"type": "text_delta", "text": block["text"]},
                 }
                 events.append(f"event: content_block_delta\ndata: {json.dumps(delta)}\n\n".encode())
+                for citation in block.get("citations", []) or []:
+                    citation_delta = {
+                        "type": "content_block_delta",
+                        "index": idx,
+                        "delta": {"type": "citations_delta", "citation": citation},
+                    }
+                    events.append(
+                        f"event: content_block_delta\ndata: {json.dumps(citation_delta)}\n\n".encode()
+                    )
             elif block.get("type") == "tool_use" and block.get("input"):
                 delta = {
                     "type": "content_block_delta",
@@ -548,6 +581,25 @@ class StreamingMixin:
                     },
                 }
                 events.append(f"event: content_block_delta\ndata: {json.dumps(delta)}\n\n".encode())
+            elif block.get("type") == "thinking":
+                if block.get("thinking"):
+                    delta = {
+                        "type": "content_block_delta",
+                        "index": idx,
+                        "delta": {"type": "thinking_delta", "thinking": block["thinking"]},
+                    }
+                    events.append(
+                        f"event: content_block_delta\ndata: {json.dumps(delta)}\n\n".encode()
+                    )
+                if block.get("signature"):
+                    delta = {
+                        "type": "content_block_delta",
+                        "index": idx,
+                        "delta": {"type": "signature_delta", "signature": block["signature"]},
+                    }
+                    events.append(
+                        f"event: content_block_delta\ndata: {json.dumps(delta)}\n\n".encode()
+                    )
 
             # content_block_stop
             block_stop = {"type": "content_block_stop", "index": idx}

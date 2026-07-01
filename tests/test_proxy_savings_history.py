@@ -343,6 +343,37 @@ def test_litellm_resolution_and_savings_estimation_fallbacks(monkeypatch):
     assert savings_tracker_module._estimate_input_cost_usd("gpt-4o", 100) == 0.0
 
 
+def test_input_cost_counts_cache_reads_when_uncached_input_is_zero(monkeypatch):
+    # Anthropic reports cache reads/writes separately from `input_tokens` (the
+    # uncached portion). A fully prefix-cached request has input_tokens == 0 but
+    # cache_read_tokens > 0 -- it still cost money and must not be priced at 0,
+    # otherwise the day shows compression savings with zero recorded spend.
+    def fake_cost_per_token(*, model, prompt_tokens, completion_tokens):
+        if model == "anthropic/claude-sonnet-4-6":
+            return {"model": model}
+        raise RuntimeError("unknown model")
+
+    fake_litellm = SimpleNamespace(
+        cost_per_token=fake_cost_per_token,
+        model_cost={
+            "anthropic/claude-sonnet-4-6": {
+                "input_cost_per_token": 0.003,
+                "cache_read_input_token_cost": 0.0003,
+                "cache_creation_input_token_cost": 0.00375,
+            },
+        },
+    )
+    monkeypatch.setattr(savings_tracker_module, "LITELLM_AVAILABLE", True)
+    monkeypatch.setattr(savings_tracker_module, "litellm", fake_litellm)
+
+    cost = savings_tracker_module._estimate_input_cost_usd(
+        "claude-sonnet-4-6",
+        0,
+        cache_read_tokens=1000,
+    )
+    assert cost == pytest.approx(0.3)
+
+
 def test_display_session_rolls_after_inactivity_and_counts_zero_savings_requests(
     tmp_path, monkeypatch
 ):

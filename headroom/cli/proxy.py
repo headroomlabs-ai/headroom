@@ -400,7 +400,7 @@ def dashboard(port: int, no_open: bool) -> None:
     envvar="HEADROOM_ANTHROPIC_PRE_UPSTREAM_ACQUIRE_TIMEOUT_SECONDS",
     help=(
         "Fail-fast timeout for waiting on the Anthropic pre-upstream semaphore "
-        "before returning 503 + Retry-After. "
+        "before failing open to passthrough compression. "
         "Default: 15.0 seconds. "
         "Env: HEADROOM_ANTHROPIC_PRE_UPSTREAM_ACQUIRE_TIMEOUT_SECONDS."
     ),
