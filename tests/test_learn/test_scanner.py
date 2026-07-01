@@ -8,6 +8,7 @@ making it impossible to reconstruct names formed from three or more tokens.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Generator
 from pathlib import Path
 from uuid import uuid4
@@ -390,6 +391,28 @@ class TestDecodeProjectPath:
         assert len(projects) == 1
         assert projects[0].name == "work"
         assert str(projects[0].project_path).startswith("C:")
+
+    def test_discover_project_prefers_session_cwd(self, tmp_path: Path, monkeypatch) -> None:
+        """Session JSONL cwd should override ambiguous path decoding."""
+        claude_dir = tmp_path / ".claude"
+        project_dir = claude_dir / "projects" / "-C-work-vibe-remote"
+        project_dir.mkdir(parents=True)
+
+        actual = tmp_path / "work" / "vibe-remote"
+        actual.mkdir(parents=True)
+        (project_dir / "session.jsonl").write_text(
+            json.dumps({"cwd": str(actual)}) + "\n", encoding="utf-8"
+        )
+
+        monkeypatch.setattr(
+            "headroom.learn.plugins.claude._decode_project_path", lambda name: tmp_path / "wrong"
+        )
+
+        projects = ClaudeCodeScanner(claude_dir=claude_dir).discover_projects()
+
+        assert len(projects) == 1
+        assert projects[0].project_path == actual
+        assert projects[0].name == "vibe-remote"
 
     def test_home_dir_username_stays_single_component(self) -> None:
         """A home-directory name must survive decoding as one component.

@@ -53,10 +53,38 @@ def _tool_result(*, ts: str, content: str = "ok") -> dict:
     }
 
 
+def _session_meta(*, ts: str, cwd: str) -> dict:
+    return {"type": "system", "timestamp": ts, "cwd": cwd}
+
+
 LONG = " ".join(["word"] * 400)  # well above the long-output floor
 
 
 class TestSignalExtraction:
+    def test_utf8_session_files_are_read_with_explicit_encoding(self, tmp_path, monkeypatch):
+        p = _write_session(
+            tmp_path,
+            "s",
+            [
+                _session_meta(ts="2026-01-01T00:00:00Z", cwd=str(tmp_path)),
+                _user("中文", ts="2026-01-01T00:00:01Z"),
+                _assistant("reply", ts="2026-01-01T00:00:02Z"),
+            ],
+        )
+
+        real_read_text = Path.read_text
+
+        def _guarded_read_text(self: Path, *args, **kwargs):
+            if self == p and kwargs.get("encoding") != "utf-8":
+                raise UnicodeDecodeError("gbk", b"\xff", 0, 1, "bad decode")
+            return real_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", _guarded_read_text)
+
+        sig, _ = extract_signals([p])
+
+        assert sig.sessions == 1
+
     def test_interrupt_counted(self, tmp_path):
         p = _write_session(
             tmp_path,

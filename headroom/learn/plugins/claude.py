@@ -68,7 +68,13 @@ class ClaudeCodePlugin(LearnPlugin, ConversationScanner):
             if not entry.is_dir() or entry.name.startswith("."):
                 continue
 
-            project_path = _decode_project_path(entry.name)
+            jsonl_files = sorted(entry.glob("*.jsonl"))
+            if not jsonl_files:
+                continue
+
+            project_path = _detect_project_path(jsonl_files)
+            if project_path is None:
+                project_path = _decode_project_path(entry.name)
             if project_path is None:
                 fallback_parts = entry.name[1:].split("-")
                 if len(fallback_parts[0]) == 1 and fallback_parts[0].isalpha():
@@ -89,10 +95,6 @@ class ClaudeCodePlugin(LearnPlugin, ConversationScanner):
             memory_file = memory_dir / "MEMORY.md" if memory_dir.exists() else None
             if memory_file and not memory_file.exists():
                 memory_file = None
-
-            jsonl_files = list(entry.glob("*.jsonl"))
-            if not jsonl_files:
-                continue
 
             projects.append(
                 ProjectInfo(
@@ -340,21 +342,43 @@ def _decode_project_path(escaped_name: str) -> Path | None:
     if not escaped_name.startswith("-"):
         return None
 
+    raw_name = escaped_name[1:]
+    if "\\" in raw_name:
+        win_candidate = Path(raw_name)
+        if raw_name.startswith(":"):
+            drive = Path.home().drive
+            if drive:
+                win_candidate = Path(f"{drive}{raw_name[1:]}")
+        if win_candidate.exists():
+            return win_candidate
+        drive = win_candidate.drive
+        if drive:
+            flat_parts = [
+                token for part in win_candidate.parts[1:] for token in part.split("-") if token
+            ]
+            result = _greedy_path_decode(Path(f"{drive}\\"), flat_parts)
+            if result is not None:
+                return result
+
     parts = escaped_name[1:].split("-")
     if len(parts) < 2:
         return None
 
     if len(parts[0]) == 1 and parts[0].isalpha():
         drive = parts[0].upper()
-        win_path = Path(f"{drive}:\\" + "\\".join(parts[1:]))
+        tail = parts[2:] if len(parts) > 2 and parts[1] == "" else parts[1:]
+        win_path = Path(f"{drive}:\\" + "\\".join(tail))
         if win_path.exists():
             return win_path
-        win_base = Path(f"{drive}:\\{parts[1]}") if len(parts) > 1 else win_path
-        if win_base.exists() and len(parts) > 2:
-            result = _greedy_path_decode(win_base, parts[2:])
+        if tail:
+            win_base = Path(f"{drive}:\\{tail[0]}")
+        else:
+            win_base = win_path
+        if win_base.exists() and len(tail) > 1:
+            result = _greedy_path_decode(win_base, tail[1:])
             if result:
                 return result
-        if len(parts) > 1 and parts[1].lower() == "users":
+        if tail and tail[0].lower() == "users":
             return win_path
 
     simple = Path("/" + escaped_name[1:].replace("-", "/"))
@@ -387,6 +411,38 @@ def _project_display_name(project_path: Path, fallback: str) -> str:
     if project_path == Path("/"):
         return fallback
     return project_path.name or fallback
+
+
+def _detect_project_path(session_paths: list[Path]) -> Path | None:
+    """Read session metadata and return first existing project cwd."""
+    for session_path in session_paths:
+        detected = _detect_project_path_from_session(session_path)
+        if detected is not None:
+            return detected
+    return None
+
+
+def _detect_project_path_from_session(session_path: Path) -> Path | None:
+    """Read Claude session JSONL and return existing cwd / project path."""
+    try:
+        with open(session_path, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(data, dict):
+                    continue
+                for key in ("cwd", "workingDirectory", "projectPath", "project_path"):
+                    raw = data.get(key, "")
+                    if not raw:
+                        continue
+                    candidate = Path(str(raw))
+                    if candidate.exists():
+                        return candidate
+    except (OSError, UnicodeDecodeError):
+        return None
+    return None
 
 
 def _greedy_path_decode(base: Path, parts: list[str]) -> Path | None:
