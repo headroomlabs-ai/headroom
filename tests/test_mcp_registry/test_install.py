@@ -29,7 +29,9 @@ class _FakeRegistrar(MCPRegistrar):
         self.name = name
         self.display_name = name.title()
         self._detected = detected
-        self._register_result = register_result or RegisterResult(RegisterStatus.REGISTERED, "ok")
+        self._register_result = register_result or RegisterResult(
+            RegisterStatus.REGISTERED, "ok"
+        )
         self.calls: list[ServerSpec] = []
 
     def detect(self) -> bool:
@@ -84,7 +86,11 @@ def test_build_spec_falls_back_to_python_module_when_no_binary(monkeypatch) -> N
     assert spec.env == {}
 
 
-def test_build_serena_spec_uses_agent_context() -> None:
+def test_build_serena_spec_uses_agent_context(monkeypatch) -> None:
+    # serena not on PATH → use uvx
+    monkeypatch.setattr(
+        "headroom.mcp_registry.install.shutil.which", lambda x: None
+    )
     spec = build_serena_spec("codex")
     assert spec.name == "serena"
     assert spec.command == "uvx"
@@ -96,6 +102,26 @@ def test_build_serena_spec_uses_agent_context() -> None:
         "--project-from-cwd",
         "--context",
         "codex",
+        "--open-web-dashboard",
+        "False",
+    )
+    assert spec.env == {}
+
+
+def test_build_serena_spec_prefers_local_binary(monkeypatch) -> None:
+    # serena on PATH → use local binary
+    monkeypatch.setattr(
+        "headroom.mcp_registry.install.shutil.which",
+        lambda x: "serena" if x == "serena" else None,
+    )
+    spec = build_serena_spec("claude-code")
+    assert spec.name == "serena"
+    assert spec.command == "serena"
+    assert spec.args == (
+        "start-mcp-server",
+        "--project-from-cwd",
+        "--context",
+        "claude-code",
         "--open-web-dashboard",
         "False",
     )
