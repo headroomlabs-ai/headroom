@@ -1228,6 +1228,29 @@ class TestCLIProxyExcludeToolsEnvVar:
         assert result.exit_code == 0, result.output
         assert captured_config["config"].tool_profiles is None
 
+    def test_tool_profiles_none_level_accepted(self, runner):
+        """HEADROOM_TOOL_PROFILES=Bash:none is accepted and yields an inf bias."""
+        import math
+
+        captured_config = {}
+
+        def mock_run_server(config, **kwargs):
+            captured_config["config"] = config
+
+        with patch("headroom.proxy.server.run_server", mock_run_server):
+            result = runner.invoke(
+                main,
+                ["proxy"],
+                env={"HEADROOM_TOOL_PROFILES": "Bash:none"},
+                catch_exceptions=False,
+            )
+
+        assert result.exit_code == 0, result.output
+        cfg = captured_config["config"]
+        assert cfg.tool_profiles is not None
+        assert "Bash" in cfg.tool_profiles
+        assert math.isinf(cfg.tool_profiles["Bash"].bias)
+
 
 class TestCLIProxyRpmTpm:
     """--rpm/--tpm flags and HEADROOM_RPM/HEADROOM_TPM env vars must reach ProxyConfig."""

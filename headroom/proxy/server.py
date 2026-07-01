@@ -4383,7 +4383,7 @@ def _parse_tool_profiles(cli_profiles: list[str]) -> dict[str, Any]:
             profiles[tool_name] = PROFILE_PRESETS[level]
         else:
             logger.warning(
-                "Unknown profile level '%s' for tool '%s'. Use: conservative, moderate, aggressive",
+                "Unknown profile level '%s' for tool '%s'. Use: none, conservative, moderate, aggressive",
                 level,
                 tool_name,
             )

@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 import headroom.transforms.content_router as content_router_module
+from headroom.config import CompressionProfile
 from headroom.transforms.content_detector import ContentType, DetectionResult
 from headroom.transforms.content_router import (
     CompressionCache,
@@ -19,6 +20,14 @@ from headroom.transforms.content_router import (
     is_mixed_content,
     split_into_sections,
 )
+
+
+class _TinyTokenizer:
+    def count_text(self, text: str) -> int:
+        return max(1, len(text) // 4)
+
+    def count_messages(self, messages: list[dict]) -> int:
+        return sum(self.count_text(str(message.get("content", ""))) for message in messages)
 
 
 def test_compression_cache_handles_hits_skips_evictions_and_clear(
@@ -174,6 +183,67 @@ def test_mixed_content_section_splitting_and_json_extraction() -> None:
     assert json_block == '[\n{"id": 1}\n]'
     assert end_idx == 2
     assert _extract_json_block(["{", '"a": 1'], 0) == (None, 0)
+
+
+def test_tool_profile_none_skips_openai_tool_message() -> None:
+    tool_output = "important exact output\n" * 200
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "Bash", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": tool_output},
+    ]
+    router = ContentRouter(
+        ContentRouterConfig(tool_profiles={"Bash": CompressionProfile(bias=float("inf"), min_k=0)})
+    )
+
+    result = router.apply(messages, _TinyTokenizer(), read_protection_window=0)
+
+    assert result.messages == messages
+    assert "router:protected:tool_profile_none" in result.transforms_applied
+
+
+def test_tool_profile_none_skips_anthropic_tool_result_block() -> None:
+    tool_output = "important exact output\n" * 200
+    messages = [
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "Bash",
+                    "input": {},
+                }
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_1",
+                    "content": tool_output,
+                }
+            ],
+        },
+    ]
+    router = ContentRouter(
+        ContentRouterConfig(tool_profiles={"Bash": CompressionProfile(bias=float("inf"), min_k=0)})
+    )
+
+    result = router.apply(messages, _TinyTokenizer(), read_protection_window=0)
+
+    assert result.messages == messages
+    assert "router:protected:tool_profile_none" in result.transforms_applied
 
 
 def test_extract_json_block_ignores_brackets_inside_strings() -> None:

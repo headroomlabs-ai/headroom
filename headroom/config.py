@@ -337,7 +337,10 @@ class CompressionProfile:
 
 
 # Named presets for convenience
+# "none" uses bias=inf as a sentinel: ContentRouter detects isinf(bias) and
+# skips compression entirely, returning the tool output verbatim.
 PROFILE_PRESETS: dict[str, CompressionProfile] = {
+    "none": CompressionProfile(bias=float("inf"), min_k=0),
     "conservative": CompressionProfile(bias=1.5, min_k=5),
     "moderate": CompressionProfile(bias=1.0, min_k=3),
     "aggressive": CompressionProfile(bias=0.7, min_k=3),
