@@ -13,6 +13,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `<headroom_proactive_expansion>` XML tags, giving downstream consumers
   (LLMs, loggers, attribution parsers) a machine-readable provenance
   boundary and preventing misattribution in multi-agent threads.
+- **cli:** the startup banner no longer advertises
+  `HEADROOM_COMPRESSION_STABLE_AFTER_TURN` and
+  `HEADROOM_STALE_READ_COMPRESS_AFTER_TURNS` as tuning knobs. Both were read
+  only to render the `Performance Tuning` banner section and were never wired
+  into the compression path, so setting them changed the banner but had no
+  effect on behavior. The banner now surfaces only the embedding sidecar,
+  which is a real, consumed setting.
 
 ### Changed
 

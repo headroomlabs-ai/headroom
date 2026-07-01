@@ -1313,31 +1313,16 @@ Memory (Multi-Provider):
     context_tool_line = f"  Context Tool: {_selected_context_tool()}"
 
     # Performance tuning section — only shown when at least one tuning var is active.
-    _stable_turn = _get_env_int_optional("HEADROOM_COMPRESSION_STABLE_AFTER_TURN") or 0
-    _stale_turns = _get_env_int_optional("HEADROOM_STALE_READ_COMPRESS_AFTER_TURNS") or 0
     _embed_socket = os.environ.get("HEADROOM_EMBEDDING_SERVER_SOCKET") or (
         embedding_server and (embedding_server_socket or f"/tmp/headroom-embed-{port}.sock")
     )
     _tuning_lines: list[str] = []
-    if _stable_turn:
-        _tuning_lines.append(
-            f"  Prefix stability:        conservative for first {_stable_turn} turns"
-            f"  (HEADROOM_COMPRESSION_STABLE_AFTER_TURN={_stable_turn})"
-        )
-    if _stale_turns:
-        _tuning_lines.append(
-            f"  Stale read compression:  reads older than {_stale_turns} turns eligible"
-            f"  (HEADROOM_STALE_READ_COMPRESS_AFTER_TURNS={_stale_turns})"
-        )
     if _embed_socket:
         _tuning_lines.append(f"  Embedding sidecar:       {_embed_socket}")
     if _tuning_lines:
         tuning_section = "\nPerformance Tuning:\n" + "\n".join(_tuning_lines)
     else:
-        tuning_section = (
-            "\nPerformance Tuning:  (all defaults — set HEADROOM_COMPRESSION_STABLE_AFTER_TURN"
-            " / HEADROOM_STALE_READ_COMPRESS_AFTER_TURNS to tune)"
-        )
+        tuning_section = ""
 
     click.echo(f"""
 ╔═══════════════════════════════════════════════════════════════════════╗
