@@ -6,6 +6,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from headroom.install.models import DeploymentManifest, InstallPreset
 from headroom.install.runtime import (
     _clear_pid,
@@ -544,3 +546,128 @@ def test_runtime_status_reads_container_and_pid_state(monkeypatch, tmp_path: Pat
         backend="anthropic",
     )
     assert runtime_status(python_manifest) == "running"
+
+
+# ---------------------------------------------------------------------------
+# Tests for SystemError handling (Issue B: Windows PID probe)
+# ---------------------------------------------------------------------------
+
+
+def test_stop_runtime_catches_system_error_on_windows(monkeypatch, tmp_path: Path) -> None:
+    """os.kill raising SystemError during stop_runtime must not crash."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    python_manifest = DeploymentManifest(
+        profile="default",
+        preset="persistent-service",
+        runtime_kind="python",
+        supervisor_kind="service",
+        scope="user",
+        provider_mode="manual",
+        targets=[],
+        port=8787,
+        host="127.0.0.1",
+        backend="anthropic",
+    )
+    _write_pid("default", 999)
+    monkeypatch.setattr(
+        "headroom.install.runtime.os.kill",
+        lambda pid, sig: (_ for _ in ()).throw(SystemError("WinError 87")),
+    )
+    stop_runtime(python_manifest)
+    assert _read_pid("default") is None
+
+
+def test_runtime_status_catches_system_error_on_windows(monkeypatch, tmp_path: Path) -> None:
+    """pid_alive returning False (e.g. stale PID / WinError 87) → 'stopped'."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    pid_file = tmp_path / ".headroom" / "deploy" / "default" / "runner.pid"
+    pid_file.parent.mkdir(parents=True)
+    pid_file.write_text("999", encoding="utf-8")
+    monkeypatch.setattr(
+        "headroom.install.runtime.pid_alive",
+        lambda pid: False,
+    )
+    python_manifest = DeploymentManifest(
+        profile="default",
+        preset="persistent-service",
+        runtime_kind="python",
+        supervisor_kind="service",
+        scope="user",
+        provider_mode="manual",
+        targets=[],
+        port=8787,
+        host="127.0.0.1",
+        backend="anthropic",
+    )
+    assert runtime_status(python_manifest) == "stopped"
+
+
+def test_runtime_status_uses_non_destructive_probe(monkeypatch, tmp_path: Path) -> None:
+    """runtime_status must use pid_alive, never raw os.kill(pid, 0)."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    pid_file = tmp_path / ".headroom" / "deploy" / "default" / "runner.pid"
+    pid_file.parent.mkdir(parents=True)
+    pid_file.write_text("999", encoding="utf-8")
+    monkeypatch.setattr(
+        "headroom.install.runtime.pid_alive",
+        lambda pid: True,
+    )
+    os_kill_called = False
+    _real_kill = os.kill
+
+    def _spy_kill(pid, sig):
+        nonlocal os_kill_called
+        os_kill_called = True
+        return _real_kill(pid, sig)
+
+    monkeypatch.setattr("headroom.install.runtime.os.kill", _spy_kill)
+    python_manifest = DeploymentManifest(
+        profile="default",
+        preset="persistent-service",
+        runtime_kind="python",
+        supervisor_kind="service",
+        scope="user",
+        provider_mode="manual",
+        targets=[],
+        port=8787,
+        host="127.0.0.1",
+        backend="anthropic",
+    )
+    assert runtime_status(python_manifest) == "running"
+    assert not os_kill_called, "runtime_status must not call os.kill directly"
+
+
+# ---------------------------------------------------------------------------
+# Tests for start_detached_agent fd-leak on Popen failure
+# ---------------------------------------------------------------------------
+
+
+def test_start_detached_agent_closes_log_file_on_popen_failure(monkeypatch, tmp_path: Path) -> None:
+    """If Popen raises, the log fd must still be closed (no fd leak)."""
+    log_file = tmp_path / "agent.log"
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    opened_files: list = []
+
+    real_open = open
+
+    def tracking_open(path, *args, **kwargs):
+        f = real_open(path, *args, **kwargs)
+        if str(path) == str(log_file):
+            opened_files.append(f)
+        return f
+
+    monkeypatch.setattr("builtins.open", tracking_open)
+    monkeypatch.setattr("headroom.install.runtime.log_path", lambda profile: log_file)
+    monkeypatch.setattr(
+        "headroom.install.runtime.resolve_headroom_command", lambda: ["headroom"]
+    )
+    monkeypatch.setattr(
+        "headroom.install.runtime.subprocess.Popen",
+        lambda *a, **kw: (_ for _ in ()).throw(OSError("boom")),
+    )
+
+    with pytest.raises(OSError, match="boom"):
+        start_detached_agent("demo")
+
+    assert len(opened_files) == 1
+    assert opened_files[0].closed

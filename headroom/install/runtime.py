@@ -13,7 +13,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, cast
 
-from headroom._subprocess import run
+from headroom._subprocess import pid_alive, run
 
 from .health import probe_ready
 from .models import DeploymentManifest, InstallPreset, RuntimeKind
@@ -275,7 +275,10 @@ def start_detached_agent(profile: str) -> subprocess.Popen[str]:
         )
     else:
         kwargs["start_new_session"] = True
-    return subprocess.Popen(command, **kwargs)
+    try:
+        return subprocess.Popen(command, **kwargs)
+    finally:
+        log_file.close()
 
 
 def start_persistent_docker(manifest: DeploymentManifest) -> None:
@@ -321,7 +324,7 @@ def stop_runtime(manifest: DeploymentManifest) -> None:
         return
     try:
         os.kill(pid, signal.SIGTERM)
-    except OSError:
+    except (OSError, SystemError):
         pass
     _clear_pid(manifest.profile)
 
@@ -351,8 +354,6 @@ def runtime_status(manifest: DeploymentManifest) -> str:
     pid = _read_pid(manifest.profile)
     if pid is None:
         return "stopped"
-    try:
-        os.kill(pid, 0)
-    except OSError:
+    if not pid_alive(pid):
         return "stopped"
     return "running"

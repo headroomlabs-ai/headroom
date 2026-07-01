@@ -33,7 +33,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
-from headroom._subprocess import run
+from headroom._subprocess import pid_alive, run
 
 # Fix Windows cp1252 encoding — box-drawing characters require UTF-8
 if sys.platform == "win32" and hasattr(sys.stdout, "buffer"):
@@ -2410,11 +2410,11 @@ def _kill_proxy_by_pid(pid: int, port: int) -> bool:
     """
     try:
         os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass  # Already gone
     except PermissionError:
         click.echo(f"  Warning: No permission to kill proxy PID {pid}")
         return False
+    except (ProcessLookupError, OSError, SystemError):
+        pass  # Already gone or stale PID (WinError 87 → SystemError)
 
     # Wait for port to free (up to 5 seconds)
     for _ in range(50):
@@ -2426,7 +2426,7 @@ def _kill_proxy_by_pid(pid: int, port: int) -> bool:
     try:
         _kill_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
         os.kill(pid, _kill_signal)
-    except (ProcessLookupError, PermissionError):
+    except (ProcessLookupError, PermissionError, OSError, SystemError):
         pass
 
     for _ in range(20):
@@ -3056,28 +3056,7 @@ def _unregister_proxy_client(port: int) -> None:
         pass
 
 
-def _pid_alive(pid: int) -> bool:
-    """Return True if ``pid`` names a live process."""
-    if pid <= 0:
-        return False  # non-positive PIDs are never valid client markers
-    try:
-        import psutil  # type: ignore[import-untyped]  # optional dep, already used elsewhere
-
-        return bool(psutil.pid_exists(pid))
-    except Exception:
-        pass
-    try:
-        os.kill(pid, 0)
-    except PermissionError:
-        return True  # exists but owned by another user
-    except (ProcessLookupError, OSError, SystemError):
-        # On Windows, os.kill against a stale/invalid PID can fail with WinError
-        # 87 ("The parameter is incorrect"); CPython sometimes surfaces this as a
-        # SystemError rather than an OSError. SystemError is not an OSError
-        # subclass, so a bare `except OSError` lets it escape and crash cleanup(),
-        # leaving the shared proxy running.
-        return False
-    return True
+_pid_alive = pid_alive
 
 
 def _marker_pid_reused(marker: Path, pid: int) -> bool:

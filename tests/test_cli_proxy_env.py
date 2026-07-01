@@ -7,6 +7,7 @@ Verifies that:
 """
 
 import os
+import signal
 from unittest.mock import patch
 
 import pytest
@@ -1319,3 +1320,104 @@ class TestCLIProxyRpmTpm:
 
         assert result.exit_code == 0, result.output
         assert captured_config["config"].rate_limit_tokens_per_minute == 80000
+
+
+# ---------------------------------------------------------------------------
+# Tests for _kill_proxy_by_pid (Issue A: SystemError on Windows PID probe)
+# ---------------------------------------------------------------------------
+
+
+class TestKillProxyByPid:
+    """Verify _kill_proxy_by_pid handles OS-level kill errors gracefully."""
+
+    def test_system_error_on_windows(self, monkeypatch):
+        """os.kill raising SystemError (WinError 87) must not crash."""
+        monkeypatch.setattr(
+            wrap_mod, "_check_proxy", lambda port: False  # port freed immediately
+        )
+        monkeypatch.setattr(
+            "headroom.cli.wrap.os.kill",
+            lambda pid, sig: (_ for _ in ()).throw(SystemError("WinError 87")),
+        )
+        monkeypatch.setattr("headroom.cli.wrap.time.sleep", lambda _: None)
+        assert wrap_mod._kill_proxy_by_pid(99999, 8080) is True
+
+    def test_permission_error_returns_false(self, monkeypatch):
+        """PermissionError must be caught and return False."""
+        monkeypatch.setattr(
+            "headroom.cli.wrap.os.kill",
+            lambda pid, sig: (_ for _ in ()).throw(PermissionError("not allowed")),
+        )
+        assert wrap_mod._kill_proxy_by_pid(99999, 8080) is False
+
+    def test_escalates_after_sigterm_timeout(self, monkeypatch):
+        """If SIGTERM doesn't free the port, SIGKILL is attempted."""
+        kills: list[tuple[int, int]] = []
+        monkeypatch.setattr(
+            "headroom.cli.wrap.os.kill",
+            lambda pid, sig: kills.append((pid, sig)),
+        )
+        call_count = 0
+
+        def _check_proxy_stub(port):
+            nonlocal call_count
+            call_count += 1
+            # Port stays busy for all 50 SIGTERM checks, then frees on 1st SIGKILL check
+            return call_count <= 50
+
+        monkeypatch.setattr(wrap_mod, "_check_proxy", _check_proxy_stub)
+        monkeypatch.setattr("headroom.cli.wrap.time.sleep", lambda _: None)
+
+        result = wrap_mod._kill_proxy_by_pid(42, 8080)
+        assert result is True
+        assert kills[0][1] == signal.SIGTERM
+        assert len(kills) == 2  # SIGTERM + SIGKILL/fallback
+
+    def test_process_already_gone(self, monkeypatch):
+        """ProcessLookupError on SIGTERM means process is gone — should return True."""
+        monkeypatch.setattr(
+            "headroom.cli.wrap.os.kill",
+            lambda pid, sig: (_ for _ in ()).throw(ProcessLookupError()),
+        )
+        monkeypatch.setattr(wrap_mod, "_check_proxy", lambda port: False)
+        monkeypatch.setattr("headroom.cli.wrap.time.sleep", lambda _: None)
+        assert wrap_mod._kill_proxy_by_pid(99999, 8080) is True
+
+
+# ---------------------------------------------------------------------------
+# Tests for _start_proxy (Issue C: file open moved inside try block)
+# ---------------------------------------------------------------------------
+
+
+class TestStartProxyLogFileLeak:
+    """Verify that stdio_log_file is closed even if Popen raises."""
+
+    def test_closes_log_file_on_popen_failure(self, monkeypatch, tmp_path):
+        """If Popen raises, the stdio log fd must still be closed."""
+        log_file = tmp_path / "stdio.log"
+        opened_files: list = []
+
+        real_open = open
+
+        def tracking_open(path, *args, **kwargs):
+            f = real_open(path, *args, **kwargs)
+            if str(path) == str(log_file):
+                opened_files.append(f)
+            return f
+
+        monkeypatch.setattr("builtins.open", tracking_open)
+        monkeypatch.setattr(wrap_mod, "_get_proxy_stdio_log_path", lambda: str(log_file))
+        monkeypatch.setattr(wrap_mod, "_resolve_wrap_proxy_timeout_seconds", lambda: 5)
+        monkeypatch.setattr(wrap_mod, "_get_log_path", lambda: str(tmp_path / "proxy.log"))
+        monkeypatch.setattr(wrap_mod, "_wrap_agent_savings_profile", lambda _: None)
+
+        monkeypatch.setattr(
+            "headroom.cli.wrap.subprocess.Popen",
+            lambda *a, **kw: (_ for _ in ()).throw(OSError("boom")),
+        )
+
+        with pytest.raises(OSError, match="boom"):
+            wrap_mod._start_proxy(port=9999, agent_type="unknown")
+
+        assert len(opened_files) == 1
+        assert opened_files[0].closed
