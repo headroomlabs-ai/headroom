@@ -15,6 +15,20 @@ from headroom.proxy.handlers.openai import _resolve_codex_routing_headers
 
 logger = logging.getLogger("headroom.proxy.routes")
 
+# Allowlist of GitHub Copilot LLM hostnames that the patched VS Code extension
+# may forward via X-Original-Host. Only these hosts are trusted; any other value
+# is rejected to prevent SSRF attacks (localhost, link-local metadata addresses,
+# internal service names, or arbitrary external hosts).
+_COPILOT_ALLOWED_HOSTS: frozenset[str] = frozenset(
+    {
+        "api.githubcopilot.com",
+        "api.individual.githubcopilot.com",
+        "api.business.githubcopilot.com",
+        "api.enterprise.githubcopilot.com",
+        "api-model-lab.githubcopilot.com",
+    }
+)
+
 
 def _api_target(proxy: Any, provider_name: str) -> str:
     legacy_attrs = {
@@ -988,6 +1002,14 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
     @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
     async def passthrough(request: Request, path: str):
         custom_base = request.headers.get("x-headroom-base-url")
+        if not custom_base:
+            original_host = request.headers.get("x-original-host", "")
+            if original_host in _COPILOT_ALLOWED_HOSTS:
+                custom_base = f"https://{original_host}"
+            elif original_host:
+                logger.warning(
+                    "Rejected X-Original-Host %r: not in Copilot allowlist", original_host
+                )
         if custom_base:
             return await proxy.handle_passthrough(request, custom_base.rstrip("/"))
 

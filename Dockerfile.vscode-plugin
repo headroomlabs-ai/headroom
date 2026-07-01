@@ -1,0 +1,29 @@
+FROM node:24-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG VSCODE_FORK_REPO=https://github.com/damnthonyy/vscode.git
+# Pinned to an audited commit for supply-chain safety. Update this SHA
+# (and note the audit in the PR) whenever a new fork revision is needed.
+ARG VSCODE_FORK_COMMIT=bd6c147a19b5934e8008e8e1b518383b2de90218
+
+WORKDIR /build
+RUN git init vscode && cd vscode && \
+    git remote add origin ${VSCODE_FORK_REPO} && \
+    git fetch --depth=1 origin ${VSCODE_FORK_COMMIT} && \
+    git checkout ${VSCODE_FORK_COMMIT}
+
+WORKDIR /build/vscode/extensions/copilot
+
+# Install deps without running postinstall (needs source files already present from the clone)
+RUN npm install --ignore-scripts
+
+# Run postinstall now that sources are present, build, then package
+RUN npm run postinstall && \
+    npx tsx .esbuild.mts --sourcemaps && \
+    mkdir -p /plugin && \
+    npx vsce package --out /plugin/copilot-proxy.vsix --allow-missing-repository
+
+CMD ["sh", "-c", "cp /plugin/copilot-proxy.vsix /output/ && echo 'Done:' && ls -lh /output/*.vsix"]

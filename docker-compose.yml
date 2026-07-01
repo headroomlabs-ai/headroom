@@ -1,6 +1,9 @@
 services:
   headroom-proxy:
-    build: .
+    build:
+      context: .
+      args:
+        HEADROOM_EXTRAS: "proxy,code,ml"
     command: ["--host", "0.0.0.0"]
     environment:
       - HEADROOM_HOST=0.0.0.0
@@ -46,6 +49,22 @@ services:
       - NEO4J_apoc_export_file_enabled=true
       - NEO4J_apoc_import_file_enabled=true
       - NEO4J_apoc_import_file_use__neo4j__config=true
+
+  # Build the patched Copilot Chat VSIX that routes LLM requests through headroom.
+  # Usage:
+  #   docker compose --profile plugin run --rm vscode-plugin-builder
+  #   code --install-extension ./plugin/copilot-proxy.vsix --force
+  vscode-plugin-builder:
+    build:
+      context: .
+      dockerfile: Dockerfile.vscode-plugin
+      args:
+        VSCODE_FORK_REPO: ${VSCODE_FORK_REPO:-https://github.com/damnthonyy/vscode.git}
+        VSCODE_FORK_COMMIT: ${VSCODE_FORK_COMMIT:-bd6c147a19b5934e8008e8e1b518383b2de90218}
+    volumes:
+      - ./plugin:/output
+    profiles:
+      - plugin
 
 volumes:
   headroom_workspace:    # persists proxy_savings, memory.db, session_stats, toin across image updates
