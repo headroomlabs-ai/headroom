@@ -26,6 +26,7 @@ This page is the authoritative reference for the **Python Headroom CLI** exposed
 | `headroom proxy` | Run the Headroom proxy server | **native in container** |
 | `headroom learn` | Learn from past tool-call failures | **native in container** |
 | `headroom perf` | Summarize recent proxy performance | **native in container** |
+| `headroom inspect` | Show original vs compressed content for recent requests | **native in container** |
 | `headroom evals ...` | Run memory evaluation workflows | **native in container** |
 | `headroom memory ...` | Inspect and manage stored memories | **native in container** |
 | `headroom mcp ...` | Install, inspect, remove, or serve MCP integration | **native in container** |
@@ -328,6 +329,30 @@ headroom perf --raw
 The command reads `${HEADROOM_WORKSPACE_DIR}/logs/proxy.log` (defaults
 to `~/.headroom/logs/proxy.log` — see the
 [Filesystem Contract](filesystem-contract.md)).
+
+## `headroom inspect`
+
+Show the original vs compressed content for recent requests so you can *see*
+what the compressor changed (not just the token counts). Useful for building
+trust in compression and debugging quality regressions.
+
+```bash
+headroom inspect                 # inspect the most recent request
+headroom inspect --last 5        # inspect the 5 most recent requests
+headroom inspect --full          # include unchanged messages
+headroom inspect --format json   # raw feed for piping into another tool
+```
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--port` / `-p` | `8787` | Proxy port to query (env: `HEADROOM_PORT`) |
+| `--last` | `1` | Number of most-recent requests to show |
+| `--format` | `text` | `text` renders a highlighted diff; `json` emits the raw feed |
+| `--full` | off | Include messages the compressor left unchanged |
+
+`inspect` queries the running proxy's loopback `/transformations/feed` endpoint,
+so the proxy must be started with `--log-messages` (or `--log-file`) for the
+pre/post-compression snapshots to be captured.
 
 ## `headroom evals`
 
