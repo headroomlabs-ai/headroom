@@ -69,15 +69,6 @@ def resolve_targets(
     valid = {target.value for target in valid_targets}
     requested = [target.strip().lower() for target in requested_targets]
 
-    if scope == ConfigScope.PROVIDER.value:
-        unsupported = [target for target in requested if target and target not in valid]
-        if unsupported:
-            unsupported_list = ", ".join(sorted(set(unsupported)))
-            raise click.ClickException(
-                "Provider scope supports only claude, codex, openclaw, and opencode; "
-                f"unsupported targets: {unsupported_list}"
-            )
-
     if provider_mode == ProviderSelectionMode.ALL.value:
         return [target.value for target in valid_targets]
 
@@ -88,6 +79,20 @@ def resolve_targets(
             ToolTarget.CODEX.value,
             *([] if scope == ConfigScope.PROVIDER.value else [ToolTarget.COPILOT.value]),
         ]
+
+    # Manual selection is the only mode that consults `requested`, so the
+    # provider-scope validation belongs here. Running it earlier rejected
+    # unsupported entries that `all`/`auto` ignore entirely — e.g.
+    # `install apply --scope provider --providers all --target cursor` raised
+    # instead of returning the provider target set.
+    if scope == ConfigScope.PROVIDER.value:
+        unsupported = [target for target in requested if target and target not in valid]
+        if unsupported:
+            unsupported_list = ", ".join(sorted(set(unsupported)))
+            raise click.ClickException(
+                "Provider scope supports only claude, codex, openclaw, and opencode; "
+                f"unsupported targets: {unsupported_list}"
+            )
 
     normalized = []
     seen: set[str] = set()
