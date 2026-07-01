@@ -210,6 +210,7 @@ _AGENT_LABELS: dict[str, str] = {
     "codex": "Codex",
     "codex-cli": "Codex",
     "cursor": "Cursor",
+    "grok_build": "Grok Build",
     "copilot": "GitHub Copilot",
     "github-copilot": "GitHub Copilot",
     "aider": "Aider",

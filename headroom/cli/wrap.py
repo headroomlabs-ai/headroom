@@ -7,6 +7,7 @@ Usage:
     headroom wrap aider                     # Start proxy + aider
     headroom wrap vibe                      # Start proxy + Mistral Vibe
     headroom wrap cursor                    # Start proxy + print Cursor config instructions
+    headroom wrap grok-build                # Start proxy + configure Grok Build
     headroom wrap openclaw                  # Install + configure OpenClaw plugin
     headroom wrap claude --no-context-tool  # Without CLI context-tool setup
     headroom wrap claude --port 9999        # Custom proxy port
@@ -99,6 +100,11 @@ from headroom.providers.copilot import (
     validate_configuration as _validate_copilot_configuration,
 )
 from headroom.providers.cursor import render_setup_lines as _render_cursor_setup_lines
+from headroom.providers.grok_build.config import (
+    inject_grok_provider_config,
+    restore_grok_provider_config,
+)
+from headroom.providers.grok_build import render_setup_lines as _render_grok_build_setup_lines
 from headroom.providers.mistral_vibe import build_launch_env as _build_mistral_vibe_launch_env
 from headroom.providers.openclaw import (
     build_plugin_entry as _build_openclaw_plugin_entry_impl,
@@ -147,7 +153,7 @@ _CONTEXT_TOOL_ENV = "HEADROOM_CONTEXT_TOOL"
 _CONTEXT_TOOL_RTK = "rtk"
 _CONTEXT_TOOL_LEAN_CTX = "lean-ctx"
 _VALID_CONTEXT_TOOLS = {_CONTEXT_TOOL_RTK, _CONTEXT_TOOL_LEAN_CTX}
-_AGENT_SAVINGS_TARGET_AGENTS = {"claude", "codex", "cursor", "opencode"}
+_AGENT_SAVINGS_TARGET_AGENTS = {"claude", "codex", "cursor", "grok_build", "opencode"}
 _WRAP_PROXY_TIMEOUT_ENV = "HEADROOM_WRAP_PROXY_TIMEOUT"
 _WRAP_PROXY_TIMEOUT_DEFAULT_SECONDS = 45
 _WRAP_PROXY_TIMEOUT_ML_DEFAULT_SECONDS = 90
@@ -163,7 +169,7 @@ _WRAP_PROXY_TIMEOUT_ML_MODULES = ("torch", "sentence_transformers", "spacy")
 # `init` and `install` via the Claude provider package to prevent drift.
 _TOOL_SEARCH_ENV = TOOL_SEARCH_ENV
 _TOOL_SEARCH_DEFAULT = TOOL_SEARCH_DEFAULT
-_AGENT_SAVINGS_WRAP_AGENTS = {"claude", "codex", "cursor"}
+_AGENT_SAVINGS_WRAP_AGENTS = {"claude", "codex", "cursor", "grok_build"}
 
 # 1M context window for `wrap claude` (#1158). Claude Code only sends the
 # `context-1m` beta header — unlocking the 1M window for entitled subscription
@@ -3435,6 +3441,7 @@ def wrap() -> None:
         headroom wrap aider               # Aider
         headroom wrap vibe                # Mistral Vibe
         headroom wrap cursor              # Cursor (prints config instructions)
+        headroom wrap grok-build          # Grok Build (updates ~/.grok/config.toml)
         headroom wrap cline               # Cline (VS Code; prints config instructions)
         headroom wrap continue            # Continue (VS Code/JetBrains; injects systemMessage)
         headroom wrap goose               # Goose (Block) CLI
@@ -4710,6 +4717,94 @@ def cursor(
 
 
 # =============================================================================
+# Grok Build
+# =============================================================================
+
+
+@wrap.command("grok-build", context_settings={"ignore_unknown_options": True})
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
+@click.option(
+    "--no-context-tool",
+    "--no-rtk",
+    "no_rtk",
+    is_flag=True,
+    help="Skip CLI context-tool setup",
+)
+@click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
+@click.option("--learn", is_flag=True, help="Enable live traffic learning")
+@click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
+@click.option("--verbose", "-v", is_flag=True, help="Verbose output")
+@click.option("--prepare-only", is_flag=True, hidden=True)
+def grok_build(
+    port: int,
+    no_rtk: bool,
+    no_proxy: bool,
+    learn: bool,
+    memory: bool,
+    verbose: bool,
+    prepare_only: bool,
+) -> None:
+    """Start Headroom proxy for use with Grok Build.
+
+    \b
+    Grok Build reads model endpoints from ``~/.grok/config.toml``. This
+    command starts the proxy, optionally sets up the selected CLI context
+    tool, injects a Headroom-managed ``[model.grok-build]`` override, and
+    prints next steps.
+
+    \b
+    Example:
+        headroom wrap grok-build
+        headroom wrap grok-build --no-context-tool
+        headroom wrap grok-build --port 9999
+    """
+    project = _project_name_from_cwd()
+    agents_md: Path | None = Path.cwd() / "AGENTS.md" if not no_rtk else None
+    if not no_rtk:
+        _setup_context_tool_for_agent(
+            agent="grok_build",
+            agent_display="Grok Build",
+            marker_path=agents_md,
+            on_rtk_ready=lambda _rtk: _inject_rtk_instructions(cast(Path, agents_md), verbose=verbose)
+            if agents_md is not None
+            else None,
+            verbose=verbose,
+        )
+
+    try:
+        config_file = inject_grok_provider_config(port, project=project)
+        click.echo(f"  Grok config: injected Headroom proxy override into {config_file}")
+    except Exception as e:
+        click.echo(f"  Warning: could not update Grok config: {e}")
+
+    if prepare_only:
+        return
+
+    def _print_grok_build_setup() -> None:
+        for line in _render_grok_build_setup_lines(port, project=project):
+            click.echo(line)
+        if not no_rtk:
+            click.echo()
+            if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
+                click.echo("  lean-ctx configured for Grok Build")
+            else:
+                click.echo("  rtk instructions injected into AGENTS.md")
+            click.echo("  Grok Build will use token-optimized commands automatically.")
+
+    _run_proxy_only_watcher(
+        agent_label="grok-build",
+        port=port,
+        no_proxy=no_proxy,
+        learn=learn,
+        memory=memory,
+        agent_type="grok_build",
+        print_setup_lines=_print_grok_build_setup,
+    )
+
+
+# =============================================================================
 # Cline (VS Code extension)
 # =============================================================================
 
@@ -5770,6 +5865,47 @@ def unwrap_openclaw(
 # =============================================================================
 # OpenAI Codex CLI (unwrap)
 # =============================================================================
+
+
+@unwrap.command("grok-build")
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
+@click.option("--no-stop-proxy", is_flag=True, help="Do not stop the local Headroom proxy")
+def unwrap_grok_build(port: int, no_stop_proxy: bool) -> None:
+    """Undo ``headroom wrap grok-build`` edits to the active Grok config file."""
+    click.echo()
+    click.echo("  ╔═══════════════════════════════════════════════╗")
+    click.echo("  ║         HEADROOM UNWRAP: GROK BUILD          ║")
+    click.echo("  ╚═══════════════════════════════════════════════╝")
+    click.echo()
+
+    try:
+        status, config_file = restore_grok_provider_config()
+    except Exception as e:  # pragma: no cover - filesystem-level errors
+        raise click.ClickException(f"could not unwrap Grok Build config: {e}") from e
+
+    if status == "restored":
+        click.echo(f"  Restored prior {config_file} from pre-wrap backup.")
+    elif status == "cleaned":
+        click.echo(f"  Removed Headroom block from {config_file}; other content preserved.")
+    elif status == "removed":
+        click.echo(f"  Removed {config_file} (contained only Headroom-written config).")
+    else:
+        if not os.environ.get("GROK_HOME"):
+            click.echo(
+                "  Warning: found no Headroom wrap markers in the default Grok config. "
+                "If you wrapped Grok Build with GROK_HOME, rerun unwrap with the same "
+                "environment variable, e.g. GROK_HOME=/path/to/grok-home "
+                "headroom unwrap grok-build."
+            )
+        click.echo(f"  Nothing to undo: {config_file} has no Headroom wrap markers.")
+
+    click.echo()
+    click.echo("✓ Grok Build is no longer routed through the Headroom proxy.")
+    if not no_stop_proxy and status != "noop":
+        _echo_unwrap_proxy_stop_status(_stop_local_proxy_for_unwrap(port), port)
+    click.echo()
 
 
 @unwrap.command("codex")

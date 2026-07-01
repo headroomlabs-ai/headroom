@@ -26,6 +26,7 @@ SUPPORTED_TARGETS = [
     ToolTarget.CODEX,
     ToolTarget.AIDER,
     ToolTarget.CURSOR,
+    ToolTarget.GROK_BUILD,
     ToolTarget.OPENCLAW,
     ToolTarget.OPENCODE,
 ]
@@ -53,6 +54,9 @@ def detect_targets() -> list[str]:
             detected.append(target.value)
             continue
         if target == ToolTarget.CURSOR and shutil.which("cursor"):
+            detected.append(target.value)
+            continue
+        if target == ToolTarget.GROK_BUILD and shutil.which("grok"):
             detected.append(target.value)
     return detected
 

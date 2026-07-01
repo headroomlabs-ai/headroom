@@ -158,7 +158,9 @@ def _reject_task_lifecycle(manifest: DeploymentManifest, action: str) -> None:
     "--target",
     "targets",
     multiple=True,
-    type=click.Choice(["claude", "copilot", "codex", "aider", "cursor", "openclaw", "opencode"]),
+    type=click.Choice(
+        ["claude", "copilot", "codex", "aider", "cursor", "grok_build", "openclaw", "opencode"]
+    ),
     help="Tool target to configure when --providers manual is used.",
 )
 @click.option("--profile", default="default", show_default=True, help="Deployment profile name.")
