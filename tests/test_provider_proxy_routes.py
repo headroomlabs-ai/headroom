@@ -372,6 +372,22 @@ def test_provider_specific_routes_delegate_to_expected_proxy_handlers(monkeypatc
             "claude-3-5-sonnet@20240620",
             True,
         ]
+        assert client.post(
+            "/model/anthropic.claude-3-sonnet-20240229-v1:0/invoke"
+        ).json()["args"] == [
+            None,
+            "anthropic",
+            "anthropic.claude-3-sonnet-20240229-v1:0",
+            False,
+        ]
+        assert client.post(
+            "/model/anthropic.claude-3-sonnet-20240229-v1:0/invoke-with-response-stream"
+        ).json()["args"] == [
+            None,
+            "anthropic",
+            "anthropic.claude-3-sonnet-20240229-v1:0",
+            True,
+        ]
         assert client.post("/v1internal:streamGenerateContent").json()["handler"] == (
             "handle_google_cloudcode_stream"
         )

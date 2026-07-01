@@ -119,15 +119,12 @@ def _paths(cfg: ProxyConfig) -> set[str]:
     return {r.path for r in app.routes if hasattr(r, "path")}
 
 
-def test_routes_absent_when_bedrock_api_url_unset():
-    paths = _paths(ProxyConfig())
-    assert "/model/{model_id:path}/invoke" not in paths
-
-
-def test_routes_present_when_bedrock_api_url_set():
-    paths = _paths(_make_config())
-    assert "/model/{model_id:path}/invoke" in paths
-    assert "/model/{model_id:path}/invoke-with-response-stream" in paths
+def test_routes_always_present():
+    paths_with = _paths(_make_config())
+    paths_without = _paths(ProxyConfig())
+    for paths in (paths_with, paths_without):
+        assert "/model/{model_id:path}/invoke" in paths
+        assert "/model/{model_id:path}/invoke-with-response-stream" in paths
 
 
 # ── compression ───────────────────────────────────────────────────────

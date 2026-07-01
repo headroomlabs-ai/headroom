@@ -483,13 +483,14 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
     async def anthropic_messages(request: Request):
         return await proxy.handle_anthropic_messages(request)
 
-    # AWS Bedrock InvokeModel passthrough. Registered ONLY when an upstream is
-    # configured (`--bedrock-api-url` / BEDROCK_TARGET_API_URL): without it,
-    # `/model/{id}/invoke` keeps falling through to the catch-all (verbatim,
-    # signature-intact) so existing behavior is unchanged. The `{model_id:path}`
-    # converter captures inference-profile ids that contain dots, colons and
-    # slashes (e.g. `us.anthropic.claude-sonnet-4-5-20250929-v1:0`). See
-    # headroom/proxy/handlers/bedrock.py for the SigV4 caveat.
+    # AWS Bedrock InvokeModel endpoints.
+    # When an upstream is configured (`--bedrock-api-url` / BEDROCK_TARGET_API_URL),
+    # these paths are intercepted and passed through to the AWS gateway.
+    # Otherwise, they are intercepted and evaluated natively by the proxy as if they
+    # were `/v1/messages` requests, enabling Bedrock clients to leverage Headroom's
+    # compression without an external Bedrock upstream.
+    # The `{model_id:path}` converter captures inference-profile ids that contain dots,
+    # colons and slashes (e.g. `us.anthropic.claude-sonnet-4-5-20250929-v1:0`).
     if getattr(proxy.config, "bedrock_api_url", None):
 
         @app.post("/model/{model_id:path}/invoke")
@@ -499,6 +500,25 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         @app.post("/model/{model_id:path}/invoke-with-response-stream")
         async def bedrock_invoke_stream(request: Request, model_id: str):
             return await proxy.handle_bedrock_invoke(request, model_id, stream=True)
+    else:
+
+        @app.post("/model/{model_id:path}/invoke")
+        async def bedrock_native_invoke(request: Request, model_id: str):
+            return await proxy.handle_anthropic_messages(
+                request, None, "anthropic", model_id, False
+            )
+
+        @app.post("/model/{model_id:path}/invoke-with-response-stream")
+        async def bedrock_native_invoke_stream(request: Request, model_id: str):
+            return await proxy.handle_anthropic_messages(
+                request, None, "anthropic", model_id, True
+            )
+
+        @app.get("/inference-profiles")
+        async def bedrock_native_inference_profiles(request: Request):
+            from fastapi.responses import JSONResponse
+
+            return JSONResponse(content={"inferenceProfileSummaries": []})
 
     @app.post("/v1/messages/count_tokens")
     async def anthropic_count_tokens(request: Request):
