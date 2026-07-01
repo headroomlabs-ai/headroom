@@ -35,7 +35,7 @@ def load_mcp_config() -> dict[str, Any]:
     """Load existing MCP config or return empty structure."""
     if MCP_CONFIG_PATH.exists():
         try:
-            with open(MCP_CONFIG_PATH) as f:
+            with open(MCP_CONFIG_PATH, encoding="utf-8") as f:
                 result: dict[str, Any] = json.load(f)
                 return result
         except (json.JSONDecodeError, OSError):
@@ -46,7 +46,7 @@ def load_mcp_config() -> dict[str, Any]:
 def save_mcp_config(config: dict) -> None:
     """Save MCP config, creating directory if needed."""
     CLAUDE_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    with open(MCP_CONFIG_PATH, "w") as f:
+    with open(MCP_CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2)
         f.write("\n")  # Trailing newline
 
@@ -287,6 +287,10 @@ def mcp_status() -> None:
             click.echo("                Run: headroom proxy")
         except httpx.TimeoutException:
             click.echo("Proxy Status:   ✗ Timeout")
+        except httpx.HTTPError as e:
+            # Catch the rest (InvalidURL, UnsupportedProtocol, ProtocolError, …)
+            # so a malformed configured HEADROOM_PROXY_URL can't crash `status`.
+            click.echo(f"Proxy Status:   ✗ Unreachable ({proxy_url}: {e})")
     except ImportError:
         click.echo("Proxy Status:   ? (httpx not installed)")
 

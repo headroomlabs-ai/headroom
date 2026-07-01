@@ -54,4 +54,4 @@ jobs:
           files: dist/headroom-sbom.cdx.json
 
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@v1.13.0

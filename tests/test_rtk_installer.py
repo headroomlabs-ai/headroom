@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import stat
 import tarfile
 from pathlib import Path
 from unittest.mock import patch
@@ -51,8 +52,23 @@ def test_download_rtk_skips_verify_for_non_native_target(monkeypatch, tmp_path: 
     with patch.object(installer, "RTK_BIN_DIR", tmp_path):
         with patch.object(installer, "urlopen", return_value=_Response()):
             with patch.object(installer.subprocess, "run") as subprocess_run:
-                installed_path = installer.download_rtk("v0.28.2")
+                installed_path = installer.download_rtk("v0.42.4")
 
     assert installed_path == tmp_path / "rtk"
     assert installed_path.exists()
     subprocess_run.assert_not_called()
+
+
+def test_register_claude_hooks_survives_forked_daemon(tmp_path: Path) -> None:
+    """rtk init that exits fast but leaves a child holding stdout must not hang.
+
+    Regression: capturing through pipes made subprocess.run drain until EOF,
+    which a lingering grandchild deferred past the 10s timeout even though the
+    hooks were already registered. Output now goes to a temp file, so we wait
+    only on the direct child.
+    """
+    fake_rtk = tmp_path / "rtk"
+    fake_rtk.write_text("#!/bin/bash\n( sleep 30 ) &\necho done\nexit 0\n")
+    fake_rtk.chmod(fake_rtk.stat().st_mode | stat.S_IEXEC)
+
+    assert installer.register_claude_hooks(fake_rtk) is True

@@ -13,6 +13,10 @@ from .paths import deploy_root, manifest_path, profile_root
 logger = logging.getLogger(__name__)
 
 
+class ManifestError(Exception):
+    """A deployment manifest exists on disk but could not be parsed."""
+
+
 def save_manifest(manifest: DeploymentManifest) -> None:
     """Persist a deployment manifest to disk.
 
@@ -35,10 +39,17 @@ def load_manifest(profile: str = "default") -> DeploymentManifest | None:
     path = manifest_path(profile)
     if not path.exists():
         return None
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    payload["mutations"] = [ManagedMutation(**item) for item in payload.get("mutations", [])]
-    payload["artifacts"] = [ArtifactRecord(**item) for item in payload.get("artifacts", [])]
-    return DeploymentManifest(**payload)
+    # A present-but-corrupt manifest (partial write, hand-edit, schema drift)
+    # must not crash callers with a raw traceback — every install lifecycle
+    # command and the auto-run `init hook ensure` route through here. Raise a
+    # typed error so callers can report cleanly or degrade gracefully.
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["mutations"] = [ManagedMutation(**item) for item in payload.get("mutations", [])]
+        payload["artifacts"] = [ArtifactRecord(**item) for item in payload.get("artifacts", [])]
+        return DeploymentManifest(**payload)
+    except (json.JSONDecodeError, ValueError, TypeError, OSError) as e:
+        raise ManifestError(f"deployment profile '{profile}' is corrupt ({path}): {e}") from e
 
 
 def list_manifests() -> list[DeploymentManifest]:

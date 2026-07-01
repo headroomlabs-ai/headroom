@@ -227,8 +227,9 @@ class TestStatsEndpointTelemetryFlag:
 
     pytest.importorskip("fastapi")
 
-    async def test_stats_includes_anon_telemetry_shipping_true(self, monkeypatch):
-        # Opt-in: shipping is only true once telemetry is explicitly enabled.
+    async def test_stats_anon_telemetry_shipping_always_false(self, monkeypatch):
+        # The anonymous telemetry beacon was removed, so nothing is ever shipped
+        # externally — even with telemetry explicitly enabled.
         monkeypatch.setenv("HEADROOM_TELEMETRY", "on")
         from headroom.proxy.server import ProxyConfig, create_app
 
@@ -248,7 +249,7 @@ class TestStatsEndpointTelemetryFlag:
         assert resp.status_code == 200
         data = resp.json()
         assert "anon_telemetry_shipping" in data
-        assert data["anon_telemetry_shipping"] is True
+        assert data["anon_telemetry_shipping"] is False
 
     async def test_stats_includes_anon_telemetry_shipping_false(self, monkeypatch):
         monkeypatch.setenv("HEADROOM_TELEMETRY", "off")

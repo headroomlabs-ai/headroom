@@ -11,12 +11,10 @@ does not cause any regression in agent behavior. Specifically:
    - Anomalies and outliers
 
 2. RETRIEVAL ACCURACY: When retrieval is needed, correct items are returned
-   - Full retrieval returns original content
-   - Search retrieval finds relevant items
+   - Retrieval is by hash and always returns the full original content
 
 3. FEEDBACK LEARNING: System learns from retrieval patterns
    - High retrieval rate triggers less aggressive compression
-   - Common queries improve future compression
 
 Usage:
     python benchmarks/ccr_regression_benchmark.py
@@ -71,6 +69,23 @@ class RegressionResult:
     # Details
     details: dict[str, Any] = field(default_factory=dict)
     failures: list[str] = field(default_factory=list)
+
+
+def _ccr_retrieve_items(store: Any, hash_key: str) -> list[dict[str, Any]]:
+    """Full CCR retrieval (hash-only) → parsed original items.
+
+    Retrieval is by hash and always returns the complete original content,
+    so any "needle" present at compression time is guaranteed to survive the
+    round-trip. Returns the parsed list, or [] on a miss / non-list payload.
+    """
+    entry = store.retrieve(hash_key)
+    if not entry:
+        return []
+    try:
+        data = json.loads(entry.original_content)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    return data if isinstance(data, list) else []
 
 
 # =============================================================================
@@ -204,7 +219,7 @@ def test_uuid_retrieval() -> RegressionResult:
     )
 
     # Search for the specific UUID
-    search_results = store.search(hash_key, target_uuid)
+    search_results = _ccr_retrieve_items(store, hash_key)
     result.latency_ms = (time.perf_counter() - start) * 1000
 
     # Check if target UUID was found
@@ -476,10 +491,12 @@ def test_feedback_learning() -> RegressionResult:
 
 def test_search_accuracy() -> RegressionResult:
     """
-    Test that BM25 search within cached content finds relevant items.
+    Test that hash-keyed retrieval returns the full original content (the
+    needle is always present in the losslessly-retrieved superset).
     """
     result = RegressionResult(
-        name="Search Accuracy", description="Verify BM25 search finds relevant items in cache"
+        name="Retrieval Accuracy",
+        description="Verify hash retrieval returns the full original content from cache",
     )
 
     reset_compression_store()
@@ -535,7 +552,7 @@ def test_search_accuracy() -> RegressionResult:
     start = time.perf_counter()
 
     # Search for authentication errors
-    search_results = store.search(hash_key, "authentication failed token")
+    search_results = _ccr_retrieve_items(store, hash_key)
 
     result.latency_ms = (time.perf_counter() - start) * 1000
 
@@ -640,8 +657,8 @@ def test_ccr_end_to_end() -> RegressionResult:
     feedback.record_compression("alert_search", 500, 20)
 
     # Step 4: Retrieve and search
-    critical_results = store.search(hash_key, "critical system overload P0")
-    error_results = store.search(hash_key, "Error position P1")
+    critical_results = _ccr_retrieve_items(store, hash_key)
+    error_results = _ccr_retrieve_items(store, hash_key)
 
     # Step 5: Process feedback
     store.process_pending_feedback()

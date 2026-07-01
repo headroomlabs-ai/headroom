@@ -250,6 +250,42 @@ def test_resolve_subscription_exchange_uses_cloud_enterprise_advertised_api(
     assert copilot_auth._token_exchange_url() == "https://api.github.com/copilot_internal/v2/token"
 
 
+def test_api_url_from_exchange_payload_rejects_non_copilot_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("GITHUB_COPILOT_API_URL", raising=False)
+    monkeypatch.delenv("GITHUB_COPILOT_ENTERPRISE_URL", raising=False)
+    monkeypatch.delenv("GITHUB_COPILOT_ENTERPRISE_DOMAIN", raising=False)
+    monkeypatch.setattr(
+        copilot_auth,
+        "_fetch_copilot_user_info",
+        lambda _token: {"endpoints": {"api": "https://api.business.githubcopilot.com"}},
+    )
+
+    resolved = copilot_auth._api_url_from_exchange_payload(
+        {"endpoints": {"api": "https://api.openai.com/v1"}},
+        oauth_token="gho-oauth",
+    )
+
+    assert resolved == "https://api.business.githubcopilot.com"
+
+
+def test_api_url_from_exchange_payload_rejects_non_copilot_host_without_user_info(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("GITHUB_COPILOT_API_URL", raising=False)
+    monkeypatch.delenv("GITHUB_COPILOT_ENTERPRISE_URL", raising=False)
+    monkeypatch.delenv("GITHUB_COPILOT_ENTERPRISE_DOMAIN", raising=False)
+    monkeypatch.setattr(copilot_auth, "_fetch_copilot_user_info", lambda _token: None)
+
+    resolved = copilot_auth._api_url_from_exchange_payload(
+        {"endpoints": {"api": "https://api.openai.com/v1"}},
+        oauth_token="gho-oauth",
+    )
+
+    assert resolved == copilot_auth.DEFAULT_API_URL
+
+
 def test_enterprise_domain_routes_token_exchange_and_user_info_together(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

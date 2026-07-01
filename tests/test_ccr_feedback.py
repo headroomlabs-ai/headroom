@@ -353,24 +353,3 @@ class TestFeedbackIntegrationWithStore:
         patterns = feedback.get_all_patterns()
         assert "test_tool" in patterns
         assert patterns["test_tool"].total_retrievals == 1
-
-    def test_search_retrieval_tracked_separately(self):
-        """Search retrievals are tracked as search type."""
-        store = CompressionStore()
-
-        hash_key = store.store(
-            original='[{"id": 1, "name": "alice"}, {"id": 2, "name": "bob"}]',
-            compressed='[{"id": 1}]',
-            original_item_count=2,
-            compressed_item_count=1,
-            tool_name="test_tool",
-        )
-
-        # Search (should log as search type)
-        store.search(hash_key, "alice")
-
-        # Check events
-        events = store.get_retrieval_events()
-        assert len(events) > 0
-        assert events[0].retrieval_type == "search"
-        assert events[0].query == "alice"

@@ -16,16 +16,8 @@ from headroom.ccr.tool_injection import CCR_TOOL_NAME
 
 
 class FakeStore:
-    def __init__(
-        self, *, search_error: Exception | None = None, retrieve_error: Exception | None = None
-    ) -> None:
-        self.search_error = search_error
+    def __init__(self, *, retrieve_error: Exception | None = None) -> None:
         self.retrieve_error = retrieve_error
-
-    def search(self, hash_key: str, query: str) -> list[dict[str, str]]:
-        if self.search_error:
-            raise self.search_error
-        return [{"id": "1", "text": query}]
 
     def retrieve(self, hash_key: str):
         if self.retrieve_error:
@@ -88,7 +80,6 @@ def test_parse_ccr_tool_calls_google_and_other_calls() -> None:
         CCRToolCall(
             tool_call_id=CCR_TOOL_NAME,
             hash_key="aaaaaaaaaaaaaaaaaaaaaaaa",
-            query="pizza",
         )
     ]
     assert other_calls == [{"functionCall": {"name": "other_tool", "args": {}}}]
@@ -96,16 +87,7 @@ def test_parse_ccr_tool_calls_google_and_other_calls() -> None:
 
 def test_execute_retrieval_error_paths(monkeypatch: pytest.MonkeyPatch) -> None:
     handler = CCRResponseHandler()
-    monkeypatch.setattr(
-        "headroom.ccr.response_handler.get_compression_store",
-        lambda: FakeStore(search_error=RuntimeError("search boom")),
-    )
-    search_result = handler._execute_retrieval(
-        CCRToolCall(tool_call_id="t1", hash_key="abc", query="find")
-    )
-    assert search_result.success is False
-    assert "Retrieval failed: search boom" in search_result.content
-
+    # Retrieval is by hash only; a store error surfaces as a failed result.
     monkeypatch.setattr(
         "headroom.ccr.response_handler.get_compression_store",
         lambda: FakeStore(retrieve_error=RuntimeError("retrieve boom")),

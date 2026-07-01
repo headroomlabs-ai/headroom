@@ -7,6 +7,7 @@ import re
 import subprocess
 from pathlib import Path
 
+from headroom import fsutil
 from headroom._subprocess import run
 from headroom.providers.install_registry import (
     apply_provider_scope_mutations,
@@ -29,7 +30,7 @@ _ENV_PATTERN = re.compile(
 
 def _merge_marker_block(file_path: Path, block: str, pattern: re.Pattern[str], marker: str) -> str:
     if file_path.exists():
-        existing = file_path.read_text()
+        existing = fsutil.read_text(file_path)
         if marker in existing:
             return pattern.sub(block, existing)
         return existing.rstrip() + "\n\n" + block + "\n"
@@ -66,7 +67,7 @@ def _apply_unix_env_scope(manifest: DeploymentManifest) -> list[ManagedMutation]
     for path in targets:
         path.parent.mkdir(parents=True, exist_ok=True)
         merged = _merge_marker_block(path, block, _ENV_PATTERN, _ENV_MARKER_START)
-        path.write_text(merged)
+        fsutil.write_text(path, merged)
         mutations.append(ManagedMutation(target="env", kind="shell-block", path=str(path)))
     return mutations
 
@@ -78,10 +79,10 @@ def _remove_unix_env_scope(mutations: list[ManagedMutation]) -> None:
         path = Path(mutation.path)
         if not path.exists():
             continue
-        content = path.read_text()
+        content = fsutil.read_text(path)
         if _ENV_MARKER_START not in content:
             continue
-        path.write_text(_ENV_PATTERN.sub("", content).strip() + "\n")
+        fsutil.write_text(path, _ENV_PATTERN.sub("", content).strip() + "\n")
 
 
 def _apply_windows_env_scope(manifest: DeploymentManifest) -> list[ManagedMutation]:

@@ -109,33 +109,6 @@ class TestCompressionStore:
         assert store.exists(hashes[3])
         assert store.exists(hashes[4])
 
-    def test_search_with_bm25(self):
-        """Search within cached content using BM25."""
-        store = CompressionStore()
-
-        items = [
-            {"id": 1, "content": "Python programming language"},
-            {"id": 2, "content": "JavaScript web development"},
-            {"id": 3, "content": "Python data science pandas"},
-            {"id": 4, "content": "Java enterprise applications"},
-            {"id": 5, "content": "Python machine learning tensorflow"},
-        ]
-
-        hash_key = store.store(
-            original=json.dumps(items),
-            compressed=json.dumps(items[:2]),
-            original_item_count=5,
-            compressed_item_count=2,
-        )
-
-        # Search for Python items
-        results = store.search(hash_key, "Python programming")
-
-        assert len(results) >= 1
-        # Should prioritize Python items
-        result_ids = [r["id"] for r in results]
-        assert 1 in result_ids  # "Python programming language"
-
     def test_retrieval_tracking(self):
         """Retrieval events are tracked for feedback."""
         store = CompressionStore(enable_feedback=True)
@@ -149,14 +122,12 @@ class TestCompressionStore:
         # Retrieve multiple times
         store.retrieve(hash_key)
         store.retrieve(hash_key, query="test query")
-        store.search(hash_key, "another query")
 
         events = store.get_retrieval_events(limit=10)
         assert len(events) >= 2
 
-        # Check event details
+        # Check event details — retrieval is always full
         assert any(e.retrieval_type == "full" for e in events)
-        assert any(e.retrieval_type == "search" for e in events)
 
     def test_access_tracking_on_entry(self):
         """Entry tracks access count and queries."""
@@ -274,20 +245,18 @@ class TestCCRFeedbackLoop:
 
         # Simulate retrievals
         store.retrieve(hash_key)
-        store.search(hash_key, "specific query")
-        store.search(hash_key, "another query")
+        store.retrieve(hash_key)
+        store.retrieve(hash_key)
 
         events = store.get_retrieval_events(limit=10)
 
         # Should have logged all retrievals
         assert len(events) >= 3
 
-        # Check event types
+        # Check event types — retrieval is always full
         full_events = [e for e in events if e.retrieval_type == "full"]
-        search_events = [e for e in events if e.retrieval_type == "search"]
 
-        assert len(full_events) >= 1
-        assert len(search_events) >= 2
+        assert len(full_events) >= 3
 
     def test_tool_name_in_events(self):
         """Tool name is preserved in retrieval events."""
@@ -340,59 +309,6 @@ class TestCCREdgeCases:
         reset_compression_store()
         yield
         reset_compression_store()
-
-    def test_search_expired_entry(self):
-        """Search on expired entry returns empty."""
-        store = CompressionStore(default_ttl=1)
-
-        hash_key = store.store(
-            original=json.dumps([{"id": 1}]),
-            compressed="[]",
-        )
-
-        time.sleep(1.1)
-
-        results = store.search(hash_key, "query")
-        assert results == []
-
-    def test_search_invalid_json(self):
-        """Search handles invalid JSON gracefully."""
-        store = CompressionStore()
-
-        hash_key = store.store(
-            original="not valid json",
-            compressed="[]",
-        )
-
-        results = store.search(hash_key, "query")
-        assert results == []
-
-    def test_search_non_array(self):
-        """Search handles non-array content gracefully."""
-        store = CompressionStore()
-
-        hash_key = store.store(
-            original=json.dumps({"key": "value"}),
-            compressed="{}",
-        )
-
-        results = store.search(hash_key, "query")
-        assert results == []
-
-    def test_empty_query_search(self):
-        """Search with empty query returns empty or all."""
-        store = CompressionStore()
-
-        items = [{"id": i} for i in range(10)]
-        hash_key = store.store(
-            original=json.dumps(items),
-            compressed="[]",
-        )
-
-        # Empty query should return something (BM25 handles this)
-        results = store.search(hash_key, "")
-        # Behavior depends on BM25 implementation
-        assert isinstance(results, list)
 
     def test_ccr_disabled_no_caching(self):
         """When CCR disabled, no caching occurs."""

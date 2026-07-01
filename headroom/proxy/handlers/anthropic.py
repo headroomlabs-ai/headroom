@@ -29,6 +29,7 @@ from headroom.pipeline import PipelineStage, summarize_routing_markers
 from headroom.proxy.auth_mode import classify_auth_mode, classify_client
 from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.forwarded_headers import resolve_client_ip
+from headroom.proxy.handlers._debug_dump import _debug_dump_mode, _redact_debug_value
 from headroom.proxy.helpers import extract_tags
 from headroom.proxy.memory_decision import MemoryDecision
 from headroom.proxy.memory_query import MemoryQuery
@@ -113,6 +114,21 @@ class AnthropicHandlerMixin:
         return (name, canonical)
 
     @staticmethod
+    def _has_headroom_retrieve_tool(tools: Any) -> bool:
+        """Return True when the final Anthropic tool list includes CCR retrieve."""
+        if not isinstance(tools, list):
+            return False
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            if tool.get("name") == "headroom_retrieve":
+                return True
+            function = tool.get("function")
+            if isinstance(function, dict) and function.get("name") == "headroom_retrieve":
+                return True
+        return False
+
+    @staticmethod
     def _extract_anthropic_cache_ttl_metrics(usage: dict[str, Any] | None) -> tuple[int, int]:
         """Extract observed Anthropic cache-write TTL bucket usage.
 
@@ -147,6 +163,18 @@ class AnthropicHandlerMixin:
         if not tools:
             return tools
         return sorted(tools, key=cls._tool_sort_key)
+
+    @classmethod
+    def _tools_for_forwarding(
+        cls,
+        tools: list[dict[str, Any]] | None,
+        *,
+        preserve_order: bool,
+    ) -> list[dict[str, Any]] | None:
+        """Return upstream tools, preserving client order for passthrough requests."""
+        if preserve_order:
+            return tools
+        return cls._sort_tools_deterministically(tools)
 
     @staticmethod
     def _compress_latest_user_turn_images_cache_safe(
@@ -427,7 +455,7 @@ class AnthropicHandlerMixin:
             self.pipeline_extensions = PipelineExtensionManager(discover=False)
 
         from fastapi import HTTPException
-        from fastapi.responses import JSONResponse, Response
+        from fastapi.responses import JSONResponse, Response, StreamingResponse
 
         from headroom.cache.compression_store import get_compression_store
         from headroom.ccr import CCRToolInjector
@@ -522,6 +550,7 @@ class AnthropicHandlerMixin:
             )
 
         if pre_upstream_sem is not None:
+            _pre_upstream_saturated = False
             _wait_started_at = time.perf_counter()
             _acquire_timeout_seconds = self.config.anthropic_pre_upstream_acquire_timeout_seconds
             try:
@@ -531,7 +560,7 @@ class AnthropicHandlerMixin:
                 )
             except asyncio.TimeoutError:
                 _wait_ms = (time.perf_counter() - _wait_started_at) * 1000.0
-                stage_timer.record("pre_upstream_wait", _wait_ms)
+                _pre_upstream_saturated = True
                 logger.warning(
                     "[%s] Anthropic pre-upstream queue saturated after %.2f ms "
                     "(timeout=%.1fs, session_id=%s)",
@@ -540,22 +569,13 @@ class AnthropicHandlerMixin:
                     _acquire_timeout_seconds,
                     trace_session_id,
                 )
-                await _finalize_pre_upstream()
-                return JSONResponse(
-                    status_code=503,
-                    headers={"Retry-After": str(max(1, int(_acquire_timeout_seconds) + 1))},
-                    content={
-                        "type": "error",
-                        "error": {
-                            "type": "service_unavailable",
-                            "message": (
-                                "Anthropic pre-upstream queue is saturated. Please retry shortly."
-                            ),
-                        },
-                    },
+                logger.info(
+                    "[%s] pre-upstream saturation fail-open; continuing without compression path",
+                    request_id,
                 )
-            _pre_upstream_sem_acquired = True
-            _wait_ms = (time.perf_counter() - _wait_started_at) * 1000.0
+            else:
+                _pre_upstream_sem_acquired = True
+                _wait_ms = (time.perf_counter() - _wait_started_at) * 1000.0
             stage_timer.record("pre_upstream_wait", _wait_ms)
             if _wait_ms > 100.0:
                 logger.info(
@@ -567,6 +587,7 @@ class AnthropicHandlerMixin:
                 )
         else:
             stage_timer.record("pre_upstream_wait", 0.0)
+            _pre_upstream_saturated = False
 
         try:
             # Check request body size
@@ -662,6 +683,7 @@ class AnthropicHandlerMixin:
                 request.headers.get("x-headroom-bypass", "").lower() == "true"
                 or request.headers.get("x-headroom-mode", "").lower() == "passthrough"
             )
+            preserve_tool_order = _bypass or not self.config.optimize
             if _bypass:
                 logger.info(f"[{request_id}] Bypass: skipping compression (header)")
 
@@ -797,10 +819,33 @@ class AnthropicHandlerMixin:
             )
             memory_decision.apply_to_tags(tags)
 
+            # Snapshot cache-key fields from the request body ONCE here
+            # (pre-upstream) and reuse them verbatim at the cache.set site
+            # below. The pipeline may mutate body before the response is
+            # cached, so re-reading there would compute a different key and the
+            # cache would never hit (#327). Anthropic system/stop_sequences are
+            # top-level fields, never inside messages. Fold in the response-shaping
+            # fields the request forwards — else two requests with identical
+            # messages but a different tool_choice / thinking / output shape
+            # collide and the second caller is served a response made under other
+            # semantics (#1473 review). Non-generation metadata (metadata,
+            # service_tier) is intentionally excluded.
+            cache_key_fields = {
+                "system": body.get("system"),
+                "tools": body.get("tools"),
+                "tool_choice": body.get("tool_choice"),
+                "temperature": body.get("temperature"),
+                "top_p": body.get("top_p"),
+                "top_k": body.get("top_k"),
+                "max_tokens": body.get("max_tokens"),
+                "stop": body.get("stop_sequences"),
+                "thinking": body.get("thinking"),
+                "output_config": body.get("output_config"),
+            }
             # Check cache (non-streaming only)
             cache_hit = False
             if self.cache and not stream:
-                cached = await self.cache.get(messages, model)
+                cached = await self.cache.get(messages, model, **cache_key_fields)
                 if cached:
                     cache_hit = True
                     self.pipeline_extensions.emit(
@@ -1011,11 +1056,20 @@ class AnthropicHandlerMixin:
                 messages=messages,
             )
             _decision.apply_to_tags(tags)
+            _skip_compression_for_backpressure = (
+                _pre_upstream_saturated and _decision.should_compress
+            )
+            if _skip_compression_for_backpressure:
+                tags["passthrough_reason"] = "pre_upstream_backpressure"
+                logger.info(
+                    "[%s] Compression skipped: reason=pre_upstream_backpressure",
+                    request_id,
+                )
             if not _decision.should_compress:
                 logger.info(
                     f"[{request_id}] Compression skipped: reason={_decision.passthrough_reason}"
                 )
-            if _decision.should_compress:
+            if _decision.should_compress and not _skip_compression_for_backpressure:
                 try:
                     from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS
 
@@ -1049,6 +1103,8 @@ class AnthropicHandlerMixin:
                     def should_skip_ccr_request_compression(
                         current_frozen_message_count: int,
                     ) -> bool:
+                        if is_token_mode(self.config.mode):
+                            return False
                         # If the tool is already present, CCR stays reversible even on frozen turns.
                         return (
                             self.config.ccr_inject_tool
@@ -1456,13 +1512,12 @@ class AnthropicHandlerMixin:
                         f"(frozen prefix={frozen_message_count}) to preserve cache"
                     )
                     inject_system_instructions = False
-                inject_tool = self.config.ccr_inject_tool
-                if inject_tool and frozen_message_count > 0:
+                configured_inject_tool = self.config.ccr_inject_tool
+                if configured_inject_tool and frozen_message_count > 0:
                     logger.info(
                         f"[{request_id}] CCR: deferring tool injection "
-                        f"(frozen prefix={frozen_message_count}) to preserve cache"
+                        f"(frozen_message_count={frozen_message_count}) to preserve cache"
                     )
-                    inject_tool = False
                 # Scan for compression markers + maybe inject system instructions.
                 # Tool-list injection is handled separately via the sticky helper.
                 injector = CCRToolInjector(
@@ -1477,7 +1532,31 @@ class AnthropicHandlerMixin:
                 # Sticky-on tool registration (PR-B7): always inject the
                 # retrieval tool once a session has done CCR, regardless
                 # of whether THIS turn produced compressed content.
-                if inject_tool:
+                #
+                # #1006: if tool injection was deferred (frozen prefix) but
+                # compression just emitted NEW markers this turn, override the
+                # deferral — the agent has no other way to redeem those markers.
+                # The cache miss on this one request is preferable to silent
+                # data loss.  If the session has already done CCR the tool is
+                # already in the client's tool list, so sticky replay is a
+                # no-op and the cache is unaffected.
+                # ponytail: ceiling is one extra cache miss on the first CCR
+                # turn in a frozen-prefix session.
+                from headroom.proxy.helpers import should_inject_ccr_tool
+
+                should_inject, is_marker_override = should_inject_ccr_tool(
+                    configured_inject_tool=configured_inject_tool,
+                    frozen_message_count=frozen_message_count,
+                    has_compressed_content=injector.has_compressed_content,
+                )
+                if should_inject:
+                    if is_marker_override:
+                        logger.info(
+                            f"[{request_id}] CCR: overriding injection deferral — "
+                            f"new markers emitted but headroom_retrieve unavailable "
+                            f"(frozen_message_count={frozen_message_count}); injecting to "
+                            "prevent unredeemable markers (#1006)"
+                        )
                     from headroom.proxy.helpers import apply_session_sticky_ccr_tool
 
                     tools, ccr_tool_injected = apply_session_sticky_ccr_tool(
@@ -1817,9 +1896,12 @@ class AnthropicHandlerMixin:
             # Update body
             body["messages"] = optimized_messages
             if tools or _original_tools is not None:
-                sorted_tools = self._sort_tools_deterministically(tools)
-                if sorted_tools != tools:
-                    tools = sorted_tools
+                forwarded_tools = self._tools_for_forwarding(
+                    tools,
+                    preserve_order=preserve_tool_order,
+                )
+                if forwarded_tools != tools:
+                    tools = forwarded_tools
                 if tools != _original_tools:
                     body["tools"] = tools
 
@@ -1839,11 +1921,10 @@ class AnthropicHandlerMixin:
                 optimized_messages = presend_event.messages
                 body["messages"] = optimized_messages
             if presend_event.tools is not None:
-                sorted_tools = self._sort_tools_deterministically(presend_event.tools)
-                if sorted_tools != presend_event.tools:
-                    tools = sorted_tools
-                else:
-                    tools = presend_event.tools
+                tools = self._tools_for_forwarding(
+                    presend_event.tools,
+                    preserve_order=preserve_tool_order,
+                )
                 if tools or body.get("tools") is not None:
                     if tools != body.get("tools"):
                         body["tools"] = tools
@@ -2105,7 +2186,30 @@ class AnthropicHandlerMixin:
                 url = f"{url}?{request.url.query}"
 
             try:
-                if stream:
+                ccr_handler_config = getattr(self.ccr_response_handler, "config", None)
+                ccr_response_handler_enabled = bool(
+                    self.ccr_response_handler and getattr(ccr_handler_config, "enabled", True)
+                )
+                buffered_stream_ccr = bool(
+                    stream
+                    and ccr_response_handler_enabled
+                    and self._has_headroom_retrieve_tool(
+                        tools if tools is not None else body.get("tools")
+                    )
+                )
+                if buffered_stream_ccr:
+                    if body.get("stream") is not False:
+                        body["stream"] = False
+                        body_mutation_tracker.mark_mutated(
+                            "ccr_streaming_retrieve_buffered_non_stream"
+                        )
+                    logger.info(
+                        f"[{request_id}] CCR: stream:true request has "
+                        "headroom_retrieve available; using buffered stream:false "
+                        "upstream request for server-side retrieval handling"
+                    )
+
+                if stream and not buffered_stream_ccr:
                     self.pipeline_extensions.emit(
                         PipelineStage.POST_SEND,
                         operation="proxy.request",
@@ -2117,6 +2221,15 @@ class AnthropicHandlerMixin:
                         metadata={"path": pipeline_path, "stream": True},
                     )
                     await _finalize_pre_upstream()
+                    session_key = self._get_session_key(
+                        body,
+                        session_header=request.headers.get("x-headroom-session-id"),
+                    )
+                    if session_key in self._active_streams:
+                        from fastapi.responses import JSONResponse
+
+                        queued = self._queue_mid_turn_message(session_key, body)
+                        return JSONResponse(content=queued, status_code=202)
                     return await self._stream_response(
                         url,
                         headers,
@@ -2139,6 +2252,7 @@ class AnthropicHandlerMixin:
                         mutation_reasons=body_mutation_tracker.reasons,
                         memory_request_ctx=memory_request_ctx,
                         outcome_provider=provider_name,
+                        session_key=session_key,
                     )
                 else:
                     async with stage_timer.measure("upstream_connect"):
@@ -2167,6 +2281,8 @@ class AnthropicHandlerMixin:
                         metadata={
                             "path": pipeline_path,
                             "stream": False,
+                            "client_stream": buffered_stream_ccr,
+                            "ccr_stream_buffered": buffered_stream_ccr,
                             "status_code": response.status_code,
                         },
                     )
@@ -2180,6 +2296,8 @@ class AnthropicHandlerMixin:
                         metadata={
                             "path": pipeline_path,
                             "stream": False,
+                            "client_stream": buffered_stream_ccr,
+                            "ccr_stream_buffered": buffered_stream_ccr,
                             "status_code": response.status_code,
                         },
                     )
@@ -2219,59 +2337,84 @@ class AnthropicHandlerMixin:
                             f"stream={stream}"
                         )
 
-                        # Dump full request details to debug file
-                        try:
-                            from headroom import paths as _hr_paths
+                        # Diagnostic dump of the full upstream-error request.
+                        # OFF by default: it can contain cleartext prompt / tool /
+                        # system content. Opt in with HEADROOM_DEBUG_DUMP=1
+                        # (redacted: structure + lengths only) or =full (content).
+                        # Never written in stateless mode.
+                        dump_mode = _debug_dump_mode(self.config)
+                        if dump_mode != "off":
+                            try:
+                                from headroom import paths as _hr_paths
 
-                            debug_dir = _hr_paths.debug_400_dir()
-                            debug_dir.mkdir(parents=True, exist_ok=True)
-                            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                            debug_file = debug_dir / f"{ts}_{request_id}.json"
+                                debug_dir = _hr_paths.debug_400_dir()
+                                debug_dir.mkdir(parents=True, exist_ok=True)
+                                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                                debug_file = debug_dir / f"{ts}_{request_id}.json"
 
-                            # Sanitize headers (redact API keys)
-                            safe_headers = {}
-                            for k, v in headers.items():
-                                if k.lower() in ("x-api-key", "authorization"):
-                                    safe_headers[k] = v[:12] + "..." if v else ""
-                                else:
-                                    safe_headers[k] = v
+                                # Sanitize headers (redact API keys)
+                                safe_headers = {}
+                                for k, v in headers.items():
+                                    if k.lower() in ("x-api-key", "authorization"):
+                                        safe_headers[k] = v[:12] + "..." if v else ""
+                                    else:
+                                        safe_headers[k] = v
 
-                            debug_payload = {
-                                "request_id": request_id,
-                                "timestamp": datetime.now().isoformat(),
-                                "status_code": response.status_code,
-                                "error_response": err_body,
-                                "model": model,
-                                "stream": stream,
-                                "headers": safe_headers,
-                                "compression": {
-                                    "was_compressed": bool(transforms_applied),
-                                    "transforms": transforms_applied,
-                                    "original_tokens": original_tokens,
-                                    "optimized_tokens": optimized_tokens,
-                                    "tokens_saved": tokens_saved,
-                                    "compression_failed": _compression_failed,
-                                },
-                                "tools_sent": body.get("tools"),
-                                "tool_count": len(body.get("tools") or []),
-                                "original_tool_count": len(_original_tools or []),
-                                "messages_sent": body.get("messages"),
-                                "message_count": len(body.get("messages", [])),
-                                "original_messages": (
+                                # In redacted mode, elide prompt/tool/system
+                                # content but keep structure, roles, and lengths.
+                                redact = dump_mode == "redacted"
+                                messages_sent = body.get("messages")
+                                original_dump: Any = (
                                     original_messages
                                     if original_messages is not body.get("messages")
                                     else "__same_as_sent__"
-                                ),
-                                "original_message_count": len(original_messages),
-                                "system_prompt": body.get("system"),
-                            }
+                                )
+                                tools_sent = body.get("tools")
+                                system_prompt = body.get("system")
+                                if redact:
+                                    messages_sent = _redact_debug_value(messages_sent)
+                                    if original_dump != "__same_as_sent__":
+                                        original_dump = _redact_debug_value(original_dump)
+                                    tools_sent = _redact_debug_value(tools_sent)
+                                    system_prompt = _redact_debug_value(system_prompt)
 
-                            with open(debug_file, "w") as f:
-                                json.dump(debug_payload, f, indent=2, default=str)
+                                debug_payload = {
+                                    "request_id": request_id,
+                                    "timestamp": datetime.now().isoformat(),
+                                    "dump_mode": dump_mode,
+                                    "status_code": response.status_code,
+                                    "error_response": err_body,
+                                    "model": model,
+                                    "stream": stream,
+                                    "headers": safe_headers,
+                                    "compression": {
+                                        "was_compressed": bool(transforms_applied),
+                                        "transforms": transforms_applied,
+                                        "original_tokens": original_tokens,
+                                        "optimized_tokens": optimized_tokens,
+                                        "tokens_saved": tokens_saved,
+                                        "compression_failed": _compression_failed,
+                                    },
+                                    "tools_sent": tools_sent,
+                                    "tool_count": len(body.get("tools") or []),
+                                    "original_tool_count": len(_original_tools or []),
+                                    "messages_sent": messages_sent,
+                                    "message_count": len(body.get("messages", [])),
+                                    "original_messages": original_dump,
+                                    "original_message_count": len(original_messages),
+                                    "system_prompt": system_prompt,
+                                }
 
-                            logger.warning(f"[{request_id}] Full debug dump: {debug_file}")
-                        except Exception as dump_err:
-                            logger.error(f"[{request_id}] Failed to write debug dump: {dump_err}")
+                                with open(debug_file, "w") as f:
+                                    json.dump(debug_payload, f, indent=2, default=str)
+
+                                logger.warning(
+                                    f"[{request_id}] Debug dump ({dump_mode}): {debug_file}"
+                                )
+                            except Exception as dump_err:
+                                logger.error(
+                                    f"[{request_id}] Failed to write debug dump: {dump_err}"
+                                )
 
                     # Parse response for CCR handling
                     resp_json = None
@@ -2560,6 +2703,7 @@ class AnthropicHandlerMixin:
                             response.content,
                             dict(response.headers),
                             tokens_saved=tokens_saved,
+                            **cache_key_fields,
                         )
 
                     # Subscription tracker: update headroom contribution
@@ -2672,15 +2816,87 @@ class AnthropicHandlerMixin:
                                 content=json.dumps(resp_json).encode(),
                                 headers=response_headers,
                             )
-                            return Response(
-                                content=response.content,
-                                status_code=response.status_code,
-                                headers=response_headers,
-                            )
+                            if not buffered_stream_ccr:
+                                return Response(
+                                    content=response.content,
+                                    status_code=response.status_code,
+                                    headers=response_headers,
+                                )
                         except Exception as sec_err:
                             logger.warning(
                                 f"[{request_id}] Security response scan error: {sec_err}"
                             )
+
+                    if buffered_stream_ccr and response.status_code == 200 and resp_json:
+                        sse_headers = {
+                            k: v
+                            for k, v in response_headers.items()
+                            if k.lower()
+                            not in (
+                                "content-encoding",
+                                "content-length",
+                                "transfer-encoding",
+                                "content-type",
+                            )
+                        }
+
+                        def _sse_error_event(message: str) -> bytes:
+                            error_event = {
+                                "type": "error",
+                                "error": {"type": "api_error", "message": message},
+                            }
+                            return f"event: error\ndata: {json.dumps(error_event)}\n\n".encode()
+
+                        if (
+                            self.ccr_response_handler
+                            and self.ccr_response_handler.has_ccr_tool_calls(resp_json, "anthropic")
+                        ):
+                            logger.warning(
+                                f"[{request_id}] CCR: Buffered streaming response still "
+                                "contains headroom_retrieve after handling; failing closed"
+                            )
+
+                            async def _residual_ccr_error_sse():
+                                yield _sse_error_event(
+                                    "Unable to safely complete streamed CCR retrieval."
+                                )
+
+                            return StreamingResponse(
+                                _residual_ccr_error_sse(),
+                                media_type="text/event-stream",
+                                headers=sse_headers,
+                                status_code=502,
+                            )
+
+                        try:
+                            sse_events = self._response_to_sse(resp_json, "anthropic")
+                        except ValueError as sse_err:
+                            logger.warning(
+                                f"[{request_id}] CCR: Failed to convert buffered response "
+                                f"to SSE: {sse_err}"
+                            )
+
+                            async def _conversion_error_sse():
+                                yield _sse_error_event(
+                                    "Unable to safely convert buffered response to SSE."
+                                )
+
+                            return StreamingResponse(
+                                _conversion_error_sse(),
+                                media_type="text/event-stream",
+                                headers=sse_headers,
+                                status_code=502,
+                            )
+
+                        async def _buffered_ccr_sse():
+                            for event in sse_events:
+                                yield event
+
+                        return StreamingResponse(
+                            _buffered_ccr_sse(),
+                            media_type="text/event-stream",
+                            headers=sse_headers,
+                        )
 
                     return Response(
                         content=response.content,
@@ -2836,10 +3052,6 @@ class AnthropicHandlerMixin:
             params = batch_req.get("params", {})
             canonical_params = dict(params)
             original_tools = canonical_params.get("tools")
-            if original_tools is not None:
-                sorted_tools = self._sort_tools_deterministically(original_tools)
-                if sorted_tools != original_tools:
-                    canonical_params["tools"] = sorted_tools
             messages = params.get("messages", [])
             original_messages = copy.deepcopy(messages)
             model = params.get("model", "unknown")
@@ -2853,6 +3065,11 @@ class AnthropicHandlerMixin:
                     }
                 )
                 continue
+
+            if original_tools is not None:
+                sorted_tools = self._sort_tools_deterministically(original_tools)
+                if sorted_tools != original_tools:
+                    canonical_params["tools"] = sorted_tools
 
             # Apply optimization
             original_tokens = 0  # Initialize before try to prevent UnboundLocalError

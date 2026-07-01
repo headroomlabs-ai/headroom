@@ -13,7 +13,7 @@ By participating, you agree to our [Code of Conduct](CODE_OF_CONDUCT.md).
 | 🧹 Refactor-only | **Don't.** Only if a maintainer asked, as part of a concrete fix. |
 | 🧪 Test/CI-only PR chasing a known `main` failure | **Don't.** We're tracking it. |
 | 📦 New dep or version bump | **PR with written justification.** |
-| ❓ Question | **Discord `#help` |
+| ❓ Question | Ask in **Discord `#help`** |
 
 **Open PR cap: 10 per author.** Get existing ones merged before opening more.
 

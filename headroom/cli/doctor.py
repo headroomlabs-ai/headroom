@@ -356,7 +356,7 @@ def _render(checks: list[CheckResult], port: int, installed: str) -> None:
     "--port",
     "-p",
     default=8787,
-    type=int,
+    type=click.IntRange(1, 65535),
     envvar="HEADROOM_PORT",
     help="Proxy port to check (default: 8787, env: HEADROOM_PORT)",
 )

@@ -779,7 +779,12 @@ def _api_url_from_exchange_payload(payload: dict[str, Any], *, oauth_token: str)
 
     api_url = _api_url_from_payload(payload)
     if api_url:
-        return api_url
+        if is_copilot_api_url(api_url):
+            return api_url
+        logger.warning(
+            "Ignoring non-Copilot API URL from token exchange payload: %s",
+            api_url,
+        )
 
     return _subscription_api_url_from_user_info(oauth_token)
 

@@ -23,6 +23,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import pytest
+
 from headroom.proxy.handlers.streaming import StreamingMixin
 
 
@@ -182,3 +184,55 @@ def test_redacted_thinking_data_preserved() -> None:
     # `data` field MUST be preserved byte-for-byte for signature
     # validation on the next turn.
     assert block["data"] == redacted_blob
+
+
+def test_response_to_sse_preserves_thinking_redacted_and_citations() -> None:
+    parser = _Parser()
+    redacted_blob = "ENC:" + ("y" * 200)
+    response = {
+        "id": "msg_2",
+        "model": "claude-opus-4",
+        "role": "assistant",
+        "content": [
+            {"type": "thinking", "thinking": "plan carefully", "signature": "sig_123"},
+            {
+                "type": "text",
+                "text": "Per source A",
+                "citations": [
+                    {
+                        "type": "page_location",
+                        "cited_text": "abc",
+                        "document_index": 0,
+                    }
+                ],
+            },
+            {"type": "redacted_thinking", "data": redacted_blob},
+        ],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 10, "output_tokens": 3},
+    }
+
+    sse_text = b"".join(parser._response_to_sse(response, "anthropic")).decode("utf-8")
+
+    assert "thinking_delta" in sse_text
+    assert "signature_delta" in sse_text
+    assert "citations_delta" in sse_text
+    assert "redacted_thinking" in sse_text
+    assert redacted_blob in sse_text
+
+    round_tripped = parser._parse_sse_to_response(sse_text, "anthropic")
+    assert round_tripped is not None
+    assert round_tripped["content"][0]["thinking"] == "plan carefully"
+    assert round_tripped["content"][0]["signature"] == "sig_123"
+    assert round_tripped["content"][1]["citations"][0]["cited_text"] == "abc"
+    assert round_tripped["content"][2]["data"] == redacted_blob
+
+
+def test_response_to_sse_rejects_unknown_content_block() -> None:
+    parser = _Parser()
+
+    with pytest.raises(ValueError, match="Unsupported Anthropic content block type"):
+        parser._response_to_sse(
+            {"content": [{"type": "future_block", "payload": "preserve me"}]},
+            "anthropic",
+        )
