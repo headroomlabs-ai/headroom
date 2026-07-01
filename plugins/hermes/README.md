@@ -55,7 +55,7 @@ HEADROOM_EXCLUDE_TOOLS=read_file,headroom_retrieve
 ## Behavior
 
 - Accepts the bare hash or the whole marker — `<<ccr:abc123,base64,4.5KB>>`, `ccr:abc123`, and `hash=abc123` are all normalized to `abc123`.
-- Optional `query` parameter filters very large results via the proxy's BM25 search.
+- Retrieval is by hash and always returns the full original content.
 - Clear, actionable errors: expired hash (TTL) and proxy-unreachable cases both tell the model to re-run the original command instead of retrying blindly.
 
 ## Requirements

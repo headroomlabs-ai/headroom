@@ -76,10 +76,15 @@ def _resolve_litellm_model_uncached(model: str) -> str:
         "o3-": "openai/",
         "o4-": "openai/",
         "gemini-": "google/",
+        "minimax-": "minimax/",
         "deepseek-": "deepseek/",
     }
+    # Case-insensitive prefix match: MiniMax uses mixed-case model
+    # names like "MiniMax-M3" (capital M's); we shouldn't require the
+    # user to lower-case their config to match.
+    model_lower = model.lower()
     for pattern, prefix in prefixes.items():
-        if model.startswith(pattern):
+        if model_lower.startswith(pattern):
             prefixed = f"{prefix}{model}"
             try:
                 litellm.cost_per_token(model=prefixed, prompt_tokens=1, completion_tokens=0)
@@ -87,6 +92,30 @@ def _resolve_litellm_model_uncached(model: str) -> str:
             except Exception:
                 break
     return model
+
+
+def _register_minimax_pricing() -> None:
+    """Pre-register MiniMax-M3 in litellm.model_cost from `minimax/MiniMax-M3`.
+
+    The proxy receives the bare model name `MiniMax-M3` from Claude Code.
+    LiteLLM's community pricing database only stores it under the
+    `minimax/MiniMax-M3` key. The resolver's `minimax-` prefix rule
+    handles the lookup; this pre-registration is a safety net so
+    `estimate_cost()` succeeds even if (a) the resolver cache is cold,
+    or (b) LiteLLM drops the prefixed entry in a future release.
+    Pricing mirrors the upstream DB (input $0.60/M, output $2.40/M,
+    cache read $0.12/M as of 2026-06). Re-check after LiteLLM updates.
+    """
+    if not LITELLM_AVAILABLE:
+        return
+    source_key = "minimax/MiniMax-M3"
+    if source_key not in litellm.model_cost:
+        return
+    if "MiniMax-M3" not in litellm.model_cost:
+        litellm.model_cost["MiniMax-M3"] = dict(litellm.model_cost[source_key])
+
+
+_register_minimax_pricing()
 
 
 @dataclass

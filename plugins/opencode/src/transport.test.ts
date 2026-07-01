@@ -20,7 +20,11 @@ type SeenRequest = {
   body: string;
 };
 
-function proxyServer(): Promise<{ url: string; seen: SeenRequest[]; close: () => Promise<void> }> {
+function proxyServer(pathPrefix: string = "/v1"): Promise<{
+  url: string;
+  seen: SeenRequest[];
+  close: () => Promise<void>;
+}> {
   const seen: SeenRequest[] = [];
   const server = http.createServer((req, res) => {
     let body = "";
@@ -44,7 +48,7 @@ function proxyServer(): Promise<{ url: string; seen: SeenRequest[]; close: () =>
         return;
       }
       resolve({
-        url: `http://127.0.0.1:${address.port}/v1`,
+        url: `http://127.0.0.1:${address.port}${pathPrefix}`,
         seen,
         close: () => new Promise((done) => server.close(() => done())),
       });
@@ -53,6 +57,54 @@ function proxyServer(): Promise<{ url: string; seen: SeenRequest[]; close: () =>
 }
 
 describe("Headroom OpenCode transport", () => {
+  it("routes fetch chat paths through /v1/chat/completions with proxy base and normalized-path header", async () => {
+    const proxyTargets = ["http://127.0.0.1:8787", "http://127.0.0.1:8787/v1"];
+    const upstreamPath = "/api/coding/paas/v4/chat/completions";
+    for (const proxyUrl of proxyTargets) {
+      const proxyOrigin = new URL(proxyUrl).origin;
+      const originalFetch = globalThis.fetch;
+      const fetchMock = vi.fn(async (..._args: FetchCall) => new Response("ok"));
+      globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+      installHeadroomTransport({ proxyUrl });
+
+      await fetch(`https://open.bigmodel.cn${upstreamPath}`, { method: "POST", headers: { "content-type": "application/json" } });
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(fetchMock.mock.calls[0][0]).toEqual(new URL(`${proxyOrigin}/v1/chat/completions`));
+      const headers = new Headers(fetchMock.mock.calls[0][1]?.headers);
+      expect(headers.get("x-headroom-base-url")).toBe("https://open.bigmodel.cn");
+      expect(headers.get("x-headroom-original-path")).toBe(upstreamPath);
+
+      globalThis.fetch = originalFetch;
+      uninstallHeadroomTransport();
+    }
+  });
+
+  it("routes fetch responses paths through /v1/responses with proxy base and normalized-path header", async () => {
+    const proxyTargets = ["http://127.0.0.1:8787", "http://127.0.0.1:8787/v1"];
+    const upstreamPath = "/api/coding/paas/v4/responses";
+    for (const proxyUrl of proxyTargets) {
+      const proxyOrigin = new URL(proxyUrl).origin;
+      const originalFetch = globalThis.fetch;
+      const fetchMock = vi.fn(async (..._args: FetchCall) => new Response("ok"));
+      globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+      installHeadroomTransport({ proxyUrl });
+
+      await fetch(`https://open.bigmodel.cn${upstreamPath}`, { method: "POST", headers: { "content-type": "application/json" } });
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(fetchMock.mock.calls[0][0]).toEqual(new URL(`${proxyOrigin}/v1/responses`));
+      const headers = new Headers(fetchMock.mock.calls[0][1]?.headers);
+      expect(headers.get("x-headroom-base-url")).toBe("https://open.bigmodel.cn");
+      expect(headers.get("x-headroom-original-path")).toBe(upstreamPath);
+
+      globalThis.fetch = originalFetch;
+      uninstallHeadroomTransport();
+    }
+  });
+
   it("routes external fetch calls through the proxy without pre-registering providers", async () => {
     const originalFetch = globalThis.fetch;
     const fetchMock = vi.fn(async (..._args: FetchCall) => new Response("ok"));
@@ -78,6 +130,22 @@ describe("Headroom OpenCode transport", () => {
     expect(new Headers(fetchMock.mock.calls[1][1]?.headers).get("x-headroom-base-url")).toBe(
       "https://new-provider.example",
     );
+
+    globalThis.fetch = originalFetch;
+  });
+
+  it("preserves non-prefix paths like /base/v1/messages", async () => {
+    const originalFetch = globalThis.fetch;
+    const fetchMock = vi.fn(async (..._args: FetchCall) => new Response("ok"));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1" });
+
+    await fetch("https://example.test/base/v1/messages", { method: "POST" });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][0]).toEqual(new URL("http://127.0.0.1:8787/base/v1/messages"));
+    expect(new Headers(fetchMock.mock.calls[0][1]?.headers).get("x-headroom-original-path")).toBeNull();
 
     globalThis.fetch = originalFetch;
   });
@@ -120,6 +188,102 @@ describe("Headroom OpenCode transport", () => {
     expect(proxy.seen[0].headers["x-headroom-base-url"]).toBe("https://api.anthropic.com");
     expect(proxy.seen[0].headers.host).toMatch(/^127\.0\.0\.1:/);
     expect(proxy.seen[0].body).toBe("{\"model\":\"claude\"}");
+
+    await proxy.close();
+  });
+
+  it("normalizes Node HTTP(S) requests for /chat/completions and /responses", async () => {
+    const proxy = await proxyServer("");
+    installHeadroomTransport({ proxyUrl: proxy.url });
+    const httpChatPath = "/api/coding/paas/v4/chat/completions";
+    const httpResponsesPath = "/api/coding/paas/v4/responses";
+    const httpsChatPath = "/v4/openai/chat/completions";
+    const httpsResponsesPath = "/v4/openai/responses";
+
+    await new Promise<void>((resolve, reject) => {
+      const req = http.request(
+        `http://open.bigmodel.cn${httpChatPath}`,
+        { method: "POST", headers: { authorization: "Bearer test" } },
+        (res) => {
+          res.resume();
+          res.on("end", resolve);
+        },
+      );
+      req.on("error", reject);
+      req.end("{\"model\":\"gpt-4\"}");
+    });
+
+    await new Promise<void>((resolve, reject) => {
+      const req = http.request(
+        `http://open.bigmodel.cn${httpResponsesPath}`,
+        { method: "POST", headers: { authorization: "Bearer test" } },
+        (res) => {
+          res.resume();
+          res.on("end", resolve);
+        },
+      );
+      req.on("error", reject);
+      req.end("{\"model\":\"gpt-4\"}");
+    });
+
+    await new Promise<void>((resolve, reject) => {
+      const req = https.request(
+        `https://api.deepseek.com${httpsChatPath}`,
+        { method: "POST", headers: { authorization: "Bearer test" } },
+        (res) => {
+          res.resume();
+          res.on("end", resolve);
+        },
+      );
+      req.on("error", reject);
+      req.end("{\"model\":\"gpt-4\"}");
+    });
+
+    await new Promise<void>((resolve, reject) => {
+      const req = https.request(
+        `https://api.deepseek.com${httpsResponsesPath}`,
+        { method: "POST", headers: { authorization: "Bearer test" } },
+        (res) => {
+          res.resume();
+          res.on("end", resolve);
+        },
+      );
+      req.on("error", reject);
+      req.end("{\"model\":\"gpt-4\"}");
+    });
+
+    expect(proxy.seen[0]).toMatchObject({
+      method: "POST",
+      url: "/v1/chat/completions",
+      headers: expect.objectContaining({
+        "x-headroom-base-url": "http://open.bigmodel.cn",
+        "x-headroom-original-path": httpChatPath,
+      }),
+    });
+    expect(proxy.seen[1]).toMatchObject({
+      method: "POST",
+      url: "/v1/responses",
+      headers: expect.objectContaining({
+        "x-headroom-base-url": "http://open.bigmodel.cn",
+        "x-headroom-original-path": httpResponsesPath,
+      }),
+    });
+    expect(proxy.seen[2]).toMatchObject({
+      method: "POST",
+      url: "/v1/chat/completions",
+      headers: expect.objectContaining({
+        "x-headroom-base-url": "https://api.deepseek.com",
+        "x-headroom-original-path": httpsChatPath,
+      }),
+    });
+    expect(proxy.seen[3]).toMatchObject({
+      method: "POST",
+      url: "/v1/responses",
+      headers: expect.objectContaining({
+        "x-headroom-base-url": "https://api.deepseek.com",
+        "x-headroom-original-path": httpsResponsesPath,
+      }),
+    });
 
     await proxy.close();
   });

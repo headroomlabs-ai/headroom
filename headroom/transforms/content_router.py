@@ -54,6 +54,7 @@ from ..config import (
     TransformResult,
     is_tool_excluded,
 )
+from ..parser import CCR_RETRIEVAL_MARKER_RE
 from ..tokenizer import Tokenizer
 from .base import Transform
 from .content_detector import ContentType, DetectionResult
@@ -630,6 +631,9 @@ class ContentRouterConfig:
 
     # Routing preferences
     prefer_code_aware_for_code: bool = False  # Disabled: let code pass through unmangled
+    # Route ALL compressible content to Kompress, skipping per-type selection.
+    # Tool exclusion (Read/Glob/...) and reversibility gates still apply.
+    force_kompress_all: bool = False
     mixed_content_threshold: int = 2  # Min types to consider mixed
     min_section_tokens: int = 20  # Min tokens to compress a section
 
@@ -943,6 +947,17 @@ class ContentRouter(Transform):
     """
 
     name: str = "content_router"
+
+    # Lossy summarizers that emit a CCR retrieve marker only when they store the
+    # original — a marker-less result from one of these is unrecoverable. Tool
+    # ground truth (role="tool") must not be replaced by such a result (#1307).
+    LOSSY_UNMARKED_STRATEGIES = frozenset(
+        {
+            CompressionStrategy.KOMPRESS,
+            CompressionStrategy.TEXT,
+            CompressionStrategy.CODE_AWARE,
+        }
+    )
 
     def __init__(
         self,
@@ -2407,9 +2422,20 @@ class ContentRouter(Transform):
         if self.config.read_lifecycle.enabled:
             from .read_lifecycle import ReadLifecycleManager
 
+            # is None (not truthiness) so falsy test doubles are honored;
+            # guarded import keeps read_lifecycle running in stripped builds.
+            injected_store = kwargs.get("compression_store")
+            if injected_store is None:
+                try:
+                    from ..cache.compression_store import get_compression_store
+
+                    injected_store = get_compression_store()
+                except ImportError:
+                    pass
+
             lifecycle_mgr = ReadLifecycleManager(
                 self.config.read_lifecycle,
-                compression_store=kwargs.get("compression_store"),
+                compression_store=injected_store,
             )
             lifecycle_result = lifecycle_mgr.apply(
                 messages,
@@ -2445,7 +2471,9 @@ class ContentRouter(Transform):
         )
         # Store runtime options on self for access by _route_and_compress_block
         self._runtime_target_ratio: float | None = kwargs.get("target_ratio")
-        self._runtime_force_kompress: bool = bool(kwargs.get("force_kompress", False))
+        self._runtime_force_kompress: bool = bool(
+            kwargs.get("force_kompress", self.config.force_kompress_all)
+        )
         self._runtime_kompress_model: str | None = kwargs.get("kompress_model")
         # F2.2: capture the per-request CompressionPolicy so
         # ``_record_to_toin`` can gate TOIN writes on
@@ -2594,7 +2622,7 @@ class ContentRouter(Transform):
                     netcost_p_alive_override = max(0.0, 1.0 - idle_f / ttl)
 
         # Tasks: list of (slot_index, content, context, bias, content_key)
-        _PendingTask = tuple[int, str, str, float, int]
+        _PendingTask = tuple[int, str, str, float, int, bool]
         pending_tasks: list[_PendingTask] = []
 
         # #856 P2b (flag-gated, default off): net-cost frozen-floor unlock.
@@ -2768,6 +2796,12 @@ class ContentRouter(Transform):
             # Key on the runtime target_ratio too: the same content compressed at
             # a different ratio is a different result, so it must not alias.
             content_key = hash((content, getattr(self, "_runtime_target_ratio", None)))
+            # Tool ground truth is gated against lossy-unrecoverable results below
+            # (#1307). Partition its cache namespace so a gated tool entry is never
+            # served from — or poisons — an ungated entry for byte-identical content.
+            enforce_reversibility = role == "tool"
+            if enforce_reversibility:
+                content_key = hash((content_key, True))
 
             # Tier 1: skip set — instant rejection
             if self._cache.is_skipped(content_key):
@@ -2816,7 +2850,9 @@ class ContentRouter(Transform):
             # Cache miss — defer to parallel compression pass
             route_counts.setdefault("cache_miss", 0)
             route_counts["cache_miss"] += 1
-            pending_tasks.append((i, content, context, msg_bias, content_key))
+            pending_tasks.append(
+                (i, content, context, msg_bias, content_key, enforce_reversibility)
+            )
 
         # --- Pass 2: Parallel compression of all cache-miss messages ---
         if pending_tasks:
@@ -2828,7 +2864,7 @@ class ContentRouter(Transform):
             if max_workers <= 1 or len(pending_tasks) == 1:
                 # Single task or parallelism disabled — compress inline
                 task_results = []
-                for _, task_content, task_ctx, task_bias, _ in pending_tasks:
+                for _, task_content, task_ctx, task_bias, _, _ in pending_tasks:
                     t0 = time.perf_counter()
                     r = self.compress(task_content, context=task_ctx, bias=task_bias)
                     task_results.append((r, (time.perf_counter() - t0) * 1000))
@@ -2836,7 +2872,7 @@ class ContentRouter(Transform):
                 # Parallel compression via thread pool
                 with ThreadPoolExecutor(max_workers=max_workers) as executor:
                     futures = []
-                    for _, task_content, task_ctx, task_bias, _ in pending_tasks:
+                    for _, task_content, task_ctx, task_bias, _, _ in pending_tasks:
                         futures.append(
                             executor.submit(self._timed_compress, task_content, task_ctx, task_bias)
                         )
@@ -2846,9 +2882,10 @@ class ContentRouter(Transform):
             compressor_timing["parallel_compress_total"] = parallel_ms
 
             # --- Pass 3: Merge results back (sequential, updates caches) ---
-            for (slot_idx, task_content, _, _, content_key), (result, compress_ms) in zip(
-                pending_tasks, task_results
-            ):
+            for (slot_idx, task_content, _, _, content_key, enforce_rev), (
+                result,
+                compress_ms,
+            ) in zip(pending_tasks, task_results):
                 message = messages[slot_idx]
                 strategy_key = f"compressor:{result.strategy_used.value}"
                 compressor_timing[strategy_key] = (
@@ -2856,6 +2893,21 @@ class ContentRouter(Transform):
                 )
 
                 if result.compression_ratio < min_ratio:
+                    # tool ground truth must stay reversible — a lossy summarizer
+                    # (kompress/text/code) that emitted no CCR retrieve marker is
+                    # unrecoverable, so the agent would act on a fabricated summary
+                    # (#1307). Keep the original verbatim instead.
+                    if (
+                        enforce_rev
+                        and result.strategy_used in self.LOSSY_UNMARKED_STRATEGIES
+                        and not CCR_RETRIEVAL_MARKER_RE.search(result.compressed)
+                    ):
+                        self._cache.mark_skip(content_key)
+                        result_slots[slot_idx] = message
+                        route_counts["lossy_unrecoverable_skipped"] = (
+                            route_counts.get("lossy_unrecoverable_skipped", 0) + 1
+                        )
+                        continue
                     # Compressed — store in result cache. The cache is still
                     # warmed when the net-cost gate blocks the slot: the
                     # gate's verdict is contextual (suffix size), the

@@ -29,7 +29,7 @@
 	},
 	"devDependencies": {
 		"@ai-sdk/openai": "^3.0.51",
-		"@anthropic-ai/sdk": "^0.82.0",
+		"@anthropic-ai/sdk": "^0.106.0",
 		"@tailwindcss/postcss": "^4.2.2",
 		"@types/mdx": "^2.0.13",
 		"@types/node": "^25.5.0",
@@ -40,5 +40,8 @@
 		"postcss": "^8.5.13",
 		"tailwindcss": "^4.2.2",
 		"typescript": "^5.9.3"
+	},
+	"overrides": {
+		"postcss": "$postcss"
 	}
 }

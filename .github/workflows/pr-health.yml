@@ -29,9 +29,17 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.base.sha }}
 
+      - name: Fetch current PR body
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.body // ""' > .pr-body.md
+
       - name: Validate PR template
         id: validate
-        run: python3 scripts/pr-governance.py --event "$GITHUB_EVENT_PATH" --report .pr-governance-report.json
+        run: python3 scripts/pr-governance.py --event "$GITHUB_EVENT_PATH" --body-file .pr-body.md --report .pr-governance-report.json
 
       - name: Append governance summary
         run: |

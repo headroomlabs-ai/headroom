@@ -45,7 +45,6 @@ PASSTHROUGH_ENV_PREFIXES = (
     "OLLAMA_",
     "LITELLM_",
     "OTEL_",
-    "SUPABASE_",
     "QDRANT_",
     "NEO4J_",
     "LANGSMITH_",

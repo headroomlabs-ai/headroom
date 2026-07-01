@@ -10,7 +10,7 @@ When agents hand off to each other, context gets replayed in full. SharedContext
 <Tabs groupId="lang" items={['TypeScript', 'Python']}>
 <Tab value="TypeScript">
 ```ts twoslash
-import { SharedContext } from "headroom";
+import { SharedContext } from "headroom-ai";
 
 const ctx = new SharedContext();
 
@@ -53,7 +53,7 @@ Store content under a key. Compresses automatically using Headroom's full pipeli
 <Tabs groupId="lang" items={['TypeScript', 'Python']}>
 <Tab value="TypeScript">
 ```ts twoslash
-import { SharedContext } from "headroom";
+import { SharedContext } from "headroom-ai";
 const ctx = new SharedContext();
 // ---cut---
 const entry = await ctx.put("findings", bigJsonOutput, {
@@ -85,7 +85,7 @@ Retrieve content. Returns the compressed version by default, or the original wit
 <Tabs groupId="lang" items={['TypeScript', 'Python']}>
 <Tab value="TypeScript">
 ```ts twoslash
-import { SharedContext } from "headroom";
+import { SharedContext } from "headroom-ai";
 const ctx = new SharedContext();
 // ---cut---
 const compressed = ctx.get("findings");                  // 4K tokens
@@ -109,7 +109,7 @@ Aggregated statistics across all entries.
 <Tabs groupId="lang" items={['TypeScript', 'Python']}>
 <Tab value="TypeScript">
 ```ts twoslash
-import { SharedContext } from "headroom";
+import { SharedContext } from "headroom-ai";
 const ctx = new SharedContext();
 // ---cut---
 const stats = ctx.stats();
@@ -141,7 +141,7 @@ stats.savings_percent          # 80.0
 <Tabs groupId="lang" items={['TypeScript', 'Python']}>
 <Tab value="TypeScript">
 ```ts twoslash
-import { SharedContext } from "headroom";
+import { SharedContext } from "headroom-ai";
 // ---cut---
 const ctx = new SharedContext({
   model: "claude-sonnet-4-5-20250929",  // For token counting

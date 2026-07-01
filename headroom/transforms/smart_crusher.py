@@ -49,6 +49,7 @@ import os
 from dataclasses import dataclass
 from typing import Any
 
+from ..ccr.tool_injection import CCR_TOOL_NAME
 from ..config import CCRConfig, TransformResult
 from ..tokenizer import Tokenizer
 from ..utils import compute_short_hash, create_tool_digest_marker, deep_copy_messages
@@ -1008,6 +1009,13 @@ class SmartCrusher(Transform):
 
             # OpenAI-style: top-level role=tool with string content.
             if msg.get("role") == "tool":
+                # #1077: never re-compress headroom_retrieve results — they ARE
+                # already-retrieved CCR content; compressing them again creates an
+                # unresolvable retrieval loop.
+                # ponytail: ceiling is tool_call_id lookup; if the id is missing we
+                # compress (conservative: unknown tool names don't get a free pass).
+                if tool_names_by_id.get(msg.get("tool_call_id") or "") == CCR_TOOL_NAME:
+                    continue
                 content = msg.get("content", "")
                 if isinstance(content, str):
                     tokens = tokenizer.count_text(content)
@@ -1031,6 +1039,12 @@ class SmartCrusher(Transform):
             if isinstance(content, list):
                 for i, block in enumerate(content):
                     if not isinstance(block, dict) or block.get("type") != "tool_result":
+                        continue
+                    # #1077: skip headroom_retrieve results — compressing them
+                    # would produce a new <<ccr:hash>> marker the agent cannot
+                    # redeem (infinite retrieval loop).
+                    # ponytail: ceiling is tool_use_id lookup; unknown ids pass through.
+                    if tool_names_by_id.get(block.get("tool_use_id") or "") == CCR_TOOL_NAME:
                         continue
                     tool_content = block.get("content", "")
                     if not isinstance(tool_content, str):

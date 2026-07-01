@@ -26,7 +26,7 @@ using a newer Python, force a supported interpreter.
 pip install headroom-ai
 ```
 
-The core package includes the `compress()` function, SmartCrusher, CacheAligner, and IntelligentContext. No heavy dependencies.
+The core package includes the `compress()` function, SmartCrusher, and CacheAligner. No heavy dependencies.
 
 ### Extras
 
@@ -41,7 +41,8 @@ pip install "headroom-ai[all]"
 | `proxy` | Proxy server, MCP tools, HTTP API | `pip install "headroom-ai[proxy]"` |
 | `ml` | Kompress (ModernBERT text compression, requires PyTorch) | `pip install "headroom-ai[ml]"` |
 | `code` | CodeCompressor (tree-sitter AST parsing) | `pip install "headroom-ai[code]"` |
-| `memory` | Persistent memory (hnswlib, sqlite-vec, sentence-transformers) | `pip install "headroom-ai[memory]"` |
+| `memory` | Persistent memory (sqlite-vec, sentence-transformers) — pure-Python default backend, no compiler | `pip install "headroom-ai[memory]"` |
+| `vector` | Optional HNSW vector backend (hnswlib) — needs a C++ toolchain; **not in `[all]`** | `pip install "headroom-ai[vector]"` |
 | `relevance` | fastembed-based relevance scoring (BAAI/bge-small-en-v1.5, ONNX) | `pip install "headroom-ai[relevance]"` |
 | `image` | Image compression (Pillow, ONNX runtime, OCR) | `pip install "headroom-ai[image]"` |
 | `reports` | HTML/Markdown report generation (Jinja2) | `pip install "headroom-ai[reports]"` |
@@ -126,7 +127,7 @@ python -c "import headroom; print(headroom.__version__)"
 
 ## TypeScript / Node.js
 
-The TypeScript SDK is published as `headroom-ai` on npm. It requires **Node.js 18+**.
+The TypeScript SDK is published as `headroom-ai` on npm. It requires **Node.js 18+**. It is a library you import — it does **not** install the `headroom` CLI (`headroom wrap`, `headroom proxy`, etc.), which ships only with the Python package above.
 
 ```bash
 npm install headroom-ai
