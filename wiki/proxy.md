@@ -191,6 +191,37 @@ Response:
 }
 ```
 
+#### Multi-hop upstream probe
+
+By default `/health` makes no upstream call, so a `200` only confirms Headroom
+itself is up — not that the rest of a multi-hop chain (e.g. Headroom → corp
+proxy → Bedrock) is reachable. Pass `?probe=true` to actively probe the
+configured upstream:
+
+```bash
+curl "http://localhost:8787/health?probe=true"
+```
+
+The response gains an `upstreamProbe` block, and `status` becomes `degraded` if
+the probe fails (the request still returns `200` — inspect the body):
+
+```json
+{
+  "status": "healthy",
+  "upstreamProbe": {"url": "http://localhost:6655", "status": 200, "latencyMs": 12, "error": null}
+}
+```
+
+```json
+{
+  "status": "degraded",
+  "upstreamProbe": {"url": "http://localhost:6655", "status": null, "latencyMs": null, "error": "ECONNREFUSED"}
+}
+```
+
+The probe is a `HEAD` request with a 5-second timeout — it verifies TLS + TCP
+reachability without triggering an inference call.
+
 ### Detailed Statistics
 
 ```bash

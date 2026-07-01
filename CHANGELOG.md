@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Added
+- `/health?probe=true` opt-in multi-hop upstream probe. `/health` normally makes
+  no upstream call, so a `200` only means Headroom itself is up. With
+  `?probe=true` it actively `HEAD`s the configured upstream and adds an
+  `upstreamProbe` block (`url`, `status`, `latencyMs`, `error`), flipping the
+  top-level `status` to `degraded` on failure, so monitoring can distinguish
+  "Headroom is up" from "the whole chain is healthy". The default path is
+  unchanged and stays fast
+  ([#1618](https://github.com/headroomlabs-ai/headroom/issues/1618)).
+
 ### Fixed
 - Proactive expansion blocks injected into user turns are now wrapped in
   `<headroom_proactive_expansion>` XML tags, giving downstream consumers

@@ -329,3 +329,51 @@ def test_health_includes_upstream_check_result(monkeypatch):
     assert "enabled" in upstream
     assert "ready" in upstream
     assert "status" in upstream
+
+
+# --- #1618: opt-in multi-hop upstream probe via /health?probe=true ---
+
+
+def test_health_default_has_no_upstream_probe(client):
+    # Without ?probe=true the response stays as today — no probe key.
+    response = client.get("/health")
+    assert response.status_code == 200
+    assert "upstreamProbe" not in response.json()
+
+
+def test_health_probe_reports_upstream_status_and_latency(client, monkeypatch):
+    import httpx
+
+    async def fake_head(self, url, *args, **kwargs):
+        return SimpleNamespace(status_code=200)
+
+    monkeypatch.setattr(httpx.AsyncClient, "head", fake_head)
+
+    response = client.get("/health?probe=true")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "healthy"
+    probe = data["upstreamProbe"]
+    assert probe["status"] == 200
+    assert probe["error"] is None
+    assert probe["url"]
+    assert isinstance(probe["latencyMs"], int) and probe["latencyMs"] >= 0
+
+
+def test_health_probe_failure_marks_degraded(client, monkeypatch):
+    import httpx
+
+    async def failing_head(self, url, *args, **kwargs):
+        raise httpx.ConnectError("ECONNREFUSED")
+
+    monkeypatch.setattr(httpx.AsyncClient, "head", failing_head)
+
+    response = client.get("/health?probe=true")
+    # Still 200 — /health never fails the request; the body carries the verdict.
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "degraded"
+    probe = data["upstreamProbe"]
+    assert probe["status"] is None
+    assert probe["latencyMs"] is None
+    assert "ECONNREFUSED" in probe["error"]

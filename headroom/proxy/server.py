@@ -2389,6 +2389,32 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 _upstream_check_cache["error"] = str(exc)
             _upstream_check_cache["expires_at"] = time.monotonic() + _UPSTREAM_CHECK_TTL
 
+    async def _probe_upstream_once() -> dict[str, Any]:
+        """Actively probe the configured upstream once for ``/health?probe=true``.
+
+        Unlike ``_check_upstream`` this is uncached and also reports the HTTP
+        status code and round-trip latency, so an operator can verify the next
+        hop in a multi-hop chain (e.g. Headroom -> corp proxy -> Bedrock) is
+        reachable, not just that Headroom itself is up. A HEAD request with a
+        5-second timeout verifies TLS + TCP reachability without triggering an
+        inference call. On failure ``status``/``latencyMs`` are ``None`` and
+        ``error`` carries the reason.
+        """
+        url = _upstream_target_url()
+        result: dict[str, Any] = {"url": url, "status": None, "latencyMs": None, "error": None}
+        client = proxy.http_client
+        if client is None:
+            result["error"] = "proxy client not initialised"
+            return result
+        start = time.monotonic()
+        try:
+            resp = await client.head(url, timeout=5.0)
+            result["status"] = resp.status_code
+            result["latencyMs"] = int((time.monotonic() - start) * 1000)
+        except Exception as exc:  # noqa: BLE001
+            result["error"] = str(exc)
+        return result
+
     # CORS: scoped to localhost by default. The old wildcard origin combined
     # with allow_credentials=True let any web page the user had open read the
     # proxy's content endpoints (e.g. /v1/retrieve returns raw, uncompressed
@@ -2645,6 +2671,15 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         # same body as /readyz (status + checks, no config). /livez and /readyz
         # remain the unauthenticated probes for orchestration health.
         payload = _health_payload(include_config=_request_is_loopback(request))
+        # Opt-in multi-hop probe: `?probe=true` actively pings the configured
+        # upstream and reports url/status/latency so monitoring can distinguish
+        # "Headroom is up" from "the whole chain is healthy". Off by default so
+        # the common health check stays fast and makes no upstream call. (#1618)
+        if str(request.query_params.get("probe", "")).strip().lower() in {"1", "true", "yes", "on"}:
+            probe = await _probe_upstream_once()
+            payload["upstreamProbe"] = probe
+            if probe["error"] is not None and payload.get("status") == "healthy":
+                payload["status"] = "degraded"
         return JSONResponse(status_code=200, content=payload)
 
     # Loopback-only debug introspection (Unit 5). A remote IP gets 404 —
