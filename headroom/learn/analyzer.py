@@ -573,20 +573,38 @@ def _call_claude_cli_streaming(
     Threads (rather than ``select``) drain stdout/stderr so the watchdog works
     on Windows too, where ``select`` does not support pipe handles.
     """
-    try:
-        proc = Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,  # line-buffered
-        )
-    except FileNotFoundError:
+    # On Windows, raw scripts (e.g. `claude` with a bash shebang from an npm
+    # global install) can't be executed directly by CreateProcess — they need
+    # the `.cmd`/`.exe` shim. Try the bare name first; on FileNotFoundError fall
+    # back to <name>.cmd (and <name>.exe) so npm-global CLIs work on Windows.
+    candidates = [cmd]
+    if os.name == "nt" and "/" not in cmd[0] and "\\" not in cmd[0]:
+        base = cmd[0]
+        for ext in (".cmd", ".exe", ".bat"):
+            candidates.append([base + ext] + cmd[1:])
+
+    proc = None
+    last_exc: Exception | None = None
+    for candidate in candidates:
+        try:
+            proc = Popen(
+                candidate,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,  # line-buffered
+            )
+            break
+        except FileNotFoundError as exc:
+            last_exc = exc
+            continue
+
+    if proc is None:
         raise RuntimeError(
             f"`{cmd[0]}` not found in PATH. Install it or use a different backend "
             "with --model <litellm-model-name>."
-        ) from None
+        ) from last_exc
 
     assert proc.stdin is not None and proc.stdout is not None and proc.stderr is not None
     try:

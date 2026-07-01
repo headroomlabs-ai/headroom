@@ -70,12 +70,18 @@ class ClaudeCodePlugin(LearnPlugin, ConversationScanner):
 
             project_path = _decode_project_path(entry.name)
             if project_path is None:
-                fallback_parts = entry.name[1:].split("-")
-                if len(fallback_parts[0]) == 1 and fallback_parts[0].isalpha():
-                    drive = fallback_parts[0].upper()
-                    project_path = Path(f"{drive}:\\" + "\\".join(fallback_parts[1:]))
+                # Handle "D--work-DPJ" → "D:\work\DPJ" (drive letter + -- = :\)
+                if len(entry.name) >= 3 and entry.name[1:3] == "--" and entry.name[0].isalpha():
+                    drive = entry.name[0].upper()
+                    rest = entry.name[3:]
+                    project_path = Path(f"{drive}:\\{rest.replace('-', '\\')}")
                 else:
-                    project_path = Path("/" + entry.name[1:].replace("-", "/"))
+                    fallback_parts = entry.name[1:].split("-")
+                    if len(fallback_parts[0]) == 1 and fallback_parts[0].isalpha():
+                        drive = fallback_parts[0].upper()
+                        project_path = Path(f"{drive}:\\" + "\\".join(fallback_parts[1:]))
+                    else:
+                        project_path = Path("/" + entry.name[1:].replace("-", "/"))
 
             name = _project_display_name(project_path, entry.name)
 
@@ -93,6 +99,32 @@ class ClaudeCodePlugin(LearnPlugin, ConversationScanner):
             jsonl_files = list(entry.glob("*.jsonl"))
             if not jsonl_files:
                 continue
+
+            # The directory-name → path decoding is ambiguous when a project
+            # name itself contains '-' (e.g. "vibe-remote" decodes to both
+            # D:\work\vibe-remote and D:\work\vibe\remote). Resolve the TRUE
+            # project path by reading the `cwd` field recorded inside the
+            # session transcripts. Fall back to the decoded guess only if no
+            # jsonl yields a cwd (e.g. empty/corrupt files, or non-disk roots
+            # like Claude desktop which don't record a windows cwd).
+            resolved = project_path
+            for jf in jsonl_files[:3]:
+                try:
+                    with open(jf, encoding="utf-8") as fh:
+                        for line in fh:
+                            try:
+                                d = json.loads(line)
+                            except (json.JSONDecodeError, ValueError):
+                                continue
+                            cwd = d.get("cwd")
+                            if cwd and isinstance(cwd, str) and len(cwd) >= 3 and cwd[1:3] == ":\\":
+                                resolved = Path(cwd)
+                                break
+                    if resolved != project_path:
+                        break
+                except OSError:
+                    continue
+            project_path = resolved
 
             projects.append(
                 ProjectInfo(
