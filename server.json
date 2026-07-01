@@ -1,0 +1,46 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.headroomlabs-ai/headroom",
+  "description": "Headroom MCP server for compression, retrieval, and stats in MCP-compatible hosts.",
+  "title": "Headroom",
+  "websiteUrl": "https://headroomlabs-ai.github.io/headroom/",
+  "repository": {
+    "url": "https://github.com/headroomlabs-ai/headroom",
+    "source": "github",
+    "id": "1129940957"
+  },
+  "version": "0.27.0",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "registryBaseUrl": "https://pypi.org",
+      "identifier": "headroom-ai",
+      "version": "0.27.0",
+      "runtimeHint": "uvx",
+      "runtimeArguments": [
+        {
+          "type": "named",
+          "name": "--from",
+          "value": "headroom-ai[mcp]"
+        }
+      ],
+      "transport": {
+        "type": "stdio"
+      },
+      "packageArguments": [
+        {
+          "type": "positional",
+          "value": "headroom"
+        },
+        {
+          "type": "positional",
+          "value": "mcp"
+        },
+        {
+          "type": "positional",
+          "value": "serve"
+        }
+      ]
+    }
+  ]
+}

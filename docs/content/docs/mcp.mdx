@@ -121,6 +121,8 @@ headroom mcp serve --debug
 
 For MCP hosts that let you configure a local stdio server, point them at `headroom mcp serve`. If you also run the proxy, pass the proxy URL explicitly so retrieval and stats come from the intended proxy instance.
 
+If you are publishing or consuming Headroom through an MCP registry, use the canonical descriptor at `https://github.com/headroomlabs-ai/headroom/blob/main/server.json`. It captures the package form for `headroom-ai[mcp]` and the current `headroom mcp serve` launch contract in one file.
+
 ```json
 {
   "mcpServers": {

@@ -26,6 +26,7 @@ from .install import (
     install_everywhere,
 )
 from .opencode import OpencodeRegistrar
+from .server_json import build_server_json, render_server_json
 
 __all__ = [
     "DEFAULT_PROXY_URL",
@@ -39,9 +40,11 @@ __all__ = [
     "any_succeeded",
     "build_headroom_spec",
     "build_serena_spec",
+    "build_server_json",
     "build_tokensave_spec",
     "format_result",
     "format_results",
     "get_all_registrars",
     "install_everywhere",
+    "render_server_json",
 ]
