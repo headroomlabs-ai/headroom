@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Unreleased
 
 ### Fixed
+- `headroom wrap opencode` (and any other `@ai-sdk/anthropic` client) can now
+  use subagents. Mid-turn message coalescing keyed concurrent streaming
+  requests by `md5(model:system[:500])`, so a subagent sharing the main
+  agent's model and system prefix collided with the active stream: its request
+  was answered with a bare `202` and never forwarded, and the stream ended by
+  emitting a non-standard `headroom_pending_messages` SSE event the client
+  couldn't parse (`invalid_union / No matching discriminator`). Coalescing is a
+  Claude Code-only protocol and is now gated to Claude Code clients; other
+  harnesses stream normally
+  ([#1608](https://github.com/headroomlabs-ai/headroom/issues/1608)).
 - Proactive expansion blocks injected into user turns are now wrapped in
   `<headroom_proactive_expansion>` XML tags, giving downstream consumers
   (LLMs, loggers, attribution parsers) a machine-readable provenance

@@ -173,3 +173,100 @@ class TestMidTurnSteering:
         finally:
             proxy._active_streams.discard(session_key)
             proxy._mid_turn_queues.pop(session_key, None)
+
+    # --- #1608: mid-turn coalescing must be gated to Claude Code clients ---
+
+    def _normal_stream(self):
+        return self._create_mock_upstream_response(
+            [
+                b'event: message_start\ndata: {"type":"message_start"}\n\n',
+                b'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+            ]
+        )
+
+    async def _run_stream(self, proxy, session_key, user_agent):
+        mock_response = self._normal_stream()
+        proxy.http_client.build_request = MagicMock(return_value=MagicMock())
+        proxy.http_client.send = AsyncMock(return_value=mock_response)
+        return await proxy._stream_response(
+            url="https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": "sk-test", "user-agent": user_agent},
+            body={
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 100,
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+            provider="anthropic",
+            model="claude-sonnet-4-20250514",
+            request_id="test-1608",
+            original_tokens=10,
+            optimized_tokens=10,
+            tokens_saved=0,
+            transforms_applied=[],
+            tags={},
+            optimization_latency=0.0,
+            session_key=session_key,
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_claude_client_not_registered_active(self):
+        # An OpenCode subagent shares the main agent's body-derived session
+        # key; if it registered as active, the concurrent request would be
+        # swallowed. Non-Claude-Code clients must never be registered.
+        proxy = self._create_mock_proxy()
+        session_key = "opencode-session"
+        result = await self._run_stream(proxy, session_key, "opencode/1.0")
+        try:
+            assert session_key not in proxy._active_streams
+        finally:
+            async for _chunk in result.body_iterator:
+                pass
+            proxy._active_streams.discard(session_key)
+            proxy._mid_turn_queues.pop(session_key, None)
+
+    @pytest.mark.asyncio
+    async def test_claude_code_client_registered_active(self):
+        proxy = self._create_mock_proxy()
+        session_key = "claude-session"
+        result = await self._run_stream(proxy, session_key, "claude-code/1.2.3")
+        try:
+            assert session_key in proxy._active_streams
+        finally:
+            async for _chunk in result.body_iterator:
+                pass
+            proxy._active_streams.discard(session_key)
+            proxy._mid_turn_queues.pop(session_key, None)
+
+    @pytest.mark.asyncio
+    async def test_pending_event_not_emitted_for_non_claude(self):
+        # Even with a queued message, a non-Claude-Code stream must not emit the
+        # custom `headroom_pending_messages` SSE event — @ai-sdk/anthropic can't
+        # parse it and throws "invalid_union / No matching discriminator".
+        proxy = self._create_mock_proxy()
+        session_key = "opencode-pending"
+        proxy._queue_mid_turn_message(
+            session_key, {"messages": [{"role": "user", "content": "queued"}]}
+        )
+        result = await self._run_stream(proxy, session_key, "opencode/1.0")
+        try:
+            body = b"".join([chunk async for chunk in result.body_iterator])
+            assert b"headroom_pending_messages" not in body
+        finally:
+            proxy._active_streams.discard(session_key)
+            proxy._mid_turn_queues.pop(session_key, None)
+
+    @pytest.mark.asyncio
+    async def test_pending_event_emitted_for_claude_code(self):
+        proxy = self._create_mock_proxy()
+        session_key = "claude-pending"
+        proxy._queue_mid_turn_message(
+            session_key, {"messages": [{"role": "user", "content": "queued"}]}
+        )
+        result = await self._run_stream(proxy, session_key, "claude-code/1.2.3")
+        try:
+            body = b"".join([chunk async for chunk in result.body_iterator])
+            assert b"headroom_pending_messages" in body
+        finally:
+            proxy._active_streams.discard(session_key)
+            proxy._mid_turn_queues.pop(session_key, None)
