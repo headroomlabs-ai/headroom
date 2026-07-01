@@ -280,6 +280,34 @@ def record_all(root: Path | None = None) -> dict[str, str]:
     except Exception as e:
         statuses["content_detector"] = f"blocked:{e.__class__.__name__}:{e}"
 
+    # --- kompress ----------------------------------------------------------
+    # ML prose compressor. Requires onnxruntime + the kompress-v2-base model
+    # cached locally; "blocked" (soft) when either is missing so recording
+    # still succeeds for the deterministic transforms. The workload driver
+    # constructs it with enable_ccr=False so the recorded output is the pure
+    # joined kept-word stream (deterministic, store-independent).
+    try:
+        from headroom.transforms.kompress_compressor import KompressCompressor
+
+        _wrap_method(KompressCompressor, "compress", "kompress", root=root)
+        statuses["kompress"] = "patched"
+    except Exception as e:
+        statuses["kompress"] = f"blocked:{e.__class__.__name__}:{e}"
+
+    # --- code_aware_compressor ---------------------------------------------
+    # AST code compressor. The workload driver installs an individual-grammar
+    # parser patch (the installed tree-sitter-language-pack is an
+    # API-incompatible native binding) and constructs it with enable_ccr=False
+    # + fallback_to_kompress=False so output is deterministic and
+    # store/model-independent.
+    try:
+        from headroom.transforms.code_compressor import CodeAwareCompressor
+
+        _wrap_method(CodeAwareCompressor, "compress", "code_aware_compressor", root=root)
+        statuses["code_aware_compressor"] = "patched"
+    except Exception as e:
+        statuses["code_aware_compressor"] = f"blocked:{e.__class__.__name__}:{e}"
+
     return statuses
 
 
@@ -750,6 +778,8 @@ def run_default_workload(root: Path | None = None) -> dict[str, int]:
         "cache_aligner": 0,
         "ccr": 0,
         "content_detector": 0,
+        "kompress": 0,
+        "code_aware_compressor": 0,
     }
 
     # log_compressor
@@ -839,7 +869,521 @@ def run_default_workload(root: Path | None = None) -> dict[str, int]:
     except Exception as e:
         LOG.warning("content_detector workload failed: %s", e)
 
+    # kompress — ML prose compressor. enable_ccr=False so the recorded
+    # `compressed` is the deterministic joined kept-word stream. Soft-fails
+    # when onnxruntime / the model are unavailable (the Rust comparator
+    # likewise skips when the model is not cached).
+    try:
+        from headroom.transforms.kompress_compressor import (
+            KompressCompressor,
+            KompressConfig,
+        )
+
+        kc = KompressCompressor(KompressConfig(enable_ccr=False))
+        for s in _varied_kompress_inputs():
+            kc.compress(s)
+            counts["kompress"] += 1
+    except Exception as e:
+        LOG.warning("kompress workload failed: %s", e)
+
+    # code_aware_compressor — AST code compression over all 8 languages.
+    # Installs the individual-grammar parser patch first (see
+    # install_individual_grammar_parsers); enable_ccr=False +
+    # fallback_to_kompress=False keep output deterministic. Soft-fails when
+    # the per-language grammar wheels aren't installed.
+    try:
+        from headroom.transforms.code_compressor import (
+            CodeAwareCompressor,
+            CodeCompressorConfig,
+        )
+
+        install_individual_grammar_parsers()
+        cac = CodeAwareCompressor(
+            CodeCompressorConfig(enable_ccr=False, fallback_to_kompress=False)
+        )
+        for s in _varied_code_inputs():
+            cac.compress(s)
+            counts["code_aware_compressor"] += 1
+    except Exception as e:
+        LOG.warning("code_aware_compressor workload failed: %s", e)
+
     return counts
+
+
+def install_individual_grammar_parsers() -> None:
+    """Repoint `code_compressor._get_parser` at the individual
+    `tree-sitter-<lang>` grammar wheels (pinned to match the Rust crates).
+
+    The installed `tree-sitter-language-pack` is an alef-generated native
+    binding whose `get_language()` returns a non-`tree_sitter.Language` and
+    whose `parse()` wants `str` — API-incompatible with `code_compressor.py`
+    (which builds a stock `tree_sitter.Parser` from a `tree_sitter.Language`).
+    To record fixtures against grammars the Rust port can match byte-for-byte,
+    we swap in stock `tree_sitter.Parser`s bound to the per-language grammars.
+    Raises ImportError when the grammar wheels / core binding aren't present
+    (the workload driver soft-fails, like kompress without its model).
+    """
+    from tree_sitter import Language, Parser
+
+    import tree_sitter_c
+    import tree_sitter_cpp
+    import tree_sitter_go
+    import tree_sitter_java
+    import tree_sitter_javascript
+    import tree_sitter_python
+    import tree_sitter_rust
+    import tree_sitter_typescript
+
+    from headroom.transforms import code_compressor as cc
+
+    langs = {
+        "python": Language(tree_sitter_python.language()),
+        "javascript": Language(tree_sitter_javascript.language()),
+        "typescript": Language(tree_sitter_typescript.language_typescript()),
+        "go": Language(tree_sitter_go.language()),
+        "rust": Language(tree_sitter_rust.language()),
+        "java": Language(tree_sitter_java.language()),
+        "c": Language(tree_sitter_c.language()),
+        "cpp": Language(tree_sitter_cpp.language()),
+    }
+    cache: dict[str, Any] = {}
+
+    def _get_parser(language: str) -> Any:
+        if language not in cache:
+            try:
+                cache[language] = Parser(langs[language])
+            except TypeError:  # older binding: assign .language
+                p = Parser()
+                p.language = langs[language]
+                cache[language] = p
+        return cache[language]
+
+    cc._get_parser = _get_parser  # type: ignore[assignment]  # noqa: SLF001
+    cc._check_tree_sitter_available = lambda: True  # type: ignore[assignment]  # noqa: SLF001
+
+
+def _varied_code_inputs() -> list[str]:
+    """≥20 varied source-code inputs spanning all 8 supported languages.
+
+    Exercises: imports, long-bodied functions (body truncation), classes with
+    multiple methods, decorators, type definitions, top-level code, Python
+    docstring first-line reconstruction, short passthrough (<100 tokens), and
+    an UNKNOWN input (plain prose → passthrough with fallback disabled). All
+    inputs are ASCII (the non-ASCII byte/char slice ambiguity is out of parity
+    scope; see code_compressor.rs module docs)."""
+    python_basic = (
+        "import os\n"
+        "import sys\n"
+        "from typing import List, Optional\n\n"
+        "GLOBAL_CONST = 42\n\n"
+        "@dataclass\n"
+        "class Processor:\n"
+        '    """Process a stream of items efficiently."""\n'
+        "    name: str\n"
+        "    count: int = 0\n\n"
+        "    def process(self, items: List[str]) -> List[str]:\n"
+        '        """Process a list of items and return cleaned results."""\n'
+        "        results = []\n"
+        "        for item in items:\n"
+        "            if not item:\n"
+        "                continue\n"
+        "            processed = item.strip().lower()\n"
+        "            results.append(processed)\n"
+        "            self.count += 1\n"
+        "        return results\n\n"
+        "    def reset(self):\n"
+        "        self.count = 0\n\n\n"
+        "def standalone(x: int, y: int) -> int:\n"
+        "    total = 0\n"
+        "    for i in range(x):\n"
+        "        for j in range(y):\n"
+        "            total += i * j\n"
+        "    return total\n\n\n"
+        'if __name__ == "__main__":\n'
+        '    p = Processor("main")\n'
+        '    print(p.process(["a", "b"]))\n'
+    )
+    python_nodoc = (
+        "from collections import defaultdict\n\n\n"
+        "def build_index(records):\n"
+        "    index = defaultdict(list)\n"
+        "    for rec in records:\n"
+        '        key = rec.get("id")\n'
+        "        if key is None:\n"
+        "            continue\n"
+        "        index[key].append(rec)\n"
+        "        if len(index[key]) > 100:\n"
+        "            index[key] = index[key][:100]\n"
+        "    return index\n\n\n"
+        "def merge(a, b):\n"
+        "    out = dict(a)\n"
+        "    for k, v in b.items():\n"
+        "        out[k] = v\n"
+        "    return out\n"
+    )
+    python_multiline_ds = (
+        "import logging\n\n\n"
+        "def configure(level, handlers, fmt, propagate, capture_warnings):\n"
+        '    """Configure logging for the whole application.\n\n'
+        "    Sets up the root logger with the given level and handler list,\n"
+        "    applies the format string to every handler, and toggles warning\n"
+        "    capture so library warnings are routed through the logger too.\n"
+        '    """\n'
+        "    logger = logging.getLogger()\n"
+        "    logger.setLevel(level)\n"
+        "    formatter = logging.Formatter(fmt)\n"
+        "    for handler in handlers:\n"
+        "        handler.setFormatter(formatter)\n"
+        "        logger.addHandler(handler)\n"
+        "    logger.propagate = propagate\n"
+        "    logging.captureWarnings(capture_warnings)\n"
+        '    logger.info("logging configured at level %s", level)\n'
+        "    return logger\n\n\n"
+        "def teardown(logger):\n"
+        "    for handler in list(logger.handlers):\n"
+        "        handler.flush()\n"
+        "        handler.close()\n"
+        "        logger.removeHandler(handler)\n"
+        "    return logger\n"
+    )
+    javascript_basic = (
+        "import { foo } from './foo';\n"
+        "const bar = require('bar');\n\n"
+        "const CONST = 99;\n\n"
+        "export function processData(items) {\n"
+        "    const results = [];\n"
+        "    for (const item of items) {\n"
+        "        if (!item) {\n"
+        "            continue;\n"
+        "        }\n"
+        "        const clean = item.trim().toLowerCase();\n"
+        "        results.push(clean);\n"
+        "    }\n"
+        "    return results;\n"
+        "}\n\n"
+        "class Widget {\n"
+        "    constructor(name) {\n"
+        "        this.name = name;\n"
+        "        this.count = 0;\n"
+        "    }\n\n"
+        "    render(ctx) {\n"
+        "        ctx.clear();\n"
+        "        ctx.draw(this.name);\n"
+        "        this.count += 1;\n"
+        "        return ctx;\n"
+        "    }\n"
+        "}\n\n"
+        "module.exports = { processData, Widget };\n"
+    )
+    typescript_basic = (
+        "import { Foo } from './foo';\n\n"
+        "interface User {\n"
+        "    id: number;\n"
+        "    name: string;\n"
+        "    email?: string;\n"
+        "}\n\n"
+        "type Maybe<T> = T | null;\n\n"
+        "export function lookup(users: User[], id: number): Maybe<User> {\n"
+        "    for (const user of users) {\n"
+        "        if (user.id === id) {\n"
+        "            return user;\n"
+        "        }\n"
+        "    }\n"
+        "    return null;\n"
+        "}\n\n"
+        "class Repository<T> {\n"
+        "    private items: T[] = [];\n\n"
+        "    add(item: T): void {\n"
+        "        this.items.push(item);\n"
+        "        if (this.items.length > 1000) {\n"
+        "            this.items.shift();\n"
+        "        }\n"
+        "    }\n"
+        "}\n"
+    )
+    go_basic = (
+        "package main\n\n"
+        "import (\n"
+        '\t"fmt"\n'
+        '\t"strings"\n'
+        ")\n\n"
+        "type Processor struct {\n"
+        "\tName  string\n"
+        "\tCount int\n"
+        "}\n\n"
+        "func (p *Processor) Process(items []string) []string {\n"
+        "\tresults := make([]string, 0, len(items))\n"
+        "\tfor _, item := range items {\n"
+        '\t\tif item == "" {\n'
+        "\t\t\tcontinue\n"
+        "\t\t}\n"
+        "\t\tclean := strings.ToLower(strings.TrimSpace(item))\n"
+        "\t\tresults = append(results, clean)\n"
+        "\t\tp.Count++\n"
+        "\t}\n"
+        "\treturn results\n"
+        "}\n\n"
+        "func main() {\n"
+        '\tp := &Processor{Name: "main"}\n'
+        '\tfmt.Println(p.Process([]string{"a", "b"}))\n'
+        "}\n"
+    )
+    rust_basic = (
+        "use std::collections::HashMap;\n\n"
+        "pub struct Processor {\n"
+        "    name: String,\n"
+        "    count: u32,\n"
+        "}\n\n"
+        "impl Processor {\n"
+        "    pub fn new(name: String) -> Self {\n"
+        "        Self { name, count: 0 }\n"
+        "    }\n\n"
+        "    pub fn process(&mut self, items: Vec<String>) -> Vec<String> {\n"
+        "        let mut results = Vec::new();\n"
+        "        for item in items {\n"
+        "            if item.is_empty() {\n"
+        "                continue;\n"
+        "            }\n"
+        "            let clean = item.trim().to_lowercase();\n"
+        "            results.push(clean);\n"
+        "            self.count += 1;\n"
+        "        }\n"
+        "        results\n"
+        "    }\n"
+        "}\n\n"
+        "#[derive(Debug)]\n"
+        "enum Color {\n"
+        "    Red,\n"
+        "    Green,\n"
+        "    Blue,\n"
+        "}\n\n"
+        "fn main() {\n"
+        '    let mut p = Processor::new("main".to_string());\n'
+        '    println!("{:?}", p.process(vec![]));\n'
+        "}\n"
+    )
+    java_basic = (
+        "package com.example;\n\n"
+        "import java.util.List;\n"
+        "import java.util.ArrayList;\n\n"
+        "public class Processor {\n"
+        "    private String name;\n"
+        "    private int count;\n\n"
+        "    public Processor(String name) {\n"
+        "        this.name = name;\n"
+        "        this.count = 0;\n"
+        "    }\n\n"
+        "    @Override\n"
+        "    public String toString() {\n"
+        '        return "Processor(" + name + ")";\n'
+        "    }\n\n"
+        "    public List<String> process(List<String> items) {\n"
+        "        List<String> results = new ArrayList<>();\n"
+        "        for (String item : items) {\n"
+        "            if (item == null || item.isEmpty()) {\n"
+        "                continue;\n"
+        "            }\n"
+        "            String clean = item.trim().toLowerCase();\n"
+        "            results.add(clean);\n"
+        "            this.count += 1;\n"
+        "        }\n"
+        "        return results;\n"
+        "    }\n"
+        "}\n"
+    )
+    c_basic = (
+        "#include <stdio.h>\n"
+        "#include <stdlib.h>\n"
+        "#include <string.h>\n\n"
+        "typedef struct {\n"
+        "    char name[64];\n"
+        "    int count;\n"
+        "} Processor;\n\n"
+        "int process(Processor *p, const char **items, int n) {\n"
+        "    int kept = 0;\n"
+        "    for (int i = 0; i < n; i++) {\n"
+        "        if (items[i] == NULL || strlen(items[i]) == 0) {\n"
+        "            continue;\n"
+        "        }\n"
+        "        kept++;\n"
+        "        p->count++;\n"
+        "    }\n"
+        "    return kept;\n"
+        "}\n\n"
+        "int main(void) {\n"
+        '    Processor p = {"main", 0};\n'
+        '    const char *items[] = {"a", "b"};\n'
+        '    printf("%d\\n", process(&p, items, 2));\n'
+        "    return 0;\n"
+        "}\n"
+    )
+    cpp_basic = (
+        "#include <iostream>\n"
+        "#include <vector>\n"
+        "#include <string>\n\n"
+        "namespace app {\n\n"
+        "class Processor {\n"
+        "public:\n"
+        "    Processor(const std::string &name) : name_(name), count_(0) {}\n\n"
+        "    std::vector<std::string> process(const std::vector<std::string> &items) {\n"
+        "        std::vector<std::string> results;\n"
+        "        for (const auto &item : items) {\n"
+        "            if (item.empty()) {\n"
+        "                continue;\n"
+        "            }\n"
+        "            results.push_back(item);\n"
+        "            count_++;\n"
+        "        }\n"
+        "        return results;\n"
+        "    }\n\n"
+        "private:\n"
+        "    std::string name_;\n"
+        "    int count_;\n"
+        "};\n\n"
+        "}  // namespace app\n\n"
+        "int main() {\n"
+        '    app::Processor p("main");\n'
+        "    return 0;\n"
+        "}\n"
+    )
+    # Short (<100 char/4 tokens) → passthrough, per a couple languages.
+    short_py = "def f(x):\n    return x + 1\n"
+    short_js = "const a = 1;\nfunction g() { return a; }\n"
+    # UNKNOWN → passthrough (fallback_to_kompress=False in the recorder).
+    unknown_prose = (
+        "This is just a paragraph of plain English prose that contains no "
+        "recognizable source code constructs at all, so the language detector "
+        "should classify it as unknown and the compressor should pass it "
+        "through unchanged without attempting any AST based compression here.\n"
+    )
+    # A longer multi-function Python file to exercise budget allocation.
+    python_orchestrator = (
+        "import json\n\n\n"
+        "def load(path):\n"
+        "    with open(path) as fh:\n"
+        "        data = json.load(fh)\n"
+        "    cleaned = {}\n"
+        "    for key, value in data.items():\n"
+        "        if value is None:\n"
+        "            continue\n"
+        "        cleaned[key] = value\n"
+        "    return cleaned\n\n\n"
+        "def transform(records, factor):\n"
+        "    out = []\n"
+        "    for r in records:\n"
+        "        scaled = r * factor\n"
+        "        if scaled > 1000:\n"
+        "            scaled = 1000\n"
+        "        out.append(scaled)\n"
+        "    return out\n\n\n"
+        "def run(path, factor):\n"
+        "    data = load(path)\n"
+        "    values = list(data.values())\n"
+        "    result = transform(values, factor)\n"
+        "    return sum(result)\n"
+    )
+
+    return [
+        python_basic,
+        python_nodoc,
+        python_multiline_ds,
+        python_orchestrator,
+        javascript_basic,
+        typescript_basic,
+        go_basic,
+        rust_basic,
+        java_basic,
+        c_basic,
+        cpp_basic,
+        short_py,
+        short_js,
+        unknown_prose,
+        # Padded variants for >= 20 unique inputs. A trailing comment keeps
+        # each input unique (distinct fixture hash) while preserving the
+        # structural paths exercised above.
+        f"{python_basic}\n# variant 1",
+        f"{javascript_basic}\n// variant 1",
+        f"{go_basic}\n// variant 1",
+        f"{rust_basic}\n// variant 1",
+        f"{java_basic}\n// variant 1",
+        f"{c_basic}\n// variant 1",
+        f"{cpp_basic}\n// variant 1",
+        f"{typescript_basic}\n// variant 1",
+        f"{python_orchestrator}\n# variant 1",
+    ]
+
+
+def _docstring_mode_inputs() -> list[str]:
+    """Docstring-bearing Python samples, for exercising the non-default
+    `DocstringMode` branches (FULL keeps the whole docstring, REMOVE drops it).
+    The default `_varied_code_inputs` only exercises FIRST_LINE."""
+    return [s for s in _varied_code_inputs() if '"""' in s][:2]
+
+
+def _varied_kompress_inputs() -> list[str]:
+    """≥20 varied prose/log/mixed inputs for the Kompress ML compressor.
+
+    Spans short passthrough (<10 words), single-chunk prose, multi-chunk
+    bodies (>350 words), whitespace-irregular text, and log/error-like
+    content so the recorded fixtures cover chunking, max-score-per-word
+    reduction, the >0.5 threshold, and the passthrough short-circuit.
+    """
+    fox = "The quick brown fox jumps over the lazy dog. "
+    engineer = (
+        "Meanwhile the diligent engineer reviews the compression output "
+        "carefully to ensure the most salient tokens survive while redundant "
+        "filler is discarded without losing the essential meaning. "
+    )
+    log = (
+        "ERROR 2026-06-18 connection refused to upstream after 3 retries; "
+        "WARN falling back to cache; INFO request completed in 421ms status 200; "
+        "DEBUG tracing span closed for request abc123; "
+    )
+    inputs: list[str] = [
+        # short → passthrough
+        "only nine words here so it passes through cleanly",
+        "tiny input",
+        "just a handful of words below the threshold now",
+        # single-chunk prose of growing length
+        fox * 3,
+        fox * 6 + engineer,
+        engineer * 2,
+        fox * 4 + engineer * 2,
+        # log / error-like
+        log * 3,
+        log * 6,
+        "Traceback (most recent call last): File main.py line 42 in handler "
+        "raise ValueError invalid token; the request could not be processed "
+        "because the upstream returned an unexpected payload shape repeatedly. " * 3,
+        # whitespace-irregular
+        "tokens   with\tirregular\n\nwhitespace   runs   and\ttabs   scattered "
+        + "throughout the body of the text repeatedly again and again here " * 5,
+        # mixed prose + paths + assignments
+        "Configure the service by setting config.timeout = 30 and config.retries = 5 "
+        "then restart /etc/service/daemon to apply; verify via /health endpoint "
+        "returning 200 within the configured start_period window of fifteen seconds. " * 3,
+        # multi-chunk (>350 words)
+        (fox + engineer) * 20,
+        (log + engineer) * 18,
+        fox * 120,
+        # medium prose variations
+        engineer + fox * 5,
+        "Summarize the following document while preserving every named entity "
+        "and numeric figure so the reader can reconstruct the key facts later. " * 4,
+        "The committee reviewed the quarterly report and concluded that revenue "
+        "grew twelve percent while operating costs declined by four percent "
+        "year over year across all major regional markets surveyed. " * 4,
+        "Installation requires Python three point ten or newer along with the "
+        "optional machine learning extra which pulls onnxruntime and transformers "
+        "for the token compression model used by the proxy at request time. " * 3,
+        "Once the migration completes the application reads its runtime feature "
+        "flags from the host mounted configuration file and hot reloads them on "
+        "change without requiring a full restart of the running service process. " * 3,
+        "Performance benchmarks on the reference hardware show the int8 weight "
+        "only model matching the full precision baseline within one tenth of a "
+        "percent on the held out evaluation split across five hundred samples. " * 3,
+    ]
+    return inputs
 
 
 __all__ = [

@@ -62,6 +62,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     }
 
+    // Gate + (when enabled) eagerly warm the Kompress PlainText compressor.
+    // Default-off: it carries a ~261 MB cache-only model, so it loads only
+    // when an operator opts in via `--enable-kompress`. The warm runs on a
+    // blocking thread off the request path; cache-only means a cold cache
+    // just leaves it deferred (PlainText passes through) rather than stalling
+    // startup. The always-on structural compressors + CodeCompressor need no
+    // such gate.
+    headroom_core::transforms::set_kompress_enabled(config.enable_kompress);
+    if config.enable_kompress {
+        tokio::task::spawn_blocking(|| {
+            let ready = headroom_core::transforms::warm_live_zone_compressors();
+            tracing::info!(
+                event = "kompress_warm",
+                kompress_ready = ready,
+                "Kompress enabled; warmed live-zone compressors (cache-only)"
+            );
+        });
+    }
+
     let app = build_app(state).into_make_service_with_connect_info::<SocketAddr>();
 
     let listener = tokio::net::TcpListener::bind(config.listen).await?;

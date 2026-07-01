@@ -1,0 +1,42 @@
+{
+  "config": {
+    "ccr_ttl": 300,
+    "compress_comments": true,
+    "docstring_mode": "first_line",
+    "enable_ccr": false,
+    "fallback_to_kompress": false,
+    "language_hint": null,
+    "max_body_lines": 5,
+    "min_tokens_for_compression": 100,
+    "preserve_decorators": true,
+    "preserve_imports": true,
+    "preserve_signatures": true,
+    "preserve_type_annotations": true,
+    "semantic_analysis": true,
+    "target_compression_rate": 0.2
+  },
+  "input": "use std::collections::HashMap;\n\npub struct Processor {\n    name: String,\n    count: u32,\n}\n\nimpl Processor {\n    pub fn new(name: String) -> Self {\n        Self { name, count: 0 }\n    }\n\n    pub fn process(&mut self, items: Vec<String>) -> Vec<String> {\n        let mut results = Vec::new();\n        for item in items {\n            if item.is_empty() {\n                continue;\n            }\n            let clean = item.trim().to_lowercase();\n            results.push(clean);\n            self.count += 1;\n        }\n        results\n    }\n}\n\n#[derive(Debug)]\nenum Color {\n    Red,\n    Green,\n    Blue,\n}\n\nfn main() {\n    let mut p = Processor::new(\"main\".to_string());\n    println!(\"{:?}\", p.process(vec![]));\n}\n",
+  "input_sha256": "f8a7f62203b3d8ba9970fff408a9bfd628d0dbf0b67678f89b0ffb60bbc23d5c",
+  "output": {
+    "cache_key": null,
+    "compressed": "use std::collections::HashMap;\n\npub struct Processor {\n    name: String,\n    count: u32,\n}\nenum Color {\n    Red,\n    Green,\n    Blue,\n}\n\nimpl Processor {\n    pub fn new(name: String) -> Self {\n        Self { name, count: 0 }\n    }\n\n    pub fn process(&mut self, items: Vec<String>) -> Vec<String> {\n        let mut results = Vec::new();\n        for item in items {\n            if item.is_empty() {\n                continue;\n            }\n            let clean = item.trim().to_lowercase();\n            results.push(clean);\n            self.count += 1;\n        }\n        results\n    }\n}\n\nfn main() {\n    let mut p = Processor::new(\"main\".to_string());\n    // [1 lines omitted; calls: Processor, new, process]\n}\n\n#[derive(Debug)]",
+    "compressed_bodies": 0,
+    "compressed_tokens": 181,
+    "compression_ratio": 1.0168539325842696,
+    "language": "rust",
+    "language_confidence": 1.0,
+    "original": "use std::collections::HashMap;\n\npub struct Processor {\n    name: String,\n    count: u32,\n}\n\nimpl Processor {\n    pub fn new(name: String) -> Self {\n        Self { name, count: 0 }\n    }\n\n    pub fn process(&mut self, items: Vec<String>) -> Vec<String> {\n        let mut results = Vec::new();\n        for item in items {\n            if item.is_empty() {\n                continue;\n            }\n            let clean = item.trim().to_lowercase();\n            results.push(clean);\n            self.count += 1;\n        }\n        results\n    }\n}\n\n#[derive(Debug)]\nenum Color {\n    Red,\n    Green,\n    Blue,\n}\n\nfn main() {\n    let mut p = Processor::new(\"main\".to_string());\n    println!(\"{:?}\", p.process(vec![]));\n}\n",
+    "original_tokens": 178,
+    "preserved_imports": 1,
+    "preserved_signatures": 1,
+    "symbol_scores": {
+      "Processor": 1.0,
+      "main": 0.0,
+      "new": 0.333,
+      "process": 0.0
+    },
+    "syntax_valid": true
+  },
+  "recorded_at": "2026-06-19T00:15:16.330326+00:00",
+  "transform": "code_aware_compressor"
+}
