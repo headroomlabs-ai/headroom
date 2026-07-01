@@ -120,6 +120,7 @@ from headroom.proxy.cost import (
     build_prefix_cache_stats,  # noqa: F401
     build_session_summary,  # noqa: F401
     merge_cost_stats,  # noqa: F401
+    request_cost_usd,
 )
 from headroom.proxy.helpers import (
     COMPRESSION_TIMEOUT_SECONDS,  # noqa: F401
@@ -2768,6 +2769,14 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "output_tokens": log.get("output_tokens"),
                 "tokens_saved": log.get("tokens_saved"),
                 "savings_percent": log.get("savings_percent"),
+                # Per-request billed-cost estimate so tooling (e.g. claude-hud)
+                # can attribute cost to a Claude Code session by summing over
+                # turn_id / time window (issue #1079). Best-effort: it does NOT
+                # apply cache-read/cache-write discounts because recent_requests
+                # does not retain a per-request cache breakdown, so treat it as a
+                # list-price billed estimate. null = unknown (pricing
+                # unavailable), never a fabricated number.
+                "cost_usd": request_cost_usd(proxy.cost_tracker, log),
                 "optimization_latency_ms": log.get("optimization_latency_ms"),
                 "total_latency_ms": log.get("total_latency_ms"),
                 "transforms_applied": log.get("transforms_applied", []),
