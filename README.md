@@ -194,7 +194,7 @@ shows an **Output Tokens Saved** card next to input compression, labelled
 
 | Agent        | `headroom wrap` | Notes                            |
 |--------------|:---------------:|----------------------------------|
-| Claude Code  | ✅              | `--memory` · `--code-graph` · `--1m` · `--tool-search` |
+| Claude Code  | ✅              | `--memory` · `--code-graph` · `--1m` · `--tool-search` · Vertex / Bedrock auto-detected |
 | Codex        | ✅              | shares memory with Claude        |
 | Cursor       | Manual setup    | starts proxy and prints base URLs for Cursor settings |
 | Aider        | ✅              | starts proxy + launches          |

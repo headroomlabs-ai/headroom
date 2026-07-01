@@ -115,6 +115,15 @@ class ProxyConfig:
     # SigV4 signature. Leave unset (default) to keep `--backend bedrock`'s
     # direct-to-AWS, re-signing behavior unchanged.
     bedrock_api_url: str | None = None
+    # Re-sign the compressed Bedrock body with SigV4 and forward direct to the
+    # regional AWS Bedrock runtime endpoint. This is what lets `headroom wrap
+    # claude` support CLAUDE_CODE_USE_BEDROCK=1 with no re-signing gateway:
+    # Claude Code signs the request, Headroom compresses + re-signs, AWS sees a
+    # signature that matches the bytes on the wire. Mutually completes
+    # `bedrock_api_url` — when both are set, `bedrock_api_url` wins (an explicit
+    # gateway is forwarded to verbatim, no re-signing). Uses `bedrock_region`
+    # and `bedrock_profile`.
+    bedrock_sign: bool = False
     anyllm_provider: str = "openai"
 
     # Optimization mode: "token" (rewrite for max compression) or

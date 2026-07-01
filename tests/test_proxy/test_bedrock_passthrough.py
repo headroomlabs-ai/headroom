@@ -361,3 +361,102 @@ def test_env_var_feeds_config(monkeypatch):
     monkeypatch.setenv("BEDROCK_TARGET_API_URL", UPSTREAM)
     cfg = _proxy_config_from_env()
     assert cfg.bedrock_api_url == UPSTREAM
+
+
+# ── direct-to-AWS SigV4 signing mode (--bedrock-sign) ──────────────────
+
+
+def test_routes_present_when_bedrock_sign_set():
+    """Signing mode registers the same routes without a gateway URL."""
+    paths = _paths(ProxyConfig(bedrock_sign=True, bedrock_region="us-west-2"))
+    assert "/model/{model_id:path}/invoke" in paths
+    assert "/model/{model_id:path}/invoke-with-response-stream" in paths
+
+
+def test_sign_env_var_feeds_config(monkeypatch):
+    from headroom.proxy.server import _proxy_config_from_env
+
+    monkeypatch.delenv("HEADROOM_PROXY_CONFIG_JSON", raising=False)
+    monkeypatch.delenv("BEDROCK_TARGET_API_URL", raising=False)
+    monkeypatch.setenv("HEADROOM_BEDROCK_SIGN", "true")
+    cfg = _proxy_config_from_env()
+    assert cfg.bedrock_sign is True
+    assert cfg.bedrock_api_url is None
+
+
+def test_signing_forwards_to_regional_endpoint_with_signed_headers():
+    """In signing mode the compressed body is forwarded to the regional AWS
+    endpoint, carrying freshly-computed SigV4 headers over the OUTBOUND bytes."""
+    Credentials = pytest.importorskip("botocore.credentials").Credentials
+
+    app = create_app(_make_config(bedrock_api_url=None, bedrock_sign=True))
+    with TestClient(app) as client:
+        proxy = client.app.state.proxy
+        http = _install_fake_client(proxy, _FakeUpstream())
+        # Pre-seed fake creds so the test never touches the real AWS chain (CI-safe).
+        proxy._bedrock_signer()._credentials = Credentials("AKIDEXAMPLE", "secret")
+        compressed = [{"role": "user", "content": "short"}]
+        proxy.anthropic_pipeline.apply = MagicMock(
+            return_value=_FakeResult(compressed, tokens_before=5000, tokens_after=200)
+        )
+        resp = client.post(
+            INVOKE,
+            json={"messages": [{"role": "user", "content": "x" * 5000}], "max_tokens": 8},
+        )
+
+    assert resp.status_code == 200
+    url, forwarded = _forwarded(http)
+    # Forwarded direct to the regional Bedrock host, not a gateway.
+    assert url.startswith("https://bedrock-runtime.us-west-2.amazonaws.com/model/")
+    assert forwarded["messages"] == compressed
+    # Headers carry a SigV4 signature.
+    sent_headers = http.build_request.call_args.kwargs["headers"]
+    auth = next((v for k, v in sent_headers.items() if k.lower() == "authorization"), "")
+    assert auth.startswith("AWS4-HMAC-SHA256 ")
+
+
+def test_api_url_takes_precedence_over_sign():
+    """When both are set, the explicit gateway wins and we do NOT re-sign."""
+    app = create_app(_make_config(bedrock_api_url=UPSTREAM, bedrock_sign=True))
+    with TestClient(app) as client:
+        proxy = client.app.state.proxy
+        http = _install_fake_client(proxy, _FakeUpstream())
+        proxy.anthropic_pipeline.apply = MagicMock(
+            return_value=_FakeResult([{"role": "user", "content": "c"}], 900, 100)
+        )
+        resp = client.post(
+            INVOKE,
+            json={"messages": [{"role": "user", "content": "z" * 3000}], "max_tokens": 8},
+        )
+
+    assert resp.status_code == 200
+    url, _ = _forwarded(http)
+    assert url.startswith(UPSTREAM)  # gateway, not AWS
+    sent_headers = http.build_request.call_args.kwargs["headers"]
+    # No SigV4 Authorization injected — gateway owns signing.
+    auth = next((v for k, v in sent_headers.items() if k.lower() == "authorization"), "")
+    assert not auth.startswith("AWS4-HMAC-SHA256")
+
+
+def test_sign_credentials_injected_for_test(monkeypatch):
+    """Provide fake creds so signing mode doesn't hit the real AWS chain."""
+    Credentials = pytest.importorskip("botocore.credentials").Credentials
+
+    fake = Credentials(access_key="AKIDEXAMPLE", secret_key="secret")
+
+    app = create_app(_make_config(bedrock_api_url=None, bedrock_sign=True))
+    with TestClient(app) as client:
+        proxy = client.app.state.proxy
+        _install_fake_client(proxy, _FakeUpstream())
+        proxy.anthropic_pipeline.apply = MagicMock(
+            return_value=_FakeResult([{"role": "user", "content": "c"}], 900, 100)
+        )
+        # Pre-seed the signer's creds so no network/credential lookup happens.
+        signer = proxy._bedrock_signer()
+        signer._credentials = fake
+        resp = client.post(
+            INVOKE,
+            json={"messages": [{"role": "user", "content": "z" * 3000}], "max_tokens": 8},
+        )
+
+    assert resp.status_code == 200

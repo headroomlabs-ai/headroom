@@ -1740,7 +1740,7 @@ requires-dist = [
     { name = "fastembed", marker = "extra == 'relevance'", specifier = ">=0.4.0" },
     { name = "gunicorn", marker = "sys_platform != 'win32' and extra == 'proxy-prod'", specifier = ">=21.0.0" },
     { name = "headroom-ai", extras = ["proxy"], marker = "extra == 'proxy-prod'" },
-    { name = "headroom-ai", extras = ["proxy", "code", "ml", "memory", "relevance", "image", "reports", "otel", "evals", "voice", "html", "mcp", "spreadsheet"], marker = "extra == 'all'" },
+    { name = "headroom-ai", extras = ["proxy", "code", "ml", "memory", "relevance", "image", "reports", "otel", "evals", "voice", "html", "mcp", "spreadsheet", "bedrock"], marker = "extra == 'all'" },
     { name = "headroom-ai", extras = ["voice"], marker = "extra == 'voice-train'" },
     { name = "hnswlib", marker = "extra == 'dev'", specifier = ">=0.8.0" },
     { name = "hnswlib", marker = "extra == 'memory'", specifier = ">=0.8.0" },

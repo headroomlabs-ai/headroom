@@ -13,12 +13,19 @@ Anthropic models *is* the Anthropic Messages shape
 (``{anthropic_version, system, messages, max_tokens, …}``; the model travels in
 the URL), so the existing pipeline applies with no translation.
 
-LIMITATION — SigV4. Rewriting the body invalidates the caller's SigV4 signature
-(the signature covers a hash of the body). These routes therefore register
-**only** when ``--bedrock-api-url`` / ``BEDROCK_TARGET_API_URL`` is set, and the
-target must be a gateway that re-signs or does not verify the inbound signature
-(LiteLLM, LocalStack, a corporate Bedrock proxy) — never raw AWS. For
-direct-to-AWS compression use ``--backend bedrock`` (which re-signs).
+SigV4. Rewriting the body invalidates the caller's SigV4 signature (the
+signature covers a hash of the body). There are two ways to forward safely:
+
+* ``--bedrock-api-url`` / ``BEDROCK_TARGET_API_URL`` — forward to a gateway that
+  re-signs or does not verify the inbound signature (LiteLLM, LocalStack, a
+  corporate Bedrock proxy). Forwarded verbatim; Headroom does not re-sign.
+* ``--bedrock-sign`` / ``HEADROOM_BEDROCK_SIGN`` — re-sign the compressed body
+  with SigV4 and forward **direct to the regional AWS endpoint**. This is what
+  powers ``headroom wrap claude`` under ``CLAUDE_CODE_USE_BEDROCK=1`` with no
+  gateway. See ``headroom/proxy/bedrock_signer.py``.
+
+The routes register when **either** is configured. ``bedrock_api_url`` takes
+precedence when both are set (an explicit gateway is forwarded to verbatim).
 
 The response is forwarded byte-faithfully: the non-streaming reply is Anthropic
 JSON and the streaming reply uses AWS event-stream binary framing — neither is
@@ -45,15 +52,62 @@ LOG_TAG = "bedrock_invoke"
 class BedrockHandlerMixin:
     """Mixin providing the Bedrock InvokeModel passthrough handler."""
 
+    def _bedrock_signing_enabled(self) -> bool:
+        """True when we re-sign direct-to-AWS (no gateway configured)."""
+        # An explicit gateway wins: forward to it verbatim, never re-sign.
+        if getattr(self.config, "bedrock_api_url", None):  # type: ignore[attr-defined]
+            return False
+        return bool(getattr(self.config, "bedrock_sign", False))  # type: ignore[attr-defined]
+
+    def _bedrock_signer(self):  # type: ignore[no-untyped-def]
+        """Lazily build (and cache) the SigV4 signer for direct-to-AWS mode."""
+        signer = getattr(self, "_cached_bedrock_signer", None)
+        if signer is None:
+            from headroom.proxy.bedrock_signer import BedrockSigner
+
+            signer = BedrockSigner(
+                region=getattr(self.config, "bedrock_region", "us-west-2"),  # type: ignore[attr-defined]
+                profile=getattr(self.config, "bedrock_profile", None),  # type: ignore[attr-defined]
+            )
+            self._cached_bedrock_signer = signer
+        return signer
+
     def _bedrock_upstream_base(self) -> str | None:
         """Resolved Bedrock upstream, or ``None`` when unconfigured.
 
-        Returns the normalized ``config.bedrock_api_url`` (trailing slash
-        stripped). ``None`` means the feature is off — the routes are not even
+        Precedence: an explicit ``config.bedrock_api_url`` (a re-signing
+        gateway) wins; otherwise, when ``config.bedrock_sign`` is set, the
+        regional AWS Bedrock runtime endpoint derived from the configured
+        region. ``None`` means the feature is off — the routes are not even
         registered in that case, so a ``None`` here is a defensive guard only.
         """
         base = getattr(self.config, "bedrock_api_url", None)  # type: ignore[attr-defined]
-        return base.rstrip("/") if base else None
+        if base:
+            return base.rstrip("/")
+        if getattr(self.config, "bedrock_sign", False):  # type: ignore[attr-defined]
+            return self._bedrock_signer().endpoint_base()
+        return None
+
+    def _sign_if_needed(
+        self,
+        signing: bool,
+        *,
+        url: str,
+        body: bytes,
+        inbound_headers: dict[str, str],
+    ) -> dict[str, str]:
+        """Return outbound headers, SigV4-re-signed when in direct-to-AWS mode.
+
+        In gateway mode (``signing`` is False) the inbound headers pass through
+        unchanged — the gateway owns signing. In direct-to-AWS mode the headers
+        carry a fresh signature computed over ``body`` (the exact bytes about to
+        be forwarded). If signing fails (no credentials), we fail loud rather
+        than forward an unsigned request that AWS would 403 anyway.
+        """
+        if not signing:
+            return inbound_headers
+        signer = self._bedrock_signer()
+        return signer.sign(url=url, body=body, inbound_headers=inbound_headers)
 
     async def handle_bedrock_invoke(
         self,
@@ -96,7 +150,10 @@ class BedrockHandlerMixin:
                 content={
                     "error": {
                         "type": "configuration_error",
-                        "message": "Bedrock passthrough requested but --bedrock-api-url is unset.",
+                        "message": (
+                            "Bedrock passthrough requested but neither "
+                            "--bedrock-api-url nor --bedrock-sign is set."
+                        ),
                     }
                 },
             )
@@ -114,8 +171,11 @@ class BedrockHandlerMixin:
         #     by httpx and the stale content-encoding dropped. Keeping the
         #     inbound content-length here is the classic "Too little data for
         #     declared Content-Length" footgun once the body shrinks.
-        # We never touch the auth headers — the upstream gateway owns
-        # (re-)signing.
+        # In gateway mode we never touch the auth headers — the upstream gateway
+        # owns (re-)signing. In direct-to-AWS signing mode we strip the stale
+        # signature and recompute it over the bytes we actually forward (see
+        # ``_sign_if_needed``).
+        signing = self._bedrock_signing_enabled()
         in_headers = _strip_internal_headers(dict(request.headers.items()))
         client = classify_client(dict(request.headers.items()))
         tags = extract_tags(dict(request.headers.items()))
@@ -136,9 +196,15 @@ class BedrockHandlerMixin:
                 err,
             )
             raw_only = await request.body()
+            # Even verbatim bytes must be re-signed in direct-to-AWS mode: we
+            # changed the Host to the regional endpoint, so the inbound
+            # signature no longer matches regardless of the body.
+            fwd_headers = self._sign_if_needed(
+                signing, url=url, body=raw_only, inbound_headers=verbatim_headers
+            )
             return await self._forward_bedrock(
                 url=url,
-                headers=verbatim_headers,
+                headers=fwd_headers,
                 content=raw_only,
                 stream=stream,
                 request_id=request_id,
@@ -202,9 +268,14 @@ class BedrockHandlerMixin:
                 outbound = raw
 
         out_headers["content-type"] = "application/json"
+        # Sign LAST: the signature must hash exactly the bytes we forward
+        # (``outbound``), after compression has finalized them.
+        fwd_headers = self._sign_if_needed(
+            signing, url=url, body=outbound, inbound_headers=out_headers
+        )
         response = await self._forward_bedrock(
             url=url,
-            headers=out_headers,
+            headers=fwd_headers,
             content=outbound,
             stream=stream,
             request_id=request_id,

@@ -4074,6 +4074,7 @@ def _proxy_config_from_env() -> ProxyConfig:
         bedrock_region=_get_env_str("HEADROOM_BEDROCK_REGION", "us-west-2"),
         bedrock_profile=os.environ.get("AWS_PROFILE"),
         bedrock_api_url=os.environ.get("BEDROCK_TARGET_API_URL"),
+        bedrock_sign=_get_env_bool("HEADROOM_BEDROCK_SIGN", False),
         anyllm_provider=_get_env_str("HEADROOM_ANYLLM_PROVIDER", "openai"),
         disable_kompress=_get_env_bool("HEADROOM_DISABLE_KOMPRESS", False),
         disable_kompress_fallback=_get_env_bool("HEADROOM_DISABLE_KOMPRESS_FALLBACK", False),
@@ -4445,6 +4446,16 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--bedrock-sign",
+        action="store_true",
+        default=None,
+        help=(
+            "Re-sign the compressed Bedrock body with SigV4 and forward direct "
+            "to the regional AWS endpoint (no gateway). Powers `headroom wrap "
+            "claude` under CLAUDE_CODE_USE_BEDROCK=1 (env: HEADROOM_BEDROCK_SIGN)"
+        ),
+    )
+    parser.add_argument(
         "--openrouter-api-key",
         help="OpenRouter API key (or set OPENROUTER_API_KEY env var)",
     )
@@ -4684,6 +4695,11 @@ if __name__ == "__main__":
         bedrock_region=_get_env_str("HEADROOM_BEDROCK_REGION", args.bedrock_region),
         bedrock_profile=args.bedrock_profile or os.environ.get("AWS_PROFILE"),
         bedrock_api_url=_get_env_str("BEDROCK_TARGET_API_URL", args.bedrock_api_url),
+        bedrock_sign=(
+            args.bedrock_sign
+            if args.bedrock_sign is not None
+            else _get_env_bool("HEADROOM_BEDROCK_SIGN", False)
+        ),
         anyllm_provider=_get_env_str("HEADROOM_ANYLLM_PROVIDER", args.anyllm_provider),
         optimize=optimize,
         min_tokens_to_crush=_get_env_int("HEADROOM_MIN_TOKENS", args.min_tokens),

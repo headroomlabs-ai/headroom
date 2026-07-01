@@ -779,6 +779,17 @@ def dashboard(port: int, no_open: bool) -> None:
     ),
 )
 @click.option(
+    "--bedrock-sign/--no-bedrock-sign",
+    default=False,
+    envvar="HEADROOM_BEDROCK_SIGN",
+    help=(
+        "Re-sign the compressed Bedrock body with SigV4 and forward direct to "
+        "the regional AWS endpoint (no gateway needed). Powers `headroom wrap "
+        "claude` under CLAUDE_CODE_USE_BEDROCK=1. Uses --region and "
+        "--bedrock-profile / AWS_PROFILE. (env: HEADROOM_BEDROCK_SIGN)"
+    ),
+)
+@click.option(
     "--telemetry",
     is_flag=True,
     help="Opt in to anonymous usage telemetry — off by default (env: HEADROOM_TELEMETRY=on)",
@@ -885,6 +896,7 @@ def proxy(
     bedrock_region: str | None,
     bedrock_profile: str | None,
     bedrock_api_url: str | None,
+    bedrock_sign: bool,
     telemetry: bool,
     no_telemetry: bool,
     stateless: bool,
@@ -1156,6 +1168,9 @@ def proxy(
         # CLI flag > env > unset. Matches the BEDROCK_TARGET_API_URL naming of
         # the sibling *_TARGET_API_URL passthrough overrides.
         bedrock_api_url=bedrock_api_url or os.environ.get("BEDROCK_TARGET_API_URL"),
+        # Direct-to-AWS SigV4 re-signing (no gateway). click resolves the
+        # HEADROOM_BEDROCK_SIGN envvar into this flag.
+        bedrock_sign=bedrock_sign,
         anyllm_provider=effective_anyllm_provider,
         # License / Usage Reporting (managed/enterprise)
         license_key=license_key,

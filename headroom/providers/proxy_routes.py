@@ -483,14 +483,18 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
     async def anthropic_messages(request: Request):
         return await proxy.handle_anthropic_messages(request)
 
-    # AWS Bedrock InvokeModel passthrough. Registered ONLY when an upstream is
-    # configured (`--bedrock-api-url` / BEDROCK_TARGET_API_URL): without it,
-    # `/model/{id}/invoke` keeps falling through to the catch-all (verbatim,
-    # signature-intact) so existing behavior is unchanged. The `{model_id:path}`
-    # converter captures inference-profile ids that contain dots, colons and
-    # slashes (e.g. `us.anthropic.claude-sonnet-4-5-20250929-v1:0`). See
-    # headroom/proxy/handlers/bedrock.py for the SigV4 caveat.
-    if getattr(proxy.config, "bedrock_api_url", None):
+    # AWS Bedrock InvokeModel passthrough. Registered when an upstream is
+    # configured — either `--bedrock-api-url` / BEDROCK_TARGET_API_URL (forward
+    # to a re-signing gateway) or `--bedrock-sign` / HEADROOM_BEDROCK_SIGN
+    # (re-sign direct to AWS). Without either, `/model/{id}/invoke` keeps
+    # falling through to the catch-all (verbatim, signature-intact) so existing
+    # behavior is unchanged. The `{model_id:path}` converter captures
+    # inference-profile ids that contain dots, colons and slashes (e.g.
+    # `us.anthropic.claude-sonnet-4-5-20250929-v1:0`). See
+    # headroom/proxy/handlers/bedrock.py for the SigV4 handling.
+    if getattr(proxy.config, "bedrock_api_url", None) or getattr(
+        proxy.config, "bedrock_sign", False
+    ):
 
         @app.post("/model/{model_id:path}/invoke")
         async def bedrock_invoke(request: Request, model_id: str):

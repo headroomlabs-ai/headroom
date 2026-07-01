@@ -86,14 +86,8 @@ proxy-prod = [
     "gunicorn>=21.0.0; sys_platform != 'win32'",
 ]
 # AST-based code compression (tree-sitter)
-# NOTE: cap below 1.0. tree-sitter-language-pack 1.x is a breaking rewrite whose
-# get_language()/get_parser() return the pack's own binding types instead of
-# standalone tree_sitter.Language/Parser, so _get_parser() in
-# transforms/code_compressor.py fails and code compression silently no-ops.
-# The 0.x line (>=0.10,<1.0) returns standalone tree_sitter objects as expected.
 code = [
-    "tree-sitter-language-pack>=0.10.0,<1.0",
-    "tree-sitter>=0.25.2,<0.26",
+    "tree-sitter-language-pack>=0.10.0",
 ]
 # ML-based compression with Kompress (ModernBERT).
 # (The legacy [llmlingua] extra was removed in 0.9.x — no live code path used it.
@@ -286,7 +280,7 @@ dev = [
 # headroom-ai[all]` is CVE-free; researchers who need the accuracy harness
 # opt in explicitly with `pip install headroom-ai[benchmark]`.
 all = [
-    "headroom-ai[proxy,code,ml,memory,relevance,image,reports,otel,evals,voice,html,mcp,spreadsheet]",
+    "headroom-ai[proxy,code,ml,memory,relevance,image,reports,otel,evals,voice,html,mcp,spreadsheet,bedrock]",
 ]
 
 [project.scripts]
