@@ -6332,9 +6332,13 @@ class OpenAIHandlerMixin:
                     {
                         "error": {
                             "type": "upstream_protocol_error",
+                            # Full exception detail is logged server-side above;
+                            # keep the client-facing message generic so upstream
+                            # exception/stack-trace text is not exposed (CodeQL
+                            # py/stack-trace-exposure).
                             "message": (
                                 "Upstream closed the connection without sending "
-                                f"a complete response: {e}"
+                                "a complete response."
                             ),
                         }
                     }
