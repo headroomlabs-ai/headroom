@@ -13,7 +13,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, cast
 
-from headroom._subprocess import run
+from headroom._subprocess import pid_alive, run
 
 from .health import probe_ready
 from .models import DeploymentManifest, InstallPreset, RuntimeKind
@@ -321,7 +321,8 @@ def stop_runtime(manifest: DeploymentManifest) -> None:
         return
     try:
         os.kill(pid, signal.SIGTERM)
-    except OSError:
+    except (OSError, SystemError):
+        # SystemError covers the Windows WinError 87 surfacing described in #1544.
         pass
     _clear_pid(manifest.profile)
 
@@ -351,8 +352,7 @@ def runtime_status(manifest: DeploymentManifest) -> str:
     pid = _read_pid(manifest.profile)
     if pid is None:
         return "stopped"
-    try:
-        os.kill(pid, 0)
-    except OSError:
-        return "stopped"
-    return "running"
+    # Windows-safe liveness probe: a bare os.kill(pid, 0) here raised WinError 87
+    # as a SystemError against the detached agent, crashing status and taking the
+    # live proxy down with it (#1544).
+    return "running" if pid_alive(pid) else "stopped"
