@@ -578,14 +578,14 @@ def test_stop_runtime_catches_system_error_on_windows(monkeypatch, tmp_path: Pat
 
 
 def test_runtime_status_catches_system_error_on_windows(monkeypatch, tmp_path: Path) -> None:
-    """os.kill raising SystemError during runtime_status must return 'stopped'."""
+    """pid_alive returning False (e.g. stale PID / WinError 87) → 'stopped'."""
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     pid_file = tmp_path / ".headroom" / "deploy" / "default" / "runner.pid"
     pid_file.parent.mkdir(parents=True)
     pid_file.write_text("999", encoding="utf-8")
     monkeypatch.setattr(
-        "headroom.install.runtime.os.kill",
-        lambda pid, sig: (_ for _ in ()).throw(SystemError("WinError 87")),
+        "headroom.install.runtime.pid_alive",
+        lambda pid: False,
     )
     python_manifest = DeploymentManifest(
         profile="default",
@@ -600,6 +600,41 @@ def test_runtime_status_catches_system_error_on_windows(monkeypatch, tmp_path: P
         backend="anthropic",
     )
     assert runtime_status(python_manifest) == "stopped"
+
+
+def test_runtime_status_uses_non_destructive_probe(monkeypatch, tmp_path: Path) -> None:
+    """runtime_status must use pid_alive, never raw os.kill(pid, 0)."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    pid_file = tmp_path / ".headroom" / "deploy" / "default" / "runner.pid"
+    pid_file.parent.mkdir(parents=True)
+    pid_file.write_text("999", encoding="utf-8")
+    monkeypatch.setattr(
+        "headroom.install.runtime.pid_alive",
+        lambda pid: True,
+    )
+    os_kill_called = False
+    _real_kill = os.kill
+
+    def _spy_kill(pid, sig):
+        nonlocal os_kill_called
+        os_kill_called = True
+        return _real_kill(pid, sig)
+
+    monkeypatch.setattr("headroom.install.runtime.os.kill", _spy_kill)
+    python_manifest = DeploymentManifest(
+        profile="default",
+        preset="persistent-service",
+        runtime_kind="python",
+        supervisor_kind="service",
+        scope="user",
+        provider_mode="manual",
+        targets=[],
+        port=8787,
+        host="127.0.0.1",
+        backend="anthropic",
+    )
+    assert runtime_status(python_manifest) == "running"
+    assert not os_kill_called, "runtime_status must not call os.kill directly"
 
 
 # ---------------------------------------------------------------------------

@@ -1,5 +1,25 @@
+import os
 import subprocess as _sp
 from typing import Any
+
+
+def pid_alive(pid: int) -> bool:
+    """Return True if *pid* names a live process (non-destructive)."""
+    if pid <= 0:
+        return False
+    try:
+        import psutil  # type: ignore[import-untyped]  # optional dep
+
+        return bool(psutil.pid_exists(pid))
+    except Exception:
+        pass
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except (ProcessLookupError, OSError, SystemError):
+        return False
+    return True
 
 
 def run(*args: Any, **kwargs: Any) -> _sp.CompletedProcess:

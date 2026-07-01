@@ -13,7 +13,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, cast
 
-from headroom._subprocess import run
+from headroom._subprocess import pid_alive, run
 
 from .health import probe_ready
 from .models import DeploymentManifest, InstallPreset, RuntimeKind
@@ -354,8 +354,6 @@ def runtime_status(manifest: DeploymentManifest) -> str:
     pid = _read_pid(manifest.profile)
     if pid is None:
         return "stopped"
-    try:
-        os.kill(pid, 0)
-    except (OSError, SystemError):
+    if not pid_alive(pid):
         return "stopped"
     return "running"
