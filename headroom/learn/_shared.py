@@ -25,6 +25,7 @@ def claude_config_dir() -> Path:
     base = os.environ.get("CLAUDE_CONFIG_DIR")
     return Path(base) if base else Path.home() / ".claude"
 
+
 # =============================================================================
 # Error Classification
 # =============================================================================
