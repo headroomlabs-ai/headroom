@@ -24,6 +24,11 @@ from headroom.proxy.ws_session_registry import WebSocketSessionRegistry
 # ---------------------------------------------------------------------------
 
 
+class _TokenCounter:
+    def count_text(self, text: str) -> int:
+        return len(text.split())
+
+
 class _DummyMetrics:
     def __init__(self) -> None:
         self.active_ws_sessions = 0
@@ -73,7 +78,10 @@ class _DummyOpenAIHandler(OpenAIHandlerMixin):
             connect_timeout_seconds=10,
         )
         self.usage_reporter = None
-        self.openai_provider = SimpleNamespace(get_context_limit=lambda model: 128_000)
+        self.openai_provider = SimpleNamespace(
+            get_context_limit=lambda model: 128_000,
+            get_token_counter=lambda model: _TokenCounter(),
+        )
         self.openai_pipeline = SimpleNamespace(apply=MagicMock())
         self.anthropic_backend = None
         self.cost_tracker = None
@@ -300,6 +308,148 @@ def _codex_lite_headers(*, chatgpt: bool) -> dict[str, str]:
     return headers
 
 
+@pytest.mark.asyncio
+async def test_ws_first_frame_output_shaper_rewrites_without_compression(monkeypatch):
+    monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")
+    monkeypatch.setenv("HEADROOM_VERBOSITY_LEVEL", "2")
+    monkeypatch.delenv("HEADROOM_OUTPUT_HOLDOUT", raising=False)
+    upstream_events = [
+        json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
+        json.dumps(
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "r_1",
+                    "usage": {"input_tokens": 10, "output_tokens": 1},
+                },
+            }
+        ),
+    ]
+    upstream = _FakeUpstream(upstream_events)
+    fake_ws_mod = _make_fake_websockets_module(upstream)
+    client_ws = _FakeWebSocket(frames=[_first_frame()])
+    handler = _DummyOpenAIHandler()
+    handler.config.optimize = False
+    outcomes = []
+
+    async def _record_request_outcome(outcome):
+        outcomes.append(outcome)
+
+    handler._record_request_outcome = _record_request_outcome
+
+    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    sent = json.loads(upstream.sent[0])
+    payload = sent["response"]
+    assert "<headroom_output_shaping>" in payload["instructions"]
+    assert payload["text"]["verbosity"] == "low"
+    assert any(
+        t == "output_shaper:verbosity:L2"
+        for t in outcomes[-1].transforms_applied
+    )
+
+
+@pytest.mark.asyncio
+async def test_ws_output_shaper_stratum_uses_frame_input_tokens(monkeypatch):
+    monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")
+    monkeypatch.setenv("HEADROOM_VERBOSITY_LEVEL", "2")
+    long_input = " ".join(f"word{i}" for i in range(2500))
+    first_frame = json.dumps(
+        {
+            "type": "response.create",
+            "response": {"model": "gpt-5.4", "input": long_input},
+        }
+    )
+    upstream_events = [
+        json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
+        json.dumps(
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "r_1",
+                    "usage": {"input_tokens": 3000, "output_tokens": 1},
+                },
+            }
+        ),
+    ]
+    upstream = _FakeUpstream(upstream_events)
+    fake_ws_mod = _make_fake_websockets_module(upstream)
+    client_ws = _FakeWebSocket(frames=[first_frame])
+    handler = _DummyOpenAIHandler()
+    outcomes = []
+
+    async def _record_request_outcome(outcome):
+        outcomes.append(outcome)
+
+    handler._record_request_outcome = _record_request_outcome
+
+    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    transforms = outcomes[-1].transforms_applied
+    assert any(t.startswith("output_shaper:stratum:gpt|new_user_ask|s|") for t in transforms)
+    assert not any(t.startswith("output_shaper:stratum:gpt|new_user_ask|xs|") for t in transforms)
+
+
+@pytest.mark.asyncio
+async def test_ws_output_shaper_respects_bypass(monkeypatch):
+    monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")
+    upstream_events = [
+        json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
+        json.dumps({"type": "response.completed", "response": {"id": "r_1"}}),
+    ]
+    upstream = _FakeUpstream(upstream_events)
+    fake_ws_mod = _make_fake_websockets_module(upstream)
+    first = _first_frame()
+    client_ws = _FakeWebSocket(frames=[first])
+    client_ws.headers = {
+        "authorization": "Bearer test",
+        "x-headroom-bypass": "true",
+    }
+    handler = _DummyOpenAIHandler()
+
+    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    assert upstream.sent[0] == first
+
+
+@pytest.mark.asyncio
+async def test_ws_output_shaper_holdout_labels_without_rewrite(monkeypatch):
+    monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")
+    monkeypatch.setenv("HEADROOM_OUTPUT_HOLDOUT", "1")
+    upstream_events = [
+        json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
+        json.dumps(
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "r_1",
+                    "usage": {"input_tokens": 10, "output_tokens": 1},
+                },
+            }
+        ),
+    ]
+    upstream = _FakeUpstream(upstream_events)
+    fake_ws_mod = _make_fake_websockets_module(upstream)
+    first = _first_frame()
+    client_ws = _FakeWebSocket(frames=[first])
+    handler = _DummyOpenAIHandler()
+    outcomes = []
+
+    async def _record_request_outcome(outcome):
+        outcomes.append(outcome)
+
+    handler._record_request_outcome = _record_request_outcome
+
+    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    assert upstream.sent[0] == first
+    transforms = outcomes[-1].transforms_applied
+    assert any(t.startswith("output_shaper:control:") for t in transforms)
+    assert not any(t == "output_shaper:verbosity:L2" for t in transforms)
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------

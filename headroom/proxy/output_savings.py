@@ -42,7 +42,7 @@ import hashlib
 import json
 import math
 from dataclasses import asdict, dataclass, field
-from typing import Any
+from typing import Any, cast
 
 # Coarse input-token buckets. Coarse on purpose: too many strata make
 # per-stratum baselines sparse and noisy. Boundaries in tokens.
@@ -97,6 +97,50 @@ def stratum_key(
     )
 
 
+def _unwrap_response_create_body(body: dict[str, Any]) -> dict[str, Any]:
+    response = body.get("response")
+    if body.get("type") == "response.create" and isinstance(response, dict):
+        return cast("dict[str, Any]", response)
+    return body
+
+
+def _stable_response_identifier(body: dict[str, Any]) -> str:
+    def _string_value(value: Any) -> str:
+        if isinstance(value, str):
+            return value
+        if isinstance(value, dict):
+            for key in ("id", "conversation_id", "session_id", "thread_id"):
+                nested = value.get(key)
+                if isinstance(nested, str) and nested:
+                    return nested
+        return ""
+
+    for key in ("conversation", "conversation_id", "session_id", "thread_id"):
+        value = _string_value(body.get(key))
+        if value and value.lower() != "auto":
+            return f"{key}:{value}"
+
+    for container_key in ("client_metadata", "metadata"):
+        container = body.get(container_key)
+        if not isinstance(container, dict):
+            continue
+        for key in (
+            "conversation_id",
+            "conversation_key",
+            "session_id",
+            "thread_id",
+            "codex_session_id",
+        ):
+            value = _string_value(container.get(key))
+            if value and value.lower() != "auto":
+                return f"{container_key}.{key}:{value}"
+
+    instructions = body.get("instructions")
+    if isinstance(instructions, str) and instructions:
+        return f"instructions:{instructions[:512]}"
+    return ""
+
+
 def conversation_key_from_body(body: dict[str, Any]) -> str:
     """Derive a conversation-stable key for holdout assignment.
 
@@ -105,6 +149,7 @@ def conversation_key_from_body(body: dict[str, Any]) -> str:
     message's text. The first user turn is immutable for a conversation's
     lifetime, which is exactly the stability we need.
     """
+    body = _unwrap_response_create_body(body)
     model = str(body.get("model", ""))
     seed = model
     for msg in body.get("messages", []):
@@ -118,6 +163,12 @@ def conversation_key_from_body(body: dict[str, Any]) -> str:
                         seed += "\x00" + str(block.get("text", ""))[:512]
                         break
             break
+    if "input" in body:
+        stable_response_key = _stable_response_identifier(body)
+        if stable_response_key:
+            seed += "\x00" + stable_response_key
+        elif not body.get("messages"):
+            seed += "\x00responses"
     return hashlib.sha256(seed.encode("utf-8", "ignore")).hexdigest()
 
 

@@ -89,6 +89,71 @@ class TestArmAssignment:
         b = {"model": "m", "messages": [{"role": "user", "content": "task B"}]}
         assert conversation_key_from_body(a) != conversation_key_from_body(b)
 
+    def test_conversation_key_uses_responses_stable_metadata(self):
+        a = {
+            "model": "gpt-5",
+            "client_metadata": {"session_id": "session-1"},
+            "input": "task A",
+        }
+        b = {
+            "model": "gpt-5",
+            "client_metadata": {"session_id": "session-2"},
+            "input": "task A",
+        }
+        assert conversation_key_from_body(a) != conversation_key_from_body(b)
+
+    def test_conversation_key_does_not_use_responses_delta_text(self):
+        user_turn = {
+            "model": "gpt-5",
+            "instructions": "same session instructions",
+            "input": "task A",
+        }
+        tool_turn = {
+            "model": "gpt-5",
+            "instructions": "same session instructions",
+            "input": [
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "ok",
+                }
+            ],
+        }
+        assert conversation_key_from_body(user_turn) == conversation_key_from_body(tool_turn)
+
+    def test_conversation_key_unwraps_ws_response_create(self):
+        http_body = {"model": "gpt-5", "input": "build a cache"}
+        ws_body = {
+            "type": "response.create",
+            "response": {"model": "gpt-5", "input": "build a cache"},
+        }
+        assert conversation_key_from_body(http_body) == conversation_key_from_body(ws_body)
+
+    def test_conversation_key_uses_responses_conversation_id(self):
+        a = {
+            "model": "gpt-5",
+            "conversation": "conv_1",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "task A"}],
+                }
+            ],
+        }
+        b = {
+            "model": "gpt-5",
+            "conversation": "conv_2",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "task B"}],
+                }
+            ],
+        }
+        assert conversation_key_from_body(a) != conversation_key_from_body(b)
+
 
 # ---------------------------------------------------------------------------
 # baseline model

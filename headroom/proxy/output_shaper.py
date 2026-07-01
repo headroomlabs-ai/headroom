@@ -49,6 +49,17 @@ LEGACY_THINKING_FLOOR = 1024
 # Ordering for output_config.effort values. Unknown values are left alone.
 _EFFORT_RANK = {"low": 0, "medium": 1, "high": 2, "xhigh": 3, "max": 4}
 
+_TEXT_VERBOSITY_RANK = {"low": 0, "medium": 1, "high": 2}
+
+_OPENAI_RESPONSES_OUTPUT_ITEM_TYPES = frozenset(
+    {
+        "custom_tool_call_output",
+        "function_call_output",
+        "local_shell_call_output",
+        "apply_patch_call_output",
+    }
+)
+
 # Sentinel prefix marks the steering block so application is idempotent and
 # the block is recognizable in logs/diffs.
 _STEERING_SENTINEL = "<headroom_output_shaping>"
@@ -250,6 +261,22 @@ def steering_text(level: int) -> str | None:
     return f"{_STEERING_SENTINEL}\n{text}\n{_STEERING_SUFFIX}"
 
 
+def _replace_or_append_steering_block(existing: str, block: str) -> tuple[str, bool]:
+    """Replace an existing steering block in text, or append one at the tail."""
+    start = existing.find(_STEERING_SENTINEL)
+    if start >= 0:
+        end = existing.find(_STEERING_SUFFIX, start)
+        end = len(existing) if end < 0 else end + len(_STEERING_SUFFIX)
+        prefix = existing[:start].rstrip()
+        suffix = existing[end:].lstrip("\n")
+        parts = [part for part in (prefix, block, suffix) if part]
+        updated = "\n\n".join(parts)
+        return updated, updated != existing
+
+    updated = f"{existing.rstrip()}\n\n{block}" if existing.strip() else block
+    return updated, updated != existing
+
+
 def apply_verbosity_steering(body: dict[str, Any], level: int) -> bool:
     """Append the steering block to the tail of the system prompt.
 
@@ -323,6 +350,181 @@ def route_effort(
             labels.append(f"output_shaper:thinking_budget:{budget}->{LEGACY_THINKING_FLOOR}")
 
     return labels
+
+
+def _responses_part_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        texts: list[str] = []
+        for part in value:
+            if isinstance(part, str):
+                texts.append(part)
+            elif isinstance(part, dict) and isinstance(part.get("text"), str):
+                texts.append(part["text"])
+        return "\n".join(text for text in texts if text)
+    return ""
+
+
+def _responses_user_signal(item: dict[str, Any]) -> bool:
+    item_type = item.get("type")
+    role = item.get("role")
+    if role == "user":
+        content = item.get("content")
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") in {
+                    "input_file",
+                    "input_image",
+                }:
+                    return True
+        text = _responses_part_text(content)
+        return bool(text.strip())
+    if item_type == "input_text":
+        text = _responses_part_text(item.get("text"))
+        return bool(text.strip())
+    if item_type == "input_image":
+        return True
+    return False
+
+
+def classify_openai_responses_input(input_data: Any) -> TurnKind:
+    """Classify OpenAI Responses ``input`` without content heuristics."""
+    if isinstance(input_data, str):
+        return TurnKind.NEW_USER_ASK if input_data.strip() else TurnKind.UNKNOWN
+    if not isinstance(input_data, list) or not input_data:
+        return TurnKind.UNKNOWN
+
+    saw_tool_output = False
+    saw_unknown = False
+    for item in input_data:
+        if not isinstance(item, dict):
+            saw_unknown = True
+            continue
+        item_type = item.get("type")
+        if item_type in _OPENAI_RESPONSES_OUTPUT_ITEM_TYPES:
+            saw_tool_output = True
+            continue
+        if _responses_user_signal(item):
+            return TurnKind.NEW_USER_ASK
+        if item_type in {"message", "function_call", "reasoning"}:
+            continue
+        saw_unknown = True
+
+    if saw_tool_output and not saw_unknown:
+        return TurnKind.MECHANICAL_CONTINUATION
+    return TurnKind.UNKNOWN
+
+
+def apply_openai_responses_verbosity_steering(
+    body: dict[str, Any],
+    level: int,
+) -> bool:
+    """Append or replace steering in OpenAI Responses ``instructions``."""
+    text = steering_text(level)
+    if text is None:
+        return False
+
+    instructions = body.get("instructions")
+    if instructions is None:
+        body["instructions"] = text
+        return True
+    if not isinstance(instructions, str):
+        return False
+
+    updated, changed = _replace_or_append_steering_block(instructions, text)
+    if changed:
+        body["instructions"] = updated
+    return changed
+
+
+def route_openai_reasoning_effort(
+    body: dict[str, Any],
+    kind: TurnKind,
+    settings: OutputShaperSettings,
+) -> list[str]:
+    """Lower explicitly-present OpenAI reasoning effort on mechanical turns."""
+    if kind is not TurnKind.MECHANICAL_CONTINUATION:
+        return []
+
+    reasoning = body.get("reasoning")
+    if not isinstance(reasoning, dict):
+        return []
+    effort = reasoning.get("effort")
+    target = settings.mechanical_effort
+    if (
+        isinstance(effort, str)
+        and effort in _EFFORT_RANK
+        and target in _EFFORT_RANK
+        and _EFFORT_RANK[effort] > _EFFORT_RANK[target]
+    ):
+        reasoning["effort"] = target
+        return [f"output_shaper:reasoning_effort:{effort}->{target}"]
+    return []
+
+
+def route_openai_text_verbosity(body: dict[str, Any]) -> list[str]:
+    """Set or lower OpenAI ``text.verbosity`` conservatively."""
+    model = str(body.get("model") or "").lower()
+    text_config = body.get("text")
+    can_create = model.startswith("gpt-5")
+    if text_config is None:
+        if not can_create:
+            return []
+        body["text"] = {"verbosity": "low"}
+        return ["output_shaper:text_verbosity:unset->low"]
+    if not isinstance(text_config, dict):
+        return []
+
+    verbosity = text_config.get("verbosity")
+    if verbosity is None:
+        if not can_create:
+            return []
+        text_config["verbosity"] = "low"
+        return ["output_shaper:text_verbosity:unset->low"]
+    if (
+        isinstance(verbosity, str)
+        and verbosity in _TEXT_VERBOSITY_RANK
+        and _TEXT_VERBOSITY_RANK[verbosity] > _TEXT_VERBOSITY_RANK["low"]
+    ):
+        text_config["verbosity"] = "low"
+        return [f"output_shaper:text_verbosity:{verbosity}->low"]
+    return []
+
+
+def shape_openai_responses_request(
+    body: dict[str, Any],
+    settings: OutputShaperSettings | None = None,
+    level_override: int | None = None,
+) -> ShapeResult:
+    """Apply OpenAI Responses output-shaping levers in place."""
+    if settings is None:
+        settings = OutputShaperSettings.from_env()
+    result = ShapeResult()
+    if not settings.enabled:
+        return result
+
+    assert result.labels is not None  # __post_init__ guarantees
+
+    level = settings.verbosity_level if level_override is None else level_override
+    if level > 0 and apply_openai_responses_verbosity_steering(body, level):
+        result.changed = True
+        result.labels.append(f"output_shaper:verbosity:L{level}")
+
+    kind = classify_openai_responses_input(body.get("input"))
+    if settings.effort_router_enabled:
+        labels = route_openai_reasoning_effort(body, kind, settings)
+        if labels:
+            result.changed = True
+            result.labels.extend(labels)
+            logger.debug("OpenAIOutputShaper: turn=%s mutations=%s", kind.value, labels)
+
+    labels = route_openai_text_verbosity(body)
+    if labels:
+        result.changed = True
+        result.labels.extend(labels)
+
+    return result
 
 
 def shape_request(
