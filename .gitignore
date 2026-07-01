@@ -32,6 +32,7 @@ scripts/*
 !scripts/audit_wheel_glibc_symbols.py
 !scripts/replay_codex_ws_load.py
 !scripts/export_kompress_v2_onnx.py
+!scripts/record_kompress_fixtures.py
 
 # Rust / Cargo build artifacts
 /target/

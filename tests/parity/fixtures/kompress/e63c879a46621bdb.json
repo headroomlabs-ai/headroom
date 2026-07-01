@@ -1,0 +1,22 @@
+{
+  "config": {
+    "chunk_words": 350,
+    "device": "auto",
+    "enable_ccr": false,
+    "model_id": "chopratejas/kompress-v2-base",
+    "score_threshold": 0.5
+  },
+  "input": "Meanwhile the diligent engineer reviews the compression output carefully to ensure the most salient tokens survive while redundant filler is discarded without losing the essential meaning. Meanwhile the diligent engineer reviews the compression output carefully to ensure the most salient tokens survive while redundant filler is discarded without losing the essential meaning. ",
+  "input_sha256": "e63c879a46621bdb85e0063a716c136f8b11c05433ac315c86c9e536894ed004",
+  "output": {
+    "cache_key": null,
+    "compressed": "Meanwhile diligent engineer reviews compression output carefully ensure most salient tokens survive while redundant filler is discarded without losing essential meaning. Meanwhile diligent engineer reviews compression output carefully ensure most salient tokens survive while redundant filler is discarded without losing essential meaning.",
+    "compressed_tokens": 42,
+    "compression_ratio": 0.8076923076923077,
+    "model_used": "chopratejas/kompress-v2-base",
+    "original": "Meanwhile the diligent engineer reviews the compression output carefully to ensure the most salient tokens survive while redundant filler is discarded without losing the essential meaning. Meanwhile the diligent engineer reviews the compression output carefully to ensure the most salient tokens survive while redundant filler is discarded without losing the essential meaning. ",
+    "original_tokens": 52
+  },
+  "recorded_at": "2026-06-18T23:18:24.364083+00:00",
+  "transform": "kompress"
+}

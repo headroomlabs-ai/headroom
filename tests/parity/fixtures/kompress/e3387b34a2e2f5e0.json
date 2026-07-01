@@ -1,0 +1,22 @@
+{
+  "config": {
+    "chunk_words": 350,
+    "device": "auto",
+    "enable_ccr": false,
+    "model_id": "chopratejas/kompress-v2-base",
+    "score_threshold": 0.5
+  },
+  "input": "tiny input",
+  "input_sha256": "e3387b34a2e2f5e0bef68eb40e6696537a8573863aeb81c67827a15543b4515a",
+  "output": {
+    "cache_key": null,
+    "compressed": "tiny input",
+    "compressed_tokens": 2,
+    "compression_ratio": 1.0,
+    "model_used": "chopratejas/kompress-v2-base",
+    "original": "tiny input",
+    "original_tokens": 2
+  },
+  "recorded_at": "2026-06-18T23:18:19.224283+00:00",
+  "transform": "kompress"
+}

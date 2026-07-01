@@ -1868,6 +1868,7 @@ dependencies = [
  "http 1.4.2",
  "magika",
  "md-5",
+ "ort",
  "proptest",
  "rayon",
  "redis",

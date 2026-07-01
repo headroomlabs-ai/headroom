@@ -121,6 +121,15 @@ redis = { version = "0.27", optional = true, default-features = false }
 # classifier live with the other Phase B/F policy primitives without
 # cycling through the proxy crate. Tiny crate (no I/O, just types).
 http = "1"
+# `ort` (ONNX Runtime) — direct dependency for the Kompress transform's
+# inference session (`ort::session::Session` / `ort::value::Tensor`).
+# Pinned to the exact lock entry so Cargo unifies to the single ORT
+# instance already in the tree via fastembed/magika (no second runtime,
+# no extra binary download). `default-features = false` keeps ort from
+# re-triggering its own binary-download logic — fastembed already vendors
+# the runtime. EP selection (CPU/OpenVINO/CUDA) is libloading-based at
+# runtime; there are no compile-time EP feature flags.
+ort = { version = "=2.0.0-rc.12", default-features = false }
 
 [target.'cfg(not(windows))'.dependencies]
 fastembed = { version = "5", default-features = false, features = [
