@@ -21,6 +21,7 @@ import logging
 import os
 import re
 import threading
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -97,6 +98,24 @@ KOMPRESS_MAX_CONCURRENT_ENV = "HEADROOM_KOMPRESS_MAX_CONCURRENT"
 KOMPRESS_EXECUTION_SEMAPHORE_WAIT_MS_ENV = "HEADROOM_KOMPRESS_EXECUTION_TIMEOUT_MS"
 KOMPRESS_EXECUTION_SEMAPHORE_WAIT_MS_DEFAULT = 25
 KOMPRESS_BATCH_SIZE_ENV = "HEADROOM_KOMPRESS_BATCH_SIZE"
+# Must-keep patterns: tokens that MUST survive compression regardless of model
+# score. Applied as a sliding-window (1-3 word) safety net after ML inference.
+# Critical for compiler flags (-O2, -Wall), hex addresses (0xDEAD), file paths
+# (/var/log), env vars (HEADROOM_FOO), CamelCase identifiers, and version-like
+# dotted names — all of which the ModernBERT subword tokenizer splits across
+# multiple subword tokens, causing the single-token ML classifier to miss them.
+# See ultrawhale eval_domain_routing.py for the matching calibration harness.
+_MUST_KEEP_RE = re.compile(
+    r"\b0x[0-9A-Fa-f]+\b"
+    r"|(?<![\w.])\d+(?:\.\d+)?(?![\w.])"
+    r"|[A-Z_]{2,}"
+    r"|[a-z_][a-z0-9_]*\.[a-z0-9_]+"
+    r"|/[a-z0-9/._-]{2,}"
+    r"|\.[a-z]{2,4}\b"
+    r"|--?[a-zA-Z][\w-]*"
+    r"|\b[A-Z][a-z]+[A-Z]\w*"
+)
+
 
 KompressBackend = Literal["auto", "onnx", "onnx_cpu", "onnx_coreml", "pytorch", "pytorch_mps"]
 
@@ -862,6 +881,7 @@ class KompressConfig:
 
     device: str = "auto"
     enable_ccr: bool = True
+    enable_must_keep_override: bool = True
     model_id: str = HF_MODEL_ID
     chunk_words: int = 350
     score_threshold: float = 0.5
@@ -1120,6 +1140,23 @@ class KompressCompressor(Transform):
                         inference_ms,
                     )
                 return self._passthrough(content, n_words)
+
+            # Must-keep safety net: force-keep words matching critical patterns
+            # (compiler flags, hex addrs, paths, env vars) that the subword
+            # tokenizer splits and the single-token classifier misses.  Sliding
+            # window of 1-3 words catches flags like `-O2` split to ["-", "O2"].
+            if self.config.enable_must_keep_override:
+                for i in range(n_words):
+                    if i in kept_ids:
+                        continue
+                    for w in (1, 2, 3):
+                        if i + w > n_words:
+                            break
+                        window = " ".join(words[i : i + w])
+                        if _MUST_KEEP_RE.search(window):
+                            for j in range(i, i + w):
+                                kept_ids.add(j)
+                            break
 
             compressed_words = [words[w] for w in sorted(kept_ids) if w < n_words]
             compressed = " ".join(compressed_words)
