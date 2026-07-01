@@ -24,6 +24,7 @@
     "failure-learning",
     "---Proxy Server---",
     "proxy",
+    "local-llm-prefill",
     "---Integrations---",
     "vercel-ai-sdk",
     "openai-sdk",
