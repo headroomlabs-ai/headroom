@@ -30,6 +30,7 @@ import tempfile
 import time
 import urllib.parse
 from collections.abc import Callable
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, cast
 
@@ -1355,6 +1356,27 @@ def _codex_home_dir() -> Path:
     if codex_home:
         return Path(codex_home).expanduser()
     return Path.home() / ".codex"
+
+
+@contextmanager
+def _codex_session_home_overlay() -> Any:
+    """Seed a temporary Codex home from the active home and point the process at it."""
+    source_home = _codex_home_dir()
+    original_codex_home = os.environ.get("CODEX_HOME")
+
+    with tempfile.TemporaryDirectory(prefix="headroom-codex-home-") as tmp_dir:
+        session_home = Path(tmp_dir)
+        if source_home.exists():
+            shutil.copytree(source_home, session_home, dirs_exist_ok=True)
+
+        os.environ["CODEX_HOME"] = str(session_home)
+        try:
+            yield session_home
+        finally:
+            if original_codex_home is None:
+                os.environ.pop("CODEX_HOME", None)
+            else:
+                os.environ["CODEX_HOME"] = original_codex_home
 
 
 def _codex_config_paths() -> tuple[Path, Path]:
@@ -4212,6 +4234,200 @@ def unwrap_copilot(port: int, no_stop_proxy: bool) -> None:
 # =============================================================================
 
 
+def _prepare_codex_wrap_state(
+    *,
+    port: int,
+    no_rtk: bool,
+    no_mcp: bool,
+    no_tokensave: bool,
+    serena: bool,
+    no_serena: bool,
+    memory: bool,
+    verbose: bool,
+    rtk_home: Path | None = None,
+) -> None:
+    """Prepare the active Codex home for a wrap or prepare-only invocation."""
+    # Snapshot Codex config.toml BEFORE any wrap-time mutation so
+    # `headroom unwrap codex` can restore the user's pre-wrap state
+    # byte-for-byte. The snapshot is a no-op if the backup already exists
+    # or if the file already has Headroom markers, so this is safe to
+    # call repeatedly. Crucially this must run before MCP install, which
+    # writes its marker block to the same file.
+    _codex_config_file, _codex_backup_file = _codex_config_paths()
+    _snapshot_codex_config_if_unwrapped(_codex_config_file, _codex_backup_file)
+
+    # Setup CLI context tool for Codex.
+    if not no_rtk:
+        if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
+            click.echo("  Setting up lean-ctx for Codex...")
+            _setup_lean_ctx_agent("codex", verbose=verbose)
+        else:
+            click.echo("  Setting up rtk for Codex...")
+            rtk_path = _ensure_rtk_binary(verbose=verbose)
+            if rtk_path:
+                # Keep RTK guidance local to the user's Codex configuration.
+                global_agents = (rtk_home or _codex_home_dir()) / "AGENTS.md"
+                _inject_rtk_instructions(global_agents, verbose=verbose)
+
+    # Register headroom MCP server in Codex config.toml so Codex can
+    # call headroom_retrieve on compression markers from the proxy.
+    if not no_mcp:
+        from headroom.mcp_registry import CodexRegistrar
+
+        # Codex starts a long-lived local MCP subprocess from config.toml.
+        # If a previous wrap used another port, retrieval can silently point
+        # at the wrong proxy while model traffic uses the right one.
+        _setup_headroom_mcp(CodexRegistrar(), port, verbose=verbose, force=True)
+    elif verbose:
+        click.echo("  Skipping MCP retrieve tool (--no-mcp)")
+
+    # Coding-task compressor: tokensave primary, Serena backup. Codex starts
+    # long-lived MCP subprocesses from config.toml, so force re-registration.
+    from headroom.mcp_registry import CodexRegistrar
+
+    _setup_coding_compressor(
+        CodexRegistrar(),
+        serena_context="codex",
+        serena=serena,
+        no_serena=no_serena,
+        no_tokensave=no_tokensave,
+        verbose=verbose,
+        force=True,
+    )
+
+    # Setup memory MCP server for Codex (native tool integration)
+    if memory:
+        click.echo("  Setting up memory for Codex...")
+        mem_dir = Path.cwd() / ".headroom"
+        mem_dir.mkdir(parents=True, exist_ok=True)
+        db_path = str(mem_dir / "memory.db")
+        mem_user = os.environ.get("USER", os.environ.get("USERNAME", "default"))
+
+        # Register MCP server in Codex config
+        _inject_memory_mcp_config(mem_user)
+
+        # Inject memory guidance into project AGENTS.md
+        agents_md = Path.cwd() / "AGENTS.md"
+        _inject_memory_agents_md(agents_md)
+
+        # Sync Claude's memories → DB so MCP search finds them
+        try:
+            import asyncio
+
+            from headroom.memory.sync import _build_sync_backend, sync_import
+            from headroom.memory.sync_adapters.claude_code import (
+                ClaudeCodeAdapter,
+                get_claude_memory_dir,
+            )
+
+            claude_memory_dir = get_claude_memory_dir()
+
+            async def _import_claude_memories() -> int:
+                backend = _build_sync_backend(db_path)
+                await backend._ensure_initialized()
+                adapter = ClaudeCodeAdapter(claude_memory_dir)
+                count = await sync_import(backend, adapter, mem_user)
+                await backend.close()
+                return count
+
+            imported = asyncio.run(_import_claude_memories())
+            if imported:
+                click.echo(f"  Memory: imported {imported} memories from Claude")
+        except Exception as e:
+            click.echo(f"  Warning: Claude memory import failed: {e}")
+
+    # Inject Headroom provider into Codex config so WebSocket traffic also
+    # routes through the proxy.  Codex ignores OPENAI_BASE_URL for its WS
+    # transport unless a custom provider declares supports_websockets = true.
+    # NOTE: this must run BEFORE _inject_memory_mcp_config because it rewrites
+    # the config file.  Re-inject MCP config after if memory is enabled.
+    _inject_codex_provider_config(port)
+    if memory:
+        _inject_memory_mcp_config(os.environ.get("USER", os.environ.get("USERNAME", "default")))
+
+
+def _run_codex_wrap(
+    *,
+    port: int,
+    no_rtk: bool,
+    no_mcp: bool,
+    no_tokensave: bool,
+    serena: bool,
+    no_serena: bool,
+    code_graph: bool,
+    no_proxy: bool,
+    learn: bool,
+    memory: bool,
+    backend: str | None,
+    anyllm_provider: str | None,
+    region: str | None,
+    verbose: bool,
+    prepare_only: bool,
+    codex_args: tuple,
+) -> None:
+    """Execute the Codex wrap flow with the session overlay when launching."""
+    if prepare_only:
+        _prepare_codex_wrap_state(
+            port=port,
+            no_rtk=no_rtk,
+            no_mcp=no_mcp,
+            no_tokensave=no_tokensave,
+            serena=serena,
+            no_serena=no_serena,
+            memory=memory,
+            verbose=verbose,
+        )
+        return
+
+    codex_bin = shutil.which("codex")
+    if not codex_bin:
+        click.echo("Error: 'codex' not found in PATH.")
+        click.echo("Install Codex CLI: npm install -g @openai/codex")
+        raise SystemExit(1)
+
+    active_codex_home = _codex_home_dir()
+    with _codex_session_home_overlay() as session_codex_home:
+        _prepare_codex_wrap_state(
+            port=port,
+            no_rtk=no_rtk,
+            no_mcp=no_mcp,
+            no_tokensave=no_tokensave,
+            serena=serena,
+            no_serena=no_serena,
+            memory=memory,
+            verbose=verbose,
+            rtk_home=active_codex_home,
+        )
+
+        env, env_vars_display = _build_codex_launch_env(port, os.environ)
+
+        # Per-project savings attribution: the injected provider config maps the
+        # X-Headroom-Project header to HEADROOM_PROJECT via env_http_headers, so
+        # Codex sends it only when this var is set.  A user-set value wins.
+        _codex_project = _project_name_from_cwd()
+        if _codex_project and "HEADROOM_PROJECT" not in env:
+            env["HEADROOM_PROJECT"] = _codex_project
+
+        env["CODEX_HOME"] = str(session_codex_home)
+
+        _launch_tool(
+            binary=codex_bin,
+            args=codex_args,
+            env=env,
+            port=port,
+            no_proxy=no_proxy,
+            tool_label="CODEX",
+            env_vars_display=env_vars_display,
+            learn=learn,
+            memory=memory,
+            agent_type="codex",
+            code_graph=code_graph,
+            backend=backend,
+            anyllm_provider=anyllm_provider,
+            region=region,
+        )
+
+
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @click.option(
     "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
@@ -4305,138 +4521,23 @@ def codex(
         headroom wrap codex --port 9999             # Custom proxy port
         headroom wrap codex --backend anyllm --anyllm-provider groq
     """
-    # Snapshot Codex config.toml BEFORE any wrap-time mutation so
-    # `headroom unwrap codex` can restore the user's pre-wrap state
-    # byte-for-byte. The snapshot is a no-op if the backup already exists
-    # or if the file already has Headroom markers, so this is safe to
-    # call repeatedly. Crucially this must run before MCP install, which
-    # writes its marker block to the same file.
-    _codex_config_file, _codex_backup_file = _codex_config_paths()
-    _snapshot_codex_config_if_unwrapped(_codex_config_file, _codex_backup_file)
-
-    # Setup CLI context tool for Codex.
-    if not no_rtk:
-        if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
-            click.echo("  Setting up lean-ctx for Codex...")
-            _setup_lean_ctx_agent("codex", verbose=verbose)
-        else:
-            click.echo("  Setting up rtk for Codex...")
-            rtk_path = _ensure_rtk_binary(verbose=verbose)
-            if rtk_path:
-                # Keep RTK guidance local to the user's Codex configuration.
-                global_agents = _codex_home_dir() / "AGENTS.md"
-                _inject_rtk_instructions(global_agents, verbose=verbose)
-
-    # Register headroom MCP server in Codex config.toml so Codex can
-    # call headroom_retrieve on compression markers from the proxy.
-    if not no_mcp:
-        from headroom.mcp_registry import CodexRegistrar
-
-        # Codex starts a long-lived local MCP subprocess from config.toml.
-        # If a previous wrap used another port, retrieval can silently point
-        # at the wrong proxy while model traffic uses the right one.
-        _setup_headroom_mcp(CodexRegistrar(), port, verbose=verbose, force=True)
-    elif verbose:
-        click.echo("  Skipping MCP retrieve tool (--no-mcp)")
-
-    # Coding-task compressor: tokensave primary, Serena backup. Codex starts
-    # long-lived MCP subprocesses from config.toml, so force re-registration.
-    from headroom.mcp_registry import CodexRegistrar
-
-    _setup_coding_compressor(
-        CodexRegistrar(),
-        serena_context="codex",
+    return _run_codex_wrap(
+        port=port,
+        no_rtk=no_rtk,
+        no_mcp=no_mcp,
+        no_tokensave=no_tokensave,
         serena=serena,
         no_serena=no_serena,
-        no_tokensave=no_tokensave,
-        verbose=verbose,
-        force=True,
-    )
-
-    # Setup memory MCP server for Codex (native tool integration)
-    if memory:
-        click.echo("  Setting up memory for Codex...")
-        mem_dir = Path.cwd() / ".headroom"
-        mem_dir.mkdir(parents=True, exist_ok=True)
-        db_path = str(mem_dir / "memory.db")
-        mem_user = os.environ.get("USER", os.environ.get("USERNAME", "default"))
-
-        # Register MCP server in Codex config
-        _inject_memory_mcp_config(mem_user)
-
-        # Inject memory guidance into project AGENTS.md
-        agents_md = Path.cwd() / "AGENTS.md"
-        _inject_memory_agents_md(agents_md)
-
-        # Sync Claude's memories → DB so MCP search finds them
-        try:
-            import asyncio
-
-            from headroom.memory.sync import _build_sync_backend, sync_import
-            from headroom.memory.sync_adapters.claude_code import (
-                ClaudeCodeAdapter,
-                get_claude_memory_dir,
-            )
-
-            claude_memory_dir = get_claude_memory_dir()
-
-            async def _import_claude_memories() -> int:
-                backend = _build_sync_backend(db_path)
-                await backend._ensure_initialized()
-                adapter = ClaudeCodeAdapter(claude_memory_dir)
-                count = await sync_import(backend, adapter, mem_user)
-                await backend.close()
-                return count
-
-            imported = asyncio.run(_import_claude_memories())
-            if imported:
-                click.echo(f"  Memory: imported {imported} memories from Claude")
-        except Exception as e:
-            click.echo(f"  Warning: Claude memory import failed: {e}")
-
-    if prepare_only:
-        _inject_codex_provider_config(port)
-        return
-
-    codex_bin = shutil.which("codex")
-    if not codex_bin:
-        click.echo("Error: 'codex' not found in PATH.")
-        click.echo("Install Codex CLI: npm install -g @openai/codex")
-        raise SystemExit(1)
-
-    env, env_vars_display = _build_codex_launch_env(port, os.environ)
-
-    # Per-project savings attribution: the injected provider config maps the
-    # X-Headroom-Project header to HEADROOM_PROJECT via env_http_headers, so
-    # Codex sends it only when this var is set.  A user-set value wins.
-    _codex_project = _project_name_from_cwd()
-    if _codex_project and "HEADROOM_PROJECT" not in env:
-        env["HEADROOM_PROJECT"] = _codex_project
-
-    # Inject Headroom provider into Codex config so WebSocket traffic also
-    # routes through the proxy.  Codex ignores OPENAI_BASE_URL for its WS
-    # transport unless a custom provider declares supports_websockets = true.
-    # NOTE: this must run BEFORE _inject_memory_mcp_config because it rewrites
-    # the config file.  Re-inject MCP config after if memory is enabled.
-    _inject_codex_provider_config(port)
-    if memory:
-        _inject_memory_mcp_config(os.environ.get("USER", os.environ.get("USERNAME", "default")))
-
-    _launch_tool(
-        binary=codex_bin,
-        args=codex_args,
-        env=env,
-        port=port,
+        code_graph=code_graph,
         no_proxy=no_proxy,
-        tool_label="CODEX",
-        env_vars_display=env_vars_display,
         learn=learn,
         memory=memory,
-        agent_type="codex",
-        code_graph=code_graph,
         backend=backend,
         anyllm_provider=anyllm_provider,
         region=region,
+        verbose=verbose,
+        prepare_only=prepare_only,
+        codex_args=codex_args,
     )
 
 

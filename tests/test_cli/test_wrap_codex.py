@@ -855,6 +855,166 @@ def test_wrap_codex_prepare_only_respects_codex_home(
     assert not (tmp_path / ".codex" / "config.toml").exists()
 
 
+def test_codex_session_home_overlay_seeds_active_home_and_cleans_up(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_test_home(monkeypatch, tmp_path)
+    codex_home = tmp_path / "custom-codex-home"
+    codex_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    config_file = codex_home / "config.toml"
+    auth_file = codex_home / "auth.json"
+    original_config = '[profiles.default]\nmodel = "gpt-4o"\n'
+    original_auth = '{"auth_mode": "apikey"}'
+    config_file.write_text(original_config, encoding="utf-8")
+    auth_file.write_text(original_auth, encoding="utf-8")
+
+    with wrap_mod._codex_session_home_overlay() as session_home:
+        seeded_config = (session_home / "config.toml").read_text(encoding="utf-8")
+        seeded_auth = (session_home / "auth.json").read_text(encoding="utf-8")
+        assert seeded_config == original_config
+        assert seeded_auth == original_auth
+        (session_home / "config.toml").write_text('model_provider = "headroom"\n', encoding="utf-8")
+        assert config_file.read_text(encoding="utf-8") == original_config
+
+    assert not session_home.exists()
+    assert config_file.read_text(encoding="utf-8") == original_config
+    assert auth_file.read_text(encoding="utf-8") == original_auth
+
+
+def test_wrap_codex_launch_uses_session_scoped_codex_home(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_test_home(monkeypatch, tmp_path)
+    codex_home = tmp_path / "custom-codex-home"
+    codex_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    config_file = codex_home / "config.toml"
+    auth_file = codex_home / "auth.json"
+    original_config = '[profiles.default]\nmodel = "gpt-4o"\n'
+    original_auth = '{"auth_mode": "apikey"}'
+    config_file.write_text(original_config, encoding="utf-8")
+    auth_file.write_text(original_auth, encoding="utf-8")
+
+    launch_env: dict[str, str] = {}
+    session_home_seen: list[Path] = []
+
+    def fake_launch(
+        *,
+        binary: str,
+        args: tuple,
+        env: dict[str, str],
+        port: int,
+        no_proxy: bool,
+        tool_label: str,
+        env_vars_display: list[str],
+        **kwargs: object,
+    ) -> None:
+        del args, port, no_proxy, tool_label, env_vars_display, kwargs
+        assert binary == "/fake/codex"
+        launch_env.update(env)
+        session_home = Path(env["CODEX_HOME"])
+        session_home_seen.append(session_home)
+        assert session_home.exists()
+        seeded_config = (session_home / "config.toml").read_text(encoding="utf-8")
+        assert original_config in seeded_config
+        assert 'model_provider = "headroom"' in seeded_config
+        assert 'base_url = "http://127.0.0.1:8787/v1"' in seeded_config
+        assert "[mcp_servers.headroom]" in seeded_config
+        assert (session_home / "auth.json").read_text(encoding="utf-8") == original_auth
+
+    with patch("headroom.cli.wrap._ensure_rtk_binary", return_value=None):
+        with patch(
+            "headroom.cli.wrap.shutil.which",
+            side_effect=lambda cmd: "/fake/codex" if cmd == "codex" else None,
+        ):
+            with patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch):
+                result = runner.invoke(
+                    main,
+                    [
+                        "wrap",
+                        "codex",
+                        "--port",
+                        "8787",
+                        "--no-tokensave",
+                        "--no-serena",
+                    ],
+                )
+
+    assert result.exit_code == 0, result.output
+    assert session_home_seen
+    assert launch_env["CODEX_HOME"] == str(session_home_seen[0])
+    assert launch_env["OPENAI_BASE_URL"] == "http://127.0.0.1:8787/v1"
+    assert config_file.read_text(encoding="utf-8") == original_config
+    assert auth_file.read_text(encoding="utf-8") == original_auth
+    assert not session_home_seen[0].exists()
+
+
+def test_wrap_codex_launches_use_distinct_session_homes_per_port(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_test_home(monkeypatch, tmp_path)
+    codex_home = tmp_path / "custom-codex-home"
+    codex_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    config_file = codex_home / "config.toml"
+    auth_file = codex_home / "auth.json"
+    original_config = '[profiles.default]\nmodel = "gpt-4o"\n'
+    original_auth = '{"auth_mode": "apikey"}'
+    config_file.write_text(original_config, encoding="utf-8")
+    auth_file.write_text(original_auth, encoding="utf-8")
+
+    launch_records: list[tuple[int, Path, str]] = []
+
+    def fake_launch(
+        *,
+        binary: str,
+        args: tuple,
+        env: dict[str, str],
+        port: int,
+        no_proxy: bool,
+        tool_label: str,
+        env_vars_display: list[str],
+        **kwargs: object,
+    ) -> None:
+        del args, no_proxy, tool_label, env_vars_display, kwargs
+        assert binary == "/fake/codex"
+        session_home = Path(env["CODEX_HOME"])
+        assert session_home.exists()
+        launch_records.append(
+            (port, session_home, (session_home / "config.toml").read_text(encoding="utf-8"))
+        )
+
+    with patch("headroom.cli.wrap._ensure_rtk_binary", return_value=None):
+        with patch(
+            "headroom.cli.wrap.shutil.which",
+            side_effect=lambda cmd: "/fake/codex" if cmd == "codex" else None,
+        ):
+            with patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch):
+                first = runner.invoke(
+                    main,
+                    ["wrap", "codex", "--port", "8787", "--no-tokensave", "--no-serena"],
+                )
+                second = runner.invoke(
+                    main,
+                    ["wrap", "codex", "--port", "9898", "--no-tokensave", "--no-serena"],
+                )
+
+    assert first.exit_code == 0, first.output
+    assert second.exit_code == 0, second.output
+    assert len(launch_records) == 2
+    assert launch_records[0][1] != launch_records[1][1]
+    assert 'base_url = "http://127.0.0.1:8787/v1"' in launch_records[0][2]
+    assert 'base_url = "http://127.0.0.1:9898/v1"' in launch_records[1][2]
+    assert config_file.read_text(encoding="utf-8") == original_config
+    assert auth_file.read_text(encoding="utf-8") == original_auth
+    assert not launch_records[0][1].exists()
+    assert not launch_records[1][1].exists()
+
+
 def test_wrap_codex_injects_rtk_globally_without_changing_project_agents(
     runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -881,6 +1041,41 @@ def test_wrap_codex_injects_rtk_globally_without_changing_project_agents(
                 "--no-serena",
             ],
         )
+
+    assert result.exit_code == 0, result.output
+    assert project_agents.read_bytes() == original_bytes
+    global_agents = tmp_path / ".codex" / "AGENTS.md"
+    assert wrap_mod._RTK_MARKER.encode() in global_agents.read_bytes()
+
+
+def test_wrap_codex_launch_injects_rtk_globally_without_changing_project_agents(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_test_home(monkeypatch, tmp_path)
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    project_agents = project_dir / "AGENTS.md"
+    original = "# Project instructions\n\nUse the repository conventions.\n"
+    project_agents.write_text(original, encoding="utf-8")
+    original_bytes = project_agents.read_bytes()
+    monkeypatch.chdir(project_dir)
+
+    with patch("headroom.cli.wrap._ensure_rtk_binary", return_value=tmp_path / "rtk"):
+        with patch(
+            "headroom.cli.wrap.shutil.which",
+            side_effect=lambda cmd: "/fake/codex" if cmd == "codex" else None,
+        ):
+            with patch("headroom.cli.wrap._launch_tool"):
+                result = runner.invoke(
+                    main,
+                    [
+                        "wrap",
+                        "codex",
+                        "--no-mcp",
+                        "--no-serena",
+                        "--no-tokensave",
+                    ],
+                )
 
     assert result.exit_code == 0, result.output
     assert project_agents.read_bytes() == original_bytes
@@ -1330,16 +1525,14 @@ def test_wrap_codex_memory_launch_failure_unwrap_cleans_memory_only_config(
 
     assert wrap_result.exit_code == 1
     config_file = tmp_path / ".codex" / "config.toml"
-    content = config_file.read_text()
-    assert "[mcp_servers.headroom_memory]" in content
-    assert wrap_mod._CODEX_TOP_LEVEL_MARKER not in content
+    assert not config_file.exists()
+    assert not (tmp_path / ".codex" / "config.toml.headroom-backup").exists()
 
     with patch("headroom.cli.wrap._stop_local_proxy_for_unwrap") as stop_proxy:
         unwrap_result = runner.invoke(main, ["unwrap", "codex", "--no-stop-proxy"])
 
     assert unwrap_result.exit_code == 0, unwrap_result.output
-    assert not config_file.exists()
-    assert not (tmp_path / ".codex" / "config.toml.headroom-backup").exists()
+    assert "Nothing to undo" in unwrap_result.output
     stop_proxy.assert_not_called()
 
 

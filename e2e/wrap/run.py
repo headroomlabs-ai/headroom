@@ -230,6 +230,7 @@ def create_shims(shim_dir: Path) -> None:
                     "OPENAI_BASE_URL",
                     "OPENAI_API_BASE",
                     "ANTHROPIC_BASE_URL",
+                    "CODEX_HOME",
                     "OPENCODE_CONFIG_CONTENT",
                 )
                 if os.environ.get(key) is not None
@@ -286,6 +287,7 @@ def create_shims(shim_dir: Path) -> None:
                     "OPENAI_BASE_URL",
                     "OPENAI_API_BASE",
                     "ANTHROPIC_BASE_URL",
+                    "CODEX_HOME",
                     "OPENCODE_CONFIG_CONTENT",
                 )
                 if os.environ.get(key) is not None
@@ -349,6 +351,13 @@ def create_shims(shim_dir: Path) -> None:
             )
             record["headroom_model_count"] = (
                 by_model.get(model_name) if isinstance(by_model, dict) else None
+            )
+
+        codex_home = os.environ.get("CODEX_HOME")
+        if codex_home:
+            session_config = Path(codex_home) / "config.toml"
+            record["session_config"] = (
+                session_config.read_text(encoding="utf-8") if session_config.exists() else None
             )
 
         record["probes"] = probes
@@ -571,32 +580,50 @@ def verify_codex_wrap(
     )
 
     config_path = Path(base_env["HOME"]) / ".codex" / "config.toml"
-    assert_true(config_path.exists(), "Codex wrap should create ~/.codex/config.toml")
-    config = config_path.read_text(encoding="utf-8")
     assert_true(
-        f'openai_base_url = "http://127.0.0.1:{port}/v1"' in config,
-        "Codex wrap should inject openai_base_url for subscription routing",
-    )
-    assert_true(
-        f'base_url = "http://127.0.0.1:{port}/v1"' in config,
-        "Codex wrap should inject the headroom provider base_url",
-    )
-    assert_true(
-        'env_key = "OPENAI_API_KEY"' not in config,
-        "Codex wrap should preserve OAuth and never inject env_key",
-    )
-    # Bug 3 (#406): requires_openai_auth must be absent from headroom provider blocks.
-    assert_true(
-        "requires_openai_auth" not in config,
-        "Codex wrap must NOT inject requires_openai_auth into the headroom provider block",
-    )
-    assert_true(
-        "supports_websockets = true" in config, "Codex wrap missing 'supports_websockets = true'"
+        not config_path.exists(),
+        "Codex wrap should leave ~/.codex/config.toml untouched during normal launch",
     )
 
     entries = read_jsonl(log_dir / "codex.jsonl")
     assert_true(len(entries) > 0, "Codex shim should have been invoked")
     env_vars = entries[-1]["env"]
+    session_home = env_vars.get("CODEX_HOME")
+    assert_true(
+        isinstance(session_home, str) and session_home,
+        "Codex wrap should launch the child with a session-scoped CODEX_HOME",
+    )
+    assert_true(
+        Path(session_home) != config_path.parent,
+        "Codex wrap should not point the child at the real ~/.codex home",
+    )
+    config = entries[-1].get("session_config")
+    assert_true(
+        isinstance(config, str) and config,
+        "Codex wrap should capture the session-scoped config during launch",
+    )
+    assert_true(
+        f'openai_base_url = "http://127.0.0.1:{port}/v1"' in config,
+        "Codex wrap should inject openai_base_url into the session config",
+    )
+    assert_true(
+        f'base_url = "http://127.0.0.1:{port}/v1"' in config,
+        "Codex wrap should inject the headroom provider base_url into the session config",
+    )
+    assert_true(
+        'env_key = "OPENAI_API_KEY"' not in config,
+        "Codex wrap should preserve OAuth and never inject env_key into the session config",
+    )
+    # Bug 3 (#406): requires_openai_auth must be absent from headroom provider blocks.
+    assert_true(
+        "requires_openai_auth" not in config,
+        "Codex wrap must NOT inject requires_openai_auth into the session headroom provider block",
+    )
+    assert_true(
+        "supports_websockets = true" in config,
+        "Codex wrap missing 'supports_websockets = true' in the session config",
+    )
+
     assert_true(
         env_vars.get("OPENAI_BASE_URL") == f"http://127.0.0.1:{port}/v1",
         "Codex wrap should set OPENAI_BASE_URL",
