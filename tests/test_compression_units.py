@@ -35,8 +35,9 @@ def test_compression_unit_accepts_token_shrinking_replacement():
             text="alpha beta gamma delta epsilon",
             provider="openai",
             endpoint="responses",
-            role="tool",
-            item_type="local_shell_call_output",
+            role="assistant",
+            item_type="message",
+            metadata={"compress_assistant": "true"},
             min_bytes=1,
         ),
         router=Router("alpha beta"),
@@ -46,7 +47,91 @@ def test_compression_unit_accepts_token_shrinking_replacement():
     assert result.modified is True
     assert result.tokens_saved == 3
     assert result.compressed == "alpha beta"
-    assert "router:openai:responses:local_shell_call_output:kompress" in result.transforms_applied
+    assert "router:openai:responses:message:kompress" in result.transforms_applied
+
+
+def test_compression_unit_keeps_lossy_unmarked_tool_output_verbatim():
+    original = (
+        "src/app.py:12 render shell status panel\n"
+        "src/ui.py:44 draw health badge\n"
+        "src/theme.py:9 set accent color"
+    )
+    result = compress_unit_with_router(
+        CompressionUnit(
+            text=original,
+            provider="openai",
+            endpoint="responses",
+            role="tool",
+            item_type="local_shell_call_output",
+            min_bytes=1,
+        ),
+        router=Router("shell output looks organized and green"),
+        tokenizer=TokenCounter(),
+    )
+
+    assert result.modified is False
+    assert result.reason == "lossy_unrecoverable_tool_output"
+    assert result.original == original
+    assert result.compressed == original
+
+
+def test_compression_unit_accepts_lossy_tool_output_when_recoverable():
+    original = "alpha beta gamma delta epsilon zeta eta theta"
+    result = compress_unit_with_router(
+        CompressionUnit(
+            text=original,
+            provider="openai",
+            endpoint="responses",
+            role="tool",
+            item_type="local_shell_call_output",
+            min_bytes=1,
+        ),
+        router=Router("summary <<ccr:abc123>>"),
+        tokenizer=TokenCounter(),
+    )
+
+    assert result.modified is True
+    assert result.reason is None
+    assert result.compressed == "summary <<ccr:abc123>>"
+
+
+def test_compression_unit_still_compresses_non_shell_tool_output():
+    result = compress_unit_with_router(
+        CompressionUnit(
+            text="alpha beta gamma delta epsilon zeta eta theta",
+            provider="openai",
+            endpoint="responses",
+            role="tool",
+            item_type="function_call_output",
+            min_bytes=1,
+        ),
+        router=Router("summary for tool=0"),
+        tokenizer=TokenCounter(),
+    )
+
+    assert result.modified is True
+    assert result.reason is None
+    assert result.compressed == "summary for tool=0"
+
+
+def test_compression_unit_still_compresses_assistant_text():
+    result = compress_unit_with_router(
+        CompressionUnit(
+            text="alpha beta gamma delta epsilon",
+            provider="openai",
+            endpoint="responses",
+            role="assistant",
+            item_type="message",
+            min_bytes=1,
+            metadata={"compress_assistant": "true"},
+        ),
+        router=Router("alpha beta"),
+        tokenizer=TokenCounter(),
+    )
+
+    assert result.modified is True
+    assert result.reason is None
+    assert result.compressed == "alpha beta"
 
 
 def test_compression_unit_rejects_non_shrinking_replacement():
@@ -108,8 +193,9 @@ def test_batch_compression_preserves_provider_slot_references():
                 text="alpha beta gamma",
                 provider="openai",
                 endpoint="responses",
-                role="tool",
-                item_type="function_call_output",
+                role="assistant",
+                item_type="message",
+                metadata={"compress_assistant": "true"},
                 min_bytes=1,
             ),
             slot=("input", 3, "output"),
