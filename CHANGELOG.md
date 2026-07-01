@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Unreleased
 
 ### Fixed
+- **`wrap codex`:** verify proxy optional dependencies before mutating Codex `config.toml`, so a missing `[proxy]` extra aborts cleanly instead of leaving Codex pointed at a proxy that never started ([#1614](https://github.com/headroomlabs-ai/headroom/issues/1614)).
 - Proactive expansion blocks injected into user turns are now wrapped in
   `<headroom_proactive_expansion>` XML tags, giving downstream consumers
   (LLMs, loggers, attribution parsers) a machine-readable provenance

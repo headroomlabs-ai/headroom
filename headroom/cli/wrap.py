@@ -43,6 +43,7 @@ if sys.platform == "win32" and hasattr(sys.stdout, "buffer"):
 
 import click
 
+from headroom.cli.proxy import ensure_proxy_dependencies
 from headroom import fsutil
 from headroom._version import __version__ as _HEADROOM_VERSION
 from headroom.agent_savings import (
@@ -4305,6 +4306,9 @@ def codex(
         headroom wrap codex --port 9999             # Custom proxy port
         headroom wrap codex --backend anyllm --anyllm-provider groq
     """
+    if not no_proxy:
+        ensure_proxy_dependencies()
+
     # Snapshot Codex config.toml BEFORE any wrap-time mutation so
     # `headroom unwrap codex` can restore the user's pre-wrap state
     # byte-for-byte. The snapshot is a no-op if the backup already exists

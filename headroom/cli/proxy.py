@@ -14,6 +14,26 @@ from headroom.proxy.modes import PROXY_MODE_TOKEN, normalize_proxy_mode
 
 from .main import main
 
+
+def ensure_proxy_dependencies() -> None:
+    """Verify optional proxy extras are installed before starting or wrapping."""
+    try:
+        from headroom.proxy.server import (  # noqa: F401
+            ProxyConfig,
+            _parse_csv_tools,
+            _parse_exclude_tools,
+            _parse_tool_profiles,
+            run_server,
+        )
+    except ImportError as e:
+        click.secho(
+            "Error: Proxy dependencies not installed. Run: pip install headroom-ai[proxy]",
+            fg="red",
+            err=True,
+        )
+        click.secho(f"Details: {e}", fg="red", err=True)
+        raise SystemExit(1) from None
+
 # ---------------------------------------------------------------------------
 # Startup log suppression.
 #
@@ -908,22 +928,14 @@ def proxy(
         OPENAI_BASE_URL=http://localhost:8787/v1 your-app
     """
     # Import here to avoid slow startup
-    try:
-        from headroom.proxy.server import (
-            ProxyConfig,
-            _parse_csv_tools,
-            _parse_exclude_tools,
-            _parse_tool_profiles,
-            run_server,
-        )
-    except ImportError as e:
-        click.secho(
-            "Error: Proxy dependencies not installed. Run: pip install headroom-ai[proxy]",
-            fg="red",
-            err=True,
-        )
-        click.secho(f"Details: {e}", fg="red", err=True)
-        raise SystemExit(1) from None
+    ensure_proxy_dependencies()
+    from headroom.proxy.server import (
+        ProxyConfig,
+        _parse_csv_tools,
+        _parse_exclude_tools,
+        _parse_tool_profiles,
+        run_server,
+    )
 
     # Warn if --learn and --no-learn are both set (--no-learn wins, per docstring)
     if learn and no_learn:
