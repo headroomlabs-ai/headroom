@@ -210,7 +210,7 @@ def test_fastembed_uses_dynamic_ort_on_windows() -> None:
     cargo = (ROOT / "crates" / "headroom-core" / "Cargo.toml").read_text(encoding="utf-8")
     for section_marker in (
         "[target.'cfg(windows)'.dependencies]",
-        "[target.'cfg(all(target_os = \"macos\", target_arch = \"x86_64\"))'.dependencies]",
+        '[target.\'cfg(all(target_os = "macos", target_arch = "x86_64"))\'.dependencies]',
     ):
         assert section_marker in cargo, f"missing Cargo target section: {section_marker}"
         section = cargo.split(section_marker, 1)[1].split("\n[", 1)[0]
