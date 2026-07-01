@@ -1,4 +1,4 @@
-"""`headroom diff` — view original vs compressed message content.
+"""`headroom inspect` — view original vs compressed message content.
 
 Headroom already exposes *quantitative* telemetry (token counts, ratios) but no
 way to *see* what the compressor changed. This command reads the proxy's
@@ -111,7 +111,7 @@ def _render_request(transformation: dict[str, Any], *, full: bool) -> None:
         )
 
 
-@main.command()
+@main.command("inspect")
 @click.option(
     "--port",
     "-p",
@@ -138,7 +138,7 @@ def _render_request(transformation: dict[str, Any], *, full: bool) -> None:
     is_flag=True,
     help="Show unchanged messages too (default: only messages the compressor changed)",
 )
-def diff(port: int | None, last: int, output_format: str, full: bool) -> None:
+def inspect_cmd(port: int | None, last: int, output_format: str, full: bool) -> None:
     """Show original vs compressed content for recent proxy requests.
 
     \b
@@ -147,10 +147,10 @@ def diff(port: int | None, last: int, output_format: str, full: bool) -> None:
 
     \b
     Examples:
-        headroom diff                 Diff the most recent request
-        headroom diff --last 5        Diff the 5 most recent requests
-        headroom diff --full          Include unchanged messages
-        headroom diff --format json   Raw feed for piping into another tool
+        headroom inspect                 Inspect the most recent request
+        headroom inspect --last 5        Inspect the 5 most recent requests
+        headroom inspect --full          Include unchanged messages
+        headroom inspect --format json   Raw feed for piping into another tool
     """
     from headroom.install.health import probe_json
 

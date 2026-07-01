@@ -1,8 +1,11 @@
-"""Tests for the `headroom diff` command (issue #1267).
+"""Tests for the `headroom inspect` command (issue #1267).
 
 The command reads the proxy's loopback ``/transformations/feed`` endpoint and
 renders original-vs-compressed content. Tests stub ``probe_json`` so no proxy
 is required.
+
+Tests invoke the real top-level CLI (``main``) so the shipped command path —
+including subcommand registration — is exercised, not just the command object.
 """
 
 from __future__ import annotations
@@ -12,11 +15,13 @@ from unittest.mock import patch
 
 from click.testing import CliRunner
 
-from headroom.cli.diff import _extract_text, _role, diff
+from headroom.cli.inspect import _extract_text, _role
 
 
 def _run(args: list[str]):
-    return CliRunner().invoke(diff, args)
+    from headroom.cli.main import main
+
+    return CliRunner().invoke(main, ["inspect", *args])
 
 
 def test_extract_text_handles_str_and_blocks() -> None:
