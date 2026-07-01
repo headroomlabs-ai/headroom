@@ -67,7 +67,7 @@ crc32fast = "1"
 # exact patch version (no caret, no `~`) so a future minor-version
 # bump cannot silently change the alarm contract; the bump must be
 # an explicit code review that re-validates the contract.
-prometheus = { version = "=0.13.4", default-features = false }
+prometheus = { version = "=0.14.0", default-features = false }
 # PR-E6: SHA-256 over canonical bytes of the cache hot zone (system,
 # tools, early messages) for cache-bust drift detection. Already in
 # the dev-dependencies (and pulled transitively by `aws-sigv4` via
