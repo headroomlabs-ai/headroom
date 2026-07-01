@@ -34,6 +34,10 @@ from typing import Any
 
 from headroom import paths as _paths
 from headroom import savings_ledger
+from headroom.ccr.retrieve_policy import (
+    render_retrieve_query_description,
+    render_retrieve_tool_description,
+)
 
 # fcntl is Unix-only; on Windows we skip file locking (stats are best-effort).
 # Keep the module typed as Any so Windows mypy runs don't try to resolve Unix-only attrs.
@@ -428,14 +432,16 @@ class HeadroomMCPServer:
     async def _retrieve_content(
         self,
         hash_key: str,
+        query: str | None = None,
     ) -> dict[str, Any]:
         """Retrieve content by hash. Checks local store first, then proxy.
 
         Retrieval is by hash and always returns the full original content.
+        Query is feedback context, not a filter.
         """
         # Check local store first
         store = self._get_local_store()
-        entry = store.retrieve(hash_key)
+        entry = store.retrieve(hash_key, query=query)
         if entry:
             self._stats.record_retrieval(hash_key)
             return {
@@ -450,7 +456,7 @@ class HeadroomMCPServer:
         # Fall back to proxy if available
         if self.check_proxy and HTTPX_AVAILABLE:
             try:
-                result = await self._retrieve_via_proxy(hash_key)
+                result = await self._retrieve_via_proxy(hash_key, query=query)
                 if "error" not in result:
                     result["source"] = "proxy"
                     self._stats.record_retrieval(hash_key)
@@ -471,6 +477,7 @@ class HeadroomMCPServer:
     async def _retrieve_via_proxy(
         self,
         hash_key: str,
+        query: str | None = None,
     ) -> dict[str, Any]:
         """Retrieve full content by hash via proxy's HTTP endpoint."""
         if self._http_client is None:
@@ -478,6 +485,8 @@ class HeadroomMCPServer:
 
         url = f"{self.proxy_url}/v1/retrieve"
         payload: dict[str, str] = {"hash": hash_key}
+        if query:
+            payload["query"] = query
 
         response = await self._http_client.post(url, json=payload)
 
@@ -519,18 +528,17 @@ class HeadroomMCPServer:
                 ),
                 Tool(
                     name=CCR_TOOL_NAME,
-                    description=(
-                        "Retrieve original uncompressed content by hash. "
-                        "Use this when you need full details from previously compressed content. "
-                        "The hash comes from headroom_compress results or from compression "
-                        "markers like [N items compressed... hash=abc123]."
-                    ),
+                    description=render_retrieve_tool_description(),
                     inputSchema={
                         "type": "object",
                         "properties": {
                             "hash": {
                                 "type": "string",
                                 "description": "Hash key from compression (e.g., 'abc123' from hash=abc123)",
+                            },
+                            "query": {
+                                "type": "string",
+                                "description": render_retrieve_query_description(),
                             },
                         },
                         "required": ["hash"],
@@ -700,7 +708,8 @@ class HeadroomMCPServer:
             ]
 
         logger.info("event=mcp_retrieve_started hash=%s", hash_key)
-        result = await self._retrieve_content(hash_key)
+        query = arguments.get("query")
+        result = await self._retrieve_content(hash_key, query=query)
         logger.info(
             "event=mcp_retrieve_completed hash=%s result=%s",
             hash_key,

@@ -21,12 +21,22 @@ def _build_mcp_sdk_stub() -> dict[str, ModuleType]:
     class DummyServer:
         def __init__(self, name: str) -> None:
             self.name = name
+            self.list_tools_handler = None
+            self.call_tool_handler = None
 
         def list_tools(self):
-            return lambda fn: fn
+            def decorator(fn):
+                self.list_tools_handler = fn
+                return fn
+
+            return decorator
 
         def call_tool(self):
-            return lambda fn: fn
+            def decorator(fn):
+                self.call_tool_handler = fn
+                return fn
+
+            return decorator
 
         def create_initialization_options(self):
             return {}

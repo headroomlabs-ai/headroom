@@ -9,6 +9,10 @@ from headroom.cache.compression_store import (
     get_compression_store,
     reset_compression_store,
 )
+from headroom.ccr.retrieve_policy import (
+    render_retrieve_query_description,
+    render_retrieve_tool_description,
+)
 from tests._mcp_stub import import_module_with_mcp_stub
 
 mcp_server = import_module_with_mcp_stub("headroom.ccr.mcp_server")
@@ -103,6 +107,34 @@ def test_mcp_retrieve_returns_full_content(fresh_store) -> None:
     assert "error" not in result
     assert result.get("source") == "local"
     assert result["original_content"] == original
+
+
+def test_mcp_retrieve_query_records_feedback_and_returns_full_content(fresh_store) -> None:
+    items = [
+        {"id": 1, "name": "auth middleware"},
+        {"id": 2, "name": "billing worker"},
+    ]
+    original = json.dumps(items)
+    store = get_compression_store()
+    hash_key = store.store(
+        original,
+        json.dumps(items[:1]),
+        original_item_count=2,
+        compressed_item_count=1,
+    )
+
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+    content = asyncio.run(server._handle_retrieve({"hash": hash_key, "query": "auth middleware"}))
+
+    result = json.loads(content[0].kwargs["text"])
+    assert result["original_content"] == original
+    assert result["original_item_count"] == 2
+    retrieved_entry = store.retrieve(hash_key)
+    assert retrieved_entry is not None
+    assert retrieved_entry.search_queries == ["auth middleware"]
+    event = next(e for e in store.get_retrieval_events(limit=10) if e.query == "auth middleware")
+    assert event.query == "auth middleware"
+    assert event.retrieval_type == "full"
 
 
 def test_mcp_retrieve_missing_hash_still_errors(fresh_store) -> None:
@@ -201,3 +233,16 @@ def test_handle_stats_shows_zero_lifetime_totals_when_present() -> None:
     assert "Lifetime Savings:" in text
     assert "Tokens saved: 0" in text
     assert "Compression savings: $0.00" in text
+
+
+def test_mcp_tool_registration_uses_canonical_retrieve_policy(fresh_store) -> None:
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+
+    tools = asyncio.run(server.server.list_tools_handler())
+    retrieve_tool = next(tool for tool in tools if tool.kwargs["name"] == mcp_server.CCR_TOOL_NAME)
+
+    assert retrieve_tool.kwargs["description"] == render_retrieve_tool_description()
+    assert (
+        retrieve_tool.kwargs["inputSchema"]["properties"]["query"]["description"]
+        == render_retrieve_query_description()
+    )

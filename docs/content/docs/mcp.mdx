@@ -77,10 +77,10 @@ Retrieve original uncompressed content by hash.
 
 **Parameters:**
 - `hash` (required) -- hash key from a previous compression
-- `query` (optional) -- search within the original to return only matching items
+- `query` (optional) -- context hint for the concrete gap, recorded for feedback and stats. Retrieval still returns the full original content.
 
 **Returns:**
-- `original_content` (full retrieval) or `results` (filtered search)
+- `original_content` with the full original payload
 - `source` -- `"local"` or `"proxy"`
 
 Retrieval checks the local store first, then falls back to the proxy's store. Hashes from either source work transparently.

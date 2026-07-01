@@ -302,12 +302,12 @@ class ClaudeCodeWriter(ContextWriter):
             return []
         if target_path == legacy_path or not legacy_path.exists():
             return []
-        legacy_text = legacy_path.read_text(encoding="utf-8")
+        legacy_text = _read_text_tolerant(legacy_path)
         if _MARKER_START not in legacy_text:
             return []
         # If the target already owns a block, it is the source of truth -- don't
         # double-migrate or clobber accumulated learnings.
-        if target_path.exists() and _MARKER_START in target_path.read_text(encoding="utf-8"):
+        if target_path.exists() and _MARKER_START in _read_text_tolerant(target_path):
             return []
 
         migrated = _parse_prior_recommendations(legacy_text)

@@ -3559,12 +3559,14 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
         Request body:
             hash (str): Hash key from compression marker (required)
+            query (str): Optional feedback context for the concrete gap
 
         Response:
             {"hash": "...", "original_content": "...", ...}
         """
         data = await request.json()
         hash_key = data.get("hash")
+        query = data.get("query")
 
         if not hash_key:
             raise HTTPException(status_code=400, detail="hash required")
@@ -3578,8 +3580,8 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 detail=format_retrieval_miss_detail(entry_status),
             )
 
-        # Retrieval is by hash: always return the full original content.
-        entry = store.retrieve(hash_key)
+        # Query is feedback context; retrieval still returns the full original content.
+        entry = store.retrieve(hash_key, query=query)
         if entry:
             return {
                 "hash": hash_key,

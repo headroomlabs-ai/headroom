@@ -13,6 +13,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 from click.testing import CliRunner
 
+from headroom.ccr.retrieve_policy import (
+    render_retrieve_cli_guidance,
+    render_retrieve_cli_workflow_steps,
+)
 from headroom.cli.main import main
 from headroom.cli.mcp import (
     get_headroom_command,
@@ -259,6 +263,18 @@ class TestMCPServeCommand:
         assert result.exit_code == 0
         assert "proxy-url" in result.output
         assert "debug" in result.output
+
+
+class TestMCPHelpText:
+    def test_group_help_mentions_concrete_gap_rule(self):
+        runner = CliRunner()
+        result = runner.invoke(main, ["mcp", "--help"])
+
+        assert result.exit_code == 0
+        assert render_retrieve_cli_guidance() in result.output
+        for line in render_retrieve_cli_workflow_steps().splitlines():
+            assert line in result.output
+        assert "headroom_retrieve" in result.output
 
 
 @pytest.mark.skipif(not MCP_AVAILABLE, reason="MCP SDK not installed")

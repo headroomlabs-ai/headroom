@@ -109,6 +109,34 @@ class TestCCRRetrieveEndpoint:
         assert len(retrieved_items) == 50
         assert retrieved_items[0]["id"] == 0
 
+    def test_retrieve_query_records_feedback_and_returns_full_content(self, client):
+        """Query is feedback context; retrieval still returns the full payload."""
+        store = get_compression_store()
+        items = [
+            {"id": 1, "name": "auth middleware"},
+            {"id": 2, "name": "billing worker"},
+        ]
+        hash_key = store.store(
+            original=json.dumps(items),
+            compressed=json.dumps(items[:1]),
+            original_item_count=2,
+            compressed_item_count=1,
+        )
+
+        response = client.post("/v1/retrieve", json={"hash": hash_key, "query": "auth"})
+        assert response.status_code == 200
+
+        data = response.json()
+        retrieved_items = json.loads(data["original_content"])
+        assert retrieved_items == items
+        assert data["original_item_count"] == 2
+
+        stats_response = client.get("/v1/retrieve/stats")
+        assert stats_response.status_code == 200
+        latest = stats_response.json()["recent_retrievals"][-1]
+        assert latest["query"] == "auth"
+        assert latest["retrieval_type"] == "full"
+
     def test_retrieve_increments_count(self, client):
         """Each retrieval increments the retrieval count."""
         store = get_compression_store()

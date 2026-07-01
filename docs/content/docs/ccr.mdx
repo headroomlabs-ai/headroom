@@ -53,14 +53,23 @@ Headroom injects a `headroom_retrieve` tool into the LLM's available tools:
 ```json
 {
   "name": "headroom_retrieve",
-  "description": "Retrieve original uncompressed data from Headroom cache",
+  "description": "Retrieve original uncompressed content that was compressed to save tokens. Trust kept rows unless you have a concrete gap. Retrieve when you need raw, original, or complete content, or when you need to inspect the original payload for a specific follow-up. The hash is provided in compression markers like [N items compressed... hash=abc123].",
   "parameters": {
-    "hash": "The hash key from the compression marker"
+    "hash": "The hash key from the compression marker",
+    "query": "Optional context hint for the concrete gap you are checking. The hint is recorded for feedback and stats; retrieval still returns the full original content."
   }
 }
 ```
 
 The LLM sees this tool alongside your application's tools and can call it whenever the compressed data is insufficient.
+
+## When not to retrieve
+
+Trust kept rows unless you have a concrete gap.
+
+- Retrieve when the user explicitly asks for raw, original, full, exact, or omitted content.
+- Retrieve when you need to inspect the original payload for a specific follow-up the kept summary cannot answer.
+- Do not retrieve just because the user asked you to be thorough, careful, or to double-check.
 
 ## Phase 3: Response Handler
 
@@ -133,7 +142,7 @@ client = HeadroomClient(
 )
 
 # CCR happens automatically during chat completions.
-# The LLM calls headroom_retrieve when it needs more data.
+# The LLM answers from kept rows unless it has a concrete gap.
 response = client.chat.completions.create(
     model="gpt-4o",
     messages=messages,

@@ -128,14 +128,14 @@ export class HeadroomContextEngine {
         `Assembled: ${result.tokensBefore} → ${result.tokensAfter} tokens (saved ${result.tokensSaved})`,
       );
 
-      return {
-        messages: compressedAgentMessages,
-        estimatedTokens: result.tokensAfter,
-        systemPromptAddition:
-          result.tokensSaved > 100
-            ? `[Context compressed by Headroom: ${result.tokensSaved} tokens saved. Use headroom_retrieve with the hash to get full details.]`
+        return {
+          messages: compressedAgentMessages,
+          estimatedTokens: result.tokensAfter,
+          systemPromptAddition:
+            result.tokensSaved > 100
+              ? `[Context compressed by Headroom: ${result.tokensSaved} tokens saved. Trust kept rows unless you have a concrete gap. Use headroom_retrieve when you need raw, original, complete, or specific follow-up access to the original payload.]`
             : undefined,
-      };
+        };
     } catch (error) {
       this.logger.error(`Assemble failed: ${error}`);
       // Graceful fallback: return original messages

@@ -8,7 +8,7 @@ If the LLM needs data that was compressed away, it can retrieve it instantly.
 
 Features:
 - Thread-safe in-memory storage with TTL expiration
-- BM25-based search within cached content
+- Query-aware retrieval feedback tracking
 - Retrieval event tracking for feedback loop
 - Automatic eviction when capacity is reached
 

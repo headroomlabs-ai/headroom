@@ -238,30 +238,44 @@ def test_no_session_id_falls_back_to_per_turn_decision():
 _ANTHROPIC_CCR_TOOL_SNAPSHOT_BYTES = (
     b'{"name":"headroom_retrieve",'
     b'"description":"Retrieve original uncompressed content that was '
-    b"compressed to save tokens. Use this when you need more data than "
-    b"what's shown in compressed tool results. The hash is provided in "
+    b"compressed to save tokens. Trust kept rows unless you have a "
+    b"concrete gap. Retrieve when you need raw, original, or complete "
+    b"content, or when you need to inspect the original payload for a "
+    b"specific follow-up. The hash is provided in "
     b'compression markers like [N items compressed... hash=abc123].",'
     b'"input_schema":{"type":"object",'
     b'"properties":{'
     b'"hash":{"type":"string",'
     b'"description":"Hash key from the compression marker '
-    b"(e.g., 'abc123' from hash=abc123)\"}"
-    b'},"required":["hash"]}}'
+    b"(e.g., 'abc123' from hash=abc123)\"},"
+    b'"query":{"type":"string",'
+    b'"description":"Optional context hint for the concrete gap you are '
+    b"checking. The hint is recorded for feedback and stats; retrieval "
+    b'still returns the full original content."}'
+    b"},"
+    b'"required":["hash"]}}'
 )
 
 _OPENAI_CCR_TOOL_SNAPSHOT_BYTES = (
     b'{"type":"function",'
     b'"function":{"name":"headroom_retrieve",'
     b'"description":"Retrieve original uncompressed content that was '
-    b"compressed to save tokens. Use this when you need more data than "
-    b"what's shown in compressed tool results. The hash is provided in "
+    b"compressed to save tokens. Trust kept rows unless you have a "
+    b"concrete gap. Retrieve when you need raw, original, or complete "
+    b"content, or when you need to inspect the original payload for a "
+    b"specific follow-up. The hash is provided in "
     b'compression markers like [N items compressed... hash=abc123].",'
     b'"parameters":{"type":"object",'
     b'"properties":{'
     b'"hash":{"type":"string",'
     b'"description":"Hash key from the compression marker '
-    b"(e.g., 'abc123' from hash=abc123)\"}"
-    b'},"required":["hash"]}}}'
+    b"(e.g., 'abc123' from hash=abc123)\"},"
+    b'"query":{"type":"string",'
+    b'"description":"Optional context hint for the concrete gap you are '
+    b"checking. The hint is recorded for feedback and stats; retrieval "
+    b'still returns the full original content."}'
+    b"},"
+    b'"required":["hash"]}}}'
 )
 
 

@@ -15,6 +15,7 @@ from ..models import (
     ErrorCategory,
     ProjectInfo,
     SessionData,
+    SessionEvent,
     ToolCall,
 )
 from ..writer import CodexWriter, ContextWriter
@@ -141,11 +142,16 @@ class CodexPlugin(LearnPlugin, ConversationScanner):
 
         func_calls: dict[str, tuple[str, dict]] = {}
         tool_calls: list[ToolCall] = []
+        events: list[SessionEvent] = []
         msg_index = 0
 
         for item in items:
             msg_index += 1
             item_type = item.get("type", "")
+
+            if item_type == "message":
+                self._extract_user_message(item, events, msg_index)
+                continue
 
             if item_type == "function_call":
                 call_id = item.get("call_id", "")
@@ -186,26 +192,29 @@ class CodexPlugin(LearnPlugin, ConversationScanner):
                 is_err = is_error_content(result_content)
                 error_cat = classify_error(result_content) if is_err else ErrorCategory.UNKNOWN
 
-                tool_calls.append(
-                    ToolCall(
-                        name=name,
-                        tool_call_id=call_id,
-                        input_data=inp,
-                        output=result_content,
-                        is_error=is_err,
-                        error_category=error_cat,
-                        msg_index=msg_index,
-                        output_bytes=len(result_content.encode("utf-8")),
-                    )
+                tool_call = ToolCall(
+                    name=name,
+                    tool_call_id=call_id,
+                    input_data=inp,
+                    output=result_content,
+                    is_error=is_err,
+                    error_category=error_cat,
+                    msg_index=msg_index,
+                    output_bytes=len(result_content.encode("utf-8")),
+                )
+                tool_calls.append(tool_call)
+                events.append(
+                    SessionEvent(type="tool_call", msg_index=msg_index, tool_call=tool_call)
                 )
 
-        return SessionData(session_id=session_id, tool_calls=tool_calls)
+        return SessionData(session_id=session_id, tool_calls=tool_calls, events=events)
 
     def _scan_jsonl_session(self, jsonl_path: Path) -> SessionData | None:
         """Parse a modern Codex rollout session stored as JSONL."""
         session_id = jsonl_path.stem
         func_calls: dict[str, tuple[str, dict]] = {}
         tool_calls: list[ToolCall] = []
+        events: list[SessionEvent] = []
         msg_index = 0
 
         try:
@@ -232,6 +241,10 @@ class CodexPlugin(LearnPlugin, ConversationScanner):
                     msg_index += 1
                     item_type = payload.get("type", "")
 
+                    if item_type == "message":
+                        self._extract_user_message(payload, events, msg_index)
+                        continue
+
                     if item_type in ("function_call", "custom_tool_call"):
                         call_id = payload.get("call_id", "")
                         name = payload.get("name", "")
@@ -253,17 +266,19 @@ class CodexPlugin(LearnPlugin, ConversationScanner):
                     is_err = is_error_content(result_content)
                     error_cat = classify_error(result_content) if is_err else ErrorCategory.UNKNOWN
 
-                    tool_calls.append(
-                        ToolCall(
-                            name=name,
-                            tool_call_id=call_id,
-                            input_data=inp,
-                            output=result_content,
-                            is_error=is_err,
-                            error_category=error_cat,
-                            msg_index=msg_index,
-                            output_bytes=len(result_content.encode("utf-8")),
-                        )
+                    tool_call = ToolCall(
+                        name=name,
+                        tool_call_id=call_id,
+                        input_data=inp,
+                        output=result_content,
+                        is_error=is_err,
+                        error_category=error_cat,
+                        msg_index=msg_index,
+                        output_bytes=len(result_content.encode("utf-8")),
+                    )
+                    tool_calls.append(tool_call)
+                    events.append(
+                        SessionEvent(type="tool_call", msg_index=msg_index, tool_call=tool_call)
                     )
 
         except OSError as e:
@@ -273,7 +288,21 @@ class CodexPlugin(LearnPlugin, ConversationScanner):
         if not tool_calls:
             return None
 
-        return SessionData(session_id=session_id, tool_calls=tool_calls)
+        return SessionData(session_id=session_id, tool_calls=tool_calls, events=events)
+
+    def _extract_user_message(
+        self,
+        item: dict,
+        events: list[SessionEvent],
+        msg_index: int,
+    ) -> None:
+        """Capture Codex user prompts so learn can explain why a tool was called."""
+        if item.get("role") != "user":
+            return
+
+        text = _extract_codex_message_text(item.get("content", ""))
+        if text:
+            events.append(SessionEvent(type="user_message", msg_index=msg_index, text=text[:500]))
 
 
 # =============================================================================
@@ -326,6 +355,25 @@ def _parse_codex_output(output_raw: object) -> str:
         return output_raw
 
     return str(output_raw)
+
+
+def _extract_codex_message_text(content: object) -> str:
+    if isinstance(content, str):
+        return content.strip()
+
+    if not isinstance(content, list):
+        return ""
+
+    parts: list[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") not in {"input_text", "text", "output_text"}:
+            continue
+        text = block.get("text", "")
+        if isinstance(text, str) and text.strip():
+            parts.append(text.strip())
+    return "\n".join(parts).strip()
 
 
 # Module-level instance for auto-discovery by the plugin registry
