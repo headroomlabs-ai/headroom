@@ -37,6 +37,22 @@ dashmap = "6"
 # `regex` is already a transitive dep of tokenizers; depend on it directly so
 # our hunk-header parser and priority-pattern matcher have a stable surface.
 regex = "1"
+# CJK sentence + word segmentation for TextCrusher (#1171). CJK has no spaces or
+# ASCII terminators, so the default ASCII splitter/tokenizer collapses a whole
+# CJK paragraph into one segment/one token -> 0% compression. ICU4X's UAX#29
+# sentence + dictionary word segmenters fix this. Chosen over a hand-rolled
+# char-bigram (benchmarked on real CMRC2018 Chinese QA: 92.5% vs 91% answer-
+# retention) and over jieba/lindera (ZH-only / tens-to-hundreds of MB dicts).
+# - Why this version: 2.x is the stabilized ICU4X API (1.x used a different data
+#   provider model); floored at 2.2 (Cargo.lock pins the exact patch) since
+#   segmenter boundaries are observable in output -- bumps should be deliberate.
+# - Install surface: ~13 new crates, all pure Rust, no build scripts, no native
+#   code, no build/runtime network. `compiled_data` bundles locale data at
+#   compile time (hermetic). Maintained by the official unicode-org.
+# - `compiled_data` only (no `auto`/`lstm`): LSTM models cover SE-Asian scripts
+#   (Thai/Lao), not CJK -- CJK uses the dictionary, so `auto` would pull in libm
+#   for nothing. Required for CJK; pure-ASCII paths are unchanged.
+icu_segmenter = { version = "2.2", features = ["compiled_data"] }
 # `flate2` for `_validate_with_zlib` in `adaptive_sizer`. Python's adaptive
 # sizing pipeline uses `zlib.compress(..., level=1)` to validate the chosen
 # K against compression-ratio diversity. We use the default `miniz_oxide`
