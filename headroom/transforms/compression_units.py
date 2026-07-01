@@ -110,6 +110,17 @@ _CCR_MARKER_RE = re.compile(
     r"(?m)^.*(?:Retrieve more: hash=|Retrieve original: hash=|<<ccr:[^>]+>>).*$"
 )
 
+_LOSSY_UNMARKED_STRATEGIES = {
+    CompressionStrategy.KOMPRESS.value,
+    CompressionStrategy.TEXT.value,
+    CompressionStrategy.CODE_AWARE.value,
+}
+
+
+def _is_structured_shell_output(text: str) -> bool:
+    nonempty_lines = [line for line in text.splitlines() if line.strip()]
+    return len(nonempty_lines) >= 3
+
 
 def find_content_router(transforms: object) -> ContentRouter | None:
     """Return the first ContentRouter in a pipeline or iterable."""
@@ -324,6 +335,19 @@ def compress_unit_with_router(
             router_result=router_result,
             reason="rejected_not_smaller",
         )
+
+    if (
+        unit.role == "tool"
+        and unit.item_type == "local_shell_call_output"
+        and _is_structured_shell_output(unit.text)
+        and strategy in _LOSSY_UNMARKED_STRATEGIES
+    ):
+        if not _CCR_MARKER_RE.search(replacement):
+            return _with_reason(
+                strategy=strategy,
+                router_result=router_result,
+                reason="lossy_unrecoverable_tool_output",
+            )
 
     return UnitCompressionResult(
         original=unit.text,

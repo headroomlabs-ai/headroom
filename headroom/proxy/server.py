@@ -673,6 +673,7 @@ class HeadroomProxy(
                 profile_kwargs.get("smart_crusher_with_compaction", True),
             ),
             ccr_inject_marker=config.ccr_inject_marker,
+            force_kompress_all=config.force_kompress_all,
         )
         if config.disable_kompress:
             router_config.enable_kompress = False
@@ -2277,6 +2278,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "openai_api_url": config.openai_api_url,
                 "gemini_api_url": config.gemini_api_url,
                 "cloudcode_api_url": config.cloudcode_api_url,
+                "vertex_api_url": config.vertex_api_url,
                 "savings_profile": config.savings_profile,
                 "target_ratio": effective_target_ratio,
                 "target_savings_percent": (
@@ -4077,6 +4079,7 @@ def _proxy_config_from_env() -> ProxyConfig:
         disable_kompress_fallback=_get_env_bool("HEADROOM_DISABLE_KOMPRESS_FALLBACK", False),
         disable_kompress_anthropic=_get_env_optional_bool("HEADROOM_DISABLE_KOMPRESS_ANTHROPIC"),
         disable_kompress_openai=_get_env_optional_bool("HEADROOM_DISABLE_KOMPRESS_OPENAI"),
+        force_kompress_all=_get_env_bool("HEADROOM_FORCE_KOMPRESS_ALL", False),
         max_connections=_get_env_int("HEADROOM_MAX_CONNECTIONS", 500),
         max_keepalive_connections=_get_env_int("HEADROOM_MAX_KEEPALIVE", 100),
         keepalive_expiry=_get_env_float("HEADROOM_KEEPALIVE_EXPIRY", 90.0),
@@ -4562,6 +4565,16 @@ if __name__ == "__main__":
         help="Force-enable Kompress for the OpenAI/Codex pipeline, overriding --disable-kompress.",
     )
     parser.add_argument(
+        "--force-kompress-all",
+        action="store_true",
+        help=(
+            "Route ALL compressible content through Kompress (kompress-v2-base), "
+            "bypassing per-type compressor selection. Tool ground truth "
+            "(Read/Glob/... and reversibility-gated output) is still never touched. "
+            "Also settable via HEADROOM_FORCE_KOMPRESS_ALL=1."
+        ),
+    )
+    parser.add_argument(
         "--exclude-tools",
         default=None,
         help="Comma-separated tool names whose output is never compressed, "
@@ -4639,6 +4652,9 @@ if __name__ == "__main__":
         if args.disable_kompress_openai is not None
         else _get_env_optional_bool("HEADROOM_DISABLE_KOMPRESS_OPENAI")
     )
+    force_kompress_all = args.force_kompress_all or _get_env_bool(
+        "HEADROOM_FORCE_KOMPRESS_ALL", False
+    )
 
     # Set OpenRouter API key from CLI if provided
     if hasattr(args, "openrouter_api_key") and args.openrouter_api_key:
@@ -4693,6 +4709,7 @@ if __name__ == "__main__":
         disable_kompress_fallback=disable_kompress_fallback,
         disable_kompress_anthropic=disable_kompress_anthropic,
         disable_kompress_openai=disable_kompress_openai,
+        force_kompress_all=force_kompress_all,
         # Connection pool settings
         max_connections=_get_env_int("HEADROOM_MAX_CONNECTIONS", args.max_connections),
         max_keepalive_connections=_get_env_int("HEADROOM_MAX_KEEPALIVE", args.max_keepalive),

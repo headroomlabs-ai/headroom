@@ -18,8 +18,10 @@ rollback (operator opt-in, not a fallback).
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -338,6 +340,92 @@ def _make_anthropic_app(*, optimize: bool) -> tuple[TestClient, _CapturingTransp
 def _make_no_optimize_app() -> tuple[TestClient, _CapturingTransport]:
     """Boot a proxy with all transforms disabled and a capturing transport."""
     return _make_anthropic_app(optimize=False)
+
+
+def _openai_responses_body_bytes(*, stream: bool) -> bytes:
+    payload = {
+        "model": "gpt-5.5",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "hello 🔥 with spaces preserved",
+                    }
+                ],
+            }
+        ],
+        "stream": stream,
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+
+
+def _openai_responses_codex_headers(content_encoding: str) -> dict[str, str]:
+    return {
+        "authorization": "Bearer test-token",
+        "chatgpt-account-id": "acct_test",
+        "originator": "Codex Desktop",
+        "content-type": "application/json",
+        "content-encoding": content_encoding,
+        "accept": "text/event-stream",
+    }
+
+
+def _start_proxy_log_capture() -> tuple[
+    logging.Logger,
+    logging.Handler,
+    int,
+    list[logging.LogRecord],
+]:
+    proxy_logger = logging.getLogger("headroom.proxy")
+    records: list[logging.LogRecord] = []
+
+    class _ListHandler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = _ListHandler(level=logging.INFO)
+    prev_level = proxy_logger.level
+    proxy_logger.addHandler(handler)
+    proxy_logger.setLevel(logging.INFO)
+    return proxy_logger, handler, prev_level, records
+
+
+def _stop_proxy_log_capture(
+    proxy_logger: logging.Logger,
+    handler: logging.Handler,
+    prev_level: int,
+) -> None:
+    proxy_logger.removeHandler(handler)
+    proxy_logger.setLevel(prev_level)
+
+
+def _assert_openai_responses_encoded_passthrough(
+    transport: _CapturingTransport,
+    decoded_body: bytes,
+) -> None:
+    assert transport.captured_body == decoded_body
+    assert transport.captured_headers is not None
+    captured_headers = {key.lower(): value for key, value in transport.captured_headers.items()}
+    assert "content-encoding" not in captured_headers
+    assert captured_headers.get("content-length") == str(len(decoded_body))
+
+
+def _assert_outbound_passthrough_log(
+    records: list[logging.LogRecord],
+    *,
+    forwarder: str,
+) -> None:
+    messages = [record.getMessage() for record in records]
+    assert any(
+        "event=outbound_request" in message
+        and f"forwarder={forwarder}" in message
+        and "body_mutated=false" in message
+        and "source=passthrough" in message
+        for message in messages
+    ), messages
 
 
 def test_passthrough_no_mutation_byte_equal_sha256() -> None:
@@ -902,6 +990,73 @@ def test_streaming_forwarder_byte_faithful() -> None:
         f"Streaming byte-faithfulness broken: inbound {inbound_sha} vs "
         f"upstream {upstream_sha}; upstream={upstream!r}"
     )
+
+
+def test_openai_responses_gzip_nonstream_passthrough_strips_content_encoding() -> None:
+    client, transport = _make_no_optimize_app()
+    decoded_body = _openai_responses_body_bytes(stream=False)
+    encoded_body = gzip.compress(decoded_body)
+    proxy_logger, handler, prev_level, records = _start_proxy_log_capture()
+
+    try:
+        response = client.post(
+            "/v1/responses",
+            headers=_openai_responses_codex_headers("gzip"),
+            content=encoded_body,
+        )
+    finally:
+        _stop_proxy_log_capture(proxy_logger, handler, prev_level)
+
+    assert response.status_code == 200, response.text
+    _assert_openai_responses_encoded_passthrough(transport, decoded_body)
+    _assert_outbound_passthrough_log(records, forwarder="openai_responses")
+
+
+def test_openai_responses_gzip_stream_passthrough_strips_content_encoding() -> None:
+    client, transport = _make_no_optimize_app()
+    decoded_body = _openai_responses_body_bytes(stream=True)
+    encoded_body = gzip.compress(decoded_body)
+    proxy_logger, handler, prev_level, records = _start_proxy_log_capture()
+
+    try:
+        with client.stream(
+            "POST",
+            "/v1/responses",
+            headers=_openai_responses_codex_headers("gzip"),
+            content=encoded_body,
+        ) as response:
+            assert response.status_code == 200
+            for _ in response.iter_bytes():
+                pass
+    finally:
+        _stop_proxy_log_capture(proxy_logger, handler, prev_level)
+
+    _assert_openai_responses_encoded_passthrough(transport, decoded_body)
+    _assert_outbound_passthrough_log(records, forwarder="streaming")
+
+
+def test_openai_responses_codex_desktop_zstd_stream_passthrough_strips_content_encoding() -> None:
+    zstandard = pytest.importorskip("zstandard")
+    client, transport = _make_no_optimize_app()
+    decoded_body = _openai_responses_body_bytes(stream=True)
+    encoded_body = zstandard.ZstdCompressor().compress(decoded_body)
+    proxy_logger, handler, prev_level, records = _start_proxy_log_capture()
+
+    try:
+        with client.stream(
+            "POST",
+            "/v1/responses",
+            headers=_openai_responses_codex_headers("zstd"),
+            content=encoded_body,
+        ) as response:
+            assert response.status_code == 200
+            for _ in response.iter_bytes():
+                pass
+    finally:
+        _stop_proxy_log_capture(proxy_logger, handler, prev_level)
+
+    _assert_openai_responses_encoded_passthrough(transport, decoded_body)
+    _assert_outbound_passthrough_log(records, forwarder="streaming")
 
 
 # ---------------------------------------------------------------------------

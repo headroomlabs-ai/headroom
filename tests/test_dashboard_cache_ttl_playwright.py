@@ -187,6 +187,39 @@ def _install_dashboard_routes(page: Page) -> None:
     page.route("**/*", handler)
 
 
+def test_dashboard_per_project_setup_url_uses_current_origin() -> None:
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch()
+        page = browser.new_page(viewport={"width": 1720, "height": 1400}, color_scheme="dark")
+        _install_dashboard_routes(page)
+
+        page.goto("http://127.0.0.1:8788/dashboard", wait_until="load")
+        expect(
+            page.get_by_text(
+                "ANTHROPIC_BASE_URL: http://127.0.0.1:8788/p/<project-name>", exact=True
+            )
+        ).to_be_visible()
+        expect(
+            page.get_by_text(
+                "ANTHROPIC_BASE_URL: http://127.0.0.1:8787/p/<project-name>", exact=True
+            )
+        ).to_have_count(0)
+
+        page.goto("http://headroom.local:9393/dashboard", wait_until="load")
+        expect(
+            page.get_by_text(
+                "ANTHROPIC_BASE_URL: http://headroom.local:9393/p/<project-name>", exact=True
+            )
+        ).to_be_visible()
+        expect(
+            page.get_by_text(
+                "ANTHROPIC_BASE_URL: http://127.0.0.1:8787/p/<project-name>", exact=True
+            )
+        ).to_have_count(0)
+
+        browser.close()
+
+
 def test_dashboard_renders_observed_ttl_metrics_and_can_capture_screenshot() -> None:
     artifact_dir = os.environ.get("HEADROOM_PLAYWRIGHT_ARTIFACT_DIR")
 
