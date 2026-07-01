@@ -441,6 +441,21 @@ print(f"Compressed content: {result.messages[0]['content'][:200]}...")
 
 ---
 
+### "Native detector crashes with illegal instruction"
+
+On some older or virtualized x86_64 CPUs, AVX2 may be unavailable. The
+Magika/ONNX Runtime detector can require AVX2 through its precompiled runtime
+binary. Headroom skips that detector tier on x86/x86_64 hosts without AVX2 and
+falls back to non-Magika detection tiers instead of crashing.
+
+If native startup still fails on an older CPU, set:
+
+```bash
+export HEADROOM_REQUIRE_RUST_CORE=false
+```
+
+---
+
 ## Error Reference
 
 | Exception | Meaning | Solution |

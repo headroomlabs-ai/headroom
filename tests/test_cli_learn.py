@@ -175,6 +175,74 @@ def test_learn_project_lookup_and_apply_flow(
     assert plugin.writer.calls[0][2] is False
 
 
+def test_verbosity_all_apply_aggregates_baselines_across_projects(
+    monkeypatch: pytest.MonkeyPatch, runner: CliRunner, tmp_path: Path
+) -> None:
+    import json as _json
+
+    from headroom.proxy.output_savings import BaselineModel, SavingsLedger
+
+    # Two projects, each with a transcript dir holding a dummy session file
+    # (analyze is faked, so contents are irrelevant — only presence matters).
+    proj_a_dir = tmp_path / "a"
+    proj_b_dir = tmp_path / "b"
+    for d in (proj_a_dir, proj_b_dir):
+        d.mkdir()
+        (d / "s.jsonl").write_text("{}")
+    proj_a = SimpleNamespace(name="a", project_path=tmp_path / "src-a", data_path=proj_a_dir)
+    proj_b = SimpleNamespace(name="b", project_path=tmp_path / "src-b", data_path=proj_b_dir)
+    plugin = FakePlugin("claude", "Claude Code", [proj_a, proj_b])
+
+    # Per-project synthetic baselines. Project A has more samples, so its level
+    # must be the one applied.
+    base_a = BaselineModel()
+    for v in (100, 200, 300):
+        base_a.observe("opus|new_user_ask|s|tools", v)
+    base_b = BaselineModel()
+    base_b.observe("sonnet|unknown|m|notools", 50)
+
+    class _Profile:
+        def __init__(self, level: int) -> None:
+            self.level = level
+            self.confidence = "high"
+            self.source = "heuristic"
+            self.rationale = "test"
+            self.signals: dict[str, object] = {}
+            self.learned_at: str | None = None
+
+        def save(self, path: object) -> None:
+            Path(str(path)).write_text(_json.dumps({"level": self.level}))
+
+    results = {
+        str(proj_a.project_path): (_Profile(1), base_a),
+        str(proj_b.project_path): (_Profile(3), base_b),
+    }
+
+    def fake_analyze(session_paths, project_path, llm_judge=None):  # noqa: ANN001, ANN201
+        return results[project_path]
+
+    monkeypatch.setattr("headroom.learn.registry.get_plugin", lambda name: plugin)
+    monkeypatch.setattr("headroom.learn.verbosity.analyze", fake_analyze)
+    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path / "ws"))
+
+    result = runner.invoke(
+        main,
+        ["learn", "--agent", "claude", "--verbosity", "--all", "--apply"],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0, result.output
+
+    ledger = SavingsLedger.load(tmp_path / "ws" / "output_savings.json")
+    # Aggregated, not last-project-wins: both strata present and totals summed.
+    assert ledger.baseline.total_samples == 4
+    assert "opus|new_user_ask|s|tools" in ledger.baseline.strata
+    assert "sonnet|unknown|m|notools" in ledger.baseline.strata
+    assert "across 2 project(s)" in result.output
+    # The applied level comes from the project with the most samples (A → 1).
+    verbosity = _json.loads((tmp_path / "ws" / "verbosity.json").read_text())
+    assert verbosity["level"] == 1
+
+
 def test_learn_reports_missing_requested_project_and_lists_discovered(
     monkeypatch: pytest.MonkeyPatch, runner: CliRunner, tmp_path: Path
 ) -> None:

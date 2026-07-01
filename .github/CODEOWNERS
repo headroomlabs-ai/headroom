@@ -1,0 +1,11 @@
+# CODEOWNERS — default reviewers for this repository.
+# Docs: https://docs.github.com/articles/about-code-owners
+#
+# Owners listed here are auto-requested for review on matching pull requests.
+# When branch protection requires code-owner review, any one of them can
+# satisfy it. Owners must have write access to the repo or the line is ignored.
+#
+# Order matters: the last matching pattern wins.
+
+# Catch-all: the maintainers own everything by default.
+* @chopratejas @JerrettDavis @DevanshiVyas

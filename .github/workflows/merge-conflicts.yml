@@ -1,0 +1,30 @@
+name: Merge Conflicts
+
+# Reject unresolved Git merge-conflict markers committed into tracked files.
+#
+# This lives in its own workflow ON PURPOSE: ci.yml sets
+# `on.pull_request.paths-ignore: ['**/*.md', ...]`, so a Markdown/CHANGELOG-only
+# PR skips that workflow entirely. The conflict markers this guard exists to
+# catch landed in CHANGELOG.md, so the check must run with no `paths-ignore`.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  merge-conflicts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - name: Reject unresolved merge-conflict markers
+        run: |
+          if git grep -nI -E '^(<{7}|>{7}|\|{7})( |$)' -- .; then
+            echo "::error::Unresolved Git merge-conflict markers found in tracked files (see matches above)."
+            exit 1
+          fi
+          echo "No merge-conflict markers found."

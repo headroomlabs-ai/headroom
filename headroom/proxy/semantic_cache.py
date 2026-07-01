@@ -13,12 +13,29 @@ import json
 import sys
 from collections import OrderedDict
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from ..memory.tracker import ComponentStats
 
 from headroom.proxy.models import CacheEntry
+
+
+def _strip_cache_control(obj: Any) -> Any:
+    """Recursively drop ``cache_control`` annotations before hashing.
+
+    Clients (notably Claude Code) move the ``cache_control`` cache breakpoint to
+    the newest content on each call, so the same logical ``system``/``tools``
+    payload carries the marker on one call and not the next. Stripping it keeps
+    the cache key stable across that movement. Mirrors
+    ``helpers._strip_per_call_annotations`` but kept local so the cache module
+    stays free of the heavier proxy-helpers import chain.
+    """
+    if isinstance(obj, dict):
+        return {k: _strip_cache_control(v) for k, v in obj.items() if k != "cache_control"}
+    if isinstance(obj, list):
+        return [_strip_cache_control(item) for item in obj]
+    return obj
 
 
 class SemanticCache:
@@ -34,21 +51,34 @@ class SemanticCache:
         self._cache: OrderedDict[str, CacheEntry] = OrderedDict()
         self._lock = asyncio.Lock()
 
-    def _compute_key(self, messages: list[dict], model: str) -> str:
-        """Compute cache key from messages and model."""
-        # Normalize messages for consistent hashing
+    def _compute_key(self, messages: list[dict], model: str, **key_fields: Any) -> str:
+        """Compute cache key from messages, model, and response-shaping fields.
+
+        ``key_fields`` carries every request field that changes generation,
+        forwarded verbatim from each handler's ``cache_key_fields`` snapshot —
+        that snapshot, next to the ``body.get`` reads, is the authoritative field
+        list. The key must include all of them, or two requests with identical
+        ``messages`` but a different ``system`` prompt (top-level on Anthropic,
+        never in messages), tool set, sampling config, or output shape collide
+        and the second caller is served the first's response. Each value is run
+        through ``_strip_cache_control`` so a moved ``cache_control`` breakpoint
+        on ``system``/``tools`` does not fragment the key (scalars pass through
+        untouched). Absent fields don't contribute, so truly-identical requests
+        still hit.
+        """
         normalized = json.dumps(
             {
                 "model": model,
                 "messages": messages,
+                **{k: _strip_cache_control(v) for k, v in key_fields.items()},
             },
             sort_keys=True,
         )
         return hashlib.sha256(normalized.encode()).hexdigest()[:32]
 
-    async def get(self, messages: list[dict], model: str) -> CacheEntry | None:
+    async def get(self, messages: list[dict], model: str, **key_fields: Any) -> CacheEntry | None:
         """Get cached response if exists and not expired."""
-        key = self._compute_key(messages, model)
+        key = self._compute_key(messages, model, **key_fields)
         async with self._lock:
             entry = self._cache.get(key)
 
@@ -73,9 +103,10 @@ class SemanticCache:
         response_body: bytes,
         response_headers: dict[str, str],
         tokens_saved: int = 0,
+        **key_fields: Any,
     ):
         """Cache a response."""
-        key = self._compute_key(messages, model)
+        key = self._compute_key(messages, model, **key_fields)
 
         async with self._lock:
             # If key already exists, remove it first to update position
