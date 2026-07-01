@@ -257,9 +257,34 @@ def test_unwrap_opencode_restores_from_backup(
     _set_test_home(monkeypatch, tmp_path)
 
     config_file = tmp_path / ".config" / "opencode" / "opencode.json"
-    backup_file = config_file.with_suffix(".json.headroom-backup")
+    backup_file = config_file.with_name("opencode.json.headroom-backup")
     config_file.parent.mkdir(parents=True, exist_ok=True)
     original = '{"model": "openai/gpt-4o"}'
+    config_file.write_text(original)
+    backup_file.write_text(original)
+
+    with patch.object(wrap_mod, "_stop_local_proxy_for_unwrap", return_value="stopped"):
+        result = runner.invoke(main, ["unwrap", "opencode"])
+
+    assert result.exit_code == 0, result.output
+    assert "Restored prior" in result.output
+    assert not backup_file.exists()
+    assert config_file.read_text(encoding="utf-8") == original
+
+
+def test_unwrap_opencode_restores_from_backup_jsonc(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unwrap restores the pre-wrap backup and removes it for jsonc files."""
+    monkeypatch.chdir(tmp_path)
+    _set_test_home(monkeypatch, tmp_path)
+
+    config_file = tmp_path / ".config" / "opencode" / "opencode.jsonc"
+    backup_file = config_file.with_name("opencode.jsonc.headroom-backup")
+    config_file.parent.mkdir(parents=True, exist_ok=True)
+    original = '{\n  // User comment\n  "model": "openai/gpt-4o"\n}'
     config_file.write_text(original)
     backup_file.write_text(original)
 

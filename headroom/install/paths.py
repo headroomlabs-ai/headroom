@@ -125,10 +125,18 @@ def opencode_config_path() -> Path:
     """Return the OpenCode config path.
 
     Resolves ``~/.config/opencode/opencode.json`` when ``OPENCODE_CONFIG``
-    is unset; otherwise the value of that environment variable.
+    is unset; otherwise the value of that environment variable. Checks for
+    ``opencode.jsonc`` as well.
     """
 
     env_path = os.environ.get("OPENCODE_CONFIG", "").strip()
     if env_path:
         return Path(env_path).expanduser()
-    return Path.home() / ".config" / "opencode" / "opencode.json"
+
+    base_dir = Path.home() / ".config" / "opencode"
+    jsonc_path = base_dir / "opencode.jsonc"
+
+    if jsonc_path.exists():
+        return jsonc_path
+
+    return base_dir / "opencode.json"
