@@ -374,8 +374,8 @@ winget install Rustlang.Rustup && rustup default stable
 Restart your shell, then `pip install "headroom-ai[all]"`. A prebuilt wheel avoids the Rust
 build entirely where available: `pip install --only-binary headroom-ai headroom-ai`. Prebuilt
 wheels are published for Windows (`win_amd64`), Linux (`x86_64` / `aarch64`), and macOS
-(Apple Silicon), so installs on those platforms never need a local Rust toolchain — the
-Rust-first dance above is only for the platform-independent sdist fallback (e.g. Intel macOS).
+(Apple Silicon and Intel), so installs on those platforms never need a local Rust toolchain — the
+Rust-first dance above is only for the platform-independent sdist fallback when no wheel matches.
 
 Two runtime assets are fetched over TLS; if they are blocked, trust your corporate CA via
 `REQUESTS_CA_BUNDLE` / `SSL_CERT_FILE` / `CURL_CA_BUNDLE`:

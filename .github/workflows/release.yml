@@ -247,15 +247,14 @@ jobs:
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             manylinux: 2_28
-          # NOTE: `macos-15-intel` (x86_64-apple-darwin) is intentionally
-          # NOT in the matrix. `ort-sys 2.0.0-rc.12` (transitive via our
-          # ML compression backend) does not provide prebuilt ONNX Runtime
-          # binaries for `x86_64-apple-darwin`, and building ORT from
-          # source would add CMake + ~5 minutes per build. Apple Silicon
-          # macOS is fully covered below; Intel-mac users install the
-          # platform-independent sdist (also produced by this matrix).
-          # Tracked as a follow-up: switch to `ort-tract` or upstream a
-          # request for x86_64 macOS prebuilts.
+          # Intel macOS x86_64. `ort-sys 2.0.0-rc.12` does not ship
+          # prebuilt ONNX Runtime binaries for this triple, so
+          # `headroom-core/Cargo.toml` selects `ort-load-dynamic` (same
+          # as Windows) and `headroom/_ort.py` pins `ORT_DYLIB_PATH` to
+          # the pip `onnxruntime` dylib at import time.
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            manylinux: ""
           - os: macos-14
             target: aarch64-apple-darwin
             manylinux: ""
@@ -267,8 +266,9 @@ jobs:
           # or crates.io). `manylinux` is meaningless on Windows (that tag
           # is Linux-only) — leave it empty. The ONNX Runtime story is
           # already handled: `crates/headroom-core/Cargo.toml` selects
-          # `ort-load-dynamic` under `cfg(windows)`, so the wheel does not
-          # bundle/link DirectML SDK libs and loads ORT at runtime instead.
+          # `ort-load-dynamic` under `cfg(windows)` and Intel macOS, so
+          # the wheel does not bundle/link platform ORT SDK libs and loads
+          # ORT at runtime instead.
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             manylinux: ""
@@ -507,11 +507,11 @@ jobs:
           # runners (PR #376) host the container.
           - { runner: ubuntu-24.04-arm, image: "quay.io/pypa/manylinux_2_28_aarch64", python: "3.11", wheel_target: aarch64-unknown-linux-gnu, wheel_artifact: wheels-ubuntu-24.04-arm-aarch64-unknown-linux-gnu, glibc_label: "2.28-floor" }
           - { runner: ubuntu-24.04-arm, image: "ubuntu:22.04", python: "3.12", wheel_target: aarch64-unknown-linux-gnu, wheel_artifact: wheels-ubuntu-24.04-arm-aarch64-unknown-linux-gnu, glibc_label: "2.35" }
-          # macOS arm64 — runs natively on the host runner; no
-          # container. Apple Silicon is the only macOS target we
-          # ship today (Intel macOS dropped in PR #371 — ort-sys
-          # has no x86_64-apple-darwin prebuilts).
+          # macOS arm64 — runs natively on the host runner; no container.
           - { runner: macos-14, image: "", python: "3.13", wheel_target: aarch64-apple-darwin, wheel_artifact: wheels-macos-14-aarch64-apple-darwin, glibc_label: "" }
+          # macOS x86_64 (Intel) — `ort-load-dynamic`; see build-wheels
+          # matrix comment for rationale.
+          - { runner: macos-15-intel, image: "", python: "3.12", wheel_target: x86_64-apple-darwin, wheel_artifact: wheels-macos-15-intel-x86_64-apple-darwin, glibc_label: "" }
           # Windows x86_64 — runs natively on the host runner; no
           # container. `image: ""` routes this row past the Linux docker
           # path; a dedicated PowerShell step below installs + imports the

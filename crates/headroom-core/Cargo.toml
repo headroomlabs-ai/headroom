@@ -122,10 +122,22 @@ redis = { version = "0.27", optional = true, default-features = false }
 # cycling through the proxy crate. Tiny crate (no I/O, just types).
 http = "1"
 
-[target.'cfg(not(windows))'.dependencies]
+[target.'cfg(all(not(windows), not(all(target_os = "macos", target_arch = "x86_64"))))'.dependencies]
 fastembed = { version = "5", default-features = false, features = [
     "hf-hub-rustls-tls",
     "ort-download-binaries-rustls-tls",
+    "image-models",
+] }
+
+[target.'cfg(all(target_os = "macos", target_arch = "x86_64"))'.dependencies]
+# `ort-sys 2.0.0-rc.12` does not ship prebuilt ONNX Runtime binaries for
+# `x86_64-apple-darwin`. Building ORT from source in CI would add CMake and
+# several minutes per wheel. Load the pip `onnxruntime` dylib at runtime
+# instead (same approach as Windows below). `headroom/_ort.py` pins
+# `ORT_DYLIB_PATH` before `headroom._core` imports.
+fastembed = { version = "5", default-features = false, features = [
+    "hf-hub-rustls-tls",
+    "ort-load-dynamic",
     "image-models",
 ] }
 

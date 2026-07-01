@@ -75,14 +75,11 @@ jobs:
           - os: macos-14
             target: aarch64-apple-darwin
             maturin-target: aarch64-apple-darwin
-        # macOS x86_64 (Intel) is NOT in this matrix.
-        # `fastembed` → `ort` → `ort-sys` does not publish prebuilt ONNX
-        # Runtime binaries for `x86_64-apple-darwin`; building from source
-        # in CI is a multi-hour cmake job. Apple Silicon has been the
-        # default macOS target since 2020 and is sufficient for the wheels
-        # we ship. If a customer needs Intel macOS, build from source
-        # locally (the toolchain works; only prebuilt distribution skips
-        # this target).
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            maturin-target: x86_64-apple-darwin
+        # Intel macOS uses `ort-load-dynamic` (no prebuilt ORT from ort-sys);
+        # Apple Silicon bundles ORT via `ort-download-binaries-rustls-tls`.
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6

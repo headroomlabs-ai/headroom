@@ -200,24 +200,25 @@ def test_fastembed_uses_rustls_features() -> None:
 
 
 def test_fastembed_uses_dynamic_ort_on_windows() -> None:
-    """Windows sdist builds must not link Pyke's DirectML ORT binaries.
+    """Windows and Intel macOS sdist builds must not link Pyke's ORT binaries.
 
-    `ort-download-binaries-*` emits DXCORE/DXGI/D3D12/DirectML link libs on
-    Windows. Those SDK libs are not present on many Python build hosts, so the
-    Windows target must use ORT dynamic loading instead.
+    `ort-download-binaries-*` emits platform SDK link libs (DirectML on
+    Windows; unavailable prebuilts on `x86_64-apple-darwin`). Those targets
+    must use ORT dynamic loading instead.
     """
 
     cargo = (ROOT / "crates" / "headroom-core" / "Cargo.toml").read_text(encoding="utf-8")
-    assert "[target.'cfg(windows)'.dependencies]" in cargo
-    windows_section = cargo.split("[target.'cfg(windows)'.dependencies]", 1)[1].split(
-        "\n[",
-        1,
-    )[0]
-    windows_dependency_lines = "\n".join(
-        line for line in windows_section.splitlines() if not line.lstrip().startswith("#")
-    )
-    assert '"ort-load-dynamic"' in windows_section
-    assert "ort-download-binaries" not in windows_dependency_lines
+    for section_marker in (
+        "[target.'cfg(windows)'.dependencies]",
+        '[target.\'cfg(all(target_os = "macos", target_arch = "x86_64"))\'.dependencies]',
+    ):
+        assert section_marker in cargo, f"missing Cargo target section: {section_marker}"
+        section = cargo.split(section_marker, 1)[1].split("\n[", 1)[0]
+        dependency_lines = "\n".join(
+            line for line in section.splitlines() if not line.lstrip().startswith("#")
+        )
+        assert '"ort-load-dynamic"' in section
+        assert "ort-download-binaries" not in dependency_lines
 
 
 def test_dockerfiles_no_longer_install_openssl_devel() -> None:
@@ -289,16 +290,13 @@ def test_release_yml_does_not_install_openssl_or_perl_for_wheels() -> None:
         )
 
 
-def test_build_wheels_matrix_excludes_intel_macos() -> None:
-    """`ort-sys 2.0.0-rc.12` (transitive via the ML compression backend)
+def test_build_wheels_matrix_includes_intel_macos_with_dynamic_ort() -> None:
+    """Intel macOS wheels use `ort-load-dynamic` because `ort-sys 2.0.0-rc.12`
     has no prebuilt ONNX Runtime binaries for `x86_64-apple-darwin`.
-    Building ORT from source would add CMake + ~5 minutes per build.
-    Apple Silicon macOS is fully covered; Intel-mac users install from
-    the platform-independent sdist this matrix also produces.
 
     We assert against the actual matrix entry shape (`target: <triple>`
-    on a non-comment line) so explanatory comments mentioning the
-    excluded triple don't false-positive.
+    on a non-comment line) so explanatory comments mentioning other
+    triples don't false-positive.
     """
     content = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
 
@@ -319,14 +317,10 @@ def test_build_wheels_matrix_excludes_intel_macos() -> None:
     assert "aarch64-apple-darwin" in matrix_targets, "Apple Silicon must stay in the matrix"
     assert "x86_64-unknown-linux-gnu" in matrix_targets
     assert "aarch64-unknown-linux-gnu" in matrix_targets
-
-    # Intel macOS must NOT be a matrix entry — re-add only after switching
-    # off ort-sys (e.g., to ort-tract) or adding a CMake-from-source step.
-    assert "x86_64-apple-darwin" not in matrix_targets, (
-        f"x86_64-apple-darwin must not be a wheel-matrix target; got {matrix_targets}"
+    assert "x86_64-apple-darwin" in matrix_targets, (
+        f"x86_64-apple-darwin must be a wheel-matrix target; got {matrix_targets}"
     )
 
-    # The runner OS itself shouldn't appear as a configured `os:` either.
     matrix_os: list[str] = []
     for raw in body.splitlines():
         stripped = raw.lstrip()
@@ -334,7 +328,9 @@ def test_build_wheels_matrix_excludes_intel_macos() -> None:
             continue
         if stripped.startswith("os:"):
             matrix_os.append(stripped.split(":", 1)[1].strip())
-    assert "macos-15-intel" not in matrix_os
+        elif stripped.startswith("- os:"):
+            matrix_os.append(stripped.split(":", 1)[1].strip())
+    assert "macos-15-intel" in matrix_os
 
 
 def test_aarch64_wheel_uses_native_arm64_runner() -> None:
