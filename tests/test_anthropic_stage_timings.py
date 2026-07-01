@@ -245,6 +245,42 @@ def test_anthropic_http_happy_path_emits_stage_timings(stage_log_capture):
     assert "total_pre_upstream" in emitted
 
 
+def test_anthropic_no_optimize_preserves_client_tool_order():
+    tools = [
+        {
+            "name": "Read",
+            "description": "Read a file",
+            "input_schema": {"type": "object", "properties": {}},
+        },
+        {
+            "name": "Bash",
+            "description": "Run a shell command",
+            "input_schema": {"type": "object", "properties": {}},
+        },
+    ]
+    request = _build_request(
+        {
+            "model": "claude-3-5-sonnet-latest",
+            "messages": [{"role": "user", "content": "use a tool"}],
+            "tools": tools,
+        },
+        {"authorization": "Bearer sk-ant-api-test"},
+    )
+    handler = _DummyAnthropicHandler()
+
+    import headroom.tokenizers as _tk
+
+    orig_get = _tk.get_tokenizer
+    _tk.get_tokenizer = lambda model: _DummyTokenizer()
+    try:
+        anyio.run(handler.handle_anthropic_messages, request)
+    finally:
+        _tk.get_tokenizer = orig_get
+
+    _, _, _, forwarded_body = handler.captured
+    assert [tool["name"] for tool in forwarded_body["tools"]] == ["Read", "Bash"]
+
+
 def test_anthropic_http_invalid_body_still_emits_stage_timings(stage_log_capture):
     async def receive():
         # Invalid JSON — produces ``ValueError`` from ``_read_request_json``.

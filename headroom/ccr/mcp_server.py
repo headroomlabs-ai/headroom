@@ -87,10 +87,14 @@ _READ_ENABLED = os.environ.get("HEADROOM_MCP_READ", "off").lower().strip() in (
 DEFAULT_PROXY_URL = os.environ.get("HEADROOM_PROXY_URL", "http://127.0.0.1:8787")
 
 
-def _format_session_summary(summary: dict[str, Any], local_stats: dict[str, Any]) -> str:
+def _format_session_summary(
+    summary: dict[str, Any],
+    local_stats: dict[str, Any],
+    persistent_lifetime: dict[str, Any] | None = None,
+) -> str:
     """Format the proxy summary + local MCP stats into clean readable text."""
     lines: list[str] = []
-    lines.append("Headroom Session Summary")
+    lines.append("Headroom Window-Scoped Session Summary")
     lines.append("=" * 40)
 
     mode = summary.get("mode", "token")
@@ -155,6 +159,15 @@ def _format_session_summary(summary: dict[str, Any], local_stats: dict[str, Any]
     local_saved = local_stats.get("total_tokens_saved", 0)
     if local_compressions > 0:
         lines.append(f"MCP Tool: {local_compressions} compressions, {local_saved:,} tokens saved")
+        lines.append("")
+
+    # Lifetime proxy savings (cross-session)
+    if isinstance(persistent_lifetime, dict):
+        lifetime_tokens = persistent_lifetime.get("tokens_saved", 0) or 0
+        lifetime_usd = persistent_lifetime.get("compression_savings_usd", 0.0) or 0.0
+        lines.append("Lifetime Savings:")
+        lines.append(f"  Tokens saved: {lifetime_tokens:,}")
+        lines.append(f"  Compression savings: ${lifetime_usd:.2f}")
         lines.append("")
 
     # Tip
@@ -740,8 +753,14 @@ class HeadroomMCPServer:
             if proxy_data:
                 summary = proxy_data.get("summary")
                 if summary:
+                    lifetime = None
+                    persistent_savings = proxy_data.get("persistent_savings")
+                    if isinstance(persistent_savings, dict):
+                        lifetime_block = persistent_savings.get("lifetime")
+                        if isinstance(lifetime_block, dict):
+                            lifetime = lifetime_block
                     # Return clean formatted summary instead of raw JSON
-                    formatted = _format_session_summary(summary, stats)
+                    formatted = _format_session_summary(summary, stats, lifetime)
                     return [TextContent(type="text", text=formatted)]
                 # Fallback: add proxy stats to local stats
                 proxy_stats = self._extract_proxy_stats(proxy_data)

@@ -94,6 +94,8 @@ KOMPRESS_ONNX_INTRA_THREADS_ENV = "HEADROOM_KOMPRESS_ONNX_INTRA_THREADS"
 KOMPRESS_ONNX_INTER_THREADS_ENV = "HEADROOM_KOMPRESS_ONNX_INTER_THREADS"
 KOMPRESS_COREML_CACHE_DIR_ENV = "HEADROOM_KOMPRESS_COREML_CACHE_DIR"
 KOMPRESS_MAX_CONCURRENT_ENV = "HEADROOM_KOMPRESS_MAX_CONCURRENT"
+KOMPRESS_EXECUTION_SEMAPHORE_WAIT_MS_ENV = "HEADROOM_KOMPRESS_EXECUTION_TIMEOUT_MS"
+KOMPRESS_EXECUTION_SEMAPHORE_WAIT_MS_DEFAULT = 25
 KOMPRESS_BATCH_SIZE_ENV = "HEADROOM_KOMPRESS_BATCH_SIZE"
 
 KompressBackend = Literal["auto", "onnx", "onnx_cpu", "onnx_coreml", "pytorch", "pytorch_mps"]
@@ -127,6 +129,76 @@ _kompress_cache: dict[str, tuple[Any, Any, str]] = {}
 _kompress_lock = threading.Lock()
 _execution_semaphores: dict[str, threading.BoundedSemaphore] = {}
 _execution_semaphores_lock = threading.Lock()
+_execution_metrics_lock = threading.Lock()
+_execution_skip_counters: dict[str, int] = {
+    "timeout": 0,
+}
+_execution_wait_seconds_total: dict[str, float] = {
+    "timeout": 0.0,
+}
+
+
+def _execution_wait_budget_seconds() -> float:
+    raw = os.environ.get(KOMPRESS_EXECUTION_SEMAPHORE_WAIT_MS_ENV)
+    if raw is None:
+        return KOMPRESS_EXECUTION_SEMAPHORE_WAIT_MS_DEFAULT / 1000.0
+    try:
+        parsed = int(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r; using %dms",
+            KOMPRESS_EXECUTION_SEMAPHORE_WAIT_MS_ENV,
+            raw,
+            KOMPRESS_EXECUTION_SEMAPHORE_WAIT_MS_DEFAULT,
+        )
+        return KOMPRESS_EXECUTION_SEMAPHORE_WAIT_MS_DEFAULT / 1000.0
+    if parsed < 0:
+        logger.warning(
+            "Negative %s=%r; disabling timeout and using fail-open.",
+            KOMPRESS_EXECUTION_SEMAPHORE_WAIT_MS_ENV,
+            raw,
+        )
+        return 0.0
+    return parsed / 1000.0
+
+
+def _acquire_execution_slot(
+    backend: str,
+    device_type: str,
+    *,
+    timeout_seconds: float | None,
+) -> tuple[threading.BoundedSemaphore | None, float]:
+    semaphore = _execution_semaphore(backend, device_type)
+    start = time.perf_counter()
+    if timeout_seconds is None:
+        semaphore.acquire()
+        wait_ms = (time.perf_counter() - start) * 1000.0
+        return semaphore, wait_ms
+
+    acquired = semaphore.acquire(blocking=False)
+    if not acquired and timeout_seconds > 0:
+        acquired = semaphore.acquire(timeout=timeout_seconds)
+    elif not acquired and timeout_seconds == 0:
+        acquired = False
+
+    wait_ms = (time.perf_counter() - start) * 1000.0
+    if not acquired:
+        with _execution_metrics_lock:
+            _execution_skip_counters["timeout"] += 1
+            _execution_wait_seconds_total["timeout"] += wait_ms / 1000.0
+        return None, wait_ms
+
+    return semaphore, wait_ms
+
+
+def get_kompress_execution_stats() -> dict[str, int | float]:
+    """Return execution-acquire observability counters."""
+    with _execution_metrics_lock:
+        return {
+            "execution_acquire_timeout_ms": int(_execution_wait_budget_seconds() * 1000),
+            "execution_timeout_skips_total": _execution_skip_counters["timeout"],
+            "execution_wait_seconds_total": _execution_wait_seconds_total["timeout"],
+        }
 
 
 def _selected_backend() -> KompressBackend:
@@ -602,7 +674,14 @@ def _validate_pytorch_device(model: Any, tokenizer: Any, device: str) -> None:
     )
     input_ids = encoding["input_ids"].to(device)
     attention_mask = encoding["attention_mask"].to(device)
-    with _execution_semaphore("pytorch", device):
+    semaphore, _wait_ms = _acquire_execution_slot(
+        "pytorch",
+        device,
+        timeout_seconds=None,
+    )
+    assert semaphore is not None
+    with contextlib.ExitStack() as stack:
+        stack.callback(semaphore.release)
         scores = model.get_scores(input_ids, attention_mask)
         _ = scores[0].detach().cpu()
 
@@ -969,7 +1048,24 @@ class KompressCompressor(Transform):
                     input_ids = input_ids.to(device)
                     attention_mask = attention_mask.to(device)
 
-                with _execution_semaphore(backend, device_type):
+                semaphore, _wait_ms = _acquire_execution_slot(
+                    backend,
+                    device_type,
+                    timeout_seconds=_execution_wait_budget_seconds(),
+                )
+                if semaphore is None:
+                    logger.warning(
+                        "Kompress execution saturated after %.2fms; skipping chunk=%d "
+                        "for backend=%s device=%s after deadline path",
+                        _wait_ms,
+                        chunk_start,
+                        backend,
+                        device_type,
+                    )
+                    return self._passthrough(content, n_words)
+
+                with contextlib.ExitStack() as stack:
+                    stack.callback(semaphore.release)
                     inference_started = time.perf_counter()
                     if target_ratio is not None:
                         scores = model.get_scores(input_ids, attention_mask)
@@ -1228,7 +1324,27 @@ class KompressCompressor(Transform):
                     attention_mask = attention_mask.to(device)
 
                 # Single forward pass for all chunks in this batch.
-                with _execution_semaphore(backend, device_type):
+                semaphore, wait_ms = _acquire_execution_slot(
+                    backend,
+                    device_type,
+                    timeout_seconds=_execution_wait_budget_seconds(),
+                )
+                if semaphore is None:
+                    logger.warning(
+                        "Kompress execution saturated at batch start after %.2fms; "
+                        "passing through remaining batch inputs",
+                        wait_ms,
+                    )
+                    for text_idx, _, _, _ in batch:
+                        if results[text_idx] is None:
+                            results[text_idx] = self._passthrough(
+                                contents[text_idx], len(word_lists[text_idx])
+                            )
+                            kept_ids_per_text.pop(text_idx, None)
+                    continue
+
+                with contextlib.ExitStack() as stack:
+                    stack.callback(semaphore.release)
                     inference_started = time.perf_counter()
                     scores = model.get_scores(input_ids, attention_mask)
                     inference_ms += (time.perf_counter() - inference_started) * 1000

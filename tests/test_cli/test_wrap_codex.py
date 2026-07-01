@@ -735,6 +735,61 @@ class TestInjectAvoidsDuplicateTopLevelKeys:
         assert 'openai_base_url = "http://127.0.0.1:8787/v1"' in content
         assert "[model_providers.headroom]" in content
 
+    def test_inject_replaces_existing_headroom_provider_table(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Existing headroom provider table must not create duplicate TOML keys."""
+        import tomllib  # Python 3.11+ stdlib
+
+        _set_test_home(monkeypatch, tmp_path)
+        config_dir = tmp_path / ".codex"
+        config_dir.mkdir()
+        config_file = config_dir / "config.toml"
+        config_file.write_text(
+            "[model_providers.headroom]\n"
+            'name = "Existing custom headroom"\n'
+            'base_url = "http://example.invalid/v1"\n'
+            "supports_websockets = true\n"
+            'env_http_headers = { "X-Headroom-Project" = "HEADROOM_PROJECT" }\n'
+            "\n"
+            "[profiles.default]\n"
+            'model = "gpt-5"\n'
+        )
+
+        wrap_mod._inject_codex_provider_config(8787)
+        content = config_file.read_text()
+
+        tomllib.loads(content)
+        assert content.count("[model_providers.headroom]") == 1
+        assert content.count("env_http_headers") == 1
+        assert 'base_url = "http://127.0.0.1:8787/v1"' in content
+        assert 'env_http_headers = { "X-Headroom-Project" = "HEADROOM_PROJECT" }' in content
+        assert "[profiles.default]" in content
+        assert 'model = "gpt-5"' in content
+
+    def test_unwrap_restores_prior_headroom_provider_table(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Pre-wrap headroom provider table is restored from snapshot."""
+        _set_test_home(monkeypatch, tmp_path)
+        config_dir = tmp_path / ".codex"
+        config_dir.mkdir()
+        config_file = config_dir / "config.toml"
+        original = (
+            "[model_providers.headroom]\n"
+            'name = "Existing custom headroom"\n'
+            'base_url = "http://example.invalid/v1"\n'
+            "supports_websockets = true\n"
+            'env_http_headers = { "X-Headroom-Project" = "HEADROOM_PROJECT" }\n'
+        )
+        config_file.write_text(original)
+
+        wrap_mod._inject_codex_provider_config(8787)
+        status, _ = wrap_mod._restore_codex_provider_config()
+
+        assert status == "restored"
+        assert config_file.read_text() == original
+
     def test_unwrap_restores_prior_model_provider_after_rewrite(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:

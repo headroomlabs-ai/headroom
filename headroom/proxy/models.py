@@ -171,6 +171,15 @@ class ProxyConfig:
     disable_kompress_anthropic: bool | None = None
     disable_kompress_openai: bool | None = None
 
+    # Force ALL compressible content through Kompress (kompress-v2-base),
+    # bypassing per-type compressor selection (SmartCrusher/CodeAware/log/
+    # diff/html/tabular/search). Tool ground truth stays protected: excluded
+    # tools (Read/Glob/Grep/...) and reversibility-gated tool output are never
+    # touched. Off by default; opt-in for systems that want one uniform
+    # compressor at the cost of per-type structural fidelity.
+    # CLI: --force-kompress-all; env: HEADROOM_FORCE_KOMPRESS_ALL=1.
+    force_kompress_all: bool = False
+
     # Code graph live watcher (triggers incremental reindex on file changes)
     code_graph_watcher: bool = False
 
@@ -373,7 +382,7 @@ class ProxyConfig:
     # Precedence: CLI > env > auto-compute.
     anthropic_pre_upstream_concurrency: int | None = None
     # Upper bound for waiting on the Anthropic pre-upstream semaphore
-    # before failing fast with a 503 + Retry-After. Keeps the queue bounded
+    # before failing open to passthrough compression. Keeps the queue bounded
     # when all pre-upstream slots are occupied by slow/hung work.
     anthropic_pre_upstream_acquire_timeout_seconds: float = 15.0
     # Fail-open timeout for Anthropic memory-context lookup while the request

@@ -87,10 +87,10 @@ Headroom compresses everything your AI agent reads — tool outputs, logs, RAG c
 
 ```bash
 # 1 — Install
-pip install "headroom-ai[all]"          # Python
-npm install headroom-ai                 # Node / TypeScript
+pip install "headroom-ai[all]"          # Python — ships the `headroom` CLI
+npm install headroom-ai                 # TypeScript SDK only — no `headroom` CLI
 
-# 2 — Pick your mode
+# 2 — Pick your mode  (the `headroom` commands below come from the pip install)
 headroom wrap claude                    # wrap a coding agent
 headroom proxy --port 8787              # drop-in proxy, zero code changes
 # or: from headroom import compress      # inline library
@@ -100,6 +100,8 @@ headroom doctor                         # health check — confirms routing is w
 headroom perf
 headroom dashboard                      # live savings dashboard (proxy must be running)
 ```
+
+The `headroom` CLI ships **only** via the PyPI package. The npm `headroom-ai` is the TypeScript SDK — a library you import (`import { compress } from 'headroom-ai'`), not a CLI, so it provides no `headroom` command.
 
 Granular extras: `[proxy]`, `[mcp]`, `[ml]`, `[code]`, `[memory]`, `[vector]` (optional HNSW backend — needs a C++ toolchain, not in `[all]`), `[relevance]`, `[image]`, `[agno]`, `[langchain]`, `[evals]`, `[pytorch-mps]` (Apple-GPU memory-embedder offload — set `HEADROOM_EMBEDDER_RUNTIME=pytorch_mps`). Requires **Python 3.10+**.
 
@@ -319,8 +321,8 @@ Everything in this repo stays open source (Apache 2.0). The managed offering is 
 ## Install
 
 ```bash
-pip install "headroom-ai[all]"          # Python, everything
-npm install headroom-ai                 # TypeScript / Node
+pip install "headroom-ai[all]"          # Python, everything — includes the `headroom` CLI
+npm install headroom-ai                 # TypeScript SDK (library only — no `headroom` CLI)
 docker pull ghcr.io/chopratejas/headroom:latest
 ```
 

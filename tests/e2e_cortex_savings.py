@@ -173,14 +173,18 @@ def _sf_call(messages: list[dict], token: str, host: str) -> dict:
         {
             "model": _SF_MODEL,
             "messages": messages,
-            "max_tokens": 64,
+            "max_completion_tokens": 64,
             "stream": False,
         }
     ).encode()
     req = urllib.request.Request(
-        f"https://{host}/api/v2/cortex/inference:complete",
+        f"https://{host}/api/v2/cortex/v1/chat/completions",
         data=body,
-        headers={"Authorization": f'Snowflake Token="{token}"', "Content-Type": "application/json"},
+        headers={
+            "Authorization": f'Snowflake Token="{token}"',
+            "Content-Type": "application/json",
+            "User-Agent": "headroom-bench/1.0",
+        },
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=60) as r:
@@ -315,7 +319,7 @@ def main() -> int:
     results: list[R] = []
 
     # ── 1. Snowflake Cortex (system-message pattern) ──────────────────────────
-    print("\n▶  Snowflake Cortex  /api/v2/cortex/inference:complete")
+    print("\n▶  Snowflake Cortex  /api/v2/cortex/v1/chat/completions")
     try:
         import io
 
