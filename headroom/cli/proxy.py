@@ -714,8 +714,8 @@ def dashboard(port: int, no_open: bool) -> None:
     envvar="HEADROOM_BACKEND",
     help=(
         "API backend: 'anthropic' (direct), 'bedrock' (AWS), 'openrouter' (OpenRouter), "
-        "'anyllm' (any-llm), or 'litellm-<provider>' (e.g., litellm-vertex). "
-        "Env: HEADROOM_BACKEND."
+        "'deepseek' (Deepseek), 'anyllm' (any-llm), or 'litellm-<provider>' "
+        "(e.g., litellm-vertex). Env: HEADROOM_BACKEND."
     ),
 )
 @click.option(

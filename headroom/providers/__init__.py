@@ -8,6 +8,7 @@ Supported Providers:
 - AnthropicProvider: Claude models
 - GoogleProvider: Google Gemini models
 - CohereProvider: Cohere Command models
+- DeepseekProvider: Deepseek models
 - OpenAICompatibleProvider: Universal provider for any OpenAI-compatible API
   (Ollama, vLLM, Together, Groq, Fireworks, LM Studio, etc.)
 - LiteLLMProvider: Universal provider via LiteLLM (100+ providers)
@@ -23,6 +24,7 @@ if TYPE_CHECKING:
     from headroom.providers.anthropic import AnthropicProvider
     from headroom.providers.base import Provider, TokenCounter
     from headroom.providers.cohere import CohereProvider
+    from headroom.providers.deepseek import DeepseekProvider
     from headroom.providers.google import GoogleProvider
     from headroom.providers.litellm import (
         LiteLLMProvider,
@@ -34,6 +36,7 @@ if TYPE_CHECKING:
         ModelCapabilities,
         OpenAICompatibleProvider,
         create_anyscale_provider,
+        create_deepseek_provider,
         create_fireworks_provider,
         create_groq_provider,
         create_lmstudio_provider,
@@ -51,6 +54,7 @@ __all__ = [
     "AnthropicProvider",
     "GoogleProvider",
     "CohereProvider",
+    "DeepseekProvider",
     # Universal providers
     "OpenAICompatibleProvider",
     "ModelCapabilities",
@@ -62,6 +66,7 @@ __all__ = [
     "create_groq_provider",
     "create_fireworks_provider",
     "create_anyscale_provider",
+    "create_deepseek_provider",
     "create_vllm_provider",
     "create_lmstudio_provider",
     "create_litellm_provider",
@@ -76,6 +81,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "AnthropicProvider": ("headroom.providers.anthropic", "AnthropicProvider"),
     "GoogleProvider": ("headroom.providers.google", "GoogleProvider"),
     "CohereProvider": ("headroom.providers.cohere", "CohereProvider"),
+    "DeepseekProvider": ("headroom.providers.deepseek", "DeepseekProvider"),
     # Universal providers
     "OpenAICompatibleProvider": (
         "headroom.providers.openai_compatible",
@@ -98,6 +104,10 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "create_anyscale_provider": (
         "headroom.providers.openai_compatible",
         "create_anyscale_provider",
+    ),
+    "create_deepseek_provider": (
+        "headroom.providers.openai_compatible",
+        "create_deepseek_provider",
     ),
     "create_vllm_provider": ("headroom.providers.openai_compatible", "create_vllm_provider"),
     "create_lmstudio_provider": (
