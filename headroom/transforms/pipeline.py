@@ -42,6 +42,28 @@ MAX_WASTE_SIGNAL_DETECTION_TOKENS = 100_000
 # runs when compression saved more than this many tokens.
 _MIN_TOKENS_SAVED_FOR_WASTE_SIGNALS = 100
 
+# OTel GenAI semantic conventions (open-telemetry/semantic-conventions-genai).
+# The compression-pipeline span carries this gen_ai.* attribute alongside the
+# proprietary headroom.* ones, so Headroom's telemetry groups/filters by the
+# standard schema in any OTel-native backend (Grafana, Datadog, etc.). It is a
+# string literal rather than an opentelemetry.semconv constant because the gen_ai
+# attributes are stability=development (no stable constants are published).
+#
+# v1 emits only gen_ai.request.model — the one attribute this span can set
+# correctly and unconditionally (the model is always known here). The rest are
+# deliberately deferred to v2 because this span cannot set them correctly:
+#   - gen_ai.operation.name: apply() is shared by many callers (chat, /v1/compress,
+#     batch, Gemini countTokens), so no single value is right — it must be threaded
+#     from each caller, not hardcoded.
+#   - gen_ai.provider.name: Headroom's provider label can't distinguish Bedrock /
+#     Gemini from Anthropic / OpenAI at this layer (Bedrock routes via the
+#     Anthropic provider).
+#   - gen_ai.usage.*: provider-authoritative usage lives on the response path, not
+#     this pre-flight compression span (the compressed-input estimate stays under
+#     headroom.tokens.after).
+GEN_AI_REQUEST_MODEL = "gen_ai.request.model"
+
+
 _N = TypeVar("_N", int, float)
 
 
@@ -269,12 +291,16 @@ class TransformPipeline:
         )
 
         tracer = get_headroom_tracer()
-        span_attributes = {
+        span_attributes: dict[str, Any] = {
             "headroom.model": model,
             "headroom.provider": provider_name or "unknown",
             "headroom.message_count": len(messages),
             "headroom.tokens.before": tokens_before,
         }
+        # OTel GenAI semconv request descriptor — emitted alongside headroom.* so
+        # the span is groupable by the standard schema (v1: model only).
+        if model:
+            span_attributes[GEN_AI_REQUEST_MODEL] = model
         pipeline_span_context = (
             tracer.start_as_current_span(
                 "headroom.compression.pipeline",
