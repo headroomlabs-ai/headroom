@@ -3035,3 +3035,38 @@ def reset_tool_search_hint_state() -> None:
     global _tool_search_hint_emitted
     with _tool_search_hint_lock:
         _tool_search_hint_emitted = False
+
+
+# ── LeanContext (pure-Python, in-process) ────────────────────────────
+
+_leanctx_python_stats: dict[str, Any] = {
+    "tool": "leanctx-py",
+    "label": "LeanContext (Python)",
+    "scope": "project",
+    "tokens_saved": 0,
+    "lines_dropped": 0,
+    "calls": 0,
+}
+
+
+def apply_leanctx_python(text: str, window_radius: int = 50) -> str:
+    """Apply in-process LeanContext filtering to tool output text.
+    
+    Returns filtered text and updates internal stats.
+    """
+    from headroom.transforms.lean_context import get_lean_context
+    
+    lc = get_lean_context(window_radius)
+    result = lc.truncate(text)
+    
+    _leanctx_python_stats["lines_dropped"] += result.dropped_lines
+    _leanctx_python_stats["calls"] += 1
+    # Rough token estimate: 4 chars ≈ 1 token
+    _leanctx_python_stats["tokens_saved"] += result.dropped_lines * 20  # ~20 tokens/line avg
+    
+    return result.text
+
+
+def get_leanctx_python_stats() -> dict[str, Any]:
+    """Get LeanContext Python in-process stats."""
+    return dict(_leanctx_python_stats)

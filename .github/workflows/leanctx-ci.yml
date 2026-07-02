@@ -1,0 +1,21 @@
+name: leanctx-ci
+on:
+  push:
+    paths:
+      - 'headroom/transforms/lean_context.py'
+      - 'headroom/proxy/coalescer.py'
+  pull_request:
+    paths:
+      - 'headroom/transforms/lean_context.py'
+      - 'headroom/proxy/coalescer.py'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install pytest
+      - run: python -m pytest tests/test_transforms/test_lean_context.py tests/test_transforms/test_lean_context_bench.py tests/test_proxy/test_coalescer.py -v

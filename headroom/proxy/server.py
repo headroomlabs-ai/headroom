@@ -2865,6 +2865,13 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
         # Fetch CLI filtering savings from the selected context tool. These
         # tokens are avoided before they reach model context.
+        
+        # LeanContext Python in-process stats
+        try:
+            from headroom.proxy.helpers import get_leanctx_python_stats
+            leanctx_py_stats = get_leanctx_python_stats()
+        except ImportError:
+            leanctx_py_stats = {"tool": "leanctx-py", "tokens_saved": 0}
         cli_filtering_stats = await asyncio.to_thread(_get_context_tool_stats)
         cli_filtering_tool = (
             str(cli_filtering_stats.get("tool", "rtk")) if cli_filtering_stats else "rtk"
