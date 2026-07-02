@@ -55,13 +55,13 @@ describe("HeadroomPlugin", () => {
       proxyUrl: "http://127.0.0.1:8787",
     });
     const result = await plugin.tool?.headroom_retrieve.execute(
-      { hash: "0123456789abcdef01234567", query: "needle" },
+      { hash: "0123456789abcdef01234567" },
       {} as never,
     );
 
     expect(result).toBe("original content");
     expect(fetchMock).toHaveBeenCalledWith(
-      "http://127.0.0.1:8787/v1/retrieve/0123456789abcdef01234567?query=needle",
+      "http://127.0.0.1:8787/v1/retrieve/0123456789abcdef01234567",
       expect.any(Object),
     );
   });

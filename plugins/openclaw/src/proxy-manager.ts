@@ -11,6 +11,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import os from "os";
 
 export interface ProxyManagerConfig {
   proxyUrl?: string;
@@ -258,12 +259,27 @@ export class ProxyManager {
       checkCommand: process.platform === "win32" ? "where.exe" : "sh",
       checkArgs: process.platform === "win32"
         ? ["headroom"]
-        : ["-lc", "command -v headroom >/dev/null 2>&1"],
+        : ["-c", "command -v headroom >/dev/null 2>&1"],
       useShell: process.platform === "win32",
       checkUseShell: false,
     });
 
-    // 4) Local npm install (inside plugin install path)
+    // 4) uv tool install path (~/.local/bin/headroom)
+    const uvBin = join(
+      os.homedir(),
+      ".local", "bin", "headroom"
+    );
+    if (existsSync(uvBin)) {
+      specs.push({
+        label: `uv tool: ${uvBin}`,
+        command: uvBin,
+        args: commonArgs,
+        checkCommand: uvBin,
+        checkArgs: ["--version"],
+      });
+    }
+
+    // 5) Local npm install (inside plugin install path)
     const moduleDir = dirname(fileURLToPath(import.meta.url)); // .../dist
     const packageRoot = dirname(moduleDir);
     const localBinDir = join(packageRoot, "node_modules", ".bin");

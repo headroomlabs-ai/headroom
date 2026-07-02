@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sys
 import threading
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -21,14 +21,21 @@ from headroom.subscription.tracker import SubscriptionTracker
 
 
 def _make_snapshot(
-    *, token_prefix: str = "token123", reset_offset_hours: int = 5
+    *,
+    token_prefix: str = "token123",
+    reset_offset_hours: int = 5,
+    resets_at: datetime | None = None,
 ) -> SubscriptionSnapshot:
     return SubscriptionSnapshot(
         five_hour=RateLimitWindow(
             used=10,
             limit=100,
             utilization_pct=10.0,
-            resets_at=_utc_now() + timedelta(hours=reset_offset_hours),
+            resets_at=(
+                resets_at
+                if resets_at is not None
+                else _utc_now() + timedelta(hours=reset_offset_hours)
+            ),
         ),
         seven_day=RateLimitWindow(used=20, limit=200, utilization_pct=10.0),
         token_prefix=token_prefix,
@@ -105,6 +112,45 @@ async def test_tracker_start_stop_and_rollover_reset(
     tracker._state.history = [
         _make_snapshot(reset_offset_hours=5),
         _make_snapshot(reset_offset_hours=6),
+    ]
+    tracker._state.contribution = HeadroomContribution(tokens_submitted=99)
+    tracker._maybe_reset_contribution(tracker._state.history[-1])
+    assert tracker._state.contribution.tokens_submitted == 0
+
+
+def test_second_level_reset_jitter_does_not_reset_contribution(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Regression: the usage API reports ``resets_at`` with second-level jitter
+    within a single window (observed flapping between ``01:59:59Z`` and
+    ``02:00:00Z`` on consecutive polls). That must NOT be treated as a rollover,
+    or the contribution counters get zeroed every poll and the dashboard sticks
+    at ~0% savings.
+    """
+    monkeypatch.setattr(SubscriptionTracker, "_load_persisted_state", lambda self: None)
+    tracker = SubscriptionTracker(persist_path=tmp_path / "state.json")
+
+    base = _utc_now() + timedelta(hours=3)
+    tracker._state.history = [
+        _make_snapshot(resets_at=base),
+        _make_snapshot(resets_at=base + timedelta(seconds=1)),
+    ]
+    tracker._state.contribution = HeadroomContribution(tokens_submitted=99)
+    tracker._maybe_reset_contribution(tracker._state.history[-1])
+    assert tracker._state.contribution.tokens_submitted == 99
+
+
+def test_genuine_five_hour_rollover_resets_contribution(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A real rollover advances ``resets_at`` by ~5 hours and still resets."""
+    monkeypatch.setattr(SubscriptionTracker, "_load_persisted_state", lambda self: None)
+    tracker = SubscriptionTracker(persist_path=tmp_path / "state.json")
+
+    base = _utc_now()
+    tracker._state.history = [
+        _make_snapshot(resets_at=base),
+        _make_snapshot(resets_at=base + timedelta(hours=5)),
     ]
     tracker._state.contribution = HeadroomContribution(tokens_submitted=99)
     tracker._maybe_reset_contribution(tracker._state.history[-1])

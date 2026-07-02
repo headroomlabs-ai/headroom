@@ -24,7 +24,7 @@ export function createHeadroomRetrieveTool(config: RetrieveToolConfig) {
       "Retrieve original uncompressed content from Headroom's compression store. " +
       "Use when compressed context mentions a hash and you need the full details. " +
       "Pass the hash from the compression marker (24 hex characters). " +
-      "Optionally pass a query to search within the original content.",
+      "Retrieval is by hash and always returns the full original content.",
     parameters: {
       type: "object" as const,
       properties: {
@@ -32,15 +32,11 @@ export function createHeadroomRetrieveTool(config: RetrieveToolConfig) {
           type: "string",
           description: "The 24-character hex hash from the compression marker",
         },
-        query: {
-          type: "string",
-          description: "Optional search query to filter results within the original content",
-        },
       },
       required: ["hash"],
     },
-    execute: async (args: { hash: string; query?: string }): Promise<string> => {
-      const { hash, query } = args;
+    execute: async (args: { hash: string }): Promise<string> => {
+      const { hash } = args;
 
       if (!/^[a-f0-9]{24}$/i.test(hash)) {
         return JSON.stringify({
@@ -49,9 +45,7 @@ export function createHeadroomRetrieveTool(config: RetrieveToolConfig) {
       }
 
       try {
-        const url = query
-          ? `${origin}/v1/retrieve/${hash}?query=${encodeURIComponent(query)}`
-          : `${origin}/v1/retrieve/${hash}`;
+        const url = `${origin}/v1/retrieve/${hash}`;
 
         const resp = await fetch(url, {
           signal: AbortSignal.timeout(10_000),

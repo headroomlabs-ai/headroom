@@ -21,7 +21,7 @@ The canonical, always-current documentation index lives at the docs site below. 
 - TypeScript / Node: `npm install headroom-ai` (or `pnpm add headroom-ai`, `bun add headroom-ai`)
 - Docker: `docker run -p 8787:8787 ghcr.io/chopratejas/headroom:latest`
 - Run the proxy: `headroom proxy --port 8787` then point any client at `http://127.0.0.1:8787`
-- Wrap an agent in one command: `headroom wrap claude` (also: `codex`, `cursor`, `aider`, `copilot`, `opencode`)
+- Wrap an agent in one command: `headroom wrap claude` (also: `codex`, `copilot`, `cursor`, `aider`, `opencode`, `cline`, `continue`, `goose`, `openhands`, `openclaw`, `vibe`)
 
 ## Entry points
 
@@ -53,7 +53,7 @@ The canonical, always-current documentation index lives at the docs site below. 
 
 - [Persistent memory](https://headroom-docs.vercel.app/docs/memory): Per-project SQLite + HNSW vector store. No cross-project bleed (GH #462).
 - [SharedContext](https://headroom-docs.vercel.app/docs/shared-context): Compressed inter-agent context handoffs.
-- [Failure learning](https://headroom-docs.vercel.app/docs/failure-learning): Offline analysis writes corrections to `CLAUDE.md` / `AGENTS.md`.
+- [Failure learning](https://headroom-docs.vercel.app/docs/failure-learning): Offline analysis writes corrections to `CLAUDE.local.md` (default, gitignored) or `CLAUDE.md` (shared) / `AGENTS.md` / `GEMINI.md`.
 
 ## Operations
 
@@ -64,4 +64,4 @@ The canonical, always-current documentation index lives at the docs site below. 
 
 ## Licensing
 
-Apache 2.0. Use commercially, modify, redistribute. Data stays on the user's machine when running the library, proxy, or MCP server locally. Anonymous telemetry enabled by default; set `HEADROOM_TELEMETRY=off` to disable.
+Apache 2.0. Use commercially, modify, redistribute. Data stays on the user's machine when running the library, proxy, or MCP server locally. Anonymous telemetry is **off by default** (opt-in); enable with `HEADROOM_TELEMETRY=on` or `headroom proxy --telemetry`.

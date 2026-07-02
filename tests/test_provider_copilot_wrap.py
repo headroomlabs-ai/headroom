@@ -47,7 +47,30 @@ def test_detect_running_proxy_backend_requires_string_backend(monkeypatch) -> No
 
 
 def test_resolve_provider_type_prefers_explicit_and_env() -> None:
-    assert resolve_provider_type("anthropic", "openai") == "openai"
+    assert (
+        resolve_provider_type(
+            "anthropic",
+            "openai",
+            {"COPILOT_PROVIDER_TYPE": "anthropic", "HEADROOM_BACKEND": "anthropic"},
+        )
+        == "openai"
+    )
+    assert (
+        resolve_provider_type(
+            "anthropic",
+            "auto",
+            {"COPILOT_PROVIDER_TYPE": "openai", "HEADROOM_BACKEND": "anthropic"},
+        )
+        == "openai"
+    )
+    assert (
+        resolve_provider_type(
+            None,
+            "auto",
+            {"COPILOT_PROVIDER_TYPE": "not-a-provider", "HEADROOM_BACKEND": "anthropic"},
+        )
+        == "anthropic"
+    )
     assert resolve_provider_type(None, "auto", {"HEADROOM_BACKEND": "anthropic"}) == "anthropic"
     assert resolve_provider_type(None, "auto", {"HEADROOM_BACKEND": "anyllm"}) == "openai"
 

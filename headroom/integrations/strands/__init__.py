@@ -90,6 +90,6 @@ __all__ = [
     # Provider detection
     "get_headroom_provider",
     "get_model_name_from_strands",
-    # One-helper MCP + hook wiring (Headroom + Serena + RTK-equivalent)
+    # One-helper MCP + hook wiring (Headroom + tokensave/Serena + RTK-equivalent)
     "HeadroomBundle",
 ]

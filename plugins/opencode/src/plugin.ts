@@ -45,7 +45,6 @@ export const HeadroomPlugin: Plugin = async (input, options = {}) => {
           hash: z
             .string()
             .regex(/^[a-f0-9]{24}$/i, "Expected 24-character hex hash"),
-          query: z.string().optional(),
         },
         async execute(args) {
           return retrieveTool.execute(args);

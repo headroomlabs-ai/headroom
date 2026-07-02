@@ -338,3 +338,62 @@ class ShoppingCart:
         # Should achieve some compression
         assert result.tokens_after < result.tokens_before
         assert result.compression_ratio < 1.0
+
+
+class TestSecurityAuditRegressions:
+    """End-to-end regressions for the June 2026 security audit findings."""
+
+    def test_sec01_entropy_preservation_keeps_high_entropy_secret(self):
+        """SEC-01: an enabled entropy pass must preserve high-entropy strings.
+
+        With the character-level tokenization bug, use_entropy_preservation was
+        a silent no-op, so a secret buried in a compressible region was dropped.
+        Uses the deterministic truncation fallback (use_kompress=False) so the
+        middle of the content is genuinely removed when preservation is off.
+        """
+        secret = "Zx9Kq3Wm7Pv2Lr8Nt4Bc6Df1Gh5Jy"  # gitleaks:allow synthetic test fixture
+        filler = "the quick brown fox jumps over the lazy dog and runs on. " * 6
+        content = filler + " " + secret + " " + filler
+
+        off = UniversalCompressor(
+            config=UniversalCompressorConfig(
+                use_magika=False,
+                use_kompress=False,
+                use_entropy_preservation=False,
+                ccr_enabled=False,
+            )
+        ).compress(content, content_type=ContentType.TEXT)
+        on = UniversalCompressor(
+            config=UniversalCompressorConfig(
+                use_magika=False,
+                use_kompress=False,
+                use_entropy_preservation=True,
+                ccr_enabled=False,
+            )
+        ).compress(content, content_type=ContentType.TEXT)
+
+        assert secret not in off.compressed  # dropped without preservation
+        assert secret in on.compressed  # preserved with the fix
+
+    def test_sec02_json_fallback_stays_valid_json(self):
+        """SEC-02: the truncation fallback must not emit control chars into JSON.
+
+        The old separator embedded raw newlines, producing invalid JSON inside a
+        string value when Kompress was unavailable. Validate both paths.
+        """
+        payload = json.dumps(
+            {
+                "service": "api",
+                "payload": "This is a fictional long string value " * 4 + "END",
+            }
+        )
+        for use_kompress in (False, True):
+            res = UniversalCompressor(
+                config=UniversalCompressorConfig(
+                    use_magika=False,
+                    use_kompress=use_kompress,
+                    ccr_enabled=False,
+                )
+            ).compress(payload, content_type=ContentType.JSON)
+            assert "\n" not in res.compressed, f"raw newline leaked (use_kompress={use_kompress})"
+            json.loads(res.compressed)  # must not raise

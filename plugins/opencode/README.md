@@ -1,6 +1,9 @@
 # headroom-opencode
 
-Headroom proxy integration for [OpenCode](https://opencode.ai). Routes LLM traffic through the Headroom proxy for token compression, provides CCR retrieval, and handles provider configuration.
+OpenCode integration helpers for Headroom. The package supports two integration paths:
+
+1. Provider config helpers used by `headroom wrap opencode` and persistent installs.
+2. A native OpenCode plugin that installs Headroom transport interception and exposes the retrieve tool.
 
 ## Install
 
@@ -8,119 +11,96 @@ Headroom proxy integration for [OpenCode](https://opencode.ai). Routes LLM traff
 npm install headroom-opencode
 ```
 
-## Quick start
+## Provider Config Helpers
 
-### Create a Headroom provider for opencode.json
-
-```ts
-import { createHeadroomProvider } from "headroom-opencode";
-
-const provider = createHeadroomProvider({
-  proxyPort: 8787,
-});
-
-// Write to opencode.json:
-// {
-//   "provider": { "headroom": provider },
-//   "model": "headroom/claude-sonnet-4-6"
-// }
-```
-
-### Build OPENCODE_CONFIG_CONTENT
+Use these helpers when you need to generate OpenCode config that routes a `headroom` provider through a running Headroom proxy.
 
 ```ts
-import { buildOpencodeConfigContentJson } from "headroom-opencode";
+import {
+  buildOpencodeConfigContent,
+  createHeadroomProvider,
+} from "headroom-opencode";
 
-const json = buildOpencodeConfigContentJson({
+const provider = createHeadroomProvider({ proxyPort: 8787 });
+const config = buildOpencodeConfigContent({
   proxyPort: 8787,
   defaultModel: "claude-sonnet-4-6",
 });
 
-// Set as env var: process.env.OPENCODE_CONFIG_CONTENT = json;
+console.log(provider.provider.headroom.npm);
+console.log(config.model);
 ```
 
-### Compress messages through the proxy
+The generated provider uses `@ai-sdk/openai-compatible` and points model requests at `http://127.0.0.1:<port>/v1`.
+
+## Native OpenCode Plugin
+
+Use `HeadroomPlugin` when OpenCode should intercept provider traffic in-process and expose Headroom tooling from a plugin.
 
 ```ts
-import { compressWithHeadroom } from "headroom-opencode";
+import { HeadroomPlugin } from "headroom-opencode";
 
-const result = await compressWithHeadroom(messages, {
-  model: "gpt-4o",
-  proxyUrl: "http://localhost:8787",
-});
-
-console.log(`Saved ${result.tokensSaved} tokens`);
+export default async function plugin(input) {
+  return HeadroomPlugin(input, {
+    proxyUrl: process.env.HEADROOM_PROXY_URL ?? "http://127.0.0.1:8787",
+  });
+}
 ```
 
-### CCR retrieve tool
+`HeadroomPlugin`:
+
+- installs Headroom transport interception for OpenCode provider traffic.
+- exposes the `headroom_retrieve` tool.
+- publishes `HEADROOM_PROXY_URL` in the plugin output env.
+- defaults to `http://127.0.0.1:8787` when no proxy URL is supplied.
+
+## Retrieve Tool
 
 ```ts
 import { createHeadroomRetrieveTool } from "headroom-opencode";
 
-const retrieveTool = createHeadroomRetrieveTool({
-  proxyBaseUrl: "http://localhost:8787",
+const retrieve = createHeadroomRetrieveTool({
+  proxyBaseUrl: "http://127.0.0.1:8787",
 });
 
-// Register in OpenCode's MCP config under mcp.headroom_retrieve
+const result = await retrieve.execute({
+  hash: "0123456789abcdef01234567",
+});
 ```
 
-## API
+The tool calls `/v1/retrieve/<hash>` on the Headroom proxy.
 
-### `createHeadroomProvider(options?)`
+## Compression Helper
 
-Creates a provider object compatible with OpenCode's `@ai-sdk/openai-compatible` format.
+```ts
+import { compressWithHeadroom } from "headroom-opencode";
 
-| Option | Default | Description |
-|---|---|---|
-| `proxyBaseUrl` | `http://127.0.0.1:8787` | Full proxy base URL |
-| `proxyPort` | `8787` | Proxy port (ignored if proxyBaseUrl is set) |
-| `models` | See below | Custom model mappings |
-| `defaultModel` | `claude-sonnet-4-6` | Default model ID |
+const result = await compressWithHeadroom(
+  [{ role: "user", content: "Summarize this file" }],
+  { model: "gpt-4o", proxyUrl: "http://127.0.0.1:8787" },
+);
 
-### `buildOpencodeConfigContent(options?)`
+console.log(`Saved ${result.tokensSaved} tokens`);
+```
 
-Returns a full `OPENCODE_CONFIG_CONTENT` JSON object with provider and model.
+## Models
 
-### `buildOpencodeConfigContentJson(options?)`
-
-Same as above but returns a JSON string ready for the `OPENCODE_CONFIG_CONTENT` env var.
-
-### `compressWithHeadroom(messages, options?)`
-
-Compresses an array of messages through the Headroom proxy. Returns compression stats and compressed messages.
-
-### `createHeadroomRetrieveTool(config)`
-
-Creates a CCR retrieve tool for OpenCode's MCP system.
-
-### `setDefaultProxyUrl(url)` / `getDefaultProxyUrl()`
-
-Set or get the default proxy URL for all operations. Defaults to `HEADROOM_BASE_URL` env var or `http://localhost:8787`.
-
-## Default models
-
-| Model ID | Context | Output |
-|---|---|---|
+| Model | Context | Output |
+|---|---:|---:|
 | `claude-sonnet-4-6` | 200K | 16K |
 | `claude-opus-4-6` | 200K | 16K |
 | `claude-haiku-4-5-20251001` | 200K | 8K |
 | `gpt-4o` | 128K | 16K |
 | `gpt-4.1` | 1M | 32K |
 
-## OpenCode plugin
+The provider config exposes these as `headroom/<model>` and defaults to `headroom/claude-sonnet-4-6`.
 
-The package default export is an OpenCode plugin. It adds a `headroom_retrieve`
-tool and Headroom metadata for shell commands:
+## Environment
 
-```json
-{
-  "plugin": [["headroom-opencode", { "proxyUrl": "http://127.0.0.1:8787" }]]
-}
-```
-
-The plugin does not set `OPENAI_BASE_URL` or `ANTHROPIC_BASE_URL`. Model traffic
-is routed by the `headroom` provider config generated by
-`buildOpencodeConfigContent` or `headroom wrap opencode`.
+| Variable | Used by | Description |
+|---|---|---|
+| `HEADROOM_PROXY_URL` | Native plugin | Proxy URL used by `HeadroomPlugin` |
+| `OPENCODE_CONFIG_CONTENT` | OpenCode wrapper | Generated OpenCode provider, model, and MCP config |
 
 ## License
 

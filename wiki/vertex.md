@@ -71,7 +71,7 @@ Anthropic publisher route.
 To run **Claude Code** against Claude-on-Vertex **with Headroom compressing the
 context**, use the dedicated, tested runbook:
 
-➡️ **[Claude Code + Vertex + Headroom](../docs/claude-code-vertex-headroom.md)**
+➡️ **[Claude Code + Vertex + Headroom](https://headroom-docs.vercel.app/docs/claude-code-vertex)**
 
 Short version: run Claude Code in **normal Anthropic mode** (`ANTHROPIC_BASE_URL`
 → the proxy) and start the proxy with `--backend litellm-vertex_ai --region <loc>

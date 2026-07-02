@@ -781,6 +781,18 @@ try:
 except ValueError:
     COMPRESSION_TIMEOUT_SECONDS = 30.0
 
+# Eager startup preload timeout in seconds. The preload (compressor/parser models,
+# cache-only, allow_download=False) runs off the event loop during startup; this
+# bound only fires on a true hang or an uncatchable native stall so the proxy still
+# binds its port instead of never opening (GH #790). Override via
+# HEADROOM_EAGER_PRELOAD_TIMEOUT_SECONDS. Falls back to 120 on an unparseable value.
+try:
+    EAGER_PRELOAD_TIMEOUT_SECONDS = float(
+        os.environ.get("HEADROOM_EAGER_PRELOAD_TIMEOUT_SECONDS", "120")
+    )
+except ValueError:
+    EAGER_PRELOAD_TIMEOUT_SECONDS = 120.0
+
 # Maximum compression cache sessions (prevents unbounded memory growth)
 MAX_COMPRESSION_CACHE_SESSIONS = 500
 
@@ -938,6 +950,14 @@ def retry_after_ms(response: httpx.Response, max_ms: int) -> float | None:
         except (TypeError, ValueError):
             return None
     return min(max(seconds, 0.0) * 1000.0, float(max_ms))
+
+
+# Transient upstream statuses worth retrying with backoff: 429 (rate limit) and
+# 529 (Anthropic ``overloaded_error``). Both mean "the server is temporarily
+# limiting/overloaded — try again shortly", unlike other 4xx which signal a
+# problem with the request itself. Single source of truth so the streaming and
+# non-streaming forwarders agree on what is retriable.
+RETRYABLE_OVERLOAD_STATUSES: frozenset[int] = frozenset({429, 529})
 
 
 # Image compression availability (do not retain a global compressor instance)
@@ -2544,6 +2564,35 @@ def _reset_session_ccr_tracker_for_test() -> None:
     global _session_ccr_tracker
     with _session_ccr_tracker_lock:
         _session_ccr_tracker = None
+
+
+def should_inject_ccr_tool(
+    *,
+    configured_inject_tool: bool,
+    frozen_message_count: int,
+    has_compressed_content: bool,
+) -> tuple[bool, bool]:
+    """Decide whether the ``headroom_retrieve`` tool must be injected this turn.
+
+    This is the decision the Anthropic handler used to inline. It is extracted
+    so the #1006 regression can be pinned at the decision point itself.
+
+    Tool injection is normally deferred when there is a frozen message prefix
+    (``frozen_message_count > 0``) to preserve the prompt cache. But if
+    compression emitted fresh markers this turn, deferring would hand the agent
+    a ``<<ccr:hash>>`` marker with no tool to redeem it — silent data loss. In
+    that case we override the deferral and inject anyway (one cache miss is
+    cheaper than dropped content).
+
+    Returns ``(should_inject, is_marker_override)``. ``is_marker_override`` is
+    True only when injection happens *because* of new markers despite a deferral,
+    so the caller can log the override distinctly.
+    """
+    inject_tool = configured_inject_tool
+    if inject_tool and frozen_message_count > 0:
+        inject_tool = False  # defer to preserve cache
+    is_marker_override = not inject_tool and has_compressed_content
+    return (inject_tool or is_marker_override), is_marker_override
 
 
 def apply_session_sticky_ccr_tool(

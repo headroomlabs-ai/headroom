@@ -173,14 +173,14 @@ def test_vertex_rawpredict_versionless_anthropic_rewrites_to_v1(monkeypatch) -> 
     assert resp.status_code == 200
     assert captured == {
         "path": (
-            "/v1/projects/p/locations/europe-west1/publishers/anthropic/models/"
+            "/projects/p/locations/europe-west1/publishers/anthropic/models/"
             "claude-sonnet-4-6:rawPredict"
         ),
         "raw_path": (
-            b"/v1/projects/p/locations/europe-west1/publishers/anthropic/models/"
+            b"/projects/p/locations/europe-west1/publishers/anthropic/models/"
             b"claude-sonnet-4-6:rawPredict"
         ),
-        "base_url": "https://europe-west1-aiplatform.googleapis.com",
+        "base_url": "https://europe-west1-aiplatform.googleapis.com/v1",
         "provider": "vertex:anthropic",
         "model": "claude-sonnet-4-6",
         "force_stream": False,
@@ -219,10 +219,10 @@ def test_vertex_stream_rawpredict_versionless_anthropic_forces_stream(monkeypatc
     assert resp.status_code == 200
     assert captured == {
         "path": (
-            "/v1/projects/p/locations/europe-west1/publishers/anthropic/models/"
+            "/projects/p/locations/europe-west1/publishers/anthropic/models/"
             "claude-sonnet-4-6:streamRawPredict"
         ),
-        "base_url": "https://europe-west1-aiplatform.googleapis.com",
+        "base_url": "https://europe-west1-aiplatform.googleapis.com/v1",
         "provider": "vertex:anthropic",
         "model": "claude-sonnet-4-6",
         "force_stream": True,

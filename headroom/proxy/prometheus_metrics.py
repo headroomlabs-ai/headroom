@@ -68,7 +68,11 @@ class PrometheusMetrics:
         savings_tracker: SavingsTracker | None = None,
         cost_tracker: CostTracker | None = None,
         otel_metrics: HeadroomOtelMetrics | None = None,
+        stateless: bool = False,
     ):
+        # Stateless mode: keep live in-memory metrics but never write the
+        # durable savings files (proxy_savings.json, savings_events.jsonl).
+        self._stateless = stateless
         self.requests_total = 0
         self.requests_by_provider: dict[str, int] = defaultdict(int)
         self.requests_by_model: dict[str, int] = defaultdict(int)
@@ -236,7 +240,7 @@ class PrometheusMetrics:
 
         # Cumulative savings history (timestamp → cumulative tokens saved)
         self.savings_history: list[tuple[str, int]] = []
-        self.savings_tracker = savings_tracker or SavingsTracker()
+        self.savings_tracker = savings_tracker or SavingsTracker(stateless=stateless)
         self.cost_tracker = cost_tracker
         tracker_lifetime = self.savings_tracker.snapshot()["lifetime"]
         self._savings_tracker_input_tokens_offset = max(
@@ -677,7 +681,7 @@ class PrometheusMetrics:
             # client is the harness classified from the User-Agent / X-Client
             # (claude-code, codex, cursor, ...); it falls back to "proxy" only
             # when the harness is unidentified.
-            if tokens_saved > 0:
+            if tokens_saved > 0 and not self._stateless:
                 savings_ledger.record_savings_event(
                     tokens_before=input_tokens,
                     tokens_after=max(input_tokens - tokens_saved, 0),
@@ -896,11 +900,9 @@ class PrometheusMetrics:
             # internally on `self.compressions_by_strategy` and
             # `self.tokens_saved_by_strategy` (populated by
             # `record_compression`) but **deliberately not exported
-            # here**. The proxy's metric→Supabase pipeline treats
-            # each metric name as a column, and we cannot add new
-            # columns. The state is still observable for tests +
-            # programmatic introspection; if/when a non-column-
-            # adding export path exists, surface it there.
+            # here** as individual Prometheus series. The state is
+            # still observable via /stats + tests + programmatic
+            # introspection.
             _append_metric(
                 lines,
                 name="headroom_latency_ms_sum",

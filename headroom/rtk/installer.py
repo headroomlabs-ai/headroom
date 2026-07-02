@@ -9,6 +9,7 @@ import platform
 import stat
 import subprocess
 import tarfile
+import tempfile
 import zipfile
 from pathlib import Path
 from urllib.request import urlopen
@@ -75,7 +76,7 @@ def download_rtk(version: str | None = None) -> Path:
     """Download rtk binary from GitHub releases.
 
     Args:
-        version: Version to download (e.g., "v0.28.2"). Defaults to pinned version.
+        version: Version to download (e.g., "v0.42.4"). Defaults to pinned version.
 
     Returns:
         Path to the installed binary.
@@ -169,18 +170,35 @@ def register_claude_hooks(rtk_path: Path | None = None) -> bool:
     """
     rtk_path = rtk_path or RTK_BIN_PATH
 
+    # Capture output to a temp file rather than pipes: `rtk init` may fork a
+    # background process that inherits our stdout/stderr, and a piped
+    # `subprocess.run` drains those pipes until EOF — which never arrives while
+    # the daemon holds them open, so it blocks to the timeout even though
+    # `rtk init` itself exited and already registered the hooks. A file fd has
+    # no such reader, so we wait only on the direct child. stdin is DEVNULL so a
+    # stray prompt can never block either.
     try:
-        result = run(
-            [str(rtk_path), "init", "--global", "--auto-patch"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if result.returncode == 0:
-            logger.info("rtk hooks registered in Claude Code")
-            return True
-        else:
-            logger.warning("rtk init failed: %s", result.stderr)
+        with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as out:
+            try:
+                result = subprocess.run(
+                    [str(rtk_path), "init", "--global", "--auto-patch"],
+                    stdin=subprocess.DEVNULL,
+                    stdout=out,
+                    stderr=out,
+                    timeout=10,
+                )
+            except subprocess.TimeoutExpired:
+                # Read the temp file while it is still open — the outer handler
+                # runs after the `with` closes it, so any captured diagnostics
+                # would be gone by then.
+                out.seek(0)
+                logger.warning("rtk init timed out: %s", out.read().strip())
+                return False
+            if result.returncode == 0:
+                logger.info("rtk hooks registered in Claude Code")
+                return True
+            out.seek(0)
+            logger.warning("rtk init failed: %s", out.read().strip())
             return False
     except Exception as e:
         logger.warning("Failed to register rtk hooks: %s", e)

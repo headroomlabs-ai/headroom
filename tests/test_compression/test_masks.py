@@ -8,6 +8,7 @@ from headroom.compression.masks import (
     StructureMask,
     apply_mask_to_text,
     compute_entropy_mask,
+    compute_entropy_mask_for_content,
     mask_to_spans,
 )
 
@@ -230,6 +231,47 @@ class TestComputeEntropyMask:
 
         assert mask.metadata["source"] == "entropy"
         assert mask.metadata["threshold"] == 0.9
+
+
+class TestComputeEntropyMaskForContent:
+    """Tests for compute_entropy_mask_for_content (SEC-01 regression).
+
+    The character-level path (`compute_entropy_mask(list(content))`) is a silent
+    no-op on plain text because every single-character token is below
+    min_token_length. The content-level helper must restore preservation by
+    scoring whole words and mapping them back to character positions.
+    """
+
+    def test_char_level_tokenization_is_inert(self):
+        """Regression: char tokens never reach min length -> nothing preserved."""
+        secret = "Zx9Kq3Wm7Pv2Lr8Nt4Bc6Df1Gh5Jy"  # gitleaks:allow synthetic test fixture
+        char_mask = compute_entropy_mask(list(f"k={secret}"), threshold=0.85)
+        # This is the bug the fix routes around: zero preservation.
+        assert sum(char_mask.mask) == 0
+
+    def test_high_entropy_word_char_range_preserved(self):
+        """The full character span of a high-entropy word is marked True."""
+        secret = "Zx9Kq3Wm7Pv2Lr8Nt4Bc6Df1Gh5Jy"  # gitleaks:allow synthetic test fixture
+        content = f"prefix {secret} suffix"
+        mask = compute_entropy_mask_for_content(content, threshold=0.85)
+
+        start = content.index(secret)
+        end = start + len(secret)
+        assert all(mask.mask[start:end])  # secret preserved
+        assert not any(mask.mask[:start])  # ordinary words not preserved
+        assert not any(mask.mask[end:])  # trailing words not preserved
+        assert len(mask.mask) == len(content)  # char-aligned
+
+    def test_short_words_not_preserved(self):
+        """Short words are not scored regardless of entropy."""
+        mask = compute_entropy_mask_for_content("a b cd ef", threshold=0.5)
+        assert sum(mask.mask) == 0
+
+    def test_metadata_marks_word_granularity(self):
+        mask = compute_entropy_mask_for_content("plain words only", threshold=0.9)
+        assert mask.metadata["source"] == "entropy"
+        assert mask.metadata["threshold"] == 0.9
+        assert mask.metadata["granularity"] == "word"
 
 
 class TestApplyMaskToText:

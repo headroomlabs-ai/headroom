@@ -54,7 +54,7 @@ def test_prepare_only_injects_rtk_into_hintfile(
     assert result.exit_code == 0, result.output
     marker = tmp_path / hintfile
     assert marker.exists(), f"{hintfile} should be created"
-    content = marker.read_text()
+    content = marker.read_text(encoding="utf-8")
     assert wrap_mod._RTK_MARKER in content
     assert "RTK (Rust Token Killer)" in content
 
@@ -75,7 +75,7 @@ def test_prepare_only_idempotent_no_duplicate_block(
         runner.invoke(main, ["wrap", agent, "--prepare-only"])
         runner.invoke(main, ["wrap", agent, "--prepare-only"])
 
-    content = (tmp_path / hintfile).read_text()
+    content = (tmp_path / hintfile).read_text(encoding="utf-8")
     assert content.count(wrap_mod._RTK_MARKER) == 1
 
 
@@ -111,13 +111,13 @@ def test_preserves_existing_hintfile_content(
     monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
     marker_path = tmp_path / hintfile
     original = "# Project conventions\n\nAlways use Python 3.12.\n"
-    marker_path.write_text(original)
+    marker_path.write_text(original, encoding="utf-8")
 
     with patch.object(wrap_mod, "_ensure_rtk_binary", return_value=Path("/tmp/rtk")):
         result = runner.invoke(main, ["wrap", agent, "--prepare-only"])
 
     assert result.exit_code == 0, result.output
-    content = marker_path.read_text()
+    content = marker_path.read_text(encoding="utf-8")
     assert "Always use Python 3.12." in content
     assert wrap_mod._RTK_MARKER in content
 
@@ -145,7 +145,7 @@ def test_keyboardinterrupt_during_prelude_emits_clear_message(
         # hint-file marker but before _ensure_proxy returns. We trigger via
         # _ensure_rtk_binary side-effect so the marker exists on disk.
         marker_path = tmp_path / hintfile
-        marker_path.write_text(wrap_mod.RTK_INSTRUCTIONS_BLOCK)
+        marker_path.write_text(wrap_mod.RTK_INSTRUCTIONS_BLOCK, encoding="utf-8")
         raise KeyboardInterrupt
 
     with patch.object(wrap_mod, "_ensure_rtk_binary", side_effect=raise_kbd):
@@ -156,3 +156,27 @@ def test_keyboardinterrupt_during_prelude_emits_clear_message(
     assert "idempotent" in result.output.lower()
     assert (tmp_path / hintfile).exists()
     assert hintfile in result.output
+
+
+@pytest.mark.parametrize("agent,hintfile", HINTFILE_AGENTS)
+def test_inject_rtk_handles_utf8_content(
+    agent: str,
+    hintfile: str,
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Existing hint files with non-ASCII UTF-8 content must not crash (#1126)."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    marker_path = tmp_path / hintfile
+    original = "# Instructions\n\nUse “smart quotes” and an em dash — here.\n"
+    marker_path.write_text(original, encoding="utf-8")
+
+    with patch.object(wrap_mod, "_ensure_rtk_binary", return_value=Path("/tmp/rtk")):
+        result = runner.invoke(main, ["wrap", agent, "--prepare-only"])
+
+    assert result.exit_code == 0, result.output
+    content = marker_path.read_text(encoding="utf-8")
+    assert "“smart quotes”" in content
+    assert wrap_mod._RTK_MARKER in content

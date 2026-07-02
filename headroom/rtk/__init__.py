@@ -12,7 +12,7 @@ from pathlib import Path
 
 from headroom import paths as _paths
 
-RTK_VERSION = "v0.28.2"
+RTK_VERSION = "v0.42.4"
 RTK_BIN_DIR = _paths.bin_dir()
 _RTK_NAME = "rtk.exe" if platform.system() == "Windows" else "rtk"
 RTK_BIN_PATH = RTK_BIN_DIR / _RTK_NAME

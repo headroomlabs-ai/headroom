@@ -217,13 +217,17 @@ def _estimate_input_cost_usd(
     otherwise falls back to list-price input tokens.
     """
     total_input_tokens = _coerce_int(input_tokens)
-    litellm = _get_litellm_module()
-    if total_input_tokens <= 0 or litellm is None:
-        return 0.0
-
     cache_read = _coerce_int(cache_read_tokens)
     cache_write = _coerce_int(cache_write_tokens)
     uncached = _coerce_int(uncached_input_tokens)
+    litellm = _get_litellm_module()
+    # Gate on tokens actually sent. Providers like Anthropic report cache
+    # reads/writes separately from `input_tokens` (the uncached portion), so a
+    # fully prefix-cached request has input_tokens == 0 while cache_read > 0.
+    # Bailing on `input_tokens <= 0` alone dropped the real cache-read cost,
+    # leaving days with compression savings but zero recorded spend.
+    if total_input_tokens + cache_read + cache_write + uncached <= 0 or litellm is None:
+        return 0.0
 
     try:
         resolved = _resolve_litellm_model(model)
@@ -416,7 +420,12 @@ class SavingsTracker:
         max_history_age_days: int = DEFAULT_MAX_HISTORY_AGE_DAYS,
         max_response_history_points: int = DEFAULT_MAX_RESPONSE_HISTORY_POINTS,
         display_session_inactivity_minutes: int = (DEFAULT_DISPLAY_SESSION_INACTIVITY_MINUTES),
+        stateless: bool = False,
     ) -> None:
+        # In stateless mode the tracker keeps live counters in memory but never
+        # writes proxy_savings.json (honors HeadroomConfig.stateless, which
+        # disables all filesystem writes for read-only / container deployments).
+        self._stateless = stateless
         self._path = Path(path or get_default_savings_storage_path())
         self._max_history_points = max_history_points
         self._max_history_age_days = max_history_age_days
@@ -978,6 +987,9 @@ class SavingsTracker:
         return compacted
 
     def _save_locked(self) -> None:
+        if self._stateless:
+            # Stateless mode: live counters stay in memory; nothing is persisted.
+            return
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             payload = {

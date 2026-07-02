@@ -584,8 +584,8 @@ class TestGlobalTelemetryCollector:
         Pre-#390 the collector only honoured HEADROOM_TELEMETRY_DISABLED, which
         is undocumented. Users following the docs set HEADROOM_TELEMETRY=off and
         watched /v1/telemetry continue to report enabled=true. The collector now
-        consults `is_telemetry_enabled()` (the same predicate the Supabase beacon
-        uses), so both env vars take effect.
+        consults `is_telemetry_enabled()` (the documented opt-in predicate),
+        so both env vars take effect.
         """
         reset_telemetry_collector()
         monkeypatch.delenv("HEADROOM_TELEMETRY_DISABLED", raising=False)

@@ -742,18 +742,12 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         publisher: str,
         model: str,
     ):
-        # Claude Code omits the /v1 prefix when using ANTHROPIC_VERTEX_BASE_URL.
-        # Prepend it so the upstream Vertex URL is constructed correctly.
-        del project
-        request.scope["path"] = "/v1" + request.scope["path"]
-        if "raw_path" in request.scope:
-            request.scope["raw_path"] = b"/v1" + request.scope["raw_path"]
-        if hasattr(request, "_url"):
-            delattr(request, "_url")
         if publisher == "anthropic":
+            del project
+            target = _vertex_target_for_location(proxy, location).rstrip("/") + "/v1"
             return await proxy.handle_anthropic_messages(
                 request,
-                _vertex_target_for_location(proxy, location),
+                target,
                 "vertex:anthropic",
                 model,
             )
@@ -791,18 +785,12 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         publisher: str,
         model: str,
     ):
-        # Claude Code omits the /v1 prefix when using ANTHROPIC_VERTEX_BASE_URL.
-        # Prepend it so the upstream Vertex URL is constructed correctly.
-        del project
-        request.scope["path"] = "/v1" + request.scope["path"]
-        if "raw_path" in request.scope:
-            request.scope["raw_path"] = b"/v1" + request.scope["raw_path"]
-        if hasattr(request, "_url"):
-            delattr(request, "_url")
         if publisher == "anthropic":
+            del project
+            target = _vertex_target_for_location(proxy, location).rstrip("/") + "/v1"
             return await proxy.handle_anthropic_messages(
                 request,
-                _vertex_target_for_location(proxy, location),
+                target,
                 "vertex:anthropic",
                 model,
                 True,

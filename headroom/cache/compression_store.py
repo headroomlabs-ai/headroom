@@ -24,11 +24,8 @@ Usage:
         tool_name="search_api",
     )
 
-    # Retrieve later
+    # Retrieve later (by hash; always returns the full original content)
     entry = store.retrieve(hash_key)
-
-    # Or search within
-    results = store.search(hash_key, "user query")
 """
 
 from __future__ import annotations
@@ -44,8 +41,6 @@ import time
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
-
-from ..relevance.bm25 import BM25Scorer
 
 if TYPE_CHECKING:
     from ..memory.tracker import ComponentStats
@@ -190,7 +185,7 @@ class RetrievalEvent:
     total_items: int
     tool_name: str | None
     timestamp: float
-    retrieval_type: str  # "full" or "search"
+    retrieval_type: str  # always "full" (retrieval is by hash)
     tool_signature_hash: str | None = None  # For TOIN correlation
 
 
@@ -206,7 +201,7 @@ class CompressionStore:
     - Thread-safe for concurrent access
     - TTL-based expiration (default 300 seconds, env-configurable)
     - LRU-style eviction when capacity is reached
-    - Built-in BM25 search for filtering
+    - Hash-keyed retrieval that always returns the full original content
     """
 
     def __init__(
@@ -249,9 +244,6 @@ class CompressionStore:
         self._stale_heap_entries = 0
         # Threshold for triggering heap rebuild (when 50% are stale)
         self._heap_rebuild_threshold = 0.5
-
-        # BM25 scorer for search
-        self._scorer = BM25Scorer()
 
     @property
     def default_ttl_seconds(self) -> int:
@@ -487,74 +479,6 @@ class CompressionStore:
                 "ttl": entry.ttl,
             }
 
-    def search(
-        self,
-        hash_key: str,
-        query: str,
-        max_results: int = 20,
-        score_threshold: float = 0.3,
-    ) -> list[dict[str, Any]]:
-        """Search within cached content using BM25.
-
-        Args:
-            hash_key: Hash key of cached content.
-            query: Search query.
-            max_results: Maximum number of results to return.
-            score_threshold: Minimum BM25 score to include.
-
-        Returns:
-            List of matching items from original content.
-        """
-        # Get entry without logging (we'll log the search separately)
-        entry = self._get_entry_for_search(hash_key, query)
-        if entry is None:
-            return []
-
-        items = self._search_items_from_original(entry.original_content)
-
-        if not items:
-            return []
-
-        # Score each item using BM25
-        item_strs = [json.dumps(item, default=str) for item in items]
-        scores = self._scorer.score_batch(item_strs, query)
-
-        # Filter and sort by score
-        scored_items = [
-            (items[i], scores[i].score)
-            for i in range(len(items))
-            if scores[i].score >= score_threshold
-        ]
-        scored_items.sort(key=lambda x: x[1], reverse=True)
-
-        results = [item for item, _ in scored_items[:max_results]]
-
-        # Log retrieval event
-        if self._enable_feedback:
-            with self._lock:
-                self._log_retrieval(
-                    hash_key=hash_key,
-                    query=query,
-                    items_retrieved=len(results),
-                    total_items=len(items),
-                    tool_name=entry.tool_name,
-                    retrieval_type="search",
-                    tool_signature_hash=entry.tool_signature_hash,
-                )
-            # Process feedback immediately to ensure TOIN learns in real-time
-            self.process_pending_feedback()
-        self._log_retrieval_payload(
-            hash_key=hash_key,
-            query=query,
-            retrieval_type="search",
-            payload=json.dumps(results, ensure_ascii=False),
-            items_retrieved=len(results),
-            total_items=len(items),
-            entry=entry,
-        )
-
-        return results
-
     def _log_retrieval_payload(
         self,
         *,
@@ -587,189 +511,6 @@ class CompressionStore:
             "event=headroom_retrieve %s",
             json.dumps(event, ensure_ascii=False, separators=(",", ":")),
         )
-
-    def _search_items_from_original(self, original_content: str) -> list[Any]:
-        """Normalize cached originals into searchable items.
-
-        CCR producers store different shapes:
-        - SmartCrusher/search-style paths usually store JSON arrays.
-        - Kompress stores the original plain text.
-        - Some callers store JSON objects or scalar JSON values.
-
-        Search should work for all of them. Preserve the legacy JSON-array
-        result shape, but fall back to structured text chunks for everything
-        else so `headroom_retrieve(hash, query=...)` can find plain-text
-        originals.
-        """
-
-        try:
-            parsed = json.loads(original_content)
-        except json.JSONDecodeError:
-            return self._plain_text_search_items(original_content)
-
-        if isinstance(parsed, list):
-            return parsed
-        if isinstance(parsed, dict):
-            return self._json_object_search_items(parsed)
-        if isinstance(parsed, str):
-            return self._plain_text_search_items(parsed)
-        if parsed is None:
-            return []
-        return [{"type": "json_scalar", "value": parsed}]
-
-    def _json_object_search_items(self, value: dict[str, Any]) -> list[dict[str, Any]]:
-        """Return searchable leaf records for a JSON object."""
-
-        items: list[dict[str, Any]] = []
-
-        def walk(node: Any, path: str) -> None:
-            if isinstance(node, dict):
-                for key, child in node.items():
-                    child_path = f"{path}.{key}" if path else str(key)
-                    walk(child, child_path)
-                return
-            if isinstance(node, list):
-                for idx, child in enumerate(node):
-                    walk(child, f"{path}[{idx}]")
-                return
-            if node is None:
-                return
-            items.append({"type": "json_leaf", "path": path, "value": node})
-
-        walk(value, "")
-        if items:
-            return items
-        return [{"type": "json_object", "value": value}]
-
-    def _plain_text_search_items(self, text: str) -> list[dict[str, Any]]:
-        """Chunk arbitrary text into searchable records.
-
-        Line-aware chunks work well for logs/source. Word-window chunks handle
-        Kompress originals, which are often long single-line text blobs.
-        """
-
-        if not text or not text.strip():
-            return []
-
-        normalized = text.replace("\r\n", "\n").replace("\r", "\n")
-        lines = normalized.split("\n")
-        if len(lines) > 1:
-            return self._line_text_search_items(lines)
-
-        words = normalized.split()
-        if not words:
-            return []
-        max_words = 350
-        overlap_words = 50
-        if len(words) <= max_words:
-            return [
-                {
-                    "type": "text",
-                    "text": normalized,
-                    "chunk_index": 0,
-                    "word_start": 1,
-                    "word_end": len(words),
-                }
-            ]
-
-        items: list[dict[str, Any]] = []
-        start = 0
-        chunk_index = 0
-        step = max_words - overlap_words
-        while start < len(words):
-            end = min(len(words), start + max_words)
-            items.append(
-                {
-                    "type": "text",
-                    "text": " ".join(words[start:end]),
-                    "chunk_index": chunk_index,
-                    "word_start": start + 1,
-                    "word_end": end,
-                }
-            )
-            if end == len(words):
-                break
-            start += step
-            chunk_index += 1
-        return items
-
-    @staticmethod
-    def _line_text_search_items(lines: list[str]) -> list[dict[str, Any]]:
-        max_chars = 2000
-        items: list[dict[str, Any]] = []
-        current: list[str] = []
-        line_start = 1
-        char_count = 0
-
-        for idx, line in enumerate(lines, start=1):
-            line_len = len(line) + 1
-            if current and char_count + line_len > max_chars:
-                items.append(
-                    {
-                        "type": "text",
-                        "text": "\n".join(current),
-                        "chunk_index": len(items),
-                        "line_start": line_start,
-                        "line_end": idx - 1,
-                    }
-                )
-                current = []
-                line_start = idx
-                char_count = 0
-            current.append(line)
-            char_count += line_len
-
-        if current:
-            items.append(
-                {
-                    "type": "text",
-                    "text": "\n".join(current),
-                    "chunk_index": len(items),
-                    "line_start": line_start,
-                    "line_end": len(lines),
-                }
-            )
-        return items
-
-    def _get_entry_for_search(
-        self,
-        hash_key: str,
-        query: str | None = None,
-    ) -> CompressionEntry | None:
-        """Get entry without logging retrieval (used by search to avoid double-logging).
-
-        CRITICAL FIX #4: Returns a copy of the entry to prevent race conditions.
-        The caller may use the entry after we release the lock, and another thread
-        could modify or evict the original entry.
-
-        Args:
-            hash_key: Hash key returned by store().
-            query: Optional query for access tracking.
-
-        Returns:
-            CompressionEntry copy if found and not expired, None otherwise.
-        """
-        with self._lock:
-            entry = self._backend.get(hash_key)
-
-            if entry is None:
-                return None
-
-            if entry.is_expired():
-                self._backend.delete(hash_key)
-                # CRITICAL FIX: Track stale heap entry
-                self._stale_heap_entries += 1
-                return None
-
-            # Track access but don't log retrieval event (search will log separately)
-            entry.record_access(query)
-            # Update the backend with the modified entry
-            self._backend.set(hash_key, entry)
-
-            # CRITICAL FIX #4: Return a copy to prevent race conditions
-            # The entry contains mutable fields (search_queries list) that could be
-            # modified by other threads after we release the lock
-            return replace(entry, search_queries=list(entry.search_queries))
 
     def exists(self, hash_key: str, clean_expired: bool = False) -> bool:
         """Check if a hash key exists and is not expired.
@@ -1205,9 +946,9 @@ def clear_request_compression_store() -> None:
 def _create_default_ccr_backend() -> CompressionStoreBackend | None:
     """Create a CCR backend from env (e.g. HEADROOM_CCR_BACKEND=redis).
 
-    Default (env unset or "sqlite"): SQLiteBackend at
-    ~/.headroom/ccr_store.db — restart-safe and shared across worker
-    processes, which the session-scale 30-minute TTL assumes.
+    Default (env unset or "sqlite"): SQLiteBackend at workspace_dir()/ccr_store.db
+    — restart-safe and shared across worker processes, which the
+    session-scale 30-minute TTL assumes.
     "memory" opts back into the in-process dict. Other values load
     adapters via setuptools entry point 'headroom.ccr_backend'.
     Returns None to use InMemoryBackend.

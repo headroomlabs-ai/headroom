@@ -49,7 +49,7 @@ def _window_line(label: str, window: dict[str, Any]) -> str:
 @click.option("--json", "as_json", is_flag=True, help="Emit the raw report as JSON.")
 @click.option(
     "--days",
-    type=int,
+    type=click.IntRange(min=1),
     default=savings_ledger.DEFAULT_RETENTION_DAYS,
     show_default=True,
     help="Retention/lookback window for the ledger, in days.",
