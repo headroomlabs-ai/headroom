@@ -557,6 +557,72 @@ def _responses_input_to_waste_messages(instructions: Any, input_data: Any) -> li
     return messages
 
 
+def _headroom_retrieve_tool_call_ids(messages: Any) -> set[str]:
+    """Collect tool_call_ids of `headroom_retrieve` calls in chat messages.
+
+    Mirrors the Responses-path protection (which tracks retrieve `call_id`s and
+    skips compressing their outputs). The chat path had no equivalent, so a
+    retrieved original got re-compressed back into a `<<ccr:...>>` marker — the
+    marker-in / marker-out reentrancy. We rebuild the same call-id set here from
+    assistant `tool_calls` so the matching tool outputs can be protected.
+    """
+    ids: set[str] = set()
+    for msg in messages or []:
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        for call in msg.get("tool_calls") or []:
+            if not isinstance(call, dict):
+                continue
+            fn = call.get("function")
+            name = fn.get("name") if isinstance(fn, dict) else None
+            if isinstance(name, str) and (
+                name == "headroom_retrieve" or name.endswith("__headroom_retrieve")
+            ):
+                cid = call.get("id")
+                if isinstance(cid, str) and cid:
+                    ids.add(cid)
+    return ids
+
+
+def capture_headroom_retrieve_outputs(messages: Any) -> dict[str, Any]:
+    """Snapshot pristine `headroom_retrieve` tool outputs, keyed by tool_call_id.
+
+    Retrieve outputs are the *expanded* originals the model explicitly asked
+    for. They must never be re-compressed before forwarding, or the model
+    receives mangled / re-markered content instead of what it retrieved.
+    """
+    ids = _headroom_retrieve_tool_call_ids(messages)
+    if not ids:
+        return {}
+    snapshot: dict[str, Any] = {}
+    for msg in messages or []:
+        if not isinstance(msg, dict) or msg.get("role") != "tool":
+            continue
+        cid = msg.get("tool_call_id")
+        if isinstance(cid, str) and cid in ids:
+            snapshot[cid] = copy.deepcopy(msg.get("content"))
+    return snapshot
+
+
+def restore_headroom_retrieve_outputs(messages: Any, protected: dict[str, Any]) -> int:
+    """Force protected retrieve outputs back to pristine content (in place).
+
+    Matched by tool_call_id to survive any reordering the pipeline performed.
+    Returns the number of outputs restored.
+    """
+    if not protected:
+        return 0
+    restored = 0
+    for msg in messages or []:
+        if not isinstance(msg, dict) or msg.get("role") != "tool":
+            continue
+        cid = msg.get("tool_call_id")
+        if isinstance(cid, str) and cid in protected and msg.get("content") != protected[cid]:
+            msg["content"] = protected[cid]
+            restored += 1
+    return restored
+
+
 def _openai_responses_context_budget(payload: dict[str, Any]) -> dict[str, Any]:
     payload_bytes = _json_byte_len(payload)
     buckets: dict[str, int] = {}
@@ -1978,6 +2044,9 @@ class OpenAIHandlerMixin:
 
         _compression_failed = False
         original_messages = messages  # Preserve for 400-retry fallback
+        # CCR reentrancy guard: snapshot pristine headroom_retrieve outputs so
+        # compression can never re-mangle the originals the model retrieved.
+        _ccr_protected_retrieve = capture_headroom_retrieve_outputs(original_client_messages)
         _decision = CompressionDecision.decide(
             headers=request.headers,
             config=self.config,
@@ -2116,6 +2185,21 @@ class OpenAIHandlerMixin:
             optimized_messages = compressed_event.messages
             optimized_tokens = tokenizer.count_messages(optimized_messages)
             tokens_saved = original_tokens - optimized_tokens
+
+        # CCR reentrancy guard: restore headroom_retrieve outputs to pristine
+        # content before forwarding, so the model receives the real original it
+        # retrieved — never a re-compressed / re-markered version.
+        if _ccr_protected_retrieve:
+            _ccr_restored = restore_headroom_retrieve_outputs(
+                optimized_messages, _ccr_protected_retrieve
+            )
+            if _ccr_restored:
+                optimized_tokens = tokenizer.count_messages(optimized_messages)
+                tokens_saved = original_tokens - optimized_tokens
+                logger.info(
+                    f"[{request_id}] CCR: restored {_ccr_restored} headroom_retrieve "
+                    "output(s) to pristine content (anti-recompression guard)"
+                )
 
         # Hook: post_compress
         if self.config.hooks and tokens_saved > 0:
