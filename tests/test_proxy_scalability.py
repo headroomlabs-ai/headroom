@@ -6,6 +6,7 @@ These tests verify connection pooling, HTTP/2, and worker configuration.
 import asyncio
 import json
 import os
+from typing import Any
 from unittest.mock import patch
 
 import httpx
@@ -278,23 +279,64 @@ class TestWorkerConfiguration:
             os.environ.pop(_MULTI_WORKER_CONFIG_ENV, None)
 
     def test_run_server_uses_selector_loop_on_windows(self, monkeypatch):
+        import builtins
+
+        import uvicorn
+        from uvicorn.config import Config
+
         from headroom.proxy import server as server_mod
         from headroom.proxy.models import ProxyConfig
 
         captured = {}
+        policy_calls: list[Any] = []
+        real_hasattr = builtins.hasattr
+
+        class _FakeSelectorPolicy:
+            pass
 
         def fake_run(app, **kwargs):
             captured["app"] = app
             captured["kwargs"] = kwargs
 
+        def fake_set_policy(policy):
+            policy_calls.append(policy)
+
+        def fake_hasattr(obj, name):
+            if obj is Config and name == "get_loop_factory":
+                return fake_hasattr.use_new_api
+            return real_hasattr(obj, name)
+
+        fake_hasattr.use_new_api = True
+
+        monkeypatch.setattr(builtins, "hasattr", fake_hasattr)
         monkeypatch.setattr(server_mod.sys, "platform", "win32")
         monkeypatch.setattr(server_mod, "create_app", lambda config: "app")
+        monkeypatch.setattr(server_mod.asyncio, "set_event_loop_policy", fake_set_policy)
+        monkeypatch.setattr(
+            server_mod.asyncio,
+            "WindowsSelectorEventLoopPolicy",
+            _FakeSelectorPolicy,
+            raising=False,
+        )
 
         with patch("headroom.proxy.server.uvicorn.run", fake_run):
             server_mod.run_server(ProxyConfig(), print_banner=False)
 
         assert captured["app"] == "app"
         assert captured["kwargs"]["loop"] == "asyncio:SelectorEventLoop"
+        assert policy_calls == []
+
+        fake_hasattr.use_new_api = False
+        captured.clear()
+        policy_calls.clear()
+
+        with patch("headroom.proxy.server.uvicorn.run", fake_run):
+            server_mod.run_server(ProxyConfig(), print_banner=False)
+
+        assert "loop" not in captured["kwargs"]
+        assert len(policy_calls) == 1
+        assert isinstance(policy_calls[0], _FakeSelectorPolicy)
+        _ = uvicorn  # keep import for parity with runtime module path
 
     def test_run_server_keeps_default_loop_off_windows(self, monkeypatch):
         from headroom.proxy import server as server_mod

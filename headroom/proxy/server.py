@@ -4114,6 +4114,25 @@ def _get_code_aware_banner_status(config: ProxyConfig) -> str:
         return "DISABLED  (install headroom-ai[code] to enable)"
 
 
+def _configure_windows_uvicorn_loop(uvicorn_kwargs: dict[str, Any]) -> None:
+    """Select a Windows-safe asyncio loop for uvicorn across versions.
+
+    ProactorEventLoop can close the listening socket on transient AcceptEx
+    failures (for example WinError 64 from keep-alive RSTs). SelectorEventLoop
+    keeps accept errors scoped to the connection.
+
+    uvicorn >= 0.36 resolves ``asyncio:SelectorEventLoop`` as a custom loop
+    factory import path. Older uvicorn only accepts built-in loop names and
+    raises KeyError for that value, so we set the selector policy instead.
+    """
+    import uvicorn as _uvicorn
+
+    if hasattr(_uvicorn.config.Config, "get_loop_factory"):
+        uvicorn_kwargs["loop"] = "asyncio:SelectorEventLoop"
+    else:
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+
 def run_server(
     config: ProxyConfig | None = None,
     workers: int = 1,
@@ -4207,10 +4226,7 @@ def run_server(
     app_target: Any
     uvicorn_kwargs: dict[str, Any] = {}
     if sys.platform == "win32":
-        # ProactorEventLoop can close the listening socket on transient
-        # AcceptEx failures (for example WinError 64 from keep-alive RSTs).
-        # The selector loop keeps accept errors scoped to the connection.
-        uvicorn_kwargs["loop"] = "asyncio:SelectorEventLoop"
+        _configure_windows_uvicorn_loop(uvicorn_kwargs)
     if workers > 1:
         # CompressionCache and PrefixTracker are always per-worker instance vars.
         # Python CompressionStore defaults to InMemoryBackend (per-process), so
