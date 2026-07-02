@@ -646,6 +646,7 @@ def test_ensure_proxy_restarts_persistent_deployment_for_memory_mismatch(monkeyp
     # Proxy should be killed and restarted due to memory mismatch
     assert calls[0] == ("kill", 12345, 8787)
     assert calls[1][0] == "start"
+    assert calls[1][2]["memory"] is True
 
 
 def test_ensure_proxy_restarts_recovered_persistent_for_openai_api_url_mismatch(
