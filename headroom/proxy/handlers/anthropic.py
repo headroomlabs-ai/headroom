@@ -2225,7 +2225,16 @@ class AnthropicHandlerMixin:
                         body,
                         session_header=request.headers.get("x-headroom-session-id"),
                     )
-                    if session_key in self._active_streams:
+                    # Only coalesce mid-turn messages for Claude Code, the sole
+                    # client that understands the 202 `headroom_queued` reply and
+                    # the `headroom_pending_messages` SSE event. Other harnesses
+                    # (e.g. OpenCode subagents sharing a body-derived session key)
+                    # would otherwise have their request swallowed and never
+                    # answered. (#1608)
+                    if (
+                        classify_client(request.headers) == "claude-code"
+                        and session_key in self._active_streams
+                    ):
                         from fastapi.responses import JSONResponse
 
                         queued = self._queue_mid_turn_message(session_key, body)
