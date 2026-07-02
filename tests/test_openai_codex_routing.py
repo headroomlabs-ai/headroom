@@ -176,6 +176,7 @@ class _DummyOpenAIHandler(OpenAIHandlerMixin):
         self.anthropic_backend = None
         self.cost_tracker = None
         self.memory_handler = None
+        self.traffic_learner = None
         # PR-A6 wires session-sticky `OpenAI-Beta` merging into the
         # responses HTTP handler — it reads `compute_session_id` to key
         # the SessionBetaTracker. The routing tests don't exercise the
@@ -237,6 +238,33 @@ class _DummyOpenAIHandler(OpenAIHandlerMixin):
         )
 
 
+class _MemoryToolsOnlyHandler:
+    def __init__(self) -> None:
+        self.config = SimpleNamespace(
+            inject_context=False,
+            inject_tools=True,
+            project_root_override="",
+        )
+        self.compute_calls = 0
+
+    def compute_memory_tool_definitions(self, provider: str) -> list[dict]:
+        self.compute_calls += 1
+        assert provider == "openai"
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "memory_search",
+                    "description": "Search memory.",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+
+    def has_memory_tool_calls(self, response: dict, provider: str) -> bool:
+        return False
+
+
 def _build_request(body: dict, headers: dict[str, str]) -> Request:
     payload = json.dumps(body).encode("utf-8")
 
@@ -285,7 +313,40 @@ def test_handle_openai_responses_routes_chatgpt_auth_to_backend_api(monkeypatch)
     assert url == "https://chatgpt.com/backend-api/codex/responses"
     assert headers["ChatGPT-Account-ID"] == "acct-from-jwt"
     assert body["input"] == "hello"
+    assert body["store"] is False
     assert response.status_code == 200
+
+
+def test_handle_openai_responses_chatgpt_auth_skips_memory_tools(monkeypatch):
+    token = _jwt(
+        {
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "acct-from-jwt",
+            }
+        }
+    )
+    request = _build_request(
+        {"model": "gpt-5.4", "input": "hello", "store": True},
+        {"Authorization": f"Bearer {token}", "x-headroom-user-id": "user-1"},
+    )
+    handler = _DummyOpenAIHandler()
+    memory_handler = _MemoryToolsOnlyHandler()
+    handler.memory_handler = memory_handler
+    handler.session_tracker_store = SimpleNamespace(
+        compute_session_id=lambda *a, **k: "sess-chatgpt-no-memory-tools",
+    )
+
+    monkeypatch.setattr("headroom.tokenizers.get_tokenizer", lambda model: _DummyTokenizer())
+
+    response = anyio.run(handler.handle_openai_responses, request)
+
+    assert response.status_code == 200
+    assert handler.captured_request is not None
+    _, url, _, body = handler.captured_request
+    assert url == "https://chatgpt.com/backend-api/codex/responses"
+    assert body["store"] is False
+    assert "tools" not in body
+    assert memory_handler.compute_calls == 0
 
 
 def test_handle_openai_responses_chatgpt_codex_timeout_fails_open(monkeypatch):
@@ -317,6 +378,32 @@ def test_handle_openai_responses_chatgpt_codex_timeout_fails_open(monkeypatch):
     assert method == "POST"
     assert url == "https://chatgpt.com/backend-api/codex/responses"
     assert body["input"] == "large context"
+    assert body["store"] is False
+
+
+def test_handle_openai_responses_api_auth_keeps_memory_tools(monkeypatch):
+    request = _build_request(
+        {"model": "gpt-4o-mini", "input": "hello", "store": False},
+        {"Authorization": "Bearer sk-test", "x-headroom-user-id": "user-1"},
+    )
+    handler = _DummyOpenAIHandler()
+    memory_handler = _MemoryToolsOnlyHandler()
+    handler.memory_handler = memory_handler
+    handler.session_tracker_store = SimpleNamespace(
+        compute_session_id=lambda *a, **k: "sess-api-memory-tools",
+    )
+
+    monkeypatch.setattr("headroom.tokenizers.get_tokenizer", lambda model: _DummyTokenizer())
+
+    response = anyio.run(handler.handle_openai_responses, request)
+
+    assert response.status_code == 200
+    assert handler.captured_request is not None
+    _, url, _, body = handler.captured_request
+    assert url == "https://api.openai.com/v1/responses"
+    assert body["store"] is True
+    assert body["tools"][0]["name"] == "memory_search"
+    assert memory_handler.compute_calls == 1
 
 
 def test_handle_openai_responses_routes_api_key_auth_direct_to_openai(monkeypatch):

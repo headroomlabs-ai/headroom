@@ -266,6 +266,30 @@ class TestWsHttpFallback:
         assert "chatgpt.com" in captured_url["url"]
         assert "api.openai.com" not in captured_url["url"]
 
+    def test_fallback_chatgpt_auth_forces_store_false(self):
+        """ChatGPT Responses backend requires explicit store=false."""
+        handler = _make_handler()
+        ws = FakeWebSocket()
+        captured_kwargs: dict = {}
+
+        class CapturingClient:
+            def stream(self, method, url, **kwargs):
+                captured_kwargs.update(kwargs)
+                return FakeStreamResponse(200, ["data: [DONE]\n\n"])
+
+        handler.http_client = CapturingClient()
+
+        body = {"model": "gpt-5.4", "input": "test", "store": True}
+        headers = {
+            "Authorization": "Bearer chatgpt-session-token",
+            "ChatGPT-Account-ID": "acct_abc123",
+        }
+        asyncio.run(handler._ws_http_fallback(ws, body, json.dumps(body), headers, "req_store"))
+
+        posted = json.loads(captured_kwargs["content"])
+        assert posted["store"] is False
+        assert posted["stream"] is True
+
     def test_fallback_routes_api_key_to_openai(self):
         """API key auth should route to api.openai.com."""
         handler = _make_handler()
