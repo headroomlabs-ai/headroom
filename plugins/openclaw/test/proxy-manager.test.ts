@@ -365,7 +365,7 @@ describe("ProxyManager launch internals", () => {
       expect(pathSpec.checkUseShell).toBe(false);
     } else {
       expect(pathSpec.checkCommand).toBe("sh");
-      expect(pathSpec.checkArgs).toEqual(["-lc", "command -v headroom >/dev/null 2>&1"]);
+      expect(pathSpec.checkArgs).toEqual(["-c", "command -v headroom >/dev/null 2>&1"]);
     }
   });
 
