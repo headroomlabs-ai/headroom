@@ -1,0 +1,46 @@
+name: windows-smoke
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'headroom/install/**'
+      - 'headroom/paths.py'
+      - 'headroom/cli/**'
+  pull_request:
+    paths:
+      - 'headroom/install/**'
+      - 'headroom/paths.py'
+      - 'headroom/cli/**'
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install package
+        run: pip install -e .
+
+      - name: Verify CLI Version
+        run: headroom --version
+
+      - name: Verify Proxy Command
+        run: headroom proxy --help
+
+      - name: Verify Wrap Command
+        run: headroom wrap --help
