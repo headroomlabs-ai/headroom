@@ -1,0 +1,39 @@
+{
+  "config": {
+    "ccr_ttl": 300,
+    "compress_comments": true,
+    "docstring_mode": "first_line",
+    "enable_ccr": false,
+    "fallback_to_kompress": false,
+    "language_hint": null,
+    "max_body_lines": 5,
+    "min_tokens_for_compression": 100,
+    "preserve_decorators": true,
+    "preserve_imports": true,
+    "preserve_signatures": true,
+    "preserve_type_annotations": true,
+    "semantic_analysis": true,
+    "target_compression_rate": 0.2
+  },
+  "input": "#include <iostream>\n#include <vector>\n#include <string>\n\nnamespace app {\n\nclass Processor {\npublic:\n    Processor(const std::string &name) : name_(name), count_(0) {}\n\n    std::vector<std::string> process(const std::vector<std::string> &items) {\n        std::vector<std::string> results;\n        for (const auto &item : items) {\n            if (item.empty()) {\n                continue;\n            }\n            results.push_back(item);\n            count_++;\n        }\n        return results;\n    }\n\nprivate:\n    std::string name_;\n    int count_;\n};\n\n}  // namespace app\n\nint main() {\n    app::Processor p(\"main\");\n    return 0;\n}\n",
+  "input_sha256": "420dd19a087526ca88d1cc71110894f73029cee57533b406ed005b382200273b",
+  "output": {
+    "cache_key": null,
+    "compressed": "#include <iostream>\n\n#include <vector>\n\n#include <string>\n\n\nclass Processor {\npublic:\n    Processor(const std::string &name) : name_(name), count_(0) {}\n\n    std::vector<std::string> process(const std::vector<std::string> &items) {\n        std::vector<std::string> results;\n        for (const auto &item : items) {\n            if (item.empty()) {\n                continue;\n            }\n            results.push_back(item);\n            count_++;\n        }\n        return results;\n    }\n\nprivate:\n    std::string name_;\n    int count_;\n};\n\nint main() {\n    app::Processor p(\"main\");\n    return 0;\n}\n\nnamespace app {\n\nclass Processor {\npublic:\n    Processor(const std::string &name) : name_(name), count_(0) {}\n\n    std::vector<std::string> process(const std::vector<std::string> &items) {\n        std::vector<std::string> results;\n        for (const auto &item : items) {\n            if (item.empty()) {\n                continue;\n            }\n            results.push_back(item);\n            count_++;\n        }\n        return results;\n    }\n\nprivate:\n    std::string name_;\n    int count_;\n};\n\n}\n// namespace app",
+    "compressed_bodies": 0,
+    "compressed_tokens": 278,
+    "compression_ratio": 1.759493670886076,
+    "language": "cpp",
+    "language_confidence": 1.0,
+    "original": "#include <iostream>\n#include <vector>\n#include <string>\n\nnamespace app {\n\nclass Processor {\npublic:\n    Processor(const std::string &name) : name_(name), count_(0) {}\n\n    std::vector<std::string> process(const std::vector<std::string> &items) {\n        std::vector<std::string> results;\n        for (const auto &item : items) {\n            if (item.empty()) {\n                continue;\n            }\n            results.push_back(item);\n            count_++;\n        }\n        return results;\n    }\n\nprivate:\n    std::string name_;\n    int count_;\n};\n\n}  // namespace app\n\nint main() {\n    app::Processor p(\"main\");\n    return 0;\n}\n",
+    "original_tokens": 158,
+    "preserved_imports": 3,
+    "preserved_signatures": 1,
+    "symbol_scores": {
+      "Processor": 0.5
+    },
+    "syntax_valid": true
+  },
+  "recorded_at": "2026-06-19T00:15:16.336058+00:00",
+  "transform": "code_aware_compressor"
+}

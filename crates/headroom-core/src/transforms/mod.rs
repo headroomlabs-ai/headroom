@@ -17,9 +17,11 @@
 
 pub mod adaptive_sizer;
 pub mod anchor_selector;
+pub mod code_compressor;
 pub mod content_detector;
 pub mod detection;
 pub mod diff_compressor;
+pub mod kompress;
 pub mod live_zone;
 pub mod log_compressor;
 pub mod magika_detector;
@@ -32,12 +34,20 @@ pub mod tag_protector;
 pub mod text_crusher;
 pub mod unidiff_detector;
 
+pub use code_compressor::{
+    detect_language, CodeAwareCompressor, CodeCompressionResult, CodeCompressorConfig,
+    CodeLanguage, DocstringMode,
+};
 pub use content_detector::{
     detect_content_type, is_json_array_of_dicts, ContentType, DetectionResult,
 };
 pub use detection::detect;
 pub use diff_compressor::{
     DiffCompressionResult, DiffCompressor, DiffCompressorConfig, DiffCompressorStats,
+};
+pub use kompress::{
+    Kompress, KompressConfig, KompressError, KompressResult, DEFAULT_MODEL_ID,
+    DEFAULT_TOKENIZER_REPO,
 };
 pub use live_zone::{
     compress_anthropic_live_zone, compress_openai_chat_live_zone,
