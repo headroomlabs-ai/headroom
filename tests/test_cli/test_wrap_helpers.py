@@ -12,6 +12,7 @@ once with confusing diffs.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import subprocess
@@ -270,10 +271,10 @@ def test_run_proxy_only_watcher_calls_setup_lines_callback(
 
     callback_calls: list[None] = []
 
-    def fake_setup() -> None:
+    def fake_setup(_port: int) -> None:
         callback_calls.append(None)
 
-    monkeypatch.setattr(wrap_mod, "_ensure_proxy", lambda *a, **kw: fake_proc)
+    monkeypatch.setattr(wrap_mod, "_ensure_proxy", lambda *a, **kw: (fake_proc, 8787))
     # Replace time.sleep with a no-op so the loop spins quickly.
     monkeypatch.setattr(wrap_mod.time, "sleep", lambda _s: None)
     # Replace _make_cleanup to avoid side-effects on real ports/files.
@@ -321,7 +322,7 @@ def test_run_proxy_only_watcher_keyboardinterrupt_shuts_down_cleanly(
         if sleep_calls["n"] >= 1:
             raise KeyboardInterrupt
 
-    monkeypatch.setattr(wrap_mod, "_ensure_proxy", lambda *a, **kw: _FakeProc())
+    monkeypatch.setattr(wrap_mod, "_ensure_proxy", lambda *a, **kw: (_FakeProc(), 8787))
     monkeypatch.setattr(wrap_mod.time, "sleep", raising_sleep)
     monkeypatch.setattr(wrap_mod, "_make_cleanup", lambda holder, port: lambda *a, **kw: None)
     monkeypatch.setattr(wrap_mod.signal, "signal", lambda *a, **kw: None)
@@ -337,7 +338,7 @@ def test_run_proxy_only_watcher_keyboardinterrupt_shuts_down_cleanly(
             learn=False,
             memory=False,
             agent_type="cursor",
-            print_setup_lines=lambda: None,
+            print_setup_lines=lambda _port: None,
         )
 
     inv = runner.invoke(_cmd)
@@ -368,7 +369,7 @@ def test_run_proxy_only_watcher_unexpected_exception_returns_exit_1(
             learn=False,
             memory=False,
             agent_type="cline",
-            print_setup_lines=lambda: None,
+            print_setup_lines=lambda _port: None,
         )
 
     inv = runner.invoke(_cmd)
@@ -404,7 +405,7 @@ def test_run_proxy_only_watcher_calls_cleanup_on_finally(
             learn=False,
             memory=False,
             agent_type="cline",
-            print_setup_lines=lambda: None,
+            print_setup_lines=lambda _port: None,
         )
 
     inv = runner.invoke(_cmd)
@@ -789,3 +790,65 @@ def test_resolve_1m_model_falls_back_to_default_when_unset() -> None:
     """With no model selected, fall back to the default Opus carrying [1m]."""
     assert wrap_mod._resolve_1m_model(None) == "claude-opus-4-8[1m]"
     assert wrap_mod._resolve_1m_model("  ") == "claude-opus-4-8[1m]"
+
+
+class TestFindAvailablePort:
+    """Tests for _find_available_port (Vite-style port fallback)."""
+
+    def test_port_free_returns_same(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When port is free, returns the same port."""
+        monkeypatch.setattr(wrap_mod, "_port_bind_error", lambda port: None)
+        assert wrap_mod._find_available_port(8787) == 8787
+
+    def test_port_busy_finds_next(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When port is busy, returns the next free port."""
+
+        def mock_bind(port: int) -> OSError | None:
+            if port == 8787:
+                return OSError(errno.EADDRINUSE, "Address in use")
+            return None
+
+        monkeypatch.setattr(wrap_mod, "_port_bind_error", mock_bind)
+        assert wrap_mod._find_available_port(8787) == 8788
+
+    def test_multiple_busy_ports(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When multiple consecutive ports are busy, skips all of them."""
+
+        def mock_bind(port: int) -> OSError | None:
+            if port in (8787, 8788, 8789):
+                return OSError(errno.EADDRINUSE, "Address in use")
+            return None
+
+        monkeypatch.setattr(wrap_mod, "_port_bind_error", mock_bind)
+        assert wrap_mod._find_available_port(8787) == 8790
+
+    def test_propagates_unexpected_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Errors other than EADDRINUSE/EACCES (e.g. EADDRNOTAVAIL) propagate."""
+        monkeypatch.setattr(
+            wrap_mod,
+            "_port_bind_error",
+            lambda port: OSError(errno.EADDRNOTAVAIL, "Address not available"),
+        )
+        with pytest.raises(OSError, match="Address not available"):
+            wrap_mod._find_available_port(8787)
+
+    def test_propagates_eaddrinuse_with_eacces(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Both EADDRINUSE and EACCES are skipped (not propagated)."""
+
+        def mock_bind(port: int) -> OSError | None:
+            if port == 8787:
+                return OSError(errno.EACCES, "Permission denied")
+            return None
+
+        monkeypatch.setattr(wrap_mod, "_port_bind_error", mock_bind)
+        assert wrap_mod._find_available_port(8787) == 8788
+
+    def test_exhausts_range(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When all ports in range are busy, raises RuntimeError."""
+        monkeypatch.setattr(
+            wrap_mod,
+            "_port_bind_error",
+            lambda port: OSError(errno.EADDRINUSE, "Address in use"),
+        )
+        with pytest.raises(RuntimeError, match="No available port found"):
+            wrap_mod._find_available_port(8787, max_attempts=3)
