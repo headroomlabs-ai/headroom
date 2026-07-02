@@ -7,6 +7,7 @@ import webbrowser
 from click.testing import CliRunner
 
 from headroom.cli.main import main
+from headroom.dashboard import get_dashboard_html
 
 
 def test_dashboard_no_open_prints_url(monkeypatch):
@@ -44,3 +45,15 @@ def test_dashboard_browser_failure_is_swallowed(monkeypatch):
 
     assert result.exit_code == 0, result.output
     assert "/dashboard" in result.output
+
+
+def test_proxy_savings_card_uses_live_proxy_cost():
+    """Hero proxy dollars must match the live proxy-token subtitle."""
+
+    html = get_dashboard_html()
+
+    assert "formatCurrency(stats.cost?.compression_savings_usd || 0)" in html
+    assert (
+        "formatCurrency(stats.persistent_savings?.lifetime?.compression_savings_usd || 0)"
+        not in html
+    )
