@@ -187,13 +187,55 @@ def test_provider_passthrough_routes_forward_expected_targets(monkeypatch) -> No
         assert client.delete("/v1beta/cachedContents/cache-1").json()["sub_path"] == (
             "cachedContents"
         )
-        assert (
-            client.get(
-                "/unhandled/path",
-                headers={"x-headroom-base-url": "https://custom.example/base/"},
-            ).json()["base_url"]
-            == "https://custom.example/base"
-        )
+        custom_passthrough = client.get(
+            "/unhandled/path",
+            headers={"x-headroom-base-url": "https://custom.example/base/"},
+        ).json()
+        assert custom_passthrough["base_url"] == "https://custom.example/base"
+        assert custom_passthrough["sub_path"] == ""
+        assert custom_passthrough["provider"] == ""
+
+        opencode_zen_passthrough = client.post(
+            "/zen/v1/chat/completions",
+            headers={"x-headroom-base-url": "https://opencode.ai/"},
+            json={"model": "zen"},
+        ).json()
+        assert opencode_zen_passthrough["base_url"] == "https://opencode.ai"
+        assert opencode_zen_passthrough["sub_path"] == "chat/completions"
+        assert opencode_zen_passthrough["provider"] == "zen"
+
+        unrelated_custom_passthrough = client.post(
+            "/mcp",
+            headers={"x-headroom-base-url": "https://opencode.ai/"},
+            json={},
+        ).json()
+        assert unrelated_custom_passthrough["sub_path"] == ""
+        assert unrelated_custom_passthrough["provider"] == ""
+        for unrelated_path in (
+            "/mcp/v1/chat/completions",
+            "/npm/v1/chat/completions",
+            "/context7/v1/chat/completions",
+        ):
+            unrelated_custom_passthrough = client.post(
+                unrelated_path,
+                headers={"x-headroom-base-url": "https://opencode.ai/"},
+                json={},
+            ).json()
+            assert unrelated_custom_passthrough["sub_path"] == ""
+            assert unrelated_custom_passthrough["provider"] == ""
+        get_custom_passthrough = client.get(
+            "/zen/v1/chat/completions",
+            headers={"x-headroom-base-url": "https://opencode.ai/"},
+        ).json()
+        assert get_custom_passthrough["sub_path"] == ""
+        assert get_custom_passthrough["provider"] == ""
+        other_host_custom_passthrough = client.post(
+            "/zen/v1/chat/completions",
+            headers={"x-headroom-base-url": "https://custom.example/"},
+            json={"model": "zen"},
+        ).json()
+        assert other_host_custom_passthrough["sub_path"] == ""
+        assert other_host_custom_passthrough["provider"] == ""
         assert client.get("/another/path", headers={"x-goog-api-key": "test"}).json()[
             "base_url"
         ] == ("https://api.gemini.test")

@@ -11,7 +11,10 @@ from urllib.parse import quote
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import Response
 
-from headroom.proxy.handlers.openai import _resolve_codex_routing_headers
+from headroom.proxy.handlers.openai import (
+    _custom_base_passthrough_telemetry,
+    _resolve_codex_routing_headers,
+)
 
 logger = logging.getLogger("headroom.proxy.routes")
 
@@ -989,7 +992,18 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
     async def passthrough(request: Request, path: str):
         custom_base = request.headers.get("x-headroom-base-url")
         if custom_base:
-            return await proxy.handle_passthrough(request, custom_base.rstrip("/"))
+            base_url = custom_base.rstrip("/")
+            endpoint_name, provider_name = _custom_base_passthrough_telemetry(
+                request.method,
+                path,
+                base_url,
+            )
+            return await proxy.handle_passthrough(
+                request,
+                base_url,
+                endpoint_name,
+                provider_name,
+            )
 
         # Intercept Code Assist authentication and onboarding routes
         clean_path = path.lstrip("/")

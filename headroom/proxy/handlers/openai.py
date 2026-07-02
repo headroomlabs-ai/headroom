@@ -74,6 +74,7 @@ _OPENAI_CHAT_COMPLETIONS_PATH = "/chat/completions"
 _OPENAI_RESPONSES_PATH = "/responses"
 _OPENAI_ORIGINAL_PATH_HEADER = "x-headroom-original-path"
 _OPENAI_BASE_URL_HEADER = "x-headroom-base-url"
+_OPENCODE_ZEN_HOSTS = {"opencode.ai", "www.opencode.ai"}
 
 
 def _header_get(headers: dict[str, str], name: str) -> str | None:
@@ -83,6 +84,25 @@ def _header_get(headers: dict[str, str], name: str) -> str | None:
         if key.lower() == lowered:
             return value
     return None
+
+
+def _custom_base_passthrough_telemetry(method: str, path: str, base_url: str) -> tuple[str, str]:
+    """Return passthrough telemetry metadata for narrow custom-base exceptions."""
+    # OpenCode Zen sends provider-prefixed OpenAI-compatible traffic through
+    # custom-base routing. Keep this exact to avoid labeling arbitrary
+    # custom-base tool traffic as LLM provider telemetry.
+    if method.upper() != "POST":
+        return "", ""
+    try:
+        host = (urlparse(base_url.strip()).hostname or "").lower()
+    except ValueError:
+        return "", ""
+    if host not in _OPENCODE_ZEN_HOSTS:
+        return "", ""
+    normalized_path = path[1:] if path.startswith("/") else path
+    if normalized_path == "zen/v1/chat/completions":
+        return "chat/completions", "zen"
+    return "", ""
 
 
 def _resolve_openai_handler_path(
@@ -1770,6 +1790,21 @@ class OpenAIHandlerMixin:
             stripped_count=_pre_strip_count_chat,
             request_id=request_id,
         )
+        upstream_base_url = _resolve_openai_upstream_base(request.headers)
+        handler_path = (
+            _resolve_openai_handler_path(
+                request.headers,
+                handler_path=_OPENAI_CHAT_COMPLETIONS_PATH,
+            )
+            if upstream_base_url is not None
+            else "/v1/chat/completions"
+        )
+        _, custom_chat_provider = _custom_base_passthrough_telemetry(
+            request.method,
+            handler_path,
+            upstream_base_url or "",
+        )
+        openai_chat_outcome_provider = custom_chat_provider or "openai"
 
         # Memory: Get user ID when memory is enabled. Reads `request.headers`
         # directly because `headers` was stripped of `x-headroom-*` for the
@@ -1820,7 +1855,7 @@ class OpenAIHandlerMixin:
             rate_key = headers.get("authorization", "default")[:20]
             allowed, wait_seconds = await self.rate_limiter.check_request(rate_key)
             if not allowed:
-                await self.metrics.record_rate_limited(provider="openai")
+                await self.metrics.record_rate_limited(provider=openai_chat_outcome_provider)
                 raise HTTPException(
                     status_code=429,
                     detail=f"Rate limited. Retry after {wait_seconds:.1f}s",
@@ -1877,7 +1912,7 @@ class OpenAIHandlerMixin:
                 await self._record_request_outcome(
                     RequestOutcome(
                         request_id=request_id,
-                        provider="openai",
+                        provider=openai_chat_outcome_provider,
                         model=model,
                         original_tokens=0,
                         optimized_tokens=0,
@@ -2565,14 +2600,6 @@ class OpenAIHandlerMixin:
                 )
 
         # Direct OpenAI API (no backend configured)
-        upstream_base_url = _resolve_openai_upstream_base(request.headers)
-        handler_path = (
-            _resolve_openai_handler_path(
-                request.headers, handler_path=_OPENAI_CHAT_COMPLETIONS_PATH
-            )
-            if upstream_base_url is not None
-            else "/v1/chat/completions"
-        )
         url = build_copilot_upstream_url(
             upstream_base_url or self.OPENAI_API_URL,
             handler_path,
@@ -2613,6 +2640,7 @@ class OpenAIHandlerMixin:
                     optimization_latency,
                     pipeline_timing=pipeline_timing,
                     prefix_tracker=openai_prefix_tracker,
+                    outcome_provider=openai_chat_outcome_provider,
                 )
             else:
                 headers = await apply_copilot_api_auth(headers, url=url)
@@ -2864,7 +2892,7 @@ class OpenAIHandlerMixin:
                 await self._record_request_outcome(
                     RequestOutcome(
                         request_id=request_id,
-                        provider="openai",
+                        provider=openai_chat_outcome_provider,
                         model=model,
                         original_tokens=original_tokens,
                         optimized_tokens=total_input_tokens,
@@ -2920,7 +2948,7 @@ class OpenAIHandlerMixin:
                     headers=response_headers,
                 )
         except Exception as e:
-            await self.metrics.record_failed(provider="openai")
+            await self.metrics.record_failed(provider=openai_chat_outcome_provider)
             # Log full error details internally for debugging
             logger.error(f"[{request_id}] OpenAI request failed: {type(e).__name__}: {e}")
             # Return sanitized error message to client (don't expose internal details)

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock
-
 import httpx
 import pytest
 
@@ -61,7 +59,11 @@ def _build_openai_client():
         )
 
     proxy._retry_request = _fake_retry
-    proxy._record_request_outcome = AsyncMock()
+
+    async def _record_request_outcome(outcome: object) -> None:
+        captured["outcome"] = outcome
+
+    proxy._record_request_outcome = _record_request_outcome
 
     return TestClient(app), captured
 
@@ -199,6 +201,26 @@ def test_query_string_is_preserved_for_reconstructed_upstream_paths() -> None:
         assert captured["method"] == "POST"
         _assert_origin(captured, "https://api.deepseek.com")
         _assert_path(captured, expected_path)
+
+
+def test_opencode_zen_reconstructed_chat_path_records_zen_provider() -> None:
+    headers = {
+        "Authorization": "Bearer sk-test",
+        "x-headroom-base-url": "https://opencode.ai",
+        "x-headroom-original-path": "/zen/v1/chat/completions",
+    }
+    body = {"model": "zen-model", "messages": [{"role": "user", "content": "hi"}]}
+
+    client, captured = _build_openai_client()
+    response = client.post(_OPENAI_CHAT_PATH, headers=headers, json=body)
+    assert response.status_code == 200, response.text
+
+    _assert_origin(captured, "https://opencode.ai")
+    _assert_path(captured, "/zen/v1/chat/completions")
+    outcome = captured.get("outcome")
+    assert outcome is not None
+    assert outcome.provider == "zen"
+    assert outcome.model == "zen-model"
 
 
 def test_non_http_base_url_falls_back_to_v1() -> None:
