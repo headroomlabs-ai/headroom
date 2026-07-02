@@ -33,14 +33,31 @@ _tree_sitter_local = threading.local()
 
 
 def _check_tree_sitter() -> bool:
-    """Check if tree-sitter is available."""
+    """Check if tree-sitter is available and can actually parse.
+
+    Constructs a parser and runs a minimal parse so that ABI mismatches
+    between ``tree_sitter`` and ``tree_sitter_language_pack`` surface here
+    instead of silently falling back to the text compressor at request time.
+    """
     global _tree_sitter_available
     if _tree_sitter_available is None:
         try:
-            import tree_sitter_language_pack  # noqa: F401
+            from tree_sitter import Parser
+            from tree_sitter_language_pack import get_language
 
+            parser = Parser()
+            parser.language = get_language("python")
+            tree = parser.parse(b"x = 1\n")
+            if tree.root_node.child_count == 0:
+                raise RuntimeError("tree-sitter parse returned empty tree")
             _tree_sitter_available = True
         except ImportError:
+            _tree_sitter_available = False
+        except Exception:
+            logger.warning(
+                "tree-sitter imported but failed to parse; "
+                "code-aware compression disabled (ABI mismatch?)"
+            )
             _tree_sitter_available = False
     return _tree_sitter_available
 
