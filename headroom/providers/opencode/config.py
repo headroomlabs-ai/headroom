@@ -13,7 +13,6 @@ import click
 
 from headroom import fsutil
 from headroom.install.paths import opencode_config_path
-from headroom.mcp_registry.install import DEFAULT_PROXY_URL
 
 # Headroom-managed JSON marker comments for idempotent block injection.
 _PROVIDER_MARKER_START = "// --- Headroom proxy provider ---"
@@ -94,27 +93,6 @@ def _render_provider_block(port: int) -> str:
         _PROVIDER_MARKER_START,
         f'"provider": {json.dumps(provider, indent=2)},',
         _PROVIDER_MARKER_END,
-    ]
-    return "\n".join(lines)
-
-
-def _render_mcp_block(port: int) -> str:
-    """Render a Headroom MCP block as a JSON comment-wrapped snippet."""
-    proxy_url = f"http://127.0.0.1:{port}"
-    mcp_entry: dict[str, Any] = {
-        "type": "local",
-        "command": ["headroom", "mcp", "serve"],
-        "enabled": True,
-    }
-    if proxy_url != DEFAULT_PROXY_URL:
-        mcp_entry["environment"] = {"HEADROOM_PROXY_URL": proxy_url}
-    mcp = {
-        "headroom": mcp_entry,
-    }
-    lines = [
-        _MCP_MARKER_START,
-        f'"mcp": {json.dumps(mcp, indent=2)},',
-        _MCP_MARKER_END,
     ]
     return "\n".join(lines)
 

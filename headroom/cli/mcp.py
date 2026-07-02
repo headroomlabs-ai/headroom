@@ -6,14 +6,10 @@ needing API key access.
 """
 
 import json
-import shutil
-import subprocess
 from pathlib import Path
 from typing import Any
 
 import click
-
-from headroom._subprocess import run
 
 from .main import main
 
@@ -163,70 +159,31 @@ def mcp_install(proxy_url: str, agents: tuple[str, ...], force: bool) -> None:
 
 @mcp.command("uninstall")
 def mcp_uninstall() -> None:
-    """Remove Headroom MCP server from Claude Code config.
+    """Remove Headroom MCP server from detected agent configs.
 
     \b
-    Removes headroom from both the claude CLI registry (Claude Code CLI >=2.x)
-    and ~/.claude/mcp.json if present. Other MCP servers are preserved.
+    Removes headroom from every agent registrar known to Headroom. Other MCP
+    servers are preserved.
     """
+    from headroom.mcp_registry import get_all_registrars
+
     removed = False
 
-    # Remove from claude CLI registry (Claude Code CLI >=2.x)
-    claude_cli = shutil.which("claude")
-    if claude_cli:
-        check = subprocess.run(
-            [claude_cli, "mcp", "get", "headroom"],
-            capture_output=True,
-        )
-        if check.returncode == 0:
-            rm = run(
-                [claude_cli, "mcp", "remove", "headroom", "-s", "user"],
-                capture_output=True,
-                text=True,
-            )
-            if rm.returncode == 0:
-                click.echo("✓ Headroom MCP server removed (via claude mcp remove)")
-                removed = True
-            else:
-                click.echo(
-                    f"Warning: 'claude mcp remove' failed ({rm.stderr.strip()}).",
-                    err=True,
-                )
-
-    # Also remove codebase-memory-mcp if registered (installed by --code-graph)
-    if claude_cli:
-        cbm_check = subprocess.run(
-            [claude_cli, "mcp", "get", "codebase-memory-mcp"],
-            capture_output=True,
-        )
-        if cbm_check.returncode == 0:
-            cbm_rm = run(
-                [claude_cli, "mcp", "remove", "codebase-memory-mcp", "-s", "user"],
-                capture_output=True,
-                text=True,
-            )
-            if cbm_rm.returncode == 0:
-                click.echo("✓ codebase-memory-mcp MCP server removed")
-                removed = True
-
-    # Also remove from mcp.json fallback config if present
-    if MCP_CONFIG_PATH.exists():
-        config = load_mcp_config()
-        changed = False
+    for registrar in get_all_registrars():
+        if not registrar.detect():
+            continue
+        removed_names: list[str] = []
         for server_name in ("headroom", "codebase-memory-mcp"):
-            if server_name in config.get("mcpServers", {}):
-                del config["mcpServers"][server_name]
-                changed = True
-        if changed:
-            save_mcp_config(config)
-            click.echo(f"✓ MCP servers removed from {MCP_CONFIG_PATH}")
+            if registrar.unregister_server(server_name):
+                removed_names.append(server_name)
+        if removed_names:
+            click.echo(
+                f"✓ {registrar.display_name}: removed {', '.join(removed_names)} MCP server(s)"
+            )
             removed = True
 
     if not removed:
-        if MCP_CONFIG_PATH.exists():
-            click.echo("Headroom MCP is not configured. Nothing to uninstall.")
-        else:
-            click.echo("No MCP config found. Nothing to uninstall.")
+        click.echo("Headroom MCP is not configured. Nothing to uninstall.")
 
 
 @mcp.command("status")
@@ -249,32 +206,30 @@ def mcp_status() -> None:
         click.echo("MCP SDK:        ✗ Not installed")
         click.echo("                pip install 'headroom-ai[mcp]'")
 
-    # Check config
-    if MCP_CONFIG_PATH.exists():
-        config = load_mcp_config()
-        if "headroom" in config.get("mcpServers", {}):
-            server_config = config["mcpServers"]["headroom"]
-            click.echo("Claude Config:  ✓ Configured")
-            click.echo(f"                {MCP_CONFIG_PATH}")
+    from headroom.mcp_registry import get_all_registrars
 
-            # Show proxy URL
-            env = server_config.get("env", {})
-            proxy_url = env.get("HEADROOM_PROXY_URL", DEFAULT_PROXY_URL)
-            click.echo(f"Proxy URL:      {proxy_url}")
-        else:
-            click.echo("Claude Config:  ✗ Not configured")
-            click.echo("                Run: headroom mcp install")
-    else:
-        click.echo("Claude Config:  ✗ No config file")
+    proxy_url = DEFAULT_PROXY_URL
+    any_configured = False
+    click.echo("Agent Config:")
+    for registrar in get_all_registrars():
+        if not registrar.detect():
+            click.echo(f"  {registrar.display_name}: ✗ Not detected")
+            continue
+        spec = registrar.get_server("headroom")
+        if spec is None:
+            click.echo(f"  {registrar.display_name}: ✗ Not configured")
+            continue
+        any_configured = True
+        proxy_url = spec.env.get("HEADROOM_PROXY_URL", proxy_url)
+        click.echo(f"  {registrar.display_name}: ✓ Configured")
+
+    if not any_configured:
         click.echo("                Run: headroom mcp install")
+    click.echo(f"Proxy URL:      {proxy_url}")
 
     # Check proxy connectivity
     try:
         import httpx
-
-        config = load_mcp_config()
-        env = config.get("mcpServers", {}).get("headroom", {}).get("env", {})
-        proxy_url = env.get("HEADROOM_PROXY_URL", DEFAULT_PROXY_URL)
 
         try:
             response = httpx.get(f"{proxy_url}/health", timeout=2.0)
