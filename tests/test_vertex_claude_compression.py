@@ -138,3 +138,92 @@ def test_vertex_rawpredict_anthropic_runs_compression_handler(monkeypatch) -> No
     assert captured["provider"] == "vertex:anthropic"
     assert captured["base_url"] == "https://europe-west1-aiplatform.googleapis.com"
     assert captured["model"] == "claude-sonnet-4-6"
+
+
+def test_vertex_rawpredict_versionless_anthropic_rewrites_to_v1(monkeypatch) -> None:
+    captured: dict[str, Any] = {}
+
+    async def fake(
+        self,
+        request,
+        base_url,
+        provider,
+        model,
+        force_stream=False,
+    ):  # type: ignore[no-untyped-def]
+        captured.update(
+            path=request.url.path,
+            raw_path=request.scope.get("raw_path"),
+            base_url=str(base_url),
+            provider=str(provider),
+            model=str(model),
+            force_stream=force_stream,
+        )
+        return JSONResponse({"ok": True})
+
+    monkeypatch.setattr(HeadroomProxy, "handle_anthropic_messages", fake)
+
+    with TestClient(_default_vertex_app()) as client:
+        resp = client.post(
+            "/projects/p/locations/europe-west1/publishers/anthropic/models/"
+            "claude-sonnet-4-6:rawPredict",
+            json={"anthropic_version": "vertex-2023-10-16", "messages": []},
+        )
+
+    assert resp.status_code == 200
+    assert captured == {
+        "path": (
+            "/projects/p/locations/europe-west1/publishers/anthropic/models/"
+            "claude-sonnet-4-6:rawPredict"
+        ),
+        "raw_path": (
+            b"/projects/p/locations/europe-west1/publishers/anthropic/models/"
+            b"claude-sonnet-4-6:rawPredict"
+        ),
+        "base_url": "https://europe-west1-aiplatform.googleapis.com/v1",
+        "provider": "vertex:anthropic",
+        "model": "claude-sonnet-4-6",
+        "force_stream": False,
+    }
+
+
+def test_vertex_stream_rawpredict_versionless_anthropic_forces_stream(monkeypatch) -> None:
+    captured: dict[str, Any] = {}
+
+    async def fake(
+        self,
+        request,
+        base_url,
+        provider,
+        model,
+        force_stream=False,
+    ):  # type: ignore[no-untyped-def]
+        captured.update(
+            path=request.url.path,
+            base_url=str(base_url),
+            provider=str(provider),
+            model=str(model),
+            force_stream=force_stream,
+        )
+        return JSONResponse({"ok": True})
+
+    monkeypatch.setattr(HeadroomProxy, "handle_anthropic_messages", fake)
+
+    with TestClient(_default_vertex_app()) as client:
+        resp = client.post(
+            "/projects/p/locations/europe-west1/publishers/anthropic/models/"
+            "claude-sonnet-4-6:streamRawPredict",
+            json={"anthropic_version": "vertex-2023-10-16", "messages": []},
+        )
+
+    assert resp.status_code == 200
+    assert captured == {
+        "path": (
+            "/projects/p/locations/europe-west1/publishers/anthropic/models/"
+            "claude-sonnet-4-6:streamRawPredict"
+        ),
+        "base_url": "https://europe-west1-aiplatform.googleapis.com/v1",
+        "provider": "vertex:anthropic",
+        "model": "claude-sonnet-4-6",
+        "force_stream": True,
+    }

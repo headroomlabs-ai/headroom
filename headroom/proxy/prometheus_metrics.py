@@ -825,6 +825,7 @@ class PrometheusMetrics:
             stage_timing_count_snapshot = dict(self.stage_timing_count)
             stage_timing_max_snapshot = dict(self.stage_timing_max)
         async with self._lock:
+            lifetime_savings = self.savings_tracker.snapshot()["lifetime"]
             lines: list[str] = []
             _append_metric(
                 lines,
@@ -895,6 +896,44 @@ class PrometheusMetrics:
                 metric_type="counter",
                 help_text="Tokens saved by optimization",
                 value=self.tokens_saved_total,
+            )
+            _append_metric(
+                lines,
+                name="headroom_persistent_savings_requests_total",
+                metric_type="counter",
+                help_text="Durable lifetime requests recorded by the proxy savings tracker",
+                value=lifetime_savings["requests"],
+            )
+            _append_metric(
+                lines,
+                name="headroom_persistent_savings_tokens_saved_total",
+                metric_type="counter",
+                help_text="Durable lifetime input tokens saved by proxy compression",
+                value=lifetime_savings["tokens_saved"],
+            )
+            _append_metric(
+                lines,
+                name="headroom_persistent_savings_input_tokens_total",
+                metric_type="counter",
+                help_text="Durable lifetime input tokens recorded by the proxy savings tracker",
+                value=lifetime_savings["total_input_tokens"],
+            )
+            _append_metric(
+                lines,
+                name="headroom_persistent_savings_input_cost_usd_total",
+                metric_type="counter",
+                help_text="Durable lifetime input spend in USD estimated by the proxy savings tracker",
+                value=lifetime_savings["total_input_cost_usd"],
+            )
+            _append_metric(
+                lines,
+                name="headroom_persistent_savings_compression_savings_usd_total",
+                metric_type="counter",
+                help_text=(
+                    "Durable lifetime compression savings in USD estimated by the "
+                    "proxy savings tracker"
+                ),
+                value=lifetime_savings["compression_savings_usd"],
             )
             # NOTE: per-strategy compression breakdown is tracked
             # internally on `self.compressions_by_strategy` and

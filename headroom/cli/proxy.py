@@ -418,6 +418,18 @@ def dashboard(port: int, no_open: bool) -> None:
     ),
 )
 @click.option(
+    "--compression-max-workers",
+    type=int,
+    default=None,
+    envvar="HEADROOM_COMPRESSION_MAX_WORKERS",
+    help=(
+        "Bound the dedicated compression threadpool (CPU-bound Kompress work). "
+        "Default (unset): min(32, (cpu_count or 1) * 4). Lower it to reduce CPU "
+        "oversubscription under concurrent sessions; a value < 1 is clamped to 1. "
+        "Env: HEADROOM_COMPRESSION_MAX_WORKERS."
+    ),
+)
+@click.option(
     "--log-file",
     default=None,
     envvar="HEADROOM_LOG_FILE",
@@ -843,6 +855,7 @@ def proxy(
     anthropic_pre_upstream_concurrency: int | None,
     anthropic_pre_upstream_acquire_timeout_seconds: float | None,
     anthropic_pre_upstream_memory_context_timeout_seconds: float | None,
+    compression_max_workers: int | None,
     log_file: str | None,
     log_messages: bool,
     codex_wire_debug: bool,
@@ -1167,6 +1180,7 @@ def proxy(
         # Precedence: CLI > env > auto-compute (click's ``envvar``
         # handles the env-var fallback).
         anthropic_pre_upstream_concurrency=anthropic_pre_upstream_concurrency,
+        compression_max_workers=compression_max_workers,
         anthropic_pre_upstream_acquire_timeout_seconds=(
             anthropic_pre_upstream_acquire_timeout_seconds
             if anthropic_pre_upstream_acquire_timeout_seconds is not None
@@ -1313,31 +1327,16 @@ Memory (Multi-Provider):
     context_tool_line = f"  Context Tool: {_selected_context_tool()}"
 
     # Performance tuning section — only shown when at least one tuning var is active.
-    _stable_turn = _get_env_int_optional("HEADROOM_COMPRESSION_STABLE_AFTER_TURN") or 0
-    _stale_turns = _get_env_int_optional("HEADROOM_STALE_READ_COMPRESS_AFTER_TURNS") or 0
     _embed_socket = os.environ.get("HEADROOM_EMBEDDING_SERVER_SOCKET") or (
         embedding_server and (embedding_server_socket or f"/tmp/headroom-embed-{port}.sock")
     )
     _tuning_lines: list[str] = []
-    if _stable_turn:
-        _tuning_lines.append(
-            f"  Prefix stability:        conservative for first {_stable_turn} turns"
-            f"  (HEADROOM_COMPRESSION_STABLE_AFTER_TURN={_stable_turn})"
-        )
-    if _stale_turns:
-        _tuning_lines.append(
-            f"  Stale read compression:  reads older than {_stale_turns} turns eligible"
-            f"  (HEADROOM_STALE_READ_COMPRESS_AFTER_TURNS={_stale_turns})"
-        )
     if _embed_socket:
         _tuning_lines.append(f"  Embedding sidecar:       {_embed_socket}")
     if _tuning_lines:
         tuning_section = "\nPerformance Tuning:\n" + "\n".join(_tuning_lines)
     else:
-        tuning_section = (
-            "\nPerformance Tuning:  (all defaults — set HEADROOM_COMPRESSION_STABLE_AFTER_TURN"
-            " / HEADROOM_STALE_READ_COMPRESS_AFTER_TURNS to tune)"
-        )
+        tuning_section = ""
 
     click.echo(f"""
 ╔═══════════════════════════════════════════════════════════════════════╗

@@ -72,6 +72,9 @@ headroom_requests_total{mode="optimize"} 1234
 # HELP headroom_tokens_saved_total Total tokens saved
 headroom_tokens_saved_total 5678900
 
+# HELP headroom_persistent_savings_tokens_saved_total Durable lifetime input tokens saved by proxy compression
+headroom_persistent_savings_tokens_saved_total 5678900
+
 # HELP headroom_compression_ratio Compression ratio histogram
 headroom_compression_ratio_bucket{le="0.5"} 890
 headroom_compression_ratio_bucket{le="0.7"} 1100
@@ -253,7 +256,8 @@ When the budget is exceeded, requests return a budget exceeded error, the `/stat
 
 | Metric | What It Tells You | Target |
 |--------|-------------------|--------|
-| `tokens_saved_total` | Total cost savings | Higher is better |
+| `headroom_tokens_saved_total` | Runtime tokens saved since this proxy process started | Higher is better |
+| `headroom_persistent_savings_tokens_saved_total` | Durable lifetime tokens saved from `/stats.persistent_savings` | Higher is better |
 | `compression_ratio_avg` | Efficiency | 0.7--0.9 typical |
 | `cache_hit_rate` | Cache effectiveness | >20% is good |
 | `latency_p99` | Performance impact | &lt;10ms |
@@ -265,7 +269,8 @@ Example Prometheus queries for a Grafana dashboard:
 
 | Panel | PromQL |
 |-------|--------|
-| Tokens Saved | `headroom_tokens_saved_total` |
+| Runtime Tokens Saved | `headroom_tokens_saved_total` |
+| Lifetime Tokens Saved | `headroom_persistent_savings_tokens_saved_total` |
 | Compression Ratio (median) | `histogram_quantile(0.5, headroom_compression_ratio_bucket)` |
 | Request Latency (p99) | `histogram_quantile(0.99, headroom_latency_seconds_bucket)` |
 | Cache Hit Rate | `headroom_cache_hits_total / (headroom_cache_hits_total + headroom_cache_misses_total)` |

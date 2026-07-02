@@ -866,6 +866,12 @@ def test_stats_history_persists_across_restarts_and_stats_stays_compatible(tmp_p
         assert stats_data["persistent_savings"]["lifetime"]["tokens_saved"] == 40
         assert stats_data["persistent_savings"]["storage_path"] == str(savings_path)
 
+        metrics = client.get("/metrics")
+        assert metrics.status_code == 200
+        assert "headroom_tokens_saved_total 40" in metrics.text
+        assert "headroom_persistent_savings_tokens_saved_total 40" in metrics.text
+        assert "headroom_persistent_savings_requests_total 1" in metrics.text
+
         history = client.get("/stats-history")
         assert history.status_code == 200
         history_data = history.json()
@@ -907,6 +913,12 @@ def test_stats_history_persists_across_restarts_and_stats_stays_compatible(tmp_p
         assert history.json()["lifetime"]["tokens_saved"] == 40
         assert history.json()["display_session"]["requests"] == 1
 
+        metrics = client.get("/metrics")
+        assert metrics.status_code == 200
+        assert "headroom_tokens_saved_total 0" in metrics.text
+        assert "headroom_persistent_savings_tokens_saved_total 40" in metrics.text
+        assert "headroom_persistent_savings_requests_total 1" in metrics.text
+
         _record_request(client, model="gpt-4o", tokens_saved=15)
 
         updated = client.get("/stats-history").json()
@@ -921,6 +933,12 @@ def test_stats_history_persists_across_restarts_and_stats_stays_compatible(tmp_p
         assert updated["display_session"]["savings_percent"] == pytest.approx(18.64)
         assert updated["series"]["daily"][0]["total_input_tokens_delta"] == 240
         assert updated["series"]["daily"][0]["total_input_cost_usd_delta"] == pytest.approx(0.48)
+
+        metrics = client.get("/metrics")
+        assert metrics.status_code == 200
+        assert "headroom_tokens_saved_total 15" in metrics.text
+        assert "headroom_persistent_savings_tokens_saved_total 55" in metrics.text
+        assert "headroom_persistent_savings_requests_total 2" in metrics.text
 
         full = client.get("/stats-history?history_mode=full").json()
         assert full["history_summary"]["mode"] == "full"

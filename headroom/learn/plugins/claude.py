@@ -10,7 +10,7 @@ import logging
 import re
 from pathlib import Path, PureWindowsPath
 
-from .._shared import classify_error, is_error_content
+from .._shared import classify_error, claude_config_dir, is_error_content
 from ..base import ConversationScanner, LearnPlugin
 from ..models import (
     ErrorCategory,
@@ -33,7 +33,7 @@ class ClaudeCodePlugin(LearnPlugin, ConversationScanner):
     """
 
     def __init__(self, claude_dir: Path | None = None):
-        self.claude_dir = claude_dir or Path.home() / ".claude"
+        self.claude_dir = claude_dir or claude_config_dir()
         self.projects_dir = self.claude_dir / "projects"
 
     # --- LearnPlugin identity ---

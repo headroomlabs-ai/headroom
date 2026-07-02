@@ -2565,26 +2565,14 @@
 
                 // --- Headline savings percent ---
                 //
-                // Active ratio (saved / attempted) is the right metric when we have
-                // a working denominator. Some backend-routed paths don't yet
-                // populate `proxy_attempted_tokens` consistently — in that case
-                // the active number reads 0% even when compression is happening,
-                // so fall back to the whole-request ratio (`proxy_savings_percent`)
-                // instead of showing a misleading zero. Issue #455.
                 get headlineSavingsPercent() {
-                    const attempted = this.stats.tokens?.proxy_attempted_tokens || 0;
-                    const active = this.stats.tokens?.active_savings_percent || 0;
-                    if (attempted > 0 && active > 0) return active;
-                    return this.stats.tokens?.proxy_savings_percent || 0;
+                    return this.stats.tokens?.savings_percent
+                        ?? this.stats.tokens?.proxy_savings_percent
+                        ?? 0;
                 },
 
                 get headlineSavingsTitle() {
-                    const attempted = this.stats.tokens?.proxy_attempted_tokens || 0;
-                    const active = this.stats.tokens?.active_savings_percent || 0;
-                    if (attempted > 0 && active > 0) {
-                        return 'Of compressible tokens attempted';
-                    }
-                    return 'Of whole pre-compression request (attempted-tokens metric unavailable)';
+                    return 'Of total wire input tokens';
                 },
 
                 // --- Expandable Rows ---

@@ -15,6 +15,7 @@ from headroom.cli.doctor import (
     SKIP,
     WARN,
     check_budget,
+    check_claude_remote_control_gate,
     check_claude_routing,
     check_codex_routing,
     check_deployments,
@@ -24,6 +25,7 @@ from headroom.cli.doctor import (
     check_version_drift,
 )
 from headroom.cli.main import main
+from headroom.providers.claude.runtime import remote_control_gate_message
 
 LIVEZ_OK = {
     "service": "headroom-proxy",
@@ -116,6 +118,46 @@ class TestClaudeRouting:
         result = check_claude_routing(path, 8787)
         assert result.status == WARN
         assert "gateway.corp.example" in result.summary
+
+
+class TestClaudeRemoteControlGate:
+    def test_settings_custom_base_warns(self, tmp_path):
+        path = tmp_path / "settings.json"
+        path.write_text(
+            json.dumps({"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8787"}}),
+            encoding="utf-8",
+        )
+        result = check_claude_remote_control_gate(path, {})
+        assert result is not None
+        assert result.status == WARN
+        assert remote_control_gate_message("ANTHROPIC_BASE_URL from settings") in result.summary
+
+    def test_shell_env_custom_base_warns(self, tmp_path):
+        path = tmp_path / "settings.json"
+        path.write_text("{}", encoding="utf-8")
+        result = check_claude_remote_control_gate(
+            path, {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8787"}
+        )
+        assert result is not None
+        assert result.status == WARN
+        assert remote_control_gate_message("ANTHROPIC_BASE_URL in shell") in result.summary
+
+    def test_no_custom_base_no_warning(self, tmp_path):
+        path = tmp_path / "settings.json"
+        path.write_text(
+            json.dumps({"env": {"ANTHROPIC_BASE_URL": "https://api.anthropic.com"}}),
+            encoding="utf-8",
+        )
+        assert check_claude_remote_control_gate(path, {}) is None
+
+    def test_settings_check_still_routes(self, tmp_path):
+        path = tmp_path / "settings.json"
+        path.write_text(
+            json.dumps({"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8787"}}),
+            encoding="utf-8",
+        )
+        result = check_claude_routing(path, 8787)
+        assert result.status == PASS
 
 
 class TestCodexRouting:
@@ -287,7 +329,7 @@ class TestDoctorCommand:
         result = runner.invoke(main, ["doctor"])
         assert result.exit_code == 1
 
-    def test_all_pass_exits_0(self, runner, isolated, monkeypatch):
+    def test_remote_control_warning_exits_1(self, runner, isolated, monkeypatch):
         monkeypatch.setattr(doctor_mod, "probe_json", self._probe(LIVEZ_OK, STATS_OK))
         monkeypatch.setattr(doctor_mod, "get_version", lambda: "0.26.0")
         (isolated / "settings.json").write_text(
@@ -301,8 +343,8 @@ class TestDoctorCommand:
         result = runner.invoke(
             main, ["doctor"], env={"ANTHROPIC_BASE_URL": "http://127.0.0.1:8787"}
         )
-        assert result.exit_code == 0, result.output
-        assert "all checks passed" in result.output
+        assert result.exit_code == 1, result.output
+        assert "Remote Control" in result.output
 
     def test_json_output_parses(self, runner, isolated, monkeypatch):
         monkeypatch.setattr(doctor_mod, "probe_json", self._probe(LIVEZ_OK, STATS_OK))

@@ -9,6 +9,7 @@ import pytest
 from headroom.observability import reset_headroom_tracing, reset_otel_metrics
 from headroom.proxy.cost import CostTracker, build_prefix_cache_stats
 from headroom.proxy.prometheus_metrics import PrometheusMetrics
+from headroom.proxy.savings_tracker import SavingsTracker
 
 
 def test_prometheus_metrics_tracks_observed_ttl_buckets() -> None:
@@ -79,8 +80,10 @@ def test_prefix_cache_stats_include_observed_ttl_mix() -> None:
     assert stats["totals"]["observed_ttl_buckets"]["1h"]["tokens"] == 45
 
 
-def test_prometheus_metrics_export_includes_extended_fields() -> None:
-    metrics = PrometheusMetrics()
+def test_prometheus_metrics_export_includes_extended_fields(tmp_path) -> None:
+    metrics = PrometheusMetrics(
+        savings_tracker=SavingsTracker(path=str(tmp_path / "proxy_savings.json"))
+    )
 
     asyncio.run(
         metrics.record_request(
@@ -105,12 +108,42 @@ def test_prometheus_metrics_export_includes_extended_fields() -> None:
 
     exported = asyncio.run(metrics.export())
 
+    assert "headroom_requests_total 1" in exported
+    assert "headroom_tokens_saved_total 5" in exported
+    assert "headroom_persistent_savings_requests_total 1" in exported
+    assert "headroom_persistent_savings_tokens_saved_total 5" in exported
+    assert "headroom_persistent_savings_input_tokens_total 100" in exported
     assert "headroom_latency_ms_count 1" in exported
     assert 'headroom_transform_timing_ms_sum{transform="router"} 4.5' in exported
     assert 'headroom_waste_signal_tokens_total{signal="json_bloat"} 7' in exported
     assert 'headroom_cache_write_ttl_tokens_total{provider="anthropic",ttl="5m"} 10' in exported
     assert 'headroom_provider_cache_hit_requests_total{provider="anthropic"} 1' in exported
     assert "headroom_cache_bust_tokens_lost_total 11" in exported
+
+
+def test_prometheus_export_includes_persistent_savings_after_restart(tmp_path) -> None:
+    savings_path = tmp_path / "proxy_savings.json"
+    metrics = PrometheusMetrics(savings_tracker=SavingsTracker(path=str(savings_path)))
+
+    asyncio.run(
+        metrics.record_request(
+            provider="openai",
+            model="gpt-4o",
+            input_tokens=120,
+            output_tokens=20,
+            tokens_saved=40,
+            latency_ms=12.5,
+        )
+    )
+
+    reloaded = PrometheusMetrics(savings_tracker=SavingsTracker(path=str(savings_path)))
+    exported = asyncio.run(reloaded.export())
+
+    assert "headroom_tokens_saved_total 0" in exported
+    assert "headroom_requests_total 0" in exported
+    assert "headroom_persistent_savings_requests_total 1" in exported
+    assert "headroom_persistent_savings_tokens_saved_total 40" in exported
+    assert "headroom_persistent_savings_input_tokens_total 120" in exported
 
 
 def test_streaming_parser_extracts_anthropic_ttl_bucket_usage() -> None:
