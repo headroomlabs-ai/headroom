@@ -29,6 +29,7 @@ from headroom.proxy.helpers import (
     extract_tags,
     jitter_delay_ms,
 )
+from headroom.proxy.loopback_guard import is_loopback_host
 from headroom.proxy.stage_timer import StageTimer, emit_stage_timings_log
 from headroom.proxy.ws_session_registry import (
     TerminationCause,
@@ -65,6 +66,81 @@ _OPENAI_RESPONSES_UNIT_PARALLELISM_MAX = 16
 _OPENAI_RESPONSES_UNIT_CACHE_INIT_LOCK = threading.RLock()
 _OPENAI_RESPONSES_UNIT_EXECUTOR_LOCK = threading.RLock()
 _OPENAI_RESPONSES_UNIT_EXECUTOR: ThreadPoolExecutor | None = None
+_WS_ALLOWED_ORIGINS_ENV = "HEADROOM_WS_ORIGINS"
+_CORS_ALLOWED_ORIGINS_ENV = "HEADROOM_CORS_ORIGINS"
+
+
+def _header_get(headers: dict[str, str], name: str) -> str | None:
+    """Case-insensitive header lookup for plain dicts."""
+    lowered = name.lower()
+    for key, value in headers.items():
+        if key.lower() == lowered:
+            return value
+    return None
+
+
+def _normalize_origin(origin: str) -> str | None:
+    parsed = urlparse(origin.strip())
+    if not parsed.scheme or not parsed.hostname:
+        return None
+    scheme = parsed.scheme.lower()
+    hostname = parsed.hostname.lower()
+    if scheme not in {"http", "https", "ws", "wss"}:
+        return None
+    port = parsed.port
+    default_port = (scheme in {"http", "ws"} and port == 80) or (
+        scheme in {"https", "wss"} and port == 443
+    )
+    port_part = "" if port is None or default_port else f":{port}"
+    return f"{scheme}://{hostname}{port_part}"
+
+
+def _allowed_ws_origins_from_env() -> list[str] | None:
+    raw = os.environ.get(_WS_ALLOWED_ORIGINS_ENV)
+    if raw is None or not raw.strip():
+        raw = os.environ.get(_CORS_ALLOWED_ORIGINS_ENV)
+    if raw is None or not raw.strip():
+        return None
+    return [origin.strip() for origin in raw.split(",") if origin.strip()]
+
+
+def _is_loopback_ws_origin(origin: str) -> bool:
+    parsed = urlparse(origin.strip())
+    if parsed.scheme.lower() not in {"http", "https", "ws", "wss"}:
+        return False
+    if parsed.hostname is None:
+        return False
+    return is_loopback_host(parsed.hostname)
+
+
+def _is_allowed_websocket_origin(headers: dict[str, str]) -> bool:
+    """Return True when the WebSocket Origin matches the configured policy.
+
+    Native clients commonly omit Origin, so absence is allowed. When Origin is
+    present, default to loopback-only and allow explicit configured origins via
+    HEADROOM_WS_ORIGINS or HEADROOM_CORS_ORIGINS.
+    """
+    origin = _header_get(headers, "origin")
+    if not origin:
+        return True
+
+    allowed_origins = _allowed_ws_origins_from_env()
+    if allowed_origins is None:
+        return _is_loopback_ws_origin(origin)
+    if "*" in allowed_origins:
+        return True
+
+    normalized_origin = _normalize_origin(origin)
+    if normalized_origin is None:
+        return False
+
+    normalized_allowed = {
+        normalized
+        for allowed in allowed_origins
+        for normalized in (_normalize_origin(allowed),)
+        if normalized is not None
+    }
+    return normalized_origin in normalized_allowed
 
 
 def _usage_int(value: Any) -> int:
@@ -3639,6 +3715,16 @@ class OpenAIHandlerMixin:
         _ws_path = getattr(_ws_url_obj, "path", "") if _ws_url_obj is not None else ""
         if not _ws_path:
             _ws_path = "/v1/responses"
+        if not _is_allowed_websocket_origin(ws_headers):
+            logger.warning(
+                "event=websocket_origin_not_allowed request_id=%s session_id=%s path=%s origin=%r",
+                request_id,
+                session_id,
+                _ws_path,
+                _header_get(ws_headers, "origin"),
+            )
+            await websocket.close(code=1008, reason="origin not allowed")
+            return
         # WS sessions bypass the HTTP middleware that stamps X-Client: codex on
         # the Responses endpoint, so apply the same path-based stamp here before
         # classify_client runs (parallels server.py / should_stamp_codex_client).
