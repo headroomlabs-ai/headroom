@@ -117,6 +117,42 @@ class TestClaudeRouting:
         assert result.status == WARN
         assert "gateway.corp.example" in result.summary
 
+    def test_foundry_url_passes(self, tmp_path):
+        # In Foundry mode ANTHROPIC_BASE_URL is absent by design; routing lives
+        # in ANTHROPIC_FOUNDRY_BASE_URL. doctor must recognize it as routed.
+        path = tmp_path / "settings.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "env": {
+                        "CLAUDE_CODE_USE_FOUNDRY": "1",
+                        "ANTHROPIC_FOUNDRY_BASE_URL": "http://127.0.0.1:8787",
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        assert check_claude_routing(path, 8787).status == PASS
+
+    def test_foundry_without_base_url_warns(self, tmp_path):
+        # Foundry mode on but no upstream URL configured: still unrouted.
+        path = tmp_path / "settings.json"
+        path.write_text(
+            json.dumps({"env": {"CLAUDE_CODE_USE_FOUNDRY": "1"}}),
+            encoding="utf-8",
+        )
+        assert check_claude_routing(path, 8787).status == WARN
+
+    def test_foundry_url_ignored_without_flag(self, tmp_path):
+        # Without CLAUDE_CODE_USE_FOUNDRY the foundry URL is not consulted, so a
+        # settings file carrying only the foundry key reads as unrouted.
+        path = tmp_path / "settings.json"
+        path.write_text(
+            json.dumps({"env": {"ANTHROPIC_FOUNDRY_BASE_URL": "http://127.0.0.1:8787"}}),
+            encoding="utf-8",
+        )
+        assert check_claude_routing(path, 8787).status == WARN
+
 
 class TestCodexRouting:
     def test_missing_file_warns(self, tmp_path):

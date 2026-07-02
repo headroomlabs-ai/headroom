@@ -138,6 +138,13 @@ def check_claude_routing(settings_path: Path, port: int) -> CheckResult:
     env_block = payload.get("env")
     if isinstance(env_block, dict):
         base_url = str(env_block.get("ANTHROPIC_BASE_URL", "") or "")
+        # Foundry mode (CLAUDE_CODE_USE_FOUNDRY=1): Claude Code routes through
+        # ANTHROPIC_FOUNDRY_BASE_URL instead of ANTHROPIC_BASE_URL, so the
+        # latter is legitimately absent. Fall back to it before declaring the
+        # client unrouted — otherwise doctor reports a false negative on every
+        # correctly-wired Foundry setup.
+        if not base_url and str(env_block.get("CLAUDE_CODE_USE_FOUNDRY", "") or ""):
+            base_url = str(env_block.get("ANTHROPIC_FOUNDRY_BASE_URL", "") or "")
     if not base_url:
         return CheckResult(
             name=name,
