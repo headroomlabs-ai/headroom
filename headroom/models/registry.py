@@ -631,12 +631,29 @@ class ModelRegistry:
         if model_lower in _ALIASES:
             return _MODELS[_ALIASES[model_lower]]
 
-        # Prefix matching
+        # Prefix matching. Two rules keep this from silently mis-resolving
+        # newer or larger variants:
+        #   1. The registered name must end at a version boundary in the query
+        #      (next char is a separator like ``-``/``/``/``:``/``@``/``_``), so
+        #      ``gpt-4.1`` — a distinct model, not a variant of ``gpt-4`` — does
+        #      not inherit gpt-4's 8192-token window (the ``.`` is not a
+        #      boundary, so it no longer matches).
+        #   2. When several names qualify, the LONGEST wins, so
+        #      ``gpt-4-32k-0613`` resolves to ``gpt-4-32k`` (32768) rather than
+        #      the shorter ``gpt-4`` (8192) that happens to be registered first.
+        best: ModelInfo | None = None
+        best_len = -1
         for name, info in _MODELS.items():
-            if model_lower.startswith(name):
-                return info
+            if not model_lower.startswith(name):
+                continue
+            rest = model_lower[len(name) :]
+            if rest and rest[0] not in ("-", "/", ":", "@", "_"):
+                continue
+            if len(name) > best_len:
+                best = info
+                best_len = len(name)
 
-        return None
+        return best
 
     @classmethod
     def resolve(
