@@ -1564,7 +1564,10 @@ class ContentRouter(Transform):
                     if compressor:
                         compressor_name = type(compressor).__name__
                         result = compressor.compress(content, language=language, context=context)
-                        compressed, compressed_tokens = result.compressed, result.compressed_tokens
+                        compressed, compressed_tokens = (
+                            result.compressed,
+                            len(result.compressed.split()),
+                        )
                         decision_reason = "code_aware"
                 if compressed is None:
                     # Fallback to Kompress

@@ -1438,7 +1438,11 @@ class CodeAwareCompressor(Transform):
             if _brace_in_signature:
                 # Opening brace already in signature line — just find closing
                 pass
-            elif body_lines and body_lines[0].strip().startswith("{"):
+            elif body_lines and body_lines[0].strip().endswith("{"):
+                # Matches both a bare `{` line and a multi-line signature's
+                # closing line (e.g. Go's `) error {`), where the brace
+                # shares a line with the closing paren/return type rather
+                # than starting one of its own.
                 opening_brace_line = body_lines[0]
                 body_lines = body_lines[1:]
             if body_lines and body_lines[-1].strip().endswith("}"):
@@ -1551,6 +1555,17 @@ class CodeAwareCompressor(Transform):
                 continue
             # Skip unnamed tokens (tree-sitter anonymous nodes like braces)
             if not child.is_named:
+                continue
+            # Some grammars (e.g. Go) wrap all body statements in one generic
+            # list node instead of exposing them as direct siblings of the
+            # block. Treating that wrapper as a single statement makes its
+            # row range swallow the block's own closing brace line, causing
+            # a duplicated `}` later. Unwrap it into its real statements.
+            if child.type == "statement_list":
+                for inner in child.children:
+                    if inner.type in _SKIP_TYPES or not inner.is_named:
+                        continue
+                    body_stmts.append((inner.start_point[0], inner.end_point[0]))
                 continue
             body_stmts.append((child.start_point[0], child.end_point[0]))
 
