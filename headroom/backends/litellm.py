@@ -813,7 +813,52 @@ class LiteLLMBackend(Backend):
 
             msg_id = f"msg_{uuid.uuid4().hex[:24]}"
 
-            # Emit message_start
+            # Request LiteLLM to include usage in the final streaming chunk so
+            # we can surface real input_tokens in message_start (issue #1132).
+            # Without include_usage=True, the final chunk carries no usage and
+            # message_start always emits input_tokens=0, breaking OTel metrics.
+            if "stream_options" not in kwargs:
+                kwargs["stream_options"] = {"include_usage": True}
+            elif isinstance(kwargs.get("stream_options"), dict):
+                kwargs["stream_options"].setdefault("include_usage", True)
+
+            # Buffer all chunks so we can extract real token counts from the
+            # final usage chunk before emitting message_start.
+            response = await acompletion(**kwargs)
+            buffered_chunks: list[Any] = []
+            input_tokens = 0
+            output_tokens_from_usage = 0
+            cache_read_input_tokens = 0
+            cache_creation_input_tokens = 0
+
+            async for chunk in response:
+                buffered_chunks.append(chunk)
+                # LiteLLM emits usage on the final chunk when include_usage=True.
+                if hasattr(chunk, "usage") and chunk.usage is not None:
+                    input_tokens = int(getattr(chunk.usage, "prompt_tokens", 0) or 0)
+                    output_tokens_from_usage = int(
+                        getattr(chunk.usage, "completion_tokens", 0) or 0
+                    )
+                    cache_read_input_tokens = int(
+                        getattr(chunk.usage, "cache_read_input_tokens", 0) or 0
+                    )
+                    cache_creation_input_tokens = int(
+                        getattr(chunk.usage, "cache_creation_input_tokens", 0) or 0
+                    )
+
+            # Build usage dict for message_start — include cache fields only
+            # when the backend actually reported them (avoids confusing 0 with
+            # "confirmed no cache" vs "backend didn't report").
+            msg_start_usage: dict[str, int] = {
+                "input_tokens": input_tokens,
+                "output_tokens": 0,
+            }
+            if cache_read_input_tokens:
+                msg_start_usage["cache_read_input_tokens"] = cache_read_input_tokens
+            if cache_creation_input_tokens:
+                msg_start_usage["cache_creation_input_tokens"] = cache_creation_input_tokens
+
+            # Emit message_start with real token counts from the buffered usage.
             yield StreamEvent(
                 event_type="message_start",
                 data={
@@ -826,20 +871,19 @@ class LiteLLMBackend(Backend):
                         "model": original_model,
                         "stop_reason": None,
                         "stop_sequence": None,
-                        "usage": {"input_tokens": 0, "output_tokens": 0},
+                        "usage": msg_start_usage,
                     },
                 },
             )
 
-            # Stream content — blocks emitted dynamically based on response
-            response = await acompletion(**kwargs)
-            output_tokens = 0
+            # Process buffered chunks for content events.
+            output_tokens_counted = 0
             current_block_index = -1
             active_block_type: str | None = None  # "text" or "tool_use"
             tool_block_map: dict[int, int] = {}  # litellm tc.index → SSE block index
             stop_reason = "end_turn"
 
-            async for chunk in response:
+            for chunk in buffered_chunks:
                 if not hasattr(chunk, "choices") or not chunk.choices:
                     continue
 
@@ -902,7 +946,7 @@ class LiteLLMBackend(Backend):
                                     },
                                 },
                             )
-                            output_tokens += 1
+                            output_tokens_counted += 1
 
                 # Handle text content in the delta
                 elif hasattr(delta, "content") and delta.content:
@@ -936,7 +980,7 @@ class LiteLLMBackend(Backend):
                             "delta": {"type": "text_delta", "text": delta.content},
                         },
                     )
-                    output_tokens += 1
+                    output_tokens_counted += 1
 
             # Close the last open block
             if active_block_type is not None:
@@ -944,6 +988,10 @@ class LiteLLMBackend(Backend):
                     event_type="content_block_stop",
                     data={"type": "content_block_stop", "index": current_block_index},
                 )
+
+            # Prefer real completion_tokens from LiteLLM usage; fall back to
+            # the per-delta counter when include_usage wasn't honoured.
+            output_tokens = output_tokens_from_usage or output_tokens_counted
 
             # Emit message_delta with correct stop reason
             yield StreamEvent(
