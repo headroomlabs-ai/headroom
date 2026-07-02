@@ -16,7 +16,6 @@ COMMIT_PATTERN = re.compile(
     r"^(feat|fix|ci|chore|perf|refactor|docs|style|test)(\(.+\))?(!)?:\s*(.+)$"
 )
 BREAKING_CHANGE_PATTERN = re.compile(r"^BREAKING CHANGE:\s*(.+)$", re.MULTILINE)
-COMMIT_ENTRY_PATTERN = re.compile(r"^(.+?)(?:\n(.+))?\|(\w+)$", re.MULTILINE)
 FIELD_SEP = "\x1f"
 RECORD_SEP = "\x1e"
 GIT_LOG_FORMAT = "%s%x1f%b%x1f%h%x1e"
@@ -49,28 +48,24 @@ def iter_commit_entries(log_output: str) -> list[tuple[str, str, str]]:
     if not log_output.strip():
         return []
 
-    if RECORD_SEP in log_output and FIELD_SEP in log_output:
-        entries: list[tuple[str, str, str]] = []
-        for raw_entry in log_output.split(RECORD_SEP):
-            if not raw_entry:
-                continue
-            if FIELD_SEP not in raw_entry:
-                continue
-            subject, body_and_hash = raw_entry.split(FIELD_SEP, 1)
-            if FIELD_SEP not in body_and_hash:
-                continue
-            body, commit_hash = body_and_hash.rsplit(FIELD_SEP, 1)
-            entries.append((subject.strip(), body.strip(), commit_hash.strip()))
-        return entries
-
-    return [
-        (
-            match.group(1).strip(),
-            (match.group(2) or "").strip(),
-            match.group(3).strip(),
+    if RECORD_SEP not in log_output or FIELD_SEP not in log_output:
+        raise ValueError(
+            "git log output does not contain expected field/record separators "
+            "(\\x1f / \\x1e). Check GIT_LOG_FORMAT."
         )
-        for match in COMMIT_ENTRY_PATTERN.finditer(log_output)
-    ]
+
+    entries: list[tuple[str, str, str]] = []
+    for raw_entry in log_output.split(RECORD_SEP):
+        if not raw_entry:
+            continue
+        if FIELD_SEP not in raw_entry:
+            continue
+        subject, body_and_hash = raw_entry.split(FIELD_SEP, 1)
+        if FIELD_SEP not in body_and_hash:
+            continue
+        body, commit_hash = body_and_hash.rsplit(FIELD_SEP, 1)
+        entries.append((subject.strip(), body.strip(), commit_hash.strip()))
+    return entries
 
 
 def get_merge_summary(subject: str, body: str) -> str:
@@ -177,6 +172,10 @@ def run_git_log(since: str | None, cwd: Path) -> str:
     else:
         cmd.append("HEAD")
     result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"git log failed (exit {result.returncode}): {result.stderr.strip()}"
+        )
     return result.stdout
 
 
