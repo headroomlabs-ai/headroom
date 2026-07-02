@@ -13,7 +13,7 @@ Usage:
     from headroom.cache.backends import SQLiteBackend, CompressionStoreBackend
     from headroom.cache.compression_store import CompressionStore, get_compression_store
 
-    # Env-driven default (SQLite at ~/.headroom/ccr_store.db)
+    # Env-driven default (SQLite at workspace_dir()/ccr_store.db)
     store = get_compression_store()
 
     # Direct construction defaults to in-memory; pass a backend for persistence

@@ -9,10 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Unreleased
 
 ### Fixed
+- `--backend bedrock` now fails fast with an actionable error when temporary
+  AWS credentials (`AWS_SESSION_TOKEN`) are used but botocore is not installed
+  (e.g. the slim default Docker image). litellm's session-token auth path
+  imports botocore, so the missing dependency previously surfaced only at
+  request time as a misleading `authentication_error: No module named
+  'botocore'`. The proxy now tells the user to install the `bedrock` extra up
+  front ([#1551](https://github.com/headroomlabs-ai/headroom/issues/1551)).
+- Content detection no longer crashes the proxy on text containing an
+  orphaned `+++ ` target line with no preceding `--- ` source line (common in
+  `set -x` xtrace output and partial diffs). The bundled `unidiff` 0.4.0 parser
+  panics on that input instead of returning an error; the Rust diff detector now
+  contains the panic and treats the fragment as plain text, so the request is
+  compressed and forwarded normally instead of returning HTTP 500
+  ([#1547](https://github.com/headroomlabs-ai/headroom/issues/1547)).
 - Proactive expansion blocks injected into user turns are now wrapped in
   `<headroom_proactive_expansion>` XML tags, giving downstream consumers
   (LLMs, loggers, attribution parsers) a machine-readable provenance
   boundary and preventing misattribution in multi-agent threads.
+- **memory/embedder:** cap CPU thread oversubscription in the local
+  torch/sentence-transformers embedder. Concurrent encodes previously each
+  fanned out to ~`os.cpu_count()` BLAS/OpenMP threads, so under load the memory
+  path starved the asyncio event loop and spiked `/livez` latency to several
+  seconds. CPU encodes now run on a dedicated, size-limited executor whose
+  workers each pin their thread pool, bounding total embedding threads to
+  `HEADROOM_EMBED_CONCURRENCY` × `HEADROOM_EMBED_NUM_THREADS` (defaults
+  `min(4, cpu)` × 1). The ONNX embedder already capped its threads; this brings
+  the torch path to parity
+  ([#198](https://github.com/headroomlabs-ai/headroom/issues/198)).
 
 ### Changed
 
