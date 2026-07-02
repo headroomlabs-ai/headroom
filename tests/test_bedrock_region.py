@@ -150,7 +150,9 @@ class TestFetchBedrockInferenceProfiles:
         mock_client.list_inference_profiles.side_effect = Exception(
             "AccessDeniedException: not authorized"
         )
-        mock_boto3.client.return_value = mock_client
+        mock_session = MagicMock()
+        mock_session.client.return_value = mock_client
+        mock_boto3.Session.return_value = mock_session
 
         with patch("headroom.backends.litellm.boto3", mock_boto3, create=True):
             # Patch the import inside the function
@@ -188,7 +190,9 @@ class TestFetchBedrockInferenceProfiles:
                 {"inferenceProfileId": "eu.meta.llama-3-70b-v1:0"},  # non-Anthropic, should skip
             ]
         }
-        mock_boto3.client.return_value = mock_client
+        mock_session = MagicMock()
+        mock_session.client.return_value = mock_client
+        mock_boto3.Session.return_value = mock_session
 
         import builtins
 
