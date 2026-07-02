@@ -42,6 +42,7 @@ import math
 import os
 import re
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -66,6 +67,7 @@ logger = logging.getLogger(__name__)
 
 _detect_backend_warned = False
 _detect_panic_warned = False
+_detect_native_unhealthy = False  # circuit breaker: native detect hung once (#575)
 
 
 def _router_debug_dumps(value: Any) -> str:
@@ -129,6 +131,60 @@ def _resolve_detect_backend() -> str:
     return "python" if sys.platform == "win32" else "rust"
 
 
+_DETECT_TIMEOUT_ENV = "HEADROOM_DETECT_TIMEOUT_SECS"
+_DEFAULT_DETECT_TIMEOUT_SECS = 5.0
+
+
+def _detect_timeout_secs() -> float:
+    """Watchdog budget (seconds) for one native detect call.
+
+    Override with ``HEADROOM_DETECT_TIMEOUT_SECS``; blank, non-numeric, or
+    non-positive values fall back to the default.
+    """
+    raw = os.environ.get(_DETECT_TIMEOUT_ENV, "").strip()
+    if not raw:
+        return _DEFAULT_DETECT_TIMEOUT_SECS
+    try:
+        secs = float(raw)
+    except ValueError:
+        return _DEFAULT_DETECT_TIMEOUT_SECS
+    return secs if secs > 0 else _DEFAULT_DETECT_TIMEOUT_SECS
+
+
+def _rust_detect_watchdogged(rust_detect: Any, content: str, timeout: float) -> Any:
+    """Run the native detector under a watchdog thread, bounding the caller's wait.
+
+    On Windows the first native ``detect_content_type`` can park forever in an
+    ort/``Once`` init (``WaitOnAddress``) at 0% CPU, and a wedged native call
+    cannot be cancelled from Python (#575). The native call releases the GIL
+    while parked, so a watchdog thread runs it and the caller waits at most
+    ``timeout`` seconds before raising ``TimeoutError`` — letting
+    ``_detect_content`` degrade to the pure-Python detector instead of
+    deadlocking (and, in the proxy, instead of permanently consuming a
+    compression-executor worker — see #575's executor-saturation report).
+
+    # ponytail: can't kill a GIL-released native call; the watchdog frees the
+    # caller and the stuck daemon thread is left to die with the process. The
+    # upgrade path is the Rust-side fix that makes first-call init non-blocking.
+    """
+    box: dict[str, Any] = {}
+
+    def _run() -> None:
+        try:
+            box["result"] = rust_detect(content)
+        except BaseException as exc:  # noqa: BLE001 — relayed to the caller's degrade path
+            box["error"] = exc
+
+    worker = threading.Thread(target=_run, name="headroom-detect-watchdog", daemon=True)
+    worker.start()
+    worker.join(timeout)
+    if worker.is_alive():
+        raise TimeoutError(f"native detect_content_type exceeded {timeout:.1f}s watchdog")
+    if "error" in box:
+        raise box["error"]
+    return box["result"]
+
+
 def _detect_content(content: str) -> DetectionResult:
     """Detect content type via the native chain, with a safe Windows default.
 
@@ -144,7 +200,7 @@ def _detect_content(content: str) -> DetectionResult:
     only consumed `.content_type` from it; the strategy mapping in
     `_strategy_from_detection` keys off that field alone.
     """
-    global _detect_backend_warned
+    global _detect_backend_warned, _detect_panic_warned, _detect_native_unhealthy
 
     backend = _resolve_detect_backend()
     if backend == "python":
@@ -157,11 +213,23 @@ def _detect_content(content: str) -> DetectionResult:
             )
         return _regex_detect_content_type(content)
 
+    if _detect_native_unhealthy:
+        # Circuit breaker (#575): the native detector hung once under the
+        # watchdog; every later call would wait the full budget and strand
+        # another stuck daemon thread, so route straight to pure-Python.
+        return _regex_detect_content_type(content)
+
     from headroom._core import detect_content_type as _rust_detect
 
-    global _detect_panic_warned
     try:
-        rust_result = _rust_detect(content)
+        if sys.platform == "win32":
+            # Windows is the only platform where the native detector can deadlock
+            # on first use (#575); bound it with a watchdog so a hang degrades to
+            # the pure-Python detector below. Elsewhere it is the trusted default
+            # hot path — call it directly, with no per-call thread overhead.
+            rust_result = _rust_detect_watchdogged(_rust_detect, content, _detect_timeout_secs())
+        else:
+            rust_result = _rust_detect(content)
         # Rust's `content_type` is the lowercase string tag (e.g.
         # "json_array"); translate to the Python `ContentType` enum so
         # downstream mapping keys match.
@@ -178,7 +246,17 @@ def _detect_content(content: str) -> DetectionResult:
         # as asyncio.CancelledError — keep them propagating.
         if isinstance(exc, asyncio.CancelledError):
             raise
-        if not _detect_panic_warned:
+        if isinstance(exc, TimeoutError):
+            # Watchdog tripped: the native detector hung (#575). Disable it
+            # process-wide so later calls don't each wait the full budget and
+            # strand another daemon thread in the wedged native call.
+            _detect_native_unhealthy = True
+            logger.warning(
+                "Native content detector hung (%s); disabling it for this process "
+                "and using pure-Python detection.",
+                exc,
+            )
+        elif not _detect_panic_warned:
             _detect_panic_warned = True
             logger.warning(
                 "Native content detector failed (%s); falling back to pure-Python detection.",
