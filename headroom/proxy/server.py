@@ -4249,6 +4249,32 @@ def run_server(
     else:
         app_target = create_app(config)
 
+    # Never fetch remote model cost map — local backup is identical.
+    os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "true")
+
+    # HF_HUB_OFFLINE prevents synchronous huggingface_hub network calls
+    # (registry fetch, user-agent detection, etc.) from blocking the asyncio
+    # event loop. This is the upstream-recommended setting for the proxy.
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+
+    # However, actual model downloads (Kompress ONNX, embedders) must still
+    # work. Patch hf_hub_download to temporarily lift HF_HUB_OFFLINE so
+    # genuine model downloads are not blocked by the env var default.
+    import huggingface_hub as _hf
+
+    _orig_hf_download = _hf.hf_hub_download
+
+    def _hf_download_allow(repo_id: str, filename: str, **kwargs: Any) -> str:  # type: ignore[misc]
+        if os.environ.get("HF_HUB_OFFLINE") == "1":
+            os.environ.pop("HF_HUB_OFFLINE")
+            try:
+                return _orig_hf_download(repo_id, filename, **kwargs)
+            finally:
+                os.environ["HF_HUB_OFFLINE"] = "1"
+        return _orig_hf_download(repo_id, filename, **kwargs)
+
+    _hf.hf_hub_download = _hf_download_allow
+
     uvicorn.run(
         app_target,
         host=config.host,
