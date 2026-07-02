@@ -42,6 +42,7 @@ Telemetry is **off by default** (opt-in). Opt in with `HEADROOM_TELEMETRY=on` or
 | `--log-messages` | `false` | Store full request/response content for the live feed |
 | `--budget` | None | Daily budget limit in USD |
 | `--openai-api-url` | `https://api.openai.com` | Custom OpenAI API URL |
+| `--provider-name` | Detected from `--openai-api-url` | Display name for the OpenAI-compatible upstream on the dashboard (e.g. `OpenRouter`). Well-known hosts (OpenRouter, Groq, Together, Azure OpenAI, …) are detected automatically; this overrides them. Routing and pricing are unaffected. |
 | `--anthropic-api-url` | Anthropic default | Custom Anthropic API URL |
 | `--gemini-api-url` | Gemini default | Custom Gemini API URL |
 | `--backend` | `anthropic` | Backend: `anthropic`, `bedrock`, `openrouter`, `anyllm`, or `litellm-<provider>` |
