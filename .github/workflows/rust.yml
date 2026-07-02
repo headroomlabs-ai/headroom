@@ -20,9 +20,10 @@ on:
       - 'tests/parity/**'
       - 'Makefile'
       - '.github/workflows/rust.yml'
-  schedule:
-    # Nightly parity run at 07:17 UTC (weekdays only). Phase 0 allows failure.
-    - cron: '17 7 * * 1-5'
+  # PR-I6 (REALIGNMENT/11-phase-I-test-infra.md): parity is now a per-PR
+  # gate, not a nightly cron. The `parity` job below blocks merge on `Diff`
+  # outcomes; `Skipped` is allowed by default so still-stub comparators
+  # don't block. Re-enable nightly only if a separate use case demands it.
 
 concurrency:
   group: rust-${{ github.ref }}
@@ -34,6 +35,22 @@ concurrency:
 # this here means even if the repo default changes, this workflow stays safe.
 permissions:
   contents: read
+
+# Workflow-level env. Job-level fields like `timeout-minutes` evaluate
+# expressions before job-level `env:` blocks are loaded, so the parity
+# timeout knobs live at workflow scope. Override per branch by editing
+# this file — no repo-secret roundtrip needed.
+env:
+  # PR-I6 (REALIGNMENT/11-phase-I-test-infra.md): parity timeout knob.
+  # Maturin + cargo build dominate wall time on a cold cache (~6min);
+  # 30min is comfortable headroom.
+  HEADROOM_CI_PARITY_TIMEOUT_SECONDS: '1800'
+  HEADROOM_CI_PARITY_TIMEOUT_MINUTES: '30'
+  HEADROOM_PARITY_FIXTURE_DIR: 'tests/parity/fixtures'
+  # Default off: stub comparators are allowed to skip. Flip to '1' once
+  # PR-I5 lands real impls for ccr / log_compressor / cache_aligner so
+  # any regression to a stub fails the build.
+  HEADROOM_PARITY_STRICT: '0'
 
 jobs:
   test:
@@ -125,11 +142,18 @@ jobs:
         continue-on-error: true
         run: cargo deny check licenses
 
-  parity-nightly:
-    name: parity (nightly, allowed to fail during Phase 0)
-    if: github.event_name == 'schedule'
+  parity:
+    # PR-I6 (REALIGNMENT/11-phase-I-test-infra.md, bug P6-65): per-PR
+    # parity gate. Replaces the prior nightly cron with `continue-on-error:
+    # true`. `Diff` outcomes fail the build. `Skipped` outcomes (today: the
+    # `ccr`, `log_compressor`, `cache_aligner` stubs) are tolerated until
+    # PR-I5 promotes them to real comparators. Once promoted, set
+    # `HEADROOM_PARITY_STRICT=1` (workflow-level env above) to refuse
+    # regressions.
+    name: parity
+    needs: test
     runs-on: ubuntu-latest
-    continue-on-error: true
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -138,15 +162,26 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.11'
-      - uses: Swatinem/rust-cache@v2
-      - name: Install deps
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-parity-${{ hashFiles('pyproject.toml', 'uv.lock') }}
+          restore-keys: |
+            pip-${{ runner.os }}-parity-
+      - name: Install python deps + maturin
         run: |
           python -m venv .venv
           source .venv/bin/activate
           pip install --upgrade pip
           pip install maturin
           pip install -e .
-      - name: Run parity harness
+      - name: Run parity harness (per-PR gate)
         run: |
           source .venv/bin/activate
-          make test-parity
+          # Makefile target builds headroom-py via maturin develop and
+          # runs `parity-run run --fixtures $FIXTURES`. The CLI honors
+          # HEADROOM_PARITY_FIXTURE_DIR + HEADROOM_PARITY_STRICT.
+          make test-parity FIXTURES="$HEADROOM_PARITY_FIXTURE_DIR"

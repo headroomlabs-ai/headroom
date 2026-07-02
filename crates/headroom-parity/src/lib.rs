@@ -125,6 +125,35 @@ impl Report {
     }
 }
 
+/// Cross-comparator summary used by the `parity-run` CLI to derive the
+/// process exit code. PR-I6 contract:
+/// - any `Diff` is non-zero (always fails the build).
+/// - any `Skipped` is zero by default (lets stub comparators land);
+///   non-zero when `strict = true` (set via `--strict` /
+///   `HEADROOM_PARITY_STRICT`).
+/// - all-`Match` is zero.
+/// - empty (no fixtures at all) is zero — the harness has nothing to say.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RunSummary {
+    pub matched: usize,
+    pub diffed: usize,
+    pub skipped: usize,
+}
+
+impl RunSummary {
+    /// Resolve to a Unix-style exit code. `strict` flips `Skipped` from
+    /// allowed to failing; `Diff` is always failing.
+    pub fn exit_code(&self, strict: bool) -> i32 {
+        if self.diffed > 0 {
+            return 1;
+        }
+        if strict && self.skipped > 0 {
+            return 2;
+        }
+        0
+    }
+}
+
 /// Run a comparator over every fixture under `dir/<transform>/` and return a
 /// report. Propagates IO/parse errors but never panics on comparator errors —
 /// those become `Skipped` entries.
@@ -583,6 +612,71 @@ mod tests {
         let report = run_comparator(tmp.path(), &LogCompressorComparator).unwrap();
         assert_eq!(report.skipped.len(), 1);
         assert_eq!(report.matched, 0);
+    }
+
+    // --- PR-I6 exit-code semantics --------------------------------------
+
+    #[test]
+    fn run_summary_diff_is_nonzero_exit() {
+        let summary = RunSummary {
+            matched: 0,
+            diffed: 1,
+            skipped: 0,
+        };
+        assert_eq!(summary.exit_code(false), 1);
+        assert_eq!(summary.exit_code(true), 1);
+    }
+
+    #[test]
+    fn run_summary_skipped_alone_is_zero_exit_by_default() {
+        let summary = RunSummary {
+            matched: 0,
+            diffed: 0,
+            skipped: 3,
+        };
+        assert_eq!(summary.exit_code(false), 0);
+    }
+
+    #[test]
+    fn run_summary_strict_flips_skipped_to_nonzero() {
+        let summary = RunSummary {
+            matched: 0,
+            diffed: 0,
+            skipped: 3,
+        };
+        assert_eq!(summary.exit_code(true), 2);
+    }
+
+    #[test]
+    fn run_summary_all_matched_is_zero_under_strict() {
+        let summary = RunSummary {
+            matched: 5,
+            diffed: 0,
+            skipped: 0,
+        };
+        assert_eq!(summary.exit_code(false), 0);
+        assert_eq!(summary.exit_code(true), 0);
+    }
+
+    #[test]
+    fn run_summary_diff_dominates_skipped_under_strict() {
+        // If both Diff and Skipped are present, Diff (exit 1) must take
+        // precedence over Skipped-strict (exit 2). The CI signal "real
+        // divergence detected" should never be masked by "stub didn't
+        // run".
+        let summary = RunSummary {
+            matched: 0,
+            diffed: 2,
+            skipped: 1,
+        };
+        assert_eq!(summary.exit_code(true), 1);
+    }
+
+    #[test]
+    fn run_summary_empty_is_zero() {
+        let summary = RunSummary::default();
+        assert_eq!(summary.exit_code(false), 0);
+        assert_eq!(summary.exit_code(true), 0);
     }
 
     /// Minimal tempdir helper to avoid a dev-dependency on `tempfile`.

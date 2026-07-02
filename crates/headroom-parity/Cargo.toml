@@ -18,8 +18,10 @@ path = "src/bin/parity_run.rs"
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
-clap = { workspace = true }
+clap = { workspace = true, features = ["derive", "env"] }
 thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 headroom-core = { path = "../headroom-core" }
 # NOTE: Phase 0 does not invoke Python from Rust. Phase 1 adds `pyo3` with
 # `auto-initialize` here so comparators can call into the installed
