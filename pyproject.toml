@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "headroom-ai"
-version = "0.27.0"
+version = "0.28.0"
 description = "The Context Optimization Layer for LLM Applications - Cut costs by 50-90%"
 readme = "README.md"
 license = "Apache-2.0"
@@ -231,7 +231,13 @@ evals = [
 ]
 # AWS Bedrock backend
 bedrock = [
-    "boto3>=1.28.0",
+    # `aws login` (IAM Identity Provider / console-login, DPoP) requires
+    # boto3 >= 1.41.0 AND the AWS Common Runtime (CRT) per AWS docs
+    # ("Boto3 1.41.0 or later with CRT"). CRT is a separate install — pull it
+    # via the botocore [crt] extra (awscrt). Without it, resolving `aws login`
+    # credentials raises botocore's MissingDependencyException.
+    "boto3>=1.41.0",
+    "botocore[crt]>=1.41.0",
 ]
 # HTML content extraction
 html = [

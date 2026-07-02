@@ -1180,7 +1180,7 @@
                     <div class="text-xs text-gray-500 mb-3">No per-project data yet.</div>
                     <div class="text-xs text-gray-600 font-mono leading-relaxed">
                         Add to each project's <span class="text-gray-400">.claude/settings.local.json</span>:<br>
-                        <span class="text-accent">ANTHROPIC_BASE_URL: http://127.0.0.1:8787/p/&lt;project-name&gt;</span>
+                        <span class="text-accent" x-text="'ANTHROPIC_BASE_URL: ' + window.location.origin + '/p/<project-name>'"></span>
                     </div>
                 </div>
             </template>

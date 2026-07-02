@@ -631,6 +631,9 @@ class ContentRouterConfig:
 
     # Routing preferences
     prefer_code_aware_for_code: bool = False  # Disabled: let code pass through unmangled
+    # Route ALL compressible content to Kompress, skipping per-type selection.
+    # Tool exclusion (Read/Glob/...) and reversibility gates still apply.
+    force_kompress_all: bool = False
     mixed_content_threshold: int = 2  # Min types to consider mixed
     min_section_tokens: int = 20  # Min tokens to compress a section
 
@@ -2419,9 +2422,20 @@ class ContentRouter(Transform):
         if self.config.read_lifecycle.enabled:
             from .read_lifecycle import ReadLifecycleManager
 
+            # is None (not truthiness) so falsy test doubles are honored;
+            # guarded import keeps read_lifecycle running in stripped builds.
+            injected_store = kwargs.get("compression_store")
+            if injected_store is None:
+                try:
+                    from ..cache.compression_store import get_compression_store
+
+                    injected_store = get_compression_store()
+                except ImportError:
+                    pass
+
             lifecycle_mgr = ReadLifecycleManager(
                 self.config.read_lifecycle,
-                compression_store=kwargs.get("compression_store"),
+                compression_store=injected_store,
             )
             lifecycle_result = lifecycle_mgr.apply(
                 messages,
@@ -2457,7 +2471,9 @@ class ContentRouter(Transform):
         )
         # Store runtime options on self for access by _route_and_compress_block
         self._runtime_target_ratio: float | None = kwargs.get("target_ratio")
-        self._runtime_force_kompress: bool = bool(kwargs.get("force_kompress", False))
+        self._runtime_force_kompress: bool = bool(
+            kwargs.get("force_kompress", self.config.force_kompress_all)
+        )
         self._runtime_kompress_model: str | None = kwargs.get("kompress_model")
         # F2.2: capture the per-request CompressionPolicy so
         # ``_record_to_toin`` can gate TOIN writes on

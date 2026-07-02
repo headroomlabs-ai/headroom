@@ -69,6 +69,11 @@ _OPENAI_RESPONSES_UNIT_EXECUTOR_LOCK = threading.RLock()
 _OPENAI_RESPONSES_UNIT_EXECUTOR: ThreadPoolExecutor | None = None
 _WS_ALLOWED_ORIGINS_ENV = "HEADROOM_WS_ORIGINS"
 _CORS_ALLOWED_ORIGINS_ENV = "HEADROOM_CORS_ORIGINS"
+_CODEX_RESPONSES_LITE_HEADER = "x-openai-internal-codex-responses-lite"
+_OPENAI_CHAT_COMPLETIONS_PATH = "/chat/completions"
+_OPENAI_RESPONSES_PATH = "/responses"
+_OPENAI_ORIGINAL_PATH_HEADER = "x-headroom-original-path"
+_OPENAI_BASE_URL_HEADER = "x-headroom-base-url"
 
 
 def _header_get(headers: dict[str, str], name: str) -> str | None:
@@ -78,6 +83,51 @@ def _header_get(headers: dict[str, str], name: str) -> str | None:
         if key.lower() == lowered:
             return value
     return None
+
+
+def _resolve_openai_handler_path(
+    request_headers: dict[str, str],
+    *,
+    handler_path: str,
+) -> str:
+    raw_path = _header_get(request_headers, _OPENAI_ORIGINAL_PATH_HEADER)
+    upstream_path = raw_path.strip() if raw_path is not None else None
+
+    default_path = f"/v1{handler_path}"
+    if upstream_path is None:
+        return default_path
+
+    if not upstream_path.startswith("/") or upstream_path.startswith("//"):
+        return default_path
+
+    parsed = urlparse(upstream_path)
+    if parsed.scheme or parsed.netloc or parsed.query or parsed.fragment:
+        return default_path
+
+    if not parsed.path.endswith(handler_path):
+        return f"/v1{handler_path}"
+
+    return parsed.path
+
+
+def _resolve_openai_upstream_base(request_headers: dict[str, str]) -> str | None:
+    raw_base_url = _header_get(request_headers, _OPENAI_BASE_URL_HEADER)
+    if raw_base_url is None:
+        return None
+
+    normalized = _normalize_origin(raw_base_url)
+    if normalized is None:
+        return None
+    if urlparse(normalized).scheme not in {"http", "https"}:
+        return None
+    return normalized
+
+
+def _append_request_query(url: str, query: str) -> str:
+    if not query:
+        return url
+    separator = "&" if "?" in url else "?"
+    return f"{url}{separator}{query}"
 
 
 def _normalize_origin(origin: str) -> str | None:
@@ -1776,9 +1826,39 @@ class OpenAIHandlerMixin:
                     detail=f"Rate limited. Retry after {wait_seconds:.1f}s",
                 )
 
+        # Snapshot cache-key fields ONCE here (pre-upstream), reused verbatim
+        # at the cache.set site below — re-reading body at set risks a mutated
+        # body (e.g. tools reassigned) and a key mismatch (#327). OpenAI's
+        # system prompt lives inside `messages` (already in the key), so it is
+        # not folded separately. Fold in the response-shaping fields the request
+        # forwards — else two requests with identical messages but a different
+        # reasoning_effort / response_format / sampling config collide and the
+        # second caller is served a response made under other semantics (#1473
+        # review). Transport/metadata fields (stream, store, user, service_tier)
+        # and the deprecated functions API are intentionally excluded.
+        cache_key_fields = {
+            "tools": body.get("tools"),
+            "tool_choice": body.get("tool_choice"),
+            "response_format": body.get("response_format"),
+            "parallel_tool_calls": body.get("parallel_tool_calls"),
+            "temperature": body.get("temperature"),
+            "top_p": body.get("top_p"),
+            "max_tokens": body.get("max_tokens") or body.get("max_completion_tokens"),
+            "stop": body.get("stop"),
+            "seed": body.get("seed"),
+            "presence_penalty": body.get("presence_penalty"),
+            "frequency_penalty": body.get("frequency_penalty"),
+            "logit_bias": body.get("logit_bias"),
+            "n": body.get("n"),
+            "logprobs": body.get("logprobs"),
+            "top_logprobs": body.get("top_logprobs"),
+            "reasoning_effort": body.get("reasoning_effort"),
+            "verbosity": body.get("verbosity"),
+            "modalities": body.get("modalities"),
+        }
         # Check cache
         if self.cache and not stream:
-            cached = await self.cache.get(messages, model)
+            cached = await self.cache.get(messages, model, **cache_key_fields)
             if cached:
                 self.pipeline_extensions.emit(
                     PipelineStage.INPUT_CACHED,
@@ -2485,7 +2565,19 @@ class OpenAIHandlerMixin:
                 )
 
         # Direct OpenAI API (no backend configured)
-        url = build_copilot_upstream_url(self.OPENAI_API_URL, "/v1/chat/completions")
+        upstream_base_url = _resolve_openai_upstream_base(request.headers)
+        handler_path = (
+            _resolve_openai_handler_path(
+                request.headers, handler_path=_OPENAI_CHAT_COMPLETIONS_PATH
+            )
+            if upstream_base_url is not None
+            else "/v1/chat/completions"
+        )
+        url = build_copilot_upstream_url(
+            upstream_base_url or self.OPENAI_API_URL,
+            handler_path,
+        )
+        url = _append_request_query(url, request.url.query)
 
         try:
             if stream:
@@ -2744,6 +2836,7 @@ class OpenAIHandlerMixin:
                         response.content,
                         dict(response.headers),
                         tokens_saved,
+                        **cache_key_fields,
                     )
 
                 # Capture Codex rate-limit window data from response headers
@@ -2860,7 +2953,8 @@ class OpenAIHandlerMixin:
 
         from headroom.proxy.helpers import (
             MAX_REQUEST_BODY_SIZE,
-            _read_request_json,
+            BodyMutationTracker,
+            read_request_json_with_bytes,
         )
         from headroom.tokenizers import get_tokenizer
         from headroom.utils import extract_user_query
@@ -2892,7 +2986,7 @@ class OpenAIHandlerMixin:
 
         # Parse request
         try:
-            body = await _read_request_json(request)
+            body, original_body_bytes = await read_request_json_with_bytes(request)
         except (json.JSONDecodeError, ValueError) as e:
             return JSONResponse(
                 status_code=400,
@@ -2907,6 +3001,7 @@ class OpenAIHandlerMixin:
 
         model = body.get("model", "unknown")
         stream = body.get("stream", False)
+        body_mutation_tracker = BodyMutationTracker()
         _bypass = self._headroom_bypass_enabled(request.headers)
         if _bypass:
             logger.info(
@@ -2947,6 +3042,10 @@ class OpenAIHandlerMixin:
         headers = dict(request.headers.items())
         headers.pop("host", None)
         headers.pop("content-length", None)
+        # The parsed request body has already been content-decoded. Remove
+        # entity headers that described the client-to-proxy wire body.
+        headers.pop("content-encoding", None)
+        headers.pop("transfer-encoding", None)
         # Strip accept-encoding so httpx negotiates its own encoding.
         # Cloudflare Workers forward "br, zstd" which OpenAI may honor;
         # if httpx lacks brotli support the response body is undecipherable → 502.
@@ -3133,6 +3232,7 @@ class OpenAIHandlerMixin:
                                     if current_input
                                     else memory_context
                                 )
+                                body_mutation_tracker.mark_mutated("responses_memory_context")
                                 log_memory_injection(
                                     request_id=request_id,
                                     session_id=None,
@@ -3146,6 +3246,7 @@ class OpenAIHandlerMixin:
                                 )
                                 if bytes_appended > 0:
                                     body["input"] = new_input
+                                    body_mutation_tracker.mark_mutated("responses_memory_context")
                                     log_memory_injection(
                                         request_id=request_id,
                                         session_id=None,
@@ -3210,12 +3311,14 @@ class OpenAIHandlerMixin:
                 )
                 if mem_tools_injected:
                     body["tools"] = resp_tools
+                    body_mutation_tracker.mark_mutated("responses_memory_tools")
                     logger.info(f"[{request_id}] Memory: Injected memory tools (openai/responses)")
 
                     if _ensure_responses_store_for_memory_tools(
                         body,
                         memory_tools_injected=True,
                     ):
+                        body_mutation_tracker.mark_mutated("responses_memory_store")
                         logger.info(
                             f"[{request_id}] Memory: forced store=true for Responses memory tool continuation"
                         )
@@ -3244,7 +3347,17 @@ class OpenAIHandlerMixin:
         if is_chatgpt_auth:
             url = "https://chatgpt.com/backend-api/codex/responses"
         else:
-            url = build_copilot_upstream_url(self.OPENAI_API_URL, "/v1/responses")
+            upstream_base_url = _resolve_openai_upstream_base(request.headers)
+            handler_path = (
+                _resolve_openai_handler_path(request.headers, handler_path=_OPENAI_RESPONSES_PATH)
+                if upstream_base_url is not None
+                else "/v1/responses"
+            )
+            url = build_copilot_upstream_url(
+                upstream_base_url or self.OPENAI_API_URL,
+                handler_path,
+            )
+            url = _append_request_query(url, request.url.query)
 
         # The standalone Rust proxy has native /v1/responses item handling,
         # but the default CLI runtime is this Python proxy. Compress the
@@ -3271,6 +3384,7 @@ class OpenAIHandlerMixin:
                 )
                 attempted_input_tokens = int(_attempted_tokens)
                 if _modified:
+                    body_mutation_tracker.mark_mutated("responses_compression")
                     tokens_saved = int(_tokens_saved)
                     optimized_tokens = max(0, original_tokens - tokens_saved)
                     transforms_applied = [*_transforms, *list(transforms_applied)]
@@ -3396,11 +3510,25 @@ class OpenAIHandlerMixin:
                     optimization_latency,
                     memory_user_id=memory_user_id,
                     memory_request_ctx=memory_request_ctx,
+                    original_body_bytes=original_body_bytes,
+                    body_mutated=body_mutation_tracker.mutated,
+                    mutation_reasons=body_mutation_tracker.reasons,
                     waste_signals=waste_signals_dict,
                 )
             else:
                 headers = await apply_copilot_api_auth(headers, url=url)
-                response = await self._retry_request("POST", url, headers, body)
+                response = await self._retry_request(
+                    "POST",
+                    url,
+                    headers,
+                    body,
+                    original_body_bytes=original_body_bytes,
+                    body_mutated=body_mutation_tracker.mutated,
+                    mutation_reasons=body_mutation_tracker.reasons,
+                    request_id=request_id,
+                    forwarder_name="openai_responses",
+                    path_for_log=url,
+                )
                 _response_body_for_debug: Any = None
                 _response_raw_for_debug: str | None = None
                 try:
@@ -3780,6 +3908,12 @@ class OpenAIHandlerMixin:
         )
 
         upstream_headers, is_chatgpt_auth = _resolve_codex_routing_headers(upstream_headers)
+        # OpenAI rejects newer Codex models when this client-only lite header leaks upstream.
+        upstream_headers = {
+            key: value
+            for key, value in upstream_headers.items()
+            if key.lower() != _CODEX_RESPONSES_LITE_HEADER
+        }
         _lower_headers = {k.lower(): v for k, v in upstream_headers.items()}
 
         # Build upstream WebSocket URL based on auth mode
