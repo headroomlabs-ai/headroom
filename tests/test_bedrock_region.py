@@ -343,6 +343,7 @@ class TestBedrockModelMapping:
             result = backend.map_model_id("claude-sonnet-4-5-20250929")
             assert result == "bedrock/au.anthropic.claude-sonnet-4-5-20250929-v1:0"
 
+
 # =============================================================================
 # Normalize Bedrock Profile ID (edge cases)
 # =============================================================================
@@ -426,10 +427,13 @@ class TestBedrockProfileForwardedToCompletion:
             captured_kwargs.update(kwargs)
             return _make_fake_completion_resp()
 
-        with patch(
-            "headroom.backends.litellm._fetch_bedrock_inference_profiles",
-            return_value=_MODEL_MAP_US,
-        ), patch("headroom.backends.litellm.acompletion", side_effect=fake_acompletion):
+        with (
+            patch(
+                "headroom.backends.litellm._fetch_bedrock_inference_profiles",
+                return_value=_MODEL_MAP_US,
+            ),
+            patch("headroom.backends.litellm.acompletion", side_effect=fake_acompletion),
+        ):
             backend = LiteLLMBackend(
                 provider="bedrock", region="us-east-1", profile_name="my-sso-profile"
             )
@@ -450,10 +454,13 @@ class TestBedrockProfileForwardedToCompletion:
 
             return _empty()
 
-        with patch(
-            "headroom.backends.litellm._fetch_bedrock_inference_profiles",
-            return_value=_MODEL_MAP_US,
-        ), patch("headroom.backends.litellm.acompletion", side_effect=fake_acompletion):
+        with (
+            patch(
+                "headroom.backends.litellm._fetch_bedrock_inference_profiles",
+                return_value=_MODEL_MAP_US,
+            ),
+            patch("headroom.backends.litellm.acompletion", side_effect=fake_acompletion),
+        ):
             backend = LiteLLMBackend(
                 provider="bedrock", region="us-east-1", profile_name="my-sso-profile"
             )
@@ -471,10 +478,13 @@ class TestBedrockProfileForwardedToCompletion:
             captured_kwargs.update(kwargs)
             return _make_fake_completion_resp()
 
-        with patch(
-            "headroom.backends.litellm._fetch_bedrock_inference_profiles",
-            return_value=_MODEL_MAP_US,
-        ), patch("headroom.backends.litellm.acompletion", side_effect=fake_acompletion):
+        with (
+            patch(
+                "headroom.backends.litellm._fetch_bedrock_inference_profiles",
+                return_value=_MODEL_MAP_US,
+            ),
+            patch("headroom.backends.litellm.acompletion", side_effect=fake_acompletion),
+        ):
             backend = LiteLLMBackend(provider="bedrock", region="us-east-1")
             await backend.send_message(body=_BODY, headers={})
 

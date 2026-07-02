@@ -78,7 +78,9 @@ def _capture_provider(backend: str) -> dict[str, Any]:
     captured: dict[str, Any] = {}
 
     class FakeLiteLLM:
-        def __init__(self, provider: str, region: str | None = None, profile_name: str | None = None) -> None:
+        def __init__(
+            self, provider: str, region: str | None = None, profile_name: str | None = None
+        ) -> None:
             captured["provider"] = provider
             captured["region"] = region
 
