@@ -99,18 +99,63 @@ export function applyGatewayProviderBaseUrlsInPlace(
     ) {
       continue;
     }
-    const nextBaseUrl = routeBaseUrlThroughProxy({
-      providerId,
-      proxyUrl,
-      currentBaseUrl,
-    });
+    let nextBaseUrl: string;
+    const isOpenAI =
+      providerId === "openai" ||
+      nextConfig.api === "openai-completions" ||
+      providerId === "opencode-go" ||
+      providerId === "openrouter" ||
+      providerId === "opencode" ||
+      providerId === "huggingface";
+
+    const upstreamBaseUrl = currentBaseUrl ?? defaultBaseUrl;
+
+    const isAlreadyProxied =
+      currentBaseUrl &&
+      (currentBaseUrl.startsWith(proxyUrl) ||
+       currentBaseUrl.includes("127.0.0.1") ||
+       currentBaseUrl.includes("localhost")) &&
+      nextConfig.headers &&
+      typeof nextConfig.headers === "object" &&
+      typeof nextConfig.headers["x-headroom-base-url"] === "string";
+
+    if (isAlreadyProxied) {
+      nextBaseUrl = currentBaseUrl;
+    } else if (isOpenAI && upstreamBaseUrl && providerId !== "openai-codex") {
+      try {
+        const upstreamUrl = new URL(upstreamBaseUrl);
+        const upstreamOrigin = upstreamUrl.origin;
+        const upstreamPath = upstreamUrl.pathname.replace(/\/$/, "");
+
+        nextBaseUrl = proxyUrl.replace(/\/$/, "") + "/v1";
+
+        nextConfig.headers = {
+          ...(nextConfig.headers || {}),
+          "x-headroom-base-url": upstreamOrigin,
+          "x-headroom-original-path": `${upstreamPath}/chat/completions`,
+        };
+      } catch {
+        nextBaseUrl = routeBaseUrlThroughProxy({
+          providerId,
+          proxyUrl,
+          currentBaseUrl,
+        });
+      }
+    } else {
+      nextBaseUrl = routeBaseUrlThroughProxy({
+        providerId,
+        proxyUrl,
+        currentBaseUrl,
+      });
+    }
 
     if (!Array.isArray(nextConfig.models)) {
       nextConfig.models = [];
       changed = true;
     }
 
-    if (nextConfig.baseUrl === nextBaseUrl) {
+    const headersChanged = JSON.stringify(currentConfig.headers) !== JSON.stringify(nextConfig.headers);
+    if (nextConfig.baseUrl === nextBaseUrl && !headersChanged) {
       providers[providerId] = nextConfig;
       continue;
     }

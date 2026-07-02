@@ -111,7 +111,9 @@ def _resolve_openai_handler_path(
 
 
 def _resolve_openai_upstream_base(request_headers: dict[str, str]) -> str | None:
-    raw_base_url = _header_get(request_headers, _OPENAI_BASE_URL_HEADER)
+    raw_base_url = request_headers.get(_OPENAI_BASE_URL_HEADER)
+    if raw_base_url is None:
+        raw_base_url = _header_get(request_headers, _OPENAI_BASE_URL_HEADER)
     if raw_base_url is None:
         return None
 

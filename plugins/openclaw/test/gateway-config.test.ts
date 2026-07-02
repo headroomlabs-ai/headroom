@@ -56,7 +56,11 @@ describe("applyGatewayProviderBaseUrls", () => {
         models: [],
       },
       openrouter: {
-        baseUrl: "http://127.0.0.1:8787/api/v1",
+        baseUrl: "http://127.0.0.1:8787/v1",
+        headers: {
+          "x-headroom-base-url": "https://openrouter.ai",
+          "x-headroom-original-path": "/api/v1/chat/completions",
+        },
         models: [],
       },
       google: {
@@ -178,7 +182,7 @@ describe("applyGatewayProviderBaseUrls", () => {
     });
   });
 
-  it("preserves OpenAI-compatible /api/v1 paths", () => {
+  it("routes OpenAI-compatible /api/v1 paths using headers", () => {
     const result = applyGatewayProviderBaseUrls(
       {
         models: {
@@ -195,7 +199,11 @@ describe("applyGatewayProviderBaseUrls", () => {
 
     expect(result.changed).toBe(true);
     expect((result.config as any).models.providers.openrouter).toEqual({
-      baseUrl: "http://127.0.0.1:8787/api/v1",
+      baseUrl: "http://127.0.0.1:8787/v1",
+      headers: {
+        "x-headroom-base-url": "https://openrouter.ai",
+        "x-headroom-original-path": "/api/v1/chat/completions",
+      },
       models: [],
     });
   });
