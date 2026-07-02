@@ -129,6 +129,29 @@ class TestBaselineModel:
         assert m2.lookup("k|a|s|tools") == m.lookup("k|a|s|tools")
         assert m2.total_samples == 3
 
+    def test_merge_is_equivalent_to_observing_both_streams(self):
+        # Merging two baselines must equal observing every value against one
+        # model — same totals per stratum and same global fallback.
+        a = BaselineModel()
+        for v in (100, 200):
+            a.observe("opus|new_user_ask|s|tools", v)
+        b = BaselineModel()
+        b.observe("opus|new_user_ask|s|tools", 300)
+        b.observe("sonnet|unknown|m|notools", 50)
+
+        a.merge(b)
+
+        mean, _, n = a.lookup("opus|new_user_ask|s|tools")
+        assert n == 3
+        assert mean == 200.0  # (100 + 200 + 300) / 3
+        assert a.total_samples == 4  # 3 + 1 across both strata
+
+        reference = BaselineModel()
+        for v in (100, 200, 300):
+            reference.observe("opus|new_user_ask|s|tools", v)
+        reference.observe("sonnet|unknown|m|notools", 50)
+        assert a.to_dict() == reference.to_dict()
+
 
 # ---------------------------------------------------------------------------
 # synthetic-control estimate

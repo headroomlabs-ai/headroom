@@ -11,6 +11,8 @@ in a background daemon thread instead.
 
 from __future__ import annotations
 
+import threading
+
 from headroom.transforms import kompress_compressor as kc
 from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
 from headroom.transforms.kompress_compressor import KompressCompressor
@@ -134,3 +136,154 @@ def test_router_compresses_cache_only_when_ready(monkeypatch):
 
     assert seen["allow_download"] is False  # request path stays cache-only even when ready
     assert out == "kept words"
+
+
+def test_saturation_fail_open_does_not_hang_request(monkeypatch):
+    """A saturated execution slot must fail open instead of blocking indefinitely."""
+
+    class _FakeEncoding(dict):
+        def __init__(self, word_count: int):
+            self._ids = list(range(word_count))
+            super().__init__()
+            self["input_ids"] = [[1 for _ in range(word_count)]]
+            self["attention_mask"] = [[1 for _ in range(word_count)]]
+
+        def word_ids(self, batch_index: int = 0):
+            return self._ids
+
+    class _FakeModel:
+        def get_scores(self, input_ids, attention_mask):
+            return [[0.0 for _ in input_ids[0]]]
+
+    class _FakeTokenizer:
+        def __call__(self, chunk_words, **kwargs):
+            return _FakeEncoding(len(chunk_words))
+
+    execution_semaphore = threading.BoundedSemaphore(1)
+    execution_semaphore.acquire()
+
+    monkeypatch.setattr(kc, "_execution_semaphore", lambda *_a, **_k: execution_semaphore)
+    monkeypatch.setattr(
+        kc,
+        "_load_kompress",
+        lambda *args, **kwargs: (_FakeModel(), _FakeTokenizer(), "onnx"),
+    )
+    monkeypatch.setenv("HEADROOM_KOMPRESS_EXECUTION_TIMEOUT_MS", "1")
+
+    before = kc.get_kompress_execution_stats()["execution_timeout_skips_total"]
+    text = " ".join(["word"] * 40)
+    result_holder: dict[str, object] = {}
+
+    def _run() -> None:
+        result_holder["result"] = KompressCompressor().compress(text, allow_download=False)
+
+    worker = threading.Thread(target=_run)
+    worker.start()
+    worker.join(timeout=0.25)
+    try:
+        assert not worker.is_alive(), (
+            "Kompress saturation path is blocking request progress; expected fail-open under pressure"
+        )
+        assert "result" in result_holder
+    finally:
+        try:
+            execution_semaphore.release()
+        except ValueError:
+            pass
+        worker.join(timeout=1.0)
+
+    result = result_holder["result"]
+    assert result.compressed == text
+    assert result.compression_ratio == 1.0
+    after = kc.get_kompress_execution_stats()["execution_timeout_skips_total"]
+    assert after == before + 1
+
+
+def test_capacity_available_still_compresses(monkeypatch):
+    """When execution semaphore capacity is available, compression is still attempted."""
+
+    class _FakeEncoding(dict):
+        def __init__(self, word_count: int):
+            self._ids = list(range(word_count))
+            self["input_ids"] = [[1 for _ in range(word_count)]]
+            self["attention_mask"] = [[1 for _ in range(word_count)]]
+
+        def word_ids(self, batch_index: int = 0):
+            return self._ids
+
+    class _FakeModel:
+        def get_scores(self, input_ids, attention_mask):
+            return [[1.0 if idx % 2 == 0 else 0.0 for idx in range(len(input_ids[0]))]]
+
+        def get_keep_mask(self, input_ids, attention_mask):
+            return [[idx % 2 == 0 for idx in range(len(input_ids[0]))]]
+
+    class _FakeTokenizer:
+        def __call__(self, chunk_words, **kwargs):
+            return _FakeEncoding(len(chunk_words))
+
+    monkeypatch.setattr(
+        kc, "_execution_semaphore", lambda *_args, **_kwargs: threading.BoundedSemaphore(1)
+    )
+    monkeypatch.setattr(
+        kc,
+        "_load_kompress",
+        lambda *args, **kwargs: (_FakeModel(), _FakeTokenizer(), "onnx"),
+    )
+
+    result = KompressCompressor().compress(" ".join(["word"] * 20), allow_download=False)
+    assert 0 < result.compression_ratio < 1.0
+    assert result.compressed != " ".join(["word"] * 20)
+
+
+def test_validation_probe_waits_for_execution_slot(monkeypatch):
+    """Model-load validation must block for a slot instead of failing open."""
+
+    class _FakeTensor:
+        def to(self, _device):
+            return self
+
+    class _FakeEncoding(dict):
+        def __init__(self):
+            super().__init__()
+            self["input_ids"] = _FakeTensor()
+            self["attention_mask"] = _FakeTensor()
+
+    class _FakeTokenizer:
+        def __call__(self, *_args, **_kwargs):
+            return _FakeEncoding()
+
+    class _FakeScore:
+        def detach(self):
+            return self
+
+        def cpu(self):
+            return self
+
+    class _FakeModel:
+        def __init__(self):
+            self.calls = 0
+
+        def get_scores(self, input_ids, attention_mask):
+            self.calls += 1
+            return [_FakeScore()]
+
+    semaphore = threading.BoundedSemaphore(1)
+    semaphore.acquire()
+    model = _FakeModel()
+
+    monkeypatch.setattr(kc, "_execution_semaphore", lambda *_args, **_kwargs: semaphore)
+
+    worker = threading.Thread(
+        target=kc._validate_pytorch_device,
+        args=(model, _FakeTokenizer(), "mps"),
+    )
+    worker.start()
+    worker.join(timeout=0.05)
+    assert worker.is_alive(), "validation should wait for an execution slot"
+
+    semaphore.release()
+    worker.join(timeout=1.0)
+
+    assert not worker.is_alive()
+    assert model.calls == 1

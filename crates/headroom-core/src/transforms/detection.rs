@@ -28,6 +28,14 @@
 //! issue. Loud-on-error stays at the [`magika_detect`] entry point for
 //! callers who care; the chain swallows the err with a log line.
 //!
+//! # CPU compatibility
+//!
+//! Precompiled ONNX Runtime binaries from `ort-sys` may contain AVX2-family
+//! instructions. On x86/x86_64 CPUs where AVX2 is unavailable, the magika
+//! session init returns an init error before touching ONNX. The chain
+//! handles this identically to any other tier-1 error — logs it and falls
+//! through to Tier 2 / Tier 3.
+//!
 //! # SearchResults / BuildOutput
 //!
 //! The retired regex detector recognized grep-style search output
@@ -84,6 +92,7 @@ pub fn detect(content: &str) -> ContentType {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transforms::magika_detector::magika_onnx_runtime_supported_by_cpu;
 
     #[test]
     fn empty_input_short_circuits_to_plain_text() {
@@ -93,19 +102,38 @@ mod tests {
     #[test]
     fn json_array_routes_via_tier_1() {
         let payload = r#"[{"id": 1}, {"id": 2}, {"id": 3}]"#;
-        assert_eq!(detect(payload), ContentType::JsonArray);
+        if !magika_onnx_runtime_supported_by_cpu() {
+            // On no-AVX2 hosts, magika returns Err and the chain
+            // falls through to Tier 2 (unidiff — no match for JSON)
+            // then Tier 3 (PlainText).
+            assert_eq!(detect(payload), ContentType::PlainText);
+        } else {
+            assert_eq!(detect(payload), ContentType::JsonArray);
+        }
     }
 
     #[test]
     fn source_code_routes_via_tier_1() {
         let py = "def hello():\n    print('world')\n\nclass Foo:\n    pass\n";
-        assert_eq!(detect(py), ContentType::SourceCode);
+        if !magika_onnx_runtime_supported_by_cpu() {
+            // Magika fallthrough — unidiff won't catch Python source,
+            // so the chain lands on PlainText.
+            assert_eq!(detect(py), ContentType::PlainText);
+        } else {
+            assert_eq!(detect(py), ContentType::SourceCode);
+        }
     }
 
     #[test]
     fn html_routes_via_tier_1() {
         let html = "<!DOCTYPE html><html><body><h1>x</h1></body></html>";
-        assert_eq!(detect(html), ContentType::Html);
+        if !magika_onnx_runtime_supported_by_cpu() {
+            // Magika fallthrough — unidiff won't catch HTML,
+            // so the chain lands on PlainText.
+            assert_eq!(detect(html), ContentType::PlainText);
+        } else {
+            assert_eq!(detect(html), ContentType::Html);
+        }
     }
 
     #[test]
@@ -118,7 +146,8 @@ mod tests {
                     +    print(\"new\")\n";
         // Either magika tags it `diff` (Tier 1 hit) or magika
         // mis-classifies as text and unidiff catches it (Tier 2).
-        // Both paths produce GitDiff.
+        // On no-AVX2 hosts, magika is unavailable so Tier 2 still
+        // catches the diff. Both paths produce GitDiff.
         assert_eq!(detect(diff), ContentType::GitDiff);
     }
 
@@ -127,7 +156,7 @@ mod tests {
         // Magika often mis-classifies naked hunks (no `diff --git`
         // wrapper) because the visible bytes look like ordinary
         // patch lines mixed with code. Tier 2 (unidiff parser)
-        // catches these.
+        // catches these — even when magika is unavailable.
         let diff = "--- a/foo.py\n\
                     +++ b/foo.py\n\
                     @@ -1,2 +1,2 @@\n\
@@ -195,7 +224,13 @@ mod tests {
         // YAML lives in magika's `code` group; the chain returns it
         // as SourceCode so the router picks the code-aware compressor.
         let yaml = "name: my-app\nversion: 1.0\ndependencies:\n  - foo\n";
-        assert_eq!(detect(yaml), ContentType::SourceCode);
+        if !magika_onnx_runtime_supported_by_cpu() {
+            // Magika fallthrough — unidiff won't catch YAML,
+            // so the chain lands on PlainText.
+            assert_eq!(detect(yaml), ContentType::PlainText);
+        } else {
+            assert_eq!(detect(yaml), ContentType::SourceCode);
+        }
     }
 
     #[test]
@@ -205,13 +240,21 @@ mod tests {
                   impl Counter {\n    \
                       pub fn new() -> Self { Self { counts: HashMap::new() } }\n\
                   }\n";
-        assert_eq!(detect(rs), ContentType::SourceCode);
+        if !magika_onnx_runtime_supported_by_cpu() {
+            // Magika fallthrough — unidiff won't catch Rust source,
+            // so the chain lands on PlainText.
+            assert_eq!(detect(rs), ContentType::PlainText);
+        } else {
+            assert_eq!(detect(rs), ContentType::SourceCode);
+        }
     }
 
     #[test]
     fn chain_is_deterministic_across_repeated_calls() {
         // Magika returns the same label for identical input on
         // repeated calls; the chain wraps that determinism.
+        // On no-AVX2 hosts, the chain always falls through to
+        // PlainText — which is equally deterministic.
         let payload = r#"{"users": [{"id": 1}, {"id": 2}]}"#;
         let a = detect(payload);
         let b = detect(payload);

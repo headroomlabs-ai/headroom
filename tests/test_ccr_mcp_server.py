@@ -110,3 +110,94 @@ def test_mcp_retrieve_missing_hash_still_errors(fresh_store) -> None:
     server = mcp_server.HeadroomMCPServer(check_proxy=False)
     result = asyncio.run(server._retrieve_content("nonexistent_hash"))
     assert "Content not found" in result.get("error", "")
+
+
+def test_handle_stats_session_output_is_window_scoped() -> None:
+    """window-scoped stats output should be explicitly labeled after this change."""
+
+    async def fetch_stats() -> dict[str, object]:
+        return {
+            "summary": {
+                "mode": "token",
+                "api_requests": 3,
+                "compression": {},
+            }
+        }
+
+    server = mcp_server.HeadroomMCPServer(check_proxy=True)
+    server._fetch_full_proxy_stats = fetch_stats
+    response = asyncio.run(server._handle_stats())
+    text = response[0].kwargs["text"]
+
+    assert "Headroom Window-Scoped Session Summary" in text
+    assert "Headroom Session Summary" not in text
+
+
+def test_handle_stats_includes_lifetime_totals_from_persistent_savings() -> None:
+    """Lifetime savings are appended from /stats persistent_savings.lifetime."""
+
+    async def fetch_stats() -> dict[str, object]:
+        return {
+            "summary": {
+                "mode": "token",
+                "api_requests": 3,
+                "compression": {},
+            },
+            "persistent_savings": {
+                "lifetime": {"tokens_saved": 12345, "compression_savings_usd": 7.25}
+            },
+        }
+
+    server = mcp_server.HeadroomMCPServer(check_proxy=True)
+    server._fetch_full_proxy_stats = fetch_stats
+    response = asyncio.run(server._handle_stats())
+    text = response[0].kwargs["text"]
+
+    assert "Lifetime Savings:" in text
+    assert "Tokens saved: 12,345" in text
+    assert "Compression savings: $7.25" in text
+
+
+def test_handle_stats_falls_back_gracefully_without_persistent_lifetime() -> None:
+    """Missing lifetime data should still return a valid session summary."""
+
+    async def fetch_stats() -> dict[str, object]:
+        return {
+            "summary": {
+                "mode": "token",
+                "api_requests": 3,
+                "compression": {},
+            },
+            "persistent_savings": {"lifetime": None},
+        }
+
+    server = mcp_server.HeadroomMCPServer(check_proxy=True)
+    server._fetch_full_proxy_stats = fetch_stats
+    response = asyncio.run(server._handle_stats())
+    text = response[0].kwargs["text"]
+
+    assert "Headroom Window-Scoped Session Summary" in text
+    assert "Lifetime Savings:" not in text
+
+
+def test_handle_stats_shows_zero_lifetime_totals_when_present() -> None:
+    """A present lifetime payload should still render explicit zero totals."""
+
+    async def fetch_stats() -> dict[str, object]:
+        return {
+            "summary": {
+                "mode": "token",
+                "api_requests": 3,
+                "compression": {},
+            },
+            "persistent_savings": {"lifetime": {"tokens_saved": 0, "compression_savings_usd": 0.0}},
+        }
+
+    server = mcp_server.HeadroomMCPServer(check_proxy=True)
+    server._fetch_full_proxy_stats = fetch_stats
+    response = asyncio.run(server._handle_stats())
+    text = response[0].kwargs["text"]
+
+    assert "Lifetime Savings:" in text
+    assert "Tokens saved: 0" in text
+    assert "Compression savings: $0.00" in text
