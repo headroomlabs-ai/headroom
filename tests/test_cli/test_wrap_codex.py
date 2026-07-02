@@ -459,6 +459,53 @@ class TestInjectAndRestoreRoundTrip:
         assert status == "restored"
         assert config_file.read_text(encoding="utf-8") == malformed
 
+    def test_unwrap_removes_rtk_block_from_global_agents(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """`wrap codex` injects the rtk block into the Codex global AGENTS.md;
+        `unwrap codex` must take it back out (regression for #1421)."""
+        _set_test_home(monkeypatch, tmp_path)
+        codex_home = tmp_path / ".codex"
+        codex_home.mkdir()
+        agents = codex_home / "AGENTS.md"
+        wrap_mod._inject_rtk_instructions(agents)
+        assert wrap_mod._RTK_MARKER in agents.read_text(encoding="utf-8")
+
+        wrap_mod.unwrap_codex.callback(port=8787, no_stop_proxy=True)
+
+        remaining = agents.read_text(encoding="utf-8") if agents.exists() else ""
+        assert wrap_mod._RTK_MARKER not in remaining
+
+    def test_unwrap_preserves_user_content_in_global_agents(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Only the marker-fenced rtk block is removed; the user's own AGENTS.md
+        prose survives the unwrap."""
+        _set_test_home(monkeypatch, tmp_path)
+        codex_home = tmp_path / ".codex"
+        codex_home.mkdir()
+        agents = codex_home / "AGENTS.md"
+        agents.write_text("# My project rules\n\nAlways write tests.\n", encoding="utf-8")
+        wrap_mod._inject_rtk_instructions(agents)
+        assert wrap_mod._RTK_MARKER in agents.read_text(encoding="utf-8")
+
+        wrap_mod.unwrap_codex.callback(port=8787, no_stop_proxy=True)
+
+        remaining = agents.read_text(encoding="utf-8")
+        assert wrap_mod._RTK_MARKER not in remaining
+        assert "# My project rules" in remaining
+        assert "Always write tests." in remaining
+
+    def test_unwrap_is_safe_when_no_global_agents(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """No Codex AGENTS.md → unwrap is a clean no-op, not a crash."""
+        _set_test_home(monkeypatch, tmp_path)
+
+        wrap_mod.unwrap_codex.callback(port=8787, no_stop_proxy=True)
+
+        assert not (tmp_path / ".codex" / "AGENTS.md").exists()
+
 
 # ---------------------------------------------------------------------------
 # Thread retag: wrap pulls native threads into the headroom menu, unwrap hands

@@ -5832,6 +5832,16 @@ def unwrap_codex(port: int, no_stop_proxy: bool) -> None:
         elif serena_status == "failed":
             click.echo("  Serena MCP server matched Headroom ledger but could not be removed.")
 
+    # `wrap codex` injects the marker-fenced rtk guidance into the Codex global
+    # AGENTS.md (`_codex_home_dir() / "AGENTS.md"`); that block is durable state
+    # the config restore above does not touch. Without removing it, a plain
+    # `codex` launch keeps following Headroom's "prefix shell commands with rtk"
+    # instruction and fails when the managed rtk binary is off PATH. Mirror what
+    # unwrap_copilot already does. Best-effort and unconditional, like the MCP
+    # cleanup above.
+    if _remove_rtk_instructions(_codex_home_dir() / "AGENTS.md"):
+        click.echo("  Removed Headroom rtk instructions from Codex AGENTS.md.")
+
     if status in {"restored", "cleaned", "removed"}:
         # Hand the threads back to the native-provider menu so the full history
         # stays visible once Codex no longer routes through Headroom. Best-effort.
