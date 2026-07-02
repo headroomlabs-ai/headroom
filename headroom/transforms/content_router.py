@@ -3270,7 +3270,9 @@ class ContentRouter(Transform):
             new_blocks.append(block)
 
         if any_compressed:
-            return {**message, "content": new_blocks}
+            # Preserve any non-standard message-level fields (e.g., reasoning_content)
+            new_msg = {**message, "content": new_blocks}
+            return new_msg
         return message
 
     def _compress_block_content(

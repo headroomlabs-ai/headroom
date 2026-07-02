@@ -2300,6 +2300,19 @@ class OpenAIHandlerMixin:
                 tools = remembered_event.tools
 
         body["messages"] = optimized_messages
+        # Preserve reasoning_content from original messages for DeepSeek
+        # thinking mode.  The pipeline preserves most non-standard fields
+        # via {**message, ...} spreading, but explicit preservation here
+        # guards against edge cases where message dicts are reconstructed
+        # without the non-standard field (e.g. during content-block
+        # extraction or tool-use coercion).
+        if original_messages is not optimized_messages:
+            for i, msg in enumerate(optimized_messages):
+                if i < len(original_messages):
+                    orig = original_messages[i]
+                    if orig.get("role") == "assistant" and "reasoning_content" in orig:
+                        if "reasoning_content" not in msg:
+                            msg["reasoning_content"] = orig["reasoning_content"]
         if tools or _original_tools is not None:
             body["tools"] = tools
 

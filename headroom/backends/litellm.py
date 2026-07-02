@@ -500,7 +500,11 @@ class LiteLLMBackend(Backend):
 
             # Handle string content directly
             if isinstance(content, str):
-                converted.append({"role": role, "content": content})
+                msg_entry: dict[str, Any] = {"role": role, "content": content}
+                # Preserve DeepSeek reasoning_content for thinking mode
+                if "reasoning_content" in msg:
+                    msg_entry["reasoning_content"] = msg["reasoning_content"]
+                converted.append(msg_entry)
                 continue
 
             # Handle content blocks (Anthropic style)
@@ -550,6 +554,9 @@ class LiteLLMBackend(Backend):
                         assistant_msg["content"] = "\n".join(text_parts)
                     else:
                         assistant_msg["content"] = None
+                    # Preserve DeepSeek reasoning_content for thinking mode
+                    if "reasoning_content" in msg:
+                        assistant_msg["reasoning_content"] = msg["reasoning_content"]
                     assistant_msg["tool_calls"] = [
                         {
                             "id": tu["id"],
