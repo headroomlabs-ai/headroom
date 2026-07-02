@@ -15,6 +15,7 @@ from headroom.perf.analyzer import (
     PerfRecord,
     PerfReport,
     TransformRecord,
+    build_overhead_summary,
     build_perf_summary,
     perf_records_as_dicts,
 )
@@ -116,6 +117,49 @@ def test_build_perf_summary_empty_report_no_zero_division():
     assert summary["savings_pct"] == 0.0
     assert summary["cache_hit_pct"] == 0.0
     assert summary["by_model"] == []
+    assert summary["overhead"]["optimization_ms"]["count"] == 0
+
+
+def test_build_overhead_summary_attributes_slow_stages():
+    report = PerfReport(
+        perf_records=[
+            PerfRecord(
+                timestamp="2026-06-05 10:00:00,000",
+                request_id="fast",
+                model="gpt-5",
+                tokens_before=1000,
+                tokens_after=500,
+                tokens_saved=500,
+                optimization_ms=100.0,
+                total_ms=300.0,
+                stages={"cache_align": 10.0, "content_router": 90.0},
+            ),
+            PerfRecord(
+                timestamp="2026-06-05 10:01:00,000",
+                request_id="slow",
+                model="gpt-5",
+                tokens_before=1000,
+                tokens_after=500,
+                tokens_saved=500,
+                optimization_ms=700.0,
+                total_ms=900.0,
+                stages={"kompress": 650.0, "content_router": 40.0},
+            ),
+        ]
+    )
+
+    overhead = build_overhead_summary(report, slow_threshold_ms=500.0)
+
+    assert overhead["optimization_ms"]["count"] == 2
+    assert overhead["optimization_ms"]["average_ms"] == 400.0
+    assert overhead["optimization_ms"]["p50_ms"] == 400.0
+    assert overhead["optimization_ms"]["p95_ms"] == 670.0
+    assert overhead["optimization_ms"]["p99_ms"] == 694.0
+    assert overhead["optimization_ms"]["slow_request_count"] == 1
+    assert overhead["stage_breakdown"][0]["stage"] == "kompress"
+    assert overhead["stage_breakdown"][0]["total_ms"] == 650.0
+    assert overhead["top_slow_requests"][0]["request_id"] == "slow"
+    assert overhead["top_slow_requests"][0]["slowest_stage"] == "kompress"
 
 
 def test_perf_records_as_dicts_roundtrips_fields():
@@ -144,6 +188,7 @@ def test_perf_json_format(runner, monkeypatch):
     assert data["savings_pct"] == 50.0
     assert "by_model" in data
     assert data["total_requests"] == 2
+    assert data["overhead"]["optimization_ms"]["p95_ms"] == 11.8
 
 
 def test_perf_json_raw_is_array(runner, monkeypatch):
@@ -214,6 +259,7 @@ def test_perf_text_default_unchanged(runner, monkeypatch):
     result = runner.invoke(main, ["perf"])
     assert result.exit_code == 0, result.output
     assert "Headroom Performance Report" in result.output
+    assert "p50/p95/p99" in result.output
 
 
 def test_perf_rejects_unknown_format(runner, monkeypatch):
