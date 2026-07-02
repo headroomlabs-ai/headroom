@@ -784,6 +784,18 @@ class OpenAIHandlerMixin:
         """Return True when inbound headers request full passthrough."""
         return _headroom_bypass_enabled(headers)
 
+    def _resolve_openai_upstream(self, request: Request) -> str:
+        """Return the OpenAI upstream base URL for ``request``.
+
+        Honors the ``x-headroom-base-url`` request header so OpenAI-compatible
+        gateways (LiteLLM, CPA, self-hosted vLLM, Azure OpenAI) route through
+        the dedicated ``/v1/chat/completions`` and ``/v1/responses`` handlers,
+        not just the generic passthrough route that already honors it. Falls
+        back to the configured ``OPENAI_API_URL`` (``OPENAI_TARGET_API_URL``).
+        """
+        custom = request.headers.get("x-headroom-base-url", "").strip()
+        return custom or self.OPENAI_API_URL
+
     @staticmethod
     def _strict_previous_turn_frozen_count(
         messages: list[dict[str, Any]],

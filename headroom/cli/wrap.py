@@ -33,7 +33,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
-from headroom._subprocess import run
+from headroom._subprocess import pid_alive, run
 
 # Fix Windows cp1252 encoding — box-drawing characters require UTF-8
 if sys.platform == "win32" and hasattr(sys.stdout, "buffer"):
@@ -447,6 +447,10 @@ def _start_proxy(
     # Ensure proxy subprocess uses UTF-8 (Windows defaults to cp1252)
     proxy_env = os.environ.copy()
     proxy_env["PYTHONIOENCODING"] = "utf-8"
+    # Vertex AI RST_STREAMs HTTP/2 connections (error_code:2). Force HTTP/1.1
+    # when wrapping a Vertex-mode client so upstream requests succeed.
+    if os.environ.get("CLAUDE_CODE_USE_VERTEX") or os.environ.get("ANTHROPIC_VERTEX_PROJECT_ID"):
+        proxy_env.setdefault("HEADROOM_HTTP2", "false")
     # Tell the proxy which agent is being wrapped (for traffic learning output)
     if agent_type != "unknown":
         proxy_env["HEADROOM_AGENT_TYPE"] = agent_type
@@ -3057,27 +3061,12 @@ def _unregister_proxy_client(port: int) -> None:
 
 
 def _pid_alive(pid: int) -> bool:
-    """Return True if ``pid`` names a live process."""
-    if pid <= 0:
-        return False  # non-positive PIDs are never valid client markers
-    try:
-        import psutil  # type: ignore[import-untyped]  # optional dep, already used elsewhere
+    """Return True if ``pid`` names a live process.
 
-        return bool(psutil.pid_exists(pid))
-    except Exception:
-        pass
-    try:
-        os.kill(pid, 0)
-    except PermissionError:
-        return True  # exists but owned by another user
-    except (ProcessLookupError, OSError, SystemError):
-        # On Windows, os.kill against a stale/invalid PID can fail with WinError
-        # 87 ("The parameter is incorrect"); CPython sometimes surfaces this as a
-        # SystemError rather than an OSError. SystemError is not an OSError
-        # subclass, so a bare `except OSError` lets it escape and crash cleanup(),
-        # leaving the shared proxy running.
-        return False
-    return True
+    Thin wrapper over the shared Windows-safe helper so the marker-cleanup path
+    and the install/runtime status path use one liveness probe (see #1544).
+    """
+    return pid_alive(pid)
 
 
 def _marker_pid_reused(marker: Path, pid: int) -> bool:
