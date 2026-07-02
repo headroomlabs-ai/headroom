@@ -34,6 +34,7 @@ def runner() -> CliRunner:
 
 def _clear_claude_mode_env(monkeypatch: pytest.MonkeyPatch) -> None:
     for key in (
+        "ANTHROPIC_BASE_URL",
         "ANTHROPIC_VERTEX_BASE_URL",
         "ANTHROPIC_FOUNDRY_BASE_URL",
         "ANTHROPIC_FOUNDRY_RESOURCE",
@@ -95,6 +96,16 @@ def _invoke_wrap_claude(
 
     assert result.exit_code == 0, result.output
     return captured, result.output
+
+
+def test_wrap_claude_plain_mode_warns_about_remote_control_gate(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured, output = _invoke_wrap_claude(runner, monkeypatch, env={})
+
+    assert captured["child_cmd"] == ["/usr/bin/claude"]
+    assert "Remote Control" in output
+    assert "wrapped Claude session's ANTHROPIC_BASE_URL" in output
 
 
 def test_wrap_claude_vertex_passes_custom_base_url_to_proxy_before_child_redirect(

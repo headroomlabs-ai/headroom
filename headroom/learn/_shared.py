@@ -6,9 +6,25 @@ used across all scanner plugins.
 
 from __future__ import annotations
 
+import os
 import re
+from pathlib import Path
 
 from .models import ErrorCategory
+
+
+def claude_config_dir() -> Path:
+    """Resolve the Claude Code config directory, honoring ``CLAUDE_CONFIG_DIR``.
+
+    Claude Code relocates its config (including ``projects/`` logs and the
+    global ``CLAUDE.md``) when ``CLAUDE_CONFIG_DIR`` is set. ``headroom learn``
+    must read and write the same directory, mirroring the override already
+    honored in ``subscription`` and ``mcp_registry``. Falls back to
+    ``~/.claude``.
+    """
+    base = os.environ.get("CLAUDE_CONFIG_DIR")
+    return Path(base) if base else Path.home() / ".claude"
+
 
 # =============================================================================
 # Error Classification

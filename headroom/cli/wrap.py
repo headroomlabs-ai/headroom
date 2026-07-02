@@ -56,8 +56,11 @@ from headroom.copilot_auth import (
 )
 from headroom.providers.aider import build_launch_env as _build_aider_launch_env
 from headroom.providers.claude import (
+    REMOTE_CONTROL_BASE_URL_ENV,
     TOOL_SEARCH_DEFAULT,
     TOOL_SEARCH_ENV,
+    is_custom_anthropic_base_url,
+    remote_control_gate_message,
 )
 from headroom.providers.claude import (
     proxy_base_url as _claude_proxy_base_url,
@@ -447,6 +450,10 @@ def _start_proxy(
     # Ensure proxy subprocess uses UTF-8 (Windows defaults to cp1252)
     proxy_env = os.environ.copy()
     proxy_env["PYTHONIOENCODING"] = "utf-8"
+    # Vertex AI RST_STREAMs HTTP/2 connections (error_code:2). Force HTTP/1.1
+    # when wrapping a Vertex-mode client so upstream requests succeed.
+    if os.environ.get("CLAUDE_CODE_USE_VERTEX") or os.environ.get("ANTHROPIC_VERTEX_PROJECT_ID"):
+        proxy_env.setdefault("HEADROOM_HTTP2", "false")
     # Tell the proxy which agent is being wrapped (for traffic learning output)
     if agent_type != "unknown":
         proxy_env["HEADROOM_AGENT_TYPE"] = agent_type
@@ -3726,6 +3733,13 @@ def claude(
             )
         else:
             click.echo(f"  ANTHROPIC_BASE_URL={proxy_url}")
+            if is_custom_anthropic_base_url(proxy_url):
+                click.echo(
+                    "  "
+                    + remote_control_gate_message(
+                        f"the wrapped Claude session's {REMOTE_CONTROL_BASE_URL_ENV}"
+                    )
+                )
         if claude_args:
             click.echo(f"  Extra args: {' '.join(claude_args)}")
         _print_telemetry_notice()
