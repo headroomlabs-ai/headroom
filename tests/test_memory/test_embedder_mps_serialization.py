@@ -20,13 +20,16 @@ from headroom.memory.adapters.embedders import LocalEmbedder  # noqa: E402
 _HAS_MPS = bool(getattr(torch.backends, "mps", None)) and torch.backends.mps.is_available()
 
 
-async def test_cpu_uses_shared_executor() -> None:
-    """On CPU the dedicated executor stays None (unchanged default-pool behavior)."""
+async def test_cpu_uses_dedicated_thread_capped_executor() -> None:
+    """On CPU a dedicated, size-limited executor is used so encodes run with a
+    bounded thread pool instead of oversubscribing BLAS/OMP threads (issue #198)."""
     emb = LocalEmbedder(device="cpu")
     await emb.embed("hello world")
     assert emb._device == "cpu"
-    assert emb._executor is None  # default shared executor, not serialized
+    assert emb._executor is not None  # dedicated capped pool, not the shared default
+    assert emb._executor._max_workers >= 1  # type: ignore[attr-defined]
     await emb.close()
+    assert emb._executor is None  # close() tears it down
 
 
 @pytest.mark.skipif(not _HAS_MPS, reason="requires Apple-Silicon MPS")

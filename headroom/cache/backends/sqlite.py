@@ -13,7 +13,7 @@ cannot provide, both load-bearing for the no-accuracy-loss guarantee:
 
 Set ``HEADROOM_CCR_BACKEND=memory`` to opt back into the in-memory
 backend, or ``HEADROOM_CCR_SQLITE_PATH`` to relocate the database file
-(default ``~/.headroom/ccr_store.db``).
+(default ``workspace_dir()/ccr_store.db``).
 """
 
 from __future__ import annotations
@@ -49,11 +49,13 @@ _PURGE_INTERVAL = 60.0
 
 
 def default_db_path() -> Path:
-    """Resolve the database path (env override or ~/.headroom/)."""
+    """Resolve the database path (env override, else workspace root)."""
     env = os.environ.get("HEADROOM_CCR_SQLITE_PATH", "").strip()
     if env:
         return Path(env).expanduser()
-    return Path.home() / ".headroom" / "ccr_store.db"
+    from ...paths import workspace_dir
+
+    return workspace_dir() / "ccr_store.db"
 
 
 class SQLiteBackend:

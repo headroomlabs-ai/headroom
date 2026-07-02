@@ -946,9 +946,9 @@ def clear_request_compression_store() -> None:
 def _create_default_ccr_backend() -> CompressionStoreBackend | None:
     """Create a CCR backend from env (e.g. HEADROOM_CCR_BACKEND=redis).
 
-    Default (env unset or "sqlite"): SQLiteBackend at
-    ~/.headroom/ccr_store.db — restart-safe and shared across worker
-    processes, which the session-scale 30-minute TTL assumes.
+    Default (env unset or "sqlite"): SQLiteBackend at workspace_dir()/ccr_store.db
+    — restart-safe and shared across worker processes, which the
+    session-scale 30-minute TTL assumes.
     "memory" opts back into the in-process dict. Other values load
     adapters via setuptools entry point 'headroom.ccr_backend'.
     Returns None to use InMemoryBackend.
