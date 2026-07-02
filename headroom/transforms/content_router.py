@@ -1276,6 +1276,23 @@ class ContentRouter(Transform):
             except Exception as e:  # pragma: no cover - defensive
                 logger.debug("CompressionObserver raised (non-fatal): %s", e)
 
+    def _observe_kompress_size_gate(self, outcome: str) -> None:
+        """Forward one kompress size-gate decision to the observer.
+
+        ``outcome`` is "exceeded" when an eligible block trips the size
+        ceiling and is routed off ML, "within" when it passes the gate.
+        Goes through the same observer hook as ``_observe`` so the metric
+        reaches the PrometheusMetrics singleton without ``content_router``
+        importing ``headroom.proxy`` (no cycle). Defensive: a missing
+        method or a buggy observer must not break the compression.
+        """
+        if self._observer is None:
+            return
+        try:
+            self._observer.record_kompress_size_gate(outcome)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.debug("CompressionObserver raised (non-fatal): %s", e)
+
     def _determine_strategy(self, content: str) -> CompressionStrategy:
         """Determine the compression strategy from content analysis.
 
@@ -1764,6 +1781,7 @@ class ContentRouter(Transform):
         # rather than ModernBERT, keeping the request path bounded.
         if self._kompress_max_tokens > 0 and len(text_to_compress) > self._kompress_max_tokens * 4:
             self._kompress_gate_fires += 1
+            self._observe_kompress_size_gate("exceeded")
             logger.info(
                 "kompress size-gate fired: ~%d tok (>%d) routed off ML (fire #%d)",
                 len(text_to_compress) // 4,
@@ -1793,6 +1811,12 @@ class ContentRouter(Transform):
             if protected:
                 out = restore_tags(out, protected)
             return out, len(out.split())
+
+        # Reached only when the gate is enabled and this eligible block is
+        # under the ceiling — the counterpart "within" outcome to the
+        # "exceeded" branch above. Lets /metrics prove the gate's hit rate.
+        if self._kompress_max_tokens > 0:
+            self._observe_kompress_size_gate("within")
 
         # Primary: Kompress. On a cold cache the model is fetched once in the
         # background (ensure_background_load) instead of blocking this request

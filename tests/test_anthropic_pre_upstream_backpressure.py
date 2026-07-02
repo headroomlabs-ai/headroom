@@ -72,6 +72,9 @@ class _DummyMetrics:
     async def record_failed(self, **kwargs) -> None:
         return None
 
+    def record_compression_failed(self, reason: str) -> None:
+        return None
+
 
 class _ResponseStub:
     def __init__(self) -> None:

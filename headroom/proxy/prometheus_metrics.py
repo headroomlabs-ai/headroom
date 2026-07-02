@@ -111,6 +111,29 @@ class PrometheusMetrics:
         self.compressions_by_strategy: dict[str, int] = defaultdict(int)
         self.tokens_saved_by_strategy: dict[str, int] = defaultdict(int)
 
+        # Fail-open compression failures, keyed by reason ("timeout",
+        # "error"). The proxy fails open on any optimization error so the
+        # request still succeeds; without this counter the failure is only
+        # visible as a log line. Splitting timeout from other errors tells us
+        # whether the compression budget is too tight vs. a real bug.
+        self.compression_failed_by_reason: dict[str, int] = defaultdict(int)
+
+        # Kompress size-gate outcomes, keyed by outcome ("within",
+        # "exceeded"). The gate routes oversized blocks away from ML
+        # compression (ContentRouter._kompress_max_tokens, #1171). This
+        # counter proves whether the gate ever fires on live traffic.
+        self.kompress_size_gate_by_outcome: dict[str, int] = defaultdict(int)
+
+        # These two counters are mutated from the compression thread-pool
+        # worker (record_kompress_size_gate runs inside ContentRouter, which
+        # the proxy runs in an executor), while export()/reset_runtime() read
+        # and clear them from the event-loop thread. asyncio.Lock can't be
+        # taken off-loop, so guard them with a plain threading.Lock, mirroring
+        # _stage_timing_lock below. Without it a first-time key insert can race
+        # an export iteration ("dictionary changed size during iteration") and
+        # concurrent increments can be lost.
+        self._obs_counter_lock = threading.Lock()
+
         # Codex WebSocket compression observability. These are intentionally
         # aggregate counters/sums, not per-unit storage, so /stats can answer
         # routing questions without growing with traffic volume.
@@ -286,6 +309,9 @@ class PrometheusMetrics:
 
             self.compressions_by_strategy.clear()
             self.tokens_saved_by_strategy.clear()
+            with self._obs_counter_lock:
+                self.compression_failed_by_reason.clear()
+                self.kompress_size_gate_by_outcome.clear()
 
             self.codex_ws_units_total = 0
             self.codex_ws_units_modified_total = 0
@@ -442,6 +468,30 @@ class PrometheusMetrics:
         saved = original_tokens - compressed_tokens
         if saved > 0:
             self.tokens_saved_by_strategy[strategy] += saved
+
+    def record_compression_failed(self, reason: str) -> None:
+        """Record one fail-open compression failure, bucketed by ``reason``.
+
+        Called from the optimization fail-open site (handlers/anthropic.py)
+        with ``reason`` in ``{"timeout", "error"}``. Guarded by
+        ``_obs_counter_lock`` so it stays consistent with the off-thread
+        ``record_kompress_size_gate`` writer and the export/reset readers.
+        """
+        with self._obs_counter_lock:
+            self.compression_failed_by_reason[reason or "error"] += 1
+
+    def record_kompress_size_gate(self, outcome: str) -> None:
+        """Record one kompress size-gate decision, bucketed by ``outcome``.
+
+        Called from ContentRouter via the observer hook with ``outcome`` in
+        ``{"within", "exceeded"}`` — "exceeded" when an eligible block is too
+        large and routed off ML, "within" when it passes the gate. Proves
+        whether the size gate (#1171) ever fires on live traffic. Runs on the
+        compression executor thread, so the increment is guarded by
+        ``_obs_counter_lock`` to stay safe against the export/reset readers.
+        """
+        with self._obs_counter_lock:
+            self.kompress_size_gate_by_outcome[outcome or "within"] += 1
 
     def record_router_route_counts(self, counts: dict[str, int]) -> None:
         """Accumulate ContentRouter routing-category counts for a single
@@ -1016,6 +1066,38 @@ class PrometheusMetrics:
                             f'headroom_cache_miss_attribution_total{{provider="{_provider}",'
                             f'reason="{_reason}"}} {_count}'
                         )
+                lines.append("")
+
+            # Snapshot the off-thread observer counters under their own lock,
+            # then format outside it (see _obs_counter_lock).
+            with self._obs_counter_lock:
+                compression_failed = dict(self.compression_failed_by_reason)
+                kompress_size_gate = dict(self.kompress_size_gate_by_outcome)
+
+            if compression_failed:
+                lines.extend(
+                    [
+                        "# HELP headroom_compression_failed_total Fail-open compression failures by reason",
+                        "# TYPE headroom_compression_failed_total counter",
+                    ]
+                )
+                for reason, count in compression_failed.items():
+                    lines.append(
+                        f'headroom_compression_failed_total{{reason="{_escape_label_value(reason)}"}} {count}'
+                    )
+                lines.append("")
+
+            if kompress_size_gate:
+                lines.extend(
+                    [
+                        "# HELP headroom_kompress_size_gate_total Kompress size-gate decisions by outcome; within counts a gate pass, not whether ML compression then ran",
+                        "# TYPE headroom_kompress_size_gate_total counter",
+                    ]
+                )
+                for outcome, count in kompress_size_gate.items():
+                    lines.append(
+                        f'headroom_kompress_size_gate_total{{outcome="{_escape_label_value(outcome)}"}} {count}'
+                    )
                 lines.append("")
 
             lines.extend(
