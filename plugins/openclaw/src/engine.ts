@@ -169,8 +169,10 @@ export class HeadroomContextEngine {
       tokensAfter?: number;
     };
   }> {
-    if (!this.proxyUrl) {
-      return { ok: false, compacted: false, reason: "Proxy not available" };
+    try {
+      await this.ensureProxyUrl();
+    } catch (error) {
+      return { ok: false, compacted: false, reason: `Proxy not available: ${error}` };
     }
 
     // Read current messages from session file if available
