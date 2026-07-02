@@ -144,6 +144,32 @@ jobs:
               print(f'::warning title=Fidelity recall::{result.failed_cases} case(s) fell below 0.9 recall: {result.errors[:3]}')
           "
 
+      # Real-dataset recall on the prose path (HotpotQA): does the ground-truth
+      # answer survive compressing the supporting context? Uses the production
+      # routing path, so prose flows through Kompress (ModernBERT) — allowed here
+      # because the weekly job installs [all]. Non-blocking and defensive: a
+      # dataset download or model failure warns rather than fails the job.
+      - name: Dataset recall report — HotpotQA (model-allowed, non-blocking)
+        run: |
+          python -c "
+          try:
+              from headroom.transforms.kompress_compressor import warm_kompress_model
+              from headroom.evals.datasets import load_hotpotqa
+              from headroom.evals.runners.compression_only import CompressionOnlyRunner
+              # Block until the Kompress model is loaded; otherwise prose passes
+              # through uncompressed and the recall number is meaningless.
+              warmed = warm_kompress_model()
+              suite = load_hotpotqa(n=50)
+              result = CompressionOnlyRunner().evaluate_dataset_recall(suite)
+              print(f'HotpotQA answer recall: {result.passed_cases}/{result.total_cases} probeable cases >=0.9, avg compression {result.avg_compression_ratio:.1%} (model_warmed={warmed})')
+              if result.avg_compression_ratio < 0.01:
+                  print('::warning title=Dataset recall::compression did not engage (~0%); recall is not a meaningful fidelity signal — check Kompress model availability')
+              elif result.failed_cases:
+                  print(f'::warning title=Dataset recall::{result.failed_cases} HotpotQA case(s) lost the answer under compression')
+          except Exception as e:
+              print(f'::warning title=Dataset recall::skipped (dataset/model unavailable): {e}')
+          " || true
+
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v7

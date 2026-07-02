@@ -840,6 +840,33 @@ def ensure_background_download(model_id: str = HF_MODEL_ID, device: str = "auto"
         thread.start()
 
 
+def warm_kompress_model(
+    model_id: str = HF_MODEL_ID,
+    device: str = "cpu",
+    *,
+    allow_download: bool = True,
+) -> bool:
+    """Synchronously load the Kompress model, blocking until it is ready.
+
+    Unlike :func:`ensure_background_download` (which loads in a daemon thread and
+    lets early requests pass through uncompressed while the download runs), this
+    blocks the caller so the *next* compression uses the model rather than
+    passing through. Intended for batch/eval contexts that must measure real
+    compression, not passthrough.
+
+    Returns ``True`` if the model is loaded and ready, ``False`` if Kompress is
+    unavailable or the load failed.
+    """
+    if not is_kompress_available():
+        return False
+    try:
+        _load_kompress(model_id, device, allow_download=allow_download)
+        return model_id in _kompress_cache
+    except Exception as exc:  # pragma: no cover - network/model load failure
+        logger.warning("Kompress: synchronous warm failed for %s: %s", model_id, exc)
+        return False
+
+
 # ── Compressor ────────────────────────────────────────────────────────
 
 
