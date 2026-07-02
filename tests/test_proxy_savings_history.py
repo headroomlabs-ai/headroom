@@ -219,6 +219,41 @@ def test_record_compression_savings_skips_empty_updates_and_normalizes_timestamp
     assert persisted["history"][-1]["timestamp"] == "2026-03-27T12:34:00Z"
 
 
+def test_stateless_savings_tracker_writes_nothing(tmp_path):
+    """In stateless mode the tracker updates in-memory counters but never
+    touches the filesystem — no proxy_savings.json is created."""
+    path = tmp_path / "proxy_savings.json"
+    tracker = SavingsTracker(path=str(path), stateless=True)
+
+    # Both write paths that would normally persist a checkpoint:
+    assert tracker.record_compression_savings(model="gpt-4o", tokens_saved=4096) is True
+    tracker.record_request(
+        model="gpt-4o",
+        input_tokens=8192,
+        tokens_saved=4096,
+        timestamp="2026-03-27T09:00:00Z",
+    )
+
+    # Nothing written to disk...
+    assert not path.exists()
+    # ...but live in-memory counters still reflect the activity.
+    assert tracker.snapshot()["lifetime"]["tokens_saved"] >= 4096
+
+
+def test_non_stateless_savings_tracker_still_persists(tmp_path):
+    """Control: default (stateless=False) behavior is unchanged — it persists."""
+    path = tmp_path / "proxy_savings.json"
+    tracker = SavingsTracker(path=str(path))
+
+    tracker.record_request(
+        model="gpt-4o",
+        input_tokens=8192,
+        tokens_saved=4096,
+        timestamp="2026-03-27T09:00:00Z",
+    )
+    assert path.exists()
+
+
 def test_savings_tracker_save_does_not_flock_target_inode_before_replace(tmp_path, monkeypatch):
     path = tmp_path / "proxy_savings.json"
     tracker = SavingsTracker(path=str(path))
@@ -306,6 +341,37 @@ def test_litellm_resolution_and_savings_estimation_fallbacks(monkeypatch):
     monkeypatch.setattr(savings_tracker_module, "LITELLM_AVAILABLE", False)
     assert savings_tracker_module._estimate_compression_savings_usd("gpt-4o", 100) == 0.0
     assert savings_tracker_module._estimate_input_cost_usd("gpt-4o", 100) == 0.0
+
+
+def test_input_cost_counts_cache_reads_when_uncached_input_is_zero(monkeypatch):
+    # Anthropic reports cache reads/writes separately from `input_tokens` (the
+    # uncached portion). A fully prefix-cached request has input_tokens == 0 but
+    # cache_read_tokens > 0 -- it still cost money and must not be priced at 0,
+    # otherwise the day shows compression savings with zero recorded spend.
+    def fake_cost_per_token(*, model, prompt_tokens, completion_tokens):
+        if model == "anthropic/claude-sonnet-4-6":
+            return {"model": model}
+        raise RuntimeError("unknown model")
+
+    fake_litellm = SimpleNamespace(
+        cost_per_token=fake_cost_per_token,
+        model_cost={
+            "anthropic/claude-sonnet-4-6": {
+                "input_cost_per_token": 0.003,
+                "cache_read_input_token_cost": 0.0003,
+                "cache_creation_input_token_cost": 0.00375,
+            },
+        },
+    )
+    monkeypatch.setattr(savings_tracker_module, "LITELLM_AVAILABLE", True)
+    monkeypatch.setattr(savings_tracker_module, "litellm", fake_litellm)
+
+    cost = savings_tracker_module._estimate_input_cost_usd(
+        "claude-sonnet-4-6",
+        0,
+        cache_read_tokens=1000,
+    )
+    assert cost == pytest.approx(0.3)
 
 
 def test_display_session_rolls_after_inactivity_and_counts_zero_savings_requests(

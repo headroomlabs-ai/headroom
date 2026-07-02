@@ -53,11 +53,14 @@ headroom proxy --no-optimize
 # Disable semantic caching
 headroom proxy --no-cache
 
-# Disable CCR response handling
-headroom proxy --no-ccr-responses
+# Disable CCR tool injection
+headroom proxy --no-ccr-inject-tool
 
-# Disable proactive expansion
-headroom proxy --no-ccr-expansion
+# Disable CCR retrieval markers
+headroom proxy --no-ccr-marker
+
+# Disable proactive CCR expansion
+headroom proxy --no-ccr-proactive-expansion
 
 # (The earlier --llmlingua flag was retired in 0.9.x and replaced by
 # Kompress (ModernBERT). See `wiki/transforms.md` for the current
@@ -197,107 +200,21 @@ config = CacheAlignerConfig(
 )
 ```
 
-## Rolling Window Configuration
+## Context Management
 
-Control context window management:
+Context management is handled automatically inside the pipeline
+(live-zone-only compression) — there is nothing to configure. Headroom
+**never** drops messages from the conversation history and does not do
+position-based or score-based context management. It compresses only the
+newest content blocks (the latest user message and the latest tool result /
+tool output), type-aware and reversible via CCR. The cache hot zone — system
+prompt, tools, and older turns — is never mutated, which preserves provider
+prompt caching.
 
-```python
-from headroom.transforms import RollingWindowConfig
-
-config = RollingWindowConfig(
-    # Minimum turns to always keep
-    min_keep_turns=3,
-
-    # Reserve tokens for output
-    output_buffer_tokens=4000,
-
-    # Drop oldest tool outputs first
-    prefer_drop_tool_outputs=True,
-)
-```
-
-## Intelligent Context Manager Configuration
-
-For semantic-aware context management with importance scoring:
-
-```python
-from headroom.config import IntelligentContextConfig, ScoringWeights
-
-# Customize scoring weights (must sum to 1.0, or will be normalized)
-weights = ScoringWeights(
-    recency=0.20,              # Newer messages score higher
-    semantic_similarity=0.20,  # Similarity to recent context
-    toin_importance=0.25,      # TOIN-learned retrieval patterns
-    error_indicator=0.15,      # TOIN-learned error field types
-    forward_reference=0.15,    # Messages referenced by later messages
-    token_density=0.05,        # Information density
-)
-
-config = IntelligentContextConfig(
-    # Enable/disable the manager
-    enabled=True,
-
-    # Protection settings
-    keep_system=True,           # Never drop system messages
-    keep_last_turns=2,          # Protect last N user turns
-
-    # Token budget
-    output_buffer_tokens=4000,  # Reserve for model output
-
-    # Scoring settings
-    use_importance_scoring=True,    # Use semantic scoring (vs position-only)
-    scoring_weights=weights,        # Custom weights
-    toin_integration=True,          # Use TOIN patterns if available
-    recency_decay_rate=0.1,         # Exponential decay lambda
-
-    # Strategy thresholds
-    compress_threshold=0.1,     # Try compression first if <10% over budget
-)
-```
-
-### CCR Integration
-
-When IntelligentContext drops messages, they're stored in CCR for potential retrieval:
-
-```python
-from headroom.telemetry import get_toin
-
-# Pass TOIN for bidirectional integration
-toin = get_toin()
-manager = IntelligentContextManager(config=config, toin=toin)
-
-# Dropped messages are:
-# 1. Stored in CCR (so LLM can retrieve if needed)
-# 2. Recorded to TOIN (so it learns which patterns matter)
-# 3. Marked with CCR reference in the inserted message
-```
-
-The marker inserted when messages are dropped includes the CCR reference:
-```
-[Earlier context compressed: 14 message(s) dropped by importance scoring.
-Full content available via ccr_retrieve tool with reference 'abc123def456'.]
-```
-
-### Scoring Weights
-
-The `ScoringWeights` class controls how messages are scored:
-
-| Weight | Default | Description |
-|--------|---------|-------------|
-| `recency` | 0.20 | Exponential decay from conversation end |
-| `semantic_similarity` | 0.20 | Embedding cosine similarity to recent context |
-| `toin_importance` | 0.25 | TOIN retrieval_rate (high retrieval = important) |
-| `error_indicator` | 0.15 | TOIN field_semantics error detection |
-| `forward_reference` | 0.15 | Count of later messages referencing this one |
-| `token_density` | 0.05 | Unique tokens / total tokens |
-
-Weights are automatically normalized to sum to 1.0:
-
-```python
-weights = ScoringWeights(recency=1.0, toin_importance=1.0)
-normalized = weights.normalized()
-# recency=0.5, toin_importance=0.5, others=0.0
-```
+> The earlier `RollingWindowConfig`, `IntelligentContextConfig`, and
+> `ScoringWeights` configuration classes (and the position-/score-based
+> context managers they configured) have been removed and are no longer part
+> of Headroom.
 
 ## Environment Variables
 
@@ -507,8 +424,8 @@ The TypeScript SDK is configured via environment variables or constructor option
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `HEADROOM_BASE_URL` | Base URL of the Headroom proxy or cloud API | `http://localhost:8787` |
-| `HEADROOM_API_KEY` | API key for Headroom Cloud authentication | - |
+| `HEADROOM_BASE_URL` | Base URL of the Headroom proxy | `http://localhost:8787` |
+| `HEADROOM_API_KEY` | Optional API key for authenticated Headroom endpoints | - |
 
 ### Usage
 

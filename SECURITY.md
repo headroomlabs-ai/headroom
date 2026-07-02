@@ -4,8 +4,8 @@
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 0.2.x   | :white_check_mark: |
-| 0.1.x   | :x:                |
+| 0.27.x (latest) | :white_check_mark: |
+| < 0.27.x | :x:              |
 
 ## Reporting a Vulnerability
 
@@ -15,7 +15,7 @@ We take security vulnerabilities seriously. If you discover a security issue, pl
 
 **Please DO NOT open a public GitHub issue for security vulnerabilities.**
 
-Instead, please email us at: **security@headroom.dev**
+Instead, please email us at: **security@headroomlabs.ai**
 
 Include the following information:
 - Type of vulnerability (e.g., injection, data exposure, authentication bypass)
@@ -46,7 +46,7 @@ When using Headroom:
 The following are in scope for security reports:
 - Headroom Python package (`pip install headroom-ai`)
 - Headroom proxy server
-- Official integrations (LangChain, MCP)
+- Official integrations (LangChain, Agno, Strands, LiteLLM, Vercel AI SDK, Anthropic/OpenAI SDK wrappers, MCP)
 
 The following are out of scope:
 - Third-party integrations not maintained by us

@@ -210,6 +210,26 @@ def test_unwrap_claude_keep_flags_skip_cleanup(
     stop_proxy.assert_not_called()
 
 
+def test_unwrap_claude_restores_all_base_url_modes(runner: CliRunner) -> None:
+    restore_calls: list[dict[str, object]] = []
+
+    def restore_base_url(previous: str | None, **kwargs: object) -> None:
+        restore_calls.append({"previous": previous, **kwargs})
+
+    with patch("headroom.cli.wrap._restore_claude_wrap_base_url", side_effect=restore_base_url):
+        result = runner.invoke(
+            main,
+            ["unwrap", "claude", "--keep-mcp", "--keep-rtk", "--no-stop-proxy"],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert restore_calls == [
+        {"previous": None},
+        {"previous": None, "foundry_mode": True},
+        {"previous": None, "vertex_mode": True},
+    ]
+
+
 def test_remove_claude_rtk_hooks_removes_init_hooks_and_env(tmp_path: Path) -> None:
     settings = tmp_path / "settings.json"
     settings.write_text(

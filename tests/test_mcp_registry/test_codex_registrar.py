@@ -9,11 +9,16 @@ import pytest
 
 from headroom.mcp_registry.base import RegisterStatus, ServerSpec
 from headroom.mcp_registry.codex import CodexRegistrar
+from headroom.mcp_registry.install import build_headroom_spec
 
 if sys.version_info >= (3, 11):
     import tomllib
 else:  # pragma: no cover
     import tomli as tomllib
+
+
+_RESOLVED_COMMAND = ("/usr/bin/python", "-m", "headroom.cli")
+_RESOLVED_ARGS = ("-m", "headroom.cli", "mcp", "serve")
 
 
 def _make_registrar(tmp_path: Path) -> CodexRegistrar:
@@ -23,10 +28,18 @@ def _make_registrar(tmp_path: Path) -> CodexRegistrar:
 def _spec(env: dict[str, str] | None = None) -> ServerSpec:
     return ServerSpec(
         name="headroom",
-        command="headroom",
-        args=("mcp", "serve"),
+        command=_RESOLVED_COMMAND[0],
+        args=_RESOLVED_ARGS,
         env=env or {},
     )
+
+
+def _install_spec(monkeypatch: pytest.MonkeyPatch) -> ServerSpec:
+    monkeypatch.setattr(
+        "headroom.mcp_registry.install.resolve_headroom_command",
+        lambda: list(_RESOLVED_COMMAND),
+    )
+    return build_headroom_spec()
 
 
 def _serena_spec() -> ServerSpec:
@@ -111,16 +124,16 @@ def test_get_server_returns_spec_when_table_present(tmp_path: Path) -> None:
     cfg.parent.mkdir()
     cfg.write_text(
         "[mcp_servers.headroom]\n"
-        'command = "headroom"\n'
-        'args = ["mcp", "serve"]\n'
+        f"command = {_RESOLVED_COMMAND[0]!r}\n"
+        f"args = {list(_RESOLVED_ARGS)!r}\n"
         "\n"
         "[mcp_servers.headroom.env]\n"
         'HEADROOM_PROXY_URL = "http://127.0.0.1:9000"\n'
     )
     got = _make_registrar(tmp_path).get_server("headroom")
     assert got is not None
-    assert got.command == "headroom"
-    assert got.args == ("mcp", "serve")
+    assert got.command == _RESOLVED_COMMAND[0]
+    assert got.args == _RESOLVED_ARGS
     assert got.env == {"HEADROOM_PROXY_URL": "http://127.0.0.1:9000"}
 
 
@@ -136,9 +149,11 @@ def test_get_server_robust_to_unparseable_toml(tmp_path: Path) -> None:
 # ----------------------------------------------------------------------
 
 
-def test_register_creates_config_when_missing(tmp_path: Path) -> None:
+def test_register_creates_config_when_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     reg = _make_registrar(tmp_path)
-    result = reg.register_server(_spec())
+    result = reg.register_server(_install_spec(monkeypatch))
     assert result.status == RegisterStatus.REGISTERED
     cfg = _config_path(tmp_path)
     assert cfg.exists()
@@ -146,8 +161,8 @@ def test_register_creates_config_when_missing(tmp_path: Path) -> None:
     assert "# --- Headroom MCP server ---" in text
     assert "[mcp_servers.headroom]" in text
     parsed = tomllib.loads(text)
-    assert parsed["mcp_servers"]["headroom"]["command"] == "headroom"
-    assert parsed["mcp_servers"]["headroom"]["args"] == ["mcp", "serve"]
+    assert parsed["mcp_servers"]["headroom"]["command"] == _RESOLVED_COMMAND[0]
+    assert parsed["mcp_servers"]["headroom"]["args"] == list(_RESOLVED_ARGS)
 
 
 def test_register_appends_to_existing_config_preserves_other_keys(tmp_path: Path) -> None:
@@ -166,7 +181,7 @@ def test_register_appends_to_existing_config_preserves_other_keys(tmp_path: Path
     parsed = tomllib.loads(text)
     assert parsed["model"] == "gpt-4o"
     assert parsed["other_section"]["value"] == 42
-    assert parsed["mcp_servers"]["headroom"]["command"] == "headroom"
+    assert parsed["mcp_servers"]["headroom"]["command"] == _RESOLVED_COMMAND[0]
 
 
 def test_register_includes_env_subtable(tmp_path: Path) -> None:
@@ -193,7 +208,7 @@ def test_register_headroom_and_serena_coexist(tmp_path: Path) -> None:
     assert "# --- Headroom MCP server: serena ---" in text
 
     parsed = tomllib.loads(text)
-    assert parsed["mcp_servers"]["headroom"]["command"] == "headroom"
+    assert parsed["mcp_servers"]["headroom"]["command"] == _RESOLVED_COMMAND[0]
     assert parsed["mcp_servers"]["serena"]["command"] == "uvx"
 
 
@@ -326,11 +341,11 @@ def test_unregister_preserves_user_managed_entry(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     "spec",
     [
-        ServerSpec(name="headroom", command="headroom", args=("mcp", "serve")),
+        ServerSpec(name="headroom", command=_RESOLVED_COMMAND[0], args=_RESOLVED_ARGS),
         ServerSpec(
             name="headroom",
-            command="headroom",
-            args=("mcp", "serve"),
+            command=_RESOLVED_COMMAND[0],
+            args=_RESOLVED_ARGS,
             env={"HEADROOM_PROXY_URL": "http://127.0.0.1:9000"},
         ),
         ServerSpec(name="headroom", command="/usr/bin/headroom", args=()),
@@ -344,3 +359,40 @@ def test_round_trip(tmp_path: Path, spec: ServerSpec) -> None:
     assert got.command == spec.command
     assert got.args == spec.args
     assert got.env == spec.env
+
+
+# ---------------------------------------------------------------------------
+# #733 — encoding / line-ending safety on GBK / CRLF Windows configs
+# ---------------------------------------------------------------------------
+
+
+def test_register_does_not_double_crlf(tmp_path: Path) -> None:
+    """A pre-existing CRLF config must not gain ``\\r\\r\\n`` after register."""
+    import tomllib
+
+    cfg = _config_path(tmp_path)
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_bytes(b'model = "gpt-5"\r\nworkers = 1\r\n')
+
+    result = _make_registrar(tmp_path).register_server(_spec())
+
+    assert result.status == RegisterStatus.REGISTERED
+    raw = cfg.read_bytes()
+    assert b"\r\r\n" not in raw
+    tomllib.loads(raw.decode("utf-8"))  # still valid TOML
+
+
+def test_register_preserves_non_ascii_values(tmp_path: Path) -> None:
+    """A config with non-ASCII (Chinese) values survives register and stays parseable."""
+    import tomllib
+
+    cfg = _config_path(tmp_path)
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text('model = "gpt-5"\nproject = "比赛/机器人"\n', encoding="utf-8")
+
+    result = _make_registrar(tmp_path).register_server(_spec())
+
+    assert result.status == RegisterStatus.REGISTERED
+    data = tomllib.loads(cfg.read_text(encoding="utf-8"))
+    assert data["project"] == "比赛/机器人"
+    assert "headroom" in data.get("mcp_servers", {})

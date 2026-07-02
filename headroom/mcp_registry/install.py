@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
+from headroom.install.runtime import resolve_headroom_command
+
 from .base import MCPRegistrar, RegisterResult, RegisterStatus, ServerSpec
 from .claude import ClaudeRegistrar
 from .codex import CodexRegistrar
@@ -30,10 +32,11 @@ def build_headroom_spec(proxy_url: str = DEFAULT_PROXY_URL) -> ServerSpec:
     env: dict[str, str] = {}
     if proxy_url and proxy_url != DEFAULT_PROXY_URL:
         env["HEADROOM_PROXY_URL"] = proxy_url
+    command = resolve_headroom_command()
     return ServerSpec(
         name="headroom",
-        command="headroom",
-        args=("mcp", "serve"),
+        command=command[0],
+        args=(*command[1:], "mcp", "serve"),
         env=env,
     )
 
@@ -65,6 +68,22 @@ def build_serena_spec(context: str) -> ServerSpec:
             "--open-web-dashboard",
             "False",
         ),
+    )
+
+
+def build_tokensave_spec(binary: str = "tokensave") -> ServerSpec:
+    """Construct the canonical tokensave MCP server spec.
+
+    tokensave (https://github.com/aovestdipaperino/tokensave) is the primary
+    coding-task compressor — a local semantic code-graph server launched as
+    ``tokensave serve`` over stdio. ``binary`` is the command the agent runs;
+    pass an absolute path when tokensave was fetched to ``~/.local/bin`` and
+    is not on the agent's PATH, or leave the default when it is on PATH.
+    """
+    return ServerSpec(
+        name="tokensave",
+        command=binary,
+        args=("serve",),
     )
 
 

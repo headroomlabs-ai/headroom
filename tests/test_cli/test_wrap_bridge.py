@@ -89,8 +89,9 @@ def test_wrap_codex_prepare_only_updates_config(monkeypatch, tmp_path: Path) -> 
     assert result.exit_code == 0, result.output
     config_file = tmp_path / ".codex" / "config.toml"
     assert config_file.exists()
-    assert 'model_provider = "headroom"' in config_file.read_text()
-    assert 'base_url = "http://127.0.0.1:8787/v1"' in config_file.read_text()
+    content = config_file.read_text(encoding="utf-8")
+    assert 'model_provider = "headroom"' in content
+    assert 'base_url = "http://127.0.0.1:8787/v1"' in content
 
 
 def test_wrap_codex_prepare_only_uses_lean_ctx_when_configured(monkeypatch, tmp_path: Path) -> None:
@@ -151,7 +152,7 @@ def test_wrap_aider_prepare_only_injects_conventions(monkeypatch, tmp_path: Path
         assert result.exit_code == 0, result.output
         conventions = Path("CONVENTIONS.md")
         assert conventions.exists()
-        assert "headroom:rtk-instructions" in conventions.read_text()
+        assert "headroom:rtk-instructions" in conventions.read_text(encoding="utf-8")
 
 
 def test_wrap_cursor_prepare_only_injects_cursorrules(monkeypatch, tmp_path: Path) -> None:
@@ -165,7 +166,7 @@ def test_wrap_cursor_prepare_only_injects_cursorrules(monkeypatch, tmp_path: Pat
         assert result.exit_code == 0, result.output
         cursorrules = Path(".cursorrules")
         assert cursorrules.exists()
-        assert "headroom:rtk-instructions" in cursorrules.read_text()
+        assert "headroom:rtk-instructions" in cursorrules.read_text(encoding="utf-8")
 
 
 def test_wrap_cursor_prepare_only_uses_lean_ctx_when_configured(

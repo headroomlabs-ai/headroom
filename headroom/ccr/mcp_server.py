@@ -87,10 +87,14 @@ _READ_ENABLED = os.environ.get("HEADROOM_MCP_READ", "off").lower().strip() in (
 DEFAULT_PROXY_URL = os.environ.get("HEADROOM_PROXY_URL", "http://127.0.0.1:8787")
 
 
-def _format_session_summary(summary: dict[str, Any], local_stats: dict[str, Any]) -> str:
+def _format_session_summary(
+    summary: dict[str, Any],
+    local_stats: dict[str, Any],
+    persistent_lifetime: dict[str, Any] | None = None,
+) -> str:
     """Format the proxy summary + local MCP stats into clean readable text."""
     lines: list[str] = []
-    lines.append("Headroom Session Summary")
+    lines.append("Headroom Window-Scoped Session Summary")
     lines.append("=" * 40)
 
     mode = summary.get("mode", "token")
@@ -155,6 +159,15 @@ def _format_session_summary(summary: dict[str, Any], local_stats: dict[str, Any]
     local_saved = local_stats.get("total_tokens_saved", 0)
     if local_compressions > 0:
         lines.append(f"MCP Tool: {local_compressions} compressions, {local_saved:,} tokens saved")
+        lines.append("")
+
+    # Lifetime proxy savings (cross-session)
+    if isinstance(persistent_lifetime, dict):
+        lifetime_tokens = persistent_lifetime.get("tokens_saved", 0) or 0
+        lifetime_usd = persistent_lifetime.get("compression_savings_usd", 0.0) or 0.0
+        lines.append("Lifetime Savings:")
+        lines.append(f"  Tokens saved: {lifetime_tokens:,}")
+        lines.append(f"  Compression savings: ${lifetime_usd:.2f}")
         lines.append("")
 
     # Tip
@@ -415,56 +428,29 @@ class HeadroomMCPServer:
     async def _retrieve_content(
         self,
         hash_key: str,
-        query: str | None,
     ) -> dict[str, Any]:
-        """Retrieve content. Checks local store first, then proxy."""
+        """Retrieve content by hash. Checks local store first, then proxy.
+
+        Retrieval is by hash and always returns the full original content.
+        """
         # Check local store first
         store = self._get_local_store()
-        if query:
-            results = store.search(hash_key, query)
-            if results:
-                self._stats.record_retrieval(hash_key)
-                return {
-                    "hash": hash_key,
-                    "source": "local",
-                    "query": query,
-                    "results": results,
-                    "count": len(results),
-                }
-            # The query matched no items above the relevance floor, but the
-            # entry itself may still be present and unexpired. An empty search
-            # is not the same as a missing/expired hash, so fall back to the
-            # full content rather than reporting it as not found.
-            entry = store.retrieve(hash_key)
-            if entry:
-                self._stats.record_retrieval(hash_key)
-                return {
-                    "hash": hash_key,
-                    "source": "local",
-                    "query": query,
-                    "results": [],
-                    "count": 0,
-                    "original_content": entry.original_content,
-                    "note": "Entry exists but no item matched the query above "
-                    "the relevance threshold; returning the full content.",
-                }
-        else:
-            entry = store.retrieve(hash_key)
-            if entry:
-                self._stats.record_retrieval(hash_key)
-                return {
-                    "hash": hash_key,
-                    "source": "local",
-                    "original_content": entry.original_content,
-                    "original_item_count": entry.original_item_count,
-                    "compressed_item_count": entry.compressed_item_count,
-                    "retrieval_count": entry.retrieval_count,
-                }
+        entry = store.retrieve(hash_key)
+        if entry:
+            self._stats.record_retrieval(hash_key)
+            return {
+                "hash": hash_key,
+                "source": "local",
+                "original_content": entry.original_content,
+                "original_item_count": entry.original_item_count,
+                "compressed_item_count": entry.compressed_item_count,
+                "retrieval_count": entry.retrieval_count,
+            }
 
         # Fall back to proxy if available
         if self.check_proxy and HTTPX_AVAILABLE:
             try:
-                result = await self._retrieve_via_proxy(hash_key, query)
+                result = await self._retrieve_via_proxy(hash_key)
                 if "error" not in result:
                     result["source"] = "proxy"
                     self._stats.record_retrieval(hash_key)
@@ -485,16 +471,13 @@ class HeadroomMCPServer:
     async def _retrieve_via_proxy(
         self,
         hash_key: str,
-        query: str | None,
     ) -> dict[str, Any]:
-        """Retrieve content via proxy's HTTP endpoint."""
+        """Retrieve full content by hash via proxy's HTTP endpoint."""
         if self._http_client is None:
             self._http_client = httpx.AsyncClient(timeout=15.0)
 
         url = f"{self.proxy_url}/v1/retrieve"
         payload: dict[str, str] = {"hash": hash_key}
-        if query:
-            payload["query"] = query
 
         response = await self._http_client.post(url, json=payload)
 
@@ -548,13 +531,6 @@ class HeadroomMCPServer:
                             "hash": {
                                 "type": "string",
                                 "description": "Hash key from compression (e.g., 'abc123' from hash=abc123)",
-                            },
-                            "query": {
-                                "type": "string",
-                                "description": (
-                                    "Optional search query to filter results. "
-                                    "If provided, returns only items matching the query."
-                                ),
                             },
                         },
                         "required": ["hash"],
@@ -723,17 +699,11 @@ class HeadroomMCPServer:
                 )
             ]
 
-        query = arguments.get("query")
+        logger.info("event=mcp_retrieve_started hash=%s", hash_key)
+        result = await self._retrieve_content(hash_key)
         logger.info(
-            "event=mcp_retrieve_started hash=%s query=%s",
+            "event=mcp_retrieve_completed hash=%s result=%s",
             hash_key,
-            json.dumps(query, ensure_ascii=False, default=str),
-        )
-        result = await self._retrieve_content(hash_key, query)
-        logger.info(
-            "event=mcp_retrieve_completed hash=%s query=%s result=%s",
-            hash_key,
-            json.dumps(query, ensure_ascii=False, default=str),
             json.dumps(result, ensure_ascii=False, default=str),
         )
 
@@ -783,8 +753,14 @@ class HeadroomMCPServer:
             if proxy_data:
                 summary = proxy_data.get("summary")
                 if summary:
+                    lifetime = None
+                    persistent_savings = proxy_data.get("persistent_savings")
+                    if isinstance(persistent_savings, dict):
+                        lifetime_block = persistent_savings.get("lifetime")
+                        if isinstance(lifetime_block, dict):
+                            lifetime = lifetime_block
                     # Return clean formatted summary instead of raw JSON
-                    formatted = _format_session_summary(summary, stats)
+                    formatted = _format_session_summary(summary, stats, lifetime)
                     return [TextContent(type="text", text=formatted)]
                 # Fallback: add proxy stats to local stats
                 proxy_stats = self._extract_proxy_stats(proxy_data)

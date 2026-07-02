@@ -168,7 +168,9 @@ def test_content_router_protects_instruction_roles_but_compresses_tool_outputs()
     def fake_compress(text: str, **kwargs: Any) -> SimpleNamespace:
         calls.append(text)
         return SimpleNamespace(
-            compressed="COMPRESSED",
+            # CCR marker -> recoverable, so the #1307 gate keeps this lossy tool
+            # compression (tool output still compresses *because* it can be retrieved).
+            compressed="COMPRESSED <<ccr:tool>>",
             compression_ratio=0.1,
             strategy_used=CompressionStrategy.KOMPRESS,
         )
@@ -187,7 +189,7 @@ def test_content_router_protects_instruction_roles_but_compresses_tool_outputs()
     assert result.messages[0]["content"] == messages[0]["content"]
     assert result.messages[1]["content"] == messages[1]["content"]
     assert result.messages[2]["content"] == messages[2]["content"]
-    assert result.messages[3]["content"] == "COMPRESSED"
+    assert result.messages[3]["content"] == "COMPRESSED <<ccr:tool>>"
     assert calls == [tool_text]
 
 

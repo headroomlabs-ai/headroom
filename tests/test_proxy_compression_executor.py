@@ -258,6 +258,67 @@ def test_timeout_before_worker_start_does_not_leak_in_flight() -> None:
         assert proxy._compression_leaked_threads == 0
 
 
+def test_compression_executor_skip_signal_remains_visible() -> None:
+    """A compression executor queue timeout increments visible runtime counters."""
+    from fastapi.testclient import TestClient
+
+    config = ProxyConfig(
+        optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+        log_requests=False,
+        ccr_inject_tool=False,
+        ccr_handle_responses=False,
+        ccr_context_tracking=False,
+        image_optimize=False,
+        compression_max_workers=1,
+    )
+    app = create_app(config)
+    proxy = app.state.proxy
+
+    with TestClient(app) as client:
+        baseline = client.get("/health").json()["runtime"]["compression_executor"][
+            "queue_timeouts_total"
+        ]
+
+    first_started = threading.Event()
+    release_first = threading.Event()
+
+    def _blocking_compression():
+        first_started.set()
+        release_first.wait(timeout=5.0)
+        return "first"
+
+    def _queued_compression():
+        return "second"
+
+    async def _drive():
+        first_task = asyncio.create_task(
+            proxy._run_compression_in_executor(_blocking_compression, timeout=10.0)
+        )
+        for _ in range(50):
+            if first_started.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert first_started.is_set()
+
+        with pytest.raises(asyncio.TimeoutError):
+            await proxy._run_compression_in_executor(_queued_compression, timeout=0.05)
+
+        with proxy._compression_metrics_lock:
+            assert proxy._compression_queued == 0
+
+        release_first.set()
+        return await first_task
+
+    asyncio.run(_drive())
+
+    with TestClient(app) as client:
+        after = client.get("/health").json()["runtime"]["compression_executor"]
+        assert after["queue_timeouts_total"] == baseline + 1
+
+
 def test_compression_executor_metrics_appear_in_runtime_payload() -> None:
     """``/stats runtime.compression_executor`` surfaces the new gauges."""
     from fastapi.testclient import TestClient

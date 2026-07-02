@@ -23,7 +23,8 @@ class TestCCRToolDefinition:
         assert "input_schema" in tool
         assert tool["input_schema"]["type"] == "object"
         assert "hash" in tool["input_schema"]["properties"]
-        assert "query" in tool["input_schema"]["properties"]
+        # Retrieval is by hash only — no query/search parameter.
+        assert "query" not in tool["input_schema"]["properties"]
         assert tool["input_schema"]["required"] == ["hash"]
 
     def test_openai_format(self):
@@ -266,13 +267,12 @@ class TestParseToolCall:
         tool_call = {
             "id": "toolu_123",
             "name": CCR_TOOL_NAME,
-            "input": {"hash": "abc123def456abc123def456", "query": "errors"},
+            "input": {"hash": "abc123def456abc123def456"},
         }
 
-        hash_key, query = parse_tool_call(tool_call, "anthropic")
+        hash_key = parse_tool_call(tool_call, "anthropic")
 
         assert hash_key == "abc123def456abc123def456"
-        assert query == "errors"
 
     def test_parse_openai_format(self):
         """Parse OpenAI tool call format."""
@@ -280,14 +280,13 @@ class TestParseToolCall:
             "id": "call_123",
             "function": {
                 "name": CCR_TOOL_NAME,
-                "arguments": json.dumps({"hash": "def456abc123def456abc123", "query": None}),
+                "arguments": json.dumps({"hash": "def456abc123def456abc123"}),
             },
         }
 
-        hash_key, query = parse_tool_call(tool_call, "openai")
+        hash_key = parse_tool_call(tool_call, "openai")
 
         assert hash_key == "def456abc123def456abc123"
-        assert query is None
 
     def test_parse_non_ccr_tool(self):
         """Returns None for non-CCR tool calls."""
@@ -296,10 +295,9 @@ class TestParseToolCall:
             "input": {"param": "value"},
         }
 
-        hash_key, query = parse_tool_call(tool_call, "anthropic")
+        hash_key = parse_tool_call(tool_call, "anthropic")
 
         assert hash_key is None
-        assert query is None
 
     def test_parse_malformed_openai_args(self):
         """Handles malformed JSON in OpenAI arguments."""
@@ -311,7 +309,7 @@ class TestParseToolCall:
             },
         }
 
-        hash_key, query = parse_tool_call(tool_call, "openai")
+        hash_key = parse_tool_call(tool_call, "openai")
 
         assert hash_key is None
 
@@ -331,7 +329,7 @@ class TestHashSecurityValidation:
             "input": {"hash": "abc123"},  # Only 6 chars
         }
 
-        hash_key, query = parse_tool_call(tool_call, "anthropic")
+        hash_key = parse_tool_call(tool_call, "anthropic")
         assert hash_key is None  # Rejected
 
     def test_rejects_long_hash(self):
@@ -341,7 +339,7 @@ class TestHashSecurityValidation:
             "input": {"hash": "abc123def456abc123def456abc123"},  # 30 chars
         }
 
-        hash_key, query = parse_tool_call(tool_call, "anthropic")
+        hash_key = parse_tool_call(tool_call, "anthropic")
         assert hash_key is None  # Rejected
 
     def test_rejects_non_hex_characters(self):
@@ -351,7 +349,7 @@ class TestHashSecurityValidation:
             "input": {"hash": "abc123xyz456abc123xyz456"},  # Contains xyz
         }
 
-        hash_key, query = parse_tool_call(tool_call, "anthropic")
+        hash_key = parse_tool_call(tool_call, "anthropic")
         assert hash_key is None  # Rejected
 
     def test_accepts_valid_24_char_hash(self):
@@ -361,7 +359,7 @@ class TestHashSecurityValidation:
             "input": {"hash": "abc123def456abc123def456"},
         }
 
-        hash_key, query = parse_tool_call(tool_call, "anthropic")
+        hash_key = parse_tool_call(tool_call, "anthropic")
         assert hash_key == "abc123def456abc123def456"
 
     def test_accepts_uppercase_hex(self):
@@ -371,7 +369,7 @@ class TestHashSecurityValidation:
             "input": {"hash": "ABC123DEF456ABC123DEF456"},
         }
 
-        hash_key, query = parse_tool_call(tool_call, "anthropic")
+        hash_key = parse_tool_call(tool_call, "anthropic")
         # Note: validation accepts uppercase since we use .lower() for hex check
         assert hash_key == "ABC123DEF456ABC123DEF456"
 
@@ -433,13 +431,12 @@ class TestSmartCrusherCcrMarkers:
         """``parse_tool_call`` accepts a 12-char SmartCrusher hash."""
         tool_call = {
             "name": CCR_TOOL_NAME,
-            "input": {"hash": "e21a26620105", "query": "auth middleware"},
+            "input": {"hash": "e21a26620105"},
         }
 
-        hash_key, query = parse_tool_call(tool_call, "anthropic")
+        hash_key = parse_tool_call(tool_call, "anthropic")
 
         assert hash_key == "e21a26620105"
-        assert query == "auth middleware"
 
     def test_parse_tool_call_still_accepts_24_char_hash(self):
         """24-char legacy hashes remain valid (regression guard)."""
@@ -448,7 +445,7 @@ class TestSmartCrusherCcrMarkers:
             "input": {"hash": "abc123def456abc123def456"},
         }
 
-        hash_key, _ = parse_tool_call(tool_call, "anthropic")
+        hash_key = parse_tool_call(tool_call, "anthropic")
 
         assert hash_key == "abc123def456abc123def456"
 
