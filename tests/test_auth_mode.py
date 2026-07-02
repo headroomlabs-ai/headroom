@@ -47,6 +47,15 @@ def test_oauth_sk_ant_oat_classified_oauth() -> None:
     assert classify_auth_mode(headers) is AuthMode.OAUTH
 
 
+def test_oauth_real_sk_ant_oat01_classified_oauth() -> None:
+    """Real Anthropic OAuth access tokens are ``sk-ant-oat01-...`` (a version
+    number, no dash after ``oat``). These must classify as OAUTH — matching on
+    ``sk-ant-oat-`` missed them and let them fall through to PAYG, enabling
+    aggressive lossy compression on subscription-bound requests."""
+    headers = {"authorization": "Bearer sk-ant-oat01-abc123def456"}
+    assert classify_auth_mode(headers) is AuthMode.OAUTH
+
+
 def test_claude_code_ua_classified_subscription() -> None:
     """Claude Code CLI: ``User-Agent: claude-code/1.2.3 ...``."""
     headers = {"user-agent": "claude-code/1.2.3 (darwin; arm64)"}

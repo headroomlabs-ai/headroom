@@ -151,9 +151,13 @@ def classify_auth_mode(headers: Mapping[str, Any] | Any) -> AuthMode:
 
     if auth.startswith("Bearer "):
         token = auth[len("Bearer ") :]
-        # Order matters: `sk-ant-oat-*` shares a prefix with
+        # Order matters: `sk-ant-oat*` shares a prefix with
         # `sk-ant-api*` only at `sk-ant-`, so check OAuth first.
-        if token.startswith("sk-ant-oat-"):
+        # Real Anthropic OAuth access tokens are `sk-ant-oat01-...`
+        # (a version number, no dash after `oat`), so match on the
+        # dash-less `sk-ant-oat` prefix — matching on `sk-ant-oat-`
+        # missed every real token and let it fall through to PAYG.
+        if token.startswith("sk-ant-oat"):
             return AuthMode.OAUTH
         if token.startswith("sk-ant-api") or token.startswith("sk-"):
             return AuthMode.PAYG
