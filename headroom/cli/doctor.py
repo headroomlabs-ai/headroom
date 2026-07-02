@@ -87,7 +87,7 @@ def check_proxy_liveness(livez: dict[str, Any] | None, base_url: str) -> CheckRe
         )
     version = livez.get("version", "unknown")
     uptime = livez.get("uptime_seconds")
-    uptime_text = f"up {_format_uptime(uptime)}" if isinstance(uptime, (int, float)) else "up"
+    uptime_text = f"up {_format_uptime(uptime)}" if isinstance(uptime, int | float) else "up"
     return CheckResult(
         name="proxy",
         status=PASS,
@@ -245,7 +245,8 @@ def check_savings(stats: dict[str, Any] | None, savings_file: Path) -> CheckResu
     lifetime = payload.get("lifetime") or {}
     tokens = lifetime.get("tokens_saved", 0) or 0
     usd = lifetime.get("compression_savings_usd", 0.0) or 0.0
-    if not tokens:
+    cache_reads = lifetime.get("cache_read_tokens", 0) or 0
+    if not tokens and not cache_reads:
         return CheckResult(
             name=name,
             status=WARN,
@@ -259,6 +260,9 @@ def check_savings(stats: dict[str, Any] | None, savings_file: Path) -> CheckResu
     if isinstance(last_activity, str):
         freshness = _format_since(last_activity)
     summary = f"{tokens:,} tokens / ${usd:,.2f} saved lifetime"
+    if cache_reads:
+        cache_usd = lifetime.get("cache_savings_usd", 0.0) or 0.0
+        summary += f"; {cache_reads:,} cache-read tokens / ${cache_usd:,.2f} cache savings"
     if freshness:
         summary += f" — last request {freshness}"
     return CheckResult(name=name, status=PASS, summary=f"{summary} ({source})")

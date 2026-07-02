@@ -165,9 +165,14 @@ def _format_session_summary(
     if isinstance(persistent_lifetime, dict):
         lifetime_tokens = persistent_lifetime.get("tokens_saved", 0) or 0
         lifetime_usd = persistent_lifetime.get("compression_savings_usd", 0.0) or 0.0
+        lifetime_cache_reads = persistent_lifetime.get("cache_read_tokens", 0) or 0
+        lifetime_cache_usd = persistent_lifetime.get("cache_savings_usd", 0.0) or 0.0
         lines.append("Lifetime Savings:")
         lines.append(f"  Tokens saved: {lifetime_tokens:,}")
         lines.append(f"  Compression savings: ${lifetime_usd:.2f}")
+        if lifetime_cache_reads:
+            lines.append(f"  Cache-read tokens: {lifetime_cache_reads:,}")
+            lines.append(f"  Cache savings: ${lifetime_cache_usd:.2f}")
         lines.append("")
 
     # Tip

@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   contains the panic and treats the fragment as plain text, so the request is
   compressed and forwarded normally instead of returning HTTP 500
   ([#1547](https://github.com/headroomlabs-ai/headroom/issues/1547)).
+* **proxy:** persist lifetime cache-read savings (tokens + USD) in `proxy_savings.json` (schema v4, additive) so cache-mode savings survive proxy restarts and upgrades. Previously prefix-cache read savings lived only in process memory and every restart reset the dashboard's cache figure to zero; the "Cache Reads (lifetime)" tile now reads the persisted value and the Prefix Cache Impact card renders after a restart with zero traffic, marking session-scoped tiles "no activity since restart".
 - Proactive expansion blocks injected into user turns are now wrapped in
   `<headroom_proactive_expansion>` XML tags, giving downstream consumers
   (LLMs, loggers, attribution parsers) a machine-readable provenance

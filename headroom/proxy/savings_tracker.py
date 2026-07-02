@@ -10,6 +10,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import logging
+import math
 import os
 import tempfile
 import threading
@@ -27,7 +28,7 @@ logger = logging.getLogger(__name__)
 HEADROOM_SAVINGS_PATH_ENV_VAR = _paths.HEADROOM_SAVINGS_PATH_ENV
 DEFAULT_SAVINGS_DIR = ".headroom"
 DEFAULT_SAVINGS_FILE = "proxy_savings.json"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 DEFAULT_MAX_HISTORY_POINTS = 5000
 DEFAULT_MAX_PROJECTS = 50
 PROJECT_NAME_MAX_LENGTH = 128
@@ -105,17 +106,24 @@ def _bucket_start(timestamp: datetime, bucket: str) -> datetime:
 
 
 def _coerce_int(value: Any, default: int = 0) -> int:
+    # OverflowError: int(float("inf")) — json accepts bare Infinity, and a
+    # corrupted state file must not crash proxy startup.
     try:
         return max(int(value), 0)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
 
 
 def _coerce_float(value: Any, default: float = 0.0) -> float:
+    # NaN is absorbing under += — one poisoned value would brick an
+    # accumulator forever, so reject non-finite values outright.
     try:
-        return max(float(value), 0.0)
+        coerced = float(value)
     except (TypeError, ValueError):
         return default
+    if not math.isfinite(coerced):
+        return default
+    return max(coerced, 0.0)
 
 
 PROVIDER_UNKNOWN = "unknown"
@@ -199,6 +207,36 @@ def _estimate_compression_savings_usd(model: str, tokens_saved: int) -> float:
         if not input_cost_per_token:
             return 0.0
         return float(tokens_saved) * float(input_cost_per_token)
+    except Exception:
+        return 0.0
+
+
+def _estimate_cache_savings_usd(model: str, cache_read_tokens: int) -> float:
+    """Estimate cache-read savings in USD — the discount delta vs list price.
+
+    Cache reads bill at the provider's discounted rate, so the saving per token
+    is ``input_cost_per_token - cache_read_input_token_cost``. Unknown models or
+    an unavailable litellm price as 0.0 (fail open); tokens still accumulate.
+
+    Deliberately diverges from ``proxy/cost.py``'s session-scoped provider
+    multipliers (``_CACHE_ECONOMICS``): this lifetime figure follows the
+    per-model litellm pricing the rest of this module already uses.
+    """
+    litellm = _get_litellm_module()
+    if cache_read_tokens <= 0 or litellm is None:
+        return 0.0
+
+    try:
+        resolved = _resolve_litellm_model(model)
+        info = litellm.model_cost.get(resolved, {})
+        input_cost_per_token = info.get("input_cost_per_token")
+        if not input_cost_per_token:
+            return 0.0
+        cache_read_cost = info.get("cache_read_input_token_cost", input_cost_per_token)
+        discount = float(input_cost_per_token) - float(cache_read_cost)
+        if discount <= 0:
+            return 0.0
+        return float(cache_read_tokens) * discount
     except Exception:
         return 0.0
 
@@ -305,6 +343,8 @@ def _empty_display_session() -> dict[str, Any]:
         "requests": 0,
         "tokens_saved": 0,
         "compression_savings_usd": 0.0,
+        "cache_read_tokens": 0,
+        "cache_savings_usd": 0.0,
         "total_input_tokens": 0,
         "total_input_cost_usd": 0.0,
         "savings_percent": 0.0,
@@ -397,6 +437,11 @@ def _normalize_display_session(entry: Any) -> dict[str, Any]:
         "tokens_saved": tokens_saved,
         "compression_savings_usd": round(
             _coerce_float(entry.get("compression_savings_usd")),
+            6,
+        ),
+        "cache_read_tokens": _coerce_int(entry.get("cache_read_tokens")),
+        "cache_savings_usd": round(
+            _coerce_float(entry.get("cache_savings_usd")),
             6,
         ),
         "total_input_tokens": total_input_tokens,
@@ -542,6 +587,8 @@ class SavingsTracker:
         delta_tokens_saved = _coerce_int(tokens_saved)
         delta_input_tokens = _coerce_int(input_tokens)
         delta_savings_usd = _estimate_compression_savings_usd(model, delta_tokens_saved)
+        delta_cache_read_tokens = _coerce_int(cache_read_tokens)
+        delta_cache_savings_usd = _estimate_cache_savings_usd(model, delta_cache_read_tokens)
         delta_input_cost_usd = _estimate_input_cost_usd(
             model,
             delta_input_tokens,
@@ -587,6 +634,11 @@ class SavingsTracker:
                 lifetime["compression_savings_usd"] + delta_savings_usd,
                 6,
             )
+            lifetime["cache_read_tokens"] += delta_cache_read_tokens
+            lifetime["cache_savings_usd"] = round(
+                lifetime["cache_savings_usd"] + delta_cache_savings_usd,
+                6,
+            )
             lifetime["total_input_tokens"] = next_total_input_tokens
             lifetime["total_input_cost_usd"] = next_total_input_cost_usd
 
@@ -604,6 +656,11 @@ class SavingsTracker:
             session["tokens_saved"] += delta_tokens_saved
             session["compression_savings_usd"] = round(
                 session["compression_savings_usd"] + delta_savings_usd,
+                6,
+            )
+            session["cache_read_tokens"] += delta_cache_read_tokens
+            session["cache_savings_usd"] = round(
+                session["cache_savings_usd"] + delta_cache_savings_usd,
                 6,
             )
             session["total_input_tokens"] += session_input_tokens_delta
@@ -824,6 +881,8 @@ class SavingsTracker:
                 "requests": 0,
                 "tokens_saved": 0,
                 "compression_savings_usd": 0.0,
+                "cache_read_tokens": 0,
+                "cache_savings_usd": 0.0,
                 "total_input_tokens": 0,
                 "total_input_cost_usd": 0.0,
             },
@@ -863,12 +922,16 @@ class SavingsTracker:
         lifetime_requests = 0
         lifetime_tokens_saved = 0
         lifetime_savings_usd = 0.0
+        lifetime_cache_read_tokens = 0
+        lifetime_cache_savings_usd = 0.0
         lifetime_input_tokens = 0
         lifetime_input_cost_usd = 0.0
         if isinstance(lifetime_raw, dict):
             lifetime_requests = _coerce_int(lifetime_raw.get("requests"))
             lifetime_tokens_saved = _coerce_int(lifetime_raw.get("tokens_saved"))
             lifetime_savings_usd = _coerce_float(lifetime_raw.get("compression_savings_usd"))
+            lifetime_cache_read_tokens = _coerce_int(lifetime_raw.get("cache_read_tokens"))
+            lifetime_cache_savings_usd = _coerce_float(lifetime_raw.get("cache_savings_usd"))
             lifetime_input_tokens = _coerce_int(lifetime_raw.get("total_input_tokens"))
             lifetime_input_cost_usd = _coerce_float(lifetime_raw.get("total_input_cost_usd"))
 
@@ -897,6 +960,8 @@ class SavingsTracker:
                 "requests": lifetime_requests,
                 "tokens_saved": lifetime_tokens_saved,
                 "compression_savings_usd": round(lifetime_savings_usd, 6),
+                "cache_read_tokens": lifetime_cache_read_tokens,
+                "cache_savings_usd": round(lifetime_cache_savings_usd, 6),
                 "total_input_tokens": lifetime_input_tokens,
                 "total_input_cost_usd": round(lifetime_input_cost_usd, 6),
             },

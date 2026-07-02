@@ -756,42 +756,70 @@
             </div>
         </template>
 
-        <template x-if="(stats.prefix_cache?.totals?.requests || 0) > 0">
+        <!-- Card renders on live cache traffic OR persisted lifetime cache savings —
+             the lifetime figure must survive a restart with zero traffic. -->
+        <template x-if="cacheSessionActive || (stats.persistent_savings?.lifetime?.cache_read_tokens || 0) > 0">
             <div class="bg-surface rounded-lg p-4 border border-border mb-6">
                 <div class="flex justify-between items-center mb-3">
                     <div class="text-sm font-medium text-gray-300">Prefix Cache Impact</div>
-                    <div class="text-xs text-emerald-400 font-mono" x-text="'Net savings: $' + formatCurrency(stats.prefix_cache?.totals?.net_savings_usd || 0)"></div>
+                    <div class="text-xs text-emerald-400 font-mono"
+                         x-show="cacheSessionActive"
+                         x-text="'Net savings: $' + formatCurrency(stats.prefix_cache?.totals?.net_savings_usd || 0)"></div>
+                    <div class="text-xs text-gray-500 font-mono"
+                         x-show="!cacheSessionActive">no activity since restart</div>
                 </div>
                 <!-- Totals row -->
                 <div class="grid grid-cols-2 md:grid-cols-5 gap-4 mb-4">
                     <div>
-                        <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Cache Reads</div>
-                        <div class="text-2xl font-light tabular-nums text-emerald-400" x-text="formatNumber(stats.prefix_cache?.totals?.cache_read_tokens || 0)"></div>
-                        <div class="text-xs text-emerald-400/70" x-text="'$' + formatCurrency(stats.prefix_cache?.totals?.savings_usd || 0) + ' saved'"></div>
+                        <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Cache Reads (lifetime)</div>
+                        <div class="text-2xl font-light tabular-nums text-emerald-400" x-text="formatNumber(stats.persistent_savings?.lifetime?.cache_read_tokens || 0)"></div>
+                        <!-- Three-way zero state mirrors the Proxy $ Saved tile: real value /
+                             unpriced-but-healthy / litellm unavailable. -->
+                        <div class="text-xs text-emerald-400/70"
+                             x-show="(stats.persistent_savings?.lifetime?.cache_savings_usd || 0) > 0"
+                             x-text="'$' + formatCurrency(stats.persistent_savings?.lifetime?.cache_savings_usd || 0) + ' saved'"></div>
+                        <div class="text-xs text-gray-500"
+                             x-show="!((stats.persistent_savings?.lifetime?.cache_savings_usd || 0) > 0) && stats.litellm_available !== false">savings not priced yet</div>
+                        <div class="text-xs text-gray-500"
+                             x-show="!((stats.persistent_savings?.lifetime?.cache_savings_usd || 0) > 0) && stats.litellm_available === false">pricing needs LiteLLM</div>
                     </div>
                     <div>
                         <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Cache Writes</div>
-                        <div class="text-2xl font-light tabular-nums text-amber-400" x-text="formatNumber(stats.prefix_cache?.totals?.cache_write_tokens || 0)"></div>
-                        <div class="text-xs text-amber-400/70" x-text="'$' + formatCurrency(stats.prefix_cache?.totals?.write_premium_usd || 0) + ' write premium'"></div>
+                        <div class="text-2xl font-light tabular-nums text-amber-400"
+                             x-show="cacheSessionActive"
+                             x-text="formatNumber(stats.prefix_cache?.totals?.cache_write_tokens || 0)"></div>
+                        <div class="text-2xl font-light tabular-nums text-gray-600"
+                             x-show="!cacheSessionActive">&mdash;</div>
+                        <div class="text-xs text-amber-400/70"
+                             x-show="cacheSessionActive"
+                             x-text="'$' + formatCurrency(stats.prefix_cache?.totals?.write_premium_usd || 0) + ' write premium'"></div>
+                        <div class="text-xs text-gray-500"
+                             x-show="!cacheSessionActive">no activity since restart</div>
                     </div>
                     <div>
                         <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Hit Rate</div>
-                        <div class="text-2xl font-light tabular-nums" :class="(stats.prefix_cache?.totals?.hit_rate || 0) > 80 ? 'text-emerald-400' : (stats.prefix_cache?.totals?.hit_rate || 0) > 50 ? 'text-amber-400' : 'text-red-400'" x-text="(stats.prefix_cache?.totals?.hit_rate || 0).toFixed(0) + '%'"></div>
-                        <div class="text-xs text-gray-500" x-text="(stats.prefix_cache?.totals?.hit_requests || 0) + ' / ' + (stats.prefix_cache?.totals?.requests || 0) + ' requests'"></div>
+                        <div class="text-2xl font-light tabular-nums" x-show="cacheSessionActive" :class="(stats.prefix_cache?.totals?.hit_rate || 0) > 80 ? 'text-emerald-400' : (stats.prefix_cache?.totals?.hit_rate || 0) > 50 ? 'text-amber-400' : 'text-red-400'" x-text="(stats.prefix_cache?.totals?.hit_rate || 0).toFixed(0) + '%'"></div>
+                        <div class="text-2xl font-light tabular-nums text-gray-600" x-show="!cacheSessionActive">&mdash;</div>
+                        <div class="text-xs text-gray-500" x-show="cacheSessionActive" x-text="(stats.prefix_cache?.totals?.hit_requests || 0) + ' / ' + (stats.prefix_cache?.totals?.requests || 0) + ' requests'"></div>
+                        <div class="text-xs text-gray-500" x-show="!cacheSessionActive">no activity since restart</div>
                     </div>
                     <div>
                         <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Cache Busts</div>
-                        <div class="text-2xl font-light tabular-nums" :class="(stats.prefix_cache?.totals?.bust_count || 0) > 5 ? 'text-red-400' : (stats.prefix_cache?.totals?.bust_count || 0) > 0 ? 'text-amber-400' : 'text-emerald-400'" x-text="stats.prefix_cache?.totals?.bust_count || 0"></div>
-                        <div class="text-xs text-gray-500" x-text="formatNumber(stats.prefix_cache?.totals?.bust_write_tokens || 0) + ' tokens re-written'"></div>
+                        <div class="text-2xl font-light tabular-nums" x-show="cacheSessionActive" :class="(stats.prefix_cache?.totals?.bust_count || 0) > 5 ? 'text-red-400' : (stats.prefix_cache?.totals?.bust_count || 0) > 0 ? 'text-amber-400' : 'text-emerald-400'" x-text="stats.prefix_cache?.totals?.bust_count || 0"></div>
+                        <div class="text-2xl font-light tabular-nums text-gray-600" x-show="!cacheSessionActive">&mdash;</div>
+                        <div class="text-xs text-gray-500" x-show="cacheSessionActive" x-text="formatNumber(stats.prefix_cache?.totals?.bust_write_tokens || 0) + ' tokens re-written'"></div>
+                        <div class="text-xs text-gray-500" x-show="!cacheSessionActive">no activity since restart</div>
                     </div>
                     <div>
                         <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Providers</div>
-                        <div class="text-2xl font-light tabular-nums text-gray-300" x-text="Object.keys(stats.prefix_cache?.by_provider || {}).length"></div>
-                        <div class="text-xs text-gray-500">with cache data</div>
+                        <div class="text-2xl font-light tabular-nums text-gray-300" x-show="cacheSessionActive" x-text="Object.keys(stats.prefix_cache?.by_provider || {}).length"></div>
+                        <div class="text-2xl font-light tabular-nums text-gray-600" x-show="!cacheSessionActive">&mdash;</div>
+                        <div class="text-xs text-gray-500" x-show="cacheSessionActive">with cache data</div>
+                        <div class="text-xs text-gray-500" x-show="!cacheSessionActive">no activity since restart</div>
                     </div>
                 </div>
-                <!-- Cache efficiency bar -->
-                <div>
+                <!-- Cache efficiency bar (session-scoped; hidden until traffic arrives) -->
+                <div x-show="cacheSessionActive">
                     <div class="flex justify-between text-xs text-gray-500 mb-1">
                         <span>Cache Efficiency</span>
                         <span x-text="cacheSavingsPercent + '% of input served from cache'"></span>
@@ -2401,6 +2429,10 @@
                 },
 
                 // --- Prefix Cache ---
+
+                get cacheSessionActive() {
+                    return (this.stats.prefix_cache?.totals?.requests || 0) > 0;
+                },
 
                 get cacheSavingsPercent() {
                     const t = this.stats.prefix_cache?.totals || {};
