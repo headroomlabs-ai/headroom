@@ -12,8 +12,10 @@ LiteLLM handles all the auth and format translation internally.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import logging
+import os
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -423,6 +425,19 @@ class LiteLLMBackend(Backend):
 
         # For Bedrock, fetch model map dynamically from AWS API
         if provider == "bedrock":
+            # litellm takes the botocore-backed `_auth_with_aws_session_token`
+            # path as soon as temporary credentials (AWS_SESSION_TOKEN) are
+            # present. botocore is an optional dependency (the `bedrock`
+            # extra); when it is absent — as in the slim default Docker image —
+            # the failure only surfaces at request time as a misleading
+            # `authentication_error: No module named 'botocore'` (#1551). Fail
+            # fast at startup with an actionable message instead.
+            if os.environ.get("AWS_SESSION_TOKEN") and importlib.util.find_spec("botocore") is None:
+                raise ImportError(
+                    "Bedrock with temporary credentials (AWS_SESSION_TOKEN) requires "
+                    "botocore, which is not installed. Install the bedrock extra: "
+                    "pip install 'headroom-ai[bedrock]' (or pip install botocore)."
+                )
             self._model_map = _fetch_bedrock_inference_profiles(region)
             litellm.set_verbose = False  # Reduce noise
         else:
