@@ -7,6 +7,8 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 from headroom.install.models import DeploymentManifest, InstallPreset
 from headroom.install.runtime import (
     _clear_pid,
@@ -359,6 +361,56 @@ def test_run_foreground_and_detached_helpers(monkeypatch, tmp_path: Path) -> Non
         "headroom.install.runtime.subprocess.Popen", lambda command, **kwargs: fake_proc_posix
     )
     assert start_detached_agent("demo") is fake_proc_posix
+
+
+def test_start_detached_agent_closes_parent_log_fd(monkeypatch, tmp_path: Path) -> None:
+    """The parent must close its copy of the log file after Popen.
+
+    The child inherits the descriptor, so leaving the parent's copy open
+    leaks one fd per call and pins the log file open against rotation.
+    """
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr("headroom.install.runtime.resolve_headroom_command", lambda: ["headroom"])
+    monkeypatch.setattr("headroom.install.runtime.sys.platform", "linux")
+
+    captured: dict[str, object] = {}
+
+    class FakeProc:
+        pid = 999
+
+    def fake_popen(command: list[str], **kwargs):
+        captured["stdout"] = kwargs["stdout"]
+        captured["stderr"] = kwargs["stderr"]
+        return FakeProc()
+
+    monkeypatch.setattr("headroom.install.runtime.subprocess.Popen", fake_popen)
+
+    start_detached_agent("demo")
+
+    log_handle = captured["stdout"]
+    # Same handle is passed to both streams, and the parent closed it.
+    assert captured["stderr"] is log_handle
+    assert log_handle.closed is True
+
+
+def test_start_detached_agent_closes_log_fd_when_popen_raises(monkeypatch, tmp_path: Path) -> None:
+    """A Popen failure must not leak the just-opened log file handle."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr("headroom.install.runtime.resolve_headroom_command", lambda: ["headroom"])
+    monkeypatch.setattr("headroom.install.runtime.sys.platform", "linux")
+
+    captured: dict[str, object] = {}
+
+    def boom(command: list[str], **kwargs):
+        captured["stdout"] = kwargs["stdout"]
+        raise OSError("spawn failed")
+
+    monkeypatch.setattr("headroom.install.runtime.subprocess.Popen", boom)
+
+    with pytest.raises(OSError, match="spawn failed"):
+        start_detached_agent("demo")
+
+    assert captured["stdout"].closed is True
 
 
 def test_start_stop_wait_and_runtime_status_branches(monkeypatch, tmp_path: Path) -> None:
