@@ -708,7 +708,7 @@ class ContentRouterConfig:
     enable_image_optimizer: bool = True  # Image token optimization
 
     # Routing preferences
-    prefer_code_aware_for_code: bool = False  # Disabled: let code pass through unmangled
+    prefer_code_aware_for_code: bool = True  # Route code to CodeAware over Kompress for higher, syntax-safe compression
     # Route ALL compressible content to Kompress, skipping per-type selection.
     # Tool exclusion (Read/Glob/...) and reversibility gates still apply.
     force_kompress_all: bool = False
@@ -1564,7 +1564,10 @@ class ContentRouter(Transform):
                     if compressor:
                         compressor_name = type(compressor).__name__
                         result = compressor.compress(content, language=language, context=context)
-                        compressed, compressed_tokens = result.compressed, result.compressed_tokens
+                        compressed, compressed_tokens = (
+                            result.compressed,
+                            len(result.compressed.split()),
+                        )
                         decision_reason = "code_aware"
                 if compressed is None:
                     # Fallback to Kompress
