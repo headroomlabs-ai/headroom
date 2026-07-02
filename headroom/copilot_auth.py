@@ -166,6 +166,12 @@ def _configured_enterprise_domain() -> str | None:
     return _copilot_subdomain_enterprise_host(enterprise_url)
 
 
+def default_oauth_domain() -> str:
+    """Return the OAuth domain from GITHUB_COPILOT_ENTERPRISE_URL, or github.com."""
+    domain = _configured_enterprise_domain()
+    return domain if domain else DEFAULT_GITHUB_HOST
+
+
 def _configured_api_url() -> str:
     api_url = os.environ.get("GITHUB_COPILOT_API_URL", "").strip()
     if api_url:
