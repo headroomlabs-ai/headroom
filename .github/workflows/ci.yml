@@ -10,6 +10,8 @@ name: CI
 #
 # Notes: CPU-only torch everywhere (no CUDA stack); test shards run HF_HUB_OFFLINE.
 # Multi-version (3.10/3.11/3.13) coverage on main is a planned follow-up.
+# Windows wheel (win_amd64) built separately — builds the Rust ext just like the
+# Linux wheel, then uploads as a separate artifact for downstream consumption.
 
 on:
   push:
@@ -115,6 +117,31 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: headroom-wheel
+          path: dist/*.whl
+          retention-days: 1
+
+  build-wheel-windows:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PY_VERSION }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+      - name: Build wheel (fast CI cargo profile)
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip maturin
+          maturin build --profile ci --out dist --interpreter "python${{ env.PY_VERSION }}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: headroom-wheel-windows
           path: dist/*.whl
           retention-days: 1
 
