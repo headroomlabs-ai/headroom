@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Unreleased
 
 ### Fixed
+- **`wrap codex`:** verify proxy optional dependencies before mutating Codex `config.toml`, so a missing `[proxy]` extra aborts cleanly instead of leaving Codex pointed at a proxy that never started ([#1614](https://github.com/headroomlabs-ai/headroom/issues/1614)).
 - `--backend bedrock` now fails fast with an actionable error when temporary
   AWS credentials (`AWS_SESSION_TOKEN`) are used but botocore is not installed
   (e.g. the slim default Docker image). litellm's session-token auth path

@@ -48,6 +48,7 @@ from headroom._version import __version__ as _HEADROOM_VERSION
 from headroom.agent_savings import (
     apply_agent_savings_env_defaults,
 )
+from headroom.cli.proxy import ensure_proxy_dependencies
 from headroom.copilot_auth import (
     has_oauth_auth,
     resolve_client_bearer_token,
@@ -4290,6 +4291,9 @@ def codex(
         headroom wrap codex --port 9999             # Custom proxy port
         headroom wrap codex --backend anyllm --anyllm-provider groq
     """
+    if not no_proxy:
+        ensure_proxy_dependencies()
+
     # Snapshot Codex config.toml BEFORE any wrap-time mutation so
     # `headroom unwrap codex` can restore the user's pre-wrap state
     # byte-for-byte. The snapshot is a no-op if the backup already exists

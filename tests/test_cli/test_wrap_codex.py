@@ -20,6 +20,7 @@ from click.testing import CliRunner
 
 from headroom.cli import wrap as wrap_mod
 from headroom.cli.main import main
+from headroom.cli.proxy import ensure_proxy_dependencies
 from headroom.mcp_registry.install import build_headroom_spec
 
 
@@ -830,6 +831,90 @@ def test_wrap_codex_prepare_only_creates_backup_and_config(
     backup = tmp_path / ".codex" / "config.toml.headroom-backup"
     assert backup.exists()
     assert backup.read_text(encoding="utf-8") == original
+
+
+def test_wrap_codex_aborts_before_mutating_config_when_proxy_deps_missing(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_test_home(monkeypatch, tmp_path)
+    config_file = tmp_path / ".codex" / "config.toml"
+    config_file.parent.mkdir(parents=True)
+    original = 'model_provider = "openai"\n'
+    config_file.write_text(original, encoding="utf-8")
+
+    with (
+        patch("headroom.cli.wrap._ensure_rtk_binary", return_value=None),
+        patch(
+            "headroom.cli.wrap.ensure_proxy_dependencies",
+            side_effect=SystemExit(1),
+        ),
+    ):
+        result = runner.invoke(
+            main,
+            ["wrap", "codex", "--prepare-only", "--no-serena", "--port", "8787"],
+        )
+
+    assert result.exit_code == 1, result.output
+    assert config_file.read_text(encoding="utf-8") == original
+    assert "[mcp_servers.headroom]" not in config_file.read_text(encoding="utf-8")
+    assert not (tmp_path / ".codex" / "config.toml.headroom-backup").exists()
+
+
+def test_wrap_codex_skips_proxy_dependency_check_with_no_proxy(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_test_home(monkeypatch, tmp_path)
+    config_file = tmp_path / ".codex" / "config.toml"
+    config_file.parent.mkdir(parents=True)
+    config_file.write_text('model_provider = "openai"\n', encoding="utf-8")
+
+    with (
+        patch("headroom.cli.wrap._ensure_rtk_binary", return_value=None),
+        patch(
+            "headroom.cli.wrap.ensure_proxy_dependencies",
+            side_effect=AssertionError("should not run with --no-proxy"),
+        ),
+    ):
+        result = runner.invoke(
+            main,
+            [
+                "wrap",
+                "codex",
+                "--prepare-only",
+                "--no-proxy",
+                "--no-serena",
+                "--port",
+                "8787",
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+
+
+def test_ensure_proxy_dependencies_exits_when_server_import_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import builtins
+
+    real_import = builtins.__import__
+
+    def fake_import(
+        name: str,
+        globals: dict | None = None,
+        locals: dict | None = None,
+        fromlist: tuple = (),
+        level: int = 0,
+    ):
+        if name == "headroom.proxy.server":
+            raise ImportError("No module named 'fastapi'")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+
+    with pytest.raises(SystemExit) as exc_info:
+        ensure_proxy_dependencies()
+
+    assert exc_info.value.code == 1
 
 
 def test_wrap_codex_prepare_only_respects_codex_home(
