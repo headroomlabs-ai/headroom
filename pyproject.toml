@@ -59,6 +59,13 @@ dependencies = [
     "opentelemetry-api>=1.24.0",  # Safe no-op OTEL API for instrumentation
     "ast-grep-cli>=0.30.0",       # AST-aware code slicing (CodeCompressor); binary wheel
     "tomli>=2.0.0; python_version < '3.11'",  # tomllib backport for helper scripts
+    # Batteries-included: pull in every standard optional feature by default so a
+    # plain `pip install headroom-ai` ships the proxy, ML/Kompress, code, memory,
+    # relevance, image, reports, otel, evals, voice, html, benchmark, mcp and
+    # spreadsheet extras. Self-references the [all] aggregate (same pattern already
+    # used by [all]/[proxy-prod]/[voice-train]); platform-specific extras
+    # (pytorch-mps, proxy-prod/gunicorn, memory-stack) stay opt-in as before.
+    "headroom-ai[all]",
 ]
 
 [project.optional-dependencies]
