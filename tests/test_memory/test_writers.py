@@ -230,6 +230,33 @@ class TestClaudeCodeWriter:
         assert result.files_written == []
         assert any("ignored for mutation" in w for w in result.warnings)
 
+    def test_config_ignore_mutate_blocks_export(self, tmp_path: Path):
+        """HeadroomConfig.ignore.mutate (passed to export()) blocks a real write."""
+        from headroom.config import HeadroomConfig, IgnoreConfig
+
+        writer = ClaudeCodeMemoryWriter(project_path=tmp_path, memory_dir=tmp_path / "memory")
+        entries = _make_entries(3)
+        config = HeadroomConfig(ignore=IgnoreConfig(mutate=["MEMORY.md"]))
+
+        result = writer.export(entries, dry_run=False, config=config)
+
+        assert not (tmp_path / "memory" / "MEMORY.md").exists()
+        assert result.files_written == []
+        assert any("ignored for mutation" in w for w in result.warnings)
+
+    def test_config_ignore_mutate_ignored_without_passing_config(self, tmp_path: Path):
+        """Backward compatibility: omitting `config` behaves exactly as before."""
+        from headroom.config import HeadroomConfig, IgnoreConfig
+
+        writer = ClaudeCodeMemoryWriter(project_path=tmp_path, memory_dir=tmp_path / "memory")
+        entries = _make_entries(3)
+        HeadroomConfig(ignore=IgnoreConfig(mutate=["MEMORY.md"]))  # never passed in
+
+        result = writer.export(entries, dry_run=False)
+
+        assert (tmp_path / "memory" / "MEMORY.md").exists()
+        assert result.warnings == []
+
 
 # =============================================================================
 # Cursor Writer Tests

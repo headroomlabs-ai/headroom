@@ -61,6 +61,7 @@ class ContextWriter(ABC):
         recommendations: list[Recommendation],
         project: ProjectInfo,
         dry_run: bool = True,
+        config: object | None = None,
     ) -> WriteResult: ...
 
 
@@ -84,15 +85,29 @@ class WriteResult:
         self.content_by_file[path] = content
 
 
-def _mutation_blocked(target_path: Path, project: ProjectInfo, result: WriteResult) -> bool:
+def _mutation_blocked(
+    target_path: Path,
+    project: ProjectInfo,
+    result: WriteResult,
+    config: object | None = None,
+) -> bool:
     """Return True and record a warning if ``target_path`` is ignored for mutation.
 
     Central enforcement point for the ``.headroomignore`` / ``ignore.mutate``
     policy (see :mod:`headroom.ignore`): repositories can list generated
     agent-harness files (e.g. cARL-managed ``CLAUDE.md``/``AGENTS.md``) so
     Headroom's ``learn`` writers never overwrite them.
+
+    ``config``, if given, should be a ``headroom.config.HeadroomConfig`` (or
+    any object with an ``ignore`` attribute shaped like ``IgnoreConfig``) so
+    programmatic callers (SDK integrations that already hold a
+    ``HeadroomConfig``) get ``ignore.mutate`` enforcement too. The
+    ``headroom learn`` CLI itself has no config-file loader today, so it
+    calls writers without ``config`` and only ``.headroomignore`` applies —
+    see README "Ignoring governed / generated files".
     """
-    policy = IgnorePolicy.load(project.project_path)
+    ignore_config = getattr(config, "ignore", None) if config is not None else None
+    policy = IgnorePolicy.load(project.project_path, ignore_config)
     rule = policy.matching_rule(target_path, "mutate")
     if rule is None:
         return False
@@ -261,6 +276,7 @@ class ClaudeCodeWriter(ContextWriter):
         recommendations: list[Recommendation],
         project: ProjectInfo,
         dry_run: bool = True,
+        config: object | None = None,
     ) -> WriteResult:
         result = WriteResult()
         result.dry_run = dry_run
@@ -270,7 +286,7 @@ class ClaudeCodeWriter(ContextWriter):
 
         if context_recs:
             target_path = self._resolve_context_path(project)
-            if not _mutation_blocked(target_path, project, result):
+            if not _mutation_blocked(target_path, project, result, config):
                 # Migrate any stale block left in the team-shared CLAUDE.md by
                 # older headroom versions into the new target, then strip it
                 # from CLAUDE.md so the shared file is no longer polluted.
@@ -285,7 +301,7 @@ class ClaudeCodeWriter(ContextWriter):
 
         if memory_recs:
             memory_path = self._resolve_memory_path(project)
-            if not _mutation_blocked(memory_path, project, result):
+            if not _mutation_blocked(memory_path, project, result, config):
                 full_content = _merge_into_file(memory_path, memory_recs)
                 result.add(memory_path, full_content)
                 if not dry_run:
@@ -378,6 +394,7 @@ class CodexWriter(ContextWriter):
         recommendations: list[Recommendation],
         project: ProjectInfo,
         dry_run: bool = True,
+        config: object | None = None,
     ) -> WriteResult:
         result = WriteResult()
         result.dry_run = dry_run
@@ -387,7 +404,7 @@ class CodexWriter(ContextWriter):
 
         if context_recs:
             agents_md = project.context_file or (project.project_path / "AGENTS.md")
-            if not _mutation_blocked(agents_md, project, result):
+            if not _mutation_blocked(agents_md, project, result, config):
                 full_content = _merge_into_file(agents_md, context_recs)
                 result.add(agents_md, full_content)
                 if not dry_run:
@@ -396,7 +413,7 @@ class CodexWriter(ContextWriter):
 
         if memory_recs:
             instructions_md = project.memory_file or (project.data_path.parent / "instructions.md")
-            if not _mutation_blocked(instructions_md, project, result):
+            if not _mutation_blocked(instructions_md, project, result, config):
                 full_content = _merge_into_file(instructions_md, memory_recs)
                 result.add(instructions_md, full_content)
                 if not dry_run:
@@ -419,6 +436,7 @@ class GeminiWriter(ContextWriter):
         recommendations: list[Recommendation],
         project: ProjectInfo,
         dry_run: bool = True,
+        config: object | None = None,
     ) -> WriteResult:
         result = WriteResult()
         result.dry_run = dry_run
@@ -427,7 +445,7 @@ class GeminiWriter(ContextWriter):
             return result
 
         gemini_md = project.context_file or (project.project_path / "GEMINI.md")
-        if _mutation_blocked(gemini_md, project, result):
+        if _mutation_blocked(gemini_md, project, result, config):
             return result
         full_content = _merge_into_file(gemini_md, recommendations)
         result.add(gemini_md, full_content)

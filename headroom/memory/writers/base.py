@@ -76,13 +76,26 @@ class ExportResult:
     warnings: list[str] = field(default_factory=list)
 
 
-def _mutation_blocked(target: Path, project_path: Path, result: ExportResult) -> bool:
+def _mutation_blocked(
+    target: Path,
+    project_path: Path,
+    result: ExportResult,
+    config: object | None = None,
+) -> bool:
     """Return True and record a warning if ``target`` is ignored for mutation.
 
     Shared enforcement point for the ``.headroomignore`` / ``ignore.mutate``
     policy (see :mod:`headroom.ignore`) across all agent-native memory writers.
+
+    ``config``, if given, should be a ``headroom.config.HeadroomConfig`` (or
+    any object with an ``ignore`` attribute shaped like ``IgnoreConfig``).
+    ``headroom memory export`` (the CLI) has no config-file loader today, so
+    it calls ``export()`` without ``config`` and only ``.headroomignore``
+    applies; programmatic callers that already hold a ``HeadroomConfig``
+    should pass it through to get ``ignore.mutate`` enforcement too.
     """
-    policy = IgnorePolicy.load(project_path)
+    ignore_config = getattr(config, "ignore", None) if config is not None else None
+    policy = IgnorePolicy.load(project_path, ignore_config)
     rule = policy.matching_rule(target, "mutate")
     if rule is None:
         return False
@@ -124,6 +137,7 @@ class AgentWriter(ABC):
         memories: list[MemoryEntry],
         output_path: Path | None = None,
         dry_run: bool = True,
+        config: object | None = None,
     ) -> ExportResult:
         """Export memories to agent-native format.
 
@@ -131,6 +145,9 @@ class AgentWriter(ABC):
             memories: Memory entries to export.
             output_path: Override output path (uses default if None).
             dry_run: If True, don't write files.
+            config: Optional ``HeadroomConfig`` (or object with an ``ignore``
+                attribute) so ``ignore.mutate`` config rules — not just
+                ``.headroomignore`` — are enforced for this export.
 
         Returns:
             ExportResult with files written and stats.
@@ -176,7 +193,7 @@ class AgentWriter(ABC):
 
         # Determine output path
         target = output_path or self.default_path()
-        if _mutation_blocked(target, self._project_path, result):
+        if _mutation_blocked(target, self._project_path, result, config):
             return result
 
         # Merge into existing file

@@ -299,6 +299,45 @@ class TestIgnorePolicyEnforcement:
         assert claude_local.exists()
         assert result.warnings == []
 
+    def test_config_ignore_mutate_blocks_context_file_write(self, tmp_path):
+        """HeadroomConfig.ignore.mutate — not just .headroomignore — is honored.
+
+        Exercises the real `ClaudeCodeWriter.write(..., config=...)` production
+        path (not just `IgnorePolicy` directly), per issue review: config-driven
+        ignore.mutate must actually stop a writer mutation.
+        """
+        from headroom.config import HeadroomConfig, IgnoreConfig
+
+        proj = _project(tmp_path)
+        writer = ClaudeCodeWriter()
+        recs = [_rec(RecommendationTarget.CONTEXT_FILE, "Environment", "- Use uv")]
+        config = HeadroomConfig(ignore=IgnoreConfig(mutate=["CLAUDE.local.md"]))
+
+        result = writer.write(recs, proj, dry_run=False, config=config)
+
+        claude_local = proj.project_path / "CLAUDE.local.md"
+        assert not claude_local.exists()
+        assert result.files_written == []
+        assert any("ignored for mutation" in w for w in result.warnings)
+
+    def test_config_ignore_mutate_not_applied_without_passing_config(self, tmp_path):
+        """Backward compatibility: omitting `config` behaves exactly as before."""
+        from headroom.config import HeadroomConfig, IgnoreConfig
+
+        proj = _project(tmp_path)
+        writer = ClaudeCodeWriter()
+        recs = [_rec(RecommendationTarget.CONTEXT_FILE, "Environment", "- Use uv")]
+        # A HeadroomConfig with a matching ignore.mutate rule exists, but the
+        # caller doesn't pass it in — matches today's `headroom learn` CLI,
+        # which has no config-file loader.
+        HeadroomConfig(ignore=IgnoreConfig(mutate=["CLAUDE.local.md"]))
+
+        result = writer.write(recs, proj, dry_run=False)
+
+        claude_local = proj.project_path / "CLAUDE.local.md"
+        assert claude_local.exists()
+        assert result.warnings == []
+
 
 class TestContextTargetOverride:
     """--target / set_context_target controls where CONTEXT_FILE recs are written."""

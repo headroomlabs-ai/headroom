@@ -62,6 +62,7 @@ class CursorMemoryWriter(AgentWriter):
         memories: list[MemoryEntry],
         output_path: Path | None = None,
         dry_run: bool = True,
+        config: object | None = None,
     ) -> ExportResult:
         """Export with Cursor-specific .mdc frontmatter."""
         result = ExportResult(dry_run=dry_run)
@@ -98,7 +99,7 @@ class CursorMemoryWriter(AgentWriter):
         body = self.format_memories(budgeted)
 
         target = output_path or self.default_path()
-        if _mutation_blocked(target, self._project_path, result):
+        if _mutation_blocked(target, self._project_path, result, config):
             return result
 
         # If file exists and has our markers, only replace marker section
