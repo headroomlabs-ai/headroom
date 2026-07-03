@@ -761,6 +761,17 @@ class IgnoreConfig:
     from a canonical source (e.g. cARL's ``.github/carl/``) can list those
     paths here (or in ``.headroomignore``) so Headroom never learns from or
     overwrites the generated projections.
+
+    Wiring status (see README "Ignoring governed / generated files" for the
+    full picture): ``mutate``/``learn``/``memory`` are enforced by the
+    ``headroom learn`` writers/analyzer, the memory writers, and the
+    code-graph watcher — the CLI paths only see ``.headroomignore`` (no
+    config-file loader exists), but ``ContextWriter.write(..., config=...)``
+    / ``AgentWriter.export(..., config=...)`` / ``SessionAnalyzer(config=...)``
+    honor this config when a caller passes it in. ``compress`` is enforced in
+    the SDK (``TransformPipeline``) and proxy compression paths, specifically
+    in Read-lifecycle stale/superseded detection — the one place a real file
+    path is known during compression.
     """
 
     paths: list[str] = field(default_factory=list)

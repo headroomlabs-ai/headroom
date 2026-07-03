@@ -124,11 +124,7 @@ class IgnoreRule:
             # Bare directory name (e.g. "node_modules/"): matches that
             # directory at *any* depth, mirroring a plain gitignore entry.
             segments = rel_posix.split("/")
-            return (
-                rel_posix == pat
-                or rel_posix.startswith(pat + "/")
-                or pat in segments[:-1]
-            )
+            return rel_posix == pat or rel_posix.startswith(pat + "/") or pat in segments[:-1]
 
         if rooted or "/" in pat:
             # Rooted pattern: match against the full relative path. Also treat

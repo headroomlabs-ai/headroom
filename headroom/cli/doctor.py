@@ -637,7 +637,9 @@ def _estimated_basis_note(cost: dict[str, Any]) -> str:
     return note
 
 
-def check_ignore_rules(project_dir: Path | None = None, config: object | None = None) -> CheckResult:
+def check_ignore_rules(
+    project_dir: Path | None = None, config: object | None = None
+) -> CheckResult:
     """Surface the ``.headroomignore`` file / ``ignore.*`` config rules in effect.
 
     Purely local (no proxy needed): always runs so users can see which paths

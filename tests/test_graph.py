@@ -267,9 +267,7 @@ def test_code_graph_watcher_ignores_headroomignore_paths(monkeypatch, tmp_path: 
     assert scheduled == ["reindex"]
 
 
-def test_code_graph_watcher_ignores_config_ignore_memory_paths(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_code_graph_watcher_ignores_config_ignore_memory_paths(monkeypatch, tmp_path: Path) -> None:
     """`ignore.memory` config (no .headroomignore file) also suppresses reindex (#1150)."""
     from headroom.config import IgnoreConfig
 
