@@ -611,6 +611,72 @@ with your stack and rough monthly LLM spend.
 Everything in this repo stays open source under Apache 2.0. The managed offering
 is for teams that would rather have it deployed, supported and scaled for them.
 
+## Ignoring governed / generated files (`.headroomignore`)
+
+Some repositories generate agent-instruction files (`CLAUDE.md`, `AGENTS.md`,
+`.github/copilot-instructions.md`, `.cursorrules`, `ANTIGRAVITY.md`, ...) from
+a canonical source of truth managed by another tool — for example a
+[cARL](https://github.com/headroomlabs-ai/headroom)-managed repository, where
+durable governance/memory lives under `.github/carl/` and the harness files
+above are generated projections. If Headroom compresses, learns from,
+indexes, or mutates those projections directly, it can drift from the
+canonical source and get silently overwritten the next time the owning tool
+regenerates them.
+
+Add a `.headroomignore` file at your repository root (gitignore-flavored glob
+syntax) to protect those paths from every Headroom behavior:
+
+```gitignore
+# cARL canonical runtime and governance artefacts
+.github/carl/**
+
+# cARL-generated harness projections
+.github/copilot-instructions.md
+CLAUDE.md
+AGENTS.md
+.cursorrules
+ANTIGRAVITY.md
+```
+
+- Blank lines and `#` comments are ignored.
+- A pattern ending in `/` ignores that directory and everything below it.
+- A pattern containing `/` is matched relative to the repository root
+  (`.github/carl/**` only matches under `.github/carl/`).
+- A bare pattern with no `/` (e.g. `CLAUDE.md`) matches at any depth, like a
+  normal `.gitignore` entry.
+
+For code-driven configuration, or to scope a rule to a single behavior, set
+`HeadroomConfig.ignore`:
+
+```python
+from headroom.config import HeadroomConfig, IgnoreConfig
+
+config = HeadroomConfig(
+    ignore=IgnoreConfig(
+        # Applies to every behavior (compress/learn/mutate/memory) — equivalent
+        # to a .headroomignore entry.
+        paths=[".github/carl/**"],
+        # Or scope to a single behavior:
+        mutate=[".github/copilot-instructions.md", "CLAUDE.md", "AGENTS.md", ".cursorrules", "ANTIGRAVITY.md"],
+    )
+)
+```
+
+`.headroomignore` and `HeadroomConfig.ignore` are merged — a path ignored by
+either is ignored. With neither present, nothing changes: existing behavior
+is fully backward compatible.
+
+Today this is enforced wherever Headroom writes learned corrections
+(`headroom learn`'s `CLAUDE.local.md`/`AGENTS.md`/`GEMINI.md`/`MEMORY.md`
+writers), reads a context/memory file back in as a learning baseline, and
+triggers repository re-indexing (the code-graph file watcher). The same
+`headroom.ignore.IgnorePolicy` is a small, reusable API any other code path
+can call to ask "is this path ignored for X?" instead of adding ad hoc glob
+checks.
+
+Run `headroom doctor` to see which ignore rules are currently active (an
+`ignore-rules` check lists every loaded pattern, its scope, and its source).
+
 ## Documentation
 
 | Start here | Go deeper |

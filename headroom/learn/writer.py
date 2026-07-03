@@ -11,6 +11,8 @@ from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 from pathlib import Path
 
+from headroom.ignore import IgnorePolicy
+
 from ._shared import claude_config_dir
 from .models import (
     ProjectInfo,
@@ -80,6 +82,25 @@ class WriteResult:
     def add(self, path: Path, content: str) -> None:
         self.files_written.append(path)
         self.content_by_file[path] = content
+
+
+def _mutation_blocked(target_path: Path, project: ProjectInfo, result: WriteResult) -> bool:
+    """Return True and record a warning if ``target_path`` is ignored for mutation.
+
+    Central enforcement point for the ``.headroomignore`` / ``ignore.mutate``
+    policy (see :mod:`headroom.ignore`): repositories can list generated
+    agent-harness files (e.g. cARL-managed ``CLAUDE.md``/``AGENTS.md``) so
+    Headroom's ``learn`` writers never overwrite them.
+    """
+    policy = IgnorePolicy.load(project.project_path)
+    rule = policy.matching_rule(target_path, "mutate")
+    if rule is None:
+        return False
+    result.warnings.append(
+        f"Skipped writing {target_path}: ignored for mutation by rule "
+        f"'{rule.pattern}' (from {rule.source})."
+    )
+    return True
 
 
 # =============================================================================
@@ -249,25 +270,27 @@ class ClaudeCodeWriter(ContextWriter):
 
         if context_recs:
             target_path = self._resolve_context_path(project)
-            # Migrate any stale block left in the team-shared CLAUDE.md by older
-            # headroom versions into the new target, then strip it from CLAUDE.md
-            # so the shared file is no longer polluted.
-            migrated = self._migrate_legacy_block(project, target_path, result, dry_run)
-            new_sections = {r.section for r in context_recs}
-            merged_recs = context_recs + [r for r in migrated if r.section not in new_sections]
-            full_content = _merge_into_file(target_path, merged_recs)
-            result.add(target_path, full_content)
-            if not dry_run:
-                target_path.parent.mkdir(parents=True, exist_ok=True)
-                target_path.write_text(full_content, encoding="utf-8", newline="\n")
+            if not _mutation_blocked(target_path, project, result):
+                # Migrate any stale block left in the team-shared CLAUDE.md by
+                # older headroom versions into the new target, then strip it
+                # from CLAUDE.md so the shared file is no longer polluted.
+                migrated = self._migrate_legacy_block(project, target_path, result, dry_run)
+                new_sections = {r.section for r in context_recs}
+                merged_recs = context_recs + [r for r in migrated if r.section not in new_sections]
+                full_content = _merge_into_file(target_path, merged_recs)
+                result.add(target_path, full_content)
+                if not dry_run:
+                    target_path.parent.mkdir(parents=True, exist_ok=True)
+                    target_path.write_text(full_content, encoding="utf-8", newline="\n")
 
         if memory_recs:
             memory_path = self._resolve_memory_path(project)
-            full_content = _merge_into_file(memory_path, memory_recs)
-            result.add(memory_path, full_content)
-            if not dry_run:
-                memory_path.parent.mkdir(parents=True, exist_ok=True)
-                memory_path.write_text(full_content, encoding="utf-8", newline="\n")
+            if not _mutation_blocked(memory_path, project, result):
+                full_content = _merge_into_file(memory_path, memory_recs)
+                result.add(memory_path, full_content)
+                if not dry_run:
+                    memory_path.parent.mkdir(parents=True, exist_ok=True)
+                    memory_path.write_text(full_content, encoding="utf-8", newline="\n")
 
         return result
 
@@ -364,19 +387,21 @@ class CodexWriter(ContextWriter):
 
         if context_recs:
             agents_md = project.context_file or (project.project_path / "AGENTS.md")
-            full_content = _merge_into_file(agents_md, context_recs)
-            result.add(agents_md, full_content)
-            if not dry_run:
-                agents_md.parent.mkdir(parents=True, exist_ok=True)
-                agents_md.write_text(full_content, encoding="utf-8", newline="\n")
+            if not _mutation_blocked(agents_md, project, result):
+                full_content = _merge_into_file(agents_md, context_recs)
+                result.add(agents_md, full_content)
+                if not dry_run:
+                    agents_md.parent.mkdir(parents=True, exist_ok=True)
+                    agents_md.write_text(full_content, encoding="utf-8", newline="\n")
 
         if memory_recs:
             instructions_md = project.memory_file or (project.data_path.parent / "instructions.md")
-            full_content = _merge_into_file(instructions_md, memory_recs)
-            result.add(instructions_md, full_content)
-            if not dry_run:
-                instructions_md.parent.mkdir(parents=True, exist_ok=True)
-                instructions_md.write_text(full_content, encoding="utf-8", newline="\n")
+            if not _mutation_blocked(instructions_md, project, result):
+                full_content = _merge_into_file(instructions_md, memory_recs)
+                result.add(instructions_md, full_content)
+                if not dry_run:
+                    instructions_md.parent.mkdir(parents=True, exist_ok=True)
+                    instructions_md.write_text(full_content, encoding="utf-8", newline="\n")
 
         return result
 
@@ -402,6 +427,8 @@ class GeminiWriter(ContextWriter):
             return result
 
         gemini_md = project.context_file or (project.project_path / "GEMINI.md")
+        if _mutation_blocked(gemini_md, project, result):
+            return result
         full_content = _merge_into_file(gemini_md, recommendations)
         result.add(gemini_md, full_content)
         if not dry_run:

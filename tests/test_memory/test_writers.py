@@ -219,6 +219,17 @@ class TestClaudeCodeWriter:
         assert "john-doe" not in rendered
         assert rendered.endswith("MEMORY.md")
 
+    def test_headroomignore_blocks_export(self, tmp_path: Path):
+        (tmp_path / ".headroomignore").write_text("MEMORY.md\n")
+        writer = ClaudeCodeMemoryWriter(project_path=tmp_path, memory_dir=tmp_path / "memory")
+        entries = _make_entries(3)
+
+        result = writer.export(entries, dry_run=False)
+
+        assert not (tmp_path / "memory" / "MEMORY.md").exists()
+        assert result.files_written == []
+        assert any("ignored for mutation" in w for w in result.warnings)
+
 
 # =============================================================================
 # Cursor Writer Tests
@@ -263,6 +274,17 @@ class TestCursorWriter:
         assert "old stuff" not in content
         assert "Test memory entry" in content
         assert "alwaysApply: true" in content  # Preserved
+
+    def test_headroomignore_blocks_export(self, tmp_path: Path):
+        (tmp_path / ".headroomignore").write_text(".cursor/rules/**\n")
+        writer = CursorMemoryWriter(project_path=tmp_path)
+        entries = _make_entries(3)
+
+        result = writer.export(entries, dry_run=False)
+
+        mdc_path = tmp_path / ".cursor" / "rules" / "headroom-memory.mdc"
+        assert not mdc_path.exists()
+        assert any("ignored for mutation" in w for w in result.warnings)
 
 
 # =============================================================================

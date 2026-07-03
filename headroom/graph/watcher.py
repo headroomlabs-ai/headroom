@@ -24,6 +24,7 @@ import time
 from pathlib import Path
 
 from headroom._subprocess import run
+from headroom.ignore import IgnorePolicy
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +116,7 @@ class CodeGraphWatcher:
         self.project_dir = str(project_dir)
         self.debounce_seconds = debounce_seconds
         self.cbm_binary: str | None = None
+        self._ignore_policy = IgnorePolicy.load(project_dir)
         if cbm_binary:
             self.cbm_binary = cbm_binary
         else:
@@ -165,6 +167,12 @@ class CodeGraphWatcher:
 
                 # Skip temporary/swap files
                 if path.name.startswith(".") or path.name.endswith("~"):
+                    return
+
+                # Skip paths ignored for indexing/memory (.headroomignore /
+                # ignore.memory config — e.g. generated agent-harness files
+                # projected from a canonical source; issue #1150).
+                if self._watcher._ignore_policy.is_ignored(path, "memory"):
                     return
 
                 self._watcher._schedule_reindex()

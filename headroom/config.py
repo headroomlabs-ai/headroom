@@ -740,6 +740,37 @@ class PrefixFreezeConfig:
 
 
 @dataclass
+class IgnoreConfig:
+    """Path/glob ignore rules for compress/learn/mutate/memory behaviors.
+
+    Complements a ``.headroomignore`` file at the repository root (same glob
+    syntax — see :mod:`headroom.ignore`). Both sources are merged; a path
+    matching *either* is ignored for the relevant behavior(s).
+
+    ``paths`` applies to every behavior (compress, learn, mutate, memory).
+    The per-behavior lists let a rule apply narrowly, e.g. allowing a file to
+    be compressed but never mutated::
+
+        HeadroomConfig(ignore=IgnoreConfig(
+            mutate=[".github/carl/**", "CLAUDE.md", "AGENTS.md"],
+        ))
+
+    This is the generic mechanism behind issue #1150: repositories that
+    generate agent-harness files (``CLAUDE.md``, ``AGENTS.md``,
+    ``.github/copilot-instructions.md``, ``.cursorrules``, ``ANTIGRAVITY.md``)
+    from a canonical source (e.g. cARL's ``.github/carl/``) can list those
+    paths here (or in ``.headroomignore``) so Headroom never learns from or
+    overwrites the generated projections.
+    """
+
+    paths: list[str] = field(default_factory=list)
+    compress: list[str] = field(default_factory=list)
+    learn: list[str] = field(default_factory=list)
+    mutate: list[str] = field(default_factory=list)
+    memory: list[str] = field(default_factory=list)
+
+
+@dataclass
 class HeadroomConfig:
     """Main configuration for HeadroomClient."""
 
@@ -753,6 +784,7 @@ class HeadroomConfig:
     cache_optimizer: CacheOptimizerConfig = field(default_factory=CacheOptimizerConfig)
     ccr: CCRConfig = field(default_factory=CCRConfig)  # Compress-Cache-Retrieve
     prefix_freeze: PrefixFreezeConfig = field(default_factory=PrefixFreezeConfig)
+    ignore: IgnoreConfig = field(default_factory=IgnoreConfig)
 
     # Output buffer reserved for the model's response when sizing the
     # incoming context. Previously lived on RollingWindowConfig; hoisted

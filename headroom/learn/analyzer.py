@@ -25,6 +25,7 @@ import time
 import typing
 
 from headroom._subprocess import Popen, run
+from headroom.ignore import IgnorePolicy
 
 from .loops import LoopPattern, apply_loop_weighting, detect_loops, format_loops_for_digest
 from .models import (
@@ -266,8 +267,15 @@ def _build_prior_patterns_section(project: ProjectInfo) -> str:
         ("CLAUDE.md (CONTEXT_FILE, project-level stable facts)", project.context_file),
         ("MEMORY.md (MEMORY_FILE, session-level evolving preferences)", project.memory_file),
     )
+    policy = IgnorePolicy.load(project.project_path)
     for label, path in candidates:
         if path is None or not path.exists():
+            continue
+        if policy.is_ignored(path, "learn"):
+            # Ignored for learning — e.g. a generated agent-harness file
+            # projected from a canonical source (issue #1150). Treating it
+            # as a baseline would let Headroom "learn" content it didn't
+            # write and that will be overwritten by the owning tool anyway.
             continue
         block = extract_marker_block(path.read_text(encoding="utf-8", errors="replace"))
         if block:

@@ -637,6 +637,38 @@ def _estimated_basis_note(cost: dict[str, Any]) -> str:
     return note
 
 
+def check_ignore_rules(project_dir: Path | None = None) -> CheckResult:
+    """Surface the ``.headroomignore`` / ``ignore.*`` config rules in effect.
+
+    Purely local (no proxy needed): always runs so users can see which paths
+    are shielded from compress/learn/mutate/memory before wiring up routing.
+    """
+    from headroom.ignore import IgnorePolicy
+
+    policy = IgnorePolicy.load(project_dir or Path.cwd())
+    if policy.warnings:
+        return CheckResult(
+            name="ignore-rules",
+            status=WARN,
+            summary=f"{len(policy.warnings)} problem(s) loading ignore rules",
+            hint="; ".join(policy.warnings),
+        )
+    rules = policy.active_rules()
+    if not rules:
+        return CheckResult(
+            name="ignore-rules",
+            status=PASS,
+            summary="no ignore rules configured",
+            hint="add a .headroomignore or HeadroomConfig(ignore=...) to protect generated files",
+        )
+    return CheckResult(
+        name="ignore-rules",
+        status=PASS,
+        summary=f"{len(rules)} active rule(s)",
+        hint="; ".join(policy.describe()),
+    )
+
+
 def check_deployments(manifests: list[Any], probe: Any = probe_json) -> CheckResult | None:
     """Probe persistent deployment health URLs. None when no deployments."""
     if not manifests:
@@ -738,6 +770,7 @@ def doctor(port: int, emit_json: bool) -> None:
         check_shell_env(os.environ, port),
         check_savings(stats, savings_path()),
         check_budget(stats),
+        check_ignore_rules(),
     ]
     auth_conflict_check = check_claude_auth_conflict(
         claude_settings_path(),
