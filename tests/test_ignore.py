@@ -206,6 +206,9 @@ class TestMalformedConfig:
             policy = IgnorePolicy.load(tmp_path, config)
         assert policy.is_ignored("CLAUDE.md", "mutate")
         assert any("malformed" in record.message for record in caplog.records)
+        # Not just logged — surfaced on the policy so `headroom doctor` can
+        # report it too.
+        assert any("malformed" in w for w in policy.warnings)
 
     def test_unreadable_headroomignore_surfaces_warning(self, tmp_path: Path) -> None:
         ignore_path = _write(tmp_path / ".headroomignore", "CLAUDE.md\n")
@@ -264,6 +267,92 @@ class TestConvenienceFunction:
         _write(tmp_path / ".headroomignore", "CLAUDE.md\n")
         assert is_path_ignored("CLAUDE.md", "mutate", root=tmp_path)
         assert not is_path_ignored("README.md", "mutate", root=tmp_path)
+
+
+class TestGlobSemantics:
+    """9. Tricky glob cases — pins down the *limited* gitignore-like syntax.
+
+    These document actual current behavior (including known deviations from
+    real gitignore, e.g. a single "*" crossing "/" boundaries) so future
+    changes to matching semantics are visible as test diffs, not surprises.
+    """
+
+    def test_github_star_matches_direct_and_nested_children(self, tmp_path: Path) -> None:
+        # Known limitation: unlike real gitignore, ".github/*" is NOT limited
+        # to direct children — fnmatch's "*" has no path-segment concept.
+        _write(tmp_path / ".headroomignore", ".github/*\n")
+        policy = IgnorePolicy.load(tmp_path)
+        assert policy.is_ignored(".github/copilot-instructions.md", "mutate")
+        assert policy.is_ignored(".github/workflows/ci.yml", "mutate")
+        assert not policy.is_ignored("src/.github/x.md", "mutate")
+
+    def test_github_globstar_matches_any_depth(self, tmp_path: Path) -> None:
+        _write(tmp_path / ".headroomignore", ".github/**\n")
+        policy = IgnorePolicy.load(tmp_path)
+        assert policy.is_ignored(".github/workflows/ci.yml", "mutate")
+        assert policy.is_ignored(".github/carl/x/y.md", "mutate")
+        assert not policy.is_ignored("other/.github/x.md", "mutate")
+
+    def test_github_carl_globstar_covers_directory_itself(self, tmp_path: Path) -> None:
+        _write(tmp_path / ".headroomignore", ".github/carl/**\n")
+        policy = IgnorePolicy.load(tmp_path)
+        assert policy.is_ignored(".github/carl", "mutate")
+        assert policy.is_ignored(".github/carl/x.md", "mutate")
+        assert not policy.is_ignored(".github/other.md", "mutate")
+
+    def test_bare_directory_slash_matches_any_depth(self, tmp_path: Path) -> None:
+        # "dir/" with no other "/" matches like a plain gitignore directory
+        # entry: at any depth, not just at the repository root.
+        _write(tmp_path / ".headroomignore", "dir/\n")
+        policy = IgnorePolicy.load(tmp_path)
+        assert policy.is_ignored("dir/x.py", "mutate")
+        assert policy.is_ignored("dir", "mutate")
+        assert policy.is_ignored("nested/dir/x.py", "mutate")
+        assert not policy.is_ignored("otherdir/x.py", "mutate")
+
+    def test_star_md_matches_any_depth(self, tmp_path: Path) -> None:
+        _write(tmp_path / ".headroomignore", "*.md\n")
+        policy = IgnorePolicy.load(tmp_path)
+        assert policy.is_ignored("CLAUDE.md", "mutate")
+        assert policy.is_ignored("nested/CLAUDE.md", "mutate")
+        assert not policy.is_ignored("nested/CLAUDE.txt", "mutate")
+
+    def test_nested_bare_filename_matches_at_any_depth_not_just_listed_depth(
+        self, tmp_path: Path
+    ) -> None:
+        _write(tmp_path / ".headroomignore", "nested/CLAUDE.md\n")
+        policy = IgnorePolicy.load(tmp_path)
+        assert policy.is_ignored("nested/CLAUDE.md", "mutate")
+        # Rooted (contains "/"): does NOT match at a different depth.
+        assert not policy.is_ignored("other/nested/CLAUDE.md", "mutate")
+
+    def test_rooted_leading_slash_matches_only_at_repo_root(self, tmp_path: Path) -> None:
+        _write(tmp_path / ".headroomignore", "/CLAUDE.md\n")
+        policy = IgnorePolicy.load(tmp_path)
+        assert policy.is_ignored("CLAUDE.md", "mutate")
+        assert not policy.is_ignored("nested/CLAUDE.md", "mutate")
+
+    def test_rooted_directory_leading_slash(self, tmp_path: Path) -> None:
+        _write(tmp_path / ".headroomignore", "/dir/\n")
+        policy = IgnorePolicy.load(tmp_path)
+        assert policy.is_ignored("dir/x.py", "mutate")
+        assert not policy.is_ignored("nested/dir/x.py", "mutate")
+
+    def test_negation_patterns_unsupported_and_warned(self, tmp_path: Path) -> None:
+        _write(tmp_path / ".headroomignore", "!README.md\n")
+        policy = IgnorePolicy.load(tmp_path)
+        # The negation line is skipped entirely (not loaded as a rule at
+        # all — in particular NOT matched as a literal path "!README.md")
+        # and reported as a warning instead.
+        assert policy.active_rules() == []
+        assert not policy.is_ignored("!README.md", "mutate")
+        assert any("negation" in w for w in policy.warnings)
+
+    def test_negation_pattern_in_config_unsupported_and_warned(self, tmp_path: Path) -> None:
+        config = IgnoreConfig(mutate=["!CLAUDE.md"])
+        policy = IgnorePolicy.load(tmp_path, config)
+        assert policy.active_rules() == []
+        assert any("negation" in w for w in policy.warnings)
 
 
 if __name__ == "__main__":

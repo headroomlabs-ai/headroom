@@ -267,6 +267,50 @@ def test_code_graph_watcher_ignores_headroomignore_paths(monkeypatch, tmp_path: 
     assert scheduled == ["reindex"]
 
 
+def test_code_graph_watcher_ignores_config_ignore_memory_paths(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """`ignore.memory` config (no .headroomignore file) also suppresses reindex (#1150)."""
+    from headroom.config import IgnoreConfig
+
+    monkeypatch.setattr("headroom.graph.installer.get_cbm_path", lambda: tmp_path / "cbm")
+    graph_watcher = watcher.CodeGraphWatcher(
+        tmp_path, ignore_config=IgnoreConfig(memory=["CLAUDE.md"])
+    )
+
+    watchdog_mod = ModuleType("watchdog")
+    events_mod = ModuleType("watchdog.events")
+    observers_mod = ModuleType("watchdog.observers")
+
+    class FileSystemEventHandler:
+        pass
+
+    class FakeObserver:
+        def schedule(self, handler, project_dir, recursive=True) -> None:
+            self.scheduled = (handler, project_dir, recursive)
+
+        def start(self) -> None:
+            pass
+
+    events_mod.FileSystemEventHandler = FileSystemEventHandler
+    observers_mod.Observer = FakeObserver
+    monkeypatch.setitem(__import__("sys").modules, "watchdog", watchdog_mod)
+    monkeypatch.setitem(__import__("sys").modules, "watchdog.events", events_mod)
+    monkeypatch.setitem(__import__("sys").modules, "watchdog.observers", observers_mod)
+
+    scheduled: list[str] = []
+    monkeypatch.setattr(graph_watcher, "_schedule_reindex", lambda: scheduled.append("reindex"))
+
+    assert graph_watcher.start() is True
+    handler, _, _ = graph_watcher._observer.scheduled
+
+    handler.on_any_event(SimpleNamespace(src_path=str(tmp_path / "CLAUDE.md")))
+    assert scheduled == []
+
+    handler.on_any_event(SimpleNamespace(src_path=str(tmp_path / "main.py")))
+    assert scheduled == ["reindex"]
+
+
 def test_code_graph_watcher_start_returns_false_without_watchdog(
     monkeypatch, tmp_path: Path
 ) -> None:

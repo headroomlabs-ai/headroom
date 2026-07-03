@@ -637,15 +637,21 @@ def _estimated_basis_note(cost: dict[str, Any]) -> str:
     return note
 
 
-def check_ignore_rules(project_dir: Path | None = None) -> CheckResult:
-    """Surface the ``.headroomignore`` / ``ignore.*`` config rules in effect.
+def check_ignore_rules(project_dir: Path | None = None, config: object | None = None) -> CheckResult:
+    """Surface the ``.headroomignore`` file / ``ignore.*`` config rules in effect.
 
     Purely local (no proxy needed): always runs so users can see which paths
     are shielded from compress/learn/mutate/memory before wiring up routing.
+
+    ``headroom doctor`` (the CLI) has no way to load a caller's in-process
+    ``HeadroomConfig`` — there is no on-disk config file format today — so it
+    only ever sees the ``.headroomignore`` file at ``project_dir``. Passing
+    ``config`` (e.g. from a programmatic caller that already holds a
+    ``HeadroomConfig``) additionally reports ``HeadroomConfig.ignore`` rules.
     """
     from headroom.ignore import IgnorePolicy
 
-    policy = IgnorePolicy.load(project_dir or Path.cwd())
+    policy = IgnorePolicy.load(project_dir or Path.cwd(), config)
     if policy.warnings:
         return CheckResult(
             name="ignore-rules",
@@ -659,7 +665,11 @@ def check_ignore_rules(project_dir: Path | None = None) -> CheckResult:
             name="ignore-rules",
             status=PASS,
             summary="no ignore rules configured",
-            hint="add a .headroomignore or HeadroomConfig(ignore=...) to protect generated files",
+            hint=(
+                "add a .headroomignore file to protect generated files "
+                "(this check cannot see HeadroomConfig(ignore=...) unless a "
+                "caller passes it in — the CLI has no config-file loader today)"
+            ),
         )
     return CheckResult(
         name="ignore-rules",

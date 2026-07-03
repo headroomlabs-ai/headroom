@@ -16,13 +16,29 @@ Two sources of rules, both optional and both off by default (so existing
 behavior is unchanged when neither is present):
 
 1. A ``.headroomignore`` file at the repository/workspace root, using a
-   gitignore-flavored (not 100% gitignore-compatible) glob syntax:
+   **limited gitignore-like** glob syntax — it is NOT a full gitignore or
+   ``pathspec`` implementation (no ``.gitignore``-file discovery/precedence,
+   no negation). Rules:
      - Blank lines and lines starting with ``#`` are ignored.
+     - Lines starting with ``!`` (gitignore negation/re-inclusion) are
+       **not supported**: they are skipped and reported in
+       :attr:`IgnorePolicy.warnings` rather than silently matched as a
+       literal path.
      - A trailing ``/`` marks a directory rule: it matches the directory
-       itself and everything below it.
-     - A pattern containing ``/`` is matched relative to the root (rooted
-       match) using ``fnmatch`` glob semantics (``*``/``?``/``[...]``,
-       and ``**`` for "any number of path segments").
+       itself and everything below it. A bare directory name (no other
+       ``/``, e.g. ``node_modules/``) matches at *any* depth, same as a
+       plain gitignore entry; a directory rule containing another ``/``
+       (e.g. ``.github/carl/``) or a leading ``/`` is rooted instead.
+     - A leading ``/`` roots the pattern at the repository root (e.g.
+       ``/CLAUDE.md`` matches only the top-level ``CLAUDE.md``, never
+       ``nested/CLAUDE.md``) — same as gitignore.
+     - A pattern containing ``/`` (after stripping a leading ``/``, if any)
+       is matched relative to the root (rooted match) using ``fnmatch`` glob
+       semantics (``*``/``?``/``[...]``, and ``**`` for "any number of path
+       segments"). Known deviation from real gitignore: a single ``*``
+       here can still cross ``/`` boundaries (``fnmatch`` has no
+       path-segment concept), so e.g. ``.github/*`` also matches
+       ``.github/nested/file``, not just direct children.
      - A pattern with no ``/`` matches the basename at *any* depth, mirroring
        plain gitignore entries (e.g. ``CLAUDE.md`` matches both
        ``CLAUDE.md`` and ``nested/CLAUDE.md``).
@@ -81,6 +97,10 @@ class IgnoreRule:
 
         ``rel_posix`` is a root-relative, forward-slash path with no leading
         slash (e.g. ``"a/b/c.py"``).
+
+        This is a *limited* gitignore-like syntax, not a full gitignore/
+        pathspec implementation — see the module docstring for the precise
+        (and intentionally narrower) rules this implements.
         """
         pattern = self.pattern
         is_dir_rule = pattern.endswith("/")
@@ -88,13 +108,38 @@ class IgnoreRule:
         if not pat:
             return False
 
-        if is_dir_rule:
-            return rel_posix == pat or rel_posix.startswith(pat + "/")
+        # A leading "/" explicitly roots the pattern at the repository root
+        # (gitignore semantics), same as a pattern that contains "/"
+        # elsewhere — it is never treated as a bare "match at any depth"
+        # basename pattern.
+        rooted = pat.startswith("/")
+        if rooted:
+            pat = pat[1:]
+        if not pat:
+            return False
 
-        if "/" in pat:
+        if is_dir_rule:
+            if rooted or "/" in pat:
+                return rel_posix == pat or rel_posix.startswith(pat + "/")
+            # Bare directory name (e.g. "node_modules/"): matches that
+            # directory at *any* depth, mirroring a plain gitignore entry.
+            segments = rel_posix.split("/")
+            return (
+                rel_posix == pat
+                or rel_posix.startswith(pat + "/")
+                or pat in segments[:-1]
+            )
+
+        if rooted or "/" in pat:
             # Rooted pattern: match against the full relative path. Also treat
             # a pattern ending in "/**" as matching the directory itself, not
             # just its contents (gitignore lets "dir/**" cover "dir" too).
+            #
+            # Known limitation: unlike real gitignore, a single "*" here can
+            # still cross "/" boundaries (fnmatch has no path-segment concept),
+            # so e.g. ".github/*" also matches ".github/nested/file" — not
+            # just direct children. Use a rooted, no-wildcard pattern or
+            # ``.github/**`` if that distinction matters to you.
             if fnmatch.fnmatchcase(rel_posix, pat):
                 return True
             if pat.endswith("/**"):
@@ -109,27 +154,45 @@ class IgnoreRule:
         return fnmatch.fnmatchcase(name, pat) or fnmatch.fnmatchcase(rel_posix, pat)
 
 
-def _parse_lines(text: str, source: str) -> list[IgnoreRule]:
+def _parse_lines(text: str, source: str) -> tuple[list[IgnoreRule], list[str]]:
     rules: list[IgnoreRule] = []
+    warnings: list[str] = []
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
+        if line.startswith("!"):
+            # Negation patterns ("!foo" = re-include a previously ignored
+            # path) are valid gitignore syntax but are NOT supported here —
+            # rules are a flat allow-list of ignores with no re-inclusion
+            # pass. Skip (rather than silently matching the literal path
+            # "!foo") and surface a warning so this is visible in
+            # `headroom doctor`.
+            msg = f"ignoring unsupported negation pattern {line!r} in {source} (negation is not supported)"
+            logger.warning(msg)
+            warnings.append(msg)
+            continue
         rules.append(IgnoreRule(pattern=line, behaviors=frozenset(ALL_BEHAVIORS), source=source))
-    return rules
+    return rules, warnings
 
 
-def _rules_from_config(config: object | None) -> list[IgnoreRule]:
+def _rules_from_config(config: object | None) -> tuple[list[IgnoreRule], list[str]]:
     """Build rules from a ``headroom.config.IgnoreConfig``-shaped object.
 
     Duck-typed (rather than importing ``IgnoreConfig`` directly) to avoid a
     circular import between ``config.py`` and this module; ``config.py``
     imports ``IgnorePolicy``/``load_ignore_policy`` for diagnostics helpers.
+
+    Returns ``(rules, warnings)``. Malformed entries are both logged *and*
+    returned as warnings so ``IgnorePolicy.warnings`` (and therefore
+    ``headroom doctor``) can surface them — logging alone is invisible to
+    anyone not tailing application logs.
     """
     if config is None:
-        return []
+        return [], []
 
     rules: list[IgnoreRule] = []
+    warnings: list[str] = []
     for behavior in ("paths", *ALL_BEHAVIORS):
         raw_patterns = getattr(config, behavior, None)
         if not raw_patterns:
@@ -138,14 +201,26 @@ def _rules_from_config(config: object | None) -> list[IgnoreRule]:
         source = f"config:ignore.{behavior}"
         for pattern in raw_patterns:
             if not isinstance(pattern, str) or not pattern.strip():
-                logger.warning(
-                    "Ignoring malformed ignore.%s entry %r (expected non-empty string)",
-                    behavior,
-                    pattern,
+                msg = (
+                    f"ignoring malformed ignore.{behavior} entry {pattern!r} "
+                    "(expected non-empty string)"
                 )
+                logger.warning(msg)
+                warnings.append(msg)
                 continue
-            rules.append(IgnoreRule(pattern=pattern.strip(), behaviors=behaviors, source=source))
-    return rules
+            stripped = pattern.strip()
+            if stripped.startswith("!"):
+                # See _parse_lines: negation patterns are valid gitignore
+                # syntax but unsupported here.
+                msg = (
+                    f"ignoring unsupported negation pattern {stripped!r} in "
+                    f"ignore.{behavior} (negation is not supported)"
+                )
+                logger.warning(msg)
+                warnings.append(msg)
+                continue
+            rules.append(IgnoreRule(pattern=stripped, behaviors=behaviors, source=source))
+    return rules, warnings
 
 
 @dataclass
@@ -180,14 +255,19 @@ class IgnorePolicy:
                 logger.warning(msg)
                 warnings.append(msg)
             else:
-                rules.extend(_parse_lines(text, source=IGNORE_FILE_NAME))
+                file_rules, file_warnings = _parse_lines(text, source=IGNORE_FILE_NAME)
+                rules.extend(file_rules)
+                warnings.extend(file_warnings)
 
         try:
-            rules.extend(_rules_from_config(config))
+            config_rules, config_warnings = _rules_from_config(config)
         except (TypeError, AttributeError) as exc:  # malformed config object
             msg = f"could not load ignore rules from config: {exc}"
             logger.warning(msg)
             warnings.append(msg)
+        else:
+            rules.extend(config_rules)
+            warnings.extend(config_warnings)
 
         return cls(root=root_path, rules=rules, warnings=warnings)
 
