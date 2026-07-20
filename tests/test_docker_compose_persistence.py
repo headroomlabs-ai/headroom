@@ -110,4 +110,5 @@ def test_published_dockerfile_stages_default_to_loopback() -> None:
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
 
     assert dockerfile.count("ENV HEADROOM_HOST=127.0.0.1") == 2
-    assert dockerfile.count('CMD ["--port", "8787"]') == 2
+    assert 'CMD ["--port", "8787"]' not in dockerfile
+    assert 'CMD ["--host", "0.0.0.0"]' not in dockerfile
