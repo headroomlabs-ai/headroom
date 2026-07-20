@@ -229,8 +229,10 @@ EXPOSE 8787
 
 # This stage is distroless, so there is no shell to expand ${HEADROOM_PORT}.
 # Resolve the port inside Python instead, keeping exec form (issue #2432).
+# `or` rather than a get() default so an empty HEADROOM_PORT falls back the
+# same way `${HEADROOM_PORT:-8787}` does in the shell-form stage above.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD ["python3", "-c", "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:' + os.environ.get('HEADROOM_PORT', '8787') + '/readyz', timeout=5)"]
+    CMD ["python3", "-c", "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:' + (os.environ.get('HEADROOM_PORT') or '8787') + '/readyz', timeout=5)"]
 
 ENTRYPOINT ["python3", "-m", "headroom.cli", "proxy"]
 # Keep host and port defaults in the CLI so HEADROOM_HOST and HEADROOM_PORT

@@ -80,8 +80,9 @@ def test_distroless_stage_healthcheck_stays_shell_free() -> None:
     directives = _healthcheck_directives(_stage_body(dockerfile, "runtime-slim"))
 
     assert len(directives) == 1
-    assert "os.environ.get('HEADROOM_PORT', '8787')" in directives[0]
     assert "${HEADROOM_PORT" not in directives[0]
+    # `or` and not a get() default, so an empty value falls back like `:-` does.
+    assert "(os.environ.get('HEADROOM_PORT') or '8787')" in directives[0]
 
 
 def test_debian_stage_healthcheck_expands_the_port_variable() -> None:
