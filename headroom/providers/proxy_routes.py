@@ -62,6 +62,7 @@ from headroom.providers.vertex import (
     is_vertex_google_publisher,
     vertex_anthropic_target,
     vertex_publisher_provider_name,
+    with_vertex_diagnostics,
 )
 from headroom.proxy.passthrough import (
     custom_base_passthrough_telemetry as _custom_base_passthrough_telemetry,
@@ -304,6 +305,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
     @app.post(
         "/{api_version}/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:generateContent"
     )
+    @with_vertex_diagnostics
     async def vertex_generate_content(
         request: Request,
         api_version: str,
@@ -325,6 +327,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
     @app.post(
         "/{api_version}/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:streamGenerateContent"
     )
+    @with_vertex_diagnostics
     async def vertex_stream_generate_content(
         request: Request,
         api_version: str,
@@ -350,6 +353,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
     @app.post(
         "/{api_version}/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:countTokens"
     )
+    @with_vertex_diagnostics
     async def vertex_count_tokens(
         request: Request,
         api_version: str,
@@ -371,6 +375,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
     @app.post(
         "/{api_version}/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:rawPredict"
     )
+    @with_vertex_diagnostics
     async def vertex_raw_predict(
         request: Request,
         api_version: str,
@@ -392,6 +397,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
     @app.post(
         "/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:rawPredict"
     )
+    @with_vertex_diagnostics
     async def vertex_raw_predict_no_version(
         request: Request,
         project: str,
@@ -416,6 +422,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
     @app.post(
         "/{api_version}/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:streamRawPredict"
     )
+    @with_vertex_diagnostics
     async def vertex_stream_raw_predict(
         request: Request,
         api_version: str,
@@ -442,6 +449,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
     @app.post(
         "/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:streamRawPredict"
     )
+    @with_vertex_diagnostics
     async def vertex_stream_raw_predict_no_version(
         request: Request,
         project: str,

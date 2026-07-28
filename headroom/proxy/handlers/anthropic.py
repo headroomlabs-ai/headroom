@@ -41,6 +41,7 @@ from headroom.proxy.buffered_ccr_response import (
     DEFAULT_BUFFERED_CCR_GRACE_SECONDS,
     buffered_ccr_asgi_call,
 )
+from headroom.providers.vertex import annotate_backend_error_body, backend_error_hint
 from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.forwarded_headers import resolve_client_ip
 from headroom.proxy.handlers._debug_dump import _debug_dump_mode, _redact_debug_value
@@ -3418,7 +3419,12 @@ class AnthropicHandlerMixin:
                         if backend_response.error:
                             return JSONResponse(
                                 status_code=backend_response.status_code,
-                                content=backend_response.body,
+                                content=annotate_backend_error_body(
+                                    backend_response.body,
+                                    backend_response.status_code,
+                                    logger=logger,
+                                    request_id=request_id,
+                                ),
                             )
 
                         # Track metrics
@@ -3570,17 +3576,30 @@ class AnthropicHandlerMixin:
 
                         return JSONResponse(
                             status_code=backend_response.status_code,
-                            content=backend_response.body,
+                            content=annotate_backend_error_body(
+                                backend_response.body,
+                                backend_response.status_code,
+                                logger=logger,
+                                request_id=request_id,
+                            ),
                         )
                 except Exception as e:
                     logger.error(f"[{request_id}] Bedrock backend error: {e}")
                     # Unit 4: release the pre-upstream semaphore on error.
                     await _finalize_pre_upstream()
+                    # A backend that never initialized (missing optional SDK, no
+                    # ADC) otherwise surfaces as an opaque provider string that
+                    # tells the user nothing about the fix.
+                    message = str(e)
+                    hint = backend_error_hint(message)
+                    if hint:
+                        logger.error(f"[{request_id}] backend setup hint: {hint}")
+                        message = f"{message}\n[headroom] hint: {hint}"
                     return JSONResponse(
                         status_code=500,
                         content={
                             "type": "error",
-                            "error": {"type": "api_error", "message": str(e)},
+                            "error": {"type": "api_error", "message": message},
                         },
                     )
 
