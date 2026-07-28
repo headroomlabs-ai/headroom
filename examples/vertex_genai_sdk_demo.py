@@ -29,9 +29,9 @@ only bare ``httpx`` installed it fails at startup on the missing ``h2`` package.
 from __future__ import annotations
 
 import argparse
-import sys
 import os
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -68,11 +68,12 @@ DEFAULT_MODEL = "gemini-flash-latest"
 # Proxy lifecycle
 # ----------------------------------------------------------------------------
 
+
 def start_proxy(port: int, region: str) -> subprocess.Popen[bytes]:
     """Spawn `headroom proxy --backend vertex` as a subprocess."""
     env = os.environ.copy()
     env.setdefault("HEADROOM_LOG", "INFO")
-    
+
     cmd = [
         sys.executable,
         "-m",
@@ -130,6 +131,7 @@ def stop_proxy(proc: subprocess.Popen[bytes]) -> None:
 # ----------------------------------------------------------------------------
 # Main demo
 # ----------------------------------------------------------------------------
+
 
 def explain_failure(exc: Exception, region: str, model_id: str) -> str:
     """Turn a raw Vertex exception into something the reader can act on."""
@@ -203,13 +205,13 @@ def run_demo(port: int, region: str, model_id: str) -> int:
             vertexai=True,
             project=project_id,
             location=region,
-            http_options={'base_url': f'http://127.0.0.1:{port}'},
+            http_options={"base_url": f"http://127.0.0.1:{port}"},
         )
 
         print("\n[3/3] Probes")
         print("\n  a. Standard Inference:")
         content = "Count to 5, listing each number separated by commas."
-        
+
         try:
             response = client.models.generate_content(
                 model=model_id,
@@ -222,13 +224,11 @@ def run_demo(port: int, region: str, model_id: str) -> int:
             return 1
 
         print("\n  b. Inference with Thinking Config:")
-        # Configure thinking config (where supported). 
+        # Configure thinking config (where supported).
         # For now, we just pass parameters and see if Headroom properly parses/forwards them.
         try:
             config = types.GenerateContentConfig(
-                thinking_config=types.ThinkingConfig(
-                    thinking_budget=128
-                ) 
+                thinking_config=types.ThinkingConfig(thinking_budget=128)
             )
             response = client.models.generate_content(
                 model=model_id,
@@ -240,7 +240,7 @@ def run_demo(port: int, region: str, model_id: str) -> int:
         except Exception as e:
             print(f"  ! Thinking inference failed: {explain_failure(e, region, model_id)}")
             return 1
-            
+
         return 0
 
     finally:
