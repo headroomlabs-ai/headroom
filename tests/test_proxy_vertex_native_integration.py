@@ -52,7 +52,7 @@ def project_id():
     "model,publisher",
     [
         ("gemini-flash-latest", "google"),
-        ("claude-3-5-sonnet-v2@20241022", "anthropic"),
+        ("claude-sonnet-4-6", "anthropic"),
     ],
 )
 class TestVertexNativeGenerateContent:
