@@ -16,6 +16,7 @@ run with `-rs` so those reasons are printed.
 
 import json
 import os
+
 import pytest
 
 pytestmark = pytest.mark.skipif(
@@ -27,6 +28,7 @@ pytest.importorskip("fastapi")
 pytest.importorskip("httpx")
 
 from fastapi.testclient import TestClient  # noqa: E402
+
 from headroom.proxy.server import ProxyConfig, create_app  # noqa: E402
 
 
@@ -150,28 +152,32 @@ class TestVertexNativeGenerateContent:
 
     def test_basic_generation(self, vertex_client, api_key, project_id, location, model, publisher):
         """Basic text generation works."""
-        
+
         # Determine the action based on publisher
         action = "generateContent" if publisher == "google" else "rawPredict"
         url = f"/v1/projects/{project_id}/locations/{location}/publishers/{publisher}/models/{model}:{action}"
-        
-        # Prepare the payload (Anthropic Vertex requires Claude messages format for rawPredict, 
+
+        # Prepare the payload (Anthropic Vertex requires Claude messages format for rawPredict,
         # Google Vertex requires contents format for generateContent)
-        
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
-        }
-        
+
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+
         if publisher == "google":
             payload = {
-                "contents": [{"role": "user", "parts": [{"text": "What is 2+2? Reply with just the number."}]}]
+                "contents": [
+                    {
+                        "role": "user",
+                        "parts": [{"text": "What is 2+2? Reply with just the number."}],
+                    }
+                ]
             }
         else:
             payload = {
                 "anthropic_version": "vertex-2023-10-16",
-                "messages": [{"role": "user", "content": "What is 2+2? Reply with just the number."}],
-                "max_tokens": 100
+                "messages": [
+                    {"role": "user", "content": "What is 2+2? Reply with just the number."}
+                ],
+                "max_tokens": 100,
             }
 
         response = vertex_client.post(url, headers=headers, json=payload)
@@ -193,15 +199,14 @@ class TestVertexNativeGenerateContent:
         """Test thinking extensions where supported."""
         action = "generateContent" if publisher == "google" else "rawPredict"
         url = f"/v1/projects/{project_id}/locations/{location}/publishers/{publisher}/models/{model}:{action}"
-        
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
-        }
-        
+
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+
         if publisher == "google":
             payload = {
-                "contents": [{"role": "user", "parts": [{"text": "Think deeply about the number 42."}]}],
+                "contents": [
+                    {"role": "user", "parts": [{"text": "Think deeply about the number 42."}]}
+                ],
                 # REST spelling is thinkingBudget (camelCase); thinkingBudgetTokens
                 # is silently ignored, which makes the assertion below meaningless.
                 "generationConfig": {
@@ -213,10 +218,7 @@ class TestVertexNativeGenerateContent:
                 "anthropic_version": "vertex-2023-10-16",
                 "messages": [{"role": "user", "content": "Think deeply about the number 42."}],
                 "max_tokens": 8192,
-                "thinking": {
-                    "type": "enabled",
-                    "budget_tokens": 1024
-                }
+                "thinking": {"type": "enabled", "budget_tokens": 1024},
             }
 
         response = vertex_client.post(url, headers=headers, json=payload)
@@ -226,7 +228,9 @@ class TestVertexNativeGenerateContent:
         # actually produced a scored generation rather than an empty envelope.
         data = response.json()
         if publisher == "google":
-            assert data.get("candidates"), f"No candidates in thinking response: {json.dumps(data)[:500]}"
+            assert data.get("candidates"), (
+                f"No candidates in thinking response: {json.dumps(data)[:500]}"
+            )
             assert "usageMetadata" in data, f"No usageMetadata: {json.dumps(data)[:500]}"
         else:
             assert data.get("content"), f"No content in thinking response: {json.dumps(data)[:500]}"
