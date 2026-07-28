@@ -50,6 +50,7 @@ from headroom.proxy.buffered_ccr_response import (
     DEFAULT_BUFFERED_CCR_GRACE_SECONDS,
     buffered_ccr_asgi_call,
 )
+from headroom.providers.vertex import annotate_backend_error_body, backend_error_hint
 from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.forwarded_headers import resolve_client_ip
 from headroom.proxy.handlers._debug_dump import _debug_dump_mode, _redact_debug_value
@@ -3678,7 +3679,12 @@ class AnthropicHandlerMixin:
                         if backend_response.error:
                             return JSONResponse(
                                 status_code=backend_response.status_code,
-                                content=backend_response.body,
+                                content=annotate_backend_error_body(
+                                    backend_response.body,
+                                    backend_response.status_code,
+                                    logger=logger,
+                                    request_id=request_id,
+                                ),
                             )
 
                         # Track metrics
@@ -3830,19 +3836,33 @@ class AnthropicHandlerMixin:
 
                         return JSONResponse(
                             status_code=backend_response.status_code,
-                            content=backend_response.body,
+                            content=annotate_backend_error_body(
+                                backend_response.body,
+                                backend_response.status_code,
+                                logger=logger,
+                                request_id=request_id,
+                            ),
                         )
                 except Exception as e:
                     error_message = format_exception_message(e)
                     logger.error(f"[{request_id}] Bedrock backend error: {error_message}")
                     # Unit 4: release the pre-upstream semaphore on error.
                     await _finalize_pre_upstream()
+                    # A backend that never initialized (missing optional SDK, no
+                    # ADC) otherwise surfaces as a bare internal_error. The hint
+                    # is matched against the raw text server-side but is itself
+                    # a fixed constant, so the public body stays within the
+                    # public_errors contract: no exception text leaves the proxy.
+                    hint = backend_error_hint(error_message)
+                    if hint:
+                        logger.error(f"[{request_id}] backend setup hint: {hint}")
                     return JSONResponse(
                         status_code=500,
                         content=public_errors.anthropic_error_body(
                             public_errors.classify_or_internal(e),
                             request_id=str(request_id),
                             error_type="api_error",
+                            hint=hint,
                         ),
                     )
 

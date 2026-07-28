@@ -11,11 +11,13 @@ Google documents Gemini generation on Vertex with `generateContent` and
 shape. See Google Cloud's model inference reference:
 https://docs.cloud.google.com/vertex-ai/generative-ai/docs/model-reference/inference
 
-Google Cloud REST calls authenticate with a bearer access token. For local
-development, Google documents both `gcloud auth print-access-token` and
-`gcloud auth application-default print-access-token`; Application Default
-Credentials search `GOOGLE_APPLICATION_CREDENTIALS`, local ADC files, and
-attached service accounts in that order. See:
+Google Cloud REST calls authenticate with a bearer access token. Use
+**`gcloud auth application-default print-access-token`**: a plain
+`gcloud auth print-access-token` user token is rejected by
+`aiplatform.googleapis.com` with `401 ACCESS_TOKEN_TYPE_UNSUPPORTED` for many
+identities. Application Default Credentials search
+`GOOGLE_APPLICATION_CREDENTIALS`, local ADC files, and attached service accounts
+in that order. Tokens expire after ~1 hour. See:
 
 - https://docs.cloud.google.com/docs/authentication/rest
 - https://docs.cloud.google.com/docs/authentication/application-default-credentials
@@ -28,16 +30,39 @@ Set the Vertex regional host explicitly:
 headroom proxy --vertex-api-url https://us-central1-aiplatform.googleapis.com
 ```
 
-The same setting is available through `VERTEX_TARGET_API_URL`.
+The same setting is available through `VERTEX_TARGET_API_URL`. Left unset, the
+proxy derives the host from each request's `locations/{location}` segment, so
+one proxy serves every region plus `global`.
+
+### Picking a location
+
+Vertex serves each publisher model in only a subset of locations, and this is
+the most common source of a confusing `404` during onboarding:
+
+| Model | Where it serves |
+| --- | --- |
+| `gemini-flash-latest`, `gemini-flash-lite-latest` | `global` only |
+| `gemini-3.5-flash` | `global`, `europe-west2`, `asia-northeast1`, `asia-south1`, `asia-southeast1` |
+| `claude-sonnet-4-6` (and 4.6-or-older Claude) | `global`, `us-east5`, `europe-west1`, `asia-southeast1` |
+| Claude 4.7+ | `global` or the `us`/`eu` multi-region only -- no named regions |
+
+**Gemini 3.x has no US regional endpoint.** Start with `global` and only pin a
+region when you need Provisioned Throughput or data residency. Partner models
+(Claude, Llama, Mistral) also need a one-time per-project enable in Model
+Garden before they serve.
+
+When Vertex rejects a request, Headroom appends a `[headroom] hint: ...` note to
+`error.message` (also emitted as an `x-headroom-hint` header and a proxy WARNING)
+naming the likely fix.
 
 ## Gemini On Vertex
 
 Send Vertex publisher paths through the proxy unchanged:
 
 ```bash
-LOCATION="us-central1"
+LOCATION="global"
 MODEL="gemini-flash-latest"
-ACCESS_TOKEN="$(gcloud auth print-access-token)"
+ACCESS_TOKEN="$(gcloud auth application-default print-access-token)"
 
 curl -sS \
   -H "Authorization: Bearer ${ACCESS_TOKEN}" \
@@ -62,27 +87,32 @@ import os
 from google import genai
 from google.genai import types
 
-LOCATION = os.environ.get("LOCATION", "us-central1")
+LOCATION = os.environ.get("LOCATION", "global")
 MODEL = os.environ.get("MODEL", "gemini-flash-latest")
 
 client = genai.Client(
     vertexai=True,
     project=os.environ.get("GCP_PROJECT_ID", "your-project"),
     location=LOCATION,
-    http_options={"api_endpoint": "127.0.0.1:8787"}
+    http_options={"base_url": "http://127.0.0.1:8787"},
 )
 
 response = client.models.generate_content(
     model=MODEL,
     contents="Think deeply. Which is heavier: a kg of feathers or a kg of steel?",
     config=types.GenerateContentConfig(
-        thinking_config=types.ThinkingConfig(
-            thinking_budget_tokens=100
-        ) 
-    )
+        thinking_config=types.ThinkingConfig(thinking_budget=128),
+    ),
 )
 print(response.text)
 ```
+
+A runnable version of exactly this flow -- it starts the proxy, probes it, and
+tears it down -- lives at `examples/vertex_genai_sdk_demo.py`.
+
+Note the `google-genai` SDK only builds `publishers/google/...` paths, so it
+cannot reach Claude on Vertex; use the `publishers/anthropic/...:rawPredict`
+route below for that.
 
 Supported passthrough actions:
 
@@ -100,6 +130,12 @@ Headroom also forwards Anthropic publisher calls on Vertex:
 The Python proxy preserves caller-supplied Google bearer auth. The native Rust
 proxy path additionally resolves GCP ADC and injects the bearer token for the
 Anthropic publisher route.
+
+These native routes are a straight passthrough and need **no** `--backend` flag.
+`--backend vertex_ai` is a different mode -- it routes Anthropic *Messages*
+traffic through LiteLLM and requires `pip install "google-cloud-aiplatform>=1.38"`.
+Passing it when you are calling Vertex paths directly turns a working request
+into a `500`.
 
 ## Claude Code with Headroom compression (validated)
 

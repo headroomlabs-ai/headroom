@@ -15,11 +15,15 @@ What this script does
 Requirements
 ------------
 - GCP credentials with Vertex AI access (run `gcloud auth application-default login`)
-- ``pip install google-genai``
+- ``pip install "headroom-ai[proxy]" google-genai``
 
 Run
 ---
+    export GCP_PROJECT_ID=your-project
     python examples/vertex_genai_sdk_demo.py
+
+Note the proxy needs the ``[proxy]`` extra (fastapi, uvicorn, httpx[http2]); with
+only bare ``httpx`` installed it fails at startup on the missing ``h2`` package.
 """
 
 from __future__ import annotations
@@ -49,9 +53,15 @@ except ImportError:
 # ----------------------------------------------------------------------------
 
 DEFAULT_PORT = 8787
-DEFAULT_REGION = "us-central1"
-DEFAULT_MODEL = "claude-sonnet-4-6" 
-# Other options: gemini-flash-latest
+# The google-genai SDK always builds `publishers/google/...` paths, so this demo
+# can only exercise Gemini. Claude on Vertex lives under `publishers/anthropic`
+# and uses :rawPredict -- see tests/test_proxy_vertex_native_integration.py.
+#
+# `global` is the default because the evergreen "-latest" aliases are global-only;
+# Gemini 3.x currently has no US regional endpoint.
+DEFAULT_REGION = "global"
+DEFAULT_MODEL = "gemini-flash-latest"
+# Other options: gemini-3.5-flash (also servable in europe-west2, asia-northeast1)
 
 
 # ----------------------------------------------------------------------------
@@ -121,6 +131,45 @@ def stop_proxy(proc: subprocess.Popen[bytes]) -> None:
 # Main demo
 # ----------------------------------------------------------------------------
 
+def explain_failure(exc: Exception, region: str, model_id: str) -> str:
+    """Turn a raw Vertex exception into something the reader can act on."""
+    msg = str(exc)
+    hints: list[str] = []
+    if "404" in msg or "NOT_FOUND" in msg:
+        hints.append(
+            f"'{model_id}' is not available to this project at location '{region}'. "
+            "Evergreen '-latest' aliases and Gemini 3.x are global-only today; "
+            "Gemini 3.x has no US regional endpoint (try --region global, or "
+            "europe-west2 / asia-northeast1 for gemini-3.5-flash)."
+        )
+    if "401" in msg or "UNAUTHENTICATED" in msg:
+        hints.append(
+            "Credentials are missing or stale (tokens expire hourly). Run: "
+            "gcloud auth application-default login"
+        )
+    if "403" in msg or "PERMISSION_DENIED" in msg:
+        hints.append(
+            "The project cannot serve this model: enable aiplatform.googleapis.com, "
+            "grant roles/aiplatform.user, and (for partner models) enable the model "
+            "in Model Garden for this project."
+        )
+    if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
+        hints.append("Quota exhausted for this model/location -- retry or pick another region.")
+    if "publishers/anthropic" in msg or model_id.startswith("claude"):
+        hints.append(
+            "The google-genai SDK only builds publishers/google paths, so Claude "
+            "cannot be reached through it. Use the rawPredict path directly "
+            "(see tests/test_proxy_vertex_native_integration.py)."
+        )
+    if not hints:
+        hints.append(
+            "Not a known provisioning condition -- suspect the proxy (path rewrite, "
+            "body mangling, dropped auth header) and reproduce with curl straight "
+            "against Vertex to confirm."
+        )
+    return msg + "\n    hint: " + "\n    hint: ".join(hints)
+
+
 def run_demo(port: int, region: str, model_id: str) -> int:
     print("=" * 76)
     print(" Headroom E2E: google-genai SDK -> Headroom proxy -> Vertex")
@@ -139,15 +188,22 @@ def run_demo(port: int, region: str, model_id: str) -> int:
         print("  proxy ready.")
 
         print("\n[2/3] Configuring google-genai SDK for Vertex via Proxy")
-        project_id = os.environ.get("GCP_PROJECT_ID", "dummy-project")
-        
+        project_id = os.environ.get("GCP_PROJECT_ID")
+        if not project_id:
+            print(
+                "  ! GCP_PROJECT_ID is not set. Every probe below will 404.\n"
+                "    export GCP_PROJECT_ID=$(gcloud config get-value project)",
+                file=sys.stderr,
+            )
+            return 2
+
         # We enforce vertexai=True to hit standard Vertex boundaries.
         # Ensure your GCP ADC variables are valid / authorized if routing through real GCP APIs.
         client = genai.Client(
             vertexai=True,
             project=project_id,
             location=region,
-            http_options={'api_endpoint': f'127.0.0.1:{port}'}
+            http_options={'base_url': f'http://127.0.0.1:{port}'},
         )
 
         print("\n[3/3] Probes")
@@ -162,7 +218,8 @@ def run_demo(port: int, region: str, model_id: str) -> int:
             print("  ✓ Standard response received successfully!")
             print(f"  > {response.text.strip()}")
         except Exception as e:
-            print(f"  ! Standard inference failed (ensure GCP credentials): {e}")
+            print(f"  ! Standard inference failed: {explain_failure(e, region, model_id)}")
+            return 1
 
         print("\n  b. Inference with Thinking Config:")
         # Configure thinking config (where supported). 
@@ -170,7 +227,7 @@ def run_demo(port: int, region: str, model_id: str) -> int:
         try:
             config = types.GenerateContentConfig(
                 thinking_config=types.ThinkingConfig(
-                    thinking_budget_tokens=100
+                    thinking_budget=128
                 ) 
             )
             response = client.models.generate_content(
@@ -181,7 +238,8 @@ def run_demo(port: int, region: str, model_id: str) -> int:
             print("  ✓ Thinking response received successfully!")
             print(f"  > {response.text.strip()}")
         except Exception as e:
-            print(f"  ! Thinking inference error: {e}")
+            print(f"  ! Thinking inference failed: {explain_failure(e, region, model_id)}")
+            return 1
             
         return 0
 
