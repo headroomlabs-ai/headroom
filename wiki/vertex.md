@@ -131,11 +131,31 @@ The Python proxy preserves caller-supplied Google bearer auth. The native Rust
 proxy path additionally resolves GCP ADC and injects the bearer token for the
 Anthropic publisher route.
 
-These native routes are a straight passthrough and need **no** `--backend` flag.
-`--backend vertex_ai` is a different mode -- it routes Anthropic *Messages*
-traffic through LiteLLM and requires `pip install "google-cloud-aiplatform>=1.38"`.
-Passing it when you are calling Vertex paths directly turns a working request
-into a `500`.
+These native routes are a straight passthrough: they need **no** `--backend`
+flag and no extra beyond `[proxy]`.
+
+`--backend vertex` (aliases: `vertex_ai`, `litellm-vertex`, `google-vertex`) is a
+different mode. It routes Anthropic *Messages* traffic — `/v1/messages` — through
+LiteLLM, and needs the Vertex SDK:
+
+```bash
+pip install "headroom-ai[proxy,vertex]"
+```
+
+That extra is kept out of `[proxy]` because `google-cloud-aiplatform` and its
+transitive tree add roughly 175 MB, and only this backend uses it. Select the
+backend without it and the proxy refuses to start rather than failing on every
+request:
+
+```text
+Cannot start proxy: Vertex backend selected but the Vertex SDK is missing. ...
+```
+
+Do not combine the two. With `--backend vertex` set, native publisher requests
+are re-routed through LiteLLM, which takes the project, region and model from
+its own configuration (`VERTEXAI_PROJECT` / `VERTEXAI_LOCATION`) and ignores the
+ones in your URL — so a request that works without the flag can come back `404`
+for a model you never named.
 
 ## Claude Code with Headroom compression (validated)
 
@@ -153,6 +173,7 @@ Short version: run Claude Code in **normal Anthropic mode** (`ANTHROPIC_BASE_URL
 > URL before sending a request ("model … not available on your vertex deployment"),
 > so the proxy is never reached. Use the Anthropic-mode runbook above instead.
 >
-> ⚠️ Two easy-to-miss requirements: `pip install "google-cloud-aiplatform>=1.38"`
-> (LiteLLM `vertex_ai` provider) and the `--code-aware` flag (code compression is
-> off by default). Without them you get a 500 or `tokens_saved: 0`.
+> ⚠️ Two easy-to-miss requirements: `pip install "headroom-ai[proxy,vertex]"`
+> (the LiteLLM `vertex_ai` provider needs the Vertex SDK) and the `--code-aware`
+> flag (code compression is off by default). Without the first the proxy refuses
+> to start; without the second you get `tokens_saved: 0`.

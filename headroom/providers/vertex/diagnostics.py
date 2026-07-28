@@ -17,10 +17,13 @@ Only already-failing responses are touched; success bodies are never modified.
 from __future__ import annotations
 
 import functools
+import importlib.util
 import json
 import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
+
+from headroom.providers.registry import BackendUnavailableError
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +71,8 @@ _QUOTA = (
 
 _MISSING_VERTEX_SDK = (
     "`--backend vertex` routes Anthropic Messages traffic through LiteLLM's vertex_ai "
-    'provider, which needs the Vertex SDK: `pip install "google-cloud-aiplatform>=1.38"`. '
+    'provider, which needs the Vertex SDK: `pip install "headroom-ai[proxy,vertex]"` '
+    '(or `pip install "google-cloud-aiplatform>=1.38"`). '
     "Note the native Vertex routes (/v1/projects/.../publishers/anthropic/models/...:rawPredict) "
     "are a straight passthrough and do NOT need `--backend vertex` -- drop the flag if you are "
     "calling Vertex paths directly."
@@ -78,6 +82,25 @@ _MISSING_ADC = (
     "No usable Google credentials were found. Run `gcloud auth application-default login`, or "
     "point GOOGLE_APPLICATION_CREDENTIALS at a service-account key."
 )
+
+
+def vertex_sdk_available() -> bool:
+    """Whether the LiteLLM vertex_ai provider's `vertexai` import will succeed."""
+    return importlib.util.find_spec("vertexai") is not None
+
+
+def ensure_vertex_sdk_available() -> None:
+    """Refuse to start a Vertex LiteLLM backend that cannot possibly serve.
+
+    Without the SDK the backend still constructs cleanly and then fails on
+    *every* request with an opaque provider string. Failing here instead turns a
+    per-request mystery into one startup error at the moment of misconfiguration.
+    """
+    if vertex_sdk_available():
+        return
+    raise BackendUnavailableError(
+        f"Vertex backend selected but the Vertex SDK is missing. {_MISSING_VERTEX_SDK}"
+    )
 
 
 def _is_anthropic(publisher: str) -> bool:

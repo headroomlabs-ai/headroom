@@ -25,6 +25,14 @@ AnyLLMBackendType: Any = None
 LiteLLMBackendType: Any = None
 
 
+class BackendUnavailableError(RuntimeError):
+    """A selected backend cannot serve and no amount of retrying will help.
+
+    Raised at startup for operator misconfiguration (a missing optional
+    dependency, say) so callers can print the remedy instead of a traceback.
+    """
+
+
 @dataclass(frozen=True)
 class ProviderApiOverrides:
     """Optional upstream API URL overrides configured for the proxy."""
@@ -249,6 +257,15 @@ def create_proxy_backend(
     # (`vertex/…` instead of `vertex_ai/…`), region dropped, auth mishandled.
     if provider in ("vertex", "google-vertex", "googlevertex"):
         provider = "vertex_ai"
+    if provider in ("vertex_ai", "vertex_ai_beta") and litellm_backend_cls is None:
+        # Preflight instead of discovering this per-request: without the Vertex
+        # SDK the backend below still constructs cleanly and then fails on every
+        # call with a provider string that names neither the cause nor the cure.
+        # Skipped when a backend class is injected, so tests can use fakes.
+        # Imported locally: headroom.providers.vertex imports this module.
+        from headroom.providers.vertex import ensure_vertex_sdk_available
+
+        ensure_vertex_sdk_available()
     try:
         backend_cls = litellm_backend_cls or _load_litellm_backend()
         instance = cast(

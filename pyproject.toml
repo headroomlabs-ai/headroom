@@ -101,6 +101,17 @@ proxy-prod = [
     "headroom-ai[proxy]",
     "gunicorn>=21.0.0; sys_platform != 'win32'",
 ]
+# Google Vertex through the LiteLLM translation backend
+# (`--backend vertex` / `vertex_ai` / `litellm-vertex`), which imports `vertexai`.
+# Kept separate from [proxy] for the same reason as proxy-prod: this pulls
+# google-cloud-aiplatform and its transitive tree (~175MB installed), and the
+# proxy's *native* Vertex passthrough routes
+# (/v1/projects/.../locations/.../publishers/...) do not need it at all.  Only
+# the LiteLLM backend does.  Install with:
+#   pip install headroom-ai[proxy,vertex]
+vertex = [
+    "google-cloud-aiplatform>=1.38",
+]
 # AST-based code compression (tree-sitter)
 # tree-sitter-language-pack >=1.0 removed the bundled tree-sitter package and
 # switched to an incompatible internal node API (.kind vs .type, callable

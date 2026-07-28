@@ -5,15 +5,19 @@ need to be correct without a live GCP project -- everything here is pure.
 """
 
 import json
+import logging
 
 import pytest
 
+from headroom.providers.registry import BackendUnavailableError, create_proxy_backend
 from headroom.providers.vertex import (
     HINT_HEADER,
     annotate_backend_error_body,
     annotate_vertex_error,
     backend_error_hint,
+    ensure_vertex_sdk_available,
     vertex_error_hint,
+    vertex_sdk_available,
 )
 
 
@@ -151,3 +155,70 @@ class TestAnnotateBackendErrorBody:
 
     def test_non_dict_body_survives(self):
         assert annotate_backend_error_body("plain text", 500) == "plain text"
+
+
+class TestVertexSdkPreflight:
+    """`--backend vertex` without the SDK must fail at startup, not per-request."""
+
+    def _no_sdk(self, monkeypatch):
+        monkeypatch.setattr(
+            "headroom.providers.vertex.diagnostics.importlib.util.find_spec",
+            lambda name: None if name == "vertexai" else object(),
+        )
+
+    def test_available_reflects_import_spec(self, monkeypatch):
+        self._no_sdk(monkeypatch)
+        assert vertex_sdk_available() is False
+
+    def test_ensure_raises_with_both_remedies(self, monkeypatch):
+        self._no_sdk(monkeypatch)
+        with pytest.raises(BackendUnavailableError) as excinfo:
+            ensure_vertex_sdk_available()
+        message = str(excinfo.value)
+        assert "headroom-ai[proxy,vertex]" in message
+        # The cheaper remedy: native passthrough routes never needed the flag.
+        assert "do NOT need `--backend vertex`" in message
+
+    def test_ensure_is_a_noop_when_present(self, monkeypatch):
+        monkeypatch.setattr(
+            "headroom.providers.vertex.diagnostics.importlib.util.find_spec",
+            lambda name: object(),
+        )
+        ensure_vertex_sdk_available()
+
+    @pytest.mark.parametrize(
+        "backend", ["vertex", "vertex_ai", "litellm-vertex", "google-vertex", "googlevertex"]
+    )
+    def test_every_vertex_alias_is_preflighted(self, monkeypatch, backend):
+        """registry aliases several spellings onto vertex_ai; all must be caught."""
+        self._no_sdk(monkeypatch)
+        with pytest.raises(BackendUnavailableError):
+            create_proxy_backend(
+                backend=backend,
+                anyllm_provider="",
+                bedrock_region=None,
+                logger=logging.getLogger("test"),
+            )
+
+    def test_other_providers_are_unaffected(self, monkeypatch):
+        """The preflight must not become a general-purpose backend gate."""
+        self._no_sdk(monkeypatch)
+        create_proxy_backend(
+            backend="litellm-openrouter",
+            anyllm_provider="",
+            bedrock_region=None,
+            logger=logging.getLogger("test"),
+        )
+
+    def test_injected_backend_class_bypasses_preflight(self, monkeypatch):
+        """Tests supplying a fake backend should not need the real SDK."""
+        self._no_sdk(monkeypatch)
+        sentinel = object()
+        result = create_proxy_backend(
+            backend="vertex",
+            anyllm_provider="",
+            bedrock_region="us-east5",
+            logger=logging.getLogger("test"),
+            litellm_backend_cls=lambda **kwargs: sentinel,
+        )
+        assert result is sentinel
