@@ -679,6 +679,32 @@ def test_preservation_get_operator_context_limit_declared():
     assert provider.get_context_limit("step-router-v1") == 262_144
 
 
+def test_preservation_get_operator_context_limit_sanitized_variant():
+    """A sanitized lookup finds the declaration for a styled model id."""
+    from headroom.providers.anthropic import AnthropicProvider
+
+    provider = AnthropicProvider(
+        context_limits={"claude-opus-4": 262_144},
+        warn=False,
+    )
+
+    assert provider.get_operator_context_limit("claude-opus-4[1m]") == 262_144
+    assert provider.has_raw_operator_context_limit("claude-opus-4[1m]") is False
+
+
+def test_preservation_has_raw_operator_context_limit():
+    """A declaration keyed by the styled id is recognized as raw."""
+    from headroom.providers.anthropic import AnthropicProvider
+
+    provider = AnthropicProvider(
+        context_limits={"claude-opus-4[1m]": 1_000_000},
+        warn=False,
+    )
+
+    assert provider.get_operator_context_limit("claude-opus-4[1m]") == 1_000_000
+    assert provider.has_raw_operator_context_limit("claude-opus-4[1m]") is True
+
+
 def test_preservation_no_message_mutation(monkeypatch):
     """The guard never mutates body['messages'], body['system'], or body['tools']."""
     monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_MODE", "observe")
