@@ -3839,7 +3839,7 @@ class AnthropicHandlerMixin:
                 if _cbp_should_guard:
                     _cbp_mode = _cbp_resolve_mode()
                     _cbp_margin = _cbp_resolve_safety_margin()
-                    _cbp_declared = self.anthropic_provider.get_operator_context_limit(model)
+                    _cbp_declared = self.anthropic_provider.get_operator_context_limit(raw_model)
                     _cbp_max_out = int(body.get("max_tokens") or 0)
 
                     # Degrade to observe when the outbound anthropic-beta carries
@@ -3850,12 +3850,24 @@ class AnthropicHandlerMixin:
                     _cbp_outbound_beta = headers.get("anthropic-beta", "")
                     _cbp_has_context1m = "context-1m" in _cbp_outbound_beta
                     if _cbp_has_context1m and not (
-                        self.anthropic_provider.has_raw_operator_context_limit(model)
+                        self.anthropic_provider.has_raw_operator_context_limit(raw_model)
                     ):
                         _cbp_mode = "observe"
 
+                    _cbp_final_messages = body.get("messages", optimized_messages)
+                    if body.get("system") is not None:
+                        _cbp_final_messages = [
+                            {"role": "system", "content": body["system"]},
+                            *_cbp_final_messages,
+                        ]
+                    _cbp_counted_tokens = tokenizer.count_messages(_cbp_final_messages)
+                    if body.get("tools"):
+                        _cbp_counted_tokens += tokenizer.count_text(
+                            json.dumps(body["tools"], default=str)
+                        )
+
                     _cbp_decision = _cbp_evaluate(
-                        counted_tokens=optimized_tokens,
+                        counted_tokens=_cbp_counted_tokens,
                         declared_limit=_cbp_declared,
                         max_output_tokens=_cbp_max_out,
                         mode=_cbp_mode,

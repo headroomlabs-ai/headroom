@@ -20,6 +20,7 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 import anyio
+import pytest
 from fastapi import Request
 from fastapi.testclient import TestClient
 
@@ -42,6 +43,19 @@ class _DummyTokenizer:
 
     def count(self, messages) -> int:
         return self._count
+
+
+class _FinalizedBodyTokenizer(_DummyTokenizer):
+    """Expose system and tool content only when the final body is counted."""
+
+    def count_messages(self, messages) -> int:
+        count = self._count
+        if any(message.get("role") == "system" for message in messages):
+            count += 50_000
+        return count
+
+    def count_text(self, text: str) -> int:
+        return 50_000 if "large-tool-schema" in text else 0
 
 
 class _DummyMetrics:
@@ -129,6 +143,7 @@ class _DummyHandler:
         self._token_count = token_count
         self._bypass_header = bypass
         self.upstream_calls: list[dict] = []
+        self.upstream_bodies: list[dict] = []
 
         self.rate_limiter = None
         self.metrics = _DummyMetrics()
@@ -218,6 +233,7 @@ class _DummyHandler:
 
     async def _retry_request(self, method, url, headers, body, **_kwargs):
         self.upstream_calls.append({"method": method, "url": url})
+        self.upstream_bodies.append(json.loads(body) if isinstance(body, bytes) else body)
         return _stub_response()
 
     def _get_compression_cache(self, session_id):
@@ -315,6 +331,22 @@ def test_contract_isolation_standalone_evaluate_matches_handler(monkeypatch):
     assert direct.should_reject is True
     assert direct.reason == "over_threshold"
 
+    BudgetHandler = _make_handler_subclass()
+    handler = BudgetHandler(operator_limit=262_144, token_count=270_000)
+    req = _build_request(
+        {
+            "model": "step-router-v1",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 8_192,
+        }
+    )
+    import headroom.tokenizers as _tk
+
+    monkeypatch.setattr(_tk, "get_tokenizer", lambda m: _DummyTokenizer(270_000))
+    response = anyio.run(handler.handle_anthropic_messages, req)
+    assert response.status_code == 400
+    assert len(handler.upstream_calls) == 0
+
 
 # --------------------------------------------------------------------------- #
 # Policy evaluate branches (mode_ / variant_)                                 #
@@ -363,6 +395,38 @@ def test_mode_observe_over_threshold():
     assert d.should_reject is False  # observe => no rejection
 
 
+def test_variant_observe_over_threshold_logs_decision_fields(monkeypatch, caplog):
+    monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_MODE", "observe")
+    monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_SAFETY_MARGIN", "0")
+    import headroom.tokenizers as _tk
+
+    BudgetHandler = _make_handler_subclass()
+    handler = BudgetHandler(operator_limit=262_144, token_count=260_000)
+    req = _build_request(
+        {
+            "model": "step-router-v1",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 8_192,
+        }
+    )
+    monkeypatch.setattr(_tk, "get_tokenizer", lambda m: _DummyTokenizer(260_000))
+
+    anyio.run(handler.handle_anthropic_messages, req)
+
+    assert len(handler.upstream_calls) == 1
+    warning = next(
+        record.getMessage()
+        for record in caplog.records
+        if "context_budget_guard" in record.getMessage()
+    )
+    assert "declared_limit=262144" in warning
+    assert "reserve=8192" in warning
+    assert "threshold=253952" in warning
+    assert "counted=260000" in warning
+    assert "overage=6048" in warning
+    assert "mode=observe" in warning
+
+
 def test_mode_reject_over_threshold():
     from headroom.proxy.context_budget_policy import evaluate
 
@@ -375,6 +439,27 @@ def test_mode_reject_over_threshold():
     )
     assert d.reason == "over_threshold"
     assert d.should_reject is True
+
+
+def test_mode_resolvers_default_and_invalid(monkeypatch):
+    from headroom.proxy.context_budget_policy import resolve_mode, resolve_safety_margin
+
+    monkeypatch.delenv("HEADROOM_CONTEXT_LIMIT_MODE", raising=False)
+    monkeypatch.delenv("HEADROOM_CONTEXT_LIMIT_SAFETY_MARGIN", raising=False)
+    assert resolve_mode() == "observe"
+    assert resolve_safety_margin() == 0
+
+    monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_MODE", "invalid")
+    with pytest.raises(ValueError, match="accepted values"):
+        resolve_mode()
+
+    monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_SAFETY_MARGIN", "not-an-int")
+    with pytest.raises(ValueError, match="not an integer"):
+        resolve_safety_margin()
+
+    monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_SAFETY_MARGIN", "-1")
+    with pytest.raises(ValueError, match="must be >= 0"):
+        resolve_safety_margin()
 
 
 def test_variant_degenerate_threshold():
@@ -519,16 +604,16 @@ def test_preservation_unconfigured_install_forwards(monkeypatch):
     BudgetHandler = _make_handler_subclass()
     handler = BudgetHandler(operator_limit=None, token_count=999_999)
 
-    req = _build_request(
-        {
-            "model": "step-router-v1",
-            "messages": [{"role": "user", "content": "hi"}],
-            "max_tokens": 8_192,
-        },
-    )
+    original_body = {
+        "model": "step-router-v1",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 8_192,
+    }
+    req = _build_request(original_body)
     monkeypatch.setattr(_tk, "get_tokenizer", lambda m: _DummyTokenizer(999_999))
     anyio.run(handler.handle_anthropic_messages, req)
     assert len(handler.upstream_calls) == 1
+    assert handler.upstream_bodies[-1] == original_body
 
 
 def test_preservation_get_context_limit_unchanged():
@@ -584,6 +669,9 @@ def test_preservation_no_message_mutation(monkeypatch):
     # Body forwarded: upstream was called (observe mode, not rejected)
     assert len(handler.upstream_calls) == 1
     # The guard must not have mutated messages; the request reached upstream unchanged.
+    assert handler.upstream_bodies[-1]["messages"] == original_messages
+    assert "system" not in handler.upstream_bodies[-1]
+    assert "tools" not in handler.upstream_bodies[-1]
 
 
 # --------------------------------------------------------------------------- #
@@ -677,6 +765,90 @@ def test_variant_context1m_with_raw_declaration_still_enforces(monkeypatch):
     resp = anyio.run(handler.handle_anthropic_messages, req)
 
     assert resp.status_code == 400
+    assert len(handler.upstream_calls) == 0
+
+
+def test_variant_context1m_suffixed_declaration_still_enforces(monkeypatch):
+    """A declaration keyed by the [1m] model id survives handler sanitization."""
+    monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_MODE", "reject")
+    monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_SAFETY_MARGIN", "0")
+    import headroom.tokenizers as _tk
+
+    BudgetHandler = _make_handler_subclass()
+    handler = BudgetHandler(operator_limit=None, token_count=300_000)
+    handler.anthropic_provider._operator_context_limits["claude-opus-4[1m]"] = 262_144
+    req = _build_request(
+        {
+            "model": "claude-opus-4[1m]",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 8_192,
+        },
+        {"anthropic-beta": "context-1m"},
+    )
+    monkeypatch.setattr(_tk, "get_tokenizer", lambda m: _DummyTokenizer(300_000))
+
+    response = anyio.run(handler.handle_anthropic_messages, req)
+
+    assert response.status_code == 400
+    assert len(handler.upstream_calls) == 0
+
+
+def test_variant_finalized_body_counts_system_and_tools(monkeypatch):
+    """Reject mode counts top-level system and tool input after shaping."""
+    monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_MODE", "reject")
+    monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_SAFETY_MARGIN", "0")
+    import headroom.tokenizers as _tk
+
+    BudgetHandler = _make_handler_subclass()
+    handler = BudgetHandler(operator_limit=262_144, token_count=220_000)
+    req = _build_request(
+        {
+            "model": "step-router-v1",
+            "system": "system instructions",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"name": "large-tool-schema", "input_schema": {"type": "object"}}],
+            "max_tokens": 8_192,
+        }
+    )
+    monkeypatch.setattr(_tk, "get_tokenizer", lambda m: _FinalizedBodyTokenizer(220_000))
+
+    response = anyio.run(handler.handle_anthropic_messages, req)
+
+    assert response.status_code == 400
+    assert len(handler.upstream_calls) == 0
+
+
+def test_variant_output_shaper_mutation_is_counted_after_recount(monkeypatch):
+    """The guard sees a system mutation made after the metrics recount."""
+    monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_MODE", "reject")
+    monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_SAFETY_MARGIN", "0")
+    monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")
+    import headroom.proxy.output_savings as _savings
+    import headroom.proxy.output_shaper as _shaper
+    import headroom.tokenizers as _tk
+
+    monkeypatch.setattr(_savings, "assign_arm", lambda *args: "treatment")
+    monkeypatch.setattr(_shaper, "resolve_verbosity_level", lambda settings: (2, "test"))
+
+    def _mutate_body(body, settings, *, level_override):
+        body["system"] = "new system content"
+        return SimpleNamespace(changed=True, labels=["test-shaper"])
+
+    monkeypatch.setattr(_shaper, "shape_request", _mutate_body)
+    BudgetHandler = _make_handler_subclass()
+    handler = BudgetHandler(operator_limit=262_144, token_count=220_000)
+    req = _build_request(
+        {
+            "model": "step-router-v1",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 8_192,
+        }
+    )
+    monkeypatch.setattr(_tk, "get_tokenizer", lambda m: _FinalizedBodyTokenizer(220_000))
+
+    response = anyio.run(handler.handle_anthropic_messages, req)
+
+    assert response.status_code == 400
     assert len(handler.upstream_calls) == 0
 
 
