@@ -3815,6 +3815,95 @@ class AnthropicHandlerMixin:
             ):
                 headers["anthropic-beta"] = _client_beta_value
 
+            # Context budget guard (#2649). Applied after all input shaping
+            # so the count covers the finalized body. Only operator-declared
+            # limits are accepted; inferred defaults never drive a refusal.
+            # Fail-open: any exception inside the block forwards the request
+            # unchanged.
+            try:
+                from headroom.proxy.context_budget_policy import (
+                    evaluate as _cbp_evaluate,
+                )
+                from headroom.proxy.context_budget_policy import (
+                    resolve_mode as _cbp_resolve_mode,
+                )
+                from headroom.proxy.context_budget_policy import (
+                    resolve_safety_margin as _cbp_resolve_safety_margin,
+                )
+
+                _cbp_should_guard = True
+                # Short-circuit: bypass header skips all Headroom behaviour.
+                if _bypass:
+                    _cbp_should_guard = False
+
+                if _cbp_should_guard:
+                    _cbp_mode = _cbp_resolve_mode()
+                    _cbp_margin = _cbp_resolve_safety_margin()
+                    _cbp_declared = self.anthropic_provider.get_operator_context_limit(model)
+                    _cbp_max_out = int(body.get("max_tokens") or 0)
+
+                    # Degrade to observe when the outbound anthropic-beta carries
+                    # context-1m and no raw-id declaration exists: the effective
+                    # window is then unknowable because sanitize_anthropic_model_id
+                    # strips the [1m] suffix and the declared limit would apply to
+                    # the base model, not the 1M variant.
+                    _cbp_outbound_beta = headers.get("anthropic-beta", "")
+                    _cbp_has_context1m = "context-1m" in _cbp_outbound_beta
+                    if _cbp_has_context1m and not (
+                        self.anthropic_provider.has_raw_operator_context_limit(model)
+                    ):
+                        _cbp_mode = "observe"
+
+                    _cbp_decision = _cbp_evaluate(
+                        counted_tokens=optimized_tokens,
+                        declared_limit=_cbp_declared,
+                        max_output_tokens=_cbp_max_out,
+                        mode=_cbp_mode,
+                        safety_margin=_cbp_margin,
+                    )
+
+                    if _cbp_decision.reason == "over_threshold":
+                        logger.warning(
+                            "[%s] context_budget_guard: model=%s declared_limit=%d "
+                            "reserve=%d threshold=%d counted=%d overage=%d mode=%s",
+                            request_id,
+                            model,
+                            _cbp_decision.declared_limit,
+                            _cbp_decision.reserve,
+                            _cbp_decision.threshold,
+                            _cbp_decision.counted_tokens,
+                            _cbp_decision.overage,
+                            _cbp_mode,
+                        )
+
+                    if _cbp_decision.should_reject:
+                        await _finalize_pre_upstream()
+                        return JSONResponse(
+                            status_code=400,
+                            content={
+                                "type": "error",
+                                "error": {
+                                    "type": "invalid_request_error",
+                                    "message": (
+                                        f"Request exceeds the declared context limit for {model}: "
+                                        f"{_cbp_decision.counted_tokens} tokens counted, "
+                                        f"{_cbp_decision.threshold} available "
+                                        f"(declared {_cbp_decision.declared_limit}, "
+                                        f"reserve {_cbp_decision.reserve}). "
+                                        "Set HEADROOM_CONTEXT_LIMIT_MODE=observe to log only."
+                                    ),
+                                },
+                            },
+                        )
+            except Exception:
+                # Any failure in limit lookup, mode resolution, or evaluation
+                # forwards the request unchanged.
+                logger.debug(
+                    "[%s] context_budget_guard: exception during evaluation, forwarding",
+                    request_id,
+                    exc_info=True,
+                )
+
             # Forward request - use Bedrock backend if configured, otherwise direct API
             #
             # An extension may have published a per-request routing decision on
