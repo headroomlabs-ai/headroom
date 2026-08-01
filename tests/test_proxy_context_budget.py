@@ -144,6 +144,7 @@ class _DummyHandler:
         self._bypass_header = bypass
         self.upstream_calls: list[dict] = []
         self.upstream_bodies: list[dict] = []
+        self.upstream_original_body_bytes: list[bytes | None] = []
 
         self.rate_limiter = None
         self.metrics = _DummyMetrics()
@@ -234,6 +235,7 @@ class _DummyHandler:
     async def _retry_request(self, method, url, headers, body, **_kwargs):
         self.upstream_calls.append({"method": method, "url": url})
         self.upstream_bodies.append(json.loads(body) if isinstance(body, bytes) else body)
+        self.upstream_original_body_bytes.append(_kwargs.get("original_body_bytes"))
         return _stub_response()
 
     def _get_compression_cache(self, session_id):
@@ -535,7 +537,7 @@ def test_variant_bypass_not_evaluated(monkeypatch):
     assert len(handler.upstream_calls) == 1
 
 
-def test_variant_context1m_without_raw_declaration_degrades_to_observe(monkeypatch):
+def test_variant_context1m_without_raw_declaration_degrades_to_observe(monkeypatch, caplog):
     """context-1m beta without raw-id declaration degrades to observe even in reject mode."""
     monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_MODE", "reject")
     monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_SAFETY_MARGIN", "0")
@@ -544,12 +546,9 @@ def test_variant_context1m_without_raw_declaration_degrades_to_observe(monkeypat
     # Operator declared 'claude-opus-4' (sanitized form) but NOT 'claude-opus-4[1m]'
     BudgetHandler = _make_handler_subclass()
 
-    # No [1m]-keyed declaration in _operator_context_limits
     handler = BudgetHandler(operator_limit=None, token_count=300_000)
-    # Override _operator_context_limits to have the sanitized key but not raw
-    handler.anthropic_provider._operator_context_limits = {}
-    handler.anthropic_provider.get_operator_context_limit = lambda m: None
-    handler.anthropic_provider.has_raw_operator_context_limit = lambda m: False
+    # The sanitized declaration must be present so this is a true context-1m false positive.
+    handler.anthropic_provider._operator_context_limits.update({"claude-opus-4": 262_144})
 
     req = _build_request(
         {
@@ -557,13 +556,14 @@ def test_variant_context1m_without_raw_declaration_degrades_to_observe(monkeypat
             "messages": [{"role": "user", "content": "hi"}],
             "max_tokens": 8_192,
         },
-        # client carries context-1m beta
-        {"anthropic-beta": "context-1m"},
+        # Configured header casing must not change context-1m detection.
+        {"anthropic-beta": "Context-1M"},
     )
     monkeypatch.setattr(_tk, "get_tokenizer", lambda m: _DummyTokenizer(300_000))
     anyio.run(handler.handle_anthropic_messages, req)
     # Degrades to observe: request forwards (not rejected)
     assert len(handler.upstream_calls) == 1
+    assert any("no raw model declaration" in record.getMessage() for record in caplog.records)
 
 
 def test_variant_guard_internal_error_forwards(monkeypatch):
@@ -592,6 +592,32 @@ def test_variant_guard_internal_error_forwards(monkeypatch):
     assert len(handler.upstream_calls) == 1
 
 
+def test_variant_invalid_guard_configuration_forwards_with_warning(monkeypatch, caplog):
+    """Invalid operator values fail open and identify the configuration fix."""
+    monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_MODE", "invalid")
+    import headroom.tokenizers as _tk
+
+    BudgetHandler = _make_handler_subclass()
+    handler = BudgetHandler(operator_limit=262_144, token_count=300_000)
+    req = _build_request(
+        {
+            "model": "step-router-v1",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 8_192,
+        }
+    )
+    monkeypatch.setattr(_tk, "get_tokenizer", lambda m: _DummyTokenizer(300_000))
+
+    anyio.run(handler.handle_anthropic_messages, req)
+
+    assert len(handler.upstream_calls) == 1
+    assert any(
+        "invalid configuration" in record.getMessage()
+        and "forwarding unchanged" in record.getMessage()
+        for record in caplog.records
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Preservation (preservation)                                                  #
 # --------------------------------------------------------------------------- #
@@ -614,6 +640,7 @@ def test_preservation_unconfigured_install_forwards(monkeypatch):
     anyio.run(handler.handle_anthropic_messages, req)
     assert len(handler.upstream_calls) == 1
     assert handler.upstream_bodies[-1] == original_body
+    assert handler.upstream_original_body_bytes[-1] == json.dumps(original_body).encode()
 
 
 def test_preservation_get_context_limit_unchanged():
@@ -672,6 +699,30 @@ def test_preservation_no_message_mutation(monkeypatch):
     assert handler.upstream_bodies[-1]["messages"] == original_messages
     assert "system" not in handler.upstream_bodies[-1]
     assert "tools" not in handler.upstream_bodies[-1]
+
+
+def test_preservation_system_and_tools_forward_unchanged(monkeypatch):
+    """Observe mode forwards top-level system and tools without mutation."""
+    monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_MODE", "observe")
+    import headroom.tokenizers as _tk
+
+    original_body = {
+        "model": "step-router-v1",
+        "system": "system instructions",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"name": "tool", "input_schema": {"type": "object"}}],
+        "max_tokens": 8_192,
+    }
+    BudgetHandler = _make_handler_subclass()
+    handler = BudgetHandler(operator_limit=262_144, token_count=10)
+    req = _build_request(original_body)
+    monkeypatch.setattr(_tk, "get_tokenizer", lambda m: _DummyTokenizer(10))
+
+    anyio.run(handler.handle_anthropic_messages, req)
+
+    assert len(handler.upstream_calls) == 1
+    assert handler.upstream_bodies[-1] == original_body
+    assert handler.upstream_original_body_bytes[-1] == json.dumps(original_body).encode()
 
 
 # --------------------------------------------------------------------------- #

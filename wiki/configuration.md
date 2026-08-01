@@ -234,7 +234,7 @@ Some settings can be configured via environment variables:
 |----------|-------------|---------|
 | `HEADROOM_MODEL_LIMITS` | Custom model config (JSON string or file path) | - |
 | `HEADROOM_CONTEXT_LIMIT_MODE` | Context budget guard mode. `observe` (default) logs over-limit finalized requests and forwards them; `reject` returns a local 400 before any upstream attempt. Effective only when a model limit is declared in `HEADROOM_MODEL_LIMITS` or `models.json`. | `observe` |
-| `HEADROOM_CONTEXT_LIMIT_SAFETY_MARGIN` | Token reserve subtracted from the declared model context limit before comparing against the finalized request token count (in addition to `max_tokens`). A non-negative integer. | `0` |
+| `HEADROOM_CONTEXT_LIMIT_SAFETY_MARGIN` | Token reserve subtracted from the declared model context limit before comparing against the finalized request token count. The reserve is the larger of this value and `max_tokens`. A non-negative integer. | `0` |
 | `HEADROOM_CONFIG_DIR` | Canonical config (read-mostly) root. Derives `models.json` and per-plugin config paths when set. | `~/.headroom/config` |
 | `HEADROOM_WORKSPACE_DIR` | Canonical workspace (read-write state) root. Derives savings ledger, memory DB, logs, TOIN, subscription state, and more when set. | `~/.headroom` |
 | `HEADROOM_SAVINGS_PATH` | Full path to the proxy savings JSON ledger. Always wins when set. | derived from `${HEADROOM_WORKSPACE_DIR}` |

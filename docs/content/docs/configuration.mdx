@@ -376,7 +376,7 @@ headroom proxy --learn --min-evidence 3
 | `HEADROOM_MODEL_LIMITS` | Custom model config (JSON string or file path) | -- |
 | `HEADROOM_LOSSLESS_COMPACTION` | Set to `0` to disable the byte-reversible lossless folds (grep heading, log run-collapse, diff/config folds) while leaving the rest of the compression pipeline active. Read per request, so the proxy's `/admin/runtime-env` hot-sync applies without a restart. | `1` |
 | `HEADROOM_CONTEXT_LIMIT_MODE` | Context budget guard mode. `observe` (default) logs over-limit finalized requests and forwards them; `reject` returns a local 400 before any upstream attempt. Effective only when a model limit is declared in `HEADROOM_MODEL_LIMITS` or `models.json`. | `observe` |
-| `HEADROOM_CONTEXT_LIMIT_SAFETY_MARGIN` | Token reserve subtracted from the declared model context limit before comparing against the finalized request token count (in addition to `max_tokens`). A non-negative integer. | `0` |
+| `HEADROOM_CONTEXT_LIMIT_SAFETY_MARGIN` | Token reserve subtracted from the declared model context limit before comparing against the finalized request token count. The reserve is the larger of this value and `max_tokens`. A non-negative integer. | `0` |
 | `HEADROOM_BASE_URL` | Base URL of the Headroom proxy (TypeScript SDK) | `http://localhost:8787` |
 | `HEADROOM_API_KEY` | Optional API key for authenticated Headroom endpoints (TypeScript SDK) | -- |
 | `HEADROOM_CONFIG_DIR` | Canonical config (read-mostly) root. Derives `models.json` and per-plugin config paths when set. | `~/.headroom/config` |

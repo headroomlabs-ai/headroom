@@ -3831,15 +3831,12 @@ class AnthropicHandlerMixin:
                     resolve_safety_margin as _cbp_resolve_safety_margin,
                 )
 
-                _cbp_should_guard = True
                 # Short-circuit: bypass header skips all Headroom behaviour.
-                if _bypass:
-                    _cbp_should_guard = False
-
-                if _cbp_should_guard:
+                if not _bypass:
+                    _cbp_declared = self.anthropic_provider.get_operator_context_limit(raw_model)
+                if not _bypass and _cbp_declared is not None:
                     _cbp_mode = _cbp_resolve_mode()
                     _cbp_margin = _cbp_resolve_safety_margin()
-                    _cbp_declared = self.anthropic_provider.get_operator_context_limit(raw_model)
                     _cbp_max_out = int(body.get("max_tokens") or 0)
 
                     # Degrade to observe when the outbound anthropic-beta carries
@@ -3848,11 +3845,17 @@ class AnthropicHandlerMixin:
                     # strips the [1m] suffix and the declared limit would apply to
                     # the base model, not the 1M variant.
                     _cbp_outbound_beta = headers.get("anthropic-beta", "")
-                    _cbp_has_context1m = "context-1m" in _cbp_outbound_beta
+                    _cbp_has_context1m = "context-1m" in _cbp_outbound_beta.lower()
                     if _cbp_has_context1m and not (
                         self.anthropic_provider.has_raw_operator_context_limit(raw_model)
                     ):
                         _cbp_mode = "observe"
+                        logger.warning(
+                            "[%s] context_budget_guard: context-1m beta has no raw model "
+                            "declaration for %s; forwarding in observe mode",
+                            request_id,
+                            raw_model,
+                        )
 
                     _cbp_final_messages = body.get("messages", optimized_messages)
                     if body.get("system") is not None:
@@ -3877,7 +3880,7 @@ class AnthropicHandlerMixin:
                     if _cbp_decision.reason == "over_threshold":
                         logger.warning(
                             "[%s] context_budget_guard: model=%s declared_limit=%d "
-                            "reserve=%d threshold=%d counted=%d overage=%d mode=%s",
+                            "reserve=%d threshold=%d counted=%d overage=%d mode=%s %s",
                             request_id,
                             model,
                             _cbp_decision.declared_limit,
@@ -3886,6 +3889,8 @@ class AnthropicHandlerMixin:
                             _cbp_decision.counted_tokens,
                             _cbp_decision.overage,
                             _cbp_mode,
+                            "; set HEADROOM_CONTEXT_LIMIT_MODE=reject to refuse locally or "
+                            "adjust HEADROOM_MODEL_LIMITS",
                         )
 
                     if _cbp_decision.should_reject:
@@ -3907,6 +3912,14 @@ class AnthropicHandlerMixin:
                                 },
                             },
                         )
+            except ValueError as exc:
+                logger.warning(
+                    "[%s] context_budget_guard: invalid configuration (%s); forwarding "
+                    "unchanged. Set HEADROOM_CONTEXT_LIMIT_MODE to observe or reject and "
+                    "use a non-negative HEADROOM_CONTEXT_LIMIT_SAFETY_MARGIN.",
+                    request_id,
+                    exc,
+                )
             except Exception:
                 # Any failure in limit lookup, mode resolution, or evaluation
                 # forwards the request unchanged.
