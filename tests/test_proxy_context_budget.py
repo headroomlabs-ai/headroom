@@ -465,7 +465,12 @@ def test_mode_resolvers_default_and_invalid(monkeypatch):
 
 
 def test_variant_degenerate_threshold():
-    """When max_output_tokens >= declared_limit the threshold is <= 0: no rejection."""
+    """Equal max_output_tokens (threshold=0) is over budget in reject mode.
+
+    A request whose reserved output consumes the entire window cannot fit by
+    construction, so reject mode refuses it instead of forwarding (review
+    4850625429 regression).
+    """
     from headroom.proxy.context_budget_policy import evaluate
 
     d = evaluate(
@@ -476,11 +481,13 @@ def test_variant_degenerate_threshold():
         safety_margin=0,
     )
     assert d.reason == "degenerate_threshold"
-    assert d.should_reject is False
+    assert d.threshold == 0
+    assert d.should_reject is True
+    assert d.overage == 100_000  # counted_tokens - threshold
 
 
 def test_variant_degenerate_threshold_max_output_exceeds():
-    """max_output_tokens > declared_limit is also degenerate."""
+    """max_output_tokens > declared_limit is over budget in reject mode."""
     from headroom.proxy.context_budget_policy import evaluate
 
     d = evaluate(
@@ -491,7 +498,140 @@ def test_variant_degenerate_threshold_max_output_exceeds():
         safety_margin=0,
     )
     assert d.reason == "degenerate_threshold"
+    assert d.threshold == 8_192 - 16_000
+    assert d.should_reject is True
+    assert d.overage == 100_000 - d.threshold
+
+
+def test_variant_degenerate_threshold_observe_forwards():
+    """Observe mode keeps a non-positive threshold non-rejecting and logs."""
+    from headroom.proxy.context_budget_policy import evaluate
+
+    d = evaluate(
+        counted_tokens=100_000,
+        declared_limit=8_192,
+        max_output_tokens=8_192,
+        mode="observe",
+        safety_margin=0,
+    )
+    assert d.reason == "degenerate_threshold"
     assert d.should_reject is False
+    assert d.overage == 100_000
+
+
+def test_variant_degenerate_threshold_safety_margin_reject():
+    """safety_margin >= declared_limit is over budget in reject mode."""
+    from headroom.proxy.context_budget_policy import evaluate
+
+    d = evaluate(
+        counted_tokens=100_000,
+        declared_limit=8_192,
+        max_output_tokens=4_096,
+        mode="reject",
+        safety_margin=8_192,  # equal to declared_limit -> threshold <= 0
+    )
+    assert d.reason == "degenerate_threshold"
+    assert d.threshold <= 0
+    assert d.should_reject is True
+    assert d.overage == 100_000 - d.threshold
+
+
+def test_variant_degenerate_threshold_safety_margin_observe():
+    """Degenerate safety_margin in observe mode stays non-rejecting."""
+    from headroom.proxy.context_budget_policy import evaluate
+
+    d = evaluate(
+        counted_tokens=100_000,
+        declared_limit=8_192,
+        max_output_tokens=4_096,
+        mode="observe",
+        safety_margin=8_192,
+    )
+    assert d.reason == "degenerate_threshold"
+    assert d.should_reject is False
+
+
+def test_handler_degenerate_max_tokens_rejects_with_zero_upstream(monkeypatch):
+    """Handler: max_tokens >= declared_limit in reject mode returns 400 locally.
+
+    Review 4850625429 scenario: declared_limit=200_000, max_output_tokens=200_000,
+    counted_tokens=1, mode=reject. The threshold is 0, which must count as over
+    budget so the request is refused before any upstream attempt.
+    """
+    monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_MODE", "reject")
+    monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_SAFETY_MARGIN", "0")
+    import headroom.tokenizers as _tk
+
+    BudgetHandler = _make_handler_subclass()
+    handler = BudgetHandler(operator_limit=200_000, token_count=1)
+    req = _build_request(
+        {
+            "model": "step-router-v1",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 200_000,  # equals declared_limit -> threshold=0
+        },
+    )
+    monkeypatch.setattr(_tk, "get_tokenizer", lambda m: _DummyTokenizer(1))
+
+    resp = anyio.run(handler.handle_anthropic_messages, req)
+
+    assert resp.status_code == 400, f"Expected local 400, got {resp.status_code}"
+    body = json.loads(resp.body)
+    assert "step-router-v1" in body["error"]["message"]
+    assert len(handler.upstream_calls) == 0
+
+
+def test_handler_degenerate_safety_margin_rejects_with_zero_upstream(monkeypatch):
+    """Handler: safety_margin >= declared_limit in reject mode returns 400 locally."""
+    monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_MODE", "reject")
+    monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_SAFETY_MARGIN", "200000")
+    import headroom.tokenizers as _tk
+
+    BudgetHandler = _make_handler_subclass()
+    handler = BudgetHandler(operator_limit=200_000, token_count=1)
+    req = _build_request(
+        {
+            "model": "step-router-v1",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 8_192,
+        },
+    )
+    monkeypatch.setattr(_tk, "get_tokenizer", lambda m: _DummyTokenizer(1))
+
+    resp = anyio.run(handler.handle_anthropic_messages, req)
+
+    assert resp.status_code == 400, f"Expected local 400, got {resp.status_code}"
+    assert len(handler.upstream_calls) == 0
+
+
+def test_handler_degenerate_observe_logs_and_forwards(monkeypatch, caplog):
+    """Handler: observe mode logs a degenerate threshold and still forwards."""
+    monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_MODE", "observe")
+    monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_SAFETY_MARGIN", "0")
+    import headroom.tokenizers as _tk
+
+    BudgetHandler = _make_handler_subclass()
+    handler = BudgetHandler(operator_limit=200_000, token_count=1)
+    req = _build_request(
+        {
+            "model": "step-router-v1",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 200_000,
+        },
+    )
+    monkeypatch.setattr(_tk, "get_tokenizer", lambda m: _DummyTokenizer(1))
+
+    anyio.run(handler.handle_anthropic_messages, req)
+
+    assert len(handler.upstream_calls) == 1
+    warning = next(
+        record.getMessage()
+        for record in caplog.records
+        if "context_budget_guard" in record.getMessage()
+    )
+    assert "declared_limit=200000" in warning
+    assert "threshold=0" in warning
+    assert "overage=1" in warning
 
 
 def test_variant_safety_margin_adds_reserve():

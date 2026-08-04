@@ -67,7 +67,8 @@ def evaluate(
 
     Branches (in order):
     1. declared_limit is None  -> reason='no_declared_limit', should_reject=False
-    2. threshold <= 0          -> reason='degenerate_threshold', should_reject=False
+    2. threshold <= 0          -> reason='degenerate_threshold', overage reported,
+                                  should_reject=(mode=='reject')
     3. counted_tokens <= threshold -> reason='under_threshold', should_reject=False
     4. else                    -> reason='over_threshold', should_reject=(mode=='reject')
 
@@ -91,14 +92,20 @@ def evaluate(
     threshold = declared_limit - reserve
 
     if threshold <= 0:
+        # The reserved output alone consumes the whole declared window, so no
+        # request can fit by construction. In reject mode that is over budget:
+        # refusing keeps the proxy's promise that an impossible request never
+        # reaches upstream. Observe mode still logs and forwards. The overage
+        # uses the same counted - threshold formula as the over-threshold branch,
+        # which is positive whenever the threshold is non-positive.
         return BudgetDecision(
             mode=mode,
             counted_tokens=counted_tokens,
             declared_limit=declared_limit,
             reserve=reserve,
             threshold=threshold,
-            overage=0,
-            should_reject=False,
+            overage=counted_tokens - threshold,
+            should_reject=(mode == "reject"),
             reason="degenerate_threshold",
         )
 

@@ -3877,7 +3877,7 @@ class AnthropicHandlerMixin:
                         safety_margin=_cbp_margin,
                     )
 
-                    if _cbp_decision.reason == "over_threshold":
+                    if _cbp_decision.reason in ("over_threshold", "degenerate_threshold"):
                         logger.warning(
                             "[%s] context_budget_guard: model=%s declared_limit=%d "
                             "reserve=%d threshold=%d counted=%d overage=%d mode=%s %s",
