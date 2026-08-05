@@ -110,6 +110,27 @@ class TestEviction:
         assert ctx.get("second") is not None
         assert ctx.get("third") is not None
 
+    def test_updating_existing_key_at_capacity_does_not_evict(self) -> None:
+        """Overwriting an existing key at capacity must not evict an unrelated one.
+
+        Regression: ``_evict_if_needed`` runs before the assignment, so it
+        drops the oldest entry even when the ``put`` was going to overwrite
+        (not grow) the map — the size stays inside the cap without eviction.
+        Same class of bug as fixed for ``SemanticCache`` in #2094.
+        """
+
+        ctx = SharedContext(max_entries=3)
+        ctx.put("a", "data a")
+        ctx.put("b", "data b")
+        ctx.put("c", "data c")
+        assert set(ctx.keys()) == {"a", "b", "c"}
+
+        # Update an existing key at capacity — must be a no-op for the others.
+        ctx.put("c", "data c UPDATED")
+
+        assert set(ctx.keys()) == {"a", "b", "c"}
+        assert ctx.get("c", full=True) == "data c UPDATED"
+
 
 class TestClear:
     def test_clear_removes_all(self) -> None:

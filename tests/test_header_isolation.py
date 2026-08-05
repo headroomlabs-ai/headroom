@@ -34,6 +34,7 @@ from fastapi.testclient import TestClient
 from headroom.proxy.helpers import (
     _strip_internal_headers,
     get_strip_internal_headers_mode,
+    merge_extra_headers,
 )
 from headroom.proxy.server import ProxyConfig, create_app
 
@@ -225,7 +226,7 @@ class _FakePrefixTracker:
         return None
 
 
-def _make_anthropic_app() -> tuple[TestClient, _CapturingTransport]:
+def _make_anthropic_app(**config_overrides) -> tuple[TestClient, _CapturingTransport]:
     config = ProxyConfig(
         optimize=False,
         cache_enabled=False,
@@ -236,6 +237,7 @@ def _make_anthropic_app() -> tuple[TestClient, _CapturingTransport]:
         ccr_handle_responses=False,
         ccr_context_tracking=False,
         image_optimize=False,
+        **config_overrides,
     )
     app = create_app(config)
     proxy = app.state.proxy
@@ -569,3 +571,68 @@ def test_openai_chat_x_headroom_bypass_not_forwarded() -> None:
     assert "x-headroom-bypass" not in sent_headers
     assert "x-headroom-user-id" not in sent_headers
     assert sent_headers.get("authorization") == "Bearer sk-test"
+
+
+# ---------------------------------------------------------------------------
+# Configured extra headers (anthropic_extra_headers / openai_extra_headers)
+# ---------------------------------------------------------------------------
+
+
+def test_anthropic_extra_headers_merged_and_override_client_header() -> None:
+    """Configured extra headers reach upstream and override same-named client headers."""
+    client, transport = _make_anthropic_app(
+        anthropic_extra_headers={"x-api-key": "gateway-key", "x-gateway-id": "gw-1"}
+    )
+    resp = client.post(
+        "/v1/messages",
+        headers={
+            "x-api-key": "client-key",
+            "anthropic-version": "2023-06-01",
+        },
+        json={
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert transport.captured_headers is not None
+    upstream = {k.lower(): v for k, v in transport.captured_headers.items()}
+    # Configured header wins over the client-sent value for the same key.
+    assert upstream.get("x-api-key") == "gateway-key"
+    # A configured header not sent by the client is still added.
+    assert upstream.get("x-gateway-id") == "gw-1"
+
+
+def test_anthropic_no_extra_headers_configured_is_unchanged() -> None:
+    """With no extra headers configured, forwarding behavior is unchanged."""
+    client, transport = _make_anthropic_app()
+    resp = client.post(
+        "/v1/messages",
+        headers={"x-api-key": "client-key", "anthropic-version": "2023-06-01"},
+        json={
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    upstream = {k.lower(): v for k, v in transport.captured_headers.items()}
+    assert upstream.get("x-api-key") == "client-key"
+    assert "x-gateway-id" not in upstream
+
+
+def test_merge_extra_headers_overrides_case_insensitively() -> None:
+    """A configured extra header wins even when the client used different casing."""
+    out = merge_extra_headers(
+        {"Authorization": "client", "keep": "v"}, {"authorization": "gateway"}
+    )
+    assert out == {"authorization": "gateway", "keep": "v"}
+    # Exactly one authorization header survives (no duplicate casings upstream).
+    assert [k for k in out if k.lower() == "authorization"] == ["authorization"]
+
+
+def test_merge_extra_headers_none_returns_same_object() -> None:
+    """No configured extras -> caller's dict is returned unchanged (no copy)."""
+    headers = {"a": "b"}
+    assert merge_extra_headers(headers, None) is headers

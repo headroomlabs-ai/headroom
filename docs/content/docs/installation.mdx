@@ -7,6 +7,8 @@ description: Install Headroom via pip, npm, or Docker. Includes all Python extra
 
 ## Install options
 
+**uv tool** - you want the `headroom` CLI (`proxy`, `wrap`, `mcp`, `learn`, `perf`) installed once on your machine in an isolated app environment.
+
 **pip** - you're writing Python, or you need the CLI (`headroom proxy`, `wrap`, `mcp`, `learn`, `perf`), regardless of what language your app is in.
 
 **npm** - you're writing TypeScript/Node and want inline `compress()`, SDK wrapping (`withHeadroom`), or Vercel AI SDK middleware.
@@ -20,13 +22,58 @@ Current release wheels are built for Python **3.10 through 3.13** on Linux
 from the sdist and need a working native toolchain. If your installer is
 using a newer Python, force a supported interpreter.
 
+### CLI install with uv
+
+For a host-level `headroom` command on macOS Apple Silicon or Linux, prefer
+`uv tool install`. It keeps Headroom in a dedicated app environment instead of
+tying it to the current project or shell Python.
+
+```bash
+uv tool install --python 3.13 "headroom-ai[all]"
+headroom --version
+```
+
+On macOS with Homebrew, `python3` may point at a newer interpreter than the
+current Headroom wheel set. Passing `--python 3.13` keeps installation on a
+wheel-supported interpreter. If Python 3.13 is missing, install it with
+Homebrew or let uv download a managed interpreter:
+
+```bash
+brew install python@3.13
+uv tool install --python 3.13 "headroom-ai[all]"
+```
+
+If `headroom` is installed but your shell cannot find it, add uv's tool
+directory to `PATH`:
+
+```bash
+uv tool update-shell
+```
+
+For MCP clients such as Codex that do not inherit your interactive shell
+`PATH`, configure the absolute executable path returned by `command -v
+headroom`:
+
+```toml
+[mcp_servers.headroom]
+command = "/Users/you/.local/bin/headroom"
+args = ["mcp", "serve"]
+```
+
+Native Intel macOS installs are currently tracked in
+[headroomlabs-ai/headroom#525](https://github.com/headroomlabs-ai/headroom/issues/525).
+Use [Docker-Native Install](/docs/docker-install) on Intel Macs until native
+wheel support lands.
+
 ### Core package
 
 ```bash
 pip install headroom-ai
 ```
 
-The core package includes the `compress()` function, SmartCrusher, CacheAligner, and IntelligentContext. No heavy dependencies.
+The core package includes the `compress()` function, SmartCrusher, CacheAligner, and live-zone ContentRouter compression. No heavy dependencies.
+
+> **Note:** IntelligentContext / RollingWindow (score-based history dropping) were retired in PR-B1. Headroom compresses fresh tool output and new turns only — it does not drop conversation history.
 
 ### Extras
 
@@ -41,7 +88,8 @@ pip install "headroom-ai[all]"
 | `proxy` | Proxy server, MCP tools, HTTP API | `pip install "headroom-ai[proxy]"` |
 | `ml` | Kompress (ModernBERT text compression, requires PyTorch) | `pip install "headroom-ai[ml]"` |
 | `code` | CodeCompressor (tree-sitter AST parsing) | `pip install "headroom-ai[code]"` |
-| `memory` | Persistent memory (hnswlib, sqlite-vec, sentence-transformers) | `pip install "headroom-ai[memory]"` |
+| `memory` | Persistent memory (sqlite-vec, sentence-transformers) — pure-Python default backend, no compiler | `pip install "headroom-ai[memory]"` |
+| `vector` | Optional HNSW vector backend (hnswlib) — needs a C++ toolchain; **not in `[all]`** | `pip install "headroom-ai[vector]"` |
 | `relevance` | fastembed-based relevance scoring (BAAI/bge-small-en-v1.5, ONNX) | `pip install "headroom-ai[relevance]"` |
 | `image` | Image compression (Pillow, ONNX runtime, OCR) | `pip install "headroom-ai[image]"` |
 | `reports` | HTML/Markdown report generation (Jinja2) | `pip install "headroom-ai[reports]"` |
@@ -92,7 +140,7 @@ To install the prerequisites:
 
 If you'd rather avoid the native toolchain entirely, run Headroom
 through Docker — see the [Docker](#docker) section below. Native
-Windows wheels are tracked in [#636](https://github.com/chopratejas/headroom/issues/636).
+Windows wheels are tracked in [#636](https://github.com/headroomlabs-ai/headroom/issues/636).
 
 ### pipx
 
@@ -100,7 +148,8 @@ Windows wheels are tracked in [#636](https://github.com/chopratejas/headroom/iss
 unsupported Python version, `pipx` may resolve an older compatible Headroom
 release instead of the newest one.
 
-Use Python 3.13 explicitly:
+Use Python 3.13 explicitly. If you already use uv, prefer the
+[`uv tool`](#cli-install-with-uv) path above.
 
 ```bash
 pipx install --python python3.13 "headroom-ai[all]"
@@ -126,7 +175,7 @@ python -c "import headroom; print(headroom.__version__)"
 
 ## TypeScript / Node.js
 
-The TypeScript SDK is published as `headroom-ai` on npm. It requires **Node.js 18+**.
+The TypeScript SDK is published as `headroom-ai` on npm. It requires **Node.js 18+**. It is a library you import — it does **not** install the `headroom` CLI (`headroom wrap`, `headroom proxy`, etc.), which ships only with the Python package above.
 
 ```bash
 npm install headroom-ai
@@ -169,8 +218,8 @@ node -e "const h = require('headroom-ai'); console.log('headroom-ai loaded')"
 Pre-built images are published to GitHub Container Registry on every release.
 
 ```bash
-docker pull ghcr.io/chopratejas/headroom:latest
-docker run -p 8787:8787 ghcr.io/chopratejas/headroom:latest
+docker pull ghcr.io/headroomlabs-ai/headroom:latest
+docker run -p 8787:8787 ghcr.io/headroomlabs-ai/headroom:latest
 ```
 
 <Callout type="info" title="Running Headroom without installing Python or Node?">
@@ -219,6 +268,12 @@ These variables configure Headroom at runtime. Set them in your shell, `.env` fi
 | `ANTHROPIC_API_KEY` | Anthropic API key (used when proxying to Anthropic) |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | AWS credentials for Bedrock backend |
 | `GOOGLE_APPLICATION_CREDENTIALS` | Google Cloud credentials for Vertex AI backend |
+| `VERTEXAI_PROJECT` | GCP project id for the Vertex AI backend (LiteLLM-specific — distinct from `GOOGLE_CLOUD_PROJECT`; set it explicitly to avoid silently billing your ADC default quota project) |
+| `VERTEXAI_LOCATION` | GCP region for the Vertex AI backend (LiteLLM-specific — distinct from `GOOGLE_CLOUD_LOCATION`) |
+
+The Vertex AI backend also requires `google-cloud-aiplatform>=1.38`, which is not
+included in any extra or Docker image — see
+[Google Vertex AI](/docs/proxy#google-vertex-ai) for setup details.
 
 ### Proxy configuration
 
@@ -226,8 +281,9 @@ These variables configure Headroom at runtime. Set them in your shell, `.env` fi
 |---|---|---|
 | `HEADROOM_PORT` | `8787` | Port the proxy listens on |
 | `HEADROOM_HOST` | `127.0.0.1` | Host the proxy binds to |
-| `HEADROOM_MODE` | `token` | Default optimization mode: `token` or `cache` |
-| `HEADROOM_TELEMETRY` | enabled | Set to `off` to disable anonymous telemetry |
+| `HEADROOM_MODE` | `cache` | Default optimization mode: `token` or `cache` |
+| `HEADROOM_TELEMETRY` | `off` | Set to `on` for local-only usage stats (nothing is sent externally) |
+| `HEADROOM_REQUEST_TIMEOUT` | `300` | Request timeout in seconds |
 
 ### TypeScript SDK
 
@@ -253,7 +309,7 @@ python3 --version
 If needed (Mac with Homebrew):
 
 ```bash
-brew install python@3.11
+brew install python@3.13
 ```
 
 ### Editable install fails (`pip install -e`)
@@ -269,6 +325,18 @@ python3 -m pip install --upgrade pip
 Some tests require Rust tooling.
 
 The recommended way to install rust is using `rustup`. You can find the official installation instructions [here](https://rust-lang.org/tools/install/).
+
+## Dashboard
+
+Headroom serves a live savings dashboard while the proxy is running. Open it with:
+
+```bash
+headroom dashboard            # opens http://localhost:8787/dashboard in your browser
+headroom dashboard --no-open  # just print the URL
+```
+
+Or browse to `http://localhost:8787/dashboard` directly (use `--port` / `HEADROOM_PORT` if you
+run the proxy on a different port).
 
 ## Next steps
 

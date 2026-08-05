@@ -154,11 +154,26 @@ def find_knee(curve: list[int]) -> int | None:
     return knee_idx + 1 if knee_idx is not None else None
 
 
+def _is_cjk_char(c: str) -> bool:
+    """True for CJK ideographs, kana, and Hangul. Code-point ranges kept
+    byte-identical with the Rust port for adaptive-sizer parity."""
+    o = ord(c)
+    return (
+        0x3040 <= o <= 0x30FF
+        or 0x3400 <= o <= 0x4DBF
+        or 0x4E00 <= o <= 0x9FFF
+        or 0xAC00 <= o <= 0xD7AF
+        or 0xF900 <= o <= 0xFAFF
+    )
+
+
 def compute_unique_bigram_curve(items: Sequence[str]) -> list[int]:
     """Build cumulative unique bigram coverage curve.
 
     For each item (in order), extracts word-level bigrams, adds them to a
-    running set, and records the total unique count.
+    running set, and records the total unique count. A spaceless CJK item
+    (no whitespace to word-split on) uses character bigrams instead, so CJK
+    lists produce a real coverage curve rather than one pseudo-bigram per item.
 
     Args:
         items: Sequence of string items in importance order.
@@ -171,12 +186,18 @@ def compute_unique_bigram_curve(items: Sequence[str]) -> list[int]:
 
     for item in items:
         words = item.lower().split()
-        if len(words) < 2:
-            # For single-word items, use the word itself as a "unigram bigram"
-            seen_bigrams.add((words[0] if words else "", ""))
-        else:
+        if len(words) >= 2:
             for j in range(len(words) - 1):
                 seen_bigrams.add((words[j], words[j + 1]))
+        elif words and len(words[0]) >= 2 and any(_is_cjk_char(c) for c in words[0]):
+            # Spaceless CJK item: word-split yields one giant token with no
+            # coverage signal, so use character bigrams instead.
+            w = words[0]
+            for j in range(len(w) - 1):
+                seen_bigrams.add((w[j], w[j + 1]))
+        else:
+            # Single ASCII word (or empty): a "unigram bigram".
+            seen_bigrams.add((words[0] if words else "", ""))
         curve.append(len(seen_bigrams))
 
     return curve

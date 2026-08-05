@@ -201,7 +201,8 @@ def _parse_judge_response(text: str) -> tuple[float, str]:
         Tuple of (score, reasoning).
     """
     reasoning = ""
-    score = 3.0  # Default to middle score if parsing fails
+    score: float | None = None
+    parsed = False
 
     lines = text.strip().split("\n")
 
@@ -222,8 +223,19 @@ def _parse_judge_response(text: str) -> tuple[float, str]:
                     score = float(match.group(1))
                     # Clamp to valid range
                     score = max(1.0, min(5.0, score))
+                    parsed = True
             except ValueError:
                 logger.warning(f"Could not parse score from: {score_text}")
+
+    if not parsed:
+        # Default to a failing score so unparseable judge output doesn't
+        # silently pass downstream `judge_score >= 3.0` checks.
+        logger.warning(
+            f"Could not parse a score from judge response, defaulting to 0.0 (fail): {text!r}"
+        )
+        score = 0.0
+
+    assert score is not None
 
     # If no explicit reasoning found, use the whole text
     if not reasoning:

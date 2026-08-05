@@ -5,7 +5,16 @@ import sys
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import pytest
+
 from headroom.models.ml_models import MLModelRegistry
+
+
+@pytest.fixture(autouse=True)
+def reset_ml_model_registry():
+    MLModelRegistry.reset()
+    yield
+    MLModelRegistry.reset()
 
 
 def test_unload_many_removes_requested_keys_once(monkeypatch) -> None:

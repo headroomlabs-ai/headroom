@@ -72,6 +72,15 @@ export interface RequestMetrics {
   model: string;
   stream: boolean;
   mode: string;
+  inputTokensOriginal?: number | null;
+  inputTokensOptimized?: number | null;
+  outputTokens?: number | null;
+  tokensSaved?: number | null;
+  savingsPercent?: number | null;
+  optimizationLatencyMs?: number | null;
+  totalLatencyMs?: number | null;
+  hasExactTokens?: boolean;
+  tokenAccountingStatus?: "complete" | "partial" | "missing";
   tokensInputBefore: number;
   tokensInputAfter: number;
   tokensOutput?: number | null;

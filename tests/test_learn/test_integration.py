@@ -83,11 +83,11 @@ class TestIdempotency:
         writer = ClaudeCodeWriter()
         # First write
         writer.write(recs, proj, dry_run=False)
-        first_content = (tmp_path / "CLAUDE.md").read_text()
+        first_content = (tmp_path / "CLAUDE.local.md").read_text()
 
         # Second write (same recs)
         writer.write(recs, proj, dry_run=False)
-        second_content = (tmp_path / "CLAUDE.md").read_text()
+        second_content = (tmp_path / "CLAUDE.local.md").read_text()
 
         # Content should be identical (replaced, not appended)
         assert first_content == second_content
@@ -216,7 +216,7 @@ class TestClaudeCodeIntegration:
 
             assert write_result.dry_run is True
             for fp in write_result.files_written:
-                assert "CLAUDE.md" in fp.name or "MEMORY.md" in fp.name
+                assert "CLAUDE" in fp.name or "MEMORY" in fp.name
 
 
 class TestDecodeProjectPath:

@@ -15,6 +15,14 @@ Agno (pip install agno):
     - HeadroomPreHook/HeadroomPostHook: Agent-level hooks for tracking
     - create_headroom_hooks: Convenience function to create hook pairs
 
+CrewAI (pip install headroom[crewai]):
+    - HeadroomToolWrapper: Tool output compression for CrewAI agents
+    - wrap_tools_with_headroom: Batch wrapper for CrewAI tools
+
+AutoGen (pip install headroom[autogen]):
+    - HeadroomToolWrapper: Tool output compression for AutoGen agents
+    - wrap_tools_with_headroom: Batch wrapper for AutoGen tools
+
 MCP (Model Context Protocol):
     - HeadroomMCPCompressor: Compress MCP tool results
     - compress_tool_result: Simple function for tool compression
@@ -103,6 +111,56 @@ try:
 except ImportError:
     _AGNO_AVAILABLE = False
 
+# Re-export from crewai subpackage (optional dependency)
+try:
+    from .crewai import (
+        HeadroomToolWrapper as CrewAIToolWrapper,
+    )
+    from .crewai import (
+        ToolCompressionMetrics as CrewAIToolCompressionMetrics,
+    )
+    from .crewai import (
+        ToolMetricsCollector as CrewAIToolMetricsCollector,
+    )
+    from .crewai import (
+        get_tool_metrics as get_crewai_tool_metrics,
+    )
+    from .crewai import (
+        reset_tool_metrics as reset_crewai_tool_metrics,
+    )
+    from .crewai import (
+        wrap_tools_with_headroom as wrap_crewai_tools,
+    )
+
+    _CREWAI_AVAILABLE = True
+except ImportError:
+    _CREWAI_AVAILABLE = False
+
+# Re-export from autogen subpackage (optional dependency)
+try:
+    from .autogen import (
+        HeadroomToolWrapper as AutoGenToolWrapper,
+    )
+    from .autogen import (
+        ToolCompressionMetrics as AutoGenToolCompressionMetrics,
+    )
+    from .autogen import (
+        ToolMetricsCollector as AutoGenToolMetricsCollector,
+    )
+    from .autogen import (
+        get_tool_metrics as get_autogen_tool_metrics,
+    )
+    from .autogen import (
+        reset_tool_metrics as reset_autogen_tool_metrics,
+    )
+    from .autogen import (
+        wrap_tools_with_headroom as wrap_autogen_tools,
+    )
+
+    _AUTOGEN_AVAILABLE = True
+except ImportError:
+    _AUTOGEN_AVAILABLE = False
+
 __all__ = [
     # LangChain Core
     "HeadroomChatModel",
@@ -156,4 +214,18 @@ __all__ = [
     "get_model_name_from_agno",
     "AgnoOptimizationMetrics",
     "optimize_agno_messages",
+    # CrewAI
+    "CrewAIToolWrapper",
+    "CrewAIToolCompressionMetrics",
+    "CrewAIToolMetricsCollector",
+    "wrap_crewai_tools",
+    "get_crewai_tool_metrics",
+    "reset_crewai_tool_metrics",
+    # AutoGen
+    "AutoGenToolWrapper",
+    "AutoGenToolCompressionMetrics",
+    "AutoGenToolMetricsCollector",
+    "wrap_autogen_tools",
+    "get_autogen_tool_metrics",
+    "reset_autogen_tool_metrics",
 ]

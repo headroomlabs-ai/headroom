@@ -22,11 +22,26 @@ def normalize_text(text: str) -> str:
     return text
 
 
+# CJK has no word spaces, so a CJK run is split into overlapping char bigrams
+# (unigram if length 1) -- this makes token-level F1/recall meaningful instead of
+# all-or-nothing on a whole-string CJK token. ASCII/digit runs are kept whole.
+_CJK = re.compile(r"[㐀-鿿぀-ヿ가-힯]")
+_CJK_OR_OTHER = re.compile(r"[㐀-鿿぀-ヿ가-힯]+|[^㐀-鿿぀-ヿ가-힯]+")
+
+
 def tokenize(text: str) -> list[str]:
-    """Simple word tokenization."""
-    # Split on whitespace and punctuation
-    tokens = re.findall(r"\b\w+\b", text.lower())
-    return tokens
+    """Word tokenization (CJK-aware: CJK runs -> overlapping char bigrams)."""
+    out: list[str] = []
+    for tok in re.findall(r"\b\w+\b", text.lower()):
+        for run in _CJK_OR_OTHER.findall(tok):
+            if _CJK.match(run):
+                if len(run) > 1:
+                    out.extend(run[i : i + 2] for i in range(len(run) - 1))
+                else:
+                    out.append(run)
+            else:
+                out.append(run)
+    return out
 
 
 def compute_exact_match(response_a: str, response_b: str) -> bool:

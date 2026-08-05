@@ -1,0 +1,5 @@
+{
+  "aggregate_recall": 0.9167,
+  "tolerance": 0.02,
+  "note": "Mean information-recall across all golden cases (answer_evidence + supporting_facts) after lossy SmartCrusher compression. Deterministic. Regenerate fixtures via `python tests/fixtures/fidelity_golden/_generate.py`; update this value only when a recall change is intended and understood."
+}

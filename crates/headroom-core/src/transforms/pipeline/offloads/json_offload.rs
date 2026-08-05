@@ -48,7 +48,8 @@
 use md5::{Digest, Md5};
 
 use crate::ccr::CcrStore;
-use crate::transforms::pipeline::config::JsonOffloadConfig;
+use crate::transforms::pipeline::config::{JsonOffloadConfig, PipelineConfig, ProseFieldConfig};
+use crate::transforms::pipeline::offloads::prose_field::ProseFieldOffload;
 use crate::transforms::pipeline::traits::{
     CompressionContext, OffloadOutput, OffloadTransform, TransformError,
 };
@@ -63,6 +64,7 @@ const CONFIDENCE: f32 = 0.85;
 pub struct JsonOffload {
     crusher: SmartCrusher,
     config: JsonOffloadConfig,
+    prose: ProseFieldOffload,
 }
 
 impl JsonOffload {
@@ -75,13 +77,38 @@ impl JsonOffload {
         Self {
             crusher: SmartCrusher::new(SmartCrusherConfig::default()),
             config,
+            prose: ProseFieldOffload::new(PipelineConfig::default().offload.prose_field),
+        }
+    }
+
+    pub fn from_pipeline(config: &PipelineConfig) -> Self {
+        Self {
+            crusher: SmartCrusher::new(SmartCrusherConfig::default()),
+            config: config.offload.json,
+            prose: ProseFieldOffload::new(config.offload.prose_field),
         }
     }
 
     /// Custom constructor — used by tests that want a stubbed crusher
     /// or a custom SmartCrusher config.
     pub fn with_crusher(crusher: SmartCrusher, config: JsonOffloadConfig) -> Self {
-        Self { crusher, config }
+        Self {
+            crusher,
+            config,
+            prose: ProseFieldOffload::new(PipelineConfig::default().offload.prose_field),
+        }
+    }
+
+    pub fn with_crusher_and_prose(
+        crusher: SmartCrusher,
+        config: JsonOffloadConfig,
+        prose_config: ProseFieldConfig,
+    ) -> Self {
+        Self {
+            crusher,
+            config,
+            prose: ProseFieldOffload::new(prose_config),
+        }
     }
 }
 
@@ -121,7 +148,17 @@ impl OffloadTransform for JsonOffload {
         ctx: &CompressionContext,
         store: &dyn CcrStore,
     ) -> Result<OffloadOutput, TransformError> {
-        let result = self.crusher.crush(content, &ctx.query, 0.0);
+        let prose = &self.prose;
+        let prose_hook = |leaf: &str, query: &str| {
+            let leaf_ctx = CompressionContext::with_query(query);
+            prose
+                .apply(leaf, &leaf_ctx, store)
+                .ok()
+                .map(|output| (output.output, output.cache_key))
+        };
+        let result = self
+            .crusher
+            .crush_with_prose_hook(content, &ctx.query, 0.0, &prose_hook);
         if !result.was_modified {
             return Err(TransformError::skipped(
                 NAME,
@@ -196,6 +233,94 @@ mod tests {
 
     fn offload() -> JsonOffload {
         JsonOffload::new(cfg())
+    }
+
+    #[test]
+    fn from_pipeline_uses_overrideable_prose_config() {
+        let config = PipelineConfig::from_toml_str(
+            r#"
+            [pipeline]
+            reformat_target_ratio = 0.5
+            bloat_threshold = 0.5
+            offload_fallback_ratio = 0.85
+
+            [bloat.log]
+            min_lines = 50
+            sample_size = 100
+            high_priority_threshold = 0.4
+            uniqueness_weight = 0.5
+            priority_dilution_weight = 0.5
+
+            [bloat.diff]
+            min_lines = 50
+            normal_context_ratio = 0.6
+
+            [bloat.search]
+            min_matches = 10
+            cluster_threshold = 10.0
+
+            [reformat.log_template]
+            min_lines = 20
+            min_run = 3
+            similarity_threshold = 0.4
+            min_constant_tokens = 2
+
+            [offload.json]
+            min_array_rows = 5
+            saturation_rows = 50
+
+            [offload.prose_field]
+            min_bytes = 300
+            min_segments = 5
+            target_ratio = 0.4
+
+            [offload.diff_noise]
+            min_lines = 30
+            lockfile_suffixes = ["Cargo.lock"]
+            drop_whitespace_only_hunks = true
+        "#,
+        )
+        .expect("override parses");
+
+        let offload = JsonOffload::from_pipeline(&config);
+        assert_eq!(offload.prose.config(), config.offload.prose_field);
+    }
+
+    #[test]
+    fn prose_hook_ignores_diff_shaped_leaf() {
+        let diff = format!(
+            "diff --git a/foo.py b/foo.py\n--- a/foo.py\n+++ b/foo.py\n@@ -1,20 +1,20 @@\n{}",
+            (0..20)
+                .map(|i| format!("-old line {i}\n+new line {i}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let input = serde_json::json!([{"description": diff}]).to_string();
+        let store = InMemoryCcrStore::new();
+        let output = offload()
+            .apply(&input, &CompressionContext::default(), &store)
+            .expect("diff-shaped leaf should still process through the direct offload path");
+        let marker = output
+            .output
+            .split("<<ccr:")
+            .nth(1)
+            .and_then(|tail| tail.split(">>").next())
+            .expect("direct offload should still emit a leaf marker");
+        assert!(
+            marker.contains(",string,"),
+            "diff leaf should stay on the opaque string route, got {marker}"
+        );
+    }
+
+    #[test]
+    fn prose_hook_preserves_opaque_html_leaf() {
+        let html = "<html><body><p>".to_string() + &"x".repeat(300) + "</p></body></html>";
+        let input = serde_json::json!([{"summary": html}]).to_string();
+        let store = InMemoryCcrStore::new();
+        let result = offload()
+            .apply(&input, &CompressionContext::with_query("recovery"), &store)
+            .expect("structured html should still process");
+        assert!(result.output.contains(",html,"));
     }
 
     /// Build a JSON array of N similar dicts with id + name + value.

@@ -13,9 +13,19 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, cast
 
+from headroom._subprocess import pid_alive, run
+
 from .health import probe_ready
-from .models import DeploymentManifest, InstallPreset, RuntimeKind
+from .models import DeploymentManifest, InstallPreset, RuntimeKind, SupervisorKind
 from .paths import log_path, pid_path, profile_root
+from .state import load_manifest
+
+# Inside the container the proxy must listen on every interface so the
+# host-side published port (127.0.0.1:<port>) can reach it.
+CONTAINER_BIND_HOST = "0.0.0.0"  # noqa: S104 — container-internal bind, published only on 127.0.0.1
+# proxy_args always starts with the host flag/value pair (see planner.py); we
+# drop it and substitute CONTAINER_BIND_HOST for the in-container bind.
+_PROXY_ARGS_HOST_PAIR_LEN = 2
 
 PASSTHROUGH_ENV_PREFIXES = (
     "HEADROOM_",
@@ -36,7 +46,6 @@ PASSTHROUGH_ENV_PREFIXES = (
     "OLLAMA_",
     "LITELLM_",
     "OTEL_",
-    "SUPABASE_",
     "QDRANT_",
     "NEO4J_",
     "LANGSMITH_",
@@ -74,7 +83,7 @@ def _runtime_env(manifest: DeploymentManifest) -> dict[str, str]:
 
 
 def _ensure_host_dirs() -> None:
-    for subdir in (".headroom", ".claude", ".codex", ".gemini"):
+    for subdir in (".headroom", ".claude", ".codex", ".gemini", ".config/opencode"):
         (Path.home() / subdir).mkdir(parents=True, exist_ok=True)
 
 
@@ -120,7 +129,12 @@ def build_runtime_command(manifest: DeploymentManifest) -> list[str]:
         f"{_mount_source(home, '.codex')}:{container_home}/.codex",
         "--volume",
         f"{_mount_source(home, '.gemini')}:{container_home}/.gemini",
+        "--volume",
+        f"{_mount_source(home, '.config/opencode')}:{container_home}/.config/opencode",
     ]
+    docker_gpus = manifest.base_env.get("HEADROOM_DOCKER_GPUS", "").strip()
+    if docker_gpus:
+        command.extend(["--gpus", docker_gpus])
     if not _is_windows():
         getuid = getattr(os, "getuid", None)
         getgid = getattr(os, "getgid", None)
@@ -130,16 +144,24 @@ def build_runtime_command(manifest: DeploymentManifest) -> list[str]:
     for name, value in runtime_env.items():
         command.extend(["--env", f"{name}={value}"])
     for name in sorted(os.environ):
-        if name.startswith(PASSTHROUGH_ENV_PREFIXES):
+        # Skip any name the manifest already pinned above: Docker resolves
+        # duplicate `--env` last-wins, so a bare `--env HEADROOM_BACKEND`
+        # passthrough (which reads the host process env at
+        # `start_persistent_docker` time) would silently override the manifest's
+        # `--env HEADROOM_BACKEND=<value>`, diverging the container from its
+        # deployment config.
+        if name.startswith(PASSTHROUGH_ENV_PREFIXES) and name not in runtime_env:
             command.extend(["--env", name])
+    # The image ENTRYPOINT already runs `headroom proxy` (see Dockerfile), so
+    # the args appended after the image name are only the proxy flags — never
+    # `headroom proxy` again, or Docker would run `headroom proxy headroom
+    # proxy ...` and Click aborts on the extra arguments (issue #833).
     command.extend(
         [
             manifest.image,
-            "headroom",
-            "proxy",
             "--host",
-            "0.0.0.0",
-            *manifest.proxy_args[2:],
+            CONTAINER_BIND_HOST,
+            *manifest.proxy_args[_PROXY_ARGS_HOST_PAIR_LEN:],
         ]
     )
     return command
@@ -190,7 +212,8 @@ def acquire_runtime_start_lock(profile: str) -> Iterator[bool]:
             import fcntl
 
             try:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl_any = cast(Any, fcntl)
+                fcntl_any.flock(lock_file.fileno(), fcntl_any.LOCK_EX | fcntl_any.LOCK_NB)
                 acquired = True
             except BlockingIOError:
                 yield False
@@ -215,7 +238,8 @@ def acquire_runtime_start_lock(profile: str) -> Iterator[bool]:
                 else:
                     import fcntl
 
-                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                    fcntl_any = cast(Any, fcntl)
+                    fcntl_any.flock(lock_file.fileno(), fcntl_any.LOCK_UN)
 
 
 def run_foreground(manifest: DeploymentManifest) -> int:
@@ -256,12 +280,23 @@ def start_detached_agent(profile: str) -> subprocess.Popen[str]:
 
     kwargs: dict[str, Any] = {"stdout": log_file, "stderr": log_file}
     if _is_windows():
-        kwargs["creationflags"] = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(
+        # DETACHED_PROCESS makes CREATE_NO_WINDOW a no-op (per Win32 docs), so a
+        # detached console child pops up a visible window. Use CREATE_NO_WINDOW
+        # instead; it still detaches from the parent's console.
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) | getattr(
             subprocess, "CREATE_NEW_PROCESS_GROUP", 0
         )
     else:
         kwargs["start_new_session"] = True
-    return subprocess.Popen(command, **kwargs)
+    try:
+        proc = subprocess.Popen(command, **kwargs)
+    finally:
+        # The child has inherited the log file descriptor, so the parent's
+        # copy is dead weight. Closing it (even when Popen raises) avoids
+        # leaking one fd per `headroom install start` and lets the log file
+        # be rotated. Wrapped in try/finally so a Popen failure can't leak.
+        log_file.close()
+    return proc
 
 
 def start_persistent_docker(manifest: DeploymentManifest) -> None:
@@ -278,7 +313,11 @@ def start_persistent_docker(manifest: DeploymentManifest) -> None:
         manifest.container_name,
         *command[5:],  # drop initial `docker run --rm --name ...`
     ]
-    subprocess.run(["docker", "rm", "-f", manifest.container_name], capture_output=True, text=True)
+    run(
+        ["docker", "rm", "-f", manifest.container_name],
+        capture_output=True,
+        text=True,
+    )
     subprocess.run(docker_cmd, check=True)
 
 
@@ -286,9 +325,15 @@ def stop_runtime(manifest: DeploymentManifest) -> None:
     """Stop the raw runtime for the deployment."""
 
     if manifest.preset == InstallPreset.PERSISTENT_DOCKER.value:
-        subprocess.run(["docker", "stop", manifest.container_name], capture_output=True, text=True)
-        subprocess.run(
-            ["docker", "rm", "-f", manifest.container_name], capture_output=True, text=True
+        run(
+            ["docker", "stop", manifest.container_name],
+            capture_output=True,
+            text=True,
+        )
+        run(
+            ["docker", "rm", "-f", manifest.container_name],
+            capture_output=True,
+            text=True,
         )
         return
 
@@ -297,7 +342,8 @@ def stop_runtime(manifest: DeploymentManifest) -> None:
         return
     try:
         os.kill(pid, signal.SIGTERM)
-    except OSError:
+    except (OSError, SystemError):
+        # SystemError covers the Windows WinError 87 surfacing described in #1544.
         pass
     _clear_pid(manifest.profile)
 
@@ -316,8 +362,10 @@ def runtime_status(manifest: DeploymentManifest) -> str:
     """Return a short status string for the deployment runtime."""
 
     if manifest.preset == InstallPreset.PERSISTENT_DOCKER.value:
-        result = subprocess.run(
-            ["docker", "ps", "--format", "{{.Names}}"], capture_output=True, text=True
+        result = run(
+            ["docker", "ps", "--format", "{{.Names}}"],
+            capture_output=True,
+            text=True,
         )
         if manifest.container_name in result.stdout.splitlines():
             return "running"
@@ -325,8 +373,91 @@ def runtime_status(manifest: DeploymentManifest) -> str:
     pid = _read_pid(manifest.profile)
     if pid is None:
         return "stopped"
-    try:
-        os.kill(pid, 0)
-    except OSError:
-        return "stopped"
-    return "running"
+    # Windows-safe liveness probe: a bare os.kill(pid, 0) here raised WinError 87
+    # as a SystemError against the detached agent, crashing status and taking the
+    # live proxy down with it (#1544).
+    return "running" if pid_alive(pid) else "stopped"
+
+
+def detect_current_deployment() -> tuple[DeploymentManifest | None, str]:
+    """Detect how THIS running proxy was launched.
+
+    Returns ``(manifest_or_none, mode)`` where ``mode`` is one of:
+
+    * ``"docker"``     — persistent-docker deployment. Cannot self-restart:
+      there is no docker socket/CLI inside the container.
+    * ``"service"``    — any other persistent (supervised) deployment; can
+      self-restart via ``headroom install restart``.
+    * ``"foreground"`` — a plain ``headroom proxy`` (or unknown); not
+      self-restartable.
+
+    Keys off the ``HEADROOM_DEPLOYMENT_*`` env vars the supervisor injects at
+    launch (see :func:`_deployment_env`); a foreground proxy has none set.
+    """
+    profile = os.environ.get("HEADROOM_DEPLOYMENT_PROFILE")
+    preset = os.environ.get("HEADROOM_DEPLOYMENT_PRESET")
+    if not profile:
+        return None, "foreground"
+    manifest = load_manifest(profile)
+    if preset == InstallPreset.PERSISTENT_DOCKER.value:
+        return manifest, "docker"
+    if manifest is None:
+        return None, "foreground"
+    if manifest.supervisor_kind == SupervisorKind.TASK.value:
+        return manifest, "task"
+    return manifest, "service"
+
+
+def _spawn_detached_restart(profile: str) -> None:
+    """Spawn a detached ``headroom install restart --profile <p>`` process.
+
+    Detached (``start_new_session`` on POSIX) so it outlives this process being
+    torn down by the very restart it triggers.
+    """
+    command = [*resolve_headroom_command(), "install", "restart", "--profile", profile]
+    popen_kwargs: dict[str, Any] = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+    if _is_windows():
+        popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    else:
+        popen_kwargs["start_new_session"] = True
+    subprocess.Popen(command, **popen_kwargs)
+
+
+def restart_current_deployment() -> dict[str, Any]:
+    """Restart the current deployment so new settings take effect.
+
+    * service -> spawn a detached restart, return ``{restarted: True, ...}``.
+    * docker  -> not restartable in-container; return the host command to run.
+    * task    -> not restartable via the CLI (``headroom install`` rejects
+      lifecycle ops for task-scheduled deployments); return an instruction.
+    * foreground/unknown -> return a manual-restart instruction.
+    """
+    manifest, mode = detect_current_deployment()
+    profile = os.environ.get("HEADROOM_DEPLOYMENT_PROFILE") or (
+        manifest.profile if manifest else "default"
+    )
+    if mode == "service":
+        _spawn_detached_restart(profile)
+        return {"restarted": True, "mode": "service", "profile": profile}
+    if mode == "docker":
+        return {
+            "restarted": False,
+            "mode": "docker",
+            "command": f"headroom install restart --profile {profile}",
+        }
+    if mode == "task":
+        return {
+            "restarted": False,
+            "mode": "task",
+            "instruction": (
+                "This deployment is managed by an OS task scheduler, not "
+                "`headroom install`; stop the running process so it is "
+                "relaunched (with the new settings) on its next scheduled "
+                "trigger, or restart it via your OS task scheduler."
+            ),
+        }
+    return {
+        "restarted": False,
+        "mode": "foreground",
+        "instruction": "Restart the proxy to apply the new settings.",
+    }

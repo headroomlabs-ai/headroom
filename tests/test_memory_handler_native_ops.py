@@ -30,6 +30,7 @@ class FakeBackend:
         self.saved: list[dict[str, object]] = []
         self.updated: list[dict[str, object]] = []
         self.deleted: list[str] = []
+        self.accessed: list[list[str]] = []
         self.raise_on: str | None = None
 
     async def search_memories(self, **kwargs):  # noqa: ANN003
@@ -54,6 +55,12 @@ class FakeBackend:
             raise RuntimeError("delete failed")
         self.deleted.append(memory_id)
         return True
+
+    async def record_access(self, memory_ids: list[str]) -> int:
+        if self.raise_on == "record_access":
+            raise RuntimeError("access tracking failed")
+        self.accessed.append(memory_ids)
+        return len(memory_ids)
 
 
 def make_result(
@@ -697,9 +704,7 @@ async def test_warmup_embedder_and_close(handler: MemoryHandler) -> None:
 
 
 @pytest.mark.asyncio
-async def test_execute_memory_tool_save_and_background_dedup(
-    handler: MemoryHandler, monkeypatch: pytest.MonkeyPatch
-) -> None:
+async def test_execute_memory_tool_save_returns_dedup_hint(handler: MemoryHandler) -> None:
     backend = FakeBackend()
     handler._backend = backend
 
@@ -711,14 +716,6 @@ async def test_execute_memory_tool_save_and_background_dedup(
         "error": "content is required",
     }
 
-    created_tasks: list[object] = []
-
-    def fake_create_task(coro):  # noqa: ANN001
-        created_tasks.append(coro)
-        coro.close()
-        return SimpleNamespace()
-
-    monkeypatch.setattr("headroom.proxy.memory_handler.asyncio.create_task", fake_create_task)
     backend.search_results = [
         make_result(
             "other",
@@ -750,7 +747,7 @@ async def test_execute_memory_tool_save_and_background_dedup(
     assert "Similar memory exists" in saved["note"]
     assert "saved by claude" in saved["note"]
     assert backend.saved[-1]["metadata"]["source_provider"] == "openai"
-    assert len(created_tasks) == 1
+    assert backend.deleted == []
 
     backend.raise_on = "save"
     errored = json.loads(await handler._execute_memory_tool("memory_save", {"content": "x"}, "u1"))
@@ -758,9 +755,7 @@ async def test_execute_memory_tool_save_and_background_dedup(
 
 
 @pytest.mark.asyncio
-async def test_execute_save_handles_search_failure_and_background_dedup_filters(
-    handler: MemoryHandler,
-) -> None:
+async def test_execute_save_handles_search_failure(handler: MemoryHandler) -> None:
     backend = FakeBackend()
     handler._backend = backend
 
@@ -768,18 +763,35 @@ async def test_execute_save_handles_search_failure_and_background_dedup_filters(
     saved = json.loads(await handler._execute_save({"content": "Useful fact"}, "u1"))
     assert saved == {"status": "saved", "memory_id": "mem-1", "content": "Useful fact"}
 
-    backend.raise_on = None
-    similar = [
-        make_result("mem-1", "same", score=0.99),
-        make_result("old-1", "duplicate", score=0.95, metadata={}),
-        make_result("old-2", "already handled", score=0.99, metadata={"superseded_by": "new"}),
-        make_result("old-3", "too low", score=0.5, metadata={}),
-    ]
-    await handler._background_dedup("mem-1", similar, "u1")
-    assert backend.deleted == ["old-1"]
 
-    backend.raise_on = "delete"
-    await handler._background_dedup("mem-1", [make_result("old-4", "duplicate", score=0.95)], "u1")
+@pytest.mark.asyncio
+async def test_execute_save_preserves_high_similarity_distinct_memory(
+    handler: MemoryHandler,
+) -> None:
+    backend = FakeBackend()
+    handler._backend = backend
+    backend.search_results = [
+        make_result(
+            "existing-memory",
+            "User uses Python at work",
+            score=0.99,
+            metadata={"source_agent": "claude"},
+        )
+    ]
+
+    saved = json.loads(
+        await handler._execute_save(
+            {"content": "User prefers Python for side projects"},
+            "u1",
+        )
+    )
+    # Give any accidentally scheduled background work a chance to run.
+    await asyncio.sleep(0)
+
+    assert saved["status"] == "saved"
+    assert "Similar memory exists" in saved["note"]
+    assert "ignore if these are distinct facts" in saved["note"]
+    assert backend.deleted == []
 
 
 def test_inject_tools_extract_query_and_has_tool_calls(
@@ -967,12 +979,21 @@ async def test_search_and_format_context_and_handle_memory_tool_calls(
     # tripping through memory_search.
     assert "1. [m1] Alice likes pizza" in context
     assert "(Related: Alice, pizza)" in context
+    assert backend.accessed == [["m1"]]
 
     backend.raise_on = "search"
     assert (
         await handler.search_and_format_context("u1", [{"role": "user", "content": "Question"}])
         is None
     )
+    backend.raise_on = None
+
+    backend.raise_on = "record_access"
+    context = await handler.search_and_format_context(
+        "u1",
+        [{"role": "user", "content": "What food does Alice like?"}],
+    )
+    assert "1. [m1] Alice likes pizza" in context
     backend.raise_on = None
 
     async def fake_ensure_initialized() -> None:
@@ -1060,6 +1081,38 @@ async def test_search_and_format_context_and_handle_memory_tool_calls(
         "openai",
     )
     assert skipped == []
+
+
+@pytest.mark.asyncio
+async def test_search_records_only_memories_left_by_final_text_budget(
+    handler: MemoryHandler,
+) -> None:
+    backend = FakeBackend()
+    handler._backend = backend
+    handler._initialized = True
+    backend.search_results = [
+        make_result("m1", "First preference"),
+        make_result("m2", "Second preference"),
+    ]
+
+    class FirstEntryBudget:
+        max_entries = 2
+        min_similarity = 0.3
+        max_tokens = 1024
+
+        @staticmethod
+        def apply_to_text(text: str) -> str:
+            return text.split("2. [m2]", maxsplit=1)[0]
+
+    context = await handler.search_and_format_context(
+        "u1",
+        [{"role": "user", "content": "What are my preferences?"}],
+        budget=FirstEntryBudget(),
+    )
+
+    assert "[m1]" in context
+    assert "[m2]" not in context
+    assert backend.accessed == [["m1"]]
 
 
 @pytest.mark.asyncio

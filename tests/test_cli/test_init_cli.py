@@ -389,6 +389,22 @@ def test_json_file_handles_missing_empty_and_non_mapping(monkeypatch, tmp_path: 
     assert init_cli._json_file(array_payload) == {}
 
 
+def test_json_file_rejects_malformed_json(monkeypatch, tmp_path: Path) -> None:
+    # A user-owned settings file with a hand-edit typo (trailing comma) must
+    # fail with an actionable error rather than crashing init with a raw
+    # JSONDecodeError or silently overwriting the file (which the caller's
+    # subsequent _write_json would do if this returned {}).
+    init_cli, _ = _load_init_module(monkeypatch)
+    malformed = tmp_path / "settings.json"
+    malformed.write_text('{"env": {"A": "B",}}\n', encoding="utf-8")
+
+    with pytest.raises(click.ClickException, match="invalid JSON"):
+        init_cli._json_file(malformed)
+
+    # The file is left untouched (not overwritten).
+    assert malformed.read_text(encoding="utf-8") == '{"env": {"A": "B",}}\n'
+
+
 def test_ensure_claude_hooks_rewrites_existing_entries(monkeypatch, tmp_path: Path) -> None:
     init_cli, _ = _load_init_module(monkeypatch)
     settings_path = tmp_path / "settings.json"
@@ -424,7 +440,11 @@ def test_ensure_claude_hooks_rewrites_existing_entries(monkeypatch, tmp_path: Pa
     init_cli._ensure_claude_hooks(settings_path, "init-local-demo", 9001)
 
     payload = json.loads(settings_path.read_text(encoding="utf-8"))
-    assert payload["env"] == {"KEEP": "1", "ANTHROPIC_BASE_URL": "http://127.0.0.1:9001"}
+    assert payload["env"] == {
+        "KEEP": "1",
+        "ANTHROPIC_BASE_URL": "http://127.0.0.1:9001",
+        "ENABLE_TOOL_SEARCH": "true",
+    }
     session_entries = payload["hooks"]["SessionStart"]
     assert session_entries[0] == "not-a-dict"
     assert session_entries[1] == {"hooks": "not-a-list"}
@@ -458,6 +478,42 @@ def test_ensure_copilot_hooks_replaces_existing_marker(monkeypatch, tmp_path: Pa
     payload = json.loads(config_path.read_text(encoding="utf-8"))
     commands = [entry["command"] for entry in payload["hooks"]["SessionStart"]]
     assert commands == ["echo keep", "headroom init hook ensure --marker headroom-init-copilot"]
+
+
+def test_ensure_codex_hooks_preserves_user_hooks(monkeypatch, tmp_path: Path) -> None:
+    """init codex must merge into hooks.json, not overwrite it — a user's own
+    hooks (and unrelated top-level keys) must survive."""
+    init_cli, _ = _load_init_module(monkeypatch)
+    path = tmp_path / "hooks.json"
+    path.write_text(
+        json.dumps(
+            {
+                "notify": True,  # unrelated top-level key
+                "hooks": {
+                    "SessionStart": [
+                        {
+                            "matcher": "startup",
+                            "hooks": [{"type": "command", "command": "echo keep"}],
+                        }
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(init_cli, "_hook_command", lambda *parts: "headroom init hook ensure")
+
+    init_cli._ensure_codex_hooks(path, "init-user")
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    # The unrelated top-level key survives.
+    assert payload["notify"] is True
+    # The user's own hook is retained and Headroom's is appended exactly once.
+    ss_commands = [
+        item["command"] for entry in payload["hooks"]["SessionStart"] for item in entry["hooks"]
+    ]
+    assert "echo keep" in ss_commands
+    assert sum(1 for c in ss_commands if "headroom-init-codex" in c) == 1
 
 
 def test_replace_marker_block_replaces_existing_block(monkeypatch) -> None:
@@ -527,6 +583,33 @@ def test_ensure_codex_provider_replaces_existing_model_provider(
     parsed = tomllib.loads(path.read_text(encoding="utf-8"))  # raises on a duplicate key
     assert parsed["model_provider"] == "headroom"
     assert parsed["features"]["hooks"] is True
+
+
+def test_ensure_codex_provider_preserves_profile_overrides(monkeypatch, tmp_path: Path) -> None:
+    """Per-profile model_provider/openai_base_url overrides must survive init.
+
+    init owns the ROOT-level keys, but the same keys inside [profiles.*] are the
+    user's per-profile routing; a broad strip silently reroutes those profiles
+    to the injected "headroom" default (config corruption).
+    """
+    init_cli, _ = _load_init_module(monkeypatch)
+    path = tmp_path / "config.toml"
+    path.write_text(
+        'model_provider = "openai"\n\n'
+        "[profiles.work]\n"
+        'model_provider = "azure"\n'
+        'openai_base_url = "https://azure.example/v1"\n',
+        encoding="utf-8",
+    )
+
+    init_cli._ensure_codex_provider(path, 8787)
+
+    parsed = tomllib.loads(path.read_text(encoding="utf-8"))
+    # Root is replaced by headroom (no duplicate top-level key).
+    assert parsed["model_provider"] == "headroom"
+    # The user's per-profile overrides are untouched.
+    assert parsed["profiles"]["work"]["model_provider"] == "azure"
+    assert parsed["profiles"]["work"]["openai_base_url"] == "https://azure.example/v1"
 
 
 def test_ensure_codex_provider_emits_requires_openai_auth_for_chatgpt(
@@ -1398,6 +1481,48 @@ def test_init_codex_writes_openai_base_url(monkeypatch, tmp_path: Path) -> None:
     assert "requires_openai_auth" not in content, (
         f"requires_openai_auth must not appear in init codex config:\n{content}"
     )
+
+
+def test_init_codex_provider_retags_existing_threads(monkeypatch, tmp_path: Path) -> None:
+    """`headroom init` injects `model_provider = "headroom"` for Codex, which
+    Codex Desktop filters its history menu by. Without retagging, existing native
+    `openai` threads vanish from the sidebar/search (#961). `_ensure_codex_provider`
+    must retag existing threads openai->headroom so the history stays visible —
+    the same reconciliation the install and wrap paths already perform."""
+    import sqlite3
+
+    init_cli, _ = _load_init_module(monkeypatch)
+
+    codex_home = tmp_path / ".codex"
+    config_path = codex_home / "config.toml"
+    # Codex Desktop reads <codex_home>/sqlite/state_5.sqlite.
+    db = codex_home / "sqlite" / "state_5.sqlite"
+    db.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db))
+    try:
+        conn.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, model_provider TEXT NOT NULL)")
+        conn.executemany(
+            "INSERT INTO threads (id, model_provider) VALUES (?, ?)",
+            [("t1", "openai"), ("t2", "openai"), ("t3", "anthropic")],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    init_cli._ensure_codex_provider(config_path, 8787)
+
+    conn = sqlite3.connect(str(db))
+    try:
+        counts = dict(
+            conn.execute("SELECT model_provider, COUNT(*) FROM threads GROUP BY model_provider")
+        )
+    finally:
+        conn.close()
+    # Native threads now live under the active headroom provider (stay visible);
+    # third-party providers are left untouched.
+    assert counts.get("headroom") == 2, f"existing openai threads not retagged: {counts}"
+    assert counts.get("openai", 0) == 0, f"openai threads still hidden: {counts}"
+    assert counts.get("anthropic") == 1, f"third-party provider must be left alone: {counts}"
 
 
 def test_init_codex_strip_removes_openai_base_url(monkeypatch, tmp_path: Path) -> None:

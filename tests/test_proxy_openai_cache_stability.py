@@ -21,6 +21,16 @@ class _FakePrefixTracker:
     def get_frozen_message_count(self) -> int:
         return self._frozen_count
 
+    # Empty history → overlay_cached_prefix() is a no-op here, so these tests
+    # keep asserting the cache-freeze behavior they always have. The cross-turn
+    # overlay itself is exercised in test_cross_turn_cache_safety.py against the
+    # real tracker; these stubs just satisfy the handler's overlay call.
+    def get_last_original_messages(self):  # noqa: ANN201
+        return []
+
+    def get_last_forwarded_messages(self):  # noqa: ANN201
+        return []
+
     def update_from_response(self, **kwargs):  # noqa: ANN003
         return None
 
@@ -100,6 +110,85 @@ def test_openai_cache_mode_freezes_previous_turns() -> None:
 
         assert response.status_code == 200
         assert captured["frozen_message_count"] == 2
+
+
+@pytest.mark.parametrize("tail_role", ["tool", "function"])
+def test_openai_cache_mode_keeps_final_tool_observation_mutable(tail_role: str) -> None:
+    captured = {}
+    with _make_proxy_client() as client:
+        proxy = client.app.state.proxy
+        proxy.config.optimize = True
+        proxy.config.mode = "cache"
+
+        fake_tracker = _FakePrefixTracker(frozen_count=0)
+        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
+            "stable-session"
+        )
+        proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+
+        def _fake_apply(**kwargs):
+            captured.setdefault("calls", []).append(
+                {
+                    "frozen_message_count": kwargs.get("frozen_message_count"),
+                    "roles": [msg.get("role") for msg in kwargs["messages"]],
+                    "mode": proxy.config.mode,
+                }
+            )
+            return SimpleNamespace(
+                messages=kwargs["messages"],
+                transforms_applied=["test:compress-tail"],
+                timing={},
+                tokens_before=120,
+                tokens_after=80,
+                waste_signals=None,
+            )
+
+        proxy.openai_pipeline.apply = _fake_apply
+
+        async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
+            return httpx.Response(
+                200,
+                json={
+                    "id": "chatcmpl_tool_tail",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 80, "completion_tokens": 3, "total_tokens": 83},
+                },
+            )
+
+        proxy._retry_request = _fake_retry
+
+        tail = {
+            "role": tail_role,
+            "content": "large command observation " * 200,
+        }
+        if tail_role == "tool":
+            tail["tool_call_id"] = "call_1"
+        else:
+            tail["name"] = "bash"
+
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"authorization": "Bearer test-key"},
+            json={
+                "model": "gpt-4o-mini",
+                "messages": [
+                    {"role": "user", "content": "turn1"},
+                    {"role": "assistant", "content": "run command"},
+                    tail,
+                ],
+            },
+        )
+
+        assert response.status_code == 200
+        assert any(call["frozen_message_count"] == 2 for call in captured["calls"]), captured[
+            "calls"
+        ]
 
 
 def test_openai_cache_mode_restores_mutated_frozen_prefix() -> None:
@@ -280,3 +369,86 @@ def test_issue_327_openai_handler_does_not_call_walker_functions() -> None:
     # Sanity: the safe positional methods DID fire.
     assert "compute_frozen_count" in method_names
     assert "apply_cached" in method_names
+
+
+def test_openai_chat_completions_compacts_tools_when_profile_enabled() -> None:
+    captured = {}
+    with _make_proxy_client() as client:
+        proxy = client.app.state.proxy
+        proxy.config.optimize = True
+        proxy.config.mode = "token"
+        proxy.config.savings_profile = "agent-90"
+
+        def _fake_apply(**kwargs):  # noqa: ANN003
+            return SimpleNamespace(
+                messages=kwargs["messages"],
+                transforms_applied=[],
+                timing={},
+                tokens_before=10,
+                tokens_after=10,
+                waste_signals=None,
+            )
+
+        proxy.openai_pipeline.apply = _fake_apply
+
+        async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
+            captured["body"] = body
+            return httpx.Response(
+                200,
+                json={
+                    "id": "chatcmpl_tools",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 500, "completion_tokens": 3, "total_tokens": 503},
+                },
+            )
+
+        proxy._retry_request = _fake_retry
+        verbose_schema_note = "schema annotation repeated for opencode tool definitions " * 50
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "read file helper",
+                    "parameters": {
+                        "$schema": "https://json-schema.org/draft/2020-12/schema",
+                        "title": "ReadFileParameters",
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "title": "Path",
+                                "description": verbose_schema_note,
+                                "examples": [verbose_schema_note],
+                            }
+                        },
+                        "required": ["path"],
+                    },
+                },
+            }
+        ]
+
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"authorization": "Bearer test-key"},
+            json={
+                "model": "gpt-4o-mini",
+                "messages": [{"role": "user", "content": "inspect this file"}],
+                "tools": tools,
+            },
+        )
+
+        assert response.status_code == 200
+        assert "openai:chat:tool_schema_compaction" in response.headers["x-headroom-transforms"]
+        assert int(response.headers["x-headroom-tokens-saved"]) > 0
+        sent_params = captured["body"]["tools"][0]["function"]["parameters"]
+        assert "$schema" not in sent_params
+        assert "title" not in sent_params
+        assert "title" not in sent_params["properties"]["path"]
+        assert "examples" not in sent_params["properties"]["path"]

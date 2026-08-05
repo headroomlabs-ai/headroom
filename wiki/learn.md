@@ -8,8 +8,11 @@ Offline failure learning for coding agents. Analyzes past conversations, finds w
 # See recommendations for current project (dry-run, no changes)
 headroom learn
 
-# Write recommendations to CLAUDE.md and MEMORY.md
+# Write recommendations to CLAUDE.local.md (gitignored, personal default)
 headroom learn --apply
+
+# Write to the shared team file instead
+headroom learn --apply --target CLAUDE.md
 
 # Analyze a specific project
 headroom learn --project ~/my-project --apply
@@ -99,10 +102,10 @@ Commands repeatedly rejected — model should suggest them to the user instead.
 
 | Pattern | Claude Code | Codex | Gemini CLI |
 |---------|-------------|-------|-----------|
-| Environment, paths, commands | **CLAUDE.md** | **AGENTS.md** | **GEMINI.md** |
+| Environment, paths, commands | **CLAUDE.local.md** (default) or `CLAUDE.md` (with `--target CLAUDE.md`) | **AGENTS.md** | **GEMINI.md** |
 | Retry patterns, permissions | **MEMORY.md** | **instructions.md** | **GEMINI.md** |
 
-Output files are agent-native: Claude Code uses CLAUDE.md/MEMORY.md, Codex uses AGENTS.md, Gemini uses GEMINI.md. The same learnings, written to the format each agent reads.
+Output files are agent-native: Claude Code writes to `CLAUDE.local.md` by default (gitignored, personal); pass `--target CLAUDE.md` for the shared team file. Codex uses `AGENTS.md`, Gemini uses `GEMINI.md`. The same learnings, written to the format each agent reads.
 
 ## Marker-Based Updates
 
@@ -150,12 +153,32 @@ headroom learn [OPTIONS]
 
 Options:
   --project PATH               Project directory (default: current directory)
-  --all                        Analyze all discovered projects
+  --all                        Analyze all discovered projects (mutually exclusive with --project)
   --apply                      Write recommendations (default: dry-run)
+  --target TEXT                Context file to write (default: CLAUDE.local.md for Claude Code)
+  --main-only                  Write only to the main context file, skip MEMORY.md
   --agent [auto|claude|codex|gemini]
                                Which agent to analyze (default: auto-detect)
   --model TEXT                 LLM for analysis (default: auto from API keys or CLI)
+  --workers / -j INTEGER       Parallel analysis workers (min 1, default: auto)
+  --verbosity                  Analyze verbosity level instead of failure patterns
+  --llm-judge                  Use an LLM to score verbosity quality (requires --verbosity)
 ```
+
+### Verbosity learning (`--verbosity`)
+
+`headroom learn --verbosity` analyzes past sessions to infer the ideal output verbosity level for your project and writes a `verbosity.json` profile.
+
+**Important**: the output shaper is **off by default**. Running `--verbosity --apply` will either:
+- Hot-enable the output shaper on a running proxy (`POST /admin/runtime-env`), OR
+- Print instructions to set `HEADROOM_OUTPUT_SHAPER=1` before `headroom wrap ...`
+
+To keep the shaper on across proxy restarts, add `export HEADROOM_OUTPUT_SHAPER=1` to your shell profile before starting the proxy.
+
+**Flag interactions**:
+- `--all` and `--project` are mutually exclusive
+- `--llm-judge` requires `--verbosity`
+- `--verbosity --all --apply` is rejected (verbosity persists a single global level)
 
 ### Supported Agents
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from headroom.transforms.content_detector import (
     ContentType,
     _try_detect_code,
@@ -10,6 +12,7 @@ from headroom.transforms.content_detector import (
     _try_detect_search,
     detect_content_type,
     is_json_array_of_dicts,
+    normalize_concatenated_json,
 )
 from headroom.transforms.error_detection import (
     ERROR_INDICATOR_KEYWORDS,
@@ -53,10 +56,57 @@ def test_json_detection_distinguishes_dict_arrays_and_other_lists() -> None:
     assert empty_result is not None
     assert empty_result.metadata == {"item_count": 0, "is_dict_array": False}
 
-    assert _try_detect_json('{"id": 1}') is None
+    # JSON OBJECTS are recognized too (config/data files are ``{…}``, not arrays).
+    object_result = _try_detect_json('{"id": 1}')
+    assert object_result is not None
+    assert object_result.content_type is ContentType.JSON_ARRAY
+    assert object_result.metadata == {"is_dict_array": False, "is_object": True}
+
     assert _try_detect_json("[not valid json") is None
     assert is_json_array_of_dicts('[{"id": 1}]') is True
     assert is_json_array_of_dicts('["value"]') is False
+
+
+def test_space_separated_json_objects_detected_as_array() -> None:
+    # Typical web_search output: back-to-back JSON objects, no array brackets.
+    content = " ".join(
+        json.dumps({"title": f"Result {i}", "url": f"http://example.com/{i}"}) for i in range(3)
+    )
+    result = _try_detect_json(content)
+    assert result is not None
+    assert result.content_type is ContentType.JSON_ARRAY
+    assert result.confidence == 1.0
+    assert result.metadata == {"item_count": 3, "is_dict_array": True, "concatenated": True}
+
+    # Reaches the same verdict through the top-level detector (not PLAIN_TEXT).
+    assert detect_content_type(content).content_type is ContentType.JSON_ARRAY
+    assert is_json_array_of_dicts(content) is True
+
+    # Newline separation is just as common and must also be recognized.
+    newline_sep = "\n".join(json.dumps({"id": i, "snippet": "x"}) for i in range(2))
+    assert _try_detect_json(newline_sep).content_type is ContentType.JSON_ARRAY
+
+
+def test_json_detection_is_liberal_but_bulk_gated() -> None:
+    # Liberal (parse-based): a lone JSON object IS structured data worth routing —
+    # config/data files are ``{...}`` (chosen over the earlier conservative stance
+    # when this PR merged with the concatenated-JSON detector, #1742).
+    assert _try_detect_json('{"id": 1}').content_type is ContentType.JSON_ARRAY
+    # But a JSON fragment that is only a minority of the content (prose or a loose
+    # scalar around it) is NOT claimed — the decoded value must be the bulk.
+    assert _try_detect_json('{"id": 1} then some prose {"id": 2}') is None
+    assert _try_detect_json('{"id": 1} "loose string"') is None
+
+
+def test_normalize_concatenated_json_roundtrips_to_array() -> None:
+    content = '{"a": 1} {"b": 2}'
+    normalized = normalize_concatenated_json(content)
+    assert normalized is not None
+    assert json.loads(normalized) == [{"a": 1}, {"b": 2}]
+
+    # Already-valid arrays and single objects are left for the caller as-is.
+    assert normalize_concatenated_json('[{"a": 1}]') is None
+    assert normalize_concatenated_json('{"a": 1}') is None
 
 
 def test_diff_detection_tracks_headers_and_changes() -> None:

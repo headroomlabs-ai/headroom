@@ -222,6 +222,26 @@ class TestJSONStructureHandler:
             "UUID value should be preserved via entropy"
         )
 
+    def test_short_value_threshold_excludes_quotes(self):
+        """The short-value threshold measures the payload, not the token.
+
+        Regression: len(token.text) included both quote characters, so a
+        value of exactly threshold length was rejected (off-by-2).
+        """
+        handler = JSONStructureHandler(
+            preserve_short_values=True,
+            short_value_threshold=20,
+            preserve_high_entropy=False,
+        )
+        exact = "x" * 20  # exactly at threshold — must be preserved
+        content = f'{{"key": "{exact}"}}'
+        result = handler.get_mask(content)
+
+        start = content.index(exact)
+        assert all(result.mask.mask[i] for i in range(start, start + len(exact))), (
+            "value of exactly threshold length should be preserved"
+        )
+
     def test_metadata_contains_key_count(self, handler):
         """Test that metadata includes key count."""
         content = '{"a": 1, "b": 2, "c": 3}'

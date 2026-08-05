@@ -6,7 +6,17 @@ Get Headroom running in 5 minutes with these copy-paste examples.
 
 ## Installation
 
-**Python:**
+**CLI on macOS Apple Silicon/Linux with uv:**
+
+```bash
+uv tool install --python 3.13 "headroom-ai[all]"
+headroom --version
+```
+
+Use `uv tool update-shell` if the install succeeds but `headroom` is not on
+`PATH`.
+
+**Python project / virtualenv:**
 
 ```bash
 # Core only (minimal dependencies)
@@ -319,7 +329,7 @@ response = client.chat.completions.create(
 
 ## Next Steps
 
-- **[Configuration Reference](api.md)** - All configuration options
+- **[Configuration Reference](configuration.md)** - All configuration options
 - **[Transform Reference](transforms.md)** - How each transform works
 - **[Troubleshooting](troubleshooting.md)** - Common issues and solutions
 - **[Examples](../examples/)** - More complete examples

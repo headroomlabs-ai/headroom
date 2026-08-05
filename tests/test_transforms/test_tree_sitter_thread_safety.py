@@ -98,7 +98,7 @@ def test_parser_usable_in_thread_pool() -> None:
 
     def parse_in_worker() -> bool:
         parser = _get_parser("python")
-        tree = parser.parse("x = 1\n")
+        tree = parser.parse(b"x = 1\n")
         return tree is not None
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:

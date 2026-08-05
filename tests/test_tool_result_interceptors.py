@@ -701,3 +701,30 @@ def test_transform_adapter_tokens_before_is_baseline_not_reconstruction(tokenize
     # No spans, no change.
     assert result.tokens_before == result.tokens_after
     assert result.transforms_applied == []
+
+
+def test_proxy_pipeline_includes_interceptor_when_env_enabled(monkeypatch):
+    """When HEADROOM_INTERCEPT_ENABLED=1, ToolResultInterceptorTransform is at index 0 in both pipelines."""
+    monkeypatch.setenv("HEADROOM_INTERCEPT_ENABLED", "1")
+    from headroom.proxy.interceptors import ToolResultInterceptorTransform
+    from headroom.proxy.models import ProxyConfig
+    from headroom.proxy.server import HeadroomProxy
+
+    proxy = HeadroomProxy(ProxyConfig())
+    for pipeline in (proxy.anthropic_pipeline, proxy.openai_pipeline):
+        transforms = pipeline.transforms
+        assert len(transforms) > 0
+        assert isinstance(transforms[0], ToolResultInterceptorTransform)
+
+
+def test_proxy_pipeline_excludes_interceptor_when_env_not_set(monkeypatch):
+    """When HEADROOM_INTERCEPT_ENABLED is unset, no interceptor in either pipeline."""
+    monkeypatch.delenv("HEADROOM_INTERCEPT_ENABLED", raising=False)
+    from headroom.proxy.interceptors import ToolResultInterceptorTransform
+    from headroom.proxy.models import ProxyConfig
+    from headroom.proxy.server import HeadroomProxy
+
+    proxy = HeadroomProxy(ProxyConfig())
+    for pipeline in (proxy.anthropic_pipeline, proxy.openai_pipeline):
+        transforms = pipeline.transforms
+        assert not any(isinstance(t, ToolResultInterceptorTransform) for t in transforms)

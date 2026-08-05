@@ -45,6 +45,7 @@ from __future__ import annotations
 import logging
 import re
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -61,16 +62,48 @@ _tree_sitter_local = threading.local()
 
 
 def _check_tree_sitter_available() -> bool:
-    """Check if tree-sitter packages are available."""
+    """Check if tree-sitter is available *and actually parses*.
+
+    The mere presence of ``tree_sitter_language_pack`` is not enough: prior
+    versions of this code green-lit a code path that raised ``TypeError`` at
+    parse time and silently fell back to a lossy stripper.  To stop misleading
+    callers, we now verify an end-to-end parse of a tiny snippet and only
+    return ``True`` if it yields a real AST.
+    """
     global _tree_sitter_available
     if _tree_sitter_available is None:
         try:
-            import tree_sitter_language_pack  # noqa: F401
-
-            _tree_sitter_available = True
-        except ImportError:
+            parser = _get_parser("python")
+            tree = parser.parse(b"def _probe():\n    return 1\n")
+            root = tree.root_node
+            # A real parse yields a non-error root with children.
+            _tree_sitter_available = (
+                root is not None
+                and root.type == "module"
+                and root.child_count > 0
+                and not _has_syntax_issues(root)
+            )
+        except Exception:
             _tree_sitter_available = False
     return _tree_sitter_available
+
+
+def _tree_sitter_importable() -> bool:
+    """Return True if the tree-sitter grammar pack can be imported.
+
+    This only checks importability (cheap, no parse). Use
+    :func:`_check_tree_sitter_available` for the stronger "parsing actually
+    works" guarantee.
+    """
+    try:
+        import tree_sitter_language_pack  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
+_UNSAFE_TREE_SITTER_LANGUAGES: frozenset[str] = frozenset({"perl"})
 
 
 def _get_parser(language: str) -> Any:
@@ -100,7 +133,12 @@ def _get_parser(language: str) -> Any:
         ImportError: If tree-sitter is not installed.
         ValueError: If language is not supported.
     """
-    if not _check_tree_sitter_available():
+    if language in _UNSAFE_TREE_SITTER_LANGUAGES:
+        raise ValueError(f"Language '{language}' is quarantined for code-aware compression.")
+    # NOTE: guard on importability (not _check_tree_sitter_available), because
+    # _check_tree_sitter_available now performs a real end-to-end parse via
+    # _get_parser; guarding on it here would recurse.
+    if not _tree_sitter_importable():
         raise ImportError(
             "tree-sitter is not installed. Install with: pip install headroom-ai[code]\n"
             "This adds ~50MB for tree-sitter grammars."
@@ -129,7 +167,7 @@ def _get_parser(language: str) -> Any:
         except Exception as e:
             raise ValueError(
                 f"Language '{language}' is not supported by tree-sitter. "
-                f"Supported: python, javascript, typescript, go, rust, java, c, cpp. "
+                f"Supported: python, javascript, typescript, go, rust, java, c, cpp, csharp, php. "
                 f"Error: {e}"
             ) from e
 
@@ -183,7 +221,57 @@ class CodeLanguage(Enum):
     JAVA = "java"
     C = "c"
     CPP = "cpp"
+    PERL = "perl"
+    CSHARP = "csharp"
+    PHP = "php"
     UNKNOWN = "unknown"
+
+
+# Common language hints and markdown fence tags that are not the canonical
+# ``CodeLanguage`` value. Mapping them here keeps ``` ```js ``` / ``` ```ts ```
+# / ``` ```py ``` fenced blocks (and callers that pass an alias) on the
+# code-aware path instead of raising ValueError.
+_LANGUAGE_ALIASES: dict[str, CodeLanguage] = {
+    "js": CodeLanguage.JAVASCRIPT,
+    "jsx": CodeLanguage.JAVASCRIPT,
+    "mjs": CodeLanguage.JAVASCRIPT,
+    "cjs": CodeLanguage.JAVASCRIPT,
+    "node": CodeLanguage.JAVASCRIPT,
+    "ts": CodeLanguage.TYPESCRIPT,
+    "tsx": CodeLanguage.TYPESCRIPT,
+    "py": CodeLanguage.PYTHON,
+    "python3": CodeLanguage.PYTHON,
+    "golang": CodeLanguage.GO,
+    "rs": CodeLanguage.RUST,
+    "c++": CodeLanguage.CPP,
+    "cxx": CodeLanguage.CPP,
+    "cc": CodeLanguage.CPP,
+    "hpp": CodeLanguage.CPP,
+    "pl": CodeLanguage.PERL,
+    "phtml": CodeLanguage.PHP,
+    "php5": CodeLanguage.PHP,
+    "php7": CodeLanguage.PHP,
+    "php8": CodeLanguage.PHP,
+}
+
+
+def coerce_language(value: str) -> CodeLanguage:
+    """Map a language hint or markdown fence tag to a ``CodeLanguage``.
+
+    Accepts the canonical enum values and common aliases/fence tags
+    (``js``/``ts``/``py``/...). Unknown strings return ``CodeLanguage.UNKNOWN``
+    instead of raising ``ValueError`` from ``CodeLanguage(value)``, so an
+    unrecognized fence tag falls back to content-based detection rather than
+    crashing the caller (or, inside the router, silently skipping code-aware
+    compression because the ValueError is swallowed).
+    """
+    key = (value or "").strip().lower()
+    if not key:
+        return CodeLanguage.UNKNOWN
+    try:
+        return CodeLanguage(key)
+    except ValueError:
+        return _LANGUAGE_ALIASES.get(key, CodeLanguage.UNKNOWN)
 
 
 class DocstringMode(Enum):
@@ -238,11 +326,24 @@ class LangConfig:
 
     # Quick pre-filter hints for language detection (substrings to check)
     detection_hints: tuple[str, ...] = ()
+    # Optional override for node types that contain class/impl members.
+    class_body_node_types: frozenset[str] | None = None
+    # Optional container nodes (e.g. C# block-scoped namespaces) that wrap
+    # type declarations in a member list. Routed through class compression so
+    # their members compress and the wrapper isn't re-emitted verbatim.
+    container_node_types: frozenset[str] | None = None
+    # Optional opaque nodes (e.g. C# `#if`/`#endif` conditionals) preserved
+    # verbatim without recursing into them. Recursing would capture their
+    # descendants individually while the top-level pass re-emits the whole
+    # wrapper verbatim, duplicating content. Prefer the false negative.
+    opaque_node_types: frozenset[str] | None = None
 
 
 _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
     CodeLanguage.PYTHON: LangConfig(
-        import_nodes=frozenset({"import_statement", "import_from_statement"}),
+        import_nodes=frozenset(
+            {"future_import_statement", "import_statement", "import_from_statement"}
+        ),
         function_nodes=frozenset({"function_definition"}),
         class_nodes=frozenset({"class_definition"}),
         type_nodes=frozenset({"type_alias_statement"}),
@@ -288,6 +389,7 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
         mutation_receiver_nodes=frozenset({"member_expression", "subscript_expression"}),
         effect_boundary_nodes=frozenset({"throw_statement", "try_statement"}),
         detection_hints=("function ", "const ", "let ", "var ", "export ", "require("),
+        class_body_node_types=frozenset({"class_body"}),
     ),
     CodeLanguage.TYPESCRIPT: LangConfig(
         import_nodes=frozenset({"import_statement", "import_declaration"}),
@@ -313,6 +415,7 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
         mutation_receiver_nodes=frozenset({"member_expression", "subscript_expression"}),
         effect_boundary_nodes=frozenset({"throw_statement", "try_statement"}),
         detection_hints=("interface ", "type ", ": string", ": number", ": boolean"),
+        class_body_node_types=frozenset({"class_body"}),
     ),
     CodeLanguage.GO: LangConfig(
         import_nodes=frozenset({"import_declaration"}),
@@ -360,6 +463,7 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
         mutation_receiver_nodes=frozenset({"field_expression", "index_expression"}),
         effect_boundary_nodes=frozenset(),
         detection_hints=("fn ", "struct ", "impl ", "mod ", "use "),
+        class_body_node_types=frozenset({"declaration_list"}),
     ),
     CodeLanguage.JAVA: LangConfig(
         import_nodes=frozenset({"import_declaration"}),
@@ -384,6 +488,7 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
         mutation_receiver_nodes=frozenset({"field_access", "array_access"}),
         effect_boundary_nodes=frozenset({"throw_statement", "try_statement"}),
         detection_hints=("public ", "private ", "protected ", "class ", "interface "),
+        class_body_node_types=frozenset({"class_body"}),
     ),
     CodeLanguage.C: LangConfig(
         import_nodes=frozenset({"preproc_include"}),
@@ -438,6 +543,67 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
         ),
         effect_boundary_nodes=frozenset({"throw_statement", "try_statement"}),
         detection_hints=("#include", "namespace ", "class ", "::"),
+        class_body_node_types=frozenset({"field_declaration_list"}),
+    ),
+    CodeLanguage.PERL: LangConfig(
+        import_nodes=frozenset({"use_statement", "use_version_statement"}),
+        function_nodes=frozenset(
+            {"subroutine_declaration_statement", "method_declaration_statement"}
+        ),
+        class_nodes=frozenset({"package_statement", "class_statement", "role_statement"}),
+        type_nodes=frozenset(),
+        body_node_types=frozenset({"block"}),
+        decorator_node=None,
+        comment_prefix="#",
+        uses_colon_after_signature=False,
+        package_node="package_statement",
+        detection_hints=("sub ", "my ", "our ", "use ", "package "),
+    ),
+    CodeLanguage.CSHARP: LangConfig(
+        import_nodes=frozenset({"using_directive", "file_scoped_namespace_declaration"}),
+        function_nodes=frozenset(
+            {
+                "method_declaration",
+                "constructor_declaration",
+                "destructor_declaration",
+                "operator_declaration",
+                "local_function_statement",
+            }
+        ),
+        class_nodes=frozenset(
+            {
+                "class_declaration",
+                "struct_declaration",
+                "record_declaration",
+                "interface_declaration",
+            }
+        ),
+        type_nodes=frozenset({"enum_declaration", "delegate_declaration"}),
+        body_node_types=frozenset({"block"}),
+        decorator_node=None,
+        comment_prefix="//",
+        uses_colon_after_signature=False,
+        detection_hints=("using ", "namespace ", "public ", "private ", "void "),
+        class_body_node_types=frozenset({"declaration_list"}),
+        container_node_types=frozenset({"namespace_declaration"}),
+        opaque_node_types=frozenset({"preproc_if"}),
+    ),
+    CodeLanguage.PHP: LangConfig(
+        import_nodes=frozenset({"namespace_use_declaration"}),
+        function_nodes=frozenset({"function_definition", "method_declaration"}),
+        class_nodes=frozenset({"class_declaration", "interface_declaration", "trait_declaration"}),
+        type_nodes=frozenset({"enum_declaration"}),
+        body_node_types=frozenset({"compound_statement"}),
+        decorator_node=None,
+        comment_prefix="//",
+        uses_colon_after_signature=False,
+        # Statement-scoped `namespace App;` hoists to the top of the output
+        # (before the use declarations); the rarer block-scoped
+        # `namespace A { ... }` form takes the same path and is preserved
+        # verbatim — valid output, no compression inside the block.
+        package_node="namespace_definition",
+        detection_hints=("<?php", "function ", "namespace ", "->", "$this"),
+        class_body_node_types=frozenset({"declaration_list"}),
     ),
 }
 
@@ -446,6 +612,7 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
 class CodeStructure:
     """Extracted structure from parsed code."""
 
+    header_code: list[str] = field(default_factory=list)
     imports: list[str] = field(default_factory=list)
     type_definitions: list[str] = field(default_factory=list)
     class_definitions: list[str] = field(default_factory=list)
@@ -628,6 +795,31 @@ _LANGUAGE_PREFILTER: dict[CodeLanguage, list[re.Pattern[str]]] = {
         re.compile(r"\bnamespace\s+\w+", re.MULTILINE),
         re.compile(r"::\w+", re.MULTILINE),
     ],
+    CodeLanguage.PERL: [
+        re.compile(r"^\s*(sub|package|use|require)\s+[\w:]+", re.MULTILINE),
+        re.compile(r"^\s*(my|our|local)\s+[\$@%]", re.MULTILINE),
+        re.compile(r"[\$@%]\w+", re.MULTILINE),
+    ],
+    CodeLanguage.CSHARP: [
+        re.compile(r"^\s*using\s+[\w.]+\s*;", re.MULTILINE),
+        re.compile(r"^\s*namespace\s+[\w.]+", re.MULTILINE),
+        re.compile(
+            r"^\s*(public|private|protected|internal|sealed|static|abstract|partial)\s+"
+            r"(class|struct|record|interface|enum)\b",
+            re.MULTILINE,
+        ),
+        re.compile(r"\bget;\s*set;", re.MULTILINE),
+    ],
+    CodeLanguage.PHP: [
+        re.compile(r"<\?php\b"),
+        re.compile(r"^\s*namespace\s+[\w\\]+\s*;", re.MULTILINE),
+        re.compile(r"^\s*use\s+[\w\\]+(\s+as\s+\w+)?\s*;", re.MULTILINE),
+        re.compile(
+            r"^\s*(public|private|protected|static|abstract|final)?\s*function\s+\w+\s*\(",
+            re.MULTILINE,
+        ),
+        re.compile(r"\$this->|->\w+\s*\(", re.MULTILINE),
+    ],
 }
 
 
@@ -681,6 +873,23 @@ def detect_language(code: str) -> tuple[CodeLanguage, float]:
     if CodeLanguage.CPP in candidates and CodeLanguage.C in candidates:
         if candidates[CodeLanguage.CPP] >= 2:
             candidates[CodeLanguage.C] = 0
+
+    # Disambiguation: PHP's sigil variables ($x) overlap Perl's prefilter.
+    # An explicit `<?php` open tag is unambiguous — no Perl source contains
+    # it, so drop Perl from the candidates before the Perl-dominance guard
+    # below returns UNKNOWN for what is actually PHP.
+    if CodeLanguage.PHP in candidates and "<?php" in sample:
+        candidates.pop(CodeLanguage.PERL, None)
+
+    perl_score = candidates.get(CodeLanguage.PERL, 0)
+    if perl_score > 0:
+        best_non_perl = max(
+            (score for lang, score in candidates.items() if lang != CodeLanguage.PERL),
+            default=0,
+        )
+        if perl_score > best_non_perl:
+            return CodeLanguage.UNKNOWN, 0.0
+        candidates.pop(CodeLanguage.PERL, None)
 
     # Phase 2: If tree-sitter available, parse with candidates and pick fewest errors
     if _check_tree_sitter_available():
@@ -962,7 +1171,7 @@ class CodeAwareCompressor(Transform):
         body_line_counts: dict[str, int] = {}
         for qname, node in definitions.items():
             collect_calls_in_function(node, qname)
-            node_text = code[node.start_byte : node.end_byte]
+            node_text = _slice_code_bytes(code, node.start_byte, node.end_byte)
             body_line_counts[qname] = max(1, len(node_text.split("\n")) - 2)
 
         # Reference counts: subtract definition occurrences
@@ -977,9 +1186,7 @@ class CodeAwareCompressor(Transform):
             ref_counts[qname] = max(0, count - short_name_def_count.get(short, 1))
 
         # Raw importance signals per symbol
-        context_lower = context.lower() if context else ""
-        context_words = set(re.split(r"[\s,;:.()\[\]{}\"']+", context_lower)) if context else set()
-        context_words.discard("")
+        context_words, context_lower, context_has_cjk = _query_context_tokens(context)
 
         raw_signals: dict[str, float] = {}
         for qname in definitions:
@@ -1000,13 +1207,9 @@ class CodeAwareCompressor(Transform):
                 if short and short[0].isupper():
                     raw += 1.0
 
-            # Context boost
-            if context_words:
-                name_lower = short.lower()
-                if name_lower in context_words or (
-                    len(name_lower) > 3 and name_lower in context_lower
-                ):
-                    raw += 3.0
+            # Context boost: the relevance query named this symbol.
+            if _symbol_in_context(short.lower(), context_words, context_lower, context_has_cjk):
+                raw += 3.0
 
             raw_signals[qname] = raw
 
@@ -1123,13 +1326,22 @@ class CodeAwareCompressor(Transform):
                 syntax_valid=True,
             )
 
-        # Detect or use specified language
+        # Detect or use specified language. An explicit hint or fence tag may be
+        # an alias (js/ts/py/...) or something we don't recognize — coerce it
+        # instead of constructing CodeLanguage() directly (which raises), and
+        # fall back to content detection when the hint is unknown.
         if language:
-            detected_lang = CodeLanguage(language.lower())
-            confidence = 1.0
+            detected_lang = coerce_language(language)
+            if detected_lang == CodeLanguage.UNKNOWN:
+                detected_lang, confidence = detect_language(code)
+            else:
+                confidence = 1.0
         elif self.config.language_hint:
-            detected_lang = CodeLanguage(self.config.language_hint.lower())
-            confidence = 1.0
+            detected_lang = coerce_language(self.config.language_hint)
+            if detected_lang == CodeLanguage.UNKNOWN:
+                detected_lang, confidence = detect_language(code)
+            else:
+                confidence = 1.0
         else:
             detected_lang, confidence = detect_language(code)
 
@@ -1148,6 +1360,19 @@ class CodeAwareCompressor(Transform):
                     language_confidence=0.0,
                     syntax_valid=True,
                 )
+        if detected_lang == CodeLanguage.PERL:
+            if self.config.fallback_to_kompress:
+                return self._fallback_compress(code, original_tokens)
+            return CodeCompressionResult(
+                compressed=code,
+                original=code,
+                original_tokens=original_tokens,
+                compressed_tokens=original_tokens,
+                compression_ratio=1.0,
+                language=detected_lang,
+                language_confidence=confidence,
+                syntax_valid=True,
+            )
 
         # Check if tree-sitter is available
         if not _check_tree_sitter_available():
@@ -1174,6 +1399,20 @@ class CodeAwareCompressor(Transform):
 
             # Verify syntax validity (checks both ERROR and MISSING nodes)
             syntax_valid = self._verify_syntax(compressed, detected_lang)
+            original_syntax_valid = True
+
+            if not syntax_valid and detected_lang == CodeLanguage.PYTHON:
+                original_syntax_valid = self._verify_syntax(code, detected_lang)
+                if original_syntax_valid:
+                    compressed, structure, symbol_scores = self._compress_with_ast(
+                        code,
+                        detected_lang,
+                        context,
+                        tokenizer,
+                        recover_invalid_python_nodes=True,
+                    )
+                    compressed_tokens = self._estimate_tokens(compressed, tokenizer)
+                    syntax_valid = self._verify_syntax(compressed, detected_lang)
 
             # If syntax invalid, return original (never serve broken code)
             if not syntax_valid:
@@ -1272,6 +1511,7 @@ class CodeAwareCompressor(Transform):
         language: CodeLanguage,
         context: str,
         tokenizer: Tokenizer | None = None,
+        recover_invalid_python_nodes: bool = False,
     ) -> tuple[str, CodeStructure, dict[str, float]]:
         """Compress code using AST parsing with symbol importance analysis.
 
@@ -1290,6 +1530,23 @@ class CodeAwareCompressor(Transform):
         parser = _get_parser(language.value)
         tree = parser.parse(bytes(code, "utf-8"))
         root = tree.root_node
+        candidate_validator: Callable[[Any, str], str] | None = None
+
+        if recover_invalid_python_nodes and language == CodeLanguage.PYTHON:
+            code_bytes = code.encode("utf-8")
+
+            def candidate_validator(node: Any, candidate_text: str) -> str:
+                original_text = _slice_code_bytes(code, node.start_byte, node.end_byte)
+                if candidate_text == original_text:
+                    return candidate_text
+                candidate_module = (
+                    code_bytes[: node.start_byte]
+                    + candidate_text.encode("utf-8")
+                    + code_bytes[node.end_byte :]
+                ).decode("utf-8")
+                if self._verify_syntax(candidate_module, CodeLanguage.PYTHON):
+                    return candidate_text
+                return original_text
 
         # Analyze symbol importance and allocate compression budget
         analysis = self._analyze_symbol_importance(root, code, language, context)
@@ -1299,7 +1556,14 @@ class CodeAwareCompressor(Transform):
         lang_config = _LANG_CONFIGS.get(language)
         if lang_config:
             structure = self._extract_structure(
-                root, code, language, lang_config, body_limits, analysis, context
+                root,
+                code,
+                language,
+                lang_config,
+                body_limits,
+                analysis,
+                context,
+                candidate_validator=candidate_validator,
             )
         else:
             structure = self._extract_generic_structure(root, code)
@@ -1330,6 +1594,7 @@ class CodeAwareCompressor(Transform):
         body_limits: dict[str, int],
         analysis: _SymbolAnalysis,
         context: str,
+        candidate_validator: Callable[[Any, str], str] | None = None,
     ) -> CodeStructure:
         """Extract structure from AST using data-driven language config.
 
@@ -1339,23 +1604,31 @@ class CodeAwareCompressor(Transform):
         structure = CodeStructure()
         captured_byte_ranges: list[tuple[int, int]] = []
 
+        def _validated_candidate(node: Any, compressed: str) -> str:
+            if candidate_validator is None:
+                return compressed
+            return candidate_validator(node, compressed)
+
         def visit(node: Any) -> None:
             node_type = node.type
 
             # Package declarations (Go, Java)
             if lang_config.package_node and node_type == lang_config.package_node:
-                structure.imports.insert(0, _get_node_text(node, code))
+                leading = _get_leading_comment_text(node, code, captured_byte_ranges)
+                structure.imports.insert(0, leading + _get_node_text(node, code))
                 captured_byte_ranges.append((node.start_byte, node.end_byte))
                 return
 
             # Import statements
             if node_type in lang_config.import_nodes:
-                structure.imports.append(_get_node_text(node, code))
+                leading = _get_leading_comment_text(node, code, captured_byte_ranges)
+                structure.imports.append(leading + _get_node_text(node, code))
                 captured_byte_ranges.append((node.start_byte, node.end_byte))
                 return
 
             # Export statements (JS/TS) — may contain functions or re-exports
             if node_type == "export_statement":
+                leading = _get_leading_comment_text(node, code, captured_byte_ranges)
                 text = _get_node_text(node, code)
                 # Check if this export wraps a function or class
                 has_func_or_class = False
@@ -1369,19 +1642,24 @@ class CodeAwareCompressor(Transform):
                             child, code, language, lang_config, body_limits, analysis, context
                         )
                         # Reconstruct export with compressed inner definition
-                        export_prefix = code[node.start_byte : child.start_byte]
-                        export_suffix = code[child.end_byte : node.end_byte]
+                        export_prefix = _slice_code_bytes(code, node.start_byte, child.start_byte)
+                        export_suffix = _slice_code_bytes(code, child.end_byte, node.end_byte)
                         structure.function_signatures.append(
-                            export_prefix + compressed + export_suffix
+                            leading
+                            + _validated_candidate(
+                                node,
+                                export_prefix + compressed + export_suffix,
+                            )
                         )
                         break
                 if not has_func_or_class:
-                    structure.imports.append(text)
+                    structure.imports.append(leading + text)
                 captured_byte_ranges.append((node.start_byte, node.end_byte))
                 return
 
             # Decorated definitions (Python)
             if lang_config.decorator_node and node_type == lang_config.decorator_node:
+                leading = _get_leading_comment_text(node, code, captured_byte_ranges)
                 decorator_text = []
                 definition_compressed = None
                 for child in node.children:
@@ -1396,40 +1674,88 @@ class CodeAwareCompressor(Transform):
                             child, code, language, lang_config, body_limits, analysis, context
                         )
                 if decorator_text and definition_compressed:
-                    full_def = "\n".join(decorator_text) + "\n" + definition_compressed
+                    full_def = _validated_candidate(
+                        node,
+                        "\n".join(decorator_text) + "\n" + definition_compressed,
+                    )
                     # Route to correct list based on inner definition type
                     for child in node.children:
                         if child.type in lang_config.class_nodes:
-                            structure.class_definitions.append(full_def)
+                            structure.class_definitions.append(leading + full_def)
                             break
                     else:
-                        structure.function_signatures.append(full_def)
+                        structure.function_signatures.append(leading + full_def)
                 elif definition_compressed:
-                    structure.function_signatures.append(definition_compressed)
+                    structure.function_signatures.append(
+                        leading + _validated_candidate(node, definition_compressed)
+                    )
                 captured_byte_ranges.append((node.start_byte, node.end_byte))
                 return
 
             # Function/method definitions
             if node_type in lang_config.function_nodes:
+                leading = _get_leading_comment_text(node, code, captured_byte_ranges)
                 compressed = self._compress_function_ast(
                     node, code, language, lang_config, body_limits, analysis, context
                 )
-                structure.function_signatures.append(compressed)
+                structure.function_signatures.append(
+                    leading + _validated_candidate(node, compressed)
+                )
+                captured_byte_ranges.append((node.start_byte, node.end_byte))
+                return
+
+            if lang_config.container_node_types and node_type in lang_config.container_node_types:
+                compressed = self._compress_class_ast(
+                    node, code, language, lang_config, body_limits, analysis, context
+                )
+                structure.class_definitions.append(_validated_candidate(node, compressed))
                 captured_byte_ranges.append((node.start_byte, node.end_byte))
                 return
 
             # Class definitions — compress each method individually
             if node_type in lang_config.class_nodes:
+                leading = _get_leading_comment_text(node, code, captured_byte_ranges)
                 compressed = self._compress_class_ast(
                     node, code, language, lang_config, body_limits, analysis, context
                 )
-                structure.class_definitions.append(compressed)
+                structure.class_definitions.append(leading + _validated_candidate(node, compressed))
                 captured_byte_ranges.append((node.start_byte, node.end_byte))
+                trailing_semicolon = _get_same_line_trailing_semicolon(node)
+                if trailing_semicolon is not None:
+                    captured_byte_ranges.append(
+                        (trailing_semicolon.start_byte, trailing_semicolon.end_byte)
+                    )
                 return
 
             # Type definitions
             if node_type in lang_config.type_nodes:
-                structure.type_definitions.append(_get_node_text(node, code))
+                leading = _get_leading_comment_text(node, code, captured_byte_ranges)
+                structure.type_definitions.append(leading + _get_node_text(node, code))
+                captured_byte_ranges.append((node.start_byte, node.end_byte))
+                return
+
+            # Opaque regions (e.g. C# preprocessor conditionals) — preserved
+            # verbatim, never recursed into. Recursing captures descendants
+            # individually while the top-level pass re-emits the uncaptured
+            # wrapper verbatim, duplicating its whole content in the output.
+            # Blocks wrapping only import directives (`#if NET6_0\nusing X;`)
+            # are emitted with the imports: usings must precede type
+            # declarations, so appending them as trailing top-level code would
+            # produce invalid output (and fall back to no compression).
+            if lang_config.opaque_node_types and node_type in lang_config.opaque_node_types:
+                child_types = [child.type for child in node.named_children]
+                has_import = any(t in lang_config.import_nodes for t in child_types)
+                has_declaration = any(
+                    t in lang_config.class_nodes
+                    or t in lang_config.type_nodes
+                    or t in lang_config.function_nodes
+                    or (lang_config.container_node_types and t in lang_config.container_node_types)
+                    for t in child_types
+                )
+                if has_import and not has_declaration:
+                    structure.imports.append(_get_node_text(node, code))
+                else:
+                    structure.top_level_code.append(_get_node_text(node, code))
                 captured_byte_ranges.append((node.start_byte, node.end_byte))
                 return
 
@@ -1441,13 +1767,22 @@ class CodeAwareCompressor(Transform):
 
         # Capture top-level code that wasn't handled by any of the above.
         # This preserves global variables, constants, if __name__ blocks,
-        # module-level assignments, etc.
+        # module-level assignments, etc. Uncaptured nodes that precede the
+        # first captured node are file headers (license banners, C# `#region
+        # License` blocks, module comments): they are emitted first, in
+        # original order, rather than relocated to the end of the output —
+        # e.g. tree-sitter-c-sharp rejects top-level `#region` after a type
+        # declaration, which would fail validation and forfeit compression.
+        first_captured = min((r[0] for r in captured_byte_ranges), default=None)
         for child in root.children:
             child_range = (child.start_byte, child.end_byte)
             if child_range not in captured_byte_ranges:
                 text = _get_node_text(child, code).strip()
                 if text:
-                    structure.top_level_code.append(text)
+                    if first_captured is not None and child.end_byte <= first_captured:
+                        structure.header_code.append(text)
+                    else:
+                        structure.top_level_code.append(text)
 
         return structure
 
@@ -1478,9 +1813,7 @@ class CodeAwareCompressor(Transform):
         # preserve indentation. This is critical for nested definitions
         # (methods inside classes).
         code_lines = code.split("\n")
-        start_row = node.start_point[0]
-        end_row = node.end_point[0]
-        node_lines = code_lines[start_row : end_row + 1]
+        node_lines = _get_node_lines(node, code_lines)
         node_text = "\n".join(node_lines)
 
         func_name = _get_definition_name(node)
@@ -1537,7 +1870,11 @@ class CodeAwareCompressor(Transform):
             if _brace_in_signature:
                 # Opening brace already in signature line — just find closing
                 pass
-            elif body_lines and body_lines[0].strip().startswith("{"):
+            elif body_lines and body_lines[0].strip().endswith("{"):
+                # Matches both a bare `{` line and a multi-line signature's
+                # closing line (e.g. Go's `) error {`), where the brace
+                # shares a line with the closing paren/return type rather
+                # than starting one of its own.
                 opening_brace_line = body_lines[0]
                 body_lines = body_lines[1:]
             if body_lines and body_lines[-1].strip().endswith("}"):
@@ -1664,7 +2001,7 @@ class CodeAwareCompressor(Transform):
         if signature_lines:
             result_parts.extend(signature_lines)
         else:
-            sig_text = code[node.start_byte : body_node.start_byte].rstrip()
+            sig_text = _slice_code_bytes(code, node.start_byte, body_node.start_byte).rstrip()
             result_parts.append(sig_text)
 
         if opening_brace_line is not None:
@@ -1714,14 +2051,15 @@ class CodeAwareCompressor(Transform):
         # Use line-based extraction to preserve indentation
         code_lines = code.split("\n")
         start_row = node.start_point[0]
-        end_row = node.end_point[0]
-        node_lines = code_lines[start_row : end_row + 1]
+        node_lines = _get_node_lines(node, code_lines)
         node_text = "\n".join(node_lines)
 
-        # Find the body node
+        # Find the class/member container. For some languages this is not the
+        # same node type as a function body's executable block.
+        class_body_node_types = lang_config.class_body_node_types or lang_config.body_node_types
         body_node = None
         for child in node.children:
-            if child.type in lang_config.body_node_types:
+            if child.type in class_body_node_types:
                 body_node = child
                 break
 
@@ -1732,16 +2070,27 @@ class CodeAwareCompressor(Transform):
         node_start_line = node.start_point[0]
         body_start_line = body_node.start_point[0]
         sig_end = body_start_line - node_start_line
-        header_lines = node_lines[:sig_end] if sig_end > 0 else [node_lines[0]]
+        if sig_end > 0:
+            header_lines = node_lines[:sig_end]
+            brace_line = node_lines[sig_end]
+            if brace_line.strip().startswith("{"):
+                header_lines = [*header_lines, brace_line]
+        else:
+            header_lines = [node_lines[0]]
 
         # Process each child of the class body individually
         body_parts: list[str] = []
         processed_ranges: list[tuple[int, int]] = []
 
         for child in body_node.children:
+            if not child.is_named:
+                continue
+
             # Use line-based extraction for children too
             child_start = child.start_point[0]
             child_end = child.end_point[0]
+            if child.end_point[1] == 0 and child_end > child_start:
+                child_end -= 1
             child_text = "\n".join(code_lines[child_start : child_end + 1])
 
             # Methods/functions inside the class — compress individually
@@ -1757,7 +2106,9 @@ class CodeAwareCompressor(Transform):
                 method_compressed = None
                 for deco_child in child.children:
                     if deco_child.type == "decorator":
-                        decorator_lines.append(_get_node_text(deco_child, code))
+                        deco_start = deco_child.start_point[0]
+                        deco_end = deco_child.end_point[0]
+                        decorator_lines.append("\n".join(code_lines[deco_start : deco_end + 1]))
                     elif deco_child.type in lang_config.function_nodes:
                         method_compressed = self._compress_function_ast(
                             deco_child,
@@ -1775,8 +2126,10 @@ class CodeAwareCompressor(Transform):
                 else:
                     body_parts.append(child_text)
                 processed_ranges.append((child.start_byte, child.end_byte))
-            # Nested classes — recurse
-            elif child.type in lang_config.class_nodes:
+            # Nested classes / containers (e.g. nested namespaces) — recurse
+            elif child.type in lang_config.class_nodes or (
+                lang_config.container_node_types and child.type in lang_config.container_node_types
+            ):
                 compressed = self._compress_class_ast(
                     child, code, language, lang_config, body_limits, analysis, context
                 )
@@ -1794,17 +2147,23 @@ class CodeAwareCompressor(Transform):
         for part in body_parts:
             result_parts.append(part)
 
-        # Handle closing brace for brace-delimited languages
+        # Handle closing brace for brace-delimited languages. The class body
+        # node ends at the brace, while C++ class_specifier excludes the
+        # trailing semicolon; keeping only the body node span prevents a second
+        # semicolon from being rendered later as top-level code.
         body_end_line = body_node.end_point[0]
         body_end_rel = body_end_line - node_start_line + 1
         after_lines = node_lines[body_end_rel:]
-        if after_lines:
+        if not lang_config.uses_colon_after_signature:
+            if body_end_line != start_row:
+                closing_line = code_lines[body_end_line]
+                closing_text = closing_line[: body_node.end_point[1]]
+                if _get_same_line_trailing_semicolon(node) is not None:
+                    closing_text += ";"
+                if closing_text.strip():
+                    result_parts.append(closing_text)
+        elif after_lines:
             result_parts.extend(after_lines)
-        elif not lang_config.uses_colon_after_signature:
-            # Ensure closing brace
-            last_body_line = node_lines[-1] if node_lines else ""
-            if last_body_line.strip() == "}":
-                result_parts.append(last_body_line)
 
         return "\n".join(result_parts)
 
@@ -1825,6 +2184,11 @@ class CodeAwareCompressor(Transform):
     ) -> str:
         """Assemble compressed code from structure."""
         parts: list[str] = []
+
+        # File header (license banners, top-of-file comments) stays on top
+        if structure.header_code:
+            parts.extend(structure.header_code)
+            parts.append("")
 
         # Imports first
         if structure.imports:
@@ -1868,6 +2232,12 @@ class CodeAwareCompressor(Transform):
         (tokens the parser expected but didn't find).
         """
         try:
+            if language == CodeLanguage.PYTHON:
+                import ast
+
+                ast.parse(code)
+                compile(code, "<headroom-compressed>", "exec")
+
             parser = _get_parser(language.value)
             tree = parser.parse(bytes(code, "utf-8"))
             return not _has_syntax_issues(tree.root_node)
@@ -2109,9 +2479,78 @@ _STATEMENT_KIND_MAP: dict[str, _StatementKind] = {
 }
 
 
+def _slice_code_bytes(code: str, start_byte: int, end_byte: int) -> str:
+    """Extract source text using tree-sitter UTF-8 byte offsets."""
+    return code.encode("utf-8")[start_byte:end_byte].decode("utf-8")
+
+
 def _get_node_text(node: Any, code: str) -> str:
     """Extract text from AST node."""
-    return code[node.start_byte : node.end_byte]
+    return _slice_code_bytes(code, node.start_byte, node.end_byte)
+
+
+_COMMENT_NODE_TYPES = frozenset({"comment", "line_comment", "block_comment"})
+
+
+def _get_leading_comment_text(
+    node: Any, code: str, captured_byte_ranges: list[tuple[int, int]]
+) -> str:
+    """Collect contiguous doc-comment siblings immediately preceding a node.
+
+    Doc comments are top-level siblings of the declaration they document, not
+    children of it. Left uncaptured, they fall through to the leftover
+    top-level sweep and get grouped separately from the declarations they
+    document instead of staying attached. Only comments with no blank line
+    before the node (or the next comment) are treated as attached.
+    """
+    comments: list[Any] = []
+    sibling = getattr(node, "prev_sibling", None)
+    anchor_row = node.start_point[0]
+    while (
+        sibling is not None
+        and sibling.type in _COMMENT_NODE_TYPES
+        and (anchor_row - sibling.end_point[0] <= 1)
+    ):
+        comments.append(sibling)
+        anchor_row = sibling.start_point[0]
+        sibling = getattr(sibling, "prev_sibling", None)
+    if not comments:
+        return ""
+    comments.reverse()
+    captured_byte_ranges.extend((c.start_byte, c.end_byte) for c in comments)
+    return "\n".join(_get_node_text(c, code) for c in comments) + "\n"
+
+
+def _get_node_lines(node: Any, code_lines: list[str]) -> list[str]:
+    """Line-based slice of a node's source, preserving original indentation.
+
+    Line-based (not byte-offset) slicing is used deliberately so leading
+    whitespace survives for indented nested definitions (e.g. methods inside
+    a class). But when a node shares its first line with a preceding sibling
+    (e.g. the `export` keyword in `export function foo() {`), a naive
+    full-line slice pulls in that sibling's text too — and callers that
+    reconstruct the wrapper (re-adding the sibling text themselves) end up
+    duplicating it. Trim the sibling prefix from the first line when it's not
+    pure whitespace; keep the whole line (indentation intact) otherwise.
+    """
+    start_row, start_col = node.start_point
+    end_row = node.end_point[0]
+    node_lines = list(code_lines[start_row : end_row + 1])
+    if node_lines and node_lines[0][:start_col].strip():
+        node_lines[0] = node_lines[0][start_col:]
+    return node_lines
+
+
+def _get_same_line_trailing_semicolon(node: Any) -> Any | None:
+    """Return a trailing semicolon sibling that belongs to this declaration."""
+    next_sibling = getattr(node, "next_sibling", None)
+    if (
+        next_sibling is not None
+        and next_sibling.type == ";"
+        and next_sibling.start_point[0] == node.end_point[0]
+    ):
+        return next_sibling
+    return None
 
 
 def _classify_statement_kind(node: Any, lang_config: LangConfig) -> _StatementKind:
@@ -2163,9 +2602,7 @@ def _collect_statement_symbols(
     )
     for assignment in assignment_nodes:
         assignment_children = getattr(assignment, "children", [])
-        first_named = next(
-            (c for c in assignment_children if getattr(c, "is_named", False)), None
-        )
+        first_named = next((c for c in assignment_children if getattr(c, "is_named", False)), None)
         if first_named is not None:
             add_identifiers(defined, first_named)
         else:
@@ -2246,15 +2683,14 @@ def _detect_side_effect(unit: _StatementUnit, lang_config: LangConfig) -> bool:
             if getattr(child, "type", "") in lang_config.mutation_receiver_nodes:
                 return True
 
-    if unit.kind == _StatementKind.EXPR and unit.called_names:
-        if getattr(unit.node, "type", "") == "expression_statement":
-            call_like = [
-                desc
-                for desc in _iter_descendants(unit.node)
-                if getattr(desc, "type", "") in lang_config.call_nodes
-            ]
-            if call_like:
-                return True
+    if unit.kind in {_StatementKind.EXPR, _StatementKind.CALL} and unit.called_names:
+        call_like = [
+            desc
+            for desc in _iter_descendants(unit.node)
+            if getattr(desc, "type", "") in lang_config.call_nodes
+        ]
+        if call_like:
+            return True
 
     return False
 
@@ -2385,7 +2821,6 @@ def _select_statement_units(units: list[_StatementUnit], body_limit: int) -> lis
             selected.append(unit)
             break
 
-    selected = _nearest_definitions(selected, units)
     selected.sort(key=lambda u: u.idx)
     return selected
 
@@ -2406,7 +2841,14 @@ def _extract_statement_units(
     skip_types = frozenset({"{", "}", ";", ",", "comment", "line_comment", "block_comment"})
     units: list[_StatementUnit] = []
 
+    children: list[Any] = []
     for child in getattr(body_node, "children", []):
+        if getattr(child, "type", "") == "statement_list":
+            children.extend(getattr(child, "children", []))
+        else:
+            children.append(child)
+
+    for child in children:
         if child.start_point[0] <= ds_end_row:
             continue
         if child.type in skip_types or not getattr(child, "is_named", False):
@@ -2446,6 +2888,43 @@ def _get_definition_name(node: Any) -> str | None:
             text = child.text
             return text.decode("utf-8") if isinstance(text, bytes) else str(text)
     return None
+
+
+# Symbol names are ASCII identifiers; CJK relevance queries have no spaces and use
+# CJK/full-width punctuation, so the ASCII-only delimiter class would collapse the
+# whole query into one blob and never isolate an ASCII name the user asked to keep.
+_CONTEXT_DELIMS = re.compile(r"[\s,;:.()\[\]{}\"'，、；：。．！？（）【】「」『』《》〈〉·…—　]+")
+_CJK_CHARS = re.compile(r"[　-鿿가-힯＀-￯]")
+
+
+def _query_context_tokens(context: str) -> tuple[set[str], str, bool]:
+    """Tokenize a relevance query for symbol-name matching (CJK-aware).
+
+    Returns (word set, lowercased query, has_cjk). CJK/full-width punctuation and
+    the ideographic space are delimiters so an ASCII symbol name wrapped in CJK is
+    still isolated as its own token.
+    """
+    if not context:
+        return set(), "", False
+    lowered = context.lower()
+    words = set(_CONTEXT_DELIMS.split(lowered))
+    words.discard("")
+    return words, lowered, bool(_CJK_CHARS.search(lowered))
+
+
+def _symbol_in_context(name_lower: str, words: set[str], context_lower: str, has_cjk: bool) -> bool:
+    """Whether the relevance query names this symbol.
+
+    Exact token match, or a substring fallback gated by len>3 for ASCII queries
+    (avoids spurious short-name matches) but relaxed for CJK queries -- a short
+    ASCII name glued to CJK has no delimiter to isolate it, so exact-match can't
+    fire and the guard would wrongly drop it.
+    """
+    if not words or not name_lower:
+        return False
+    if name_lower in words:
+        return True
+    return name_lower in context_lower and (len(name_lower) > 3 or has_cjk)
 
 
 def _is_public_symbol(name: str, language: CodeLanguage) -> bool:

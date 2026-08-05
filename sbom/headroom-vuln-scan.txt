@@ -1,0 +1,3 @@
+NAME        INSTALLED  TYPE    VULNERABILITY        SEVERITY  EPSS         RISK  
+sqlitedict  2.1.0      python  GHSA-g4r7-86gm-pgqc  High      0.9% (54th)  0.7   
+nltk        3.9.4      python  GHSA-p4gq-832x-fm9v  High      0.4% (35th)  0.3

@@ -24,7 +24,6 @@ client = HeadroomClient(
 | `store_url` | `str` | `None` | Storage URL for metrics |
 | `smart_crusher_config` | `SmartCrusherConfig` | Default | Compression settings |
 | `cache_aligner_config` | `CacheAlignerConfig` | Default | Cache alignment settings |
-| `rolling_window_config` | `RollingWindowConfig` | Default | Context window settings |
 
 ### Methods
 
@@ -94,64 +93,6 @@ config = CacheAlignerConfig(
     normalize_whitespace=True,
     stable_prefix_min_tokens=100,
 )
-```
-
-### RollingWindowConfig
-
-```python
-from headroom import RollingWindowConfig
-
-config = RollingWindowConfig(
-    max_tokens=100000,
-    preserve_system=True,
-    preserve_recent_turns=5,
-    drop_oldest_first=True,
-)
-```
-
-### IntelligentContextConfig
-
-```python
-from headroom.config import IntelligentContextConfig, ScoringWeights
-
-weights = ScoringWeights(
-    recency=0.20,
-    semantic_similarity=0.20,
-    toin_importance=0.25,
-    error_indicator=0.15,
-    forward_reference=0.15,
-    token_density=0.05,
-)
-
-config = IntelligentContextConfig(
-    enabled=True,
-    keep_system=True,
-    keep_last_turns=2,
-    output_buffer_tokens=4000,
-    use_importance_scoring=True,
-    scoring_weights=weights,
-    toin_integration=True,
-    recency_decay_rate=0.1,
-    compress_threshold=0.1,
-)
-```
-
-### ScoringWeights
-
-```python
-from headroom.config import ScoringWeights
-
-weights = ScoringWeights(
-    recency=0.20,              # Exponential decay from end
-    semantic_similarity=0.20,  # Embedding similarity to recent context
-    toin_importance=0.25,      # TOIN retrieval_rate
-    error_indicator=0.15,      # TOIN field_semantics error detection
-    forward_reference=0.15,    # Messages referenced by later messages
-    token_density=0.05,        # Unique/total token ratio
-)
-
-# Weights are auto-normalized to sum to 1.0
-normalized = weights.normalized()
 ```
 
 ### RelevanceScorerConfig
@@ -335,64 +276,10 @@ aligner = CacheAligner()
 result = aligner.align(messages)
 ```
 
-### RollingWindow
-
-```python
-from headroom import RollingWindow
-
-window = RollingWindow(config)
-result = window.apply(messages, max_tokens=100000)
-```
-
-### IntelligentContextManager
-
-```python
-from headroom.transforms import IntelligentContextManager
-from headroom.config import IntelligentContextConfig
-from headroom.telemetry import get_toin
-
-# With TOIN integration for learned patterns
-toin = get_toin()
-config = IntelligentContextConfig(
-    keep_system=True,
-    keep_last_turns=2,
-    use_importance_scoring=True,
-)
-
-manager = IntelligentContextManager(config, toin=toin)
-result = manager.apply(messages, tokenizer, model_limit=128000)
-
-# Access scoring details
-print(result.transforms_applied)  # ["intelligent_cap:3"]
-print(result.tokens_before, result.tokens_after)
-```
-
-### MessageScorer
-
-```python
-from headroom.transforms import MessageScorer, MessageScore
-from headroom.config import ScoringWeights
-
-scorer = MessageScorer(
-    weights=ScoringWeights(),
-    toin=None,  # Optional TOIN for learned patterns
-    embedding_provider=None,  # Optional for semantic similarity
-    recency_decay_rate=0.1,
-)
-
-# Score messages
-scores: list[MessageScore] = scorer.score_messages(
-    messages=messages,
-    protected_indices={0},  # System message
-    tool_unit_indices={2, 3},  # Tool call + response
-)
-
-for score in scores:
-    print(f"Message {score.message_index}: {score.total_score:.2f}")
-    print(f"  Recency: {score.recency_score:.2f}")
-    print(f"  TOIN: {score.toin_score:.2f}")
-    print(f"  Protected: {score.is_protected}")
-```
+> **Context management** is handled automatically inside the pipeline
+> (live-zone-only compression). The position-based `RollingWindow` and
+> score-based `IntelligentContextManager` / `MessageScorer` APIs have been
+> removed and are no longer part of Headroom.
 
 ### TransformPipeline
 
@@ -402,7 +289,6 @@ from headroom import TransformPipeline
 pipeline = TransformPipeline([
     SmartCrusher(),
     CacheAligner(),
-    RollingWindow(),
 ])
 
 result = pipeline.transform(messages)

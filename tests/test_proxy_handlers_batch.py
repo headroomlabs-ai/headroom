@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from headroom.proxy.handlers import batch as batch_module
+from headroom.proxy.handlers.gemini import GeminiHandlerMixin
 
 
 class FakeResponse:
@@ -72,7 +73,10 @@ class FakeMetrics:
         self.failed_calls.append(kwargs)
 
 
-class DummyBatchHandler(batch_module.BatchHandlerMixin):
+class DummyBatchHandler(batch_module.BatchHandlerMixin, GeminiHandlerMixin):
+    # GeminiHandlerMixin supplies the real _rebuild_gemini_contents (and the
+    # other content helpers); the two converter methods below intentionally
+    # override the mixin's for the stub-based tests.
     OPENAI_API_URL = "https://openai.example"
     GEMINI_API_URL = "https://gemini.example"
 
@@ -112,6 +116,12 @@ class DummyBatchHandler(batch_module.BatchHandlerMixin):
 
     async def handle_passthrough(self, request, base_url):  # noqa: ANN001, ANN201
         return {"request": request, "base_url": base_url}
+
+    async def _run_compression_in_executor(self, fn, *, timeout):  # noqa: ANN001, ANN201
+        # Mirror of HeadroomProxy._run_compression_in_executor: batch handlers
+        # offload pipeline.apply() off the event loop (#1701). Inline is fine
+        # for tests — only the call contract matters here.
+        return fn()
 
     async def _retry_request(self, method, url, headers, body, **kwargs):  # noqa: ANN001, ANN201
         return self._retry_response
@@ -931,6 +941,184 @@ async def test_handle_google_batch_create_covers_passthrough_revert_and_store_fa
     optimized = seen_bodies[0]["batch"]["input_config"]["requests"]["requests"][2]["request"]
     assert optimized["contents"][0] == {"parts": [{"text": "new"}]}
     assert optimized["systemInstruction"] == {"parts": [{"text": "sys"}]}
+
+
+@pytest.mark.asyncio
+async def test_handle_google_batch_create_preserves_functioncall_response_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A batch request that interleaves text turns with text-less
+    functionCall/functionResponse entries must reach Google with all entries
+    intact and in order. The old raw-index restore loop overwrote the model's
+    answer with the functionCall and dropped the functionResponse."""
+
+    class RealConvHandler(batch_module.BatchHandlerMixin, GeminiHandlerMixin):
+        # Real Gemini converters + _rebuild_gemini_contents (no stubs), so the
+        # actual index interleaving runs.
+        GEMINI_API_URL = "https://gemini.example"
+
+        def __init__(self) -> None:
+            self.http_client = FakeHttpClient()
+            self.metrics = FakeMetrics()
+            self.config = SimpleNamespace(
+                optimize=True, ccr_inject_tool=False, ccr_inject_system_instructions=False
+            )
+            self.openai_provider = SimpleNamespace(get_context_limit=lambda m: 8192)
+            # No-op pipeline: return the messages unchanged, no token inflation.
+            self.openai_pipeline = SimpleNamespace(
+                apply=lambda **kw: SimpleNamespace(
+                    messages=kw["messages"], timing={}, tokens_before=100, tokens_after=100
+                )
+            )
+            self.captured_body: dict | None = None
+
+        async def _next_request_id(self) -> str:
+            return "req-1"
+
+        async def _record_request_outcome(self, outcome) -> None:  # noqa: ANN001
+            pass
+
+        def _extract_tags(self, headers: dict) -> dict[str, str]:
+            return {}
+
+        async def _run_compression_in_executor(self, fn, *, timeout):  # noqa: ANN001, ANN201
+            return fn()
+
+        async def _store_google_batch_context(self, *a, **k) -> None:  # noqa: ANN002, ANN003
+            pass
+
+        async def _retry_request(self, method, url, headers, body, **kwargs):  # noqa: ANN001, ANN201
+            # Capture the (in-place mutated) forwarded batch body for assertions.
+            self.captured_body = body
+            return FakeResponse(status_code=200, content=b"{}", json_data={"name": "batches/1"})
+
+    handler = RealConvHandler()
+
+    contents = [
+        {"role": "user", "parts": [{"text": "What's the weather in Paris?"}]},
+        {
+            "role": "model",
+            "parts": [{"functionCall": {"name": "get_weather", "args": {"city": "Paris"}}}],
+        },
+        {
+            "role": "user",
+            "parts": [{"functionResponse": {"name": "get_weather", "response": {"temp_c": 18}}}],
+        },
+        {"role": "model", "parts": [{"text": "It's 18C and cloudy in Paris."}]},
+    ]
+    batch_body = {
+        "batch": {
+            "input_config": {
+                "requests": {"requests": [{"request": {"contents": contents}, "metadata": {}}]}
+            }
+        }
+    }
+
+    async def payload(request):  # noqa: ANN001, ANN201
+        return batch_body
+
+    monkeypatch.setattr("headroom.proxy.helpers._read_request_json", payload)
+
+    resp = await handler.handle_google_batch_create(FakeRequest("{}"), "gemini-pro")
+    assert resp.status_code == 200
+
+    out = handler.captured_body["batch"]["input_config"]["requests"]["requests"][0]["request"][
+        "contents"
+    ]
+    # All four entries survive in order. The old loop produced only two, dropping
+    # the functionResponse and overwriting the model answer with the functionCall.
+    assert len(out) == 4
+    assert "text" in out[0]["parts"][0]
+    assert out[1]["parts"][0].get("functionCall", {}).get("name") == "get_weather"
+    assert out[2]["parts"][0].get("functionResponse", {}).get("name") == "get_weather"
+    assert "Paris" in out[3]["parts"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_handle_google_batch_create_preserves_sibling_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A batch request whose tools array carries googleSearch / codeExecution
+    alongside functionDeclarations must reach Google with those siblings intact.
+    The old code collapsed the whole array to a single functionDeclarations
+    entry, silently disabling Google Search and code execution."""
+
+    class RealConvHandler(batch_module.BatchHandlerMixin, GeminiHandlerMixin):
+        GEMINI_API_URL = "https://gemini.example"
+
+        def __init__(self) -> None:
+            self.http_client = FakeHttpClient()
+            self.metrics = FakeMetrics()
+            self.config = SimpleNamespace(
+                optimize=True, ccr_inject_tool=False, ccr_inject_system_instructions=False
+            )
+            self.openai_provider = SimpleNamespace(get_context_limit=lambda m: 8192)
+            self.openai_pipeline = SimpleNamespace(
+                apply=lambda **kw: SimpleNamespace(
+                    messages=kw["messages"], timing={}, tokens_before=100, tokens_after=100
+                )
+            )
+            self.captured_body: dict | None = None
+
+        async def _next_request_id(self) -> str:
+            return "req-1"
+
+        async def _record_request_outcome(self, outcome) -> None:  # noqa: ANN001
+            pass
+
+        def _extract_tags(self, headers: dict) -> dict[str, str]:
+            return {}
+
+        async def _run_compression_in_executor(self, fn, *, timeout):  # noqa: ANN001, ANN201
+            return fn()
+
+        async def _store_google_batch_context(self, *a, **k) -> None:  # noqa: ANN002, ANN003
+            pass
+
+        async def _retry_request(self, method, url, headers, body, **kwargs):  # noqa: ANN001, ANN201
+            self.captured_body = body
+            return FakeResponse(status_code=200, content=b"{}", json_data={"name": "batches/1"})
+
+    handler = RealConvHandler()
+
+    tools = [
+        {"functionDeclarations": [{"name": "get_weather"}]},
+        {"googleSearch": {}},
+        {"codeExecution": {}},
+    ]
+    batch_body = {
+        "batch": {
+            "input_config": {
+                "requests": {
+                    "requests": [
+                        {
+                            "request": {
+                                "contents": [{"role": "user", "parts": [{"text": "hello there"}]}],
+                                "tools": tools,
+                            },
+                            "metadata": {},
+                        }
+                    ]
+                }
+            }
+        }
+    }
+
+    async def payload(request):  # noqa: ANN001, ANN201
+        return batch_body
+
+    monkeypatch.setattr("headroom.proxy.helpers._read_request_json", payload)
+
+    resp = await handler.handle_google_batch_create(FakeRequest("{}"), "gemini-pro")
+    assert resp.status_code == 200
+
+    out_tools = handler.captured_body["batch"]["input_config"]["requests"]["requests"][0][
+        "request"
+    ]["tools"]
+    keys = [next(iter(entry)) for entry in out_tools]
+    assert "googleSearch" in keys
+    assert "codeExecution" in keys
+    assert "functionDeclarations" in keys
 
 
 @pytest.mark.asyncio

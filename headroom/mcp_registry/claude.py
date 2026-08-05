@@ -1,10 +1,12 @@
 """Claude Code MCP registrar.
 
-Claude Code 2.x stores MCP server configuration in ``~/.claude/.claude.json``
-and ships a CLI (``claude mcp add/remove/list/get``) that owns the file.
+Claude Code 2.x stores user-scope MCP server configuration in
+``~/.claude.json``, directly under the home directory. The ``claude`` CLI
+(``claude mcp add/remove/list/get``) owns this file; setting
+``CLAUDE_CONFIG_DIR`` relocates it to ``$CLAUDE_CONFIG_DIR/.claude.json``.
 Older Claude Code releases (and the Claude Desktop app) read
-``~/.claude/mcp.json``. This registrar prefers the CLI for writes when
-available, and reads the underlying JSON files directly for compare /
+``~/.claude/mcp.json`` instead. This registrar prefers the CLI for writes
+when available, and reads the underlying JSON files directly for compare /
 ``get_server`` so it is robust to CLI output format changes.
 """
 
@@ -12,10 +14,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
-import subprocess
 from pathlib import Path
 from typing import Any
+
+from headroom._subprocess import run
 
 from .base import MCPRegistrar, RegisterResult, RegisterStatus, ServerSpec
 
@@ -33,17 +37,29 @@ class ClaudeRegistrar(MCPRegistrar):
         *,
         claude_cli: str | None | object = ...,
         home_dir: Path | None = None,
+        config_dir: Path | None = None,
     ) -> None:
         """Allow overrides for testing.
 
         ``claude_cli`` defaults to :func:`shutil.which` lookup. Pass
         ``None`` to force the file-based fallback path. Pass an explicit
-        path to point at a specific binary.
+        path to point at a specific binary. ``CLAUDE_CONFIG_DIR`` is honored
+        for real user sessions; ``home_dir`` isolates file-based reads and
+        writes from the caller's real home directory, unless ``config_dir``
+        is passed explicitly. It does not isolate CLI subprocess calls (see
+        ``claude_cli``) — pass ``claude_cli=None`` alongside ``home_dir`` to
+        keep a test fully off the real ``claude`` binary.
         """
         home = home_dir if home_dir is not None else Path.home()
+        modern_dir = _resolve_claude_config_dir(home, config_dir, honor_env=home_dir is None)
+        # Legacy config lives under the real ``.claude`` directory regardless
+        # of where the modern config resolved to (CLAUDE_CONFIG_DIR only
+        # relocates the modern file, per Claude Code's own behavior).
         self._claude_dir = home / ".claude"
-        self._modern_config = home / ".claude" / ".claude.json"
-        self._legacy_config = home / ".claude" / "mcp.json"
+        self._modern_dir = modern_dir
+        self._isolated_cli_env = home_dir is not None or config_dir is not None
+        self._modern_config = modern_dir / ".claude.json"
+        self._legacy_config = self._claude_dir / "mcp.json"
         if claude_cli is ...:
             self._claude_cli = shutil.which("claude")
         else:
@@ -57,7 +73,7 @@ class ClaudeRegistrar(MCPRegistrar):
     def detect(self) -> bool:
         if self._claude_cli:
             return True
-        return self._claude_dir.is_dir()
+        return self._claude_dir.is_dir() or self._modern_config.exists()
 
     def get_server(self, server_name: str) -> ServerSpec | None:
         # Read from disk regardless of whether the CLI is present — the file
@@ -86,18 +102,20 @@ class ClaudeRegistrar(MCPRegistrar):
         return self._register_via_file(spec)
 
     def unregister_server(self, server_name: str) -> bool:
+        removed = False
         if self._claude_cli:
-            result = subprocess.run(
+            result = run(
                 [str(self._claude_cli), "mcp", "remove", server_name, "-s", "user"],
                 capture_output=True,
                 text=True,
+                env=self._claude_cli_env(),
             )
             if result.returncode == 0:
-                return True
-            logger.debug("claude mcp remove failed: %s", result.stderr.strip())
-            # Fall through to file-based removal in case CLI didn't know
-            # about the user-scope entry but the file still has it.
-        removed = False
+                removed = True
+            else:
+                logger.debug("claude mcp remove failed: %s", result.stderr.strip())
+        # Always clean up both files too — the CLI only touches the modern
+        # config, so a legacy entry (or one it didn't know about) can remain.
         for config_path in (self._modern_config, self._legacy_config):
             removed = self._remove_from_file(config_path, server_name) or removed
         return removed
@@ -112,7 +130,12 @@ class ClaudeRegistrar(MCPRegistrar):
             cmd += ["-e", f"{k}={v}"]
         cmd += ["--", spec.command, *spec.args]
 
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = run(
+            cmd,
+            capture_output=True,
+            text=True,
+            env=self._claude_cli_env(),
+        )
         if result.returncode == 0:
             return RegisterResult(RegisterStatus.REGISTERED, "via `claude mcp add` (scope: user)")
         # CLI failed — try the file fallback rather than giving up.
@@ -141,10 +164,20 @@ class ClaudeRegistrar(MCPRegistrar):
 
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
-            config = _read_json(target)
-            servers = config.setdefault("mcpServers", {})
+            config = _read_json_for_write(target)
+            servers = config.get("mcpServers")
+            if not isinstance(servers, dict):
+                config["mcpServers"] = servers = {}
             servers[spec.name] = _spec_to_entry(spec)
             _write_json(target, config)
+        except _MalformedConfigError as exc:
+            # Refuse to overwrite: the file holds unrelated Claude state
+            # (projects, oauthAccount, history) that a blind rewrite would wipe.
+            return RegisterResult(
+                RegisterStatus.FAILED,
+                f"{target} exists but is not valid JSON ({exc}); refusing to overwrite. "
+                "Fix or remove the file, then re-run.",
+            )
         except OSError as exc:
             return RegisterResult(RegisterStatus.FAILED, f"could not write {target}: {exc}")
         return RegisterResult(RegisterStatus.REGISTERED, f"wrote to {target}")
@@ -156,8 +189,8 @@ class ClaudeRegistrar(MCPRegistrar):
             config = _read_json(path)
         except OSError:
             return False
-        servers = config.get("mcpServers", {})
-        if server_name not in servers:
+        servers = config.get("mcpServers")
+        if not isinstance(servers, dict) or server_name not in servers:
             return False
         del servers[server_name]
         try:
@@ -173,23 +206,61 @@ class ClaudeRegistrar(MCPRegistrar):
             config = _read_json(path)
         except OSError:
             return None
-        entry = config.get("mcpServers", {}).get(server_name)
+        servers = config.get("mcpServers")
+        if not isinstance(servers, dict):
+            return None
+        entry = servers.get(server_name)
         if not isinstance(entry, dict):
             return None
         return _entry_to_spec(server_name, entry)
 
+    # ----------------------------------------------------------------------
+    # Helpers
+    # ----------------------------------------------------------------------
 
-# ----------------------------------------------------------------------
-# Helpers
-# ----------------------------------------------------------------------
+    def _claude_cli_env(self) -> dict[str, str] | None:
+        if not self._isolated_cli_env:
+            return None
+        env = os.environ.copy()
+        # Point the CLI at the directory holding the modern ``.claude.json``
+        # (CLAUDE_CONFIG_DIR relocates that file), not the legacy ``.claude`` dir.
+        env["CLAUDE_CONFIG_DIR"] = str(self._modern_dir)
+        return env
+
+
+def _resolve_claude_config_dir(
+    home: Path,
+    config_dir: Path | None,
+    *,
+    honor_env: bool,
+) -> Path:
+    """Resolve the directory holding the *modern* ``.claude.json`` config.
+
+    Defaults to ``home`` itself, since Claude Code's modern config lives at
+    ``~/.claude.json`` directly under the home directory. ``CLAUDE_CONFIG_DIR``,
+    when set, relocates it to ``$CLAUDE_CONFIG_DIR/.claude.json``.
+    """
+    if config_dir is not None:
+        return config_dir
+    if honor_env:
+        env_dir = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
+        if env_dir:
+            return Path(env_dir).expanduser()
+    return home
 
 
 def _read_json(path: Path) -> dict[str, Any]:
-    """Read a JSON file, returning empty dict if absent or unparseable."""
+    """Read a JSON file, returning empty dict if absent or unparseable.
+
+    Safe for READ-ONLY callers. Do NOT use before a full-file rewrite: an
+    unparseable existing file returns ``{}`` here, and writing that back would
+    destroy the user's other config. Use :func:`_read_json_for_write` on the
+    write path instead.
+    """
     if not path.exists():
         return {}
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             data = json.load(f)
     except (OSError, json.JSONDecodeError):
         return {}
@@ -198,9 +269,40 @@ def _read_json(path: Path) -> dict[str, Any]:
     return data
 
 
+class _MalformedConfigError(Exception):
+    """The target config file exists but is not a parseable JSON object.
+
+    Raised on the write path so we refuse to clobber a file we can't safely
+    merge into, rather than silently overwriting the user's state.
+    """
+
+
+def _read_json_for_write(path: Path) -> dict[str, Any]:
+    """Read a JSON object for a subsequent full-file rewrite.
+
+    Returns ``{}`` only when the file is absent or empty (safe to start fresh).
+    If the file exists with content but does not parse as a JSON object, raise
+    :class:`_MalformedConfigError` so the caller aborts instead of overwriting
+    unrelated user config (e.g. ``~/.claude/.claude.json`` holds ``projects``,
+    ``oauthAccount``, and session history alongside ``mcpServers``).
+    """
+    if not path.exists():
+        return {}
+    raw = path.read_text(encoding="utf-8")  # OSError propagates to the caller
+    if not raw.strip():
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise _MalformedConfigError(str(exc)) from exc
+    if not isinstance(data, dict):
+        raise _MalformedConfigError("top-level JSON is not an object")
+    return data
+
+
 def _write_json(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
         f.write("\n")
 

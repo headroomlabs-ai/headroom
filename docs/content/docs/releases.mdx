@@ -1,13 +1,15 @@
 ---
 title: Releases & CI/CD
-description: Automated release pipeline with semantic versioning, multi-package publishing, and changelog generation.
+description: Automated release pipeline with release-please, semantic versioning, multi-package publishing, and changelog generation.
 ---
 
 ## Overview
 
-Headroom uses a unified GitHub Actions workflow (`.github/workflows/release.yml`) that automatically publishes all three packages, builds version-matched Docker images, generates changelogs from conventional commits, and creates GitHub Releases with package assets attached.
+Headroom uses `release-please` to maintain a release PR from conventional commits on `main`. Merging that release PR creates the release tag and GitHub Release, which triggers `.github/workflows/release.yml` to publish all packages, build version-matched Docker images, and attach release assets.
 
 The release workflow also calls `.github/workflows/docker.yml` as a reusable workflow so GHCR images are published in the same release run with the exact same synced version as PyPI, npm, and GitHub release assets.
+
+For the end-to-end visual flow, see [CI/CD Flow Diagrams](/docs/ci-cd-flows).
 
 ## Packages & Registries
 
@@ -24,69 +26,73 @@ The release workflow also calls `.github/workflows/docker.yml` as a reusable wor
 
 ## Version Strategy
 
-The workflow uses a **canonical + commit-height** algorithm that eliminates infinite loops:
+Release Please calculates the release version from conventional commits and the release manifest. The release workflow still computes and verifies the version it is about to publish:
 
-1. `pyproject.toml` holds the **canonical version** (e.g., `0.5.25`). This is the single source of truth — set manually before merging.
-2. On every push to `main`, the workflow counts commits since the last tagged release at the same canonical level.
-3. The **git tag** uses `v{canonical}.{height}` format (e.g., `v0.5.25.3` = 3 commits since canonical `0.5.25`).
-4. The **npm version** uses 3-part semver — bumped from canonical based on commit type (e.g., `feat:` + canonical `0.5.25` → `0.6.0`).
+1. `.release-please-config.json` defines release-please behavior.
+2. `.release-please-manifest.json` tracks current package versions.
+3. The release PR updates versions and changelog content.
+4. Merging the release PR publishes a GitHub Release tagged `vX.Y.Z`.
+5. `release.yml` uses that tag as the manual version for the publish run.
 
 ### Version Files
 
-- `pyproject.toml` — `[project].version` — **canonical** (set manually before merge)
-- `headroom/_version.py` — `__version__` — synced at build time
-- `plugins/openclaw/package.json` — `version` — synced at build time
-- `sdk/typescript/package.json` — `version` — synced at build time
+- `.release-please-config.json` - release-please package configuration
+- `.release-please-manifest.json` - release-please version manifest
+- `pyproject.toml` - `[project].version`
+- `headroom/_version.py` - `__version__`, synced at build time
+- `plugins/openclaw/package.json` - `version`, synced at build time
+- `sdk/typescript/package.json` - `version`, synced at build time
 
-**The workflow NEVER commits back to the repo** — this breaks the infinite loop.
+`release.yml` does not commit back to the repo. Version synchronization happens inside the release build workspace.
 
 ## Conventional Commits & Semantic Bumping
 
-The workflow analyzes the **unreleased commits since the previous release tag** and applies the highest required bump level:
+Release Please analyzes unreleased conventional commits and applies the highest required bump level:
 
-| Commit | Bump | Git Tag Example | npm Version |
-|--------|------|-----------------|-------------|
-| `fix:`, `ci:`, `chore:`, `perf:`, `refactor:` | patch | `v0.5.25.3` | `0.5.26` |
-| `feat:` | minor | `v0.6.0.0` | `0.6.0` |
-| Any conventional commit with `!` or any commit with `BREAKING CHANGE` in the body | major | `v1.0.0.0` | `1.0.0` |
+| Commit | Bump |
+|--------|------|
+| `fix:` | patch |
+| `feat:` | minor |
+| Any conventional commit with `!` or any commit with `BREAKING CHANGE` in the body | major |
+| `docs:`, `ci:`, `chore:`, `refactor:` | no release note by default unless configured |
 
 Commits are linted in CI via `commitlint` using `@commitlint/config-conventional`.
 
-### How the Canonical + Height Algorithm Works
-
-```
-Canonical in pyproject.toml: 0.5.25
-Last tag at this canonical:  v0.5.25.2 (2 commits ago)
-
-HEAD commit: fix: resolve bug
-  → bump = patch
-  → height = 3 (2 prior + 1 new)
-  → git tag: v0.5.25.3
-  → npm version: 0.5.26 (canonical 0.5.25 + 1 patch bump)
-```
-
-After npm publishes `0.5.26`, update `pyproject.toml` to `0.5.26` (manually, before next release).
+The release PR is the place where version and changelog changes are reviewed before publishing.
 
 ## Release Workflow
 
-The `release.yml` workflow runs on every push to `main` and consists of five jobs:
+The `release.yml` workflow runs when a GitHub Release is published, which normally happens when the release-please PR is merged. It also supports manual `workflow_dispatch` and PR dry-runs for release-critical workflow/package changes.
 
 ```
-detect-version → build → publish-pypi
-                        → publish-npm
-                        → publish-github-packages → create-release
+detect-version → build → build-wheels → collect-dist → smoke-import-wheels
+                                      ↘ publish-pypi
+                                      ↘ publish-npm
+                                      ↘ publish-github-packages
+                                      ↘ publish-docker
+                                        → create-release
 ```
 
-**Note:** The workflow never commits back to the repo. `pyproject.toml` is updated manually before merging.
+The workflow never commits back to the repo.
 
 ### detect-version
-Reads canonical version from `pyproject.toml`, counts commits since the previous release tag, chooses the highest bump level across that unreleased commit range, and computes both the git tag version (`v{canonical}.{height}`) and npm version (3-part semver).
+Resolves the release version from the trigger. On `release: published`, it uses the published tag (`vX.Y.Z`) as the manual version for the run. On `workflow_dispatch`, it uses the optional `version` input when provided. PR dry-runs compute a version without publishing.
 
 ### build
-1. Syncs version across TypeScript package files via `scripts/version-sync.py --version {npm_version}`
-2. Generates changelog via `scripts/changelog-gen.py`
-3. Builds the Python package (`python -m build`)
-4. Uploads artifacts (dist + changelog)
+1. Syncs version across package files via `scripts/version-sync.py --version {npm_version}`
+2. Verifies package versions with `scripts/verify-versions.py`
+3. Generates the changelog artifact
+4. Builds npm release packages for the TypeScript SDK and OpenClaw plugin
+5. Uploads release asset artifacts for downstream publish jobs
+
+### build-wheels
+Builds the Python wheel matrix for Linux x86_64, Linux arm64, and Apple Silicon macOS, plus one source distribution. Linux wheels are audited for glibc symbol compatibility.
+
+### collect-dist
+Collects the wheel matrix, source distribution, and npm tarballs into the canonical artifacts used by publishing and GitHub Release asset upload.
+
+### smoke-import-wheels
+Installs the built wheels into representative customer environments and imports `headroom._core`. This blocks publishing if a wheel builds successfully but cannot import on its promised platform floor.
 
 ### publish-pypi
 Downloads the Python dist artifact and publishes to PyPI via `pypa/gh-action-pypi-publish@release/v1` (trusted publisher).
@@ -108,7 +114,7 @@ Uploads the built Python distributions and both npm tarballs to the GitHub Relea
 Calls the reusable Docker workflow to publish GHCR images with the same semantic version and synced package metadata as the rest of the release.
 
 ### create-release
-Creates or updates the GitHub Release in the current repo, uploads the built Python distributions and npm tarballs as release assets, and publishes the generated changelog as release notes. The job still runs after the build succeeds even if one of the external registry publishes fails, so GitHub-hosted artifacts remain available on `main`.
+Creates or updates the GitHub Release in the current repo and uploads the built Python distributions and npm tarballs as release assets. PyPI publish is a hard gate unless `PYPI_SKIP=true`, so release notes and assets do not advertise a version that failed to publish to PyPI.
 
 ## Configuration
 
@@ -160,37 +166,43 @@ for a top-level `LICENSE` file before any publish job can consume it.
 
 ## Workflow Triggers
 
-The workflow runs on push to `main`, but ignores pushes that only touch docs, CI config, or scripts:
+Release Please runs on pushes to `main` and maintains the release PR:
 
 ```yaml
 on:
   push:
     branches: [main]
-    paths-ignore:
-      - "docs/**"
-      - ".github/workflows/ci.yml"
-      - ".github/workflows/publish.yml"
-      - "scripts/**"
-      - ...
 ```
 
-For manual control, use `workflow_dispatch`:
+The publish workflow runs when a GitHub Release is published, on PR dry-runs for release-critical paths, and by manual dispatch:
 
 ```yaml
 on:
+  release:
+    types: [published]
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - ".github/workflows/docker.yml"
+      - "crates/headroom-py/**"
+      - "pyproject.toml"
+      - "scripts/verify-versions.py"
+      - "scripts/version-sync.py"
+      - "Cargo.toml"
+      - "Cargo.lock"
   workflow_dispatch:
     inputs:
       version:
-        description: "Manual version override (e.g. 0.6.0)"
+        description: "Manual version override"
         required: false
       dry_run:
         description: "Skip publish"
         type: boolean
         default: false
 ```
-
-- **No version input:** auto-detected from commits (normal flow)
-- **`dry_run: true`:** runs all jobs except publish steps — useful for testing
+- **Normal release:** merge the release-please PR; the bot publishes a GitHub Release, which triggers `release.yml`.
+- **PR dry-run:** release-critical PRs build and smoke-import wheels before merge, but do not publish.
+- **Manual dispatch:** use `version` to override the release version and `dry_run: true` to skip publish steps.
 
 ## Local Testing with `act`
 
@@ -212,13 +224,21 @@ act workflow_dispatch -W .github/workflows/release.yml -e .github/act/dry-run.js
 
 This runs the full workflow end-to-end with `dry_run=true`, skipping all publish steps.
 
-### Test a Specific Commit Type
+### Simulate Release Please
 
 ```bash
-act push -W .github/workflows/release.yml -e .github/act/push-feat.json
+act push -W .github/workflows/release-please.yml -e .github/act/push-feat.json
 ```
 
-The `push-feat.json` event file simulates a `feat:` commit on `main`.
+The `push-feat.json` event file simulates a `feat:` commit on `main` so the release-please workflow can be validated locally.
+
+### Simulate a Published Release
+
+```bash
+act release -W .github/workflows/release.yml -e .github/act/release-published.json -n
+```
+
+The `release-published.json` event file simulates the event emitted when the release-please PR is merged.
 
 ### Validate the Release and Docker Workflows
 
@@ -242,6 +262,7 @@ cp .env.act.example .env.act
 | File | Purpose |
 |------|---------|
 | `.github/workflows/release.yml` | Main release pipeline |
+| `.github/workflows/release-please.yml` | Release PR aggregation from conventional commits |
 | `.github/workflows/ci.yml` | CI — lint, test, commitlint |
 | `.github/workflows/publish.yml` | Manual-only PyPI fallback (superseded by `release.yml`) |
 | `.commitlintrc.json` | Conventional commit rules |
@@ -250,6 +271,7 @@ cp .env.act.example .env.act
 | `scripts/verify-versions.py` | Pre-release version alignment check |
 | `.github/act/dry-run.json` | `act` event file for dry-run testing |
 | `.github/act/push-feat.json` | `act` event file for feat commit testing |
+| `.github/act/release-published.json` | `act` event file for release publish simulation |
 | `.github/act/docker-version.json` | `act` event file for Docker workflow validation |
 | `scripts/validate-workflows.sh` | Shared `actionlint` + `act -n` workflow validation script |
 | `.actrc` | Default `act` flags (Ubuntu runner, reuse, quiet) |
@@ -264,14 +286,12 @@ cp .env.act.example .env.act
 
 The PyPI publish uses trusted publisher OIDC — no secret required, only the `pypi` GitHub Environment must be configured with your PyPI project.
 
-## First Release Note
+## Release Cadence
 
-TypeScript packages (`headroom-ai` SDK and `headroom-openclaw`) start at version `0.1.0`, while Python `headroom-ai` is at `0.5.25`. Before the first automated release:
+Day to day:
 
-1. Update `pyproject.toml` to set the desired canonical version (e.g., `0.6.0`)
-2. Use `workflow_dispatch` with a manual `version` input to set the target version explicitly
-3. The workflow will align all three packages to the same version on first release
-
-### Release Cadence with Canonical + Height
-
-After each release, update `pyproject.toml` to match the published version before merging the next feature branch. This keeps the canonical current and ensures each release gets a unique git tag.
+1. Merge regular PRs to `main`.
+2. Release Please updates the open release PR when releasable conventional commits land.
+3. Review the release PR changelog and version bump.
+4. Merge the release PR when ready to ship.
+5. Watch `release.yml` publish PyPI, npm, GitHub Packages, Docker, and GitHub Release assets.

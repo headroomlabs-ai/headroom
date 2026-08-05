@@ -15,7 +15,7 @@ if TYPE_CHECKING:
     from fastapi.responses import Response
 
 from headroom.proxy.auth_mode import classify_client
-from headroom.proxy.helpers import extract_tags
+from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS, extract_tags
 from headroom.proxy.outcome import RequestOutcome
 
 logger = logging.getLogger("headroom.proxy")
@@ -161,11 +161,18 @@ class BatchHandlerMixin:
                 )
 
                 # Use OpenAI pipeline (similar message format after conversion)
-                result = self.openai_pipeline.apply(
-                    messages=messages,
-                    model=model,
-                    model_limit=context_limit,
-                    context=extract_user_query(messages),
+                # Offload off the event loop (#1701): inline apply() blocks
+                # every other request; timeouts fall to the except below.
+                result = await self._run_compression_in_executor(
+                    lambda messages=messages, model=model, context_limit=context_limit: (
+                        self.openai_pipeline.apply(
+                            messages=messages,
+                            model=model,
+                            model_limit=context_limit,
+                            context=extract_user_query(messages),
+                        )
+                    ),
+                    timeout=COMPRESSION_TIMEOUT_SECONDS,
                 )
 
                 optimized_messages = result.messages
@@ -218,17 +225,41 @@ class BatchHandlerMixin:
                     optimized_messages
                 )
 
-                # Restore preserved content entries that had non-text parts
-                for orig_idx, original_content in preserved_contents.items():
-                    if orig_idx < len(optimized_contents):
-                        optimized_contents[orig_idx] = original_content
+                # Restore preserved (non-text) entries at their ORIGINAL positions.
+                # preserved_indices are indices into the original contents[], but
+                # optimized_contents lives in a shorter index space (text-less
+                # entries produced no message), so indexing it by orig_idx
+                # overwrites the wrong entry and drops any preserved entry whose
+                # original index is >= len(optimized_contents). Use the shared
+                # interleaving helper the non-batch Gemini handlers already use
+                # (#836).
+                optimized_contents = self._rebuild_gemini_contents(
+                    contents, preserved_indices, preserved_contents, optimized_contents
+                )
 
                 # Create compressed batch request
                 compressed_req_content = {**req_content, "contents": optimized_contents}
                 if optimized_sys_inst:
                     compressed_req_content["systemInstruction"] = optimized_sys_inst
                 if existing_funcs is not None:
-                    compressed_req_content["tools"] = [{"functionDeclarations": existing_funcs}]
+                    # Preserve sibling tool configs (googleSearch, codeExecution,
+                    # ...) that live alongside functionDeclarations in the tools
+                    # array. Replace only the functionDeclarations entry with the
+                    # (possibly CCR-injected) funcs and append a new entry when the
+                    # original had none, instead of collapsing the whole array to a
+                    # single functionDeclarations entry (which dropped the siblings
+                    # and silently disabled Google Search / code execution).
+                    rebuilt_tools = []
+                    replaced = False
+                    for tool in tools or []:
+                        if "functionDeclarations" in tool:
+                            rebuilt_tools.append({**tool, "functionDeclarations": existing_funcs})
+                            replaced = True
+                        else:
+                            rebuilt_tools.append(tool)
+                    if not replaced:
+                        rebuilt_tools.append({"functionDeclarations": existing_funcs})
+                    compressed_req_content["tools"] = rebuilt_tools
 
                 compressed_req = {
                     "request": compressed_req_content,
@@ -378,14 +409,21 @@ class BatchHandlerMixin:
         # Byte-faithful body bytes (PR-A3, fixes P0-2). When ``body`` is
         # None we forward the original bytes verbatim; otherwise the dict
         # has been synthesized by Headroom and is canonically serialized.
-        from headroom.proxy.helpers import (
-            log_outbound_request,
+        from headroom.proxy.body_forwarding import (
+            get_python_forwarder_mode,
             prepare_outbound_body_bytes,
             serialize_body_canonical,
         )
+        from headroom.proxy.helpers import log_outbound_request
 
         if body is None:
-            body_content = await request.body()
+            from starlette.requests import ClientDisconnect
+
+            try:
+                body_content = await request.body()
+            except ClientDisconnect:
+                logger.debug("Client disconnected during body read for google batch passthrough")
+                return Response(status_code=204)
             outbound_source = "passthrough"
             body_mutated = False
         else:
@@ -404,8 +442,6 @@ class BatchHandlerMixin:
         )
         # ``prepare_outbound_body_bytes`` is consulted only for the legacy
         # operator opt-in path so we honor the env-var override here too.
-        from headroom.proxy.helpers import get_python_forwarder_mode
-
         if get_python_forwarder_mode() == "legacy_json_kwarg" and body is not None:
             outbound_bytes, _ = prepare_outbound_body_bytes(
                 body=body,
@@ -496,7 +532,13 @@ class BatchHandlerMixin:
             else:
                 url = f"{url}?key={api_key}"
 
-        body = await request.body()
+        from starlette.requests import ClientDisconnect
+
+        try:
+            body = await request.body()
+        except ClientDisconnect:
+            logger.debug("Client disconnected during body read for gemini passthrough")
+            return Response(status_code=204)
 
         response = await self.http_client.request(  # type: ignore[union-attr]
             method=request.method,
@@ -914,10 +956,8 @@ class BatchHandlerMixin:
             # batch_body is synthesized by Headroom (compressed file_id +
             # metadata), so it is treated as mutated and goes through the
             # canonical serializer.
-            from headroom.proxy.helpers import (
-                log_outbound_request,
-                prepare_outbound_body_bytes,
-            )
+            from headroom.proxy.body_forwarding import prepare_outbound_body_bytes
+            from headroom.proxy.helpers import log_outbound_request
 
             outbound_bytes, outbound_source = prepare_outbound_body_bytes(
                 body=batch_body,
@@ -1078,11 +1118,18 @@ class BatchHandlerMixin:
                 if self.config.optimize:
                     try:
                         context_limit = self.openai_provider.get_context_limit(model)
-                        result = self.openai_pipeline.apply(
-                            messages=messages,
-                            model=model,
-                            model_limit=context_limit,
-                            context=extract_user_query(messages),
+                        # Offload off the event loop (#1701); timeouts fall to
+                        # the except below and pass the line through.
+                        result = await self._run_compression_in_executor(
+                            lambda messages=messages, model=model, context_limit=context_limit: (
+                                self.openai_pipeline.apply(
+                                    messages=messages,
+                                    model=model,
+                                    model_limit=context_limit,
+                                    context=extract_user_query(messages),
+                                )
+                            ),
+                            timeout=COMPRESSION_TIMEOUT_SECONDS,
                         )
                         compressed_messages = result.messages
                         # Use pipeline's token counts for consistency with pipeline logs
@@ -1158,12 +1205,12 @@ class BatchHandlerMixin:
         """
         from fastapi.responses import Response
 
+        from headroom.proxy.body_forwarding import prepare_outbound_body_bytes
         from headroom.proxy.helpers import (
             _read_request_body_bytes,
             _strip_internal_headers,
             log_outbound_headers,
             log_outbound_request,
-            prepare_outbound_body_bytes,
         )
 
         headers = dict(request.headers.items())

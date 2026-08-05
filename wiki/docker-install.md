@@ -72,7 +72,7 @@ docker run --rm -it \
 `wrap` is host-oriented in Docker-native mode:
 
 - the wrapper starts the Headroom proxy in Docker
-- container-side prep writes Headroom config, memory, and `rtk` guidance into mounted host files
+- container-side prep writes Headroom config and memory into mounted host files
 - the target CLI itself is launched on the host by the wrapper
 
 Supported host wrap flows:

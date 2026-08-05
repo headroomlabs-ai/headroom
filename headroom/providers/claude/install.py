@@ -8,13 +8,23 @@ from pathlib import Path
 from headroom.install.models import ConfigScope, DeploymentManifest, ManagedMutation, ToolTarget
 from headroom.install.paths import claude_settings_path
 
-from .runtime import proxy_base_url
+from .runtime import TOOL_SEARCH_DEFAULT, TOOL_SEARCH_ENV, proxy_base_url
 
 
 def build_install_env(*, port: int, backend: str) -> dict[str, str]:
     """Build the persistent install environment for Claude."""
     del backend
-    return {"ANTHROPIC_BASE_URL": proxy_base_url(port)}
+    # TOOL_SEARCH_ENV keeps Claude Code deferring MCP/system tool schemas behind
+    # the server-side Tool Search Tool when pointed at the proxy's custom
+    # ANTHROPIC_BASE_URL; without it Claude Code materializes every schema into
+    # its context window (GH #746) — breaking sub-agents and forcing compaction.
+    # The install env is headroom-managed and reverted on uninstall, so it is
+    # authoritative — unlike `init`, it always writes the default rather than
+    # deferring to a pre-existing user value.
+    return {
+        "ANTHROPIC_BASE_URL": proxy_base_url(port),
+        TOOL_SEARCH_ENV: TOOL_SEARCH_DEFAULT,
+    }
 
 
 def apply_provider_scope(manifest: DeploymentManifest) -> ManagedMutation | None:

@@ -16,6 +16,9 @@ Locks the following invariants:
 4. Jobs that time out while still queued do not leak the running gauge.
 5. ``/stats runtime.compression_executor`` surfaces the gauges + counters so
    operators can see leaked-thread rate and queue pressure.
+6. Once a timed-out worker is known to still be running, new compression work
+   raises an asyncio timeout immediately until that worker exits instead of
+   multiplying the timeout debt across the executor.
 
 These tests also serve as documentation: anyone reading them sees that
 "timeout fired" does not mean "compression was cancelled" — it means "we
@@ -55,14 +58,14 @@ def _make_proxy(compression_max_workers: int | None = None):
     return app.state.proxy
 
 
-def test_compression_executor_default_size_matches_asyncio_default() -> None:
+def test_compression_executor_default_size_matches_cpu_count() -> None:
     """When ``compression_max_workers`` is None, the resolved size should
-    match asyncio's default executor sizing (``min(32, (cpu+1)*4)`` style).
+    match the host CPU count.
     """
     import os
 
     proxy = _make_proxy(compression_max_workers=None)
-    expected = min(32, (os.cpu_count() or 1) * 4)
+    expected = max(1, os.cpu_count() or 1)
     assert proxy.compression_max_workers == expected
     assert proxy._compression_executor._max_workers == expected
 
@@ -206,6 +209,73 @@ def test_timeout_fires_and_leaked_thread_is_counted() -> None:
         assert proxy._compression_in_flight == 0
 
 
+def test_timeout_quarantines_new_work_until_timed_out_worker_finishes() -> None:
+    """One post-timeout worker must not admit more compression work.
+
+    This is the production failure mode behind the executor cascade: the
+    asyncio waiter times out, but its thread continues running. Without a
+    quarantine, every subsequent request can occupy another worker and repeat
+    the same timeout until the pool is exhausted.
+    """
+    proxy = _make_proxy(compression_max_workers=2)
+    first_started = threading.Event()
+    release_first = threading.Event()
+    second_started = threading.Event()
+
+    def _timed_out_compression():
+        first_started.set()
+        release_first.wait(timeout=5.0)
+        return "late"
+
+    def _second_compression():
+        second_started.set()
+        return "second"
+
+    async def _drive():
+        with pytest.raises(asyncio.TimeoutError):
+            await proxy._run_compression_in_executor(_timed_out_compression, timeout=0.05)
+        assert first_started.is_set()
+
+        bypass_started = time.monotonic()
+        try:
+            # asyncio.TimeoutError is distinct from builtin TimeoutError on
+            # Python 3.10. The quarantine signal must follow the former so the
+            # existing handler failure policy classifies it as a timeout.
+            with pytest.raises(asyncio.TimeoutError, match="quarantin"):
+                await proxy._run_compression_in_executor(_second_compression, timeout=1.0)
+            bypass_elapsed = time.monotonic() - bypass_started
+            assert bypass_elapsed < 0.2
+            assert not second_started.is_set()
+
+            with proxy._compression_metrics_lock:
+                assert proxy._compression_timed_out_in_flight == 1
+                assert proxy._compression_quarantine_skips == 1
+                assert proxy._compression_quarantine_activations == 1
+        finally:
+            release_first.set()
+
+        for _ in range(100):
+            with proxy._compression_metrics_lock:
+                if proxy._compression_timed_out_in_flight == 0:
+                    break
+            await asyncio.sleep(0.01)
+
+        with proxy._compression_metrics_lock:
+            assert proxy._compression_timed_out_in_flight == 0
+            assert proxy._compression_leaked_threads == 1
+
+        # Quarantine is self-clearing: normal compression resumes after the
+        # timed-out worker has genuinely left the executor.
+        assert (
+            await proxy._run_compression_in_executor(_second_compression, timeout=1.0) == "second"
+        )
+        return await proxy.metrics.export()
+
+    prometheus_text = asyncio.run(_drive())
+    assert 'headroom_compression_quarantine_total{event="activated"} 1' in prometheus_text
+    assert 'headroom_compression_quarantine_total{event="skipped"} 1' in prometheus_text
+
+
 def test_timeout_before_worker_start_does_not_leak_in_flight() -> None:
     """If a queued job times out before a worker starts, queued accounting
     is cleaned up without touching the running gauge.
@@ -256,6 +326,70 @@ def test_timeout_before_worker_start_does_not_leak_in_flight() -> None:
         assert proxy._compression_queued == 0
         assert proxy._compression_in_flight == 0
         assert proxy._compression_leaked_threads == 0
+        assert proxy._compression_timed_out_in_flight == 0
+        assert proxy._compression_quarantine_activations == 0
+        assert proxy._compression_quarantine_skips == 0
+
+
+def test_compression_executor_skip_signal_remains_visible() -> None:
+    """A compression executor queue timeout increments visible runtime counters."""
+    from fastapi.testclient import TestClient
+
+    config = ProxyConfig(
+        optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+        log_requests=False,
+        ccr_inject_tool=False,
+        ccr_handle_responses=False,
+        ccr_context_tracking=False,
+        image_optimize=False,
+        compression_max_workers=1,
+    )
+    app = create_app(config)
+    proxy = app.state.proxy
+
+    with TestClient(app) as client:
+        baseline = client.get("/health").json()["runtime"]["compression_executor"][
+            "queue_timeouts_total"
+        ]
+
+    first_started = threading.Event()
+    release_first = threading.Event()
+
+    def _blocking_compression():
+        first_started.set()
+        release_first.wait(timeout=5.0)
+        return "first"
+
+    def _queued_compression():
+        return "second"
+
+    async def _drive():
+        first_task = asyncio.create_task(
+            proxy._run_compression_in_executor(_blocking_compression, timeout=10.0)
+        )
+        for _ in range(50):
+            if first_started.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert first_started.is_set()
+
+        with pytest.raises(asyncio.TimeoutError):
+            await proxy._run_compression_in_executor(_queued_compression, timeout=0.05)
+
+        with proxy._compression_metrics_lock:
+            assert proxy._compression_queued == 0
+
+        release_first.set()
+        return await first_task
+
+    asyncio.run(_drive())
+
+    with TestClient(app) as client:
+        after = client.get("/health").json()["runtime"]["compression_executor"]
+        assert after["queue_timeouts_total"] == baseline + 1
 
 
 def test_compression_executor_metrics_appear_in_runtime_payload() -> None:
@@ -292,6 +426,11 @@ def test_compression_executor_metrics_appear_in_runtime_payload() -> None:
         assert ce["queue_wait_seconds_total"] == 0.0
         assert ce["run_seconds_total"] == 0.0
         assert ce["leaked_threads_total"] == 0
+        assert ce["quarantine_active"] is False
+        assert ce["timed_out_workers"] == 0
+        assert ce["timed_out_workers_max"] == 0
+        assert ce["quarantine_activations_total"] == 0
+        assert ce["quarantine_skips_total"] == 0
         assert ce["source"] == "explicit"
 
 

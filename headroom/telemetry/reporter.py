@@ -332,14 +332,20 @@ class UsageReporter:
                     total_requests,
                     total_tokens_saved,
                 )
+                # Only advance the baseline after a confirmed 200. Usage is a
+                # delta against the last snapshot, so snapshotting on a failed
+                # send (non-200 or exception) would permanently drop this
+                # window's requests/tokens from billing — the next report starts
+                # from the advanced baseline and never re-includes them. Leaving
+                # both baselines intact makes the next report retry the full
+                # period. (The empty-report early-return above only advances the
+                # time, since there is nothing to lose.)
+                self._snapshot_metrics()
+                self._last_report_time = now
             else:
                 logger.warning("Usage report returned status %d", resp.status_code)
         except Exception:
             logger.warning("Failed to send usage report", exc_info=True)
-
-        # Update snapshot
-        self._snapshot_metrics()
-        self._last_report_time = now
 
     def _snapshot_metrics(self) -> None:
         """Take a snapshot of current proxy metrics for delta computation."""

@@ -68,32 +68,61 @@ class CodexAdapter(AgentMemoryAdapter):
         return memories
 
     async def write_memories(self, memories: list[dict[str, Any]]) -> int:
-        """Write memories into the headroom section of AGENTS.md."""
+        """Merge memories into the headroom section of AGENTS.md.
+
+        ``sync_export`` hands this adapter only the *delta* — memories the
+        agent doesn't already have (see ``AgentMemoryAdapter`` contract; the
+        sibling ClaudeCode adapter is additive for the same reason). So this
+        must accumulate: rebuilding the section from just ``memories`` would
+        erase every previously-synced fact on each run, thrashing the file
+        between disjoint subsets and never converging.
+        """
         if not memories:
             return 0
 
-        # Build section content
-        lines = ["## Headroom Shared Memory", ""]
-        for mem in memories:
-            content = mem["content"].split("\n")[0].strip()  # First line only
-            lines.append(f"- {content}")
-        lines.append("")
+        existing_content = self._path.read_text(encoding="utf-8") if self._path.exists() else ""
 
+        # Facts already in the managed section — preserve them (dedup by the
+        # rendered first-line, matching how read_memories reconstructs them).
+        facts: list[str] = []
+        seen: set[str] = set()
+        existing_match = _MARKER_PATTERN.search(existing_content)
+        if existing_match:
+            for line in existing_match.group(1).split("\n"):
+                stripped = line.strip()
+                if stripped.startswith("- "):
+                    fact = stripped[2:].strip()
+                    if fact and fact not in seen:
+                        seen.add(fact)
+                        facts.append(fact)
+
+        added = 0
+        for mem in memories:
+            fact = mem["content"].split("\n")[0].strip()  # First line only
+            if fact and fact not in seen:
+                seen.add(fact)
+                facts.append(fact)
+                added += 1
+
+        lines = ["## Headroom Shared Memory", ""]
+        lines.extend(f"- {fact}" for fact in facts)
+        lines.append("")
         section = f"{_MARKER_START}\n" + "\n".join(lines) + f"{_MARKER_END}"
 
-        # Merge into AGENTS.md
-        if self._path.exists():
-            content = self._path.read_text(encoding="utf-8")
-            if _MARKER_START in content:
-                content = _MARKER_PATTERN.sub(lambda _match: section, content)
+        # Splice the section back in. Use a function replacement (not a string
+        # template) so literal backslashes / \\u in a memory aren't treated as
+        # regex escapes.
+        if existing_content:
+            if _MARKER_START in existing_content:
+                content = _MARKER_PATTERN.sub(lambda _match: section, existing_content)
             else:
-                content = content.rstrip() + "\n\n" + section + "\n"
+                content = existing_content.rstrip() + "\n\n" + section + "\n"
         else:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             content = section + "\n"
 
         self._path.write_text(content, encoding="utf-8")
-        return len(memories)
+        return added
 
     def fingerprint(self) -> str:
         """Hash of AGENTS.md contents."""

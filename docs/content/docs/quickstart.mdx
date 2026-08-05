@@ -15,6 +15,10 @@ npm install headroom-ai
 </Tab>
 <Tab value="Python">
 ```bash
+# CLI/proxy/wrap on your machine
+uv tool install --python 3.13 "headroom-ai[all]"
+
+# Python project or virtualenv
 pip install "headroom-ai[all]"
 ```
 </Tab>
@@ -24,7 +28,8 @@ pip install "headroom-ai[all]"
 The TypeScript SDK sends messages to a local Headroom proxy for compression. Start the proxy before using the TS SDK:
 
 ```bash
-pip install "headroom-ai[proxy]"
+uv tool install --python 3.13 "headroom-ai[proxy]"
+# or, inside a Python project: pip install "headroom-ai[proxy]"
 headroom proxy --port 8787
 ```
 
@@ -197,6 +202,13 @@ Transforms:    ['smart_crusher', 'cache_aligner']
 </Tabs>
 
 ## Alternative: proxy mode (zero code changes)
+
+<Callout type="info" title="Using Claude Code inside VS Code?">
+Run `headroom wrap vscode-claude`, reload the VS Code window once, and keep the
+wrapper running while you use the official Claude Code extension. See the
+[complete VS Code Claude Code guide](/docs/vscode-claude-code) for verification,
+undo steps, custom profiles, and remote development.
+</Callout>
 
 If you do not want to change any code, run Headroom as a proxy and point your existing client at it:
 

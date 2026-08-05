@@ -25,6 +25,7 @@ import warnings
 from datetime import date
 from typing import Any
 
+from headroom.models.registry import ModelRegistry
 from headroom.tokenizers import EstimatingTokenCounter
 
 from .base import Provider, TokenCounter
@@ -32,13 +33,11 @@ from .base import Provider, TokenCounter
 # Check if litellm is available for pricing/context limit lookups
 try:
     import litellm
-    from litellm import get_model_info as litellm_get_model_info
 
     LITELLM_AVAILABLE = True
 except ImportError:
     LITELLM_AVAILABLE = False
     litellm = None  # type: ignore[assignment]
-    litellm_get_model_info = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -271,15 +270,15 @@ class GoogleProvider(Provider):
         return "google"
 
     def supports_model(self, model: str) -> bool:
-        """Check if model is a known Gemini model."""
-        model_lower = model.lower()
-        if model_lower in _CONTEXT_LIMITS:
-            return True
-        # Check prefix match
-        for prefix in ["gemini-2", "gemini-1.5", "gemini-1.0", "gemini-pro"]:
-            if model_lower.startswith(prefix):
-                return True
-        return False
+        """Check if this Google provider can handle a Gemini model."""
+        return (
+            ModelRegistry.resolve(
+                model,
+                provider="google",
+                default_context_window=1000000,
+            )
+            is not None
+        )
 
     def get_token_counter(self, model: str) -> TokenCounter:
         """Get token counter for a Gemini model.
@@ -296,44 +295,17 @@ class GoogleProvider(Provider):
     def get_context_limit(self, model: str) -> int:
         """Get context limit for a Gemini model.
 
-        Tries LiteLLM first for up-to-date limits, falls back to hardcoded values.
-        Note: Gemini 1.5 Pro has 2M token context!
+        Runtime capability lookup goes through the shared ModelRegistry so
+        future Gemini families can use catalog or family fallback metadata
+        instead of hard-failing on the provider's static table.
         """
-        model_lower = model.lower()
-
-        # Try LiteLLM first for up-to-date context limits
-        if LITELLM_AVAILABLE and litellm_get_model_info is not None:
-            # Try different model name formats that LiteLLM might recognize
-            model_variants = [
-                f"gemini/{model_lower}",  # gemini/gemini-1.5-pro
-                model_lower,  # gemini-1.5-pro
-            ]
-            for variant in model_variants:
-                try:
-                    info = litellm_get_model_info(variant)
-                    if info:
-                        if "max_input_tokens" in info and info["max_input_tokens"]:
-                            return info["max_input_tokens"]
-                        if "max_tokens" in info and info["max_tokens"]:
-                            return info["max_tokens"]
-                except Exception:
-                    continue
-
-        # Fallback to hardcoded limits
-        # Direct match
-        if model_lower in _CONTEXT_LIMITS:
-            return _CONTEXT_LIMITS[model_lower]
-
-        # Prefix match
-        for prefix, limit in [
-            ("gemini-2.0", 1000000),
-            ("gemini-1.5-pro", 2000000),
-            ("gemini-1.5-flash", 1000000),
-            ("gemini-1.0", 32768),
-            ("gemini-pro", 32768),
-        ]:
-            if model_lower.startswith(prefix):
-                return limit
+        info = ModelRegistry.resolve(
+            model,
+            provider="google",
+            default_context_window=1000000,
+        )
+        if info is not None:
+            return info.context_window
 
         raise ValueError(
             f"Unknown context limit for model '{model}'. "

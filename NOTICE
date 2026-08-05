@@ -41,3 +41,17 @@ NumPy (optional dependency)
 Copyright (c) 2005-2024, NumPy Developers
 Licensed under the BSD 3-Clause License
 https://github.com/numpy/numpy
+
+Vendored dashboard assets (headroom/dashboard/static/)
+------------------------------------------------------
+Tailwind CSS 3.4.17 (Play CDN build) — MIT License
+Copyright (c) Tailwind Labs, Inc.
+https://github.com/tailwindlabs/tailwindcss
+
+htmx 1.9.10 — Zero-Clause BSD License
+Copyright (c) 2020, Big Sky Software
+https://github.com/bigskysoftware/htmx
+
+Alpine.js 3.13.3 — MIT License
+Copyright (c) 2019-2025 Caleb Porzio and contributors
+https://github.com/alpinejs/alpine

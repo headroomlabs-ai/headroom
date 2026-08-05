@@ -492,3 +492,36 @@ class TestPassthroughErrorHandling:
             content=b"not valid json",
         )
         assert response.status_code >= 400
+
+
+# =============================================================================
+# HEAD request regression test — GH #2032
+# =============================================================================
+
+
+def test_head_root_returns_200_not_405(monkeypatch: pytest.MonkeyPatch) -> None:
+    """HEAD / must not return 405; Claude Code uses it as connectivity preflight."""
+    from headroom.proxy.server import ProxyConfig, create_app
+
+    # Dummy upstream so the proxy doesn't crash on missing HTTP client.
+    monkeypatch.setenv("ANTHROPIC_TARGET_API_URL", "https://api.anthropic.example")
+
+    config = ProxyConfig(
+        optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+        log_requests=False,
+        ccr_inject_tool=False,
+        ccr_handle_responses=False,
+        ccr_context_tracking=False,
+        image_optimize=False,
+    )
+    app = create_app(config)
+    with TestClient(app) as client:
+        resp = client.head("/")
+        # The upstream is fake (connection error → 502), but the proxy must
+        # *accept* HEAD — a 405 would mean the route is missing.
+        assert resp.status_code != 405, (
+            f"HEAD / returned 405; allowed methods: {resp.headers.get('allow', 'N/A')}"
+        )

@@ -57,6 +57,15 @@ Use `HEADROOM_SAVINGS_PATH` to override the file location directly, or
 set `HEADROOM_WORKSPACE_DIR` to relocate the entire state root. See the
 [Filesystem Contract](filesystem-contract.md) for details.
 
+> **`compression_savings_usd` needs LiteLLM (Python 3.13).** Dollar figures are
+> priced entirely from LiteLLM's cost tables, and LiteLLM can't be installed on
+> Python 3.14+. On 3.14 the token counts are unaffected but every USD field
+> (and the dashboard's *Proxy $ Saved* tile) reads `0`. `/stats` exposes a
+> top-level `"litellm_available"` boolean so clients can tell "genuinely $0"
+> apart from "pricing unavailable"; the dashboard uses it to prompt a reinstall
+> on 3.13 (`pipx reinstall headroom-ai --python python3.13`) rather than showing
+> a misleading `$0.00`.
+
 For Anthropic-style providers that return cache-write TTL buckets, `/stats`
 also surfaces observed cache TTL usage under `prefix_cache`:
 
@@ -248,7 +257,7 @@ Headroom's managed OTEL exporters are intentionally scoped to Headroom's own ins
 
 Headroom has two separate systems:
 
-- `HEADROOM_TELEMETRY` / `--no-telemetry` controls the privacy-preserving anonymous data-flywheel beacon and TOIN-related aggregate reporting.
+- `HEADROOM_TELEMETRY` / `--telemetry` / `--no-telemetry` controls the privacy-preserving anonymous data-flywheel beacon and TOIN-related aggregate reporting. It is **off by default** (opt-in): set `HEADROOM_TELEMETRY=on` or pass `--telemetry` to enable it.
 - `HEADROOM_OTEL_*` controls operational OTEL metric export.
 
 They are independent by design so you can disable the anonymous beacon while keeping OTEL metrics enabled, or vice versa.
@@ -401,8 +410,8 @@ DEBUG:headroom.transforms.smart_crusher:Kept items: [0,1,2,42,77,97,98,99] (erro
 # Log to file
 headroom proxy --log-file headroom.jsonl
 
-# Increase verbosity
-headroom proxy --log-level debug
+# Enable request logging
+headroom proxy --log-messages
 ```
 
 ## Grafana Dashboard

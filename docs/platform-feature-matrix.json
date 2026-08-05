@@ -1,0 +1,329 @@
+{
+  "schema_version": 1,
+  "updated": "2026-07-06",
+  "source_issues": [
+    "https://github.com/headroomlabs-ai/headroom/issues/1843"
+  ],
+  "status_values": [
+    "covered",
+    "partial",
+    "gap",
+    "blocked"
+  ],
+  "platforms": [
+    "linux",
+    "macos",
+    "windows"
+  ],
+  "features": [
+    {
+      "id": "install_apply_python",
+      "name": "Persistent Python install applies and starts",
+      "risk": "install",
+      "platforms": {
+        "linux": {
+          "status": "covered",
+          "tests": [
+            "tests/test_cli/test_install_cli.py",
+            "tests/test_install/test_supervisors.py",
+            ".github/workflows/install-native-e2e.yml"
+          ]
+        },
+        "macos": {
+          "status": "covered",
+          "tests": [
+            "tests/test_install/test_supervisors.py",
+            ".github/workflows/install-native-e2e.yml"
+          ]
+        },
+        "windows": {
+          "status": "partial",
+          "tests": [
+            "tests/test_install/test_supervisors.py",
+            "tests/test_install/test_runtime.py",
+            ".github/workflows/ci.yml#windows-native-wrapper"
+          ],
+          "gap": "Native install smoke workflow is source-level until Windows wheel CRT conflicts are resolved."
+        }
+      }
+    },
+    {
+      "id": "install_windows_service",
+      "name": "Windows service install uses sc.exe safely",
+      "risk": "install",
+      "platforms": {
+        "linux": {
+          "status": "covered",
+          "tests": [
+            "tests/test_install/test_supervisors.py"
+          ]
+        },
+        "macos": {
+          "status": "covered",
+          "tests": [
+            "tests/test_install/test_supervisors.py"
+          ]
+        },
+        "windows": {
+          "status": "covered",
+          "tests": [
+            "tests/test_install/test_supervisors.py"
+          ]
+        }
+      }
+    },
+    {
+      "id": "single_instance_start",
+      "name": "Persistent runtime start is single-instance by default",
+      "risk": "runtime",
+      "platforms": {
+        "linux": {
+          "status": "covered",
+          "tests": [
+            "tests/test_cli/test_install_cli.py",
+            "tests/test_install/test_runtime.py"
+          ]
+        },
+        "macos": {
+          "status": "covered",
+          "tests": [
+            "tests/test_cli/test_install_cli.py",
+            "tests/test_install/test_runtime.py"
+          ]
+        },
+        "windows": {
+          "status": "covered",
+          "tests": [
+            "tests/test_cli/test_install_cli.py",
+            "tests/test_install/test_runtime.py"
+          ]
+        }
+      }
+    },
+    {
+      "id": "compression_fail_open",
+      "name": "Slow or saturated compression fails open",
+      "risk": "performance",
+      "platforms": {
+        "linux": {
+          "status": "covered",
+          "tests": [
+            "tests/test_platform_stabilization_functional.py",
+            "tests/test_kompress_request_nonblocking.py",
+            "tests/test_proxy_compression_executor.py",
+            "tests/test_openai_codex_ws_lifecycle.py"
+          ]
+        },
+        "macos": {
+          "status": "partial",
+          "tests": [
+            "tests/test_platform_stabilization_functional.py",
+            "tests/test_kompress_request_nonblocking.py",
+            "tests/test_proxy_compression_executor.py"
+          ],
+          "gap": "Native workflow coverage should add focused performance-gate tests without full model downloads."
+        },
+        "windows": {
+          "status": "partial",
+          "tests": [
+            "tests/test_platform_stabilization_functional.py",
+            "tests/test_kompress_request_nonblocking.py",
+            "tests/test_proxy_compression_executor.py"
+          ],
+          "gap": "Source-level tests validate fail-open semantics; full native proxy e2e waits on Windows wheel availability."
+        }
+      }
+    },
+    {
+      "id": "proxy_functional_smoke",
+      "name": "Proxy health and /v1/compress work through the app surface",
+      "risk": "proxy",
+      "platforms": {
+        "linux": {
+          "status": "covered",
+          "tests": [
+            "tests/test_platform_stabilization_functional.py",
+            "tests/test_ccr_row_drop_store_bridge.py"
+          ]
+        },
+        "macos": {
+          "status": "partial",
+          "tests": [
+            "tests/test_platform_stabilization_functional.py",
+            "tests/test_ccr_row_drop_store_bridge.py"
+          ],
+          "gap": "FastAPI route coverage exists; native persistent proxy process smoke should be added."
+        },
+        "windows": {
+          "status": "partial",
+          "tests": [
+            "tests/test_platform_stabilization_functional.py",
+            "tests/test_ccr_row_drop_store_bridge.py"
+          ],
+          "gap": "FastAPI route coverage exists; native persistent proxy process smoke waits on Windows wheel availability."
+        }
+      }
+    },
+    {
+      "id": "ccr_persistence",
+      "name": "CCR survives restart when persistent storage is enabled",
+      "risk": "cache",
+      "platforms": {
+        "linux": {
+          "status": "covered",
+          "tests": [
+            "crates/headroom-core/tests/ccr_backends.rs",
+            "tests/test_storage_backends.py"
+          ]
+        },
+        "macos": {
+          "status": "partial",
+          "tests": [
+            "crates/headroom-core/tests/ccr_backends.rs",
+            "tests/test_storage_backends.py"
+          ],
+          "gap": "Rust backend tests run in the Rust workflow; native macOS restart e2e is not yet present."
+        },
+        "windows": {
+          "status": "partial",
+          "tests": [
+            "crates/headroom-core/tests/ccr_backends.rs",
+            "tests/test_storage_backends.py"
+          ],
+          "gap": "Windows restart e2e is blocked by the native wheel CRT conflict."
+        }
+      }
+    },
+    {
+      "id": "init_cli",
+      "name": "headroom init configures supported agents",
+      "risk": "install",
+      "platforms": {
+        "linux": {
+          "status": "covered",
+          "tests": [
+            ".github/workflows/init-native-e2e.yml"
+          ]
+        },
+        "macos": {
+          "status": "covered",
+          "tests": [
+            ".github/workflows/init-native-e2e.yml"
+          ]
+        },
+        "windows": {
+          "status": "blocked",
+          "tests": [
+            ".github/workflows/init-native-e2e.yml"
+          ],
+          "gap": "Matrix entry is intentionally excluded until Windows wheel CRT conflicts are resolved."
+        }
+      }
+    },
+    {
+      "id": "wrap_prepare_only",
+      "name": "headroom wrap prepare-only mutates config safely",
+      "risk": "install",
+      "platforms": {
+        "linux": {
+          "status": "covered",
+          "tests": [
+            ".github/workflows/wrap-native-e2e.yml"
+          ]
+        },
+        "macos": {
+          "status": "covered",
+          "tests": [
+            ".github/workflows/wrap-native-e2e.yml"
+          ]
+        },
+        "windows": {
+          "status": "blocked",
+          "tests": [
+            ".github/workflows/wrap-native-e2e.yml"
+          ],
+          "gap": "Matrix entry is intentionally excluded until Windows wheel CRT conflicts are resolved."
+        }
+      }
+    },
+    {
+      "id": "toin_skip_recommendations",
+      "name": "TOIN skip-compression recommendations are exposed",
+      "risk": "cache",
+      "platforms": {
+        "linux": {
+          "status": "covered",
+          "tests": [
+            "tests/test_toin.py",
+            "tests/test_proxy_ccr.py",
+            "tests/test_compression_policy_toin_gate.py"
+          ]
+        },
+        "macos": {
+          "status": "partial",
+          "tests": [
+            "tests/test_toin.py",
+            "tests/test_compression_policy_toin_gate.py"
+          ],
+          "gap": "Native end-to-end verification of served recommendations is still needed."
+        },
+        "windows": {
+          "status": "partial",
+          "tests": [
+            "tests/test_toin.py",
+            "tests/test_compression_policy_toin_gate.py"
+          ],
+          "gap": "Native end-to-end verification is blocked by Windows wheel availability."
+        }
+      }
+    }
+  ],
+  "sanity_tests": [
+    {
+      "id": "cli_help",
+      "description": "Every public CLI command renders help without importing optional heavy runtimes.",
+      "tests": [
+        "tests/test_cli"
+      ]
+    },
+    {
+      "id": "install_paths",
+      "description": "Install paths resolve under the active user profile and never require administrator paths for user scope.",
+      "tests": [
+        "tests/test_install/test_paths.py"
+      ]
+    },
+    {
+      "id": "runtime_selection",
+      "description": "Python, Docker, service, and task runtime commands are generated deterministically for each platform.",
+      "tests": [
+        "tests/test_install/test_runtime.py",
+        "tests/test_install/test_supervisors.py"
+      ]
+    },
+    {
+      "id": "health_startup",
+      "description": "Persistent starts wait for /readyz and surface startup failure instead of silently succeeding.",
+      "tests": [
+        "tests/test_cli/test_install_cli.py",
+        "tests/test_install/test_health.py"
+      ]
+    },
+    {
+      "id": "compression_backpressure",
+      "description": "Compression queue saturation and model cold-start fail open without hanging request paths.",
+      "tests": [
+        "tests/test_platform_stabilization_functional.py",
+        "tests/test_kompress_request_nonblocking.py",
+        "tests/test_proxy_compression_executor.py"
+      ]
+    },
+    {
+      "id": "proxy_route_smoke",
+      "description": "Health and /v1/compress routes return functional metrics and fail open on timeout.",
+      "tests": [
+        "tests/test_platform_stabilization_functional.py"
+      ]
+    }
+  ]
+}

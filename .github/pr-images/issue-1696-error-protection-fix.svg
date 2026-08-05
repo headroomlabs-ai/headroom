@@ -1,0 +1,78 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 900" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+  <rect x="0" y="0" width="1200" height="900" fill="#ffffff"/>
+  <text x="600" y="36" text-anchor="middle" font-size="22" font-weight="700" fill="#111827">Headroom: Error-Output Protection False-Positive Fix (#1696)</text>
+
+  <!-- Box 1: pipeline -->
+  <g>
+    <rect x="20" y="60" width="560" height="190" rx="10" fill="#eff6ff" stroke="#2563eb"/>
+    <text x="36" y="88" font-size="15" font-weight="700" fill="#1d4ed8">1. THE GATE</text>
+    <text x="36" y="112" font-size="13" fill="#111827">content_router.py routes every message/content-block through</text>
+    <text x="36" y="130" font-size="13" fill="#111827">content_has_strong_error_indicators() before deciding whether</text>
+    <text x="36" y="148" font-size="13" fill="#111827">to compress it or protect it (pass through untouched).</text>
+    <text x="36" y="176" font-size="13" fill="#111827">Rule: if the text contains 2+ DISTINCT keywords from</text>
+    <text x="36" y="194" font-size="13" font-family="Consolas, monospace" fill="#b91c1c">[error, fail, exception, traceback, fatal, panic, crash]</text>
+    <text x="36" y="218" font-size="13" fill="#111827">the block is protected — assumed to be a real failure trace.</text>
+  </g>
+
+  <!-- Box 2: the bug -->
+  <g>
+    <rect x="620" y="60" width="560" height="190" rx="10" fill="#fef2f2" stroke="#dc2626"/>
+    <text x="636" y="88" font-size="15" font-weight="700" fill="#b91c1c">2. THE BUG</text>
+    <text x="636" y="112" font-size="13" fill="#111827">Passing build/test output mentions BOTH words without failing:</text>
+    <text x="636" y="136" font-size="13" font-family="Consolas, monospace" fill="#111827">tsc:   "Found 0 errors"</text>
+    <text x="636" y="156" font-size="13" font-family="Consolas, monospace" fill="#111827">jest:  "0 failures, 42 passed"</text>
+    <text x="636" y="184" font-size="13" fill="#111827">→ 2 distinct keyword hits ("error" + "fail") on a CLEAN run</text>
+    <text x="636" y="202" font-size="13" font-weight="700" fill="#b91c1c">→ wrongly protected, forever, from compression.</text>
+  </g>
+
+  <!-- Box 3: impact -->
+  <g>
+    <rect x="20" y="270" width="1160" height="150" rx="10" fill="#fff7ed" stroke="#ea580c"/>
+    <text x="36" y="298" font-size="15" font-weight="700" fill="#c2410c">3. OBSERVED IMPACT (issue #1696 stats.json)</text>
+    <text x="36" y="324" font-size="13" fill="#111827">In a long multi-turn JS/TS coding session (KiloCode via headroom proxy), "router:protected:error_output" fired on</text>
+    <text x="36" y="344" font-size="13" fill="#111827">nearly every request. Combined with tool-output exclusion and small-block skips, only a sliver of tokens were ever</text>
+    <text x="36" y="364" font-size="13" fill="#111827">eligible for compression.</text>
+    <rect x="900" y="325" width="60" height="60" fill="#fecaca"/>
+    <text x="930" y="360" text-anchor="middle" font-size="16" font-weight="700" fill="#7f1d1d">0.3%</text>
+    <text x="930" y="400" text-anchor="middle" font-size="11" fill="#111827">actual</text>
+    <rect x="980" y="285" width="60" height="100" fill="#bbf7d0"/>
+    <text x="1010" y="340" text-anchor="middle" font-size="14" font-weight="700" fill="#14532d">60-95%</text>
+    <text x="1010" y="400" text-anchor="middle" font-size="11" fill="#111827">expected</text>
+  </g>
+
+  <!-- Box 4: the fix -->
+  <g>
+    <rect x="20" y="440" width="560" height="200" rx="10" fill="#ecfdf5" stroke="#059669"/>
+    <text x="36" y="468" font-size="15" font-weight="700" fill="#047857">4. THE FIX</text>
+    <text x="36" y="494" font-size="13" fill="#111827">Strip common zero-result phrases before the keyword scan:</text>
+    <text x="36" y="516" font-size="13" font-family="Consolas, monospace" fill="#111827">"0 error(s)", "no error(s)", "0 failing",</text>
+    <text x="36" y="536" font-size="13" font-family="Consolas, monospace" fill="#111827">"0 failure(s)", "no failure(s)"</text>
+    <text x="36" y="562" font-size="13" fill="#111827">headroom/transforms/error_detection.py</text>
+    <text x="36" y="582" font-size="13" fill="#111827">content_has_strong_error_indicators()</text>
+    <text x="36" y="608" font-size="13" font-weight="700" fill="#047857">→ clean tool output no longer trips protection.</text>
+  </g>
+
+  <!-- Box 5: still safe -->
+  <g>
+    <rect x="620" y="440" width="560" height="200" rx="10" fill="#f5f3ff" stroke="#7c3aed"/>
+    <text x="636" y="468" font-size="15" font-weight="700" fill="#6d28d9">5. REAL FAILURES STILL PROTECTED</text>
+    <text x="636" y="494" font-size="13" font-family="Consolas, monospace" fill="#111827">Traceback (most recent call last):</text>
+    <text x="636" y="512" font-size="13" font-family="Consolas, monospace" fill="#111827">  ...</text>
+    <text x="636" y="530" font-size="13" font-family="Consolas, monospace" fill="#111827">ValueError: fatal error during load</text>
+    <text x="636" y="558" font-size="13" fill="#111827">"traceback" + "fatal" (+ "error") — 2+ distinct hits</text>
+    <text x="636" y="576" font-size="13" fill="#111827">outside a stripped zero-result phrase</text>
+    <text x="636" y="602" font-size="13" font-weight="700" fill="#6d28d9">→ still protected, correctly.</text>
+  </g>
+
+  <!-- Box 6: tests -->
+  <g>
+    <rect x="20" y="660" width="1160" height="140" rx="10" fill="#f8fafc" stroke="#334155"/>
+    <text x="36" y="688" font-size="15" font-weight="700" fill="#1e293b">6. TEST COVERAGE ADDED (tests/test_error_detection.py — none existed before)</text>
+    <text x="36" y="714" font-size="13" fill="#111827">✓ real error/traceback text is still flagged      ✓ single keyword mention is not flagged</text>
+    <text x="36" y="736" font-size="13" fill="#111827">✓ passing tsc summary ("Found 0 errors") is not flagged      ✓ passing eslint summary is not flagged</text>
+    <text x="36" y="758" font-size="13" fill="#111827">✓ "0 errors" text does not mask a real second indicator elsewhere in the same blob</text>
+    <text x="36" y="782" font-size="13" fill="#111827">All 5 new tests + full existing content_router suite (86 tests total) pass.</text>
+  </g>
+
+  <text x="600" y="850" text-anchor="middle" font-size="12" fill="#6b7280">Fixes GitHub issue #1696 · headroomlabs-ai/headroom</text>
+</svg>

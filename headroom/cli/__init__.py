@@ -13,16 +13,20 @@ survives that kind of sys.modules mutation.
 """
 
 from . import (  # noqa: F401
+    audit,
     capture,
     copilot_auth,
     evals,
     init,
+    inspect,
     install,
     learn,
     mcp,
     perf,
     proxy,
+    recover,
     tools,
+    update,
     wrap,
 )
 from .main import main

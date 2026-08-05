@@ -128,7 +128,7 @@ class SharedContext:
         )
 
         with self._lock:
-            self._evict_if_needed()
+            self._evict_if_needed(incoming_key=key)
             self._entries[key] = entry
 
         logger.debug(
@@ -206,12 +206,22 @@ class SharedContext:
         with self._lock:
             self._entries.clear()
 
-    def _evict_if_needed(self) -> None:
-        """Evict expired and oldest entries if at capacity. Lock must be held."""
+    def _evict_if_needed(self, *, incoming_key: str | None = None) -> None:
+        """Evict expired and oldest entries if at capacity. Lock must be held.
+
+        ``incoming_key`` is the key about to be written. When it names an entry
+        that already exists, this ``put`` is an update — the map size will not
+        grow — so no eviction is required. Without this guard, updating a key
+        at capacity dropped an unrelated entry (same defect fixed for
+        ``SemanticCache`` in #2094).
+        """
         now = time.time()
         expired = [k for k, e in self._entries.items() if now - e.timestamp > self._ttl]
         for k in expired:
             del self._entries[k]
+
+        if incoming_key is not None and incoming_key in self._entries:
+            return
 
         while len(self._entries) >= self._max_entries:
             oldest_key = min(self._entries, key=lambda k: self._entries[k].timestamp)

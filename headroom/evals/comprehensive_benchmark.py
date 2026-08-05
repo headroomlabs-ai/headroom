@@ -30,13 +30,14 @@ from __future__ import annotations
 import json
 import logging
 import os
-import subprocess
 import sys
 import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+from headroom._subprocess import run
 
 logger = logging.getLogger(__name__)
 
@@ -272,7 +273,7 @@ def run_lm_eval(
         "TOKENIZERS_PARALLELISM": "false",
         "HF_ALLOW_CODE_EVAL": "1",  # Required for humaneval/mbpp tasks
     }
-    result = subprocess.run(
+    result = run(
         cmd,
         capture_output=True,
         text=True,

@@ -28,7 +28,8 @@ def client():
         cost_tracking_enabled=False,
     )
     app = create_app(config)
-    with TestClient(app) as client:
+    # CCR endpoints are loopback-gated (#1227).
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)) as client:
         yield client
     reset_compression_store()
 
@@ -67,7 +68,7 @@ class TestCCRRetrieveEndpoint:
         response = client.post("/v1/retrieve", json={"hash": "nonexistent123"})
         assert response.status_code == 404
         assert "Entry not found" in response.json()["detail"]
-        assert "CCR TTL: 300 seconds" in response.json()["detail"]
+        assert "CCR TTL: 1800 seconds" in response.json()["detail"]
 
     def test_retrieve_expired_hash_reports_expiration_detail(self, client):
         """Expired entries report expiration separately from missing hashes."""
@@ -107,62 +108,6 @@ class TestCCRRetrieveEndpoint:
         retrieved_items = json.loads(data["original_content"])
         assert len(retrieved_items) == 50
         assert retrieved_items[0]["id"] == 0
-
-    def test_retrieve_with_search(self, client):
-        """Search retrieval filters by query."""
-        store = get_compression_store()
-        items = [
-            {"id": 1, "text": "Python programming language"},
-            {"id": 2, "text": "JavaScript web development"},
-            {"id": 3, "text": "Python data science"},
-            {"id": 4, "text": "Java enterprise"},
-        ]
-        hash_key = store.store(
-            original=json.dumps(items),
-            compressed="[]",
-            original_item_count=4,
-            compressed_item_count=0,
-        )
-
-        response = client.post(
-            "/v1/retrieve", json={"hash": hash_key, "query": "Python programming"}
-        )
-        assert response.status_code == 200
-
-        data = response.json()
-        assert data["hash"] == hash_key
-        assert data["query"] == "Python programming"
-        assert "results" in data
-        assert data["count"] >= 1
-
-    def test_retrieve_with_search_plain_text_original(self, client):
-        """Query retrieval searches plain-text originals stored by Kompress."""
-        store = get_compression_store()
-        original = (
-            "Codex WS compression stores plain text originals. "
-            "The target symbol is _compress_openai_responses_payload."
-        )
-        hash_key = store.store(original=original, compressed="compressed")
-
-        response = client.post(
-            "/v1/retrieve",
-            json={"hash": hash_key, "query": "_compress_openai_responses_payload"},
-        )
-        assert response.status_code == 200
-
-        data = response.json()
-        assert data["hash"] == hash_key
-        assert data["count"] == 1
-        assert data["results"][0]["type"] == "text"
-        assert "_compress_openai_responses_payload" in data["results"][0]["text"]
-
-    def test_retrieve_with_search_nonexistent_hash_returns_404(self, client):
-        """Query mode should not mask a missing hash as an empty search."""
-        response = client.post(
-            "/v1/retrieve",
-            json={"hash": "nonexistent123", "query": "anything"},
-        )
-        assert response.status_code == 404
 
     def test_retrieve_increments_count(self, client):
         """Each retrieval increments the retrieval count."""
@@ -205,47 +150,6 @@ class TestCCRRetrieveGetEndpoint:
         assert data["original_item_count"] == 20
         assert data["tool_name"] == "get_test_tool"
 
-    def test_get_retrieve_with_query(self, client):
-        """GET retrieval with query parameter invokes search."""
-        store = get_compression_store()
-        # Create items with distinctive content
-        items = [
-            {"id": 1, "msg": "Python programming language tutorial for beginners"},
-            {"id": 2, "msg": "JavaScript web development framework guide"},
-            {"id": 3, "msg": "Python data science machine learning pandas"},
-            {"id": 4, "msg": "Java enterprise application development"},
-        ]
-        hash_key = store.store(
-            original=json.dumps(items),
-            compressed="[]",
-        )
-
-        response = client.get(f"/v1/retrieve/{hash_key}?query=Python programming")
-        assert response.status_code == 200
-
-        data = response.json()
-        assert data["query"] == "Python programming"
-        # Response includes search results structure
-        assert "results" in data
-        assert "count" in data
-        # Results should be a list (may be empty if BM25 threshold not met)
-        assert isinstance(data["results"], list)
-
-    def test_get_retrieve_with_query_plain_text_original(self, client):
-        """GET query retrieval searches plain-text originals."""
-        store = get_compression_store()
-        hash_key = store.store(
-            original="plain text contains _compress_openai_responses_payload",
-            compressed="plain text",
-        )
-
-        response = client.get(f"/v1/retrieve/{hash_key}?query=_compress_openai_responses_payload")
-        assert response.status_code == 200
-
-        data = response.json()
-        assert data["count"] == 1
-        assert data["results"][0]["type"] == "text"
-
     def test_get_retrieve_nonexistent(self, client):
         """GET with nonexistent hash returns 404."""
         response = client.get("/v1/retrieve/nonexistent123")
@@ -263,7 +167,7 @@ class TestCCRStatsEndpoint:
         data = response.json()
         assert "store" in data
         assert data["store"]["entry_count"] == 0
-        assert data["store"]["default_ttl_seconds"] == 300
+        assert data["store"]["default_ttl_seconds"] == 1800
         assert "recent_retrievals" in data
 
     def test_stats_exposes_env_configured_ttl(self, client, monkeypatch):
@@ -297,7 +201,6 @@ class TestCCRStatsEndpoint:
 
         store = get_compression_store()
 
-        # Use non-empty content so search actually logs
         content = json_module.dumps(
             [
                 {"id": "1", "name": "test item", "value": 100},
@@ -310,9 +213,9 @@ class TestCCRStatsEndpoint:
             tool_name="stats_test_tool",
         )
 
-        # Make some retrievals
-        client.post("/v1/retrieve", json={"hash": hash_key})  # Full retrieval
-        client.post("/v1/retrieve", json={"hash": hash_key, "query": "test"})  # Search retrieval
+        # Make some retrievals (retrieval is by hash → always full)
+        client.post("/v1/retrieve", json={"hash": hash_key})
+        client.post("/v1/retrieve", json={"hash": hash_key})
 
         response = client.get("/v1/retrieve/stats")
         assert response.status_code == 200
@@ -321,10 +224,10 @@ class TestCCRStatsEndpoint:
         assert data["store"]["total_retrievals"] >= 2
         assert len(data["recent_retrievals"]) >= 2
 
-        # Verify we have both retrieval types (no double-logging of full)
+        # All retrievals are full (no double-logging)
         retrieval_types = [r["retrieval_type"] for r in data["recent_retrievals"]]
         assert "full" in retrieval_types
-        assert "search" in retrieval_types
+        assert all(rt == "full" for rt in retrieval_types)
 
 
 class TestCCRIntegration:
@@ -373,19 +276,6 @@ class TestCCREdgeCases:
 
         data = response.json()
         assert data["original_item_count"] == 1000
-
-    def test_search_no_matches(self, client):
-        """Search with no matches returns empty results."""
-        store = get_compression_store()
-        items = [{"id": 1, "text": "hello world"}]
-        hash_key = store.store(original=json.dumps(items), compressed="[]")
-
-        response = client.post("/v1/retrieve", json={"hash": hash_key, "query": "xyznonexistent"})
-        assert response.status_code == 200
-
-        data = response.json()
-        assert data["count"] == 0
-        assert data["results"] == []
 
     def test_unicode_content(self, client):
         """Unicode content is handled correctly."""
@@ -453,7 +343,8 @@ class TestEndToEndTOINIntegration:
             cost_tracking_enabled=False,
         )
         app = create_app(config)
-        with TestClient(app) as client:
+        # CCR endpoints are loopback-gated (#1227).
+        with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)) as client:
             yield client
         reset_compression_store()
 
@@ -705,10 +596,10 @@ class TestEndToEndTOINIntegration:
                 strategy="smart_sample",
             )
 
-        # Step 2: Retrieve through proxy endpoint
+        # Step 2: Retrieve through proxy endpoint (by hash → full content)
         response = client_with_optimization.post(
             "/v1/retrieve",
-            json={"hash": hash_key, "query": "category:cat_1"},
+            json={"hash": hash_key},
         )
         assert response.status_code == 200
 

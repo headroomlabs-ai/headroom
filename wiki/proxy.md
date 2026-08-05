@@ -2,7 +2,7 @@
 
 The Headroom proxy server is a production-ready HTTP server that applies context optimization to all requests passing through it.
 
-> **New:** The proxy now supports the [TypeScript SDK](typescript-sdk.md) via the `POST /v1/compress` endpoint, enabling compression-as-a-service for any HTTP client without calling an LLM.
+> The proxy exposes compression-as-a-service via the `POST /v1/compress` endpoint — used by the [TypeScript SDK](typescript-sdk.md), LiteLLM's `headroom` guardrail, and gateway sidecars. It is loopback-only by default; see the endpoint section below.
 
 ## Starting the Proxy
 
@@ -36,7 +36,7 @@ OPENAI_BASE_URL=http://localhost:8787/v1 your-app
 
 `headroom wrap copilot` uses Copilot CLI's BYOK provider settings under the hood. In `provider-type=auto`, it chooses Headroom's Anthropic route for the default proxy backend and the OpenAI-compatible `/v1` route for translated backends such as `anyllm` and LiteLLM.
 
-Anonymous aggregate telemetry is enabled by default. Opt out with `HEADROOM_TELEMETRY=off` or `headroom proxy --no-telemetry`. Downstream apps can set `HEADROOM_SDK=headroom-app` to override the anonymous telemetry `sdk` label; the default remains `proxy`.
+Anonymous aggregate telemetry is **off by default** (opt-in). Opt in with `HEADROOM_TELEMETRY=on` or `headroom proxy --telemetry`. Downstream apps can set `HEADROOM_SDK=headroom-app` to override the anonymous telemetry `sdk` label; the default remains `proxy`.
 
 Operational OTEL metrics are configured separately and are **off by default**. Install `headroom-ai[proxy,otel]` and set:
 
@@ -74,10 +74,11 @@ When configured, Headroom emits OTLP traces for the shared compression pipeline 
 | `--no-rate-limit` | `false` | Disable rate limiting |
 | `--log-file` | None | Path to JSONL log file |
 | `--budget` | None | Daily budget limit in USD |
-| `--code-aware` | true | Enable AST-based code compression (env: HEADROOM_CODE_AWARE_ENABLED) |
-| `--no-code-aware` | false | Disable code-aware compression |
+| `--code-aware` / `--no-code-aware` | disabled | Enable or disable AST-based code compression. Requires `headroom-ai[code]` (env: HEADROOM_CODE_AWARE_ENABLED=1 to enable) |
 | `--anthropic-api-url` | `https://api.anthropic.com` | Custom Anthropic API URL endpoint |
 | `--openai-api-url` | `https://api.openai.com` | Custom OpenAI API URL endpoint |
+| `--anthropic-extra-headers` | unset | JSON object of extra headers merged into (and overriding) forwarded Anthropic requests, e.g. `'{"Api-Key": "..."}'` |
+| `--openai-extra-headers` | unset | JSON object of extra headers merged into (and overriding) forwarded OpenAI requests |
 
 ### Run Modes
 
@@ -102,23 +103,14 @@ Legacy values (`token_headroom`, `cost_savings`) are still accepted as aliases.
 
 ### Context Management Options
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--no-intelligent-context` | `false` | Disable IntelligentContextManager (fall back to RollingWindow) |
-| `--no-intelligent-scoring` | `false` | Disable multi-factor importance scoring (use position-based) |
-| `--no-compress-first` | `false` | Disable trying deeper compression before dropping messages |
+Context management in the proxy is handled automatically by the compression pipeline. CCR (Compress-Cache-Retrieve) ensures that when content is compressed or messages are dropped, the original data remains accessible for the LLM to retrieve on demand. See [CCR documentation](ccr.md) for details.
 
-By default, the proxy uses **IntelligentContextManager** which scores messages by multiple factors (recency, semantic similarity, TOIN-learned patterns, error indicators, forward references) and drops lowest-scored messages first. This is smarter than simple age-based truncation.
+Key CCR-related proxy flags:
 
-**CCR Integration:** When messages are dropped, they're stored in CCR so the LLM can retrieve them if needed. The inserted marker includes the CCR reference. Drops are also recorded to TOIN, so the system learns which message patterns are important across all users.
-
-```bash
-# Use legacy RollingWindow (drops oldest first)
-headroom proxy --no-intelligent-context
-
-# Disable semantic scoring (faster, but less intelligent)
-headroom proxy --no-intelligent-scoring
-```
+| Option | Description |
+|--------|-------------|
+| `--no-ccr` | Disable CCR entirely — no retrieval markers in compressed output and no injected `headroom_retrieve` tool (lossy, no recovery path) |
+| `--no-ccr-proactive-expansion` | Disable proactive context expansion before the LLM asks |
 
 ### ML Compression — RETIRED `--llmlingua` flag
 
@@ -274,13 +266,30 @@ POST /v1/chat/completions
 
 ### `POST /v1/compress`
 
-Compression-only endpoint. Compresses messages without calling any LLM. Used by the [TypeScript SDK](typescript-sdk.md) and any HTTP client that wants compression as a service.
+Compression-only endpoint. Compresses messages without ever making a **completion request to an LLM provider** — no generation, no provider API key. Used by the [TypeScript SDK](typescript-sdk.md), LiteLLM's `headroom` guardrail, and gateway sidecars.
+
+**It does run local ML models.** Compression is ML-backed: Kompress is a ModernBERT encoder scoring tokens for retention (classification, not generation) and Magika classifies content types, both in-process by default. If `HEADROOM_KOMPRESS_ENDPOINT` is set, Kompress inference is offloaded over HTTP to that model server — real egress from the sidecar. Only inference goes remote; the CCR store and markers stay proxy-local. `HEADROOM_DISABLE_KOMPRESS=1` gives structural compression only.
+
+**Loopback-only by default.** Non-loopback callers get **404** (not 403 — the route stays invisible to scanners). Set `HEADROOM_COMPRESS_ALLOW_REMOTE=1` to allow remote callers.
+
+**No format conversion.** `messages` may be OpenAI-shaped (`role: "tool"` + `tool_call_id`) or Anthropic-shaped (`tool_use` / `tool_result` content blocks); the same shape comes back. `model` selects the tokenizer and context limit — send the real name, including gateway-prefixed forms like `bedrock/anthropic.claude-3-5-sonnet`.
+
+**`system` and `tools` are ignored.** Anthropic sends both out of band. This endpoint accepts them without complaint (200, no warning) and returns neither, so neither is compressed — keep carrying them yourself. That means the Anthropic system prompt is not compressed here, and tool-schema compaction / tool-search deferral are not reachable through this route; run Headroom as the proxy if you need those.
 
 **Request:**
 ```json
 {
-  "messages": [...],     // OpenAI chat format
-  "model": "gpt-4o"     // model name (for token counting)
+  "messages": [...],          // either wire format
+  "model": "gpt-4o",          // tokenizer + context limit
+  "token_budget": 8000,       // optional: override the context limit
+  "config": {                 // optional
+    "mode": "lossy_inline",       // ccr | lossy_inline | lossless_then_lossy
+    "frozen_message_count": 12,   // pin an already-cached prefix
+    "compress_user_messages": false,
+    "target_ratio": 0.5,
+    "protect_recent": 2,
+    "protect_analysis_context": true
+  }
 }
 ```
 
@@ -291,16 +300,40 @@ Compression-only endpoint. Compresses messages without calling any LLM. Used by 
   "tokens_before": 15000,
   "tokens_after": 3500,
   "tokens_saved": 11500,
-  "compression_ratio": 0.23,
+  "compression_ratio": 0.23,    // tokens_after / tokens_before — LOWER is better
   "transforms_applied": ["router:smart_crusher:0.35"],
-  "ccr_hashes": ["a1b2c3"]
+  "transforms_summary": {"router:smart_crusher:0.35": 1},
+  "ccr_hashes": []              // non-empty only with mode="ccr"
 }
 ```
 
 **Headers:**
-- `x-headroom-bypass: true` — skip compression, return messages as-is
+- `x-headroom-bypass: true` — skip compression, return messages as-is with zeroed metrics
 
-**Error responses:** 400 (missing fields), 401 (bad API key), 503 (compression failed)
+**Error responses:** 400 (missing/invalid fields, bad `config.mode` or `config.frozen_message_count`), 401 (bad `HEADROOM_PROXY_TOKEN`), 404 (non-loopback without `HEADROOM_COMPRESS_ALLOW_REMOTE=1`), 503 (compression failed)
+
+**Fail-open:** on timeout you get 200 with the original messages plus `compression_skipped: true` and `skip_reason: "compression_timeout"`.
+
+**Multi-turn callers — don't lose the prefix cache.** This endpoint is stateless: unlike the proxy's own request path (which runs a CacheAligner and tracks provider cache hits across turns), it has no idea what the provider already cached.
+
+The provider caches the bytes you *forwarded*, which compression already changed — so your originals and the cached prefix are no longer the same thing, and it is the forwarded version you must keep reproducing. Compression also varies with position: an older tool result can fall outside the recent-read protection window as the conversation grows and be compressed harder than last turn, so re-compression is not guaranteed to reproduce earlier output either. Two rules:
+
+1. Pass `config.frozen_message_count` = the number of leading messages already cached upstream.
+2. Send back the messages you **previously forwarded**, not the pristine originals. `frozen_message_count` returns leading messages exactly as passed in, so feeding it originals hands the provider different bytes than last turn and busts the cache anyway.
+
+```python
+forwarded = []
+def next_turn(new_messages):
+    r = requests.post(f"{proxy}/v1/compress", json={
+        "messages": forwarded + new_messages,
+        "model": "claude-sonnet-4-6",
+        "config": {"frozen_message_count": len(forwarded)},
+    }).json()
+    forwarded[:] = r["messages"]   # next turn's frozen prefix
+    return forwarded
+```
+
+Note `protect_recent` is not a substitute — it guards the newest messages, while `frozen_message_count` guards the oldest, which is the cached end.
 
 ## Using with Claude Code
 

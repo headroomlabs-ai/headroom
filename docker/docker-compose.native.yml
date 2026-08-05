@@ -1,6 +1,6 @@
 services:
   cli:
-    image: ${HEADROOM_IMAGE:-ghcr.io/chopratejas/headroom:latest}
+    image: ${HEADROOM_IMAGE:-ghcr.io/headroomlabs-ai/headroom:latest}
     entrypoint: ["headroom"]
     working_dir: /workspace
     stdin_open: true
@@ -22,7 +22,7 @@ services:
     command: ["--help"]
 
   proxy:
-    image: ${HEADROOM_IMAGE:-ghcr.io/chopratejas/headroom:latest}
+    image: ${HEADROOM_IMAGE:-ghcr.io/headroomlabs-ai/headroom:latest}
     entrypoint: ["headroom", "proxy"]
     working_dir: /workspace
     restart: unless-stopped

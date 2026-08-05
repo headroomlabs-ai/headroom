@@ -5,32 +5,19 @@ description: All configuration options for the Headroom Python and TypeScript SD
 
 Headroom can be configured via the SDK constructor, proxy command line, environment variables, or per-request overrides.
 
-## CLI Context Tool
+If Codex history disappeared after using an older wrapper, see [Recover Codex State](/docs/codex-recovery) before wrapping Codex again.
 
-`headroom wrap ...` uses RTK for local shell-output filtering by default.
-Set `HEADROOM_CONTEXT_TOOL=lean-ctx` to have wrap commands install or reuse
-`lean-ctx` and run `lean-ctx init --agent <tool>` instead of RTK setup.
+## SDK Modes (`default_mode` / `headroom_mode`)
 
-```bash
-export HEADROOM_CONTEXT_TOOL=lean-ctx
-headroom wrap claude
-headroom wrap codex --prepare-only
-```
-
-Supported values are `rtk` and `lean-ctx`; unset defaults to `rtk`.
-
-The proxy reads RTK lifetime savings with global scope by default so a shared
-daemon reports savings across the operator's projects. Set
-`HEADROOM_RTK_GAIN_SCOPE=project` to query `rtk gain --project` from the
-proxy process working directory.
-
-## Modes
+These modes apply to SDK usage via `HeadroomClient(default_mode=...)` or per-request `headroom_mode=...`. They are **not** the same as the proxy `--mode` flag.
 
 | Mode | Behavior | Use Case |
 |------|----------|----------|
 | `audit` | Observes and logs, no modifications | Production monitoring, baseline measurement |
 | `optimize` | Applies safe, deterministic transforms | Production optimization |
 | `simulate` | Returns plan without API call | Testing, cost estimation |
+
+> **Proxy `--mode` is a separate axis**: `headroom proxy --mode token` (maximize compression) or `--mode cache` (freeze prior turns for prefix-cache stability). The proxy does not accept `audit`, `optimize`, or `simulate`.
 
 ## SDK Configuration
 
@@ -123,6 +110,33 @@ response = client.chat.completions.create(
 </Tab>
 </Tabs>
 
+### Proxy upstream override (`x-headroom-base-url`)
+
+When using the proxy, send the `x-headroom-base-url` request header to route a
+single request to a different upstream instead of the configured provider URL.
+This lets a client that speaks a provider's wire format authenticate against a
+compatible gateway (for example an OpenAI-compatible endpoint, or an
+Anthropic-Messages gateway such as OpenCode Zen) without changing the proxy
+configuration.
+
+The header is honored by the OpenAI-compatible routes, the Anthropic Messages
+route (`POST /v1/messages`), and the generic passthrough route. The proxy
+forwards the request to `<x-headroom-base-url>` + the original request path
+(e.g. `/v1/messages`). An empty or whitespace-only value is ignored and the
+configured upstream is used.
+
+```bash
+curl http://127.0.0.1:8787/v1/messages \
+  -H "content-type: application/json" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "x-headroom-base-url: https://opencode.ai/zen/go" \
+  -H "x-api-key: <gateway-api-key>" \
+  -d '{"model":"glm-5.2","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}'
+```
+
+When `HEADROOM_STRIP_INTERNAL_HEADERS` is `enabled` (the default), the proxy
+reads this header for routing and then strips it before forwarding upstream.
+
 ## SmartCrusher Configuration
 
 Fine-tune JSON compression behavior:
@@ -180,7 +194,40 @@ response = client.chat.completions.create(
 )
 ```
 
-The `RollingWindowConfig`, `IntelligentContextConfig`, and `ScoringWeights` classes were removed in 0.9.x. Context management now happens automatically inside the pipeline.
+The `RollingWindowConfig`, `IntelligentContextConfig`, and `ScoringWeights` classes are no longer part of Headroom. Context management now happens automatically inside the pipeline (live-zone-only compression).
+
+## Pipeline Extensions
+
+Use a `headroom.pipeline_extension` entry point when you need to normalize or annotate requests before they leave Headroom. The `PRE_SEND` stage is the right place for provider-specific request cleanup, such as turning `content: null` into `content: ""` for upstreams that reject OpenAI-spec tool-call messages.
+
+```python
+from headroom.pipeline import PipelineEvent, PipelineStage
+
+
+class NormalizeNullContent:
+    def on_pipeline_event(self, event: PipelineEvent) -> PipelineEvent:
+        if event.stage is not PipelineStage.PRE_SEND or not event.messages:
+            return event
+
+        for message in event.messages:
+            if (
+                message.get("role") == "assistant"
+                and message.get("content") is None
+                and message.get("tool_calls")
+            ):
+                message["content"] = ""
+
+        return event
+```
+
+Register it in `pyproject.toml`:
+
+```toml
+[project.entry-points."headroom.pipeline_extension"]
+normalize_null_content = "my_pkg.normalize:NormalizeNullContent"
+```
+
+If the upstream base URL itself must vary per request, use the `x-headroom-base-url` override header in addition to the normalization hook.
 
 ## Proxy Configuration
 
@@ -218,28 +265,131 @@ headroom proxy --learn --min-evidence 3
 |----------|-------------|---------|
 | `HEADROOM_HOST` | Proxy bind host | `127.0.0.1` |
 | `HEADROOM_PORT` | Proxy bind port | `8787` |
-| `HEADROOM_MODE` | Proxy optimization mode: `token` or `cache` | `token` |
+| `HEADROOM_MODE` | Proxy optimization mode: `token` or `cache` | `cache` |
 | `HEADROOM_WORKERS` | Uvicorn worker count | `1` |
 | `HEADROOM_LIMIT_CONCURRENCY` | Maximum concurrent connections before 503 | `1000` |
 | `HEADROOM_MAX_CONNECTIONS` | Maximum upstream HTTP connections | `500` |
 | `HEADROOM_MAX_KEEPALIVE` | Maximum upstream keep-alive connections | `100` |
+| `HEADROOM_KEEPALIVE_EXPIRY` | Seconds an idle upstream keep-alive connection is kept open | `90` |
+| `HEADROOM_HTTP_PROXY` | HTTP proxy URL for upstream provider requests only; HTTPS provider APIs use CONNECT | -- |
 | `HEADROOM_BUDGET` | Daily budget limit in USD | -- |
-| `HEADROOM_TELEMETRY` | Set to `off` to disable anonymous telemetry | enabled |
+| `HEADROOM_TELEMETRY` | Set to `on` for **local-only** usage stats (powers your own `/stats` and dashboard; nothing is sent externally) | `off` |
 | `HEADROOM_STATELESS` | Set to `true` to disable filesystem writes | `false` |
 | `HEADROOM_MODEL_LIMITS` | Custom model config (JSON string or file path) | -- |
 | `HEADROOM_BASE_URL` | Base URL of the Headroom proxy (TypeScript SDK) | `http://localhost:8787` |
-| `HEADROOM_API_KEY` | API key for Headroom Cloud authentication | -- |
+| `HEADROOM_API_KEY` | Optional API key for authenticated Headroom endpoints (TypeScript SDK) | -- |
 | `HEADROOM_CONFIG_DIR` | Canonical config (read-mostly) root. Derives `models.json` and per-plugin config paths when set. | `~/.headroom/config` |
 | `HEADROOM_WORKSPACE_DIR` | Canonical workspace (read-write state) root. Derives savings, memory DB, logs, TOIN, subscription state, and more when set. | `~/.headroom` |
 | `HEADROOM_SAVINGS_PATH` | Override persistent savings file location. Always wins when set. | derived from `${HEADROOM_WORKSPACE_DIR}` |
 | `HEADROOM_TOIN_PATH` | Override TOIN telemetry file location. Always wins when set. | derived from `${HEADROOM_WORKSPACE_DIR}` |
 | `HEADROOM_SUBSCRIPTION_STATE_PATH` | Override subscription tracker state file. Always wins when set. | derived from `${HEADROOM_WORKSPACE_DIR}` |
-| `HEADROOM_TELEMETRY` | Set to `off` to disable anonymous telemetry | `on` |
+| `HEADROOM_PERIODIC_TOIN_STATS` | Controls periodic TOIN stats logging in long-lived proxy workers. Set to `0`, `false`, `off`, or `no` to disable the 5-minute stats loop without disabling TOIN learning or request-time feedback. | `true` |
 | `HEADROOM_MEMORY_INJECTION_MODE` | Memory-context routing mode: `live_zone_tail` (default) or `disabled`. The legacy `system_prompt` mode was retired by PR-A2; supplying it raises. | `live_zone_tail` |
 | `HEADROOM_PROXY_PYTHON_FORWARDER_MODE` | Python forwarder serialization mode. `byte_faithful` (default) forwards original request bytes verbatim when no transform mutated the body and re-serializes canonically only when needed — keeps Anthropic prompt-cache hit-rate intact. `legacy_json_kwarg` is an explicit operator opt-in for emergency rollback to the historical `httpx ... json=body` behavior. NOT a fallback — only flip on explicit operator decision. | `byte_faithful` |
 | `HEADROOM_STRIP_INTERNAL_HEADERS` | Python proxy: whether to strip internal `x-headroom-*` request headers (e.g. `x-headroom-bypass`, `x-headroom-mode`, `x-headroom-user-id`, `x-headroom-stack`, `x-headroom-base-url`) before every upstream forwarder call (PR-A5, fixes P5-49). `enabled` (default) stops fingerprinting / leakage. `disabled` is an explicit operator opt-in for diagnostic shadow tracing — NOT a fallback. Inbound reads of these headers (bypass gating, memory user-id resolution) are unaffected because they read `request.headers` directly. | `enabled` |
 | `HEADROOM_PROXY_STRIP_INTERNAL_HEADERS` | Rust proxy: same policy as `HEADROOM_STRIP_INTERNAL_HEADERS` but for the Rust transparent proxy. Stripping happens inside `build_forward_request_headers` so both HTTP and WebSocket upstream calls are gated by one flag. `enabled` default; `disabled` operator opt-in for diagnostic shadow tracing. Response-side `X-Headroom-*` injection (e.g. `x-headroom-tokens-saved`) is unrelated and stays. | `enabled` |
 | `HEADROOM_EMBEDDER_RUNTIME` | Set to `pytorch_mps` to run the memory embedder via the torch sentence-transformers backend on the Apple GPU (MPS). Only engages when Apple MPS is actually available; otherwise it logs a warning and uses the existing default embedder selection path. `pytorch_mps` is the only accepted value. Requires the `[pytorch-mps]` extra. See [Memory](/docs/memory#embedding-runtime--gpu-offload-apple-silicon). | default embedder selection |
+| `ORT_DYLIB_PATH` | Path to the ONNX Runtime shared library loaded by the Rust core (magika detection, fastembed embeddings), which loads ORT dynamically on every platform. Auto-pinned at `import headroom` to the library inside the `onnxruntime` pip package (`onnxruntime.dll` / `libonnxruntime.so*` / `libonnxruntime*.dylib`); set it yourself to override. Without a pin, ML detection degrades to the non-ONNX tiers — and on Windows the bare DLL search can resolve to the Windows ML System32 build (1.17.x on Win11 24H2+), which deadlocks ONNX session init — see [Troubleshooting](/docs/troubleshooting#windows-ml-content-detection-hangs-or-silently-falls-back). | auto-pinned |
+| `HEADROOM_MAGIKA_INIT_TIMEOUT_SECS` | Upper bound (integer seconds, > 0) on magika's one-time ONNX session init in the Rust detection chain. On timeout the init error is cached and detection uses the non-ML fallback tiers for the rest of the process; a warning is logged. Safety net for environments where the dylib pin above does not apply. | `5` |
+| `HEADROOM_REQUEST_TIMEOUT` | Request timeout in seconds | `300` |
+| `HEADROOM_BETA_HEADER_STICKY` | Controls per-session `anthropic-beta` / `OpenAI-Beta` re-echo. `enabled` (default): the proxy unions beta tokens across turns within a session — if the client sends a token in turn N and omits it in turn N+1, the proxy re-injects it to preserve prefix-cache stability. `disabled`: the client's value is forwarded verbatim with no accumulation. Any other value raises at request time. See [Session Beta Header Tracking](/docs/configuration#session-beta-header-tracking). | `enabled` |
+| `HEADROOM_BETA_TRACKER_MAX_SESSIONS` | LRU capacity of the in-memory session beta tracker. Once full, the oldest session entry is evicted. | `1000` |
+| `HEADROOM_MODEL_ROUTER_ENABLED` | Enable cost-aware model routing. `1`/`true`/`yes`/`on`/`enabled` turns it on and requires `HEADROOM_MODEL_ROUTES`. See [Cost-aware model routing](/docs/configuration#cost-aware-model-routing). | `off` |
+| `HEADROOM_MODEL_ROUTES` | JSON array of ordered routing rules for cost-aware model routing (schema below). | -- |
+| `HEADROOM_THINKING_COMPACT` | Compact plain-text reasoning that models re-send every turn (Kimi/GLM/DeepSeek `reasoning_content` / inline `<think>`): Kompress it on warm turns, drop it on cold turns. No-op for Claude/Codex/OpenAI (encrypted reasoning). See [Cold-prefix hook](#cold-prefix-hook--reasoning-compaction). | `off` |
+| `HEADROOM_THINKING_COMPACT_KEEP_LAST` | Most-recent assistant turns whose reasoning is left intact (the active reasoning the model still uses). Only applies with `HEADROOM_THINKING_COMPACT`. | `1` |
+| `HEADROOM_COLD_RECOMPACT` | On a confirmed-cold turn (idle past the real cache TTL), recompact the whole prefix — cross-turn dedupe + superseded-read drop + lossless folds — instead of forwarding a byte-identical prefix to a dead cache. Warm turns unchanged. Pair with `HEADROOM_DEDUPE`. See [Cold-prefix hook](#cold-prefix-hook--reasoning-compaction). | `off` |
+| `HEADROOM_DEDUPE` | Whole-conversation verbatim cross-turn dedup in the router (cache-safe, information-preserving via retrieval markers). Superseded-read drop + lossless folds run without it; this adds verbatim dedup. | `off` |
+| `HEADROOM_CACHE_TTL_LEARN` | Append per-turn cache-outcome observations (provider, model, idle, hit/miss) to `cache_ttl_observations.jsonl` for the offline `headroom-cache-ttl` learner. Observation-only (no request-behavior change); respects `HEADROOM_STATELESS`; the log is size-bounded. | `off` |
+| `HEADROOM_KOMPRESS_ENDPOINT` / `HEADROOM_KOMPRESS_ENDPOINT_TOKEN` | Offload ML compression (Kompress) to a remote endpoint instead of the local ONNX model — used by reasoning compaction and the router when set. | -- |
+
+For provider-only proxying, prefer `HEADROOM_HTTP_PROXY` over process-wide variables such as `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, or `NO_PROXY`. HTTPX reads those global variables, but Headroom also passes them through to tool executions.
+
+### Cold-prefix hook & reasoning compaction
+
+Two related optimizations target tokens that agent harnesses re-send every turn:
+model **reasoning** (re-billed as input on Kimi/GLM/DeepSeek and on Claude 4.6+),
+and the **prefix** itself once its prompt cache has lapsed. All flags below are
+**off by default** — the base proxy is unchanged until you opt in.
+
+**What to set for what:**
+
+| Goal | Set | Notes |
+|------|-----|-------|
+| Shrink Kimi/GLM/DeepSeek reasoning re-sent each turn | `HEADROOM_THINKING_COMPACT=1` (+ `HEADROOM_KOMPRESS_ENDPOINT` for the best ratio) | Warm turns Kompress the reasoning; cold turns drop it. No-op for Claude/Codex/OpenAI (their reasoning is an encrypted handle, already cheap on resend). |
+| Recompact a dead-cache prefix instead of re-sending it whole | `HEADROOM_COLD_RECOMPACT=1` (+ `HEADROOM_DEDUPE=1`) | Fires only when the cache has genuinely lapsed. Works in both `cache` and `token` mode. |
+| Learn each provider's real cache TTL | `HEADROOM_CACHE_TTL_LEARN=1`, then run the `headroom-cache-ttl` estimator periodically | Sharpens cold detection for providers that don't expose a TTL (Kimi/OpenAI). |
+
+**How cold detection knows the TTL.** A wrong "cold" call would recompact a
+*warm* prefix and bust the cache, so the TTL must be right:
+
+- **Claude Code:** read exactly, from the request's `cache_control.ttl` plus CC's
+  own controls — `ENABLE_PROMPT_CACHING_1H` (1h), `FORCE_PROMPT_CACHING_5M` (5m),
+  and `DISABLE_PROMPT_CACHING` (+ per-model `DISABLE_PROMPT_CACHING_<FAMILY>`),
+  which turns caching off and makes every turn a free recompaction candidate.
+- **Kimi / OpenAI / Codex:** they don't expose a TTL, so detection uses a
+  conservative default until the learner (`HEADROOM_CACHE_TTL_LEARN` + the
+  `headroom-cache-ttl` plugin) fills in the real value from observed hits/misses.
+
+**Can these be on by default?**
+
+- `HEADROOM_THINKING_COMPACT` — **stays opt-in.** It rewrites model inputs
+  (reasoning the model actively uses) and depends on Kompress, so its quality /
+  latency trade should be a deliberate choice.
+- `HEADROOM_COLD_RECOMPACT` — **opt-in today; a candidate to default for Claude
+  Code** once TTL detection is field-validated. It only fires on confirmed-cold
+  turns and recompacts losslessly, but a mis-read TTL would bust a warm cache
+  (expensive), so it waits for confidence. For Kimi/OpenAI it should stay opt-in
+  until the learner has data.
+- `HEADROOM_CACHE_TTL_LEARN` — **the safest to default on:** observation-only, a
+  size-bounded local log, and it respects `HEADROOM_STATELESS`. Kept opt-in for
+  now so nothing is written to disk unasked.
+
+### Cost-aware model routing
+
+Complementary to content compression, Headroom can rewrite the upstream model per request to stretch quota and control spend, for example by sending small, tool-free requests to a cheaper model. Routing is opt-in and disabled by default, so behavior is unchanged unless you configure it.
+
+Enable it with `HEADROOM_MODEL_ROUTER_ENABLED=1` and declare ordered rules in `HEADROOM_MODEL_ROUTES` (a JSON array). The router evaluates rules top to bottom and the first rule whose conditions all match wins; every decision is logged with a reason so routing stays observable. Each rule object supports:
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `to_model` | string (required) | Model to route to when the rule matches. |
+| `max_input_tokens` | integer | Match only when the estimated input size is at or below this. |
+| `min_input_tokens` | integer | Match only when the estimated input size is at or above this. |
+| `require_no_tools` | boolean | Match only when the request declares no tools (a proxy for low-risk work). |
+| `from_models` | list of strings | Restrict the rule to these source models. Omit for any source model. |
+| `name` | string | Label surfaced in the decision log. |
+
+```bash
+export HEADROOM_MODEL_ROUTER_ENABLED=1
+export HEADROOM_MODEL_ROUTES='[
+  {"name": "small-no-tools", "max_input_tokens": 4000, "require_no_tools": true,
+   "from_models": ["claude-sonnet-4-6"], "to_model": "claude-haiku-4-5"}
+]'
+```
+
+Notes:
+
+- Input size is a fast, tokenizer-free estimate over the messages, tools, and top-level `system` prompt, meant for tier selection rather than exact accounting.
+- A malformed rule fails open: it is skipped (never silently widened), and the rest of the rules still apply.
+- Routing is skipped for byte-faithful passthrough requests (`x-headroom-bypass: true` or `x-headroom-mode: passthrough`), so those are never model-rewritten.
+- Routing currently applies on the Anthropic `/v1/messages` path.
+
+### Session Beta Header Tracking
+
+When running as a proxy, Headroom maintains a per-session union of `anthropic-beta` (and `OpenAI-Beta`) tokens via `SessionBetaTracker`. The session key is derived from the `x-headroom-session-id` header if present, otherwise from `md5(model + system_prompt[:500])[:16]` — stable across turns of the same conversation.
+
+**Why:** clients such as Claude Code and Codex CLI may drop a beta token between consecutive turns. Because `anthropic-beta` is part of the request bytes that determine the upstream prefix-cache key, a dropped token would bust the cache mid-conversation. The tracker re-injects any token seen earlier in the session so the cache key stays stable.
+
+**Trade-off:** once the proxy has seen a beta token in a session it will continue re-sending it for the rest of that session, even if the client stops including it. Stopping the token on the client side alone is not sufficient — the proxy re-injects it. Set `HEADROOM_BETA_HEADER_STICKY=disabled` to pass the client's `anthropic-beta` value verbatim and bypass this accumulation.
+
+```bash
+# Disable sticky beta re-echo
+export HEADROOM_BETA_HEADER_STICKY=disabled
+headroom proxy ...
+```
+
+Note: disabling sticky mode may reduce prefix-cache hit rates for clients that legitimately drop-and-re-add beta tokens across turns.
 
 ### Filesystem Contract
 
@@ -249,7 +399,7 @@ precedence rules: explicit argument > per-resource env var > derived
 from canonical root > default. Every legacy env var continues to work
 unchanged.
 
-See the **[Filesystem Contract](https://github.com/chopratejas/headroom/blob/main/wiki/filesystem-contract.md)**
+See the **[Filesystem Contract](/docs/filesystem-contract)**
 page for the full bucket table, plugin-author guidance, and the Docker
 naming overlap note (`HEADROOM_WORKSPACE` is *not* the same as
 `HEADROOM_WORKSPACE_DIR`).
@@ -331,7 +481,7 @@ provider = AnthropicProvider(
 </Tab>
 <Tab value="Google">
 ```python
-from headroom import GoogleProvider
+from headroom.providers import GoogleProvider
 
 provider = GoogleProvider(
     enable_context_caching=True,

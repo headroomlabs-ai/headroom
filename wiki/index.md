@@ -64,7 +64,7 @@ Headroom works as a **transparent proxy** (zero code changes), a **Python functi
 === "Proxy (Zero Code Changes)"
 
     ```bash
-    pip install "headroom-ai[all]"
+    uv tool install --python 3.13 "headroom-ai[all]"
     headroom proxy
     ```
 
@@ -236,24 +236,23 @@ headroom wrap openclaw
 
 ## How It Works
 
-Headroom runs a three-stage pipeline on every request:
+Headroom runs a two-stage pipeline on every request:
 
 ```mermaid
 graph LR
     A[Your Prompt] --> B[CacheAligner]
     B --> C[ContentRouter]
-    C --> D[IntelligentContext]
-    D --> E[LLM Provider]
+    C --> E[LLM Provider]
 
     C -->|JSON| F[SmartCrusher]
     C -->|Code| G[CodeCompressor]
     C -->|Text| H[Kompress]
     C -->|Logs| I[LogCompressor]
 
-    F --> D
-    G --> D
-    H --> D
-    I --> D
+    F --> E
+    G --> E
+    H --> E
+    I --> E
 ```
 
 **Stage 1: CacheAligner** — Stabilizes message prefixes so the provider's KV cache actually hits. Claude offers a 90% read discount on cached prefixes; CacheAligner makes that work.
@@ -270,7 +269,7 @@ graph LR
 | Git diffs | **DiffCompressor** | Preserves change hunks, drops unchanged context. |
 | HTML | **HTMLExtractor** | Strips markup, extracts readable content. |
 
-**Stage 3: IntelligentContext** — If the conversation still exceeds the model's context limit, scores each message by importance (recency, references, density) and drops the lowest-value ones.
+Context management is handled automatically inside the pipeline (live-zone-only compression): Headroom compresses only the newest content blocks (the latest user message and tool results) and never drops messages from history. The system prompt, tool definitions, and older turns — the provider cache hot zone — are left untouched so prompt caching keeps working.
 
 **Nothing is lost.** Compressed content goes into the CCR store (Compress-Cache-Retrieve). The LLM gets a `headroom_retrieve` tool and can fetch full originals when it needs more detail.
 
@@ -392,6 +391,7 @@ Or via LiteLLM for 100+ providers (Together, Groq, Fireworks, Ollama, vLLM, etc.
 ## Installation
 
 ```bash
+uv tool install --python 3.13 "headroom-ai[all]"  # CLI on macOS Apple Silicon/Linux
 pip install headroom-ai                # Core library (Python)
 pip install "headroom-ai[all]"         # Everything (recommended)
 npm install headroom-ai                # TypeScript / Node.js
@@ -402,7 +402,8 @@ pip install "headroom-ai[agno]"        # Agno integration
 pip install "headroom-ai[evals]"       # Evaluation framework
 ```
 
-Requires Python 3.10+.
+Requires Python 3.10+. On macOS, use Python 3.13 for the uv/pipx CLI path if
+your default `python3` is newer than the current wheel set.
 
 ---
 

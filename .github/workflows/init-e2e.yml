@@ -3,8 +3,12 @@ name: Init E2E
 on:
   pull_request:
     branches: [main]
+    # Scoped to what the `headroom init` flow actually exercises (mirrors
+    # init-native-e2e), not all of headroom/** — a pure-Python logic change
+    # elsewhere shouldn't spin up a docker init E2E.
     paths:
-      - 'headroom/**'
+      - 'headroom/cli/**'
+      - 'headroom/install/**'
       - 'crates/**'
       - 'docker/**'
       - 'Dockerfile'
@@ -33,7 +37,7 @@ jobs:
     timeout-minutes: 45
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Build init e2e image
         run: docker build -f e2e/init/Dockerfile -t headroom-init-e2e .

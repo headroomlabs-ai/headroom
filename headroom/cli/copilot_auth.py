@@ -6,7 +6,7 @@ import click
 
 from headroom.cli.main import main
 from headroom.copilot_auth import (
-    DEFAULT_GITHUB_HOST,
+    default_oauth_domain,
     headroom_copilot_auth_path,
     poll_copilot_device_authorization,
     read_headroom_copilot_oauth_token,
@@ -24,15 +24,16 @@ def copilot_auth() -> None:
 @copilot_auth.command("login")
 @click.option(
     "--domain",
-    default=DEFAULT_GITHUB_HOST,
-    show_default=True,
+    default=None,
     help=(
-        "GitHub login domain. Use github.com for GitHub.com Enterprise Cloud; "
-        "only pass a custom hostname for GitHub Enterprise Server."
+        "GitHub login domain. Defaults to GITHUB_COPILOT_ENTERPRISE_URL if set, "
+        "otherwise github.com."
     ),
 )
-def login(domain: str) -> None:
+def login(domain: str | None) -> None:
     """Sign in with GitHub's Copilot OAuth device-code flow."""
+
+    domain = domain or default_oauth_domain()
 
     try:
         device = start_copilot_device_authorization(domain=domain)

@@ -24,6 +24,30 @@ from headroom.transforms.diff_compressor import (
 )
 
 
+def _fake_diff_result(compressed: str = "compressed") -> DiffCompressionResult:
+    return DiffCompressionResult(
+        compressed=compressed,
+        original_line_count=1,
+        compressed_line_count=1,
+        files_affected=1,
+        additions=0,
+        deletions=0,
+        hunks_kept=1,
+        hunks_removed=0,
+    )
+
+
+class _FakeRustDiffCompressor:
+    def __init__(self) -> None:
+        self.contexts: list[str] = []
+
+    def compress(self, content: str, context: str):
+        if context is None:
+            raise AssertionError("Rust diff compressor received None context")
+        self.contexts.append(context)
+        return _fake_diff_result(content)
+
+
 class TestContextReduction:
     """Tests for context line reduction."""
 
@@ -372,6 +396,32 @@ class TestEdgeCases:
 
         # Should not crash
         assert result.compressed is not None
+
+
+class TestContextNormalization:
+    """Tests for the Python-to-Rust diff compressor boundary."""
+
+    def test_none_and_omitted_context_become_empty_string(self) -> None:
+        compressor = object.__new__(DiffCompressor)
+        fake_rust = _FakeRustDiffCompressor()
+        compressor._rust = fake_rust
+
+        diff = "diff --git a/file.py b/file.py\n--- a/file.py\n+++ b/file.py\n"
+
+        compressor.compress(diff, context=None)
+        compressor.compress(diff)
+
+        assert fake_rust.contexts == ["", ""]
+
+    def test_non_empty_context_passes_through_unchanged(self) -> None:
+        compressor = object.__new__(DiffCompressor)
+        fake_rust = _FakeRustDiffCompressor()
+        compressor._rust = fake_rust
+
+        diff = "diff --git a/file.py b/file.py\n--- a/file.py\n+++ b/file.py\n"
+        compressor.compress(diff, context="question context")
+
+        assert fake_rust.contexts == ["question context"]
 
 
 class TestConfigOptions:

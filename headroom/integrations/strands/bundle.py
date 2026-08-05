@@ -11,11 +11,14 @@ Strands-native primitives:
   needs the original; Strands' MCP dispatcher resolves it via this
   server. Works identically in streaming and non-streaming.
 
-* **Serena MCP** — semantic code intelligence (symbol search,
-  references, etc.). Auto-installed via ``uvx`` on first launch.
+* **Serena MCP** — the coding-task compressor (symbol search,
+  references, call chains, impact analysis) so the agent queries
+  the code graph instead of reading whole files. Auto-installed via
+  ``uvx`` on first launch. On by default; disable with
+  ``enable_serena_mcp=False``.
 
-* **HeadroomHookProvider** — the RTK-equivalent for Strands.
-  Compresses tool outputs in-place via ``AfterToolCallEvent`` so
+* **HeadroomHookProvider** — the in-process tool-output compressor
+  for Strands. Compresses tool outputs in-place via ``AfterToolCallEvent`` so
   verbose JSON / log / search outputs are shrunk before they
   pollute the agent's context.
 
@@ -89,8 +92,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_SERENA_CONTEXT = "ide-assistant"
 
 
-def _make_headroom_client(proxy_url: str) -> MCPClient:
-    spec = build_headroom_spec(proxy_url)
+def _client_for(spec: Any) -> MCPClient:
     params = StdioServerParameters(
         command=spec.command,
         args=list(spec.args),
@@ -100,14 +102,12 @@ def _make_headroom_client(proxy_url: str) -> MCPClient:
     return MCPClient(partial(stdio_client, params))
 
 
+def _make_headroom_client(proxy_url: str) -> MCPClient:
+    return _client_for(build_headroom_spec(proxy_url))
+
+
 def _make_serena_client(context: str) -> MCPClient:
-    spec = build_serena_spec(context)
-    params = StdioServerParameters(
-        command=spec.command,
-        args=list(spec.args),
-        env=dict(spec.env) if spec.env else None,
-    )
-    return MCPClient(partial(stdio_client, params))
+    return _client_for(build_serena_spec(context))
 
 
 @dataclass
@@ -120,11 +120,10 @@ class HeadroomBundle:
             (``http://127.0.0.1:8787``).
         serena_context: Serena context label. Default ``"ide-assistant"``.
         enable_headroom_mcp: Include the Headroom MCP server. Default True.
-        enable_serena_mcp: Include the Serena MCP server. Default True.
-            Disabling skips the ``uvx`` first-launch download entirely.
+        enable_serena_mcp: Include the Serena MCP server — the coding-task
+            compressor. Default True. Adds a ``uvx`` first-launch download.
         enable_hooks: Include :class:`HeadroomHookProvider` for in-place
-            tool-output compression (the RTK-equivalent for Strands).
-            Default True.
+            tool-output compression. Default True.
         config: Optional :class:`HeadroomConfig` passed to
             :class:`HeadroomHookProvider`. Default uses framework
             defaults.
@@ -138,6 +137,7 @@ class HeadroomBundle:
     proxy_url: str = DEFAULT_PROXY_URL
     serena_context: str = DEFAULT_SERENA_CONTEXT
     enable_headroom_mcp: bool = True
+    # Serena is the coding-task compressor (symbol-level code navigation).
     enable_serena_mcp: bool = True
     # The proxy is the single source of truth for compression — it sees
     # the full message list, owns CompressionPolicy, owns PrefixCacheTracker,
@@ -164,7 +164,7 @@ class HeadroomBundle:
         if self.enable_serena_mcp:
             self._serena_mcp = _make_serena_client(self.serena_context)
             logger.info(
-                "HeadroomBundle: Serena MCP client constructed (context=%s)",
+                "HeadroomBundle: Serena MCP client constructed (code memory, context=%s)",
                 self.serena_context,
             )
         if self.enable_hooks:

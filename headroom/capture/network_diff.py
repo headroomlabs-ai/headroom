@@ -10,11 +10,14 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+logger = logging.getLogger(__name__)
 
 SENSITIVE_HEADER_PARTS = ("authorization", "api-key", "apikey", "token", "secret", "cookie")
 SENSITIVE_QUERY_PARTS = ("key", "token", "secret", "signature", "code")
@@ -168,13 +171,22 @@ def load_capture_file(path: str | Path, *, fallback_lane: str) -> list[CapturedE
 
     exchanges: list[CapturedExchange] = []
     capture_path = Path(path)
+    skipped = 0
     for line_number, line in enumerate(capture_path.read_text(encoding="utf-8").splitlines(), 1):
         if not line.strip():
             continue
-        record = json.loads(line)
+        # mitmproxy captures can be truncated mid-write; skip a corrupt line
+        # rather than aborting the whole diff with a raw JSONDecodeError.
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            skipped += 1
+            continue
         exchanges.append(
             exchange_from_record(record, fallback_lane=fallback_lane, sequence=line_number)
         )
+    if skipped:
+        logger.warning("Skipped %d malformed line(s) in capture file %s", skipped, capture_path)
     return exchanges
 
 

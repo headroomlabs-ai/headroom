@@ -47,8 +47,10 @@ HEADROOM_WORKSPACE_DIR_ENV = "HEADROOM_WORKSPACE_DIR"
 # ---------------------------------------------------------------------------
 
 HEADROOM_SAVINGS_PATH_ENV = "HEADROOM_SAVINGS_PATH"
+HEADROOM_SAVINGS_EVENTS_PATH_ENV = "HEADROOM_SAVINGS_EVENTS_PATH"
 HEADROOM_TOIN_PATH_ENV = "HEADROOM_TOIN_PATH"
 HEADROOM_SUBSCRIPTION_STATE_PATH_ENV = "HEADROOM_SUBSCRIPTION_STATE_PATH"
+HEADROOM_SETTINGS_PATH_ENV = "HEADROOM_SETTINGS_PATH"
 
 # ---------------------------------------------------------------------------
 # Default sub-path fragments
@@ -59,6 +61,7 @@ _CONFIG_DIR_DEFAULT_SUFFIX = "config"
 
 # Resource file/sub-dir names (kept here so nothing else has to hardcode them)
 _SAVINGS_FILE = "proxy_savings.json"
+_SETTINGS_FILE = "settings.json"
 _TOIN_FILE = "toin.json"
 _MODELS_FILE = "models.json"
 _SUBSCRIPTION_FILE = "subscription_state.json"
@@ -66,6 +69,7 @@ _MEMORY_DB_FILE = "memory.db"
 _MEMORIES_DIR = "memories"
 _LICENSE_CACHE_FILE = "license_cache.json"
 _SESSION_STATS_FILE = "session_stats.jsonl"
+_SAVINGS_EVENTS_FILE = "savings_events.jsonl"
 _SYNC_STATE_FILE = "sync_state.json"
 _BRIDGE_STATE_FILE = "bridge_state.json"
 _LOGS_DIR = "logs"
@@ -74,10 +78,6 @@ _DEBUG_400_DIR = "debug_400"
 _CODEX_WIRE_DEBUG_DIR = "codex_wire"
 _BIN_DIR = "bin"
 _PROXY_CLIENTS_DIR = "clients"
-_RTK_UNIX = "rtk"
-_RTK_WIN = "rtk.exe"
-_LEAN_CTX_UNIX = "lean-ctx"
-_LEAN_CTX_WIN = "lean-ctx.exe"
 _DEPLOY_DIR = "deploy"
 _PLUGINS_DIR = "plugins"
 
@@ -91,6 +91,35 @@ def _env(name: str) -> str:
     """Return a trimmed environment value, or ``""`` when unset/blank."""
 
     return os.environ.get(name, "").strip()
+
+
+# ---------------------------------------------------------------------------
+# Process-wide stateless flag
+# ---------------------------------------------------------------------------
+# Stateless mode forbids writes to the workspace. Many persisters are
+# module-level singletons reached without a config object, so the proxy records
+# the mode here once at startup and writers consult ``process_is_stateless()``.
+
+_PROCESS_STATELESS: bool = False
+
+
+def set_process_stateless(value: bool) -> None:
+    """Record process-wide stateless mode (set once at proxy startup)."""
+
+    global _PROCESS_STATELESS
+    _PROCESS_STATELESS = bool(value)
+
+
+def process_is_stateless() -> bool:
+    """True when the process must not write to the workspace.
+
+    True if ``set_process_stateless(True)`` was called OR the ``HEADROOM_STATELESS``
+    environment variable is set, so non-proxy entrypoints honor it too.
+    """
+
+    if _PROCESS_STATELESS:
+        return True
+    return _env("HEADROOM_STATELESS").lower() in ("1", "true", "yes", "on")
 
 
 def _resolve(explicit: str | os.PathLike[str] | None, env_var: str, derived: Path) -> Path:
@@ -179,6 +208,16 @@ def savings_path(explicit: str | os.PathLike[str] | None = None) -> Path:
     )
 
 
+def settings_path(explicit: str | os.PathLike[str] | None = None) -> Path:
+    """Return the path for the dashboard-managed settings JSON file."""
+
+    return _resolve(
+        explicit,
+        HEADROOM_SETTINGS_PATH_ENV,
+        workspace_dir() / _SETTINGS_FILE,
+    )
+
+
 def toin_path(explicit: str | os.PathLike[str] | None = None) -> Path:
     """Return the path for the TOIN telemetry JSON file.
 
@@ -226,6 +265,21 @@ def session_stats_path() -> Path:
     """Return the path for the per-session stats JSONL file."""
 
     return workspace_dir() / _SESSION_STATS_FILE
+
+
+def savings_events_path(explicit: str | os.PathLike[str] | None = None) -> Path:
+    """Return the path for the durable append-only savings event ledger.
+
+    Unlike :func:`session_stats_path` (pruned to a short rolling window), this
+    file accrues one line per compression across proxy restarts and concurrent
+    MCP processes, and is the source of truth for ``headroom savings``.
+    """
+
+    return _resolve(
+        explicit,
+        HEADROOM_SAVINGS_EVENTS_PATH_ENV,
+        workspace_dir() / _SAVINGS_EVENTS_FILE,
+    )
 
 
 def sync_state_path() -> Path:
@@ -276,20 +330,6 @@ def proxy_clients_dir(port: int) -> Path:
     return workspace_dir() / _PROXY_CLIENTS_DIR / str(port)
 
 
-def rtk_path() -> Path:
-    """Return the path to the vendored ``rtk`` binary."""
-
-    name = _RTK_WIN if os.name == "nt" else _RTK_UNIX
-    return bin_dir() / name
-
-
-def lean_ctx_path() -> Path:
-    """Return the path to the vendored ``lean-ctx`` binary."""
-
-    name = _LEAN_CTX_WIN if os.name == "nt" else _LEAN_CTX_UNIX
-    return bin_dir() / name
-
-
 def deploy_root() -> Path:
     """Return the root directory for persistent deployment profiles."""
 
@@ -324,19 +364,38 @@ def models_config_path() -> Path:
 # ---------------------------------------------------------------------------
 
 
+def _validate_plugin_name(plugin_name: str) -> None:
+    """Reject plugin names that would escape the ``plugins/`` sandbox.
+
+    Path separators (``/``, ``\\``) are rejected so a name cannot address a
+    subdirectory. ``.`` and ``..`` are rejected because ``plugins / ".."``
+    resolves to the plugins-parent (i.e. the whole config/workspace root),
+    handing a plugin read/write access to every other plugin's state and the
+    workspace's savings ledger, memory DB, license cache, and logs. NUL is
+    rejected because it terminates paths on POSIX APIs.
+    """
+
+    if (
+        not plugin_name
+        or plugin_name in {".", ".."}
+        or "/" in plugin_name
+        or "\\" in plugin_name
+        or "\x00" in plugin_name
+    ):
+        raise ValueError(f"invalid plugin name: {plugin_name!r}")
+
+
 def plugin_config_dir(plugin_name: str) -> Path:
     """Return the config directory for a named plugin."""
 
-    if not plugin_name or "/" in plugin_name or "\\" in plugin_name:
-        raise ValueError(f"invalid plugin name: {plugin_name!r}")
+    _validate_plugin_name(plugin_name)
     return config_dir() / _PLUGINS_DIR / plugin_name
 
 
 def plugin_workspace_dir(plugin_name: str) -> Path:
     """Return the workspace directory for a named plugin."""
 
-    if not plugin_name or "/" in plugin_name or "\\" in plugin_name:
-        raise ValueError(f"invalid plugin name: {plugin_name!r}")
+    _validate_plugin_name(plugin_name)
     return workspace_dir() / _PLUGINS_DIR / plugin_name
 
 
@@ -344,8 +403,12 @@ __all__ = [
     "HEADROOM_CONFIG_DIR_ENV",
     "HEADROOM_WORKSPACE_DIR_ENV",
     "HEADROOM_SAVINGS_PATH_ENV",
+    "HEADROOM_SAVINGS_EVENTS_PATH_ENV",
     "HEADROOM_TOIN_PATH_ENV",
     "HEADROOM_SUBSCRIPTION_STATE_PATH_ENV",
+    "HEADROOM_SETTINGS_PATH_ENV",
+    "set_process_stateless",
+    "process_is_stateless",
     "config_dir",
     "workspace_dir",
     "ensure_config_dir",
@@ -357,6 +420,8 @@ __all__ = [
     "native_memory_dir",
     "license_cache_path",
     "session_stats_path",
+    "savings_events_path",
+    "settings_path",
     "sync_state_path",
     "bridge_state_path",
     "log_dir",
@@ -365,8 +430,6 @@ __all__ = [
     "codex_wire_debug_dir",
     "bin_dir",
     "proxy_clients_dir",
-    "rtk_path",
-    "lean_ctx_path",
     "deploy_root",
     "beacon_lock_path",
     "models_config_path",

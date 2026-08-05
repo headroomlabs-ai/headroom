@@ -46,6 +46,7 @@ def _load_handler_module(monkeypatch: pytest.MonkeyPatch, module_name: str, rela
     httpx_mod.ConnectError = type("ConnectError", (Exception,), {})
     httpx_mod.ConnectTimeout = type("ConnectTimeout", (Exception,), {})
     httpx_mod.PoolTimeout = type("PoolTimeout", (Exception,), {})
+    httpx_mod.ReadTimeout = type("ReadTimeout", (Exception,), {})
     monkeypatch.setitem(sys.modules, "httpx", httpx_mod)
 
     responses_mod = types.ModuleType("fastapi.responses")
@@ -227,3 +228,42 @@ def test_streaming_response_applies_copilot_auth(monkeypatch: pytest.MonkeyPatch
     assert sent_headers["Authorization"] == "Bearer upstream-token"
     assert sent_headers["content-type"] == "application/json"
     assert response.status_code == 200
+
+
+def test_openai_chat_routes_copilot_requests_per_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    openai_mod = _load_handler_module(
+        monkeypatch,
+        "tests.headroom_proxy_handlers_openai",
+        "headroom/proxy/handlers/openai.py",
+    )
+
+    copilot_base = "https://api.githubcopilot.com"
+    gpt54_mini_url = openai_mod.build_copilot_upstream_url(
+        copilot_base,
+        openai_mod._resolve_openai_handler_path(
+            {},
+            handler_path=openai_mod._resolve_openai_chat_handler_path(copilot_base, "gpt-5.4-mini"),
+        ),
+    )
+    claude_url = openai_mod.build_copilot_upstream_url(
+        copilot_base,
+        openai_mod._resolve_openai_handler_path(
+            {},
+            handler_path=openai_mod._resolve_openai_chat_handler_path(
+                copilot_base, "claude-sonnet-5"
+            ),
+        ),
+    )
+    openai_url = openai_mod.build_copilot_upstream_url(
+        "https://api.openai.com",
+        openai_mod._resolve_openai_handler_path(
+            {},
+            handler_path=openai_mod._resolve_openai_chat_handler_path(
+                "https://api.openai.com", "gpt-5.4-mini"
+            ),
+        ),
+    )
+
+    assert gpt54_mini_url == "https://api.githubcopilot.com/responses"
+    assert claude_url == "https://api.githubcopilot.com/chat/completions"
+    assert openai_url == "https://api.openai.com/v1/chat/completions"

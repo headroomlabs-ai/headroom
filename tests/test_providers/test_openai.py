@@ -21,6 +21,18 @@ class TestOpenAITokenCounting:
         count = openai_tokenizer.count_text(text)
         assert count > 0
 
+    def test_count_text_allows_literal_special_tokens(self, openai_tokenizer):
+        """count_text must not raise on literal tiktoken special-token strings.
+
+        Regression: a /v1/responses request whose context contained the literal
+        "<|endoftext|>" made tiktoken raise ValueError (default
+        disallowed_special="all"), which the proxy turned into an HTTP 413
+        compression_refused. Markers must be counted as ordinary text instead.
+        """
+        text = "before <|endoftext|> after"
+        count = openai_tokenizer.count_text(text)
+        assert count > openai_tokenizer.count_text("before  after")
+
     def test_count_messages_single(self, openai_tokenizer):
         messages = [{"role": "user", "content": "Hello"}]
         count = openai_tokenizer.count_messages(messages)

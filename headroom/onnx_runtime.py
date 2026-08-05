@@ -3,11 +3,81 @@
 from __future__ import annotations
 
 import ctypes
+import logging
+import os
 import sys
 from typing import Any
 
+logger = logging.getLogger(__name__)
 
-def hf_hub_download_local_first(repo_id: str, filename: str, *, allow_network: bool = True) -> str:
+# Override for the CPU memory-arena default below: "1"/"true" forces the
+# arena ON, "0"/"false" forces it OFF, unset/"auto" uses the platform default.
+ONNX_CPU_ARENA_ENV = "HEADROOM_ONNX_CPU_ARENA"
+
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+_FALSY = frozenset({"0", "false", "no", "off"})
+
+
+def _env_flag(name: str) -> bool | None:
+    raw = os.environ.get(name, "").strip().lower()
+    if raw in _TRUTHY:
+        return True
+    if raw in _FALSY:
+        return False
+    if raw and raw != "auto":
+        logger.warning("%s must be a boolean or 'auto', got %r; using auto", name, raw)
+    return None
+
+
+def cpu_arena_enabled() -> bool:
+    """Whether ONNX Runtime's CPU memory arena should stay enabled.
+
+    Disabling the arena trades peak throughput for lower retained RSS, which
+    is the right call on the small Linux VMs Headroom commonly runs on. On
+    Windows the same setting is catastrophic: without the arena every
+    ``Run()`` falls back to per-node VirtualAlloc/free, slowing transformer
+    inference by 2-3 orders of magnitude (onnxruntime#11627). That turned
+    every compression into a >30s timeout for Windows proxy users, so the
+    arena stays at ORT's default (enabled) there.
+    """
+    override = _env_flag(ONNX_CPU_ARENA_ENV)
+    if override is not None:
+        return override
+    return sys.platform == "win32"
+
+
+# Pin model artifacts to immutable commit SHAs so a changed or compromised
+# upstream HuggingFace repo cannot be pulled silently (supply-chain integrity).
+# Repos not listed here fall back to the floating default ref. Set
+# HEADROOM_HF_PIN=off to bypass pinning (e.g. when intentionally evaluating a
+# newer model revision). To upgrade a model, bump its SHA here deliberately.
+_PINNED_REVISIONS: dict[str, str] = {
+    # chopratejas/kompress-v2-base @ 2026-06-10
+    "chopratejas/kompress-v2-base": "b1563631b35bfdcee37587ad530147497d820d4c",
+    "chopratejas/technique-router-onnx": "27b0b4bfa510a1cff66d888072c0b807082721a8",
+    "chopratejas/siglip-image-encoder-onnx": "d0a9fbd66d4bd8c761bff592d44831f7c2ae184e",
+    # Third-party repo — pinning matters most here.
+    "Qdrant/all-MiniLM-L6-v2-onnx": "5f1b8cd78bc4fb444dd171e59b18f3a3af89a079",
+}
+
+
+def _resolve_revision(repo_id: str, revision: str | None) -> str | None:
+    """Resolve the HF revision to download: explicit arg wins, else the pinned
+    SHA for a known repo, else ``None`` (floating ref)."""
+    if revision is not None:
+        return revision
+    if os.environ.get("HEADROOM_HF_PIN", "").strip().lower() in ("off", "0", "false", "no"):
+        return None
+    return _PINNED_REVISIONS.get(repo_id)
+
+
+def hf_hub_download_local_first(
+    repo_id: str,
+    filename: str,
+    *,
+    allow_network: bool = True,
+    revision: str | None = None,
+) -> str:
     """Download a file from HuggingFace Hub, preferring the local cache.
 
     Tries ``local_files_only=True`` first to avoid a network HEAD request when
@@ -21,6 +91,10 @@ def hf_hub_download_local_first(repo_id: str, filename: str, *, allow_network: b
             a cache miss re-raises the local-lookup error. Used by startup
             preload so a cold cache cannot block (or, via native crashes in the
             download stack, kill) the process before it binds its port.
+        revision: Explicit git revision (commit SHA / tag / branch). When
+            ``None``, a pinned SHA is applied for known repos (see
+            ``_PINNED_REVISIONS``) for supply-chain integrity; unknown repos use
+            the floating default ref.
 
     Returns:
         Absolute path to the local cached file.
@@ -33,12 +107,33 @@ def hf_hub_download_local_first(repo_id: str, filename: str, *, allow_network: b
     from huggingface_hub import hf_hub_download
     from huggingface_hub.errors import EntryNotFoundError, LocalEntryNotFoundError
 
+    revision = _resolve_revision(repo_id, revision)
+
     try:
-        return str(hf_hub_download(repo_id, filename, local_files_only=True))
+        return str(hf_hub_download(repo_id, filename, revision=revision, local_files_only=True))
     except (LocalEntryNotFoundError, EntryNotFoundError, OSError):
         if not allow_network:
             raise
-        return str(hf_hub_download(repo_id, filename))
+        return str(hf_hub_download(repo_id, filename, revision=revision))
+
+
+def hf_entry_known_absent(repo_id: str, filename: str, *, revision: str | None = None) -> bool:
+    """True only if a prior network lookup already confirmed ``filename`` does
+    not exist in ``repo_id`` at the resolved revision.
+
+    Backed by ``huggingface_hub``'s own cache of negative lookups (the
+    ``.no_exist`` marker written after a real 404), so this never makes a
+    network call itself. Returns ``False`` both when the file is cached and
+    when nothing is known yet about it, on purpose: callers in a cache-only
+    (``allow_network=False``) code path can use this to tell "confirmed
+    missing upstream, safe to use a fallback file" apart from "just never
+    checked yet, do not guess."
+    """
+    from huggingface_hub import _CACHED_NO_EXIST, try_to_load_from_cache
+
+    revision = _resolve_revision(repo_id, revision)
+    result = try_to_load_from_cache(repo_id, filename, revision=revision)
+    return result is _CACHED_NO_EXIST
 
 
 def create_cpu_session_options(
@@ -53,6 +148,9 @@ def create_cpu_session_options(
     memory usage over peak ONNX throughput. Disabling ORT's CPU arena and memory
     pattern caches reduces retained anonymous RSS after variable-size inference
     workloads, which is especially important on small VMs.
+
+    The arena is left at ORT's default on Windows (see ``cpu_arena_enabled``),
+    where disabling it degrades inference latency by orders of magnitude.
     """
     sess_options = ort.SessionOptions()
 
@@ -61,10 +159,11 @@ def create_cpu_session_options(
     if inter_op_num_threads is not None:
         sess_options.inter_op_num_threads = inter_op_num_threads
 
-    if hasattr(sess_options, "enable_cpu_mem_arena"):
-        sess_options.enable_cpu_mem_arena = False
-    if hasattr(sess_options, "enable_mem_pattern"):
-        sess_options.enable_mem_pattern = False
+    if not cpu_arena_enabled():
+        if hasattr(sess_options, "enable_cpu_mem_arena"):
+            sess_options.enable_cpu_mem_arena = False
+        if hasattr(sess_options, "enable_mem_pattern"):
+            sess_options.enable_mem_pattern = False
 
     return sess_options
 

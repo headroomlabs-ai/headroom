@@ -9,8 +9,12 @@ from typing import Any, Literal, cast
 import click
 
 from headroom import paths as _paths
-from headroom.providers.registry import resolve_api_overrides, resolve_api_targets
-from headroom.proxy.modes import PROXY_MODE_TOKEN, normalize_proxy_mode
+from headroom.providers.registry import (
+    resolve_api_overrides,
+    resolve_api_targets,
+    resolve_extra_headers,
+)
+from headroom.proxy.modes import PROXY_MODE_CACHE, normalize_proxy_mode
 
 from .main import main
 
@@ -34,6 +38,20 @@ from .main import main
 os.environ.setdefault("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1")
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 
+# Corporate TLS-inspection support (issue #1308). When HEADROOM_TLS_STRICT=0,
+# strip OpenSSL's RFC 5280 strict CA-constraint check from urllib3's context
+# builder *before* huggingface_hub / requests import and cache it — otherwise
+# model downloads (huggingface.co) fail with "Basic Constraints of CA cert not
+# marked critical" behind Zscaler/Netskope on Python 3.13+. The proxy's own
+# httpx upstream client is handled separately in proxy/server.py via
+# build_httpx_verify(). No-op unless the toggle is set.
+try:  # pragma: no cover - exercised via integration, not unit-importable cheaply
+    from headroom.proxy.ssl_context import apply_global_tls_relaxation as _apply_tls_relax
+
+    _apply_tls_relax()
+except Exception:  # never let TLS relaxation wiring break startup
+    pass
+
 # Logger-level suppression: httpx HEAD/GET manifest checks + HF advisory msgs.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
@@ -47,11 +65,6 @@ warnings.filterwarnings("ignore", message=".*huggingface.*token.*", category=Use
 warnings.filterwarnings("ignore", category=UserWarning, module="huggingface_hub")
 
 # ---------------------------------------------------------------------------
-
-_CONTEXT_TOOL_ENV = "HEADROOM_CONTEXT_TOOL"
-_CONTEXT_TOOL_RTK = "rtk"
-_CONTEXT_TOOL_LEAN_CTX = "lean-ctx"
-_VALID_CONTEXT_TOOLS = {_CONTEXT_TOOL_RTK, _CONTEXT_TOOL_LEAN_CTX}
 
 
 def _get_env_bool(name: str, default: bool) -> bool:
@@ -69,25 +82,60 @@ def _get_env_bool_optional(name: str) -> bool | None:
 
 def _get_env_int_optional(name: str) -> int | None:
     val = os.environ.get(name)
-    return int(val) if val is not None and val != "" else None
+    if val is None or val == "":
+        return None
+    try:
+        return int(val)
+    except ValueError:
+        raise click.ClickException(f"{name} must be an integer, got {val!r}") from None
+
+
+def _get_env_int(name: str, default: int) -> int:
+    """Return the env var as an int, or ``default`` only when it is unset.
+
+    Unlike ``_get_env_int_optional(name) or default``, an explicit ``0`` is
+    preserved — ``0`` is a legitimate value (e.g. ``HEADROOM_MIN_TOKENS=0``
+    means "crush every item") and ``0 or default`` would silently discard it.
+    Mirrors ``headroom.proxy.server._get_env_int``.
+    """
+    value = _get_env_int_optional(name)
+    return default if value is None else value
 
 
 def _get_env_float_optional(name: str) -> float | None:
     val = os.environ.get(name)
-    return float(val) if val is not None and val != "" else None
+    if val is None or val == "":
+        return None
+    try:
+        return float(val)
+    except ValueError:
+        raise click.ClickException(f"{name} must be a number, got {val!r}") from None
 
 
-def _selected_context_tool() -> str:
-    raw = os.environ.get(_CONTEXT_TOOL_ENV, "").strip().lower().replace("_", "-")
-    if not raw:
-        return _CONTEXT_TOOL_RTK
-    if raw == "leanctx":
-        raw = _CONTEXT_TOOL_LEAN_CTX
-    if raw not in _VALID_CONTEXT_TOOLS:
-        raise click.ClickException(
-            f"{_CONTEXT_TOOL_ENV} must be one of: {', '.join(sorted(_VALID_CONTEXT_TOOLS))}"
-        )
-    return raw
+@main.command()
+@click.option(
+    "--port",
+    "-p",
+    default=8787,
+    type=click.IntRange(1, 65535),
+    envvar="HEADROOM_PORT",
+    help="Proxy port (default: 8787, env: HEADROOM_PORT)",
+)
+@click.option("--no-open", is_flag=True, help="Print the URL instead of opening a browser")
+def dashboard(port: int, no_open: bool) -> None:
+    """Open the Headroom savings dashboard in your browser.
+
+    Requires a running proxy (start one with `headroom proxy` or `headroom wrap ...`).
+    """
+    import webbrowser
+
+    url = f"http://127.0.0.1:{port}/dashboard"
+    click.echo(f"  Dashboard: {url}")
+    if not no_open:
+        try:
+            webbrowser.open(url)
+        except Exception:  # noqa: BLE001 — headless/no browser: URL already printed
+            pass
 
 
 @main.command()
@@ -101,7 +149,7 @@ def _selected_context_tool() -> str:
     "--port",
     "-p",
     default=8787,
-    type=int,
+    type=click.IntRange(1, 65535),
     envvar="HEADROOM_PORT",
     help="Port to bind to (default: 8787, env: HEADROOM_PORT)",
 )
@@ -138,6 +186,34 @@ def _selected_context_tool() -> str:
     help="Maximum upstream keep-alive connections (default: 100, env: HEADROOM_MAX_KEEPALIVE)",
 )
 @click.option(
+    "--http2/--no-http2",
+    "http2",
+    default=True,
+    envvar="HEADROOM_HTTP2",
+    help=(
+        "Use HTTP/2 to upstream providers (default: on, env: HEADROOM_HTTP2). "
+        "Disable to force HTTP/1.1, which avoids shared-connection TLS corruption "
+        "(SSLV3_ALERT_BAD_RECORD_MAC) when many concurrent streams are cancelled."
+    ),
+)
+@click.option(
+    "--http-proxy",
+    default=None,
+    envvar="HEADROOM_HTTP_PROXY",
+    help=(
+        "HTTP proxy URL for upstream provider requests only "
+        "(HTTPS uses CONNECT; env: HEADROOM_HTTP_PROXY)."
+    ),
+)
+@click.option(
+    "--keepalive-expiry",
+    "keepalive_expiry",
+    default=90.0,
+    type=click.FloatRange(min=0),
+    envvar="HEADROOM_KEEPALIVE_EXPIRY",
+    help="Seconds an idle upstream keep-alive connection is kept open (default: 90, env: HEADROOM_KEEPALIVE_EXPIRY)",
+)
+@click.option(
     "--mode",
     default=None,
     metavar="[token|cache]",
@@ -157,11 +233,24 @@ def _selected_context_tool() -> str:
         case_sensitive=False,
     ),
     help=(
-        "Optimization mode (default: token).\n"
+        "Optimization mode (default: cache).\n"
         "  token  — prioritize compression; prior turns may be rewritten for max savings.\n"
         "  cache  — freeze prior turns to maximise provider prefix-cache hit rate.\n"
         "Legacy aliases (token_mode, token_savings, token_headroom, cache_mode, "
         "cost_savings) are still accepted. Env: HEADROOM_MODE."
+    ),
+)
+@click.option(
+    "--target-ratio",
+    type=float,
+    default=None,
+    show_default=True,
+    envvar="HEADROOM_TARGET_RATIO",
+    help=(
+        "Override Kompress keep-ratio for text (prose/code) compression — lower is "
+        "more aggressive (e.g. 0.4 keeps ~40% of tokens). Unset (default): let "
+        "Kompress decide via its own importance threshold (conservative). "
+        "Env: HEADROOM_TARGET_RATIO."
     ),
 )
 @click.option(
@@ -176,20 +265,53 @@ def _selected_context_tool() -> str:
 @click.option("--no-cache", is_flag=True, help="Disable semantic caching")
 @click.option("--no-rate-limit", is_flag=True, help="Disable rate limiting")
 @click.option(
-    "--no-ccr-inject-tool",
-    is_flag=True,
-    envvar="HEADROOM_NO_CCR_INJECT_TOOL",
+    "--protect-tool-results",
+    default=None,
+    envvar="HEADROOM_PROTECT_TOOL_RESULTS",
     help=(
-        "Don't inject the CCR headroom_retrieve tool. Run compression-only — "
-        "for streaming / non-MCP clients that can't resolve the retrieve tool "
-        "and would otherwise error on it. Env: HEADROOM_NO_CCR_INJECT_TOOL."
+        "Comma-separated tool names whose results are never lossy-compressed, "
+        "merged with the built-in defaults (e.g. Bash,WebFetch). "
+        "In token mode, this also resets protect_recent_reads_fraction "
+        "from 0.3 (only recent ~30% of results protected) to 0.0 (all "
+        "results protected indefinitely), which prevents older Read/Glob/"
+        "Grep/Write/Edit tool results from being silently compressed. "
+        "Env: HEADROOM_PROTECT_TOOL_RESULTS."
     ),
 )
 @click.option(
-    "--no-ccr-marker",
+    "--rpm",
+    default=None,
+    type=click.IntRange(min=1),
+    envvar="HEADROOM_RPM",
+    help="Max requests per minute. Env: HEADROOM_RPM. Default: 60.",
+)
+@click.option(
+    "--tpm",
+    default=None,
+    type=click.IntRange(min=1),
+    envvar="HEADROOM_TPM",
+    help="Max tokens per minute. Env: HEADROOM_TPM. Default: 100000.",
+)
+@click.option(
+    "--no-ccr",
     is_flag=True,
-    envvar="HEADROOM_NO_CCR_MARKER",
-    help=("Don't add CCR retrieval markers to compressed content. Env: HEADROOM_NO_CCR_MARKER."),
+    envvar="HEADROOM_NO_CCR",
+    help=(
+        "Disable CCR entirely: no retrieval markers in compressed content AND no "
+        "headroom_retrieve tool injected. Lossy compression with no recovery path "
+        "(maximum savings; also right for streaming / non-MCP clients that can't "
+        "resolve an injected tool). Env: HEADROOM_NO_CCR."
+    ),
+)
+@click.option(
+    "--lossless",
+    is_flag=True,
+    envvar="HEADROOM_LOSSLESS",
+    help=(
+        "No-CCR lossless mode: compress tool outputs with format-native lossless "
+        "compaction (and marker-free SmartCrusher) without emitting any CCR "
+        "retrieval marker, so no MCP retrieve tool is needed. Env: HEADROOM_LOSSLESS=1."
+    ),
 )
 @click.option(
     "--no-ccr-proactive-expansion",
@@ -209,6 +331,20 @@ def _selected_context_tool() -> str:
         "Enable a registered proxy extension by entry-point name (opt-in). "
         "Repeat the flag or pass a comma-separated list. Use '*' to enable "
         "every discovered extension. Env: HEADROOM_PROXY_EXTENSIONS."
+    ),
+)
+@click.option(
+    "--compressor",
+    "compressor",
+    multiple=True,
+    envvar="HEADROOM_COMPRESSORS",
+    help=(
+        "Restrict the active built-in compressors to the named set (opt-in). "
+        "Repeat the flag or pass a comma-separated list; recognized names are "
+        "smart_crusher, kompress, code_aware, search, log, tabular, config, "
+        "html, image. Unselected built-ins are disabled; '*' selects all. "
+        "Omit to keep every compressor enabled (default). "
+        "Env: HEADROOM_COMPRESSORS."
     ),
 )
 @click.option(
@@ -242,6 +378,37 @@ def _selected_context_tool() -> str:
     ),
 )
 @click.option(
+    "--retry-base-delay-ms",
+    type=click.IntRange(min=0),
+    default=None,
+    envvar="HEADROOM_RETRY_BASE_DELAY_MS",
+    help=(
+        "Initial upstream retry delay in milliseconds (minimum: 0, default: 1000). "
+        "Env: HEADROOM_RETRY_BASE_DELAY_MS."
+    ),
+)
+@click.option(
+    "--retry-max-delay-ms",
+    type=click.IntRange(min=0),
+    default=None,
+    envvar="HEADROOM_RETRY_MAX_DELAY_MS",
+    help=(
+        "Maximum upstream retry delay in milliseconds (minimum: 0, default: 30000). "
+        "Env: HEADROOM_RETRY_MAX_DELAY_MS."
+    ),
+)
+@click.option(
+    "--request-timeout-seconds",
+    type=int,
+    default=None,
+    envvar="HEADROOM_REQUEST_TIMEOUT",
+    help=(
+        "Request timeout in seconds (default: 300). "
+        "Useful for slow providers (eg local). "
+        "Env: HEADROOM_REQUEST_TIMEOUT."
+    ),
+)
+@click.option(
     "--connect-timeout-seconds",
     type=click.IntRange(min=1, max=300),
     default=None,
@@ -249,6 +416,17 @@ def _selected_context_tool() -> str:
     help=(
         "Upstream connection timeout in seconds (1–300, default: 10). "
         "Env: HEADROOM_CONNECT_TIMEOUT_SECONDS."
+    ),
+)
+@click.option(
+    "--anthropic-buffered-request-timeout-seconds",
+    type=click.IntRange(min=1),
+    default=None,
+    envvar="HEADROOM_ANTHROPIC_BUFFERED_REQUEST_TIMEOUT_SECONDS",
+    help=(
+        "Buffered Anthropic read timeout in seconds for non-streaming "
+        "message and batch paths (default: 600). "
+        "Env: HEADROOM_ANTHROPIC_BUFFERED_REQUEST_TIMEOUT_SECONDS."
     ),
 )
 @click.option(
@@ -272,7 +450,7 @@ def _selected_context_tool() -> str:
     envvar="HEADROOM_ANTHROPIC_PRE_UPSTREAM_ACQUIRE_TIMEOUT_SECONDS",
     help=(
         "Fail-fast timeout for waiting on the Anthropic pre-upstream semaphore "
-        "before returning 503 + Retry-After. "
+        "before failing open to passthrough compression. "
         "Default: 15.0 seconds. "
         "Env: HEADROOM_ANTHROPIC_PRE_UPSTREAM_ACQUIRE_TIMEOUT_SECONDS."
     ),
@@ -287,6 +465,18 @@ def _selected_context_tool() -> str:
         "still holds a pre-upstream slot. "
         "Default: 2.0 seconds. "
         "Env: HEADROOM_ANTHROPIC_PRE_UPSTREAM_MEMORY_CONTEXT_TIMEOUT_SECONDS."
+    ),
+)
+@click.option(
+    "--compression-max-workers",
+    type=int,
+    default=None,
+    envvar="HEADROOM_COMPRESSION_MAX_WORKERS",
+    help=(
+        "Bound the dedicated compression threadpool (CPU-bound Kompress work). "
+        "Default (unset): cpu_count or 1. Lower it to reduce CPU "
+        "oversubscription under concurrent sessions; a value < 1 is clamped to 1. "
+        "Env: HEADROOM_COMPRESSION_MAX_WORKERS."
     ),
 )
 @click.option(
@@ -329,8 +519,33 @@ def _selected_context_tool() -> str:
     default=None,
     envvar="HEADROOM_BUDGET",
     help=(
-        "Daily budget limit in USD. Requests are rejected with 429 once the limit is reached. "
-        "Resets at midnight UTC. Env: HEADROOM_BUDGET."
+        "Budget limit in USD per --budget-period. Requests are rejected with 429 "
+        "once the limit is reached. Env: HEADROOM_BUDGET."
+    ),
+)
+@click.option(
+    "--budget-period",
+    type=click.Choice(["hourly", "daily", "monthly"]),
+    default="daily",
+    envvar="HEADROOM_BUDGET_PERIOD",
+    help=(
+        "Period the --budget limit applies to. Hourly resets on a rolling hour, "
+        "daily at local midnight, monthly on the 1st. Default: daily. "
+        "Env: HEADROOM_BUDGET_PERIOD."
+    ),
+)
+@click.option(
+    "--budget-estimated-basis",
+    type=click.Choice(["count", "ignore", "block"]),
+    default="count",
+    envvar="HEADROOM_BUDGET_ESTIMATED_BASIS",
+    help=(
+        "What to do with spend booked from Headroom's own token estimate, which "
+        "happens when a provider response carries no input-token breakdown. "
+        "count: it consumes the budget like measured spend (default). "
+        "ignore: only provider-reported spend consumes the budget. "
+        "block: refuse requests rather than enforce a hard limit on an estimate. "
+        "Env: HEADROOM_BUDGET_ESTIMATED_BASIS."
     ),
 )
 # Code-aware compression (AST-based, requires `pip install headroom-ai[code]`).
@@ -357,6 +572,36 @@ def _selected_context_tool() -> str:
         "Env: HEADROOM_DISABLE_KOMPRESS=1."
     ),
 )
+@click.option(
+    "--disable-kompress-fallback",
+    is_flag=True,
+    envvar="HEADROOM_DISABLE_KOMPRESS_FALLBACK",
+    help=(
+        "With --disable-kompress, route fall-through content to PASSTHROUGH instead of "
+        "the default KOMPRESS fallback (restores legacy --disable-kompress behaviour). "
+        "Env: HEADROOM_DISABLE_KOMPRESS_FALLBACK=1."
+    ),
+)
+@click.option(
+    "--disable-kompress-anthropic/--enable-kompress-anthropic",
+    "disable_kompress_anthropic",
+    default=None,
+    envvar="HEADROOM_DISABLE_KOMPRESS_ANTHROPIC",
+    help=(
+        "Disable (or --enable-) Kompress for the Anthropic pipeline only, overriding "
+        "--disable-kompress. Env: HEADROOM_DISABLE_KOMPRESS_ANTHROPIC=1."
+    ),
+)
+@click.option(
+    "--disable-kompress-openai/--enable-kompress-openai",
+    "disable_kompress_openai",
+    default=None,
+    envvar="HEADROOM_DISABLE_KOMPRESS_OPENAI",
+    help=(
+        "Disable (or --enable-) Kompress for the OpenAI/Codex pipeline only, overriding "
+        "--disable-kompress. Env: HEADROOM_DISABLE_KOMPRESS_OPENAI=1."
+    ),
+)
 # Code graph: indexes project + watches files for live reindex via codebase-memory-mcp.
 # Only useful when the proxy is launched from a project root — it indexes the
 # current working directory.
@@ -374,6 +619,41 @@ def _selected_context_tool() -> str:
     "--no-read-lifecycle",
     is_flag=True,
     help="Disable Read lifecycle management (stale/superseded Read compression)",
+)
+# Read maturation (Mechanism B) — experimental, OFF by default
+@click.option(
+    "--read-maturation",
+    is_flag=True,
+    envvar="HEADROOM_READ_MATURATION",
+    help=(
+        "EXPERIMENTAL: activity-based read maturation — hold fresh Reads "
+        "out of the provider prefix cache and compress them once their "
+        "file quiesces (env: HEADROOM_READ_MATURATION=1)"
+    ),
+)
+@click.option(
+    "--read-maturation-quiesce-turns",
+    type=click.IntRange(min=1),
+    default=5,
+    show_default=True,
+    envvar="HEADROOM_READ_MATURATION_QUIESCE_TURNS",
+    help="Read maturation: mature a held Read once its file is quiet this many assistant turns.",
+)
+@click.option(
+    "--read-maturation-max-hold-turns",
+    type=click.IntRange(min=1),
+    default=25,
+    show_default=True,
+    envvar="HEADROOM_READ_MATURATION_MAX_HOLD_TURNS",
+    help="Read maturation: force-mature a Read held this many turns even if its file stays active.",
+)
+@click.option(
+    "--read-maturation-min-size-bytes",
+    type=click.IntRange(min=0),
+    default=2048,
+    show_default=True,
+    envvar="HEADROOM_READ_MATURATION_MIN_SIZE_BYTES",
+    help="Read maturation: only hold/mature Read outputs at least this many bytes.",
 )
 # Memory System (Multi-Provider Support)
 @click.option(
@@ -468,7 +748,7 @@ def _selected_context_tool() -> str:
 )
 @click.option(
     "--memory-qdrant-port",
-    type=int,
+    type=click.IntRange(1, 65535),
     default=None,
     help=(
         "Qdrant port for the qdrant-neo4j backend (default: 6333, also reads HEADROOM_QDRANT_PORT)"
@@ -494,7 +774,7 @@ def _selected_context_tool() -> str:
 )
 @click.option(
     "--min-evidence",
-    type=int,
+    type=click.IntRange(min=1),
     default=None,
     envvar="HEADROOM_MIN_EVIDENCE",
     help=(
@@ -534,6 +814,15 @@ def _selected_context_tool() -> str:
     help="Custom OpenAI API URL for passthrough endpoints (env: OPENAI_TARGET_API_URL)",
 )
 @click.option(
+    "--provider-name",
+    default=None,
+    help=(
+        "Display name for the OpenAI-compatible upstream shown on the dashboard "
+        "(e.g. 'OpenRouter'). Overrides hostname detection from --openai-api-url. "
+        "Internal routing and pricing are unaffected."
+    ),
+)
+@click.option(
     "--gemini-api-url",
     default=None,
     help="Custom Gemini API URL for passthrough endpoints (env: GEMINI_TARGET_API_URL)",
@@ -565,9 +854,24 @@ def _selected_context_tool() -> str:
     help="AWS profile name for Bedrock (default: use default credentials)",
 )
 @click.option(
+    "--bedrock-api-url",
+    default=None,
+    help=(
+        "Custom Bedrock InvokeModel upstream for the /model/{id}/invoke "
+        "passthrough routes. Point at a re-signing gateway (LiteLLM, "
+        "LocalStack), NOT raw AWS — rewriting the body breaks SigV4. "
+        "(env: BEDROCK_TARGET_API_URL)"
+    ),
+)
+@click.option(
+    "--telemetry",
+    is_flag=True,
+    help="Opt in to anonymous usage telemetry — off by default (env: HEADROOM_TELEMETRY=on)",
+)
+@click.option(
     "--no-telemetry",
     is_flag=True,
-    help="Disable anonymous usage telemetry (env: HEADROOM_TELEMETRY=off)",
+    help="Force anonymous usage telemetry off (already the default; env: HEADROOM_TELEMETRY=off)",
 )
 @click.option(
     "--stateless",
@@ -591,40 +895,78 @@ def _selected_context_tool() -> str:
     "Default: /tmp/headroom-embed-{port}.sock. "
     "(env: HEADROOM_EMBEDDING_SERVER_SOCKET)",
 )
+@click.option(
+    "--anthropic-extra-headers",
+    default=None,
+    help=(
+        "JSON object of extra headers merged into (and overriding) headers forwarded to "
+        'the Anthropic endpoint, e.g. \'{"Api-Key": "..."}\' (env: ANTHROPIC_TARGET_API_HEADERS)'
+    ),
+)
+@click.option(
+    "--openai-extra-headers",
+    default=None,
+    help=(
+        "JSON object of extra headers merged into (and overriding) headers forwarded to "
+        "the OpenAI endpoint (env: OPENAI_TARGET_API_HEADERS)"
+    ),
+)
 @click.pass_context
 def proxy(
     ctx: click.Context,
     mode: str | None,
+    target_ratio: float | None,
     host: str,
     port: int,
     workers: int,
     limit_concurrency: int,
     max_connections: int,
     max_keepalive_connections: int,
+    keepalive_expiry: float,
+    http2: bool,
+    http_proxy: str | None,
     intercept_tool_results: bool,
     no_optimize: bool,
     no_cache: bool,
     no_rate_limit: bool,
-    no_ccr_inject_tool: bool,
-    no_ccr_marker: bool,
+    protect_tool_results: str | None,
+    rpm: int | None,
+    tpm: int | None,
+    no_ccr: bool,
+    lossless: bool,
     no_ccr_proactive_expansion: bool,
     proxy_extension: tuple[str, ...],
+    compressor: tuple[str, ...],
     no_subscription_tracking: bool,
     subscription_poll_interval: int | None,
     retry_max_attempts: int | None,
+    retry_base_delay_ms: int | None,
+    retry_max_delay_ms: int | None,
+    request_timeout_seconds: int | None,
     connect_timeout_seconds: int | None,
+    anthropic_buffered_request_timeout_seconds: int | None,
     anthropic_pre_upstream_concurrency: int | None,
     anthropic_pre_upstream_acquire_timeout_seconds: float | None,
     anthropic_pre_upstream_memory_context_timeout_seconds: float | None,
+    compression_max_workers: int | None,
     log_file: str | None,
     log_messages: bool,
     codex_wire_debug: bool,
     codex_wire_debug_dir: str | None,
     budget: float | None,
+    budget_period: str,
+    budget_estimated_basis: str,
     code_aware_flag: bool | None,
     disable_kompress: bool,
+    disable_kompress_fallback: bool,
+    disable_kompress_anthropic: bool | None,
+    disable_kompress_openai: bool | None,
     code_graph: bool,
     no_read_lifecycle: bool,
+    read_maturation: bool,
+    read_maturation_quiesce_turns: int,
+    read_maturation_max_hold_turns: int,
+    read_maturation_min_size_bytes: int,
     memory: bool,
     memory_db_path: str,
     memory_storage: str,
@@ -642,13 +984,18 @@ def proxy(
     backend: str,
     anyllm_provider: str,
     anthropic_api_url: str | None,
+    anthropic_extra_headers: str | None,
+    openai_extra_headers: str | None,
     openai_api_url: str | None,
+    provider_name: str | None,
     gemini_api_url: str | None,
     cloudcode_api_url: str | None,
     vertex_api_url: str | None,
     region: str,
     bedrock_region: str | None,
     bedrock_profile: str | None,
+    bedrock_api_url: str | None,
+    telemetry: bool,
     no_telemetry: bool,
     stateless: bool,
     embedding_server: bool,
@@ -674,6 +1021,7 @@ def proxy(
     try:
         from headroom.proxy.server import (
             ProxyConfig,
+            _parse_csv_tools,
             _parse_exclude_tools,
             _parse_tool_profiles,
             run_server,
@@ -692,6 +1040,28 @@ def proxy(
         click.secho(
             "Warning: both --learn and --no-learn were specified; --no-learn takes precedence "
             "and traffic learning will be disabled.",
+            fg="yellow",
+            err=True,
+        )
+
+    # Warn on contradictory / no-op flag combinations. The resolved value still
+    # applies; the warning just prevents a silently-ignored flag.
+    if no_rate_limit and (rpm is not None or tpm is not None):
+        click.secho(
+            "Warning: --rpm/--tpm have no effect because --no-rate-limit disables rate limiting.",
+            fg="yellow",
+            err=True,
+        )
+    if no_optimize and target_ratio is not None:
+        click.secho(
+            "Warning: --target-ratio has no effect because --no-optimize disables compression.",
+            fg="yellow",
+            err=True,
+        )
+    if telemetry and no_telemetry:
+        click.secho(
+            "Warning: both --telemetry and --no-telemetry were specified; --no-telemetry "
+            "takes precedence and telemetry will be disabled.",
             fg="yellow",
             err=True,
         )
@@ -721,6 +1091,17 @@ def proxy(
             sys.exit(1)
         os.environ["HEADROOM_INTERCEPT_ENABLED"] = "1"
 
+    try:
+        resolved_anthropic_extra_headers = resolve_extra_headers(
+            anthropic_extra_headers, "ANTHROPIC_TARGET_API_HEADERS"
+        )
+        resolved_openai_extra_headers = resolve_extra_headers(
+            openai_extra_headers, "OPENAI_TARGET_API_HEADERS"
+        )
+    except ValueError as exc:
+        click.secho(f"error: {exc}", fg="red", err=True)
+        sys.exit(1)
+
     provider_api_overrides = resolve_api_overrides(
         anthropic_api_url=anthropic_api_url,
         openai_api_url=openai_api_url,
@@ -730,12 +1111,20 @@ def proxy(
         environ=os.environ,
     )
 
-    # Resolve anyllm provider: env var takes precedence over CLI default (matches argparse path)
-    effective_anyllm_provider = os.environ.get("HEADROOM_ANYLLM_PROVIDER") or anyllm_provider
+    # Resolve anyllm provider. An explicit --anyllm-provider flag always wins;
+    # otherwise honor HEADROOM_ANYLLM_PROVIDER, which the settings store may
+    # have exported into os.environ after Click parsed the option (so the
+    # already-parsed param can't see it).
+    _anyllm_source = click.get_current_context().get_parameter_source("anyllm_provider")
+    if _anyllm_source is click.core.ParameterSource.COMMANDLINE:
+        effective_anyllm_provider = anyllm_provider
+    else:
+        effective_anyllm_provider = os.environ.get("HEADROOM_ANYLLM_PROVIDER") or anyllm_provider
 
-    # Resolve mode: CLI flag > env var > default
+    # Resolve mode: CLI flag > env var > default. Default is CACHE (Headroom's
+    # coding posture): delta-only compression at ~0 prefix-cache busts.
     effective_mode: str = normalize_proxy_mode(
-        mode or os.environ.get("HEADROOM_MODE") or PROXY_MODE_TOKEN
+        mode or os.environ.get("HEADROOM_MODE") or PROXY_MODE_CACHE
     )
 
     # Stateless mode: CLI flag or env var
@@ -746,7 +1135,10 @@ def proxy(
         "on",
     )
 
-    # Telemetry opt-out: --no-telemetry flag sets the env var
+    # Telemetry is opt-in (off by default). --telemetry opts in; --no-telemetry
+    # forces it off. If both are passed, the explicit opt-out wins (fail-closed).
+    if telemetry:
+        os.environ["HEADROOM_TELEMETRY"] = "on"
     if no_telemetry:
         os.environ["HEADROOM_TELEMETRY"] = "off"
 
@@ -780,7 +1172,10 @@ def proxy(
         host=host,
         port=port,
         anthropic_api_url=provider_api_overrides.anthropic,
+        anthropic_extra_headers=resolved_anthropic_extra_headers,
+        openai_extra_headers=resolved_openai_extra_headers,
         openai_api_url=provider_api_overrides.openai,
+        provider_name=provider_name,
         gemini_api_url=provider_api_overrides.gemini,
         cloudcode_api_url=provider_api_overrides.cloudcode,
         vertex_api_url=provider_api_overrides.vertex,
@@ -788,23 +1183,30 @@ def proxy(
         optimize=not no_optimize,
         cache_enabled=not no_cache,
         rate_limit_enabled=not no_rate_limit,
+        rate_limit_requests_per_minute=rpm if rpm is not None else 60,
+        rate_limit_tokens_per_minute=tpm if tpm is not None else 100_000,
         compress_user_messages=_get_env_bool("HEADROOM_COMPRESS_USER_MESSAGES", False),
-        min_tokens_to_crush=_get_env_int_optional("HEADROOM_MIN_TOKENS") or 500,
-        max_items_after_crush=_get_env_int_optional("HEADROOM_MAX_ITEMS") or 50,
+        min_tokens_to_crush=_get_env_int("HEADROOM_MIN_TOKENS", 500),
+        max_items_after_crush=_get_env_int("HEADROOM_MAX_ITEMS", 50),
         exclude_tools=_parse_exclude_tools(None) or None,
+        protect_tool_results=frozenset(_parse_csv_tools(protect_tool_results))
+        if protect_tool_results
+        else frozenset(),
         tool_profiles=_parse_tool_profiles([]) or None,
         smart_crusher_with_compaction=_get_env_bool_optional("HEADROOM_SMART_CRUSHER_COMPACTION"),
-        savings_profile=os.environ.get("HEADROOM_SAVINGS_PROFILE") or None,
-        target_ratio=_get_env_float_optional("HEADROOM_TARGET_RATIO"),
+        savings_profile=os.environ.get("HEADROOM_SAVINGS_PROFILE") or "coding",
+        target_ratio=target_ratio,
         compress_system_messages=_get_env_bool_optional("HEADROOM_COMPRESS_SYSTEM_MESSAGES"),
         protect_recent=_get_env_int_optional("HEADROOM_PROTECT_RECENT"),
         protect_analysis_context=_get_env_bool_optional("HEADROOM_PROTECT_ANALYSIS_CONTEXT"),
         accuracy_guard=os.environ.get("HEADROOM_ACCURACY_GUARD") or None,
-        # CCR opt-outs for compression-only deployments (streaming / non-MCP
-        # clients that can't resolve the injected retrieve tool). Defaults keep
-        # CCR fully on; each flag flips one dataclass default to False.
-        ccr_inject_tool=not no_ccr_inject_tool,
-        ccr_inject_marker=not no_ccr_marker,
+        # CCR opt-out: --no-ccr disables both halves at once (markers in content
+        # AND the injected retrieve tool). Markers without a tool — or a tool
+        # without markers — are useless, so it is a single switch. Default keeps
+        # CCR fully on.
+        ccr_inject_tool=not no_ccr,
+        ccr_inject_marker=not no_ccr,
+        lossless=lossless,
         ccr_proactive_expansion=not no_ccr_proactive_expansion,
         # Flatten repeat-flag tuple AND any comma-separated values inside it.
         # `--proxy-extension a,b --proxy-extension c` and `HEADROOM_PROXY_EXTENSIONS=a,b,c`
@@ -813,36 +1215,71 @@ def proxy(
             [part.strip() for chunk in proxy_extension for part in chunk.split(",") if part.strip()]
             or None
         ),
+        # Same flatten-and-split shape as proxy_extensions, but a set: order
+        # and duplicates don't matter for a selection. None when nothing was
+        # supplied, which leaves every built-in compressor enabled.
+        compressors=(
+            {part.strip() for chunk in compressor for part in chunk.split(",") if part.strip()}
+            or None
+        ),
         subscription_tracking_enabled=not no_subscription_tracking,
         subscription_poll_interval_s=(
             subscription_poll_interval if subscription_poll_interval is not None else 300
         ),
         retry_max_attempts=retry_max_attempts if retry_max_attempts is not None else 3,
+        retry_base_delay_ms=retry_base_delay_ms if retry_base_delay_ms is not None else 1000,
+        retry_max_delay_ms=retry_max_delay_ms if retry_max_delay_ms is not None else 30000,
+        request_timeout_seconds=request_timeout_seconds
+        if request_timeout_seconds is not None and request_timeout_seconds > 0
+        else 300,
         connect_timeout_seconds=connect_timeout_seconds
         if connect_timeout_seconds is not None
         else 10,
+        anthropic_buffered_request_timeout_seconds=(
+            anthropic_buffered_request_timeout_seconds
+            if anthropic_buffered_request_timeout_seconds is not None
+            else 600
+        ),
         max_connections=max_connections,
         max_keepalive_connections=max_keepalive_connections,
+        keepalive_expiry=keepalive_expiry,
+        http2=http2,
+        http_proxy=http_proxy,
         log_file=None if is_stateless else log_file,
         log_full_messages=log_messages
         or os.environ.get("HEADROOM_LOG_MESSAGES", "").lower() in ("true", "1", "yes", "on"),
         budget_limit_usd=budget,
+        budget_period=cast(Literal["hourly", "daily", "monthly"], budget_period),
+        budget_estimated_basis=cast(Literal["count", "ignore", "block"], budget_estimated_basis),
         # Code-aware compression resolution:
         # 1. Explicit --code-aware / --no-code-aware always wins.
         # 2. Otherwise read HEADROOM_CODE_AWARE_ENABLED (truthy = on).
         # 3. Otherwise default off — matches the prior cli/proxy.py behavior so
         #    existing users see no change unless they opt in.
+        # Default ON (coding posture; consistent with the argparse server path).
+        # Degrades gracefully to a no-op when tree-sitter isn't installed.
         code_aware_enabled=(
             bool(code_aware_flag)
             if code_aware_flag is not None
-            else os.environ.get("HEADROOM_CODE_AWARE_ENABLED", "").strip().lower()
+            else os.environ.get("HEADROOM_CODE_AWARE_ENABLED", "1").strip().lower()
             in ("true", "1", "yes", "on")
         ),
         disable_kompress=disable_kompress,
+        disable_kompress_fallback=disable_kompress_fallback,
+        disable_kompress_anthropic=disable_kompress_anthropic,
+        disable_kompress_openai=disable_kompress_openai,
+        # Optional inbound auth token + air-gap switch (env-driven).
+        proxy_token=os.environ.get("HEADROOM_PROXY_TOKEN") or None,
+        offline=_get_env_bool("HEADROOM_OFFLINE", False),
         # Code graph: live file watcher for incremental reindexing
         code_graph_watcher=code_graph,
         # Read lifecycle: ON by default (use --no-read-lifecycle to disable)
         read_lifecycle=not no_read_lifecycle,
+        # Read maturation (Mechanism B): experimental, OFF by default
+        read_maturation=read_maturation,
+        read_maturation_quiesce_turns=read_maturation_quiesce_turns,
+        read_maturation_max_hold_turns=read_maturation_max_hold_turns,
+        read_maturation_min_size_bytes=read_maturation_min_size_bytes,
         # Memory System (Multi-Provider with auto-detection)
         # --learn implies --memory (need backend for storing patterns)
         # Stateless mode disables memory (requires SQLite on disk)
@@ -863,6 +1300,9 @@ def proxy(
         backend=backend,
         bedrock_region=bedrock_region or region,
         bedrock_profile=bedrock_profile,
+        # CLI flag > env > unset. Matches the BEDROCK_TARGET_API_URL naming of
+        # the sibling *_TARGET_API_URL passthrough overrides.
+        bedrock_api_url=bedrock_api_url or os.environ.get("BEDROCK_TARGET_API_URL"),
         anyllm_provider=effective_anyllm_provider,
         # License / Usage Reporting (managed/enterprise)
         license_key=license_key,
@@ -874,6 +1314,7 @@ def proxy(
         # Precedence: CLI > env > auto-compute (click's ``envvar``
         # handles the env-var fallback).
         anthropic_pre_upstream_concurrency=anthropic_pre_upstream_concurrency,
+        compression_max_workers=compression_max_workers,
         anthropic_pre_upstream_acquire_timeout_seconds=(
             anthropic_pre_upstream_acquire_timeout_seconds
             if anthropic_pre_upstream_acquire_timeout_seconds is not None
@@ -952,14 +1393,17 @@ Memory (Multi-Provider):
 
     from headroom.telemetry.beacon import is_telemetry_enabled
 
-    # Build telemetry section for the startup banner
+    # Build telemetry section for the startup banner. Telemetry is opt-in
+    # (off by default); the disabled line surfaces how to opt in.
     if is_telemetry_enabled():
         telemetry_line = (
-            "  Telemetry:    ENABLED (anonymous aggregate stats)\n"
+            "  Telemetry:    ENABLED (anonymous aggregate stats — you opted in)\n"
             "                Disable: HEADROOM_TELEMETRY=off or headroom proxy --no-telemetry"
         )
     else:
-        telemetry_line = "  Telemetry:    DISABLED"
+        telemetry_line = (
+            "  Telemetry:    DISABLED (opt in: HEADROOM_TELEMETRY=on or headroom proxy --telemetry)"
+        )
 
     # Discover proxy extensions (third-party packages registered via the
     # `headroom.proxy_extension` entry-point group). Surfaced in the banner
@@ -988,40 +1432,44 @@ Memory (Multi-Provider):
             f"(available: {','.join(_ext_available)})"
         )
 
+    # Security posture line: inbound auth token + air-gap mode, and a loud
+    # flag for the open-bind case (non-loopback host with no token).
+    from headroom.proxy.loopback_guard import is_loopback_host
+
+    _auth_on = bool(config.proxy_token or os.environ.get("HEADROOM_PROXY_TOKEN"))
+    if config.offline:
+        _security_status = "OFFLINE (all egress disabled)" + (
+            " · inbound token REQUIRED (non-loopback)" if _auth_on else ""
+        )
+    elif _auth_on:
+        _security_status = "inbound token REQUIRED for non-loopback callers"
+    elif not is_loopback_host(config.host):
+        _security_status = (
+            "WARNING non-loopback bind with NO token — /v1/* is UNAUTHENTICATED "
+            "(set HEADROOM_PROXY_TOKEN)"
+        )
+    else:
+        _security_status = "loopback-only (no inbound token)"
+    security_line = f"  Security:     {_security_status}"
+
     # Code-aware status line — same logic the inner banner uses, surfaced here
     # so the click-CLI banner is a complete picture (avoids the dual-banner
     # confusion this branch retired).
     from headroom.proxy.server import _get_code_aware_banner_status
 
     code_aware_line = f"  Code-Aware:   {_get_code_aware_banner_status(config)}"
-    context_tool_line = f"  Context Tool: {_selected_context_tool()}"
 
     # Performance tuning section — only shown when at least one tuning var is active.
-    _stable_turn = int(os.environ.get("HEADROOM_COMPRESSION_STABLE_AFTER_TURN", "0"))
-    _stale_turns = int(os.environ.get("HEADROOM_STALE_READ_COMPRESS_AFTER_TURNS", "0"))
     _embed_socket = os.environ.get("HEADROOM_EMBEDDING_SERVER_SOCKET") or (
         embedding_server and (embedding_server_socket or f"/tmp/headroom-embed-{port}.sock")
     )
     _tuning_lines: list[str] = []
-    if _stable_turn:
-        _tuning_lines.append(
-            f"  Prefix stability:        conservative for first {_stable_turn} turns"
-            f"  (HEADROOM_COMPRESSION_STABLE_AFTER_TURN={_stable_turn})"
-        )
-    if _stale_turns:
-        _tuning_lines.append(
-            f"  Stale read compression:  reads older than {_stale_turns} turns eligible"
-            f"  (HEADROOM_STALE_READ_COMPRESS_AFTER_TURNS={_stale_turns})"
-        )
     if _embed_socket:
         _tuning_lines.append(f"  Embedding sidecar:       {_embed_socket}")
     if _tuning_lines:
         tuning_section = "\nPerformance Tuning:\n" + "\n".join(_tuning_lines)
     else:
-        tuning_section = (
-            "\nPerformance Tuning:  (all defaults — set HEADROOM_COMPRESSION_STABLE_AFTER_TURN"
-            " / HEADROOM_STALE_READ_COMPRESS_AFTER_TURNS to tune)"
-        )
+        tuning_section = ""
 
     click.echo(f"""
 ╔═══════════════════════════════════════════════════════════════════════╗
@@ -1039,8 +1487,8 @@ Starting proxy server...
   Memory:       {memory_status}
   License:      {license_status}
 {code_aware_line}
-{context_tool_line}
 {extensions_line}
+{security_line}
 {stateless_line}{telemetry_line}
 {backend_section}{tuning_section}
 
@@ -1066,6 +1514,17 @@ Endpoints:
 Press Ctrl+C to stop.
 """)
 
+    # Surface an "update available" notice (reads cache only; no network here).
+    # Best-effort: a broken update check must never block proxy startup.
+    try:
+        from headroom.update_check import format_update_notice
+
+        _update_notice = format_update_notice()
+        if _update_notice:
+            click.echo(f"\n{_update_notice}\n")
+    except Exception:  # noqa: BLE001 — banner must never crash startup
+        pass
+
     # -----------------------------------------------------------------------
     # Option E: start embedding server sidecar if requested
     # -----------------------------------------------------------------------
@@ -1078,9 +1537,13 @@ Press Ctrl+C to stop.
 
         import asyncio as _asyncio
 
-        from headroom.memory.adapters.watchdog import EmbeddingServerWatchdog
-
         async def _start_embed_watchdog() -> Any:
+            # Import lazily inside the guarded coroutine. The sidecar module is
+            # optional and may be absent; keeping the import here lets the
+            # try/except below fall back to the per-worker embedder instead of
+            # crashing the proxy at startup with ModuleNotFoundError.
+            from headroom.memory.adapters.watchdog import EmbeddingServerWatchdog
+
             wd = EmbeddingServerWatchdog(socket_path=_embed_socket)
             await wd.start()
             ok = await wd.wait_until_healthy(timeout=30.0)

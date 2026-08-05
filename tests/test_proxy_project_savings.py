@@ -38,6 +38,22 @@ def test_sanitize_project_name_normalizes_and_caps():
     assert sanitize_project_name(42) is None
 
 
+def test_sanitize_project_name_decodes_percent_encoded_non_ascii():
+    """Percent-encoded non-ASCII cwd names (issue #1069) must decode to Unicode."""
+    import urllib.parse
+
+    chinese = "第二大脑共享"
+    encoded = urllib.parse.quote(chinese, safe="-_.() ")
+    assert sanitize_project_name(encoded) == chinese
+
+    mixed = "test-中文-项目"
+    encoded_mixed = urllib.parse.quote(mixed, safe="-_.() ")
+    assert sanitize_project_name(encoded_mixed) == mixed
+
+    # Plain ASCII names must still pass through unchanged.
+    assert sanitize_project_name("my-project") == "my-project"
+
+
 def test_classify_project_reads_header_case_insensitively():
     assert classify_project({"x-headroom-project": "frontend"}) == "frontend"
     assert classify_project({"X-Headroom-Project": " frontend "}) == "frontend"
@@ -106,6 +122,7 @@ def test_tracker_accumulates_per_project_and_persists(tmp_path):
     # Survives a restart via the persisted JSON state.
     reloaded = SavingsTracker(path=str(path))
     assert reloaded.stats_preview()["projects"]["api"]["tokens_saved"] == 500
+    assert reloaded.lifetime_response()["projects"]["api"]["tokens_saved"] == 500
 
 
 def test_tracker_migrates_v2_state_without_projects(tmp_path):
@@ -240,7 +257,7 @@ def test_funnel_attributes_savings_from_context_and_stats_exposes_them(tmp_path,
         assert stats["persistent_savings"]["projects_limit"] == DEFAULT_MAX_PROJECTS
 
         history = client.get("/stats-history").json()
-        assert history["schema_version"] == 3
+        assert history["schema_version"] == 5
         assert history["projects"]["ctx-project"]["requests"] == 1
 
 

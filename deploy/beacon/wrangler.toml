@@ -1,0 +1,44 @@
+name = "headroom-beacon"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+
+# PHASE 1 — deploy to <name>.<subdomain>.workers.dev with no DNS changes.
+# Lets the whole path be tested against a real client before headroomlabs.ai
+# nameservers move anywhere.
+workers_dev = true
+
+# PHASE 2 — the permanent address. Uncomment once headroomlabs.ai is on
+# Cloudflare nameservers, then redeploy. This string is baked into every
+# released client (DEFAULT_ENDPOINT in headroom/telemetry/session.py), so it can
+# never change afterwards — everything behind it can.
+#
+# Deploying this while the zone is still on Namecheap fails: wrangler cannot
+# find the zone. That is the intended guardrail, not a bug.
+#
+# [[routes]]
+# pattern = "otlp.headroomlabs.ai/v1/logs"
+# zone_name = "headroomlabs.ai"
+# custom_domain = false
+
+# The corpus. R2 rather than S3 specifically for zero egress: training jobs
+# re-read the whole dataset, and on S3 that is a recurring bill for data we
+# already own.
+[[r2_buckets]]
+binding = "CORPUS"
+bucket_name = "headroom-telemetry"
+
+# Optional metrics lane, added later without touching this file:
+#   npx wrangler secret put METRICS_OTLP_URL
+#   npx wrangler secret put METRICS_OTLP_AUTH
+# Absent = R2 only, which is the right place to start.
+
+[observability]
+enabled = true
+
+# Rate limiting is configured in the Cloudflare dashboard, not here — this
+# endpoint is unauthenticated by design (anonymity is the product), so it is
+# the only thing between the Worker and a bored stranger:
+#   Security > WAF > Rate limiting rules
+#   otlp.headroomlabs.ai/v1/logs -> 60 requests / minute / IP
+# A real client sends ~2 requests/hour, so that is ~1000x headroom while still
+# capping a single abusive source hard.

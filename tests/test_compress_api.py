@@ -1,10 +1,11 @@
 """Tests for the one-function compress() API and integrations."""
 
 import json
+from dataclasses import replace as _dc_replace
 
 import pytest
 
-from headroom.compress import CompressResult, compress
+from headroom.compress import CompressConfig, CompressResult, compress
 from headroom.hooks import CompressionHooks
 
 try:
@@ -96,6 +97,39 @@ class TestCompressFunction:
         result = compress(messages, optimize=False)
         assert result.messages is messages
         assert result.tokens_saved == 0
+
+    def test_kwargs_do_not_mutate_caller_config(self):
+        """kwargs must not smuggle their values onto the caller's CompressConfig.
+
+        Regression: ``compress`` did ``cfg = config or CompressConfig()`` and
+        then ``setattr(cfg, key, value)`` for every matching kwarg — so a caller
+        who passed ``config=my_cfg, protect_recent=0`` came back to find their
+        long-lived ``my_cfg`` silently rewritten. A shared, per-agent config
+        was corrupted by every request that overrode a single option.
+        """
+
+        big_data = json.dumps([{"id": i, "status": "active"} for i in range(200)])
+        messages = [
+            {"role": "user", "content": "analyze"},
+            {"role": "tool", "content": big_data, "tool_call_id": "c1"},
+        ]
+        cfg = CompressConfig(protect_recent=4, target_ratio=0.8)
+        snapshot = _dc_replace(cfg)
+
+        compress(
+            messages,
+            model="claude-sonnet-4-5-20250929",
+            config=cfg,
+            protect_recent=0,
+            target_ratio=0.2,
+        )
+
+        assert cfg.protect_recent == snapshot.protect_recent, (
+            "compress() mutated caller's config.protect_recent via kwargs"
+        )
+        assert cfg.target_ratio == snapshot.target_ratio, (
+            "compress() mutated caller's config.target_ratio via kwargs"
+        )
 
     def test_with_custom_hooks(self):
         """Hooks are called when provided."""
@@ -272,3 +306,111 @@ class TestLiteLLMCallback:
 
         result = asyncio.run(callback.async_pre_call_hook("key", data, "embedding"))
         assert result is data
+
+
+# =============================================================================
+# Tests: frozen_message_count through library-mode compress()
+# =============================================================================
+
+
+class TestFrozenMessageCount:
+    """The frozen prefix must be reachable from library mode.
+
+    Proxy handlers pass frozen_message_count so transforms never rewrite
+    messages already anchored in the provider's prompt cache. Library-mode
+    callers manage their own conversation loop and need the same control —
+    without it, read_lifecycle rewrites sent history and converts cached
+    prefix reads into full-price rewrites.
+    """
+
+    @staticmethod
+    def _stale_read_conversation() -> list[dict]:
+        """Anthropic-format conversation with a stale Read: file read early,
+        edited later. read_lifecycle should classify the Read as STALE."""
+        big_content = "\n".join(f"line {i}: some file content here" for i in range(80))
+        return [
+            {"role": "user", "content": "read then edit the config"},
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "t_read",
+                        "name": "Read",
+                        "input": {"file_path": "/app/config.py"},
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "t_read", "content": big_content}
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "t_edit",
+                        "name": "Edit",
+                        "input": {
+                            "file_path": "/app/config.py",
+                            "old_string": "old",
+                            "new_string": "new",
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "t_edit", "content": "ok"}],
+            },
+            {"role": "assistant", "content": "edited."},
+            {"role": "user", "content": "now summarize the change"},
+        ]
+
+    @staticmethod
+    def _read_result_content(messages: list[dict]) -> str:
+        for msg in messages:
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if isinstance(block, dict) and block.get("tool_use_id") == "t_read":
+                    return str(block.get("content"))
+        raise AssertionError("t_read tool_result not found")
+
+    def test_stale_read_rewritten_without_frozen_prefix(self):
+        """Baseline: with no frozen prefix, the stale Read is rewritten."""
+        messages = self._stale_read_conversation()
+        original = self._read_result_content(messages)
+        result = compress(messages, model="claude-sonnet-4-5-20250929")
+        assert self._read_result_content(result.messages) != original
+
+    def test_frozen_prefix_blocks_stale_read_rewrite(self):
+        """frozen_message_count as kwarg: messages inside the frozen prefix
+        must come back byte-identical, even though the Read is stale."""
+        messages = self._stale_read_conversation()
+        original = self._read_result_content(messages)
+        result = compress(
+            messages,
+            model="claude-sonnet-4-5-20250929",
+            frozen_message_count=5,
+        )
+        assert self._read_result_content(result.messages) == original
+
+    def test_frozen_prefix_via_config_object(self):
+        """frozen_message_count set on CompressConfig behaves identically."""
+        messages = self._stale_read_conversation()
+        original = self._read_result_content(messages)
+        cfg = CompressConfig(frozen_message_count=5)
+        result = compress(messages, model="claude-sonnet-4-5-20250929", config=cfg)
+        assert self._read_result_content(result.messages) == original
+
+    def test_frozen_zero_is_legacy_behavior(self):
+        """Explicit 0 matches the default: stale Read gets rewritten."""
+        messages = self._stale_read_conversation()
+        original = self._read_result_content(messages)
+        result = compress(messages, model="claude-sonnet-4-5-20250929", frozen_message_count=0)
+        assert self._read_result_content(result.messages) != original

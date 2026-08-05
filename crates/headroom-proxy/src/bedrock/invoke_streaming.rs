@@ -74,8 +74,7 @@ use crate::proxy::AppState;
 // `Extension<AuthMode>` extractor.
 use headroom_core::auth_mode::AuthMode;
 
-/// Anthropic vendor prefix as encoded in Bedrock model ids.
-const ANTHROPIC_VENDOR_PREFIX: &str = "anthropic.";
+use crate::bedrock::vendor::is_anthropic_model_id;
 
 /// AWS Bedrock Runtime DNS template.
 const BEDROCK_RUNTIME_HOST_TEMPLATE: &str = "bedrock-runtime.{region}.amazonaws.com";
@@ -153,7 +152,7 @@ pub async fn handle_invoke_streaming(
     );
 
     // 1. Live-zone compression for Anthropic-shape bodies (same as D1).
-    let is_anthropic = model_id.starts_with(ANTHROPIC_VENDOR_PREFIX);
+    let is_anthropic = is_anthropic_model_id(&model_id);
     let outbound_body: Bytes = if is_anthropic {
         run_anthropic_compression(&body, &state, auth_mode, &request_id)
     } else {
@@ -855,14 +854,13 @@ fn run_anthropic_compression(
 ) -> Bytes {
     use crate::bedrock::envelope::BedrockEnvelope;
 
-    if let Err(e) = BedrockEnvelope::parse(body) {
-        tracing::warn!(
-            event = "bedrock_envelope_parse_error",
+    let parsed_envelope = BedrockEnvelope::parse(body).is_ok();
+    if !parsed_envelope {
+        tracing::info!(
+            event = "bedrock_envelope_parse_skipped",
             request_id = %request_id,
-            error = %e,
-            "bedrock invoke-streaming: envelope parse failed; passing body through unchanged"
+            "bedrock invoke-streaming: envelope parse skipped; attempting generic anthropic compression"
         );
-        return body.clone();
     }
 
     // PR-E3: Bedrock channel hard-codes OAuth so cache_control
@@ -887,17 +885,21 @@ fn run_anthropic_compression(
             body.clone()
         }
         AnthropicOutcome::Compressed { body: new_body, .. } => {
-            match BedrockEnvelope::ensure_anthropic_version_first(&new_body) {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::error!(
-                        event = "bedrock_envelope_reemit_failed",
-                        request_id = %request_id,
-                        error = %e,
-                        "bedrock invoke-streaming: failed to re-emit envelope"
-                    );
-                    body.clone()
+            if parsed_envelope {
+                match BedrockEnvelope::ensure_anthropic_version_first(&new_body) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::error!(
+                            event = "bedrock_envelope_reemit_failed",
+                            request_id = %request_id,
+                            error = %e,
+                            "bedrock invoke-streaming: failed to re-emit envelope"
+                        );
+                        body.clone()
+                    }
                 }
+            } else {
+                new_body
             }
         }
     }

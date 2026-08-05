@@ -31,6 +31,17 @@ export OPENAI_API_KEY='your-key'
 python examples/streaming_example.py
 ```
 
+### tabular_compression_demo.py
+
+Tabular + spreadsheet compression on generated sample data (no API key needed).
+Shows where CSV/markdown tables and `.xlsx` workbooks compress and where compact,
+all-unique data correctly passes through:
+
+```bash
+python examples/tabular_compression_demo.py            # run all scenarios
+python examples/tabular_compression_demo.py --write DIR # also save the sample files
+```
+
 ## Evaluation Examples
 
 ### smart_vs_naive_eval.py

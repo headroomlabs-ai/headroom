@@ -30,6 +30,7 @@ except ImportError:
     ModelResponse = dict  # type: ignore[misc,assignment]
 
 from headroom import HeadroomConfig, HeadroomMode
+from headroom.parser import _coerce_tool_call_to_dict
 from headroom.providers import OpenAIProvider
 from headroom.transforms import TransformPipeline
 
@@ -320,9 +321,16 @@ class HeadroomAgnoModel(Model):  # type: ignore[misc]
                 else:
                     entry["content"] = content
 
-                # Handle tool calls
+                # Handle tool calls. During streaming, Agno may surface
+                # tool_calls as raw provider SDK objects (OpenAI's
+                # `ChoiceDeltaToolCall`) rather than plain dicts. The
+                # Headroom pipeline + Agno's own re-serialization both call
+                # `.get()` on each entry, which raises
+                # `'ChoiceDeltaToolCall' object has no attribute 'get'`
+                # (issue #1312). Normalize to OpenAI-format dicts here so
+                # every downstream consumer sees a uniform shape.
                 if hasattr(msg, "tool_calls") and msg.tool_calls:
-                    entry["tool_calls"] = msg.tool_calls
+                    entry["tool_calls"] = [_coerce_tool_call_to_dict(tc) for tc in msg.tool_calls]
                 # Handle tool call ID for tool responses
                 if hasattr(msg, "tool_call_id") and msg.tool_call_id:
                     entry["tool_call_id"] = msg.tool_call_id

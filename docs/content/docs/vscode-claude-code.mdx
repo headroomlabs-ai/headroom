@@ -1,0 +1,127 @@
+---
+title: Use Headroom with Claude Code in VS Code
+description: Route the official Claude Code extension through Headroom's local compression proxy.
+---
+
+The official Claude Code extension for VS Code embeds Claude Code. Headroom can
+route its Anthropic API requests through the same local compression proxy used by
+`headroom wrap claude`, without changing your Anthropic sign-in or selected model.
+
+<Callout type="info" title="Using Claude Code in a terminal instead?">
+Use `headroom wrap claude`. This page is specifically for Anthropic's official
+Claude Code extension inside VS Code.
+</Callout>
+
+## Requirements
+
+- VS Code 1.98 or newer
+- Anthropic's official Claude Code extension, signed in and working
+- Headroom with proxy dependencies: `pip install "headroom-ai[proxy]"`
+- Loopback access to `127.0.0.1` from the VS Code extension host
+
+Confirm that Claude Code works normally in VS Code before adding Headroom. This
+makes authentication or extension problems easier to distinguish from proxy
+configuration problems.
+
+## Quick start
+
+1. Open a terminal in the project you use with Claude Code.
+2. Start Headroom:
+
+```bash
+headroom wrap vscode-claude
+```
+
+Headroom starts its proxy and adds two entries under `env` in the Claude Code
+user settings file:
+
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8787/p/your-project",
+    "ENABLE_TOOL_SEARCH": "true"
+  }
+}
+```
+
+`ANTHROPIC_BASE_URL` changes the endpoint, not the selected model.
+`ENABLE_TOOL_SEARCH` keeps Claude Code's on-demand tool loading enabled when it
+uses a custom endpoint. Existing settings and prior values for both variables are
+preserved for restoration. Headroom does not store or replace your Anthropic
+credentials.
+
+3. After the first configuration, run **Developer: Reload Window** from the VS
+Code Command Palette.
+4. Keep the wrapper terminal running and use the Claude Code panel normally.
+
+## Verify that it is working
+
+While the wrapper is running:
+
+1. Open `http://127.0.0.1:8787/health`; it should report a healthy proxy.
+2. Send a message in the Claude Code panel.
+3. Open the dashboard or proxy log whose locations are printed by the wrapper.
+   Confirm that the request appears there; savings are recorded with each
+   completed request.
+
+If the health check succeeds but no request appears in the dashboard or proxy
+log, reload the VS Code window and confirm that the extension host can reach the
+same `127.0.0.1` as Headroom.
+
+## Settings location
+
+The default user settings file is `~/.claude/settings.json` on macOS and Linux,
+or `%USERPROFILE%\.claude\settings.json` on Windows. `CLAUDE_CONFIG_DIR` is
+respected when set. To target another profile explicitly:
+
+```bash
+headroom wrap vscode-claude --settings-file /path/to/.claude/settings.json
+```
+
+Use `--no-configure` to print the settings without editing a file.
+
+The proxy URL includes the current directory as the project attribution name.
+Run the wrapper from the intended project directory. If you select another port,
+for example `--port 8788`, Headroom writes that same port to the settings file.
+
+## Stop and undo
+
+Press `Ctrl+C` to stop the proxy. The endpoint remains configured so requests
+fail closed rather than silently bypassing Headroom while it is stopped. Restart
+it with `headroom wrap vscode-claude` before using Claude Code again.
+
+Restore the values that existed before Headroom configured the extension:
+
+```bash
+headroom unwrap vscode-claude
+```
+
+Headroom records only the two values it owns in a sidecar next to the Claude
+settings file. It refuses malformed settings or conflicting edits rather than
+overwriting them. Unrelated Claude settings are preserved.
+
+If you used `--settings-file` during setup, pass the same option when undoing it:
+
+```bash
+headroom unwrap vscode-claude --settings-file /path/to/.claude/settings.json
+```
+
+## Remote development
+
+For Dev Containers, SSH, or WSL, `127.0.0.1` must refer to the environment where
+the Claude Code process runs. Run Headroom there or forward the selected port,
+and pass that environment's Claude settings file with `--settings-file` when
+automatic discovery does not match it.
+
+## Troubleshooting
+
+- Check `http://127.0.0.1:8787/health` while the wrapper is running.
+- Run `headroom wrap vscode-claude --port 8788` if port 8787 is occupied.
+- Reload the VS Code window after changing Claude Code settings.
+- Keep the wrapper process running for the entire Claude Code session. A stopped
+  proxy intentionally does not fall back to a direct Anthropic connection.
+- If configuration reports a conflict, inspect `~/.claude/settings.json`; Headroom
+  will not replace a managed value that changed after setup.
+- If you use `CLAUDE_CONFIG_DIR`, launch Headroom from an environment where it is
+  set to the same value used by Claude Code.
+- This integration is for the Claude Code extension, not the Claude desktop app.

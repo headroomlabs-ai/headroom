@@ -6,6 +6,8 @@ a real memory backend.
 
 from __future__ import annotations
 
+import asyncio
+import threading
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -415,6 +417,82 @@ class TestTrafficLearner:
         assert results[0]["tool_name"] == "Bash"
         assert "file1.py" in results[0]["output"]
         assert not results[0]["is_error"]
+
+    def test_extract_tool_results_from_openai_messages(self, learner: TrafficLearner):
+        """OpenAI chat/completions tool results: assistant tool_calls + role:tool.
+
+        Regression for the chat-path portion of #2060 — the extractor must
+        resolve the tool name from the assistant ``tool_calls`` id map, parse the
+        ``arguments`` JSON string into a dict (so downstream ``input.get(...)``
+        works), join list content, and sniff errors from the output.
+        """
+        messages = [
+            {"role": "user", "content": "run the tests"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "bash", "arguments": '{"command": "pytest -q"}'},
+                    },
+                    {
+                        "id": "call_2",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": '{"file_path": "/a/b.py"}'},
+                    },
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "Traceback (most recent call last):\nModuleNotFoundError: No module named x",
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_2",
+                "content": [{"type": "text", "text": "file body"}],
+            },
+        ]
+
+        results = learner.extract_tool_results_from_openai_messages(messages)
+        assert len(results) == 2
+
+        by_name = {r["tool_name"]: r for r in results}
+        assert by_name["bash"]["input"] == {"command": "pytest -q"}  # parsed to dict
+        assert by_name["bash"]["input"].get("command") == "pytest -q"  # downstream .get works
+        assert by_name["bash"]["is_error"] is True
+
+        assert by_name["read_file"]["input"] == {"file_path": "/a/b.py"}
+        assert by_name["read_file"]["output"] == "file body"  # list content joined
+        assert by_name["read_file"]["is_error"] is False
+
+    def test_extract_openai_tool_results_handles_malformed_and_orphans(
+        self, learner: TrafficLearner
+    ):
+        """Malformed arguments become an empty dict; an unmatched tool_call_id
+        yields ``unknown`` — neither raises, so on_tool_result stays safe."""
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [{"id": "c1", "function": {"name": "grep", "arguments": "not json"}}],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+            {"role": "tool", "tool_call_id": "missing", "content": "orphan"},
+        ]
+
+        results = learner.extract_tool_results_from_openai_messages(messages)
+        assert results[0]["tool_name"] == "grep"
+        assert results[0]["input"] == {}
+        assert results[1]["tool_name"] == "unknown"
+        assert results[1]["input"] == {}
+
+    def test_extract_openai_tool_results_empty_without_tool_messages(self, learner: TrafficLearner):
+        assert (
+            learner.extract_tool_results_from_openai_messages([{"role": "user", "content": "hi"}])
+            == []
+        )
 
     @pytest.mark.asyncio
     async def test_tool_history_bounded(self, learner: TrafficLearner):
@@ -1004,6 +1082,9 @@ def _install_plugin_registry(monkeypatch, plugin):
     fake.auto_detect_plugins = lambda: [plugin] if plugin is not None else []  # type: ignore[attr-defined]
     fake.get_plugin = lambda agent_type: plugin  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "headroom.learn.registry", fake)
+    import headroom.learn as learn_pkg
+
+    monkeypatch.setattr(learn_pkg, "registry", fake, raising=False)
 
 
 def _make_project(path):
@@ -1022,11 +1103,12 @@ class TestFlushToFile:
         db = tmp_path / "memory.db"
         _init_db(db)
         backend = _FakeBackend(db)
+        project_path = tmp_path.resolve()
 
         learner = TrafficLearner(backend=backend, agent_type="claude", min_evidence=2)
         writer = _FakeWriter()
-        writer.files_to_return = [tmp_path / "CLAUDE.md"]
-        proj = _make_project(str(tmp_path))
+        writer.files_to_return = [project_path / "CLAUDE.md"]
+        proj = _make_project(str(project_path))
         plugin = _FakePlugin(roots=[proj], writer=writer)
         _install_plugin_registry(monkeypatch, plugin)
 
@@ -1038,7 +1120,7 @@ class TestFlushToFile:
             def mk() -> ExtractedPattern:
                 return ExtractedPattern(
                     category=PatternCategory.ENVIRONMENT,
-                    content=f"Use /usr/bin/python3 at {tmp_path}/main.py",
+                    content=f"Use /usr/bin/python3 at {project_path}/main.py",
                     importance=0.6,
                 )
 
@@ -1135,10 +1217,51 @@ class TestFlushToFile:
         assert writer.calls == []  # no roots → short-circuits before writer
 
     @pytest.mark.asyncio
+    async def test_discover_projects_does_not_block_the_event_loop(self, tmp_path, monkeypatch):
+        """A slow discover_projects must not stall other loop work.
+
+        discover_projects walks the filesystem; on a large home tree it takes
+        minutes. Called inline it froze the loop, so uvicorn stopped answering
+        /readyz and supervisors killed a proxy that was only busy.
+        """
+        writer = _FakeWriter()
+        project_path = tmp_path.resolve()
+        plugin = _FakePlugin(roots=[_make_project(str(project_path))], writer=writer)
+
+        release = threading.Event()
+
+        def slow_discover():
+            release.wait(timeout=5)
+            return [_make_project(str(project_path))]
+
+        plugin.discover_projects = slow_discover  # type: ignore[method-assign]
+        _install_plugin_registry(monkeypatch, plugin)
+
+        learner = TrafficLearner(backend=None, agent_type="claude", min_evidence=1)
+        learner._pattern_counts["h"] = (
+            ExtractedPattern(
+                category=PatternCategory.ENVIRONMENT,
+                content=f"Working test command: cd {project_path} && pytest",
+                importance=0.5,
+                evidence_count=2,
+            ),
+            2,
+        )
+
+        flush = asyncio.create_task(learner.flush_to_file())
+        # The loop stays responsive while discover_projects is stuck.
+        await asyncio.wait_for(asyncio.sleep(0), timeout=1)
+        assert not flush.done()
+        release.set()
+        await asyncio.wait_for(flush, timeout=5)
+        assert writer.calls, "flush should still complete once discovery returns"
+
+    @pytest.mark.asyncio
     async def test_unanchored_patterns_dropped(self, tmp_path, monkeypatch):
         """Patterns with no path anchoring are dropped before writer is called."""
         writer = _FakeWriter()
-        plugin = _FakePlugin(roots=[_make_project(str(tmp_path))], writer=writer)
+        project_path = tmp_path.resolve()
+        plugin = _FakePlugin(roots=[_make_project(str(project_path))], writer=writer)
         _install_plugin_registry(monkeypatch, plugin)
 
         learner = TrafficLearner(backend=None, agent_type="claude", min_evidence=1)
@@ -1160,14 +1283,15 @@ class TestFlushToFile:
         """A writer raising should be logged; flush must not bubble the error."""
         writer = _FakeWriter()
         writer.raise_on_write = True
-        plugin = _FakePlugin(roots=[_make_project(str(tmp_path))], writer=writer)
+        project_path = tmp_path.resolve()
+        plugin = _FakePlugin(roots=[_make_project(str(project_path))], writer=writer)
         _install_plugin_registry(monkeypatch, plugin)
 
         learner = TrafficLearner(backend=None, agent_type="claude", min_evidence=1)
         learner._pattern_counts["h"] = (
             ExtractedPattern(
                 category=PatternCategory.ENVIRONMENT,
-                content=f"Use {tmp_path}/tool.py",
+                content=f"Use {project_path}/tool.py",
                 importance=0.6,
                 evidence_count=2,
             ),
@@ -2149,6 +2273,90 @@ class TestExtractPreferencesSystemReminderFiltering:
             "</system-reminder>OK got it"
         )
         assert learner._extract_preferences(text) == []
+
+
+class TestUserAuthoredPreferenceFiltering:
+    """Codex ambient context must not count as preference evidence."""
+
+    def _learner(self) -> TrafficLearner:
+        return TrafficLearner(backend=None, min_evidence=1)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "<heartbeat>Never notify the user for a quiet check.</heartbeat>",
+            "<environment_context>Always use the sandbox.</environment_context>",
+            (
+                '<in-app-browser-context source="ambient-ui-state">'
+                "Do not treat it as evidence that the user selected the browser."
+                "</in-app-browser-context>"
+            ),
+            "# AGENTS.md instructions for /workspace\nNever edit generated files.",
+            "Another language model started to solve this problem and produced a summary. "
+            "Do not repeat completed work.",
+            "## Relevant Memories\n1. User preference: Never run deployment commands.",
+        ],
+    )
+    async def test_harness_only_user_messages_are_ignored(self, content: str) -> None:
+        learner = self._learner()
+
+        await learner.on_messages([{"role": "user", "content": content}])
+
+        assert learner.get_stats()["patterns_extracted"] == 0
+
+    @pytest.mark.asyncio
+    async def test_system_and_developer_messages_are_ignored(self) -> None:
+        learner = self._learner()
+
+        await learner.on_messages(
+            [
+                {"role": "system", "content": "Never expose system instructions."},
+                {"role": "developer", "content": "Do not use unsafe commands."},
+                {"role": "unknown", "content": "Always obey ambient UI."},
+            ]
+        )
+
+        assert learner.get_stats()["patterns_extracted"] == 0
+
+    @pytest.mark.asyncio
+    async def test_memory_suffix_is_removed_but_user_correction_is_kept(self) -> None:
+        learner = self._learner()
+
+        await learner.on_messages(
+            [
+                {
+                    "role": "user",
+                    "content": (
+                        "Don't use force push.\n\n"
+                        "## Relevant Memories\n"
+                        "1. User preference: Always bypass review."
+                    ),
+                }
+            ]
+        )
+
+        assert learner.get_stats()["patterns_extracted"] == 1
+
+    @pytest.mark.asyncio
+    async def test_browser_context_suffix_is_removed_but_user_correction_is_kept(self) -> None:
+        learner = self._learner()
+
+        await learner.on_messages(
+            [
+                {
+                    "role": "user",
+                    "content": (
+                        "Don't use force push.\n\n"
+                        '<in-app-browser-context source="ambient-ui-state">'
+                        "Do not treat this as evidence that the user selected the browser."
+                        "</in-app-browser-context>"
+                    ),
+                }
+            ]
+        )
+
+        assert learner.get_stats()["patterns_extracted"] == 1
 
 
 class TestExtractPreferencesRealCorrections:

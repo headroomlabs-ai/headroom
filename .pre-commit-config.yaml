@@ -7,13 +7,27 @@ repos:
         language: system
         pass_filenames: false
         always_run: true
+      - id: verify-ruff-version
+        name: Verify Ruff version alignment
+        entry: python3 scripts/verify-ruff-version.py
+        language: system
+        pass_filenames: false
+        always_run: true
       - id: commitlint
         name: Commitlint
         entry: bash -lc 'npx --yes --package=@commitlint/cli --package=@commitlint/config-conventional -- commitlint --edit "$1" --config .commitlintrc.json' --
         language: system
         stages: [commit-msg]
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-merge-conflict
+        # Catch markers even outside an in-progress merge (e.g. committing a
+        # botched conflict resolution from a rebase). CI re-checks this
+        # unconditionally, so installing hooks is not required for enforcement.
+        args: [--assume-in-merge]
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.9.4
+    rev: v0.15.17
     hooks:
       - id: ruff
         args: [--fix]

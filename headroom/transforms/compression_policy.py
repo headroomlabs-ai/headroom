@@ -58,6 +58,13 @@ _MAX_LOSSY_RATIO_SUBSCRIPTION: float = 0.25
 #: Anthropic prompt-cache write multiplier: a ``cache_creation`` token
 #: costs 1.25x a plain input token (5-minute TTL tier). Input to the
 #: net-cost mutation formula (#856). Mirrors the Rust ``pub const``.
+#: ponytail: hardcoded to the 5m tier. A client on Anthropic's 1h cache
+#: (ENABLE_PROMPT_CACHING_1H / cache_control.ttl="1h", which Headroom
+#: preserves) writes at 2.0x, so its mutations are gated with a ~40%
+#: under-stated write penalty. Harmless while the net-cost gate stays
+#: default-off (HEADROOM_NET_COST_POLICY); thread the TTL from
+#: cold_prefix.anthropic_cache_ttl_seconds through ContentRouter ->
+#: net_mutation_gain if that gate is ever turned on.
 CACHE_WRITE_MULTIPLIER: float = 1.25
 
 #: Anthropic prompt-cache read multiplier: a ``cache_read`` token costs

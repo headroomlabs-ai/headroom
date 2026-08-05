@@ -1,8 +1,5 @@
 # Spec — `headroom-oauth2` (generic OAuth2 client-credentials upstream auth)
 
-Feature request: [chopratejas/headroom#778](https://github.com/chopratejas/headroom/issues/778).
-Status: implementation ready; awaiting maintainer 👍 before merge.
-
 ## Summary
 
 A vendor-neutral proxy extension (registers on Headroom's `headroom.proxy_extension` seam) that

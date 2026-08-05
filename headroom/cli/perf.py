@@ -12,9 +12,9 @@ from .main import main
 @main.command()
 @click.option(
     "--hours",
-    type=float,
+    type=click.FloatRange(min=0),
     default=168.0,
-    help="Analyze logs from the last N hours (default: 168 = 7 days)",
+    help="Analyze logs from the last N hours (default: 168 = 7 days; 0 = all data)",
 )
 @click.option("--raw", is_flag=True, help="Show raw PERF records instead of report")
 @click.option(

@@ -10,7 +10,7 @@ Headroom provides specialized compressors for text-based content that isn't JSON
 | `SearchCompressor` | grep/ripgrep output | Relevant matches, file diversity | 80-95% |
 | `LogCompressor` | Build/test logs | Errors, stack traces, summaries | 85-95% |
 | `DiffCompressor` | Unified diffs | Changed lines, context | 60-80% |
-| `TextCompressor` | General text | Relevant paragraphs, anchors | 60-80% |
+| `TextCrusher` | General text | Relevant sentences, anchors | 30-60% |
 | `KompressCompressor` | General text fallback | Learned token scoring via ONNX | 30-50% |
 
 ## SearchCompressor
@@ -47,9 +47,11 @@ print(result.compressed)
 from headroom.transforms import SearchCompressor, SearchCompressorConfig
 
 config = SearchCompressorConfig(
-    max_results=50,                # Keep up to 50 matches
-    preserve_file_diversity=True,  # Ensure different files represented
-    relevance_threshold=0.3,       # Minimum relevance score to keep
+    max_total_matches=30,       # Cap total matches kept across all files
+    max_matches_per_file=5,     # Cap matches kept per file (diversity)
+    max_files=15,               # Cap number of distinct files kept
+    boost_errors=True,          # Prioritize lines that look like errors
+    context_keywords=["auth"],  # Extra terms to bias selection toward
 )
 
 compressor = SearchCompressor(config)
@@ -112,21 +114,22 @@ compressor = DiffCompressor()
 result = compressor.compress(diff_output)
 ```
 
-## TextCompressor
+## TextCrusher
 
-General-purpose text compression with anchor preservation. Best for documentation, README files, and prose content.
+Extractive prose compression -- it keeps the most relevant input sentences verbatim (selection, not rewriting). Best for documentation, README files, and prose content. `TextCrusher` lives in its own module rather than the `headroom.transforms` package root:
 
 ```python
-from headroom.transforms import TextCompressor
+from headroom.transforms.text_crusher import TextCrusher
 
 long_text = """
 ... thousands of lines of documentation ...
 """
 
-compressor = TextCompressor()
+compressor = TextCrusher()
 result = compressor.compress(long_text, context="authentication")
 
 print(result.compressed)
+print(f"{result.original_tokens} -> {result.compressed_tokens} tokens")
 ```
 
 **What gets preserved:**
@@ -166,7 +169,8 @@ if detection.content_type == ContentType.SEARCH_RESULTS:
 elif detection.content_type == ContentType.BUILD_OUTPUT:
     result = LogCompressor().compress(content)
 elif detection.content_type == ContentType.PLAIN_TEXT:
-    result = TextCompressor().compress(content, context="process")
+    from headroom.transforms.text_crusher import TextCrusher
+    result = TextCrusher().compress(content, context="process")
 ```
 
 ## When Each Compressor Is Used
@@ -178,7 +182,7 @@ The ContentRouter selects the right compressor automatically. Here's when each f
 | `file:line:content` lines | SearchCompressor | grep/ripgrep output format |
 | pytest, npm, cargo markers | LogCompressor | Build tool output patterns |
 | `---/+++` and `@@` markers | DiffCompressor | Unified diff format |
-| Prose, documentation | TextCompressor | Fallback for non-structured text |
+| Prose, documentation | TextCrusher | Fallback for non-structured text |
 | Long plain text | KompressCompressor | ContentRouter fallback |
 
 ## Performance
@@ -188,5 +192,5 @@ The ContentRouter selects the right compressor automatically. Here's when each f
 | SearchCompressor | 1,000 matches | 30-50 matches | ~2ms |
 | LogCompressor | 5,000 lines | 100-200 lines | ~3ms |
 | DiffCompressor | Large diff | Changed hunks only | ~2ms |
-| TextCompressor | 10,000 chars | 2,000 chars | ~2ms |
+| TextCrusher | 10,000 chars | 2,000 chars | ~2ms |
 | KompressCompressor | Plain text | 50-70% of original | model-dependent |

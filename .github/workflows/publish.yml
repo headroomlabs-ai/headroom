@@ -17,7 +17,7 @@ jobs:
       contents: write  # For uploading release assets
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -54,4 +54,4 @@ jobs:
           files: dist/headroom-sbom.cdx.json
 
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@v1.13.0

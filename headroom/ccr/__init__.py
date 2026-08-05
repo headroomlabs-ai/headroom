@@ -50,6 +50,12 @@ from .response_handler import (
     StreamingCCRBuffer,
     StreamingCCRHandler,
 )
+from .tool_calls import (
+    extract_tool_calls,
+    has_ccr_tool_calls,
+    parse_ccr_tool_calls,
+    tool_call_id_for_provider,
+)
 from .tool_injection import (
     CCR_TOOL_NAME,
     CCRToolInjector,
@@ -82,6 +88,10 @@ __all__ = [
     "ResponseHandlerConfig",
     "StreamingCCRBuffer",
     "StreamingCCRHandler",
+    "extract_tool_calls",
+    "has_ccr_tool_calls",
+    "parse_ccr_tool_calls",
+    "tool_call_id_for_provider",
     # Context tracking
     "CompressedContext",
     "ContextTracker",

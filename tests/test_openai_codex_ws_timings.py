@@ -38,6 +38,7 @@ class _DummyOpenAIHandler(OpenAIHandlerMixin):
             retry_base_delay_ms=1,
             retry_max_delay_ms=1,
             connect_timeout_seconds=10,
+            openai_extra_headers=None,
         )
         self.usage_reporter = None
         self.openai_provider = SimpleNamespace(get_context_limit=lambda model: 128_000)
@@ -45,9 +46,34 @@ class _DummyOpenAIHandler(OpenAIHandlerMixin):
         self.anthropic_backend = None
         self.cost_tracker = None
         self.memory_handler = None
+        self.traffic_learner = None
 
     async def _next_request_id(self) -> str:
         return "req-ws-test"
+
+
+class _MemoryToolsOnlyHandler:
+    def __init__(self) -> None:
+        self.config = SimpleNamespace(
+            inject_context=False,
+            inject_tools=True,
+            project_root_override="",
+        )
+        self.compute_calls = 0
+
+    def compute_memory_tool_definitions(self, provider: str) -> list[dict]:
+        self.compute_calls += 1
+        assert provider == "openai"
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "memory_search",
+                    "description": "Search memory.",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
 
 
 class _FakeWebSocket:
@@ -223,6 +249,44 @@ def test_codex_ws_happy_path_emits_all_stage_timings(stage_log_capture):
     path, emitted = handler.metrics.stage_timings[-1]
     assert path == "openai_responses_ws"
     assert "total_session" in emitted
+
+
+def test_codex_ws_chatgpt_auth_skips_memory_tools(stage_log_capture):
+    upstream_events = [
+        json.dumps({"type": "response.created", "response": {"id": "resp_1"}}),
+        json.dumps({"type": "response.completed", "response": {"id": "resp_1"}}),
+    ]
+    upstream = _FakeUpstream(upstream_events)
+    fake_ws_mod = _make_fake_websockets_module(upstream)
+
+    first_frame = json.dumps(
+        {
+            "type": "response.create",
+            "response": {"model": "gpt-5.4", "input": "hello", "store": True},
+        }
+    )
+    client_ws = _FakeWebSocket(
+        frames=[first_frame],
+        headers={
+            "authorization": "Bearer chatgpt-session-token",
+            "chatgpt-account-id": "acct_123",
+            "x-headroom-user-id": "user-1",
+        },
+    )
+    handler = _DummyOpenAIHandler()
+    memory_handler = _MemoryToolsOnlyHandler()
+    handler.memory_handler = memory_handler
+
+    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
+        anyio.run(handler.handle_openai_responses_ws, client_ws)
+
+    assert len(upstream.sent) == 1
+    sent = json.loads(upstream.sent[0])
+    response_body = sent["response"]
+    assert response_body["store"] is False
+    assert "tools" not in response_body
+    assert "## Memory" not in response_body.get("instructions", "")
+    assert memory_handler.compute_calls == 0
 
 
 def test_codex_ws_upstream_connect_failure_still_logs_timings(stage_log_capture):

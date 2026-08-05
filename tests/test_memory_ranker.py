@@ -84,6 +84,13 @@ def test_from_backend_result_preserves_memory_id() -> None:
     assert cand.score == 0.91
 
 
+def test_rank_preserves_memory_id() -> None:
+    """The ranker must not drop the backend ID when rebuilding candidates."""
+    cand = MemoryCandidate(content="User prefers Python.", score=0.91, id="mem_abc_123")
+    out = RecencyBoostRanker().rank([cand])
+    assert out[0].id == "mem_abc_123"
+
+
 def test_from_backend_result_handles_missing_id() -> None:
     """Defensive: legacy backend rows without an ID become ``id=""``;
     the auto-tail formatter renders ``[?]`` for those rows, no crash."""

@@ -17,7 +17,6 @@ CCR eliminates this tradeoff.
 |-----------|-------------------|-----------------|
 | **SmartCrusher** | JSON arrays (tool outputs) | Stores original array, marker includes hash |
 | **ContentRouter** | Code, logs, search results, text | Stores original content by strategy |
-| **IntelligentContextManager** | Messages (conversation turns) | Stores dropped messages, marker includes hash |
 
 ## How CCR Works
 
@@ -55,8 +54,7 @@ Headroom injects a `headroom_retrieve` tool into the LLM's available tools:
   "name": "headroom_retrieve",
   "description": "Retrieve original uncompressed data from Headroom cache",
   "parameters": {
-    "hash": "The hash key from the compression marker",
-    "query": "Optional: search within the cached data"
+    "hash": "The hash key from the compression marker"
   }
 }
 ```
@@ -91,36 +89,31 @@ Turn 5: User asks "What about the auth middleware?"
         → LLM sees full file list, finds auth_middleware.py
 ```
 
-## Message-Level CCR (IntelligentContext)
+## CCR Stores Content Blocks, Not Dropped Messages
 
-IntelligentContextManager is a **message-level compressor**. When it drops low-importance messages to fit the context budget, those messages are stored in CCR:
+Headroom never drops whole messages from conversation history. CCR is purely about compressed **content blocks** — the newest tool outputs, tool results, and user content that the live-zone pipeline compresses. The original block is stored in the cache and is retrievable on demand:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│  LONG CONVERSATION (100 messages, 50K tokens)                    │
-│  └─ IntelligentContext scores messages by importance            │
-│  └─ Drops 60 low-scoring messages                               │
-│  └─ Dropped messages cached with hash=def456                    │
-│  └─ Marker inserted: "60 messages dropped, retrieve: def456"    │
+│  LATEST TOOL RESULT (500 files, 12K tokens)                      │
+│  └─ ContentRouter / SmartCrusher compresses the block           │
+│  └─ Original cached with hash=def456                            │
+│  └─ Marker inserted: "500 items compressed, retrieve: def456"   │
 └─────────────────────────────────────────────────────────────────┘
                               │
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │  LLM PROCESSING                                                  │
-│  Option A: LLM solves task with remaining messages → Done       │
-│  Option B: LLM needs earlier context                            │
+│  Option A: LLM solves task with the compressed block → Done     │
+│  Option B: LLM needs the full content                           │
 │            → Calls headroom_retrieve(hash=def456)               │
-│            → Full conversation restored                          │
+│            → Full original block restored                        │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-**The marker includes the CCR reference:**
-```
-[Earlier context compressed: 60 message(s) dropped by importance scoring.
-Full content available via ccr_retrieve tool with reference 'def456'.]
-```
+The older conversation turns, system prompt, and tool definitions — the provider cache hot zone — are never mutated, so prompt caching keeps working. Compression happens only on the live zone (the newest content blocks) and is fully reversible via CCR.
 
-**TOIN integration:** When users retrieve dropped messages, TOIN learns to score those message patterns higher next time, improving future drop decisions across all users.
+**TOIN integration:** When users retrieve compressed content, TOIN learns to treat those patterns as higher value next time, improving future compression decisions across all users.
 
 ## Features
 
@@ -128,7 +121,7 @@ Full content available via ccr_retrieve tool with reference 'def456'.]
 |---------|-------------|
 | **Automatic Response Handling** | When LLM calls `headroom_retrieve`, the proxy handles it automatically |
 | **Multi-Turn Context Tracking** | Tracks compressed content across turns, proactively expands when relevant |
-| **BM25 Search** | LLM can search within compressed data: `headroom_retrieve(hash, query="errors")` |
+| **Hash-Keyed Retrieval** | `headroom_retrieve(hash)` always returns the full original content |
 | **Feedback Learning** | Learns from retrieval patterns to improve future compression |
 
 ## Configuration

@@ -146,7 +146,7 @@ def test_list_release_commits_parses_empty_body_entries(
     run.return_value = Mock(
         stdout="feat: add capability\x1f\x1efix: patch bug\x1fbody text\x1e",
     )
-    monkeypatch.setattr("headroom.release_version.subprocess.run", run)
+    monkeypatch.setattr("headroom.release_version.run", run)
 
     commits = list_release_commits(ROOT, "")
 

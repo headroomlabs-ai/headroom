@@ -22,6 +22,14 @@ on:
   release:
     types: [published]
 
+# A merge spree pushes many commits to main; without this, each commit starts
+# a full multi-arch image build and they pile up against the 20-job concurrency
+# cap. Supersede all but the latest build for a given ref. cancel-in-progress is
+# scoped to main only so a release tag's publish (its own ref) is never killed.
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref == 'refs/heads/main' }}
+
 env:
   REGISTRY: ghcr.io
 
@@ -64,7 +72,7 @@ jobs:
           - { name: arm64, runs_on: ubuntu-24.04-arm, platform: linux/arm64 }
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Normalize image name
         id: image-name

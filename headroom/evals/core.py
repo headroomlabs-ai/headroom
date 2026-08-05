@@ -260,8 +260,10 @@ class CompressionEvaluator:
         return f"Based on the context, {' '.join(words[:20])}..."
 
     def _estimate_tokens(self, text: str) -> int:
-        """Estimate token count (roughly 4 chars per token)."""
-        return len(text) // 4
+        """Estimate token count: ~1.5 tokens per CJK char (CJK is dense, ~1-2
+        tokens/char), ~4 chars per token otherwise."""
+        cjk = sum(1 for c in text if "　" <= c <= "鿿" or "가" <= c <= "힯")
+        return int(cjk * 1.5) + (len(text) - cjk) // 4
 
     def evaluate_case(
         self,

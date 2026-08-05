@@ -22,11 +22,22 @@ This is ideal for local development environments where you want "set and forget"
 ### Installing Headroom with Proxy Support
 
 ```bash
-# Install with proxy support
-pip install headroom-ai[proxy]
+# Install the host CLI with proxy support
+uv tool install --python 3.13 "headroom-ai[proxy]"
+
+# If your shell cannot find `headroom` after installation
+uv tool update-shell
 
 # Verify installation
 headroom proxy --help
+```
+
+On macOS with Homebrew, `python3` may point at a newer interpreter than the
+current Headroom wheel set. Passing `--python 3.13` keeps the CLI install on a
+wheel-supported interpreter. If Python 3.13 is missing, install it first:
+
+```bash
+brew install python@3.13
 ```
 
 ### API Key Configuration
@@ -390,7 +401,7 @@ tail -n 50 ~/Library/Logs/headroom/proxy-error.log
 | Error | Solution |
 |-------|----------|
 | `ANTHROPIC_API_KEY not set` | Set API key in environment or plist |
-| `ModuleNotFoundError: No module named 'headroom'` | Install: `pip install headroom-ai[proxy]` |
+| `ModuleNotFoundError: No module named 'headroom'` | Install: `uv tool install --python 3.13 "headroom-ai[proxy]"` |
 | `command not found: headroom` | Update plist with correct path: `command -v headroom` |
 | `Address already in use` | Change port or stop conflicting service |
 
@@ -421,9 +432,9 @@ tail -f ~/Library/Logs/headroom/proxy-error.log
 
 **Common causes:**
 
-- Missing dependencies: `pip install headroom-ai[proxy]`
+- Missing dependencies: `uv tool install --python 3.13 "headroom-ai[proxy]"`
 - Invalid API key: Verify `ANTHROPIC_API_KEY`
-- Python version incompatible: Requires Python 3.9+
+- Python version incompatible: Requires Python 3.10+
 
 ### ANTHROPIC_BASE_URL Not Set
 

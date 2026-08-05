@@ -38,7 +38,7 @@ from headroom.compression.handlers.code_handler import CodeStructureHandler
 from headroom.compression.handlers.json_handler import JSONStructureHandler
 from headroom.compression.masks import (
     StructureMask,
-    compute_entropy_mask,
+    compute_entropy_mask_for_content,
     mask_to_spans,
 )
 
@@ -209,11 +209,13 @@ class UniversalCompressor:
         if len(text) <= target_len:
             return text
 
-        # Keep first and last portions
+        # Keep first and last portions. The separator must contain no control
+        # characters (RFC 8259 §7): this fallback can run on a span inside a
+        # JSON string value, and a raw newline there produces invalid JSON.
         keep_start = target_len * 2 // 3
         keep_end = target_len // 3
 
-        return text[:keep_start] + "\n...[compressed]...\n" + text[-keep_end:]
+        return text[:keep_start] + " ...[compressed]... " + text[-keep_end:]
 
     def compress(
         self,
@@ -266,10 +268,13 @@ class UniversalCompressor:
         handler_result = handler.get_mask(content, tokens, **kwargs)
         structure_mask = handler_result.mask
 
-        # Optionally add entropy-based preservation
+        # Optionally add entropy-based preservation. Score whole words (mapped
+        # back to character positions) rather than the character-level `tokens`
+        # above — single-character tokens never reach the min length, which
+        # would make entropy preservation a silent no-op on plain text.
         if self.config.use_entropy_preservation:
-            entropy_mask = compute_entropy_mask(
-                tokens,
+            entropy_mask = compute_entropy_mask_for_content(
+                content,
                 threshold=self.config.entropy_threshold,
             )
             # Union: preserve if either mask says preserve

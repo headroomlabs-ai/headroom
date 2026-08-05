@@ -77,11 +77,12 @@ Install automatically selects the `contextEngine` slot for `headroom` on current
 - `http://127.0.0.1:<proxyPort>`
 - `http://localhost:<proxyPort>`
 
-Default `proxyPort` is `8787`.
+Default `proxyPort` is `8787`. Auto-start is opt-in; in production, prefer an externally
+managed proxy such as systemd with `proxyUrl` set and `autoStart: false`.
 
 ### Upstream gateway routing
 
-By default, the plugin also rewrites the built-in `openai-codex` provider base URL to the active Headroom proxy at runtime. That means Codex provider traffic flows through Headroom, so `/stats` can observe real upstream request and cache activity instead of only local context compression.
+By default, the plugin also rewrites the built-in `openai-codex` provider base URL to a verified active Headroom proxy at runtime. That means Codex provider traffic flows through Headroom, so `/stats` can observe real upstream request and cache activity instead of only local context compression.
 
 This does not replace Headroom's existing Codex routing rules. The proxy already decides between `api.openai.com` and `chatgpt.com/backend-api/codex/responses` based on ChatGPT auth. The plugin change only points OpenClaw's provider config at the active proxy in memory and preserves the rest of the provider config.
 
@@ -199,10 +200,10 @@ Compression is lossless via CCR (Compress-Cache-Retrieve): originals are stored 
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `proxyUrl` | auto-detected | Optional URL of a Headroom proxy. Local addresses (`http://127.0.0.1:<port>`, `http://localhost:<port>`) enable auto-start; remote URLs (`https://headroom.example.com`) are connect-only. |
-| `proxyPort` | `8787` | Port used for default auto-detect/auto-start when `proxyUrl` is not set. |
+| `proxyUrl` | auto-detected | Optional URL of a Headroom proxy. Configured URLs are probe-gated before provider routing. Remote URLs (`https://headroom.example.com`) are connect-only. |
+| `proxyPort` | `8787` | Port used for default auto-detect and optional local auto-start when `proxyUrl` is not set. |
 | `pythonPath` | auto-detected | Optional Python executable override for Python fallback launcher. |
-| `autoStart` | `true` | Auto-start a local `headroom proxy` if not already running (local URLs only; ignored for remote proxies) |
+| `autoStart` | `false` | Opt-in auto-start for a local `headroom proxy` if not already running (local URLs only; ignored for remote proxies). Keep `false` when systemd owns the proxy. |
 | `startupTimeoutMs` | `20000` | Time to wait for auto-started proxy to become healthy |
 | `routeCodexViaProxy` | `true` | Rewrite OpenClaw's built-in `openai-codex` provider to use the active Headroom proxy in memory so upstream Codex requests pass through Headroom. |
 | `gatewayProviderIds` | `[]` | Optional explicit list of OpenClaw provider ids to route through the active Headroom proxy in memory. Friendly aliases `codex`, `claude`, `copilot`, and `gemini` are also accepted. When set, this overrides the default `openai-codex` routing list. |

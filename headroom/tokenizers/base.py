@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from typing import Any, Protocol, runtime_checkable
 
 
@@ -54,6 +55,14 @@ class BaseTokenizer(ABC):
     # Override in subclasses for model-specific overhead
     MESSAGE_OVERHEAD = 4
     REPLY_OVERHEAD = 3  # Assistant reply start tokens
+
+    # Oversized-blob token estimation (see _count_serialized). Serializing a blob
+    # is cheap; running count_text over the whole multi-megabyte string is what
+    # blocks the proxy event loop, so a large blob is counted from an even-spread
+    # sample of the serialized string, scaled by length.
+    LARGE_BLOB_CHARS = 50_000  # above this serialized size, sample instead of full count
+    SAMPLE_CHARS = 20_000  # total characters fed to count_text for an oversized blob
+    SAMPLE_CHUNK = 2_000  # size of each evenly-spaced chunk in that sample
 
     @abstractmethod
     def count_text(self, text: str) -> int:
@@ -151,11 +160,18 @@ class BaseTokenizer(ABC):
                     content = part.get("content", "")
                     if isinstance(content, str):
                         total += self.count_text(content)
+                    elif isinstance(content, list):
+                        # Recurse into nested blocks (matching the Strands
+                        # toolResult branch below). A tool that returns an image
+                        # nests a base64 block here; serializing it would price
+                        # the ~KB/MB base64 string as text — a 50-200x overcount
+                        # (a screenshot reads as tens of thousands of tokens).
+                        total += self._count_content_parts(content)
                     else:
-                        total += self.count_text(json.dumps(content))
+                        total += self._count_serialized(content)
                 elif part_type == "tool_use":
                     total += self.count_text(part.get("name", ""))
-                    total += self.count_text(json.dumps(part.get("input", {})))
+                    total += self._count_serialized(part.get("input", {}))
                 elif not part_type and "text" in part:
                     # Strands SDK format: {"text": "..."} without "type" field
                     total += self.count_text(part["text"])
@@ -163,7 +179,7 @@ class BaseTokenizer(ABC):
                     # Strands SDK tool_use: {"toolUse": {"name": ..., "input": ...}}
                     tool_use = part["toolUse"]
                     total += self.count_text(tool_use.get("name", ""))
-                    total += self.count_text(json.dumps(tool_use.get("input", {})))
+                    total += self._count_serialized(tool_use.get("input", {}))
                 elif not part_type and "toolResult" in part:
                     # Strands SDK tool_result: {"toolResult": {"content": [...]}}
                     tool_result = part["toolResult"]
@@ -174,7 +190,7 @@ class BaseTokenizer(ABC):
                         # Recurse into nested content blocks
                         total += self._count_content_parts(tr_content)
                     else:
-                        total += self.count_text(json.dumps(tr_content))
+                        total += self._count_serialized(tr_content)
                 elif not part_type and "reasoningContent" in part:
                     # Strands SDK reasoning: {"reasoningContent": {"reasoningText": {"text": "..."}}}
                     # This is actual text — count it precisely.
@@ -218,11 +234,36 @@ class BaseTokenizer(ABC):
                         total += 3200
                 else:
                     # Unknown type - estimate from JSON
-                    total += self.count_text(json.dumps(part))
+                    total += self._count_serialized(part)
             elif isinstance(part, str):
                 total += self.count_text(part)
 
         return total
+
+    def _count_serialized(self, obj: Any) -> int:
+        """Count tokens for a non-string content blob.
+
+        Small blobs are counted exactly. For an oversized one, run ``count_text``
+        over an even-spread sample of the serialized string and scale by length.
+        Serializing is cheap; ``count_text`` over the whole multi-megabyte string
+        is what blocks the request path, so its input is bounded here. The even
+        spread keeps the sample representative (a single slice would skew the scale
+        high), and bounding the count biases the estimate slightly low — the safe
+        direction. Fails open. Mirrors the image and document guards above.
+        """
+        try:
+            s = json.dumps(obj)
+        except Exception:
+            # fail-open: nominal estimate when obj isn't JSON-serializable
+            return self.LARGE_BLOB_CHARS // 4
+        if len(s) <= self.LARGE_BLOB_CHARS:
+            return self.count_text(s)
+        chunks = max(1, self.SAMPLE_CHARS // self.SAMPLE_CHUNK)
+        step = len(s) / chunks
+        sample = "".join(
+            s[int(i * step) : int(i * step) + self.SAMPLE_CHUNK] for i in range(chunks)
+        )
+        return int(self.count_text(sample) * len(s) / len(sample))
 
     @staticmethod
     def _estimate_image_tokens(image_data: dict[str, Any]) -> int:
@@ -319,3 +360,39 @@ class BaseTokenizer(ABC):
             NotImplementedError: If decoding is not supported.
         """
         raise NotImplementedError(f"{self.__class__.__name__} does not support decoding")
+
+
+class _DelegatingBlockCounter(BaseTokenizer):
+    """Adapter exposing :meth:`BaseTokenizer._count_content_parts` to non-subclasses.
+
+    The provider token counters in ``headroom/providers/`` are not
+    ``BaseTokenizer`` subclasses, and each grew its own shortened content-block
+    walker that handled only the shapes its provider was expected to send. The
+    result was that every one of them priced most modern blocks at ~0: measured
+    on a 6,800-char block, ``OpenAITokenCounter`` returned 8 tokens for
+    ``tool_result``/``thinking``/``document``/``mcp_tool_result`` and — its own
+    Responses shapes — ``output_text``/``refusal``; ``AnthropicTokenCounter``
+    returned 7 for ``thinking``/``document``, which are Anthropic's own.
+
+    Rather than add a fifth partial walker, this lets them borrow the audited one.
+    It is image-safe (base64 blobs get a pixel-based estimate instead of being
+    serialized and priced as text) and bounds oversized blobs, which a naive
+    ``count_text(str(block))`` catch-all does not.
+    """
+
+    __slots__ = ("_count_text_fn",)
+
+    def __init__(self, count_text_fn: Callable[[str], int]) -> None:
+        self._count_text_fn = count_text_fn
+
+    def count_text(self, text: str) -> int:
+        return self._count_text_fn(text)
+
+
+def count_content_blocks(parts: list[Any], count_text_fn: Callable[[str], int]) -> int:
+    """Count a multi-part content list using *count_text_fn* for text.
+
+    Shared entry point for provider counters. See
+    :class:`_DelegatingBlockCounter` for why this exists.
+    """
+    return _DelegatingBlockCounter(count_text_fn)._count_content_parts(parts)

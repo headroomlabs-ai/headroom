@@ -40,12 +40,29 @@ def _is_tool_result_message(msg: dict) -> bool:
     return False
 
 
+def _extract_text_from_blocks(blocks: list) -> str | None:
+    """Extract joined text from a list-of-blocks content (e.g. Anthropic list-of-text-blocks).
+
+    Modern Claude Code sends ``tool_result`` content as a list of typed
+    blocks (``[{"type": "text", "text": "..."}]``) instead of a plain
+    string.  This helper extracts text from ``type == "text"`` blocks and
+    joins them.
+    """
+    texts = [b.get("text", "") for b in blocks if isinstance(b, dict) and b.get("type") == "text"]
+    return "\n".join(t for t in texts if t != "") or None
+
+
 def _extract_tool_result_content(msg: dict) -> str | None:
     """Extract text content from a tool result message (both formats)."""
     # OpenAI format
     if msg.get("role") == "tool":
         content = msg.get("content")
-        return content if isinstance(content, str) else None
+        if isinstance(content, str):
+            return content
+        # OpenAI content can also be a list of content parts
+        if isinstance(content, list):
+            return _extract_text_from_blocks(content)
+        return None
     # Anthropic format
     content = msg.get("content")
     if isinstance(content, list):
@@ -54,6 +71,8 @@ def _extract_tool_result_content(msg: dict) -> str | None:
                 inner = block.get("content")
                 if isinstance(inner, str):
                     return inner
+                if isinstance(inner, list):
+                    return _extract_text_from_blocks(inner)
     return None
 
 
@@ -69,7 +88,16 @@ def _swap_tool_result_content(msg: dict, new_content: str) -> dict:
     if isinstance(content, list):
         for block in content:
             if isinstance(block, dict) and block.get("type") == "tool_result":
-                block["content"] = new_content
+                inner = block.get("content")
+                if isinstance(inner, list):
+                    # Collapse list-of-blocks to a single text block.
+                    # The compressed content is a single string; preserving
+                    # multiple text blocks would produce a different joined
+                    # output on re-extraction (first text block replaced,
+                    # remaining text blocks still joined).
+                    block["content"] = [{"type": "text", "text": new_content}]
+                else:
+                    block["content"] = new_content
                 break
     return new_msg
 

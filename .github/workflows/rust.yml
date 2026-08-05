@@ -1,27 +1,22 @@
 name: rust
 
+# Path gating lives in the `rust-changes` job below, NOT in a workflow-level
+# `paths:` filter. The distinction matters for branch protection: a workflow
+# skipped by `paths:` never creates its check runs at all, so a required status
+# check from it sits pending forever on any PR that misses those paths, and the
+# PR can never merge. A job skipped by `if:` still creates a check run, reports
+# `skipped`, and GitHub counts skipped as success for a required check.
+#
+# Same coverage as the old filter — the path list moved verbatim into
+# `rust-changes` — but `parity` is now safe to mark required on `main`.
 on:
   push:
     branches: [ main, rust-rewrite ]
-    paths:
-      - 'crates/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'rust-toolchain.toml'
-      - 'tests/parity/**'
-      - 'Makefile'
-      - '.github/workflows/rust.yml'
   pull_request:
-    paths:
-      - 'crates/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'rust-toolchain.toml'
-      - 'tests/parity/**'
-      - 'Makefile'
-      - '.github/workflows/rust.yml'
   schedule:
-    # Nightly parity run at 07:17 UTC (weekdays only). Phase 0 allows failure.
+    # Nightly parity run at 07:17 UTC (weekdays only). Redundant with the
+    # per-PR gate below, but catches drift from toolchain/dependency updates
+    # that land without touching any filtered path.
     - cron: '17 7 * * 1-5'
 
 concurrency:
@@ -36,12 +31,47 @@ permissions:
   contents: read
 
 jobs:
+  # Carries the path list the workflow-level `paths:` filter used to hold. Named
+  # `rust-changes` rather than `changes` so it does not collide with ci.yml's
+  # `changes` check.
+  rust-changes:
+    name: rust-changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      rust: ${{ steps.decide.outputs.rust }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dorny/paths-filter@v4
+        id: filter
+        if: github.event_name == 'pull_request' || github.event_name == 'push'
+        with:
+          filters: |
+            rust:
+              - 'crates/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - 'tests/parity/**'
+              - 'Makefile'
+              - '.github/workflows/rust.yml'
+      - id: decide
+        # `schedule` and `workflow_dispatch` have no diff to filter against, so
+        # they run the full suite — that is the point of the nightly job.
+        run: |
+          case "${{ github.event_name }}" in
+            pull_request|push) echo "rust=${{ steps.filter.outputs.rust }}" >> "$GITHUB_OUTPUT" ;;
+            *)                 echo "rust=true" >> "$GITHUB_OUTPUT" ;;
+          esac
+
   test:
     name: test (ubuntu)
+    needs: rust-changes
+    if: needs.rust-changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Install stable toolchain
         # Pin action code to @stable (latest fixes), toolchain version
         # via input. The @1.95.0 ref shipped action code that errors on
@@ -54,6 +84,60 @@ jobs:
           components: rustfmt, clippy
       - name: Cache cargo registry + build
         uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - name: Provide ONNX Runtime dylib
+        # headroom-core is built with `ort-load-dynamic` (see its
+        # Cargo.toml): the ONNX Runtime shared library is dlopen'd at
+        # runtime instead of statically linked, so the magika/detection
+        # tests need a real libonnxruntime.so and ORT_DYLIB_PATH pointing
+        # at it — same contract `headroom/_ort.py` fulfills for Python
+        # users via the pip `onnxruntime` package.
+        run: |
+          # >= 1.24, not 1.16: `ort`'s ORT_API_VERSION resolves to 24 because
+          # `fastembed` enables its `api-24` feature.
+          pip install 'onnxruntime>=1.24'
+          # Pre-flight, not just a pin. `ort` deadlocks rather than errors on
+          # ANY failure inside `load_dylib_from_path` — a version mismatch and
+          # a library that cannot be resolved at all both re-enter the `Once`
+          # that `setup_api()` is initialising, and `std::sync::Once` blocks
+          # forever on re-entry. Either way the job burns its full 30-minute
+          # timeout at 0% CPU with nothing in the log. Assert both conditions
+          # here so a bad runner fails in seconds with a readable message.
+          python - <<'PY' >> "$GITHUB_ENV"
+          import pathlib, sys
+
+          def die(msg: str) -> None:
+              print(f"::error::{msg}", file=sys.stderr)
+              raise SystemExit(1)
+
+          try:
+              import onnxruntime
+          except Exception as exc:  # noqa: BLE001 - any import failure is fatal here
+              die(f"onnxruntime is not importable: {exc}")
+
+          version = onnxruntime.__version__
+          try:
+              major, minor = (int(part) for part in version.split(".")[:2])
+          except ValueError:
+              die(f"cannot parse onnxruntime version {version!r}")
+          if (major, minor) < (1, 24):
+              die(
+                  f"onnxruntime {version} is too old: ort requires >= 1.24 "
+                  "(ORT_API_VERSION=24, set by fastembed's api-24 feature). "
+                  "ort DEADLOCKS instead of erroring below this, so the tests "
+                  "would hang rather than fail."
+              )
+
+          capi = pathlib.Path(onnxruntime.__file__).parent / "capi"
+          libs = sorted(capi.glob("libonnxruntime.so*")) or sorted(capi.glob("libonnxruntime*.dylib"))
+          if not libs:
+              die(f"no libonnxruntime shared library under {capi}")
+
+          print(f"ORT_DYLIB_PATH={libs[0]}")
+          print(f"onnxruntime {version} -> {libs[0]}", file=sys.stderr)
+          PY
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
       - name: cargo clippy
@@ -61,8 +145,31 @@ jobs:
       - name: cargo test
         run: cargo test --workspace
 
+  simulator-e2e:
+    name: simulator e2e (${{ matrix.os }})
+    needs: rust-changes
+    if: needs.rust-changes.outputs.rust == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+      - name: cargo test simulator-backed proxy e2e
+        run: cargo test -p headroom-proxy --test e2e_simulators
+
   wheels:
     name: wheels (${{ matrix.target }})
+    needs: rust-changes
+    if: needs.rust-changes.outputs.rust == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:
@@ -75,16 +182,13 @@ jobs:
           - os: macos-14
             target: aarch64-apple-darwin
             maturin-target: aarch64-apple-darwin
-        # macOS x86_64 (Intel) is NOT in this matrix.
-        # `fastembed` → `ort` → `ort-sys` does not publish prebuilt ONNX
-        # Runtime binaries for `x86_64-apple-darwin`; building from source
-        # in CI is a multi-hour cmake job. Apple Silicon has been the
-        # default macOS target since 2020 and is sufficient for the wheels
-        # we ship. If a customer needs Intel macOS, build from source
-        # locally (the toolchain works; only prebuilt distribution skips
-        # this target).
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            maturin-target: x86_64-apple-darwin
+        # Intel macOS uses `ort-load-dynamic` (no prebuilt ORT from ort-sys);
+        # Apple Silicon bundles ORT via `ort-download-binaries-rustls-tls`.
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
         with:
           python-version: '3.11'
@@ -106,10 +210,12 @@ jobs:
 
   audit:
     name: audit
+    needs: rust-changes
+    if: needs.rust-changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.95.0
@@ -125,28 +231,29 @@ jobs:
         continue-on-error: true
         run: cargo deny check licenses
 
-  parity-nightly:
-    name: parity (nightly, allowed to fail during Phase 0)
-    if: github.event_name == 'schedule'
+  # Blocking on every PR that touches Rust. Safe to harden now because the
+  # harness fails only on a Diff — `parity-run` sets `any_diffs` inside the
+  # diffed loop alone, so the 65 fixtures still served by `stub_comparator!`
+  # report as Skipped and cannot turn this red. Measured on main today:
+  # 111 matched / 65 skipped / 0 diffed.
+  #
+  # What it protects: the recorded fixtures are frozen Python output, so this
+  # gate catches the Rust side drifting away from that snapshot — exactly the
+  # failure mode the ongoing port produces. It cannot detect the Python side
+  # drifting away from the fixtures; that needs re-recording, not this job.
+  parity:
+    name: parity
+    needs: rust-changes
+    if: needs.rust-changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.95.0
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.11'
       - uses: Swatinem/rust-cache@v2
-      - name: Install deps
-        run: |
-          python -m venv .venv
-          source .venv/bin/activate
-          pip install --upgrade pip
-          pip install maturin
-          pip install -e .
+      # No Python toolchain: headroom-parity links headroom-core directly and
+      # never crosses into the interpreter, so the venv + maturin + `pip
+      # install -e .` setup this job used to do was pure overhead.
       - name: Run parity harness
-        run: |
-          source .venv/bin/activate
-          make test-parity
+        run: make test-parity

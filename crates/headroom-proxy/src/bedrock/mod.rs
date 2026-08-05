@@ -52,6 +52,7 @@ pub mod eventstream_to_sse;
 pub mod invoke;
 pub mod invoke_streaming;
 pub mod sigv4;
+pub mod vendor;
 
 pub use auth_mode_layer::classify_and_attach_auth_mode;
 pub use envelope::{BedrockEnvelope, EnvelopeError};

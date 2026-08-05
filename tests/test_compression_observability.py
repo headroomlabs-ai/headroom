@@ -11,9 +11,9 @@ strategy. These tests exist so the next regression of that shape
 fails the suite the day it lands instead of waiting on an audit.
 
 The counters live ONLY as in-process state on the metrics instance;
-they are deliberately NOT exported through the Prometheus scrape or
-OTel surface, because the metric→Supabase pipeline treats each
-metric name as a column and we cannot add new columns. CI-level
+they are deliberately NOT exported as new Prometheus metric names
+(to avoid unbounded metric-series growth) — they remain observable
+via /stats. CI-level
 observability via these tests is enough to catch silent regressions;
 production export waits on a non-column-adding pipeline.
 
@@ -33,6 +33,7 @@ Coverage:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -273,6 +274,50 @@ def test_prometheus_metrics_accumulates_per_strategy_counters():
     assert m.tokens_saved_by_strategy == {"smart_crusher": 210}
 
 
+def test_prometheus_metrics_accumulates_extension_savings_per_key() -> None:
+    from headroom.proxy.prometheus_metrics import PrometheusMetrics
+
+    m = PrometheusMetrics()
+
+    m.record_extension_savings("tool_router", 120)
+    m.record_extension_savings("tool_router", 30)
+    m.record_extension_savings("skill_search", 45)
+    m.record_extension_savings("skill_search", 0)  # no savings, ignored
+    m.record_extension_savings("noop_ext", -10)  # negative, ignored
+
+    # Savings accumulate per key; non-positive values never create or
+    # bump an entry.
+    assert m.extension_savings == {"tool_router": 150, "skill_search": 45}
+
+
+def test_extension_savings_surface_in_stats(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from fastapi.testclient import TestClient
+
+    from headroom.proxy.server import ProxyConfig, create_app
+
+    monkeypatch.setenv("HEADROOM_SAVINGS_PATH", str(tmp_path / "proxy_savings.json"))
+    config = ProxyConfig(
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        log_requests=False,
+    )
+    app = create_app(config)
+    with TestClient(app) as client:
+        proxy = app.state.proxy
+        proxy.metrics.record_extension_savings("tool_router", 200)
+        proxy.metrics.record_extension_savings("tool_router", 50)
+        proxy.metrics.record_extension_savings("skill_search", 75)
+
+        stats = client.get("/stats")
+        assert stats.status_code == 200
+        assert stats.json()["extension_savings"] == {
+            "tool_router": 250,
+            "skill_search": 75,
+        }
+
+
 def test_prometheus_metrics_accumulates_codex_ws_unit_and_frame_counters():
     from headroom.proxy.prometheus_metrics import PrometheusMetrics
 
@@ -342,11 +387,11 @@ def test_prometheus_metrics_accumulates_codex_ws_unit_and_frame_counters():
 
 def test_prometheus_export_does_not_leak_per_strategy_metrics():
     """Per-strategy state is tracked in-process only. The Prometheus
-    scrape output deliberately must NOT emit new metric names — the
-    metric→Supabase pipeline treats each metric name as a column, and
-    we cannot add new columns. This test guards that constraint: if a
-    future change adds the metric to the scrape, this fails and forces
-    a conscious decision."""
+    scrape output deliberately must NOT emit new metric names (to avoid
+    unbounded metric-series growth); the state stays observable via
+    /stats. This test guards that constraint: if a future change adds
+    the metric to the scrape, this fails and forces a conscious
+    decision."""
     import asyncio
 
     from headroom.proxy.prometheus_metrics import PrometheusMetrics

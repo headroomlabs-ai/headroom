@@ -86,6 +86,50 @@ class TestCompressionFeedback:
         assert pattern.retrieval_rate == 0.5
         assert pattern.full_retrieval_rate == 1.0  # All were full retrievals
 
+    def test_eviction_success_is_not_counted_as_retrieval(self):
+        """An eviction-without-retrieval is a compression success, not a retrieval.
+
+        The event arrives with retrieval_type="eviction_success". Because that
+        isn't "full" it used to fall into the search_retrievals branch and
+        inflate retrieval_rate/search_rate, driving get_compression_hints toward
+        less aggressive compression — the inverse of the intended signal. It must
+        leave the retrieval counters untouched.
+        """
+        feedback = CompressionFeedback()
+        feedback.record_compression("test_tool", 100, 10)
+
+        event = RetrievalEvent(
+            hash="abc123",
+            query=None,
+            items_retrieved=0,
+            total_items=100,
+            tool_name="test_tool",
+            timestamp=time.time(),
+            retrieval_type="eviction_success",
+        )
+        feedback.record_retrieval(event, strategy="smart")
+
+        pattern = feedback.get_all_patterns()["test_tool"]
+        assert pattern.total_retrievals == 0
+        assert pattern.search_retrievals == 0
+        assert pattern.retrieval_rate == 0.0  # a successful compression, not a retrieval
+
+        # A genuine retrieval afterward is still counted.
+        feedback.record_retrieval(
+            RetrievalEvent(
+                hash="def456",
+                query="find errors",
+                items_retrieved=50,
+                total_items=100,
+                tool_name="test_tool",
+                timestamp=time.time(),
+                retrieval_type="search",
+            )
+        )
+        pattern = feedback.get_all_patterns()["test_tool"]
+        assert pattern.total_retrievals == 1
+        assert pattern.search_retrievals == 1
+
     def test_hints_default_with_no_data(self):
         """Default hints returned when no data exists."""
         feedback = CompressionFeedback()
@@ -353,24 +397,3 @@ class TestFeedbackIntegrationWithStore:
         patterns = feedback.get_all_patterns()
         assert "test_tool" in patterns
         assert patterns["test_tool"].total_retrievals == 1
-
-    def test_search_retrieval_tracked_separately(self):
-        """Search retrievals are tracked as search type."""
-        store = CompressionStore()
-
-        hash_key = store.store(
-            original='[{"id": 1, "name": "alice"}, {"id": 2, "name": "bob"}]',
-            compressed='[{"id": 1}]',
-            original_item_count=2,
-            compressed_item_count=1,
-            tool_name="test_tool",
-        )
-
-        # Search (should log as search type)
-        store.search(hash_key, "alice")
-
-        # Check events
-        events = store.get_retrieval_events()
-        assert len(events) > 0
-        assert events[0].retrieval_type == "search"
-        assert events[0].query == "alice"

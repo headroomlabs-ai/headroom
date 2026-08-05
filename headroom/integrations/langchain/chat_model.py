@@ -28,6 +28,7 @@ Example:
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 from collections.abc import AsyncIterator, Iterator, Sequence
@@ -450,8 +451,25 @@ class HeadroomChatModel(BaseChatModel):
             f"({metrics.savings_percent:.1f}% saved)"
         )
 
-        # Call wrapped model's async generate
-        result: ChatResult = await self.wrapped_model._agenerate(
+        # If the wrapped model has streaming=True, create a per-call copy
+        # with streaming=False. This avoids mutating shared state across an
+        # await, which would race with concurrent ainvoke() calls on the
+        # same HeadroomChatModel instance. (GitHub #1285, review feedback)
+        model_to_call = self.wrapped_model
+        if getattr(self.wrapped_model, "streaming", False):
+            try:
+                model_to_call = self.wrapped_model.model_copy(update={"streaming": False})
+            except Exception:
+                # model_copy not available (non-pydantic model) — try shallow copy
+                model_to_call = copy.copy(self.wrapped_model)
+                try:
+                    model_to_call.streaming = False
+                except Exception:
+                    # Cannot override streaming — fall through with original model
+                    model_to_call = self.wrapped_model
+
+        # Call the (possibly copied) model's async generate
+        result: ChatResult = await model_to_call._agenerate(
             optimized_messages,
             stop=stop,
             run_manager=run_manager,

@@ -9,7 +9,7 @@ from urllib.parse import urlsplit
 
 import pytest
 
-from headroom.dashboard import get_dashboard_html
+from headroom.dashboard import STATIC_DIR, get_dashboard_html
 
 playwright = pytest.importorskip("playwright.sync_api")
 Page = playwright.Page
@@ -22,8 +22,7 @@ def _sample_stats() -> dict:
         "cost": {
             "savings_usd": 12.34,
             "compression_savings_usd": 12.34,
-            "cache_savings_usd": 5.67,
-            "cli_tokens_avoided": 0,
+            "cache_savings_usd": 5.25,
         },
         "requests": {
             "total": 128,
@@ -37,7 +36,6 @@ def _sample_stats() -> dict:
             "input": 245_000,
             "output": 88_000,
             "saved": 143_000,
-            "cli_tokens_avoided": 0,
             "total_before_compression": 388_000,
             "savings_percent": 36.86,
         },
@@ -76,7 +74,7 @@ def _sample_stats() -> dict:
                     "write_premium": "25%",
                     "savings_usd": 5.67,
                     "write_premium_usd": 0.42,
-                    "net_savings_usd": 5.67,
+                    "net_savings_usd": 5.25,
                     "label": "Explicit breakpoints, 5-min TTL",
                     "observed_ttl_buckets": {
                         "5m": {"tokens": 185_000, "requests": 18},
@@ -102,7 +100,7 @@ def _sample_stats() -> dict:
                 "bust_write_tokens": 0,
                 "savings_usd": 5.67,
                 "write_premium_usd": 0.42,
-                "net_savings_usd": 5.67,
+                "net_savings_usd": 5.25,
                 "hit_rate": 75.0,
                 "observed_ttl_buckets": {
                     "5m": {"tokens": 185_000, "requests": 18},
@@ -155,6 +153,25 @@ def _sample_history() -> dict:
     }
 
 
+def _fulfill_static_asset(route, path: str) -> bool:  # type: ignore[no-untyped-def]
+    """Serve the vendored dashboard JS from disk; True when it handled the route.
+
+    The harnesses in this file and its siblings intercept every request, so the
+    dashboard's relative asset URLs would otherwise fall through to a real fetch
+    against a fake origin with nothing listening. Alpine has to load: every
+    section of <main> lives inside a `<template x-if>`, which renders nothing at
+    all without it, so an empty <main> is the symptom to look for here.
+    """
+    if not path.startswith("/dashboard/static/"):
+        return False
+    route.fulfill(
+        status=200,
+        content_type="text/javascript",
+        body=(STATIC_DIR / Path(path).name).read_bytes(),
+    )
+    return True
+
+
 def _install_dashboard_routes(page: Page) -> None:
     stats = _sample_stats()
     history = _sample_history()
@@ -168,6 +185,8 @@ def _install_dashboard_routes(page: Page) -> None:
         path = urlsplit(route.request.url).path
         if path in ("/dashboard", "/"):
             route.fulfill(status=200, content_type="text/html", body=dashboard_html)
+            return
+        if _fulfill_static_asset(route, path):
             return
         if "/stats-history" in path:
             route.fulfill(
@@ -185,6 +204,39 @@ def _install_dashboard_routes(page: Page) -> None:
         route.continue_()
 
     page.route("**/*", handler)
+
+
+def test_dashboard_per_project_setup_url_uses_current_origin() -> None:
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch()
+        page = browser.new_page(viewport={"width": 1720, "height": 1400}, color_scheme="dark")
+        _install_dashboard_routes(page)
+
+        page.goto("http://127.0.0.1:8788/dashboard", wait_until="load")
+        expect(
+            page.get_by_text(
+                "ANTHROPIC_BASE_URL: http://127.0.0.1:8788/p/<project-name>", exact=True
+            )
+        ).to_be_visible()
+        expect(
+            page.get_by_text(
+                "ANTHROPIC_BASE_URL: http://127.0.0.1:8787/p/<project-name>", exact=True
+            )
+        ).to_have_count(0)
+
+        page.goto("http://headroom.local:9393/dashboard", wait_until="load")
+        expect(
+            page.get_by_text(
+                "ANTHROPIC_BASE_URL: http://headroom.local:9393/p/<project-name>", exact=True
+            )
+        ).to_be_visible()
+        expect(
+            page.get_by_text(
+                "ANTHROPIC_BASE_URL: http://127.0.0.1:8787/p/<project-name>", exact=True
+            )
+        ).to_have_count(0)
+
+        browser.close()
 
 
 def test_dashboard_renders_observed_ttl_metrics_and_can_capture_screenshot() -> None:

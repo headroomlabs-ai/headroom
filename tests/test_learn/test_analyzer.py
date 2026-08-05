@@ -155,6 +155,54 @@ class TestDigestBuilder:
         digest = _build_digest(_project(), [])
         assert "0 sessions" in digest or "test-project" in digest
 
+    def test_long_error_output_preserves_tail_root_cause(self):
+        # A traceback's diagnosis lives at the tail; a head-only slice would drop it (#2590).
+        traceback = (
+            "Traceback (most recent call last):\n"
+            + "\n".join(
+                f'  File "mod{i}.py", line {i}, in fn{i}\n    call_{i}()' for i in range(40)
+            )
+            + "\nKeyError: 'the-actual-root-cause'"
+        )
+        sessions = [
+            SessionData(
+                session_id="s1",
+                tool_calls=[
+                    _tc(
+                        name="Bash",
+                        output=traceback,
+                        is_error=True,
+                        error_category=ErrorCategory.UNKNOWN,
+                        msg_index=0,
+                    )
+                ],
+            )
+        ]
+        digest = _build_digest(_project(), sessions)
+        assert "Traceback" in digest
+        assert "KeyError: 'the-actual-root-cause'" in digest
+        assert "…" in digest
+
+    def test_short_error_output_not_truncated(self):
+        short = "ModuleNotFoundError: No module named 'foo'"
+        sessions = [
+            SessionData(
+                session_id="s1",
+                tool_calls=[
+                    _tc(
+                        name="Bash",
+                        output=short,
+                        is_error=True,
+                        error_category=ErrorCategory.MODULE_NOT_FOUND,
+                        msg_index=0,
+                    )
+                ],
+            )
+        ]
+        digest = _build_digest(_project(), sessions)
+        assert short in digest
+        assert "…" not in digest
+
 
 # =============================================================================
 # Prior Patterns Injection Tests
@@ -592,6 +640,23 @@ class TestStripFencedJson:
         with pytest.raises(json.JSONDecodeError):
             _strip_fenced_json("not json at all")
 
+    def test_prose_preamble_before_fence(self):
+        # Models sometimes add a preamble before the fence despite being told
+        # to return JSON only (e.g. "Here it is:\n\n```json ...").
+        raw = 'The JSON is my deliverable. Here it is:\n\n```json\n{"key": "value"}\n```'
+        result = _strip_fenced_json(raw)
+        assert result == {"key": "value"}
+
+    def test_prose_around_bare_object(self):
+        raw = 'Sure, here you go: {"key": "value"} hope that helps!'
+        result = _strip_fenced_json(raw)
+        assert result == {"key": "value"}
+
+    def test_triple_backtick_inside_payload(self):
+        raw = '```json\n{"note": "run ```code``` here", "n": 1}\n```'
+        result = _strip_fenced_json(raw)
+        assert result == {"note": "run ```code``` here", "n": 1}
+
 
 def _fake_claude_popen(
     *,
@@ -822,6 +887,87 @@ class TestCallCliLlm:
         )
         with pytest.raises(RuntimeError, match="unparseable output"):
             _call_cli_llm("test digest", "codex-cli")
+
+
+class TestWindowsCliShimFallback:
+    """npm-installed CLIs on Windows are ``.cmd``/``.bat`` shims, not directly
+    executable — ``subprocess`` uses ``CreateProcess``, which (unlike a shell)
+    does not apply the ``PATHEXT`` extension search, so ``Popen`` raises
+    ``FileNotFoundError`` even though the shell (and ``shutil.which``) finds
+    the CLI fine (issue #1624). A FileNotFoundError on Windows should trigger
+    one ``shutil.which``-based retry with the resolved executable path.
+    """
+
+    def test_streaming_cli_retries_with_resolved_shim(self, monkeypatch):
+        monkeypatch.setattr("headroom.learn.analyzer.os.name", "nt")
+        monkeypatch.setattr(
+            "headroom.learn.analyzer.shutil.which",
+            lambda name: r"C:\npm\claude.cmd" if name == "claude" else None,
+        )
+        stdout = [_result_event('{"context_file_rules": [], "memory_file_rules": []}')]
+        fake_popen = _fake_claude_popen(stdout_lines=stdout)
+        calls: list[list[str]] = []
+
+        def _construct(cmd, *args, **kwargs):
+            calls.append(cmd)
+            if cmd[0] == "claude":
+                raise FileNotFoundError("No such file or directory: 'claude'")
+            return fake_popen.side_effect(cmd, *args, **kwargs)
+
+        popen = MagicMock(side_effect=_construct)
+        with patch("headroom.learn.analyzer.subprocess.Popen", popen):
+            result = _call_cli_llm("test digest", "claude-cli")
+
+        assert result == {"context_file_rules": [], "memory_file_rules": []}
+        assert calls[0][0] == "claude"
+        assert calls[1][0] == r"C:\npm\claude.cmd"
+        assert calls[1][1:] == calls[0][1:]  # remaining args preserved
+
+    def test_non_streaming_cli_retries_with_resolved_shim(self, monkeypatch):
+        monkeypatch.setattr("headroom.learn.analyzer.os.name", "nt")
+        monkeypatch.setattr(
+            "headroom.learn.analyzer.shutil.which",
+            lambda name: r"C:\npm\codex.cmd" if name == "codex" else None,
+        )
+        calls: list[list[str]] = []
+
+        def _run(cmd, *args, **kwargs):
+            calls.append(cmd)
+            if cmd[0] == "codex":
+                raise FileNotFoundError("No such file or directory: 'codex'")
+            return MagicMock(
+                returncode=0,
+                stdout='{"context_file_rules": [], "memory_file_rules": []}',
+                stderr="",
+            )
+
+        with patch("headroom.learn.analyzer.subprocess.run", side_effect=_run):
+            result = _call_cli_llm("test digest", "codex-cli")
+
+        assert result == {"context_file_rules": [], "memory_file_rules": []}
+        assert calls[0][0] == "codex"
+        assert calls[1][0] == r"C:\npm\codex.cmd"
+
+    def test_shim_unresolvable_still_raises_not_found_in_path(self, monkeypatch):
+        monkeypatch.setattr("headroom.learn.analyzer.os.name", "nt")
+        monkeypatch.setattr("headroom.learn.analyzer.shutil.which", lambda name: None)
+        mock_run = MagicMock(side_effect=FileNotFoundError("No such file or directory: 'codex'"))
+        with patch("headroom.learn.analyzer.subprocess.run", mock_run):
+            with pytest.raises(RuntimeError, match="not found in PATH"):
+                _call_cli_llm("test digest", "codex-cli")
+        # shutil.which couldn't resolve anything — no retry attempted.
+        assert mock_run.call_count == 1
+
+    def test_non_windows_skips_shim_resolution(self, monkeypatch):
+        monkeypatch.setattr("headroom.learn.analyzer.os.name", "posix")
+        which = MagicMock(return_value=r"/usr/local/bin/codex")
+        monkeypatch.setattr("headroom.learn.analyzer.shutil.which", which)
+        mock_run = MagicMock(side_effect=FileNotFoundError("No such file or directory: 'codex'"))
+        with patch("headroom.learn.analyzer.subprocess.run", mock_run):
+            with pytest.raises(RuntimeError, match="not found in PATH"):
+                _call_cli_llm("test digest", "codex-cli")
+        which.assert_not_called()
+        assert mock_run.call_count == 1
 
 
 class TestParseStreamEvent:

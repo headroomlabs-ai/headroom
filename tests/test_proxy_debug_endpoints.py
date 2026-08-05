@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
 
 import pytest
 
@@ -419,6 +420,100 @@ def test_debug_warmup_reports_registry_slots(client):
     assert "status" in data["memory_backend"]
     assert data["runtime"]["anthropic_pre_upstream"]["resolved_concurrency"] >= 0
     assert data["runtime"]["websocket_sessions"]["active_relay_tasks"] == 0
+
+
+class _KompressStub:
+    """Read-only stand-in exposing the accessors the health reconciler uses.
+
+    ``preload`` / ``ensure_background_load`` raise so the tests fail loudly if
+    ``/debug/warmup`` ever triggers a model load instead of just observing.
+    """
+
+    def __init__(self, *, backend="onnx", ready=True):
+        self.backend = backend
+        self.ready = ready
+        self.calls: list[str] = []
+
+    def is_ready(self):
+        self.calls.append("is_ready")
+        return self.ready
+
+    def ready_backend(self):
+        self.calls.append("ready_backend")
+        return self.backend
+
+    def preload(self):
+        raise AssertionError("/debug/warmup must never preload kompress")
+
+    def ensure_background_load(self):
+        raise AssertionError("/debug/warmup must never start a background load")
+
+
+@contextmanager
+def _deferred_kompress_client(compressor):
+    """Client whose kompress slot still carries the startup ``deferred`` mark.
+
+    Mirrors the real cold-start shape: ``eager_load_compressors`` reported
+    ``deferred``, the model then loaded on the request path, and nothing wrote
+    the promotion back to the registry.
+    """
+    config = ProxyConfig(
+        optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+    )
+    app = create_app(config)
+    with TestClient(
+        app,
+        base_url="http://127.0.0.1",
+        client=("127.0.0.1", 12345),
+    ) as test_client:
+        proxy = app.state.proxy
+        router = proxy.anthropic_pipeline.transforms[-1]
+        router._kompress = compressor
+        proxy.warmup.kompress.mark_null()
+        proxy.warmup.kompress.info["source_status"] = "deferred"
+        yield proxy, test_client
+
+
+def _clear_kompress_cache(monkeypatch):
+    """Neutralize the process-global ONNX cache the reconciler falls back to."""
+    try:
+        from headroom.transforms import kompress_compressor
+    except ImportError:
+        return
+    monkeypatch.setattr(kompress_compressor, "_kompress_cache", {}, raising=False)
+
+
+def test_debug_warmup_promotes_deferred_kompress_after_runtime_load():
+    compressor = _KompressStub()
+    with _deferred_kompress_client(compressor) as (_proxy, client):
+        slot = client.get("/debug/warmup").json()["kompress"]
+
+    assert slot["status"] == "loaded"
+    assert slot["info"]["backend"] == "onnx"
+    assert slot["info"]["source_status"] == "runtime"
+
+
+def test_debug_warmup_keeps_pending_kompress_null(monkeypatch):
+    _clear_kompress_cache(monkeypatch)
+    compressor = _KompressStub(ready=False)
+    with _deferred_kompress_client(compressor) as (_proxy, client):
+        slot = client.get("/debug/warmup").json()["kompress"]
+
+    assert slot["status"] == "null"
+    assert slot["info"]["source_status"] == "deferred"
+    assert compressor.calls == ["is_ready"]
+
+
+def test_debug_warmup_never_starts_kompress_loading():
+    compressor = _KompressStub()
+    with _deferred_kompress_client(compressor) as (_proxy, client):
+        client.get("/debug/warmup")
+
+    # Observation only: no preload(), no ensure_background_load(), no compress().
+    assert compressor.calls == ["is_ready", "ready_backend"]
 
 
 def test_debug_ws_sessions_reports_live_session(app_and_client):

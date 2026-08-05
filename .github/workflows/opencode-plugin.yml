@@ -1,0 +1,53 @@
+name: OpenCode Plugin
+
+# The OpenCode plugin (plugins/opencode) is the routing shim that carries
+# `headroom wrap opencode` traffic through the proxy, yet nothing in CI ever
+# compiled it — so TypeScript / @types/node major bumps and source changes had
+# zero build evidence. This gate runs the plugin's own typecheck + build + test
+# whenever it (or this workflow) changes.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "plugins/opencode/**"
+      - "headroom/providers/opencode/_dist/**"
+      - ".github/workflows/opencode-plugin.yml"
+  push:
+    branches: [main]
+    paths:
+      - "plugins/opencode/**"
+      - "headroom/providers/opencode/_dist/**"
+      - ".github/workflows/opencode-plugin.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: typecheck + build + test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: plugins/opencode
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: plugins/opencode/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+      - run: npm test
+      # The wheel ships a committed self-contained bundle at
+      # headroom/providers/opencode/_dist/entry.opencode.js so pip installs
+      # get the transport plugin too. Rebuild it and fail if the committed
+      # artifact has drifted from the source.
+      - run: npm run build:standalone
+      - name: verify committed wheel bundle matches source
+        run: |
+          cmp dist-standalone/entry.opencode.js \
+            ../../headroom/providers/opencode/_dist/entry.opencode.js \
+            || { echo "::error::headroom/providers/opencode/_dist/entry.opencode.js is stale - run 'npm run build:standalone' in plugins/opencode and commit the result"; exit 1; }

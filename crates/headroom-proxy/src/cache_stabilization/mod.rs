@@ -26,7 +26,8 @@
 //!   the cache hot zone (system / tools / early messages). Emits
 //!   `cache_drift_first_request` on first sight and
 //!   `cache_drift_observed` when consecutive requests on the same
-//!   session disagree on any of the three dimensions.
+//!   session drift on any of the three dimensions (append-only
+//!   conversation growth and `cache_control` relocation are benign).
 //! - [`tool_def_normalize`] — PR-E1 / PR-E2: sorts `tools[]`
 //!   alphabetically by name (PR-E1) and recursively sorts JSON
 //!   Schema object keys inside each tool's `input_schema` /

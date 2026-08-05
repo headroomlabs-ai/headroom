@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import fnmatch
+import json
+from collections.abc import Iterable
 from dataclasses import InitVar, dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -207,7 +210,13 @@ class AnchorConfig:
 # Tool outputs that are reference data and must NOT be compressed.
 # Read/Glob/Grep contain exact file contents/search results the agent needs for edits.
 # Write/Edit record what changes were made — compressing them causes duplicate/conflicting edits.
+# WebSearch/WebFetch results are large reference payloads that must remain verbatim.
 # Bash is NOT excluded — its outputs (build logs, test output) are ideal compression targets.
+# To protect Bash or other non-excluded tools from lossy compression, use
+# HEADROOM_PROTECT_TOOL_RESULTS=Bash or --protect-tool-results Bash.
+# headroom_retrieve: its entire contract is returning already-retrieved, original
+# CCR content verbatim. Recompressing it writes a new <<ccr:hash>> marker the
+# agent can never redeem (#1077).
 DEFAULT_EXCLUDE_TOOLS: frozenset[str] = frozenset(
     {
         "Read",
@@ -215,16 +224,129 @@ DEFAULT_EXCLUDE_TOOLS: frozenset[str] = frozenset(
         "Grep",
         "Write",
         "Edit",
-        "Bash",
+        "WebSearch",
+        "WebFetch",
+        "headroom_retrieve",
         # Lowercase variants for case-insensitive matching
         "read",
         "glob",
         "grep",
         "write",
         "edit",
-        "bash",
+        "web_search",
+        "web_fetch",
     }
 )
+
+# These excluded web-tool results must remain byte-faithful. Even the
+# excluded-tool lossless fold rewrites formatted JSON.
+# Three independent consumers key off this frozenset, all in
+# transforms/content_router.py: ContentRouter's two per-block CCR-retrieve
+# guards, and _cross_turn_dedup_messages's verbatim_tool_ids -- the latter has
+# no dedicated guard of its own, so removing headroom_retrieve from here would
+# silently reopen the retrieval loop for that path with cross-turn dedup on.
+DEFAULT_VERBATIM_EXCLUDE_TOOLS: frozenset[str] = frozenset(
+    {
+        "WebSearch",
+        "WebFetch",
+        "web_search",
+        "web_fetch",
+        "headroom_retrieve",
+    }
+)
+
+
+def _tool_name_aliases(name: str) -> tuple[str, ...]:
+    """Return equivalent spellings for tool exclusion matching."""
+    if not isinstance(name, str):
+        # Pre-existing fragility (not introduced here): a malformed message can
+        # put a non-string value in the tool-name map (see _build_tool_name_map's
+        # truthy-only `if tc_id and name:` filter). Fail safe -- no aliases means
+        # is_tool_excluded() returns False -- rather than crashing the pipeline.
+        return ()
+    aliases = [name]
+    lname = name.lower()
+
+    if lname.startswith("mcp__"):
+        # OpenAI-style MCP wrappers use mcp__server__tool. Custom agents that
+        # speak Anthropic sometimes emit the same wrapper as mcp_Server_tool.
+        parts = name.split("__", 2)
+        if len(parts) == 3 and parts[1] and parts[2]:
+            aliases.append(f"mcp_{parts[1]}_{parts[2]}")
+            aliases.append(parts[2])
+    elif lname.startswith("mcp_"):
+        parts = name.split("_", 2)
+        if len(parts) == 3 and parts[1] and parts[2]:
+            aliases.append(f"mcp__{parts[1]}__{parts[2]}")
+            aliases.append(parts[2])
+
+    return tuple(dict.fromkeys(aliases))
+
+
+# Hermes Agent's deferred-tool bridge. Hermes loads on-demand tools via a
+# `tool_search`/`tool_describe`/`tool_call` indirection; on the wire the
+# emitted tool call is named `tool_call` and the REAL tool name lives in the
+# arguments payload (`{"name": "...", "arguments": {...}}`). Tool exclusion /
+# protect lists match on the real name, so we must unwrap this bridge before
+# building the tool_call_id -> name map, or whitelists silently no-op for all
+# deferred tools.
+_HERMES_TOOL_CALL_WRAPPER = "tool_call"
+
+
+def unwrap_tool_call_name(name: str, arguments: Any) -> str:
+    """Extract the real tool name from a Hermes deferred ``tool_call`` wrapper.
+
+    Non-wrapper names pass through unchanged. Malformed/unparseable wrappers
+    fail open and return the wrapper name (caller decides what that means).
+    """
+    if name != _HERMES_TOOL_CALL_WRAPPER:
+        return name
+    raw = arguments
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (ValueError, TypeError):
+            return name
+    if isinstance(raw, dict):
+        inner = raw.get("name")
+        if isinstance(inner, str) and inner.strip():
+            return inner.strip()
+    return name
+
+
+def is_tool_excluded(name: str, exclude_tools: Iterable[str]) -> bool:
+    """Return True if ``name`` matches the tool-exclusion set.
+
+    Plain entries match by exact (case-insensitive) name, so the common case
+    stays a set lookup. Entries containing a glob metacharacter (``*``, ``?`` or
+    ``[``) are matched with :func:`fnmatch.fnmatchcase`, letting a single pattern
+    such as ``mcp__*`` cover every tool an MCP server exposes without listing
+    each name (issue #870).
+
+    MCP tool wrappers are also matched through their common aliases. For example,
+    ``mcp__Headroom__headroom_retrieve`` and
+    ``mcp_Headroom_headroom_retrieve`` both match ``mcp__*`` and the bare
+    ``headroom_retrieve`` entry.
+    """
+    if not exclude_tools:
+        return False
+
+    patterns = tuple(exclude_tools)
+    if not patterns:
+        return False
+    aliases = _tool_name_aliases(name)
+    exact_patterns = set(patterns)
+    lower_exact_patterns = {pat.lower() for pat in exact_patterns}
+    if any(alias in exact_patterns or alias.lower() in lower_exact_patterns for alias in aliases):
+        return True
+
+    return any(
+        fnmatch.fnmatchcase(alias.lower(), pat.lower())
+        for alias in aliases
+        for pat in patterns
+        if "*" in pat or "?" in pat or "[" in pat
+    )
+
 
 # Tool names recognized as Read/Edit/Write for lifecycle tracking
 _READ_TOOL_NAMES: frozenset[str] = frozenset({"Read", "read"})
@@ -253,6 +375,48 @@ class ReadLifecycleConfig:
     compress_stale: bool = True  # Replace Reads of files that were later edited
     compress_superseded: bool = False  # Disabled: busts Anthropic prompt cache prefix
     min_size_bytes: int = 512  # Skip tiny Read outputs (not worth the overhead)
+
+
+@dataclass
+class ReadMaturationConfig:
+    """Mechanism B: hold-back Read maturation (compress before cache entry).
+
+    Motivation (measured by `headroom audit-reads`): the median Read stays
+    in context for ~118 assistant turns after it appears, billed at the
+    provider's cache-read rate every request — a Read's lifetime cost is
+    roughly 13x its size. The only cache-safe moment to shrink it is
+    BEFORE it is ever cache-written.
+
+    Mechanics: a fresh large Read is held out of the provider prefix
+    cache (the trailing cache breakpoint is relocated to just before it)
+    while its file is ACTIVE, stays verbatim the whole time the model is
+    working with it, and matures into a CCR-backed marker once the file
+    has been quiet for `quiesce_turns`. Only that final compressed form
+    ever enters the cache. No cached byte is ever mutated — there is
+    nothing to bust.
+
+    Activity-based (not a fixed hold window) because the audit-reads
+    simulation showed touch gaps are fat-tailed: next-touch p50 is 4
+    turns but p90 is 81 — no fixed window covers the tail, while a
+    quiesce rule covers the activity cluster and lets the tail self-heal
+    via the model's observed habit of re-reading ranges from disk (95%
+    of re-reads in real traffic are partial-range reads made while the
+    full text was still in context).
+
+    Disabled by default while the mechanism is validated in pilots.
+    """
+
+    enabled: bool = False
+    # Mature a held Read once its FILE has had no activity (reads or
+    # edits) for this many assistant turns. Simulation: next-touch p50
+    # is 4 turns, so 5 covers the median activity cluster.
+    quiesce_turns: int = 5
+    # Safety valve: mature regardless once held this many turns, bounding
+    # the hold-out cost for files that stay active for long stretches.
+    max_hold_turns: int = 25
+    # Only hold/mature Reads at least this large; small Reads are cached
+    # immediately as before (holding them costs more than it saves).
+    min_size_bytes: int = 2048
 
 
 @dataclass
@@ -358,10 +522,28 @@ class SmartCrusherConfig:
     first_fraction: float = 0.3  # 30% of K from start of array
     last_fraction: float = 0.15  # 15% of K from end of array
 
-    # Lossless compaction only replaces the original when it saves at
-    # least this byte fraction vs the (minified) input. Mirrors the
-    # Rust default.
-    lossless_min_savings_ratio: float = 0.30
+    # Lossless-first dispatch: minimum byte-savings ratio for the lossless
+    # Table/CSV compaction path to win over the lossy path. Must stay in
+    # lockstep with the Rust default (smart_crusher config.rs) and the
+    # transforms-level dataclass.
+    lossless_min_savings_ratio: float = 0.15
+
+    # Strict lossless mode. When True, lossless tabular compaction still
+    # applies, but any path that would emit a CCR marker (lossy row-drop
+    # OR opaque-blob offload) leaves the content uncompacted instead, so
+    # the output is always marker-free and byte-recoverable. Mirrors the
+    # Rust default. See also `CCRConfig` — with this on, no `<<ccr:…>>`
+    # markers are produced regardless of CCR settings.
+    lossless_only: bool = False
+
+    # Compaction heuristics (mirror Rust CompactConfig). A field is "core"
+    # if present in at least this fraction of rows; arrays whose key sets
+    # are mostly non-core are bucketed by a discriminator instead.
+    compaction_core_field_fraction: float = 0.8
+    compaction_heterogeneous_core_ratio: float = 0.6
+    compaction_max_flatten_inner_keys: int = 6
+    compaction_min_buckets: int = 2
+    compaction_max_buckets: int = 8
 
 
 @dataclass
@@ -404,7 +586,7 @@ class CCRConfig:
     1. COMPRESS: SmartCrusher compresses array from 1000 to 20 items
     2. CACHE: Original 1000 items stored in CompressionStore
     3. INJECT: Marker added to tell LLM how to retrieve more
-    4. RETRIEVE: If LLM needs more, it calls headroom_retrieve(hash, query)
+    4. RETRIEVE: If LLM needs more, it calls headroom_retrieve(hash) to get the full original back
 
     Benefits:
     - Zero-risk compression: worst case = LLM retrieves what it needs
@@ -412,14 +594,20 @@ class CCRConfig:
     - Network effect: retrieval patterns improve compression for all users
 
     GOTCHAS:
-    - Cache has TTL (default 300 seconds) - retrieval fails after expiration
+    - Cache has TTL (default 30 min) - retrieval fails after expiration
     - Memory usage: ~1KB per cached entry
     - Only works with array compression (not string truncation)
     """
 
     enabled: bool = True  # Enable CCR (cache + retrieval markers)
     store_max_entries: int = 1000  # Max entries in compression store
-    store_ttl_seconds: int = 300  # Cache TTL in seconds
+    # Session-scale TTL. The original 5-minute default predates agentic
+    # sessions that routinely run 30+ minutes; an expired entry silently
+    # converts "lossless with retrieval" into "lossy", so the TTL is the
+    # weakest link in the no-accuracy-loss guarantee. Kept in lockstep
+    # with Rust DEFAULT_TTL (crates/headroom-core/src/ccr/mod.rs) and
+    # DEFAULT_CCR_TTL_SECONDS (cache/compression_store.py).
+    store_ttl_seconds: int = 1800  # Cache TTL (30 minutes)
     inject_retrieval_marker: bool = True  # Add retrieval hint to compressed output
     feedback_enabled: bool = True  # Track retrieval events for learning
     min_items_to_cache: int = 20  # Only cache if original had >= N items

@@ -138,8 +138,17 @@ class ImageCompressor:
         self.use_siglip = use_siglip
         self.device = device
 
-        # Lazy-loaded router
+        # Lazy-loaded routers. The ONNX router loads native ort.InferenceSession
+        # models that Python's GC does not eagerly reclaim, so building one per
+        # compress() call grew RSS unboundedly under image traffic (#2513).
+        # Cache it on the instance and reuse it.
         self._router: TrainedRouter | None = None
+        self._onnx_router: Any = None
+
+        # Set on a process-wide shared instance (see the isolation worker and
+        # _get_image_compressor) so a per-request close() does not unload models
+        # the next request would just reload.
+        self._is_singleton = False
 
         # Last compression result (for metrics)
         self.last_result: CompressionResult | None = None
@@ -163,13 +172,36 @@ class ImageCompressor:
             )
         return self._router
 
+    def _get_onnx_router(self) -> Any:
+        """Lazy-load and cache the ONNX technique router.
+
+        Building an ``OnnxTechniqueRouter`` loads native ``ort.InferenceSession``
+        models; creating one per ``compress()`` call leaked native memory and
+        grew RSS unboundedly under image traffic (#2513). Cache one per instance.
+        """
+        if self._onnx_router is None:
+            from .onnx_router import OnnxTechniqueRouter
+
+            self._onnx_router = OnnxTechniqueRouter(use_siglip=self.use_siglip)
+        return self._onnx_router
+
     def close(self, unload_models: bool = True) -> None:
-        """Release any router-held model state."""
+        """Release any router-held model state.
+
+        A process-wide shared instance (``_is_singleton``) keeps its models
+        loaded across requests, so a per-request ``close()`` must be a no-op
+        there; otherwise every image request would reload the ONNX/torch models
+        it just cached, reintroducing the #2513 leak.
+        """
+        if self._is_singleton:
+            return
         if self._router is not None:
             # Only loaded routers hold heavyweight image models; plain has_images()
             # checks remain cheap and have nothing to release.
             self._router.release_models(unload_registry=unload_models)
             self._router = None
+        # Drop the cached ONNX router so its native sessions can be reclaimed.
+        self._onnx_router = None
 
     def has_images(self, messages: list[dict[str, Any]]) -> bool:
         """Check if messages contain images."""
@@ -675,9 +707,7 @@ class ImageCompressor:
                 confidence = 0.0
         else:
             try:
-                from .onnx_router import OnnxTechniqueRouter
-
-                onnx_router = OnnxTechniqueRouter(use_siglip=self.use_siglip)
+                onnx_router = self._get_onnx_router()
                 decision = onnx_router.classify(image_data, query)
                 technique = decision.technique
                 confidence = decision.confidence

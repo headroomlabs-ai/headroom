@@ -24,12 +24,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-# Section delimiters surfaced in the embedding input so the embedder
-# sees structured context rather than a wall of run-on text. Kept short
-# so they don't dominate the embedding signal.
-_USER_DELIM = "### USER ###\n"
-_ASSISTANT_DELIM = "\n### PRIOR_ASSISTANT ###\n"
-_TOOL_DELIM = "\n### TOOL_OUTPUT ###\n"
+from .memory_query_policy import (
+    extract_memory_query_sources,
+    render_embedding_input,
+)
 
 
 @dataclass(frozen=True)
@@ -59,16 +57,11 @@ class MemoryQuery:
         embedder's positional weighting often emphasizes the tail of
         the input.
         """
-        parts: list[str] = []
-        for asst in self.recent_assistant_turns:
-            if asst:
-                parts.append(_ASSISTANT_DELIM + asst)
-        for tool_out in self.recent_tool_outputs:
-            if tool_out:
-                parts.append(_TOOL_DELIM + tool_out)
-        if self.user_text:
-            parts.append(_USER_DELIM + self.user_text)
-        return "".join(parts)
+        return render_embedding_input(
+            user_text=self.user_text,
+            recent_tool_outputs=self.recent_tool_outputs,
+            recent_assistant_turns=self.recent_assistant_turns,
+        )
 
     @classmethod
     def from_messages(
@@ -91,70 +84,14 @@ class MemoryQuery:
         Handles both OpenAI shape (``role: tool``) and Anthropic shape
         (``tool_result`` content block inside a ``role: user`` message).
         """
-        if not messages:
-            return cls(
-                user_text="",
-                recent_tool_outputs=(),
-                recent_assistant_turns=(),
-                conversation_id=conversation_id,
-            )
-
-        latest_user = ""
-        assistant_turns: list[str] = []
-        tool_outputs: list[str] = []
-
-        # Walk messages backward so we naturally find the LATEST entries
-        # first; preserve chronological order in the output by reversing
-        # the collected lists at the end.
-        for msg in reversed(messages):
-            role = msg.get("role")
-            content = msg.get("content", "")
-
-            if role == "user":
-                # Distinguish "real user text" from "Anthropic tool_result
-                # masquerading as a user message". Anthropic uses
-                # role=user with content=[{type: tool_result, ...}].
-                if isinstance(content, list):
-                    for block in content:
-                        if isinstance(block, dict) and block.get("type") == "tool_result":
-                            tool_text = block.get("content", "")
-                            if isinstance(tool_text, list):
-                                # Nested content blocks; flatten text fields.
-                                tool_text = "\n".join(
-                                    b.get("text", "") for b in tool_text if isinstance(b, dict)
-                                )
-                            if tool_text and len(tool_outputs) < lookback_tools:
-                                tool_outputs.append(str(tool_text))
-                    # Anthropic tool_result is NOT a real user turn —
-                    # don't use it as the user_text source. Continue
-                    # walking back for the actual user message.
-                elif isinstance(content, str):
-                    if not latest_user:
-                        latest_user = content
-
-            elif role == "assistant":
-                if isinstance(content, str) and content:
-                    if len(assistant_turns) < lookback_assistant:
-                        assistant_turns.append(content)
-                elif isinstance(content, list):
-                    text_parts = [
-                        b.get("text", "")
-                        for b in content
-                        if isinstance(b, dict) and b.get("type") == "text"
-                    ]
-                    joined = "\n".join(p for p in text_parts if p)
-                    if joined and len(assistant_turns) < lookback_assistant:
-                        assistant_turns.append(joined)
-
-            elif role == "tool":
-                # OpenAI shape: tool messages carry the result.
-                if isinstance(content, str) and content and len(tool_outputs) < lookback_tools:
-                    tool_outputs.append(content)
-
-        # Reverse to restore chronological order (we walked backward).
+        user_text, recent_tool_outputs, recent_assistant_turns = extract_memory_query_sources(
+            messages,
+            lookback_assistant=lookback_assistant,
+            lookback_tools=lookback_tools,
+        )
         return cls(
-            user_text=latest_user,
-            recent_tool_outputs=tuple(reversed(tool_outputs)),
-            recent_assistant_turns=tuple(reversed(assistant_turns)),
+            user_text=user_text,
+            recent_tool_outputs=recent_tool_outputs,
+            recent_assistant_turns=recent_assistant_turns,
             conversation_id=conversation_id,
         )

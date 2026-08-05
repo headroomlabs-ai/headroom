@@ -1,0 +1,41 @@
+{
+  "config": {
+    "ccr_ttl": 300,
+    "compress_comments": true,
+    "docstring_mode": "first_line",
+    "enable_ccr": false,
+    "fallback_to_kompress": false,
+    "language_hint": null,
+    "max_body_lines": 5,
+    "min_tokens_for_compression": 100,
+    "preserve_decorators": true,
+    "preserve_imports": true,
+    "preserve_signatures": true,
+    "preserve_type_annotations": true,
+    "semantic_analysis": true,
+    "target_compression_rate": 0.2
+  },
+  "input": "package com.example;\n\nimport java.util.List;\nimport java.util.ArrayList;\n\npublic class Processor {\n    private String name;\n    private int count;\n\n    public Processor(String name) {\n        this.name = name;\n        this.count = 0;\n    }\n\n    @Override\n    public String toString() {\n        return \"Processor(\" + name + \")\";\n    }\n\n    public List<String> process(List<String> items) {\n        List<String> results = new ArrayList<>();\n        for (String item : items) {\n            if (item == null || item.isEmpty()) {\n                continue;\n            }\n            String clean = item.trim().toLowerCase();\n            results.add(clean);\n            this.count += 1;\n        }\n        return results;\n    }\n}\n\n// variant 1",
+  "input_sha256": "5c057f7bfd56af058ab2f8745bf0242d97e3a458ce8efedae8263066c1c709a7",
+  "output": {
+    "cache_key": null,
+    "compressed": "package com.example;\nimport java.util.List;\nimport java.util.ArrayList;\n\npublic class Processor {\n    private String name;\n    private int count;\n\n    public Processor(String name) {\n        this.name = name;\n        this.count = 0;\n    }\n\n    @Override\n    public String toString() {\n        return \"Processor(\" + name + \")\";\n    }\n\n    public List<String> process(List<String> items) {\n        List<String> results = new ArrayList<>();\n        for (String item : items) {\n            if (item == null || item.isEmpty()) {\n                continue;\n            }\n            String clean = item.trim().toLowerCase();\n            results.add(clean);\n            this.count += 1;\n        }\n        return results;\n    }\n}\n\n// variant 1",
+    "compressed_bodies": 0,
+    "compressed_tokens": 183,
+    "compression_ratio": 1.0,
+    "language": "java",
+    "language_confidence": 1.0,
+    "original": "package com.example;\n\nimport java.util.List;\nimport java.util.ArrayList;\n\npublic class Processor {\n    private String name;\n    private int count;\n\n    public Processor(String name) {\n        this.name = name;\n        this.count = 0;\n    }\n\n    @Override\n    public String toString() {\n        return \"Processor(\" + name + \")\";\n    }\n\n    public List<String> process(List<String> items) {\n        List<String> results = new ArrayList<>();\n        for (String item : items) {\n            if (item == null || item.isEmpty()) {\n                continue;\n            }\n            String clean = item.trim().toLowerCase();\n            results.add(clean);\n            this.count += 1;\n        }\n        return results;\n    }\n}\n\n// variant 1",
+    "original_tokens": 183,
+    "preserved_imports": 3,
+    "preserved_signatures": 0,
+    "symbol_scores": {
+      "Processor": 0.071,
+      "String": 1.0,
+      "process": 0.0
+    },
+    "syntax_valid": true
+  },
+  "recorded_at": "2026-06-19T00:15:16.346983+00:00",
+  "transform": "code_aware_compressor"
+}

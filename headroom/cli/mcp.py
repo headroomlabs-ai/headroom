@@ -6,8 +6,6 @@ needing API key access.
 """
 
 import json
-import shutil
-import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +16,13 @@ from .main import main
 # Default paths
 CLAUDE_CONFIG_DIR = Path.home() / ".claude"
 MCP_CONFIG_PATH = CLAUDE_CONFIG_DIR / "mcp.json"
+# Servers registered via `claude mcp add` (user scope) live in ~/.claude.json,
+# NOT in ~/.claude/mcp.json. Status must check both to avoid a false negative.
+CLAUDE_JSON_PATH = Path.home() / ".claude.json"
 DEFAULT_PROXY_URL = "http://127.0.0.1:8787"
+DEFAULT_HTTP_HOST = "127.0.0.1"
+DEFAULT_HTTP_PORT = 8788
+DEFAULT_HTTP_PATH = "/mcp"
 
 
 def get_headroom_command() -> list[str]:
@@ -33,7 +37,7 @@ def load_mcp_config() -> dict[str, Any]:
     """Load existing MCP config or return empty structure."""
     if MCP_CONFIG_PATH.exists():
         try:
-            with open(MCP_CONFIG_PATH) as f:
+            with open(MCP_CONFIG_PATH, encoding="utf-8") as f:
                 result: dict[str, Any] = json.load(f)
                 return result
         except (json.JSONDecodeError, OSError):
@@ -44,9 +48,33 @@ def load_mcp_config() -> dict[str, Any]:
 def save_mcp_config(config: dict) -> None:
     """Save MCP config, creating directory if needed."""
     CLAUDE_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    with open(MCP_CONFIG_PATH, "w") as f:
+    with open(MCP_CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2)
         f.write("\n")  # Trailing newline
+
+
+def find_headroom_registration() -> tuple[Path, dict[str, Any]] | None:
+    """Locate an existing 'headroom' MCP server registration.
+
+    Claude Code stores servers registered with `claude mcp add` (user scope) in
+    ~/.claude.json under "mcpServers". Headroom's own `mcp install` fallback
+    writes ~/.claude/mcp.json, and a project may define ./.mcp.json. Check all of
+    them so `status` reflects reality instead of only looking at mcp.json.
+
+    Returns (config_path, server_config) for the first match, else None.
+    """
+    for path in (CLAUDE_JSON_PATH, MCP_CONFIG_PATH, Path.cwd() / ".mcp.json"):
+        if not path.exists():
+            continue
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            continue
+        servers = data.get("mcpServers", {})
+        if isinstance(servers, dict) and "headroom" in servers:
+            return path, servers["headroom"]
+    return None
 
 
 @main.group()
@@ -161,70 +189,31 @@ def mcp_install(proxy_url: str, agents: tuple[str, ...], force: bool) -> None:
 
 @mcp.command("uninstall")
 def mcp_uninstall() -> None:
-    """Remove Headroom MCP server from Claude Code config.
+    """Remove Headroom MCP server from detected agent configs.
 
     \b
-    Removes headroom from both the claude CLI registry (Claude Code CLI >=2.x)
-    and ~/.claude/mcp.json if present. Other MCP servers are preserved.
+    Removes headroom from every agent registrar known to Headroom. Other MCP
+    servers are preserved.
     """
+    from headroom.mcp_registry import get_all_registrars
+
     removed = False
 
-    # Remove from claude CLI registry (Claude Code CLI >=2.x)
-    claude_cli = shutil.which("claude")
-    if claude_cli:
-        check = subprocess.run(
-            [claude_cli, "mcp", "get", "headroom"],
-            capture_output=True,
-        )
-        if check.returncode == 0:
-            rm = subprocess.run(
-                [claude_cli, "mcp", "remove", "headroom", "-s", "user"],
-                capture_output=True,
-                text=True,
-            )
-            if rm.returncode == 0:
-                click.echo("✓ Headroom MCP server removed (via claude mcp remove)")
-                removed = True
-            else:
-                click.echo(
-                    f"Warning: 'claude mcp remove' failed ({rm.stderr.strip()}).",
-                    err=True,
-                )
-
-    # Also remove codebase-memory-mcp if registered (installed by --code-graph)
-    if claude_cli:
-        cbm_check = subprocess.run(
-            [claude_cli, "mcp", "get", "codebase-memory-mcp"],
-            capture_output=True,
-        )
-        if cbm_check.returncode == 0:
-            cbm_rm = subprocess.run(
-                [claude_cli, "mcp", "remove", "codebase-memory-mcp", "-s", "user"],
-                capture_output=True,
-                text=True,
-            )
-            if cbm_rm.returncode == 0:
-                click.echo("✓ codebase-memory-mcp MCP server removed")
-                removed = True
-
-    # Also remove from mcp.json fallback config if present
-    if MCP_CONFIG_PATH.exists():
-        config = load_mcp_config()
-        changed = False
+    for registrar in get_all_registrars():
+        if not registrar.detect():
+            continue
+        removed_names: list[str] = []
         for server_name in ("headroom", "codebase-memory-mcp"):
-            if server_name in config.get("mcpServers", {}):
-                del config["mcpServers"][server_name]
-                changed = True
-        if changed:
-            save_mcp_config(config)
-            click.echo(f"✓ MCP servers removed from {MCP_CONFIG_PATH}")
+            if registrar.unregister_server(server_name):
+                removed_names.append(server_name)
+        if removed_names:
+            click.echo(
+                f"✓ {registrar.display_name}: removed {', '.join(removed_names)} MCP server(s)"
+            )
             removed = True
 
     if not removed:
-        if MCP_CONFIG_PATH.exists():
-            click.echo("Headroom MCP is not configured. Nothing to uninstall.")
-        else:
-            click.echo("No MCP config found. Nothing to uninstall.")
+        click.echo("Headroom MCP is not configured. Nothing to uninstall.")
 
 
 @mcp.command("status")
@@ -247,32 +236,30 @@ def mcp_status() -> None:
         click.echo("MCP SDK:        ✗ Not installed")
         click.echo("                pip install 'headroom-ai[mcp]'")
 
-    # Check config
-    if MCP_CONFIG_PATH.exists():
-        config = load_mcp_config()
-        if "headroom" in config.get("mcpServers", {}):
-            server_config = config["mcpServers"]["headroom"]
-            click.echo("Claude Config:  ✓ Configured")
-            click.echo(f"                {MCP_CONFIG_PATH}")
+    from headroom.mcp_registry import get_all_registrars
 
-            # Show proxy URL
-            env = server_config.get("env", {})
-            proxy_url = env.get("HEADROOM_PROXY_URL", DEFAULT_PROXY_URL)
-            click.echo(f"Proxy URL:      {proxy_url}")
-        else:
-            click.echo("Claude Config:  ✗ Not configured")
-            click.echo("                Run: headroom mcp install")
-    else:
-        click.echo("Claude Config:  ✗ No config file")
+    proxy_url = DEFAULT_PROXY_URL
+    any_configured = False
+    click.echo("Agent Config:")
+    for registrar in get_all_registrars():
+        if not registrar.detect():
+            click.echo(f"  {registrar.display_name}: ✗ Not detected")
+            continue
+        spec = registrar.get_server("headroom")
+        if spec is None:
+            click.echo(f"  {registrar.display_name}: ✗ Not configured")
+            continue
+        any_configured = True
+        proxy_url = spec.env.get("HEADROOM_PROXY_URL", proxy_url)
+        click.echo(f"  {registrar.display_name}: ✓ Configured")
+
+    if not any_configured:
         click.echo("                Run: headroom mcp install")
+    click.echo(f"Proxy URL:      {proxy_url}")
 
     # Check proxy connectivity
     try:
         import httpx
-
-        config = load_mcp_config()
-        env = config.get("mcpServers", {}).get("headroom", {}).get("env", {})
-        proxy_url = env.get("HEADROOM_PROXY_URL", DEFAULT_PROXY_URL)
 
         try:
             response = httpx.get(f"{proxy_url}/health", timeout=2.0)
@@ -285,6 +272,10 @@ def mcp_status() -> None:
             click.echo("                Run: headroom proxy")
         except httpx.TimeoutException:
             click.echo("Proxy Status:   ✗ Timeout")
+        except httpx.HTTPError as e:
+            # Catch the rest (InvalidURL, UnsupportedProtocol, ProtocolError, …)
+            # so a malformed configured HEADROOM_PROXY_URL can't crash `status`.
+            click.echo(f"Proxy Status:   ✗ Unreachable ({proxy_url}: {e})")
     except ImportError:
         click.echo("Proxy Status:   ? (httpx not installed)")
 
@@ -297,6 +288,32 @@ def mcp_status() -> None:
     help=f"Headroom proxy URL (default: {DEFAULT_PROXY_URL})",
 )
 @click.option(
+    "--transport",
+    type=click.Choice(["stdio", "http"], case_sensitive=False),
+    default="stdio",
+    show_default=True,
+    help="Transport to use for headroom mcp serve",
+)
+@click.option(
+    "--host",
+    default=DEFAULT_HTTP_HOST,
+    show_default=True,
+    help="HTTP bind host",
+)
+@click.option(
+    "--port",
+    default=DEFAULT_HTTP_PORT,
+    show_default=True,
+    type=int,
+    help="HTTP bind port",
+)
+@click.option(
+    "--path",
+    default=DEFAULT_HTTP_PATH,
+    show_default=True,
+    help="HTTP endpoint path",
+)
+@click.option(
     "--direct",
     is_flag=True,
     help="(Deprecated, ignored) Direct CompressionStore access is no longer supported",
@@ -306,16 +323,26 @@ def mcp_status() -> None:
     is_flag=True,
     help="Enable debug logging",
 )
-def mcp_serve(proxy_url: str | None, direct: bool, debug: bool) -> None:
+def mcp_serve(
+    proxy_url: str | None,
+    transport: str,
+    host: str,
+    port: int,
+    path: str,
+    direct: bool,
+    debug: bool,
+) -> None:
     """Start the MCP server (called by Claude Code).
 
     \b
     This command is typically invoked by Claude Code via the MCP config,
-    not run directly. It starts the MCP server with stdio transport.
+    not run directly. It starts the MCP server with stdio by default or
+    Streamable HTTP when requested.
 
     \b
     For manual testing:
         headroom mcp serve --debug
+        headroom mcp serve --transport http --host 127.0.0.1 --port 8788 --path /mcp
     """
     import asyncio
     import logging
@@ -340,6 +367,8 @@ def mcp_serve(proxy_url: str | None, direct: bool, debug: bool) -> None:
             format="%(levelname)s: %(message)s",
         )
 
+    transport = transport.lower()
+
     # Use default if not specified
     effective_proxy_url = proxy_url or DEFAULT_PROXY_URL
 
@@ -353,7 +382,10 @@ def mcp_serve(proxy_url: str | None, direct: bool, debug: bool) -> None:
 
     async def run() -> None:
         try:
-            await server.run_stdio()
+            if transport == "http":
+                await server.run_streamable_http(host=host, port=port, path=path, debug=debug)
+            else:
+                await server.run_stdio()
         finally:
             await server.cleanup()
 

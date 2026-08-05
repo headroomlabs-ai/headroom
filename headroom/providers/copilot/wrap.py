@@ -22,6 +22,10 @@ def resolve_provider_type(
         return provider_type
 
     env = environ or os.environ
+    # Check COPILOT_PROVIDER_TYPE env var before falling back to backend default.
+    env_type = env.get("COPILOT_PROVIDER_TYPE")
+    if env_type in {"anthropic", "openai"}:
+        return env_type
     effective_backend = backend or env.get("HEADROOM_BACKEND") or "anthropic"
     return "anthropic" if effective_backend == "anthropic" else "openai"
 
@@ -65,6 +69,49 @@ def validate_configuration(
         raise click.ClickException(
             "--wire-api responses is not supported with translated backends; use completions."
         )
+
+
+#: Copilot virtual model names that map to native auto-routing.
+#: Forwarding these to BYOK endpoints causes a 400; they must be stripped.
+_AUTO_MODEL_ALIASES: frozenset[str] = frozenset({"auto"})
+
+
+def is_auto_model(model: str | None) -> bool:
+    """Return True when the model name is a Copilot auto-routing alias.
+
+    ``model auto`` is a virtual model ID that Copilot resolves internally.
+    It is **not** a valid model string for BYOK providers (Anthropic, OpenAI)
+    and causes a ``400 The requested model is not supported`` error if forwarded
+    verbatim.  This helper centralises the detection so both the CLI and the
+    proxy layer can guard against it.
+    """
+    if not model:
+        return False
+    return model.strip().lower() in _AUTO_MODEL_ALIASES
+
+
+def strip_auto_model_args(copilot_args: tuple[str, ...]) -> tuple[str, ...]:
+    """Remove ``--model auto`` (and ``--model=auto``) from Copilot CLI args.
+
+    Used in the subscription/OAuth path: when the user passes ``--model auto``
+    to ``headroom wrap copilot --subscription``, we strip it before launching
+    Copilot so the CLI falls back to its own native automatic model selection
+    instead of sending the unsupported ``auto`` string to the BYOK API.
+    """
+    result: list[str] = []
+    i = 0
+    while i < len(copilot_args):
+        arg = copilot_args[i]
+        if arg == "--model" and i + 1 < len(copilot_args):
+            if is_auto_model(copilot_args[i + 1]):
+                i += 2  # skip both --model and auto
+                continue
+        elif arg.startswith("--model=") and is_auto_model(arg.split("=", 1)[1]):
+            i += 1  # skip --model=auto
+            continue
+        result.append(arg)
+        i += 1
+    return tuple(result)
 
 
 def _normalized_model_name(model: str | None) -> str:
@@ -156,14 +203,15 @@ def build_launch_env(
 
 
 def model_configured(copilot_args: tuple[str, ...], env: Mapping[str, str]) -> bool:
-    """Return True when Copilot BYOK model selection is configured."""
-    if env.get("COPILOT_MODEL") or env.get("COPILOT_PROVIDER_MODEL_ID"):
-        return True
+    """Return True when Copilot BYOK model selection is configured (non-auto).
 
-    for idx, arg in enumerate(copilot_args):
-        if arg == "--model" and idx + 1 < len(copilot_args):
-            return True
-        if arg.startswith("--model="):
-            return True
-
-    return False
+    ``--model auto`` is **not** considered configured for BYOK purposes: it is
+    a virtual Copilot routing token that has no meaning to external providers
+    such as Anthropic or OpenAI, and forwarding it causes a 400.  Returning
+    ``False`` here ensures the BYOK "model required" warning is still shown
+    when the user mistakenly passes ``--model auto`` in BYOK mode.
+    """
+    model = copilot_model_from_args(copilot_args, env)
+    if model is None or is_auto_model(model):
+        return False
+    return True

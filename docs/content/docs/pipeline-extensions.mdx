@@ -1,0 +1,79 @@
+---
+title: Pipeline Extensions
+description: Write a request-normalization extension for a quirky upstream provider, and route requests to different upstream bases per request with x-headroom-base-url.
+---
+
+Headroom emits lifecycle events at every stage of the canonical request pipeline. Third-party packages can hook these events — without forking Headroom — by registering a **pipeline extension** under the `headroom.pipeline_extension` entry-point group. Extensions can mutate `messages`, `tools`, `headers`, or `metadata` in place before the request is forwarded upstream.
+
+Both the SDK client and the proxy dispatch the same events, so one extension covers both deployments.
+
+## Lifecycle stages
+
+Extensions receive a `PipelineEvent` for each stage in `headroom.pipeline.PipelineStage`:
+
+| Stage | When |
+|-------|------|
+| `SETUP`, `PRE_START`, `POST_START` | Process/pipeline startup |
+| `INPUT_RECEIVED` | Raw request accepted |
+| `INPUT_CACHED`, `INPUT_ROUTED`, `INPUT_COMPRESSED`, `INPUT_REMEMBERED` | Cache, routing, compression, memory stages |
+| `PRE_SEND` | Last hook before the request is forwarded upstream |
+| `POST_SEND`, `RESPONSE_RECEIVED` | After forwarding / on response |
+
+`PRE_SEND` is the right stage for normalizing requests to fit a quirky upstream: compression and caching are done, and whatever you write into `event.messages` is exactly what the provider receives.
+
+## Recipe: normalize requests for a quirky upstream provider
+
+Some OpenAI-compatible gateways reject valid OpenAI-spec payloads. A real example: an upstream returns `400 "Message content is null"` for assistant messages that carry `content: null` alongside `tool_calls` — a combination the OpenAI spec explicitly produces when the model returns only tool calls. The provider-recommended workaround is to send `content: ""` instead.
+
+An extension that rewrites those messages at `PRE_SEND`:
+
+```python
+# my_headroom_ext/normalize.py
+from headroom.pipeline import PipelineEvent, PipelineStage
+
+
+class NullContentNormalizer:
+    """Rewrite `content: null` + tool_calls to `content: ""` before send."""
+
+    def on_pipeline_event(self, event: PipelineEvent) -> PipelineEvent | None:
+        if event.stage is not PipelineStage.PRE_SEND or not event.messages:
+            return None
+        for message in event.messages:
+            if (
+                message.get("role") == "assistant"
+                and message.get("content") is None
+                and message.get("tool_calls")
+            ):
+                message["content"] = ""
+        return None  # mutated in place; returning None keeps the event
+```
+
+Register it as an entry point in your extension package:
+
+```toml
+# pyproject.toml of your extension package
+[project.entry-points."headroom.pipeline_extension"]
+null-content-normalizer = "my_headroom_ext.normalize:NullContentNormalizer"
+```
+
+Install the package into the same environment as Headroom (`pip install my-headroom-ext`) and it is discovered automatically — entry points are loaded on startup, and a failing extension is isolated and logged rather than breaking the pipeline.
+
+Notes on the contract:
+
+- An extension is either an object with an `on_pipeline_event(event)` method or a class Headroom instantiates with no arguments.
+- Return `None` (mutate in place) or return a replacement `PipelineEvent`.
+- Exceptions raised by an extension are caught and logged (`fail-open`); the request proceeds unmodified.
+- Discovery can be disabled with the SDK config flag `discover_pipeline_extensions=False`, and explicit instances can be passed via `pipeline_extensions=[...]` (SDK `HeadroomConfig` and proxy `ProxyConfig` both expose these fields).
+
+## Per-request upstream routing with `x-headroom-base-url`
+
+To route different models through one Headroom instance to different OpenAI-compatible upstream bases — instead of one global `OPENAI_API_URL` / `OPENAI_TARGET_API_URL` per proxy process — send the `x-headroom-base-url` request header. The dedicated OpenAI handlers (`/v1/chat/completions`, `/v1/responses`) and the generic passthrough route all honor it, falling back to the configured upstream when absent:
+
+```bash
+curl http://localhost:8787/v1/chat/completions \
+  -H "content-type: application/json" \
+  -H "x-headroom-base-url: https://api.example-gateway.ai/gemini-3-flash" \
+  -d '{"model": "gemini-3-flash", "messages": [{"role": "user", "content": "hi"}]}'
+```
+
+Internal `x-headroom-*` headers (including this one) are stripped before the request is forwarded upstream by default — see `HEADROOM_STRIP_INTERNAL_HEADERS` in [Configuration](/docs/configuration).

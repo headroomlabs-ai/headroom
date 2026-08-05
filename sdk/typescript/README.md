@@ -23,7 +23,7 @@ const response = await openai.chat.completions.create({
 });
 ```
 
-Requires a running Headroom proxy (`headroom proxy`) or Headroom Cloud API key.
+Requires a running Headroom proxy (`headroom proxy`).
 
 ## Framework Adapters
 
@@ -359,8 +359,8 @@ import { compress } from 'headroom-ai';
 
 const result = await compress(messages, {
   model: 'gpt-4o',
-  baseUrl: 'http://localhost:8787',  // or https://api.headroom.ai
-  apiKey: 'hr_...',                   // for Headroom Cloud
+  baseUrl: 'http://localhost:8787',  // proxy URL
+  apiKey: 'your-api-key',             // optional, for authenticated endpoints
   timeout: 30000,                     // ms
   fallback: true,                     // return uncompressed if proxy is down (default)
   retries: 1,                         // retry on transient failures (default)
@@ -370,8 +370,8 @@ const result = await compress(messages, {
 ```
 
 Or use environment variables:
-- `HEADROOM_BASE_URL` — proxy/cloud URL
-- `HEADROOM_API_KEY` — Cloud API key
+- `HEADROOM_BASE_URL` — proxy URL
+- `HEADROOM_API_KEY` — optional API key for authenticated endpoints
 
 ## Utilities
 

@@ -103,7 +103,7 @@ class DiffCompressor:
         )
 
     def compress(self, content: str, context: str = "") -> DiffCompressionResult:
-        r = self._rust.compress(content, context)
+        r = self._rust.compress(content, context or "")
         cache_key: str | None = r.cache_key
         if cache_key is not None:
             # Mirror log_compressor.py + search_compressor.py: when the

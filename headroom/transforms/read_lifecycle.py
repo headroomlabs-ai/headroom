@@ -11,6 +11,12 @@ Real-world data shows 75% of Read output bytes fall into these two categories:
 - 67% stale (file edited after Read)
 - 12% superseded (file re-Read later)
 - Only 20% are fresh (untouched)
+
+NOTE: a first-sight repeat-Read dedup mechanism (DEDUP_REPEAT) was
+prototyped here and removed — `headroom audit-reads` measured
+byte-identical repeats at 0.1% of Read bytes on real traffic. If a
+deployment's audit shows otherwise, the implementation is in git history
+on the feat/compression-extraction branch.
 """
 
 from __future__ import annotations
@@ -171,7 +177,7 @@ class ReadLifecycleManager:
                 continue
 
             # OpenAI format: tool_calls array
-            for tc in msg.get("tool_calls", []):
+            for tc in msg.get("tool_calls") or []:  # coalesce None (OpenAI tool_calls:null)
                 if not isinstance(tc, dict):
                     continue
                 tc_id = tc.get("id", "")
@@ -266,7 +272,7 @@ class ReadLifecycleManager:
                 continue
 
             # OpenAI format
-            for tc in msg.get("tool_calls", []):
+            for tc in msg.get("tool_calls") or []:  # coalesce None (OpenAI tool_calls:null)
                 if isinstance(tc, dict) and tc.get("id") == tool_call_id:
                     return i
 
@@ -374,7 +380,7 @@ class ReadLifecycleManager:
         ccr_hashes: list[str] = []
         bytes_before = 0
         bytes_after = 0
-        counts = {ReadState.FRESH: 0, ReadState.STALE: 0, ReadState.SUPERSEDED: 0}
+        counts = dict.fromkeys(ReadState, 0)
 
         for c in classifications:
             counts[c.state] += 1
@@ -468,32 +474,41 @@ class ReadLifecycleManager:
         if content_bytes < self.config.min_size_bytes:
             return False, content, None
 
-        # Store original in CCR if available
-        ccr_hash = None
+        # Best-effort CCR persistence (mirrors read_maturation.py): a store
+        # failure must not break compress().
+        ccr_hash = hashlib.sha256(content.encode()).hexdigest()[:24]
         if self.store is not None:
-            ccr_hash = self.store.store(
-                original=content,
-                compressed="",
-                tool_name="Read",
-                tool_call_id=classification.tool_call_id,
-                compression_strategy=f"read_lifecycle:{classification.state.value}",
-            )
-
-        # Generate marker
-        if ccr_hash is None:
-            # No CCR store — generate a content hash for reference
-            ccr_hash = hashlib.sha256(content.encode()).hexdigest()[:24]
+            try:
+                ccr_hash = self.store.store(
+                    original=content,
+                    compressed="",
+                    tool_name="Read",
+                    tool_call_id=classification.tool_call_id,
+                    compression_strategy=f"read_lifecycle:{classification.state.value}",
+                    explicit_hash=ccr_hash,
+                )
+            except Exception as e:  # noqa: BLE001 - storage failure must not break the request
+                logger.warning(
+                    "read_lifecycle: CCR store failed for %s: %s",
+                    classification.tool_call_id,
+                    e,
+                )
 
         file_display = classification.file_path or "unknown"
 
+        # NOTE: the literal phrase "Retrieve original: hash=" is load-bearing —
+        # the compression-pinning checks in ContentRouter and the
+        # marker-preserving regex in compression_units.py match on it.
         if classification.state == ReadState.STALE:
             marker = (
-                f"[Read content stale: {file_display} was modified after this read. "
+                f"[Read content stale: {file_display} was modified after this read — "
+                f"re-read the file for current content. "
                 f"Retrieve original: hash={ccr_hash}]"
             )
         else:  # SUPERSEDED
             marker = (
-                f"[Read content superseded: {file_display} was re-read later. "
+                f"[Read content superseded: {file_display} was re-read later — "
+                f"re-read the file if needed. "
                 f"Retrieve original: hash={ccr_hash}]"
             )
 

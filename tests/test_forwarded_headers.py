@@ -19,7 +19,9 @@ from fastapi.testclient import TestClient
 from starlette.datastructures import Headers, State
 
 from headroom.proxy.forwarded_headers import (
+    TRUSTED_DASHBOARD_CLIENT_CIDRS_ENV,
     TRUSTED_GATEWAY_CIDRS_ENV,
+    load_trusted_dashboard_client_cidrs,
     load_trusted_gateway_cidrs,
     peer_is_trusted_gateway,
     resolve_client_ip,
@@ -113,6 +115,36 @@ def test_load_cidrs_reads_env_by_default(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setenv(TRUSTED_GATEWAY_CIDRS_ENV, "10.0.0.0/8")
     cidrs = load_trusted_gateway_cidrs()
     assert [str(c) for c in cidrs] == ["10.0.0.0/8"]
+
+
+def test_load_dashboard_client_cidrs_uses_their_own_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        TRUSTED_DASHBOARD_CLIENT_CIDRS_ENV,
+        "100.90.0.5/32, fd7a:115c:a1e0::/48",
+    )
+
+    cidrs = load_trusted_dashboard_client_cidrs()
+
+    assert [str(cidr) for cidr in cidrs] == [
+        "100.90.0.5/32",
+        "fd7a:115c:a1e0::/48",
+    ]
+
+
+def test_load_dashboard_client_cidrs_unset_is_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(TRUSTED_DASHBOARD_CLIENT_CIDRS_ENV, raising=False)
+    assert load_trusted_dashboard_client_cidrs() == ()
+
+
+def test_load_dashboard_client_cidrs_empty_and_malformed_values() -> None:
+    assert load_trusted_dashboard_client_cidrs("") == ()
+    assert load_trusted_dashboard_client_cidrs("   ") == ()
+    with pytest.raises(ValueError, match=TRUSTED_DASHBOARD_CLIENT_CIDRS_ENV):
+        load_trusted_dashboard_client_cidrs("100.90.0.5/32,not-a-cidr")
 
 
 # ──────────────────────────────────────────────────────────────────

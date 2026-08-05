@@ -4,7 +4,31 @@ from __future__ import annotations
 
 import json
 
-from headroom.transforms.adaptive_sizer import compute_optimal_k
+from headroom.transforms.adaptive_sizer import (
+    compute_optimal_k,
+    compute_unique_bigram_curve,
+)
+
+
+def test_bigram_curve_cjk_uses_char_bigrams():
+    # Spaceless CJK: char bigrams give a real coverage curve (was 1 per item).
+    # Same input + expected as the Rust reference test -> proves byte-exact parity.
+    assert compute_unique_bigram_curve(["数据库连接失败", "数据库连接成功"]) == [6, 8]
+
+
+def test_bigram_curve_cjk_single_char_is_unigram():
+    assert compute_unique_bigram_curve(["中", "文"]) == [1, 2]
+
+
+def test_bigram_curve_ascii_unchanged():
+    # non-CJK behavior is byte-identical to before the CJK branch
+    assert compute_unique_bigram_curve(["the cat", "the dog", "a fish"]) == [1, 2, 3]
+    assert compute_unique_bigram_curve(["hello", "world", "hello"]) == [1, 2, 2]
+
+
+def test_bigram_curve_empty_string_contributes_one():
+    # mirrors the Rust reference test for the empty-item ("", "") path
+    assert compute_unique_bigram_curve(["", "a", "a b"]) == [1, 2, 3]
 
 
 def _make_unique_items(n: int) -> list[str]:

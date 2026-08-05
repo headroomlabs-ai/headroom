@@ -5,6 +5,11 @@ from __future__ import annotations
 import json
 from typing import Any
 
+# Published npm package name for the OpenClaw plugin. This MUST match the
+# "name" field in plugins/openclaw/package.json and the release workflow's
+# NPM_OPENCLAW_PACKAGE (.github/workflows/release.yml). Keep the three in sync.
+OPENCLAW_NPM_PACKAGE = "headroom-openclaw"
+
 DEFAULT_GATEWAY_PROVIDER_IDS = ["openai-codex"]
 
 

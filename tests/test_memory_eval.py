@@ -180,6 +180,19 @@ Score: 3.5"""
         score, _ = _parse_judge_response(response)
         assert score == 1.0
 
+    def test_parse_judge_response_unparseable_defaults_to_failing_score(self):
+        """Unparseable judge output must default below the pass threshold.
+
+        Regression test for #1890: a missing/garbled "Score:" line used to
+        default to 3.0, which is exactly the `judge_score >= 3.0` pass
+        threshold in before_after.py, silently marking unparseable judge
+        responses as passing.
+        """
+        response = "The model's response looks reasonable overall."
+
+        score, _ = _parse_judge_response(response)
+        assert score < 3.0
+
     def test_simple_judge_exact_match(self):
         """Test simple judge with exact match."""
         score, reasoning = simple_judge(

@@ -194,15 +194,25 @@ def configure_langfuse_tracing(
 
 def get_langfuse_tracing_status() -> dict[str, Any]:
     with _tracing_lock:
-        if _owned_langfuse_config is None:
-            return {
-                "configured": False,
-                "enabled": False,
-                "service_name": None,
-                "base_url": None,
-                "endpoint": None,
-            }
-        return _owned_langfuse_config.status()
+        if _owned_langfuse_config is not None:
+            return _owned_langfuse_config.status()
+    if not any(
+        os.environ.get(name)
+        for name in (
+            "HEADROOM_LANGFUSE_ENABLED",
+            "LANGFUSE_PUBLIC_KEY",
+            "LANGFUSE_SECRET_KEY",
+            "LANGFUSE_BASE_URL",
+        )
+    ):
+        return {
+            "configured": False,
+            "enabled": False,
+            "service_name": None,
+            "base_url": None,
+            "endpoint": None,
+        }
+    return LangfuseTracingConfig.from_env(default_service_name="headroom-proxy").status()
 
 
 def shutdown_headroom_tracing() -> None:

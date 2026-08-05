@@ -50,9 +50,11 @@ except ImportError:  # pragma: no cover - fastapi is a hard dep in practice
 
 __all__ = [
     "LOOPBACK_HOSTS",
+    "is_ip_literal_host_header",
     "is_loopback_host",
     "is_loopback_host_header",
     "require_loopback",
+    "require_same_origin",
 ]
 
 
@@ -128,6 +130,46 @@ def is_loopback_host_header(header_value: str | None) -> bool:
     return is_loopback_host(host_part)
 
 
+def is_ip_literal_host_header(header_value: str | None) -> bool:
+    """Return whether ``Host:`` contains an IPv4 or bracketed IPv6 literal.
+
+    Dashboard clients may use a non-loopback server address, but retaining an
+    IP-literal Host requirement prevents DNS-rebinding requests from using an
+    attacker-controlled hostname. Ports are accepted in normal HTTP forms.
+    """
+    if not header_value:
+        return False
+
+    candidate = header_value.strip()
+    if not candidate or "/" in candidate or "@" in candidate:
+        return False
+
+    if candidate.startswith("["):
+        closing = candidate.find("]")
+        if closing == -1 or candidate.count("[") != 1 or candidate.count("]") != 1:
+            return False
+        host_part = candidate[1:closing]
+        suffix = candidate[closing + 1 :]
+        if suffix and (not suffix.startswith(":") or not suffix[1:].isdigit()):
+            return False
+        try:
+            return isinstance(ipaddress.ip_address(host_part), ipaddress.IPv6Address)
+        except ValueError:
+            return False
+
+    if candidate.count(":") == 1:
+        host_part, port = candidate.rsplit(":", 1)
+        if not port.isdigit():
+            return False
+    else:
+        host_part = candidate
+
+    try:
+        return isinstance(ipaddress.ip_address(host_part), ipaddress.IPv4Address)
+    except ValueError:
+        return False
+
+
 def require_loopback(request: Request) -> None:  # type: ignore[valid-type]
     """FastAPI dependency: 404 any non-loopback caller.
 
@@ -172,3 +214,35 @@ def require_loopback(request: Request) -> None:  # type: ignore[valid-type]
         host_header = None
     if not is_loopback_host_header(host_header):
         raise HTTPException(status_code=404)
+
+
+def require_same_origin(request: Request) -> None:  # type: ignore[valid-type]
+    """FastAPI dependency: reject cross-origin browser requests on mutating routes.
+
+    ``require_loopback``'s Host-header check stops DNS-rebinding, but not a
+    plain CSRF where a remote page's JS targets a known
+    ``http://127.0.0.1:<port>`` URL directly with a non-preflighted "simple"
+    request (e.g. ``Content-Type: text/plain`` carrying a JSON body) -- the
+    browser's ``Host:`` header still reads the real destination (loopback),
+    but its ``Origin:`` header reflects the page's actual origin. CORS alone
+    does not stop this: CORS only blocks the attacker's JS from *reading* the
+    response, not the server from acting on the request.
+
+    Reject when ``Origin`` is present and does not itself name a loopback
+    host, or is the opaque literal ``"null"`` (sandboxed iframe / ``file://``
+    page). Requests with no ``Origin`` header (CLI tools, curl, ``TestClient``,
+    same-origin simple navigations) pass through unchanged -- a real browser
+    always sets ``Origin`` on cross-origin fetch/XHR.
+    """
+    if HTTPException is None:  # pragma: no cover - defensive
+        raise RuntimeError("FastAPI is required for the same-origin guard")
+
+    headers = getattr(request, "headers", None)
+    origin = headers.get("origin") if headers is not None else None
+    if not origin:
+        return
+    if origin == "null":
+        raise HTTPException(status_code=403, detail="cross-origin request rejected")
+    host_part = origin.split("://", 1)[-1].split("/", 1)[0]
+    if not is_loopback_host_header(host_part):
+        raise HTTPException(status_code=403, detail="cross-origin request rejected")

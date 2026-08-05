@@ -342,6 +342,31 @@ class SQLiteMemoryStore:
 
             return [self._row_to_memory(row) for row in cursor]
 
+    async def record_access(
+        self,
+        memory_ids: list[str],
+        accessed_at: datetime | None = None,
+    ) -> int:
+        """Atomically record one retrieval for each distinct memory ID."""
+        unique_ids = list(dict.fromkeys(memory_ids))
+        if not unique_ids:
+            return 0
+
+        timestamp = accessed_at or datetime.utcnow()
+        placeholders = ", ".join("?" for _ in unique_ids)
+        with self._get_conn() as conn:
+            cursor = conn.execute(
+                f"""
+                UPDATE memories
+                SET access_count = access_count + 1,
+                    last_accessed = ?
+                WHERE id IN ({placeholders})
+                """,  # nosec B608
+                [timestamp.isoformat(), *unique_ids],
+            )
+            conn.commit()
+            return cursor.rowcount
+
     async def delete(self, memory_id: str) -> bool:
         """Delete a memory by ID.
 
@@ -403,13 +428,18 @@ class SQLiteMemoryStore:
                 conditions.append("session_id = ?")
                 params.append(filter.session_id)
 
+                # agent_id and turn_id are independent narrowing constraints:
+                # turn_id must be applied even when agent_id is absent. Nesting
+                # the turn_id check inside the agent_id block dropped the turn
+                # filter for a (session_id + turn_id, no agent_id) query, so it
+                # returned the whole session instead of the one turn.
                 if filter.agent_id is not None:
                     conditions.append("agent_id = ?")
                     params.append(filter.agent_id)
 
-                    if filter.turn_id is not None:
-                        conditions.append("turn_id = ?")
-                        params.append(filter.turn_id)
+                if filter.turn_id is not None:
+                    conditions.append("turn_id = ?")
+                    params.append(filter.turn_id)
             elif filter.agent_id is not None:
                 # Agent without session - unusual but supported
                 conditions.append("agent_id = ?")
@@ -561,6 +591,11 @@ class SQLiteMemoryStore:
             params.append(filter.limit)
 
         if filter.offset > 0:
+            # SQLite only accepts OFFSET as part of a LIMIT clause; an OFFSET
+            # without a LIMIT is a syntax error. When the caller paginates with
+            # an offset but no limit, use SQLite's unbounded ``LIMIT -1``.
+            if filter.limit is None:
+                query += " LIMIT -1"
             query += " OFFSET ?"
             params.append(filter.offset)
 
@@ -663,6 +698,54 @@ class SQLiteMemoryStore:
             conn.commit()
 
         return new_memory
+
+    async def detach_supersession(
+        self,
+        old_memory_id: str,
+        new_memory_id: str,
+    ) -> tuple[Memory, Memory]:
+        """Atomically detach one verified supersession edge.
+
+        This is an explicit repair operation. It never infers identity from
+        content or embedding similarity and leaves neighboring chain edges
+        untouched.
+        """
+        if old_memory_id == new_memory_id:
+            raise ValueError("A memory cannot supersede itself")
+
+        with self._get_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                "SELECT * FROM memories WHERE id IN (?, ?)",
+                (old_memory_id, new_memory_id),
+            ).fetchall()
+            memories = {row["id"]: self._row_to_memory(row) for row in rows}
+            old_memory = memories.get(old_memory_id)
+            new_memory = memories.get(new_memory_id)
+
+            if old_memory is None:
+                raise ValueError(f"Memory {old_memory_id} not found")
+            if new_memory is None:
+                raise ValueError(f"Memory {new_memory_id} not found")
+            if old_memory.superseded_by != new_memory_id or new_memory.supersedes != old_memory_id:
+                raise ValueError(
+                    f"Memories {old_memory_id} and {new_memory_id} do not form "
+                    "a reciprocal supersession edge"
+                )
+
+            conn.execute(
+                "UPDATE memories SET valid_until = NULL, superseded_by = NULL WHERE id = ?",
+                (old_memory_id,),
+            )
+            conn.execute(
+                "UPDATE memories SET supersedes = NULL WHERE id = ?",
+                (new_memory_id,),
+            )
+
+        old_memory.valid_until = None
+        old_memory.superseded_by = None
+        new_memory.supersedes = None
+        return old_memory, new_memory
 
     async def get_history(
         self,

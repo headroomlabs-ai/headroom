@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import importlib
-import os
 import sys
 import types
 from pathlib import Path
@@ -22,6 +21,12 @@ def _expected_project_prefix() -> str:
     return f"/p/{quote(Path.cwd().name, safe='')}"
 
 
+@pytest.fixture(autouse=True)
+def _no_retired_context_tool_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A developer's exported HEADROOM_CONTEXT_TOOL would abort every wrap below."""
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+
+
 @pytest.fixture
 def runner() -> CliRunner:
     return CliRunner()
@@ -33,6 +38,8 @@ def _subscription_resolution(
     api_url: str = DEFAULT_API_URL,
     source: str = "headroom-copilot-auth:/tmp/copilot_auth.json:token-exchange",
     confidence: str = "copilot-token-exchange",
+    refresh_oauth_token: str | None = None,
+    api_token_expires_at: float | None = None,
 ) -> CopilotSubscriptionTokenResolution:
     return CopilotSubscriptionTokenResolution(
         token=token,
@@ -40,6 +47,8 @@ def _subscription_resolution(
         confidence=confidence,
         api_url=api_url,
         token_fingerprint="sha256:0123456789ab",
+        refresh_oauth_token=refresh_oauth_token,
+        api_token_expires_at=api_token_expires_at,
     )
 
 
@@ -85,13 +94,13 @@ def wrap_modules(monkeypatch: pytest.MonkeyPatch) -> tuple[types.ModuleType, cli
                 headroom_pkg.cli = saved_headroom_cli_attr
 
 
-def test_wrap_copilot_auto_anthropic_injects_instructions(
+def test_wrap_copilot_auto_anthropic_sets_provider_env(
     runner: CliRunner,
     wrap_modules: tuple[types.ModuleType, click.Group],
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    wrap_cli, main = wrap_modules
+    _wrap_cli, main = wrap_modules
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-dummy")
     captured: dict[str, object] = {}
@@ -102,7 +111,6 @@ def test_wrap_copilot_auto_anthropic_injects_instructions(
     with (
         patch("headroom.cli.wrap.shutil.which", return_value="copilot"),
         patch("headroom.cli.wrap.has_oauth_auth", return_value=False),
-        patch("headroom.cli.wrap._ensure_rtk_binary", return_value=Path("/tmp/rtk")),
         patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch_tool),
     ):
         result = runner.invoke(
@@ -111,12 +119,6 @@ def test_wrap_copilot_auto_anthropic_injects_instructions(
         )
 
     assert result.exit_code == 0, result.output
-    instructions = tmp_path / ".github" / "copilot-instructions.md"
-    assert instructions.exists()
-    content = instructions.read_text()
-    assert wrap_cli._RTK_MARKER in content
-    assert "RTK (Rust Token Killer)" in content
-
     env = captured["env"]
     assert isinstance(env, dict)
     assert env["COPILOT_PROVIDER_TYPE"] == "anthropic"
@@ -149,7 +151,6 @@ def test_wrap_copilot_openai_backend_sets_completions_env(
             [
                 "wrap",
                 "copilot",
-                "--no-rtk",
                 "--backend",
                 "anyllm",
                 "--anyllm-provider",
@@ -171,10 +172,40 @@ def test_wrap_copilot_openai_backend_sets_completions_env(
         f"http://127.0.0.1:8787{_expected_project_prefix()}/v1"
     )
     assert env["COPILOT_PROVIDER_WIRE_API"] == "completions"
-    assert captured["backend"] == "anyllm"
-    assert captured["anyllm_provider"] == "groq"
-    assert captured["region"] == "us-central1"
-    assert captured["args"] == ("--model", "gpt-4o")
+
+
+def test_wrap_copilot_byok_rejects_auto_model_before_launch(
+    runner: CliRunner,
+    wrap_modules: tuple[types.ModuleType, click.Group],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _wrap_cli, main = wrap_modules
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-dummy")
+
+    def fail_launch_tool(**_kwargs: object) -> None:
+        raise AssertionError("_launch_tool must not run with --model auto in BYOK mode")
+
+    with (
+        patch("headroom.cli.wrap.shutil.which", return_value="copilot"),
+        patch("headroom.cli.wrap.has_oauth_auth", return_value=False),
+        patch("headroom.cli.wrap._launch_tool", side_effect=fail_launch_tool),
+    ):
+        result = runner.invoke(
+            main,
+            [
+                "wrap",
+                "copilot",
+                "--provider-type",
+                "openai",
+                "--",
+                "--model",
+                "auto",
+            ],
+        )
+
+    assert result.exit_code == 1
+    assert "'--model auto' is not supported in Copilot BYOK mode" in result.output
+    assert "Use a concrete model" in result.output
 
 
 def test_wrap_copilot_auto_detects_running_proxy_backend(
@@ -198,7 +229,7 @@ def test_wrap_copilot_auto_detects_running_proxy_backend(
     ):
         result = runner.invoke(
             main,
-            ["wrap", "copilot", "--no-rtk", "--", "--model", "gpt-4o"],
+            ["wrap", "copilot", "--", "--model", "gpt-4o"],
         )
 
     assert result.exit_code == 0, result.output
@@ -229,7 +260,7 @@ def test_wrap_copilot_prefers_existing_oauth_session(
                 with patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch_tool):
                     result = runner.invoke(
                         main,
-                        ["wrap", "copilot", "--no-rtk", "--", "--model", "claude-sonnet-4.6"],
+                        ["wrap", "copilot", "--", "--model", "claude-sonnet-4.6"],
                     )
 
     assert result.exit_code == 0, result.output
@@ -256,6 +287,9 @@ def test_wrap_copilot_subscription_uses_github_auth_without_provider_key(
     _wrap_cli, main = wrap_modules
     for var in ("COPILOT_PROVIDER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
         monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("GITHUB_COPILOT_API_TOKEN", "stale-parent-token")
+    monkeypatch.setenv("GITHUB_COPILOT_REFRESH_OAUTH_TOKEN", "stale-parent-refresh")
+    monkeypatch.setenv("GITHUB_COPILOT_API_TOKEN_EXPIRES_AT", "1")
     captured: dict[str, object] = {}
 
     def fake_launch_tool(**kwargs):  # noqa: ANN003
@@ -272,7 +306,7 @@ def test_wrap_copilot_subscription_uses_github_auth_without_provider_key(
     ):
         result = runner.invoke(
             main,
-            ["wrap", "copilot", "--subscription", "--no-rtk"],
+            ["wrap", "copilot", "--subscription"],
         )
 
     assert result.exit_code == 0, result.output
@@ -312,7 +346,7 @@ def test_wrap_copilot_subscription_defaults_to_responses_for_reasoning_model(
     ):
         result = runner.invoke(
             main,
-            ["wrap", "copilot", "--subscription", "--no-rtk", "--", "--model", "gpt-5.4"],
+            ["wrap", "copilot", "--subscription", "--", "--model", "gpt-5.4"],
         )
 
     assert result.exit_code == 0, result.output
@@ -352,7 +386,7 @@ def test_wrap_copilot_subscription_keeps_gpt4_on_completions(
     ):
         result = runner.invoke(
             main,
-            ["wrap", "copilot", "--subscription", "--no-rtk", "--", "--model", "gpt-4.1"],
+            ["wrap", "copilot", "--subscription", "--", "--model", "gpt-4.1"],
         )
 
     assert result.exit_code == 0, result.output
@@ -391,7 +425,6 @@ def test_wrap_copilot_subscription_allows_explicit_responses_wire_api(
                 "--subscription",
                 "--wire-api",
                 "responses",
-                "--no-rtk",
                 "--",
                 "--model",
                 "gpt-5.4",
@@ -432,12 +465,25 @@ def test_wrap_copilot_subscription_pins_validated_token_for_proxy(
         patch("headroom.cli.wrap.shutil.which", return_value="copilot"),
         patch(
             "headroom.cli.wrap.resolve_subscription_bearer_token_details",
-            return_value=_subscription_resolution("gho-validated", api_url=business_api),
+            return_value=_subscription_resolution(
+                "gho-validated",
+                api_url=business_api,
+                refresh_oauth_token="gho-refresh",
+                api_token_expires_at=1234567890.0,
+            ),
         ),
         patch("headroom.cli.wrap.has_oauth_auth", return_value=False),
         patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch_tool),
     ):
-        result = runner.invoke(main, ["wrap", "copilot", "--subscription", "--no-rtk"])
+        result = runner.invoke(
+            main,
+            ["wrap", "copilot", "--subscription"],
+            env={
+                "GITHUB_COPILOT_API_TOKEN": "stale-parent-token",
+                "GITHUB_COPILOT_REFRESH_OAUTH_TOKEN": "stale-parent-refresh",
+                "GITHUB_COPILOT_API_TOKEN_EXPIRES_AT": "1",
+            },
+        )
 
     assert result.exit_code == 0, result.output
     env = captured["env"]
@@ -445,8 +491,11 @@ def test_wrap_copilot_subscription_pins_validated_token_for_proxy(
     # The validated token is handed to the proxy as an explicit launch
     # argument — not via the child env, not via the parent's os.environ.
     assert captured["copilot_api_token"] == "gho-validated"
+    assert captured["copilot_refresh_oauth_token"] == "gho-refresh"
+    assert captured["copilot_api_token_expires_at"] == 1234567890.0
     assert "GITHUB_COPILOT_API_TOKEN" not in env
-    assert os.environ.get("GITHUB_COPILOT_API_TOKEN") is None
+    assert "GITHUB_COPILOT_REFRESH_OAUTH_TOKEN" not in env
+    assert "GITHUB_COPILOT_API_TOKEN_EXPIRES_AT" not in env
     assert env["COPILOT_PROVIDER_TYPE"] == "openai"
     assert env["COPILOT_PROVIDER_BEARER_TOKEN"] == "gho-validated"
     assert env["GITHUB_COPILOT_USE_TOKEN_EXCHANGE"] == "false"
@@ -466,7 +515,7 @@ def test_wrap_copilot_subscription_requires_reusable_auth(
         patch("headroom.cli.wrap.shutil.which", return_value="copilot"),
         patch("headroom.cli.wrap.resolve_subscription_bearer_token_details", return_value=None),
     ):
-        result = runner.invoke(main, ["wrap", "copilot", "--subscription", "--no-rtk"])
+        result = runner.invoke(main, ["wrap", "copilot", "--subscription"])
 
     assert result.exit_code != 0
     assert "subscription mode requires a reusable GitHub/Copilot bearer token" in result.output
@@ -481,7 +530,7 @@ def test_wrap_copilot_subscription_rejects_translated_backend(
     with patch("headroom.cli.wrap.shutil.which", return_value="copilot"):
         result = runner.invoke(
             main,
-            ["wrap", "copilot", "--subscription", "--backend", "anyllm", "--no-rtk"],
+            ["wrap", "copilot", "--subscription", "--backend", "anyllm"],
         )
 
     assert result.exit_code != 0
@@ -496,7 +545,7 @@ def test_wrap_copilot_subscription_rejects_anthropic_provider_type(
     with patch("headroom.cli.wrap.shutil.which", return_value="copilot"):
         result = runner.invoke(
             main,
-            ["wrap", "copilot", "--subscription", "--provider-type", "anthropic", "--no-rtk"],
+            ["wrap", "copilot", "--subscription", "--provider-type", "anthropic"],
         )
 
     assert result.exit_code != 0
@@ -530,7 +579,6 @@ def test_wrap_copilot_translated_backend_still_requires_byok(
                 [
                     "wrap",
                     "copilot",
-                    "--no-rtk",
                     "--backend",
                     "anyllm",
                     "--",
@@ -610,7 +658,7 @@ def test_wrap_copilot_clears_stale_wire_api_in_anthropic_mode(
     ):
         result = runner.invoke(
             main,
-            ["wrap", "copilot", "--no-rtk", "--", "--model", "claude-sonnet-4-20250514"],
+            ["wrap", "copilot", "--", "--model", "claude-sonnet-4-20250514"],
             env={
                 "COPILOT_PROVIDER_WIRE_API": "responses",
                 "ANTHROPIC_API_KEY": "sk-test-dummy",
@@ -637,6 +685,50 @@ def test_wrap_copilot_fails_when_binary_missing(
     assert "Install GitHub Copilot CLI" in result.output
 
 
+def test_unwrap_copilot_stops_proxy(
+    runner: CliRunner,
+    wrap_modules: tuple[types.ModuleType, click.Group],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`unwrap copilot` stops the local proxy on the requested port.
+
+    Copilot is env-var wrapped, so there is no config to restore — stopping the
+    proxy (and reporting it) is the whole contract.
+    """
+    _wrap_cli, main = wrap_modules
+    monkeypatch.chdir(tmp_path)
+
+    with patch(
+        "headroom.cli.wrap._stop_local_proxy_for_unwrap",
+        return_value="stopped",
+    ) as stop_proxy:
+        result = runner.invoke(main, ["unwrap", "copilot", "--port", "9999"])
+
+    assert result.exit_code == 0, result.output
+    stop_proxy.assert_called_once_with(9999)
+    assert "Stopped local Headroom proxy on port 9999" in result.output
+
+
+def test_unwrap_copilot_leaves_user_instruction_file_untouched(
+    runner: CliRunner,
+    wrap_modules: tuple[types.ModuleType, click.Group],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A user-authored copilot-instructions.md is never rewritten or deleted."""
+    _wrap_cli, main = wrap_modules
+    monkeypatch.chdir(tmp_path)
+    instructions = tmp_path / ".github" / "copilot-instructions.md"
+    instructions.parent.mkdir()
+    instructions.write_text("Keep user guidance.\n", encoding="utf-8")
+
+    result = runner.invoke(main, ["unwrap", "copilot", "--no-stop-proxy"])
+
+    assert result.exit_code == 0, result.output
+    assert instructions.read_text(encoding="utf-8") == "Keep user guidance.\n"
+
+
 # ---------------------------------------------------------------------------
 # Regression suite for #610 — GitHub Copilot endpoint routing per auth mode.
 #
@@ -661,9 +753,12 @@ def _clear_copilot_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "COPILOT_PROVIDER_BEARER_TOKEN",
         "OPENAI_API_KEY",
         "ANTHROPIC_API_KEY",
+        "GITHUB_COPILOT_API_TOKEN",
         "GITHUB_COPILOT_API_URL",
+        "GITHUB_COPILOT_API_TOKEN_EXPIRES_AT",
         "GITHUB_COPILOT_ENTERPRISE_URL",
         "GITHUB_COPILOT_ENTERPRISE_DOMAIN",
+        "GITHUB_COPILOT_REFRESH_OAUTH_TOKEN",
         "GITHUB_COPILOT_TOKEN",
         "GITHUB_COPILOT_GITHUB_TOKEN",
         "COPILOT_MODEL",
@@ -697,7 +792,7 @@ def test_wrap_copilot_oauth_keeps_generic_endpoint_when_account_advertised(
         patch("headroom.copilot_auth._fetch_copilot_user_info", return_value=_ACCOUNT_USER_INFO),
         patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch_tool),
     ):
-        result = runner.invoke(main, ["wrap", "copilot", "--no-rtk", "--", "--model", "gpt-5.4"])
+        result = runner.invoke(main, ["wrap", "copilot", "--", "--model", "gpt-5.4"])
 
     assert result.exit_code == 0, result.output
     env = captured["env"]
@@ -730,7 +825,7 @@ def test_wrap_copilot_oauth_honors_api_url_override(
         patch("headroom.copilot_auth._fetch_copilot_user_info", return_value=_ACCOUNT_USER_INFO),
         patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch_tool),
     ):
-        result = runner.invoke(main, ["wrap", "copilot", "--no-rtk", "--", "--model", "gpt-5.4"])
+        result = runner.invoke(main, ["wrap", "copilot", "--", "--model", "gpt-5.4"])
 
     assert result.exit_code == 0, result.output
     env = captured["env"]
@@ -767,7 +862,7 @@ def test_wrap_copilot_byok_never_resolves_copilot_endpoint(
     ):
         result = runner.invoke(
             main,
-            ["wrap", "copilot", "--no-rtk", "--provider-type", "openai", "--", "--model", "gpt-4o"],
+            ["wrap", "copilot", "--provider-type", "openai", "--", "--model", "gpt-4o"],
         )
 
     assert result.exit_code == 0, result.output
@@ -803,7 +898,7 @@ def test_wrap_copilot_subscription_uses_resolved_subscription_endpoint(
     ):
         result = runner.invoke(
             main,
-            ["wrap", "copilot", "--subscription", "--no-rtk", "--", "--model", "gpt-5.4"],
+            ["wrap", "copilot", "--subscription", "--", "--model", "gpt-5.4"],
         )
 
     assert result.exit_code == 0, result.output
@@ -812,6 +907,57 @@ def test_wrap_copilot_subscription_uses_resolved_subscription_endpoint(
     assert captured["openai_api_url"] == business_api
     assert env["OPENAI_TARGET_API_URL"] == business_api
     assert env["COPILOT_PROVIDER_BEARER_TOKEN"] == "copilot-api"
+
+
+def test_wrap_copilot_subscription_normalizes_enterprise_host(
+    runner: CliRunner,
+    wrap_modules: tuple[types.ModuleType, click.Group],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _wrap_cli, main = wrap_modules
+    _clear_copilot_env(monkeypatch)
+    captured: dict[str, object] = {}
+
+    def fake_launch_tool(**kwargs):  # noqa: ANN003
+        captured.update(kwargs)
+
+    with (
+        patch("headroom.cli.wrap.shutil.which", return_value="copilot"),
+        patch("headroom.cli.wrap.has_oauth_auth", return_value=True),
+        patch(
+            "headroom.copilot_auth.iter_oauth_token_candidates",
+            return_value=[
+                types.SimpleNamespace(
+                    token="gho-oauth",
+                    source="headroom-copilot-auth:/tmp/copilot_auth.json",
+                    confidence="copilot-oauth",
+                    validate_for_subscription=True,
+                )
+            ],
+        ),
+        patch(
+            "headroom.copilot_auth.CopilotTokenProvider._exchange_token_sync",
+            staticmethod(
+                lambda _headers: {
+                    "token": "copilot-api",
+                    "expires_at": 9999999999,
+                    "endpoints": {"api": "https://api.enterprise.githubcopilot.com"},
+                }
+            ),
+        ),
+        patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch_tool),
+    ):
+        result = runner.invoke(
+            main,
+            ["wrap", "copilot", "--subscription", "--", "--model", "gpt-5.4"],
+        )
+
+    assert result.exit_code == 0, result.output
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert captured["openai_api_url"] == DEFAULT_API_URL
+    assert env["OPENAI_TARGET_API_URL"] == DEFAULT_API_URL
+    assert env["GITHUB_COPILOT_API_URL"] == DEFAULT_API_URL
 
 
 def test_wrap_copilot_subscription_honors_api_url_override(
@@ -845,7 +991,7 @@ def test_wrap_copilot_subscription_honors_api_url_override(
     ):
         result = runner.invoke(
             main,
-            ["wrap", "copilot", "--subscription", "--no-rtk", "--", "--model", "gpt-5.4"],
+            ["wrap", "copilot", "--subscription", "--", "--model", "gpt-5.4"],
         )
 
     assert result.exit_code == 0, result.output

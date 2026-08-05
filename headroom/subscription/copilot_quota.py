@@ -163,7 +163,13 @@ def parse_copilot_quota(data: dict[str, Any]) -> CopilotQuotaSnapshot:
         raw = raw_qs.get(cat_name)
         if not raw:
             continue
-        remaining = raw.get("remaining") or raw.get("quota_remaining")
+        # Use an explicit None check, not `or`: a fully-consumed category reports
+        # `remaining: 0`, and `0 or raw.get("quota_remaining")` would discard that
+        # legitimate 0 (→ None), so `used`/`used_percent` then render the exhausted
+        # quota as unknown / 0% on the dashboard.
+        remaining = raw.get("remaining")
+        if remaining is None:
+            remaining = raw.get("quota_remaining")
         cat = CopilotQuotaCategory(
             name=cat_name,
             entitlement=raw.get("entitlement"),

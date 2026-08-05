@@ -18,7 +18,11 @@ from urllib.parse import urlsplit
 import pytest
 
 from headroom.dashboard import get_dashboard_html
-from tests.test_dashboard_cache_ttl_playwright import _sample_history, _sample_stats
+from tests.test_dashboard_cache_ttl_playwright import (
+    _fulfill_static_asset,
+    _sample_history,
+    _sample_stats,
+)
 
 playwright = pytest.importorskip("playwright.sync_api")
 Page = playwright.Page
@@ -55,6 +59,8 @@ def _install_dashboard_routes(page: Page, stats: dict) -> None:
         path = urlsplit(route.request.url).path
         if path in ("/dashboard", "/"):
             route.fulfill(status=200, content_type="text/html", body=dashboard_html)
+            return
+        if _fulfill_static_asset(route, path):
             return
         if "/stats-history" in path:
             route.fulfill(status=200, content_type="application/json", body=json.dumps(history))

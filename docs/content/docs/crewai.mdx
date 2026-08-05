@@ -1,0 +1,123 @@
+---
+title: CrewAI
+description: Automatic tool output compression for CrewAI agents with per-tool metrics tracking.
+---
+
+Headroom integrates with [CrewAI](https://github.com/crewAIInc/crewAI) to compress tool outputs before they enter the agent's LLM context. Tool-heavy agents that return large JSON arrays, database results, or verbose logs see 60-90% token reduction.
+
+## Installation
+
+```bash
+pip install headroom-ai crewai
+```
+
+## Quick start
+
+Wrap tools in one line:
+
+```python
+from crewai import Agent, Crew, Task
+from crewai.tools.base_tool import tool
+from headroom.integrations.crewai import wrap_tools_with_headroom
+
+@tool
+def search_database(query: str) -> str:
+    """Search the database and return results."""
+    return json.dumps({"results": [...], "total": 1000})
+
+wrapped = wrap_tools_with_headroom([search_database])
+
+agent = Agent(
+    role="Researcher",
+    goal="Answer questions using data",
+    backstory="You research things.",
+    tools=wrapped,
+)
+task = Task(description="Find all active users", agent=agent, expected_output="Summary")
+crew = Crew(agents=[agent], tasks=[task])
+crew.kickoff()
+```
+
+## Per-tool metrics
+
+Track compression stats across all tool invocations:
+
+```python
+from headroom.integrations.crewai import get_tool_metrics
+
+metrics = get_tool_metrics()
+print(metrics.get_summary())
+# {
+#   'total_invocations': 25,
+#   'total_compressions': 18,
+#   'total_chars_saved': 450000,
+#   'average_compression_ratio': 0.35,
+#   'by_tool': {
+#     'search_database': {'invocations': 15, 'compressions': 12, 'chars_saved': 320000},
+#     'fetch_logs': {'invocations': 10, 'compressions': 6, 'chars_saved': 130000},
+#   }
+# }
+```
+
+Reset between sessions:
+
+```python
+from headroom.integrations.crewai import reset_tool_metrics
+
+reset_tool_metrics()
+```
+
+## Custom configuration
+
+Control the compression threshold:
+
+```python
+wrapped = wrap_tools_with_headroom(
+    [search_database, fetch_logs],
+    min_chars_to_compress=500,  # Default: 1000
+)
+```
+
+Use a dedicated metrics collector instead of the global one:
+
+```python
+from headroom.integrations.crewai import ToolMetricsCollector, wrap_tools_with_headroom
+
+collector = ToolMetricsCollector()
+wrapped = wrap_tools_with_headroom(
+    [search_database],
+    metrics_collector=collector,
+)
+
+# After crew run
+print(collector.get_summary())
+```
+
+## Wrapping individual tools
+
+For finer control, wrap tools individually:
+
+```python
+from headroom.integrations.crewai import HeadroomToolWrapper
+
+wrapper = HeadroomToolWrapper(
+    search_database,
+    min_chars_to_compress=500,
+)
+
+# Use wrapper directly — it's a BaseTool
+agent = Agent(role="Researcher", tools=[wrapper], ...)
+```
+
+## How it works
+
+CrewAI tools extend `BaseTool` with a `run()` → `_run()` execution flow.
+`HeadroomToolWrapper` subclasses `BaseTool` and overrides `_run()` to:
+
+1. Call the original tool's `run()` method
+2. Check if the output exceeds `min_chars_to_compress`
+3. If so, compress via Headroom's `compress_tool_result()`
+4. Record metrics and return the compressed output
+
+The wrapper preserves the original tool's name, description, and argument
+schema, so it works as a drop-in replacement anywhere CrewAI expects a tool.

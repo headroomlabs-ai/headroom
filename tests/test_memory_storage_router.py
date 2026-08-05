@@ -155,6 +155,67 @@ def test_extract_system_prompt_missing_returns_empty() -> None:
     assert extract_system_prompt({"messages": []}) == ""
 
 
+def test_extract_system_prompt_user_reminder_with_cwd_reaches_resolver() -> None:
+    body = {
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "<system-reminder>\n\n"
+                            "The maximum number of terminals is 5.\n\n"
+                            "<available_terminal>\n"
+                            "- terminal_id: 9\n"
+                            "- cwd: S:\\workspace-zhuangxiu\\decorate-offer-api\n"
+                            "</available_terminal>\n\n"
+                            "</system-reminder>"
+                        ),
+                    }
+                ],
+            }
+        ]
+    }
+
+    prompt = extract_system_prompt(body)
+    assert "cwd:" in prompt
+    resolved = ProjectResolver().resolve(_ctx(system_prompt=prompt))
+
+    assert resolved is not None
+    _, display = resolved
+    assert "decorate-offer-api" in display
+
+
+def test_extract_system_prompt_ordinary_user_text_returns_empty() -> None:
+    body = {"messages": [{"role": "user", "content": "Hello, can you help me refactor this?"}]}
+
+    assert extract_system_prompt(body) == ""
+
+
+def test_extract_system_prompt_system_message_beats_user_cwd_fallback() -> None:
+    body = {
+        "messages": [
+            {"role": "system", "content": "Working directory: /system/project"},
+            {"role": "user", "content": "cwd: /user/project\nDo the thing."},
+        ]
+    }
+
+    prompt = extract_system_prompt(body)
+    resolved = ProjectResolver().resolve(_ctx(system_prompt=prompt))
+
+    assert prompt == "Working directory: /system/project"
+    assert resolved is not None
+    _, display = resolved
+    assert display == "project"
+
+
+def test_extract_system_prompt_cwd_in_non_user_message_returns_empty() -> None:
+    body = {"messages": [{"role": "assistant", "content": "cwd: /spoof/project"}]}
+
+    assert extract_system_prompt(body) == ""
+
+
 # ---------------------------------------------------------------------------
 # BackendRouter path-layout tests (no real backend I/O — we stub the class).
 # ---------------------------------------------------------------------------

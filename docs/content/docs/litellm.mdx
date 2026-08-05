@@ -5,6 +5,13 @@ description: Add Headroom compression to LiteLLM with a single callback. Works w
 
 Headroom integrates with [LiteLLM](https://github.com/BerriAI/litellm) as a callback that compresses messages before they reach any provider. One line to enable, works with all 100+ LiteLLM-supported providers.
 
+<Callout type="info">
+Looking for the proxy's `--backend vertex_ai` / `bedrock` options
+instead? Those make the Headroom **proxy** call cloud providers through LiteLLM — a
+different mechanism from the callback documented here. See
+[Cloud providers](/docs/proxy#cloud-providers).
+</Callout>
+
 ## Installation
 
 ```bash
@@ -87,3 +94,24 @@ app.add_middleware(CompressionMiddleware)
 ```
 
 Response headers include `x-headroom-compressed: true` and `x-headroom-tokens-saved: 1234`.
+
+## Over HTTP (guardrail / gateway)
+
+The options above run Headroom **in** the LiteLLM process. If instead LiteLLM runs as its own proxy and you want it to call Headroom over the network — the guardrail deployment — point it at [`POST /v1/compress`](/docs/proxy#post-v1compress). LiteLLM swaps `messages` for the compressed result and forwards to the provider.
+
+Two things this deployment needs:
+
+```bash
+# Headroom is loopback-only by default and answers remote callers with 404.
+HEADROOM_COMPRESS_ALLOW_REMOTE=1 headroom proxy
+```
+
+<Callout type="warning" title="404 means blocked, not missing">
+Without `HEADROOM_COMPRESS_ALLOW_REMOTE=1` a remote caller gets `404`, not `403` — so a misconfigured guardrail looks exactly like a wrong URL. If you also set `HEADROOM_PROXY_TOKEN`, send it as `X-Headroom-Proxy-Token` or you get `401`.
+</Callout>
+
+Leave `config.mode` unset. The default pipeline is marker-free, which is what a forward-only caller wants: `mode: "ccr"` emits retrieval markers that are a dangling pointer unless you also inject the `headroom_retrieve` tool and can reach `/v1/retrieve`.
+
+Because LiteLLM passes model names through, send the real one — `claude-sonnet-4-6`, `bedrock/anthropic.claude-3-5-sonnet`, `gemini-2.5-pro` — so Headroom resolves the right tokenizer and context limit. Anthropic-shaped messages need no conversion; see [Message format](/docs/proxy#message-format).
+
+For multi-turn agent loops, set `config.frozen_message_count` to the number of messages the provider has already cached, **and send back the messages you previously forwarded rather than the pristine originals**. Getting this wrong silently destroys the provider's prefix cache — see [Multi-turn usage](/docs/proxy#multi-turn-usage-keeping-the-prefix-cache) for the loop.

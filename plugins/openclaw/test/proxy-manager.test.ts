@@ -6,23 +6,29 @@ import {
   probeHeadroomProxy,
 } from "../src/proxy-manager.js";
 
+const retrieveStatsBody = JSON.stringify({ store: { entry_count: 0 }, recent_retrievals: [] });
+const proxyStatsBody = JSON.stringify({ proxy_inbound: { total: 1 } });
+
 afterEach(() => {
   vi.restoreAllMocks();
 });
 
-/** Stub fetch with a sequence of health/retrieve probe outcomes. */
 function stubProbeSuccess() {
-  const mock = vi.fn()
-    .mockResolvedValueOnce({ ok: true, status: 200 })   // /health
-    .mockResolvedValueOnce({ ok: true, status: 200 });   // /v1/retrieve/stats
+  const mock = vi
+    .fn()
+    .mockResolvedValueOnce({ ok: false, status: 404 }) // /readyz
+    .mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      text: () => Promise.resolve(retrieveStatsBody),
+    }); // /v1/retrieve/stats
   vi.stubGlobal("fetch", mock);
   return mock;
 }
 
 function stubProbeNonHeadroom() {
-  const mock = vi.fn()
-    .mockResolvedValueOnce({ ok: true, status: 200 })   // /health OK
-    .mockResolvedValueOnce({ ok: false, status: 404 });  // /v1/retrieve/stats 404
+  // Every endpoint reachable but non-OK => reachable, non-Headroom (occupied port).
+  const mock = vi.fn().mockResolvedValue({ ok: false, status: 404 });
   vi.stubGlobal("fetch", mock);
   return mock;
 }
@@ -72,13 +78,114 @@ describe("isLocalProxyUrl", () => {
 });
 
 describe("probeHeadroomProxy", () => {
-  it("returns reachable+isHeadroom when both endpoints succeed", async () => {
-    stubProbeSuccess();
+  /**
+   * Resolve fetch outcomes by request path so tests express the new probe order
+   * (/readyz, /v1/retrieve/stats, /stats, /health) without depending on call
+   * sequencing. Unlisted paths reject (treated as unreachable).
+   */
+  function stubByPath(byPath: Record<string, { ok: boolean; status: number; body?: string }>) {
+    const mock = vi.fn((url: string) => {
+      for (const [path, response] of Object.entries(byPath)) {
+        if (url.endsWith(path)) {
+          return Promise.resolve({
+            ok: response.ok,
+            status: response.status,
+            text: () => Promise.resolve(response.body ?? ""),
+          });
+        }
+      }
+      return Promise.reject(new Error("ECONNREFUSED"));
+    });
+    vi.stubGlobal("fetch", mock);
+    return mock;
+  }
+
+  it("does not treat /readyz success alone as Headroom identity", async () => {
+    stubByPath({
+      "/readyz": { ok: true, status: 200 },
+      "/v1/retrieve/stats": { ok: false, status: 404 },
+      "/stats": { ok: false, status: 404 },
+      "/health": { ok: false, status: 404 },
+    });
+    const result = await probeHeadroomProxy("http://127.0.0.1:8787");
+    expect(result.reachable).toBe(true);
+    expect(result.isHeadroom).toBe(false);
+  });
+
+  it("treats Headroom-shaped /v1/retrieve/stats 200 as Headroom even when /readyz is OK and /health is 503", async () => {
+    stubByPath({
+      "/health": { ok: false, status: 503 },
+      "/readyz": { ok: true, status: 200 },
+      "/v1/retrieve/stats": { ok: true, status: 200, body: retrieveStatsBody },
+    });
     const result = await probeHeadroomProxy("http://127.0.0.1:8787");
     expect(result).toEqual({ reachable: true, isHeadroom: true });
   });
 
-  it("returns reachable but non-headroom when retrieve endpoint fails", async () => {
+  it("treats Headroom-shaped /v1/retrieve/stats 200 as Headroom even when /health is 503", async () => {
+    stubByPath({
+      "/health": { ok: false, status: 503 },
+      "/readyz": { ok: false, status: 404 },
+      "/v1/retrieve/stats": { ok: true, status: 200, body: retrieveStatsBody },
+    });
+    const result = await probeHeadroomProxy("http://127.0.0.1:8787");
+    expect(result).toEqual({ reachable: true, isHeadroom: true });
+  });
+
+  it("does not treat generic /v1/retrieve/stats 200 as Headroom identity", async () => {
+    stubByPath({
+      "/readyz": { ok: true, status: 200 },
+      "/v1/retrieve/stats": { ok: true, status: 200, body: JSON.stringify({ ok: true }) },
+      "/stats": { ok: false, status: 404 },
+      "/health": { ok: true, status: 200 },
+    });
+    const result = await probeHeadroomProxy("http://127.0.0.1:8787");
+    expect(result.reachable).toBe(true);
+    expect(result.isHeadroom).toBe(false);
+  });
+
+  it("falls through from auth-gated /v1/retrieve/stats to Headroom-shaped /stats", async () => {
+    stubByPath({
+      "/readyz": { ok: true, status: 200 },
+      "/v1/retrieve/stats": { ok: false, status: 403 },
+      "/stats": { ok: true, status: 200, body: proxyStatsBody },
+    });
+    const result = await probeHeadroomProxy("http://127.0.0.1:8787");
+    expect(result).toEqual({ reachable: true, isHeadroom: true });
+  });
+
+  it("continues probing when one endpoint is unreachable", async () => {
+    stubByPath({
+      "/readyz": { ok: true, status: 200 },
+      // /v1/retrieve/stats rejects because it is not listed.
+      "/stats": { ok: true, status: 200, body: proxyStatsBody },
+    });
+    const result = await probeHeadroomProxy("http://127.0.0.1:8787");
+    expect(result).toEqual({ reachable: true, isHeadroom: true });
+  });
+
+  it("falls back to /stats only when the response has a Headroom stats shape", async () => {
+    stubByPath({
+      // /readyz and /v1/retrieve/stats unavailable (reject), /stats answers.
+      "/stats": { ok: true, status: 200, body: proxyStatsBody },
+    });
+    const result = await probeHeadroomProxy("http://127.0.0.1:8787");
+    expect(result).toEqual({ reachable: true, isHeadroom: true });
+  });
+
+  it("does not treat generic /stats 200 as Headroom identity", async () => {
+    stubByPath({
+      "/readyz": { ok: false, status: 404 },
+      "/v1/retrieve/stats": { ok: false, status: 404 },
+      "/stats": { ok: true, status: 200, body: JSON.stringify({ uptime: 123 }) },
+      "/health": { ok: true, status: 200 },
+    });
+    const result = await probeHeadroomProxy("http://127.0.0.1:8787");
+    expect(result.reachable).toBe(true);
+    expect(result.isHeadroom).toBe(false);
+  });
+
+  it("returns reachable but non-headroom when identity endpoints are non-OK", async () => {
     stubProbeNonHeadroom();
     const result = await probeHeadroomProxy("http://127.0.0.1:8787");
     expect(result.reachable).toBe(true);
@@ -86,7 +193,7 @@ describe("probeHeadroomProxy", () => {
     expect(result.reason).toMatch(/retrieve stats HTTP 404/);
   });
 
-  it("returns unreachable when health check fails", async () => {
+  it("returns unreachable when no endpoint responds", async () => {
     stubProbeUnreachable();
     const result = await probeHeadroomProxy("http://127.0.0.1:8787");
     expect(result.reachable).toBe(false);
@@ -98,12 +205,20 @@ describe("ProxyManager.start", () => {
   it("auto-detects running proxy on default candidates", async () => {
     const manager = new ProxyManager({});
 
-    // Candidate 1: health fail. Candidate 2: health+retrieve succeed.
+    // Candidate 1 (127.0.0.1): all four probes fail.
+    // Candidate 2 (localhost): /v1/retrieve/stats succeeds.
     const fetchMock = vi
       .fn()
-      .mockRejectedValueOnce(new Error("down"))
-      .mockResolvedValueOnce({ ok: true, status: 200 })
-      .mockResolvedValueOnce({ ok: true, status: 200 });
+      .mockRejectedValueOnce(new Error("down")) // 127.0.0.1 /readyz
+      .mockRejectedValueOnce(new Error("down")) // 127.0.0.1 /v1/retrieve/stats
+      .mockRejectedValueOnce(new Error("down")) // 127.0.0.1 /stats
+      .mockRejectedValueOnce(new Error("down")) // 127.0.0.1 /health
+      .mockResolvedValueOnce({ ok: true, status: 200 }) // localhost /readyz
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        text: () => Promise.resolve(retrieveStatsBody),
+      }); // localhost /v1/retrieve/stats
     vi.stubGlobal("fetch", fetchMock);
 
     const startSpy = vi.spyOn(manager as any, "startHeadroomProxy");
@@ -136,11 +251,20 @@ describe("ProxyManager.start", () => {
     const manager = new ProxyManager({ proxyUrl: "http://127.0.0.1", autoStart: true });
     const startSpy = vi.spyOn(manager as any, "startHeadroomProxy").mockResolvedValue(undefined);
 
+    // Initial probe of the single candidate fails on all four endpoints, then
+    // after auto-start the identity probe succeeds on /v1/retrieve/stats.
     const fetchMock = vi
       .fn()
-      .mockRejectedValueOnce(new Error("down"))
-      .mockResolvedValueOnce({ ok: true, status: 200 })
-      .mockResolvedValueOnce({ ok: true, status: 200 });
+      .mockRejectedValueOnce(new Error("down")) // /readyz
+      .mockRejectedValueOnce(new Error("down")) // /v1/retrieve/stats
+      .mockRejectedValueOnce(new Error("down")) // /stats
+      .mockRejectedValueOnce(new Error("down")) // /health
+      .mockResolvedValueOnce({ ok: true, status: 200 }) // post-start /readyz
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        text: () => Promise.resolve(retrieveStatsBody),
+      }); // post-start /v1/retrieve/stats
     vi.stubGlobal("fetch", fetchMock);
 
     const url = await manager.start();
@@ -179,13 +303,24 @@ describe("ProxyManager.start", () => {
     const manager = new ProxyManager({ autoStart: true });
     const startSpy = vi.spyOn(manager as any, "startHeadroomProxy").mockResolvedValue(undefined);
 
-    // First two candidate probes fail (health only), then waitForHealthy probe succeeds.
+    // Both candidates fail all four probes, then the post-start identity probe
+    // succeeds on /v1/retrieve/stats.
     const fetchMock = vi
       .fn()
-      .mockRejectedValueOnce(new Error("down"))
-      .mockRejectedValueOnce(new Error("down"))
-      .mockResolvedValueOnce({ ok: true, status: 200 })
-      .mockResolvedValueOnce({ ok: true, status: 200 });
+      .mockRejectedValueOnce(new Error("down")) // 127.0.0.1 /readyz
+      .mockRejectedValueOnce(new Error("down")) // 127.0.0.1 /v1/retrieve/stats
+      .mockRejectedValueOnce(new Error("down")) // 127.0.0.1 /stats
+      .mockRejectedValueOnce(new Error("down")) // 127.0.0.1 /health
+      .mockRejectedValueOnce(new Error("down")) // localhost /readyz
+      .mockRejectedValueOnce(new Error("down")) // localhost /v1/retrieve/stats
+      .mockRejectedValueOnce(new Error("down")) // localhost /stats
+      .mockRejectedValueOnce(new Error("down")) // localhost /health
+      .mockResolvedValueOnce({ ok: true, status: 200 }) // post-start /readyz
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        text: () => Promise.resolve(retrieveStatsBody),
+      }); // post-start /v1/retrieve/stats
     vi.stubGlobal("fetch", fetchMock);
 
     const url = await manager.start();

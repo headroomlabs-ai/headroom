@@ -45,7 +45,7 @@ FLUSH_DEBOUNCE_SECONDS = 10.0
 
 # Absolute file-path heuristic for anchoring a pattern to a project root.
 # Matches POSIX paths (starts with /) and common Windows drive paths.
-_ABS_PATH_RE = re.compile(r"(?:[A-Za-z]:[\\/]|/)[\w./\\\-]+")
+_ABS_PATH_RE = re.compile(r"(?:[A-Za-z]:[\\/]|/)[\w./\\@\-]+")
 
 # Error-recovery refinement: the Learned: error recovery section is capped,
 # decayed, and re-validated at render time. Other categories are untouched.
@@ -60,6 +60,50 @@ _BASH_VOLATILE_SUFFIX_RE = re.compile(
     r"|\s+-A\s*\d+|\s+-B\s*\d+|\s+-C\s*\d+"
     r"|\s+2>&1|\s+2>/dev/null)+\s*$"
 )
+
+# Agent harnesses can encode orchestration metadata as user-role messages.
+# These prefixes identify whole messages that are not authored by the user.
+_HARNESS_USER_PREFIXES = (
+    "another language model started to solve this problem and produced a summary",
+    "<app-context>",
+    "<codex_delegation>",
+    "<environment_context>",
+    "<heartbeat>",
+    "<permissions instructions>",
+    "<skills_instructions>",
+    "# agents.md instructions for ",
+    "you are in a fork of an existing codex thread",
+)
+
+_MEMORY_CONTEXT_MARKERS = (
+    "\n\n## relevant memories",
+    "\n## relevant memories",
+)
+
+_AMBIENT_CONTEXT_MARKERS = ("<in-app-browser-context",)
+
+
+def _canonicalize_user_text(text: str) -> str:
+    """Remove proxy- or client-appended context from a user-role message."""
+    canonical = text or ""
+    folded = canonical.casefold()
+    if folded.lstrip().startswith("## relevant memories"):
+        return ""
+    markers = (*_MEMORY_CONTEXT_MARKERS, *_AMBIENT_CONTEXT_MARKERS)
+    marker_indexes = [folded.find(marker) for marker in markers]
+    marker_indexes = [index for index in marker_indexes if index >= 0]
+    if marker_indexes:
+        canonical = canonical[: min(marker_indexes)]
+    return canonical.strip()
+
+
+def _is_learnable_user_text(text: str) -> bool:
+    """Return whether user-role text is plausibly authored by the user."""
+    canonical = _canonicalize_user_text(text)
+    if not canonical:
+        return False
+    folded = canonical.lstrip().casefold()
+    return not any(folded.startswith(prefix) for prefix in _HARNESS_USER_PREFIXES)
 
 
 # =============================================================================
@@ -585,10 +629,15 @@ class TrafficLearner:
         if not patterns:
             return
 
-        # Bucket patterns by project.
+        # Bucket patterns by project. discover_projects() walks the filesystem
+        # to decode escaped project directory names, which on a large home tree
+        # takes minutes; running it inline blocked the event loop, so uvicorn
+        # could not answer /readyz and supervisors killed a proxy that was
+        # merely busy. It is called once per learner (cached below), so the
+        # thread hop costs nothing on the steady-state path.
         if self._project_roots_cache is None:
             try:
-                self._project_roots_cache = plugin.discover_projects()
+                self._project_roots_cache = await asyncio.to_thread(plugin.discover_projects)
             except Exception as e:
                 logger.warning("discover_projects failed: %s", e)
                 self._project_roots_cache = []
@@ -759,7 +808,10 @@ class TrafficLearner:
                 continue
 
             if role == "user":
-                patterns = self._extract_preferences(content)
+                canonical = _canonicalize_user_text(self._strip_system_reminders(content))
+                if not _is_learnable_user_text(canonical):
+                    continue
+                patterns = self._extract_preferences(canonical)
                 for pattern in patterns:
                     await self._accumulate(pattern)
 
@@ -1014,7 +1066,9 @@ class TrafficLearner:
           truncation past ``max_chars``.
         """
 
-        cleaned = self._strip_system_reminders(user_text)[:500]
+        cleaned = _canonicalize_user_text(self._strip_system_reminders(user_text))[:500]
+        if not _is_learnable_user_text(cleaned):
+            return []
         correction = self._find_correction(cleaned)
         if correction is None:
             return []
@@ -1396,6 +1450,84 @@ class TrafficLearner:
                         "is_error": block.get("is_error", False) or _is_error(str(result_content)),
                     }
                 )
+
+        return results
+
+    def extract_tool_results_from_openai_messages(
+        self,
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Extract tool results from OpenAI chat/completions-format messages.
+
+        The OpenAI counterpart of :meth:`extract_tool_results_from_messages`.
+        Chat/completions represents tool calls and their results differently
+        from Anthropic: the call lives on an assistant message's ``tool_calls``
+        array (``id`` -> function ``name`` + ``arguments``), and each result is
+        a separate ``role: "tool"`` message keyed by ``tool_call_id``.
+
+        Returns the same ``{tool_name, input, output, is_error}`` shape as the
+        Anthropic extractor so :meth:`on_tool_result` stays format-agnostic. The
+        OpenAI ``arguments`` JSON string is parsed into a dict so the downstream
+        environment/recovery extractors (which call ``input.get(...)``) see the
+        same shape as an Anthropic ``tool_use.input``.
+        """
+        results: list[dict[str, Any]] = []
+
+        # Build tool_call_id -> function (name, arguments) from assistant turns.
+        tool_calls: dict[str, dict[str, Any]] = {}
+        for msg in messages:
+            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                continue
+            calls = msg.get("tool_calls")
+            if not isinstance(calls, list):
+                continue
+            for call in calls:
+                if not isinstance(call, dict):
+                    continue
+                call_id = call.get("id", "")
+                function = call.get("function")
+                if isinstance(function, dict) and call_id:
+                    tool_calls[call_id] = function
+
+        for msg in messages:
+            if not isinstance(msg, dict) or msg.get("role") != "tool":
+                continue
+            function = tool_calls.get(msg.get("tool_call_id", ""), {})
+
+            # Tool-message content is usually a string, but the spec also allows
+            # a list of content parts.
+            result_content = msg.get("content", "")
+            if isinstance(result_content, list):
+                result_content = " ".join(
+                    b.get("text", "")
+                    for b in result_content
+                    if isinstance(b, dict) and b.get("type") == "text"
+                )
+            output = str(result_content)
+
+            # Normalize the OpenAI ``arguments`` JSON string into a dict so the
+            # downstream extractors that call ``input.get(...)`` don't blow up.
+            raw_args = function.get("arguments", {})
+            if isinstance(raw_args, dict):
+                tool_input: dict[str, Any] = raw_args
+            elif isinstance(raw_args, str) and raw_args:
+                try:
+                    parsed = json.loads(raw_args)
+                except (ValueError, TypeError):
+                    parsed = None
+                tool_input = parsed if isinstance(parsed, dict) else {}
+            else:
+                tool_input = {}
+
+            # OpenAI tool messages carry no is_error flag; sniff the output.
+            results.append(
+                {
+                    "tool_name": function.get("name", "unknown"),
+                    "input": tool_input,
+                    "output": output,
+                    "is_error": _is_error(output),
+                }
+            )
 
         return results
 

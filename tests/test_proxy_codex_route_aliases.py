@@ -227,6 +227,14 @@ def test_codex_model_metadata_fetches_codex_registry_for_chatgpt_auth(monkeypatc
         "gpt-5.5",
         "gpt-5.3-codex-spark",
     }
+    assert {entry["slug"] for entry in list_payload["models"]} == {
+        "gpt-5.5",
+        "gpt-5.3-codex-spark",
+    }
+    for entry in list_payload["models"]:
+        assert entry["display_name"]
+        assert entry["default_reasoning_level"] == "medium"
+        assert entry["supports_parallel_tool_calls"] is True
 
     # Single-model GET returns a model object when known.
     assert known_response.status_code == 200
@@ -240,3 +248,53 @@ def test_codex_model_metadata_fetches_codex_registry_for_chatgpt_auth(monkeypatc
 
     # Unknown model variants 404 against the dynamic registry.
     assert unknown_response.status_code == 404
+
+
+_CODEX_DESKTOP_UA = (
+    "Codex Desktop/0.140.0-alpha.2 (Mac OS 15.7.7; arm64) unknown (Codex Desktop; 26.609.71450)"
+)
+
+
+def test_responses_middleware_stamps_x_client_codex_for_unidentified_caller(monkeypatch):
+    # Codex Desktop's User-Agent isn't a known codex UA, so the HTTP middleware
+    # must stamp X-Client: codex on /v1/responses before the handler classifies
+    # the caller — otherwise a compression timeout is refused with a 413 that
+    # Codex treats as a hard connection failure.
+    seen: dict[str, str | None] = {}
+
+    async def fake_handle(self, request):  # type: ignore[no-untyped-def]
+        seen["x-client"] = request.headers.get("x-client")
+        return JSONResponse({"ok": True})
+
+    monkeypatch.setattr(HeadroomProxy, "handle_openai_responses", fake_handle)
+
+    with TestClient(create_app(ProxyConfig())) as client:
+        response = client.post(
+            "/v1/responses",
+            headers={"user-agent": _CODEX_DESKTOP_UA},
+            json={"model": "gpt-5.3-codex"},
+        )
+
+    assert response.status_code == 200
+    assert seen["x-client"] == "codex"
+
+
+def test_responses_middleware_preserves_explicit_x_client(monkeypatch):
+    # A caller that already self-identifies is left untouched by the stamp.
+    seen: dict[str, str | None] = {}
+
+    async def fake_handle(self, request):  # type: ignore[no-untyped-def]
+        seen["x-client"] = request.headers.get("x-client")
+        return JSONResponse({"ok": True})
+
+    monkeypatch.setattr(HeadroomProxy, "handle_openai_responses", fake_handle)
+
+    with TestClient(create_app(ProxyConfig())) as client:
+        response = client.post(
+            "/v1/responses",
+            headers={"x-client": "aider", "user-agent": _CODEX_DESKTOP_UA},
+            json={"model": "gpt-5.3-codex"},
+        )
+
+    assert response.status_code == 200
+    assert seen["x-client"] == "aider"

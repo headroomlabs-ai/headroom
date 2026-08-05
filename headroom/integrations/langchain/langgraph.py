@@ -47,6 +47,8 @@ except ImportError:
     BaseMessage = object  # type: ignore[misc,assignment]
     ToolMessage = object  # type: ignore[misc,assignment]
 
+from headroom.ccr.tool_injection import CCR_TOOL_NAME
+from headroom.config import is_tool_excluded
 from headroom.transforms.smart_crusher import SmartCrusher, SmartCrusherConfig
 
 logger = logging.getLogger(__name__)
@@ -156,6 +158,7 @@ def _get_crusher(min_tokens: int) -> SmartCrusher:
 def _should_skip(
     content: str,
     config: CompressToolMessagesConfig,
+    tool_name: str | None = None,
 ) -> str | None:
     """Check if a ToolMessage should skip compression.
 
@@ -163,6 +166,9 @@ def _should_skip(
     """
     if not content:
         return "empty_content"
+
+    if tool_name and is_tool_excluded(tool_name, (CCR_TOOL_NAME,)):
+        return "tool_excluded"
 
     tokens = _estimate_tokens(content)
     if tokens < config.min_tokens_to_compress:
@@ -174,6 +180,18 @@ def _should_skip(
                 return "error_content_preserved"
 
     return None
+
+
+def _tool_names_by_id(messages: list[BaseMessage]) -> dict[str, str]:  # type: ignore[type-arg]
+    """Index tool-call names so results without a copied name remain classifiable."""
+    names: dict[str, str] = {}
+    for message in messages:
+        for tool_call in getattr(message, "tool_calls", ()) or ():
+            tool_call_id = tool_call.get("id")
+            tool_name = tool_call.get("name")
+            if tool_call_id and tool_name:
+                names[tool_call_id] = tool_name
+    return names
 
 
 def compress_tool_messages(
@@ -223,6 +241,7 @@ def compress_tool_messages(
     crusher = _get_crusher(config.min_tokens_to_compress)
     result_messages: list[BaseMessage] = []
     metrics: list[ToolMessageCompressionMetrics] = []
+    tool_names = _tool_names_by_id(messages)
 
     for msg in messages:
         if not isinstance(msg, ToolMessage):
@@ -233,7 +252,8 @@ def compress_tool_messages(
         request_id = str(uuid4())
 
         # Check if we should skip
-        skip_reason = _should_skip(content, config)
+        tool_name = getattr(msg, "name", None) or tool_names.get(getattr(msg, "tool_call_id", ""))
+        skip_reason = _should_skip(content, config, tool_name)
         if skip_reason:
             result_messages.append(msg)
             tokens = _estimate_tokens(content)

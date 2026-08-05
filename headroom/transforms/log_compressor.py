@@ -109,6 +109,13 @@ class LogCompressorConfig:
     max_total_lines: int = 100
     enable_ccr: bool = True
     min_lines_for_ccr: int = 50
+    # Frame collapse: when a trace exceeds stack_trace_max_lines, keep the
+    # message/chain-head lines, the first trace_head_frames frames, and up to
+    # trace_app_frames app-code frames; runtime/stdlib frames collapse into a
+    # `[... N frames collapsed]` marker instead of blind tail-truncation.
+    collapse_runtime_frames: bool = True
+    trace_head_frames: int = 3
+    trace_app_frames: int = 5
 
 
 @dataclass
@@ -186,6 +193,9 @@ class LogCompressor:
                 enable_ccr=cfg.enable_ccr,
                 min_lines_for_ccr=cfg.min_lines_for_ccr,
                 min_compression_ratio_for_ccr=0.5,
+                collapse_runtime_frames=cfg.collapse_runtime_frames,
+                trace_head_frames=cfg.trace_head_frames,
+                trace_app_frames=cfg.trace_app_frames,
             )
         )
 
@@ -252,6 +262,20 @@ class LogCompressor:
             re.compile(r"^\s+at [\w.$]+\("),
             re.compile(r"^\s*--> .+:\d+:\d+"),
             re.compile(r"^\s*\d+:\s+0x[0-9a-f]+"),
+            # Rust panics (RustBacktrace flavor)
+            re.compile(r"^thread '[^']*' panicked at"),
+            re.compile(r"^stack backtrace:"),
+            re.compile(r"^\s+\d+: \S"),
+            # Go panics / goroutine dumps (GoPanic flavor)
+            re.compile(r"^(?:panic|fatal error): "),
+            re.compile(r"^goroutine \d+ \["),
+            re.compile(r"^\t\S+\.go:\d+(?: \+0x[0-9a-f]+)?$"),
+            # .NET (DotNet flavor)
+            re.compile(r"^Unhandled exception\."),
+            re.compile(r"^\s*at .+\) in .+:line \d+"),
+            # Java chained-exception continuations
+            re.compile(r"^Caused by: "),
+            re.compile(r"^\s*\.\.\. \d+ more$"),
         ]
         summary_patterns = [
             re.compile(r"^={3,}"),

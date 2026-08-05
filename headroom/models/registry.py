@@ -487,6 +487,108 @@ for model_name, info in _MODELS.items():
         _ALIASES[alias.lower()] = model_name
 
 
+_PROVIDER_TOKENIZER_BACKENDS = {
+    "anthropic": "anthropic",
+    "google": "google",
+    "openai": "tiktoken",
+}
+
+_PROVIDER_FAMILY_DEFAULTS: dict[str, tuple[tuple[str, dict[str, Any]], ...]] = {
+    "google": (
+        (
+            "gemini-1.0",
+            {
+                "context_window": 32768,
+                "max_output_tokens": 4096,
+                "supports_vision": False,
+                "tokenizer_backend": "google",
+                "notes": "Google Gemini 1.0 family fallback",
+            },
+        ),
+        (
+            "gemini-pro",
+            {
+                "context_window": 32768,
+                "max_output_tokens": 4096,
+                "supports_vision": False,
+                "tokenizer_backend": "google",
+                "notes": "Legacy Google Gemini Pro fallback",
+            },
+        ),
+        (
+            "gemini-1.5-pro",
+            {
+                "context_window": 2000000,
+                "max_output_tokens": 8192,
+                "supports_vision": True,
+                "tokenizer_backend": "google",
+                "notes": "Google Gemini 1.5 Pro family fallback",
+            },
+        ),
+        (
+            "gemini-1.5-flash",
+            {
+                "context_window": 1000000,
+                "max_output_tokens": 8192,
+                "supports_vision": True,
+                "tokenizer_backend": "google",
+                "notes": "Google Gemini 1.5 Flash family fallback",
+            },
+        ),
+        (
+            "gemini-2",
+            {
+                "context_window": 1000000,
+                "max_output_tokens": 8192,
+                "supports_vision": True,
+                "tokenizer_backend": "google",
+                "notes": "Google Gemini 2 family fallback",
+            },
+        ),
+        (
+            "gemini-",
+            {
+                "context_window": 1000000,
+                "max_output_tokens": 8192,
+                "supports_vision": True,
+                "tokenizer_backend": "google",
+                "notes": "Future Google Gemini family fallback",
+            },
+        ),
+    ),
+}
+
+
+def _infer_provider(model: str) -> str | None:
+    """Infer a provider from common model id prefixes."""
+    model_lower = model.lower()
+    if model_lower.startswith(("gemini-", "gemini/gemini-", "google/gemini-")):
+        return "google"
+    if model_lower.startswith(("claude", "anthropic/claude")):
+        return "anthropic"
+    if model_lower.startswith(("gpt-", "o1", "o3", "o4", "openai/gpt-")):
+        return "openai"
+    return None
+
+
+def _unprefixed_model_id(model: str) -> str:
+    """Drop a common LiteLLM provider prefix before family matching."""
+    model_lower = model.lower()
+    for prefix in ("anthropic/", "gemini/", "google/", "openai/"):
+        if model_lower.startswith(prefix):
+            return model_lower[len(prefix) :]
+    return model_lower
+
+
+def _family_fallback(model: str, provider: str) -> ModelInfo | None:
+    """Return a provider-scoped family fallback for plausible future models."""
+    model_lower = _unprefixed_model_id(model)
+    for prefix, defaults in _PROVIDER_FAMILY_DEFAULTS.get(provider, ()):
+        if model_lower.startswith(prefix):
+            return ModelInfo(name=model, provider=provider, **defaults)
+    return None
+
+
 class ModelRegistry:
     """Registry of LLM models and their capabilities.
 
@@ -529,10 +631,94 @@ class ModelRegistry:
         if model_lower in _ALIASES:
             return _MODELS[_ALIASES[model_lower]]
 
-        # Prefix matching
+        # Prefix matching. Two rules keep this from silently mis-resolving
+        # newer or larger variants:
+        #   1. The registered name must end at a version boundary in the query
+        #      (next char is a separator like ``-``/``/``/``:``/``@``/``_``), so
+        #      ``gpt-4.1`` — a distinct model, not a variant of ``gpt-4`` — does
+        #      not inherit gpt-4's 8192-token window (the ``.`` is not a
+        #      boundary, so it no longer matches).
+        #   2. When several names qualify, the LONGEST wins, so
+        #      ``gpt-4-32k-0613`` resolves to ``gpt-4-32k`` (32768) rather than
+        #      the shorter ``gpt-4`` (8192) that happens to be registered first.
+        best: ModelInfo | None = None
+        best_len = -1
         for name, info in _MODELS.items():
-            if model_lower.startswith(name):
-                return info
+            if not model_lower.startswith(name):
+                continue
+            rest = model_lower[len(name) :]
+            if rest and rest[0] not in ("-", "/", ":", "@", "_"):
+                continue
+            if len(name) > best_len:
+                best = info
+                best_len = len(name)
+
+        return best
+
+    @classmethod
+    def resolve(
+        cls,
+        model: str,
+        provider: str | None = None,
+        default_context_window: int = 128000,
+    ) -> ModelInfo | None:
+        """Resolve model capabilities for a runtime provider path.
+
+        This is the tolerant runtime counterpart to :meth:`get`: it first
+        checks the built-in registry, then LiteLLM metadata, then
+        provider-scoped family fallbacks. Unknown models for unrelated
+        providers still return ``None`` instead of being claimed globally.
+
+        Args:
+            model: Model identifier from a request/provider.
+            provider: Optional provider hint (for example ``"google"``).
+            default_context_window: Conservative context window when a
+                plausible family fallback has no exact catalog hit.
+
+        Returns:
+            Resolved ModelInfo when the model belongs to the hinted or
+            inferred provider, otherwise None.
+        """
+        provider_hint = provider.lower() if provider else None
+
+        info = cls.get(model)
+        if info is not None and (provider_hint is None or info.provider == provider_hint):
+            return info
+
+        inferred_provider = _infer_provider(model)
+        if (
+            provider_hint is not None
+            and inferred_provider is not None
+            and inferred_provider != provider_hint
+        ):
+            return None
+
+        resolved_provider = provider_hint or inferred_provider
+        if resolved_provider is None:
+            return None
+
+        fallback = _family_fallback(model, resolved_provider)
+        if provider_hint is not None and inferred_provider is None and fallback is None:
+            return None
+
+        pricing = get_model_pricing(model)
+        if pricing is not None:
+            context_window = (
+                pricing.max_input_tokens or pricing.max_tokens or default_context_window
+            )
+            max_output_tokens = pricing.max_output_tokens or 4096
+            return ModelInfo(
+                name=model,
+                provider=resolved_provider,
+                context_window=int(context_window),
+                max_output_tokens=int(max_output_tokens),
+                supports_vision=pricing.supports_vision,
+                tokenizer_backend=_PROVIDER_TOKENIZER_BACKENDS.get(resolved_provider),
+                notes="Resolved from LiteLLM pricing metadata",
+            )
+
+        if fallback is not None:
+            return fallback
 
         return None
 

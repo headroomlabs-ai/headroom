@@ -48,6 +48,8 @@ except ImportError:
     ToolResult = dict  # type: ignore[misc,assignment]
 
 from headroom import HeadroomConfig
+from headroom.ccr.tool_injection import CCR_TOOL_NAME
+from headroom.config import is_tool_excluded
 from headroom.transforms.smart_crusher import SmartCrusher, SmartCrusherConfig
 
 logger = logging.getLogger(__name__)
@@ -314,7 +316,7 @@ class HeadroomHookProvider(HookProvider):  # type: ignore[misc]
         tool_use_id = event.tool_use.get("toolUseId", "unknown")
 
         # Check if compression should be skipped
-        skip_reason = self._should_skip_compression(result)
+        skip_reason = self._should_skip_compression(result, tool_name)
         if skip_reason:
             self._record_metrics(
                 request_id=request_id,
@@ -421,11 +423,15 @@ class HeadroomHookProvider(HookProvider):  # type: ignore[misc]
                 tokens_before,
             )
 
-    def _should_skip_compression(self, result: ToolResult) -> str | None:
+    def _should_skip_compression(
+        self, result: ToolResult, tool_name: str | None = None
+    ) -> str | None:
         """Check if compression should be skipped for this result.
 
         Args:
             result: The tool result to check.
+            tool_name: The name of the tool that produced the result, used to
+                honor the shared tool-exclusion set.
 
         Returns:
             Skip reason string if should skip, None if should compress.
@@ -433,6 +439,9 @@ class HeadroomHookProvider(HookProvider):  # type: ignore[misc]
         # Skip if compression is disabled
         if not self.compress_tool_outputs:
             return "compression_disabled"
+
+        if tool_name and is_tool_excluded(tool_name, (CCR_TOOL_NAME,)):
+            return "tool_excluded"
 
         # Skip error results if preserve_errors is True
         if self.preserve_errors and result.get("status") == "error":

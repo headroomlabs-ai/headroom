@@ -51,6 +51,22 @@ class TestTiktokenCounter:
         # gpt-4-turbo snapshots use cl100k_base.
         assert get_encoding_for_model("gpt-4-turbo-2099") == "cl100k_base"
 
+    def test_gpt41_and_o4_families_use_o200k(self):
+        """gpt-4.1 / gpt-4.5 / o4 use o200k_base, not cl100k_base.
+
+        Regression: gpt-4.1* and gpt-4.5* matched the broad "gpt-4" prefix and
+        resolved to cl100k_base, and o4* matched no prefix and fell to the
+        cl100k_base default — both wrong encodings for those models.
+        """
+        from headroom.tokenizers.tiktoken_counter import get_encoding_for_model
+
+        assert get_encoding_for_model("gpt-4.1") == "o200k_base"
+        assert get_encoding_for_model("gpt-4.1-mini") == "o200k_base"
+        assert get_encoding_for_model("gpt-4.5-preview") == "o200k_base"
+        assert get_encoding_for_model("o4-mini") == "o200k_base"
+        # A plain gpt-4 snapshot must still use cl100k_base (not shadowed).
+        assert get_encoding_for_model("gpt-4-0613") == "cl100k_base"
+
     def test_count_text_empty(self):
         """Test counting empty text."""
         counter = TiktokenCounter()
@@ -103,6 +119,43 @@ class TestTiktokenCounter:
         count = counter.count_messages(messages)
         assert count > 0
 
+    def test_count_messages_image_block_is_not_stringified(self):
+        """An Anthropic-style image block must be priced as an image, not text.
+
+        Over the wire the image arrives as a base64 string inside list content.
+        The old count_messages else-branch stringified any non-text/non-image_url
+        part and tokenized it as text, so a 1MB image counted as ~330K phantom
+        tokens. The base handler prices image blocks by a bounded estimate, so the
+        count must stay small regardless of the base64 payload size.
+        """
+        import base64
+
+        counter = TiktokenCounter()
+        blob = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"\x00" * 200_000).decode()
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "What is in this screenshot?"},
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": blob,
+                        },
+                    },
+                ],
+            }
+        ]
+
+        count = counter.count_messages(messages)
+
+        # The base64 blob alone would be tens of thousands of text tokens; a
+        # bounded image estimate keeps the whole message well under that.
+        assert count < 5000, count
+        assert count < len(blob) // 10
+
     def test_encode_decode_roundtrip(self):
         """Test encode/decode roundtrip."""
         counter = TiktokenCounter()
@@ -110,6 +163,29 @@ class TestTiktokenCounter:
         tokens = counter.encode(text)
         decoded = counter.decode(tokens)
         assert decoded == text
+
+    def test_count_text_allows_literal_special_tokens(self):
+        """count_text must not raise on literal tiktoken special-token strings.
+
+        Regression: passthrough/tool content containing "<|endoftext|>" (or FIM
+        markers) made tiktoken raise ValueError under its default
+        disallowed_special="all", aborting token counting for the whole request.
+        Through the proxy this surfaced as an HTTP 413 compression_refused.
+        """
+        counter = TiktokenCounter("gpt-4o")
+        text = "before <|endoftext|> after <|fim_prefix|> end"
+        # Must not raise; markers are counted as ordinary text.
+        count = counter.count_text(text)
+        assert count > counter.count_text("before  after  end")
+
+    def test_encode_allows_literal_special_tokens(self):
+        """encode must treat literal special-token strings as ordinary text."""
+        counter = TiktokenCounter("gpt-4o")
+        text = "x <|endoftext|> y"
+        tokens = counter.encode(text)
+        assert isinstance(tokens, list) and len(tokens) > 0
+        # Encoding as ordinary text round-trips back to the original literal.
+        assert counter.decode(tokens) == text
 
     def test_repr(self):
         """Test string representation."""
@@ -152,6 +228,26 @@ class TestEstimatingTokenCounter:
         count = counter.count_text(text)
         assert count == 10  # 50 / 5 = 10
 
+    def test_count_text_fixed_ratio_prices_cjk(self):
+        """The fixed-ratio path must price dense scripts (CJK) like the auto path.
+
+        The registry builds provider counters (Anthropic 3.5, Google 4.0, ...)
+        with a fixed ratio; before the fix CJK was priced at the Latin ratio, so
+        a large CJK context read as ~40-55% of its true size and could skip
+        compression."""
+        counter = EstimatingTokenCounter(chars_per_token=3.5)
+        cjk = "これはテストです" * 100  # 800 dense-script chars, no ASCII
+
+        count = counter.count_text(cjk)
+
+        # ~1 token per 1.5 chars (CHARS_PER_TOKEN_CJK), not 1 per 3.5.
+        assert count == pytest.approx(len(cjk) / 1.5, rel=0.05)
+        # Far higher than the old Latin-ratio estimate.
+        assert count > len(cjk) / 3.5 * 2
+
+        # ASCII is unaffected by the fixed ratio.
+        assert counter.count_text("x" * 35) == 10
+
     def test_count_text_minimum_one(self):
         """Test minimum of 1 token."""
         counter = EstimatingTokenCounter()
@@ -184,6 +280,47 @@ def hello():
 """
         count = counter.count_text(code_text)
         assert count > 0
+
+    def test_count_text_cjk_not_underestimated(self):
+        """CJK text must not be priced at the Latin ~4-chars/token ratio.
+
+        Regression: count_text divided the whole string length by the Latin
+        ratio (4.0), so 100 Chinese characters estimated ~25 tokens while real
+        tokenizers (cl100k_base / DeepSeek / Qwen) produce ~60-150. Dense
+        scripts tokenize at roughly one token per character, so the estimate
+        must be far above len/4 and on the order of the character count.
+        """
+        counter = EstimatingTokenCounter()
+        text = "你好世界" * 25  # 100 CJK characters
+        count = counter.count_text(text)
+        # Old behavior returned len/4 == 25; require clearly above that floor.
+        assert count > len(text) / 3
+        # And in the right ballpark for one-token-per-char scripts.
+        assert count >= int(len(text) * 0.6)
+
+    def test_count_text_cjk_japanese_and_korean(self):
+        """Japanese (Kana) and Korean (Hangul) are also dense scripts."""
+        counter = EstimatingTokenCounter()
+        for text in ("こんにちは世界" * 10, "안녕하세요" * 10):
+            count = counter.count_text(text)
+            assert count >= int(len(text) * 0.6)
+
+    def test_count_text_mixed_latin_cjk(self):
+        """Mixed text prices the Latin part and the CJK part independently."""
+        counter = EstimatingTokenCounter()
+        latin = "The quick brown fox jumps over the lazy dog. "  # 45 chars
+        cjk = "今天天气很好"  # 6 CJK chars
+        mixed = counter.count_text(latin + cjk)
+        # Must exceed the all-Latin estimate of the same length, since the CJK
+        # tail is priced denser than 4 chars/token.
+        latin_only = counter.count_text(latin + "x" * len(cjk))
+        assert mixed > latin_only
+
+    def test_count_text_latin_unchanged(self):
+        """Pure-Latin estimates are unchanged by the CJK adjustment."""
+        counter = EstimatingTokenCounter()
+        text = "Hello, world!"
+        assert 2 <= counter.count_text(text) <= 6
 
     def test_repr(self):
         """Test string representation."""
@@ -226,14 +363,41 @@ class TestTokenizerRegistry:
         assert isinstance(tokenizer, TiktokenCounter)
 
     def test_get_anthropic_model(self):
-        """Test getting tokenizer for Anthropic model."""
+        """Anthropic (Claude) has no public tokenizer, so it is priced against a
+        real BPE proxy (tiktoken o200k_base) rather than a character estimate —
+        for consistent, monotone before/after counts. Falls back to the estimator
+        only when the tiktoken vocab can't be loaded."""
         tokenizer = get_tokenizer("claude-3-sonnet")
-        assert isinstance(tokenizer, EstimatingTokenCounter)
+        if isinstance(tokenizer, TiktokenCounter):
+            assert tokenizer.encoding_name == "o200k_base"
+        else:  # vocab unavailable in this environment → documented fallback
+            assert isinstance(tokenizer, EstimatingTokenCounter)
 
     def test_get_unknown_model_fallback(self):
         """Test fallback for unknown model."""
         tokenizer = get_tokenizer("unknown-model-xyz")
         assert isinstance(tokenizer, EstimatingTokenCounter)
+
+    def test_get_kimi_moonshot_calibrated_estimator(self):
+        """Kimi/Moonshot resolves to the calibrated (3.1 chars/tok) estimator
+        across every serving form — Fireworks body, litellm slug, native — so
+        the size-gates aren't starved by the ~20% under-count of the default
+        adaptive estimator (measured on a SWE-bench Kimi-K2.7-code run)."""
+        for m in (
+            "accounts/fireworks/models/kimi-k2p7-code",  # Fireworks body model
+            "fireworks_ai/kimi-k2p7-code-high",  # litellm slug
+            "moonshotai/Kimi-K2-Instruct",  # native
+            "KIMI-K2P7-CODE",  # case-insensitive
+        ):
+            tk = get_tokenizer(m)
+            assert isinstance(tk, EstimatingTokenCounter), m
+            assert tk._fixed_ratio == 3.1, f"{m}: expected 3.1, got {tk._fixed_ratio}"
+        # calibrated estimate must beat the default adaptive on Kimi-like code
+        # (which the default under-counts): denser ratio -> more tokens.
+        code = 'def f(x):\n    return {"a": 1, "b": [2, 3]}\n' * 200
+        kimi = get_tokenizer("fireworks_ai/kimi-k2p7-code-high").count_text(code)
+        default = get_tokenizer("unknown-model-xyz").count_text(code)
+        assert kimi > default, (kimi, default)
 
     def test_get_with_specific_backend(self):
         """Test forcing specific backend."""
@@ -460,3 +624,106 @@ class TestMistralTokenizer:
         tokenizer = get_tokenizer("codestral")
         MistralTokenizer = get_mistral_tokenizer()
         assert isinstance(tokenizer, MistralTokenizer)
+
+
+class TestLargeToolBlobEstimation:
+    """Oversized tool blobs are token-estimated without serializing them in full."""
+
+    def test_oversized_tool_blob_count_text_is_bounded(self, monkeypatch):
+        """Regression: count_text over a multi-megabyte serialized blob froze the
+        event loop (~seconds). json.dumps itself is cheap; count_text over the
+        whole string is the cost, so its input must stay bounded for oversized
+        blobs.
+        """
+        tok = EstimatingTokenCounter()
+        sizes: list[int] = []
+        real_count_text = tok.count_text
+
+        def spy(text):
+            sizes.append(len(text))
+            return real_count_text(text)
+
+        monkeypatch.setattr(tok, "count_text", spy)
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "content": {"small": "x"}},
+                    {"type": "tool_result", "content": {"data": "A" * 4_000_000}},
+                ],
+            }
+        ]
+        tok.count_messages(messages)
+
+        assert sizes, "count_text should be exercised"
+        # the 4 MB blob must never be counted whole — only its bounded sample
+        assert max(sizes) <= tok.SAMPLE_CHARS + tok.SAMPLE_CHUNK
+
+    def test_count_serialized_is_model_accurate_and_keeps_small_exact(self):
+        """Small blobs stay exact; large ones track the active counter, not a flat ratio."""
+        import json
+
+        tok = EstimatingTokenCounter(chars_per_token=3.5)  # Claude-like ratio
+        small = {"k": "v"}
+        assert tok._count_serialized(small) == tok.count_text(json.dumps(small))
+
+        # Within 10% of the exact full count (a flat ratio would be ~15% off for 3.5).
+        big = {"k": "A" * 200_000}
+        exact = tok.count_text(json.dumps(big))
+        assert abs(tok._count_serialized(big) - exact) / exact < 0.10
+
+    def test_tool_result_list_recurses_into_image_block(self):
+        """A tool that returns an image nests a base64 block inside a
+        `tool_result` list. Serializing it prices the base64 as text (a 50-200x
+        overcount); recursing into the block prices the image at ~1600 tokens."""
+        tok = EstimatingTokenCounter()
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "t1",
+                        "content": [
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/png",
+                                    "data": "A" * 280_000,  # ~280KB base64
+                                },
+                            }
+                        ],
+                    }
+                ],
+            }
+        ]
+
+        count = tok.count_messages(messages)
+
+        # The image is priced structurally (~1600), not as a huge text blob.
+        assert count < 5_000
+
+    def test_oversized_estimate_never_overcounts(self):
+        """R4 (prefer false negatives): a token-dense head + sparse tail must not
+        over-count. Counting per leaf cannot extrapolate a dense front slice to the
+        whole the way scaling one sample could.
+        """
+        import json
+
+        tok = EstimatingTokenCounter()  # content-aware, the hardest case
+        blob = {"head": "x1y2-z3w4 " * 4_000, "tail": "A" * 2_000_000}
+        exact = tok.count_text(json.dumps(blob))
+        assert tok._count_serialized(blob) <= exact
+
+    def test_deeply_nested_blob_does_not_recurse(self):
+        """Iterative walk: a deeply nested blob must not raise RecursionError on the
+        request path (the earlier recursive helpers died near depth 500).
+        """
+        deep: dict = {}
+        cur = deep
+        for _ in range(2_000):
+            cur["n"] = {}
+            cur = cur["n"]
+        cur["leaf"] = "x" * 60_000
+        assert EstimatingTokenCounter()._count_serialized(deep) >= 0

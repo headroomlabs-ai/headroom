@@ -270,6 +270,46 @@ class TestHeadroomAgnoModel:
         assert "tool_calls" in openai_msgs[0]
         assert openai_msgs[1]["tool_call_id"] == "call_123"
 
+    def test_convert_messages_normalizes_streaming_tool_call_objects(self, mock_agno_model):
+        """Regression for issue #1312: in streaming mode Agno can surface
+        tool_calls as raw OpenAI SDK objects (`ChoiceDeltaToolCall`) with
+        attribute access and no `.get()`. `_convert_messages_to_openai`
+        must flatten them to OpenAI-format dicts so neither the Headroom
+        pipeline nor Agno's re-serialization hits
+        `'ChoiceDeltaToolCall' object has no attribute 'get'`."""
+        from headroom.integrations.agno import HeadroomAgnoModel
+
+        # Mimic the OpenAI SDK streaming object: attribute access, no .get().
+        class _Fn:
+            def __init__(self, name, arguments):
+                self.name = name
+                self.arguments = arguments
+
+        class _ChoiceDeltaToolCall:
+            def __init__(self, id, name, arguments):
+                self.id = id
+                self.index = 0
+                self.type = "function"
+                self.function = _Fn(name, arguments)
+
+        assistant_msg = MagicMock()
+        assistant_msg.role = "assistant"
+        assistant_msg.content = ""
+        assistant_msg.tool_calls = [
+            _ChoiceDeltaToolCall("call_999", "dummy_tool", '{"query": "test"}')
+        ]
+        assistant_msg.tool_call_id = None
+
+        model = HeadroomAgnoModel(wrapped_model=mock_agno_model)
+        openai_msgs = model._convert_messages_to_openai([assistant_msg])
+
+        tool_calls = openai_msgs[0]["tool_calls"]
+        # Every entry must now be a plain dict, not the SDK object.
+        assert all(isinstance(tc, dict) for tc in tool_calls)
+        assert tool_calls[0]["id"] == "call_999"
+        assert tool_calls[0]["function"]["name"] == "dummy_tool"
+        assert tool_calls[0]["function"]["arguments"] == '{"query": "test"}'
+
     def test_response_applies_optimization(self, mock_agno_model, sample_messages):
         """response() applies Headroom optimization."""
         from headroom.integrations.agno import HeadroomAgnoModel

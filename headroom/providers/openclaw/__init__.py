@@ -1,6 +1,7 @@
 """OpenClaw-specific provider helpers."""
 
 from .wrap import (
+    OPENCLAW_NPM_PACKAGE,
     build_plugin_entry,
     build_unwrap_entry,
     decode_entry_json,
@@ -8,6 +9,7 @@ from .wrap import (
 )
 
 __all__ = [
+    "OPENCLAW_NPM_PACKAGE",
     "build_plugin_entry",
     "build_unwrap_entry",
     "decode_entry_json",

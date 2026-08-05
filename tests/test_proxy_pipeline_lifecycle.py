@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, call, patch
+from unittest.mock import AsyncMock, Mock, call, patch
 
 import httpx
 from fastapi.testclient import TestClient
@@ -90,6 +90,70 @@ def test_proxy_shutdown_unloads_image_models() -> None:
         call("siglip:"),
     ]
     quota_registry.stop_all.assert_awaited_once()
+
+
+def test_proxy_shutdown_flushes_savings_tracker() -> None:
+    """Graceful shutdown must flush the savings tracker's batched tail.
+
+    The proxy throttles savings persistence (save_flush_every=25), so buffered
+    requests only reach disk on the next threshold write or an explicit flush.
+    shutdown() is that flush; if the wiring regresses, a graceful stop silently
+    drops the last few requests' lifetime totals. The tracker's flush() logic is
+    covered in test_proxy_savings_history.py — this guards only the call site.
+    """
+    config = ProxyConfig(
+        optimize=False,
+        image_optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+        log_requests=False,
+        ccr_inject_tool=False,
+        ccr_handle_responses=False,
+        ccr_context_tracking=False,
+    )
+    app = create_app(config)
+    proxy = app.state.proxy
+    proxy.http_client = None
+    proxy.memory_handler = None
+    proxy.metrics.savings_tracker.flush = Mock()
+
+    quota_registry = SimpleNamespace(stop_all=AsyncMock())
+    with (
+        patch("headroom.proxy.server.get_quota_registry", return_value=quota_registry),
+        patch("headroom.models.ml_models.MLModelRegistry.unload_prefix"),
+    ):
+        asyncio.run(proxy.shutdown())
+
+    proxy.metrics.savings_tracker.flush.assert_called_once()
+
+
+def test_proxy_shutdown_signals_retry_waiters() -> None:
+    config = ProxyConfig(
+        optimize=False,
+        image_optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+        log_requests=False,
+        ccr_inject_tool=False,
+        ccr_handle_responses=False,
+        ccr_context_tracking=False,
+    )
+    app = create_app(config)
+    proxy = app.state.proxy
+    proxy.http_client = None
+    proxy.memory_handler = None
+    proxy._shutdown_event = asyncio.Event()
+
+    quota_registry = SimpleNamespace(stop_all=AsyncMock())
+    with (
+        patch("headroom.proxy.server.get_quota_registry", return_value=quota_registry),
+        patch("headroom.models.ml_models.MLModelRegistry.unload_prefix"),
+    ):
+        asyncio.run(proxy.shutdown())
+
+    assert proxy._shutdown_event.is_set()
 
 
 def test_openai_chat_pipeline_events_cover_proxy_lifecycle(monkeypatch) -> None:

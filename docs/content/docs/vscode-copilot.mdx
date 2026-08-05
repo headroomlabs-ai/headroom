@@ -1,0 +1,163 @@
+---
+title: VS Code Copilot Integration
+description: Transparently route the model selected in GitHub Copilot through Headroom on macOS, Windows, and Linux.
+---
+
+Headroom integrates below VS Code's native Copilot model picker. It overrides the
+Copilot API proxy endpoint, not the model: if the user selects GPT-5.5, a GPT-5.6
+variant, Claude Sonnet, Claude Opus, or another Copilot model, the same model ID
+travels through Headroom to GitHub's Copilot API.
+
+No `Headroom` model appears in the picker. Headroom does not patch the built-in
+extension, terminate TLS, or edit Codex configuration.
+
+## Requirements
+
+- Current stable VS Code with GitHub Copilot enabled and signed in
+- A GitHub account with Copilot access
+- Headroom with proxy dependencies: `pip install "headroom-ai[proxy]"`
+- Loopback access to `127.0.0.1` from the VS Code extension host
+
+## One-time authentication
+
+VS Code keeps its Copilot token in extension secret storage. Headroom deliberately
+does not read or modify that encrypted store, so authorize Headroom separately:
+
+```bash
+headroom copilot-auth login
+```
+
+Open the printed GitHub device URL, enter the code, and approve it. Headroom saves
+the reusable OAuth credential in its own auth file with user-only permissions.
+At launch it exchanges that credential for a short-lived Copilot API token; that
+token remains in the proxy process and is never written to VS Code settings.
+
+## Start
+
+Run from the project whose savings should receive attribution:
+
+```bash
+headroom wrap vscode
+```
+
+The command:
+
+1. validates Copilot subscription access and resolves the account API endpoint;
+2. starts Headroom on `127.0.0.1:8787` with the short-lived upstream token;
+3. adds a marker-owned block to VS Code user settings containing
+   `github.copilot.advanced.debug.overrideProxyUrl` and
+   `github.copilot.advanced.debug.overrideAuthType`;
+4. keeps running until `Ctrl+C` so the local proxy is available to VS Code.
+
+Continue using Copilot's normal model picker. The request body—and therefore the
+selected model—is not rewritten by the VS Code integration.
+
+## What is routed
+
+The shipped Copilot extension resolves both its chat/agent endpoint and its
+completions-core endpoint through the proxy override. This covers native model
+selection without registering duplicate models. Some ancillary Copilot services
+(telemetry, GitHub API calls, MCP, embeddings, model discovery, cloud agents) use
+separate endpoints and are intentionally not redirected.
+
+```text
+Copilot UI: user selects model M
+  -> native Copilot request with model M
+  -> http://127.0.0.1:8787/p/<project>/<native Copilot path>
+  -> Headroom compression, cache alignment, metrics, attribution
+  -> authenticated GitHub Copilot API, still with model M
+  -> response from model M
+```
+
+## Safe settings lifecycle
+
+Headroom edits only a marked block in VS Code's `settings.json`. Existing JSONC
+comments, formatting, trailing commas, and unrelated settings remain byte-for-byte
+unchanged. Headroom refuses malformed files, incomplete markers, or a pre-existing
+unmanaged Copilot endpoint override instead of overwriting them.
+
+| Platform | Stable VS Code user settings |
+|---|---|
+| macOS | `~/Library/Application Support/Code/User/settings.json` |
+| Windows | `%APPDATA%\\Code\\User\\settings.json` |
+| Linux | `${XDG_CONFIG_HOME:-~/.config}/Code/User/settings.json` |
+
+For Insiders, VSCodium, portable installations, a custom `--user-data-dir`, or a
+remote extension host, provide the exact user settings file:
+
+```bash
+headroom wrap vscode --settings-file /path/to/User/settings.json
+```
+
+Use `--no-configure` to print the two settings without editing a file.
+
+## Model coverage
+
+There is no static Headroom model list. Availability stays controlled by Copilot
+and the signed-in account. To validate a model, select it in VS Code and send a
+short prompt; Headroom forwards the model identifier unchanged. This naturally
+covers newly added Copilot models without a Headroom release.
+
+The newest Copilot models may use the OpenAI Responses API instead of the legacy
+Chat Completions API. Headroom proxies both routes. Do not treat a model's
+`unsupported_api_for_model` response from `/chat/completions` as a proxy failure;
+VS Code uses the endpoint supported by that model.
+
+Live verification on July 31, 2026 confirmed the account catalog and a successful
+HTTP 200 response through Headroom's `/responses` route for each of these exact
+model IDs:
+
+- `gpt-5.5`
+- `gpt-5.6-luna`
+- `gpt-5.6-sol`
+- `gpt-5.6-terra`
+
+Each response retained the requested model ID. Model availability remains subject
+to the signed-in user's Copilot plan and organization policy.
+
+The proxy supports the native Copilot OpenAI-compatible request paths used by
+GPT and Claude models. Headroom's upstream auth hook replaces local client auth
+with the current Copilot API token on every Copilot-bound request.
+
+## Stop and undo
+
+Press `Ctrl+C` to stop the session proxy. The VS Code endpoint setting remains so
+future `headroom wrap vscode` runs need no reconfiguration; while the proxy is
+stopped, Copilot requests will fail closed instead of bypassing Headroom.
+
+Remove only Headroom's settings block with:
+
+```bash
+headroom unwrap vscode
+```
+
+Use the same `--settings-file` override used during setup. Other VS Code and
+Copilot settings are preserved.
+
+## Remote development
+
+Copilot may run in the local or remote extension host depending on the workspace.
+For Dev Containers, SSH, or WSL, `127.0.0.1` must refer to the host running
+Headroom. Run Headroom in that environment or forward the chosen port. Portable,
+remote, and profile-specific settings should use `--settings-file` explicitly.
+
+## Enterprise
+
+GitHub.com Enterprise Cloud normally requires no override; Headroom uses the API
+URL advertised during token exchange. For GitHub Enterprise Server/custom domains,
+set `GITHUB_COPILOT_ENTERPRISE_URL` or `GITHUB_COPILOT_ENTERPRISE_DOMAIN` before
+both `copilot-auth login` and `wrap vscode`.
+
+## Verification and troubleshooting
+
+- `headroom copilot-auth status` should report `logged in`.
+- `http://127.0.0.1:8787/health` should be healthy while the wrapper runs.
+- The health payload's OpenAI upstream should be the Copilot API endpoint.
+- Select several native models and confirm Headroom metrics show each request.
+- If a model is unavailable, verify the Copilot account entitlement; Headroom
+  does not add or rename models.
+- If connection is refused, keep the wrapper running and check loopback/remote
+  port reachability.
+- Use `--port 8788` when the default port is occupied; settings update safely.
+- If Headroom refuses settings, repair the reported JSONC/marker conflict or use
+  `--no-configure` and apply the printed settings manually.

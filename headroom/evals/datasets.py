@@ -439,6 +439,61 @@ def load_longbench(
     return EvalSuite(name=f"LongBench_{task}", cases=cases)
 
 
+def load_multi_wiki_qa(
+    n: int = 100,
+    lang: str = "ja",
+) -> EvalSuite:
+    """Load multilingual SQuAD-style QA (alexandrainst/multi-wiki-qa).
+
+    Covers Chinese/Japanese/Korean (and many more) with verbatim-span answers
+    over full Wikipedia articles -- the only HF-loadable set with uniform
+    zh/ja/ko extractive QA, so it yields comparable cross-language compression
+    answer-retention numbers. License: CC-BY-NC-SA-4.0 (non-commercial).
+
+    Common lang configs: "zh-cn", "ja", "ko".
+
+    Args:
+        n: Number of samples to load
+        lang: multi-wiki-qa language config (e.g. "ja", "ko", "zh-cn")
+
+    Returns:
+        EvalSuite with multi-wiki-qa cases
+    """
+    _check_datasets_installed()
+    from datasets import load_dataset
+
+    try:
+        ds = load_dataset("alexandrainst/multi-wiki-qa", lang, split=f"train[:{n}]")
+    except Exception as e:
+        raise ValueError(f"Failed to load multi-wiki-qa '{lang}': {e}") from e
+
+    cases: list[EvalCase] = []
+    for i, item in enumerate(ds):
+        context = item.get("context", "")
+        question = item.get("question", "")
+        answers = item.get("answers") or {}
+        texts = answers.get("text") if isinstance(answers, dict) else None
+        ground_truth = texts[0] if texts else None
+        if not (context and question and ground_truth):
+            continue
+
+        cases.append(
+            EvalCase(
+                id=f"multi_wiki_qa_{lang}_{i}",
+                context=context,
+                query=question,
+                ground_truth=ground_truth,
+                metadata={
+                    "source": "multi-wiki-qa",
+                    "lang": lang,
+                    "title": item.get("title", ""),
+                },
+            )
+        )
+
+    return EvalSuite(name=f"multi_wiki_qa_{lang}", cases=cases)
+
+
 def load_narrativeqa(
     n: int = 100,
     split: str = "test",
@@ -1187,6 +1242,13 @@ DATASET_REGISTRY: dict[str, dict[str, Any]] = {
         "loader": load_narrativeqa,
         "description": "Story comprehension requiring narrative understanding",
         "category": "long_context",
+        "default_n": 100,
+    },
+    # Multilingual
+    "multi_wiki_qa": {
+        "loader": load_multi_wiki_qa,
+        "description": "Multilingual (zh/ja/ko) Wikipedia QA with verbatim-span answers",
+        "category": "rag_multilingual",
         "default_n": 100,
     },
     # Tool Use

@@ -150,7 +150,9 @@ class TestFetchBedrockInferenceProfiles:
         mock_client.list_inference_profiles.side_effect = Exception(
             "AccessDeniedException: not authorized"
         )
-        mock_boto3.client.return_value = mock_client
+        mock_session = MagicMock()
+        mock_session.client.return_value = mock_client
+        mock_boto3.Session.return_value = mock_session
 
         with patch("headroom.backends.litellm.boto3", mock_boto3, create=True):
             # Patch the import inside the function
@@ -188,7 +190,9 @@ class TestFetchBedrockInferenceProfiles:
                 {"inferenceProfileId": "eu.meta.llama-3-70b-v1:0"},  # non-Anthropic, should skip
             ]
         }
-        mock_boto3.client.return_value = mock_client
+        mock_session = MagicMock()
+        mock_session.client.return_value = mock_client
+        mock_boto3.Session.return_value = mock_session
 
         import builtins
 
@@ -212,12 +216,24 @@ class TestFetchBedrockInferenceProfiles:
         )
 
     def test_caching_prevents_repeated_api_calls(self):
-        """Second call for same region should return cached result."""
+        """Second call for same region+profile should return cached result."""
         _bedrock_profiles_cache.clear()
-        _bedrock_profiles_cache["us-east-1"] = {"test": "bedrock/test-model"}
+        _bedrock_profiles_cache["us-east-1:"] = {"test": "bedrock/test-model"}
 
         result = _fetch_bedrock_inference_profiles("us-east-1")
         assert result == {"test": "bedrock/test-model"}
+
+    def test_profile_cache_isolation(self):
+        """Different profiles for the same region must not share a cache entry."""
+        _bedrock_profiles_cache.clear()
+        _bedrock_profiles_cache["us-east-1:profileA"] = {"model": "bedrock/profile-a-model"}
+        _bedrock_profiles_cache["us-east-1:profileB"] = {"model": "bedrock/profile-b-model"}
+
+        result_a = _fetch_bedrock_inference_profiles("us-east-1", profile_name="profileA")
+        result_b = _fetch_bedrock_inference_profiles("us-east-1", profile_name="profileB")
+        assert result_a["model"] == "bedrock/profile-a-model"
+        assert result_b["model"] == "bedrock/profile-b-model"
+        assert result_a != result_b
 
 
 # =============================================================================
@@ -310,6 +326,54 @@ class TestBedrockModelMapping:
             result = backend.map_model_id("eu.anthropic.claude-sonnet-4-20250514-v1:0")
             assert result == "bedrock/eu.anthropic.claude-sonnet-4-20250514-v1:0"
 
+    def test_arn_passthrough(self):
+        """Application inference profile ARNs must use the converse route."""
+        with patch(
+            "headroom.backends.litellm._fetch_bedrock_inference_profiles",
+            return_value={},
+        ):
+            backend = LiteLLMBackend(provider="bedrock", region="ap-southeast-2")
+            arn = "arn:aws:bedrock:ap-southeast-2:123456789012:application-inference-profile/abc123"
+            result = backend.map_model_id(arn)
+            assert result == f"bedrock/converse/{arn}"
+
+    def test_ap_southeast_2_uses_au_prefix(self):
+        """ap-southeast-2 (Sydney/Australia) should use 'au.' prefix, not 'apac.'."""
+        with patch(
+            "headroom.backends.litellm._fetch_bedrock_inference_profiles",
+            return_value={},
+        ):
+            backend = LiteLLMBackend(provider="bedrock", region="ap-southeast-2")
+            result = backend.map_model_id("claude-sonnet-4-5-20250929")
+            assert result == "bedrock/au.anthropic.claude-sonnet-4-5-20250929-v1:0"
+
+    def test_override_pins_plain_name_to_app_profile_arn(self, monkeypatch):
+        """HEADROOM_BEDROCK_MODEL_MAP pins a plain name to a specific app
+        profile ARN and routes it via the converse endpoint, winning over
+        the discovered map."""
+        arn = "arn:aws:bedrock:ap-southeast-1:1:application-inference-profile/x57j1esjrt66"
+        monkeypatch.setenv("HEADROOM_BEDROCK_MODEL_MAP", f"claude-sonnet-5={arn}")
+        with patch(
+            "headroom.backends.litellm._fetch_bedrock_inference_profiles",
+            # Discovery also has a system-defined sonnet-5; the override must win.
+            return_value={"claude-sonnet-5": "bedrock/global.anthropic.claude-sonnet-5"},
+        ):
+            backend = LiteLLMBackend(provider="bedrock", region="ap-southeast-1")
+            assert backend.map_model_id("claude-sonnet-5") == f"bedrock/converse/{arn}"
+
+    def test_override_absent_falls_through_to_discovery(self, monkeypatch):
+        """A model not pinned in the override map resolves via discovery."""
+        arn = "arn:aws:bedrock:ap-southeast-1:1:application-inference-profile/x57j1esjrt66"
+        monkeypatch.setenv("HEADROOM_BEDROCK_MODEL_MAP", f"claude-sonnet-5={arn}")
+        with patch(
+            "headroom.backends.litellm._fetch_bedrock_inference_profiles",
+            return_value={"claude-opus-4-8": "bedrock/global.anthropic.claude-opus-4-8"},
+        ):
+            backend = LiteLLMBackend(provider="bedrock", region="ap-southeast-1")
+            assert backend.map_model_id("claude-opus-4-8") == (
+                "bedrock/global.anthropic.claude-opus-4-8"
+            )
+
 
 # =============================================================================
 # Normalize Bedrock Profile ID (edge cases)
@@ -352,3 +416,172 @@ class TestNormalizeBedrockProfileId:
         assert _normalize_bedrock_profile_id("claude-sonnet-4-20250514") == (
             "claude-sonnet-4-20250514"
         )
+
+    def test_global_prefix_no_version_suffix(self):
+        # Current-gen cross-region profile: "global." prefix, no version
+        # suffix at all. Must strip the prefix and keep the bare name.
+        assert _normalize_bedrock_profile_id("global.anthropic.claude-opus-4-8") == (
+            "claude-opus-4-8"
+        )
+
+    def test_global_prefix_bare_v_suffix(self):
+        # "global." prefix with an undated "-v1" (no ":revision") suffix.
+        assert _normalize_bedrock_profile_id("global.anthropic.claude-opus-4-6-v1") == (
+            "claude-opus-4-6"
+        )
+
+    def test_global_prefix_dated_full_suffix(self):
+        # "global." prefix with the legacy dated "-vN:M" suffix.
+        assert (
+            _normalize_bedrock_profile_id("global.anthropic.claude-haiku-4-5-20251001-v1:0")
+            == "claude-haiku-4-5-20251001"
+        )
+
+    def test_global_prefix_next_gen_names(self):
+        assert (
+            _normalize_bedrock_profile_id("global.anthropic.claude-sonnet-5") == "claude-sonnet-5"
+        )
+        assert _normalize_bedrock_profile_id("global.anthropic.claude-fable-5") == "claude-fable-5"
+
+
+# =============================================================================
+# HEADROOM_BEDROCK_MODEL_MAP operator override parsing
+# =============================================================================
+
+
+class TestParseBedrockModelOverrides:
+    """Test the HEADROOM_BEDROCK_MODEL_MAP override parser."""
+
+    def test_none_and_empty_yield_empty(self):
+        from headroom.backends.litellm import _parse_bedrock_model_overrides
+
+        assert _parse_bedrock_model_overrides(None) == {}
+        assert _parse_bedrock_model_overrides("") == {}
+        assert _parse_bedrock_model_overrides("   ") == {}
+
+    def test_single_pair(self):
+        from headroom.backends.litellm import _parse_bedrock_model_overrides
+
+        arn = "arn:aws:bedrock:ap-southeast-1:1:application-inference-profile/x57j1esjrt66"
+        assert _parse_bedrock_model_overrides(f"claude-sonnet-5={arn}") == {"claude-sonnet-5": arn}
+
+    def test_multiple_pairs_and_whitespace(self):
+        from headroom.backends.litellm import _parse_bedrock_model_overrides
+
+        raw = " claude-sonnet-5=arn:a , claude-opus-4-8=arn:b "
+        assert _parse_bedrock_model_overrides(raw) == {
+            "claude-sonnet-5": "arn:a",
+            "claude-opus-4-8": "arn:b",
+        }
+
+    def test_skips_malformed_entries(self):
+        from headroom.backends.litellm import _parse_bedrock_model_overrides
+
+        # Missing "=" and blank segments are skipped, valid pairs survive.
+        assert _parse_bedrock_model_overrides("garbage,,claude-sonnet-5=arn:a,=noname") == {
+            "claude-sonnet-5": "arn:a",
+        }
+
+
+# =============================================================================
+# Named profile forwarded to acompletion kwargs
+# =============================================================================
+
+_MODEL_MAP_US = {"claude-sonnet-4-20250514": "bedrock/us.anthropic.claude-sonnet-4-20250514-v1:0"}
+_BODY = {
+    "model": "claude-sonnet-4-20250514",
+    "messages": [{"role": "user", "content": "hi"}],
+    "max_tokens": 10,
+}
+
+
+def _make_fake_completion_resp():
+    mock_resp = MagicMock()
+    mock_resp.choices = [MagicMock()]
+    mock_resp.choices[0].message.content = "hello"
+    mock_resp.choices[0].message.tool_calls = None
+    mock_resp.choices[0].finish_reason = "stop"
+    mock_resp.usage.prompt_tokens = 10
+    mock_resp.usage.completion_tokens = 5
+    return mock_resp
+
+
+class TestBedrockProfileForwardedToCompletion:
+    """Regression: --bedrock-profile must be passed to acompletion(), not just to
+    _fetch_bedrock_inference_profiles() at startup. Without self.profile_name the
+    actual Bedrock call still uses ambient/default credentials even when the user
+    explicitly supplied a named SSO profile."""
+
+    def setup_method(self):
+        _bedrock_profiles_cache.clear()
+
+    async def test_send_message_passes_aws_profile_name(self):
+        """send_message() must include aws_profile_name in the acompletion() kwargs."""
+        captured_kwargs: dict = {}
+
+        async def fake_acompletion(**kwargs):
+            captured_kwargs.update(kwargs)
+            return _make_fake_completion_resp()
+
+        with (
+            patch(
+                "headroom.backends.litellm._fetch_bedrock_inference_profiles",
+                return_value=_MODEL_MAP_US,
+            ),
+            patch("headroom.backends.litellm.acompletion", side_effect=fake_acompletion),
+        ):
+            backend = LiteLLMBackend(
+                provider="bedrock", region="us-east-1", profile_name="my-sso-profile"
+            )
+            await backend.send_message(body=_BODY, headers={})
+
+        assert captured_kwargs.get("aws_profile_name") == "my-sso-profile"
+
+    async def test_stream_message_passes_aws_profile_name(self):
+        """stream_message() must include aws_profile_name in the acompletion() kwargs."""
+        captured_kwargs: dict = {}
+
+        async def fake_acompletion(**kwargs):
+            captured_kwargs.update(kwargs)
+
+            async def _empty():
+                return
+                yield  # pragma: no cover — makes this an async generator
+
+            return _empty()
+
+        with (
+            patch(
+                "headroom.backends.litellm._fetch_bedrock_inference_profiles",
+                return_value=_MODEL_MAP_US,
+            ),
+            patch("headroom.backends.litellm.acompletion", side_effect=fake_acompletion),
+        ):
+            backend = LiteLLMBackend(
+                provider="bedrock", region="us-east-1", profile_name="my-sso-profile"
+            )
+            async for _ in backend.stream_message(body=_BODY, headers={}):
+                pass
+
+        assert captured_kwargs.get("aws_profile_name") == "my-sso-profile"
+
+    async def test_no_profile_does_not_set_aws_profile_name(self):
+        """When no profile is configured, aws_profile_name must not appear in kwargs
+        (LiteLLM falls back to ambient credentials correctly)."""
+        captured_kwargs: dict = {}
+
+        async def fake_acompletion(**kwargs):
+            captured_kwargs.update(kwargs)
+            return _make_fake_completion_resp()
+
+        with (
+            patch(
+                "headroom.backends.litellm._fetch_bedrock_inference_profiles",
+                return_value=_MODEL_MAP_US,
+            ),
+            patch("headroom.backends.litellm.acompletion", side_effect=fake_acompletion),
+        ):
+            backend = LiteLLMBackend(provider="bedrock", region="us-east-1")
+            await backend.send_message(body=_BODY, headers={})
+
+        assert "aws_profile_name" not in captured_kwargs

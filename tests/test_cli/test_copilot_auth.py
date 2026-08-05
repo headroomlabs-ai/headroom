@@ -48,3 +48,38 @@ def test_copilot_auth_status_reports_missing_login(
 
     assert result.exit_code == 0, result.output
     assert "Status: not logged in" in result.output
+
+
+def test_copilot_auth_login_domain_override_wins_over_enterprise_env(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    auth_file = tmp_path / "copilot_auth.json"
+    monkeypatch.setenv("HEADROOM_COPILOT_AUTH_FILE", str(auth_file))
+    monkeypatch.setenv("GITHUB_COPILOT_ENTERPRISE_URL", "https://ghe.example.com")
+
+    captured: dict[str, object] = {}
+
+    def fake_start(domain: str) -> dict[str, object]:
+        captured["domain"] = domain
+        return {
+            "verification_uri": "https://github.com/login/device",
+            "user_code": "ABCD-1234",
+            "device_code": "device-code",
+            "interval": 1,
+            "expires_in": 900,
+        }
+
+    monkeypatch.setattr(
+        "headroom.cli.copilot_auth.start_copilot_device_authorization",
+        fake_start,
+    )
+    monkeypatch.setattr(
+        "headroom.cli.copilot_auth.poll_copilot_device_authorization",
+        lambda device_code, *, domain, interval, expires_in: "gho-headroom",
+    )
+
+    result = CliRunner().invoke(main, ["copilot-auth", "login", "--domain", "github.com"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["domain"] == "github.com"

@@ -115,11 +115,16 @@ headroom mcp uninstall
 
 # Debug mode
 headroom mcp serve --debug
+
+# Streamable HTTP mode
+headroom mcp serve --transport http --host 127.0.0.1 --port 8788 --path /mcp
 ```
 
 ## MCP host configuration
 
 For MCP hosts that let you configure a local stdio server, point them at `headroom mcp serve`. If you also run the proxy, pass the proxy URL explicitly so retrieval and stats come from the intended proxy instance.
+
+If you are publishing or consuming Headroom through an MCP registry, use the canonical descriptor at `https://github.com/headroomlabs-ai/headroom/blob/main/server.json`. It captures the package form for `headroom-ai[mcp]` and the current `headroom mcp serve` launch contract in one file.
 
 ```json
 {
@@ -152,7 +157,24 @@ For multiple proxy instances, register one stdio MCP server per proxy URL:
 }
 ```
 
-Do not assume that a running proxy exposes an HTTP MCP endpoint at `/mcp`. If `http://127.0.0.1:<port>/mcp` returns `404`, use the stdio configuration above.
+If you need Streamable HTTP instead of stdio, run `headroom mcp serve --transport http` and point your MCP host at that endpoint. The default path is `/mcp`, and the default port is `8788`.
+
+Do not assume that a running proxy exposes an HTTP MCP endpoint at `/mcp`. The proxy serves its own API; it does not automatically provide the MCP HTTP transport.
+
+### `command: "headroom"` fails to start
+
+The configurations above use `"command": "headroom"`, which only works if the `headroom`
+executable is on the PATH your MCP host (Codex, etc.) sees at startup. If you installed Headroom
+into a project virtualenv — for example with `uv add headroom-ai` — the CLI lives only inside
+that venv, and the host fails at launch with:
+
+```text
+MCP client for `headroom` failed to start: MCP startup failed: No such file or directory (os error 2)
+```
+
+Install Headroom so it's globally on PATH — `uv tool install "headroom-ai[mcp]"` (or
+`pipx install "headroom-ai[mcp]"`) — or replace `"headroom"` with the absolute path to the binary
+(`command -v headroom`, or `where headroom` on Windows).
 
 ## Cross-tool compatibility
 

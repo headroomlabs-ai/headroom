@@ -7,7 +7,8 @@ prevents future token waste.
 Plugin architecture:
     plugins/claude.py  ─┐
     plugins/codex.py   ─┤→  Analyzer (LLM)  →  Writer (adapter)
-    plugins/gemini.py  ─┘
+    plugins/gemini.py  ─┤
+    plugins/grok.py    ─┘
 
 Built-in plugins are auto-discovered from headroom.learn.plugins.*.
 External plugins register via the ``headroom.learn_plugin`` entry point.

@@ -9,7 +9,12 @@ import pytest
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 
-from headroom.observability import HeadroomOtelMetrics, reset_otel_metrics, set_otel_metrics
+from headroom.observability import (
+    HeadroomOtelMetrics,
+    get_otel_meter,
+    reset_otel_metrics,
+    set_otel_metrics,
+)
 from headroom.proxy.prometheus_metrics import PrometheusMetrics
 from headroom.transforms.pipeline import TransformPipeline
 
@@ -126,6 +131,22 @@ def test_headroom_otel_metrics_records_proxy_and_pipeline_metrics() -> None:
     assert waste_point.value == 12
 
 
+def test_get_otel_meter_uses_headrooms_configured_provider() -> None:
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(metric_readers=[reader])
+    set_otel_metrics(HeadroomOtelMetrics(meter_provider=provider))
+
+    try:
+        meter = get_otel_meter("example.integration", "1.0.0")
+        meter.create_counter("example.integration.events").add(1, {"source": "test"})
+
+        metric = _collect_metrics(reader)["example.integration.events"]
+        point = _find_point(metric, source="test")
+        assert point.value == 1
+    finally:
+        reset_otel_metrics()
+
+
 @dataclass
 class _SpyMetrics:
     pipeline_calls: list[dict[str, Any]] = field(default_factory=list)
@@ -198,3 +219,20 @@ async def test_prometheus_metrics_reads_late_configured_otel_metrics() -> None:
         assert spy.rate_limited_calls == [{"provider": "anthropic", "model": "claude-sonnet"}]
     finally:
         reset_otel_metrics()
+
+
+@pytest.mark.asyncio
+async def test_prometheus_metrics_clamps_negative_token_savings() -> None:
+    metrics = PrometheusMetrics()
+
+    await metrics.record_request(
+        provider="openai",
+        model="openai-compatible",
+        input_tokens=100,
+        output_tokens=5,
+        tokens_saved=-25,
+        latency_ms=1.0,
+    )
+
+    assert metrics.tokens_saved_total == 0
+    assert metrics.savings_history[-1][1] == 0

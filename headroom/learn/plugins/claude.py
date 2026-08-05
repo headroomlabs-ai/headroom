@@ -10,7 +10,7 @@ import logging
 import re
 from pathlib import Path, PureWindowsPath
 
-from .._shared import classify_error, is_error_content
+from .._shared import classify_error, claude_config_dir, is_error_content
 from ..base import ConversationScanner, LearnPlugin
 from ..models import (
     ErrorCategory,
@@ -33,7 +33,7 @@ class ClaudeCodePlugin(LearnPlugin, ConversationScanner):
     """
 
     def __init__(self, claude_dir: Path | None = None):
-        self.claude_dir = claude_dir or Path.home() / ".claude"
+        self.claude_dir = claude_dir or claude_config_dir()
         self.projects_dir = self.claude_dir / "projects"
 
     # --- LearnPlugin identity ---
@@ -70,19 +70,21 @@ class ClaudeCodePlugin(LearnPlugin, ConversationScanner):
 
             project_path = _decode_project_path(entry.name)
             if project_path is None:
-                fallback_parts = entry.name[1:].split("-")
-                if len(fallback_parts[0]) == 1 and fallback_parts[0].isalpha():
-                    drive = fallback_parts[0].upper()
-                    project_path = Path(f"{drive}:\\" + "\\".join(fallback_parts[1:]))
+                win = re.match(r"^-?([A-Za-z])--?(.+)$", entry.name)
+                if win:
+                    drive = win.group(1).upper()
+                    tokens = [p for p in win.group(2).split("-") if p]
+                    project_path = Path(f"{drive}:\\" + "\\".join(tokens))
                 else:
-                    project_path = Path("/" + entry.name[1:].replace("-", "/"))
+                    stripped = entry.name.lstrip("-")
+                    project_path = Path("/" + stripped.replace("-", "/"))
 
             name = _project_display_name(project_path, entry.name)
 
             context_file = None
-            if project_path.exists():
+            if _path_exists(project_path):
                 claude_md = project_path / "CLAUDE.md"
-                if claude_md.exists():
+                if _path_exists(claude_md):
                     context_file = claude_md
 
             memory_dir = entry / "memory"
@@ -93,6 +95,11 @@ class ClaudeCodePlugin(LearnPlugin, ConversationScanner):
             jsonl_files = list(entry.glob("*.jsonl"))
             if not jsonl_files:
                 continue
+
+            session_project_path = self._project_path_from_session_cwd(jsonl_files)
+            if session_project_path is not None:
+                project_path = session_project_path
+                name = _project_display_name(project_path, entry.name)
 
             projects.append(
                 ProjectInfo(
@@ -106,27 +113,78 @@ class ClaudeCodePlugin(LearnPlugin, ConversationScanner):
 
         return projects
 
-    def scan_project(self, project: ProjectInfo, max_workers: int = 1) -> list[SessionData]:
-        """Scan all conversation JSONL files for a project."""
-        jsonl_files = sorted(project.data_path.glob("*.jsonl"))
+    @staticmethod
+    def _project_path_from_session_cwd(jsonl_files: list[Path]) -> Path | None:
+        for jsonl_path in sorted(jsonl_files):
+            try:
+                with open(jsonl_path, encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        if not line.strip():
+                            continue
+                        try:
+                            event = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        cwd = event.get("cwd")
+                        if isinstance(cwd, str) and cwd:
+                            project_path = Path(cwd)
+                            if project_path.exists():
+                                return project_path
+            except (OSError, UnicodeDecodeError):
+                continue
+        return None
+
+    def scan_project(
+        self, project: ProjectInfo, max_workers: int = 1, include_subagents: bool = True
+    ) -> list[SessionData]:
+        """Scan all conversation JSONL files for a project.
+
+        Claude Code writes the main session at ``<project>/<uuid>.jsonl`` and
+        nests the transcripts it spawns under ``<project>/<uuid>/subagents/**``
+        (subagents) and ``.../subagents/workflows/**`` (workflow agents). Each
+        nested transcript is its own context window with its own token spend, so
+        by default we descend into them. Pass ``include_subagents=False`` to
+        restrict to top-level main sessions only.
+        """
+        data_path = project.data_path
+        if include_subagents:
+            jsonl_files = sorted(data_path.rglob("*.jsonl"))
+        else:
+            jsonl_files = sorted(data_path.glob("*.jsonl"))
         if not jsonl_files:
             return []
 
+        file_sources = [(f, self._classify_source(data_path, f)) for f in jsonl_files]
+
         if max_workers <= 1 or len(jsonl_files) <= 1:
-            return [s for f in jsonl_files if (s := self._scan_session(f)) and s.tool_calls]
+            return [
+                s
+                for f, src in file_sources
+                if (s := self._scan_session(f, source=src)) and s.tool_calls
+            ]
 
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
         sessions: list[SessionData] = []
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(self._scan_session, f): f for f in jsonl_files}
+            futures = {executor.submit(self._scan_session, f, src): f for f, src in file_sources}
             for future in as_completed(futures):
                 session = future.result()
                 if session and session.tool_calls:
                     sessions.append(session)
         return sessions
 
-    def _scan_session(self, jsonl_path: Path) -> SessionData | None:
+    @staticmethod
+    def _classify_source(data_path: Path, jsonl_path: Path) -> str:
+        """Tag a transcript as main / subagent / workflow from its path depth."""
+        parts = jsonl_path.relative_to(data_path).parts
+        if len(parts) == 1:
+            return "main"
+        if "workflows" in parts:
+            return "workflow"
+        return "subagent"
+
+    def _scan_session(self, jsonl_path: Path, source: str = "main") -> SessionData | None:
         """Scan a single JSONL conversation file."""
         session_id = jsonl_path.stem
         tool_uses: dict[str, tuple[str, dict]] = {}
@@ -137,7 +195,7 @@ class ClaudeCodePlugin(LearnPlugin, ConversationScanner):
         msg_index = 0
 
         try:
-            with open(jsonl_path) as f:
+            with open(jsonl_path, encoding="utf-8", errors="replace") as f:
                 for line in f:
                     try:
                         d = json.loads(line)
@@ -150,7 +208,12 @@ class ClaudeCodePlugin(LearnPlugin, ConversationScanner):
 
                     if line_type == "assistant":
                         self._extract_tool_uses(d, tool_uses)
-                        usage = d.get("message", {}).get("usage", {})
+                        # `get("message", {})` returns None for an explicit
+                        # {"message": null} line (the default only applies to a
+                        # missing key); `.get` on None then raises AttributeError,
+                        # which the OSError/UnicodeDecodeError guard does not catch
+                        # — so one malformed line crashed the whole learn run.
+                        usage = (d.get("message") or {}).get("usage", {})
                         total_input_tokens += usage.get("input_tokens", 0)
                         total_input_tokens += usage.get("cache_read_input_tokens", 0)
                         total_input_tokens += usage.get("cache_creation_input_tokens", 0)
@@ -174,11 +237,12 @@ class ClaudeCodePlugin(LearnPlugin, ConversationScanner):
             events=events,
             total_input_tokens=total_input_tokens,
             total_output_tokens=total_output_tokens,
+            source=source,
         )
 
     def _extract_tool_uses(self, d: dict, tool_uses: dict[str, tuple[str, dict]]) -> None:
         """Extract tool_use blocks from an assistant message."""
-        msg = d.get("message", {})
+        msg = d.get("message") or {}
         content = msg.get("content", [])
         if not isinstance(content, list):
             return
@@ -202,7 +266,7 @@ class ClaudeCodePlugin(LearnPlugin, ConversationScanner):
         timestamp: str | None = None,
     ) -> None:
         """Extract tool_result blocks from a user message and match to tool_uses."""
-        msg = d.get("message", {})
+        msg = d.get("message") or {}
         content = msg.get("content", [])
         if not isinstance(content, list):
             return
@@ -268,7 +332,7 @@ class ClaudeCodePlugin(LearnPlugin, ConversationScanner):
         timestamp: str | None = None,
     ) -> None:
         """Extract user text messages and interruptions from a user line."""
-        msg = d.get("message", {})
+        msg = d.get("message") or {}
         content = msg.get("content", "")
 
         if isinstance(content, str) and content.strip():
@@ -304,8 +368,58 @@ class ClaudeCodePlugin(LearnPlugin, ConversationScanner):
 # =============================================================================
 
 
+def _path_exists(path: Path) -> bool:
+    """Like ``Path.exists()`` but treats an unreadable path as absent.
+
+    ``_decode_project_path`` probes speculative candidate paths (e.g.
+    ``/home/marco/rocha`` when reconstructing ``/home/marco-rocha/...``). A
+    candidate can collide with another user's directory whose parent isn't
+    stat-able, and ``Path.exists()`` calls ``os.stat`` which then raises
+    ``PermissionError`` instead of returning ``False`` — crashing the whole
+    ``learn`` command (issue #2443). Match ``_greedy_path_decode``'s existing
+    ``OSError`` handling and treat any such error as "does not exist".
+    """
+    try:
+        return path.exists()
+    except OSError:
+        return False
+
+
+def _decode_windows_path(drive: str, parts: list[str]) -> Path | None:
+    """Reconstruct a Windows path from drive letter + dash-split tokens.
+
+    Empty tokens (from consecutive dashes in the encoded name) are dropped so
+    the literal join never produces doubled separators.
+    """
+    tokens = [p for p in parts if p]
+    if not tokens:
+        return None
+    win_path = Path(f"{drive}:\\" + "\\".join(tokens))
+    if _path_exists(win_path):
+        return win_path
+    drive_root = Path(f"{drive}:\\")
+    if _path_exists(drive_root):
+        result = _greedy_path_decode(drive_root, tokens)
+        if result:
+            return result
+    if tokens[0].lower() == "users":
+        return win_path
+    return None
+
+
 def _decode_project_path(escaped_name: str) -> Path | None:
     """Decode a Claude Code escaped project path."""
+    # Windows paths are encoded without a leading dash: "C:\Users\x" becomes
+    # "C--Users-x" (":" and "\" each collapse to "-"). Older callers also pass
+    # the legacy "-C-Users-x" form; accept both.
+    win = re.match(r"^-?([A-Za-z])--?(.+)$", escaped_name)
+    if win:
+        result = _decode_windows_path(win.group(1).upper(), win.group(2).split("-"))
+        if result is not None:
+            return result
+        if not escaped_name.startswith("-"):
+            return None
+
     if not escaped_name.startswith("-"):
         return None
 
@@ -313,21 +427,8 @@ def _decode_project_path(escaped_name: str) -> Path | None:
     if len(parts) < 2:
         return None
 
-    if len(parts[0]) == 1 and parts[0].isalpha():
-        drive = parts[0].upper()
-        win_path = Path(f"{drive}:\\" + "\\".join(parts[1:]))
-        if win_path.exists():
-            return win_path
-        win_base = Path(f"{drive}:\\{parts[1]}") if len(parts) > 1 else win_path
-        if win_base.exists() and len(parts) > 2:
-            result = _greedy_path_decode(win_base, parts[2:])
-            if result:
-                return result
-        if len(parts) > 1 and parts[1].lower() == "users":
-            return win_path
-
     simple = Path("/" + escaped_name[1:].replace("-", "/"))
-    if simple.exists():
+    if _path_exists(simple):
         return simple
 
     if len(parts) < 3:
@@ -361,15 +462,29 @@ def _project_display_name(project_path: Path, fallback: str) -> str:
 def _greedy_path_decode(base: Path, parts: list[str]) -> Path | None:
     """Greedily decode remaining path parts using real child directories."""
     if not parts:
-        return base if base.exists() else None
+        return base if _path_exists(base) else None
 
-    if not base.exists() or not base.is_dir():
+    if not _path_exists(base) or not base.is_dir():
         return None
 
     try:
-        children = sorted(child for child in base.iterdir() if child.is_dir())
+        entries = list(base.iterdir())
     except OSError:
         return None
+
+    # Windows profiles routinely contain reparse-point junctions (e.g.
+    # "AppData\Local\Temporary Internet Files") that raise PermissionError on
+    # is_dir(). Skip those entries individually instead of letting one
+    # inaccessible sibling abort the whole listing — and thus every project
+    # path that happens to walk through this directory.
+    children = []
+    for entry in entries:
+        try:
+            if entry.is_dir():
+                children.append(entry)
+        except OSError:
+            continue
+    children.sort()
 
     for child in children:
         for tokenization in _component_tokenizations(child.name):
@@ -397,9 +512,9 @@ def _component_tokenizations(component: str) -> list[list[str]]:
 
     add([component])
 
-    for separator in ("-", ".", "_", None):
+    for separator in (" ", "-", ".", "_", None):
         if separator is None:
-            tokens = [token for token in re.split(r"[-._]", component) if token]
+            tokens = [token for token in re.split(r"[-.\s_]", component) if token]
         else:
             tokens = [token for token in component.split(separator) if token]
         add(tokens)
@@ -407,9 +522,9 @@ def _component_tokenizations(component: str) -> list[list[str]]:
     if component.startswith(".") and len(component) > 1:
         hidden_component = component[1:]
         add(["", hidden_component])
-        for separator in ("-", ".", "_", None):
+        for separator in (" ", "-", ".", "_", None):
             if separator is None:
-                tokens = [token for token in re.split(r"[-._]", hidden_component) if token]
+                tokens = [token for token in re.split(r"[-.\s_]", hidden_component) if token]
             else:
                 tokens = [token for token in hidden_component.split(separator) if token]
             add(["", *tokens])

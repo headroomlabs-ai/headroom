@@ -12,6 +12,8 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import functools
+import os
 from typing import Any
 from unittest.mock import patch
 
@@ -22,6 +24,24 @@ from headroom.proxy.memory_handler import (
     MemoryConfig,
     MemoryHandler,
 )
+from tests._skip_helpers import external_model_skip_reason
+
+
+def skip_offline_model_failures(func):
+    """Skip real-backend smoke tests when the local embedder cannot start offline."""
+
+    @functools.wraps(func)
+    async def wrapper(*args, **kwargs):
+        try:
+            return await func(*args, **kwargs)
+        except Exception as exc:
+            reason = external_model_skip_reason(exc)
+            if reason is not None:
+                pytest.skip(reason)
+            raise
+
+    return wrapper
+
 
 # -------------------------------------------------------------------
 # Singleflight under concurrent callers
@@ -224,6 +244,7 @@ async def test_ensure_initialized_cancellation_propagates_and_resets_state(tmp_p
 
 
 @pytest.mark.asyncio
+@skip_offline_model_failures
 async def test_real_localbackend_initializes_via_public_entrypoint(tmp_path):
     """End-to-end sanity check: the public ``ensure_initialized`` path works
     against a real LocalBackend. This catches regressions where the new
@@ -253,6 +274,8 @@ async def test_real_localbackend_initializes_via_public_entrypoint(tmp_path):
 
     # warmup_embedder is best-effort; on a real backend it should succeed.
     warmed = await handler.warmup_embedder()
+    if not warmed and os.environ.get("TRANSFORMERS_OFFLINE") == "1":
+        pytest.skip("Skipped because required Hugging Face model files are unavailable offline")
     assert warmed is True
     await handler.close()
 

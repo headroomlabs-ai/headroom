@@ -7,9 +7,12 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import click
+
+from headroom._subprocess import run
 
 from .models import ArtifactRecord, DeploymentManifest, SupervisorKind
 from .paths import (
@@ -20,21 +23,83 @@ from .paths import (
     windows_run_cmd_path,
     windows_run_script_path,
 )
+from .providers import _powershell_literal
 from .runtime import resolve_headroom_command
+
+# After `launchctl bootout`, a follow-up `bootstrap` of the same label can
+# return EIO (error 5) for several seconds while launchd releases it. Retry the
+# bootstrap up to ~15s (30 attempts x 0.5s) to ride out that settle window.
+_MACOS_BOOTSTRAP_RETRIES = 30
+_MACOS_BOOTSTRAP_RETRY_DELAY = 0.5
+
+# `launchctl bootout` of an already-absent job exits with ESRCH ("No such
+# process"). That single code is the only failure we treat as already-stopped.
+_LAUNCHCTL_ESRCH = 3
+_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def _is_windows() -> bool:
     return sys.platform.startswith("win")
 
 
+def _validated_env_items(env: dict[str, str] | None) -> list[tuple[str, str]]:
+    items = list((env or {}).items())
+    for name, _value in items:
+        if not _ENV_NAME_RE.fullmatch(name):
+            raise click.ClickException(
+                f"Invalid environment variable name {name!r}; expected [A-Za-z_][A-Za-z0-9_]*."
+            )
+    return items
+
+
+def _bootstrap_with_retry(domain: str, plist_path: Path, *, action: str = "bootstrap") -> None:
+    """Bootstrap ``plist_path`` into ``domain``, riding out launchd's EIO window.
+
+    After a `launchctl bootout`, a follow-up `bootstrap` of the same label can
+    return EIO (error 5) for several seconds while launchd releases it. Retry
+    for ~15s before giving up. Shared by `install_supervisor` (bootout+bootstrap
+    on every apply) and `start_supervisor` (bootstrap after a failed kickstart)
+    so both self-heal instead of requiring the manual bootout+rm+reapply
+    recovery previously documented for this race.
+    """
+    last: subprocess.CompletedProcess[str] | None = None
+    for _ in range(_MACOS_BOOTSTRAP_RETRIES):
+        boot = run(
+            ["launchctl", "bootstrap", domain, str(plist_path)],
+            capture_output=True,
+            text=True,
+        )
+        if boot.returncode == 0:
+            return
+        last = boot
+        time.sleep(_MACOS_BOOTSTRAP_RETRY_DELAY)
+    detail = (last.stderr or last.stdout or "").strip() if last is not None else ""
+    raise click.ClickException(
+        f"launchctl could not {action} {domain}/{plist_path.stem}: {detail or 'unknown error'}"
+    )
+
+
 def _command_for_script(*parts: str) -> list[str]:
     return [*resolve_headroom_command(), *parts]
 
 
-def _render_unix_runner(path: Path, command: list[str]) -> ArtifactRecord:
+def _render_unix_runner(
+    path: Path, command: list[str], env: dict[str, str] | None = None
+) -> ArtifactRecord:
     path.parent.mkdir(parents=True, exist_ok=True)
+    # Supervisors (launchd, systemd, cron) invoke this script with a bare
+    # environment — they do not inherit the interactive shell's exports (e.g.
+    # AWS_PROFILE, a custom HEADROOM_WORKSPACE_DIR). Export base_env here, before
+    # the exec, so `headroom install agent run` itself (which loads the manifest
+    # from HEADROOM_WORKSPACE_DIR) sees the same environment `install apply` was
+    # run under, not just the proxy subprocess it spawns.
+    export_lines = "".join(
+        f"export {name}={shlex.quote(value)}\n" for name, value in _validated_env_items(env)
+    )
     path.write_text(
-        "#!/usr/bin/env bash\nset -euo pipefail\nexec "
+        "#!/usr/bin/env bash\nset -euo pipefail\n"
+        + export_lines
+        + "exec "
         + " ".join(shlex.quote(x) for x in command)
         + "\n"
     )
@@ -43,13 +108,20 @@ def _render_unix_runner(path: Path, command: list[str]) -> ArtifactRecord:
 
 
 def _render_windows_runner(
-    ps1_path: Path, cmd_path: Path, command: list[str]
+    ps1_path: Path, cmd_path: Path, command: list[str], env: dict[str, str] | None = None
 ) -> list[ArtifactRecord]:
     ps1_path.parent.mkdir(parents=True, exist_ok=True)
     escaped = " ".join(
         [f'"{item}"' if (" " in item or item.endswith(".cmd")) else item for item in command]
     )
-    ps1_path.write_text(f"$ErrorActionPreference = 'Stop'\n& {escaped}\nexit $LASTEXITCODE\n")
+    # See _render_unix_runner: Windows services/tasks also start with a bare
+    # environment, so base_env must be set explicitly before invoking headroom.
+    env_lines = "".join(
+        f"$env:{name} = {_powershell_literal(value)}\n" for name, value in _validated_env_items(env)
+    )
+    ps1_path.write_text(
+        f"$ErrorActionPreference = 'Stop'\n{env_lines}& {escaped}\nexit $LASTEXITCODE\n"
+    )
     cmd_path.write_text(
         '@echo off\r\npowershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0'
         + ps1_path.name
@@ -71,6 +143,7 @@ def render_runner_scripts(manifest: DeploymentManifest) -> list[ArtifactRecord]:
                 windows_run_script_path(manifest.profile),
                 windows_run_cmd_path(manifest.profile),
                 _command_for_script("install", "agent", "run", "--profile", manifest.profile),
+                manifest.base_env,
             )
         )
         records.extend(
@@ -78,6 +151,7 @@ def render_runner_scripts(manifest: DeploymentManifest) -> list[ArtifactRecord]:
                 windows_ensure_script_path(manifest.profile),
                 windows_ensure_cmd_path(manifest.profile),
                 _command_for_script("install", "agent", "ensure", "--profile", manifest.profile),
+                manifest.base_env,
             )
         )
         return records
@@ -86,10 +160,12 @@ def render_runner_scripts(manifest: DeploymentManifest) -> list[ArtifactRecord]:
         _render_unix_runner(
             unix_run_script_path(manifest.profile),
             _command_for_script("install", "agent", "run", "--profile", manifest.profile),
+            manifest.base_env,
         ),
         _render_unix_runner(
             unix_ensure_script_path(manifest.profile),
             _command_for_script("install", "agent", "ensure", "--profile", manifest.profile),
+            manifest.base_env,
         ),
     ]
 
@@ -195,7 +271,11 @@ def install_supervisor(manifest: DeploymentManifest) -> list[ArtifactRecord]:
             cron_path.write_text(content)
             records.append(ArtifactRecord(kind="cron", path=str(cron_path)))
         else:
-            current = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
+            current = run(
+                ["crontab", "-l"],
+                capture_output=True,
+                text=True,
+            )
             existing = current.stdout if current.returncode == 0 else ""
             marker_start = f"# >>> headroom {manifest.profile} >>>"
             marker_end = f"# <<< headroom {manifest.profile} <<<"
@@ -204,7 +284,12 @@ def install_supervisor(manifest: DeploymentManifest) -> list[ArtifactRecord]:
             )
             merged = pattern.sub("", existing).strip()
             new_content = (merged + "\n\n" + content).strip() + "\n"
-            subprocess.run(["crontab", "-"], input=new_content, text=True, check=True)
+            run(
+                ["crontab", "-"],
+                input=new_content,
+                text=True,
+                check=True,
+            )
             records.append(ArtifactRecord(kind="crontab", path=f"user:{manifest.profile}"))
         return records
 
@@ -223,23 +308,32 @@ def install_supervisor(manifest: DeploymentManifest) -> list[ArtifactRecord]:
             and manifest.supervisor_kind == SupervisorKind.SERVICE.value
             else f"gui/{os.getuid()}/{plist_path.stem}"
         )
-        subprocess.run(["launchctl", "bootout", domain], capture_output=True, text=True)
+        run(
+            ["launchctl", "bootout", domain],
+            capture_output=True,
+            text=True,
+        )
         bootstrap_domain = (
             "system"
             if manifest.scope == "system"
             and manifest.supervisor_kind == SupervisorKind.SERVICE.value
             else f"gui/{os.getuid()}"
         )
-        subprocess.run(["launchctl", "bootstrap", bootstrap_domain, str(plist_path)], check=True)
+        _bootstrap_with_retry(bootstrap_domain, plist_path)
         records.append(ArtifactRecord(kind="plist", path=str(plist_path)))
         return records
 
     if _is_windows() and manifest.supervisor_kind == SupervisorKind.SERVICE.value:
-        service_bin = f'cmd.exe /c "{windows_run_cmd_path(manifest.profile)}"'
-        subprocess.run(
-            ["sc.exe", "create", manifest.service_name, f"binPath= {service_bin}", "start= auto"],
-            check=True,
+        # sc.exe's binPath= value embeds its own quotes (cmd.exe /c "<path>").
+        # Passing this as an argv list lets subprocess.list2cmdline re-quote the
+        # token and sc.exe mis-tokenizes it (issue #1654), so build the exact
+        # command line ourselves and hand subprocess a string.
+        run_cmd = windows_run_cmd_path(manifest.profile)
+        create_cmd = (
+            f"sc.exe create {manifest.service_name} "
+            f'binPath= "cmd.exe /c \\"{run_cmd}\\"" start= auto'
         )
+        subprocess.run(create_cmd, check=True)
         subprocess.run(
             ["sc.exe", "failure", manifest.service_name, "reset= 0", "actions= restart/5000"],
             check=True,
@@ -310,7 +404,28 @@ def start_supervisor(manifest: DeploymentManifest) -> None:
             and manifest.supervisor_kind == SupervisorKind.SERVICE.value
             else f"gui/{os.getuid()}"
         )
-        subprocess.run(["launchctl", "kickstart", "-k", f"{domain}/{label}"], check=True)
+        # Fast path: when the job is already bootstrapped (e.g. `start` right
+        # after `install apply`, or `start` on a running service), `kickstart`
+        # restarts it in place.
+        kick = run(
+            ["launchctl", "kickstart", "-k", f"{domain}/{label}"],
+            capture_output=True,
+            text=True,
+        )
+        if kick.returncode == 0:
+            return
+        # Otherwise the job is not registered in the domain. This is the state
+        # `stop`/`restart` leave behind, since they `bootout` the job, and
+        # `kickstart` cannot recover it (launchctl error 113). Bootstrap fresh
+        # instead — a successful bootstrap also starts the job via RunAtLoad.
+        plist_dir = (
+            Path("/Library/LaunchDaemons")
+            if manifest.scope == "system"
+            and manifest.supervisor_kind == SupervisorKind.SERVICE.value
+            else Path.home() / "Library" / "LaunchAgents"
+        )
+        plist_path = plist_dir / f"{label}.plist"
+        _bootstrap_with_retry(domain, plist_path, action="start")
         return
     if _is_windows() and manifest.supervisor_kind == SupervisorKind.SERVICE.value:
         subprocess.run(["sc.exe", "start", manifest.service_name], check=True)
@@ -333,7 +448,21 @@ def stop_supervisor(manifest: DeploymentManifest) -> None:
             and manifest.supervisor_kind == SupervisorKind.SERVICE.value
             else f"gui/{os.getuid()}"
         )
-        subprocess.run(["launchctl", "bootout", f"{domain}/{label}"], check=True)
+        # `bootout` exits with ESRCH ("No such process") when the job is already
+        # absent — tolerate only that, so `restart` can proceed to start again.
+        # Any other non-zero result is a real failure (permissions, malformed
+        # domain, launchd error) and must surface; otherwise `restart` could
+        # report success while a stale job is still running.
+        result = run(
+            ["launchctl", "bootout", f"{domain}/{label}"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode not in (0, _LAUNCHCTL_ESRCH):
+            detail = (result.stderr or result.stdout or "").strip()
+            raise click.ClickException(
+                f"launchctl bootout failed for {domain}/{label}: {detail or 'unknown error'}"
+            )
         return
     if _is_windows() and manifest.supervisor_kind == SupervisorKind.SERVICE.value:
         subprocess.run(["sc.exe", "stop", manifest.service_name], check=True)
@@ -348,7 +477,7 @@ def remove_supervisor(manifest: DeploymentManifest) -> None:
     if sys.platform.startswith("linux"):
         if manifest.supervisor_kind == SupervisorKind.SERVICE.value:
             flags = [] if manifest.scope == "system" else ["--user"]
-            subprocess.run(
+            run(
                 ["systemctl", *flags, "disable", "--now", manifest.service_name],
                 capture_output=True,
                 text=True,
@@ -356,21 +485,32 @@ def remove_supervisor(manifest: DeploymentManifest) -> None:
             unit_path, _ = _linux_service_unit(manifest, unix_run_script_path(manifest.profile))
             if unit_path.exists():
                 unit_path.unlink()
-            subprocess.run(["systemctl", *flags, "daemon-reload"], capture_output=True, text=True)
+            run(
+                ["systemctl", *flags, "daemon-reload"],
+                capture_output=True,
+                text=True,
+            )
             return
         cron_path, _ = _linux_task_spec(manifest, unix_ensure_script_path(manifest.profile))
         if cron_path and cron_path.exists():
             cron_path.unlink()
             return
-        current = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
+        current = run(
+            ["crontab", "-l"],
+            capture_output=True,
+            text=True,
+        )
         if current.returncode != 0:
             return
         marker_start = f"# >>> headroom {manifest.profile} >>>"
         marker_end = f"# <<< headroom {manifest.profile} <<<"
         pattern = re.compile(re.escape(marker_start) + r".*?" + re.escape(marker_end), re.DOTALL)
         content = pattern.sub("", current.stdout).strip()
-        subprocess.run(
-            ["crontab", "-"], input=(content + "\n") if content else "", text=True, check=True
+        run(
+            ["crontab", "-"],
+            input=(content + "\n") if content else "",
+            text=True,
+            check=True,
         )
         return
 
@@ -389,8 +529,10 @@ def remove_supervisor(manifest: DeploymentManifest) -> None:
             and manifest.supervisor_kind == SupervisorKind.SERVICE.value
             else f"gui/{os.getuid()}"
         )
-        subprocess.run(
-            ["launchctl", "bootout", f"{domain}/{label}"], capture_output=True, text=True
+        run(
+            ["launchctl", "bootout", f"{domain}/{label}"],
+            capture_output=True,
+            text=True,
         )
         if plist_path.exists():
             plist_path.unlink()
@@ -398,19 +540,23 @@ def remove_supervisor(manifest: DeploymentManifest) -> None:
 
     if _is_windows():
         if manifest.supervisor_kind == SupervisorKind.SERVICE.value:
-            subprocess.run(
-                ["sc.exe", "stop", manifest.service_name], capture_output=True, text=True
+            run(
+                ["sc.exe", "stop", manifest.service_name],
+                capture_output=True,
+                text=True,
             )
-            subprocess.run(
-                ["sc.exe", "delete", manifest.service_name], capture_output=True, text=True
+            run(
+                ["sc.exe", "delete", manifest.service_name],
+                capture_output=True,
+                text=True,
             )
             return
-        subprocess.run(
+        run(
             ["schtasks", "/Delete", "/TN", f"{manifest.service_name}-startup", "/F"],
             capture_output=True,
             text=True,
         )
-        subprocess.run(
+        run(
             ["schtasks", "/Delete", "/TN", f"{manifest.service_name}-health", "/F"],
             capture_output=True,
             text=True,

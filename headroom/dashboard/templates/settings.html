@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Headroom Settings</title>
+    <script src="/dashboard/static/tailwind.min.js"></script>
+    <script src="/dashboard/static/alpine.min.js" defer></script>
+    <script>
+        (function () {
+            const saved = localStorage.getItem('headroom-theme');
+            const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+            if (saved === 'light' || (!saved && !prefersDark)) {
+                document.documentElement.classList.remove('dark');
+            } else {
+                document.documentElement.classList.add('dark');
+            }
+        })();
+        tailwind.config = { darkMode: 'class', theme: { extend: { colors: { accent: '#22d3ee' } } } };
+    </script>
+    <style>
+        :root { --bg: #f9fafb; --surface: #ffffff; --border: #e5e7eb; --muted: #6b7280; }
+        .dark { --bg: #0b0f14; --surface: #111827; --border: #1f2937; --muted: #9ca3af; }
+        body { background: var(--bg); }
+        .card { background: var(--surface); border: 1px solid var(--border); }
+        .field-help { color: var(--muted); }
+        input, select { background: var(--surface); border: 1px solid var(--border); }
+        input:disabled, select:disabled { opacity: .55; cursor: not-allowed; }
+    </style>
+</head>
+<body class="text-gray-800 dark:text-gray-100 min-h-screen" x-data="settingsPage()" x-init="init()">
+    <div class="max-w-3xl mx-auto px-4 py-8">
+        <div class="flex items-center justify-between mb-6">
+            <div>
+                <h1 class="text-2xl font-semibold">Settings</h1>
+                <p class="text-sm field-help">Configure Headroom runtime knobs. Changes need a restart to apply.</p>
+            </div>
+            <a href="/dashboard" class="text-sm text-accent hover:underline">&larr; Dashboard</a>
+        </div>
+
+        <!-- Status / error surface -->
+        <template x-if="loadError">
+            <div class="card rounded-lg p-4 mb-4 border-red-500/50">
+                <p class="text-red-500 text-sm" x-text="loadError"></p>
+            </div>
+        </template>
+
+        <!-- Restart-required banner -->
+        <template x-if="banner">
+            <div class="card rounded-lg p-4 mb-4 border-amber-500/50" x-cloak>
+                <p class="text-amber-500 text-sm font-medium" x-text="banner"></p>
+                <template x-if="applyMode === 'docker' && applyCommand">
+                    <div class="mt-2">
+                        <p class="text-xs field-help mb-1">Run this on the host to apply:</p>
+                        <code class="block text-xs bg-black/40 rounded px-3 py-2 select-all" x-text="applyCommand"></code>
+                    </div>
+                </template>
+            </div>
+        </template>
+
+        <!-- Tier tabs -->
+        <div class="flex items-center gap-2 mb-6" role="tablist">
+            <button type="button" role="tab" @click="activeTab = 'basic'"
+                    :aria-selected="activeTab === 'basic'"
+                    :class="activeTab === 'basic' ? 'bg-accent text-black' : 'card field-help'"
+                    class="px-3 py-1.5 rounded text-sm font-medium">Settings</button>
+            <button type="button" role="tab" @click="activeTab = 'advanced'"
+                    :aria-selected="activeTab === 'advanced'"
+                    :class="activeTab === 'advanced' ? 'bg-accent text-black' : 'card field-help'"
+                    class="px-3 py-1.5 rounded text-sm font-medium">Advanced</button>
+        </div>
+        <!-- Grouped fields -->
+        <template x-if="loaded">
+            <form @submit.prevent>
+                <template x-for="group in groups.filter(g => fieldsIn(g).length > 0)" :key="group">
+                    <div class="card rounded-lg p-5 mb-4">
+                        <h2 class="text-sm font-semibold uppercase tracking-wide field-help mb-4" x-text="group"></h2>
+                        <template x-for="field in fieldsIn(group)" :key="field.key">
+                            <div class="mb-4 last:mb-0">
+                                <label class="flex items-center justify-between gap-4">
+                                    <span class="text-sm font-medium" x-text="field.label"></span>
+                                    <!-- bool -->
+                                    <template x-if="field.type === 'bool'">
+                                        <input type="checkbox" class="h-5 w-5 accent-cyan-400"
+                                               :disabled="isLocked(field)"
+                                               x-model="values[field.key]">
+                                    </template>
+                                    <!-- enum -->
+                                    <template x-if="field.type === 'enum'">
+                                        <select class="rounded px-2 py-1 text-sm w-56"
+                                                :disabled="isLocked(field)"
+                                                x-model="values[field.key]">
+                                            <template x-for="choice in field.choices" :key="choice">
+                                                <option :value="choice" x-text="choice"></option>
+                                            </template>
+                                        </select>
+                                    </template>
+                                    <!-- int / float -->
+                                    <template x-if="field.type === 'int' || field.type === 'float'">
+                                        <input type="number" class="rounded px-2 py-1 text-sm w-56"
+                                               :step="field.type === 'float' ? 'any' : '1'"
+                                               :min="field.minimum" :max="field.maximum"
+                                               :disabled="isLocked(field)"
+                                               x-model.number="values[field.key]">
+                                    </template>
+                                    <!-- str / secret / header-map -->
+                                    <template x-if="field.type === 'str' || field.type === 'header-map'">
+                                        <input :type="field.secret ? 'password' : 'text'"
+                                               class="rounded px-2 py-1 text-sm w-56"
+                                               :disabled="isLocked(field)"
+                                               x-model="values[field.key]"
+                                               @input="delete clearedKeys[field.key]">
+                                    </template>
+                                </label>
+                                <template x-if="field.secret && !isLocked(field)">
+                                    <button type="button" @click="values[field.key] = ''; clearedKeys[field.key] = true"
+                                            class="text-xs text-red-500/80 hover:underline mt-1">
+                                        Clear stored value
+                                    </button>
+                                </template>
+                                <p class="text-xs field-help mt-1" x-text="field.help"></p>
+                                <template x-if="field.manifest_managed && manifestManaged">
+                                    <p class="text-xs text-amber-500/80 mt-1">
+                                        Managed by the install manifest — change via <code>headroom install</code>.
+                                    </p>
+                                </template>
+                                <template x-if="field.env_override && !(field.manifest_managed && manifestManaged)">
+                                    <p class="text-xs text-amber-500/80 mt-1">
+                                        Overridden by environment variable <code x-text="field.env"></code> -- edits here have no effect until it's unset.
+                                    </p>
+                                </template>
+                                <template x-if="fieldErrors[field.key]">
+                                    <p class="text-xs text-red-500 mt-1" x-text="fieldErrors[field.key]"></p>
+                                </template>
+                            </div>
+                        </template>
+                    </div>
+                </template>
+
+                <div class="flex items-center gap-3 mt-6">
+                    <button type="button" @click="save()"
+                            :disabled="busy"
+                            class="px-4 py-2 rounded bg-gray-700 hover:bg-gray-600 text-white text-sm disabled:opacity-50">
+                        Save
+                    </button>
+                    <button type="button" @click="applyAndRestart()"
+                            :disabled="busy"
+                            class="px-4 py-2 rounded bg-cyan-500 hover:bg-cyan-400 text-black font-medium text-sm disabled:opacity-50">
+                        Apply &amp; Restart
+                    </button>
+                    <span class="text-sm field-help" x-text="status"></span>
+                </div>
+            </form>
+        </template>
+    </div>
+
+    <script>
+        function settingsPage() {
+            return {
+                loaded: false,
+                loadError: '',
+                fields: [],
+                groups: [],
+                values: {},
+                storedValues: {},
+                manifestManaged: false,  // true on supervised installs (locks manifest fields)
+                fieldErrors: {},
+                banner: '',
+                status: '',
+                busy: false,
+                applyMode: '',
+                applyCommand: '',
+                activeTab: 'basic',  // 'basic' (Settings tab) | 'advanced'
+                clearedKeys: {},  // secret fields explicitly cleared this session (send null on save)
+
+                async init() {
+                    try {
+                        const res = await fetch('/settings/schema');
+                        if (!res.ok) throw new Error('HTTP ' + res.status);
+                        const schema = await res.json();
+                        this.fields = schema.fields || [];
+                        this.groups = schema.groups || [];
+                        // Seed the editable model from the effective values.
+                        for (const f of this.fields) {
+                            this.values[f.key] = schema.values ? schema.values[f.key] : f.value;
+                            this.storedValues[f.key] = f.stored;
+                        }
+                        // The server tells us whether this is a supervised install
+                        // (docker/service); there manifest-managed knobs are baked
+                        // into the install manifest and cannot be changed via the GUI.
+                        this.manifestManaged = !!schema.supervised;
+                        this.loaded = true;
+                    } catch (e) {
+                        this.loadError = 'Failed to load settings: ' + e.message;
+                    }
+                },
+
+                fieldsIn(group) { return this.fields.filter(f => f.group === group && f.tier === this.activeTab); },
+
+                isLocked(field) { return (!!field.manifest_managed && this.manifestManaged) || !!field.env_override; },
+
+                isEmptyValue(value) { return value === '' || value === null || value === undefined; },
+
+                normalizedComparable(value) {
+                    return this.isEmptyValue(value) ? null : value;
+                },
+
+                editableValues() {
+                    // Send only changed, non-locked values. The server merges partial
+                    // updates; posting every effective default would freeze those
+                    // defaults into settings.json and change future upgrade behavior.
+                    // Explicit `null` clears a previously stored value.
+                    const out = {};
+                    for (const f of this.fields) {
+                        if (this.isLocked(f)) continue;
+                        if (this.clearedKeys[f.key]) { out[f.key] = null; continue; }
+                        let v = this.values[f.key];
+                        const stored = this.storedValues[f.key];
+                        const baseline = this.isEmptyValue(stored) ? f.default : stored;
+                        if (this.isEmptyValue(v)) {
+                            if (!this.isEmptyValue(stored)) out[f.key] = null;
+                            continue;
+                        }
+                        if (this.normalizedComparable(v) === this.normalizedComparable(baseline)) continue;
+                        out[f.key] = v;
+                    }
+                    return out;
+                },
+
+                async save() {
+                    this.busy = true; this.status = 'Saving…'; this.fieldErrors = {};
+                    try {
+                        const res = await fetch('/settings', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ values: this.editableValues() }),
+                        });
+                        const data = await res.json();
+                        if (res.status === 200) {
+                            this.status = 'Saved.';
+                            const changed = data.changed_keys || [];
+                            this.banner = changed.length ? ('Restart required to apply: ' + changed.join(', ')) : 'Saved — no changes to apply.';
+                            this.applyMode = ''; this.applyCommand = '';
+                            this.clearedKeys = {};
+                        } else if (res.status === 422) {
+                            this.fieldErrors = data.field_errors || {};
+                            this.status = 'Fix the highlighted fields.';
+                        } else {
+                            this.status = data.error || ('Error ' + res.status);
+                        }
+                    } catch (e) {
+                        this.status = 'Save failed: ' + e.message;
+                    } finally {
+                        this.busy = false;
+                    }
+                },
+
+                async applyAndRestart() {
+                    this.busy = true; this.status = 'Applying…'; this.fieldErrors = {};
+                    try {
+                        const res = await fetch('/settings/apply', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ values: this.editableValues() }),
+                        });
+                        const data = await res.json();
+                        if (res.status === 422) {
+                            this.fieldErrors = data.field_errors || {};
+                            this.status = 'Fix the highlighted fields.'; return;
+                        }
+                        if (res.status === 400) {
+                            this.status = data.error || 'Bad request'; return;
+                        }
+                        this.applyMode = data.mode || '';
+                        if (data.restarted && data.mode === 'service') {
+                            this.banner = 'Restarting…';
+                            this.status = 'Waiting for the proxy to come back…';
+                            await this.pollHealth();
+                        } else if (data.mode === 'docker') {
+                            this.applyCommand = data.command || '';
+                            this.banner = 'Saved. To apply, run the command on the host:';
+                            this.status = '';
+                        } else {
+                            this.banner = data.instruction || 'Saved. Restart the proxy to apply.';
+                            this.status = '';
+                        }
+                    } catch (e) {
+                        this.status = 'Apply failed: ' + e.message;
+                    } finally {
+                        this.busy = false;
+                    }
+                },
+
+                async pollHealth() {
+                    // /health is the single source of truth that the proxy is back.
+                    const deadline = 40;  // ~60s at 1.5s intervals
+                    for (let i = 0; i < deadline; i++) {
+                        await new Promise(r => setTimeout(r, 1500));
+                        try {
+                            const res = await fetch('/health', { cache: 'no-store' });
+                            if (res.ok) {
+                                this.banner = '';
+                                this.status = 'Applied — proxy restarted.';
+                                return;
+                            }
+                        } catch (e) { /* proxy still down: keep polling */ }
+                    }
+                    this.status = 'Timed out waiting for the proxy. Check the proxy logs.';
+                },
+            };
+        }
+    </script>
+</body>
+</html>

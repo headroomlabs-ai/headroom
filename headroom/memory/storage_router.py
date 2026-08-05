@@ -448,4 +448,25 @@ def extract_system_prompt(body: Mapping[str, Any]) -> str:
                 if parts:
                     return "\n".join(parts)
 
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("role") != "user":
+                continue
+            content = msg.get("content")
+            user_text: str | None = None
+            if isinstance(content, str):
+                user_text = content
+            elif isinstance(content, list):
+                parts = []
+                for block in content:
+                    if isinstance(block, dict):
+                        text = block.get("text")
+                        if isinstance(text, str):
+                            parts.append(text)
+                if parts:
+                    user_text = "\n".join(parts)
+            if user_text and any(prefix in user_text for prefix in _CWD_PREFIXES):
+                return user_text
+
     return ""

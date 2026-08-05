@@ -19,6 +19,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from headroom._subprocess import run
 from headroom.memory.writers.base import MemoryEntry, _estimate_tokens
 
 logger = logging.getLogger(__name__)
@@ -215,7 +216,7 @@ class MemoryBudgetManager:
             return self._git_files_cache
 
         try:
-            result = subprocess.run(
+            result = run(
                 ["git", "ls-files"],
                 capture_output=True,
                 text=True,

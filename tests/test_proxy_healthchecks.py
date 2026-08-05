@@ -8,7 +8,7 @@ pytest.importorskip("httpx")
 
 from fastapi.testclient import TestClient
 
-from headroom.proxy.server import ProxyConfig, create_app
+from headroom.proxy.server import ProxyConfig, __version__, create_app
 
 
 @pytest.fixture
@@ -23,7 +23,9 @@ def client(monkeypatch):
         cost_tracking_enabled=False,
     )
     app = create_app(config)
-    with TestClient(app) as test_client:
+    # Loopback client/Host: /health serves the `config` block only to loopback
+    # callers (network callers get the /readyz-shape body, no config).
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)) as test_client:
         yield test_client
 
 
@@ -35,6 +37,7 @@ def test_livez_reports_process_health(client):
     assert data["service"] == "headroom-proxy"
     assert data["status"] == "healthy"
     assert data["alive"] is True
+    assert data["version"] == __version__
     assert data["uptime_seconds"] >= 0
 
 
@@ -71,6 +74,7 @@ def test_health_preserves_backwards_compatible_config_payload(client):
     data = response.json()
     assert data["status"] == "healthy"
     assert data["ready"] is True
+    assert data["version"] == __version__
     config = data["config"]
     assert config["backend"] == "anthropic"
     assert config["optimize"] is False
@@ -105,7 +109,7 @@ def test_health_reports_agent_savings_config():
     )
     app = create_app(config)
 
-    with TestClient(app) as client:
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)) as client:
         response = client.get("/health")
 
     assert response.status_code == 200

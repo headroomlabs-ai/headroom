@@ -82,6 +82,7 @@ def test_parse_openai_responses_completed_usage_from_sse_buffer():
 @pytest.mark.asyncio
 async def test_finalize_stream_response_logs_request_for_feed():
     proxy = _build_proxy_with_real_logger(log_full_messages=False)
+    request_tags = {"stack": "wrap_claude"}
 
     await proxy._finalize_stream_response(
         body={"messages": [{"role": "user", "content": "hi"}]},
@@ -95,7 +96,7 @@ async def test_finalize_stream_response_logs_request_for_feed():
         optimization_latency=12.0,
         stream_state=_stream_state(),
         start_time=0.0,
-        tags={"stack": "wrap_claude"},
+        tags=request_tags,
     )
 
     entries = proxy.logger.get_recent(10)
@@ -109,8 +110,38 @@ async def test_finalize_stream_response_logs_request_for_feed():
     assert entry["tokens_saved"] == 400
     assert entry["savings_percent"] == pytest.approx(40.0)
     assert entry["transforms_applied"] == ["smart_crusher"]
-    assert entry["tags"] == {"stack": "wrap_claude"}
+    assert entry["tags"] == {
+        "stack": "wrap_claude",
+        "output_tokens_source": "provider",
+    }
+    assert request_tags == {"stack": "wrap_claude"}
     assert entry["cache_hit"] is False
+
+
+@pytest.mark.asyncio
+async def test_finalize_stream_response_marks_estimated_output_tokens() -> None:
+    proxy = _build_proxy_with_real_logger(log_full_messages=False)
+    state = _stream_state()
+    state["output_tokens"] = None
+    state["total_bytes"] = 200
+
+    await proxy._finalize_stream_response(
+        body={"messages": [{"role": "user", "content": "hi"}]},
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        request_id="req-stream-estimated",
+        original_tokens=10,
+        optimized_tokens=10,
+        tokens_saved=0,
+        transforms_applied=[],
+        optimization_latency=1.0,
+        stream_state=state,
+        start_time=0.0,
+    )
+
+    entry = proxy.logger.get_recent(1)[0]
+    assert entry["output_tokens"] == 5
+    assert entry["tags"]["output_tokens_source"] == "estimated_bytes"
 
 
 @pytest.mark.asyncio

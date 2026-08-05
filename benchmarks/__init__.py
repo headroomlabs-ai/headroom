@@ -16,7 +16,6 @@ Usage:
 Performance Targets:
     - SmartCrusher: < 10ms for 1000 items
     - CacheAligner: < 1ms for date extraction
-    - RollingWindow: < 5ms for 200 turns
     - BM25Scorer: < 1ms for 100 items
     - HybridScorer: < 50ms for 100 items (with embeddings)
 """

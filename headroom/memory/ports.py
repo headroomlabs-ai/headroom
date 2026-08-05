@@ -311,6 +311,22 @@ class MemoryStore(Protocol):
         """
         ...
 
+    async def record_access(
+        self,
+        memory_ids: list[str],
+        accessed_at: datetime | None = None,
+    ) -> int:
+        """Record one retrieval for each distinct memory ID.
+
+        Args:
+            memory_ids: IDs of memories actually returned to a caller.
+            accessed_at: Retrieval time (defaults to now).
+
+        Returns:
+            Number of existing memories updated.
+        """
+        ...
+
     async def delete(self, memory_id: str) -> bool:
         """
         Delete a memory by ID.
@@ -378,6 +394,23 @@ class MemoryStore(Protocol):
 
         Returns:
             The saved new memory with lineage fields populated.
+        """
+        ...
+
+    async def detach_supersession(
+        self,
+        old_memory_id: str,
+        new_memory_id: str,
+    ) -> tuple[Memory, Memory]:
+        """Detach one explicit edge from a supersession chain.
+
+        The two memories must form a reciprocal direct edge:
+        ``old.superseded_by == new.id`` and ``new.supersedes == old.id``.
+        The old memory becomes current again while all other chain edges
+        remain unchanged.
+
+        Returns:
+            The updated ``(old_memory, new_memory)`` pair.
         """
         ...
 

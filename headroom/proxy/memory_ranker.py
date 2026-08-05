@@ -21,10 +21,15 @@ no network, no disk.
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Protocol
+
+from headroom.proxy.memory_rank_policy import (
+    boost_memory_score,
+    memory_recency_factor,
+    parse_memory_created_at,
+)
 
 # Use ``timezone.utc`` (always available) instead of ``datetime.UTC``
 # (Python 3.11+) so this module imports cleanly on older interpreters.
@@ -73,7 +78,7 @@ class MemoryCandidate:
         content = str(getattr(memory, "content", "")) if memory is not None else ""
         memory_id = str(getattr(memory, "id", "") or "") if memory is not None else ""
         raw_dt = getattr(memory, "created_at", None) if memory is not None else None
-        created_at = _parse_created_at(raw_dt)
+        created_at = parse_memory_created_at(raw_dt)
         raw_related = getattr(result, "related_entities", None) or ()
         related = tuple(str(x) for x in raw_related)
         source_meta = getattr(memory, "metadata", None) or {}
@@ -95,16 +100,7 @@ def _parse_created_at(value: object) -> datetime | None:
     string (with or without trailing ``Z``). Anything else → ``None``
     so the ranker treats the candidate as recency-neutral.
     """
-    if value is None:
-        return None
-    if isinstance(value, datetime):
-        return value if value.tzinfo is not None else value.replace(tzinfo=_UTC)
-    if isinstance(value, str):
-        try:
-            return datetime.fromisoformat(value.replace("Z", "+00:00"))
-        except ValueError:
-            return None
-    return None
+    return parse_memory_created_at(value)
 
 
 class MemoryRanker(Protocol):
@@ -165,8 +161,13 @@ class RecencyBoostRanker:
         now = datetime.now(_UTC)
         boosted: list[tuple[int, MemoryCandidate, float]] = []
         for idx, c in enumerate(candidates):
-            factor = self._recency_factor(now, c.created_at)
-            boosted.append((idx, c, c.score * factor))
+            new_score = boost_memory_score(
+                score=c.score,
+                now=now,
+                created_at=c.created_at,
+                decay_days=self.decay_days,
+            )
+            boosted.append((idx, c, new_score))
 
         # Sort descending by boosted score; stable on ties via the
         # captured idx — same input order preserved on ties for
@@ -182,6 +183,7 @@ class RecencyBoostRanker:
                 created_at=c.created_at,
                 source=c.source,
                 related_entities=c.related_entities,
+                id=c.id,
             )
             for _, c, new_score in boosted
         ]
@@ -193,14 +195,8 @@ class RecencyBoostRanker:
         Future timestamps → 1.0 (clock-skew defence).
         Otherwise: ``exp(-age_days / decay_days)``.
         """
-        if created_at is None:
-            return 1.0
-        # Normalize to UTC-aware for safe subtraction.
-        if created_at.tzinfo is None:
-            created_at = created_at.replace(tzinfo=_UTC)
-        delta = now - created_at
-        age_days = delta.total_seconds() / 86400.0
-        if age_days <= 0:
-            # Future-dated row (clock skew). Clamp to neutral.
-            return 1.0
-        return math.exp(-age_days / self.decay_days)
+        return memory_recency_factor(
+            now=now,
+            created_at=created_at,
+            decay_days=self.decay_days,
+        )

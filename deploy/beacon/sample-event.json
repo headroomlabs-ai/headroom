@@ -1,0 +1,297 @@
+{
+  "resourceLogs": [
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "service.name",
+            "value": {
+              "stringValue": "headroom"
+            }
+          },
+          {
+            "key": "service.version",
+            "value": {
+              "stringValue": "0.34.0"
+            }
+          },
+          {
+            "key": "headroom.install_id",
+            "value": {
+              "stringValue": "00000000000000000000000000000000"
+            }
+          },
+          {
+            "key": "os.type",
+            "value": {
+              "stringValue": "darwin"
+            }
+          },
+          {
+            "key": "host.arch",
+            "value": {
+              "stringValue": "arm64"
+            }
+          }
+        ]
+      },
+      "scopeLogs": [
+        {
+          "scope": {
+            "name": "headroom.telemetry.session"
+          },
+          "logRecords": [
+            {
+              "timeUnixNano": "1785731364402434048",
+              "body": {
+                "kvlistValue": {
+                  "values": [
+                    {
+                      "key": "schema_version",
+                      "value": {
+                        "intValue": "1"
+                      }
+                    },
+                    {
+                      "key": "session",
+                      "value": {
+                        "kvlistValue": {
+                          "values": [
+                            {
+                              "key": "id",
+                              "value": {
+                                "stringValue": "sample0000000001"
+                              }
+                            },
+                            {
+                              "key": "seq",
+                              "value": {
+                                "intValue": "0"
+                              }
+                            },
+                            {
+                              "key": "duration_s",
+                              "value": {
+                                "intValue": "4210"
+                              }
+                            },
+                            {
+                              "key": "turns",
+                              "value": {
+                                "intValue": "47"
+                              }
+                            },
+                            {
+                              "key": "ended",
+                              "value": {
+                                "stringValue": "active"
+                              }
+                            },
+                            {
+                              "key": "final",
+                              "value": {
+                                "boolValue": false
+                              }
+                            }
+                          ]
+                        }
+                      }
+                    },
+                    {
+                      "key": "tokens",
+                      "value": {
+                        "kvlistValue": {
+                          "values": [
+                            {
+                              "key": "original",
+                              "value": {
+                                "intValue": "890000"
+                              }
+                            },
+                            {
+                              "key": "attempted",
+                              "value": {
+                                "intValue": "410000"
+                              }
+                            },
+                            {
+                              "key": "input",
+                              "value": {
+                                "intValue": "570000"
+                              }
+                            },
+                            {
+                              "key": "output",
+                              "value": {
+                                "intValue": "41000"
+                              }
+                            },
+                            {
+                              "key": "saved",
+                              "value": {
+                                "intValue": "320000"
+                              }
+                            },
+                            {
+                              "key": "tool_saved",
+                              "value": {
+                                "intValue": "48000"
+                              }
+                            },
+                            {
+                              "key": "cache_read",
+                              "value": {
+                                "intValue": "210000"
+                              }
+                            },
+                            {
+                              "key": "cache_write",
+                              "value": {
+                                "intValue": "30000"
+                              }
+                            },
+                            {
+                              "key": "uncached",
+                              "value": {
+                                "intValue": "650000"
+                              }
+                            }
+                          ]
+                        }
+                      }
+                    },
+                    {
+                      "key": "rates",
+                      "value": {
+                        "kvlistValue": {
+                          "values": [
+                            {
+                              "key": "saved_pct",
+                              "value": {
+                                "doubleValue": 35.96
+                              }
+                            },
+                            {
+                              "key": "eligible_pct",
+                              "value": {
+                                "doubleValue": 46.07
+                              }
+                            },
+                            {
+                              "key": "yield_pct",
+                              "value": {
+                                "doubleValue": 78.05
+                              }
+                            },
+                            {
+                              "key": "cache_read_pct",
+                              "value": {
+                                "doubleValue": 23.6
+                              }
+                            },
+                            {
+                              "key": "overhead_pct",
+                              "value": {
+                                "doubleValue": 1.96
+                              }
+                            }
+                          ]
+                        }
+                      }
+                    },
+                    {
+                      "key": "compression",
+                      "value": {
+                        "kvlistValue": {
+                          "values": [
+                            {
+                              "key": "transforms",
+                              "value": {
+                                "kvlistValue": {
+                                  "values": [
+                                    {
+                                      "key": "crush",
+                                      "value": {
+                                        "intValue": "47"
+                                      }
+                                    }
+                                  ]
+                                }
+                              }
+                            },
+                            {
+                              "key": "overhead_ms_total",
+                              "value": {
+                                "intValue": "1840"
+                              }
+                            },
+                            {
+                              "key": "latency_ms_total",
+                              "value": {
+                                "intValue": "94000"
+                              }
+                            },
+                            {
+                              "key": "passthrough_turns",
+                              "value": {
+                                "intValue": "0"
+                              }
+                            },
+                            {
+                              "key": "response_cache_hits",
+                              "value": {
+                                "intValue": "3"
+                              }
+                            }
+                          ]
+                        }
+                      }
+                    },
+                    {
+                      "key": "skips",
+                      "value": {
+                        "kvlistValue": {
+                          "values": []
+                        }
+                      }
+                    },
+                    {
+                      "key": "providers",
+                      "value": {
+                        "arrayValue": {
+                          "values": [
+                            {
+                              "stringValue": "anthropic"
+                            }
+                          ]
+                        }
+                      }
+                    },
+                    {
+                      "key": "models",
+                      "value": {
+                        "arrayValue": {
+                          "values": [
+                            {
+                              "stringValue": "claude-sonnet-4-5-20250929"
+                            }
+                          ]
+                        }
+                      }
+                    },
+                    {
+                      "key": "failures",
+                      "value": {
+                        "intValue": "2"
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -173,7 +173,16 @@ class TestHasNonTextParts:
 
     @pytest.mark.parametrize(
         "non_text_key",
-        ["inlineData", "fileData", "functionCall", "functionResponse"],
+        [
+            "inlineData",
+            "fileData",
+            "functionCall",
+            "functionResponse",
+            # Gemini code-execution parts, echoed back in contents[] on later
+            # turns; previously not detected, so they were dropped on round-trip.
+            "executableCode",
+            "codeExecutionResult",
+        ],
     )
     def test_each_non_text_key_detected(self, proxy, non_text_key):
         """Each non-text part type is correctly detected."""
@@ -656,6 +665,30 @@ class TestRebuildGeminiContents:
         assert len(result) == 2
         assert result[0]["parts"][0]["text"] == "Hello, world!"
         assert result[1]["parts"][0]["text"] == "Hello! How can I help you today?"
+
+    def test_code_execution_entry_survives(self, proxy):
+        """A text-less code-execution entry (executableCode + codeExecutionResult)
+        between two text turns must survive the round-trip at its position, and
+        not shift a neighboring turn. Before the fix it was not detected as
+        non-text, so it was dropped and the following user turn was misplaced."""
+        code_entry = {
+            "role": "model",
+            "parts": [
+                {"executableCode": {"language": "PYTHON", "code": "x = 1"}},
+                {"codeExecutionResult": {"outcome": "OUTCOME_OK", "output": "1"}},
+            ],
+        }
+        contents = [
+            {"role": "user", "parts": [{"text": "Question 1"}]},
+            code_entry,
+            {"role": "user", "parts": [{"text": "Question 2"}]},
+        ]
+
+        result = self._round_trip(proxy, contents)
+
+        assert len(result) == 3
+        assert result[1] == code_entry  # preserved verbatim, in place
+        assert result[2]["parts"][0]["text"] == "Question 2"
 
     def test_function_call_sequence_preserved(self, proxy):
         """functionCall and functionResponse entries must survive and appear at correct positions."""

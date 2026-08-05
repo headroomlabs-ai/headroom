@@ -1,26 +1,26 @@
 ---
 title: How Compression Works
-description: Understand Headroom's three-stage compression pipeline, automatic content routing, and how different content types are compressed.
+description: Understand Headroom's compression pipeline, automatic content routing, and how different content types are compressed.
 ---
 
 Headroom automatically detects what kind of content you're sending and routes it to the right compressor. You don't need to configure anything -- just call `compress()` and the pipeline handles the rest.
 
-## The Three-Stage Pipeline
+## The Pipeline
 
-Every request flows through three stages:
+Every request flows through a short pipeline:
 
 ```
 ┌──────────────┐     ┌────────────────┐
 │ CacheAligner │────>│ ContentRouter  │
-│              │     │                │
-│ Stabilize    │     │ Detect type &  │
-│ prefix for   │     │ route to best  │
-│ cache hits   │     │ compressor     │
+│ (off by      │     │                │
+│  default)    │     │ Detect type &  │
+│ report drift │     │ route to best  │
+│ for cache    │     │ compressor     │
 └──────────────┘     └────────────────┘
 ```
 
-1. **CacheAligner** extracts dynamic content (dates, user context) from your system prompt so the static prefix stays cacheable across requests.
-2. **ContentRouter** inspects each tool output and routes it to the optimal compressor -- SmartCrusher for JSON arrays, CodeAwareCompressor for source code, LogCompressor for build output, and so on.
+1. **CacheAligner** *(detector-only, off by default)* reports dynamic-prefix drift (dates, session context) so callers can keep the static prefix cacheable. It never rewrites your messages.
+2. **ContentRouter** inspects each content block and routes it to one compressor -- SmartCrusher for JSON arrays, CodeAwareCompressor for source code, LogCompressor for build output, and so on. This is where essentially all compression happens.
 
 ## Content Type Detection
 
@@ -33,8 +33,11 @@ The router auto-detects content type by analyzing structure and patterns. No man
 | Search results | `file:line:content` format | SearchCompressor | 80-95% |
 | Build/test logs | Timestamps, log levels, pytest/npm markers | LogCompressor | 85-95% |
 | Diffs | Unified diff format | DiffCompressor | 60-80% |
-| HTML | Tag structure | HTMLCompressor | 50-70% |
-| Plain text | Fallback | TextCompressor | 60-80% |
+| HTML | Tag structure | HTMLExtractor | 50-70% |
+| Tabular (CSV/TSV/markdown tables) | Delimited rows / table syntax | TabularCompressor | 60-90% |
+| Structured config (YAML/TOML/INI) | Config syntax | ConfigCompressor | 40-70% |
+| Plain text | Text with no stronger signal | TextCrusher | 30-60% |
+| Anything else | ML fallback | Kompress | varies |
 
 ## Quick Start
 
@@ -153,7 +156,7 @@ When you call `compress()`, here is the full sequence:
 
 1. **Content detection** -- Magika (ML-based) or pattern matching identifies the content type
 2. **Structure extraction** -- A handler extracts a structure mask marking what to preserve
-3. **Compression** -- Non-structural content is compressed (SmartCrusher, LLMLingua, or text utilities)
+3. **Compression** -- Non-structural content is compressed (SmartCrusher, Kompress ML, or text utilities like TextCrusher)
 4. **CCR storage** -- If enabled, the original is stored for retrieval when the LLM needs full context
 
 <Callout type="info" title="Zero-config by default">

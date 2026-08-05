@@ -21,10 +21,10 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import tempfile
 from pathlib import Path
 
-import httpx
 import pytest
 
 from headroom.memory.easy import Memory, MemoryResult
+from tests._skip_helpers import external_model_skip_reason
 
 # Check if hnswlib is available (local backend requires it)
 try:
@@ -38,15 +38,18 @@ pytestmark = pytest.mark.skipif(not HNSW_AVAILABLE, reason="hnswlib not availabl
 
 
 def network_timeout_handler(func):
-    """Decorator to skip tests on network timeouts (flaky CI)."""
+    """Decorator to skip tests on transient/offline model dependency failures."""
     import functools
 
     @functools.wraps(func)
     async def wrapper(*args, **kwargs):
         try:
             return await func(*args, **kwargs)
-        except httpx.ReadTimeout:
-            pytest.skip("Skipped due to network timeout (flaky CI)")
+        except Exception as exc:
+            reason = external_model_skip_reason(exc)
+            if reason is not None:
+                pytest.skip(reason)
+            raise
 
     return wrapper
 

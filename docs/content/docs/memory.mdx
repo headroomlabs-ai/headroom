@@ -86,16 +86,16 @@ response = client2.chat.completions.create(
 
 ## Memory Categories
 
-Memories are categorized for better organization and retrieval:
+Each memory carries a free-form `category` string -- pass any label you like. These are the conventional categories Headroom uses for organization and retrieval:
 
 | Category | Description | Examples |
 |----------|-------------|----------|
-| `PREFERENCE` | Likes, dislikes, preferred approaches | "Prefers Python", "Likes dark mode" |
-| `FACT` | Identity, role, constraints | "Works at fintech startup", "Senior engineer" |
-| `CONTEXT` | Current goals, ongoing tasks | "Migrating to microservices", "Working on auth" |
-| `ENTITY` | Information about entities | "Project Apollo uses React", "Team lead is Sarah" |
-| `DECISION` | Decisions made | "Chose PostgreSQL over MySQL" |
-| `INSIGHT` | Derived insights | "User tends to prefer typed languages" |
+| `"preference"` | Likes, dislikes, preferred approaches | "Prefers Python", "Likes dark mode" |
+| `"fact"` | Identity, role, constraints | "Works at fintech startup", "Senior engineer" |
+| `"context"` | Current goals, ongoing tasks | "Migrating to microservices", "Working on auth" |
+| `"entity"` | Information about entities | "Project Apollo uses React", "Team lead is Sarah" |
+| `"decision"` | Decisions made | "Chose PostgreSQL over MySQL" |
+| `"insight"` | Derived insights | "User tends to prefer typed languages" |
 
 ## Memory API
 
@@ -132,7 +132,7 @@ print(f"By category: {stats['categories']}")
 When facts change, Headroom creates a **supersession chain** that preserves history:
 
 ```python
-from headroom.memory import HierarchicalMemory, MemoryCategory
+from headroom.memory import HierarchicalMemory, MemoryFilter
 
 memory = await HierarchicalMemory.create()
 
@@ -140,7 +140,7 @@ memory = await HierarchicalMemory.create()
 orig = await memory.add(
     content="User works at Google",
     user_id="alice",
-    category=MemoryCategory.FACT,
+    category="fact",
 )
 
 # User changes jobs -- supersede the old memory

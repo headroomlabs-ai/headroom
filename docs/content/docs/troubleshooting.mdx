@@ -22,7 +22,7 @@ headroom proxy --port 8788
 pip install "headroom-ai[proxy]"
 
 # Run with debug logging
-headroom proxy --log-level debug
+headroom proxy --log-file ~/.headroom/logs/proxy.jsonl --log-messages
 ```
 
 ### Connection refused when calling proxy
@@ -43,7 +43,7 @@ ps aux | grep headroom
 
 ```bash
 # Check proxy logs for the actual error
-headroom proxy --log-level debug
+headroom proxy --log-file ~/.headroom/logs/proxy.jsonl --log-messages
 
 # Verify API key is set
 echo $OPENAI_API_KEY   # or ANTHROPIC_API_KEY
@@ -52,6 +52,39 @@ echo $OPENAI_API_KEY   # or ANTHROPIC_API_KEY
 curl https://api.openai.com/v1/models \
   -H "Authorization: Bearer $OPENAI_API_KEY"
 ```
+
+### Windows: ML content detection hangs or silently falls back
+
+**Symptom**: On Windows 11 24H2+, every proxied request stalls (historically
+`Optimization failed: TimeoutError`), or the first detection in each process
+burns ~5 seconds and compression quality drops because detection runs on the
+non-ML fallback tiers. The proxy log may show
+`magika ONNX session init timed out`.
+
+**Cause**: The Rust core loads ONNX Runtime dynamically. Without
+`ORT_DYLIB_PATH`, the bare Windows DLL search resolves `onnxruntime.dll` to
+`C:\Windows\System32\onnxruntime.dll` — the Windows ML OS component (1.17.x),
+which deadlocks ort session initialization instead of returning an error.
+
+**Fix**: Headroom pins `ORT_DYLIB_PATH` automatically at import time to the
+DLL inside the `onnxruntime` pip package (included in `headroom-ai[proxy]`).
+Confirm in the startup log:
+
+```
+Pinned ORT_DYLIB_PATH to bundled ONNX Runtime: ...\onnxruntime\capi\onnxruntime.dll
+```
+
+If the pin is skipped (library install without `onnxruntime`), either install
+it or point the variable at any modern ONNX Runtime yourself:
+
+```powershell
+pip install onnxruntime
+# or
+$env:ORT_DYLIB_PATH = "C:\path\to\onnxruntime.dll"
+```
+
+`HEADROOM_MAGIKA_INIT_TIMEOUT_SECS` (default `5`) bounds the init as a safety
+net; on timeout detection degrades to non-ML tiers for the process lifetime.
 
 ## No Token Savings
 
@@ -109,6 +142,27 @@ config.smart_crusher.min_tokens_to_crush = 100  # Default is 200
 </Tab>
 </Tabs>
 
+### Dashboard shows 0 compressed/saved tokens after upgrading to 0.31.0
+
+**Symptom**: After upgrading from 0.27.0 to 0.31.0, the dashboard's compression / "Tokens Saved" figures read ~0, even though total token spend is the same or **lower** than before.
+
+**Cause**: This is a default-mode change, not a regression. 0.31.0 ships the `coding` savings profile as the out-of-box default, and `coding` runs the proxy in **cache** mode (see [Savings profiles](/docs/proxy#savings-profiles)). Cache mode freezes the provider prefix and compresses only the newest turn *delta* — this deliberately avoids busting the provider's prompt cache. So the **compression** figure is small, and the savings shift to **cheaper prefix-cache reads** (cached input tokens are billed at a fraction of list price). On a short prompt there is little delta to compress, so the compression tile can read ~0 while your actual cost still drops.
+
+**Where the savings show up**: Look at the **Prefix Cache Impact** panel and the **Compression vs Cache** tile on the dashboard — these reflect cache-read savings rather than per-request compression. The headline "Tokens Saved" tile only counts compression, so in cache mode it understates the real benefit.
+
+**To get 0.27.0-style compression numbers back**: run the proxy in token mode, which prioritizes visible compression:
+
+```bash
+# Per run
+headroom proxy --mode token
+
+# Or pick a token-mode profile
+HEADROOM_SAVINGS_PROFILE=balanced headroom proxy   # ~70% target
+HEADROOM_SAVINGS_PROFILE=agent-90 headroom proxy   # ~90% target
+```
+
+Trade-off: token mode maximizes visible compression but rewrites prior turns, which can reduce provider prefix-cache hits — so raw compression goes up while cache-read savings go down. Cache mode is the default because, for long coding sessions, preserving the prefix cache usually wins overall.
+
 ## Claude Code context window is larger through the proxy
 
 **Symptom**: After pointing Claude Code at Headroom (`ANTHROPIC_BASE_URL`), `/context all`
@@ -148,7 +202,26 @@ ENABLE_TOOL_SEARCH=true ANTHROPIC_BASE_URL=http://localhost:8787 claude
 
 When deferral is off, the proxy log also prints a one-time hint naming the fix.
 
-See [issue #746](https://github.com/chopratejas/headroom/issues/746) for the full analysis.
+See [issue #746](https://github.com/headroomlabs-ai/headroom/issues/746) for the full analysis.
+
+<Callout type="warning" title="Claude Code VSCode extension caveat">
+  Anthropic's VSCode extension webview does not currently render the deferred-tool
+  content blocks that `ENABLE_TOOL_SEARCH=true` enables through Headroom. Tool
+  results can show up as `unsupported content type` in the extension even though
+  the standalone `claude` CLI works correctly. If you use Claude Code inside
+  VSCode, set `ENABLE_TOOL_SEARCH=false` for that target and restart the Headroom
+  deployment. See [issue #2028](https://github.com/headroomlabs-ai/headroom/issues/2028).
+</Callout>
+
+## Remote Control unavailable through custom ANTHROPIC_BASE_URL
+
+**Symptom**: When Claude Code runs with `ANTHROPIC_BASE_URL` set to a custom host (for example, Headroom), the Remote Control menu is absent.
+
+**Cause**: This is a Claude-side gate. Headroom only receives normal API traffic and can still compress it, but Claude evaluates Remote Control availability before proxy traffic reaches the server.
+
+**Fix**: Use Headroom for normal proxied API sessions, and launch Claude directly (without `ANTHROPIC_BASE_URL`) when you need Claude Remote Control.
+
+`ENABLE_TOOL_SEARCH` is unaffected and can stay enabled for context-window savings while routing through Headroom.
 
 ## Compression Too Aggressive
 
@@ -288,6 +361,70 @@ pip install "headroom-ai[code]"
 pip install "headroom-ai[all]"
 ```
 
+### Windows: Defender blocks ast-grep-cli (sg.exe) during install
+
+**Symptom**: On Windows, `uv tool install "headroom-ai[all]"` (or `pip install`) fails while installing the `ast-grep-cli` wheel, and Windows Defender flags `sg.exe`:
+
+```text
+error: Failed to install: ast_grep_cli-0.44.1-py3-none-win_amd64.whl (ast-grep-cli==0.44.1)
+Caused by: failed to open file ...\ast_grep_cli-0.44.1.data\scripts\sg.exe:
+The operation did not complete successfully because the file contains a virus
+or potentially unwanted software. (os error 225)
+
+Threat: Trojan:Win64/Lazy!MTB
+```
+
+**Cause**: A known **false positive** in the upstream `ast-grep-cli` wheel's bundled `sg.exe` ([ast-grep/ast-grep#2799](https://github.com/ast-grep/ast-grep/issues/2799)), not a Headroom issue. `ast-grep` is a base dependency, so the block also affects the `[proxy]` extra. Headroom uses `ast-grep` only for optional AST-based Read-output outlining and **runs normally without it** — the only impact is the install-time quarantine.
+
+**Workarounds** (safest first):
+
+1. **Run the proxy in Docker** — no local wheel is installed, so Defender is never triggered. See [Docker install](/docs/docker-install); the image is `ghcr.io/headroomlabs-ai/headroom`.
+
+2. **Restore the file from quarantine and retry** — open **Windows Security → Virus & threat protection → Protection history**, select the `sg.exe` detection, choose **Restore**, then re-run the install command. This changes no persistent settings.
+
+3. **Add a temporary, scoped Defender exclusion during install** (last resort; requires an elevated PowerShell). Only do this if you accept excluding a *known false positive*, and remove the exclusion afterward:
+
+   ```powershell
+   # Scope the exclusion to uv's tools directory, install, then remove it
+   $uvTools = (uv tool dir)
+   Add-MpPreference -ExclusionPath $uvTools
+   uv tool install "headroom-ai[all]"
+   Remove-MpPreference -ExclusionPath $uvTools
+   ```
+
+   Do **not** disable Defender wholesale — keep the exclusion narrow and temporary.
+
+4. **Report the false positive to Microsoft** so a corrected signature ships for everyone: submit `sg.exe` at the [Microsoft Security Intelligence sample submission](https://www.microsoft.com/en-us/wdsi/filesubmission) page.
+
+### uv build errors: "src does not appear to be a Python project"
+
+**Symptom**: `uv tool install "headroom-ai[all]"` fails to build a dependency (commonly `litellm` or `cryptography`) with:
+
+```text
+error: Failed to build: <package>==<version>
+Caused by: `src does not appear to be a Python project, as neither `pyproject.toml`
+nor `setup.py` are present`
+```
+
+or a wheel install fails with `Unknown wheel data type: .DS_Store`.
+
+**Cause**: Corrupted or stale entries in uv's local build/wheel cache, not a Headroom dependency-pin problem. Headroom does not pin exact versions of `litellm` or `cryptography` that would trigger this.
+
+**Fix**: clear uv's cache and reinstall:
+
+```bash
+uv cache clean
+uv tool install "headroom-ai[all]"
+```
+
+To clear the cache for just one package instead:
+
+```bash
+uv cache clean litellm
+```
+
+If the failure is specifically for `ast-grep-cli==0.44.1`, that release is already excluded by Headroom's dependency pin (`ast-grep-cli>=0.30.0,!=0.44.1`) due to a compromised supply-chain build ([ast-grep/ast-grep#2799](https://github.com/ast-grep/ast-grep/issues/2799)) — `uv cache clean` and a plain reinstall should pick up a safe version automatically.
+
 ## Provider-Specific Issues
 
 ### OpenAI: Invalid API key
@@ -421,4 +558,4 @@ print(f"Tokens: {result.tokens_before} -> {result.tokens_after}")
 1. Enable debug logging and check the output
 2. Use `simulate()` to see what transforms would apply
 3. Run `validate_setup()` for configuration issues
-4. File an issue at [github.com/chopratejas/headroom](https://github.com/chopratejas/headroom/issues) with your Headroom version, Python version, provider, debug log output, and minimal reproduction code
+4. File an issue at [github.com/headroomlabs-ai/headroom](https://github.com/headroomlabs-ai/headroom/issues) with your Headroom version, Python version, provider, debug log output, and minimal reproduction code

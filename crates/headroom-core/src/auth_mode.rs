@@ -93,10 +93,10 @@ const SUBSCRIPTION_UA_PREFIXES: &[&str] = &[
 /// 1. **Subscription UA prefix** → [`AuthMode::Subscription`].
 ///    The CLI's own auth-mode wins over the bearer token shape it
 ///    happens to be carrying — a Claude Code session uses a
-///    `sk-ant-oat-*` token but is a subscription client, not OAuth.
-/// 2. **`Authorization: Bearer sk-ant-oat-*`** → [`AuthMode::OAuth`]
+///    `sk-ant-oat*` token but is a subscription client, not OAuth.
+/// 2. **`Authorization: Bearer sk-ant-oat*`** → [`AuthMode::OAuth`]
 ///    (Claude Pro / Max OAuth). Checked before the broader `sk-` PAYG
-///    rule because `sk-ant-oat-` shares the `sk-` prefix.
+///    rule because `sk-ant-oat` shares the `sk-` prefix.
 /// 3. **`Authorization: Bearer sk-ant-api*` or `Bearer sk-*`** →
 ///    [`AuthMode::Payg`] (Anthropic / OpenAI API key).
 /// 4. **`Authorization: Bearer <jwt>`** (3 dot-separated segments) →
@@ -162,10 +162,11 @@ pub fn classify(headers: &HeaderMap) -> AuthMode {
     };
 
     if let Some(token) = auth.strip_prefix("Bearer ") {
-        // Order matters: the OAuth shape `sk-ant-oat-*` shares a
+        // Order matters: the OAuth shape `sk-ant-oat*` shares a
         // prefix with `sk-ant-api*` only at `sk-ant-`, so we check
-        // the OAuth shape FIRST. Then the broad PAYG shapes.
-        if token.starts_with("sk-ant-oat-") {
+        // the OAuth shape FIRST. Real OAuth access tokens are
+        // `sk-ant-oat01-...` (version number, no dash after `oat`).
+        if token.starts_with("sk-ant-oat") {
             return AuthMode::OAuth;
         }
         if token.starts_with("sk-ant-api") || token.starts_with("sk-") {

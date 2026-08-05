@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from collections.abc import Callable, Mapping
@@ -93,6 +94,21 @@ def _normalize_api_url(url: str | None, *, default: str) -> str:
     return normalized
 
 
+def _log_backend_init_failure(
+    logger: logging.Logger,
+    *,
+    backend: str,
+    provider: str,
+    exc: Exception,
+) -> None:
+    logger.error(
+        "backend initialization failed: backend=%s provider=%s error=%s",
+        backend,
+        provider,
+        exc,
+    )
+
+
 def resolve_api_overrides(
     *,
     anthropic_api_url: str | None,
@@ -113,6 +129,32 @@ def resolve_api_overrides(
         cloudcode=cloudcode_api_url or env.get("CLOUDCODE_TARGET_API_URL"),
         vertex=vertex_api_url or env.get("VERTEX_TARGET_API_URL"),
     )
+
+
+def resolve_extra_headers(
+    cli_value: str | None,
+    env_var: str,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, str] | None:
+    """Resolve extra headers to merge into (and override) forwarded provider requests.
+
+    Accepts a JSON object string from CLI or env (CLI wins). Returns ``None`` if unset.
+    Raises ``ValueError`` on invalid JSON or a non-string-keyed/valued object.
+    """
+    env = environ or os.environ
+    raw = cli_value or env.get(env_var)
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"{env_var} must be a JSON object of header name/value strings") from exc
+    if not isinstance(parsed, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in parsed.items()
+    ):
+        raise ValueError(f"{env_var} must be a JSON object of header name/value strings")
+    return parsed or None
 
 
 def resolve_api_targets(overrides: ProviderApiOverrides) -> ProviderApiTargets:
@@ -148,7 +190,9 @@ def create_proxy_backend(
     backend: str,
     anyllm_provider: str,
     bedrock_region: str | None,
+    bedrock_profile: str | None = None,
     logger: logging.Logger,
+    openai_api_url: str | None = None,
     anyllm_backend_cls: Any | None = None,
     litellm_backend_cls: Any | None = None,
 ) -> Backend | None:
@@ -158,30 +202,50 @@ def create_proxy_backend(
 
     if backend == "anyllm" or backend.startswith("anyllm-"):
         provider = anyllm_provider
+        backend_name = "anyllm" if backend == "anyllm" else backend
         try:
             backend_cls = anyllm_backend_cls or _load_anyllm_backend()
-            instance = cast("Backend", backend_cls(provider=provider))
+            instance = cast("Backend", backend_cls(provider=provider, api_base=openai_api_url))
             logger.info("any-llm backend enabled (provider=%s)", provider)
             return instance
         except ImportError as exc:
             logger.warning("any-llm backend not available: %s", exc)
             return None
         except Exception as exc:  # pragma: no cover - defensive logging
-            logger.error("Failed to initialize any-llm backend: %s", exc)
+            _log_backend_init_failure(
+                logger,
+                backend=backend_name,
+                provider=provider,
+                exc=exc,
+            )
             return None
 
     normalized_backend = backend if backend.startswith("litellm-") else f"litellm-{backend}"
     provider = normalized_backend.replace("litellm-", "")
+    # `litellm-vertex` is the name in our docs/help, but LiteLLM (and our
+    # provider registry) keys Google Vertex on `vertex_ai`. Without this alias
+    # the provider falls through to a generic pass-through: wrong model prefix
+    # (`vertex/…` instead of `vertex_ai/…`), region dropped, auth mishandled.
+    if provider in ("vertex", "google-vertex", "googlevertex"):
+        provider = "vertex_ai"
     try:
         backend_cls = litellm_backend_cls or _load_litellm_backend()
-        instance = cast("Backend", backend_cls(provider=provider, region=bedrock_region))
+        instance = cast(
+            "Backend",
+            backend_cls(provider=provider, region=bedrock_region, profile_name=bedrock_profile),
+        )
         logger.info("LiteLLM backend enabled (provider=%s, region=%s)", provider, bedrock_region)
         return instance
     except ImportError as exc:
         logger.warning("LiteLLM backend not available: %s", exc)
         return None
     except Exception as exc:  # pragma: no cover - defensive logging
-        logger.error("Failed to initialize LiteLLM backend: %s", exc)
+        _log_backend_init_failure(
+            logger,
+            backend=normalized_backend,
+            provider=provider,
+            exc=exc,
+        )
         return None
 
 

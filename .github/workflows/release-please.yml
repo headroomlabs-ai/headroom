@@ -44,6 +44,14 @@ jobs:
     steps:
       - uses: googleapis/release-please-action@v5
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          # PAT (not GITHUB_TOKEN): a release/tag created by GITHUB_TOKEN does
+          # NOT emit events that trigger other workflows, so release.yml
+          # (PyPI/npm) and docker.yml — which fire on `release: published` —
+          # never ran, and releases had to be cut by hand. A PAT is treated as a
+          # real user, so the release it creates DOES trigger those publishes; it
+          # also lets the bot tag past branch/tag protection. Falls back to
+          # GITHUB_TOKEN when the secret is unset (the release PR still opens; it
+          # just won't trigger the downstream publishes).
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
           config-file: .release-please-config.json
           manifest-file: .release-please-manifest.json

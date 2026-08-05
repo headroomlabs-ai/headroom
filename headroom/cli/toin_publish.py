@@ -15,6 +15,7 @@ result as TOML the Rust proxy loads at startup
     auth_mode = "payg"
     model_family = "claude-3-5"
     structure_hash = "deadbeef..."
+    skip_compression_recommended = false
     strategy_hint = "smart_crusher"
     confidence = 0.87
     observations = 142
@@ -30,7 +31,9 @@ alongside the Rust binary, and the proxy reads it once at startup.
 # Output stability
 
 Rows are sorted by ``(auth_mode, model_family, structure_hash)`` so the
-file diffs cleanly across publishes. Strategies ship as the
+file diffs cleanly across publishes. Rows with
+``skip_compression_recommended = true`` publish
+``strategy_hint = "skip_compression"``. Other rows ship the
 ToolPattern's learned ``optimal_strategy`` (or the dominant entry of
 ``strategy_success_rates``). Confidence is the pattern's existing
 confidence score — bounded ``[0.0, 0.95]`` by the confidence calculator.
@@ -98,16 +101,19 @@ def _format_row(
     auth_mode: str,
     model_family: str,
     structure_hash: str,
+    skip_compression_recommended: bool,
     strategy_hint: str,
     confidence: float,
     observations: int,
 ) -> str:
     """Render one ``[[recommendation]]`` block."""
+    skip_flag = "true" if skip_compression_recommended else "false"
     return (
         "[[recommendation]]\n"
         f'auth_mode = "{_toml_escape(auth_mode)}"\n'
         f'model_family = "{_toml_escape(model_family)}"\n'
         f'structure_hash = "{_toml_escape(structure_hash)}"\n'
+        f"skip_compression_recommended = {skip_flag}\n"
         f'strategy_hint = "{_toml_escape(strategy_hint)}"\n'
         f"confidence = {confidence:.4f}\n"
         f"observations = {observations}\n"
@@ -132,12 +138,18 @@ def _eligible_rows(
         if observations < min_observations:
             continue
         auth_mode, model_family, sig_hash = key
+        strategy_hint = (
+            "skip_compression"
+            if pattern.skip_compression_recommended
+            else _select_strategy(pattern)
+        )
         rows.append(
             {
                 "auth_mode": auth_mode,
                 "model_family": model_family,
                 "structure_hash": sig_hash,
-                "strategy_hint": _select_strategy(pattern),
+                "skip_compression_recommended": pattern.skip_compression_recommended,
+                "strategy_hint": strategy_hint,
                 "confidence": float(pattern.confidence),
                 "observations": observations,
             }

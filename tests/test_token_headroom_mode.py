@@ -400,3 +400,162 @@ class TestProseFormatLiveZoneInvariant:
         ]
         # Walk: user (stable, 1), tool (cached, 2). Cap → 1.
         assert cache.compute_frozen_count(messages) == 1
+
+
+# ── List-of-blocks tool_result content (Claude Code modern format) ──────────
+
+
+def _make_tool_result_list_content_msg(tool_id: str, texts: list[str]) -> dict:
+    """Anthropic-format tool result with list-of-blocks content.
+
+    Modern Claude Code sends ``tool_result`` content as a list of typed
+    blocks instead of a plain string.
+    """
+    return {
+        "role": "user",
+        "content": [
+            {
+                "type": "tool_result",
+                "tool_use_id": tool_id,
+                "content": [{"type": "text", "text": t} for t in texts],
+            }
+        ],
+    }
+
+
+def _make_openai_tool_list_content_msg(tool_call_id: str, texts: list[str]) -> dict:
+    """OpenAI-format tool message with list-of-blocks content."""
+    return {
+        "role": "tool",
+        "tool_call_id": tool_call_id,
+        "content": [{"type": "text", "text": t} for t in texts],
+    }
+
+
+class TestExtractToolResultListContent:
+    """_extract_tool_result_content handles list-of-blocks content."""
+
+    def test_anthropic_string_content_preserved(self):
+        """Plain string content in Anthropic format still works."""
+        from headroom.cache.compression_cache import _extract_tool_result_content as f
+
+        msg = _make_tool_result_msg("t1", "hello world")
+        assert f(msg) == "hello world"
+
+    def test_anthropic_list_content_extracted(self):
+        """List-of-blocks content is extracted and joined."""
+        from headroom.cache.compression_cache import _extract_tool_result_content as f
+
+        msg = _make_tool_result_list_content_msg("t1", ["Line 1", "Line 2"])
+        assert f(msg) == "Line 1\nLine 2"
+
+    def test_anthropic_mixed_blocks(self):
+        """Non-text blocks (e.g. image) are skipped, only text blocks joined."""
+        from headroom.cache.compression_cache import _extract_tool_result_content as f
+
+        msg = {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "t1",
+                    "content": [
+                        {"type": "text", "text": "Hello"},
+                        {"type": "image", "source": {"type": "base64", "data": "..."}},
+                        {"type": "text", "text": "World"},
+                    ],
+                }
+            ],
+        }
+        assert f(msg) == "Hello\nWorld"
+
+    def test_anthropic_list_empty_returns_none(self):
+        """Empty text-only list returns None."""
+        from headroom.cache.compression_cache import _extract_tool_result_content as f
+
+        msg = {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "t1", "content": []}],
+        }
+        assert f(msg) is None
+
+    def test_openai_list_content_extracted(self):
+        """OpenAI format tool message with list content is extracted."""
+        from headroom.cache.compression_cache import _extract_tool_result_content as f
+
+        msg = _make_openai_tool_list_content_msg("tc1", ["Result 1", "Result 2"])
+        assert f(msg) == "Result 1\nResult 2"
+
+    def test_openai_string_content_still_works(self):
+        """OpenAI format with plain string content is unchanged."""
+        from headroom.cache.compression_cache import _extract_tool_result_content as f
+
+        msg = _make_openai_tool_msg("tc1", "plain result")
+        assert f(msg) == "plain result"
+
+    def test_non_tool_msg_returns_none(self):
+        """Regular user/assistant messages return None."""
+        from headroom.cache.compression_cache import _extract_tool_result_content as f
+
+        assert f(_make_user_msg("hello")) is None
+        assert f(_make_assistant_msg("response")) is None
+
+
+class TestSwapToolResultListContent:
+    """_swap_tool_result_content preserves list-of-blocks structure."""
+
+    def test_swap_anthropic_list_content_preserves_structure(self):
+        """Swap on list-of-blocks content replaces text in place."""
+        from headroom.cache.compression_cache import _swap_tool_result_content
+
+        msg = _make_tool_result_list_content_msg("t1", ["original"])
+        swapped = _swap_tool_result_content(msg, "compressed")
+        inner = swapped["content"][0]["content"]
+        assert isinstance(inner, list)
+        assert inner[0]["type"] == "text"
+        assert inner[0]["text"] == "compressed"
+
+    def test_swap_anthropic_string_content_preserved(self):
+        """Swap on plain-string content still works."""
+        from headroom.cache.compression_cache import _swap_tool_result_content
+
+        msg = _make_tool_result_msg("t1", "original")
+        swapped = _swap_tool_result_content(msg, "compressed")
+        assert swapped["content"][0]["content"] == "compressed"
+
+    def test_swap_openai_list_content(self):
+        """Swap on OpenAI list-content replaces text."""
+        from headroom.cache.compression_cache import _swap_tool_result_content
+
+        msg = _make_openai_tool_list_content_msg("tc1", ["original"])
+        swapped = _swap_tool_result_content(msg, "compressed")
+        assert swapped["content"] == "compressed"
+
+    def test_swap_does_not_mutate_original(self):
+        """_swap_tool_result_content performs a deep copy."""
+        from headroom.cache.compression_cache import _swap_tool_result_content
+
+        msg = _make_tool_result_list_content_msg("t1", ["original"])
+        _swap_tool_result_content(msg, "compressed")
+        assert msg["content"][0]["content"][0]["text"] == "original"
+
+    def test_swap_list_content_adds_text_block_when_missing(self):
+        """When list has no text block, collapses to a single text block."""
+        from headroom.cache.compression_cache import _swap_tool_result_content
+
+        msg = {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "t1",
+                    "content": [{"type": "image", "source": {"type": "base64", "data": "..."}}],
+                }
+            ],
+        }
+        swapped = _swap_tool_result_content(msg, "compressed")
+        inner = swapped["content"][0]["content"]
+        assert isinstance(inner, list)
+        assert len(inner) == 1
+        assert inner[0]["type"] == "text"
+        assert inner[0]["text"] == "compressed"

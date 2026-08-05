@@ -1,2 +1,6 @@
 *.py text eol=lf
 *.sh text eol=lf
+
+# CHANGELOG appends conflict on nearly every concurrent PR; union-merge keeps
+# all entries instead of forcing a manual resolution, killing the merge cascade.
+CHANGELOG.md merge=union

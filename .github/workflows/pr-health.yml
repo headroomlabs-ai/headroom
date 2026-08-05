@@ -25,13 +25,21 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.base.sha }}
 
+      - name: Fetch current PR body
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.body // ""' > .pr-body.md
+
       - name: Validate PR template
         id: validate
-        run: python3 scripts/pr-governance.py --event "$GITHUB_EVENT_PATH" --report .pr-governance-report.json
+        run: python3 scripts/pr-governance.py --event "$GITHUB_EVENT_PATH" --body-file .pr-body.md --report .pr-governance-report.json
 
       - name: Append governance summary
         run: |
@@ -131,11 +139,10 @@ jobs:
               }
             }
 
-      - name: Fail when the PR body is incomplete
+      - name: Report incomplete PR body
         if: steps.validate.outputs.valid != 'true'
         run: |
-          echo "PR template validation failed. Update the PR body or move the PR back to draft."
-          exit 1
+          echo "PR template validation found missing fields. The governance comment and labels identify the required author updates."
 
   label:
     runs-on: ubuntu-latest
@@ -144,6 +151,10 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       REPO: ${{ github.repository }}
     steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+
       - name: Ensure maintenance labels exist
         run: |
           set -euo pipefail
@@ -186,28 +197,22 @@ jobs:
 
           for pr in $pr_numbers; do
             data="$(gh pr view "$pr" --repo "$REPO" \
-              --json isDraft,labels,mergeStateStatus,statusCheckRollup)"
+              --json isDraft,labels,mergeStateStatus,reviewDecision,statusCheckRollup)"
 
             merge_state="$(jq -r '.mergeStateStatus // "UNKNOWN"' <<<"$data")"
-            check_state="$(jq -r '
-              [
-                (.statusCheckRollup // [])[]
-                | select((.conclusion // .state // "") as $s
-                  | ["FAILURE", "TIMED_OUT", "ACTION_REQUIRED", "CANCELLED", "ERROR"] | index($s))
-              ]
-              | if length > 0 then "failing" else "passing" end
-            ' <<<"$data")"
+            check_state="$(python3 .github/scripts/pr-health-labels.py --state-json "$data")"
             is_draft="$(jq -r '.isDraft' <<<"$data")"
+            review_decision="$(jq -r '.reviewDecision // ""' <<<"$data")"
 
             if [[ "$merge_state" == "BEHIND" ]]; then
               gh pr edit "$pr" --repo "$REPO" --add-label "status: needs rebase"
-            else
+            elif [[ "$merge_state" != "UNKNOWN" ]]; then
               gh pr edit "$pr" --repo "$REPO" --remove-label "status: needs rebase" || true
             fi
 
             if [[ "$merge_state" == "DIRTY" ]]; then
               gh pr edit "$pr" --repo "$REPO" --add-label "status: has conflicts"
-            else
+            elif [[ "$merge_state" != "UNKNOWN" ]]; then
               gh pr edit "$pr" --repo "$REPO" --remove-label "status: has conflicts" || true
             fi
 
@@ -217,7 +222,7 @@ jobs:
               gh pr edit "$pr" --repo "$REPO" --remove-label "status: ci failing" || true
             fi
 
-            if [[ "$merge_state" == "BEHIND" || "$merge_state" == "DIRTY" || "$check_state" == "failing" || "$is_draft" == "true" ]]; then
+            if [[ "$merge_state" == "BEHIND" || "$merge_state" == "DIRTY" || "$check_state" == "failing" || "$is_draft" == "true" || "$review_decision" == "CHANGES_REQUESTED" ]]; then
               gh pr edit "$pr" --repo "$REPO" --remove-label "status: ready for review" || true
             fi
           done

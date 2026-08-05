@@ -3,8 +3,6 @@ title: Introduction
 description: Headroom is the context optimization layer for LLM applications. Compress tool outputs, DB results, file reads, and RAG results before they reach the model. Same answers, fraction of the tokens.
 ---
 
-<StatsSection />
-
 Headroom compresses everything your AI agent reads -- tool outputs, database results, file reads, RAG retrievals, API responses -- before it reaches the LLM. The model sees less noise, responds faster, and costs less.
 
 ## Quick preview
@@ -19,7 +17,8 @@ const messages = [
 ];
 
 const result = await compress(messages, { model: 'gpt-4o' });
-console.log(`Saved ${result.tokensSaved} tokens (${(result.compressionRatio * 100).toFixed(0)}%)`);
+// compressionRatio is tokensAfter / tokensBefore, so savings is 1 - ratio.
+console.log(`Saved ${result.tokensSaved} tokens (${((1 - result.compressionRatio) * 100).toFixed(0)}%)`);
 ```
 </Tab>
 <Tab value="Python">
@@ -35,10 +34,6 @@ print(f"Saved {result.tokens_saved} tokens ({result.compression_ratio:.0%})")
 ```
 </Tab>
 </Tabs>
-
-## Community stats
-
-<LiveStats />
 
 ## What gets compressed
 

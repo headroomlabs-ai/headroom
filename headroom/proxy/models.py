@@ -6,12 +6,38 @@ Extracted from server.py to keep the codebase maintainable.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import InitVar, dataclass, field
 from datetime import datetime
 from typing import Any, Literal
 
 from headroom.memory import qdrant_env
 from headroom.providers.registry import ProviderApiOverrides
+from headroom.proxy.model_router import ModelRouterConfig
+
+logger = logging.getLogger(__name__)
+
+
+def _qdrant_env_port_or_default() -> int:
+    """Resolve ``HEADROOM_QDRANT_PORT``, falling back to the default on a bad value.
+
+    ``qdrant_env.qdrant_env_port`` raises on an invalid port (intended for
+    explicit qdrant setup). As a ``ProxyConfig`` field ``default_factory`` it
+    runs on EVERY ``ProxyConfig()`` construction, regardless of whether
+    memory/qdrant is enabled (both off by default), so a stray or typo'd
+    ``HEADROOM_QDRANT_PORT`` would crash proxy startup for an unrelated,
+    off-by-default subsystem. Fail soft here so config construction never raises.
+    """
+    try:
+        return qdrant_env.qdrant_env_port()
+    except ValueError:
+        logger.warning(
+            "Ignoring invalid HEADROOM_QDRANT_PORT; using default %d. "
+            "Set a valid 1-65535 port to override.",
+            qdrant_env.DEFAULT_QDRANT_PORT,
+        )
+        return qdrant_env.DEFAULT_QDRANT_PORT
+
 
 # =============================================================================
 # Data Models
@@ -42,6 +68,16 @@ class RequestLog:
     tags: dict[str, str]
     cache_hit: bool
     transforms_applied: list[str]
+
+    # Provider-side cache economics (Anthropic prompt caching, #2438).
+    # ``cache_hit`` alone is ambiguous: a call billed cache-*creation* (write)
+    # cannot be told apart from a real cache-*read* hit. These raw deltas —
+    # already carried on RequestOutcome from the upstream response usage —
+    # let the JSONL telemetry reflect true economics (uncached input +
+    # cache_creation), not just the proxy's boolean.
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    uncached_input_tokens: int = 0
 
     # Waste signals detected in original messages
     waste_signals: dict[str, int] | None = None
@@ -99,14 +135,31 @@ class ProxyConfig:
     port: int = 8787
     anthropic_api_url: str | None = None  # Custom Anthropic API URL override
     openai_api_url: str | None = None  # Custom OpenAI API URL override
+    # Display label for the OpenAI-compatible upstream (dashboard/stats only).
+    # Overrides hostname detection from ``openai_api_url``; the internal
+    # provider stays ``openai`` so pricing/format keys are unaffected.
+    provider_name: str | None = None
     gemini_api_url: str | None = None  # Custom Gemini API URL override
     cloudcode_api_url: str | None = None  # Custom Cloud Code Assist API URL override
     vertex_api_url: str | None = None  # Custom Vertex AI regional API URL override
+    # Extra headers merged into (and overriding) forwarded Anthropic/OpenAI requests.
+    # JSON-object config knobs; see settings_store's anthropic_extra_headers/
+    # openai_extra_headers and providers.registry.resolve_extra_headers.
+    anthropic_extra_headers: dict[str, str] | None = None
+    openai_extra_headers: dict[str, str] | None = None
 
     # Backend: "anthropic" (direct API), "litellm-*" (via LiteLLM), or "anyllm" (via any-llm)
     backend: str = "anthropic"
     bedrock_region: str = "us-west-2"
     bedrock_profile: str | None = None
+    # Custom upstream for the Bedrock InvokeModel passthrough routes
+    # (`/model/{id}/invoke[-with-response-stream]`). When set, those routes are
+    # registered and compress the request body before forwarding here. Point it
+    # at a re-signing gateway (LiteLLM, LocalStack, a corporate Bedrock
+    # proxy) — NOT raw AWS, since rewriting the body invalidates the caller's
+    # SigV4 signature. Leave unset (default) to keep `--backend bedrock`'s
+    # direct-to-AWS, re-signing behavior unchanged.
+    bedrock_api_url: str | None = None
     anyllm_provider: str = "openai"
 
     # Optimization mode: "token" (rewrite for max compression) or
@@ -121,12 +174,17 @@ class ProxyConfig:
     smart_crusher_with_compaction: bool | None = None
     keep_last_turns: int = 4
 
+    # Cost-aware model routing (issue #1706). Opt-in and disabled by default;
+    # when configured, an ordered rule set can rewrite the outgoing model based
+    # on request size / tool presence. None keeps behavior unchanged.
+    model_router: ModelRouterConfig | None = None
+
     # CCR Tool Injection
     ccr_inject_tool: bool = True
     ccr_inject_system_instructions: bool = False
     # Proxy-level mirror of ContentRouterConfig.ccr_inject_marker, so retrieval
-    # markers can be toggled from the CLI (--no-ccr-marker). Threaded into the
-    # router in server.py; default preserves current behavior.
+    # markers can be toggled from the CLI (--no-ccr, which also drops the retrieve
+    # tool). Threaded into the router in server.py; default preserves current behavior.
     ccr_inject_marker: bool = True
 
     # CCR Response Handling
@@ -145,6 +203,44 @@ class ProxyConfig:
     # such as SmartCrusher, log/search/diff, and schema compaction enabled.
     # CLI: --disable-kompress; env: HEADROOM_DISABLE_KOMPRESS=1.
     disable_kompress: bool = False
+
+    # With disable_kompress, route fall-through content to PASSTHROUGH instead
+    # of the default KOMPRESS fallback strategy. Restores the legacy
+    # --disable-kompress behaviour for callers that relied on it. No effect
+    # unless disable_kompress is also set.
+    # CLI: --disable-kompress-fallback; env: HEADROOM_DISABLE_KOMPRESS_FALLBACK=1.
+    disable_kompress_fallback: bool = False
+
+    # Per-provider overrides for `disable_kompress`. None inherits the global
+    # value above; True/False force-disable/enable Kompress for that provider's
+    # pipeline only (other compressors and all routing/exclusion are unaffected).
+    # Lets e.g. Anthropic run without lossy text compression while OpenAI/Codex
+    # keeps it. CLI: --disable-kompress-anthropic / --enable-kompress-anthropic
+    # (and -openai); env: HEADROOM_DISABLE_KOMPRESS_ANTHROPIC / _OPENAI
+    # (1 = disable, 0 = enable).
+    disable_kompress_anthropic: bool | None = None
+    disable_kompress_openai: bool | None = None
+
+    # Force ALL compressible content through Kompress (kompress-v2-base),
+    # bypassing per-type compressor selection (SmartCrusher/CodeAware/log/
+    # diff/html/tabular/search). Tool ground truth stays protected: excluded
+    # tools (Read/Glob/Grep/...) and reversibility-gated tool output are never
+    # touched. Off by default; opt-in for systems that want one uniform
+    # compressor at the cost of per-type structural fidelity.
+    # CLI: --force-kompress-all; env: HEADROOM_FORCE_KOMPRESS_ALL=1.
+    force_kompress_all: bool = False
+
+    lossless: bool = False  # CLI: --lossless; env: HEADROOM_LOSSLESS=1. No-CCR mode: compress without any retrieval marker.
+
+    # Compress requests that fall through to the catch-all passthrough handler
+    # (custom proxy paths that don't match a built-in API route, e.g.
+    # `/api/codex-proxy/<key>/v1/responses` fronted by another proxy). Off by
+    # default because passthrough targets are unknown upstreams; opt-in for
+    # wrapper-proxy architectures that need coding-agent traffic compressed.
+    # Currently applies to OpenAI Responses-shaped bodies (paths ending in
+    # `/responses`). CLI: --compress-passthrough; env:
+    # HEADROOM_COMPRESS_PASSTHROUGH=1.
+    compress_passthrough: bool = False
 
     # Code graph live watcher (triggers incremental reindex on file changes)
     code_graph_watcher: bool = False
@@ -173,8 +269,26 @@ class ProxyConfig:
     # CLI: --exclude-tools <name1,name2>; env: HEADROOM_EXCLUDE_TOOLS=<name1,name2>
     exclude_tools: set[str] | None = None
 
+    # Tool names whose results must never be lossy-compressed (e.g. Bash, WebFetch).
+    # Merged into exclude_tools before ContentRouter processes the conversation.
+    # CLI: --protect-tool-results <name1,name2>; env: HEADROOM_PROTECT_TOOL_RESULTS=<name1,name2>
+    protect_tool_results: frozenset[str] = field(default_factory=frozenset)
+
     # Read lifecycle management
     read_lifecycle: bool = True
+
+    # Mechanism B: activity-based read maturation (hold fresh Reads out of
+    # the provider prefix cache; compress once their file quiesces).
+    # Experimental — default off. CLI: --read-maturation;
+    # env: HEADROOM_READ_MATURATION=1
+    read_maturation: bool = False
+    # Read-maturation tuning (only meaningful when read_maturation=True).
+    # Defaults mirror ReadMaturationConfig. CLI: --read-maturation-quiesce-turns,
+    # --read-maturation-max-hold-turns, --read-maturation-min-size-bytes;
+    # env: HEADROOM_READ_MATURATION_QUIESCE_TURNS / _MAX_HOLD_TURNS / _MIN_SIZE_BYTES.
+    read_maturation_quiesce_turns: int = 5
+    read_maturation_max_hold_turns: int = 25
+    read_maturation_min_size_bytes: int = 2048
 
     # Deprecated compatibility argument. ContentRouter is always active in
     # the Python proxy; accepting this avoids breaking old config constructors
@@ -205,6 +319,9 @@ class ProxyConfig:
     cost_tracking_enabled: bool = True
     budget_limit_usd: float | None = None
     budget_period: Literal["hourly", "daily", "monthly"] = "daily"
+    # What spend booked from Headroom's own token estimate (provider returned no
+    # usage breakdown) does to budget enforcement. See budget_basis_policy.
+    budget_estimated_basis: Literal["count", "ignore", "block"] = "count"
 
     # Logging
     log_requests: bool = True
@@ -217,6 +334,17 @@ class ProxyConfig:
     # CLI: --proxy-extension <name1,name2>; env: HEADROOM_PROXY_EXTENSIONS.
     proxy_extensions: list[str] | None = None
 
+    # Compressor selection (opt-in narrowing of the built-in compressor set).
+    # None (the default) leaves EVERY built-in compressor enabled — byte-
+    # identical to today. When a set is given, only the named recognized
+    # built-ins {smart_crusher, kompress, code_aware, search, log, tabular,
+    # config, html, image} stay enabled and the rest are disabled at the
+    # ContentRouterConfig `enable_*` seam; `"*"` enables all. Names that are
+    # not recognized built-ins are ignored here (reserved for the
+    # `headroom.compressor` registry). CLI: --compressor <name1,name2>
+    # (repeatable); env: HEADROOM_COMPRESSORS.
+    compressors: set[str] | None = None
+
     # Fallback
     fallback_enabled: bool = False
     fallback_provider: str | None = None
@@ -224,11 +352,16 @@ class ProxyConfig:
     # Timeouts
     request_timeout_seconds: int = 300
     connect_timeout_seconds: int = 10
+    # Anthropic buffered reads can legitimately run longer than the generic
+    # proxy request cap. Keep the generic timeout unchanged elsewhere.
+    anthropic_buffered_request_timeout_seconds: int = 600
 
     # Connection pool
     max_connections: int = 500
     max_keepalive_connections: int = 100
+    keepalive_expiry: float = 90.0
     http2: bool = True
+    http_proxy: str | None = None
 
     # Memory System
     memory_enabled: bool = False
@@ -260,7 +393,7 @@ class ProxyConfig:
     # Qdrant connection (defaults resolve from HEADROOM_QDRANT_* env vars)
     memory_qdrant_url: str | None = field(default_factory=qdrant_env.qdrant_env_url)
     memory_qdrant_host: str = field(default_factory=qdrant_env.qdrant_env_host)
-    memory_qdrant_port: int = field(default_factory=qdrant_env.qdrant_env_port)
+    memory_qdrant_port: int = field(default_factory=_qdrant_env_port_or_default)
     memory_qdrant_api_key: str | None = field(default_factory=qdrant_env.qdrant_env_api_key)
     memory_neo4j_uri: str = "neo4j://localhost:7687"
     memory_neo4j_user: str = "neo4j"
@@ -286,8 +419,26 @@ class ProxyConfig:
     subscription_poll_interval_s: int = 300
     subscription_active_window_s: int = 60
 
+    # Periodic TOIN stats logging. Enabled by default for observability, but
+    # operators of long-lived proxies can disable it if TOIN stats collection
+    # causes avoidable memory pressure on their platform.
+    # Env: HEADROOM_PERIODIC_TOIN_STATS=0.
+    periodic_toin_stats_enabled: bool = True
+
     # Stateless mode — disable all filesystem writes for read-only / container deployments
     stateless: bool = False
+
+    # Optional inbound auth. When set, non-loopback requests to the data-plane
+    # routes must present this token (``Authorization: Bearer <token>`` or the
+    # ``X-Headroom-Proxy-Token`` header). Loopback callers are exempt. Closes the
+    # gap where a container bound to 0.0.0.0 exposes unauthenticated /v1/* routes
+    # to the pod network. Env: HEADROOM_PROXY_TOKEN.
+    proxy_token: str | None = None
+
+    # Air-gap master switch — hard-disable ALL outbound network egress
+    # (telemetry beacon, update check, license/usage reporter, HuggingFace model
+    # downloads) for fully offline / regulated deployments. Env: HEADROOM_OFFLINE=1.
+    offline: bool = False
 
     # Unit 4: Bounded pre-upstream concurrency for Anthropic replay storms.
     #
@@ -308,7 +459,7 @@ class ProxyConfig:
     # Precedence: CLI > env > auto-compute.
     anthropic_pre_upstream_concurrency: int | None = None
     # Upper bound for waiting on the Anthropic pre-upstream semaphore
-    # before failing fast with a 503 + Retry-After. Keeps the queue bounded
+    # before failing open to passthrough compression. Keeps the queue bounded
     # when all pre-upstream slots are occupied by slow/hung work.
     anthropic_pre_upstream_acquire_timeout_seconds: float = 15.0
     # Fail-open timeout for Anthropic memory-context lookup while the request
@@ -319,9 +470,9 @@ class ProxyConfig:
     # Bound the dedicated compression threadpool. CPU-bound Rust work runs
     # here; the pool is separate from asyncio's default executor so other
     # ``asyncio.to_thread`` callers (file IO, etc.) are not contended by
-    # compression bursts. ``None`` resolves to ``min(32, (cpu_count or 1) * 4)``,
-    # matching asyncio's default executor sizing today. Lower the cap to
-    # tighten resource use on multi-tenant hosts; raise it to handle larger
+    # compression bursts. ``None`` resolves to ``cpu_count or 1`` so CPU-bound
+    # compression work does not oversubscribe hosts by default. Lower the cap
+    # to tighten resource use on multi-tenant hosts; raise it to handle larger
     # bursts. CLI: ``--compression-max-workers``. Env:
     # ``HEADROOM_COMPRESSION_MAX_WORKERS``.
     #
@@ -338,6 +489,15 @@ class ProxyConfig:
     def __post_init__(self, smart_routing: bool | None = None) -> None:
         if self.retry_enabled and self.retry_max_attempts < 1:
             raise ValueError("retry_max_attempts must be >= 1 when retry_enabled=True")
+        # A 0 (or negative) requests-per-minute limit divides by zero in the
+        # token-bucket wait computation (rate_limit_policy.consume_from_bucket),
+        # 500-ing every request. The CLI already guards this with IntRange(min=1);
+        # fail fast here too so the JSON/programmatic config paths can't produce a
+        # limiter that crashes at request time. Only matters when limiting is on.
+        if self.rate_limit_enabled and self.rate_limit_requests_per_minute < 1:
+            raise ValueError(
+                "rate_limit_requests_per_minute must be >= 1 when rate_limit_enabled=True"
+            )
 
     @property
     def provider_api_overrides(self) -> ProviderApiOverrides:

@@ -1,0 +1,1198 @@
+NAME                                               VERSION                        TYPE                                      
+./.github/actions/headroom-e2e-setup               UNKNOWN                        github-action           (+2 duplicates)   
+./.github/workflows/docker.yml                     UNKNOWN                        github-action-workflow                    
+@emnapi/runtime                                    1.11.0                         npm                     (+1 duplicate)    
+@esbuild/aix-ppc64                                 0.28.1                         npm                     (+1 duplicate)    
+@esbuild/android-arm                               0.28.1                         npm                     (+1 duplicate)    
+@esbuild/android-arm64                             0.28.1                         npm                     (+1 duplicate)    
+@esbuild/android-x64                               0.28.1                         npm                     (+1 duplicate)    
+@esbuild/darwin-arm64                              0.28.1                         npm                     (+1 duplicate)    
+@esbuild/darwin-x64                                0.28.1                         npm                     (+1 duplicate)    
+@esbuild/freebsd-arm64                             0.28.1                         npm                     (+1 duplicate)    
+@esbuild/freebsd-x64                               0.28.1                         npm                     (+1 duplicate)    
+@esbuild/linux-arm                                 0.28.1                         npm                     (+1 duplicate)    
+@esbuild/linux-arm64                               0.28.1                         npm                     (+1 duplicate)    
+@esbuild/linux-ia32                                0.28.1                         npm                     (+1 duplicate)    
+@esbuild/linux-loong64                             0.28.1                         npm                     (+1 duplicate)    
+@esbuild/linux-mips64el                            0.28.1                         npm                     (+1 duplicate)    
+@esbuild/linux-ppc64                               0.28.1                         npm                     (+1 duplicate)    
+@esbuild/linux-riscv64                             0.28.1                         npm                     (+1 duplicate)    
+@esbuild/linux-s390x                               0.28.1                         npm                     (+1 duplicate)    
+@esbuild/linux-x64                                 0.28.1                         npm                     (+1 duplicate)    
+@esbuild/netbsd-arm64                              0.28.1                         npm                     (+1 duplicate)    
+@esbuild/netbsd-x64                                0.28.1                         npm                     (+1 duplicate)    
+@esbuild/openbsd-arm64                             0.28.1                         npm                     (+1 duplicate)    
+@esbuild/openbsd-x64                               0.28.1                         npm                     (+1 duplicate)    
+@esbuild/openharmony-arm64                         0.28.1                         npm                     (+1 duplicate)    
+@esbuild/sunos-x64                                 0.28.1                         npm                     (+1 duplicate)    
+@esbuild/win32-arm64                               0.28.1                         npm                     (+1 duplicate)    
+@esbuild/win32-ia32                                0.28.1                         npm                     (+1 duplicate)    
+@esbuild/win32-x64                                 0.28.1                         npm                     (+1 duplicate)    
+@floating-ui/core                                  1.7.5                          npm                     (+1 duplicate)    
+@floating-ui/dom                                   1.7.6                          npm                     (+1 duplicate)    
+@floating-ui/react-dom                             2.1.8                          npm                     (+1 duplicate)    
+@floating-ui/utils                                 0.2.11                         npm                     (+1 duplicate)    
+@fuma-translate/react                              1.0.2                          npm                     (+1 duplicate)    
+@fumadocs/tailwind                                 0.0.5                          npm                     (+1 duplicate)    
+@img/colour                                        1.1.0                          npm                     (+1 duplicate)    
+@img/sharp-darwin-arm64                            0.34.5                         npm                     (+1 duplicate)    
+@img/sharp-darwin-x64                              0.34.5                         npm                     (+1 duplicate)    
+@img/sharp-libvips-darwin-arm64                    1.2.4                          npm                     (+1 duplicate)    
+@img/sharp-libvips-darwin-x64                      1.2.4                          npm                     (+1 duplicate)    
+@img/sharp-libvips-linux-arm                       1.2.4                          npm                     (+1 duplicate)    
+@img/sharp-libvips-linux-arm64                     1.2.4                          npm                     (+1 duplicate)    
+@img/sharp-libvips-linux-ppc64                     1.2.4                          npm                     (+1 duplicate)    
+@img/sharp-libvips-linux-riscv64                   1.2.4                          npm                     (+1 duplicate)    
+@img/sharp-libvips-linux-s390x                     1.2.4                          npm                     (+1 duplicate)    
+@img/sharp-libvips-linux-x64                       1.2.4                          npm                     (+1 duplicate)    
+@img/sharp-libvips-linuxmusl-arm64                 1.2.4                          npm                     (+1 duplicate)    
+@img/sharp-libvips-linuxmusl-x64                   1.2.4                          npm                     (+1 duplicate)    
+@img/sharp-linux-arm                               0.34.5                         npm                     (+1 duplicate)    
+@img/sharp-linux-arm64                             0.34.5                         npm                     (+1 duplicate)    
+@img/sharp-linux-ppc64                             0.34.5                         npm                     (+1 duplicate)    
+@img/sharp-linux-riscv64                           0.34.5                         npm                     (+1 duplicate)    
+@img/sharp-linux-s390x                             0.34.5                         npm                     (+1 duplicate)    
+@img/sharp-linux-x64                               0.34.5                         npm                     (+1 duplicate)    
+@img/sharp-linuxmusl-arm64                         0.34.5                         npm                     (+1 duplicate)    
+@img/sharp-linuxmusl-x64                           0.34.5                         npm                     (+1 duplicate)    
+@img/sharp-wasm32                                  0.34.5                         npm                     (+1 duplicate)    
+@img/sharp-win32-arm64                             0.34.5                         npm                     (+1 duplicate)    
+@img/sharp-win32-ia32                              0.34.5                         npm                     (+1 duplicate)    
+@img/sharp-win32-x64                               0.34.5                         npm                     (+1 duplicate)    
+@mdx-js/mdx                                        3.1.1                          npm                     (+1 duplicate)    
+@next/env                                          16.2.6                         npm                     (+1 duplicate)    
+@next/swc-darwin-arm64                             16.2.6                         npm                     (+1 duplicate)    
+@next/swc-darwin-x64                               16.2.6                         npm                     (+1 duplicate)    
+@next/swc-linux-arm64-gnu                          16.2.6                         npm                     (+1 duplicate)    
+@next/swc-linux-arm64-musl                         16.2.6                         npm                     (+1 duplicate)    
+@next/swc-linux-x64-gnu                            16.2.6                         npm                     (+1 duplicate)    
+@next/swc-linux-x64-musl                           16.2.6                         npm                     (+1 duplicate)    
+@next/swc-win32-arm64-msvc                         16.2.6                         npm                     (+1 duplicate)    
+@next/swc-win32-x64-msvc                           16.2.6                         npm                     (+1 duplicate)    
+@opentelemetry/api                                 1.9.0                          npm                                       
+@orama/orama                                       3.1.18                         npm                     (+1 duplicate)    
+@radix-ui/number                                   1.1.2                          npm                     (+1 duplicate)    
+@radix-ui/primitive                                1.1.4                          npm                     (+1 duplicate)    
+@radix-ui/react-accordion                          1.2.14                         npm                     (+1 duplicate)    
+@radix-ui/react-arrow                              1.1.10                         npm                     (+1 duplicate)    
+@radix-ui/react-collapsible                        1.1.14                         npm                     (+1 duplicate)    
+@radix-ui/react-collection                         1.1.10                         npm                     (+1 duplicate)    
+@radix-ui/react-compose-refs                       1.1.3                          npm                     (+1 duplicate)    
+@radix-ui/react-context                            1.1.4                          npm                     (+1 duplicate)    
+@radix-ui/react-dialog                             1.1.17                         npm                     (+1 duplicate)    
+@radix-ui/react-direction                          1.1.2                          npm                     (+1 duplicate)    
+@radix-ui/react-dismissable-layer                  1.1.13                         npm                     (+1 duplicate)    
+@radix-ui/react-focus-guards                       1.1.4                          npm                     (+1 duplicate)    
+@radix-ui/react-focus-scope                        1.1.10                         npm                     (+1 duplicate)    
+@radix-ui/react-id                                 1.1.2                          npm                     (+1 duplicate)    
+@radix-ui/react-navigation-menu                    1.2.16                         npm                     (+1 duplicate)    
+@radix-ui/react-popover                            1.1.17                         npm                     (+1 duplicate)    
+@radix-ui/react-popper                             1.3.1                          npm                     (+1 duplicate)    
+@radix-ui/react-portal                             1.1.12                         npm                     (+1 duplicate)    
+@radix-ui/react-presence                           1.1.6                          npm                     (+1 duplicate)    
+@radix-ui/react-primitive                          2.1.6                          npm                     (+1 duplicate)    
+@radix-ui/react-roving-focus                       1.1.13                         npm                     (+1 duplicate)    
+@radix-ui/react-scroll-area                        1.2.12                         npm                     (+1 duplicate)    
+@radix-ui/react-slot                               1.3.0                          npm                     (+1 duplicate)    
+@radix-ui/react-tabs                               1.1.15                         npm                     (+1 duplicate)    
+@radix-ui/react-use-callback-ref                   1.1.2                          npm                     (+1 duplicate)    
+@radix-ui/react-use-controllable-state             1.2.3                          npm                     (+1 duplicate)    
+@radix-ui/react-use-effect-event                   0.0.3                          npm                     (+1 duplicate)    
+@radix-ui/react-use-escape-keydown                 1.1.2                          npm                     (+1 duplicate)    
+@radix-ui/react-use-layout-effect                  1.1.2                          npm                     (+1 duplicate)    
+@radix-ui/react-use-previous                       1.1.2                          npm                     (+1 duplicate)    
+@radix-ui/react-use-rect                           1.1.2                          npm                     (+1 duplicate)    
+@radix-ui/react-use-size                           1.1.2                          npm                     (+1 duplicate)    
+@radix-ui/react-visually-hidden                    1.2.6                          npm                     (+1 duplicate)    
+@radix-ui/rect                                     1.1.2                          npm                     (+1 duplicate)    
+@reduxjs/toolkit                                   2.11.2                         npm                     (+1 duplicate)    
+@shikijs/core                                      4.0.2                          npm                     (+1 duplicate)    
+@shikijs/core                                      4.2.0                          npm                     (+1 duplicate)    
+@shikijs/engine-javascript                         4.2.0                          npm                     (+1 duplicate)    
+@shikijs/engine-oniguruma                          4.2.0                          npm                     (+1 duplicate)    
+@shikijs/langs                                     4.2.0                          npm                     (+1 duplicate)    
+@shikijs/primitive                                 4.0.2                          npm                     (+1 duplicate)    
+@shikijs/primitive                                 4.2.0                          npm                     (+1 duplicate)    
+@shikijs/themes                                    4.2.0                          npm                     (+1 duplicate)    
+@shikijs/twoslash                                  4.0.2                          npm                     (+1 duplicate)    
+@shikijs/types                                     4.0.2                          npm                     (+1 duplicate)    
+@shikijs/types                                     4.2.0                          npm                     (+1 duplicate)    
+@shikijs/vscode-textmate                           10.0.2                         npm                     (+1 duplicate)    
+@standard-schema/spec                              1.1.0                          npm                     (+1 duplicate)    
+@standard-schema/utils                             0.3.0                          npm                     (+1 duplicate)    
+@swc/helpers                                       0.5.15                         npm                     (+1 duplicate)    
+@tailwindcss/oxide                                 4.2.2                          npm                                       
+@ts-morph/common                                   0.28.1                         npm                     (+1 duplicate)    
+@turf/boolean-point-in-polygon                     7.3.4                          npm                     (+1 duplicate)    
+@turf/helpers                                      7.3.4                          npm                     (+1 duplicate)    
+@turf/invariant                                    7.3.4                          npm                     (+1 duplicate)    
+@types/d3-array                                    3.2.2                          npm                     (+1 duplicate)    
+@types/d3-color                                    3.1.3                          npm                     (+1 duplicate)    
+@types/d3-ease                                     3.0.2                          npm                     (+1 duplicate)    
+@types/d3-interpolate                              3.0.4                          npm                     (+1 duplicate)    
+@types/d3-path                                     3.1.1                          npm                     (+1 duplicate)    
+@types/d3-scale                                    4.0.9                          npm                     (+1 duplicate)    
+@types/d3-shape                                    3.1.8                          npm                     (+1 duplicate)    
+@types/d3-time                                     3.0.4                          npm                     (+1 duplicate)    
+@types/d3-timer                                    3.0.2                          npm                     (+1 duplicate)    
+@types/debug                                       4.1.13                         npm                     (+1 duplicate)    
+@types/estree                                      1.0.8                          npm                     (+1 duplicate)    
+@types/estree-jsx                                  1.0.5                          npm                     (+1 duplicate)    
+@types/geojson                                     7946.0.16                      npm                     (+1 duplicate)    
+@types/hast                                        3.0.4                          npm                     (+1 duplicate)    
+@types/mdast                                       4.0.4                          npm                     (+1 duplicate)    
+@types/mdx                                         2.0.13                         npm                     (+1 duplicate)    
+@types/ms                                          2.1.0                          npm                     (+1 duplicate)    
+@types/react                                       19.2.14                        npm                                       
+@types/react-dom                                   19.2.3                         npm                                       
+@types/unist                                       2.0.11                         npm                     (+1 duplicate)    
+@types/unist                                       3.0.3                          npm                     (+1 duplicate)    
+@types/use-sync-external-store                     0.0.6                          npm                     (+1 duplicate)    
+@typescript/vfs                                    1.6.4                          npm                     (+1 duplicate)    
+@ungap/structured-clone                            1.3.0                          npm                     (+1 duplicate)    
+PyO3/maturin-action                                v1                             github-action           (+1 duplicate)    
+Swatinem/rust-cache                                v2                             github-action           (+4 duplicates)   
+absl-py                                            2.4.0                          python                                    
+accelerate                                         1.12.0                         python                                    
+acorn                                              8.16.0                         npm                     (+1 duplicate)    
+acorn-jsx                                          5.3.2                          npm                     (+1 duplicate)    
+actions/cache                                      v5                             github-action           (+2 duplicates)   
+actions/checkout                                   v6                             github-action           (+14 duplicates)  
+actions/download-artifact                          v8                             github-action           (+2 duplicates)   
+actions/github-script                              v7                             github-action                             
+actions/setup-node                                 v6                             github-action           (+1 duplicate)    
+actions/setup-python                               v5                             github-action                             
+actions/setup-python                               v6                             github-action           (+7 duplicates)   
+actions/stale                                      v10                            github-action                             
+actions/upload-artifact                            v7                             github-action           (+5 duplicates)   
+adler2                                             2.0.1                          rust-crate                                
+agno                                               2.4.5                          python                                    
+ahash                                              0.8.12                         rust-crate                                
+aho-corasick                                       1.1.4                          rust-crate                                
+aiohappyeyeballs                                   2.6.1                          python                                    
+aiohttp                                            3.14.1                         python                                    
+aiosignal                                          1.4.0                          python                                    
+aligned                                            0.4.3                          rust-crate                                
+aligned-vec                                        0.6.4                          rust-crate                                
+allocator-api2                                     0.2.21                         rust-crate                                
+android_system_properties                          0.1.5                          rust-crate                                
+anes                                               0.1.6                          rust-crate                                
+annotated-doc                                      0.0.4                          python                                    
+annotated-types                                    0.7.0                          python                                    
+anstream                                           1.0.0                          rust-crate                                
+anstyle                                            1.0.14                         rust-crate                                
+anstyle-parse                                      1.0.0                          rust-crate                                
+anstyle-query                                      1.1.5                          rust-crate                                
+anstyle-wincon                                     3.0.11                         rust-crate                                
+anthropic                                          0.76.0                         python                                    
+antlr4-python3-runtime                             4.9.3                          python                                    
+any-llm-sdk                                        1.12.1                         python                                    
+anyhow                                             1.0.102                        rust-crate                                
+anyio                                              4.12.1                         python                                    
+arbitrary                                          1.4.2                          rust-crate                                
+arc-swap                                           1.9.1                          rust-crate                                
+arg_enum_proc_macro                                0.3.4                          rust-crate                                
+argparse                                           2.0.1                          npm                     (+1 duplicate)    
+aria-hidden                                        1.2.6                          npm                     (+1 duplicate)    
+arrayref                                           0.3.9                          rust-crate                                
+arrayvec                                           0.7.7                          rust-crate                                
+as-slice                                           0.2.1                          rust-crate                                
+assert-json-diff                                   2.0.2                          rust-crate                                
+ast-grep-cli                                       0.42.1                         python                                    
+astring                                            1.9.0                          npm                     (+1 duplicate)    
+async-timeout                                      5.0.1                          python                                    
+async-trait                                        0.1.89                         rust-crate                                
+atomic-waker                                       1.1.2                          rust-crate                                
+attrs                                              25.4.0                         python                                    
+autocfg                                            1.5.1                          rust-crate                                
+av-scenechange                                     0.14.1                         rust-crate                                
+av1-grain                                          0.2.5                          rust-crate                                
+avif-serialize                                     0.8.9                          rust-crate                                
+aws-config                                         1.8.18                         rust-crate                                
+aws-credential-types                               1.2.14                         rust-crate                                
+aws-lc-rs                                          1.17.0                         rust-crate                                
+aws-lc-sys                                         0.41.0                         rust-crate                                
+aws-runtime                                        1.7.5                          rust-crate                                
+aws-sdk-sso                                        1.102.0                        rust-crate                                
+aws-sdk-ssooidc                                    1.104.0                        rust-crate                                
+aws-sdk-sts                                        1.107.0                        rust-crate                                
+aws-sigv4                                          1.4.5                          rust-crate                                
+aws-smithy-async                                   1.2.14                         rust-crate                                
+aws-smithy-http                                    0.63.6                         rust-crate                                
+aws-smithy-http-client                             1.1.13                         rust-crate                                
+aws-smithy-json                                    0.62.7                         rust-crate                                
+aws-smithy-observability                           0.2.6                          rust-crate                                
+aws-smithy-query                                   0.60.15                        rust-crate                                
+aws-smithy-runtime                                 1.11.3                         rust-crate                                
+aws-smithy-runtime-api                             1.12.3                         rust-crate                                
+aws-smithy-runtime-api-macros                      1.0.0                          rust-crate                                
+aws-smithy-schema                                  0.1.0                          rust-crate                                
+aws-smithy-types                                   1.5.0                          rust-crate                                
+aws-smithy-xml                                     0.60.15                        rust-crate                                
+aws-types                                          1.3.16                         rust-crate                                
+axum                                               0.7.9                          rust-crate                                
+axum-core                                          0.4.5                          rust-crate                                
+axum-macros                                        0.4.2                          rust-crate                                
+babel                                              2.17.0                         python                                    
+backoff                                            2.2.1                          python                                    
+backports-asyncio-runner                           1.2.0                          python                                    
+bail                                               2.0.2                          npm                     (+1 duplicate)    
+balanced-match                                     4.0.4                          npm                     (+1 duplicate)    
+base64                                             0.13.1                         rust-crate                                
+base64                                             0.22.1                         rust-crate                                
+base64-simd                                        0.8.0                          rust-crate                                
+baseline-browser-mapping                           2.10.16                        npm                     (+1 duplicate)    
+bit-set                                            0.8.0                          rust-crate                                
+bit-vec                                            0.8.0                          rust-crate                                
+bit_field                                          0.10.3                         rust-crate                                
+bitflags                                           2.13.0                         rust-crate                                
+bitstream-io                                       4.10.0                         rust-crate                                
+blake3                                             1.8.5                          rust-crate                                
+block-buffer                                       0.10.4                         rust-crate                                
+block-buffer                                       0.12.1                         rust-crate                                
+boto3                                              1.42.38                        python                                    
+botocore                                           1.42.38                        python                                    
+brace-expansion                                    5.0.6                          npm                     (+1 duplicate)    
+bstr                                               1.12.1                         rust-crate                                
+built                                              0.8.1                          rust-crate                                
+bumpalo                                            3.20.3                         rust-crate                                
+bytemuck                                           1.25.0                         rust-crate                                
+byteorder                                          1.5.0                          rust-crate                                
+byteorder-lite                                     0.1.0                          rust-crate                                
+bytes                                              1.12.0                         rust-crate                                
+bytes-utils                                        0.1.4                          rust-crate                                
+bytesize                                           1.3.3                          rust-crate                                
+caniuse-lite                                       1.0.30001786                   npm                     (+1 duplicate)    
+cast                                               0.3.0                          rust-crate                                
+castaway                                           0.2.4                          rust-crate                                
+cc                                                 1.2.65                         rust-crate                                
+ccount                                             2.0.1                          npm                     (+1 duplicate)    
+certifi                                            2026.1.4                       python                                    
+cffi                                               2.0.0                          python                                    
+cfg-if                                             1.0.4                          rust-crate                                
+cfg_aliases                                        0.2.1                          rust-crate                                
+cfgv                                               3.5.0                          python                                    
+character-entities                                 2.0.2                          npm                     (+1 duplicate)    
+character-entities-html4                           2.1.0                          npm                     (+1 duplicate)    
+character-entities-legacy                          3.0.0                          npm                     (+1 duplicate)    
+character-reference-invalid                        2.0.1                          npm                     (+1 duplicate)    
+chardet                                            5.2.0                          python                                    
+charset-normalizer                                 3.4.4                          python                                    
+chokidar                                           5.0.0                          npm                     (+1 duplicate)    
+chrono                                             0.4.45                         rust-crate                                
+ciborium                                           0.2.2                          rust-crate                                
+ciborium-io                                        0.2.2                          rust-crate                                
+ciborium-ll                                        0.2.2                          rust-crate                                
+clap                                               4.6.1                          rust-crate                                
+clap_builder                                       4.6.0                          rust-crate                                
+clap_derive                                        4.6.1                          rust-crate                                
+clap_lex                                           1.1.0                          rust-crate                                
+class-variance-authority                           0.7.1                          npm                     (+1 duplicate)    
+click                                              8.3.1                          python                                    
+client-only                                        0.0.1                          npm                     (+1 duplicate)    
+clsx                                               2.1.1                          npm                     (+1 duplicate)    
+cmake                                              0.1.58                         rust-crate                                
+cmov                                               0.5.4                          rust-crate                                
+code-block-writer                                  13.0.3                         npm                     (+1 duplicate)    
+codecov/codecov-action                             v5                             github-action           (+2 duplicates)   
+collapse-white-space                               2.1.0                          npm                     (+1 duplicate)    
+color_quant                                        1.1.0                          rust-crate                                
+colorama                                           0.4.6                          python                                    
+colorchoice                                        1.0.5                          rust-crate                                
+coloredlogs                                        15.0.1                         python                                    
+colorlog                                           6.10.1                         python                                    
+combine                                            4.6.7                          rust-crate                                
+comma-separated-tokens                             2.0.3                          npm                     (+1 duplicate)    
+compact_str                                        0.9.1                          rust-crate                                
+compute-scroll-into-view                           3.1.1                          npm                     (+1 duplicate)    
+console                                            0.15.11                        rust-crate                                
+console                                            0.16.3                         rust-crate                                
+const-oid                                          0.10.2                         rust-crate                                
+constant_time_eq                                   0.4.2                          rust-crate                                
+cookie                                             0.18.1                         rust-crate                                
+cookie_store                                       0.22.1                         rust-crate                                
+core-foundation                                    0.10.1                         rust-crate                                
+core-foundation-sys                                0.8.7                          rust-crate                                
+courlan                                            1.3.2                          python                                    
+coverage                                           7.13.2                         python                                    
+cpufeatures                                        0.2.17                         rust-crate                                
+cpufeatures                                        0.3.0                          rust-crate                                
+crc32fast                                          1.5.0                          rust-crate                                
+criterion                                          0.5.1                          rust-crate                                
+criterion-plot                                     0.5.0                          rust-crate                                
+crossbeam-deque                                    0.8.6                          rust-crate                                
+crossbeam-epoch                                    0.9.18                         rust-crate                                
+crossbeam-utils                                    0.8.21                         rust-crate                                
+crunchy                                            0.2.4                          rust-crate                                
+crypto-common                                      0.1.7                          rust-crate                                
+crypto-common                                      0.2.2                          rust-crate                                
+cryptography                                       48.0.1                         python                                    
+csstype                                            3.2.3                          npm                                       
+ctutils                                            0.4.2                          rust-crate                                
+cuda-bindings                                      13.3.1                         python                                    
+cuda-pathfinder                                    1.5.5                          python                                    
+cuda-toolkit                                       13.0.2                         python                                    
+d3-array                                           3.2.4                          npm                     (+1 duplicate)    
+d3-color                                           3.1.0                          npm                     (+1 duplicate)    
+d3-ease                                            3.0.1                          npm                     (+1 duplicate)    
+d3-format                                          3.1.2                          npm                     (+1 duplicate)    
+d3-interpolate                                     3.0.1                          npm                     (+1 duplicate)    
+d3-path                                            3.1.0                          npm                     (+1 duplicate)    
+d3-scale                                           4.0.2                          npm                     (+1 duplicate)    
+d3-shape                                           3.2.0                          npm                     (+1 duplicate)    
+d3-time                                            3.1.0                          npm                     (+1 duplicate)    
+d3-time-format                                     4.1.0                          npm                     (+1 duplicate)    
+d3-timer                                           3.0.1                          npm                     (+1 duplicate)    
+darling                                            0.20.11                        rust-crate                                
+darling_core                                       0.20.11                        rust-crate                                
+darling_macro                                      0.20.11                        rust-crate                                
+dary_heap                                          0.3.9                          rust-crate                                
+dashmap                                            6.2.1                          rust-crate                                
+data-encoding                                      2.11.0                         rust-crate                                
+dataproperty                                       1.1.0                          python                                    
+datasets                                           4.5.0                          python                                    
+dateparser                                         1.2.2                          python                                    
+deadpool                                           0.12.3                         rust-crate                                
+deadpool-runtime                                   0.1.4                          rust-crate                                
+debug                                              4.4.3                          npm                     (+1 duplicate)    
+decimal.js-light                                   2.5.1                          npm                     (+1 duplicate)    
+decode-named-character-reference                   1.3.0                          npm                     (+1 duplicate)    
+dequal                                             2.0.3                          npm                     (+1 duplicate)    
+deranged                                           0.5.8                          rust-crate                                
+derive_builder                                     0.20.2                         rust-crate                                
+derive_builder_core                                0.20.2                         rust-crate                                
+derive_builder_macro                               0.20.2                         rust-crate                                
+detect-libc                                        2.1.2                          npm                     (+1 duplicate)    
+detect-node-es                                     1.1.0                          npm                     (+1 duplicate)    
+devlop                                             1.1.0                          npm                     (+1 duplicate)    
+digest                                             0.10.7                         rust-crate                                
+digest                                             0.11.3                         rust-crate                                
+dill                                               0.4.0                          python                                    
+dirs                                               6.0.0                          rust-crate                                
+dirs-sys                                           0.5.0                          rust-crate                                
+displaydoc                                         0.2.6                          rust-crate                                
+distlib                                            0.4.0                          python                                    
+distro                                             1.9.0                          python                                    
+docker/bake-action                                 v7                             github-action                             
+docker/login-action                                v4                             github-action                             
+docker/metadata-action                             v6                             github-action                             
+docker/setup-buildx-action                         v4                             github-action           (+1 duplicate)    
+docstring-parser                                   0.17.0                         python                                    
+document-features                                  0.2.12                         rust-crate                                
+dorny/paths-filter                                 v4                             github-action                             
+dotted-map                                         3.1.0                          npm                     (+1 duplicate)    
+dtolnay/rust-toolchain                             1.95.0                         github-action                             
+dtolnay/rust-toolchain                             1.96.0                         github-action           (+2 duplicates)   
+dtolnay/rust-toolchain                             stable                         github-action                             
+dunce                                              1.0.5                          rust-crate                                
+either                                             1.16.0                         rust-crate                                
+encode_unicode                                     1.0.0                          rust-crate                                
+encoding_rs                                        0.8.35                         rust-crate                                
+entities                                           6.0.1                          npm                     (+1 duplicate)    
+equator                                            0.4.2                          rust-crate                                
+equator-macro                                      0.4.2                          rust-crate                                
+equivalent                                         1.0.2                          rust-crate                                
+errno                                              0.3.14                         rust-crate                                
+es-toolkit                                         1.45.1                         npm                     (+1 duplicate)    
+esast-util-from-estree                             2.0.0                          npm                     (+1 duplicate)    
+esast-util-from-js                                 2.0.1                          npm                     (+1 duplicate)    
+esaxx-rs                                           0.1.10                         rust-crate                                
+esbuild                                            0.28.1                         npm                     (+1 duplicate)    
+escape-string-regexp                               5.0.0                          npm                     (+1 duplicate)    
+estree-util-attach-comments                        3.0.0                          npm                     (+1 duplicate)    
+estree-util-build-jsx                              3.0.1                          npm                     (+1 duplicate)    
+estree-util-is-identifier-name                     3.0.0                          npm                     (+1 duplicate)    
+estree-util-scope                                  1.0.0                          npm                     (+1 duplicate)    
+estree-util-to-js                                  2.0.0                          npm                     (+1 duplicate)    
+estree-util-value-to-estree                        3.5.0                          npm                     (+1 duplicate)    
+estree-util-visit                                  2.0.0                          npm                     (+1 duplicate)    
+estree-walker                                      3.0.3                          npm                     (+1 duplicate)    
+et-xmlfile                                         2.0.0                          python                                    
+evaluate                                           0.4.6                          python                                    
+eventemitter3                                      5.0.4                          npm                     (+1 duplicate)    
+exceptiongroup                                     1.3.1                          python                                    
+exr                                                1.74.0                         rust-crate                                
+extend                                             3.0.2                          npm                     (+1 duplicate)    
+fallible-iterator                                  0.3.0                          rust-crate                                
+fallible-streaming-iterator                        0.1.9                          rust-crate                                
+fancy-regex                                        0.17.0                         rust-crate                                
+fastapi                                            0.136.3                        python                                    
+fastembed                                          0.8.0                          python                                    
+fastembed                                          5.17.2                         rust-crate                                
+fastrand                                           2.4.1                          rust-crate                                
+fastuuid                                           0.14.0                         python                                    
+fax                                                0.2.7                          rust-crate                                
+fdeflate                                           0.3.7                          rust-crate                                
+fdir                                               6.5.0                          npm                     (+1 duplicate)    
+filelock                                           3.20.3                         python                                    
+find-msvc-tools                                    0.1.9                          rust-crate                                
+flatbuffers                                        25.12.19                       python                                    
+flate2                                             1.1.9                          rust-crate                                
+fnv                                                1.0.7                          rust-crate                                
+foldhash                                           0.2.0                          rust-crate                                
+form_urlencoded                                    1.2.2                          rust-crate                                
+framer-motion                                      12.40.0                        npm                     (+1 duplicate)    
+frozenlist                                         1.8.0                          python                                    
+fs_extra                                           1.3.0                          rust-crate                                
+fsspec                                             2025.10.0                      python                                    
+fumadocs-core                                      16.10.3                        npm                     (+1 duplicate)    
+fumadocs-mdx                                       15.0.12                        npm                     (+1 duplicate)    
+fumadocs-twoslash                                  3.1.15                         npm                     (+1 duplicate)    
+fumadocs-typescript                                4.0.14                         npm                     (+1 duplicate)    
+fumadocs-ui                                        16.10.3                        npm                     (+1 duplicate)    
+futures                                            0.3.32                         rust-crate                                
+futures-channel                                    0.3.32                         rust-crate                                
+futures-core                                       0.3.32                         rust-crate                                
+futures-executor                                   0.3.32                         rust-crate                                
+futures-io                                         0.3.32                         rust-crate                                
+futures-macro                                      0.3.32                         rust-crate                                
+futures-sink                                       0.3.32                         rust-crate                                
+futures-task                                       0.3.32                         rust-crate                                
+futures-util                                       0.3.32                         rust-crate                                
+gcp_auth                                           0.12.7                         rust-crate                                
+generic-array                                      0.14.7                         rust-crate                                
+get-nonce                                          1.0.1                          npm                     (+1 duplicate)    
+getrandom                                          0.2.17                         rust-crate                                
+getrandom                                          0.3.4                          rust-crate                                
+getrandom                                          0.4.3                          rust-crate                                
+gif                                                0.14.2                         rust-crate                                
+gitdb                                              4.0.12                         python                                    
+github-slugger                                     2.0.0                          npm                     (+1 duplicate)    
+gitpython                                          3.1.50                         python                                    
+googleapis-common-protos                           1.74.0                         python                                    
+googleapis/release-please-action                   v5                             github-action                             
+greenlet                                           3.4.0                          python                                    
+grpcio                                             1.80.0                         python                                    
+gunicorn                                           26.0.0                         python                                    
+h11                                                0.16.0                         python                                    
+h2                                                 0.4.15                         rust-crate                                
+h2                                                 4.3.0                          python                                    
+half                                               2.7.1                          rust-crate                                
+hashbrown                                          0.14.5                         rust-crate                                
+hashbrown                                          0.16.1                         rust-crate                                
+hashbrown                                          0.17.1                         rust-crate                                
+hashlink                                           0.9.1                          rust-crate                                
+hast-util-from-parse5                              8.0.3                          npm                     (+1 duplicate)    
+hast-util-parse-selector                           4.0.0                          npm                     (+1 duplicate)    
+hast-util-raw                                      9.1.0                          npm                     (+1 duplicate)    
+hast-util-to-estree                                3.1.3                          npm                     (+1 duplicate)    
+hast-util-to-html                                  9.0.5                          npm                     (+1 duplicate)    
+hast-util-to-jsx-runtime                           2.3.6                          npm                     (+1 duplicate)    
+hast-util-to-parse5                                8.0.1                          npm                     (+1 duplicate)    
+hast-util-whitespace                               3.0.0                          npm                     (+1 duplicate)    
+hastscript                                         9.0.1                          npm                     (+1 duplicate)    
+headroom-ai                                        0.22.4                         npm                                       
+headroom-ai                                        0.27.0                         npm                     (+1 duplicate)    
+headroom-ai                                        0.27.0                         python                                    
+headroom-ai                                        UNKNOWN                        npm                                       
+headroom-core                                      0.1.0                          rust-crate                                
+headroom-docs                                      0.0.0                          npm                                       
+headroom-openclaw                                  0.27.0                         npm                                       
+headroom-parity                                    0.1.0                          rust-crate                                
+headroom-proxy                                     0.1.0                          rust-crate                                
+headroom-py                                        0.1.0                          rust-crate                                
+heck                                               0.5.0                          rust-crate                                
+hermit-abi                                         0.5.2                          rust-crate                                
+hex                                                0.4.3                          rust-crate                                
+hf-hub                                             0.4.3                          rust-crate                                
+hf-hub                                             0.5.0                          rust-crate                                
+hf-xet                                             1.5.0                          python                                    
+hmac                                               0.13.0                         rust-crate                                
+hmac-sha256                                        1.1.14                         rust-crate                                
+hnswlib                                            0.8.0                          python                                    
+hpack                                              4.1.0                          python                                    
+html-void-elements                                 3.0.0                          npm                     (+1 duplicate)    
+htmldate                                           1.9.4                          python                                    
+http                                               0.2.12                         rust-crate                                
+http                                               1.4.2                          rust-crate                                
+http-body                                          0.4.6                          rust-crate                                
+http-body                                          1.0.1                          rust-crate                                
+http-body-util                                     0.1.3                          rust-crate                                
+httparse                                           1.10.1                         rust-crate                                
+httpcore                                           1.0.9                          python                                    
+httpdate                                           1.0.3                          rust-crate                                
+httpx                                              0.28.1                         python                                    
+httpx-sse                                          0.4.3                          python                                    
+huggingface-hub                                    1.16.1                         python                                    
+humanfriendly                                      10.0                           python                                    
+humantime                                          2.3.0                          rust-crate                                
+hybrid-array                                       0.4.12                         rust-crate                                
+hyper                                              1.10.1                         rust-crate                                
+hyper-rustls                                       0.27.9                         rust-crate                                
+hyper-util                                         0.1.20                         rust-crate                                
+hyperframe                                         6.1.0                          python                                    
+iana-time-zone                                     0.1.65                         rust-crate                                
+iana-time-zone-haiku                               0.1.2                          rust-crate                                
+icu_collections                                    2.2.0                          rust-crate                                
+icu_locale_core                                    2.2.0                          rust-crate                                
+icu_normalizer                                     2.2.0                          rust-crate                                
+icu_normalizer_data                                2.2.0                          rust-crate                                
+icu_properties                                     2.2.0                          rust-crate                                
+icu_properties_data                                2.2.0                          rust-crate                                
+icu_provider                                       2.2.0                          rust-crate                                
+ident_case                                         1.0.1                          rust-crate                                
+identify                                           2.6.16                         python                                    
+idna                                               1.1.0                          rust-crate                                
+idna                                               3.15                           python                                    
+idna_adapter                                       1.2.2                          rust-crate                                
+image                                              0.25.10                        rust-crate                                
+image-webp                                         0.2.4                          rust-crate                                
+imgref                                             1.12.2                         rust-crate                                
+immer                                              10.2.0                         npm                     (+1 duplicate)    
+immer                                              11.1.4                         npm                     (+1 duplicate)    
+importlib-metadata                                 8.7.1                          python                                    
+indexmap                                           2.14.0                         rust-crate                                
+indicatif                                          0.17.11                        rust-crate                                
+indicatif                                          0.18.4                         rust-crate                                
+iniconfig                                          2.3.0                          python                                    
+inline-style-parser                                0.2.7                          npm                     (+1 duplicate)    
+internmap                                          2.0.3                          npm                     (+1 duplicate)    
+interpolate_name                                   0.2.4                          rust-crate                                
+ipnet                                              2.12.0                         rust-crate                                
+is-alphabetical                                    2.0.1                          npm                     (+1 duplicate)    
+is-alphanumerical                                  2.0.1                          npm                     (+1 duplicate)    
+is-decimal                                         2.0.1                          npm                     (+1 duplicate)    
+is-hexadecimal                                     2.0.1                          npm                     (+1 duplicate)    
+is-plain-obj                                       4.1.0                          npm                     (+1 duplicate)    
+is-terminal                                        0.4.17                         rust-crate                                
+is_terminal_polyfill                               1.70.2                         rust-crate                                
+itertools                                          0.10.5                         rust-crate                                
+itertools                                          0.13.0                         rust-crate                                
+itertools                                          0.14.0                         rust-crate                                
+itoa                                               1.0.18                         rust-crate                                
+jinja2                                             3.1.6                          python                                    
+jiter                                              0.12.0                         python                                    
+jlumbroso/free-disk-space                          v1.3.1                         github-action                             
+jmespath                                           1.1.0                          python                                    
+joblib                                             1.5.3                          python                                    
+jobserver                                          0.1.34                         rust-crate                                
+js-sys                                             0.3.102                        rust-crate                                
+js-yaml                                            4.2.0                          npm                     (+1 duplicate)    
+jsonlines                                          4.0.0                          python                                    
+jsonpatch                                          1.33                           python                                    
+jsonpointer                                        3.0.0                          python                                    
+jsonschema                                         4.26.0                         python                                    
+jsonschema-specifications                          2025.9.1                       python                                    
+justext                                            3.0.2                          python                                    
+langchain-core                                     1.4.2                          python                                    
+langchain-ollama                                   1.0.1                          python                                    
+langchain-openai                                   1.2.2                          python                                    
+langchain-protocol                                 0.0.16                         python                                    
+langsmith                                          0.9.3                          python                                    
+lazy_static                                        1.5.0                          rust-crate                                
+lebe                                               0.5.3                          rust-crate                                
+libc                                               0.2.186                        rust-crate                                
+libfuzzer-sys                                      0.4.13                         rust-crate                                
+libloading                                         0.9.0                          rust-crate                                
+libredox                                           0.1.17                         rust-crate                                
+librt                                              0.7.8                          python                                    
+libsqlite3-sys                                     0.30.1                         rust-crate                                
+linux-raw-sys                                      0.12.1                         rust-crate                                
+litellm                                            1.88.1                         python                                    
+litemap                                            0.8.2                          rust-crate                                
+litrs                                              1.0.0                          rust-crate                                
+lm-eval                                            0.4.10                         python                                    
+lock_api                                           0.4.14                         rust-crate                                
+log                                                0.4.33                         rust-crate                                
+loguru                                             0.7.3                          python                                    
+longest-streak                                     3.1.0                          npm                     (+1 duplicate)    
+loop9                                              0.1.5                          rust-crate                                
+lru                                                0.18.0                         rust-crate                                
+lru-slab                                           0.1.2                          rust-crate                                
+lucide-react                                       1.20.0                         npm                     (+1 duplicate)    
+lxml                                               6.1.0                          python                                    
+lxml-html-clean                                    0.4.4                          python                                    
+lzma-rust2                                         0.15.8                         rust-crate                                
+macro_rules_attribute                              0.2.2                          rust-crate                                
+macro_rules_attribute-proc_macro                   0.2.2                          rust-crate                                
+magika                                             0.6.2                          python                                    
+magika                                             1.1.0                          rust-crate                                
+markdown-extensions                                2.0.0                          npm                     (+1 duplicate)    
+markdown-it-py                                     4.0.0                          python                                    
+markdown-table                                     3.0.4                          npm                     (+1 duplicate)    
+markupsafe                                         3.0.3                          python                                    
+matchers                                           0.2.0                          rust-crate                                
+matchit                                            0.7.3                          rust-crate                                
+matrixmultiply                                     0.3.10                         rust-crate                                
+maybe-rayon                                        0.1.1                          rust-crate                                
+mbstrdecoder                                       1.1.4                          python                                    
+mcp                                                1.26.0                         python                                    
+md-5                                               0.10.6                         rust-crate                                
+mdast-util-find-and-replace                        3.0.2                          npm                     (+1 duplicate)    
+mdast-util-from-markdown                           2.0.3                          npm                     (+1 duplicate)    
+mdast-util-gfm                                     3.1.0                          npm                     (+1 duplicate)    
+mdast-util-gfm-autolink-literal                    2.0.1                          npm                     (+1 duplicate)    
+mdast-util-gfm-footnote                            2.1.0                          npm                     (+1 duplicate)    
+mdast-util-gfm-strikethrough                       2.0.0                          npm                     (+1 duplicate)    
+mdast-util-gfm-table                               2.0.0                          npm                     (+1 duplicate)    
+mdast-util-gfm-task-list-item                      2.0.0                          npm                     (+1 duplicate)    
+mdast-util-mdx                                     3.0.0                          npm                     (+1 duplicate)    
+mdast-util-mdx-expression                          2.0.1                          npm                     (+1 duplicate)    
+mdast-util-mdx-jsx                                 3.2.0                          npm                     (+1 duplicate)    
+mdast-util-mdxjs-esm                               2.0.1                          npm                     (+1 duplicate)    
+mdast-util-phrasing                                4.1.0                          npm                     (+1 duplicate)    
+mdast-util-to-hast                                 13.2.1                         npm                     (+1 duplicate)    
+mdast-util-to-markdown                             2.1.2                          npm                     (+1 duplicate)    
+mdast-util-to-string                               4.0.0                          npm                     (+1 duplicate)    
+mdurl                                              0.1.2                          python                                    
+mem0ai                                             2.0.10                         python                                    
+memchr                                             2.8.2                          rust-crate                                
+mgrs                                               1.0.0                          npm                     (+1 duplicate)    
+micromark                                          4.0.2                          npm                     (+1 duplicate)    
+micromark-core-commonmark                          2.0.3                          npm                     (+1 duplicate)    
+micromark-extension-gfm                            3.0.0                          npm                     (+1 duplicate)    
+micromark-extension-gfm-autolink-literal           2.1.0                          npm                     (+1 duplicate)    
+micromark-extension-gfm-footnote                   2.1.0                          npm                     (+1 duplicate)    
+micromark-extension-gfm-strikethrough              2.1.0                          npm                     (+1 duplicate)    
+micromark-extension-gfm-table                      2.1.1                          npm                     (+1 duplicate)    
+micromark-extension-gfm-tagfilter                  2.0.0                          npm                     (+1 duplicate)    
+micromark-extension-gfm-task-list-item             2.1.0                          npm                     (+1 duplicate)    
+micromark-extension-mdx-expression                 3.0.1                          npm                     (+1 duplicate)    
+micromark-extension-mdx-jsx                        3.0.2                          npm                     (+1 duplicate)    
+micromark-extension-mdx-md                         2.0.0                          npm                     (+1 duplicate)    
+micromark-extension-mdxjs                          3.0.0                          npm                     (+1 duplicate)    
+micromark-extension-mdxjs-esm                      3.0.0                          npm                     (+1 duplicate)    
+micromark-factory-destination                      2.0.1                          npm                     (+1 duplicate)    
+micromark-factory-label                            2.0.1                          npm                     (+1 duplicate)    
+micromark-factory-mdx-expression                   2.0.3                          npm                     (+1 duplicate)    
+micromark-factory-space                            2.0.1                          npm                     (+1 duplicate)    
+micromark-factory-title                            2.0.1                          npm                     (+1 duplicate)    
+micromark-factory-whitespace                       2.0.1                          npm                     (+1 duplicate)    
+micromark-util-character                           2.1.1                          npm                     (+1 duplicate)    
+micromark-util-chunked                             2.0.1                          npm                     (+1 duplicate)    
+micromark-util-classify-character                  2.0.1                          npm                     (+1 duplicate)    
+micromark-util-combine-extensions                  2.0.1                          npm                     (+1 duplicate)    
+micromark-util-decode-numeric-character-reference  2.0.2                          npm                     (+1 duplicate)    
+micromark-util-decode-string                       2.0.1                          npm                     (+1 duplicate)    
+micromark-util-encode                              2.0.1                          npm                     (+1 duplicate)    
+micromark-util-events-to-acorn                     2.0.3                          npm                     (+1 duplicate)    
+micromark-util-html-tag-name                       2.0.1                          npm                     (+1 duplicate)    
+micromark-util-normalize-identifier                2.0.1                          npm                     (+1 duplicate)    
+micromark-util-resolve-all                         2.0.1                          npm                     (+1 duplicate)    
+micromark-util-sanitize-uri                        2.0.1                          npm                     (+1 duplicate)    
+micromark-util-subtokenize                         2.1.0                          npm                     (+1 duplicate)    
+micromark-util-symbol                              2.0.1                          npm                     (+1 duplicate)    
+micromark-util-types                               2.0.2                          npm                     (+1 duplicate)    
+mime                                               0.3.17                         rust-crate                                
+minimal-lexical                                    0.2.1                          rust-crate                                
+minimatch                                          10.2.5                         npm                     (+1 duplicate)    
+miniz_oxide                                        0.8.9                          rust-crate                                
+mio                                                1.2.1                          rust-crate                                
+mmh3                                               5.2.1                          python                                    
+monostate                                          0.1.18                         rust-crate                                
+monostate-impl                                     0.1.18                         rust-crate                                
+more-itertools                                     10.8.0                         python                                    
+motion                                             12.40.0                        npm                     (+1 duplicate)    
+motion-dom                                         12.40.0                        npm                     (+1 duplicate)    
+motion-utils                                       12.39.0                        npm                     (+1 duplicate)    
+moxcms                                             0.8.1                          rust-crate                                
+mpmath                                             1.3.0                          python                                    
+ms                                                 2.1.3                          npm                     (+1 duplicate)    
+multidict                                          6.7.1                          python                                    
+multiprocess                                       0.70.18                        python                                    
+mypy                                               1.19.1                         python                                    
+mypy-extensions                                    1.1.0                          python                                    
+nanoid                                             3.3.15                         npm                     (+1 duplicate)    
+ndarray                                            0.17.2                         rust-crate                                
+neo4j                                              6.1.0                          python                                    
+networkx                                           3.4.2                          python                                    
+networkx                                           3.6.1                          python                                    
+new_debug_unreachable                              1.0.6                          rust-crate                                
+next                                               16.2.6                         npm                     (+1 duplicate)    
+next-themes                                        0.4.6                          npm                     (+1 duplicate)    
+nltk                                               3.9.4                          python                                    
+no_std_io2                                         0.9.4                          rust-crate                                
+nodeenv                                            1.10.0                         python                                    
+nom                                                7.1.3                          rust-crate                                
+nom                                                8.0.0                          rust-crate                                
+noop_proc_macro                                    0.3.0                          rust-crate                                
+nu-ansi-term                                       0.50.3                         rust-crate                                
+num-bigint                                         0.4.6                          rust-crate                                
+num-complex                                        0.4.6                          rust-crate                                
+num-conv                                           0.2.2                          rust-crate                                
+num-derive                                         0.4.2                          rust-crate                                
+num-integer                                        0.1.46                         rust-crate                                
+num-rational                                       0.4.2                          rust-crate                                
+num-traits                                         0.2.19                         rust-crate                                
+num_cpus                                           1.17.0                         rust-crate                                
+number_prefix                                      0.4.0                          rust-crate                                
+numpy                                              2.2.6                          python                                    
+numpy                                              2.4.1                          python                                    
+nvidia-cublas                                      13.1.1.3                       python                                    
+nvidia-cuda-cupti                                  13.0.85                        python                                    
+nvidia-cuda-nvrtc                                  13.0.88                        python                                    
+nvidia-cuda-runtime                                13.0.96                        python                                    
+nvidia-cudnn-cu13                                  9.20.0.48                      python                                    
+nvidia-cufft                                       12.0.0.61                      python                                    
+nvidia-cufile                                      1.15.1.6                       python                                    
+nvidia-curand                                      10.4.0.35                      python                                    
+nvidia-cusolver                                    12.0.4.66                      python                                    
+nvidia-cusparse                                    12.6.3.3                       python                                    
+nvidia-cusparselt-cu13                             0.8.1                          python                                    
+nvidia-nccl-cu13                                   2.29.7                         python                                    
+nvidia-nvjitlink                                   13.0.88                        python                                    
+nvidia-nvshmem-cu13                                3.4.5                          python                                    
+nvidia-nvtx                                        13.0.85                        python                                    
+ollama                                             0.6.1                          python                                    
+omegaconf                                          2.3.0                          python                                    
+once_cell                                          1.21.4                         rust-crate                                
+once_cell_polyfill                                 1.70.2                         rust-crate                                
+onig                                               6.5.3                          rust-crate                                
+onig_sys                                           69.9.3                         rust-crate                                
+oniguruma-parser                                   0.12.2                         npm                     (+1 duplicate)    
+oniguruma-to-es                                    4.3.6                          npm                     (+1 duplicate)    
+onnxruntime                                        1.23.2                         python                                    
+onnxruntime                                        1.26.0                         python                                    
+oorandom                                           11.1.5                         rust-crate                                
+openai                                             2.41.0                         python                                    
+opencv-python                                      4.13.0.92                      python                                    
+openpyxl                                           3.1.5                          python                                    
+openresponses-types                                2.3.0.post1                    python                                    
+openssl-probe                                      0.2.1                          rust-crate                                
+opentelemetry-api                                  1.39.1                         python                                    
+opentelemetry-exporter-otlp-proto-common           1.39.1                         python                                    
+opentelemetry-exporter-otlp-proto-http             1.39.1                         python                                    
+opentelemetry-instrumentation                      0.60b1                         python                                    
+opentelemetry-instrumentation-threading            0.60b1                         python                                    
+opentelemetry-proto                                1.39.1                         python                                    
+opentelemetry-sdk                                  1.39.1                         python                                    
+opentelemetry-semantic-conventions                 0.60b1                         python                                    
+option-ext                                         0.2.0                          rust-crate                                
+orjson                                             3.11.6                         python                                    
+ort                                                2.0.0-rc.12                    rust-crate                                
+ort-sys                                            2.0.0-rc.12                    rust-crate                                
+outref                                             0.5.2                          rust-crate                                
+packaging                                          25.0                           python                                    
+pandas                                             2.3.3                          python                                    
+pandas                                             3.0.0                          python                                    
+parking_lot                                        0.12.5                         rust-crate                                
+parking_lot_core                                   0.9.12                         rust-crate                                
+parse-entities                                     4.0.2                          npm                     (+1 duplicate)    
+parse5                                             7.3.0                          npm                     (+1 duplicate)    
+paste                                              1.0.15                         rust-crate                                
+pastey                                             0.1.1                          rust-crate                                
+path-browserify                                    1.0.1                          npm                     (+1 duplicate)    
+pathspec                                           1.0.4                          python                                    
+pathvalidate                                       3.3.1                          python                                    
+percent-encoding                                   2.3.2                          rust-crate                                
+picocolors                                         1.1.1                          npm                     (+1 duplicate)    
+picomatch                                          4.0.4                          npm                     (+1 duplicate)    
+pillow                                             12.2.0                         python                                    
+pin-project                                        1.1.13                         rust-crate                                
+pin-project-internal                               1.1.13                         rust-crate                                
+pin-project-lite                                   0.2.17                         rust-crate                                
+pin-utils                                          0.1.0                          rust-crate                                
+pkg-config                                         0.3.33                         rust-crate                                
+platformdirs                                       4.5.1                          python                                    
+plotters                                           0.3.7                          rust-crate                                
+plotters-backend                                   0.3.7                          rust-crate                                
+plotters-svg                                       0.3.7                          rust-crate                                
+pluggy                                             1.6.0                          python                                    
+png                                                0.18.1                         rust-crate                                
+point-in-polygon-hao                               1.2.4                          npm                     (+1 duplicate)    
+portable-atomic                                    1.13.1                         rust-crate                                
+portable-atomic-util                               0.2.7                          rust-crate                                
+portalocker                                        3.2.0                          python                                    
+postcss                                            8.5.15                         npm                     (+1 duplicate)    
+posthog                                            7.21.0                         python                                    
+potential_utf                                      0.1.5                          rust-crate                                
+powerfmt                                           0.2.0                          rust-crate                                
+ppv-lite86                                         0.2.21                         rust-crate                                
+pre-commit                                         4.5.1                          python                                    
+proc-macro2                                        1.0.106                        rust-crate                                
+profiling                                          1.0.18                         rust-crate                                
+profiling-procmacros                               1.0.18                         rust-crate                                
+proj4                                              2.20.8                         npm                     (+1 duplicate)    
+prometheus                                         0.13.4                         rust-crate                                
+propcache                                          0.4.1                          python                                    
+property-information                               7.1.0                          npm                     (+1 duplicate)    
+proptest                                           1.11.0                         rust-crate                                
+protobuf                                           6.33.5                         python                                    
+psutil                                             7.2.1                          python                                    
+pxfm                                               0.1.29                         rust-crate                                
+py-rust-stemmers                                   0.1.5                          python                                    
+pyarrow                                            23.0.1                         python                                    
+pyclipper                                          1.4.0                          python                                    
+pycparser                                          3.0                            python                                    
+pydantic                                           2.12.5                         python                                    
+pydantic-core                                      2.41.5                         python                                    
+pydantic-settings                                  2.14.2                         python                                    
+pygments                                           2.20.0                         python                                    
+pyjwt                                              2.13.0                         python                                    
+pyo3                                               0.29.0                         rust-crate                                
+pyo3-build-config                                  0.29.0                         rust-crate                                
+pyo3-ffi                                           0.29.0                         rust-crate                                
+pyo3-log                                           0.13.4                         rust-crate                                
+pyo3-macros                                        0.29.0                         rust-crate                                
+pyo3-macros-backend                                0.29.0                         rust-crate                                
+pypa/gh-action-pypi-publish                        v1.13.0                        github-action           (+1 duplicate)    
+pyreadline3                                        3.5.4                          python                                    
+pytablewriter                                      1.2.1                          python                                    
+pytest                                             9.0.3                          python                                    
+pytest-asyncio                                     1.3.0                          python                                    
+pytest-cov                                         7.0.0                          python                                    
+python-dateutil                                    2.9.0.post0                    python                                    
+python-dotenv                                      1.2.2                          python                                    
+python-multipart                                   0.0.31                         python                                    
+pytz                                               2025.2                         python                                    
+pywin32                                            311                            python                                    
+pyyaml                                             6.0.3                          python                                    
+qdrant-client                                      1.17.1                         python                                    
+qoi                                                0.4.1                          rust-crate                                
+quick-error                                        1.2.3                          rust-crate                                
+quick-error                                        2.0.1                          rust-crate                                
+quinn                                              0.11.11                        rust-crate                                
+quinn-proto                                        0.11.15                        rust-crate                                
+quinn-udp                                          0.5.14                         rust-crate                                
+quote                                              1.0.46                         rust-crate                                
+r-efi                                              5.3.0                          rust-crate                                
+r-efi                                              6.0.0                          rust-crate                                
+rand                                               0.8.6                          rust-crate                                
+rand                                               0.9.4                          rust-crate                                
+rand_chacha                                        0.3.1                          rust-crate                                
+rand_chacha                                        0.9.0                          rust-crate                                
+rand_core                                          0.6.4                          rust-crate                                
+rand_core                                          0.9.5                          rust-crate                                
+rand_xorshift                                      0.4.0                          rust-crate                                
+rapidocr                                           3.8.1                          python                                    
+rapidocr-onnxruntime                               1.4.4                          python                                    
+rav1e                                              0.8.1                          rust-crate                                
+ravif                                              0.13.0                         rust-crate                                
+rawpointer                                         0.2.1                          rust-crate                                
+rayon                                              1.12.0                         rust-crate                                
+rayon-cond                                         0.4.0                          rust-crate                                
+rayon-core                                         1.13.0                         rust-crate                                
+react                                              19.2.4                         npm                     (+1 duplicate)    
+react-dom                                          19.2.4                         npm                     (+1 duplicate)    
+react-is                                           19.2.5                         npm                     (+1 duplicate)    
+react-redux                                        9.2.0                          npm                     (+1 duplicate)    
+react-remove-scroll                                2.7.2                          npm                     (+1 duplicate)    
+react-remove-scroll-bar                            2.3.8                          npm                     (+1 duplicate)    
+react-style-singleton                              2.2.3                          npm                     (+1 duplicate)    
+readdirp                                           5.0.0                          npm                     (+1 duplicate)    
+recharts                                           3.8.1                          npm                     (+1 duplicate)    
+recma-build-jsx                                    1.0.0                          npm                     (+1 duplicate)    
+recma-jsx                                          1.0.1                          npm                     (+1 duplicate)    
+recma-parse                                        1.0.0                          npm                     (+1 duplicate)    
+recma-stringify                                    1.0.0                          npm                     (+1 duplicate)    
+redis                                              0.27.6                         rust-crate                                
+redox_syscall                                      0.5.18                         rust-crate                                
+redox_users                                        0.5.2                          rust-crate                                
+redux                                              5.0.1                          npm                     (+1 duplicate)    
+redux-thunk                                        3.1.0                          npm                     (+1 duplicate)    
+referencing                                        0.37.0                         python                                    
+regex                                              1.12.4                         rust-crate                                
+regex                                              2026.1.15                      python                                    
+regex                                              6.1.0                          npm                     (+1 duplicate)    
+regex-automata                                     0.4.14                         rust-crate                                
+regex-lite                                         0.1.9                          rust-crate                                
+regex-recursion                                    6.0.2                          npm                     (+1 duplicate)    
+regex-syntax                                       0.8.11                         rust-crate                                
+regex-utilities                                    2.3.0                          npm                     (+1 duplicate)    
+rehype-raw                                         7.0.0                          npm                     (+1 duplicate)    
+rehype-recma                                       1.0.0                          npm                     (+1 duplicate)    
+remark                                             15.0.1                         npm                     (+1 duplicate)    
+remark-gfm                                         4.0.1                          npm                     (+1 duplicate)    
+remark-mdx                                         3.1.1                          npm                     (+1 duplicate)    
+remark-parse                                       11.0.0                         npm                     (+1 duplicate)    
+remark-rehype                                      11.1.2                         npm                     (+1 duplicate)    
+remark-stringify                                   11.0.0                         npm                     (+1 duplicate)    
+requests                                           2.33.0                         python                                    
+requests-toolbelt                                  1.0.0                          python                                    
+reqwest                                            0.12.28                        rust-crate                                
+reselect                                           5.1.1                          npm                     (+1 duplicate)    
+rgb                                                0.8.53                         rust-crate                                
+rich                                               14.3.1                         python                                    
+ring                                               0.17.14                        rust-crate                                
+robust-predicates                                  3.0.3                          npm                     (+1 duplicate)    
+rouge-score                                        0.1.2                          python                                    
+rpds-py                                            0.30.0                         python                                    
+ruff                                               0.14.14                        python                                    
+rusqlite                                           0.32.1                         rust-crate                                
+rustc-hash                                         1.1.0                          rust-crate                                
+rustc-hash                                         2.1.2                          rust-crate                                
+rustc_version                                      0.4.1                          rust-crate                                
+rustix                                             1.1.4                          rust-crate                                
+rustls                                             0.23.41                        rust-crate                                
+rustls-native-certs                                0.8.4                          rust-crate                                
+rustls-pki-types                                   1.14.1                         rust-crate                                
+rustls-webpki                                      0.103.13                       rust-crate                                
+rustversion                                        1.0.22                         rust-crate                                
+rusty-fork                                         0.3.1                          rust-crate                                
+ryu                                                1.0.23                         rust-crate                                
+s3transfer                                         0.16.0                         python                                    
+sacrebleu                                          2.6.0                          python                                    
+safetensors                                        0.7.0                          python                                    
+safetensors                                        0.8.0                          rust-crate                                
+same-file                                          1.0.6                          rust-crate                                
+schannel                                           0.1.29                         rust-crate                                
+scheduler                                          0.27.0                         npm                     (+1 duplicate)    
+scikit-learn                                       1.7.2                          python                                    
+scikit-learn                                       1.8.0                          python                                    
+scipy                                              1.15.3                         python                                    
+scipy                                              1.17.0                         python                                    
+scopeguard                                         1.2.0                          rust-crate                                
+scroll-into-view-if-needed                         3.1.0                          npm                     (+1 duplicate)    
+security-framework                                 3.7.0                          rust-crate                                
+security-framework-sys                             2.17.0                         rust-crate                                
+semver                                             1.0.28                         rust-crate                                
+semver                                             7.7.4                          npm                     (+1 duplicate)    
+sentence-transformers                              5.2.1                          python                                    
+sentencepiece                                      0.2.1                          python                                    
+serde                                              1.0.228                        rust-crate                                
+serde_core                                         1.0.228                        rust-crate                                
+serde_derive                                       1.0.228                        rust-crate                                
+serde_json                                         1.0.150                        rust-crate                                
+serde_path_to_error                                0.1.20                         rust-crate                                
+serde_spanned                                      0.6.9                          rust-crate                                
+serde_urlencoded                                   0.7.1                          rust-crate                                
+setuptools                                         80.10.2                        python                                    
+sha1                                               0.10.6                         rust-crate                                
+sha2                                               0.10.9                         rust-crate                                
+sha2                                               0.11.0                         rust-crate                                
+shapely                                            2.1.2                          python                                    
+sharded-slab                                       0.1.7                          rust-crate                                
+sharp                                              0.34.5                         npm                     (+1 duplicate)    
+shellingham                                        1.5.4                          python                                    
+shiki                                              4.2.0                          npm                     (+1 duplicate)    
+shlex                                              2.0.1                          rust-crate                                
+signal-hook-registry                               1.4.8                          rust-crate                                
+sigstore/cosign-installer                          v3                             github-action                             
+simd-adler32                                       0.3.9                          rust-crate                                
+simd_helpers                                       0.1.0                          rust-crate                                
+six                                                1.17.0                         python                                    
+slab                                               0.4.12                         rust-crate                                
+smallvec                                           1.15.2                         rust-crate                                
+smmap                                              5.0.2                          python                                    
+sniffio                                            1.3.1                          python                                    
+socket2                                            0.6.4                          rust-crate                                
+socks                                              0.3.4                          rust-crate                                
+softprops/action-gh-release                        v3                             github-action                             
+source-map                                         0.7.6                          npm                     (+1 duplicate)    
+source-map-js                                      1.2.1                          npm                     (+1 duplicate)    
+space-separated-tokens                             2.0.2                          npm                     (+1 duplicate)    
+spm_precompiled                                    0.1.4                          rust-crate                                
+sqlalchemy                                         2.0.49                         python                                    
+sqlite-vec                                         0.1.6                          python                                    
+sqlitedict                                         2.1.0                          python                                    
+sse-starlette                                      3.2.0                          python                                    
+stable_deref_trait                                 1.2.1                          rust-crate                                
+starlette                                          1.3.1                          python                                    
+static_assertions                                  1.1.0                          rust-crate                                
+strands-agents                                     1.24.0                         python                                    
+stringify-entities                                 4.0.4                          npm                     (+1 duplicate)    
+strsim                                             0.11.1                         rust-crate                                
+style-to-js                                        1.1.21                         npm                     (+1 duplicate)    
+style-to-object                                    1.0.14                         npm                     (+1 duplicate)    
+styled-jsx                                         5.1.6                          npm                     (+1 duplicate)    
+subtle                                             2.6.1                          rust-crate                                
+sympy                                              1.14.0                         python                                    
+syn                                                2.0.118                        rust-crate                                
+sync_wrapper                                       1.0.2                          rust-crate                                
+synstructure                                       0.13.2                         rust-crate                                
+tabledata                                          1.3.4                          python                                    
+tabulate                                           0.9.0                          python                                    
+taiki-e/install-action                             v2                             github-action                             
+tailwind-merge                                     3.6.0                          npm                     (+1 duplicate)    
+tailwindcss                                        4.2.2                          npm                                       
+target-lexicon                                     0.13.5                         rust-crate                                
+tcolorpy                                           0.1.7                          python                                    
+tempfile                                           3.27.0                         rust-crate                                
+tenacity                                           9.1.2                          python                                    
+thiserror                                          1.0.69                         rust-crate                                
+thiserror                                          2.0.18                         rust-crate                                
+thiserror-impl                                     1.0.69                         rust-crate                                
+thiserror-impl                                     2.0.18                         rust-crate                                
+thread_local                                       1.1.9                          rust-crate                                
+threadpoolctl                                      3.6.0                          python                                    
+tiff                                               0.11.3                         rust-crate                                
+tiktoken                                           0.12.0                         python                                    
+tiktoken-rs                                        0.11.0                         rust-crate                                
+time                                               0.3.51                         rust-crate                                
+time-core                                          0.1.9                          rust-crate                                
+time-macros                                        0.2.30                         rust-crate                                
+tiny-invariant                                     1.3.3                          npm                     (+1 duplicate)    
+tinyexec                                           1.2.4                          npm                     (+1 duplicate)    
+tinyglobby                                         0.2.17                         npm                     (+1 duplicate)    
+tinystr                                            0.8.3                          rust-crate                                
+tinytemplate                                       1.2.1                          rust-crate                                
+tinyvec                                            1.11.0                         rust-crate                                
+tinyvec_macros                                     0.1.1                          rust-crate                                
+tld                                                0.13.1                         python                                    
+tokenizers                                         0.22.2                         python                                    
+tokenizers                                         0.22.2                         rust-crate                                
+tokio                                              1.52.3                         rust-crate                                
+tokio-macros                                       2.7.0                          rust-crate                                
+tokio-rustls                                       0.26.4                         rust-crate                                
+tokio-stream                                       0.1.18                         rust-crate                                
+tokio-tungstenite                                  0.24.0                         rust-crate                                
+tokio-util                                         0.7.18                         rust-crate                                
+toml                                               0.8.23                         rust-crate                                
+toml_datetime                                      0.6.11                         rust-crate                                
+toml_edit                                          0.22.27                        rust-crate                                
+toml_write                                         0.1.2                          rust-crate                                
+tomli                                              2.4.0                          python                                    
+torch                                              2.12.1                         python                                    
+tower                                              0.5.3                          rust-crate                                
+tower-http                                         0.6.11                         rust-crate                                
+tower-layer                                        0.3.3                          rust-crate                                
+tower-service                                      0.3.3                          rust-crate                                
+tqdm                                               4.67.1                         python                                    
+tracing                                            0.1.44                         rust-crate                                
+tracing-attributes                                 0.1.31                         rust-crate                                
+tracing-core                                       0.1.36                         rust-crate                                
+tracing-futures                                    0.2.5                          rust-crate                                
+tracing-log                                        0.2.0                          rust-crate                                
+tracing-serde                                      0.2.0                          rust-crate                                
+tracing-subscriber                                 0.3.23                         rust-crate                                
+trafilatura                                        2.0.0                          python                                    
+transformers                                       5.0.0                          python                                    
+tree-sitter                                        0.25.2                         python                                    
+tree-sitter-c-sharp                                0.23.1                         python                                    
+tree-sitter-embedded-template                      0.25.0                         python                                    
+tree-sitter-language-pack                          0.13.0                         python                                    
+tree-sitter-yaml                                   0.7.2                          python                                    
+trim-lines                                         3.0.1                          npm                     (+1 duplicate)    
+triton                                             3.7.1                          python                                    
+trough                                             2.2.0                          npm                     (+1 duplicate)    
+try-lock                                           0.2.5                          rust-crate                                
+ts-morph                                           27.0.2                         npm                     (+1 duplicate)    
+tslib                                              2.8.1                          npm                     (+1 duplicate)    
+tungstenite                                        0.24.0                         rust-crate                                
+twoslash                                           0.3.6                          npm                     (+1 duplicate)    
+twoslash-protocol                                  0.3.6                          npm                     (+1 duplicate)    
+typenum                                            1.20.1                         rust-crate                                
+typepy                                             1.3.4                          python                                    
+typer                                              0.21.1                         python                                    
+typer-slim                                         0.21.1                         python                                    
+typescript                                         5.9.3                          npm                                       
+typing-extensions                                  4.15.0                         python                                    
+typing-inspection                                  0.4.2                          python                                    
+tzdata                                             2025.3                         python                                    
+tzlocal                                            5.3.1                          python                                    
+unarray                                            0.1.4                          rust-crate                                
+unicode-ident                                      1.0.24                         rust-crate                                
+unicode-normalization-alignments                   0.1.12                         rust-crate                                
+unicode-segmentation                               1.13.3                         rust-crate                                
+unicode-width                                      0.2.2                          rust-crate                                
+unicode_categories                                 0.1.1                          rust-crate                                
+unidiff                                            0.4.0                          rust-crate                                
+unified                                            11.0.5                         npm                     (+1 duplicate)    
+unist-util-is                                      6.0.1                          npm                     (+1 duplicate)    
+unist-util-position                                5.0.0                          npm                     (+1 duplicate)    
+unist-util-position-from-estree                    2.0.0                          npm                     (+1 duplicate)    
+unist-util-remove-position                         5.0.0                          npm                     (+1 duplicate)    
+unist-util-stringify-position                      4.0.0                          npm                     (+1 duplicate)    
+unist-util-visit                                   5.1.0                          npm                     (+1 duplicate)    
+unist-util-visit-parents                           6.0.2                          npm                     (+1 duplicate)    
+unit-prefix                                        0.5.2                          rust-crate                                
+untrusted                                          0.9.0                          rust-crate                                
+ureq                                               2.12.1                         rust-crate                                
+ureq                                               3.3.0                          rust-crate                                
+ureq-proto                                         0.6.0                          rust-crate                                
+url                                                2.5.8                          rust-crate                                
+urlencoding                                        2.1.3                          rust-crate                                
+urllib3                                            2.7.0                          python                                    
+use-callback-ref                                   1.3.3                          npm                     (+1 duplicate)    
+use-sidecar                                        1.1.3                          npm                     (+1 duplicate)    
+use-sync-external-store                            1.6.0                          npm                     (+1 duplicate)    
+utf-8                                              0.7.6                          rust-crate                                
+utf8-zero                                          0.8.1                          rust-crate                                
+utf8_iter                                          1.0.4                          rust-crate                                
+utf8parse                                          0.2.2                          rust-crate                                
+uuid                                               1.23.3                         rust-crate                                
+uuid-utils                                         0.14.0                         python                                    
+uvicorn                                            0.40.0                         python                                    
+v_frame                                            0.3.9                          rust-crate                                
+valuable                                           0.1.1                          rust-crate                                
+vcpkg                                              0.2.15                         rust-crate                                
+version_check                                      0.9.5                          rust-crate                                
+vfile                                              6.0.3                          npm                     (+1 duplicate)    
+vfile-location                                     5.0.3                          npm                     (+1 duplicate)    
+vfile-message                                      4.0.3                          npm                     (+1 duplicate)    
+victory-vendor                                     37.3.6                         npm                     (+1 duplicate)    
+virtualenv                                         20.36.1                        python                                    
+vsimd                                              0.8.0                          rust-crate                                
+wagoid/commitlint-github-action                    v6                             github-action                             
+wait-timeout                                       0.2.1                          rust-crate                                
+walkdir                                            2.5.0                          rust-crate                                
+want                                               0.3.1                          rust-crate                                
+wasi                                               0.11.1+wasi-snapshot-preview1  rust-crate                                
+wasip2                                             1.0.4+wasi-0.2.12              rust-crate                                
+wasm-bindgen                                       0.2.125                        rust-crate                                
+wasm-bindgen-futures                               0.4.75                         rust-crate                                
+wasm-bindgen-macro                                 0.2.125                        rust-crate                                
+wasm-bindgen-macro-support                         0.2.125                        rust-crate                                
+wasm-bindgen-shared                                0.2.125                        rust-crate                                
+wasm-streams                                       0.4.2                          rust-crate                                
+watchdog                                           6.0.0                          python                                    
+web-namespaces                                     2.0.1                          npm                     (+1 duplicate)    
+web-sys                                            0.3.102                        rust-crate                                
+web-time                                           1.1.0                          rust-crate                                
+webpki-roots                                       0.26.11                        rust-crate                                
+webpki-roots                                       1.0.8                          rust-crate                                
+websockets                                         16.0                           python                                    
+weezl                                              0.1.12                         rust-crate                                
+win32-setctime                                     1.2.0                          python                                    
+winapi                                             0.3.9                          rust-crate                                
+winapi-i686-pc-windows-gnu                         0.4.0                          rust-crate                                
+winapi-util                                        0.1.11                         rust-crate                                
+winapi-x86_64-pc-windows-gnu                       0.4.0                          rust-crate                                
+windows-core                                       0.62.2                         rust-crate                                
+windows-implement                                  0.60.2                         rust-crate                                
+windows-interface                                  0.59.3                         rust-crate                                
+windows-link                                       0.2.1                          rust-crate                                
+windows-result                                     0.4.1                          rust-crate                                
+windows-strings                                    0.5.1                          rust-crate                                
+windows-sys                                        0.52.0                         rust-crate                                
+windows-sys                                        0.59.0                         rust-crate                                
+windows-sys                                        0.60.2                         rust-crate                                
+windows-sys                                        0.61.2                         rust-crate                                
+windows-targets                                    0.52.6                         rust-crate                                
+windows-targets                                    0.53.5                         rust-crate                                
+windows_aarch64_gnullvm                            0.52.6                         rust-crate                                
+windows_aarch64_gnullvm                            0.53.1                         rust-crate                                
+windows_aarch64_msvc                               0.52.6                         rust-crate                                
+windows_aarch64_msvc                               0.53.1                         rust-crate                                
+windows_i686_gnu                                   0.52.6                         rust-crate                                
+windows_i686_gnu                                   0.53.1                         rust-crate                                
+windows_i686_gnullvm                               0.52.6                         rust-crate                                
+windows_i686_gnullvm                               0.53.1                         rust-crate                                
+windows_i686_msvc                                  0.52.6                         rust-crate                                
+windows_i686_msvc                                  0.53.1                         rust-crate                                
+windows_x86_64_gnu                                 0.52.6                         rust-crate                                
+windows_x86_64_gnu                                 0.53.1                         rust-crate                                
+windows_x86_64_gnullvm                             0.52.6                         rust-crate                                
+windows_x86_64_gnullvm                             0.53.1                         rust-crate                                
+windows_x86_64_msvc                                0.52.6                         rust-crate                                
+windows_x86_64_msvc                                0.53.1                         rust-crate                                
+winnow                                             0.7.15                         rust-crate                                
+wiremock                                           0.6.5                          rust-crate                                
+wit-bindgen                                        0.57.1                         rust-crate                                
+wkt-parser                                         1.5.5                          npm                     (+1 duplicate)    
+word2number                                        1.1                            python                                    
+wrapt                                              1.17.3                         python                                    
+writeable                                          0.6.3                          rust-crate                                
+xlrd                                               2.0.2                          python                                    
+xmlparser                                          0.13.6                         rust-crate                                
+xxhash                                             3.6.0                          python                                    
+y4m                                                0.8.0                          rust-crate                                
+yarl                                               1.22.0                         python                                    
+yoke                                               0.8.3                          rust-crate                                
+yoke-derive                                        0.8.2                          rust-crate                                
+zerocopy                                           0.8.52                         rust-crate                                
+zerocopy-derive                                    0.8.52                         rust-crate                                
+zerofrom                                           0.1.8                          rust-crate                                
+zerofrom-derive                                    0.1.7                          rust-crate                                
+zeroize                                            1.9.0                          rust-crate                                
+zerotrie                                           0.2.4                          rust-crate                                
+zerovec                                            0.11.6                         rust-crate                                
+zerovec-derive                                     0.11.3                         rust-crate                                
+zipp                                               3.23.0                         python                                    
+zmij                                               1.0.21                         rust-crate                                
+zod                                                4.4.3                          npm                     (+1 duplicate)    
+zstandard                                          0.25.0                         python                                    
+zune-core                                          0.5.1                          rust-crate                                
+zune-inflate                                       0.2.54                         rust-crate                                
+zune-jpeg                                          0.5.15                         rust-crate                                
+zwitch                                             2.0.4                          npm                     (+1 duplicate)    

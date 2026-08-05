@@ -13,7 +13,7 @@ By participating, you agree to our [Code of Conduct](CODE_OF_CONDUCT.md).
 | 🧹 Refactor-only | **Don't.** Only if a maintainer asked, as part of a concrete fix. |
 | 🧪 Test/CI-only PR chasing a known `main` failure | **Don't.** We're tracking it. |
 | 📦 New dep or version bump | **PR with written justification.** |
-| ❓ Question | **Discord `#help` |
+| ❓ Question | Ask in **Discord `#help`** |
 
 **Open PR cap: 10 per author.** Get existing ones merged before opening more.
 
@@ -77,7 +77,7 @@ A human maintainer reviews every dep change. PRs that add or bump a package must
 3. One logical change per PR.
 4. Add tests.
 5. `uv run pytest` · `uv run ruff check .` · `uv run ruff format .`
-6. Update `CHANGELOG.md` for user-facing changes.
+6. Do **not** edit `CHANGELOG.md` — release-please generates it from your Conventional Commit PR title, so a clear `fix(...)`/`feat(...)` title *is* your changelog entry. A CI guard rejects manual edits.
 7. Open the PR with a clear description + `Real behavior proof` + any spec/justification required, and keep the PR in draft until the `Review Readiness` boxes are complete.
 
 **Title format** (conventional commits): `feat:`, `fix:`, `docs:`, `test:`, `refactor:`.

@@ -1,0 +1,50 @@
+{
+  "name": "headroom-opencode",
+  "version": "0.1.0",
+  "description": "Headroom proxy integration plugin for OpenCode - routes LLM traffic through the Headroom proxy for token compression",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "hook-shim",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "build:standalone": "tsup --config tsup.standalone.config.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "^1.18.2",
+    "headroom-ai": "^0.22.3"
+  },
+  "peerDependencies": {
+    "@ai-sdk/openai-compatible": "*",
+    "@ai-sdk/provider": "*",
+    "ai": "*"
+  },
+  "peerDependenciesMeta": {
+    "@ai-sdk/openai-compatible": {
+      "optional": true
+    },
+    "@ai-sdk/provider": {
+      "optional": true
+    },
+    "ai": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.1",
+    "tsup": "^8.0.0",
+    "typescript": "^5.5.0",
+    "vitest": "^4.1.10"
+  },
+  "overrides": {
+    "esbuild": "^0.28.1"
+  },
+  "license": "Apache-2.0"
+}

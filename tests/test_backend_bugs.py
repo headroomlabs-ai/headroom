@@ -820,3 +820,157 @@ class TestBedrockApiKeyNotForwarded:
                 kwargs["api_key"] = headers["x-api-key"]
 
         assert "api_key" not in kwargs
+
+
+# =============================================================================
+# Bedrock Converse Oversized Tool Name Filtering
+# =============================================================================
+
+
+class TestBedrockOversizedToolNameFiltering:
+    """Bedrock Converse hard-rejects any request containing a tool name over
+    64 chars. Claude Code includes every globally-added claude.ai MCP
+    connector tool in every request, even disabled ones, so a single
+    oversized name would 401 the whole call. Tools over the limit must be
+    dropped before the LiteLLM call, only for the ``bedrock`` provider.
+    """
+
+    def _make_response(self):
+        mock_response = MagicMock()
+        mock_response.choices = [
+            MagicMock(message=MagicMock(content="ok", tool_calls=None), finish_reason="stop")
+        ]
+        mock_response.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
+        return mock_response
+
+    @pytest.mark.asyncio
+    async def test_send_message_drops_oversized_tool_name_on_bedrock(self):
+        with (
+            patch("headroom.backends.litellm.acompletion", new_callable=AsyncMock) as mock_acomp,
+            patch("headroom.backends.litellm._fetch_bedrock_inference_profiles", return_value={}),
+        ):
+            mock_acomp.return_value = self._make_response()
+
+            backend = LiteLLMBackend(provider="bedrock", region="us-west-2")
+            body = {
+                "model": "claude-3-5-sonnet-20241022",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [
+                    {"name": "short_tool", "input_schema": {"type": "object"}},
+                    {"name": "x" * 65, "input_schema": {"type": "object"}},
+                ],
+            }
+
+            await backend.send_message(body, {})
+
+            call_kwargs = mock_acomp.call_args[1]
+            names = [t["function"]["name"] for t in call_kwargs["tools"]]
+            assert names == ["short_tool"]
+
+    @pytest.mark.asyncio
+    async def test_send_message_keeps_exactly_64_chars_on_bedrock(self):
+        with (
+            patch("headroom.backends.litellm.acompletion", new_callable=AsyncMock) as mock_acomp,
+            patch("headroom.backends.litellm._fetch_bedrock_inference_profiles", return_value={}),
+        ):
+            mock_acomp.return_value = self._make_response()
+
+            backend = LiteLLMBackend(provider="bedrock", region="us-west-2")
+            name_64 = "y" * 64
+            body = {
+                "model": "claude-3-5-sonnet-20241022",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"name": name_64, "input_schema": {"type": "object"}}],
+            }
+
+            await backend.send_message(body, {})
+
+            call_kwargs = mock_acomp.call_args[1]
+            names = [t["function"]["name"] for t in call_kwargs["tools"]]
+            assert names == [name_64]
+
+    @pytest.mark.asyncio
+    async def test_send_message_does_not_filter_on_non_bedrock(self):
+        """The 64-char limit is a Bedrock Converse API constraint; other
+        providers must forward oversized tool names unfiltered."""
+        with (
+            patch("headroom.backends.litellm.acompletion", new_callable=AsyncMock) as mock_acomp,
+            patch("headroom.backends.litellm._fetch_bedrock_inference_profiles", return_value={}),
+        ):
+            mock_acomp.return_value = self._make_response()
+
+            backend = LiteLLMBackend(provider="openrouter")
+            oversized = "z" * 65
+            body = {
+                "model": "claude-3-5-sonnet-20241022",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"name": oversized, "input_schema": {"type": "object"}}],
+            }
+
+            await backend.send_message(body, {})
+
+            call_kwargs = mock_acomp.call_args[1]
+            names = [t["function"]["name"] for t in call_kwargs["tools"]]
+            assert names == [oversized]
+
+    @pytest.mark.asyncio
+    async def test_stream_message_drops_oversized_tool_name_on_bedrock(self):
+        async def mock_stream():
+            chunk = MagicMock()
+            chunk.choices = [
+                MagicMock(delta=MagicMock(content="hi", tool_calls=None), finish_reason="stop")
+            ]
+            yield chunk
+
+        with (
+            patch("headroom.backends.litellm.acompletion", new_callable=AsyncMock) as mock_acomp,
+            patch("headroom.backends.litellm._fetch_bedrock_inference_profiles", return_value={}),
+        ):
+            mock_acomp.return_value = mock_stream()
+
+            backend = LiteLLMBackend(provider="bedrock", region="us-west-2")
+            body = {
+                "model": "claude-3-5-sonnet-20241022",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [
+                    {"name": "short_tool", "input_schema": {"type": "object"}},
+                    {"name": "w" * 65, "input_schema": {"type": "object"}},
+                ],
+            }
+
+            events = [event async for event in backend.stream_message(body, {})]
+            assert events  # sanity: stream produced output
+
+            call_kwargs = mock_acomp.call_args[1]
+            names = [t["function"]["name"] for t in call_kwargs["tools"]]
+            assert names == ["short_tool"]
+
+    @pytest.mark.asyncio
+    async def test_stream_message_does_not_filter_on_non_bedrock(self):
+        async def mock_stream():
+            chunk = MagicMock()
+            chunk.choices = [
+                MagicMock(delta=MagicMock(content="hi", tool_calls=None), finish_reason="stop")
+            ]
+            yield chunk
+
+        with (
+            patch("headroom.backends.litellm.acompletion", new_callable=AsyncMock) as mock_acomp,
+            patch("headroom.backends.litellm._fetch_bedrock_inference_profiles", return_value={}),
+        ):
+            mock_acomp.return_value = mock_stream()
+
+            backend = LiteLLMBackend(provider="openrouter")
+            oversized = "v" * 65
+            body = {
+                "model": "claude-3-5-sonnet-20241022",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"name": oversized, "input_schema": {"type": "object"}}],
+            }
+
+            events = [event async for event in backend.stream_message(body, {})]
+            assert events
+
+            call_kwargs = mock_acomp.call_args[1]
+            names = [t["function"]["name"] for t in call_kwargs["tools"]]
+            assert names == [oversized]

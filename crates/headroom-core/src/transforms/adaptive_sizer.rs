@@ -148,12 +148,23 @@ pub fn find_knee(curve: &[usize]) -> Option<usize> {
     knee_idx.map(|i| i + 1)
 }
 
+/// True for CJK ideographs, kana, and Hangul. Code-point ranges kept
+/// byte-identical with the Python `_is_cjk_char` for adaptive-sizer parity.
+fn is_cjk_char(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x3040..=0x30FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xAC00..=0xD7AF | 0xF900..=0xFAFF
+    )
+}
+
 /// Cumulative unique-bigram coverage curve.
 ///
 /// Direct port of `compute_unique_bigram_curve` (Python
 /// `adaptive_sizer.py:157-182`). Each item contributes its word-level
-/// bigrams; single-word items contribute `(word, "")`. The curve at
-/// index `k` is the running count of unique bigrams after seeing
+/// bigrams; single-word items contribute `(word, "")`. A spaceless CJK item
+/// (no whitespace to split on) uses character bigrams instead, so CJK lists
+/// produce a real coverage curve rather than one pseudo-bigram per item. The
+/// curve at index `k` is the running count of unique bigrams after seeing
 /// `items[0..=k]`.
 pub fn compute_unique_bigram_curve(items: &[&str]) -> Vec<usize> {
     let mut seen: HashSet<(String, String)> = HashSet::new();
@@ -162,14 +173,23 @@ pub fn compute_unique_bigram_curve(items: &[&str]) -> Vec<usize> {
     for item in items {
         let lower = item.to_lowercase();
         let words: Vec<&str> = lower.split_whitespace().collect();
-        if words.len() < 2 {
-            // Single word or empty: synthesize a unigram-bigram.
-            let first = words.first().copied().unwrap_or("");
-            seen.insert((first.to_string(), String::new()));
-        } else {
+        if words.len() >= 2 {
             for j in 0..words.len() - 1 {
                 seen.insert((words[j].to_string(), words[j + 1].to_string()));
             }
+        } else if let Some(w) = words.first() {
+            let chars: Vec<char> = w.chars().collect();
+            if chars.len() >= 2 && chars.iter().any(|&c| is_cjk_char(c)) {
+                // Spaceless CJK item: synthesize character bigrams.
+                for j in 0..chars.len() - 1 {
+                    seen.insert((chars[j].to_string(), chars[j + 1].to_string()));
+                }
+            } else {
+                seen.insert((w.to_string(), String::new()));
+            }
+        } else {
+            // Empty item.
+            seen.insert((String::new(), String::new()));
         }
         curve.push(seen.len());
     }
@@ -467,6 +487,22 @@ mod tests {
         // "Hello" and "hello" should produce the same bigram.
         let items = ["Hello", "hello"];
         assert_eq!(compute_unique_bigram_curve(&items), vec![1, 1]);
+    }
+
+    #[test]
+    fn bigram_curve_cjk_uses_char_bigrams() {
+        // Spaceless CJK: char bigrams give a real coverage curve (was 1 per item).
+        // "数据库连接失败" -> 数据,据库,库连,连接,接失,失败 = 6
+        // "数据库连接成功" -> shares 4, adds 接成,成功 -> 6+2 = 8
+        let items = ["数据库连接失败", "数据库连接成功"];
+        assert_eq!(compute_unique_bigram_curve(&items), vec![6, 8]);
+    }
+
+    #[test]
+    fn bigram_curve_cjk_single_char_is_unigram() {
+        // a 1-char CJK item has no bigram -> (char, "")
+        let items = ["中", "文"];
+        assert_eq!(compute_unique_bigram_curve(&items), vec![1, 2]);
     }
 
     // ---------- find_knee ----------

@@ -52,7 +52,7 @@ Headroom includes an AST-aware CodeCompressor (tree-sitter, 8 languages) but it 
 
 **Why this is the right default**: Code is almost always fetched because the user wants to work with it. Compressing function bodies would remove exactly what they need.
 
-**Where code savings come from**: The IntelligentContextManager drops old code messages that are no longer relevant (scoring-based), which is a better strategy than stripping function bodies.
+**Where code savings come from**: Headroom compresses code in the live zone — the newest tool outputs and content blocks — with the AST-aware CodeCompressor, while keeping recent and analysis-context code fully intact. It never drops messages from the conversation history or strips function bodies.
 
 **Override**: Set `protect_analysis_context=False` in `ContentRouterConfig` for aggressive code compression. Requires `headroom-ai[code]` for tree-sitter.
 

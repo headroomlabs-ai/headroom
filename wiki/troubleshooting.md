@@ -23,8 +23,8 @@ headroom proxy --port 8788
 # 3. Check for missing dependencies
 pip install "headroom-ai[proxy]"
 
-# 4. Run with debug logging
-headroom proxy --log-level debug
+# 4. Run with request logging
+headroom proxy --log-file ~/.headroom/logs/proxy.jsonl --log-messages
 ```
 
 ### "Connection refused" when calling proxy
@@ -44,6 +44,23 @@ ps aux | grep headroom
 sudo pfctl -s rules | grep 8787
 ```
 
+### "Upstream rejects a beta token the client no longer sends"
+
+**Symptom**: The upstream API returns an error referencing a beta feature (`anthropic-beta` header) even though the client is no longer sending that header.
+
+**Cause**: Headroom's `SessionBetaTracker` re-injects any `anthropic-beta` token seen earlier in the same session to preserve prefix-cache stability. Once a token is in the tracker it persists for the rest of the session. Stopping the token on the client side alone is not sufficient.
+
+**Solution**: Set `HEADROOM_BETA_HEADER_STICKY=disabled` to pass the client's header value verbatim without accumulation:
+
+```bash
+export HEADROOM_BETA_HEADER_STICKY=disabled
+headroom proxy ...
+```
+
+Alternatively, restarting the proxy process clears the in-memory tracker. See [Session Beta Header Tracking](configuration.md#session-beta-header-tracking) for details.
+
+---
+
 ### "Proxy returns errors for some requests"
 
 **Symptom**: Some requests work, others fail with 502/503.
@@ -52,7 +69,7 @@ sudo pfctl -s rules | grep 8787
 
 ```bash
 # 1. Check proxy logs for the actual error
-headroom proxy --log-level debug
+headroom proxy --log-file ~/.headroom/logs/proxy.jsonl --log-messages
 
 # 2. Verify API key is set
 echo $OPENAI_API_KEY  # or ANTHROPIC_API_KEY
@@ -420,6 +437,21 @@ messages = [
 result = crusher.apply(messages, tokenizer)
 print(f"Tokens: {result.tokens_before} -> {result.tokens_after}")
 print(f"Compressed content: {result.messages[0]['content'][:200]}...")
+```
+
+---
+
+### "Native detector crashes with illegal instruction"
+
+On some older or virtualized x86_64 CPUs, AVX2 may be unavailable. The
+Magika/ONNX Runtime detector can require AVX2 through its precompiled runtime
+binary. Headroom skips that detector tier on x86/x86_64 hosts without AVX2 and
+falls back to non-Magika detection tiers instead of crashing.
+
+If native startup still fails on an older CPU, set:
+
+```bash
+export HEADROOM_REQUIRE_RUST_CORE=false
 ```
 
 ---

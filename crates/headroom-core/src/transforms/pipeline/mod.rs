@@ -73,9 +73,6 @@
 //!   but is NOT in the default re-exports — modern agents use scoped
 //!   `rg`/`grep`, the marginal value didn't justify default registration.
 //!
-//! Deferred to later PRs:
-//! - **ProseFieldCompressor** — Phase 3g PR3. Compresses prose-shaped
-//!   string fields inside structured payloads.
 //!
 //! [`estimate_bloat`]: traits::OffloadTransform::estimate_bloat
 
@@ -87,14 +84,14 @@ pub mod traits;
 
 pub use config::{
     BloatConfigs, ConfigError, DiffBloatConfig, DiffNoiseConfig, JsonOffloadConfig, LogBloatConfig,
-    LogTemplateConfig, OffloadConfigs, OrchestratorConfig, PipelineConfig, ReformatConfigs,
-    SearchBloatConfig,
+    LogTemplateConfig, OffloadConfigs, OrchestratorConfig, PipelineConfig, ProseFieldConfig,
+    ReformatConfigs, SearchBloatConfig,
 };
 // `SearchOffload` is intentionally NOT in the top-level re-export
 // (deprecated from default pipeline; reach via the explicit module
 // path if you want to opt in). See `offloads::search_offload` head
 // docs for rationale.
-pub use offloads::{DiffNoise, DiffOffload, JsonOffload, LogOffload};
+pub use offloads::{DiffNoise, DiffOffload, JsonOffload, LogOffload, ProseFieldOffload};
 pub use orchestrator::{CompressionPipeline, CompressionPipelineBuilder, PipelineResult};
 pub use reformats::{JsonMinifier, LogTemplate};
 pub use traits::{

@@ -20,16 +20,18 @@ import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import functools
+import gc
 import tempfile
+import time
 from pathlib import Path
 
-import httpx
 import pytest
 
 from headroom.memory.config import MemoryConfig
 from headroom.memory.core import HierarchicalMemory
 from headroom.memory.models import Memory, ScopeLevel
 from headroom.memory.ports import MemoryFilter
+from tests._skip_helpers import external_model_skip_reason
 
 # Check if hnswlib is available (HierarchicalMemory requires it)
 try:
@@ -43,14 +45,17 @@ pytestmark = pytest.mark.skipif(not HNSW_AVAILABLE, reason="hnswlib not availabl
 
 
 def network_timeout_handler(func):
-    """Decorator to skip tests on network timeouts (flaky CI)."""
+    """Decorator to skip tests on transient/offline model dependency failures."""
 
     @functools.wraps(func)
     async def wrapper(*args, **kwargs):
         try:
             return await func(*args, **kwargs)
-        except httpx.ReadTimeout:
-            pytest.skip("Skipped due to network timeout (flaky CI)")
+        except Exception as exc:
+            reason = external_model_skip_reason(exc)
+            if reason is not None:
+                pytest.skip(reason)
+            raise
 
     return wrapper
 
@@ -67,7 +72,15 @@ def temp_db_path():
         path = Path(f.name)
     yield path
     # Cleanup
-    path.unlink(missing_ok=True)
+    gc.collect()
+    for attempt in range(5):
+        try:
+            path.unlink(missing_ok=True)
+            break
+        except PermissionError:
+            if attempt == 4:
+                raise
+            time.sleep(0.1)
     for suffix in ["-shm", "-wal", ".hnsw"]:
         Path(str(path) + suffix).unlink(missing_ok=True)
 
@@ -487,6 +500,60 @@ class TestSupersede:
         results = await memory_system.search("JavaScript", user_id="alice")
         found_ids = [r.memory.id for r in results]
         assert new.id in found_ids
+
+    @pytest.mark.asyncio
+    @network_timeout_handler
+    async def test_superseded_memory_does_not_resurface_in_search(self, memory_system):
+        """The superseded (old) version must not keep coming back from search.
+
+        The vector/text index cached the old entry's metadata with
+        valid_until=None; default search filters superseded rows off that cached
+        copy, so before the fix a search that matched the old content returned
+        the stale version alongside the new one.
+        """
+        old = await memory_system.add(
+            content="User prefers Python",
+            user_id="alice",
+        )
+        new = await memory_system.supersede(
+            old.id,
+            "User now prefers JavaScript frameworks",
+        )
+
+        # A search matching the OLD content must not resurface the old entry.
+        results = await memory_system.search("Python", user_id="alice")
+        found_ids = [r.memory.id for r in results]
+        assert old.id not in found_ids
+
+        # The new version is still searchable.
+        new_results = await memory_system.search("JavaScript", user_id="alice")
+        assert new.id in [r.memory.id for r in new_results]
+
+    @pytest.mark.asyncio
+    @network_timeout_handler
+    async def test_superseded_index_removal_boundary(self, memory_system):
+        """Boundary of the supersede index-removal (#2143).
+
+        supersede now drops the old id from the vector/text index (not just
+        flips valid_until on the cached copy), so a search matching the old
+        content will not surface it even with include_superseded=True — the
+        entry is gone from the search index, not merely filtered. The store
+        still keeps the row, so get_history stays the source of truth for the
+        superseded version. This pins that contract so a future change that
+        relies on include_superseded search hitting the index fails loudly.
+        """
+        old = await memory_system.add(content="User prefers Python", user_id="alice")
+        new = await memory_system.supersede(
+            old.id,
+            "User now prefers JavaScript frameworks",
+        )
+
+        incl = await memory_system.search("Python", user_id="alice", include_superseded=True)
+        assert old.id not in [r.memory.id for r in incl]
+
+        # Retained in the store for history/audit even though it left the index.
+        history = await memory_system.get_history(new.id)
+        assert old.id in [m.id for m in history]
 
 
 # =============================================================================

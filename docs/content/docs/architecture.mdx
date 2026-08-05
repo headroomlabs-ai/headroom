@@ -1,11 +1,11 @@
 ---
 title: Architecture
-description: How Headroom's three-stage compression pipeline works, from message parsing through transform execution to provider cache optimization.
+description: How Headroom compresses LLM traffic — from request interception through the ContentRouter compression pipeline to provider cache optimization.
 ---
 
-Headroom sits between your application and the LLM provider. It intercepts messages, compresses them intelligently, and forwards the optimized request. The response comes back unchanged.
+Headroom sits between your application and the LLM provider. It intercepts the request, compresses the parts that carry the most redundant tokens — tool outputs, file reads, logs, search results — and forwards the optimized request upstream. The provider's response is returned unchanged.
 
-## High-Level Flow
+## High-level flow
 
 ```
 +---------------------------------------------------------------+
@@ -14,118 +14,107 @@ Headroom sits between your application and the LLM provider. It intercepts messa
                                |
                                v
 +---------------------------------------------------------------+
-|                      HEADROOM CLIENT                          |
-|  +-----------+   +------------+   +---------+                 |
-|  |  ANALYZE  | > |  TRANSFORM | > |  CALL   |                 |
-|  |  (Parser) |   |  (Pipeline)|   |  (API)  |                 |
-|  +-----------+   +------------+   +---------+                 |
-|       |                |                |                     |
-|       v                v                v                     |
-|  Count tokens    Apply compressions   Send to LLM provider   |
-|  Detect waste    Preserve meaning     Log metrics             |
+|                           HEADROOM                            |
+|    Proxy (FastAPI)   ·   Python compress()   ·   TS compress() |
+|                               |                               |
+|                               v                               |
+|        Transform pipeline  ──▶  ContentRouter                 |
+|      (detect content type, route to one compressor)           |
+|                               |                               |
+|                               v                               |
+|             Backend  (direct · LiteLLM · any-llm)             |
 +---------------------------------------------------------------+
                                |
                                v
 +---------------------------------------------------------------+
-|                  OPENAI / ANTHROPIC / GOOGLE                  |
+|         OPENAI · ANTHROPIC · GOOGLE · BEDROCK · 100+          |
 +---------------------------------------------------------------+
 ```
 
-## Entry Points
+## Entry points
 
-Headroom can be used in three ways, all feeding into the same pipeline:
+Headroom can be used three ways, all feeding the same compression pipeline:
 
-| Entry Point | How It Works | Code Changes |
+| Entry point | How it works | Code changes |
 |-------------|-------------|--------------|
-| **SDK Mode** | Wrap your LLM client with `HeadroomClient` | Minimal -- swap client constructor |
-| **Proxy Mode** | Run `headroom proxy` and point your client at it | Zero -- just change the base URL |
-| **Integrations** | LangChain, Vercel AI SDK, Agno adapters | Framework-specific setup |
+| **Proxy mode** | Run `headroom proxy` and point your client's base URL at it | Zero — just change the base URL |
+| **SDK mode** | Call `compress()` (Python or TypeScript) on your messages before you send them | Minimal — one function call |
+| **Integrations** | LangChain, Vercel AI SDK, Agno, Strands, LiteLLM, MCP adapters | Framework-specific setup |
 
-## The Transform Pipeline
+In proxy mode the server is a FastAPI app with per-provider handlers (Anthropic, OpenAI, Gemini, Bedrock) that each run the same compression pipeline before forwarding through the selected [backend](/docs/proxy#cloud-providers).
 
-Messages flow through a sequence of transforms. Each transform is independent, safe to skip, and fails gracefully (returns original content unchanged).
+## The compression pipeline
 
-### Stage 1: Cache Aligner
+The proxy assembles a small, ordered pipeline. Every transform is independent, safe to skip, and **fails open** — on any error it returns the content unchanged and the request still goes through.
 
-Extracts dynamic content (dates, UUIDs, session tokens) from your system prompt and moves it to the end. This stabilizes the prefix so provider caches (Anthropic `cache_control`, OpenAI prefix caching) can hit on repeated calls.
+1. **Tool-result interceptor** *(opt-in)* — light structural interceptors such as ast-grep Read outlining. Off unless you pass `--intercept-tool-results`.
+2. **CacheAligner** *(off by default)* — a detector that reports dynamic-prefix drift (dates, UUIDs, session tokens). It **never mutates, moves, or rewrites** content. It is disabled by default and hard-disabled inside the proxy; it exists to surface prefix-stability metrics, not to change your messages.
+3. **ContentRouter** — the workhorse that does essentially all of the compression. See below.
 
-```
-Before: "You are helpful. Current Date: 2024-12-15"
-         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-         Changes daily = cache miss every day
+The pipeline **never drops or reorders messages**. Earlier versions shipped a "context manager" stage (rolling-window / intelligent-context scoring) that deleted old turns to make the request fit the context window. That stage was **removed** — the `RollingWindowConfig`, `IntelligentContextConfig`, and `ScoringWeights` classes no longer exist. Headroom now does *live-zone-only* compression: it compresses content in place and leaves the message list intact. See [Context Management](/docs/context-management).
 
-After:  "You are helpful."                          [stable prefix]
-        "[Context: Current Date: 2024-12-15]"       [dynamic tail]
-```
+### ContentRouter
 
-Overhead: sub-millisecond.
+ContentRouter detects the type of each content block and dispatches it to exactly one compressor:
 
-### Stage 2: Smart Crusher
+| Detected content | Compressor | Typical savings |
+|---|---|---|
+| JSON arrays (tool outputs) | SmartCrusher | 70–90% |
+| Source code | CodeAwareCompressor (opt-in; off by default) | 40–70% |
+| Search / grep results | SearchCompressor | 80–95% |
+| Build / test logs | LogCompressor | 85–95% |
+| Diffs | DiffCompressor | 40–80% |
+| HTML | HTMLExtractor (trafilatura) | ~95% |
+| Tabular (CSV/TSV/markdown tables) | TabularCompressor | 60–90% |
+| Structured config (YAML/TOML/INI) | ConfigCompressor | 40–70% |
+| Plain text | TextCrusher | 30–60% |
+| Anything else | Kompress (ML fallback) | varies |
 
-Analyzes tool output content and compresses it using statistical methods. This is where the bulk of token savings come from.
+To avoid recompressing the same content, ContentRouter keeps a **two-tier, TTL-bounded cache**: a *skip set* of content already known not to compress, and a *result cache* of previously compressed output. Default TTL is 30 minutes.
 
-**What it does:**
+### Rust core
 
-1. Parses JSON arrays in tool outputs
-2. Runs field-level statistical analysis (variance, uniqueness, change points)
-3. Selects a representative subset using the Kneedle algorithm on bigram coverage
-4. Preserves errors, anomalies, and distribution boundaries unconditionally
-5. Factors out constant fields shared by all items
+The heaviest compressors run in a native Rust extension — `headroom._core`, built with PyO3 — that the proxy loads at startup. SmartCrusher and the search/log/diff compressors and content detection are Rust-backed; the Python classes you import are thin, API-compatible shims over them. The ML fallback (**Kompress**, a ModernBERT token compressor) runs separately through ONNX Runtime, either locally or offloaded to a remote endpoint (see [Text & Logs](/docs/text-and-logs)).
 
-**Strategies by content type:**
+## Compression modes and provider caches
 
-| Content | Strategy | Typical Savings |
-|---------|----------|-----------------|
-| JSON arrays of dicts | Statistical sampling + anomaly preservation | 83--95% |
-| JSON arrays of strings | Dedup + adaptive sampling | 60--90% |
-| JSON arrays of numbers | Statistical summary + outlier preservation | 70--85% |
-| Build/test logs | Pattern clustering | 85--94% |
-| HTML | Article extraction (trafilatura-based) | ~95% |
+Headroom runs in one of two modes (`--mode`, default `cache`):
 
-**Item retention split:** 30% from array start (schema), 15% from end (recency), 55% by importance score. Error items are always kept regardless of budget.
+- **`cache` mode (default)** — compresses only the newest delta in each turn and forwards prior turns byte-faithfully, so the provider's prefix cache is never invalidated mid-conversation. Best for coding agents and any long, multi-turn session.
+- **`token` mode** — prioritizes raw token removal and may recompress earlier turns, trading some cache stability for maximum savings.
 
-Overhead: 1--50ms for typical payloads. Scales linearly with input size.
+Because prefix caching is where most of the cost savings live on multi-turn workloads, keeping the stable prefix intact matters. What each provider's cache buys you:
 
-### Stage 3: Context Manager
+| Provider | Mechanism | Savings on cached tokens |
+|----------|-----------|--------------------------|
+| Anthropic | `cache_control` on the stable prefix | up to ~90% |
+| OpenAI | automatic prefix caching | up to ~50% |
+| Google | `CachedContent` API | up to ~75% |
 
-Ensures the final message array fits within the model's context window.
-
-**Rolling Window** (default): Drops oldest messages first, preserving system prompt and recent turns. Tool calls and their responses are dropped as atomic units.
-
-**Intelligent Context** (advanced): Scores every message on six dimensions (recency, semantic similarity, TOIN importance, error indicators, forward references, token density) and drops the lowest-scored messages first. Dropped messages are stored in CCR for potential retrieval.
-
-Overhead: sub-millisecond for Rolling Window; depends on scoring config for Intelligent Context.
-
-## Provider Cache Optimization
-
-After the pipeline, Headroom applies provider-specific cache hints:
-
-| Provider | Mechanism | Savings |
-|----------|-----------|---------|
-| Anthropic | `cache_control` blocks on stable prefix | Up to 90% on cached tokens |
-| OpenAI | Prefix alignment for automatic caching | Up to 50% on cached tokens |
-| Google | `CachedContent` API | Up to 75% on cached tokens |
+See [Cache Optimization](/docs/cache-optimization) and [Savings Profiles](/docs/proxy#savings-profiles) for how the two modes interact with the built-in profiles.
 
 ## CCR: Compress-Cache-Retrieve
 
-When SmartCrusher compresses a tool output or Intelligent Context drops messages, the original content is stored in a local compression cache. If the LLM needs the full data, it can request retrieval via a `ccr_retrieve` tool call. This makes compression reversible.
+Compression is **reversible**. When ContentRouter compresses a tool output, the original is stored in a local Compress-Cache-Retrieve (CCR) store. If the model needs the full data, it calls a `headroom_retrieve` tool and gets the original back.
 
 ```
-Compress:  1000 items  ->  15 items  (stored original in CCR)
-Cache:     Hash-indexed local store (SQLite)
-Retrieve:  LLM calls ccr_retrieve("abc123")  ->  original 1000 items
+Compress:  1000 items  ->  15 items   (original stored in CCR)
+Cache:     hash-indexed local SQLite store
+Retrieve:  model calls headroom_retrieve("abc123")  ->  original 1000 items
 ```
+
+CCR is **on by default**. Disable the markers and the injected retrieval tool with `--no-ccr`, or run a marker-free, format-native lossless mode with `--lossless`. See [Reversible Compression (CCR)](/docs/ccr).
 
 ## TOIN: Tool Output Intelligence Network
 
-TOIN learns compression patterns across sessions and users. When a tool is used repeatedly, TOIN builds up statistics about which fields matter, which items get retrieved, and what compression strategies work best. These learned patterns feed back into SmartCrusher and Intelligent Context scoring.
+TOIN learns which fields matter for a given tool over repeated calls — which items get retrieved, which fields carry signal — and feeds that back into SmartCrusher's importance scoring so compression gets sharper for the tools you actually use.
 
-Cold start: For new tool types, TOIN falls back to statistical heuristics. Patterns build up over time as tools are used.
+TOIN is **local and observation-only**: it aggregates statistics on your own machine (or your own proxy instance). Nothing about your tools or traffic is shared across users or sent off the box. For a brand-new tool type it falls back to statistical heuristics and improves as it observes more calls.
 
-## What Headroom Does NOT Touch
+## What Headroom does not rewrite
 
-- **User messages**: Never compressed (the user's intent must be preserved exactly)
-- **System prompts**: Content preserved; only dynamic parts are relocated for caching
-- **Code**: Passes through unchanged unless tree-sitter AST compression is explicitly enabled
-- **Model responses**: Returned unchanged from the provider
-- **Short content**: Tool outputs under 200 tokens pass through (overhead exceeds savings)
+- **Your prompt text** — the natural-language instructions you write are preserved. Compression targets bulk content blocks (tool outputs, file reads, logs), not your intent.
+- **System prompts** — preserved by default so the hottest part of the prefix cache stays stable. A savings profile can opt into compacting them.
+- **Code** — passes through unchanged unless AST-based code compression is explicitly enabled (off by default).
+- **Model responses** — returned from the provider unchanged.
+- **Short content** — blocks below the minimum-token threshold pass through (overhead would exceed savings).

@@ -11,14 +11,14 @@ Naive truncation breaks code. Cutting a function in half leaves invalid syntax t
 
 - **Syntax validity** -- output always parses correctly
 - **Structural preservation** -- imports, signatures, types, decorators are kept intact
-- **Lightweight** -- ~50MB (tree-sitter) vs ~1GB for LLMLingua
+- **Lightweight** -- ~50MB of tree-sitter parsers, loaded lazily and cached
 
 ## Supported Languages
 
 | Tier | Languages | Support Level |
 |---|---|---|
 | Tier 1 | Python, JavaScript, TypeScript | Full AST analysis |
-| Tier 2 | Go, Rust, Java, C, C++ | Function body compression |
+| Tier 2 | Go, Rust, Java, C, C++, C#, PHP | Function body compression |
 
 ## What Gets Preserved vs Compressed
 
@@ -150,7 +150,8 @@ pip install "headroom-ai[code]"
 Tree-sitter parsers are lazy-loaded and cached. You can free memory when done:
 
 ```python
-from headroom.transforms import is_tree_sitter_available, unload_tree_sitter
+from headroom.transforms import is_tree_sitter_available
+from headroom.transforms.code_compressor import unload_tree_sitter
 
 # Check if tree-sitter is installed
 print(is_tree_sitter_available())  # True

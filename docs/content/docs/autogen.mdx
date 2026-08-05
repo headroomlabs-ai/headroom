@@ -1,0 +1,150 @@
+---
+title: AutoGen
+description: Automatic tool output compression for AutoGen agents with per-tool metrics tracking.
+---
+
+Headroom integrates with [AutoGen](https://github.com/microsoft/autogen) (`autogen-agentchat` >=0.7) to compress tool outputs before they enter the agent's model context. Tool-heavy agents that return large JSON arrays, database results, or verbose logs see 60-90% token reduction.
+
+## Installation
+
+```bash
+pip install headroom-ai autogen-agentchat
+```
+
+## Quick start
+
+Wrap tools in one line:
+
+```python
+from autogen_agentchat.agents import AssistantAgent
+from autogen_core.tools import FunctionTool
+from headroom.integrations.autogen import wrap_tools_with_headroom
+
+def search_database(query: str) -> str:
+    """Search the database and return results."""
+    return json.dumps({"results": [...], "total": 1000})
+
+tool = FunctionTool(search_database, description="Search the database")
+wrapped = wrap_tools_with_headroom([tool])
+
+agent = AssistantAgent(
+    name="researcher",
+    model_client=model_client,
+    tools=wrapped,
+)
+```
+
+## Per-tool metrics
+
+Track compression stats across all tool invocations:
+
+```python
+from headroom.integrations.autogen import get_tool_metrics
+
+metrics = get_tool_metrics()
+print(metrics.get_summary())
+# {
+#   'total_invocations': 25,
+#   'total_compressions': 18,
+#   'total_chars_saved': 450000,
+#   'average_compression_ratio': 0.35,
+#   'by_tool': {
+#     'search_database': {'invocations': 15, 'compressions': 12, 'chars_saved': 320000},
+#   }
+# }
+```
+
+Reset between sessions:
+
+```python
+from headroom.integrations.autogen import reset_tool_metrics
+
+reset_tool_metrics()
+```
+
+## Custom configuration
+
+Control the compression threshold:
+
+```python
+wrapped = wrap_tools_with_headroom(
+    [search_tool, log_tool],
+    min_chars_to_compress=500,  # Default: 1000
+)
+```
+
+Use a dedicated metrics collector:
+
+```python
+from headroom.integrations.autogen import ToolMetricsCollector, wrap_tools_with_headroom
+
+collector = ToolMetricsCollector()
+wrapped = wrap_tools_with_headroom(
+    [search_tool],
+    metrics_collector=collector,
+)
+
+print(collector.get_summary())
+```
+
+## Wrapping individual tools
+
+For finer control, wrap tools individually:
+
+```python
+from headroom.integrations.autogen import HeadroomToolWrapper
+
+wrapper = HeadroomToolWrapper(
+    search_tool,
+    min_chars_to_compress=500,
+)
+
+# Get the wrapped FunctionTool
+compressed_tool = wrapper.as_function_tool()
+
+agent = AssistantAgent(
+    name="researcher",
+    model_client=model_client,
+    tools=[compressed_tool],
+)
+```
+
+## Async support
+
+AutoGen tools are natively async. The wrapper handles both sync and async
+tool functions transparently:
+
+```python
+async def async_search(query: str) -> str:
+    """Async database search."""
+    results = await db.search(query)
+    return json.dumps(results)
+
+tool = FunctionTool(async_search, description="Async search")
+wrapped = wrap_tools_with_headroom([tool])
+# Compression works identically for async tools
+```
+
+## How it works
+
+AutoGen routes tool execution through `FunctionTool`, which wraps a plain
+Python function. The function's return value is stringified and becomes
+`FunctionExecutionResult.content` — what the LLM reads on its next turn.
+
+`HeadroomToolWrapper` creates a new `FunctionTool` with a wrapper function that:
+
+1. Calls the original function
+2. Checks if the stringified output exceeds `min_chars_to_compress`
+3. If so, compresses via Headroom's `compress_tool_result()`
+4. Records metrics and returns the compressed string
+
+The wrapper preserves the original tool's name, description, and parameter
+schema, so it works as a drop-in replacement.
+
+### Why not `tool_call_summary_formatter`?
+
+AutoGen's `AssistantAgent` accepts a `tool_call_summary_formatter` parameter,
+which looks like a natural hook. However, it only controls the **final summary
+message** emitted after the tool loop exits — it does not touch the raw
+`FunctionExecutionResult` that gets added to `model_context` (what the LLM
+actually reads). Wrapping the function is the only clean interception point.

@@ -20,7 +20,6 @@ Example:
 
 from __future__ import annotations
 
-import json
 import logging
 import re
 import time
@@ -30,6 +29,38 @@ from typing import Any
 from ..cache.compression_store import get_compression_store
 
 logger = logging.getLogger(__name__)
+
+
+def looks_like_claude_code_compact_summary(*texts: str | None) -> bool:
+    """Return true for Claude Code `/compact` continuation summaries.
+
+    Claude Code can carry a previous session forward by injecting a compact
+    conversation summary into a fresh session. Those summaries are already
+    context; tracking them for CCR proactive expansion makes Headroom re-add
+    stale session state to later turns. Keep this detector deliberately narrow
+    so ordinary tool output that happens to mention "summary" remains eligible.
+    """
+    combined = " ".join(text.strip() for text in texts if text and text.strip())
+    if not combined:
+        return False
+
+    normalized = " ".join(combined.lower().split())
+    has_summary = "summary" in normalized or "summarized" in normalized
+
+    if "this session is being continued from a previous conversation" in normalized and has_summary:
+        return True
+
+    if "conversation is summarized below" in normalized and (
+        "ran out of context" in normalized or "previous conversation" in normalized
+    ):
+        return True
+
+    return (
+        "/compact" in normalized
+        and "claude" in normalized
+        and has_summary
+        and ("conversation" in normalized or "session" in normalized)
+    )
 
 
 @dataclass
@@ -66,8 +97,6 @@ class ExpansionRecommendation:
     hash_key: str
     reason: str
     relevance_score: float
-    expand_full: bool = True  # True = expand all, False = search only
-    search_query: str | None = None
 
 
 @dataclass
@@ -158,6 +187,13 @@ class ContextTracker:
             sample_content: Sample of the content for relevance matching.
         """
         if not self.config.enabled:
+            return
+
+        if looks_like_claude_code_compact_summary(query_context, sample_content):
+            logger.debug(
+                "CCR Tracker: skipped Claude Code compact summary %s for proactive expansion",
+                hash_key,
+            )
             return
 
         context = CompressedContext(
@@ -256,18 +292,11 @@ class ContextTracker:
             relevance *= age_factor
 
             if relevance >= self.config.relevance_threshold:
-                # Determine if full expansion or search
-                expand_full, search_query = self._determine_expansion_type(
-                    query, context, relevance
-                )
-
                 recommendations.append(
                     ExpansionRecommendation(
                         hash_key=hash_key,
                         reason=self._generate_reason(query, context, relevance),
                         relevance_score=relevance,
-                        expand_full=expand_full,
-                        search_query=search_query,
                     )
                 )
 
@@ -436,39 +465,6 @@ class ContextTracker:
 
         return [w for w in words if w not in stop_words and len(w) >= 2]
 
-    def _determine_expansion_type(
-        self,
-        query: str,
-        context: CompressedContext,
-        relevance: float,
-    ) -> tuple[bool, str | None]:
-        """Determine whether to do full expansion or search.
-
-        Returns:
-            Tuple of (expand_full, search_query)
-        """
-        # High relevance + small original count = full expansion
-        if relevance > 0.6 or context.original_item_count <= 50:
-            return True, None
-
-        # Extract specific search terms from query
-        keywords = self._extract_keywords(query.lower())
-
-        # Filter to most specific keywords (longer, less common)
-        specific_keywords = [
-            k
-            for k in keywords
-            if len(k) >= 4 and k not in {"file", "code", "show", "find", "list", "what"}
-        ]
-
-        if specific_keywords:
-            # Use top keywords as search query
-            search_query = " ".join(specific_keywords[:3])
-            return False, search_query
-
-        # Default to full expansion if we can't form a good search
-        return True, None
-
     def _generate_reason(
         self,
         query: str,
@@ -509,39 +505,23 @@ class ContextTracker:
 
         for rec in recommendations:
             try:
-                if rec.expand_full:
-                    entry = store.retrieve(rec.hash_key)
-                    if entry:
-                        results.append(
-                            {
-                                "hash": rec.hash_key,
-                                "type": "full",
-                                "content": entry.original_content,
-                                "item_count": entry.original_item_count,
-                                "reason": rec.reason,
-                            }
-                        )
-                        logger.info(
-                            f"CCR Tracker: Proactively expanded {rec.hash_key} "
-                            f"({entry.original_item_count} items)"
-                        )
-                else:
-                    search_results = store.search(rec.hash_key, rec.search_query or "")
-                    if search_results:
-                        results.append(
-                            {
-                                "hash": rec.hash_key,
-                                "type": "search",
-                                "query": rec.search_query,
-                                "content": search_results,
-                                "item_count": len(search_results),
-                                "reason": rec.reason,
-                            }
-                        )
-                        logger.info(
-                            f"CCR Tracker: Proactive search in {rec.hash_key} "
-                            f"for '{rec.search_query}' ({len(search_results)} results)"
-                        )
+                # Retrieval is by hash: proactive expansion always restores the
+                # full original content (no partial/search expansion).
+                entry = store.retrieve(rec.hash_key)
+                if entry:
+                    results.append(
+                        {
+                            "hash": rec.hash_key,
+                            "type": "full",
+                            "content": entry.original_content,
+                            "item_count": entry.original_item_count,
+                            "reason": rec.reason,
+                        }
+                    )
+                    logger.info(
+                        f"CCR Tracker: Proactively expanded {rec.hash_key} "
+                        f"({entry.original_item_count} items)"
+                    )
             except Exception as e:
                 logger.warning(f"CCR Tracker: Failed to expand {rec.hash_key}: {e}")
 
@@ -577,19 +557,15 @@ class ContextTracker:
         parts = [header]
 
         for exp in expansions:
-            if exp["type"] == "full":
-                parts.append(f"\n--- Expanded from earlier ({exp['reason']}) ---")
-                parts.append(exp["content"])
-            else:
-                parts.append(f"\n--- Search results for '{exp['query']}' ({exp['reason']}) ---")
-                if isinstance(exp["content"], list):
-                    parts.append(json.dumps(exp["content"], indent=2))
-                else:
-                    parts.append(str(exp["content"]))
+            # Expansions are always full (retrieval is by hash).
+            parts.append(f"\n--- Expanded from earlier ({exp['reason']}) ---")
+            parts.append(exp["content"])
 
-        parts.append("\n[End Proactive Expansion]")
-
-        return "\n".join(parts)
+        parts.append("[End Proactive Expansion]")
+        body = "\n".join(parts)
+        # Escape any stray close tag in payload to prevent wrapper boundary forgery
+        body = body.replace("</headroom_proactive_expansion>", "<\\/headroom_proactive_expansion>")
+        return f"<headroom_proactive_expansion>\n{body}\n</headroom_proactive_expansion>"
 
     def get_tracked_hashes(self) -> list[str]:
         """Get list of currently tracked hashes."""

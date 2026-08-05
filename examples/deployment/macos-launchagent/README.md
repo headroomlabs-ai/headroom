@@ -165,4 +165,4 @@ If you prefer manual installation:
 
 ## Documentation
 
-For complete documentation, see [docs/macos-deployment.md](../../../docs/macos-deployment.md)
+For complete documentation, see [wiki/macos-deployment.md](../../../wiki/macos-deployment.md)

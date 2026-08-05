@@ -18,7 +18,10 @@ def app():
 @pytest.mark.asyncio
 async def test_transformations_feed_endpoint_returns_list(app):
     """The endpoint should return a list of recent transformations."""
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+    async with AsyncClient(
+        transport=ASGITransport(app=app, client=("127.0.0.1", 12345)),
+        base_url="http://127.0.0.1",
+    ) as client:
         response = await client.get("/transformations/feed")
 
     assert response.status_code == 200
@@ -36,7 +39,10 @@ async def test_transformations_feed_returns_messages(app):
     The pre/post pair is what makes compression legible: consumers can diff
     the two to see what the pipeline stripped, replaced, or kept.
     """
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+    async with AsyncClient(
+        transport=ASGITransport(app=app, client=("127.0.0.1", 12345)),
+        base_url="http://127.0.0.1",
+    ) as client:
         response = await client.get("/transformations/feed")
 
     data = response.json()
@@ -53,7 +59,10 @@ async def test_transformations_feed_returns_messages(app):
 @pytest.mark.asyncio
 async def test_transformations_feed_respects_limit(app):
     """The endpoint should respect a ?limit= query parameter."""
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+    async with AsyncClient(
+        transport=ASGITransport(app=app, client=("127.0.0.1", 12345)),
+        base_url="http://127.0.0.1",
+    ) as client:
         response = await client.get("/transformations/feed?limit=5")
 
     data = response.json()

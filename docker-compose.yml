@@ -1,50 +1,98 @@
+# =============================================================================
+# Headroom — full "memory stack" compose
+# =============================================================================
+# Brings up the Headroom proxy together with the two datastores it needs for
+# semantic memory: Qdrant (vector search) and Neo4j (relationship graph).
+#
+# Quick start:
+#   1. cp .env.example .env   # then set a real NEO4J_AUTH before any non-local use
+#   2. docker compose up -d
+#   3. point your LLM client at http://localhost:8787  (proxy)
+#
+# Just want the proxy without the memory features? You can run the proxy image
+# on its own (`docker run -p 8787:8787 ghcr.io/chopratejas/headroom`); the two
+# database services below are only required for the memory/relevance features.
+#
+# Ports exposed on the host:
+#   8787  proxy (OpenAI-compatible endpoint)
+#   6333  Qdrant REST   6334  Qdrant gRPC
+#   7474  Neo4j Browser 7687  Neo4j Bolt
+# =============================================================================
+
 services:
+  # Headroom proxy — the OpenAI-compatible endpoint your client talks to.
+  # Built from the repo Dockerfile so it tracks your local checkout.
   headroom-proxy:
-    build: .
+    build:
+      context: .
+      args:
+        HEADROOM_BUILD_VERSION: ${HEADROOM_BUILD_VERSION:-source-build}
+    # Bind to all interfaces inside the container so the published port is reachable.
     command: ["--host", "0.0.0.0"]
     environment:
       - HEADROOM_HOST=0.0.0.0
+      - HOME=/home/nonroot
+      # Keep all Headroom read/write state on the named volume below.
+      - HEADROOM_WORKSPACE_DIR=/home/nonroot/.headroom
+      - HEADROOM_CONFIG_DIR=/home/nonroot/.headroom/config
       # if you want to use a custom OpenAI-compatible API endpoint,
       # uncomment and set the following line with the desired URL
       # - OPENAI_TARGET_API_URL=https://api.x.ai
     ports:
       - "8787:8787"
+    volumes:
+      - headroom_workspace:/home/nonroot/.headroom
+    # Readiness probe: the orchestrator polls /readyz so dependents and
+    # `docker compose up --wait` only see the proxy as healthy once it's serving.
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8787/readyz"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 20s
+    # Start the datastores first. Note: this waits for the containers to start,
+    # not for them to be fully ready — the proxy retries its connections, so a
+    # brief "database not ready yet" window on first boot is expected.
     depends_on:
       - qdrant
       - neo4j
 
-  # Vector database for semantic search
+  # Vector database for semantic search.
+  # Stores embeddings so the proxy can retrieve semantically similar context.
   qdrant:
     image: qdrant/qdrant:v1.17.1
     ports:
       - "6333:6333"  # REST API
       - "6334:6334"  # gRPC
+    # Named volume keeps the vector index across container restarts/recreates.
     volumes:
       - qdrant_data:/qdrant/storage
     environment:
       - QDRANT__SERVICE__GRPC_PORT=6334
 
-  # Graph database for relationships and multi-hop reasoning
+  # Graph database for relationships and multi-hop reasoning.
+  # Backs the memory features that traverse links between stored items.
   neo4j:
     image: neo4j:5.26
     ports:
       - "7474:7474"  # HTTP (Browser)
       - "7687:7687"  # Bolt
+    # Named volume persists the graph data across container restarts/recreates.
     volumes:
       - neo4j_data:/data
     environment:
+      # Credentials come from .env (NEO4J_AUTH=user/password). The default here
+      # is for LOCAL DEV ONLY — override it before exposing Neo4j anywhere.
       - NEO4J_AUTH=${NEO4J_AUTH:-neo4j/devpassword}
+      # APOC: Neo4j's standard procedure library, needed by Headroom's queries.
       - NEO4J_PLUGINS=["apoc"]
       - NEO4J_apoc_export_file_enabled=true
       - NEO4J_apoc_import_file_enabled=true
       - NEO4J_apoc_import_file_use__neo4j__config=true
 
+# Named volumes — managed by Docker, survive `docker compose down` (use
+# `docker compose down -v` to delete the stored data as well).
 volumes:
+  headroom_workspace:    # persists dashboard savings/history, logs, config, memory state, session stats, and TOIN
   qdrant_data:
   neo4j_data:

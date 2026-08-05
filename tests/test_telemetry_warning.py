@@ -53,6 +53,7 @@ class TestFormatTelemetryNotice:
 
     def test_returns_notice_when_telemetry_on(self, monkeypatch):
         monkeypatch.setenv("HEADROOM_TELEMETRY", "on")
+        monkeypatch.setenv("HEADROOM_BEACON", "off")
         monkeypatch.delenv("HEADROOM_TELEMETRY_WARN", raising=False)
         notice = format_telemetry_notice()
         assert notice != ""
@@ -62,6 +63,43 @@ class TestFormatTelemetryNotice:
 
     def test_empty_when_telemetry_off(self, monkeypatch):
         monkeypatch.setenv("HEADROOM_TELEMETRY", "off")
+        monkeypatch.setenv("HEADROOM_BEACON", "off")
+        monkeypatch.delenv("HEADROOM_TELEMETRY_WARN", raising=False)
+        assert format_telemetry_notice() == ""
+
+    def test_beacon_is_announced_by_default(self, monkeypatch):
+        """The beacon is opt-out, so the notice is the only place a user finds
+        out it is running. Silence here is how anonymous telemetry becomes a
+        trust incident."""
+        for var in ("HEADROOM_TELEMETRY", "HEADROOM_BEACON", "DO_NOT_TRACK"):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.delenv("HEADROOM_TELEMETRY_WARN", raising=False)
+        notice = format_telemetry_notice()
+        assert "compression stats" in notice
+        assert "HEADROOM_BEACON=off" in notice
+
+    def test_beacon_notice_names_what_is_not_sent(self, monkeypatch):
+        """Vague reassurance is worse than none. The notice has to name the
+        three things users actually worry about."""
+        for var in ("HEADROOM_TELEMETRY", "HEADROOM_BEACON", "DO_NOT_TRACK"):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.delenv("HEADROOM_TELEMETRY_WARN", raising=False)
+        notice = format_telemetry_notice()
+        assert "never prompts" in notice
+        assert "code" in notice
+        assert "file paths" in notice
+
+    def test_silent_when_beacon_disabled_and_no_local(self, monkeypatch):
+        monkeypatch.setenv("HEADROOM_BEACON", "off")
+        for var in ("HEADROOM_TELEMETRY", "DO_NOT_TRACK"):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.delenv("HEADROOM_TELEMETRY_WARN", raising=False)
+        assert format_telemetry_notice() == ""
+
+    def test_do_not_track_silences_the_beacon_notice(self, monkeypatch):
+        monkeypatch.setenv("DO_NOT_TRACK", "1")
+        for var in ("HEADROOM_TELEMETRY", "HEADROOM_BEACON"):
+            monkeypatch.delenv(var, raising=False)
         monkeypatch.delenv("HEADROOM_TELEMETRY_WARN", raising=False)
         assert format_telemetry_notice() == ""
 
@@ -97,12 +135,38 @@ class TestProxyCLITelemetryBanner:
         return CliRunner()
 
     def test_banner_shows_telemetry_enabled(self, runner, monkeypatch):
+        # Telemetry is opt-in: it only shows ENABLED once explicitly turned on.
+        monkeypatch.setenv("HEADROOM_TELEMETRY", "on")
+
+        from headroom.cli.main import main
+
+        with patch("headroom.proxy.server.run_server", side_effect=SystemExit(0)):
+            result = runner.invoke(main, ["proxy"])
+
+        assert "Telemetry:" in result.output
+        assert "ENABLED" in result.output
+
+    def test_banner_disabled_by_default(self, runner, monkeypatch):
+        # The whole point of opt-in: unset env => telemetry off, banner says so
+        # and surfaces how to opt in.
         monkeypatch.delenv("HEADROOM_TELEMETRY", raising=False)
 
         from headroom.cli.main import main
 
         with patch("headroom.proxy.server.run_server", side_effect=SystemExit(0)):
             result = runner.invoke(main, ["proxy"])
+
+        assert "Telemetry:" in result.output
+        assert "DISABLED" in result.output
+        assert "HEADROOM_TELEMETRY=on" in result.output or "--telemetry" in result.output
+
+    def test_telemetry_flag_opts_in(self, runner, monkeypatch):
+        monkeypatch.delenv("HEADROOM_TELEMETRY", raising=False)
+
+        from headroom.cli.main import main
+
+        with patch("headroom.proxy.server.run_server", side_effect=SystemExit(0)):
+            result = runner.invoke(main, ["proxy", "--telemetry"])
 
         assert "Telemetry:" in result.output
         assert "ENABLED" in result.output
@@ -130,7 +194,7 @@ class TestProxyCLITelemetryBanner:
         assert "DISABLED" in result.output
 
     def test_banner_shows_opt_out_instructions_when_enabled(self, runner, monkeypatch):
-        monkeypatch.delenv("HEADROOM_TELEMETRY", raising=False)
+        monkeypatch.setenv("HEADROOM_TELEMETRY", "on")
 
         from headroom.cli.main import main
 
@@ -138,17 +202,6 @@ class TestProxyCLITelemetryBanner:
             result = runner.invoke(main, ["proxy"])
 
         assert "HEADROOM_TELEMETRY=off" in result.output or "--no-telemetry" in result.output
-
-    def test_banner_shows_context_tool(self, runner, monkeypatch):
-        monkeypatch.setenv("HEADROOM_CONTEXT_TOOL", "lean-ctx")
-
-        from headroom.cli.main import main
-
-        with patch("headroom.proxy.server.run_server", side_effect=SystemExit(0)):
-            result = runner.invoke(main, ["proxy"])
-
-        assert result.exit_code == 0
-        assert "Context Tool: lean-ctx" in result.output
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +214,7 @@ class TestWrapCLITelemetryNotice:
 
     def test_print_notice_outputs_when_telemetry_on(self, monkeypatch, capsys):
         monkeypatch.setenv("HEADROOM_TELEMETRY", "on")
+        monkeypatch.setenv("HEADROOM_BEACON", "off")
         monkeypatch.delenv("HEADROOM_TELEMETRY_WARN", raising=False)
 
         from headroom.cli.wrap import _print_telemetry_notice
@@ -170,8 +224,21 @@ class TestWrapCLITelemetryNotice:
         assert "Telemetry" in captured.out
         assert "HEADROOM_TELEMETRY=off" in captured.out
 
+    def test_print_notice_announces_beacon_by_default(self, monkeypatch, capsys):
+        for var in ("HEADROOM_TELEMETRY", "HEADROOM_BEACON", "DO_NOT_TRACK"):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.delenv("HEADROOM_TELEMETRY_WARN", raising=False)
+
+        from headroom.cli.wrap import _print_telemetry_notice
+
+        _print_telemetry_notice()
+        captured = capsys.readouterr()
+        assert "compression stats" in captured.out
+        assert "HEADROOM_BEACON=off" in captured.out
+
     def test_print_notice_silent_when_telemetry_off(self, monkeypatch, capsys):
         monkeypatch.setenv("HEADROOM_TELEMETRY", "off")
+        monkeypatch.setenv("HEADROOM_BEACON", "off")
 
         from headroom.cli.wrap import _print_telemetry_notice
 
@@ -201,8 +268,10 @@ class TestStatsEndpointTelemetryFlag:
 
     pytest.importorskip("fastapi")
 
-    async def test_stats_includes_anon_telemetry_shipping_true(self, monkeypatch):
-        monkeypatch.delenv("HEADROOM_TELEMETRY", raising=False)
+    async def test_stats_anon_telemetry_shipping_always_false(self, monkeypatch):
+        # The anonymous telemetry beacon was removed, so nothing is ever shipped
+        # externally — even with telemetry explicitly enabled.
+        monkeypatch.setenv("HEADROOM_TELEMETRY", "on")
         from headroom.proxy.server import ProxyConfig, create_app
 
         app = create_app(
@@ -221,7 +290,7 @@ class TestStatsEndpointTelemetryFlag:
         assert resp.status_code == 200
         data = resp.json()
         assert "anon_telemetry_shipping" in data
-        assert data["anon_telemetry_shipping"] is True
+        assert data["anon_telemetry_shipping"] is False
 
     async def test_stats_includes_anon_telemetry_shipping_false(self, monkeypatch):
         monkeypatch.setenv("HEADROOM_TELEMETRY", "off")

@@ -72,6 +72,9 @@ headroom_requests_total{mode="optimize"} 1234
 # HELP headroom_tokens_saved_total Total tokens saved
 headroom_tokens_saved_total 5678900
 
+# HELP headroom_persistent_savings_tokens_saved_total Durable lifetime input tokens saved by proxy compression
+headroom_persistent_savings_tokens_saved_total 5678900
+
 # HELP headroom_compression_ratio Compression ratio histogram
 headroom_compression_ratio_bucket{le="0.5"} 890
 headroom_compression_ratio_bucket{le="0.7"} 1100
@@ -84,6 +87,59 @@ headroom_latency_seconds_bucket{le="0.1"} 1150
 # HELP headroom_cache_hits_total Cache hit counter
 headroom_cache_hits_total 456
 ```
+
+### OpenTelemetry (OTLP) Export
+
+The proxy can also push its counters to any OTLP/HTTP endpoint. Install the extra and set four variables:
+
+```bash
+pip install "headroom-ai[proxy,otel]"
+```
+
+```bash
+HEADROOM_OTEL_METRICS_ENABLED=1
+HEADROOM_OTEL_METRICS_ENDPOINT=http://127.0.0.1:4318/v1/metrics
+HEADROOM_OTEL_SERVICE_NAME=headroom-proxy
+HEADROOM_OTEL_RESOURCE_ATTRIBUTES=deployment.environment=prod
+```
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `HEADROOM_OTEL_METRICS_ENABLED` | `0` | Enable Headroom-managed OTLP metric export |
+| `HEADROOM_OTEL_METRICS_EXPORTER` | `otlp_http` | `otlp_http` or `console` (local debugging) |
+| `HEADROOM_OTEL_METRICS_ENDPOINT` | unset | Full OTLP metrics URL — Headroom does **not** append `/v1/metrics` for you |
+| `HEADROOM_OTEL_METRICS_HEADERS` | unset | Comma-separated `key=value` auth headers |
+| `HEADROOM_OTEL_METRICS_EXPORT_INTERVAL_MS` | `10000` | Export interval |
+| `HEADROOM_OTEL_SERVICE_NAME` | `headroom-proxy` | OTEL `service.name` |
+| `HEADROOM_OTEL_RESOURCE_ATTRIBUTES` | unset | Comma-separated resource attributes |
+
+Exported counters include `headroom.proxy.requests`, `headroom.proxy.tokens.input`, `headroom.proxy.tokens.output`, `headroom.proxy.tokens.saved`, and `headroom.proxy.cache.read_tokens` / `write_tokens`.
+
+Confirm the exporter is live with `curl -s http://localhost:8787/stats | jq .otel`.
+
+If your application already configures a global OTEL meter provider, leave `HEADROOM_OTEL_*` unset — Headroom records into the ambient provider automatically.
+
+### Dynatrace
+
+Point the exporter at your environment's OTLP API and add the API token as a header. The token needs the `metrics.ingest` scope.
+
+```bash
+HEADROOM_OTEL_METRICS_ENABLED=1
+HEADROOM_OTEL_METRICS_ENDPOINT="https://<env-id>.live.dynatrace.com/api/v2/otlp/v1/metrics"
+HEADROOM_OTEL_METRICS_HEADERS="Authorization=Api-Token dt0c01.XXXX"
+OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=DELTA
+HEADROOM_OTEL_SERVICE_NAME=headroom-proxy
+```
+
+<Callout type="warn" title="Delta temporality is not optional">
+`OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=DELTA` is required. Dynatrace [only ingests delta counters](https://docs.dynatrace.com/docs/ingest-from/opentelemetry/getting-started/metrics/limitations) and rejects cumulative ones with `UNSUPPORTED_METRIC_TYPE_MONOTONIC_CUMULATIVE_SUM`, while the OTEL SDK default is cumulative. Without this line, every Headroom metric is dropped at ingest and the proxy logs no error.
+</Callout>
+
+Restart the proxy, then search the Dynatrace metric explorer for `headroom.proxy.tokens.saved` — data appears within ~30s.
+
+For an ActiveGate deployment, swap the base URL for `https://<activegate>:9999/e/<env-id>/api/v2/otlp/v1/metrics`. If you already run an OpenTelemetry Collector, send Headroom to it instead and add the `cumulativetodelta` processor — then the temporality variable is unnecessary and the collector holds the token.
+
+Trace export is separate: Headroom's self-configured tracing targets Langfuse only. To land its spans in Dynatrace, leave `HEADROOM_LANGFUSE_*` unset and run the proxy under `opentelemetry-instrument` with the standard `OTEL_EXPORTER_OTLP_ENDPOINT` / `OTEL_EXPORTER_OTLP_HEADERS` / `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf` variables; Headroom records into the ambient tracer provider.
 
 ### Health Check
 
@@ -249,11 +305,50 @@ headroom proxy --budget 10.00
 
 When the budget is exceeded, requests return a budget exceeded error, the `/stats` endpoint shows budget status, and logs indicate the budget state.
 
+### Measured vs Estimated Spend
+
+Every cost record carries a *basis* — where its input-token count came from. When a provider response includes a usage breakdown, the basis is `measured`. When it doesn't, Headroom substitutes its own `tokens_sent` count so input cost isn't dropped from the budget, and the record's basis is `estimated`. Headroom logs one warning per model the first time this happens.
+
+`/stats` keeps the two separable under `cost.budget_basis`:
+
+```json
+{
+  "cost": {
+    "budget_limit_usd": 10.0,
+    "budget_period": "daily",
+    "budget_estimated_basis": "count",
+    "budget_basis": {
+      "total_usd": 3.1400,
+      "measured_usd": 2.9000,
+      "estimated_usd": 0.2400,
+      "estimated_pct": 7.6,
+      "records": 412,
+      "estimated_records": 31
+    }
+  }
+}
+```
+
+An estimate can drift in either direction, so you choose what it does to the hard limit:
+
+```bash
+headroom proxy --budget 10.00 --budget-estimated-basis count   # default
+```
+
+| Value | Effect |
+|-------|--------|
+| `count` | Estimated spend consumes the budget like measured spend. The default; matches historical behavior. |
+| `ignore` | Estimated spend is still booked and reported, but only provider-reported spend consumes the budget. |
+| `block` | Refuse requests once the period holds any estimated spend, rather than enforcing a hard limit against a guess. |
+
+Env: `HEADROOM_BUDGET_ESTIMATED_BASIS`. `headroom doctor` reports the estimated share alongside the budget check.
+
 ## Key Metrics to Monitor
 
 | Metric | What It Tells You | Target |
 |--------|-------------------|--------|
-| `tokens_saved_total` | Total cost savings | Higher is better |
+| `headroom_tokens_saved_total` | Runtime tokens saved since this proxy process started | Higher is better |
+| `headroom_persistent_savings_tokens_saved_total` | Durable lifetime tokens saved from `/stats.persistent_savings` | Higher is better |
 | `compression_ratio_avg` | Efficiency | 0.7--0.9 typical |
 | `cache_hit_rate` | Cache effectiveness | >20% is good |
 | `latency_p99` | Performance impact | &lt;10ms |
@@ -261,11 +356,19 @@ When the budget is exceeded, requests return a budget exceeded error, the `/stat
 
 ## Grafana Dashboard
 
-Example Prometheus queries for a Grafana dashboard:
+A ready-to-import dashboard ships in
+[`examples/grafana/headroom-dashboard.json`](https://github.com/headroomlabs-ai/headroom/blob/main/examples/grafana/headroom-dashboard.json).
+Import it in Grafana (**Dashboards → New → Import → Upload**) and pick your Prometheus
+datasource — it renders tokens saved, request throughput, and processing overhead
+(`headroom_overhead_ms_sum` / `headroom_overhead_ms_count`) straight from the metrics
+the `/metrics` endpoint exposes.
+
+Example ad-hoc queries against the same metric family:
 
 | Panel | PromQL |
 |-------|--------|
-| Tokens Saved | `headroom_tokens_saved_total` |
+| Runtime Tokens Saved | `headroom_tokens_saved_total` |
+| Lifetime Tokens Saved | `headroom_persistent_savings_tokens_saved_total` |
 | Compression Ratio (median) | `histogram_quantile(0.5, headroom_compression_ratio_bucket)` |
 | Request Latency (p99) | `histogram_quantile(0.99, headroom_latency_seconds_bucket)` |
 | Cache Hit Rate | `headroom_cache_hits_total / (headroom_cache_hits_total + headroom_cache_misses_total)` |

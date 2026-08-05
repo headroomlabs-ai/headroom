@@ -586,7 +586,7 @@ def generate_scenarios(content_types: list[str] | None = None) -> list[Scenario]
             msgs = generate_agentic_conversation(
                 turns=turns, tool_calls_per_turn=2, items_per_tool_response=items
             )
-            # Set a model_limit that forces IntelligentContext to kick in
+            # Set a model_limit large enough to exercise compression on big agentic contexts
             limit = max(50_000, turns * 2_000)
             scenarios.append(
                 Scenario(

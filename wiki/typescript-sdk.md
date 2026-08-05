@@ -8,7 +8,7 @@ The Headroom TypeScript SDK lets any JavaScript or TypeScript application compre
 npm install headroom-ai
 ```
 
-Requires a running [Headroom proxy](proxy.md) or Headroom Cloud API key.
+Requires a running [Headroom proxy](proxy.md).
 
 ## Quick Start
 
@@ -26,7 +26,9 @@ const response = await openai.chat.completions.create({
 
 ## How It Works
 
-The TypeScript SDK is an HTTP client. When you call `compress()`, it sends your messages to the Headroom proxy's `POST /v1/compress` endpoint. The proxy runs the full compression pipeline (SmartCrusher, ContentRouter, CacheAligner, etc.) and returns compressed messages. No compression logic runs in Node.js — all the heavy lifting happens in the proxy.
+The TypeScript SDK is an HTTP client. When you call `compress()`, it sends your messages to the Headroom proxy's `POST /v1/compress` endpoint. The proxy runs the compression pipeline (ContentRouter and its compressors, including SmartCrusher) and returns compressed messages. No compression logic runs in Node.js — all the heavy lifting happens in the proxy.
+
+The proxy must be reachable on **loopback**: `/v1/compress` rejects remote callers with `404` unless it was started with `HEADROOM_COMPRESS_ALLOW_REMOTE=1`.
 
 ```
 Your TypeScript App
@@ -37,7 +39,7 @@ headroom-ai (npm)  ← HTTP client
     │
     │  POST /v1/compress
     ▼
-Headroom Proxy / Cloud  ← compression pipeline (Python)
+Headroom Proxy (loopback)  ← compression pipeline (Python)
     │
     │  compressed messages
     ▼
@@ -56,7 +58,7 @@ import { compress } from 'headroom-ai';
 const result = await compress(messages, {
   model: 'gpt-4o',                      // model name (for token counting)
   baseUrl: 'http://localhost:8787',      // proxy URL (default)
-  apiKey: 'hr_...',                      // Headroom Cloud key
+  apiKey: 'your-api-key',                // optional, for authenticated endpoints
   timeout: 30000,                        // ms (default)
   fallback: true,                        // return uncompressed if proxy down (default)
   retries: 1,                            // retry on transient errors (default)
@@ -77,8 +79,8 @@ Messages use standard OpenAI chat format: `{ role, content, tool_calls?, tool_ca
 
 Instead of passing options, set environment variables:
 
-- `HEADROOM_BASE_URL` — proxy or cloud URL (default: `http://localhost:8787`)
-- `HEADROOM_API_KEY` — Headroom Cloud API key
+- `HEADROOM_BASE_URL` — proxy URL (default: `http://localhost:8787`)
+- `HEADROOM_API_KEY` — optional API key for authenticated endpoints
 
 ## Reusable Client
 
@@ -89,7 +91,7 @@ import { HeadroomClient } from 'headroom-ai';
 
 const client = new HeadroomClient({
   baseUrl: 'http://localhost:8787',
-  apiKey: 'hr_...',
+  apiKey: 'your-api-key',
 });
 
 const r1 = await client.compress(messages1, { model: 'gpt-4o' });

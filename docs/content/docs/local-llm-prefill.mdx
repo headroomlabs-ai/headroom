@@ -1,0 +1,119 @@
+---
+title: Local LLM Prefill Benchmark
+description: Measure local LLM prompt-processing savings by running Headroom in passthrough and optimized proxy modes against an OpenAI-compatible local server.
+---
+
+Local models do not charge per token, but they still pay for every prompt token during prefill. On Apple Silicon and other local inference setups, long coding-agent sessions often bottleneck on prompt processing rather than generation speed. Headroom can help by sending fewer prompt tokens to the local server.
+
+This workflow measures that effect with the proxy dashboard: run the same task once with optimization disabled, reset the agent state, run it again with optimization enabled, and compare token counts.
+
+<Callout type="info" title="Community demo">
+Joe Maddalone demonstrated this workflow in [Cut Local LLM Prompt Processing 30% on a Mac with Headroom](https://www.youtube.com/watch?v=j6U_kKiMXgo). His June 2026 demo used an OpenAI-compatible local server, a coding-agent refactor task, `--no-optimize` for the baseline, and the dashboard to compare sessions.
+</Callout>
+
+## Setup
+
+Start your local OpenAI-compatible model server first. Examples include MLX/OMLX, vLLM, LM Studio, Ollama's OpenAI-compatible endpoint, or another server that accepts `/v1/chat/completions` or `/v1/responses`.
+
+For this guide, assume the local server is listening on `http://127.0.0.1:8000`.
+
+```bash
+pip install "headroom-ai[proxy]"
+```
+
+## 1. Baseline passthrough run
+
+Start Headroom as a transparent proxy with optimization disabled:
+
+```bash
+headroom proxy \
+  --port 8787 \
+  --openai-api-url http://127.0.0.1:8000 \
+  --no-optimize
+```
+
+Point your agent or app at Headroom, not directly at the local server:
+
+```bash
+export OPENAI_BASE_URL=http://127.0.0.1:8787/v1
+export OPENAI_API_KEY=local
+```
+
+Run a realistic task. Coding-agent refactors are good benchmark candidates because they produce repeated file reads, tool results, lint/test output, and a growing conversation context.
+
+Open the dashboard while the run is active:
+
+```bash
+headroom dashboard --port 8787 --no-open
+# or open http://127.0.0.1:8787/dashboard
+```
+
+Record the baseline session totals. With `--no-optimize`, before and after token counts should match because Headroom is only forwarding traffic.
+
+## 2. Reset the task
+
+Before the optimized run, reset the benchmark state so the second run is comparable:
+
+- revert the code or data changes made by the first run
+- start a fresh agent session
+- use the same model and local server
+- use the same prompt
+- avoid changing unrelated flags or server settings
+
+For coding-agent tests, a clean git worktree is the simplest reset point.
+
+## 3. Optimized run
+
+Restart Headroom without `--no-optimize`:
+
+```bash
+headroom proxy \
+  --port 8787 \
+  --openai-api-url http://127.0.0.1:8000
+```
+
+Run the same task again with the same `OPENAI_BASE_URL` and prompt. Watch the dashboard's before/after token counts for the session.
+
+The savings percentage is the prompt-token reduction sent upstream to the local model. That does not make the model's prefill kernel faster; it reduces how much prompt the kernel has to process.
+
+## Optional: traffic learning
+
+After you have a baseline, you can test learning-enabled runs:
+
+```bash
+headroom proxy \
+  --port 8787 \
+  --openai-api-url http://127.0.0.1:8000 \
+  --learn
+```
+
+`--learn` implies memory and lets Headroom learn recurring traffic patterns from proxy sessions. Treat this as a separate benchmark condition: compare passthrough, optimized, and optimized-with-learning runs independently.
+
+## What to report
+
+For a useful local prefill benchmark, include:
+
+| Field | Example |
+|---|---|
+| Local server | MLX, vLLM, LM Studio, Ollama-compatible endpoint |
+| Model | local model name and quantization, if relevant |
+| Hardware | Mac model, RAM, or GPU/CPU target |
+| Agent/client | coding agent or app name |
+| Task | short description of the repeated task |
+| Baseline tokens | dashboard before/after total with `--no-optimize` |
+| Optimized tokens | dashboard before/after total without `--no-optimize` |
+| Savings | dashboard percentage |
+| Notes | whether `--learn`, `--memory`, or other flags were enabled |
+
+## Interpreting results
+
+Local inference changes the value proposition:
+
+- Hosted APIs: fewer input tokens usually means lower cost and lower latency.
+- Local models: fewer input tokens primarily means less prefill work and lower memory pressure.
+
+Long-running agent sessions tend to show larger gains than short chat turns because repeated file reads, tool outputs, and logs create more compressible context. If a task is mostly short natural-language turns, expect smaller savings.
+
+<Callout type="warning" title="Keep the comparison honest">
+Do not compare a cold first run against a warmed second run and attribute all improvement to compression. Keep the server, model, prompt, and agent task stable, and use the dashboard token counts as the primary measurement.
+</Callout>

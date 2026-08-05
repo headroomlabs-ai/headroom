@@ -20,7 +20,8 @@ Usage:
     # Registered in Codex config.toml (done by `headroom wrap codex --memory`):
     [mcp_servers.headroom_memory]
     command = "python"
-    args = ["-m", "headroom.memory.mcp_server", "--db", ".headroom/memory.db"]
+    args = ["-m", "headroom.memory.mcp_server", "--user", "alice"]
+    # When --db is omitted, the server resolves .headroom/memory.db from cwd.
 """
 
 from __future__ import annotations
@@ -75,7 +76,9 @@ _TOOLS = [
         description=(
             "Save information to persistent memory for future sessions. "
             "Use this for decisions, conventions, architecture context, "
-            "user preferences, project facts, or anything worth remembering.\n\n"
+            "user preferences, project facts, or anything worth remembering. "
+            "Saving a similar fact does not replace an existing memory; corrections "
+            "must use an explicit update path with the existing memory ID.\n\n"
             "IMPORTANT: Break information into atomic facts — one fact per "
             "entry in the 'facts' array. Each fact should be a single, "
             "self-contained statement that answers one question. "
@@ -158,34 +161,75 @@ def create_memory_server(db_path: str, user_id: str = "default") -> Server:
 
     server = Server("headroom-memory")
     _backend: LocalBackend | None = None
-    _init_task: asyncio.Task | None = None
+    _init_task: asyncio.Task[LocalBackend] | None = None
 
     async def _init_backend() -> LocalBackend:
         """Initialize backend with ONNX embedder (fast, no PyTorch)."""
-        nonlocal _backend
+        nonlocal _backend, _init_task
         config = LocalBackendConfig(db_path=db_path, embedder_backend="onnx")
-        _backend = LocalBackend(config)
-        await _warm_up_backend(_backend, user_id)
+        backend = LocalBackend(config)
+        init_task = asyncio.current_task()
+        try:
+            await _warm_up_backend(backend, user_id)
+        except (Exception, asyncio.CancelledError):
+            try:
+                await backend.close()
+            except Exception as cleanup_error:
+                logger.warning("Memory MCP: failed backend cleanup: %s", cleanup_error)
+            finally:
+                if _init_task is init_task:
+                    _init_task = None
+            raise
+
+        _backend = backend
+        if _init_task is init_task:
+            _init_task = None
         logger.info(f"Memory MCP: ready (db={db_path}, user={user_id})")
-        return _backend
+        return backend
+
+    def _handle_backend_init_done(init_task: asyncio.Task[LocalBackend]) -> None:
+        """Clear and log failed background initialization tasks."""
+        nonlocal _init_task
+        if init_task.cancelled():
+            if _init_task is init_task:
+                _init_task = None
+            return
+        error = init_task.exception()
+        if error is not None:
+            if _init_task is init_task:
+                _init_task = None
+            logger.warning("Memory MCP: backend initialization failed: %s", error)
+
+    def _start_backend_init() -> asyncio.Task[LocalBackend]:
+        """Start backend initialization once for all concurrent callers."""
+        nonlocal _init_task
+        if _init_task is None:
+            _init_task = asyncio.create_task(_init_backend())
+            _init_task.add_done_callback(_handle_backend_init_done)
+        return _init_task
 
     async def _get_backend() -> LocalBackend:
         nonlocal _backend, _init_task
         if _backend is not None:
             return _backend
-        # Wait for background init if it's running
-        if _init_task is not None:
-            await _init_task
-            return _backend  # type: ignore[return-value]
-        # Fallback: init inline (shouldn't normally happen)
-        return await _init_backend()
+
+        init_task = _start_backend_init()
+        try:
+            return await asyncio.shield(init_task)
+        except asyncio.CancelledError:
+            if init_task.done() and _init_task is init_task:
+                _init_task = None
+            raise
+        except Exception:
+            if _init_task is init_task:
+                _init_task = None
+            raise
 
     @server.list_tools()
     async def list_tools() -> list[Tool]:
         # Kick off background init on first list_tools (called at MCP handshake)
-        nonlocal _init_task
-        if _backend is None and _init_task is None:
-            _init_task = asyncio.create_task(_init_backend())
+        if _backend is None:
+            _start_backend_init()
         return _TOOLS
 
     @server.call_tool()
@@ -244,6 +288,12 @@ async def _handle_search(
         # Trim to requested top_k
         active_results = active_results[:top_k]
 
+        try:
+            await backend.record_access([r.memory.id for r in active_results])
+        except Exception as e:
+            # Usage metadata must never make a successful retrieval fail.
+            logger.warning(f"Memory MCP: failed to record access: {e}")
+
         lines = []
         for i, r in enumerate(active_results, 1):
             score = f"{r.score:.2f}" if hasattr(r, "score") else "?"
@@ -255,11 +305,6 @@ async def _handle_search(
     except Exception as e:
         logger.error(f"memory_search failed: {e}")
         return [TextContent(type="text", text=f"Search error: {e}")]
-
-
-# Similarity threshold for auto-supersession: if a new memory is this
-# similar to an existing one, it replaces (supersedes) the old one.
-_SUPERSEDE_SIMILARITY = 0.70
 
 
 async def _handle_save(
@@ -287,44 +332,16 @@ async def _handle_save(
             if not fact:
                 continue
 
-            # Check for semantically similar existing memory to auto-supersede
-            superseded_id: str | None = None
-            try:
-                existing = await backend.search_memories(
-                    query=fact,
-                    user_id=user_id,
-                    top_k=3,
-                )
-                for r in existing:
-                    if getattr(r.memory, "superseded_by", None):
-                        continue
-                    if r.score >= _SUPERSEDE_SIMILARITY:
-                        superseded_id = r.memory.id
-                        logger.info(
-                            f"Memory MCP: auto-superseding [{r.memory.id[:8]}] "
-                            f"(similarity={r.score:.2f}): {r.memory.content[:60]}"
-                        )
-                        break
-            except Exception:
-                pass
-
-            if superseded_id:
-                memory = await backend.update_memory(
-                    memory_id=superseded_id,
-                    new_content=fact,
-                )
-                results_lines.append(
-                    f"  updated [{superseded_id[:8]}→{memory.id[:8]}]: {fact[:60]}"
-                )
-                superseded += 1
-            else:
-                memory = await backend.save_memory(
-                    content=fact,
-                    user_id=user_id,
-                    importance=importance,
-                )
-                results_lines.append(f"  saved [{memory.id[:8]}]: {fact[:60]}")
-                saved += 1
+            # Similarity is a retrieval signal, not proof that two memories
+            # represent versions of the same fact. Only explicit update paths
+            # with a caller-supplied memory ID may create a supersession chain.
+            memory = await backend.save_memory(
+                content=fact,
+                user_id=user_id,
+                importance=importance,
+            )
+            results_lines.append(f"  saved [{memory.id[:8]}]: {fact[:60]}")
+            saved += 1
 
         summary = f"Saved {saved} new, updated {superseded} existing ({saved + superseded} total)"
         return [TextContent(type="text", text=summary + "\n" + "\n".join(results_lines))]
@@ -342,6 +359,42 @@ async def _run(db_path: str, user_id: str) -> None:
     server = create_memory_server(db_path, user_id)
     async with stdio_server() as (read_stream, write_stream):
         await server.run(read_stream, write_stream, server.create_initialization_options())
+
+
+def _memory_mcp_startup_context(
+    configured_db: str, cwd: Path, db_flag_present: bool
+) -> dict[str, str | bool]:
+    """Describe the DB path the memory MCP server will try to open."""
+    configured_path = Path(configured_db).expanduser()
+    resolved_path = (
+        configured_path if configured_path.is_absolute() else (cwd / configured_path)
+    ).resolve(strict=False)
+    active_project_db = (cwd / ".headroom" / "memory.db").resolve(strict=False)
+    if not db_flag_present:
+        config_source = "cwd-default"
+        resolution = "dynamic-cwd"
+    else:
+        config_source = "cli-flag"
+        resolution = "static-cli"
+    if resolved_path == active_project_db:
+        storage_scope = "active-project"
+    elif resolved_path.name == "memory.db":
+        storage_scope = "external-memory-db"
+    else:
+        storage_scope = "custom-db-path"
+    path_exists = resolved_path.exists()
+    path_readable = path_exists and os.access(resolved_path, os.R_OK)
+    return {
+        "configured_db": str(configured_path),
+        "resolved_db": str(resolved_path),
+        "config_source": config_source,
+        "cwd": str(cwd),
+        "project_root": str(cwd),
+        "storage_scope": storage_scope,
+        "path_exists": path_exists,
+        "path_readable": path_readable,
+        "resolution": resolution,
+    }
 
 
 def main() -> None:
@@ -368,6 +421,26 @@ def main() -> None:
         level=logging.INFO,
         stream=sys.stderr,
         format="%(name)s: %(message)s",
+    )
+
+    startup = _memory_mcp_startup_context(
+        configured_db=args.db,
+        cwd=Path.cwd(),
+        db_flag_present=any(arg == "--db" or arg.startswith("--db=") for arg in sys.argv[1:]),
+    )
+    logger.info(
+        "Memory MCP startup: configured_db=%s, resolved_db=%s, config_source=%s, "
+        "cwd=%s, project_root=%s, storage_scope=%s, path_exists=%s, "
+        "path_readable=%s, resolution=%s",
+        startup["configured_db"],
+        startup["resolved_db"],
+        startup["config_source"],
+        startup["cwd"],
+        startup["project_root"],
+        startup["storage_scope"],
+        startup["path_exists"],
+        startup["path_readable"],
+        startup["resolution"],
     )
 
     asyncio.run(_run(args.db, args.user))

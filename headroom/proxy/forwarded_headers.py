@@ -57,13 +57,24 @@ import logging
 import os
 from typing import TYPE_CHECKING, Any
 
+from headroom.proxy.forwarded_policy import (
+    ForwardedHeaderInputs,
+    header_first,
+    normalize_ip,
+    parse_cidr_list,
+    peer_is_trusted_gateway,
+    resolve_forwarded_headers,
+)
+
 if TYPE_CHECKING:
     from fastapi import Request
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "TRUSTED_DASHBOARD_CLIENT_CIDRS_ENV",
     "TRUSTED_GATEWAY_CIDRS_ENV",
+    "load_trusted_dashboard_client_cidrs",
     "load_trusted_gateway_cidrs",
     "peer_is_trusted_gateway",
     "resolve_client_ip",
@@ -73,6 +84,7 @@ __all__ = [
 
 #: Environment variable that holds the comma-separated CIDR allow-list.
 TRUSTED_GATEWAY_CIDRS_ENV = "HEADROOM_PROXY_TRUSTED_GATEWAY_CIDRS"
+TRUSTED_DASHBOARD_CLIENT_CIDRS_ENV = "HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS"
 
 
 def _parse_cidr_list(
@@ -87,20 +99,7 @@ def _parse_cidr_list(
     would silently downgrade the proxy from "strict" to "more strict",
     masking the operator's intent.
     """
-    if not raw or not raw.strip():
-        return ()
-    nets: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
-    for chunk in raw.split(","):
-        entry = chunk.strip()
-        if not entry:
-            # Tolerate `"10.0.0.0/8,"` — trailing comma is benign.
-            continue
-        # ``strict=False`` so ``10.0.0.1/8`` is accepted as the network
-        # ``10.0.0.0/8`` instead of rejecting host bits — operators
-        # routinely paste a sample IP with a netmask and expect it to
-        # mean the network.
-        nets.append(ipaddress.ip_network(entry, strict=False))
-    return tuple(nets)
+    return parse_cidr_list(raw)
 
 
 def load_trusted_gateway_cidrs(
@@ -119,6 +118,18 @@ def load_trusted_gateway_cidrs(
     return _parse_cidr_list(raw)
 
 
+def load_trusted_dashboard_client_cidrs(
+    raw: str | None = None,
+) -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
+    """Parse the Dashboard client CIDR allow-list from its environment variable."""
+    if raw is None:
+        raw = os.environ.get(TRUSTED_DASHBOARD_CLIENT_CIDRS_ENV, "")
+    try:
+        return _parse_cidr_list(raw)
+    except ValueError as exc:
+        raise ValueError(f"Invalid {TRUSTED_DASHBOARD_CLIENT_CIDRS_ENV} entry: {exc}") from exc
+
+
 def _normalize_ip(
     host: str,
 ) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
@@ -130,43 +141,7 @@ def _normalize_ip(
     Returns ``None`` on malformed input; callers treat that as "not a
     trusted gateway".
     """
-    try:
-        addr = ipaddress.ip_address(host)
-    except ValueError:
-        return None
-    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
-        return addr.ipv4_mapped
-    return addr
-
-
-def peer_is_trusted_gateway(
-    peer_host: str | None,
-    cidrs: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...],
-) -> bool:
-    """Return True iff ``peer_host`` is inside any of the allow-list CIDRs.
-
-    Empty allow-list → always False (the strict-secure default).
-    ``None`` peer (TestClient / UDS) → False; we never trust a peer we
-    can't even identify.
-    """
-    if not cidrs:
-        return False
-    if peer_host is None:
-        return False
-    addr = _normalize_ip(peer_host)
-    if addr is None:
-        return False
-    for net in cidrs:
-        # IP/network family must match; ipaddress raises TypeError if
-        # we pass an IPv4 address into an IPv6 network membership test
-        # in some versions, so we family-gate first.
-        if isinstance(addr, ipaddress.IPv4Address) and isinstance(net, ipaddress.IPv6Network):
-            continue
-        if isinstance(addr, ipaddress.IPv6Address) and isinstance(net, ipaddress.IPv4Network):
-            continue
-        if addr in net:
-            return True
-    return False
+    return normalize_ip(host)
 
 
 def _peer_host(request: Any) -> str | None:
@@ -185,10 +160,7 @@ def _header_first(value: str) -> str:
     leftmost hop is the only one whose authenticity the immediate
     gateway can vouch for, and beyond that we have no trust signal.
     """
-    if not value:
-        return ""
-    head, _, _ = value.partition(",")
-    return head.strip()
+    return header_first(value)
 
 
 def _read_header(request: Any, name: str) -> str:
@@ -249,29 +221,22 @@ def _resolve(request: Any) -> tuple[str, dict[str, str]]:
         if cached_ip is not None and cached_fwd is not None:
             return cached_ip, cached_fwd
 
-    peer_host = _peer_host(request) or ""
-    fwd_for_raw = _read_header(request, "x-forwarded-for")
-    fwd_proto_raw = _read_header(request, "x-forwarded-proto")
-    fwd_host_raw = _read_header(request, "x-forwarded-host")
-
-    cidrs = load_trusted_gateway_cidrs()
-    trusted = peer_is_trusted_gateway(peer_host or None, cidrs)
-
-    if trusted:
-        client_ip = _header_first(fwd_for_raw) or peer_host
-        forwarded = {
-            "for": _header_first(fwd_for_raw),
-            "proto": fwd_proto_raw.strip(),
-            "host": fwd_host_raw.strip(),
-        }
-    else:
-        # Headers may be absent (legitimate direct client). Only emit
-        # the rejection event if the peer ACTUALLY tried to set one —
-        # otherwise we'd spam logs for every direct request.
-        if fwd_for_raw or fwd_proto_raw or fwd_host_raw:
-            _emit_rejection_event(peer_host or None, fwd_for_raw, fwd_proto_raw, fwd_host_raw)
-        client_ip = peer_host
-        forwarded = {"for": "", "proto": "", "host": ""}
+    inputs = ForwardedHeaderInputs(
+        peer_host=_peer_host(request) or "",
+        forwarded_for=_read_header(request, "x-forwarded-for"),
+        forwarded_proto=_read_header(request, "x-forwarded-proto"),
+        forwarded_host=_read_header(request, "x-forwarded-host"),
+    )
+    resolution = resolve_forwarded_headers(inputs, load_trusted_gateway_cidrs())
+    if resolution.rejected:
+        _emit_rejection_event(
+            inputs.peer_host or None,
+            inputs.forwarded_for,
+            inputs.forwarded_proto,
+            inputs.forwarded_host,
+        )
+    client_ip = resolution.client_ip
+    forwarded = resolution.forwarded
 
     if state is not None:
         try:

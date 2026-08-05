@@ -1,40 +1,52 @@
-name: Deploy Documentation
+name: Validate Docs
+
+# There is ONE documentation site: the Next.js/Fumadocs app in `docs/`, published
+# at https://headroom-docs.vercel.app by Vercel's own Git integration. That URL is
+# what README and `pyproject.toml` (Homepage, Documentation) point at.
+#
+# This workflow therefore only *validates* — it deploys nothing. Vercel owns
+# deployment; duplicating it here is what produced a `deploy-vercel` job that
+# failed 30 times on main without ever deploying (no VERCEL_* secrets were set).
+#
+# A second site used to be built from `wiki/` by MkDocs and published to GitHub
+# Pages off the `gh-pages` branch. It was linked from nowhere in the repo, it meant
+# every documented change had to be written twice, and each Pages deploy
+# force-pushed `gh-pages` — which Vercel then tried to build, failing with
+# "The specified Root Directory 'docs' does not exist" because that branch holds
+# only the rendered site. Removed. `wiki/` stays in the repo as unpublished
+# markdown pending migration of the pages `docs/` does not yet cover (notably
+# `wiki/cli.md`); nothing builds or publishes it, so it needs no syncing.
 
 on:
-  push:
-    branches:
-      - main
+  pull_request:
+    branches: [main]
     paths:
       - 'docs/**'
-      - 'mkdocs.yml'
       - '.github/workflows/docs.yml'
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  deploy:
+  validate-nextjs:
+    name: Validate Next.js build
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
 
-      - name: Set up Python
-        uses: actions/setup-python@v6
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
         with:
-          python-version: '3.11'
-
-      - name: Cache pip
-        uses: actions/cache@v5
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-docs-${{ hashFiles('mkdocs.yml') }}
-          restore-keys: ${{ runner.os }}-pip-docs-
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: docs/package-lock.json
 
       - name: Install dependencies
-        run: pip install mkdocs-material
+        run: npm ci
+        working-directory: docs
 
-      - name: Build and deploy
-        run: mkdocs gh-deploy --force
+      - name: Build docs
+        run: npm run build
+        working-directory: docs

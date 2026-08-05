@@ -5,7 +5,8 @@ Pins:
 1. ``publish()`` writes a TOML file the stdlib ``tomllib`` can parse.
 2. Slices below ``--min-observations`` are filtered out.
 3. Rows include ``auth_mode``, ``model_family``, ``structure_hash``,
-   ``strategy_hint``, ``confidence``, ``observations`` — the schema
+   ``skip_compression_recommended``, ``strategy_hint``, ``confidence``,
+   ``observations`` — the schema
    ``crates/headroom-core/src/transforms/recommendations.rs`` consumes.
 4. The CLI entry point honors ``--output`` / ``--min-observations``.
 """
@@ -99,6 +100,7 @@ def test_publish_command_writes_toml(fresh_toin: ToolIntelligenceNetwork, tmp_pa
         "auth_mode",
         "model_family",
         "structure_hash",
+        "skip_compression_recommended",
         "strategy_hint",
         "confidence",
         "observations",
@@ -106,10 +108,47 @@ def test_publish_command_writes_toml(fresh_toin: ToolIntelligenceNetwork, tmp_pa
     assert row["auth_mode"] == "payg"
     assert row["model_family"] == "claude-3-5"
     assert row["structure_hash"] == sig.structure_hash
+    assert row["skip_compression_recommended"] is False
     assert row["strategy_hint"] == "smart_crusher"
     assert isinstance(row["confidence"], float)
     assert 0.0 <= row["confidence"] <= 1.0
     assert row["observations"] == 60
+
+
+def test_publish_preserves_skip_recommendation(
+    fresh_toin: ToolIntelligenceNetwork,
+    tmp_path: Path,
+) -> None:
+    """Skip-eligible rows publish the skip flag and skip strategy hint."""
+    items = [{"id": i, "status": "ok"} for i in range(20)]
+    sig = _record(
+        fresh_toin,
+        items=items,
+        n=60,
+        auth_mode="payg",
+        model_family="claude-3-5",
+    )
+    for _ in range(49):
+        fresh_toin.record_retrieval(
+            tool_signature_hash=sig.structure_hash,
+            retrieval_type="full",
+            strategy="smart_crusher",
+            auth_mode="payg",
+            model_family="claude-3-5",
+        )
+
+    output = tmp_path / "recommendations.toml"
+    rows_written = publish(
+        output_path=output,
+        min_observations=50,
+        toin=fresh_toin,
+    )
+    assert rows_written == 1
+
+    parsed = tomllib.loads(output.read_text(encoding="utf-8"))
+    row = parsed["recommendation"][0]
+    assert row["skip_compression_recommended"] is True
+    assert row["strategy_hint"] == "skip_compression"
 
 
 def test_publish_filters_below_min_observations(

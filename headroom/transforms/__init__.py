@@ -61,6 +61,11 @@ if TYPE_CHECKING:
         SearchCompressorConfig,
     )
     from headroom.transforms.smart_crusher import SmartCrusher, SmartCrusherConfig  # noqa: F401
+    from headroom.transforms.tabular_ingest import (  # noqa: F401
+        TabularCompressionResult,
+        TabularCompressor,
+        TabularCompressorConfig,
+    )
 
 _HTML_EXTRACTOR_AVAILABLE = importlib.util.find_spec("trafilatura") is not None
 
@@ -88,6 +93,9 @@ __all__ = [
     "LogCompressor",
     "LogCompressorConfig",
     "LogCompressionResult",
+    "TabularCompressor",
+    "TabularCompressorConfig",
+    "TabularCompressionResult",
     "DiffCompressor",
     "DiffCompressorConfig",
     "DiffCompressionResult",
@@ -154,6 +162,15 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "LogCompressor": ("headroom.transforms.log_compressor", "LogCompressor"),
     "LogCompressorConfig": ("headroom.transforms.log_compressor", "LogCompressorConfig"),
     "LogCompressionResult": ("headroom.transforms.log_compressor", "LogCompressionResult"),
+    "TabularCompressor": ("headroom.transforms.tabular_ingest", "TabularCompressor"),
+    "TabularCompressorConfig": (
+        "headroom.transforms.tabular_ingest",
+        "TabularCompressorConfig",
+    ),
+    "TabularCompressionResult": (
+        "headroom.transforms.tabular_ingest",
+        "TabularCompressionResult",
+    ),
     "DiffCompressor": ("headroom.transforms.diff_compressor", "DiffCompressor"),
     "DiffCompressorConfig": ("headroom.transforms.diff_compressor", "DiffCompressorConfig"),
     "DiffCompressionResult": (

@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "headroom-ai"
-version = "0.25.0"
+version = "0.34.0"
 description = "The Context Optimization Layer for LLM Applications - Cut costs by 50-90%"
 readme = "README.md"
 license = "Apache-2.0"
@@ -49,12 +49,23 @@ dependencies = [
     # Core: lightweight compression (SmartCrusher, ContentRouter, CCR, TOIN)
     "tiktoken>=0.5.0",            # Tokenizer for all compressors
     "pydantic>=2.0.0",            # Config and data models
-    "litellm>=1.86.2,<2.0",        # Model registry, pricing, and provider support
-    "click>=8.1.0",               # CLI framework
+    # litellm's own metadata pins requires-python <3.14, and headroom only uses it for
+    # model registry / pricing / non-core providers — all lazily imported and
+    # ImportError-guarded. Marking it 3.14-optional lets headroom install on Python 3.14
+    # (core compression + the Anthropic proxy path never import litellm). See GH #956.
+    "litellm>=1.86.2,<2.0; python_version < '3.14'",  # model registry, pricing, providers (lazy)
+    "click>=8.3.3",               # CLI framework; PYSEC-2026-2132 fix (command injection in click.edit())
     "rich>=13.0.0",               # Rich terminal output
     "opentelemetry-api>=1.24.0",  # Safe no-op OTEL API for instrumentation
-    "ast-grep-cli>=0.30.0",       # AST-aware code slicing (CodeCompressor); binary wheel
+    # AST-aware code slicing (CodeCompressor); binary wheel. 0.44.1 is excluded:
+    # that PyPI release was a compromised supply-chain build shipping an
+    # info-stealer `sg.exe` (Trojan:Win64/Lazy!MTB) alongside the real binary
+    # (GH #2332). The `!=` keeps every other release installable, including a
+    # future patched one.
+    "ast-grep-cli>=0.30.0,!=0.44.1",
+    "pyyaml>=6.0",                # omp wrap: parse/merge omp's models.yml registry
     "tomli>=2.0.0; python_version < '3.11'",  # tomllib backport for helper scripts
+    "tomlkit>=0.13.0,<1.0",       # Loss-minimizing Codex config recovery
 ]
 
 [project.optional-dependencies]
@@ -62,14 +73,17 @@ dependencies = [
 proxy = [
     "fastapi>=0.100.0",
     "uvicorn>=0.23.0,<1.0",
+    # LiteLLM provider backends (e.g. openrouter) expect orjson at runtime but
+    # litellm only declares it under its own [proxy] extra (GH #2056).
+    "orjson>=3.9.14; platform_python_implementation != 'PyPy'",
     "httpx[http2]>=0.24.0",
     "openai>=2.14.0",             # OpenAI API format support
-    "mcp>=1.0.0",                 # MCP server (headroom_compress, retrieve, stats)
+    "mcp>=1.28.1,<2.0.0",         # MCP server (headroom_compress, retrieve, stats)
     "magika>=0.6.0",              # ML content detection for ContentRouter
     "zstandard>=0.20.0",          # Decompress zstd request bodies (Codex, etc.)
     "websockets>=13.0",           # WebSocket proxy for /v1/responses (Codex gpt-5.4+)
     "onnxruntime>=1.16.0",        # Kompress ONNX INT8 text compression (no torch needed)
-    "transformers>=4.30.0,<6.0",  # Tokenizer only (for Kompress)
+    "transformers>=5.5.0,<6.0",   # Tokenizer only (for Kompress)
     "watchdog>=4.0.0",            # File watcher for live code graph reindexing (--code-graph)
     "sqlite-vec>=0.1.6",          # Vector index for memory (--memory). Lightweight, no torch.
 ]
@@ -82,37 +96,55 @@ proxy-prod = [
     "gunicorn>=21.0.0; sys_platform != 'win32'",
 ]
 # AST-based code compression (tree-sitter)
+# tree-sitter-language-pack >=1.0 removed the bundled tree-sitter package and
+# switched to an incompatible internal node API (.kind vs .type, callable
+# root_node, etc.).  Pin to <1.0.0 so that tree-sitter>=0.25.2 is pulled in
+# as a transitive dependency and the existing code_compressor.py node-walk
+# logic continues to work.  See issue #1216.
 code = [
-    "tree-sitter-language-pack>=0.10.0",
+    "tree-sitter-language-pack>=0.10.0,<1.0",
+    "tree-sitter>=0.25.2,<0.27",
 ]
 # ML-based compression with Kompress (ModernBERT).
 # (The legacy [llmlingua] extra was removed in 0.9.x — no live code path used it.
 # Use [ml] for the supported ML compression dependencies.)
 ml = [
-    "torch>=2.0.0",
-    "transformers>=4.30.0,<6.0",
+    # PyTorch does not publish wheels for macOS 15 x86_64 at this floor, which
+    # makes `headroom-ai[all]` unsatisfiable on Intel Macs (#1931).
+    "torch>=2.12.1; sys_platform != 'darwin' or platform_machine != 'x86_64'",
+    "transformers>=5.5.0,<6.0",
     # transformers >= 5.x requires huggingface-hub >= 1.5.0,<2.0; pinning
     # the floor here prevents Kompress from silently falling back to
     # "unavailable" when a sibling install (e.g. `pip install
     # strands-agents`) drags huggingface-hub backwards.
     "huggingface-hub>=1.5.0,<2.0",
 ]
-# Memory system (hierarchical memory with vector search)
+# Memory system (hierarchical memory with vector search).
+# Uses the pure-Python sqlite-vec backend by default (VectorBackend.AUTO ->
+# SQLITE_VEC), so no C++ toolchain is required. The optional HNSW backend lives
+# in the [vector] extra below; installing it here would make `[all]` (which pulls
+# [memory]) fail on any machine without a compiler — see #1368.
 memory = [
-    "hnswlib>=0.8.0",
     "sqlite-vec>=0.1.6",
-    "sentence-transformers>=2.2.0,<6.0",
+    "sentence-transformers>=2.2.0,<6.0; sys_platform != 'darwin' or platform_machine != 'x86_64'",
+]
+# Optional HNSW vector backend. Needs a C++ toolchain to build hnswlib, so it is
+# kept out of [memory] and [all]; opt in with `pip install headroom-ai[vector]`
+# and select it via MemoryConfig(vector_backend=VectorBackend.HNSW). The default
+# sqlite-vec backend needs no compiler.
+vector = [
+    "hnswlib>=0.8.0",
 ]
 # Qdrant + Neo4j memory backend helpers
 memory-stack = [
-    "mem0ai>=1.0.0,<2.0",
+    "mem0ai>=2.0.0,<3.0",
     "qdrant-client>=1.9.0,<2.0",
     "neo4j>=5.20.0,<7.0",
 ]
 # Apple-Silicon GPU (MPS) offload for the memory embedder. Opt in at runtime with
 # HEADROOM_EMBEDDER_RUNTIME=pytorch_mps. macOS-only; intentionally excluded from [all].
 pytorch-mps = [
-    "torch>=2.0.0; sys_platform == 'darwin'",
+    "torch>=2.12.1; sys_platform == 'darwin'",
     "sentence-transformers>=2.2.0; sys_platform == 'darwin'",
 ]
 # Semantic relevance scoring with embeddings.
@@ -140,7 +172,7 @@ relevance = [
 # `headroom/image/compressor.py` adapts both API shapes at runtime via
 # a try/except cascade. See issue #372 for context.
 image = [
-    "pillow>=10.0.0",
+    "pillow>=12.3.0",         # PYSEC-2026-2253/2254/2255/2256/2257 fixes (decompression-bomb + cmd-injection)
     "sentencepiece>=0.1.99",  # Required by SigLIP tokenizer (SiglipTokenizer)
     # Python 3.6–3.12: keep the proven ORT-bundled package directly.
     # ~15 MB ONNX models auto-downloaded on first use.
@@ -155,6 +187,11 @@ image = [
 # Report generation
 reports = [
     "jinja2>=3.0.0",
+]
+# Binary spreadsheet ingestion (.xlsx / .xls -> tabular text)
+spreadsheet = [
+    "openpyxl>=3.1.0",      # .xlsx
+    "xlrd>=2.0.1",          # legacy .xls
 ]
 # OpenTelemetry metrics export
 otel = [
@@ -178,16 +215,26 @@ agno = [
 strands = [
     "strands-agents>=0.1.0",
 ]
+# CrewAI agent framework integration
+crewai = [
+    "crewai>=1.0",
+]
+# AutoGen agent framework integration
+autogen = [
+    "autogen-agentchat>=0.7",
+]
 # MCP server for Claude Code integration
 mcp = [
-    "mcp>=1.0.0",
+    "mcp>=1.28.1,<2.0.0",
     "httpx>=0.24.0",
+    "starlette>=0.27.0",
+    "uvicorn>=0.23.0,<1.0",
 ]
 # Voice filler detection
 voice = [
     "onnxruntime>=1.16.0",
-    "transformers>=4.30.0,<6.0",
-    "torch>=2.0.0",
+    "transformers>=5.5.0,<6.0",
+    "torch>=2.12.1; sys_platform != 'darwin' or platform_machine != 'x86_64'",
 ]
 # Voice training (includes voice deps + training extras)
 voice-train = [
@@ -198,7 +245,7 @@ voice-train = [
 # Evaluation framework
 evals = [
     "datasets>=2.14.0",
-    "sentence-transformers>=2.2.0,<6.0",
+    "sentence-transformers>=2.2.0,<6.0; sys_platform != 'darwin' or platform_machine != 'x86_64'",
     "numpy>=1.24.0",
     "scikit-learn>=1.3.0",
     "anthropic>=0.18.0",
@@ -206,29 +253,29 @@ evals = [
 ]
 # AWS Bedrock backend
 bedrock = [
-    "boto3>=1.28.0",
+    # `aws login` (IAM Identity Provider / console-login, DPoP) requires
+    # boto3 >= 1.41.0 AND the AWS Common Runtime (CRT) per AWS docs
+    # ("Boto3 1.41.0 or later with CRT"). CRT is a separate install — pull it
+    # via the botocore [crt] extra (awscrt). Without it, resolving `aws login`
+    # credentials raises botocore's MissingDependencyException.
+    "boto3>=1.41.0",
+    "botocore[crt]>=1.41.0",
 ]
 # HTML content extraction
 html = [
     "trafilatura>=1.6.0",
-]
-# Comprehensive LLM benchmarks
-benchmark = [
-    "lm-eval[api]>=0.4.0",
-    "openai>=1.0.0",
-    "anthropic>=0.18.0",
 ]
 # Development dependencies
 dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
     "pytest-asyncio>=0.21.0",
-    "ruff>=0.1.0",
+    "ruff==0.15.17",
     "mypy>=1.0.0",
     "pre-commit>=3.0.0",
     "openai>=1.0.0",
     "anthropic>=0.18.0",
-    "litellm>=1.86.2,<2.0",
+    "litellm>=1.86.2,<2.0; python_version < '3.14'",  # see core deps note (GH #956)
     "fastapi>=0.100.0",
     "uvicorn>=0.23.0,<1.0",
     "httpx[http2]>=0.24.0",
@@ -241,10 +288,39 @@ dev = [
     "sqlite-vec>=0.1.6",
     "sentence-transformers>=2.2.0,<6.0",
     "numpy>=1.24.0",
+    "openpyxl>=3.1.0",  # exercises spreadsheet_ingest (.xlsx) in the test suite
+    "respx>=0.20.0",    # HTTP mock transport for passthrough handler tests
 ]
-# All optional dependencies (everything you need)
+# All optional dependencies (everything you need).
+#
+# The EleutherAI lm-evaluation-harness is intentionally not exposed as a
+# project extra. Headroom invokes it as an external subprocess
+# (`python -m lm_eval`), and the harness currently pulls sqlitedict
+# CVE-2024-35515 with no upstream fix. Keeping it out of locked project extras
+# prevents repository scanners from flagging production installs; researchers
+# who need standard accuracy benchmarks can install `lm-eval[api]` in their
+# benchmark environment separately.
 all = [
-    "headroom-ai[proxy,code,ml,memory,relevance,image,reports,otel,evals,voice,html,benchmark,mcp]",
+    "headroom-ai[proxy,code,ml,memory,relevance,image,reports,otel,evals,voice,html,mcp,spreadsheet]",
+]
+# Sandbox: a lean proxy with ALL torch-free capability — for running Headroom in
+# a locked-down/low-resource sandbox and offloading heavy ML elsewhere.
+#
+# = [all] MINUS:
+#   - image  (SigLIP/OCR — excluded by request)
+#   - ml     (torch — the PyTorch Kompress backend; ONNX path in [proxy] still
+#             runs Kompress locally with no torch, or offload it entirely via
+#             HEADROOM_KOMPRESS_ENDPOINT)
+#   - voice  (excluded by request)
+#   - memory + evals  (both pull sentence-transformers -> torch, i.e. the very
+#             ML weight a sandbox avoids; evals is a dev/test harness, not a
+#             runtime feature). Opt back in explicitly if you accept torch:
+#             pip install headroom-ai[sandbox,memory]
+#
+# Everything kept here is torch-free: code-aware compression (tree-sitter),
+# embedding relevance (fastembed), HTML/spreadsheet ingestion, reports, OTel.
+sandbox = [
+    "headroom-ai[proxy,code,relevance,reports,otel,html,mcp,spreadsheet]",
 ]
 
 [project.scripts]
@@ -268,6 +344,27 @@ Changelog = "https://github.com/chopratejas/headroom/blob/main/CHANGELOG.md"
 # no PIP_FIND_LINKS plumbing. Phase A0's runtime fail-loud check still
 # exists but only fires if someone forces an sdist install on a platform
 # without a wheel and the rust toolchain isn't available to compile it.
+# Constrain transitive dependencies that have CVEs requiring minimum versions.
+# These packages don't appear as direct headroom deps but are pulled in
+# transitively; the floor pins below ensure uv resolves to patched versions.
+[tool.uv]
+constraint-dependencies = [
+    # GHSA-5239-wwwm-4pmq (Low) — transitive via rich; fix at 2.20.0
+    "pygments>=2.20.0",
+    # GHSA-4xgf-cpjx-pc3j (Medium) — transitive via mcp; fix at 2.14.2
+    "pydantic-settings>=2.14.2",
+    # GHSA-mv93-w799-cj2w + 4 others (High) — transitive via agno; fix at 3.1.50
+    "gitpython>=3.1.50",
+    # GHSA-f4xh-w4cj-qxq8 (High) — transitive via langchain-core; fix at 0.8.18
+    "langsmith>=0.9.0",
+    # CVE-2026-49825 (High, XSS) — transitive via lxml[html-clean]; fix at 0.4.5
+    "lxml-html-clean>=0.4.5",
+    # CVE-2026-5241 (High) — direct optional dep for proxy/ml/voice; fix at 5.5.0
+    "transformers>=5.5.0",
+    # PYSEC-2026-3447 — transitive dependency; fix at 83.0.0
+    "setuptools>=83.0.0",
+]
+
 # Pin the project's package index to public PyPI. Without this, `uv lock`
 # inherits the developer's user-level `~/.config/uv/uv.toml` index
 # setting — including private/internal mirrors like

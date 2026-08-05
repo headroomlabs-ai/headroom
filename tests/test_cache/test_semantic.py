@@ -51,6 +51,27 @@ class TestSemanticCache:
         entry = cache.get("Unknown query", messages_hash="unknown")
         assert entry is None
 
+    def test_same_query_different_context_does_not_collide(self, cache):
+        """Two requests that share a trailing user message but differ in earlier
+        context (distinct messages_hash) must not overwrite each other. Before the
+        fix both were keyed by sha256(query), so the second clobbered the first and
+        the first's hash resolved to the second's response."""
+        cache.put("run the tests", {"text": "response A"}, messages_hash="ctxA")
+        cache.put("run the tests", {"text": "response B"}, messages_hash="ctxB")
+
+        got_a = cache.get("run the tests", messages_hash="ctxA")
+        got_b = cache.get("run the tests", messages_hash="ctxB")
+
+        assert got_a is not None and got_a.response == {"text": "response A"}
+        assert got_b is not None and got_b.response == {"text": "response B"}
+
+    def test_exact_match_verifies_messages_hash(self, cache):
+        """A stored entry is only returned when its messages_hash matches the
+        looked-up hash — never another conversation's cached response."""
+        cache.put("continue", {"text": "A"}, messages_hash="hA")
+        # A lookup for a hash that isn't stored is a miss, not a wrong hit.
+        assert cache.get("continue", messages_hash="hB") is None
+
     def test_lru_eviction(self):
         """Test LRU eviction when at capacity."""
         config = SemanticCacheConfig(max_entries=3)
@@ -74,6 +95,31 @@ class TestSemanticCache:
         # query3 and query4 should be there
         assert cache.get("query3", messages_hash="h3") is not None
         assert cache.get("query4", messages_hash="h4") is not None
+
+    def test_update_at_capacity_does_not_evict_unrelated_entry(self):
+        """Re-storing an existing key at capacity must not drop another entry.
+
+        The eviction loop used to run before the cache key was computed, so
+        overwriting a key that was already present (a retried/duplicate store)
+        still evicted the LRU-oldest distinct entry even though the update grows
+        nothing. That silently dropped a live entry and turned a later lookup for
+        it into a false miss.
+        """
+        config = SemanticCacheConfig(max_entries=2)
+        cache = SemanticCache(config)
+
+        cache.put("query1", "response1", messages_hash="h1")
+        cache.put("query2", "response2", messages_hash="h2")
+
+        # Re-store the already-present h2 (e.g. a duplicate/retried request).
+        cache.put("query2", "response2b", messages_hash="h2")
+
+        # h1 must still be there — updating h2 must not evict it.
+        got1 = cache.get("query1", messages_hash="h1")
+        assert got1 is not None and got1.response == "response1"
+        # h2 reflects the update.
+        got2 = cache.get("query2", messages_hash="h2")
+        assert got2 is not None and got2.response == "response2b"
 
     def test_ttl_expiration(self):
         """Test TTL expiration."""

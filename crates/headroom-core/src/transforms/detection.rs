@@ -28,6 +28,14 @@
 //! issue. Loud-on-error stays at the [`magika_detect`] entry point for
 //! callers who care; the chain swallows the err with a log line.
 //!
+//! # CPU compatibility
+//!
+//! Precompiled ONNX Runtime binaries from `ort-sys` may contain AVX2-family
+//! instructions. On x86/x86_64 CPUs where AVX2 is unavailable, the magika
+//! session init returns an init error before touching ONNX. The chain
+//! handles this identically to any other tier-1 error — logs it and falls
+//! through to Tier 2 / Tier 3.
+//!
 //! # SearchResults / BuildOutput
 //!
 //! The retired regex detector recognized grep-style search output
@@ -39,6 +47,7 @@
 //! for those specifically; not preemptively.
 
 use crate::transforms::content_detector::ContentType;
+#[cfg(feature = "ml")]
 use crate::transforms::magika_detector::magika_detect;
 use crate::transforms::unidiff_detector::is_diff;
 
@@ -53,6 +62,10 @@ pub fn detect(content: &str) -> ContentType {
     }
 
     // ── Tier 1: Magika ──────────────────────────────────────────
+    // Only present in the `ml` build. Without the ML crates the magika
+    // detector is compiled out; the chain skips Tier 1 and begins at
+    // Tier 2, exactly as it would when magika returns PlainText.
+    #[cfg(feature = "ml")]
     match magika_detect(content) {
         Ok(ContentType::PlainText) => {
             // Magika says "I don't know" or "plain text". Continue
@@ -84,6 +97,22 @@ pub fn detect(content: &str) -> ContentType {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "ml")]
+    use crate::transforms::magika_detector::magika_runtime_available_for_session_init;
+
+    #[cfg(feature = "ml")]
+    fn magika_available() -> bool {
+        magika_runtime_available_for_session_init().is_ok()
+    }
+
+    // Without the ML crates there is no magika session at all, so the
+    // detection chain always starts at Tier 2. Report "unavailable" so
+    // the shared assertions below exercise the same fallthrough path
+    // they use on a host where magika can't initialize.
+    #[cfg(not(feature = "ml"))]
+    fn magika_available() -> bool {
+        false
+    }
 
     #[test]
     fn empty_input_short_circuits_to_plain_text() {
@@ -93,19 +122,31 @@ mod tests {
     #[test]
     fn json_array_routes_via_tier_1() {
         let payload = r#"[{"id": 1}, {"id": 2}, {"id": 3}]"#;
-        assert_eq!(detect(payload), ContentType::JsonArray);
+        if magika_available() {
+            assert_eq!(detect(payload), ContentType::JsonArray);
+        } else {
+            assert_eq!(detect(payload), ContentType::PlainText);
+        }
     }
 
     #[test]
     fn source_code_routes_via_tier_1() {
         let py = "def hello():\n    print('world')\n\nclass Foo:\n    pass\n";
-        assert_eq!(detect(py), ContentType::SourceCode);
+        if magika_available() {
+            assert_eq!(detect(py), ContentType::SourceCode);
+        } else {
+            assert_eq!(detect(py), ContentType::PlainText);
+        }
     }
 
     #[test]
     fn html_routes_via_tier_1() {
         let html = "<!DOCTYPE html><html><body><h1>x</h1></body></html>";
-        assert_eq!(detect(html), ContentType::Html);
+        if magika_available() {
+            assert_eq!(detect(html), ContentType::Html);
+        } else {
+            assert_eq!(detect(html), ContentType::PlainText);
+        }
     }
 
     #[test]
@@ -118,7 +159,8 @@ mod tests {
                     +    print(\"new\")\n";
         // Either magika tags it `diff` (Tier 1 hit) or magika
         // mis-classifies as text and unidiff catches it (Tier 2).
-        // Both paths produce GitDiff.
+        // On no-AVX2 hosts, magika is unavailable so Tier 2 still
+        // catches the diff. Both paths produce GitDiff.
         assert_eq!(detect(diff), ContentType::GitDiff);
     }
 
@@ -127,7 +169,7 @@ mod tests {
         // Magika often mis-classifies naked hunks (no `diff --git`
         // wrapper) because the visible bytes look like ordinary
         // patch lines mixed with code. Tier 2 (unidiff parser)
-        // catches these.
+        // catches these — even when magika is unavailable.
         let diff = "--- a/foo.py\n\
                     +++ b/foo.py\n\
                     @@ -1,2 +1,2 @@\n\
@@ -195,7 +237,11 @@ mod tests {
         // YAML lives in magika's `code` group; the chain returns it
         // as SourceCode so the router picks the code-aware compressor.
         let yaml = "name: my-app\nversion: 1.0\ndependencies:\n  - foo\n";
-        assert_eq!(detect(yaml), ContentType::SourceCode);
+        if magika_available() {
+            assert_eq!(detect(yaml), ContentType::SourceCode);
+        } else {
+            assert_eq!(detect(yaml), ContentType::PlainText);
+        }
     }
 
     #[test]
@@ -205,13 +251,19 @@ mod tests {
                   impl Counter {\n    \
                       pub fn new() -> Self { Self { counts: HashMap::new() } }\n\
                   }\n";
-        assert_eq!(detect(rs), ContentType::SourceCode);
+        if magika_available() {
+            assert_eq!(detect(rs), ContentType::SourceCode);
+        } else {
+            assert_eq!(detect(rs), ContentType::PlainText);
+        }
     }
 
     #[test]
     fn chain_is_deterministic_across_repeated_calls() {
         // Magika returns the same label for identical input on
         // repeated calls; the chain wraps that determinism.
+        // On no-AVX2 hosts, the chain always falls through to
+        // PlainText — which is equally deterministic.
         let payload = r#"{"users": [{"id": 1}, {"id": 2}]}"#;
         let a = detect(payload);
         let b = detect(payload);

@@ -53,7 +53,10 @@ pub struct SmartCrusherConfig {
     /// path to be chosen over lossy. Computed as
     /// `1 - len(rendered) / len(input)`. If lossless saves less than
     /// this fraction, `crush_array` falls through to the lossy path
-    /// (with CCR-Dropped retrieval markers). Default `0.30`.
+    /// (with CCR-Dropped retrieval markers). Default `0.15` — kept in
+    /// lockstep with the Python `SmartCrusherConfig` dataclass default
+    /// (lowered from 0.30 so cleanly tabular input takes the lossless
+    /// path more often; lossless needs no CCR retrieval round-trip).
     ///
     /// **Override semantics.** OSS users can tune this via the config
     /// directly. Enterprise plug-ins replace the entire decision via
@@ -77,6 +80,50 @@ pub struct SmartCrusherConfig {
     /// still emit always; they have no Python equivalent and no
     /// production caller has asked for them to be suppressed.
     pub enable_ccr_marker: bool,
+    /// Strict lossless mode. When `true`, lossless tabular compaction
+    /// still applies, but any path that would otherwise need a CCR
+    /// marker — the lossy row-drop sentinel AND opaque-blob offload —
+    /// leaves the content uncompacted instead. The result is always
+    /// marker-free and byte-recoverable: rows are never dropped and
+    /// opaque cells render inline. Default `false` (markers allowed).
+    pub lossless_only: bool,
+    /// Compaction heuristic: a field is "core" if it appears in at
+    /// least this fraction of rows. Mirrors
+    /// `CompactConfig::core_field_fraction`. Default 0.8.
+    pub compaction_core_field_fraction: f64,
+    /// Compaction heuristic: when fewer than this fraction of all
+    /// observed keys are core, treat the array as heterogeneous and
+    /// look for a discriminator. Mirrors
+    /// `CompactConfig::heterogeneous_core_ratio`. Default 0.6.
+    pub compaction_heterogeneous_core_ratio: f64,
+    /// Compaction heuristic: cap on inner-key count for
+    /// nested-uniform flattening. Mirrors
+    /// `CompactConfig::max_flatten_inner_keys`. Default 6.
+    pub compaction_max_flatten_inner_keys: usize,
+    /// Compaction heuristic: minimum bucket count before a candidate
+    /// discriminator is "useful". Mirrors `CompactConfig::min_buckets`.
+    /// Default 2.
+    pub compaction_min_buckets: usize,
+    /// Compaction heuristic: maximum bucket count — too many buckets
+    /// means the discriminator is too granular (e.g. an ID column).
+    /// Mirrors `CompactConfig::max_buckets`. Default 8.
+    pub compaction_max_buckets: usize,
+}
+
+impl SmartCrusherConfig {
+    /// Whether opaque blobs should be offloaded to a `<<ccr:…>>` marker.
+    ///
+    /// Single source of truth for the opaque-marker gate. Markers are
+    /// emitted only when CCR markers are enabled AND strict lossless
+    /// mode is off — `lossless_only` forbids any offload because the
+    /// marker would break the marker-free / byte-recoverable guarantee.
+    /// Both compaction-stage construction (`new` /
+    /// `with_compaction_format`) and the top-level `process_string` path
+    /// derive `ClassifyConfig::emit_opaque_markers` from this method so
+    /// the three call sites can never drift apart.
+    pub fn opaque_markers_enabled(&self) -> bool {
+        self.enable_ccr_marker && !self.lossless_only
+    }
 }
 
 impl Default for SmartCrusherConfig {
@@ -101,8 +148,14 @@ impl Default for SmartCrusherConfig {
             first_fraction: 0.3,
             last_fraction: 0.15,
             relevance_threshold: 0.3,
-            lossless_min_savings_ratio: 0.30,
+            lossless_min_savings_ratio: 0.15,
             enable_ccr_marker: true,
+            lossless_only: false,
+            compaction_core_field_fraction: 0.8,
+            compaction_heterogeneous_core_ratio: 0.6,
+            compaction_max_flatten_inner_keys: 6,
+            compaction_min_buckets: 2,
+            compaction_max_buckets: 8,
         }
     }
 }
@@ -133,7 +186,13 @@ mod tests {
         assert_eq!(c.first_fraction, 0.3);
         assert_eq!(c.last_fraction, 0.15);
         assert_eq!(c.relevance_threshold, 0.3);
-        assert_eq!(c.lossless_min_savings_ratio, 0.30);
+        assert_eq!(c.lossless_min_savings_ratio, 0.15);
         assert!(c.enable_ccr_marker);
+        assert!(!c.lossless_only);
+        assert_eq!(c.compaction_core_field_fraction, 0.8);
+        assert_eq!(c.compaction_heterogeneous_core_ratio, 0.6);
+        assert_eq!(c.compaction_max_flatten_inner_keys, 6);
+        assert_eq!(c.compaction_min_buckets, 2);
+        assert_eq!(c.compaction_max_buckets, 8);
     }
 }

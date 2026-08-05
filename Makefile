@@ -12,7 +12,7 @@ FIXTURES ?= tests/parity/fixtures
 help:
 	@echo "Headroom Rust targets:"
 	@echo "  make test               - cargo test --workspace"
-	@echo "  make test-parity        - maturin develop + parity-run against fixtures"
+	@echo "  make test-parity        - parity-run against recorded fixtures"
 	@echo "  make bench              - cargo bench --workspace"
 	@echo "  make build-proxy        - release build + strip headroom-proxy, print size"
 	@echo "  make build-wheel        - release wheel for headroom-py"
@@ -21,6 +21,10 @@ help:
 	@echo "  make fmt-check          - cargo fmt --all -- --check"
 	@echo "  make lint               - cargo clippy --workspace -- -D warnings"
 	@echo "  make clean              - cargo clean"
+	@echo ""
+	@echo "E2e targets:"
+	@echo "  make build-e2e-wrap     - build the wrap-e2e Docker image"
+	@echo "  make run-e2e-wrap       - build + run the wrap-e2e Docker container"
 	@echo ""
 	@echo "Pre-push verification (run BEFORE git push to catch CI failures locally):"
 	@echo "  make ci-precheck        - run all CI gates (rust + python + commitlint)"
@@ -32,12 +36,12 @@ help:
 test:
 	$(CARGO) test --workspace
 
+# headroom-parity has no pyo3 dependency — its comparators call headroom-core
+# directly, so this target needs neither a venv nor a built extension module.
+# (See crates/headroom-parity/Cargo.toml: "Phase 0 does not invoke Python from
+# Rust.") Dropping the `maturin develop` step keeps the harness runnable from a
+# bare checkout and takes the Python toolchain off the CI parity job.
 test-parity:
-	@if [ -z "$$VIRTUAL_ENV" ]; then \
-		echo "error: activate a venv first (e.g. source .venv/bin/activate)"; \
-		exit 1; \
-	fi
-	$(MATURIN) develop -m crates/headroom-py/Cargo.toml
 	$(CARGO) run -p headroom-parity -- run --fixtures $(FIXTURES)
 
 bench:
@@ -138,3 +142,16 @@ ci-precheck-commitlint:
 
 install-git-hooks:
 	@scripts/install-git-hooks.sh
+
+# ─── E2e Docker targets ────────────────────────────────────────────────────
+#
+# The wrap-e2e Dockerfile uses manylinux_2_28_x86_64 as its builder stage,
+# which only ships amd64 binaries. Pass --platform linux/amd64 explicitly
+# so the build works on Apple Silicon (requires QEMU emulation). On native
+# x86_64 hosts the flag is harmless and matches CI behaviour.
+
+build-e2e-wrap:
+	docker build --platform linux/amd64 -f e2e/wrap/Dockerfile -t headroom-wrap-e2e .
+
+run-e2e-wrap: build-e2e-wrap
+	docker run --rm headroom-wrap-e2e

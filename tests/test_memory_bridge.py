@@ -8,7 +8,9 @@ Run with: pytest tests/test_memory_bridge.py -v
 
 from __future__ import annotations
 
+import functools
 import json
+import os
 import uuid
 
 import pytest
@@ -24,6 +26,7 @@ from headroom.memory.bridge_parsers import (
     parse_generic_markdown,
     parse_markdown,
 )
+from tests._skip_helpers import external_model_skip_reason
 
 # Sample content for testing
 CLAUDE_CODE_MEMORY = """\
@@ -61,6 +64,40 @@ The system uses FastAPI for the proxy layer.
 - Add caching layer
 - Improve error handling
 """
+
+
+def skip_offline_model_failures(func):
+    """Skip bridge integration tests when the local embedder cannot start offline."""
+
+    @functools.wraps(func)
+    async def wrapper(*args, **kwargs):
+        try:
+            return await func(*args, **kwargs)
+        except Exception as exc:
+            reason = external_model_skip_reason(exc)
+            if reason is not None:
+                pytest.skip(reason)
+            raise
+
+    return wrapper
+
+
+def decorate_async_test_methods(cls):
+    """Wrap every async test method on a class with the offline-model skip helper."""
+    for name, value in vars(cls).items():
+        if name.startswith("test_"):
+            setattr(cls, name, skip_offline_model_failures(value))
+    return cls
+
+
+def skip_if_offline_bridge_import_failed(stats) -> None:
+    """Skip bridge assertions when every section failed only because the model cache is offline."""
+    if (
+        os.environ.get("TRANSFORMERS_OFFLINE") == "1"
+        and stats.sections_imported == 0
+        and stats.sections_failed > 0
+    ):
+        pytest.skip("Skipped because required Hugging Face model files are unavailable offline")
 
 
 # =============================================================================
@@ -273,6 +310,7 @@ def bridge(bridge_config, backend):
     return MemoryBridge(bridge_config, backend)
 
 
+@decorate_async_test_methods
 class TestMemoryBridgeImport:
     @pytest.mark.asyncio
     async def test_import_claude_code_memory(self, bridge, tmp_dir, backend):
@@ -281,6 +319,7 @@ class TestMemoryBridgeImport:
         md_path.write_text(CLAUDE_CODE_MEMORY, encoding="utf-8")
 
         stats = await bridge.import_from_markdown(paths=[md_path], user_id="test_user")
+        skip_if_offline_bridge_import_failed(stats)
 
         assert stats.files_processed == 1
         assert stats.sections_imported > 0
@@ -297,6 +336,7 @@ class TestMemoryBridgeImport:
         md_path.write_text(CLAUDE_CODE_MEMORY, encoding="utf-8")
 
         stats1 = await bridge.import_from_markdown(paths=[md_path], user_id="test_user")
+        skip_if_offline_bridge_import_failed(stats1)
         assert stats1.sections_imported > 0
 
         stats2 = await bridge.import_from_markdown(paths=[md_path], user_id="test_user")
@@ -316,6 +356,7 @@ class TestMemoryBridgeImport:
         md_path.write_text(modified, encoding="utf-8")
 
         stats = await bridge.import_from_markdown(paths=[md_path], user_id="test_user")
+        skip_if_offline_bridge_import_failed(stats)
         assert stats.files_processed == 1
         assert stats.sections_imported >= 1  # At least the new section
 
@@ -339,6 +380,7 @@ class TestMemoryBridgeImport:
 
         bridge._config.md_format = MarkdownFormat.CHATGPT
         stats = await bridge.import_from_markdown(paths=[md_path], user_id="test_user")
+        skip_if_offline_bridge_import_failed(stats)
         assert stats.sections_imported > 0
 
     @pytest.mark.asyncio
@@ -366,6 +408,7 @@ class TestMemoryBridgeImport:
             assert "source_file" in metadata
 
 
+@decorate_async_test_methods
 class TestMemoryBridgeExport:
     @pytest.mark.asyncio
     async def test_export_claude_code_style(self, bridge, tmp_dir, backend):
@@ -422,6 +465,7 @@ class TestMemoryBridgeExport:
         assert "No memories" in markdown
 
 
+@decorate_async_test_methods
 class TestMemoryBridgeSync:
     @pytest.mark.asyncio
     async def test_sync_imports_and_exports(self, bridge, tmp_dir, backend):
@@ -432,6 +476,7 @@ class TestMemoryBridgeSync:
 
         # First sync: imports from file
         stats = await bridge.sync(user_id="test_user")
+        skip_if_offline_bridge_import_failed(stats.import_stats)
         assert stats.import_stats.sections_imported > 0
 
         # Add an organic memory (not from bridge)
@@ -465,6 +510,7 @@ class TestMemoryBridgeSync:
         assert stats.memories_exported == 0
 
 
+@decorate_async_test_methods
 class TestSyncStatePersistence:
     @pytest.mark.asyncio
     async def test_state_saved_and_loaded(self, tmp_dir, backend):
@@ -496,6 +542,7 @@ class TestSyncStatePersistence:
         assert stats.files_skipped_unchanged == 1
 
 
+@decorate_async_test_methods
 class TestRoundTrip:
     @pytest.mark.asyncio
     async def test_import_export_preserves_facts(self, bridge, tmp_dir, backend):

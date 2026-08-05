@@ -21,7 +21,6 @@ import httpx
 REPO_ROOT = Path("/workspace")
 PLUGIN_DIR = REPO_ROOT / "plugins" / "openclaw"
 SDK_DIR = REPO_ROOT / "sdk" / "typescript"
-RTK_MARKER = "<!-- headroom:rtk-instructions -->"
 PROXY_PORT = 28887
 CODEX_PORT = 28888
 AIDER_PORT = 28889
@@ -35,6 +34,11 @@ CLINE_PORT = 28892
 CONTINUE_PORT = 28893
 GOOSE_PORT = 28894
 OPENHANDS_PORT = 28895
+OPENCODE_PORT = 28896
+CLAUDE_PORT = 28897
+VSCODE_PORT = 28898
+VSCODE_CLAUDE_PORT = 28899
+MOCK_UPSTREAM_PORT = 19001
 
 
 def log(message: str) -> None:
@@ -116,6 +120,13 @@ class MockOpenAIHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         self._record()
+        if self.path == "/copilot_internal/user":
+            port = self.server.server_address[1]
+            self._write_json(
+                200,
+                {"endpoints": {"api": f"http://127.0.0.1:{port}/v1"}},
+            )
+            return
         if self.path == "/v1/models":
             self._write_json(
                 200,
@@ -161,6 +172,20 @@ class MockOpenAIHandler(BaseHTTPRequestHandler):
                         "completion_tokens": 5,
                         "total_tokens": 17,
                     },
+                },
+            )
+            return
+        if self.path == "/v1/messages":
+            self._write_json(
+                200,
+                {
+                    "id": "msg_e2e",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": payload.get("model", "claude-sonnet-4-6"),
+                    "content": [{"type": "text", "text": "mock Claude response"}],
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 12, "output_tokens": 4},
                 },
             )
             return
@@ -225,7 +250,13 @@ def create_shims(shim_dir: Path) -> None:
             "cwd": os.getcwd(),
             "env": {
                 key: os.environ.get(key)
-                for key in ("OPENAI_BASE_URL", "OPENAI_API_BASE", "ANTHROPIC_BASE_URL")
+                for key in (
+                    "OPENAI_BASE_URL",
+                    "OPENAI_API_BASE",
+                    "ANTHROPIC_BASE_URL",
+                    "CODEX_HOME",
+                    "OPENCODE_CONFIG_CONTENT",
+                )
                 if os.environ.get(key) is not None
             },
         }
@@ -276,7 +307,13 @@ def create_shims(shim_dir: Path) -> None:
             "cwd": os.getcwd(),
             "env": {
                 key: os.environ.get(key)
-                for key in ("OPENAI_BASE_URL", "OPENAI_API_BASE", "ANTHROPIC_BASE_URL")
+                for key in (
+                    "OPENAI_BASE_URL",
+                    "OPENAI_API_BASE",
+                    "ANTHROPIC_BASE_URL",
+                    "CODEX_HOME",
+                    "OPENCODE_CONFIG_CONTENT",
+                )
                 if os.environ.get(key) is not None
             },
         }
@@ -340,6 +377,13 @@ def create_shims(shim_dir: Path) -> None:
                 by_model.get(model_name) if isinstance(by_model, dict) else None
             )
 
+        codex_home = os.environ.get("CODEX_HOME")
+        if codex_home:
+            session_config = Path(codex_home) / "config.toml"
+            record["session_config"] = (
+                session_config.read_text(encoding="utf-8") if session_config.exists() else None
+            )
+
         record["probes"] = probes
 
         with (log_dir / f"{tool}.jsonl").open("a", encoding="utf-8") as handle:
@@ -348,24 +392,10 @@ def create_shims(shim_dir: Path) -> None:
         raise SystemExit(0)
         """
     )
-    rtk_shim = textwrap.dedent(
-        """\
-        #!/usr/bin/env python3
-        from __future__ import annotations
-
-        import sys
-
-        if "--version" in sys.argv:
-            print("rtk e2e-shim")
-        else:
-            print("rtk shim")
-        raise SystemExit(0)
-        """
-    )
     write_executable(shim_dir / "claude", generic_shim)
     write_executable(shim_dir / "codex", codex_shim)
     write_executable(shim_dir / "aider", generic_shim)
-    write_executable(shim_dir / "rtk", rtk_shim)
+    write_executable(shim_dir / "opencode", generic_shim)
 
 
 def start_mock_server(port: int) -> tuple[MockOpenAIServer, threading.Thread]:
@@ -548,52 +578,64 @@ def verify_codex_wrap(
         cwd=project_dir,
         timeout=120,
     )
-    project_agents = project_dir / "AGENTS.md"
-    global_agents = Path(base_env["HOME"]) / ".codex" / "AGENTS.md"
-    assert_true(project_agents.exists(), "Codex wrap should create project AGENTS.md")
-    assert_true(global_agents.exists(), "Codex wrap should create ~/.codex/AGENTS.md")
-    assert_true(RTK_MARKER in project_agents.read_text(encoding="utf-8"), "Missing RTK marker")
-    assert_true(
-        RTK_MARKER in global_agents.read_text(encoding="utf-8"), "Missing global RTK marker"
-    )
-
     config_path = Path(base_env["HOME"]) / ".codex" / "config.toml"
-    assert_true(config_path.exists(), "Codex wrap should create ~/.codex/config.toml")
-    config = config_path.read_text(encoding="utf-8")
     assert_true(
-        f'openai_base_url = "http://127.0.0.1:{port}/v1"' in config,
-        "Codex wrap should inject openai_base_url for subscription routing",
+        config_path.exists(),
+        "Codex wrap should persist its MCP setup in the durable Codex home",
+    )
+    durable_config = config_path.read_text(encoding="utf-8")
+    assert_true(
+        "[mcp_servers.headroom]" in durable_config,
+        "Codex wrap should persist the Headroom MCP server",
     )
     assert_true(
-        f'base_url = "http://127.0.0.1:{port}/v1"' in config,
-        "Codex wrap should inject the headroom provider base_url",
-    )
-    assert_true(
-        'env_key = "OPENAI_API_KEY"' not in config,
-        "Codex wrap should preserve OAuth and never inject env_key",
-    )
-    # Bug 3 (#406): requires_openai_auth must be absent from headroom provider blocks.
-    assert_true(
-        "requires_openai_auth" not in config,
-        "Codex wrap must NOT inject requires_openai_auth into the headroom provider block",
-    )
-    assert_true(
-        "supports_websockets = true" in config, "Codex wrap missing 'supports_websockets = true'"
+        'model_provider = "headroom"' not in durable_config
+        and "[model_providers.headroom]" not in durable_config
+        and "openai_base_url" not in durable_config,
+        "Codex wrap should keep proxy routing out of the durable config",
     )
 
     entries = read_jsonl(log_dir / "codex.jsonl")
     assert_true(len(entries) > 0, "Codex shim should have been invoked")
     env_vars = entries[-1]["env"]
+    session_home = env_vars.get("CODEX_HOME")
     assert_true(
-        env_vars.get("OPENAI_BASE_URL") == f"http://127.0.0.1:{port}/v1",
+        isinstance(session_home, str) and session_home,
+        "Codex wrap should launch the child with CODEX_HOME",
+    )
+    assert_true(
+        Path(session_home) == config_path.parent,
+        "Codex wrap should point the child at the durable ~/.codex home",
+    )
+    config = entries[-1].get("session_config")
+    assert_true(
+        isinstance(config, str) and config,
+        "Codex wrap should capture the durable config during launch",
+    )
+    project_prefix = f"/p/{quote(project_dir.name, safe='')}"
+    expected_base_url = f"http://127.0.0.1:{port}{project_prefix}/v1"
+    argv = entries[-1].get("argv")
+    assert_true(
+        isinstance(argv, list) and f'openai_base_url="{expected_base_url}"' in argv,
+        "Codex wrap should pass openai_base_url as a process-local override",
+    )
+    assert_true(
+        'env_key = "OPENAI_API_KEY"' not in config,
+        "Codex wrap should preserve OAuth and never inject env_key into the session config",
+    )
+    assert_true(
+        env_vars.get("OPENAI_BASE_URL") == expected_base_url,
         "Codex wrap should set OPENAI_BASE_URL",
     )
     assert_true(
         entries[-1]["probes"]
         == [
-            {"url": f"http://127.0.0.1:{port}/v1/models", "status": 200},
-            {"url": f"http://127.0.0.1:{port}/v1/chat/completions", "status": 200},
-            {"url": f"http://127.0.0.1:{port}/stats", "status": 200},
+            {"url": f"{expected_base_url}/models", "status": 200},
+            {"url": f"{expected_base_url}/chat/completions", "status": 200},
+            {
+                "url": f"http://127.0.0.1:{port}{project_prefix}/stats",
+                "status": 200,
+            },
         ],
         "Codex shim should prove OPENAI_BASE_URL points at a live proxy and that Headroom logged the wrapped message",
     )
@@ -617,7 +659,7 @@ def verify_codex_wrap(
 
 
 def verify_claude_wrap(base_env: dict[str, str], project_dir: Path, log_dir: Path) -> None:
-    port = PROXY_PORT + 10
+    port = CLAUDE_PORT
     run(
         ["headroom", "wrap", "claude", "--port", str(port), "--", "--help"],
         env=base_env,
@@ -645,13 +687,6 @@ def verify_aider_wrap(base_env: dict[str, str], project_dir: Path, log_dir: Path
         cwd=project_dir,
         timeout=120,
     )
-    conventions = project_dir / "CONVENTIONS.md"
-    assert_true(conventions.exists(), "Aider wrap should create CONVENTIONS.md")
-    assert_true(
-        RTK_MARKER in conventions.read_text(encoding="utf-8"),
-        "Aider wrap should inject RTK instructions",
-    )
-
     entries = read_jsonl(log_dir / "aider.jsonl")
     assert_true(len(entries) > 0, "Aider shim should have been invoked")
     env_vars = entries[-1]["env"]
@@ -702,72 +737,191 @@ def verify_cursor_wrap(base_env: dict[str, str], project_dir: Path) -> None:
             "Cursor wrap should print the Anthropic base URL override",
         )
         wait_for_http(f"http://127.0.0.1:{port}/health", timeout=15)
-        cursorrules = project_dir / ".cursorrules"
-        assert_true(cursorrules.exists(), "Cursor wrap should create .cursorrules")
-        assert_true(
-            RTK_MARKER in cursorrules.read_text(encoding="utf-8"),
-            "Cursor wrap should inject RTK instructions",
-        )
     finally:
         stop_process(proc)
 
 
+def verify_vscode_wrap(base_env: dict[str, str], project_dir: Path) -> None:
+    """Exercise the Linux settings lifecycle without real Copilot credentials."""
+    port = VSCODE_PORT
+    settings_path = Path(base_env["HOME"]) / ".config" / "Code" / "User" / "settings.json"
+    settings_path.parent.mkdir(parents=True)
+    original = b'{\n  // existing user setting\n  "editor.fontSize": 15\n}\n'
+    settings_path.write_bytes(original)
+
+    env = base_env.copy()
+    for name in (
+        "COPILOT_GITHUB_TOKEN",
+        "COPILOT_PROVIDER_BEARER_TOKEN",
+        "GH_TOKEN",
+        "GITHUB_COPILOT_GITHUB_TOKEN",
+        "GITHUB_COPILOT_REFRESH_OAUTH_TOKEN",
+        "GITHUB_COPILOT_TOKEN",
+        "GITHUB_TOKEN",
+    ):
+        env.pop(name, None)
+    env.update(
+        {
+            "GITHUB_COPILOT_API_TOKEN": "synthetic-e2e-token",
+            "GITHUB_COPILOT_API_URL": f"http://127.0.0.1:{MOCK_UPSTREAM_PORT}/v1",
+            "GITHUB_COPILOT_USER_INFO_URL": (
+                f"http://127.0.0.1:{MOCK_UPSTREAM_PORT}/copilot_internal/user"
+            ),
+            "HEADROOM_COPILOT_AUTH_FILE": str(Path(base_env["HOME"]) / "copilot-auth.json"),
+        }
+    )
+
+    proc = subprocess.Popen(
+        ["headroom", "wrap", "vscode", "--port", str(port)],
+        env=env,
+        cwd=str(project_dir),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    try:
+        output = wait_for_output(proc, "Press Ctrl+C to stop the proxy.", timeout=30)
+        project_prefix = f"/p/{quote(project_dir.name, safe='')}"
+        configured = settings_path.read_text(encoding="utf-8")
+        assert_true(
+            f'"github.copilot.advanced.debug.overrideProxyUrl": '
+            f'"http://127.0.0.1:{port}{project_prefix}"' in configured,
+            "VS Code wrap should configure the project-scoped proxy URL",
+        )
+        assert_true(
+            '"github.copilot.advanced.debug.overrideAuthType": "token"' in configured,
+            "VS Code wrap should configure token auth",
+        )
+        assert_true(
+            "synthetic-e2e-token" not in configured, "Settings must not contain credentials"
+        )
+        assert_true("model" not in configured.lower(), "Settings must not override model selection")
+        assert_true(
+            str(settings_path) in output, "Wrap output should identify the Linux settings path"
+        )
+
+        health = wait_for_http(f"http://127.0.0.1:{port}/health", timeout=15).json()
+        assert_true(
+            health.get("config", {}).get("openai_api_url")
+            == f"http://127.0.0.1:{MOCK_UPSTREAM_PORT}/v1",
+            "VS Code proxy should use the mocked Copilot upstream",
+        )
+    finally:
+        stop_process(proc)
+
+    assert_true(settings_path.read_bytes() != original, "Ctrl+C should leave managed settings")
+    run(["headroom", "unwrap", "vscode"], env=env, cwd=project_dir, timeout=60)
+    assert_true(
+        settings_path.read_bytes() == original,
+        "VS Code unwrap should restore the original settings byte-for-byte",
+    )
+
+
+def verify_vscode_claude_wrap(base_env: dict[str, str], project_dir: Path) -> None:
+    """Exercise Claude Code's settings, proxy request, and restore lifecycle."""
+    port = VSCODE_CLAUDE_PORT
+    settings_path = Path(base_env["HOME"]) / ".claude" / "settings.json"
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    original = {"env": {"KEEP": "yes"}, "permissions": {"allow": ["Read"]}}
+    settings_path.write_text(json.dumps(original), encoding="utf-8")
+
+    env = base_env.copy()
+    env["ANTHROPIC_TARGET_API_URL"] = f"http://127.0.0.1:{MOCK_UPSTREAM_PORT}"
+    proc = subprocess.Popen(
+        ["headroom", "wrap", "vscode-claude", "--port", str(port)],
+        env=env,
+        cwd=str(project_dir),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    try:
+        output = wait_for_output(proc, "Press Ctrl+C to stop the proxy.", timeout=30)
+        project_prefix = f"/p/{quote(project_dir.name, safe='')}"
+        configured = json.loads(settings_path.read_text(encoding="utf-8"))
+        proxy_url = configured["env"]["ANTHROPIC_BASE_URL"]
+        assert_true(
+            proxy_url == f"http://127.0.0.1:{port}{project_prefix}",
+            "VS Code Claude wrap should configure the project-scoped Anthropic URL",
+        )
+        assert_true(
+            configured["env"]["ENABLE_TOOL_SEARCH"] == "true",
+            "VS Code Claude wrap should retain Claude Code tool deferral",
+        )
+        assert_true(configured["env"]["KEEP"] == "yes", "Existing Claude env must remain")
+        assert_true(str(settings_path) in output, "Wrap output should identify Claude settings")
+
+        response = httpx.post(
+            f"{proxy_url}/v1/messages",
+            headers={"x-api-key": "synthetic-anthropic-key", "anthropic-version": "2023-06-01"},
+            json={
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "Reply briefly"}],
+            },
+            timeout=30,
+        )
+        assert_true(response.status_code == 200, "Claude request should traverse Headroom")
+        assert_true(
+            response.json()["content"][0]["text"] == "mock Claude response",
+            "Claude response should return through Headroom",
+        )
+    finally:
+        stop_process(proc)
+
+    run(["headroom", "unwrap", "vscode-claude"], env=env, cwd=project_dir, timeout=60)
+    assert_true(
+        json.loads(settings_path.read_text(encoding="utf-8")) == original,
+        "VS Code Claude unwrap should restore existing Claude settings",
+    )
+
+
 def verify_cline_wrap(base_env: dict[str, str], project_dir: Path) -> None:
-    """Smoke test: `wrap cline --prepare-only` writes RTK guidance to .clinerules."""
+    """Smoke test: `wrap cline --prepare-only` exits clean.
+
+    These three wraps used to be verified by the hint-file guidance they wrote.
+    With the CLI context tools removed they produce no on-disk artifact, so the
+    remaining assertion is that the prepare path still runs without crashing —
+    ``run`` raises on a non-zero exit.
+    """
     run(
         ["headroom", "wrap", "cline", "--prepare-only", "--port", str(CLINE_PORT)],
         env=base_env,
         cwd=project_dir,
         timeout=60,
     )
-    clinerules = project_dir / ".clinerules"
-    assert_true(clinerules.exists(), "Cline wrap should create .clinerules")
-    assert_true(
-        RTK_MARKER in clinerules.read_text(encoding="utf-8"),
-        "Cline wrap should inject RTK instructions",
-    )
 
 
 def verify_continue_wrap(base_env: dict[str, str], project_dir: Path) -> None:
-    """Smoke test: `wrap continue --prepare-only` injects RTK into .continue/config.json."""
+    """Smoke test: `wrap continue --prepare-only` exits clean (see verify_cline_wrap)."""
     run(
         ["headroom", "wrap", "continue", "--prepare-only", "--port", str(CONTINUE_PORT)],
         env=base_env,
         cwd=project_dir,
         timeout=60,
     )
-    config_file = project_dir / ".continue" / "config.json"
-    assert_true(config_file.exists(), "Continue wrap should create .continue/config.json")
-    data = json.loads(config_file.read_text(encoding="utf-8"))
-    system_message = data.get("systemMessage", "")
-    assert_true(
-        RTK_MARKER in system_message,
-        "Continue wrap should inject RTK instructions into systemMessage",
-    )
 
 
 def verify_goose_wrap(base_env: dict[str, str], project_dir: Path) -> None:
-    """Smoke test: `wrap goose --prepare-only` writes RTK guidance to .goosehints."""
+    """Smoke test: `wrap goose --prepare-only` exits clean (see verify_cline_wrap)."""
     run(
         ["headroom", "wrap", "goose", "--prepare-only", "--port", str(GOOSE_PORT)],
         env=base_env,
         cwd=project_dir,
         timeout=60,
     )
-    goosehints = project_dir / ".goosehints"
-    assert_true(goosehints.exists(), "Goose wrap should create .goosehints")
-    assert_true(
-        RTK_MARKER in goosehints.read_text(encoding="utf-8"),
-        "Goose wrap should inject RTK instructions",
-    )
 
 
 def verify_openhands_wrap(base_env: dict[str, str], project_dir: Path) -> None:
-    """Smoke test: `wrap openhands --prepare-only` exits clean and ensures rtk is present.
+    """Smoke test: `wrap openhands --prepare-only` exits clean.
 
-    OpenHands wires instructions via the OPENHANDS_INSTRUCTIONS env var at launch
-    time (no on-disk artifact), so --prepare-only just exercises the rtk-binary
-    setup path. The env-var wiring is covered by the unit tests.
+    This one is a real regression guard: openhands used to *require* the rtk
+    binary, so once rtk became opt-in the default path exited 1. Nothing is
+    stubbed here, so a reintroduced hard dependency fails the run.
     """
     run(
         ["headroom", "wrap", "openhands", "--prepare-only", "--port", str(OPENHANDS_PORT)],
@@ -890,14 +1044,14 @@ def main() -> None:
             path.mkdir(parents=True, exist_ok=True)
         create_shims(shim_dir)
 
-        mock_server, mock_thread = start_mock_server(19001)
+        mock_server, mock_thread = start_mock_server(MOCK_UPSTREAM_PORT)
         base_env = os.environ.copy()
         base_env.update(
             {
                 "HOME": str(home_dir),
                 "PATH": f"{shim_dir}{os.pathsep}{base_env['PATH']}",
                 "HEADROOM_E2E_LOG_DIR": str(log_dir),
-                "OPENAI_TARGET_API_URL": "http://127.0.0.1:19001/v1",
+                "OPENAI_TARGET_API_URL": f"http://127.0.0.1:{MOCK_UPSTREAM_PORT}/v1",
             }
         )
 
@@ -907,10 +1061,13 @@ def main() -> None:
             verify_codex_wrap(base_env, project_dir, log_dir, mock_server)
             verify_aider_wrap(base_env, project_dir, log_dir)
             verify_cursor_wrap(base_env, project_dir)
+            verify_vscode_wrap(base_env, project_dir)
+            verify_vscode_claude_wrap(base_env, project_dir)
             verify_cline_wrap(base_env, project_dir)
             verify_continue_wrap(base_env, project_dir)
             verify_goose_wrap(base_env, project_dir)
             verify_openhands_wrap(base_env, project_dir)
+            verify_opencode_wrap(base_env, project_dir, log_dir)
             local_plugin_dir = prepare_local_openclaw_plugin(base_env, tmp_dir)
             verify_openclaw_wrap(base_env, project_dir, local_plugin_dir)
         finally:
@@ -918,6 +1075,42 @@ def main() -> None:
             mock_thread.join(timeout=5)
 
     log("All Docker wrap e2e checks passed.")
+
+
+def verify_opencode_wrap(base_env: dict[str, str], project_dir: Path, log_dir: Path) -> None:
+    port = OPENCODE_PORT
+    run(
+        ["headroom", "wrap", "opencode", "--port", str(port), "--", "--help"],
+        env=base_env,
+        cwd=project_dir,
+        timeout=120,
+    )
+    entries = read_jsonl(log_dir / "opencode.jsonl")
+    assert_true(len(entries) > 0, "Opencode shim should have been invoked")
+    env_vars = entries[-1]["env"]
+    assert_true(
+        env_vars.get("OPENCODE_CONFIG_CONTENT") is not None,
+        "Opencode wrap should set OPENCODE_CONFIG_CONTENT",
+    )
+    config = json.loads(env_vars["OPENCODE_CONFIG_CONTENT"])
+    assert_true(
+        config["provider"]["headroom"]["options"]["baseURL"] == f"http://127.0.0.1:{port}/v1",
+        "Opencode wrap should inject headroom provider baseURL",
+    )
+
+    run(
+        ["headroom", "unwrap", "opencode", "--port", str(port)],
+        env=base_env,
+        cwd=project_dir,
+        timeout=120,
+    )
+    config_path = Path(base_env["HOME"]) / ".config" / "opencode" / "opencode.json"
+    if config_path.exists():
+        content = config_path.read_text(encoding="utf-8")
+        assert_true(
+            "headroom" not in content,
+            "Opencode unwrap should remove headroom provider from config",
+        )
 
 
 if __name__ == "__main__":

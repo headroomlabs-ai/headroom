@@ -61,7 +61,7 @@ def test_wrap_openclaw_default_installs_from_npm_and_restarts(runner: CliRunner)
         "plugins",
         "install",
         "--dangerously-force-unsafe-install",
-        "headroom-ai/openclaw",
+        "headroom-openclaw",
     ] in cmds
     assert ["openclaw", "config", "validate"] in cmds
     assert ["openclaw", "gateway", "restart"] in cmds
@@ -77,7 +77,9 @@ def test_wrap_openclaw_default_installs_from_npm_and_restarts(runner: CliRunner)
         for i, cmd in enumerate(cmds)
         if cmd[:4] == ["openclaw", "plugins", "install", "--dangerously-force-unsafe-install"]
     )
-    assert config_set_index < install_index
+    # Config must be written only after a successful install so a failed
+    # install leaves no stale plugins.entries.headroom entry (issue #1969).
+    assert install_index < config_set_index
 
     # Verify plugin install in npm mode does not set cwd
     install_call = next(
@@ -488,6 +490,44 @@ def test_wrap_openclaw_fails_for_npm_mode_hook_pack_bug_without_local_fallback(
 
     assert result.exit_code != 0
     assert "openclaw plugins install failed" in result.output
+
+
+def test_wrap_openclaw_default_plugin_spec_matches_published_package() -> None:
+    """The --plugin-spec default must be the real published npm package name."""
+    from headroom.providers.openclaw import OPENCLAW_NPM_PACKAGE
+
+    assert OPENCLAW_NPM_PACKAGE == "headroom-openclaw"
+
+    command = wrap_cli.wrap.commands["openclaw"]
+    plugin_spec_option = next(p for p in command.params if p.name == "plugin_spec")
+    assert plugin_spec_option.default == "headroom-openclaw"
+
+
+def test_wrap_openclaw_failed_install_writes_no_config_entry(runner: CliRunner) -> None:
+    """A hard `plugins install` failure must not leave a stale config entry."""
+    calls: list[dict] = []
+
+    def which(name: str) -> str | None:
+        return {"openclaw": "openclaw", "npm": "npm"}.get(name)
+
+    def run(cmd, **kwargs):  # noqa: ANN001
+        calls.append({"cmd": list(cmd), **kwargs})
+        if cmd[:3] == ["openclaw", "plugins", "install"]:
+            return MagicMock(returncode=1, stdout="", stderr="npm 404 not found")
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    with patch("headroom.cli.wrap.shutil.which", side_effect=which):
+        with patch("headroom.cli.wrap.subprocess.run", side_effect=run):
+            result = runner.invoke(main, ["wrap", "openclaw"])
+
+    assert result.exit_code != 0
+    assert "openclaw plugins install failed" in result.output
+
+    cmds = [c["cmd"] for c in calls]
+    # No plugin config entry should be written when the install hard-fails.
+    assert not any(
+        cmd[:4] == ["openclaw", "config", "set", "plugins.entries.headroom"] for cmd in cmds
+    )
 
 
 def test_wrap_openclaw_copy_mode_uses_path_install(runner: CliRunner, plugin_dir: Path) -> None:

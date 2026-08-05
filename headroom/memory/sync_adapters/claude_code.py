@@ -147,7 +147,12 @@ class ClaudeCodeAdapter(AgentMemoryAdapter):
             source_agent = mem.get("source_agent", "unknown")
             content_hash = mem.get("content_hash", "")
 
-            # Generate filename from content
+            # Generate filename from content. The slug is derived from the first
+            # line only, so two distinct memories that share a first line map to
+            # the same file — without the collision guard below the second would
+            # silently overwrite the first (data loss), and because the loser
+            # never lands on disk the next sync re-exports it, ping-ponging
+            # forever.
             first_line = content.split("\n")[0][:60].strip()
             slug = _sanitize_for_filename(first_line)
             filename = f"headroom_{slug}.md"
@@ -159,6 +164,21 @@ class ClaudeCodeAdapter(AgentMemoryAdapter):
                 existing_hash = hashlib.sha256(existing_body.strip().encode()).hexdigest()[:16]
                 if existing_hash == content_hash:
                     continue
+                # Same slug, different content. If the file on disk belongs to a
+                # *different* memory (distinct headroom_id), disambiguate with a
+                # content-hash suffix so we don't clobber it. A matching id is an
+                # update of the same memory, so the plain slug is rewritten as
+                # before (keeps existing filenames stable — no migration churn).
+                existing_id = existing_fm.get("headroom_id", "")
+                if headroom_id and existing_id and existing_id != headroom_id:
+                    suffix = (content_hash or hashlib.sha256(content.encode()).hexdigest()[:16])[:8]
+                    filename = f"headroom_{slug}_{suffix}.md"
+                    target = self._memory_dir / filename
+                    if target.exists():
+                        _, dis_body = _parse_frontmatter(target.read_text(encoding="utf-8"))
+                        dis_hash = hashlib.sha256(dis_body.strip().encode()).hexdigest()[:16]
+                        if dis_hash == content_hash:
+                            continue
 
             # Build description (first 100 chars)
             description = content.replace("\n", " ")[:100]

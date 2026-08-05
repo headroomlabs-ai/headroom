@@ -1,0 +1,9 @@
+{
+  "version": "0.34.0",
+  "packages": {
+    "pypi": "0.34.0",
+    "npm-sdk": "0.34.0",
+    "npm-openclaw": "0.34.0",
+    "agent-hooks-plugin": "0.34.0"
+  }
+}

@@ -13,7 +13,7 @@ from urllib.request import urlopen
 
 logger = logging.getLogger(__name__)
 
-CBM_VERSION = "v0.6.0"
+CBM_VERSION = "v0.8.1"
 CBM_REPO = "DeusData/codebase-memory-mcp"
 CBM_BIN_DIR = Path.home() / ".local" / "bin"
 CBM_BIN_NAME = "codebase-memory-mcp"
@@ -95,13 +95,12 @@ def download_cbm(version: str | None = None) -> Path:
 
     # Verify
     try:
-        import subprocess
+        from headroom._subprocess import run
 
-        result = subprocess.run(
+        result = run(
             [str(target_path), "--version"],
             capture_output=True,
             text=True,
-            timeout=5,
         )
         if result.returncode == 0:
             ver = result.stdout.strip()

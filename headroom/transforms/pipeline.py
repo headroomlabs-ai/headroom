@@ -30,6 +30,40 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Waste-signal detection re-parses the *original* messages for telemetry only
+# (it never changes the compression result). On very large transcripts that
+# extra parse can take tens of seconds and blow the Anthropic compression
+# timeout, making the proxy fail open and discard an already-computed
+# compression (#296). Skip the diagnostic above this size to keep the result
+# on the critical path.
+MAX_WASTE_SIGNAL_DETECTION_TOKENS = 100_000
+
+# A token saving below this is treated as noise — waste-signal detection only
+# runs when compression saved more than this many tokens.
+_MIN_TOKENS_SAVED_FOR_WASTE_SIGNALS = 100
+
+# OTel GenAI semantic conventions (open-telemetry/semantic-conventions-genai).
+# The compression-pipeline span carries this gen_ai.* attribute alongside the
+# proprietary headroom.* ones, so Headroom's telemetry groups/filters by the
+# standard schema in any OTel-native backend (Grafana, Datadog, etc.). It is a
+# string literal rather than an opentelemetry.semconv constant because the gen_ai
+# attributes are stability=development (no stable constants are published).
+#
+# v1 emits only gen_ai.request.model — the one attribute this span can set
+# correctly and unconditionally (the model is always known here). The rest are
+# deliberately deferred to v2 because this span cannot set them correctly:
+#   - gen_ai.operation.name: apply() is shared by many callers (chat, /v1/compress,
+#     batch, Gemini countTokens), so no single value is right — it must be threaded
+#     from each caller, not hardcoded.
+#   - gen_ai.provider.name: Headroom's provider label can't distinguish Bedrock /
+#     Gemini from Anthropic / OpenAI at this layer (Bedrock routes via the
+#     Anthropic provider).
+#   - gen_ai.usage.*: provider-authoritative usage lives on the response path, not
+#     this pre-flight compression span (the compressed-input estimate stays under
+#     headroom.tokens.after).
+GEN_AI_REQUEST_MODEL = "gen_ai.request.model"
+
+
 _N = TypeVar("_N", int, float)
 
 
@@ -220,6 +254,9 @@ class TransformPipeline:
         """
         record_metrics = kwargs.pop("record_metrics", True)
         waste_messages = kwargs.pop("waste_messages", None)
+        waste_signal_token_limit = int(
+            kwargs.pop("waste_signal_token_limit", MAX_WASTE_SIGNAL_DETECTION_TOKENS)
+        )
         tokenizer = self._get_tokenizer(model)
         provider_name = self._provider_name()
 
@@ -254,12 +291,16 @@ class TransformPipeline:
         )
 
         tracer = get_headroom_tracer()
-        span_attributes = {
+        span_attributes: dict[str, Any] = {
             "headroom.model": model,
             "headroom.provider": provider_name or "unknown",
             "headroom.message_count": len(messages),
             "headroom.tokens.before": tokens_before,
         }
+        # OTel GenAI semconv request descriptor — emitted alongside headroom.* so
+        # the span is groupable by the standard schema (v1: model only).
+        if model:
+            span_attributes[GEN_AI_REQUEST_MODEL] = model
         pipeline_span_context = (
             tracer.start_as_current_span(
                 "headroom.compression.pipeline",
@@ -439,7 +480,21 @@ class TransformPipeline:
             # pass a richer waste_messages list that is parsed instead — it is
             # telemetry-only and never transformed.
             waste_signals: WasteSignals | None = None
-            if tokens_before > tokens_after and (tokens_before - tokens_after) > 100:
+            saved_enough = (
+                tokens_before > tokens_after
+                and (tokens_before - tokens_after) > _MIN_TOKENS_SAVED_FOR_WASTE_SIGNALS
+            )
+            if saved_enough and tokens_before > waste_signal_token_limit:
+                # Telemetry-only re-parse would risk the compression timeout on a
+                # request this large (#296); skip it and keep the result.
+                logger.debug(
+                    "%sSkipping waste-signal detection for %d-token request "
+                    "(limit=%d) to keep the compression result on the critical path",
+                    log_prefix,
+                    tokens_before,
+                    waste_signal_token_limit,
+                )
+            elif saved_enough:
                 try:
                     from ..parser import parse_messages
 

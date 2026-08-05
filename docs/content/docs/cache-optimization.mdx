@@ -3,24 +3,28 @@ title: Cache Optimization
 description: Stabilize message prefixes for provider KV cache hits and configure provider-specific caching strategies.
 ---
 
-LLM providers cache prompt prefixes to avoid reprocessing identical input on repeated calls. Headroom's **CacheAligner** stabilizes your message prefixes so these caches actually hit, and then applies provider-specific strategies to maximize savings.
+LLM providers cache prompt prefixes to avoid reprocessing identical input on repeated calls. Headroom's **CacheAligner** is detector-only, so it surfaces prefix drift, reports observability data, and leaves message assembly to the caller.
 
-## How CacheAligner works
+<Callout type="info" title="CacheAligner is opt-in and detector-only">
+CacheAligner is **disabled by default** and hard-disabled inside the proxy — it never runs on your traffic unless you explicitly enable it, and even then it only *reports* metrics; it never repairs a prefix. In proxy mode, prefix-cache stability comes from **cache mode** (`--mode cache`, the default), which compresses only the newest delta and forwards prior turns byte-faithfully. See [Savings Profiles](/docs/proxy#savings-profiles).
+</Callout>
 
-System prompts often contain dynamic content -- today's date, session IDs, timestamps -- that changes between requests. Even a single character difference at the start of a prompt invalidates the entire provider cache.
+## What CacheAligner reports
 
-CacheAligner solves this by extracting dynamic content and moving it to the end of the message, keeping the prefix stable:
+System prompts often contain dynamic content, such as dates, session IDs, and timestamps, that changes between requests. Even a single character difference at the start of a prompt invalidates the entire provider cache.
 
-```
-Before:
-  "You are helpful. Current Date: 2025-04-06"  <- changes daily, no cache hit
+CacheAligner does not extract, move, normalize, reorder, strip, compress, or rewrite content. It detects volatile content and reports the stable prefix hash plus cache metrics so you can fix the prefix at the source:
 
-After:
-  "You are helpful."                            <- stable prefix, cache hit
-  "[Context: Current Date: 2025-04-06]"         <- dynamic part moved to tail
-```
+| Signal | Meaning |
+|---|---|
+| `warnings` | The prefix contains unstable content |
+| `cache_metrics.stable_prefix_bytes` | Stable prefix size in bytes |
+| `cache_metrics.stable_prefix_tokens_est` | Stable prefix size in estimated tokens |
+| `cache_metrics.stable_prefix_hash` | Stable prefix hash for repeated-wake comparison |
+| `cache_metrics.prefix_changed` | The prefix drifted since the previous wake |
+| `markers` | The emitted `stable_prefix_hash` marker for observability |
 
-The prefix stays byte-identical across requests, so the provider's KV cache can reuse previously computed attention states.
+The prefix must stay byte-identical across requests for provider KV caches to reuse previously computed attention states.
 
 ## Provider-specific strategies
 
@@ -30,7 +34,7 @@ Each LLM provider implements caching differently. Headroom applies the optimal s
 
 Anthropic supports explicit `cache_control` blocks that mark content as cacheable. Cached input tokens cost **90% less** than regular input tokens.
 
-Headroom automatically inserts `cache_control` breakpoints at the right positions in your messages so that stable prefixes (system prompts, early conversation turns) are cached across requests.
+Keep the stable prefix byte-identical, then place provider cache markers where your client or orchestrator already assembles the request. Headroom's job is to surface prefix instability, not repair it.
 
 | Metric | Value |
 |---|---|
@@ -40,9 +44,9 @@ Headroom automatically inserts `cache_control` breakpoints at the right position
 
 ### OpenAI
 
-OpenAI uses automatic **prefix caching** -- if consecutive requests share the same message prefix, the provider reuses cached KV states. No explicit API markers are needed, but the prefix must be byte-identical.
+OpenAI uses automatic **prefix caching**. If consecutive requests share the same message prefix, the provider reuses cached KV states. No explicit API markers are needed, but the prefix must be byte-identical.
 
-CacheAligner ensures your prefixes remain stable by extracting dynamic content, which is the key requirement for OpenAI prefix caching to work.
+CacheAligner tells you when the prefix changed, which is the only signal you need to keep OpenAI prefix caching effective.
 
 | Metric | Value |
 |---|---|
@@ -54,7 +58,7 @@ CacheAligner ensures your prefixes remain stable by extracting dynamic content, 
 
 Google provides the **CachedContent API**, which lets you explicitly cache large context (system instructions, documents, tools) and reference it across requests. Cached tokens cost **75% less**.
 
-Headroom can manage CachedContent lifecycle automatically, creating and refreshing cached content objects as needed.
+Keep the prefix stable in your integration layer; Headroom reports when the cacheable zone drifts. The CachedContent lifecycle itself also stays in your integration layer.
 
 | Metric | Value |
 |---|---|
@@ -62,102 +66,26 @@ Headroom can manage CachedContent lifecycle automatically, creating and refreshi
 | Mechanism | Explicit CachedContent API objects |
 | Min cache size | 32,768 tokens |
 
-## Configuration
+## What this means in practice
 
-<Tabs groupId="lang" items={['TypeScript', 'Python']}>
-<Tab value="TypeScript">
-```ts twoslash
-import { compress } from "headroom-ai";
-import type {
-  CacheAlignerConfig,
-  CacheOptimizerConfig,
-  HeadroomConfig,
-} from "headroom-ai";
+Keep the stable prefix first, keep volatile content out of it, and treat CacheAligner warnings as a signal that the caller needs to move assembly logic.
 
-// CacheAligner: stabilize prefixes for cache hits
-const cacheAligner: CacheAlignerConfig = {
-  enabled: true,
-  datePatterns: [
-    "Today is \\w+ \\d+, \\d{4}",
-    "Current time: .*",
-  ],
-  normalizeWhitespace: true,
-  collapseBlankLines: true,
-};
+CacheAligner surfaces prefix instability, provider caches reward byte-identical prefixes, and the caller owns the actual message layout.
 
-// CacheOptimizer: provider-level caching
-const cacheOptimizer: CacheOptimizerConfig = {
-  enabled: true,
-  autoDetectProvider: true,  // Detect Anthropic/OpenAI/Google automatically
-  minCacheableTokens: 1024,
-};
+## Cold-prefix recompaction (when the cache lapses)
 
-// Full configuration
-const config: HeadroomConfig = {
-  cacheAligner,
-  cacheOptimizer,
-};
+Byte-identical forwarding only pays off while the prompt cache is warm. When a
+session goes idle past the provider's cache TTL, that cache is dead — so
+re-sending the prefix verbatim buys nothing, and it's the one safe moment to
+rewrite it. The **cold-prefix hook** detects a lapsed cache and recompacts the
+whole prefix (cross-turn dedupe + superseded-read drop + lossless folds) instead,
+then re-caches the smaller result. It only fires on a *confirmed*-cold turn — a
+wrong call would bust a warm cache — so it reads the real TTL (exact for Claude
+Code via its cache-control env vars; learned over time for other providers).
 
-// Compress with cache optimization
-const result = await compress(messages, {
-  model: "claude-sonnet-4-20250514",
-  config,
-});
-```
-</Tab>
-<Tab value="Python">
-```python
-from headroom import HeadroomClient, OpenAIProvider, AnthropicProvider, GoogleProvider
-from headroom.transforms import CacheAlignerConfig
-from openai import OpenAI
+For models that re-send **reasoning** as plain text every turn (Kimi/GLM/DeepSeek),
+a companion hook Kompresses that reasoning on warm turns and drops it on cold ones.
 
-# CacheAligner configuration
-aligner_config = CacheAlignerConfig(
-    enabled=True,
-    dynamic_patterns=[
-        r"Today is \w+ \d+, \d{4}",
-        r"Current time: .*",
-        r"Session ID: [a-f0-9-]+",
-    ],
-)
-
-# Provider-specific cache settings
-# OpenAI: prefix caching (automatic, just keep prefixes stable)
-client = HeadroomClient(
-    original_client=OpenAI(),
-    provider=OpenAIProvider(enable_prefix_caching=True),
-    enable_cache_optimizer=True,
-)
-
-# Anthropic: cache_control blocks (90% read discount)
-from anthropic import Anthropic
-
-client = HeadroomClient(
-    original_client=Anthropic(),
-    provider=AnthropicProvider(enable_cache_control=True),
-    enable_cache_optimizer=True,
-)
-
-# Google: CachedContent API (75% read discount)
-client = HeadroomClient(
-    original_client=google_client,
-    provider=GoogleProvider(enable_context_caching=True),
-    enable_cache_optimizer=True,
-)
-```
-</Tab>
-</Tabs>
-
-## How savings compound
-
-CacheAligner and provider caching work together with Headroom's compression transforms:
-
-1. **SmartCrusher** reduces token count by 70-90%
-2. **CacheAligner** stabilizes prefixes so provider caches hit
-3. **Provider caching** discounts the remaining input tokens by 50-90%
-
-For example, with Anthropic:
-- 100K input tokens compressed to 20K (80% savings from SmartCrusher)
-- 18K of those 20K hit the cache (90% cache read discount)
-- Effective cost: 2K full-price tokens + 18K at 10% = 3.8K equivalent tokens
-- **Total savings: 96.2%** compared to the original 100K tokens
+Both are off by default. See
+[Cold-prefix hook & reasoning compaction](/docs/configuration#cold-prefix-hook--reasoning-compaction)
+for the exact flags and when each is safe to enable.

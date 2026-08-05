@@ -31,7 +31,10 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from headroom.proxy.helpers import _headroom_bypass_enabled
+from headroom.proxy.image_compression_policy import (
+    apply_image_skip_reason,
+    decide_image_compression,
+)
 
 
 @dataclass(frozen=True)
@@ -84,29 +87,18 @@ class ImageCompressionDecision:
         messages
             Request messages. ``None`` and ``[]`` are equivalent.
         """
-        bypass = _headroom_bypass_enabled(headers)
-        image_ok = bool(getattr(config, "image_optimize", False))
-        has_msgs = bool(messages)
-
-        if bypass:
-            reason: str | None = "bypass_header"
-            should = False
-        elif not image_ok:
-            reason = "image_optimize_disabled"
-            should = False
-        elif not has_msgs:
-            reason = "no_messages"
-            should = False
-        else:
-            reason = None
-            should = True
+        decision = decide_image_compression(
+            headers=headers,
+            image_optimize_enabled=bool(getattr(config, "image_optimize", False)),
+            has_messages=bool(messages),
+        )
 
         return cls(
-            should_compress=should,
-            passthrough_reason=reason,
-            bypass_header_set=bypass,
-            image_optimize_enabled=image_ok,
-            has_messages=has_msgs,
+            should_compress=decision.should_compress,
+            passthrough_reason=decision.passthrough_reason,
+            bypass_header_set=decision.bypass_header_set,
+            image_optimize_enabled=decision.image_optimize_enabled,
+            has_messages=decision.has_messages,
         )
 
     def apply_to_tags(self, tags: dict[str, str]) -> None:
@@ -121,5 +113,4 @@ class ImageCompressionDecision:
         ``memory_skip_reason``, ``image_skip_reason``) for full
         dashboard slicing.
         """
-        if self.passthrough_reason is not None:
-            tags["image_skip_reason"] = self.passthrough_reason
+        apply_image_skip_reason(tags, self.passthrough_reason)

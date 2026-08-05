@@ -29,6 +29,7 @@ export class HeadroomContextEngine {
   private logger: ProxyManagerLogger;
   private proxyReadyListeners = new Set<(proxyUrl: string) => void | Promise<void>>();
   private proxyStartupPromise: Promise<string> | null = null;
+  private proxyStartupError: unknown = null;
   private stats = {
     totalCompressions: 0,
     totalTokensSaved: 0,
@@ -235,26 +236,38 @@ export class HeadroomContextEngine {
     return this.proxyUrl;
   }
 
+  getProxyStartupError(): unknown {
+    return this.proxyStartupError;
+  }
+
   ensureProxyStarted(): void {
     if (this.config.enabled === false || this.proxyUrl || this.proxyStartupPromise) {
       return;
     }
 
+    this.proxyStartupError = null;
     this.proxyStartupPromise = this.proxyManager
       .start()
       .then(async (proxyUrl) => {
         this.proxyUrl = proxyUrl;
+        this.proxyStartupError = null;
         await this.notifyProxyReady(proxyUrl);
         this.logger.info(`Headroom proxy ready at ${proxyUrl}`);
         return proxyUrl;
       })
       .catch((error) => {
+        this.proxyStartupError = error;
         this.logger.warn(`Headroom proxy unavailable: ${error}`);
         throw error;
       })
       .finally(() => {
         this.proxyStartupPromise = null;
       });
+
+    // Fire-and-forget lifecycle callers intentionally do not await this promise.
+    // Keep the promise rejectable for ensureProxyUrl(), but mark it observed so
+    // a missing proxy cannot become a process-level unhandled rejection.
+    void this.proxyStartupPromise.catch(() => {});
   }
 
   onProxyReady(listener: (proxyUrl: string) => void | Promise<void>): () => void {
@@ -278,7 +291,11 @@ export class HeadroomContextEngine {
 
   private async notifyProxyReady(proxyUrl: string): Promise<void> {
     for (const listener of this.proxyReadyListeners) {
-      await listener(proxyUrl);
+      try {
+        await listener(proxyUrl);
+      } catch (error) {
+        this.logger.warn(`Headroom proxy ready listener failed: ${error}`);
+      }
     }
   }
 }

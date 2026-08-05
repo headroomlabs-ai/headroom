@@ -1,9 +1,11 @@
 ---
 title: Benchmarks
-description: Compression performance, accuracy preservation, latency overhead, and real-world production telemetry from 250+ Headroom proxy instances.
+description: Compression performance, accuracy preservation, and latency overhead, measured on reproducible local benchmarks.
 ---
 
-Headroom's core promise: compress context without losing accuracy. This page covers compression benchmarks, accuracy evaluations, latency overhead, and production telemetry.
+Headroom's core promise: compress context without losing accuracy. This page covers compression benchmarks, accuracy evaluations, and latency overhead. Every number below is measured locally and reproducible (see [Reproducing Results](#reproducing-results)).
+
+For local inference, the main benefit is often faster prompt processing rather than lower API spend. See [Local LLM prefill benchmarking](/docs/local-llm-prefill) for a reproducible passthrough-vs-optimized proxy workflow.
 
 ## Compression Performance
 
@@ -103,47 +105,12 @@ Compression pays for itself in latency for 11 of 12 tested scenarios against Cla
 | `text_compressor` | 32.0ms | 576ms | Text compression (Kompress ONNX) |
 | `initial_token_count` | 2.9ms | 16ms | Token counting (tiktoken) |
 
-ContentRouter accounts for 91--98% of pipeline cost on average. CacheAligner and RollingWindow are sub-millisecond.
-
-## Production Telemetry
-
-Real-world data from **50,000+ proxy sessions** across 250+ unique instances (March--April 2026). Collected via anonymous telemetry (opt-out: `HEADROOM_TELEMETRY=off`).
-
-### Proxy Overhead
-
-| Percentile | Latency |
-|---|---|
-| **Median (P50)** | **52ms** |
-| P90 | 309ms |
-| P99 | 4,172ms |
-| Mean | 161ms |
-
-The median 52ms overhead is negligible compared to LLM inference time (typically 2--10 seconds).
-
-### Compression Rate
-
-| Percentile | Compression |
-|---|---|
-| P25 | 4.8% |
-| **Median** | **4.8%** |
-| P75 | 6.9% |
-| Mean | 11.3% |
-
-Median compression is modest because many requests are short conversational turns. Heavy tool-use sessions (file reads, shell output) see 40--80% compression.
-
-### Fleet Summary
-
-| Metric | Value |
-|---|---|
-| Clean instances | 249 |
-| Total tokens saved | 1.4 billion |
-| Total savings | ~$4,000 |
-| OS distribution | Linux 57%, macOS 38%, Windows 5% |
+ContentRouter accounts for 91--98% of pipeline cost on average. CacheAligner is sub-millisecond.
 
 ## Reproducing Results
 
 ```bash
-git clone https://github.com/chopratejas/headroom.git
+git clone https://github.com/headroomlabs-ai/headroom.git
 cd headroom
 pip install -e ".[evals,html]"
 pytest tests/test_evals/ -v -s

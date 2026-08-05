@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterator
 from datetime import datetime, timezone
 from typing import Any
@@ -33,6 +34,8 @@ from .utils import (
     format_cost,
     generate_request_id,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class ChatCompletions:
@@ -747,7 +750,7 @@ class HeadroomClient:
                     "content": response.content,
                 }
         except Exception:
-            pass
+            logger.debug("Failed to extract response content for semantic cache", exc_info=True)
         return None
 
     def _simulate(

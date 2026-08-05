@@ -791,13 +791,15 @@ class MemoryToolAdapter:
         if provider == "anthropic":
             return str(tool_call.get("name", ""))
         elif provider == "openai":
-            return str(tool_call.get("function", {}).get("name", ""))
+            return str((tool_call.get("function") or {}).get("name", ""))
         elif provider == "gemini":
-            func_call = tool_call.get("functionCall", {})
+            func_call = tool_call.get("functionCall") or {}
             return str(func_call.get("name", ""))
         else:
             # Generic - try both
-            return str(tool_call.get("name", "") or tool_call.get("function", {}).get("name", ""))
+            return str(
+                tool_call.get("name", "") or (tool_call.get("function") or {}).get("name", "")
+            )
 
     def _get_tool_id(self, tool_call: dict[str, Any], provider: Provider) -> str:
         """Get the tool call ID."""
@@ -807,7 +809,7 @@ class MemoryToolAdapter:
             return str(tool_call.get("id", ""))
         elif provider == "gemini":
             # Gemini doesn't use IDs in the same way
-            return str(tool_call.get("functionCall", {}).get("name", ""))
+            return str((tool_call.get("functionCall") or {}).get("name", ""))
         else:
             return str(tool_call.get("id", ""))
 
@@ -821,25 +823,28 @@ class MemoryToolAdapter:
             result = tool_call.get("input", {})
             return dict(result) if isinstance(result, dict) else {}
         elif provider == "openai":
-            args_str = tool_call.get("function", {}).get("arguments", "{}")
+            # `or {}` guards {"function": null}; `or "{}"` guards {"arguments": null}
+            # (json.loads(None) raises TypeError, which the bare JSONDecodeError
+            # catch would miss).
+            args_str = (tool_call.get("function") or {}).get("arguments") or "{}"
             try:
                 parsed = json.loads(args_str)
                 return dict(parsed) if isinstance(parsed, dict) else {}
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, TypeError):
                 return {}
         elif provider == "gemini":
-            result = tool_call.get("functionCall", {}).get("args", {})
+            result = (tool_call.get("functionCall") or {}).get("args", {})
             return dict(result) if isinstance(result, dict) else {}
         else:
             # Generic - try both
             if "input" in tool_call:
                 result = tool_call["input"]
                 return dict(result) if isinstance(result, dict) else {}
-            args_str = tool_call.get("function", {}).get("arguments", "{}")
+            args_str = (tool_call.get("function") or {}).get("arguments") or "{}"
             try:
                 parsed = json.loads(args_str)
                 return dict(parsed) if isinstance(parsed, dict) else {}
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, TypeError):
                 return {}
 
     async def handle_tool_calls(

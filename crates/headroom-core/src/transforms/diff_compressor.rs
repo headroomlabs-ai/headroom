@@ -35,7 +35,7 @@
 //! method returns it alongside the parity-equal result; `compress` is the
 //! parity-only API that just emits a `tracing::info_span`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
 use std::time::Instant;
 
@@ -840,9 +840,42 @@ fn priority_patterns() -> &'static [Regex] {
     })
 }
 
+/// True for CJK ideographs, kana, and Hangul.
+fn is_cjk_char(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x3040..=0x30FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xAC00..=0xD7AF | 0xF900..=0xFAFF
+    )
+}
+
+/// CJK character bigrams from the CJK runs of a (lowercased) query. A spaceless
+/// CJK query rarely appears verbatim in a hunk, but its bigrams do, so these let
+/// a CJK query still boost the hunks it partially overlaps.
+fn cjk_bigrams(text: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let mut run: Vec<char> = Vec::new();
+    for c in text.chars() {
+        if is_cjk_char(c) {
+            run.push(c);
+        } else {
+            for w in run.windows(2) {
+                out.insert(w.iter().collect::<String>());
+            }
+            run.clear();
+        }
+    }
+    for w in run.windows(2) {
+        out.insert(w.iter().collect::<String>());
+    }
+    out
+}
+
 fn score_hunks(files: &mut [DiffFile], context: &str) {
     let context_lower = context.to_lowercase();
     let context_words: Vec<&str> = context_lower.split_whitespace().collect();
+    // Spaceless CJK queries don't survive whitespace-splitting into matchable
+    // words; add CJK character bigrams so they can still boost overlapping hunks.
+    let cjk_bg = cjk_bigrams(&context_lower);
 
     for file in files.iter_mut() {
         for hunk in file.hunks.iter_mut() {
@@ -857,6 +890,11 @@ fn score_hunks(files: &mut [DiffFile], context: &str) {
 
             for word in &context_words {
                 if word.len() > SCORE_CONTEXT_MIN_WORD_LEN && hunk_content_lower.contains(word) {
+                    score += SCORE_CONTEXT_WORD_WEIGHT;
+                }
+            }
+            for bg in &cjk_bg {
+                if hunk_content_lower.contains(bg.as_str()) {
                     score += SCORE_CONTEXT_WORD_WEIGHT;
                 }
             }
@@ -1515,6 +1553,58 @@ mod tests {
             r.compressed.contains("rename to new.py"),
             "missing 'rename to':\n{}",
             r.compressed
+        );
+    }
+
+    #[test]
+    fn cjk_bigrams_from_query_runs() {
+        let b = cjk_bigrams("数据库连接");
+        assert!(
+            b.contains("数据") && b.contains("据库") && b.contains("库连") && b.contains("连接")
+        );
+        assert_eq!(b.len(), 4);
+        assert!(cjk_bigrams("hello world").is_empty()); // ASCII -> no CJK bigrams
+        assert!(cjk_bigrams("a数b据").is_empty()); // isolated CJK chars -> no pair
+    }
+
+    #[test]
+    fn cjk_query_boosts_matching_hunk_into_kept_set() {
+        // Two competing middle hunks, one middle slot. The plain hunk has the
+        // higher change-density base score, so WITHOUT a query it takes the
+        // slot; a CJK query overlapping the CJK hunk boosts it past the plain one.
+        let input = "diff --git a/svc.py b/svc.py\n\
+                     --- a/svc.py\n\
+                     +++ b/svc.py\n\
+                     @@ -1,2 +1,2 @@\n\
+                     -first_old\n\
+                     +first_new\n\
+                     @@ -10,4 +10,4 @@\n\
+                     -plain_a\n\
+                     +plain_b\n\
+                     -plain_c\n\
+                     +plain_d\n\
+                     @@ -20,2 +20,2 @@\n\
+                     -数据库连接失败重试\n\
+                     +数据库连接成功\n\
+                     @@ -30,2 +30,2 @@\n\
+                     -last_old\n\
+                     +last_new\n";
+        let mk = || DiffCompressorConfig {
+            max_hunks_per_file: 3,
+            min_lines_for_ccr: 5,
+            ..Default::default()
+        };
+        let with_cjk = DiffCompressor::new(mk()).compress(input, "数据库连接超时排查");
+        let no_query = DiffCompressor::new(mk()).compress(input, "");
+        assert!(
+            with_cjk.compressed.contains("数据库连接失败重试"),
+            "CJK query should boost the overlapping hunk into the kept set:\n{}",
+            with_cjk.compressed
+        );
+        assert!(
+            !no_query.compressed.contains("数据库连接失败重试"),
+            "without a query the higher-density plain hunk should take the middle slot:\n{}",
+            no_query.compressed
         );
     }
 

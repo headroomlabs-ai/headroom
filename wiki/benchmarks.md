@@ -31,7 +31,7 @@ Tested on Apple M-series (CPU), headroom v0.5.18. Each test runs `compress()` on
 
 ## Production Telemetry
 
-Real-world data from **50,000+ proxy sessions** across 250+ unique instances (March 30 – April 2, 2026). Collected via anonymous telemetry beacon (opt-out: `HEADROOM_TELEMETRY=off`).
+Real-world data from **50,000+ proxy sessions** across 250+ unique instances (March 30 – April 2, 2026). Collected via anonymous telemetry beacon (opt-in: `HEADROOM_TELEMETRY=on`; telemetry is off by default).
 
 ### Proxy Overhead
 
@@ -184,7 +184,7 @@ A 94.9% compression means the output is 5.1% of the original size.
 - Collected via anonymous beacon (no prompts, no content, no PII)
 - Image-inflated instances excluded (base64 counted as text tokens — fixed in v0.5.18)
 - Multi-worker beacon spam excluded (per-instance MAX, not SUM)
-- Opt-out: `HEADROOM_TELEMETRY=off`
+- Opt-in: `HEADROOM_TELEMETRY=on` (telemetry is off by default)
 
 ---
 

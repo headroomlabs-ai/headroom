@@ -6,6 +6,7 @@ These tests verify connection pooling, HTTP/2, and worker configuration.
 import asyncio
 import json
 import os
+from typing import Any
 from unittest.mock import patch
 
 import httpx
@@ -250,7 +251,12 @@ class TestWorkerConfiguration:
         from headroom.proxy.server import _MULTI_WORKER_CONFIG_ENV, run_server
 
         captured = {}
-        config = ProxyConfig(host="0.0.0.0", port=8787, max_connections=200)
+        config = ProxyConfig(
+            host="0.0.0.0",
+            port=8787,
+            max_connections=200,
+            http_proxy="http://proxy.local:8080",
+        )
 
         def fake_run(app, **kwargs):
             captured["app"] = app
@@ -258,15 +264,124 @@ class TestWorkerConfiguration:
 
         monkeypatch.delenv(_MULTI_WORKER_CONFIG_ENV, raising=False)
 
-        with patch("headroom.proxy.server.uvicorn.run", fake_run):
-            run_server(config, workers=4, limit_concurrency=250)
+        try:
+            with patch("headroom.proxy.server.uvicorn.run", fake_run):
+                run_server(config, workers=4, limit_concurrency=250)
 
-        assert captured["app"] == "headroom.proxy.server:create_app_from_env"
-        assert captured["kwargs"]["workers"] == 4
-        assert captured["kwargs"]["limit_concurrency"] == 250
-        assert captured["kwargs"]["factory"] is True
-        payload = json.loads(os.environ[_MULTI_WORKER_CONFIG_ENV])
-        assert payload["host"] == "0.0.0.0"
-        assert payload["port"] == 8787
-        assert payload["max_connections"] == 200
-        monkeypatch.delenv(_MULTI_WORKER_CONFIG_ENV, raising=False)
+            assert captured["app"] == "headroom.proxy.server:create_app_from_env"
+            assert captured["kwargs"]["workers"] == 4
+            assert captured["kwargs"]["limit_concurrency"] == 250
+            assert captured["kwargs"]["factory"] is True
+            payload = json.loads(os.environ[_MULTI_WORKER_CONFIG_ENV])
+            assert payload["host"] == "0.0.0.0"
+            assert payload["port"] == 8787
+            assert payload["max_connections"] == 200
+            assert payload["http_proxy"] == "http://proxy.local:8080"
+        finally:
+            # run_server sets this via raw os.environ. Pop it directly rather
+            # than via monkeypatch.delenv: delenv records the current (JSON)
+            # value and re-restores it on teardown, leaking the config into
+            # later tests (e.g. _proxy_config_from_env then ignores HEADROOM_*).
+            os.environ.pop(_MULTI_WORKER_CONFIG_ENV, None)
+
+    def test_run_server_uses_selector_loop_on_windows(self, monkeypatch):
+        import builtins
+
+        import uvicorn
+        from uvicorn.config import Config
+
+        from headroom.proxy import server as server_mod
+        from headroom.proxy.models import ProxyConfig
+
+        captured = {}
+        policy_calls: list[Any] = []
+        real_hasattr = builtins.hasattr
+
+        class _FakeSelectorPolicy:
+            pass
+
+        def fake_run(app, **kwargs):
+            captured["app"] = app
+            captured["kwargs"] = kwargs
+
+        def fake_set_policy(policy):
+            policy_calls.append(policy)
+
+        def fake_hasattr(obj, name):
+            if obj is Config and name == "get_loop_factory":
+                return fake_hasattr.use_new_api
+            return real_hasattr(obj, name)
+
+        fake_hasattr.use_new_api = True
+
+        monkeypatch.setattr(builtins, "hasattr", fake_hasattr)
+        monkeypatch.setattr(server_mod.sys, "platform", "win32")
+        monkeypatch.setattr(server_mod, "create_app", lambda config: "app")
+        monkeypatch.setattr(server_mod.asyncio, "set_event_loop_policy", fake_set_policy)
+        monkeypatch.setattr(
+            server_mod.asyncio,
+            "WindowsSelectorEventLoopPolicy",
+            _FakeSelectorPolicy,
+            raising=False,
+        )
+
+        with patch("headroom.proxy.server.uvicorn.run", fake_run):
+            server_mod.run_server(ProxyConfig(), print_banner=False)
+
+        assert captured["app"] == "app"
+        assert captured["kwargs"]["loop"] == "asyncio:SelectorEventLoop"
+        assert policy_calls == []
+
+        fake_hasattr.use_new_api = False
+        captured.clear()
+        policy_calls.clear()
+
+        with patch("headroom.proxy.server.uvicorn.run", fake_run):
+            server_mod.run_server(ProxyConfig(), print_banner=False)
+
+        assert "loop" not in captured["kwargs"]
+        assert len(policy_calls) == 1
+        assert isinstance(policy_calls[0], _FakeSelectorPolicy)
+        _ = uvicorn  # keep import for parity with runtime module path
+
+    def test_run_server_keeps_default_loop_off_windows(self, monkeypatch):
+        from headroom.proxy import server as server_mod
+        from headroom.proxy.models import ProxyConfig
+
+        captured = {}
+
+        def fake_run(app, **kwargs):
+            captured["kwargs"] = kwargs
+
+        monkeypatch.setattr(server_mod.sys, "platform", "linux")
+        monkeypatch.setattr(server_mod, "create_app", lambda config: "app")
+
+        with patch("headroom.proxy.server.uvicorn.run", fake_run):
+            server_mod.run_server(ProxyConfig(), print_banner=False)
+
+        assert "loop" not in captured["kwargs"]
+
+
+class TestProviderHttpClientOptions:
+    """Provider HTTPX options should keep proxy settings scoped to provider clients."""
+
+    def test_default_http2_preserved_without_proxy(self):
+        from headroom.proxy.models import ProxyConfig
+        from headroom.proxy.server import _provider_httpx_client_options
+
+        http2, kwargs = _provider_httpx_client_options(ProxyConfig(http2=True), verify=True)
+
+        assert http2 is True
+        assert "proxy" not in kwargs
+
+    def test_http_proxy_sets_proxy_and_forces_http1(self):
+        from headroom.proxy.models import ProxyConfig
+        from headroom.proxy.server import _provider_httpx_client_options
+
+        http2, kwargs = _provider_httpx_client_options(
+            ProxyConfig(http2=True, http_proxy="http://proxy.local:8080"),
+            verify=True,
+        )
+
+        assert http2 is False
+        assert kwargs["proxy"] == "http://proxy.local:8080"

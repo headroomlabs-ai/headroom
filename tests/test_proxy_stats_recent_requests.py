@@ -3,7 +3,6 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
-from headroom.proxy import server
 from headroom.proxy.models import ProxyConfig
 from headroom.proxy.server import create_app
 
@@ -69,7 +68,8 @@ def test_stats_refreshes_recent_requests_when_cached() -> None:
         }
     )
 
-    with TestClient(app) as client:
+    # Loopback client/Host: recent_requests is served only to loopback callers.
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)) as client:
         logger.logs = [first_log]
         first_response = client.get("/stats?cached=1")
         assert first_response.status_code == 200
@@ -80,23 +80,91 @@ def test_stats_refreshes_recent_requests_when_cached() -> None:
         assert second_response.status_code == 200
         second_payload = second_response.json()
 
-    assert second_payload["recent_requests"][-1]["model"] == "claude-sonnet"
+    assert second_payload["recent_requests"][0]["model"] == "claude-sonnet"
     assert second_payload["request_logs"][-1]["model"] == "claude-sonnet"
+
+
+def test_stats_recent_requests_includes_token_incomplete_requests() -> None:
+    app = create_app(
+        ProxyConfig(
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+            log_requests=False,
+            ccr_inject_tool=False,
+            ccr_handle_responses=False,
+            ccr_context_tracking=False,
+            http2=False,
+        )
+    )
+    logger = FakeRequestLogger()
+    app.state.proxy.logger = logger
+
+    logger.logs = [
+        FakeLogEntry(
+            {
+                "request_id": "req-haiku-1",
+                "timestamp": "2026-07-09T10:00:00Z",
+                "provider": "anthropic",
+                "model": "claude-haiku",
+                "transforms_applied": [],
+            }
+        ),
+        FakeLogEntry(
+            {
+                "request_id": "req-haiku-2",
+                "timestamp": "2026-07-09T10:01:00Z",
+                "provider": "anthropic",
+                "model": "claude-haiku",
+                "input_tokens_original": None,
+                "input_tokens_optimized": None,
+                "output_tokens": None,
+                "tokens_saved": 0,
+                "savings_percent": 0.0,
+                "transforms_applied": [],
+            }
+        ),
+        FakeLogEntry(
+            {
+                "request_id": "req-sonnet-1",
+                "timestamp": "2026-07-09T10:02:00Z",
+                "provider": "anthropic",
+                "model": "claude-sonnet",
+                "input_tokens_original": 200,
+                "input_tokens_optimized": 120,
+                "output_tokens": 40,
+                "tokens_saved": 80,
+                "savings_percent": 40.0,
+                "transforms_applied": ["smart_crusher"],
+            }
+        ),
+    ]
+
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)) as client:
+        response = client.get("/stats")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert [req["model"] for req in payload["recent_requests"]] == [
+        "claude-sonnet",
+        "claude-haiku",
+        "claude-haiku",
+    ]
+    assert payload["recent_requests"][0]["token_accounting_status"] == "complete"
+    assert payload["recent_requests"][0]["has_exact_tokens"] is True
+    assert payload["recent_requests"][1]["output_tokens"] is None
+    assert payload["recent_requests"][1]["token_accounting_status"] == "partial"
+    assert payload["recent_requests"][1]["tokens_saved"] == 0
+    assert payload["recent_requests"][2]["input_tokens_optimized"] is None
+    assert payload["recent_requests"][2]["token_accounting_status"] == "missing"
+    assert payload["recent_requests"][2]["has_exact_tokens"] is False
+    assert payload["summary"]["uncompressed_requests"]["unknown_token_accounting"] == 2
+    assert payload["request_logs"][-1]["model"] == "claude-sonnet"
 
 
 def test_agent_usage_totals_use_proxy_only_savings(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HEADROOM_REQUIRE_RUST_CORE", "false")
-    monkeypatch.setattr(
-        server,
-        "_get_context_tool_stats",
-        lambda: {
-            "tool": "rtk",
-            "label": "RTK",
-            "tokens_saved": 500,
-            "session": {},
-            "lifetime": {},
-        },
-    )
     app = create_app(
         ProxyConfig(
             optimize=False,
@@ -140,7 +208,7 @@ def test_agent_usage_totals_use_proxy_only_savings(monkeypatch: pytest.MonkeyPat
     assert response.status_code == 200
     payload = response.json()
 
-    assert payload["tokens"]["saved"] == 600
+    assert payload["tokens"]["saved"] == 100
     assert payload["agent_usage"]["totals"]["before_tokens"] == 1000
     assert payload["agent_usage"]["totals"]["tokens_saved"] == 100
     assert payload["agent_usage"]["totals"]["savings_percent"] == 10.0
@@ -154,7 +222,10 @@ def test_stats_preserves_default_smart_crusher_compaction_state() -> None:
         rate_limit_enabled=False,
         cost_tracking_enabled=False,
     )
-    client = TestClient(create_app(config))
+    # Loopback client/Host: the `config` block is served only to loopback callers.
+    client = TestClient(
+        create_app(config), base_url="http://127.0.0.1", client=("127.0.0.1", 12345)
+    )
 
     response = client.get("/stats")
 

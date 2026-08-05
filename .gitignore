@@ -17,10 +17,17 @@ scripts/*
 !scripts/sync-plugin-versions.py
 !scripts/changelog-gen.py
 !scripts/verify-versions.py
+!scripts/verify-ruff-version.py
 !scripts/pr-governance.py
+!scripts/bootstrap-windows-dev.ps1
+!scripts/build_npm_release_assets.mjs
+!scripts/build_python_release_smoke.py
+!scripts/release_smoke_all.py
+!scripts/verify_npm_release_assets.mjs
 !scripts/tests/
 !scripts/README.md
 !scripts/repro_codex_replay.py
+!scripts/eval_output_shaper.py
 !scripts/fixtures/
 !scripts/fixtures/*.json
 !scripts/record_fixtures.py
@@ -31,6 +38,8 @@ scripts/*
 !scripts/audit_wheel_glibc_symbols.py
 !scripts/replay_codex_ws_load.py
 !scripts/export_kompress_v2_onnx.py
+!scripts/record_kompress_fixtures.py
+!scripts/record_code_compressor_fixtures.py
 
 # Rust / Cargo build artifacts
 /target/
@@ -116,6 +125,12 @@ ENV/
 env.bak/
 venv.bak/
 .python-version
+
+# Node.js dependencies (never commit vendored deps)
+node_modules/
+
+# Local release smoke outputs
+release-assets-local/
 
 # Secrets and API keys - NEVER commit these
 *.pem
@@ -222,16 +237,16 @@ pyrightconfig.json
 \#*\#
 .\#*
 
+# Local git worktrees (isolated feature branches)
+.worktrees/
+
 # Local development configuration
 CLAUDE.md
 
 # Vitals provenance data
 .vitals/
 
-# Superpowers working files (plans, specs, brainstorming)
-# docs/spec/           (lives in git - git-versioned living specification)
-
-# Managed platform (separate private repo)
+# Separate private repos — never commit here
 headroom-managed/
 
 # Local act testing (never commit test tokens)
@@ -251,3 +266,6 @@ uv.lock
 # package shadows the maturin overlay on sys.path.
 /headroom/_core.*.so
 /headroom/_core.so
+.tokensave
+
+.codebase-memory/

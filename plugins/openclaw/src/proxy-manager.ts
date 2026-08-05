@@ -11,6 +11,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import os from "os";
 
 export interface ProxyManagerConfig {
   proxyUrl?: string;
@@ -110,7 +111,7 @@ export class ProxyManager {
     }
 
     // Auto-start is only available for local proxies
-    if (this.config.autoStart !== false) {
+    if (this.config.autoStart === true) {
       const startupUrl = explicitUrl ?? defaultCandidates[0];
       const startupProbe = probeByUrl.get(startupUrl);
       if (startupProbe?.reachable && !startupProbe.isHeadroom) {
@@ -258,12 +259,27 @@ export class ProxyManager {
       checkCommand: process.platform === "win32" ? "where.exe" : "sh",
       checkArgs: process.platform === "win32"
         ? ["headroom"]
-        : ["-lc", "command -v headroom >/dev/null 2>&1"],
+        : ["-c", "command -v headroom >/dev/null 2>&1"],
       useShell: process.platform === "win32",
       checkUseShell: false,
     });
 
-    // 4) Local npm install (inside plugin install path)
+    // 4) uv tool install path (~/.local/bin/headroom)
+    const uvBin = join(
+      os.homedir(),
+      ".local", "bin", "headroom"
+    );
+    if (existsSync(uvBin)) {
+      specs.push({
+        label: `uv tool: ${uvBin}`,
+        command: uvBin,
+        args: commonArgs,
+        checkCommand: uvBin,
+        checkArgs: ["--version"],
+      });
+    }
+
+    // 5) Local npm install (inside plugin install path)
     const moduleDir = dirname(fileURLToPath(import.meta.url)); // .../dist
     const packageRoot = dirname(moduleDir);
     const localBinDir = join(packageRoot, "node_modules", ".bin");
@@ -431,36 +447,71 @@ function withDefaultPort(proxyUrl: string, defaultPort: number): string {
  */
 export async function probeHeadroomProxy(proxyUrl: string): Promise<ProxyProbeResult> {
   const origin = normalizeAndValidateProxyUrl(proxyUrl);
-
-  try {
-    const health = await fetch(`${origin}/health`, {
-      signal: AbortSignal.timeout(3_000),
-    });
-    if (!health.ok) {
-      return { reachable: false, isHeadroom: false, reason: `health HTTP ${health.status}` };
+  const probeEndpoint = async (
+    path: string,
+    options: { readBody?: boolean } = {},
+  ): Promise<{ reachable: boolean; ok: boolean; status?: number; body?: string }> => {
+    try {
+      const response = await fetch(`${origin}${path}`, {
+        signal: AbortSignal.timeout(3_000),
+      });
+      const body =
+        response.ok && options.readBody
+          ? await response.text().catch(() => undefined)
+          : undefined;
+      return { reachable: true, ok: response.ok, status: response.status, body };
+    } catch {
+      return { reachable: false, ok: false };
     }
-  } catch {
-    return { reachable: false, isHeadroom: false, reason: "health check failed" };
+  };
+
+  const ready = await probeEndpoint("/readyz");
+  const retrieveStats = await probeEndpoint("/v1/retrieve/stats", { readBody: true });
+  if (retrieveStats.ok && hasHeadroomStatsShape(retrieveStats.body)) {
+    return { reachable: true, isHeadroom: true };
+  }
+
+  const stats = await probeEndpoint("/stats", { readBody: true });
+  if (stats.ok && hasHeadroomStatsShape(stats.body)) {
+    return { reachable: true, isHeadroom: true };
+  }
+
+  const health = await probeEndpoint("/health");
+  const anyReachable = ready.reachable || retrieveStats.reachable || stats.reachable || health.reachable;
+  if (!anyReachable) {
+    return { reachable: false, isHeadroom: false, reason: "proxy probe failed" };
+  }
+
+  const reasons = [
+    ready.reachable ? `readyz HTTP ${ready.status}` : "readyz unavailable",
+    retrieveStats.reachable
+      ? `retrieve stats HTTP ${retrieveStats.status}`
+      : "retrieve stats endpoint unavailable",
+    stats.reachable ? `stats HTTP ${stats.status}` : "stats endpoint unavailable",
+    health.reachable ? `health HTTP ${health.status}` : "health check failed",
+  ];
+  return { reachable: true, isHeadroom: false, reason: reasons.join("; ") };
+}
+
+function hasHeadroomStatsShape(body: string | undefined): boolean {
+  if (!body) {
+    return false;
   }
 
   try {
-    const retrieveStats = await fetch(`${origin}/v1/retrieve/stats`, {
-      signal: AbortSignal.timeout(3_000),
-    });
-    if (retrieveStats.ok) {
-      return { reachable: true, isHeadroom: true };
-    }
-    return {
-      reachable: true,
-      isHeadroom: false,
-      reason: `retrieve stats HTTP ${retrieveStats.status}`,
-    };
+    const parsed = JSON.parse(body) as Record<string, unknown>;
+    return (
+      parsed !== null &&
+      typeof parsed === "object" &&
+      (Object.hasOwn(parsed, "proxy_inbound") ||
+        Object.hasOwn(parsed, "api_requests") ||
+        Object.hasOwn(parsed, "provider_tokens") ||
+        Object.hasOwn(parsed, "proxy_compression_saved") ||
+        Object.hasOwn(parsed, "store") ||
+        Object.hasOwn(parsed, "recent_retrievals"))
+    );
   } catch {
-    return {
-      reachable: true,
-      isHeadroom: false,
-      reason: "retrieve stats endpoint unavailable",
-    };
+    return false;
   }
 }
 

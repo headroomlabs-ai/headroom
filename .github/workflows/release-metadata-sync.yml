@@ -1,0 +1,87 @@
+name: Release Metadata Sync
+
+# Keep generated version-carrying files in sync on release-please's branch.
+#
+# Why this exists
+# ---------------
+# release-please only rewrites `pyproject.toml` plus the `extra-files` listed in
+# `.release-please-config.json` (currently the TypeScript SDK and OpenClaw
+# package.json). Several other tracked files also carry the version, and
+# `server.json` is asserted byte-for-byte against `render_server_json()` — which
+# derives its version from `pyproject.toml`. So the moment release-please bumps
+# the version, `tests/test_mcp_registry/test_server_json.py::
+# test_root_server_json_matches_builder` fails on the release PR, and the release
+# cannot be merged. That is what blocked v0.33.0 (PR #2339).
+#
+# `release.yml` already runs `scripts/version-sync.py` before its own
+# `verify-versions.py` gate, so the release *build* self-heals in the workspace.
+# The regular CI test job does not, so the fix has to be committed.
+#
+# Why a workflow rather than more `extra-files` entries
+# ----------------------------------------------------
+# `scripts/version-sync.py` is the single place that knows every version-carrying
+# file. Restating that list as per-file jsonpaths would duplicate it, and a
+# jsonpath that silently fails to match produces exactly the failure we are trying
+# to remove. Running the script instead means files added to it in future are
+# covered with no change here.
+#
+# Why the push trigger
+# --------------------
+# release-please regenerates (force-pushes) its branch on every merge to main.
+# That is what repeatedly wiped the hand-pushed metadata fixes on #2339. Keying
+# off a push to the branch means the sync re-applies after every regeneration
+# instead of being lost.
+
+on:
+  push:
+    branches:
+      - "release-please--branches--**"
+
+permissions:
+  contents: write
+
+concurrency:
+  # Never cancel: a half-applied sync would leave the release PR inconsistent.
+  group: release-metadata-sync-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref_name }}
+          # PAT (not GITHUB_TOKEN) for the same reason release-please.yml uses one:
+          # a push made with GITHUB_TOKEN does not trigger workflows, so the release
+          # PR's checks would never re-run against the synced commit and would stay
+          # red. Falls back to GITHUB_TOKEN, where the sync still lands and a manual
+          # re-run of the PR's checks picks it up.
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      # version-sync.py is stdlib-only (json/re/tomllib), so no install step.
+      - name: Sync version-carrying files release-please does not bump
+        run: python scripts/version-sync.py
+
+      - name: Verify all versions agree
+        run: python scripts/verify-versions.py
+
+      - name: Commit and push if anything changed
+        run: |
+          if git diff --quiet; then
+            echo "Already in sync — nothing to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "chore: sync generated version metadata"
+          # This push re-triggers this workflow. version-sync.py is idempotent, so
+          # the next run finds no diff and exits above without pushing — the loop
+          # terminates after one no-op run.
+          git push origin HEAD:"${GITHUB_REF_NAME}"

@@ -81,6 +81,19 @@ class TestOpenAICompatibleProvider:
         limit = provider.get_context_limit("llama-3.1-8b")
         assert limit == 128000
 
+    def test_get_context_limit_deepseek_v3_is_1m(self):
+        """DeepSeek V3/V4 support 1M context, not 128K (#1038)."""
+        provider = OpenAICompatibleProvider()
+        assert provider.get_context_limit("deepseek-v3") == 1048576
+        assert provider.get_context_limit("deepseek-v4") == 1048576
+        assert provider.get_context_limit("deepseek") == 1048576
+        assert provider.get_context_limit("deepseek-v2") == 128000
+        assert provider.get_context_limit("deepseek-v3.2") == 128000
+        assert provider.get_context_limit("deepseek-v4-pro") == 1_000_000
+        assert provider.get_context_limit("deepseek-v4-flash") == 1_000_000
+        assert provider.get_context_limit("deepseek-r1") == 131072
+        assert provider.get_context_limit("deepseek-coder-v2") == 128000
+
     def test_get_context_limit_unknown_model(self):
         """Test context limit for unknown models (defaults to 128K)."""
         provider = OpenAICompatibleProvider()
@@ -187,7 +200,18 @@ class TestOpenAICompatibleProvider:
         assert tokens == 55
         assert total == 34
 
-    def test_openai_compatible_token_counter_ignores_unhandled_content_shapes(self, monkeypatch):
+    def test_openai_compatible_token_counter_prices_declared_media(self, monkeypatch):
+        """An image block costs tokens; a non dict/str part still contributes none.
+
+        This previously asserted that BOTH contribute 0 — i.e. it pinned the
+        defect. The counter handled only ``type == "text"``, so every other block
+        priced at ~0: measured on a 6,800-char block, tool_result / thinking /
+        document / mcp_tool_result all returned 8 tokens, overhead only. Counters
+        now delegate to the shared walker, which prices a declared image with the
+        pixel-based estimate (1600, the max after provider auto-resize) rather
+        than either ignoring it or serializing its base64 as text.
+        """
+
         class DummyTokenizer:
             def count_text(self, text: str) -> int:
                 return len(text)
@@ -198,8 +222,12 @@ class TestOpenAICompatibleProvider:
         )
         counter = OpenAICompatibleProvider().get_token_counter("demo-model")
 
+        # Non-list, non-str content is still ignored.
         assert counter.count_message({"role": "user", "content": {}}) == 8
-        assert counter.count_message({"role": "user", "content": [{"type": "image"}, 123]}) == 8
+        # A bare int is not a block and still contributes nothing.
+        assert counter.count_message({"role": "user", "content": [123]}) == 8
+        # A declared image is now priced instead of silently free.
+        assert counter.count_message({"role": "user", "content": [{"type": "image"}, 123]}) == 1608
 
     def test_get_context_limit_prefix_output_buffer_and_partial_pricing(self):
         provider = OpenAICompatibleProvider(

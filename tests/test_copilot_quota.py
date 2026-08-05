@@ -149,6 +149,23 @@ class TestParseCopilotQuota:
         snap = parse_copilot_quota(data)
         assert snap.categories["chat"].remaining == 75
 
+    def test_fully_exhausted_remaining_zero_is_preserved(self):
+        """A fully-consumed category reports remaining: 0. That legitimate 0 must
+        survive (not become None), so used/used_percent report 100% not unknown."""
+        data = {
+            "quota_snapshots": {
+                "chat": {
+                    "entitlement": 300,
+                    "remaining": 0,
+                }
+            }
+        }
+        snap = parse_copilot_quota(data)
+        chat = snap.categories["chat"]
+        assert chat.remaining == 0
+        assert chat.used == 300
+        assert chat.used_percent == pytest.approx(100.0)
+
     def test_unlimited_category(self):
         data = {"quota_snapshots": {"completions": {"unlimited": True}}}
         snap = parse_copilot_quota(data)

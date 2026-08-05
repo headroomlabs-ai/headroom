@@ -28,6 +28,7 @@
 //! auth_mode = "payg"
 //! model_family = "claude-3-5"
 //! structure_hash = "deadbeef..."
+//! skip_compression_recommended = false
 //! strategy_hint = "smart_crusher"
 //! confidence = 0.87
 //! observations = 142
@@ -71,6 +72,8 @@ pub struct Recommendation {
     pub auth_mode: String,
     pub model_family: String,
     pub structure_hash: String,
+    #[serde(default)]
+    pub skip_compression_recommended: bool,
     pub strategy_hint: String,
     pub confidence: f64,
     pub observations: u64,
@@ -270,6 +273,7 @@ mod tests {
 auth_mode = "payg"
 model_family = "claude-3-5"
 structure_hash = "deadbeef"
+skip_compression_recommended = true
 strategy_hint = "smart_crusher"
 confidence = 0.87
 observations = 142
@@ -292,9 +296,19 @@ observations = 60
         let r = store
             .lookup(AuthMode::Payg, "claude-3-5", "deadbeef")
             .expect("hit");
+        assert!(r.skip_compression_recommended);
         assert_eq!(r.strategy_hint, "smart_crusher");
         assert!((r.confidence - 0.87).abs() < 1e-9);
         assert_eq!(r.observations, 142);
+    }
+
+    #[test]
+    fn from_toml_str_defaults_missing_skip_field_to_false() {
+        let store = RecommendationStore::from_toml_str(sample_toml()).expect("parses");
+        let r = store
+            .lookup(AuthMode::OAuth, "gpt-4o", "cafebabe")
+            .expect("hit");
+        assert!(!r.skip_compression_recommended);
     }
 
     #[test]

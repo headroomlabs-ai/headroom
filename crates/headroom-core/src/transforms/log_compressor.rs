@@ -168,6 +168,14 @@ pub struct LogCompressorConfig {
     /// Compression ratio threshold for CCR storage. Python defaults to
     /// 0.5 inline; promoted to a config field here.
     pub min_compression_ratio_for_ccr: f64,
+    /// When a trace exceeds `stack_trace_max_lines`, collapse runtime/stdlib
+    /// frames into a `[... N runtime frames collapsed]` marker instead of
+    /// blindly truncating the tail (which drops app frames and chain heads).
+    pub collapse_runtime_frames: bool,
+    /// First N frames always kept when collapsing (top of the trace).
+    pub trace_head_frames: usize,
+    /// App-code (non-runtime) frames kept beyond the head when collapsing.
+    pub trace_app_frames: usize,
 }
 
 impl Default for LogCompressorConfig {
@@ -186,6 +194,9 @@ impl Default for LogCompressorConfig {
             enable_ccr: true,
             min_lines_for_ccr: 50,
             min_compression_ratio_for_ccr: 0.5,
+            collapse_runtime_frames: true,
+            trace_head_frames: 3,
+            trace_app_frames: 5,
         }
     }
 }
@@ -222,6 +233,7 @@ pub struct LogCompressorStats {
     pub stack_traces_kept: usize,
     pub warnings_dropped_by_dedupe: usize,
     pub lines_dropped_by_global_cap: usize,
+    pub runtime_frames_collapsed: usize,
     pub ccr_emitted: bool,
     pub ccr_skip_reason: Option<&'static str>,
 }
@@ -404,7 +416,13 @@ enum TraceFlavor {
     Js,
     Java,
     RustError,
-    Go,
+    /// Rust panic + `RUST_BACKTRACE` dump. Frames are `N: 0x<hex>` /
+    /// `N: <symbol>` lines. (Previously misnamed `Go`, whose real panic
+    /// shape — `goroutine N [state]:` + tab-indented `.go:` frames — is
+    /// `GoPanic` below.)
+    RustBacktrace,
+    GoPanic,
+    DotNet,
 }
 
 impl StackTraceDetector {
@@ -414,14 +432,23 @@ impl StackTraceDetector {
             || Self::is_python_file_frame(trimmed)
         {
             Some(TraceFlavor::PythonTraceback)
+        } else if Self::is_dotnet_opener(trimmed) {
+            // Before Js/Java: a .NET `at Ns.Class.Method(...) in File.cs:line N`
+            // frame also satisfies the Java `at <dotted>(` shape.
+            Some(TraceFlavor::DotNet)
         } else if Self::is_js_at_frame(trimmed) {
             Some(TraceFlavor::Js)
         } else if Self::is_java_at_frame(trimmed) {
             Some(TraceFlavor::Java)
         } else if trimmed.starts_with("--> ") && Self::has_line_col_suffix(trimmed) {
             Some(TraceFlavor::RustError)
-        } else if Self::is_go_frame(line) {
-            Some(TraceFlavor::Go)
+        } else if Self::is_rust_panic_opener(trimmed)
+            || trimmed.starts_with("stack backtrace:")
+            || Self::is_rust_backtrace_frame(line)
+        {
+            Some(TraceFlavor::RustBacktrace)
+        } else if Self::is_go_panic_opener(line) {
+            Some(TraceFlavor::GoPanic)
         } else {
             None
         }
@@ -440,13 +467,17 @@ impl StackTraceDetector {
     }
 
     fn is_java_at_frame(s: &str) -> bool {
-        // Pattern: `at <package.Class.method>(`
+        // Pattern: `at <package.Class.method>(`. `/` admits JPMS module
+        // prefixes (`at java.base/java.util.Optional.get(...)`) and lambda
+        // frames (`$$Lambda$17/0x...`) — without it, modern JDK frames fail
+        // the opener re-check at the parse cap and one trace fragments into
+        // several groups.
         if !s.starts_with("at ") || !s.contains('(') {
             return false;
         }
         let body = &s[3..s.find('(').unwrap_or(s.len())];
         body.chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '$'))
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '$' | '/'))
             && !body.is_empty()
     }
 
@@ -474,7 +505,68 @@ impl StackTraceDetector {
         false
     }
 
-    fn is_go_frame(s: &str) -> bool {
+    fn is_rust_panic_opener(s: &str) -> bool {
+        // Pattern: `thread '<name>' panicked at <loc>` (any rustc era).
+        s.starts_with("thread '") && s.contains("panicked at")
+    }
+
+    fn is_go_panic_opener(line: &str) -> bool {
+        // `panic: <msg>` / `fatal error: <msg>` (column 0) or a goroutine
+        // header `goroutine <N> [<state>]:`.
+        if line.starts_with("panic: ") || line.starts_with("fatal error: ") {
+            return true;
+        }
+        Self::is_goroutine_header(line)
+    }
+
+    fn is_goroutine_header(line: &str) -> bool {
+        let Some(rest) = line.strip_prefix("goroutine ") else {
+            return false;
+        };
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        digits > 0 && rest[digits..].starts_with(" [")
+    }
+
+    fn is_go_file_frame(line: &str) -> bool {
+        // Tab-indented `<path>.go:<line> +0x<hex>` (the second line of each
+        // goroutine frame pair).
+        let Some(rest) = line.strip_prefix('\t') else {
+            return false;
+        };
+        rest.contains(".go:") && rest.contains(" +0x")
+    }
+
+    fn is_go_call_frame(line: &str) -> bool {
+        // `pkg.func(...)` / `created by pkg.func` call lines inside a
+        // goroutine block (column 0, dotted symbol).
+        if line.starts_with("created by ") {
+            return true;
+        }
+        if line.starts_with([' ', '\t']) || !line.ends_with(')') {
+            return false;
+        }
+        let Some(open) = line.find('(') else {
+            return false;
+        };
+        let symbol = &line[..open];
+        !symbol.is_empty()
+            && symbol.contains('.')
+            && symbol
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '*'))
+    }
+
+    fn is_dotnet_opener(s: &str) -> bool {
+        s.starts_with("Unhandled exception.") || Self::is_dotnet_frame(s)
+    }
+
+    fn is_dotnet_frame(s: &str) -> bool {
+        // Pattern: `at <symbol>(<args>) in <file>:line <N>` — the ` in … :line`
+        // suffix is what distinguishes .NET from Java frames.
+        s.starts_with("at ") && s.contains(") in ") && s.contains(":line ")
+    }
+
+    fn is_rust_backtrace_frame(s: &str) -> bool {
         // Pattern: `<digits>:<spaces>0x<hex>`
         let trimmed = s.trim_start();
         let mut chars = trimmed.chars().peekable();
@@ -503,7 +595,10 @@ impl StackTraceDetector {
     }
 
     /// True if `line` should end the current trace flavor's run.
-    fn terminates(flavor: TraceFlavor, line: &str) -> bool {
+    /// `lines_so_far` is how many lines the active trace has already
+    /// claimed (1 = only the opener) — RustBacktrace uses it to keep the
+    /// free-text panic-message line that follows `panicked at <loc>:`.
+    fn terminates(flavor: TraceFlavor, line: &str, lines_so_far: usize) -> bool {
         let trimmed = line.trim_start();
         match flavor {
             TraceFlavor::PythonTraceback => {
@@ -524,15 +619,229 @@ impl StackTraceDetector {
                     !trimmed.starts_with(char::is_uppercase)
                 }
             }
-            TraceFlavor::Js | TraceFlavor::Java => {
+            TraceFlavor::Js => {
                 // Terminate on the first non-`at` line.
                 !trimmed.starts_with("at ") && !line.is_empty()
             }
+            TraceFlavor::Java => {
+                // Continue across `Caused by:` / `Suppressed:` chain heads and
+                // the `... N more` frame-elision summary — terminating there
+                // split one chained exception into several traces, and the
+                // later chain heads got dropped under `max_stack_traces`.
+                let is_chain = trimmed.starts_with("Caused by:")
+                    || trimmed.starts_with("Suppressed:")
+                    || Self::is_java_more_summary(trimmed);
+                !trimmed.starts_with("at ") && !is_chain && !line.is_empty()
+            }
+            TraceFlavor::DotNet => {
+                // Continue across frames, inner-exception heads (`--->`),
+                // separator lines (`--- End of inner exception stack trace`,
+                // `--- End of stack trace from previous location`), and
+                // exception-type message lines.
+                if line.is_empty() {
+                    return false;
+                }
+                let continues = trimmed.starts_with("at ")
+                    || trimmed.starts_with("--->")
+                    || trimmed.starts_with("--- End of")
+                    || Self::is_dotnet_exception_head(trimmed);
+                !continues
+            }
             TraceFlavor::RustError => !trimmed.starts_with("--> ") && !line.is_empty(),
-            TraceFlavor::Go => {
-                !trimmed.chars().next().is_some_and(|c| c.is_ascii_digit()) && !line.is_empty()
+            TraceFlavor::RustBacktrace => {
+                if line.is_empty() || lines_so_far == 1 {
+                    // The panic message is the unindented free-text line right
+                    // after the `panicked at <loc>:` opener — keep it.
+                    return false;
+                }
+                let is_frame = trimmed.chars().next().is_some_and(|c| c.is_ascii_digit());
+                let is_continuation = line.starts_with([' ', '\t'])
+                    || trimmed.starts_with("stack backtrace:")
+                    || trimmed.starts_with("note: run with");
+                !is_frame && !is_continuation
+            }
+            TraceFlavor::GoPanic => {
+                // A goroutine dump is blocks of `goroutine N [state]:` headers,
+                // `pkg.func(...)` call lines, and tab-indented `.go:` file
+                // lines, separated by blank lines. Signal lines (`[signal
+                // SIGSEGV...]`) and chained `panic:` lines continue it.
+                if line.is_empty() {
+                    return false;
+                }
+                let continues = line.starts_with('\t')
+                    || Self::is_goroutine_header(line)
+                    || Self::is_go_call_frame(line)
+                    || line.starts_with("panic: ")
+                    || line.starts_with("fatal error: ")
+                    || line.starts_with("[signal ");
+                !continues
             }
         }
+    }
+
+    fn is_dotnet_exception_head(trimmed: &str) -> bool {
+        // `System.InvalidOperationException: message` (dotted type ending in
+        // Exception, then a colon).
+        let Some(colon) = trimmed.find(':') else {
+            return false;
+        };
+        let head = &trimmed[..colon];
+        head.ends_with("Exception")
+            && head.contains('.')
+            && head
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '`' | '+'))
+    }
+
+    fn is_java_more_summary(trimmed: &str) -> bool {
+        // `... 17 more`
+        let Some(rest) = trimmed.strip_prefix("... ") else {
+            return false;
+        };
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        digits > 0 && rest[digits..].trim() == "more"
+    }
+}
+
+// ─── Frame-collapse pass ───────────────────────────────────────────────
+
+/// Result of collapsing runtime frames in an oversized stack trace.
+struct CollapsedTrace {
+    kept: Vec<LogLine>,
+    /// Original line numbers of the dropped frames — excluded from the
+    /// context-line pass so they don't ride back in as neighbors.
+    dropped_indices: Vec<usize>,
+}
+
+/// True if `line` is a stack FRAME (vs. an exception message / chain head).
+fn is_frame_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("at ")
+        || (trimmed.starts_with("File \"") && trimmed.contains("\", line "))
+        || StackTraceDetector::is_rust_backtrace_frame(line)
+        || StackTraceDetector::is_go_file_frame(line)
+        || StackTraceDetector::is_go_call_frame(line)
+}
+
+/// Chain heads and inter-trace markers that must always survive a collapse.
+fn is_chain_head_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("Caused by:")
+        || trimmed.starts_with("Suppressed:")
+        || trimmed.starts_with("... ")
+        || trimmed.starts_with("--->")
+        || trimmed.starts_with("--- End of")
+        || trimmed.starts_with("During handling")
+        || trimmed.starts_with("The above exception")
+}
+
+/// Runtime/stdlib frame markers, split by match mode: `starts_with` on the
+/// trimmed line vs. `contains` anywhere (paths and dotted symbols).
+const RUNTIME_FRAME_PREFIXES: &[&str] = &[
+    "at java.",
+    "at jdk.",
+    "at sun.",
+    "at javax.",
+    "at scala.",
+    "at System.",
+    "at Microsoft.",
+    "runtime.",
+    "created by runtime.",
+];
+const RUNTIME_FRAME_MARKERS: &[&str] = &[
+    "site-packages/",
+    "/usr/lib/python",
+    "lib/python3.",
+    "node:internal/",
+    "node_modules/",
+    "(internal/",
+    "core::",
+    "std::",
+    "alloc::",
+    "rust_begin_unwind",
+    "__rust_",
+    "/rustc/",
+    "/usr/local/go/src/",
+    "/libexec/src/runtime/",
+];
+
+fn is_runtime_frame(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    RUNTIME_FRAME_PREFIXES
+        .iter()
+        .any(|p| trimmed.starts_with(p))
+        || RUNTIME_FRAME_MARKERS.iter().any(|m| line.contains(m))
+}
+
+/// Collapse runtime frames in an oversized trace: keep every message /
+/// chain-head line, the first `head_frames` frames, and up to `app_frames`
+/// app-code frames; each contiguous dropped run becomes one
+/// `[... N frames collapsed]` marker occupying the run's first line slot.
+/// Indented continuations of a dropped frame (Python source echo) drop
+/// with it.
+fn collapse_trace_frames(
+    stack: &[LogLine],
+    head_frames: usize,
+    app_frames: usize,
+) -> CollapsedTrace {
+    let mut kept: Vec<LogLine> = Vec::with_capacity(stack.len().min(64));
+    let mut dropped_indices: Vec<usize> = Vec::new();
+    let mut frames_seen = 0usize;
+    let mut app_kept = 0usize;
+    let mut run_start: Option<usize> = None;
+    let mut run_len = 0usize;
+    let mut prev_dropped = false;
+
+    fn flush_run(kept: &mut Vec<LogLine>, run_start: &mut Option<usize>, run_len: &mut usize) {
+        if let Some(ln) = run_start.take() {
+            let mut marker = LogLine::new(ln, format!("      [... {run_len} frames collapsed]"));
+            // Survive the score-ranked global cap: the marker stands in for
+            // many lines and must not be the first thing dropped.
+            marker.score = 0.8;
+            marker.is_stack_trace = true;
+            kept.push(marker);
+            *run_len = 0;
+        }
+    }
+
+    for line in stack {
+        if is_frame_line(&line.content) && !is_chain_head_line(&line.content) {
+            frames_seen += 1;
+            let runtime = is_runtime_frame(&line.content);
+            let keep = frames_seen <= head_frames || (!runtime && app_kept < app_frames);
+            if keep {
+                if !runtime {
+                    app_kept += 1;
+                }
+                flush_run(&mut kept, &mut run_start, &mut run_len);
+                kept.push(line.clone());
+                prev_dropped = false;
+            } else {
+                if run_start.is_none() {
+                    run_start = Some(line.line_number);
+                }
+                run_len += 1;
+                dropped_indices.push(line.line_number);
+                prev_dropped = true;
+            }
+        } else if prev_dropped
+            && line.content.starts_with([' ', '\t'])
+            && !is_chain_head_line(&line.content)
+        {
+            // Indented continuation of a dropped frame (source echo, `at
+            // <path>` sub-line already caught as frame above).
+            run_len += 1;
+            dropped_indices.push(line.line_number);
+        } else {
+            flush_run(&mut kept, &mut run_start, &mut run_len);
+            kept.push(line.clone());
+            prev_dropped = false;
+        }
+    }
+    flush_run(&mut kept, &mut run_start, &mut run_len);
+    CollapsedTrace {
+        kept,
+        dropped_indices,
     }
 }
 
@@ -707,8 +1016,9 @@ impl LogCompressor {
             // `stack_trace_max_lines`.
             if let Some(flavor) = active {
                 if trace_lines >= self.config.stack_trace_max_lines
-                    || StackTraceDetector::terminates(flavor, line)
+                    || StackTraceDetector::terminates(flavor, line, trace_lines)
                 {
+                    let cap_hit = trace_lines >= self.config.stack_trace_max_lines;
                     active = None;
                     trace_lines = 0;
                     // Re-check the current line against opener — chained
@@ -716,6 +1026,17 @@ impl LogCompressor {
                     // terminated the previous one.
                     if let Some(new_flavor) = StackTraceDetector::flavor_for(line) {
                         active = Some(new_flavor);
+                        trace_lines = 1;
+                        entry.is_stack_trace = true;
+                    } else if cap_hit && !StackTraceDetector::terminates(flavor, line, 2) {
+                        // Cap hit mid-trace on a line that is not an opener
+                        // by itself but still continues the active flavor
+                        // (goroutine file frames, Python source echoes,
+                        // blank separators). Keep marking so the selection
+                        // stage sees one contiguous trace and the frame
+                        // collapse — not arbitrary cap alignment — decides
+                        // what survives.
+                        active = Some(flavor);
                         trace_lines = 1;
                         entry.is_stack_trace = true;
                     }
@@ -803,10 +1124,30 @@ impl LogCompressor {
             selected.insert(line);
         }
 
+        let mut collapsed_frame_indices: BTreeSet<usize> = BTreeSet::new();
         for stack in stack_traces.iter().take(self.config.max_stack_traces) {
             stats.stack_traces_kept += 1;
-            for line in stack.iter().take(self.config.stack_trace_max_lines) {
-                selected.insert(line.clone());
+            if self.config.collapse_runtime_frames
+                && stack.len() > self.config.stack_trace_max_lines
+            {
+                let collapsed = collapse_trace_frames(
+                    stack,
+                    self.config.trace_head_frames,
+                    self.config.trace_app_frames,
+                );
+                stats.runtime_frames_collapsed += collapsed.dropped_indices.len();
+                collapsed_frame_indices.extend(collapsed.dropped_indices);
+                for line in collapsed
+                    .kept
+                    .into_iter()
+                    .take(self.config.stack_trace_max_lines)
+                {
+                    selected.insert(line);
+                }
+            } else {
+                for line in stack.iter().take(self.config.stack_trace_max_lines) {
+                    selected.insert(line.clone());
+                }
             }
         }
 
@@ -829,7 +1170,12 @@ impl LogCompressor {
             }
         }
         for idx in context_indices {
-            if !selected_indices.contains(&idx) && idx < log_lines.len() {
+            // Deliberately-collapsed runtime frames must not ride back in as
+            // "context" around the kept frames — that would undo the collapse.
+            if !selected_indices.contains(&idx)
+                && idx < log_lines.len()
+                && !collapsed_frame_indices.contains(&idx)
+            {
                 selected.insert(log_lines[idx].clone());
             }
         }
@@ -1291,5 +1637,159 @@ mod tests {
         assert!(line_nums.contains(&4));
         // Third slot goes to the high-scoring middle line.
         assert!(line_nums.contains(&2));
+    }
+
+    // ─── Language-aware stack-trace flavors ────────────────────────────
+
+    fn trace_flags(c: &LogCompressor, lines: &[&str]) -> Vec<bool> {
+        c.parse_lines(lines)
+            .iter()
+            .map(|l| l.is_stack_trace)
+            .collect()
+    }
+
+    #[test]
+    fn go_panic_and_goroutine_dump_detected() {
+        let c = cmp();
+        let lines = [
+            "some build output",
+            "panic: runtime error: index out of range [3] with length 3",
+            "",
+            "goroutine 1 [running]:",
+            "main.lookup(0x1, 0x2)",
+            "\t/app/pkg/lookup.go:42 +0x1d",
+            "main.main()",
+            "\t/app/main.go:10 +0x20",
+            "exit status 2",
+        ];
+        let flags = trace_flags(&c, &lines);
+        assert!(!flags[0]);
+        // panic opener through both frame pairs are all one trace.
+        assert!(flags[1..8].iter().all(|&f| f), "flags: {:?}", flags);
+        assert!(!flags[8]);
+    }
+
+    #[test]
+    fn rust_panic_backtrace_detected_with_message_line() {
+        let c = cmp();
+        let lines = [
+            "thread 'main' panicked at src/main.rs:5:5:",
+            "index out of bounds: the len is 3 but the index is 99",
+            "stack backtrace:",
+            "   0: rust_begin_unwind",
+            "             at /rustc/abc123/library/std/src/panicking.rs:645:5",
+            "   1: core::panicking::panic_fmt",
+            "   2: app::run",
+            "note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace",
+            "done",
+        ];
+        let flags = trace_flags(&c, &lines);
+        // The free-text message line after the opener stays in the trace.
+        assert!(flags[..8].iter().all(|&f| f), "flags: {:?}", flags);
+        assert!(!flags[8]);
+    }
+
+    #[test]
+    fn dotnet_trace_continues_across_inner_exception() {
+        let c = cmp();
+        let lines = [
+            "Unhandled exception. System.InvalidOperationException: outer failed",
+            " ---> System.ArgumentNullException: inner value was null",
+            "   at App.Data.Load(String path) in /src/App/Data.cs:line 42",
+            "   --- End of inner exception stack trace ---",
+            "   at App.Program.Main(String[] args) in /src/App/Program.cs:line 12",
+            "Build finished.",
+        ];
+        let flags = trace_flags(&c, &lines);
+        assert!(flags[..5].iter().all(|&f| f), "flags: {:?}", flags);
+        assert!(!flags[5]);
+    }
+
+    #[test]
+    fn java_chain_continues_across_caused_by() {
+        let c = cmp();
+        let lines = [
+            "at com.example.Service.call(Service.java:10)",
+            "at com.example.Main.run(Main.java:5)",
+            "Caused by: java.io.IOException: disk gone",
+            "at com.example.Disk.read(Disk.java:77)",
+            "... 17 more",
+            "INFO next request",
+        ];
+        let parsed = c.parse_lines(&lines);
+        let flags: Vec<bool> = parsed.iter().map(|l| l.is_stack_trace).collect();
+        assert!(flags[..5].iter().all(|&f| f), "flags: {:?}", flags);
+        assert!(!flags[5]);
+        // And selection groups it as ONE trace, not three.
+        let mut stats = LogCompressorStats::default();
+        let _ = c.select_lines(&parsed, 1.0, &mut stats);
+        assert_eq!(stats.stack_traces_seen, 1);
+    }
+
+    // ─── Frame collapse ─────────────────────────────────────────────────
+
+    fn java_chained_trace(runtime_frames: usize) -> String {
+        let mut lines =
+            vec!["Exception in thread \"main\" java.lang.IllegalStateException: boom".to_string()];
+        lines.push("at com.example.App.handle(App.java:10)".into());
+        lines.push("at com.example.App.dispatch(App.java:20)".into());
+        for i in 0..runtime_frames {
+            lines.push(format!(
+                "at java.base/java.util.stream.Op{}.eval(Op{}.java:{})",
+                i,
+                i,
+                i + 1
+            ));
+        }
+        lines.push("Caused by: java.io.IOException: disk gone".into());
+        lines.push("at com.example.Disk.read(Disk.java:77)".into());
+        for i in 0..runtime_frames {
+            lines.push(format!(
+                "at java.base/java.lang.Thread{}.run(Thread.java:{})",
+                i,
+                i + 1
+            ));
+        }
+        lines.push("... 17 more".into());
+        lines.join("\n")
+    }
+
+    #[test]
+    fn collapse_keeps_chain_heads_and_app_frames() {
+        let c = cmp();
+        let content = java_chained_trace(30); // 68 lines, way over max of 20
+        let (result, stats) = c.compress(&content, 1.0);
+        assert!(stats.runtime_frames_collapsed > 0);
+        // The signal lines survive:
+        assert!(result.compressed.contains("Caused by: java.io.IOException"));
+        assert!(result.compressed.contains("com.example.Disk.read"));
+        assert!(result.compressed.contains("... 17 more"));
+        // Runtime frames collapse behind a marker:
+        assert!(result.compressed.contains("frames collapsed]"));
+        // The deep runtime tail is gone (frame 25 of the second run existed
+        // only past the old 20-line truncation point AND is runtime).
+        assert!(!result.compressed.contains("Thread25.run"));
+    }
+
+    #[test]
+    fn collapse_beats_blind_truncation_on_chain_heads() {
+        // With collapse disabled, the old head-truncation loses the
+        // `Caused by:` head buried past max_lines; with it enabled, kept.
+        let content = java_chained_trace(30);
+        let mut cfg = LogCompressorConfig::default();
+        cfg.collapse_runtime_frames = false;
+        let (result_off, _) = LogCompressor::new(cfg).compress(&content, 1.0);
+        assert!(!result_off.compressed.contains("com.example.Disk.read"));
+        let (result_on, _) = cmp().compress(&content, 1.0);
+        assert!(result_on.compressed.contains("com.example.Disk.read"));
+    }
+
+    #[test]
+    fn small_traces_not_collapsed() {
+        let c = cmp();
+        let content = java_chained_trace(2); // 12 lines, under max of 20
+        let (result, stats) = c.compress(&content, 1.0);
+        assert_eq!(stats.runtime_frames_collapsed, 0);
+        assert!(!result.compressed.contains("frames collapsed]"));
     }
 }

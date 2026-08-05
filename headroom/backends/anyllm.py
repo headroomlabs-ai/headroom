@@ -41,13 +41,25 @@ class AnyLLMBackend(Backend):
             )
 
         self.provider = provider.lower()
-        self.api_key = api_key
-        self.api_base = api_base
+        # Normalize empty-string overrides (e.g. an env var set to "") to None
+        # so provider defaults stay active instead of forwarding a blank value.
+        self.api_key = api_key or None
+        self.api_base = api_base or None
 
-        # Create the AnyLLM instance once and reuse
-        self.llm = AnyLLM.create(self.provider)
+        # Create the AnyLLM instance once and reuse. api_key/api_base are only
+        # forwarded when set so providers keep their own env-var defaults
+        # (e.g. OPENAI_API_KEY / OPENAI_BASE_URL) otherwise.
+        create_kwargs: dict[str, Any] = {}
+        if self.api_key is not None:
+            create_kwargs["api_key"] = self.api_key
+        if self.api_base is not None:
+            create_kwargs["api_base"] = self.api_base
+        self.llm = AnyLLM.create(self.provider, **create_kwargs)
 
-        logger.info(f"any-llm backend initialized (provider={provider})")
+        logger.info(
+            f"any-llm backend initialized (provider={provider}, "
+            f"api_base={self.api_base or 'default'})"
+        )
 
     @property
     def name(self) -> str:
@@ -130,6 +142,30 @@ class AnyLLMBackend(Backend):
     ) -> dict[str, Any]:
         """Convert any-llm/OpenAI response to Anthropic format."""
         msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+
+        # A non-streaming upstream response can be HTTP 200 with an empty
+        # ``choices`` list (e.g. Azure OpenAI content filtering, or any
+        # OpenAI-compatible gateway on a usage-only / filtered turn). The
+        # streaming sibling already skips this (`if ... and chunk.choices`);
+        # indexing ``choices[0]`` here would instead raise IndexError and 500
+        # the request. Return a valid empty assistant turn.
+        if not getattr(response, "choices", None):
+            usage = {"input_tokens": 0, "output_tokens": 0}
+            if getattr(response, "usage", None):
+                usage = {
+                    "input_tokens": getattr(response.usage, "prompt_tokens", 0) or 0,
+                    "output_tokens": getattr(response.usage, "completion_tokens", 0) or 0,
+                }
+            return {
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": original_model,
+                "stop_reason": "end_turn",
+                "stop_sequence": None,
+                "usage": usage,
+            }
 
         choice = response.choices[0]
         message = choice.message

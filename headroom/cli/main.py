@@ -28,8 +28,33 @@ def main(ctx: click.Context) -> None:
         headroom proxy              Start the optimization proxy
         headroom memory list        List stored memories
         headroom memory stats       Show memory statistics
+        headroom update             Update Headroom to the latest release
     """
     ctx.ensure_object(dict)
+
+    # Apply file-backed settings (settings.json) to the process environment
+    # BEFORE Click parses any subcommand's ``envvar=`` options (Click resolves
+    # those when it builds the subcommand context, which happens after this
+    # group callback runs). ``os.environ.setdefault`` keeps explicit shell
+    # exports authoritative over the stored file. Fail-open so a corrupt
+    # settings.json can never block the CLI.
+    try:
+        from headroom import settings_store
+
+        settings_store.apply_to_environ(settings_store.load())
+    except Exception:  # noqa: BLE001 — settings load must never break the CLI
+        pass
+
+    # Fire a rate-limited, opt-out background check for newer releases so other
+    # surfaces (e.g. the proxy banner) can show an "update available" notice.
+    # Never blocks, never raises; skipped for `update` (it checks explicitly).
+    if ctx.invoked_subcommand != "update":
+        try:
+            from headroom.update_check import maybe_check_async
+
+            maybe_check_async()
+        except Exception:  # noqa: BLE001 — update check must never break the CLI
+            pass
 
 
 # Import subcommands - these register themselves with the main group
@@ -37,16 +62,23 @@ def _register_commands() -> None:
     """Register all subcommand groups."""
     from . import (
         agent_savings,  # noqa: F401
+        audit,  # noqa: F401
         capture,  # noqa: F401
         copilot_auth,  # noqa: F401
+        doctor,  # noqa: F401
         evals,  # noqa: F401
         init,  # noqa: F401
+        inspect,  # noqa: F401
         install,  # noqa: F401
         learn,  # noqa: F401
         mcp,  # noqa: F401
+        output_savings,  # noqa: F401
         perf,  # noqa: F401
         proxy,  # noqa: F401
+        recover,  # noqa: F401
+        savings,  # noqa: F401
         tools,  # noqa: F401
+        update,  # noqa: F401
         wrap,  # noqa: F401
     )
 

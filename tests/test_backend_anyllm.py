@@ -43,13 +43,83 @@ def make_backend(
 
     class FakeAnyLLM:
         @staticmethod
-        def create(requested_provider: str):
+        def create(requested_provider: str, **kwargs):  # noqa: ANN003
             assert requested_provider == provider
             return fake_instance
 
     monkeypatch.setattr(anyllm, "ANYLLM_AVAILABLE", True)
     monkeypatch.setattr(anyllm, "AnyLLM", FakeAnyLLM)
     return anyllm.AnyLLMBackend(provider=provider.upper()), fake_instance
+
+
+def test_init_forwards_api_base_and_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression for #942: custom api_base/api_key must reach AnyLLM.create."""
+    fake_instance = FakeAnyLLMInstance()
+    create_calls: list[dict[str, object]] = []
+
+    class FakeAnyLLM:
+        @staticmethod
+        def create(requested_provider: str, **kwargs):  # noqa: ANN003
+            create_calls.append({"provider": requested_provider, **kwargs})
+            return fake_instance
+
+    monkeypatch.setattr(anyllm, "ANYLLM_AVAILABLE", True)
+    monkeypatch.setattr(anyllm, "AnyLLM", FakeAnyLLM)
+
+    backend = anyllm.AnyLLMBackend(
+        provider="openai",
+        api_key="sk-custom",
+        api_base="https://custom-provider.example/v1",
+    )
+
+    assert backend.api_base == "https://custom-provider.example/v1"
+    assert create_calls == [
+        {
+            "provider": "openai",
+            "api_key": "sk-custom",
+            "api_base": "https://custom-provider.example/v1",
+        }
+    ]
+
+
+def test_init_omits_unset_api_base_and_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unset overrides must not be forwarded, preserving provider env defaults."""
+    fake_instance = FakeAnyLLMInstance()
+    create_calls: list[dict[str, object]] = []
+
+    class FakeAnyLLM:
+        @staticmethod
+        def create(requested_provider: str, **kwargs):  # noqa: ANN003
+            create_calls.append({"provider": requested_provider, **kwargs})
+            return fake_instance
+
+    monkeypatch.setattr(anyllm, "ANYLLM_AVAILABLE", True)
+    monkeypatch.setattr(anyllm, "AnyLLM", FakeAnyLLM)
+
+    anyllm.AnyLLMBackend(provider="openai")
+
+    assert create_calls == [{"provider": "openai"}]
+
+
+def test_init_treats_empty_overrides_as_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Empty-string api_base/api_key must not be forwarded (env var set to "")."""
+    fake_instance = FakeAnyLLMInstance()
+    create_calls: list[dict[str, object]] = []
+
+    class FakeAnyLLM:
+        @staticmethod
+        def create(requested_provider: str, **kwargs):  # noqa: ANN003
+            create_calls.append({"provider": requested_provider, **kwargs})
+            return fake_instance
+
+    monkeypatch.setattr(anyllm, "ANYLLM_AVAILABLE", True)
+    monkeypatch.setattr(anyllm, "AnyLLM", FakeAnyLLM)
+
+    backend = anyllm.AnyLLMBackend(provider="openai", api_key="", api_base="")
+
+    assert backend.api_base is None
+    assert backend.api_key is None
+    assert create_calls == [{"provider": "openai"}]
 
 
 def make_choice(
@@ -170,6 +240,26 @@ def test_to_anthropic_response_maps_tool_calls_and_usage(monkeypatch: pytest.Mon
     assert converted["content"][0] == {"type": "text", "text": "hello"}
     assert converted["content"][1]["input"] == {"content": "python"}
     assert converted["content"][2]["input"] == {"query": "python"}
+
+
+def test_to_anthropic_response_empty_choices_returns_empty_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A content-filtered / usage-only upstream response can be 200 with an empty
+    # choices list (e.g. Azure OpenAI content filtering). Indexing choices[0]
+    # would raise IndexError; the converter must return a valid empty turn, the
+    # way the streaming path already skips empty-choice chunks.
+    backend, _instance = make_backend(monkeypatch)
+    response = make_response(usage=SimpleNamespace(prompt_tokens=9, completion_tokens=0))
+
+    converted = backend._to_anthropic_response(response, "claude-sonnet")
+
+    assert converted["type"] == "message"
+    assert converted["role"] == "assistant"
+    assert converted["model"] == "claude-sonnet"
+    assert converted["content"] == []
+    assert converted["stop_reason"] == "end_turn"
+    assert converted["usage"] == {"input_tokens": 9, "output_tokens": 0}
 
 
 @pytest.mark.asyncio

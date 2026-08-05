@@ -31,6 +31,7 @@ if TYPE_CHECKING:
 # We operate in an authenticated-optional mode; warnings are not actionable.
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 os.environ.setdefault("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1")
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 warnings.filterwarnings("ignore", category=UserWarning, module="huggingface_hub")
 # Also silence the huggingface_hub logger which emits rate-limit advisory messages.
 logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
@@ -39,6 +40,102 @@ logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Local (torch / sentence-transformers) CPU thread cap — issue #198
+# =============================================================================
+# A long-lived proxy serves many requests concurrently. Each torch ``encode()``
+# fans out to BLAS (MKL / OpenBLAS / Accelerate) + OpenMP worker threads, which
+# default to roughly ``os.cpu_count()``. Under concurrency this oversubscribes
+# the CPU — N in-flight encodes x ~cpu_count threads each thrash the scheduler
+# and starve the asyncio event loop, so liveness probes (``/livez``) spike to
+# multiple seconds even though the loop itself is idle (issue #198).
+#
+# Capping intra-op parallelism makes a single encode modestly slower but lets
+# concurrent encodes scale linearly without thread-pool thrash — the standard
+# trade-off for serving torch models inside an async server. The ONNX embedder
+# already caps its threads (see ``onnx_runtime.create_cpu_session_options``);
+# this brings the torch path to parity.
+#
+# torch's OpenMP thread count is per-thread, and encodes run on executor worker
+# threads, so a one-shot cap would miss most workers. Instead, CPU encodes run
+# on a dedicated, size-limited executor whose ``initializer`` pins each worker's
+# thread pool once. Total embedding threads are then bounded by
+# ``workers (HEADROOM_EMBED_CONCURRENCY) x threads-per-encode
+# (HEADROOM_EMBED_NUM_THREADS)``. Applies to the CPU device only (GPU/MPS do
+# their compute off-CPU).
+_EMBED_THREADS_ENV = "HEADROOM_EMBED_NUM_THREADS"
+_DEFAULT_EMBED_THREADS = 1
+_EMBED_CONCURRENCY_ENV = "HEADROOM_EMBED_CONCURRENCY"
+_DEFAULT_EMBED_CONCURRENCY = 4
+_BLAS_THREAD_ENV_VARS = (
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+)
+
+
+def _resolve_positive_int_env(env_var: str, default: int) -> int:
+    """Read a positive integer from ``env_var``, falling back to ``default``.
+
+    A non-positive or unparseable value logs a warning and returns a safe value
+    (>= 1) rather than disabling the limit.
+    """
+    raw = os.environ.get(env_var)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning("Invalid %s=%r; falling back to %d.", env_var, raw, default)
+        return default
+    if value < 1:
+        logger.warning("%s=%d is below 1; using 1.", env_var, value)
+        return 1
+    return value
+
+
+def _resolve_embed_thread_cap() -> int:
+    """Resolve the per-encode CPU thread cap (``HEADROOM_EMBED_NUM_THREADS``)."""
+    return _resolve_positive_int_env(_EMBED_THREADS_ENV, _DEFAULT_EMBED_THREADS)
+
+
+def _resolve_embed_concurrency() -> int:
+    """Resolve the max concurrent CPU encodes (``HEADROOM_EMBED_CONCURRENCY``).
+
+    Defaults to ``min(4, os.cpu_count())`` so embedding cannot occupy every core
+    and starve the event loop, while still allowing useful parallelism.
+    """
+    cpu = os.cpu_count() or 1
+    raw = os.environ.get(_EMBED_CONCURRENCY_ENV)
+    if raw is None:
+        return max(1, min(_DEFAULT_EMBED_CONCURRENCY, cpu))
+    return _resolve_positive_int_env(
+        _EMBED_CONCURRENCY_ENV, max(1, min(_DEFAULT_EMBED_CONCURRENCY, cpu))
+    )
+
+
+def _init_cpu_embed_worker() -> None:
+    """Pin a CPU embed worker's thread pool (runs once per worker; issue #198).
+
+    Sets BLAS/OpenMP env defaults (``setdefault`` never overrides an operator's
+    explicit setting) and bounds torch's intra-op pool for this worker thread.
+    Best-effort: failures never block embedding.
+    """
+    n = _resolve_embed_thread_cap()
+    for var in _BLAS_THREAD_ENV_VARS:
+        os.environ.setdefault(var, str(n))
+    try:
+        import torch
+
+        torch.set_num_threads(n)
+    except ImportError:
+        pass
+    except Exception as exc:  # pragma: no cover - defensive, never block embedding
+        logger.debug("Could not cap torch intra-op thread pool: %s", exc)
 
 
 def _normalize_embedding(embedding: np.ndarray) -> np.ndarray:
@@ -170,6 +267,19 @@ class LocalEmbedder:
             self._device = self._requested_device
         else:
             self._device = self._detect_device()
+
+        # CPU: run encodes on a dedicated, size-limited executor whose workers
+        # each pin their torch/BLAS/OpenMP thread pool (issue #198). Without this,
+        # N concurrent encodes on the shared default executor each fan out to
+        # ~os.cpu_count() BLAS threads and starve the asyncio event loop, spiking
+        # /livez latency. Total embed threads are bounded by workers x per-encode
+        # threads.
+        if self._device == "cpu" and self._executor is None:
+            self._executor = ThreadPoolExecutor(
+                max_workers=_resolve_embed_concurrency(),
+                thread_name_prefix="cpu-embed",
+                initializer=_init_cpu_embed_worker,
+            )
 
         # torch-MPS is not thread-safe: concurrent encode() calls from the default
         # multi-worker executor abort with "commit an already committed command

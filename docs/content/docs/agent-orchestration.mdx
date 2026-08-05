@@ -1,0 +1,125 @@
+---
+title: Agent Orchestration
+description: Keep repeated agent wakes cache-friendly while using CCR for lossless memory digest retrieval.
+---
+
+Repeated agent wakes usually rebuild the same expensive prompt shape. The useful split is simple: keep the byte-stable prefix first, keep the volatile wake-specific digest later, and keep run-specific context at the end so the repeated prefix stays cacheable.
+
+## Repeated wake anatomy
+
+Each wake tends to carry four different layers:
+
+- stable instructions, project rules, and tool contracts
+- the current task and other instruction-bearing fields
+- the volatile per-wake memory digest
+- recent loop state, tool output, and child-agent context
+
+The stable layers should stay byte-identical across wakes. The volatile layers should move to the live zone, where they can change without invalidating the cacheable prefix.
+
+## CacheAligner is detector-only
+
+CacheAligner does not rewrite messages. It inspects the prefix, emits warnings for volatile content, and records observability data so callers can fix their own assembly logic.
+
+The detector reports:
+
+| Field | What it tells you |
+|---|---|
+| `warnings` | Which parts of the prefix look unstable |
+| `cache_metrics.stable_prefix_bytes` | Size of the stable prefix in bytes |
+| `cache_metrics.stable_prefix_tokens_est` | Estimated token size of the stable prefix |
+| `cache_metrics.stable_prefix_hash` | Hash of the stable prefix for repeated-wake comparison |
+| `cache_metrics.prefix_changed` | Whether the stable prefix drifted since the last wake |
+| `cache_metrics.previous_hash` | Hash from the previous wake, when available |
+| `markers` | The emitted `stable_prefix_hash` marker for downstream observability |
+
+If CacheAligner warns about drift, keep the prefix stable in the caller. The transform is a detector, not a repair pass.
+
+## Stable prefix layout
+
+Put the byte-stable prefix first, then the live wake digest, then any run-specific context.
+
+That layout keeps the provider cache path predictable:
+
+1. Stable instructions stay identical.
+2. The wake digest changes without disturbing the cacheable prefix.
+3. Recent tool output and child-agent context stay outside the repeatable prefix.
+
+## Real wake measurements
+
+Use the issue comment guidance when measuring real wakes:
+
+| Field | Record |
+|---|---|
+| Prompt section id | Name the section that changed or repeated |
+| Byte/token estimate | Capture the section size before and after curation |
+| Digest version | Track which digest schema was used |
+| Cache-hit expectation | Note whether the section should stay cacheable |
+| Compressed size | Record the compacted payload size |
+| Section type | Mark the section as instruction-bearing or safe to compress |
+
+That checklist helps separate the repeated prefix from the volatile digest before you decide where CCR belongs.
+
+## CCR digest curation
+
+CCR keeps compression reversible. The compressed digest can stay compact while the original backing detail remains recoverable from the local store.
+
+The pieces that matter here are:
+
+- `headroom_retrieve` for on-demand recovery of stored originals
+- `HEADROOM_CCR_TTL_SECONDS` for sizing the local store lifetime
+- `compression_strategy` as the authoritative discriminator on stored CCR entries
+
+For routing decisions, the same rule in plain terms is: headroom_retrieve recovers originals, HEADROOM_CCR_TTL_SECONDS sizes the local lifetime, compression_strategy identifies the producing path, and shape inference is not the routing authority.
+
+When a stored original expires, regenerate the digest or re-read the source content. Do not infer routing from payload shape. Use the stored `compression_strategy` metadata to understand how the original was produced.
+
+## Digest routing
+
+Route fields by how much exact wording they need at wake time.
+
+| Field | Suggested handling | Why |
+|---|---|---|
+| Current task | Verbatim | It is instruction-bearing and changes the next action |
+| Hard constraints | Verbatim | These are safety and acceptance boundaries |
+| Definitions of done | Verbatim | The wording needs to survive every wake intact |
+| Irreversible decisions | Verbatim summary plus retrievable backing detail | The summary stays short, the backing detail stays exact |
+| Open threads | Compact summary plus CCR-backed backing detail | The live thread can shrink while the source stays recoverable |
+| Learnings | Compact summary | They inform the next wake without needing exact prose |
+| File/search/tool outputs | CCR-backed compression | These are large backing details that should stay retrievable |
+| Prose notes | Compact summary, CCR-backed when bulky | Keep the digest readable without losing source detail |
+| Bulk JSON-ish arrays | SmartCrusher or ContentRouter, with CCR-backed backing detail when needed | Structured blobs are usually the first thing to explode in size |
+
+The important boundary is simple: instruction-bearing fields stay verbatim, or they get a verbatim compact summary plus retrievable backing detail. CCR-backed content is the backing detail, not the instruction itself.
+
+Hard constraints stay verbatim; current task text stays verbatim; file/search/tool outputs use CCR-backed backing detail when they are large enough to compress.
+
+## Integration modes
+
+Choose the integration mode by where the orchestrator controls message assembly.
+
+| Mode | Use when | Notes |
+|---|---|---|
+| Proxy | You want spawned agents and normal client traffic to pass through a local provider endpoint | Good for `headroom proxy --mode cache` and provider base URL routing |
+| Library | The orchestrator owns message assembly and wants to shape the digest before launch | Best when the caller can decide what becomes stable prefix versus live digest |
+| MCP | Agents need on-demand compression and retrieval tools | Best when `headroom_retrieve` should be available as a tool |
+| Proxy plus MCP | You need traffic shaping and tool-level retrieval together | Useful when both the provider edge and the agent toolset matter |
+
+## Local-first deployment
+
+Keep the deployment local to the user or session:
+
+- run one local proxy or MCP process per user session
+- do not assume a central proxy
+- treat the local CCR store as process-local unless the deployment explicitly shares it
+- size the TTL for the longest realistic autonomous run
+- assume a store can expire before the run finishes, then regenerate or re-read the source content
+
+That model keeps the data boundary obvious. The orchestrator can still recover backing detail, but the cacheable prefix stays small and stable.
+
+## Source-backed caveats
+
+- Prompt-cache hits require a byte-identical stable prefix.
+- CacheAligner identifies drift, it does not repair prompt assembly.
+- CCR retrieval depends on store lifetime and stored hashes.
+- Provider-neutral guidance still applies, so keep the guide away from Orcha-specific runtime claims.
+- Use `compression_strategy` to read stored CCR intent, not payload shape.

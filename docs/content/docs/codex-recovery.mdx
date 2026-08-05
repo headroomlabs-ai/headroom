@@ -1,0 +1,79 @@
+---
+title: Recover Codex State
+description: Merge sessions and configuration left in a temporary Headroom Codex home back into the durable Codex home.
+---
+
+Older versions of `headroom wrap codex` could run Codex with a temporary `CODEX_HOME` named `headroom-codex-home-*`. Chats and configuration created during that wrapped session stayed in the temporary home, so they disappeared from the normal Codex history after the wrapper exited. This recovery migrates the retained state back into the durable Codex home without deleting either source.
+
+This procedure can recover temporary homes that still exist and pinned sources retained by an interrupted recovery. A temporary home that was already deleted cannot be reconstructed unless one of those retained copies exists. Headroom reports deleted temporary homes still referenced by the Codex thread database. It does not treat paths pasted into prompts or error messages as recovery sources. See [issue #2159](https://github.com/headroomlabs-ai/headroom/issues/2159) for the regression details.
+
+## Before you recover
+
+Close Codex and any process using the temporary or durable Codex homes. Recovery detects changes made while creating each backup and aborts, but quiet homes are required for a consistent migration.
+
+The target defaults to `$CODEX_HOME` when it is set, otherwise `~/.codex`. Check that this is the durable home you normally use before confirming the migration.
+
+## Automatic recovery
+
+The first interactive `headroom wrap codex` with the fixed version searches Python's temporary directory, `$TMPDIR`, `/tmp`, `/private/tmp`, and the macOS `/private/var/folders/*/*/T` roots for non-empty `headroom-codex-home-*` directories. If it finds any, it lists them and offers to back up and recover them before Codex starts.
+
+Declining the prompt changes nothing. You can run the manual command later.
+
+## Manual recovery
+
+Let Headroom discover retained temporary homes and `source-pinned/` copies left by interrupted or failed recovery attempts, then preview the migration:
+
+```bash
+headroom recover codex
+```
+
+If no recoverable copy remains, the command audits the durable Codex thread database, rollout files, and `history.jsonl`. It reports indexed active and archived chats, surviving rollouts missing from the thread index, and history-only records whose rollouts no longer exist. History-only prompt text cannot reconstruct a full chat transcript.
+
+Codex filters the default resume picker by the current working directory. Run `codex resume --all` yourself to display indexed chats from every working directory. Headroom does not launch Codex during recovery.
+
+To select a known temporary home and an explicit durable target:
+
+```bash
+headroom recover codex \
+  --source /path/to/headroom-codex-home-12345 \
+  --target "${CODEX_HOME:-$HOME/.codex}"
+```
+
+Repeat `--source` to merge multiple homes. Headroom shows the target and every source before asking for confirmation. Use `--yes` only in automation where those paths have already been reviewed.
+
+## What gets migrated
+
+When a source used the localhost `headroom` model provider injected by the old wrapper, recovery rewrites that provider in both SQLite thread rows and rollout `session_meta` records to the active target provider. This also repairs newer target records left by an earlier broken recovery. A user-defined remote provider named `headroom` is preserved.
+
+- `history.jsonl` and other JSONL indexes are combined without duplicate records. Malformed input is excluded from the result and copied to the backup quarantine.
+- Session rollouts under `sessions/` and `archived_sessions/` keep the newer file when the same path exists in both homes.
+- SQLite databases are merged only when their tables, indexes, triggers, views, and migration checksums are compatible. Primary-key conflicts keep rows from the newer database. Recovered thread rows are rewritten to the durable rollout path, including rows restored from a pinned source after the original temporary home was deleted.
+- `config.toml` tables are merged recursively. Values from the newer config win, and localhost Headroom routing injected by the old wrapper is removed. A user-defined remote provider is preserved.
+- Other files, including credentials and user settings, keep the newer copy. The durable target wins equal modification-time ties, and missing source files never delete target files.
+
+Sockets, lock files, SQLite journals, FIFOs, and other runtime-only artifacts are recorded but not copied.
+
+## Backups and rollback
+
+Every source is pinned before migration. The existing durable home, including its current Codex configuration, is backed up before any merge begins. Backups are owner-only and retained next to the target:
+
+```text
+<target-parent>/.headroom-codex-recovery/<timestamp-pid>/
+├── source-pinned/
+├── target-before/
+├── target-failed/     # only when a merge is rolled back
+├── manifest.json
+└── quarantine/       # only when malformed input is found
+```
+
+`target-before/` is absent when the target did not exist before recovery. `manifest.json` records copied, merged, quarantined, and skipped paths.
+
+If configuration parsing, SQLite schema validation, integrity checks, foreign-key checks, or filesystem writes fail, Headroom atomically renames the failed target to `target-failed/` before restoring `target-before/`. This avoids recursive-deletion races with SQLite runtime files and preserves the failed merge for inspection. When the target did not exist before recovery, the partial target is retained only as `target-failed/`. The pinned source and recovery backup remain available for inspection.
+
+Recovery also refuses overlapping source and target paths, target symlink traversal, and a source that changes while it is being pinned.
+
+## After recovery
+
+The command prints the retained backup path after each successful source merge. Review its `manifest.json`, then start Codex normally and confirm that the recovered chats and settings appear. Keep the backup until you have verified the durable history.
+
+Fixed versions of `headroom wrap codex` run Codex against the durable home and apply proxy routing only to the launched process, so new wrapped sessions remain visible after Headroom exits.

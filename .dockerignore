@@ -1,5 +1,9 @@
 # VCS
-.git
+.git/*
+!.git/HEAD
+!.git/packed-refs
+!.git/refs/
+!.git/refs/**
 .github
 .github/*
 !.github/plugin/

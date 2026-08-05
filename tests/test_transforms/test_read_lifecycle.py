@@ -610,3 +610,92 @@ class TestNoFilePathHandling:
         # Can't match file_path, so Read is not classified at all
         assert result.reads_total == 0
         assert result.messages[1]["content"] == LARGE_CONTENT
+
+
+class TestContentRouterIntegration:
+    """Regression: ContentRouter.transform must wire a real CCR store into
+    ReadLifecycleManager so STALE Read markers resolve via headroom_retrieve."""
+
+    def test_stale_read_marker_retrievable_via_compress(self, monkeypatch):
+        import re
+
+        # Force an in-memory backend so the test is hermetic.
+        monkeypatch.setenv("HEADROOM_CCR_BACKEND", "memory")
+
+        from headroom import compress
+        from headroom.cache.compression_store import (
+            get_compression_store,
+            reset_compression_store,
+        )
+
+        reset_compression_store()
+        try:
+            large_content = "source line\n" * 500  # above read_lifecycle min_size_bytes
+            messages = [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "t1",
+                            "name": "Read",
+                            "input": {"file_path": "/tmp/foo.txt"},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "t1",
+                            "content": large_content,
+                        }
+                    ],
+                },
+                # Edit the same file -> the Read above becomes STALE.
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "t2",
+                            "name": "Edit",
+                            "input": {"file_path": "/tmp/foo.txt"},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "t2",
+                            "content": "edited",
+                        }
+                    ],
+                },
+            ]
+
+            result = compress(messages, model="claude-sonnet-4-5-20250929")
+
+            hashes: list[str] = []
+            for m in result.messages:
+                content = m.get("content")
+                if isinstance(content, list):
+                    for b in content:
+                        if isinstance(b, dict) and b.get("type") == "tool_result":
+                            s = b.get("content", "")
+                            if isinstance(s, str):
+                                hashes.extend(re.findall(r"hash=([a-f0-9]+)", s))
+            assert hashes, "Expected a STALE Read marker with a hash"
+
+            store = get_compression_store()
+            entry = store.retrieve(hashes[0])
+            assert entry is not None, "STALE Read marker hash not in CCR store"
+            assert entry.tool_name == "Read"
+            assert entry.compression_strategy == "read_lifecycle:stale"
+        finally:
+            # Drop the memory-backend singleton so later tests in the suite
+            # see the env-driven default again.
+            reset_compression_store()

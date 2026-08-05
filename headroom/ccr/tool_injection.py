@@ -55,14 +55,6 @@ def create_ccr_tool_definition(
                         "type": "string",
                         "description": "Hash key from the compression marker (e.g., 'abc123' from hash=abc123)",
                     },
-                    "query": {
-                        "type": "string",
-                        "description": (
-                            "Optional search query to filter results. "
-                            "If provided, only returns items matching the query. "
-                            "If omitted, returns all original items."
-                        ),
-                    },
                 },
                 "required": ["hash"],
             },
@@ -88,14 +80,6 @@ def create_ccr_tool_definition(
                         "type": "string",
                         "description": "Hash key from the compression marker (e.g., 'abc123' from hash=abc123)",
                     },
-                    "query": {
-                        "type": "string",
-                        "description": (
-                            "Optional search query to filter results. "
-                            "If provided, only returns items matching the query. "
-                            "If omitted, returns all original items."
-                        ),
-                    },
                 },
                 "required": ["hash"],
             },
@@ -115,10 +99,6 @@ def create_ccr_tool_definition(
                     "hash": {
                         "type": "string",
                         "description": "Hash key from the compression marker",
-                    },
-                    "query": {
-                        "type": "string",
-                        "description": "Optional search query to filter results",
                     },
                 },
                 "required": ["hash"],
@@ -155,8 +135,7 @@ Some tool outputs have been compressed to reduce context size. If you need
 the full uncompressed data, you can retrieve it using the `{CCR_TOOL_NAME}` tool.
 
 **How to retrieve:**
-- Call `{CCR_TOOL_NAME}(hash="<hash>")` to get all original items
-- Call `{CCR_TOOL_NAME}(hash="<hash>", query="search terms")` to search within
+- Call `{CCR_TOOL_NAME}(hash="<hash>")` to get the full original content back
 
 **Available hashes:** {hash_list}
 
@@ -202,17 +181,32 @@ class CCRToolInjector:
     # - Generic: any [... compressed ... hash=xxx] pattern
     _marker_patterns: list[re.Pattern] = field(
         default_factory=lambda: [
-            # All patterns require exactly 24 hex characters for hash validation
-            # CCR uses SHA256 truncated to 24 hex chars (96 bits) for collision resistance
-            # Requiring exact length prevents hash spoofing attacks with shorter hashes
+            # Hash length is validated by the patterns themselves. Legacy
+            # bracket markers carry a 24-hex-char hash (SHA-256[:24], 96 bits
+            # for collision resistance); SmartCrusher's `<<ccr:>>` markers carry
+            # a 12-hex-char hash (see transforms/smart_crusher.py and
+            # cache/compression_store.py). Both real lengths are accepted.
             #
             # Standard format: [N <type> compressed to M. Retrieve more: hash=xxx]
             # Matches items, lines, matches, or any other type
             re.compile(r"\[(\d+) \w+ compressed to (\d+)\. Retrieve more: hash=([a-f0-9]{24})\]"),
             # Legacy format without "to M" or "Retrieve more:" (old TextCompressor)
             re.compile(r"\[(\d+) \w+ compressed\. hash=([a-f0-9]{24})\]"),
-            # Generic fallback: any compression marker with hash (exactly 24 chars)
+            # Generic fallback: any bracket compression marker with hash (exactly 24 chars)
             re.compile(r"\[.*?compressed.*?hash=([a-f0-9]{24})\]", re.IGNORECASE),
+            # SmartCrusher markers: the row-drop summary
+            # `<<ccr:HASH N_rows_offloaded>>` and the opaque-blob form
+            # `<<ccr:HASH,KIND,SIZE>>`. HASH is 12-24 hex chars, terminated by a
+            # space, comma, or the closing `>>`.
+            re.compile(r"<<ccr:([a-f0-9]{12,24})\b"),
+            # read_lifecycle STALE/SUPERSEDED markers:
+            # `[Read content stale/superseded: ... Retrieve original: hash=xxx]`.
+            # These carry a retrievable CCR hash but never contain the word
+            # "compressed", so the patterns above miss them -- and the retrieve
+            # tool is then not injected, leaving the model a marker it cannot
+            # redeem (silent data loss, #1006). Match the load-bearing
+            # "Retrieve original: hash=" phrase directly.
+            re.compile(r"Retrieve original: hash=([a-f0-9]{12,24})"),
         ]
     )
 
@@ -458,52 +452,81 @@ class CCRToolInjector:
 def parse_tool_call(
     tool_call: dict[str, Any],
     provider: str = "anthropic",
-) -> tuple[str | None, str | None]:
-    """Parse a CCR tool call to extract hash and query.
+) -> str | None:
+    """Parse a CCR tool call to extract the content hash.
 
     Args:
         tool_call: The tool call object from the LLM response.
         provider: The provider type for format detection.
 
     Returns:
-        Tuple of (hash, query) or (None, None) if not a CCR tool call.
+        The hash key, or None if this is not a (valid) CCR tool call.
     """
     # Get tool name and input data based on provider format
     if provider == "anthropic":
         name = tool_call.get("name")
         input_data = tool_call.get("input", {})
     elif provider == "openai":
-        function = tool_call.get("function", {})
+        # `get("function", {})` returns None for an explicit {"function": null}
+        # (the default only applies to a missing key), so `.get` below would
+        # raise AttributeError on a malformed/partial tool call. Coalesce to {}.
+        function = tool_call.get("function") or {}
         name = function.get("name")
         # OpenAI passes args as JSON string
         args_str = function.get("arguments", "{}")
         try:
             input_data = json.loads(args_str)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, TypeError):
+            # TypeError covers a null/None `arguments` value (json.loads(None)).
             input_data = {}
     elif provider == "google":
         # Google/Gemini format: {"functionCall": {"name": "...", "args": {...}}}
-        function_call = tool_call.get("functionCall", {})
+        # Coalesce to {} so an explicit {"functionCall": null} does not crash.
+        function_call = tool_call.get("functionCall") or {}
         name = function_call.get("name")
         input_data = function_call.get("args", {})
+    elif provider == "openai_responses":
+        # Responses API: flat `function_call` item — name and arguments
+        # live directly on it, not nested under "function" like chat
+        # completions tool_calls.
+        name = tool_call.get("name")
+        args_str = tool_call.get("arguments", "{}")
+        try:
+            input_data = json.loads(args_str)
+        except (json.JSONDecodeError, TypeError):
+            # TypeError covers a null/None `arguments` value (json.loads(None)).
+            input_data = {}
     else:
         # Generic fallback
         name = tool_call.get("name")
         input_data = tool_call.get("input", tool_call.get("args", {}))
 
     if name != CCR_TOOL_NAME:
-        return None, None
+        return None
+
+    # A CCR-named tool call whose decoded arguments/input are not an object
+    # (a JSON array/string/number, or a non-dict Anthropic `input`) is simply
+    # not a valid CCR call — return None instead of crashing on `.get`.
+    if not isinstance(input_data, dict):
+        return None
 
     hash_key = input_data.get("hash")
-    query = input_data.get("query")
+    if hash_key is None:
+        return None
 
-    # Validate hash format: must be exactly 24 hex characters
-    # This prevents hash spoofing attacks with malformed hashes
-    if hash_key is not None:
-        if not isinstance(hash_key, str) or len(hash_key) != 24:
-            return None, None
-        # Validate hex characters only
-        if not all(c in "0123456789abcdef" for c in hash_key.lower()):
-            return None, None
+    # Validate hash format. SmartCrusher emits 12-hex-char hashes while legacy
+    # bracket markers / the compression_store use 24-hex-char hashes; accept
+    # either real length and reject anything else as malformed.
+    if not isinstance(hash_key, str) or len(hash_key) not in (12, 24):
+        return None
+    # Validate hex characters only
+    if not all(c in "0123456789abcdef" for c in hash_key.lower()):
+        return None
 
-    return hash_key, query
+    # Normalise to lowercase. The compression store always keys entries by a
+    # lowercase hash (sha256 hexdigest, and `explicit_hash.lower()` on store),
+    # and `retrieve` / `get_entry_status` look up the key verbatim. The hex
+    # validation above is already case-insensitive, so a model that echoes the
+    # marker hash uppercase passed validation but then missed the store lookup,
+    # failing an otherwise-valid retrieval. Return the canonical lowercase form.
+    return hash_key.lower()

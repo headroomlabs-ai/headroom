@@ -42,7 +42,7 @@ pub enum CcrBackendConfig {
 }
 
 impl CcrBackendConfig {
-    /// Production default: SQLite at `path`, 5-minute TTL.
+    /// Production default: SQLite at `path`, 30-minute TTL.
     pub fn sqlite_default(path: PathBuf) -> Self {
         Self::Sqlite {
             path,

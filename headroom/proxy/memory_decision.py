@@ -33,7 +33,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from headroom.proxy.helpers import _headroom_bypass_enabled
+from headroom.proxy.memory_decision_policy import (
+    apply_memory_skip_reason,
+    decide_memory_injection,
+)
 
 
 @dataclass(frozen=True)
@@ -96,36 +99,20 @@ class MemoryDecision:
             Comes from ``get_memory_injection_mode()`` which reads
             ``HEADROOM_MEMORY_INJECTION_MODE``.
         """
-        bypass = _headroom_bypass_enabled(headers)
-        has_handler = memory_handler is not None
-        has_user = bool(memory_user_id)
-
-        if bypass:
-            reason: str | None = "bypass_header"
-            inject = False
-        elif not has_handler:
-            reason = "no_handler"
-            inject = False
-        elif not has_user:
-            reason = "no_user_id"
-            inject = False
-        elif mode_name == "disabled":
-            reason = "mode_disabled"
-            inject = False
-        elif mode_name == "tool":
-            reason = "mode_tool"
-            inject = False
-        else:
-            reason = None
-            inject = True
+        decision = decide_memory_injection(
+            headers=headers,
+            memory_handler_present=memory_handler is not None,
+            memory_user_id_present=bool(memory_user_id),
+            mode_name=mode_name,
+        )
 
         return cls(
-            inject=inject,
-            skip_reason=reason,
-            bypass_header_set=bypass,
-            memory_handler_present=has_handler,
-            memory_user_id_present=has_user,
-            mode_name=mode_name,
+            inject=decision.inject,
+            skip_reason=decision.skip_reason,
+            bypass_header_set=decision.bypass_header_set,
+            memory_handler_present=decision.memory_handler_present,
+            memory_user_id_present=decision.memory_user_id_present,
+            mode_name=decision.mode_name,
         )
 
     def apply_to_tags(self, tags: dict[str, str]) -> None:
@@ -140,5 +127,4 @@ class MemoryDecision:
         same path the funnel already uses for ``client`` and
         ``passthrough_reason``.
         """
-        if self.skip_reason is not None:
-            tags["memory_skip_reason"] = self.skip_reason
+        apply_memory_skip_reason(tags, self.skip_reason)

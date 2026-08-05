@@ -15,6 +15,7 @@ from headroom.perf.analyzer import (
     PerfRecord,
     PerfReport,
     TransformRecord,
+    build_overhead_summary,
     build_perf_summary,
     perf_records_as_dicts,
 )
@@ -116,6 +117,49 @@ def test_build_perf_summary_empty_report_no_zero_division():
     assert summary["savings_pct"] == 0.0
     assert summary["cache_hit_pct"] == 0.0
     assert summary["by_model"] == []
+    assert summary["overhead"]["optimization_ms"]["count"] == 0
+
+
+def test_build_overhead_summary_attributes_slow_stages():
+    report = PerfReport(
+        perf_records=[
+            PerfRecord(
+                timestamp="2026-06-05 10:00:00,000",
+                request_id="fast",
+                model="gpt-5",
+                tokens_before=1000,
+                tokens_after=500,
+                tokens_saved=500,
+                optimization_ms=100.0,
+                total_ms=300.0,
+                stages={"cache_align": 10.0, "content_router": 90.0},
+            ),
+            PerfRecord(
+                timestamp="2026-06-05 10:01:00,000",
+                request_id="slow",
+                model="gpt-5",
+                tokens_before=1000,
+                tokens_after=500,
+                tokens_saved=500,
+                optimization_ms=700.0,
+                total_ms=900.0,
+                stages={"kompress": 650.0, "content_router": 40.0},
+            ),
+        ]
+    )
+
+    overhead = build_overhead_summary(report, slow_threshold_ms=500.0)
+
+    assert overhead["optimization_ms"]["count"] == 2
+    assert overhead["optimization_ms"]["average_ms"] == 400.0
+    assert overhead["optimization_ms"]["p50_ms"] == 400.0
+    assert overhead["optimization_ms"]["p95_ms"] == 670.0
+    assert overhead["optimization_ms"]["p99_ms"] == 694.0
+    assert overhead["optimization_ms"]["slow_request_count"] == 1
+    assert overhead["stage_breakdown"][0]["stage"] == "kompress"
+    assert overhead["stage_breakdown"][0]["total_ms"] == 650.0
+    assert overhead["top_slow_requests"][0]["request_id"] == "slow"
+    assert overhead["top_slow_requests"][0]["slowest_stage"] == "kompress"
 
 
 def test_perf_records_as_dicts_roundtrips_fields():
@@ -144,6 +188,7 @@ def test_perf_json_format(runner, monkeypatch):
     assert data["savings_pct"] == 50.0
     assert "by_model" in data
     assert data["total_requests"] == 2
+    assert data["overhead"]["optimization_ms"]["p95_ms"] == 11.8
 
 
 def test_perf_json_raw_is_array(runner, monkeypatch):
@@ -214,6 +259,7 @@ def test_perf_text_default_unchanged(runner, monkeypatch):
     result = runner.invoke(main, ["perf"])
     assert result.exit_code == 0, result.output
     assert "Headroom Performance Report" in result.output
+    assert "p50/p95/p99" in result.output
 
 
 def test_perf_rejects_unknown_format(runner, monkeypatch):
@@ -239,3 +285,76 @@ def test_parse_perf_line_preserves_blank_client_field(
 
     assert len(report.perf_records) == 1
     assert report.perf_records[0].client == ""
+
+
+def test_throughput_parsing_and_calculations(monkeypatch, tmp_path):
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+    monkeypatch.setattr(analyzer, "LOG_DIR", logs_dir)
+
+    log_content = (
+        '2026-06-10 10:00:00,000 - headroom.proxy - INFO - [req1] STAGE_TIMINGS {"event": "stage_timings", "stages": {"compression_first_stage": 100.0, "upstream_connect": 50.0}}\n'
+        "2026-06-10 10:00:01,000 - headroom.proxy - INFO - [req1] PERF model=gpt-5 msgs=1 tok_before=1000 tok_after=400 tok_saved=600 opt_ms=10 total_ms=500 tok_out=500 ttfb_ms=100 transforms=test client=codex\n"
+        '2026-06-10 10:00:02,000 - headroom.proxy - INFO - [req2] STAGE_TIMINGS {"event": "stage_timings", "stages": {"compression": 200.0, "upstream_connect": 50.0}}\n'
+        "2026-06-10 10:00:03,000 - headroom.proxy - INFO - [req2] PERF model=gpt-5 msgs=1 tok_before=2000 tok_after=1000 tok_saved=1000 opt_ms=20 total_ms=1000 tok_out=1000 ttfb_ms=200 transforms=test client=codex\n"
+        "2026-06-10 10:00:05,000 - headroom.proxy - INFO - [req3] PERF model=gpt-5 msgs=1 tok_before=1500 tok_after=500 tok_saved=1000 opt_ms=15 total_ms=600 tok_out=600 ttfb_ms=150 transforms=test client=codex\n"
+        '2026-06-10 10:00:06,000 - headroom.proxy - INFO - [req4] STAGE_TIMINGS {"event": "stage_timings", "stages": {"compression_first_stage": 150.0, "upstream_connect": 50.0}}\n'
+        "2026-06-10 10:00:07,000 - headroom.proxy - INFO - [req4] PERF model=gpt-5 msgs=1 tok_before=1200 tok_after=300 tok_saved=900 opt_ms=12 total_ms=400 tok_out=400 ttfb_ms=80 transforms=test client=codex\n"
+        '2026-06-10 10:00:08,000 - headroom.proxy - INFO - [req5] STAGE_TIMINGS {"event": "stage_timings", "stages": {"compression_first_stage": 50.0, "upstream_connect": 50.0}}\n'
+        "2026-06-10 10:00:09,000 - headroom.proxy - INFO - [req5] PERF model=gpt-5 msgs=1 tok_before=800 tok_after=200 tok_saved=600 opt_ms=5 total_ms=300 tok_out=300 ttfb_ms=50 transforms=test client=codex\n"
+    )
+    (logs_dir / "proxy.log").write_text(log_content, encoding="utf-8")
+
+    report = analyzer.parse_log_files(last_n_hours=0)
+
+    assert len(report.perf_records) == 5
+
+    assert report.perf_records[0].request_id == "req1"
+    assert report.perf_records[0].total_ms == 500.0
+    assert report.perf_records[0].tokens_out == 500
+    assert report.perf_records[0].ttfb_ms == 100.0
+    assert report.perf_records[0].stages == {
+        "compression_first_stage": 100.0,
+        "upstream_connect": 50.0,
+    }
+
+    assert report.perf_records[2].request_id == "req3"
+    assert report.perf_records[2].stages == {}
+
+    summary = build_perf_summary(report)
+    assert "throughput" in summary
+    tp = summary["throughput"]
+
+    rolling = tp["rolling"]
+    assert rolling["input_wall_clock"] > 0
+    assert rolling["input_active_p50"] == 2500.0
+    assert rolling["compression_p50"] == 10000.0
+
+
+def test_throughput_empty_and_percentiles():
+    from headroom.perf.analyzer import (
+        PerfReport,
+        _calculate_throughput_stats,
+        _percentile,
+        calculate_throughput,
+    )
+
+    # Empty percentiles
+    assert _percentile([], 0.5) == 0.0
+
+    # Percentiles boundary checks
+    assert _percentile([10.0], 0.5) == 10.0
+    assert _percentile([10.0, 20.0], 0.5) == 15.0
+    assert _percentile([10.0, 20.0], 0.0) == 10.0
+    assert _percentile([10.0, 20.0], 1.0) == 20.0
+    assert _percentile([10.0, 20.0], 1.5) == 20.0
+
+    # Empty calculate_throughput
+    empty_report = PerfReport()
+    tp = calculate_throughput(empty_report)
+    assert tp["rolling"]["input_wall_clock"] == 0.0
+    assert tp["current"]["input_wall_clock"] == 0.0
+
+    # _calculate_throughput_stats with empty records
+    stats = _calculate_throughput_stats([], 10.0)
+    assert stats["input_wall_clock"] == 0.0

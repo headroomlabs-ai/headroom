@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from headroom.tokenizers import get_tokenizer
+from headroom.tokenizers.base import count_content_blocks
 
 from .base import Provider
 
@@ -84,10 +85,24 @@ _DEFAULT_CONTEXT_LIMITS: dict[str, int] = {
     "qwen2-72b": 32768,
     "qwen2.5": 131072,
     # DeepSeek
-    "deepseek": 32768,
-    "deepseek-coder": 16384,
+    "deepseek": 1048576,
+    "deepseek-coder": 128000,
+    "deepseek-coder-v2": 128000,
+    "deepseek-coder-v2-lite": 128000,
     "deepseek-v2": 128000,
-    "deepseek-v3": 128000,
+    "deepseek-v2-lite": 128000,
+    "deepseek-v3": 1048576,
+    "deepseek-v3-0324": 128000,
+    "deepseek-v3.2": 128000,
+    "deepseek-r1": 131072,
+    "deepseek-r1-0528": 131072,
+    "deepseek-reasoner": 131072,
+    "deepseek-v4": 1048576,
+    "deepseek-v4-pro": 1_000_000,
+    "deepseek-v4-flash": 1_000_000,
+    "deepseek-chat": 131072,
+    "deepseek-r1-distill-qwen": 131072,
+    "deepseek-r1-distill-llama": 131072,
     # Yi
     "yi": 32768,
     "yi-34b": 32768,
@@ -145,12 +160,16 @@ class OpenAICompatibleTokenCounter:
             if isinstance(content, str):
                 tokens += self.count_text(content)
             elif isinstance(content, list):
-                for part in content:
-                    if isinstance(part, dict):
-                        if part.get("type") == "text":
-                            tokens += self.count_text(part.get("text", ""))
-                    elif isinstance(part, str):
-                        tokens += self.count_text(part)
+                # Delegate to the audited shared walker instead of a partial
+                # per-provider one. Each provider counter had grown its own
+                # shortened branch list, so every modern block priced at ~0:
+                # measured on a 6,800-char block this returned 8 tokens for
+                # tool_result, thinking, document, mcp_tool_result — and for
+                # output_text / refusal, which are OpenAI's OWN Responses shapes.
+                # The shared walker is also image-safe: a 200KB base64 image gets
+                # a pixel-based 1600, not the ~50K phantom text tokens a naive
+                # str(block) catch-all would produce.
+                tokens += count_content_blocks(content, self.count_text)
 
         name = message.get("name")
         if name:

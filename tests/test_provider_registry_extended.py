@@ -102,22 +102,48 @@ def test_create_proxy_backend_uses_injected_backend_types() -> None:
         anyllm_provider="groq",
         bedrock_region=None,
         logger=logger,
-        anyllm_backend_cls=lambda provider: {"kind": "anyllm", "provider": provider},
+        anyllm_backend_cls=lambda provider, api_base: {
+            "kind": "anyllm",
+            "provider": provider,
+            "api_base": api_base,
+        },
     )
     litellm = create_proxy_backend(
         backend="bedrock",
         anyllm_provider="ignored",
         bedrock_region="us-east-1",
         logger=logger,
-        litellm_backend_cls=lambda provider, region: {
+        litellm_backend_cls=lambda provider, region, profile_name=None: {
             "kind": "litellm",
             "provider": provider,
             "region": region,
         },
     )
 
-    assert anyllm == {"kind": "anyllm", "provider": "groq"}
+    assert anyllm == {"kind": "anyllm", "provider": "groq", "api_base": None}
     assert litellm == {"kind": "litellm", "provider": "bedrock", "region": "us-east-1"}
+
+
+def test_create_proxy_backend_passes_openai_api_url_to_anyllm() -> None:
+    """Regression for #942: --openai-api-url must reach the any-llm backend."""
+    logger = logging.getLogger("test")
+
+    anyllm = create_proxy_backend(
+        backend="anyllm",
+        anyllm_provider="openai",
+        bedrock_region=None,
+        logger=logger,
+        openai_api_url="https://custom-provider.example/v1",
+        anyllm_backend_cls=lambda provider, api_base: {
+            "provider": provider,
+            "api_base": api_base,
+        },
+    )
+
+    assert anyllm == {
+        "provider": "openai",
+        "api_base": "https://custom-provider.example/v1",
+    }
 
 
 def test_create_proxy_backend_handles_missing_or_direct_backends(
@@ -138,7 +164,9 @@ def test_create_proxy_backend_handles_missing_or_direct_backends(
             anyllm_provider="groq",
             bedrock_region=None,
             logger=logger,
-            anyllm_backend_cls=lambda provider: (_ for _ in ()).throw(ImportError("missing")),
+            anyllm_backend_cls=lambda provider, api_base: (_ for _ in ()).throw(
+                ImportError("missing")
+            ),
         )
 
     assert direct is None

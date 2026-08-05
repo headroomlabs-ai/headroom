@@ -27,6 +27,7 @@ History: this module previously wrapped `sentence-transformers`
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING
 
 from .base import RelevanceScore, RelevanceScorer
@@ -58,6 +59,26 @@ logger = logging.getLogger(__name__)
 
 # Default model name. Same string used by the Rust embedding scorer.
 DEFAULT_MODEL_NAME = "BAAI/bge-small-en-v1.5"
+
+# Pinned revision of fastembed's underlying HF repo for the default model
+# (fastembed resolves "BAAI/bge-small-en-v1.5" -> "qdrant/bge-small-en-v1.5-onnx-q").
+# fastembed's TextEmbedding signature omits ``revision`` but forwards **kwargs to
+# huggingface_hub.snapshot_download, so passing it pins the download for
+# supply-chain integrity. Only the default model is pinned; custom models float.
+# Set HEADROOM_HF_PIN=off to bypass (mirrors headroom.onnx_runtime pinning).
+_DEFAULT_MODEL_PINNED_REVISION = "52398278842ec682c6f32300af41344b1c0b0bb2"
+
+
+def _pinned_revision(model_name: str) -> str | None:
+    """Return the pinned HF revision for ``model_name`` (default model only).
+
+    Returns ``None`` for custom models or when ``HEADROOM_HF_PIN=off``.
+    """
+    if os.environ.get("HEADROOM_HF_PIN", "").strip().lower() in ("off", "0", "false", "no"):
+        return None
+    if model_name == DEFAULT_MODEL_NAME:
+        return _DEFAULT_MODEL_PINNED_REVISION
+    return None
 
 
 def _cosine_similarity(a, b) -> float:
@@ -150,7 +171,12 @@ class EmbeddingScorer(RelevanceScorer):
         if self._model is None:
             from fastembed import TextEmbedding
 
-            self._model = TextEmbedding(model_name=self.model_name)
+            revision = _pinned_revision(self.model_name)
+            if revision is not None:
+                # fastembed forwards **kwargs to snapshot_download(revision=...).
+                self._model = TextEmbedding(model_name=self.model_name, revision=revision)
+            else:
+                self._model = TextEmbedding(model_name=self.model_name)
         return self._model
 
     def _encode(self, texts: list[str]):
