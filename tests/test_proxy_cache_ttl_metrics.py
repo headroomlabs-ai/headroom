@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
 import pytest
 
@@ -465,7 +466,7 @@ def test_proxy_wires_ignore_policy_into_router_and_watcher(monkeypatch: pytest.M
     router = proxy.anthropic_pipeline.transforms[-1]
     assert router.config.ignore_policy.is_ignored("CLAUDE.md", "compress")
     assert not router.config.ignore_policy.is_ignored("AGENTS.md", "compress")
-    assert captured["project_dir"] == proxy.project_dir
+    assert captured["project_dir"] == Path.cwd()
     assert isinstance(captured["ignore_config"], IgnoreConfig)
     assert captured["ignore_config"].memory == ["AGENTS.md"]
 

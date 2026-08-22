@@ -520,6 +520,8 @@ class TestHomeDirectoryContext:
 
         global_md = fake_home / ".claude" / "CLAUDE.md"
         assert global_md.exists()
+        assert "Use uv" in global_md.read_text()
+        assert not (fake_home / "CLAUDE.local.md").exists()
 
 
 class TestCodexWriter:
@@ -595,8 +597,6 @@ class TestGeminiWriter:
 
         assert not (proj.project_path / "GEMINI.md").exists()
         assert any("GEMINI.md" in w for w in result.warnings)
-        assert "Use uv" in global_md.read_text()
-        assert not (fake_home / "CLAUDE.local.md").exists()
 
 
 class TestParsePriorRecommendations:

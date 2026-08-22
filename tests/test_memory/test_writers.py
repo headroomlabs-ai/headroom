@@ -345,7 +345,9 @@ class TestCursorWriter:
         entries = [
             MemoryEntry(content="duplicate memory entry", importance=1.0),
             MemoryEntry(content="duplicate memory entry", importance=0.5),
-            MemoryEntry(content="another unique entry that exceeds the remaining budget", importance=0.9),
+            MemoryEntry(
+                content="another unique entry that exceeds the remaining budget", importance=0.9
+            ),
         ]
 
         result = writer.export(entries, dry_run=True)
