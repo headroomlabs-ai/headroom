@@ -854,6 +854,17 @@ class TestDoctorCommand:
         assert ignore_check["status"] == "pass"
         assert "2 active rule(s)" in ignore_check["summary"]
 
+    def test_ignore_rules_check_surfaces_loading_warnings(self, runner, isolated, monkeypatch):
+        monkeypatch.setattr(doctor_mod, "probe_json", self._probe(LIVEZ_OK, STATS_OK))
+        (isolated / ".headroomignore").write_text("!README.md\n")
+        monkeypatch.chdir(isolated)
+        result = runner.invoke(main, ["doctor", "--json"])
+        payload = json.loads(result.output)
+        ignore_check = next(c for c in payload["checks"] if c["name"] == "ignore-rules")
+        assert ignore_check["status"] == "warn"
+        assert "problem(s) loading ignore rules" in ignore_check["summary"]
+        assert "negation" in (ignore_check["hint"] or "")
+
     def test_port_option_changes_probe_url(self, runner, isolated, monkeypatch):
         seen: list[str] = []
 

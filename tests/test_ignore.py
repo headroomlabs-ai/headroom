@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from headroom.config import HeadroomConfig, IgnoreConfig
-from headroom.ignore import IgnorePolicy, is_path_ignored
+from headroom.ignore import IgnorePolicy, is_path_ignored, load_ignore_policy
 
 
 def _write(path: Path, content: str = "") -> Path:
@@ -158,6 +158,11 @@ class TestRootRelativeMatching:
         # relativized against root.
         assert policy.is_ignored(outside, "mutate")
 
+    def test_dot_slash_relative_path_is_normalized(self, tmp_path: Path) -> None:
+        config = IgnoreConfig(paths=["CLAUDE.md"])
+        policy = IgnorePolicy.load(tmp_path, config)
+        assert policy.is_ignored("./CLAUDE.md", "mutate")
+
 
 class TestDiagnostics:
     """7. Diagnostics/debug output includes active ignore rules."""
@@ -219,6 +224,14 @@ class TestMalformedConfig:
         assert policy.warnings
         assert "could not read" in policy.warnings[0]
 
+    def test_broken_config_object_surfaces_warning(self, tmp_path: Path) -> None:
+        class BrokenConfig:
+            def __getattr__(self, name: str) -> object:
+                raise TypeError(f"boom for {name}")
+
+        policy = IgnorePolicy.load(tmp_path, BrokenConfig())
+        assert any("could not load ignore rules from config" in w for w in policy.warnings)
+
 
 class TestCarlFixture:
     """8. Representative cARL-style fixture."""
@@ -267,6 +280,11 @@ class TestConvenienceFunction:
         _write(tmp_path / ".headroomignore", "CLAUDE.md\n")
         assert is_path_ignored("CLAUDE.md", "mutate", root=tmp_path)
         assert not is_path_ignored("README.md", "mutate", root=tmp_path)
+
+    def test_load_ignore_policy_wrapper(self, tmp_path: Path) -> None:
+        _write(tmp_path / ".headroomignore", "AGENTS.md\n")
+        policy = load_ignore_policy(tmp_path)
+        assert policy.is_ignored("AGENTS.md", "mutate")
 
 
 class TestGlobSemantics:

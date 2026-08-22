@@ -313,6 +313,47 @@ class TestCursorWriter:
         assert not mdc_path.exists()
         assert any("ignored for mutation" in w for w in result.warnings)
 
+    def test_config_ignore_mutate_blocks_export(self, tmp_path: Path):
+        from headroom.config import HeadroomConfig, IgnoreConfig
+
+        writer = CursorMemoryWriter(project_path=tmp_path)
+        result = writer.export(
+            _make_entries(3),
+            dry_run=False,
+            config=HeadroomConfig(ignore=IgnoreConfig(mutate=[".cursor/rules/**"])),
+        )
+
+        assert not (tmp_path / ".cursor" / "rules" / "headroom-memory.mdc").exists()
+        assert any(".cursor/rules/**" in w for w in result.warnings)
+
+    def test_existing_mdc_without_markers_appends_section(self, tmp_path: Path):
+        mdc_dir = tmp_path / ".cursor" / "rules"
+        mdc_dir.mkdir(parents=True)
+        mdc_file = mdc_dir / "headroom-memory.mdc"
+        mdc_file.write_text("---\ndescription: test\nalwaysApply: true\n---\n\n# Header\n")
+
+        writer = CursorMemoryWriter(project_path=tmp_path)
+        writer.export(_make_entries(2), dry_run=False)
+
+        content = mdc_file.read_text()
+        assert "# Header" in content
+        assert MARKER_START in content
+        assert "Test memory entry" in content
+
+    def test_budget_and_dedup_stats_are_reported(self, tmp_path: Path):
+        writer = CursorMemoryWriter(project_path=tmp_path, token_budget=20)
+        entries = [
+            MemoryEntry(content="duplicate memory entry", importance=1.0),
+            MemoryEntry(content="duplicate memory entry", importance=0.5),
+            MemoryEntry(content="another unique entry that exceeds the remaining budget", importance=0.9),
+        ]
+
+        result = writer.export(entries, dry_run=True)
+
+        assert result.memories_exported == 1
+        assert result.memories_skipped_dedup == 1
+        assert result.memories_skipped_budget == 1
+
 
 # =============================================================================
 # Codex Writer Tests
