@@ -11,6 +11,7 @@ from headroom.learn.writer import (
     ClaudeCodeWriter,
     CodexWriter,
     GeminiWriter,
+    GrokWriter,
     _merge_into_file,
     _parse_prior_recommendations,
     _read_text_tolerant,
@@ -300,6 +301,20 @@ class TestIgnorePolicyEnforcement:
         claude_local = proj.project_path / "CLAUDE.local.md"
         assert claude_local.exists()
         assert result.warnings == []
+
+    def test_grok_writer_accepts_config_and_honors_ignore(self, tmp_path):
+        from headroom.config import HeadroomConfig, IgnoreConfig
+
+        proj = _project(tmp_path)
+        writer = GrokWriter()
+        recs = [_rec(RecommendationTarget.CONTEXT_FILE, "Environment", "- Use uv")]
+        config = HeadroomConfig(ignore=IgnoreConfig(mutate=["GROK.md"]))
+
+        result = writer.write(recs, proj, dry_run=False, config=config)
+
+        assert not (proj.project_path / "GROK.md").exists()
+        assert result.files_written == []
+        assert any("ignored for mutation" in w for w in result.warnings)
 
     def test_config_ignore_mutate_blocks_context_file_write(self, tmp_path):
         """HeadroomConfig.ignore.mutate — not just .headroomignore — is honored.

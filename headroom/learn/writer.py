@@ -469,6 +469,7 @@ class GrokWriter(ContextWriter):
         recommendations: list[Recommendation],
         project: ProjectInfo,
         dry_run: bool = True,
+        config: object | None = None,
     ) -> WriteResult:
         result = WriteResult()
         result.dry_run = dry_run
@@ -477,6 +478,8 @@ class GrokWriter(ContextWriter):
             return result
 
         grok_md = project.context_file or (project.project_path / "GROK.md")
+        if _mutation_blocked(grok_md, project, result, config):
+            return result
         full_content = _merge_into_file(grok_md, recommendations)
         result.add(grok_md, full_content)
         if not dry_run:
