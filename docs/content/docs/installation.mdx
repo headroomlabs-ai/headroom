@@ -87,7 +87,7 @@ pip install "headroom-ai[all]"
 | `ml` | PyTorch/Hugging Face Kompress backend and model tooling | `pip install "headroom-ai[ml]"` |
 | `code` | CodeCompressor (tree-sitter AST parsing) | `pip install "headroom-ai[code]"` |
 | `memory` | Persistent memory (sqlite-vec, sentence-transformers) — pure-Python default backend, no compiler | `pip install "headroom-ai[memory]"` |
-| `vector` | Optional HNSW vector backend (hnswlib) — needs a C++ toolchain; **not in `[all]`** | `pip install "headroom-ai[vector]"` |
+| `vector` | Optional HNSW vector backend (hnswlib) — needs a C++ toolchain and, on distro Python, development headers; **not in `[all]`** | `pip install "headroom-ai[vector]"` |
 | `memory-stack` | Optional Qdrant + Neo4j memory backend helpers; **not in `[all]`** | `pip install "headroom-ai[memory-stack]"` |
 | `relevance` | fastembed-based relevance scoring (BAAI/bge-small-en-v1.5, ONNX) | `pip install "headroom-ai[relevance]"` |
 | `image` | Image compression (Pillow, ONNX runtime, OCR) | `pip install "headroom-ai[image]"` |

@@ -416,8 +416,9 @@ docker pull ghcr.io/headroomlabs-ai/headroom:latest
 ```
 
 Granular extras: `[proxy]`, `[mcp]`, `[ml]` (Kompress-v2-base), `[code]`,
-`[memory]`, `[vector]` (optional HNSW backend — needs a C++ toolchain, not in
-`[all]`), `[relevance]`, `[image]`, `[agno]`, `[langchain]`, `[evals]`,
+`[memory]`, `[vector]` (optional HNSW backend — needs a C++ toolchain and, on
+distro Python, development headers; not in `[all]`), `[relevance]`, `[image]`,
+`[agno]`, `[langchain]`, `[evals]`,
 `[pytorch-mps]` (Apple-GPU memory-embedder offload — set
 `HEADROOM_EMBEDDER_RUNTIME=pytorch_mps`). Requires **Python 3.10+**.
 
@@ -749,6 +750,7 @@ Caveman, or any other MCP server, and Headroom compresses downstream of all of i
 ```bash
 git clone https://github.com/headroomlabs-ai/headroom.git && cd headroom
 uv sync --extra dev && uv run pytest
+# Add `--extra vector` if you need the optional HNSW backend/tests.
 ```
 
 Devcontainers in `.devcontainer/` (default, plus `memory-stack` with Qdrant and

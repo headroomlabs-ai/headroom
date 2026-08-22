@@ -137,8 +137,9 @@ memory = [
     "sqlite-vec>=0.1.6",
     "sentence-transformers>=2.2.0,<7.0; sys_platform != 'darwin' or platform_machine != 'x86_64'",
 ]
-# Optional HNSW vector backend. Needs a C++ toolchain to build hnswlib, so it is
-# kept out of [memory] and [all]; opt in with `pip install headroom-ai[vector]`
+# Optional HNSW vector backend. Needs a C++ toolchain (and, on distro-managed
+# Python installs, Python development headers) to build hnswlib, so it is kept
+# out of [memory], [dev], and [all]; opt in with `pip install headroom-ai[vector]`
 # and select it via MemoryConfig(vector_backend=VectorBackend.HNSW). The default
 # sqlite-vec backend needs no compiler.
 vector = [
@@ -302,7 +303,6 @@ dev = [
     "opentelemetry-exporter-otlp-proto-http>=1.24.0",
     "ollama>=0.4.0",
     "langchain-ollama>=0.2.0",
-    "hnswlib>=0.8.0",
     "sqlite-vec>=0.1.6",
     "sentence-transformers>=2.2.0,<7.0",
     "numpy>=1.24.0",
