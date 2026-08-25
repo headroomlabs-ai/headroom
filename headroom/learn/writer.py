@@ -90,6 +90,8 @@ def _mutation_blocked(
     project: ProjectInfo,
     result: WriteResult,
     config: object | None = None,
+    *,
+    action: str = "writing",
 ) -> bool:
     """Return True and record a warning if ``target_path`` is ignored for mutation.
 
@@ -112,7 +114,7 @@ def _mutation_blocked(
     if rule is None:
         return False
     result.warnings.append(
-        f"Skipped writing {target_path}: ignored for mutation by rule "
+        f"Skipped {action} {target_path}: ignored for mutation by rule "
         f"'{rule.pattern}' (from {rule.source})."
     )
     return True
@@ -290,7 +292,7 @@ class ClaudeCodeWriter(ContextWriter):
                 # Migrate any stale block left in the team-shared CLAUDE.md by
                 # older headroom versions into the new target, then strip it
                 # from CLAUDE.md so the shared file is no longer polluted.
-                migrated = self._migrate_legacy_block(project, target_path, result, dry_run)
+                migrated = self._migrate_legacy_block(project, target_path, result, dry_run, config)
                 new_sections = {r.section for r in context_recs}
                 merged_recs = context_recs + [r for r in migrated if r.section not in new_sections]
                 full_content = _merge_into_file(target_path, merged_recs)
@@ -330,6 +332,7 @@ class ClaudeCodeWriter(ContextWriter):
         target_path: Path,
         result: WriteResult,
         dry_run: bool,
+        config: object | None = None,
     ) -> list[Recommendation]:
         """Move a stale headroom block out of CLAUDE.md into the new target.
 
@@ -350,6 +353,19 @@ class ClaudeCodeWriter(ContextWriter):
         # If the target already owns a block, it is the source of truth -- don't
         # double-migrate or clobber accumulated learnings.
         if target_path.exists() and _MARKER_START in _read_text_tolerant(target_path):
+            return []
+
+        if _mutation_blocked(
+            legacy_path,
+            project,
+            result,
+            config,
+            action="legacy migration from",
+        ):
+            result.warnings.append(
+                f"Left Headroom learnings in {legacy_path}: legacy migration would "
+                f"rewrite or delete that protected file."
+            )
             return []
 
         migrated = _parse_prior_recommendations(legacy_text)

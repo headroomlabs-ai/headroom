@@ -688,7 +688,8 @@ is fully backward compatible.
 - `ignore.learn` / `.headroomignore` — `headroom learn` never treats an
   ignored `CLAUDE.md`/`MEMORY.md` as a prior-learned-patterns baseline.
 - `ignore.memory` / `.headroomignore` — the code-graph file watcher
-  (`--code-graph`) never triggers a reindex for an ignored path.
+  (`--code-graph`) never triggers a reindex for an ignored path and excludes
+  ignored paths from the reindex input when an allowed file triggers indexing.
 - `ignore.compress` / `.headroomignore` — the Read-lifecycle stale/superseded
   detector (the pipeline stage that decides whether a previously-Read file's
   content gets replaced/compressed) never replaces an ignored path's content.

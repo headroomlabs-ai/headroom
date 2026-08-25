@@ -760,7 +760,7 @@ class IgnoreConfig:
     ``.github/copilot-instructions.md``, ``.cursorrules``, ``ANTIGRAVITY.md``)
     from a canonical source (e.g. cARL's ``.github/carl/``) can list those
     paths here (or in ``.headroomignore``) so Headroom never learns from or
-    overwrites the generated projections.
+    indexes or overwrites the generated projections.
 
     Wiring status (see README "Ignoring governed / generated files" for the
     full picture): ``mutate``/``learn``/``memory`` are enforced by the

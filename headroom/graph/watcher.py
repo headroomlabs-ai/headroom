@@ -16,11 +16,17 @@ Usage:
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import logging
+import os
+import shutil
 import subprocess
+import tempfile
 import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 from headroom._subprocess import run
@@ -122,6 +128,9 @@ class CodeGraphWatcher:
         self.debounce_seconds = debounce_seconds
         self.cbm_binary: str | None = None
         self._ignore_policy = IgnorePolicy.load(project_dir, ignore_config)
+        self._has_memory_ignores = any(
+            rule.applies_to("memory") for rule in self._ignore_policy.active_rules()
+        )
         if cbm_binary:
             self.cbm_binary = cbm_binary
         else:
@@ -232,17 +241,21 @@ class CodeGraphWatcher:
 
         try:
             start = time.monotonic()
-            result = run(
-                [
-                    self.cbm_binary,
-                    "cli",
-                    "index_repository",
-                    json.dumps({"repo_path": self.project_dir, "mode": "fast"}),
-                ],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
+            with self._indexable_repo_path() as repo_path:
+                payload = {"repo_path": str(repo_path), "mode": "fast"}
+                if repo_path.resolve() != Path(self.project_dir).resolve():
+                    payload["name"] = Path(self.project_dir).resolve().name
+                result = run(
+                    [
+                        self.cbm_binary,
+                        "cli",
+                        "index_repository",
+                        json.dumps(payload),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
 
             elapsed = time.monotonic() - start
             self._reindex_count += 1
@@ -276,6 +289,56 @@ class CodeGraphWatcher:
             logger.warning("Code graph: reindex timed out after 30s")
         except Exception as e:
             logger.debug("Code graph: reindex error: %s", e)
+
+    @contextmanager
+    def _indexable_repo_path(self) -> Iterator[Path]:
+        """Yield a repo tree containing only files allowed for memory indexing."""
+        project_path = Path(self.project_dir)
+        project_root = project_path.resolve()
+        if not self._has_memory_ignores:
+            yield project_path
+            return
+
+        with tempfile.TemporaryDirectory(prefix="headroom-cbm-index-") as tmp:
+            staged_root = Path(tmp) / project_root.name
+            self._stage_indexable_tree(project_root, staged_root)
+            yield staged_root
+
+    def _stage_indexable_tree(self, source_root: Path, staged_root: Path) -> None:
+        """Hard-link or copy non-ignored files into ``staged_root`` for indexing."""
+        staged_root.mkdir(parents=True, exist_ok=True)
+        for dirpath, dirnames, filenames in os.walk(source_root):
+            current = Path(dirpath)
+            dirnames[:] = [
+                dirname
+                for dirname in dirnames
+                if not self._skip_index_dir(source_root, current / dirname)
+            ]
+
+            for filename in filenames:
+                source = current / filename
+                if source.is_symlink() or self._ignore_policy.is_ignored(source, "memory"):
+                    continue
+                relative = source.relative_to(source_root)
+                destination = staged_root / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    os.link(source, destination)
+                except OSError:
+                    shutil.copy2(source, destination)
+
+    def _skip_index_dir(self, source_root: Path, path: Path) -> bool:
+        if self._ignore_policy.is_ignored(path, "memory"):
+            return True
+        try:
+            parts = path.relative_to(source_root).parts
+        except ValueError:
+            parts = path.parts
+        return any(
+            ignore == part or fnmatch.fnmatchcase(part, ignore)
+            for part in parts
+            for ignore in _IGNORE_DIRS
+        )
 
     @property
     def stats(self) -> dict:

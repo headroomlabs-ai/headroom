@@ -355,6 +355,27 @@ class TestIgnorePolicyEnforcement:
         assert claude_local.exists()
         assert result.warnings == []
 
+    def test_protected_legacy_claude_md_is_not_mutated_during_migration(self, tmp_path):
+        proj = _project(tmp_path)
+        claude_md = proj.project_path / "CLAUDE.md"
+        original = _legacy_block("Build Commands", "- cargo check from src-tauri/")
+        claude_md.write_text(original)
+        (proj.project_path / ".headroomignore").write_text("CLAUDE.md\n")
+
+        writer = ClaudeCodeWriter()
+        recs = [_rec(RecommendationTarget.CONTEXT_FILE, "Environment", "- Use uv")]
+        result = writer.write(recs, proj, dry_run=False)
+
+        assert claude_md.read_text() == original
+        claude_local = proj.project_path / "CLAUDE.local.md"
+        assert claude_local.exists()
+        local_content = claude_local.read_text()
+        assert "### Environment" in local_content
+        assert "Use uv" in local_content
+        assert "Build Commands" not in local_content
+        assert any("ignored for mutation" in w for w in result.warnings)
+        assert any("legacy migration" in w for w in result.warnings)
+
 
 class TestContextTargetOverride:
     """--target / set_context_target controls where CONTEXT_FILE recs are written."""
