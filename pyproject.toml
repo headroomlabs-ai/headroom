@@ -285,6 +285,15 @@ dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
     "pytest-asyncio>=0.21.0",
+    # Opt-in local parallelism (e.g. `pytest tests/test_cli -n 4`). NOT wired
+    # into addopts: the full suite is not yet xdist-clean (shared workspace
+    # dirs/ports — see #3024's flake analysis); CI parallelizes via
+    # pytest-split VM shards instead.
+    "pytest-xdist>=3.5.0",
+    # Opt-in hang detection (`pytest --timeout=120` or @pytest.mark.timeout).
+    # No global timeout in config: playwright/model-download tests are
+    # legitimately slow and a blanket ceiling would trade hangs for flakes.
+    "pytest-timeout>=2.3.0",
     "ruff==0.16.3",
     "mypy>=1.0.0",
     "pre-commit>=3.0.0",
