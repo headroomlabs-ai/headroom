@@ -83,6 +83,9 @@ def test_direct_handler_routes_model_endpoint_intent() -> None:
     assert OPENAI_HANDLER_ROUTES == (
         ProviderHandlerRoute("POST", "/v1/chat/completions", "handle_openai_chat"),
         ProviderHandlerRoute("POST", "/chat/completions", "handle_openai_chat"),
+        # Wrap-registry targets append their declared nonstandard chat paths
+        # (IBM Bob posts under its /inference/v1 gateway prefix).
+        ProviderHandlerRoute("POST", "/inference/v1/chat/completions", "handle_openai_chat"),
     )
     assert GEMINI_HANDLER_ROUTES == (
         ProviderHandlerRoute(
