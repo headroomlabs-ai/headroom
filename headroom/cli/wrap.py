@@ -8212,23 +8212,32 @@ def _make_registry_command(target: WrapTarget) -> click.Command:
         if prepare_only:
             return
 
-        tool_bin = next((found for name in target.binaries if (found := shutil.which(name))), None)
+        # Re-resolve at invocation: the command object was generated at import
+        # time, but the effective target (wrap_targets.json overlay) should
+        # reflect the environment at launch, not at import.
+        from headroom.providers.wrap_registry import resolved_wrap_targets
+
+        run_target = resolved_wrap_targets().get(target.name, target)
+
+        tool_bin = next(
+            (found for name in run_target.binaries if (found := shutil.which(name))), None
+        )
         if not tool_bin:
-            click.echo(f"Error: '{target.binaries[0]}' not found in PATH.")
-            click.echo(target.install_hint)
+            click.echo(f"Error: '{run_target.binaries[0]}' not found in PATH.")
+            click.echo(run_target.install_hint)
             raise SystemExit(1)
 
         # Registry-preferred mode fills the gap when the user set none; an
         # explicit HEADROOM_MODE always wins. Exported before proxy startup so
         # _start_proxy forwards it as --mode.
-        if target.default_mode and not os.environ.get("HEADROOM_MODE"):
-            os.environ["HEADROOM_MODE"] = target.default_mode
+        if run_target.default_mode and not os.environ.get("HEADROOM_MODE"):
+            os.environ["HEADROOM_MODE"] = run_target.default_mode
 
         env, env_vars_display = _build_registry_launch_env(
-            target,
+            run_target,
             port,
             os.environ,
-            project=_project_name_from_cwd() if target.project_prefix else None,
+            project=_project_name_from_cwd() if run_target.project_prefix else None,
         )
 
         _launch_tool(
@@ -8237,17 +8246,17 @@ def _make_registry_command(target: WrapTarget) -> click.Command:
             env=env,
             port=port,
             no_proxy=no_proxy,
-            tool_label=target.tool_label,
+            tool_label=run_target.tool_label,
             env_vars_display=env_vars_display,
             learn=learn,
             memory=memory,
-            agent_type=target.agent_type,
+            agent_type=run_target.agent_type,
             code_graph=code_graph,
             backend=backend,
             anyllm_provider=anyllm_provider,
             region=region,
-            openai_api_url=target.openai_api_url,
-            anthropic_api_url=target.anthropic_api_url,
+            openai_api_url=run_target.openai_api_url,
+            anthropic_api_url=run_target.anthropic_api_url,
         )
 
     _run.__doc__ = target.help_text

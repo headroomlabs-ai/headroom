@@ -12,6 +12,7 @@ proxy, and upstream defaults. These tests pin two things:
 
 from __future__ import annotations
 
+import pytest
 from click.testing import CliRunner
 
 from headroom.cli.wrap import wrap
@@ -19,9 +20,20 @@ from headroom.providers.wrap_registry import (
     WRAP_TARGETS,
     EnvVar,
     WrapTarget,
+    _reset_wrap_targets_cache,
     build_launch_env,
     get_wrap_target,
 )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_from_host_wrap_config(tmp_path, monkeypatch):
+    """These tests pin CODE DEFAULTS; a developer's real
+    ~/.headroom/config/wrap_targets.json must not leak into them."""
+    monkeypatch.setenv("HEADROOM_CONFIG_DIR", str(tmp_path))
+    _reset_wrap_targets_cache()
+    yield
+    _reset_wrap_targets_cache()
 
 
 class TestBuildLaunchEnv:
