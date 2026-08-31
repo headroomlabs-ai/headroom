@@ -58,6 +58,11 @@ def test_ensure_proxy_recovers_persistent_deployment_when_socket_is_bound(monkey
     calls: list[str] = []
 
     monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: True)
+    # A bare TCP accept no longer proves the listener is Headroom (#3360);
+    # identify it via /health so the recovery path still applies.
+    monkeypatch.setattr(
+        wrap_cli, "_query_proxy_health", lambda port: {"version": "0.0.0-test", "config": {}}
+    )
     monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: _Manifest())
     monkeypatch.setattr("headroom.install.health.probe_ready", lambda url: False)
     monkeypatch.setattr(
@@ -77,6 +82,11 @@ def test_ensure_proxy_recovers_persistent_deployment_when_socket_is_bound(monkey
 
 def test_ensure_proxy_rejects_unhealthy_persistent_deployment(monkeypatch) -> None:
     monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: True)
+    # Headroom-identified listener (see #3360): a foreign squatter would fall
+    # through to a fresh port instead of raising.
+    monkeypatch.setattr(
+        wrap_cli, "_query_proxy_health", lambda port: {"version": "0.0.0-test", "config": {}}
+    )
     monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: _Manifest())
     monkeypatch.setattr("headroom.install.health.probe_ready", lambda url: False)
     monkeypatch.setattr(wrap_cli, "_recover_persistent_proxy", lambda port: False)

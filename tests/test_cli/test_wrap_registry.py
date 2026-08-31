@@ -94,12 +94,52 @@ class TestBobTarget:
     def test_registry_chat_routes_reach_openai_handler_routes(self):
         from headroom.providers.route_specs import OPENAI_HANDLER_ROUTES
 
-        inference = [
-            r for r in OPENAI_HANDLER_ROUTES if r.path == "/inference/v1/chat/completions"
-        ]
+        inference = [r for r in OPENAI_HANDLER_ROUTES if r.path == "/inference/v1/chat/completions"]
         assert len(inference) == 1
         assert inference[0].method == "POST"
         assert inference[0].handler_name == "handle_openai_chat"
+
+
+class TestDefaultMode:
+    """Registry-preferred HEADROOM_MODE: fills the gap when unset, never wins
+    over an explicit user value."""
+
+    def test_bob_declares_token_default_mode(self):
+        assert get_wrap_target("bob").default_mode == "token"
+
+    def test_other_targets_have_no_default_mode(self):
+        for name in ("goose", "openhands", "openclaude"):
+            assert get_wrap_target(name).default_mode is None
+
+    @staticmethod
+    def _invoke_bob(monkeypatch):
+        import headroom.cli.wrap as wrap_mod
+
+        monkeypatch.setattr(wrap_mod.shutil, "which", lambda name: f"/usr/bin/{name}")
+        captured: dict[str, str | None] = {}
+
+        def fake_launch_tool(**kwargs):
+            import os
+
+            captured["mode"] = os.environ.get("HEADROOM_MODE")
+
+        monkeypatch.setattr(wrap_mod, "_launch_tool", fake_launch_tool)
+        result = CliRunner().invoke(wrap, ["bob"])
+        assert result.exit_code == 0, result.output
+        return captured
+
+    def test_registry_default_fills_unset_headroom_mode(self, monkeypatch):
+        # setenv-then-delenv registers restoration of the pre-test state even
+        # though the command under test writes os.environ itself.
+        monkeypatch.setenv("HEADROOM_MODE", "sentinel")
+        monkeypatch.delenv("HEADROOM_MODE")
+        captured = self._invoke_bob(monkeypatch)
+        assert captured["mode"] == "token"
+
+    def test_explicit_headroom_mode_wins_over_registry_default(self, monkeypatch):
+        monkeypatch.setenv("HEADROOM_MODE", "cache")
+        captured = self._invoke_bob(monkeypatch)
+        assert captured["mode"] == "cache"
 
 
 class TestRegistry:
@@ -164,3 +204,107 @@ class TestGeneratedCommands:
         result = runner.invoke(wrap, ["goose", "--help"])
         assert result.exit_code == 0
         assert "OPENAI_BASE_URL" in result.output
+
+
+class TestOriginPassthrough:
+    """Bob builds full gateway paths itself; catch-all must not re-prefix them.
+
+    Regression for the 403 poll loop: base .../inference + inbound
+    /inference/v1/model/info composed into a doubled prefix, and
+    /admin/v1/profile was misrooted under /inference (#3360).
+    """
+
+    BASE = "https://api.us-east.bob.ibm.com/inference"
+
+    def test_inference_path_is_origin_rooted_not_doubled(self):
+        from headroom.providers.wrap_registry import resolve_origin_passthrough_url
+
+        url = resolve_origin_passthrough_url(self.BASE, "/inference/v1/model/info")
+        assert url == "https://api.us-east.bob.ibm.com/inference/v1/model/info"
+
+    def test_admin_path_is_origin_rooted(self):
+        from headroom.providers.wrap_registry import resolve_origin_passthrough_url
+
+        url = resolve_origin_passthrough_url(self.BASE, "/admin/v1/profile")
+        assert url == "https://api.us-east.bob.ibm.com/admin/v1/profile"
+
+    def test_non_matching_path_falls_back(self):
+        from headroom.providers.wrap_registry import resolve_origin_passthrough_url
+
+        assert resolve_origin_passthrough_url(self.BASE, "/v1/embeddings") is None
+
+    def test_non_matching_host_falls_back(self):
+        from headroom.providers.wrap_registry import resolve_origin_passthrough_url
+
+        assert (
+            resolve_origin_passthrough_url("https://api.openai.com/v1", "/inference/v1/model/info")
+            is None
+        )
+
+    def test_none_base_url_falls_back(self):
+        from headroom.providers.wrap_registry import resolve_origin_passthrough_url
+
+        assert resolve_origin_passthrough_url(None, "/inference/v1/model/info") is None
+
+
+class TestOriginPassthroughResponseStrip:
+    """Bob 2.0.1 rewrites its gateway host from region_domain in the proxied
+    /admin/v1/profile response while keeping the proxy's port, pointing every
+    later request at api.<region>:<proxy-port> (unreachable). The proxy strips
+    the key so bob keeps using its configured gateway URL."""
+
+    BASE = "https://api.us-east.bob.ibm.com/inference"
+
+    def test_strips_region_domain_from_profile(self):
+        import json
+
+        from headroom.providers.wrap_registry import strip_origin_passthrough_response_keys
+
+        body = json.dumps(
+            {
+                "profiles": [
+                    {"id": "p1", "region": "us-east", "region_domain": "us-east.bob.ibm.com"}
+                ]
+            }
+        ).encode()
+        out = strip_origin_passthrough_response_keys(self.BASE, "/admin/v1/profile", body)
+        assert out is not None
+        payload = json.loads(out)
+        assert "region_domain" not in payload["profiles"][0]
+        assert payload["profiles"][0]["region"] == "us-east"
+
+    def test_none_when_key_absent(self):
+        from headroom.providers.wrap_registry import strip_origin_passthrough_response_keys
+
+        assert (
+            strip_origin_passthrough_response_keys(self.BASE, "/admin/v1/profile", b'{"id": "p1"}')
+            is None
+        )
+
+    def test_none_for_undeclared_path(self):
+        from headroom.providers.wrap_registry import strip_origin_passthrough_response_keys
+
+        body = b'{"region_domain": "us-east.bob.ibm.com"}'
+        assert (
+            strip_origin_passthrough_response_keys(self.BASE, "/inference/v1/model/info", body)
+            is None
+        )
+
+    def test_none_for_other_host(self):
+        from headroom.providers.wrap_registry import strip_origin_passthrough_response_keys
+
+        body = b'{"region_domain": "us-east.bob.ibm.com"}'
+        assert (
+            strip_origin_passthrough_response_keys(
+                "https://api.openai.com/v1", "/admin/v1/profile", body
+            )
+            is None
+        )
+
+    def test_none_for_non_json_body(self):
+        from headroom.providers.wrap_registry import strip_origin_passthrough_response_keys
+
+        assert (
+            strip_origin_passthrough_response_keys(self.BASE, "/admin/v1/profile", b"<html>403")
+            is None
+        )

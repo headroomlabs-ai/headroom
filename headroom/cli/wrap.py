@@ -583,6 +583,22 @@ def _check_proxy(port: int) -> bool:
         return False
 
 
+def _foreign_listener(port: int) -> bool:
+    """True when something accepts TCP on ``port`` but is not a Headroom proxy.
+
+    ``_check_proxy`` is a bare TCP connect, so any service squatting the port
+    (observed: a caveman gateway on 8787) satisfies it. Headroom identity is a
+    parseable ``/health`` payload or a ``/config`` feature block; a listener
+    that yields neither must never be reused, restarted, or trusted as a live
+    wrapped session.
+    """
+    if not _check_proxy(port):
+        return False
+    if _query_proxy_health(port) is not None:
+        return False
+    return _query_proxy_config(port) is None
+
+
 def _port_bind_error(port: int) -> OSError | None:
     """Return the bind error for a local proxy port, or None when it is usable."""
     try:
@@ -1605,7 +1621,15 @@ def _check_and_clear_dead_wrap_marker(settings_path: Path, *, key: str) -> str |
         # is a live session (never cleared); only a port that fails the whole
         # retry window is dead. One probe here — no correlated double check.
         if _wrap_proxy_alive(port):
-            return None
+            if not _foreign_listener(port):
+                return None
+            if not _wrap_marker_is_stale(marker):
+                # The port answers but not as Headroom, yet the wrapper that
+                # wrote the marker is still alive — leave its claim alone.
+                return None
+            # A foreign service took the dead proxy's port (#3360): TCP-alive
+            # is a false liveness signal, and the writer PID is gone. Treat
+            # the marker as dead and restore below.
     elif not _wrap_marker_is_stale(marker):
         # No recorded port → fall back to PID-based staleness.
         return None
@@ -4089,6 +4113,19 @@ def _ensure_proxy_unlocked(
                 "  Copilot subscription seeds are session-specific; "
                 "starting a dedicated local proxy instance for this wrap session."
             )
+        if (
+            not isolated_copilot_subscription_proxy
+            and manifest is not None
+            and helpers._foreign_listener(port)
+        ):
+            # The manifest's port is held by a non-Headroom service; recovery
+            # can never rebind it. Skip the respawn/wait entirely and start a
+            # fresh proxy on another port (#3360).
+            click.echo(
+                f"  Persistent deployment '{manifest.profile}' port {port} is held by a "
+                "non-Headroom service; starting a fresh proxy on another port."
+            )
+            manifest = None
         if not isolated_copilot_subscription_proxy and manifest is not None:
             from headroom.install.health import probe_ready
 
@@ -4221,22 +4258,34 @@ def _ensure_proxy_unlocked(
                             "could not be restarted with requested features."
                         )
                     return None, port
-                elif helpers._check_proxy(port):
+                elif helpers._check_proxy(port) and not helpers._foreign_listener(port):
                     raise click.ClickException(
                         f"Persistent deployment '{manifest.profile}' on port {port} is not healthy."
                     )
+                # A foreign (non-Headroom) listener squatting the manifest's
+                # port is treated like a stale deployment: fall through and
+                # start a fresh proxy on another port (#3360).
             click.echo(
                 f"  Warning: persistent deployment '{manifest.profile}' on port {port} "
                 "is stale; starting a fresh proxy instead."
             )
 
-        if not isolated_copilot_subscription_proxy and helpers._check_proxy(port):
+        proxy_listener = not isolated_copilot_subscription_proxy and helpers._check_proxy(port)
+        health_payload = helpers._query_proxy_health(port) if proxy_listener else None
+        running_config = helpers._proxy_health_config(health_payload)
+        if proxy_listener and running_config is None:
+            running_config = helpers._query_proxy_config(port)
+        if proxy_listener and health_payload is None and running_config is None:
+            # TCP accepted, but neither /health nor /config answered like a
+            # Headroom proxy — a foreign service is squatting the port (#3360).
+            # Fall through to the port search below instead of reusing it.
+            click.echo(
+                f"  Port {port} is in use by a non-Headroom service; selecting another port..."
+            )
+            proxy_listener = False
+        if proxy_listener:
             # Proxy is running — check if it has the features we need
             needs_restart = False
-            health_payload = helpers._query_proxy_health(port)
-            running_config = helpers._proxy_health_config(health_payload)
-            if running_config is None:
-                running_config = helpers._query_proxy_config(port)
 
             if helpers._proxy_needs_version_restart(health_payload):
                 running_version = helpers._proxy_version(health_payload) or "unknown"
@@ -4750,6 +4799,10 @@ def _launch_tool(
         if actual_port != port:
             for k, v in dict(env).items():
                 env[k] = v.replace(f"127.0.0.1:{port}", f"127.0.0.1:{actual_port}")
+            env_vars_display = [
+                line.replace(f"127.0.0.1:{port}", f"127.0.0.1:{actual_port}")
+                for line in env_vars_display
+            ]
 
         if configure_launch is not None:
             args, env, env_vars_display = configure_launch(actual_port, args, env, env_vars_display)
@@ -5393,7 +5446,10 @@ def claude(
             foundry_mode=_settings_foundry[0],
             vertex_mode=_settings_vertex[0],
             settings_path=_wrap_settings_path,
-            port=port,
+            # The URL above is built from actual_port; stamping the requested
+            # port here made the marker/owner claim point at the wrong port
+            # whenever _ensure_proxy fell back to another one (#3360).
+            port=actual_port,
         )
         # Issue #2221: pair the marker just written with a reader. wrap installs
         # no hook of its own, so a session that only ran `wrap` (never `init`)
@@ -8158,6 +8214,12 @@ def _make_registry_command(target: WrapTarget) -> click.Command:
             click.echo(f"Error: '{target.binaries[0]}' not found in PATH.")
             click.echo(target.install_hint)
             raise SystemExit(1)
+
+        # Registry-preferred mode fills the gap when the user set none; an
+        # explicit HEADROOM_MODE always wins. Exported before proxy startup so
+        # _start_proxy forwards it as --mode.
+        if target.default_mode and not os.environ.get("HEADROOM_MODE"):
+            os.environ["HEADROOM_MODE"] = target.default_mode
 
         env, env_vars_display = _build_registry_launch_env(
             target,
