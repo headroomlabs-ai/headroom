@@ -141,6 +141,10 @@ class WrapTarget:
     # proxy this wrap starts — an already-running proxy is reused with the
     # mode it booted with (wrap warns on the mismatch via /health's mode).
     default_mode: str | None = None
+    # CLI arguments prepended to every launch of the tool, before any
+    # invocation args (`headroom wrap bob -- ...`). Prepended, not appended,
+    # so per-invocation args win under the usual last-flag-wins CLI rule.
+    default_args: tuple[str, ...] = ()
     agent_type: str = ""
     tool_label: str = ""
 
@@ -312,6 +316,7 @@ WRAP_TARGETS_CONFIG_VERSION = 1
 # output (``headroom wrap targets``, doctor) can say more than "value set":
 #   data         — display/launch metadata, no cross-cutting behavior
 #   launch_env   — changes the environment handed to the launched tool
+#   launch_args  — CLI args prepended to every launch of the tool
 #   upstream     — changes where the proxy sends traffic
 #   mode         — changes the proxy mode a fresh proxy boots with
 #   proxy_route  — adds compressed-chat routes to the proxy's route table
@@ -380,6 +385,14 @@ def _coerce_strip_keys(value: object) -> tuple[tuple[str, str], ...]:
     return tuple(out)
 
 
+def _coerce_args_tuple(value: object) -> tuple[str, ...]:
+    # Like _coerce_str_tuple but an empty list is valid (clears defaults) and
+    # values may be any non-empty string (flags, subcommands, values).
+    if not isinstance(value, list) or not all(isinstance(v, str) and v for v in value):
+        raise ValueError("expected a list of strings")
+    return tuple(value)
+
+
 def _coerce_mode(value: object) -> str:
     mode = _coerce_str(value)
     decision = normalize_proxy_mode_decision(mode, default="token")
@@ -417,6 +430,7 @@ _TARGET_FIELDS: dict[str, TargetField] = {
             "origin_passthrough_strip_json_keys", "proxy_rewrite", _coerce_strip_keys
         ),
         TargetField("default_mode", "mode", _coerce_mode),
+        TargetField("default_args", "launch_args", _coerce_args_tuple),
         TargetField("agent_type", "data", _coerce_str),
         TargetField("tool_label", "data", _coerce_str),
     )

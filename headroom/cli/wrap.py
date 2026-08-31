@@ -8242,7 +8242,7 @@ def _make_registry_command(target: WrapTarget) -> click.Command:
 
         _launch_tool(
             binary=tool_bin,
-            args=tool_args,
+            args=(*run_target.default_args, *tool_args),
             env=env,
             port=port,
             no_proxy=no_proxy,

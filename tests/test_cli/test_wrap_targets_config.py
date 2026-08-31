@@ -167,6 +167,45 @@ class TestPrecedence:
         assert captured["mode"] == "token"
 
 
+class TestDefaultArgs:
+    @staticmethod
+    def _launch_args(config_dir, monkeypatch, cli_args):
+        import headroom.cli.wrap as wrap_mod
+
+        monkeypatch.delenv("HEADROOM_MODE", raising=False)
+        monkeypatch.setattr(wrap_mod.shutil, "which", lambda name: f"/usr/bin/{name}")
+        captured: dict[str, tuple] = {}
+
+        def fake_launch_tool(**kwargs):
+            captured["args"] = tuple(kwargs["args"])
+
+        monkeypatch.setattr(wrap_mod, "_launch_tool", fake_launch_tool)
+        result = CliRunner().invoke(wrap, cli_args)
+        assert result.exit_code == 0, result.output
+        return captured["args"]
+
+    def test_config_default_args_prepended_before_invocation_args(
+        self, config_dir, monkeypatch
+    ):
+        write_config(
+            config_dir,
+            {"version": 1, "targets": {"bob": {"default_args": ["--auto-approve"]}}},
+        )
+        args = self._launch_args(config_dir, monkeypatch, ["bob", "run", "hi"])
+        assert args == ("--auto-approve", "run", "hi")
+
+    def test_no_default_args_leaves_invocation_args_untouched(self, config_dir, monkeypatch):
+        args = self._launch_args(config_dir, monkeypatch, ["bob", "run", "hi"])
+        assert args == ("run", "hi")
+
+    def test_invalid_default_args_skips_target(self, config_dir):
+        write_config(
+            config_dir, {"version": 1, "targets": {"bob": {"default_args": "--auto-approve"}}}
+        )
+        assert wr.get_wrap_target("bob").default_args == ()
+        assert wr.wrap_targets_overlay_status().outcomes[0].action == "skipped"
+
+
 class TestOriginIndexUsesOverlay:
     def test_overridden_strip_keys_apply(self, config_dir):
         write_config(
