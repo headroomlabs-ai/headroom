@@ -32,6 +32,10 @@ Each of these exists because of an observed production failure, not speculation:
 - **`default_mode`.** A target may prefer a proxy mode (Bob prefers `token`: it bills
   flat per token, so compression converts 1:1 into dollars). The generated command
   exports it as `HEADROOM_MODE` only when the user has not set one.
+- **`default_args`.** CLI arguments prepended to every launch of the tool, before any
+  per-invocation args (`headroom wrap bob -- ...`) — prepended so invocation args win
+  under the usual last-flag-wins rule. Configurable per target in `wrap_targets.json`,
+  e.g. `{"bob": {"default_args": ["--auto-approve"]}}`.
 
 ## User configuration: `wrap_targets.json` (v2)
 
