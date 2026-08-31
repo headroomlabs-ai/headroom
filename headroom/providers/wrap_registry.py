@@ -498,7 +498,12 @@ def _validate_target_section(
         return base, TargetOutcome(name, "skipped", errors=tuple(errors))
     if base is not None:
         applied = tuple(f"{k} ({_TARGET_FIELDS[k].effect})" for k in coerced)
-        return dataclass_replace(base, **coerced), TargetOutcome(name, "overridden", applied)
+        # Values are validated per-field by the descriptor coercers above;
+        # mypy cannot see through the dict[str, object] to the field types.
+        return (
+            dataclass_replace(base, **coerced),  # type: ignore[arg-type]
+            TargetOutcome(name, "overridden", applied),
+        )
     coerced.setdefault(
         "help_text", f"Launch {name} through Headroom proxy.\n(defined in wrap_targets.json)"
     )
