@@ -111,12 +111,16 @@ def _wrap_registry_chat_routes() -> tuple[ProviderHandlerRoute, ...]:
     forwarded uncompressed."""
     # Local import: wrap_registry pulls in provider runtime modules, which this
     # module must not require at import time for non-registry consumers.
-    from headroom.providers.wrap_registry import WRAP_TARGETS
+    # Resolved registry (not the code built-ins) so extra_chat_routes overrides
+    # from wrap_targets.json reach the proxy's route table.
+    from headroom.providers.wrap_registry import resolved_wrap_targets
 
+    seen: set[str] = set()
     return tuple(
         ProviderHandlerRoute("POST", path, "handle_openai_chat")
-        for target in WRAP_TARGETS.values()
+        for target in resolved_wrap_targets().values()
         for path in target.extra_chat_routes
+        if not (path in seen or seen.add(path))
     )
 
 

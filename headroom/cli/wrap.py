@@ -23,6 +23,7 @@ import errno
 import importlib.util
 import io
 import json
+import logging
 import os
 import re
 import shutil
@@ -4183,6 +4184,7 @@ def _ensure_proxy_unlocked(
                     if not missing:
                         click.echo(f"  Proxy already running on port {port}")
                         click.echo(f"  Dashboard:    http://127.0.0.1:{port}/dashboard")
+                        _warn_wrap_config_staleness(running_config)
                         return None, port
                 # Features mismatch or config unavailable — fall through to
                 # the non-persistent path which handles proxy restart.
@@ -4407,6 +4409,7 @@ def _ensure_proxy_unlocked(
             if not needs_restart:
                 click.echo(f"  Proxy already running on port {port}")
                 click.echo(f"  Dashboard:    http://127.0.0.1:{port}/dashboard")
+                _warn_wrap_config_staleness(helpers._proxy_health_config(health_payload))
                 return None, port
 
         # Start (or restart) the proxy with the requested flags.
@@ -8293,11 +8296,95 @@ def _make_registry_command(target: WrapTarget) -> click.Command:
     return click.command(target.name, context_settings={"ignore_unknown_options": True})(command)
 
 
-def _register_wrap_target_commands() -> None:
-    from headroom.providers.wrap_registry import WRAP_TARGETS
+logger = logging.getLogger(__name__)
 
-    for target in WRAP_TARGETS.values():
+
+def _warn_wrap_config_staleness(running_config: dict[str, Any] | None) -> None:
+    """Warn when a reused proxy loaded a different wrap_targets.json.
+
+    The proxy reports the fingerprint of the overlay file *as it loaded it*
+    in /health; comparing against the file on disk now catches both an
+    edited file and a proxy started under a different HEADROOM_CONFIG_DIR.
+    Warning-only: other clients may be attached to the running proxy.
+    """
+    if running_config is None:
+        return
+    from headroom.providers.wrap_registry import current_wrap_targets_file_fingerprint
+
+    running = running_config.get("wrap_targets_config_hash")
+    local = current_wrap_targets_file_fingerprint()
+    if running != local:
+        click.echo(
+            "  Warning: the running proxy loaded a different wrap_targets.json "
+            f"(proxy: {running or 'none'}, on disk: {local or 'none'}). "
+            "Restart the proxy to apply the current config."
+        )
+
+
+def _register_wrap_target_commands() -> None:
+    from headroom.providers.wrap_registry import resolved_wrap_targets
+
+    for target in resolved_wrap_targets().values():
+        if target.name in wrap.commands:
+            # A wrap_targets.json entry must not shadow a bespoke command
+            # (claude, codex, opencode, ...) — those need imperative setup a
+            # data target can't express.
+            logger.warning(
+                "wrap_targets config: %r collides with a built-in wrap command; ignored",
+                target.name,
+            )
+            continue
         wrap.add_command(_make_registry_command(target))
+
+
+@wrap.command("targets")
+def wrap_targets_report() -> None:
+    """Show effective wrap targets and validate wrap_targets.json.
+
+    \b
+    Lists every registry target with its source (built-in, overridden, or
+    config-defined), reports validation errors from
+    ~/.headroom/config/wrap_targets.json, and exits non-zero when the file
+    has problems — usable as a pre-flight check after editing the file.
+    """
+    from headroom.providers.wrap_registry import (
+        resolved_wrap_targets,
+        wrap_targets_overlay_status,
+    )
+
+    status = wrap_targets_overlay_status()
+    outcome_by_name = {o.name: o for o in status.outcomes}
+
+    click.echo(f"Config file: {status.path}" + ("" if status.exists else " (not present)"))
+    if status.fingerprint:
+        click.echo(f"Fingerprint: {status.fingerprint}")
+    click.echo()
+    for name, target in sorted(resolved_wrap_targets().items()):
+        outcome = outcome_by_name.get(name)
+        if outcome is None:
+            source = "built-in"
+        elif outcome.action == "added":
+            source = f"config-defined ({', '.join(outcome.fields)})"
+        elif outcome.action == "skipped":
+            source = "built-in (config entry skipped)"
+        else:
+            source = f"built-in, overridden: {', '.join(outcome.fields)}"
+        mode = f"  default_mode={target.default_mode}" if target.default_mode else ""
+        click.echo(f"  {name:<12} {source}{mode}")
+
+    problems = list(status.warnings)
+    for outcome in status.outcomes:
+        if outcome.action == "skipped":
+            problems.append(f"target {outcome.name!r} skipped: {'; '.join(outcome.errors)}")
+    if problems:
+        click.echo()
+        click.echo("Problems (these entries are ignored; built-in defaults apply):")
+        for problem in problems:
+            click.echo(f"  ✗ {problem}")
+        raise SystemExit(1)
+    if status.exists:
+        click.echo()
+        click.echo("✓ wrap_targets.json is valid")
 
 
 _register_wrap_target_commands()

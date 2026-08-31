@@ -61,6 +61,7 @@ _CONFIG_DIR_DEFAULT_SUFFIX = "config"
 
 # Resource file/sub-dir names (kept here so nothing else has to hardcode them)
 _SAVINGS_FILE = "proxy_savings.json"
+_WRAP_TARGETS_FILE = "wrap_targets.json"
 _SETTINGS_FILE = "settings.json"
 _TOIN_FILE = "toin.json"
 _MODELS_FILE = "models.json"
@@ -353,6 +354,16 @@ def proxy_start_lock_path(port: int) -> Path:
 # ---------------------------------------------------------------------------
 
 
+def wrap_targets_config_path() -> Path:
+    """Return the default path for the wrap-target overlay JSON.
+
+    Read-if-exists only — Headroom never creates this file. See
+    :mod:`headroom.providers.wrap_registry` for the format.
+    """
+
+    return config_dir() / _WRAP_TARGETS_FILE
+
+
 def models_config_path() -> Path:
     """Return the default path for the models catalog JSON.
 
@@ -440,6 +451,7 @@ __all__ = [
     "beacon_lock_path",
     "proxy_start_lock_path",
     "models_config_path",
+    "wrap_targets_config_path",
     "plugin_config_dir",
     "plugin_workspace_dir",
 ]

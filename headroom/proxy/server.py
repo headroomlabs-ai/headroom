@@ -3256,6 +3256,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         return previous_handler
 
     def _health_payload(*, include_config: bool) -> dict[str, Any]:
+        # Cached after first resolution; already imported via route_specs.
+        from headroom.providers.wrap_registry import (
+            wrap_targets_config_fingerprint as _wrap_targets_config_fingerprint,
+        )
+
         checks = _health_checks()
         # Kompress is an optional soft component: model downloads lazily on
         # first use, so "not ready" (cold cache) must not degrade overall health.
@@ -3293,6 +3298,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             )
             payload["config"] = {
                 "backend": config.backend,
+                # Fingerprint of wrap_targets.json as this process loaded it;
+                # `headroom wrap` compares it to the file on disk to warn when
+                # a reused proxy is running stale wrap-target config.
+                "wrap_targets_config_hash": _wrap_targets_config_fingerprint(),
                 "optimize": config.optimize,
                 "cache": config.cache_enabled,
                 "rate_limit": config.rate_limit_enabled,

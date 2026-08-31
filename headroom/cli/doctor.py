@@ -466,6 +466,31 @@ def _codex_block_missing_openai_auth(text: str, config_path: Path) -> bool:
         return False
 
 
+def check_wrap_targets_config() -> CheckResult | None:
+    """Validate ~/.headroom/config/wrap_targets.json; None when absent."""
+    from headroom.providers.wrap_registry import wrap_targets_overlay_status
+
+    status = wrap_targets_overlay_status()
+    if not status.exists:
+        return None
+    problems = list(status.warnings) + [
+        f"{o.name}: {'; '.join(o.errors)}" for o in status.outcomes if o.action == "skipped"
+    ]
+    if problems:
+        return CheckResult(
+            name="wrap targets config",
+            status=WARN,
+            summary=f"{status.path}: {len(problems)} entr{'y' if len(problems) == 1 else 'ies'} ignored",
+            hint="Run `headroom wrap targets` for details; ignored entries fall back to built-ins.",
+        )
+    applied = sum(1 for o in status.outcomes if o.action != "skipped")
+    return CheckResult(
+        name="wrap targets config",
+        status=PASS,
+        summary=f"{status.path}: valid ({applied} target(s) configured)",
+    )
+
+
 def check_shell_env(environ: Mapping[str, str], port: int) -> CheckResult:
     """Is the *current shell* pointed at the proxy for ad-hoc runs?"""
     name = "shell env"
@@ -742,6 +767,9 @@ def doctor(port: int, emit_json: bool) -> None:
     desktop_check = check_claude_desktop(claude_desktop_config_dir())
     if desktop_check is not None:
         checks.append(desktop_check)
+    wrap_targets_check = check_wrap_targets_config()
+    if wrap_targets_check is not None:
+        checks.append(wrap_targets_check)
     deployments = check_deployments(list_manifests())
     if deployments is not None:
         checks.append(deployments)
