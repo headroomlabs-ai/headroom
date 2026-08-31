@@ -139,7 +139,7 @@ class WrapTarget:
     # wrap command exports it as HEADROOM_MODE before proxy startup; an
     # explicit HEADROOM_MODE in the environment always wins. Only affects a
     # proxy this wrap starts — an already-running proxy is reused with the
-    # mode it booted with (/health does not expose mode for a mismatch check).
+    # mode it booted with (wrap warns on the mismatch via /health's mode).
     default_mode: str | None = None
     agent_type: str = ""
     tool_label: str = ""

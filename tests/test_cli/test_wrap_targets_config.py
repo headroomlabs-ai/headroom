@@ -240,6 +240,71 @@ class TestDescriptorParity:
         assert wr._TARGET_FIELDS["default_mode"].coerce(bob.default_mode) == bob.default_mode
 
 
+class TestProxyReuseWarnings:
+    """_warn_wrap_config_staleness: warning-only drift checks on proxy reuse."""
+
+    @staticmethod
+    def _warnings(config_dir, monkeypatch, running_config, env_mode=None):
+        from headroom.cli.wrap import _warn_wrap_config_staleness
+
+        if env_mode is None:
+            monkeypatch.delenv("HEADROOM_MODE", raising=False)
+        else:
+            monkeypatch.setenv("HEADROOM_MODE", env_mode)
+        lines: list[str] = []
+        monkeypatch.setattr("click.echo", lines.append)
+        _warn_wrap_config_staleness(running_config)
+        return lines
+
+    def test_silent_when_everything_matches(self, config_dir, monkeypatch):
+        lines = self._warnings(
+            config_dir, monkeypatch, {"mode": "cache", "wrap_targets_config_hash": None}
+        )
+        assert lines == []
+
+    def test_warns_on_mode_mismatch(self, config_dir, monkeypatch):
+        lines = self._warnings(
+            config_dir,
+            monkeypatch,
+            {"mode": "cache", "wrap_targets_config_hash": None},
+            env_mode="token",
+        )
+        assert len(lines) == 1 and "'token' mode" in lines[0] and "'cache' mode" in lines[0]
+
+    def test_mode_alias_normalized_before_compare(self, config_dir, monkeypatch):
+        # cost_savings is an alias of cache: no mismatch, no warning.
+        lines = self._warnings(
+            config_dir,
+            monkeypatch,
+            {"mode": "cache", "wrap_targets_config_hash": None},
+            env_mode="cost_savings",
+        )
+        assert lines == []
+
+    def test_no_mode_warning_without_requested_mode(self, config_dir, monkeypatch):
+        lines = self._warnings(
+            config_dir, monkeypatch, {"mode": "token", "wrap_targets_config_hash": None}
+        )
+        assert lines == []
+
+    def test_warns_on_stale_wrap_targets_hash(self, config_dir, monkeypatch):
+        write_config(config_dir, {"version": 1, "targets": {}})
+        lines = self._warnings(
+            config_dir, monkeypatch, {"mode": "cache", "wrap_targets_config_hash": None}
+        )
+        assert len(lines) == 1 and "wrap_targets.json" in lines[0]
+
+    def test_old_proxy_without_mode_field_is_silent(self, config_dir, monkeypatch):
+        # A pre-upgrade proxy's /health has no "mode" key: no false warning.
+        lines = self._warnings(
+            config_dir,
+            monkeypatch,
+            {"wrap_targets_config_hash": None},
+            env_mode="token",
+        )
+        assert lines == []
+
+
 class TestCliSurface:
     """Regression: config presence must not disturb bespoke wrap commands
     (claude, opencode) and must keep registry commands (bob) working."""

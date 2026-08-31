@@ -3298,6 +3298,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             )
             payload["config"] = {
                 "backend": config.backend,
+                # Boot-time proxy mode (token/cache). `headroom wrap` compares
+                # it to the session's requested mode to warn when a reused
+                # proxy would silently override e.g. bob's token default.
+                "mode": config.mode,
                 # Fingerprint of wrap_targets.json as this process loaded it;
                 # `headroom wrap` compares it to the file on disk to warn when
                 # a reused proxy is running stale wrap-target config.

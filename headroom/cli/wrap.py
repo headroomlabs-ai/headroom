@@ -8300,16 +8300,23 @@ logger = logging.getLogger(__name__)
 
 
 def _warn_wrap_config_staleness(running_config: dict[str, Any] | None) -> None:
-    """Warn when a reused proxy loaded a different wrap_targets.json.
+    """Warn when a reused proxy drifts from this session's expectations.
 
-    The proxy reports the fingerprint of the overlay file *as it loaded it*
-    in /health; comparing against the file on disk now catches both an
-    edited file and a proxy started under a different HEADROOM_CONFIG_DIR.
-    Warning-only: other clients may be attached to the running proxy.
+    Two checks, both warning-only because other clients may be attached to
+    the running proxy:
+
+    - wrap_targets.json staleness: the proxy reports the fingerprint of the
+      overlay file *as it loaded it* in /health; comparing against the file
+      on disk catches both an edited file and a proxy started under a
+      different HEADROOM_CONFIG_DIR.
+    - mode mismatch: a proxy runs the mode it booted with; if this session
+      requested a different HEADROOM_MODE (explicitly or via a target's
+      default_mode), the request is silently ignored on reuse — say so.
     """
     if running_config is None:
         return
     from headroom.providers.wrap_registry import current_wrap_targets_file_fingerprint
+    from headroom.proxy.proxy_mode_policy import normalize_proxy_mode_decision
 
     running = running_config.get("wrap_targets_config_hash")
     local = current_wrap_targets_file_fingerprint()
@@ -8319,6 +8326,17 @@ def _warn_wrap_config_staleness(running_config: dict[str, Any] | None) -> None:
             f"(proxy: {running or 'none'}, on disk: {local or 'none'}). "
             "Restart the proxy to apply the current config."
         )
+
+    requested_raw = os.environ.get("HEADROOM_MODE")
+    running_mode = running_config.get("mode")
+    if requested_raw and isinstance(running_mode, str):
+        decision = normalize_proxy_mode_decision(requested_raw, default=running_mode)
+        if not decision.unknown and decision.normalized != running_mode:
+            click.echo(
+                f"  Warning: this session requested {decision.normalized!r} mode but the "
+                f"running proxy is in {running_mode!r} mode (mode is fixed at proxy "
+                "startup). Restart the proxy, or use --port for a separate one."
+            )
 
 
 def _register_wrap_target_commands() -> None:
