@@ -27,12 +27,19 @@ from headroom.proxy.project_policy import with_project_prefix
 
 # How an EnvVar's URL is shaped. ``openai_v1`` ends in ``/v1`` (OpenAI-style
 # clients append ``/chat/completions``); ``anthropic`` is a bare origin
-# (Anthropic clients append ``/v1/messages``).
-UrlStyle = Literal["openai_v1", "anthropic"]
+# (Anthropic clients append ``/v1/messages``); ``bare_origin`` is for tools
+# that append their own full path prefix to the URL they are handed (e.g. IBM
+# Bob appends ``/inference/v1/chat/completions``) — handing those a ``/v1``
+# base would produce a doubled prefix.
+UrlStyle = Literal["openai_v1", "anthropic", "bare_origin"]
 
 _STYLE_BUILDERS = {
     "openai_v1": _openai_proxy_base_url,
     "anthropic": _anthropic_proxy_base_url,
+    # Same shape as the anthropic base today (http://127.0.0.1:<port>), but a
+    # distinct style: it documents *why* the URL has no /v1, and keeps targets
+    # honest if the anthropic base ever grows a suffix.
+    "bare_origin": _anthropic_proxy_base_url,
 }
 
 
@@ -67,6 +74,11 @@ class WrapTarget:
     anthropic_api_url: str | None = None
     # Whether the generated command exposes --backend/--anyllm-provider/--region.
     backend_options: bool = True
+    # Nonstandard chat-completions paths the tool posts to. Each is registered
+    # as a proxy route delegating to ``handle_openai_chat`` (see
+    # ``route_specs.OPENAI_HANDLER_ROUTES``) so the traffic is compressed
+    # instead of falling through to the uncompressed catch-all passthrough.
+    extra_chat_routes: tuple[str, ...] = ()
     agent_type: str = ""
     tool_label: str = ""
 
@@ -150,6 +162,42 @@ WRAP_TARGETS: dict[str, WrapTarget] = {
                 "Examples:\n"
                 "    headroom wrap openhands                # Start proxy + openhands\n"
                 "    headroom wrap openhands -- --task ...  # Pass args to openhands"
+            ),
+        ),
+        WrapTarget(
+            name="bob",
+            binaries=("bob",),
+            install_hint="Install IBM Bob CLI: npm install -g bobshell",
+            env_vars=(
+                # Bob resolves its gateway as config.gatewayUrl ?? BOB_GATEWAY_URL
+                # ?? default, so this env var reroutes inference without touching
+                # ~/.bob/settings. Bob appends /inference/v1/... itself.
+                EnvVar("BOB_GATEWAY_URL", "bare_origin"),
+            ),
+            # DEFAULT_API_URL carries the /inference/v1 suffix so the proxy's
+            # _normalize_api_url (strips /v1) and handle_openai_chat (re-appends
+            # /v1/chat/completions) compose back into the path IBM serves.
+            openai_api_url="https://api.us-east.bob.ibm.com/inference/v1",
+            extra_chat_routes=("/inference/v1/chat/completions",),
+            help_text=(
+                "Launch IBM Bob CLI through Headroom proxy.\n"
+                "\n"
+                "\b\n"
+                "Sets ``BOB_GATEWAY_URL`` so Bob routes inference traffic through\n"
+                "Headroom while keeping its own ``Authorization: apikey ...``\n"
+                "credential and its ~/.bob/settings files untouched.\n"
+                "\n"
+                "\b\n"
+                "Mode matters more for Bob than for most agents: its traffic is ~46%\n"
+                "system prompt and ~44% tool output, and Bob bills flat per token, so\n"
+                "token mode converts compression 1:1 into dollars:\n"
+                "    HEADROOM_MODE=token headroom wrap bob\n"
+                "\n"
+                "\b\n"
+                "Examples:\n"
+                "    headroom wrap bob                          # Start proxy + bob\n"
+                '    headroom wrap bob -- run "fix the bug"     # Pass args to bob\n'
+                "    headroom wrap bob --port 9999              # Custom proxy port"
             ),
         ),
         WrapTarget(

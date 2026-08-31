@@ -74,9 +74,37 @@ class TestBuildLaunchEnv:
         assert env["PATH"] == "/bin"
 
 
+class TestBobTarget:
+    def test_bob_env_is_bare_origin_with_project_prefix(self):
+        target = get_wrap_target("bob")
+        env, display = build_launch_env(target, 8788, environ={}, project="myproj")
+        # Bare origin: Bob appends /inference/v1/... itself; a /v1 base would
+        # produce a doubled prefix.
+        assert env["BOB_GATEWAY_URL"] == "http://127.0.0.1:8788/p/myproj"
+        assert display == ["BOB_GATEWAY_URL=http://127.0.0.1:8788/p/myproj"]
+
+    def test_bob_upstream_carries_inference_suffix(self):
+        target = get_wrap_target("bob")
+        assert target.openai_api_url == "https://api.us-east.bob.ibm.com/inference/v1"
+
+    def test_bob_declares_inference_chat_route(self):
+        target = get_wrap_target("bob")
+        assert "/inference/v1/chat/completions" in target.extra_chat_routes
+
+    def test_registry_chat_routes_reach_openai_handler_routes(self):
+        from headroom.providers.route_specs import OPENAI_HANDLER_ROUTES
+
+        inference = [
+            r for r in OPENAI_HANDLER_ROUTES if r.path == "/inference/v1/chat/completions"
+        ]
+        assert len(inference) == 1
+        assert inference[0].method == "POST"
+        assert inference[0].handler_name == "handle_openai_chat"
+
+
 class TestRegistry:
     def test_pilot_targets_registered(self):
-        for name in ("goose", "openhands", "openclaude"):
+        for name in ("goose", "openhands", "openclaude", "bob"):
             assert name in WRAP_TARGETS
 
     def test_get_unknown_target_raises(self):
@@ -101,12 +129,12 @@ class TestRegistry:
         for target in WRAP_TARGETS.values():
             for var in target.env_vars:
                 assert isinstance(var, EnvVar)
-                assert var.style in {"openai_v1", "anthropic"}
+                assert var.style in {"openai_v1", "anthropic", "bare_origin"}
 
 
 class TestGeneratedCommands:
     def test_commands_exist_under_wrap_group(self):
-        for name in ("goose", "openhands", "openclaude"):
+        for name in ("goose", "openhands", "openclaude", "bob"):
             assert name in wrap.commands, f"wrap {name} missing"
 
     def test_generated_command_option_surface(self):
@@ -127,7 +155,7 @@ class TestGeneratedCommands:
 
     def test_prepare_only_exits_cleanly(self):
         runner = CliRunner()
-        for name in ("goose", "openhands", "openclaude"):
+        for name in ("goose", "openhands", "openclaude", "bob"):
             result = runner.invoke(wrap, [name, "--prepare-only"])
             assert result.exit_code == 0, f"{name} --prepare-only failed: {result.output}"
 
