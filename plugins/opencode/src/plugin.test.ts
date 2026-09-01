@@ -150,6 +150,82 @@ describe("HeadroomPlugin", () => {
     await plugin.dispose?.();
   });
 
+  it("bounds missing postflights and records terminal unknown outcomes", async () => {
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const plugin = await HeadroomPlugin(pluginInput(), {
+      proxyUrl: "http://127.0.0.1:8787",
+      toolPolicy: { rules: [] },
+      maxPendingPreflights: 2,
+    });
+
+    for (let index = 0; index < 5; index += 1) {
+      await plugin["tool.execute.before"]?.(
+        { tool: "bash", sessionID: "session-bounded", callID: `call-${index}` },
+        { args: { command: `echo ${index}` } },
+      );
+    }
+
+    const recordsBeforeDispose = stderr.mock.calls
+      .map(([value]) => String(value).trim())
+      .filter((value) => value.startsWith("{"))
+      .map((value) => JSON.parse(value) as Record<string, unknown>);
+    expect(
+      recordsBeforeDispose.filter(
+        (record) =>
+          record.event === "headroom_tool_policy_enforcement_acknowledgement" &&
+          record.effect === "unknown" &&
+          record.reason === "capacity_evicted",
+      ),
+    ).toHaveLength(3);
+
+    await plugin.dispose?.();
+    const recordsAfterDispose = stderr.mock.calls
+      .map(([value]) => String(value).trim())
+      .filter((value) => value.startsWith("{"))
+      .map((value) => JSON.parse(value) as Record<string, unknown>);
+    expect(
+      recordsAfterDispose.filter(
+        (record) =>
+          record.event === "headroom_tool_policy_enforcement_acknowledgement" &&
+          record.effect === "unknown",
+      ),
+    ).toHaveLength(5);
+    expect(
+      recordsAfterDispose.filter(
+        (record) => record.effect === "unknown" && record.reason === "plugin_disposed",
+      ),
+    ).toHaveLength(2);
+  });
+
+  it("expires a missing postflight with an unknown outcome", async () => {
+    vi.useFakeTimers();
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    try {
+      const plugin = await HeadroomPlugin(pluginInput(), {
+        proxyUrl: "http://127.0.0.1:8787",
+        toolPolicy: { rules: [] },
+        pendingPreflightTtlMs: 25,
+      });
+      await plugin["tool.execute.before"]?.(
+        { tool: "bash", sessionID: "session-timeout", callID: "call-timeout" },
+        { args: { command: "echo waiting" } },
+      );
+
+      await vi.advanceTimersByTimeAsync(25);
+
+      expect(
+        stderr.mock.calls.some(([value]) => {
+          const output = String(value);
+          return output.includes('"effect":"unknown"') &&
+            output.includes('"reason":"postflight_timeout"');
+        }),
+      ).toBe(true);
+      await plugin.dispose?.();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("rejects an acknowledgement when final arguments differ from preflight", async () => {
     const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
     const plugin = await HeadroomPlugin(pluginInput(), {
@@ -168,12 +244,105 @@ describe("HeadroomPlugin", () => {
           metadata: {},
         },
       ),
-    ).rejects.toThrow(/did not match the bound preflight decision/);
+    ).rejects.toThrow(/did not match the bound preflight/);
     expect(
-      stderr.mock.calls.some(([value]) =>
-        String(value).includes("headroom_tool_policy_enforcement_acknowledgement"),
+      stderr.mock.calls.some(([value]) => {
+        const output = String(value);
+        return output.includes('"effect":"unknown"') &&
+          output.includes('"reason":"postflight_mismatch"');
+      }),
+    ).toBe(true);
+    await plugin.dispose?.();
+  });
+
+  it("uses a unique decision ID when a call identity is reused", async () => {
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const plugin = await HeadroomPlugin(pluginInput(), {
+      proxyUrl: "http://127.0.0.1:8787",
+      toolPolicy: { rules: [] },
+    });
+    const input = { tool: "bash", sessionID: "session-reused", callID: "call-reused" };
+
+    await plugin["tool.execute.before"]?.(input, { args: { command: "echo same" } });
+    await plugin["tool.execute.before"]?.(input, { args: { command: "echo same" } });
+
+    const decisions = stderr.mock.calls
+      .map(([value]) => String(value).trim())
+      .filter((value) => value.startsWith("{"))
+      .map((value) => JSON.parse(value) as Record<string, unknown>)
+      .filter((record) => record.event === "headroom_tool_policy_decision");
+    expect(decisions).toHaveLength(2);
+    expect(decisions[0].decision_id).not.toBe(decisions[1].decision_id);
+    expect(
+      stderr.mock.calls.some(([value]) => {
+        const output = String(value);
+        return output.includes('"effect":"unknown"') &&
+          output.includes('"reason":"call_replaced"');
+      }),
+    ).toBe(true);
+    await plugin.dispose?.();
+  });
+
+  it("never acknowledges a late postflight as a newer reused call", async () => {
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const plugin = await HeadroomPlugin(pluginInput(), {
+      proxyUrl: "http://127.0.0.1:8787",
+      toolPolicy: { rules: [] },
+    });
+    const input = { tool: "bash", sessionID: "session-late", callID: "call-late" };
+    const firstArgs = { command: "echo same" };
+    const secondArgs = { command: "echo same" };
+
+    await plugin["tool.execute.before"]?.(input, { args: firstArgs });
+    await plugin["tool.execute.before"]?.(input, { args: secondArgs });
+    await expect(
+      plugin["tool.execute.after"]?.(
+        { ...input, args: firstArgs },
+        { title: "shell", output: "late", metadata: {} },
       ),
-    ).toBe(false);
+    ).rejects.toThrow(/did not match the bound preflight object/);
+
+    const acknowledgements = stderr.mock.calls
+      .map(([value]) => String(value).trim())
+      .filter((value) => value.startsWith("{"))
+      .map((value) => JSON.parse(value) as Record<string, unknown>)
+      .filter(
+        (record) => record.event === "headroom_tool_policy_enforcement_acknowledgement",
+      );
+    expect(acknowledgements.map((record) => record.effect)).toEqual(["unknown", "unknown"]);
+    expect(acknowledgements.some((record) => record.effect === "allowed")).toBe(false);
+    await plugin.dispose?.();
+  });
+
+  it("retires a successfully acknowledged argument graph", async () => {
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const plugin = await HeadroomPlugin(pluginInput(), {
+      proxyUrl: "http://127.0.0.1:8787",
+      toolPolicy: { rules: [] },
+    });
+    const input = { tool: "bash", sessionID: "session-retired", callID: "call-retired" };
+    const args = { command: "echo same" };
+
+    await plugin["tool.execute.before"]?.(input, { args });
+    await plugin["tool.execute.after"]?.(
+      { ...input, args },
+      { title: "shell", output: "first", metadata: {} },
+    );
+    await plugin["tool.execute.before"]?.(input, { args });
+    await plugin["tool.execute.after"]?.(
+      { ...input, args },
+      { title: "shell", output: "ambiguous", metadata: {} },
+    );
+
+    const acknowledgements = stderr.mock.calls
+      .map(([value]) => String(value).trim())
+      .filter((value) => value.startsWith("{"))
+      .map((value) => JSON.parse(value) as Record<string, unknown>)
+      .filter(
+        (record) => record.event === "headroom_tool_policy_enforcement_acknowledgement",
+      );
+    expect(acknowledgements.map((record) => record.effect)).toEqual(["allowed", "unknown"]);
+    expect(acknowledgements[1].reason).toBe("ambiguous_reused_call");
     await plugin.dispose?.();
   });
 

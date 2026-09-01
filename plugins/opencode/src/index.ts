@@ -23,6 +23,7 @@ export type { HeadroomOpenCodePluginOptions } from "./plugin.js";
 export {
   defaultGlobalToolPolicyPath,
   acknowledgeNativeToolExecution,
+  acknowledgeUnknownNativeToolExecution,
   enforceNativeToolExecution,
   evaluateNativeToolPolicy,
   findLocalToolPolicyPath,

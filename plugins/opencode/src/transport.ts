@@ -165,7 +165,14 @@ export interface HeadroomToolPolicyAcknowledgement {
   event: "headroom_tool_policy_enforcement_acknowledgement";
   decisionId: string;
   authority: "authoritative";
-  effect: "allowed" | "blocked";
+  effect: "allowed" | "blocked" | "unknown";
+  reason?:
+    | "postflight_timeout"
+    | "postflight_mismatch"
+    | "ambiguous_reused_call"
+    | "capacity_evicted"
+    | "plugin_disposed"
+    | "call_replaced";
   requestHash: string;
   binding: HeadroomToolPolicyBinding;
   timestamp: string;
@@ -485,6 +492,9 @@ interface RemotePolicyCache {
 }
 
 function readRemotePolicyCache(url: string, token: string): RemotePolicyCache | undefined {
+  if (processIsStateless()) {
+    return undefined;
+  }
   const cachePath = remoteToolPolicyCachePath(url, token);
   if (!fs.existsSync(cachePath)) {
     return undefined;
@@ -1043,6 +1053,7 @@ function policyDecisionId(
 ): string {
   return createHash("sha256")
     .update(stableJson({ version: 1, requestHash, action, authority, binding }))
+    .update(binding ? randomUUID() : "")
     .digest("hex");
 }
 
@@ -1291,6 +1302,35 @@ export function acknowledgeNativeToolExecution(
     decisionId: preflight.decision.decisionId,
     authority: "authoritative",
     effect: "allowed",
+    requestHash: preflight.decision.requestHash,
+    binding,
+    timestamp: new Date().toISOString(),
+  };
+  emitPolicyAcknowledgement(acknowledgement);
+  return acknowledgement;
+}
+
+export function acknowledgeUnknownNativeToolExecution(
+  preflight: HeadroomToolPolicyPreflight,
+  reason: NonNullable<HeadroomToolPolicyAcknowledgement["reason"]>,
+): HeadroomToolPolicyAcknowledgement {
+  const binding = preflight.decision.binding;
+  if (
+    preflight.decision.authority !== "authoritative" ||
+    preflight.decision.effectiveAction !== "allow" ||
+    !binding
+  ) {
+    throw new Error(
+      "[headroom] Cannot record an unknown outcome for an unbound or blocked preflight",
+    );
+  }
+  const acknowledgement: HeadroomToolPolicyAcknowledgement = {
+    version: 1,
+    event: "headroom_tool_policy_enforcement_acknowledgement",
+    decisionId: preflight.decision.decisionId,
+    authority: "authoritative",
+    effect: "unknown",
+    reason,
     requestHash: preflight.decision.requestHash,
     binding,
     timestamp: new Date().toISOString(),
