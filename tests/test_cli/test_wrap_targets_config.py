@@ -116,6 +116,32 @@ class TestOverlay:
         assert outcome.action == "skipped"
         assert "unknown field" in outcome.errors[0]
 
+    def test_unhashable_env_var_style_skips_target_not_crash(self, config_dir):
+        # A JSON list where a string is expected raised TypeError from the
+        # `style in _STYLE_BUILDERS` check, and the validator caught only
+        # ValueError -- so a typo in the file crashed every headroom command
+        # at import instead of failing open.
+        write_config(
+            config_dir,
+            {
+                "version": 1,
+                "targets": {"bob": {"env_vars": [{"key": "X", "style": ["openai_v1"]}]}},
+            },
+        )
+        assert wr.get_wrap_target("bob") == wr.WRAP_TARGETS["bob"]
+        outcome = wr.wrap_targets_overlay_status().outcomes[0]
+        assert outcome.action == "skipped"
+        assert "style" in outcome.errors[0]
+
+    def test_empty_binaries_skips_target(self, config_dir):
+        # An empty list validated as OK and then `headroom wrap <name>` died
+        # with IndexError on binaries[0] instead of the not-found message.
+        write_config(config_dir, {"version": 1, "targets": {"bob": {"binaries": []}}})
+        assert wr.get_wrap_target("bob") == wr.WRAP_TARGETS["bob"]
+        outcome = wr.wrap_targets_overlay_status().outcomes[0]
+        assert outcome.action == "skipped"
+        assert "binaries" in outcome.errors[0]
+
 
 class TestNewTargets:
     NEW = {
@@ -140,9 +166,7 @@ class TestNewTargets:
         assert "proxy routing" in outcome.errors[0]
 
     def test_new_target_missing_required_fields_skipped(self, config_dir):
-        write_config(
-            config_dir, {"version": 1, "targets": {"mytool": {"install_hint": "pip"}}}
-        )
+        write_config(config_dir, {"version": 1, "targets": {"mytool": {"install_hint": "pip"}}})
         assert "mytool" not in wr.resolved_wrap_targets()
 
 
@@ -184,9 +208,7 @@ class TestDefaultArgs:
         assert result.exit_code == 0, result.output
         return captured["args"]
 
-    def test_config_default_args_prepended_before_invocation_args(
-        self, config_dir, monkeypatch
-    ):
+    def test_config_default_args_prepended_before_invocation_args(self, config_dir, monkeypatch):
         write_config(
             config_dir,
             {"version": 1, "targets": {"bob": {"default_args": ["--auto-approve"]}}},

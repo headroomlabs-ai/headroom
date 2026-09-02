@@ -57,7 +57,7 @@ import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from dataclasses import replace as dataclass_replace
-from typing import Literal
+from typing import Literal, cast
 
 from headroom import paths as _paths
 from headroom.providers.claude.runtime import proxy_base_url as _anthropic_proxy_base_url
@@ -348,6 +348,15 @@ def _coerce_str_tuple(value: object) -> tuple[str, ...]:
     return tuple(value)
 
 
+def _coerce_nonempty_str_tuple(value: object) -> tuple[str, ...]:
+    # `binaries` must name at least one executable: the generated command
+    # indexes binaries[0] for its not-found message.
+    out = _coerce_str_tuple(value)
+    if not out:
+        raise ValueError("expected a non-empty list of non-empty strings")
+    return out
+
+
 def _coerce_route_tuple(value: object) -> tuple[str, ...]:
     routes = _coerce_str_tuple(value)
     if not all(r.startswith("/") for r in routes):
@@ -364,10 +373,11 @@ def _coerce_env_vars(value: object) -> tuple[EnvVar, ...]:
             raise ValueError("each env var must be an object with keys: key, style, display?")
         key = _coerce_str(item.get("key"))
         style = item.get("style")
-        if style not in _STYLE_BUILDERS:
+        if not isinstance(style, str) or style not in _STYLE_BUILDERS:
             raise ValueError(f"style must be one of {sorted(_STYLE_BUILDERS)}, got {style!r}")
         display = item.get("display", True)
-        out.append(EnvVar(key, style, _coerce_bool(display)))
+        # Membership in _STYLE_BUILDERS is the runtime proof of the Literal.
+        out.append(EnvVar(key, cast(UrlStyle, style), _coerce_bool(display)))
     return tuple(out)
 
 
@@ -416,7 +426,7 @@ class TargetField:
 _TARGET_FIELDS: dict[str, TargetField] = {
     f.name: f
     for f in (
-        TargetField("binaries", "data", _coerce_str_tuple),
+        TargetField("binaries", "data", _coerce_nonempty_str_tuple),
         TargetField("install_hint", "data", _coerce_str),
         TargetField("env_vars", "launch_env", _coerce_env_vars),
         TargetField("help_text", "data", _coerce_str),
@@ -426,9 +436,7 @@ _TARGET_FIELDS: dict[str, TargetField] = {
         TargetField("backend_options", "data", _coerce_bool),
         TargetField("extra_chat_routes", "proxy_route", _coerce_route_tuple),
         TargetField("origin_passthrough_prefixes", "proxy_rewrite", _coerce_route_tuple),
-        TargetField(
-            "origin_passthrough_strip_json_keys", "proxy_rewrite", _coerce_strip_keys
-        ),
+        TargetField("origin_passthrough_strip_json_keys", "proxy_rewrite", _coerce_strip_keys),
         TargetField("default_mode", "mode", _coerce_mode),
         TargetField("default_args", "launch_args", _coerce_args_tuple),
         TargetField("agent_type", "data", _coerce_str),
@@ -486,7 +494,9 @@ def _validate_target_section(
             continue
         try:
             coerced[key] = descriptor.coerce(raw)
-        except ValueError as exc:
+        except (ValueError, TypeError) as exc:
+            # TypeError covers JSON shapes a coercer did not anticipate (e.g.
+            # a list where a string belongs); fail-open must hold regardless.
             errors.append(f"{key}: {exc}")
 
     if base is None:
@@ -526,9 +536,7 @@ def _resolve() -> _Resolution:
     path = _paths.wrap_targets_config_path()
     # Stat guard: the no-config common case does no parsing and no copying.
     if not path.exists():
-        return _Resolution(
-            WRAP_TARGETS, OverlayStatus(str(path), False, None, (), ())
-        )
+        return _Resolution(WRAP_TARGETS, OverlayStatus(str(path), False, None, (), ()))
 
     warnings: list[str] = []
     outcomes: list[TargetOutcome] = []
@@ -543,7 +551,7 @@ def _resolve() -> _Resolution:
         version = raw.get("version")
         if version != WRAP_TARGETS_CONFIG_VERSION:
             raise ValueError(
-                f"requires \"version\": {WRAP_TARGETS_CONFIG_VERSION}, got {version!r} "
+                f'requires "version": {WRAP_TARGETS_CONFIG_VERSION}, got {version!r} '
                 "(a newer Headroom may be required)"
             )
         targets_raw = raw.get("targets", {})
@@ -639,7 +647,9 @@ def _origin_index() -> dict[tuple[str, str], _OriginRules]:
         for target in resolved_wrap_targets().values():
             if not target.openai_api_url:
                 continue
-            if not (target.origin_passthrough_prefixes or target.origin_passthrough_strip_json_keys):
+            if not (
+                target.origin_passthrough_prefixes or target.origin_passthrough_strip_json_keys
+            ):
                 continue
             declared = urlsplit(target.openai_api_url)
             host = (declared.scheme, declared.netloc)
