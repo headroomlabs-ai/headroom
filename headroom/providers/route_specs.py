@@ -116,12 +116,14 @@ def _wrap_registry_chat_routes() -> tuple[ProviderHandlerRoute, ...]:
     from headroom.providers.wrap_registry import resolved_wrap_targets
 
     seen: set[str] = set()
-    return tuple(
-        ProviderHandlerRoute("POST", path, "handle_openai_chat")
-        for target in resolved_wrap_targets().values()
-        for path in target.extra_chat_routes
-        if not (path in seen or seen.add(path))
-    )
+    routes: list[ProviderHandlerRoute] = []
+    for target in resolved_wrap_targets().values():
+        for path in target.extra_chat_routes:
+            if path in seen:
+                continue
+            seen.add(path)
+            routes.append(ProviderHandlerRoute("POST", path, "handle_openai_chat"))
+    return tuple(routes)
 
 
 OPENAI_HANDLER_ROUTES: tuple[ProviderHandlerRoute, ...] = (
