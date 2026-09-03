@@ -641,10 +641,16 @@ def build_session_summary(
     best_compression = 0.0
     best_detail = ""
     if compressed_requests:
-        avg_compression = round(
-            sum(r["savings_pct"] for r in compressed_requests) / len(compressed_requests),
-            1,
-        )
+        # Size-WEIGHTED, not a mean of per-request percentages. An unweighted
+        # mean lets one tiny, highly-compressible request (e.g. a repeated log
+        # line that folds 6,070 -> 83 tokens, 98.6%) dominate the headline while
+        # the large real requests it is averaged with barely moved, so the card
+        # can read "18.6% saved" on traffic whose forwarded bytes fell ~3%.
+        # Weighting by original size makes the number mean what an operator
+        # reads it as: the share of total tokens actually removed.
+        _orig_total = sum(r["original"] for r in compressed_requests)
+        _saved_total = sum(r["tokens_saved"] for r in compressed_requests)
+        avg_compression = round(100.0 * _saved_total / _orig_total, 1) if _orig_total else 0.0
         best = max(compressed_requests, key=lambda r: r["savings_pct"])
         best_compression = best["savings_pct"]
         best_detail = f"{best['original']:,} → {best['optimized']:,} tokens"
