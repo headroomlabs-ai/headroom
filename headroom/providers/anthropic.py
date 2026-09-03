@@ -287,6 +287,22 @@ def _load_custom_model_config() -> dict[str, Any]:
                 config["context_limits"].update(anthropic_config["context_limits"])
             if "pricing" in anthropic_config:
                 config["pricing"].update(anthropic_config["pricing"])
+            if (
+                "context_limits" not in anthropic_config
+                and "pricing" not in anthropic_config
+            ):
+                # Valid JSON object, but none of the keys we consume. Previously
+                # this was a SILENT no-op: the unknown-model warning tells the
+                # operator to "set HEADROOM_MODEL_LIMITS", they set the obvious
+                # flat shape {"my-model": 262144}, nothing happens, and there is
+                # no diagnostic anywhere. Name the expected shape instead.
+                logger.warning(
+                    "HEADROOM_MODEL_LIMITS parsed but contained no 'context_limits' "
+                    "or 'pricing' key, so it had NO EFFECT. Expected shape: "
+                    '{"context_limits": {"<model>": <int>}, "pricing": {...}} '
+                    '(optionally nested under an "anthropic" key). '
+                    f"Got top-level keys: {sorted(map(str, anthropic_config))[:10]}"
+                )
 
             logger.debug(f"Loaded custom model config from HEADROOM_MODEL_LIMITS: {loaded}")
         except (ValueError, OSError) as e:
