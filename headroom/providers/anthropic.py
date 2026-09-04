@@ -287,9 +287,18 @@ def _load_custom_model_config() -> dict[str, Any]:
                 config["context_limits"].update(anthropic_config["context_limits"])
             if "pricing" in anthropic_config:
                 config["pricing"].update(anthropic_config["pricing"])
+            # Another provider's namespaced section ({"openai": {"context_limits":
+            # ...}}) is a correctly shaped config that this loader is simply not
+            # meant to consume, so it must not trip the no-effect warning below.
+            other_provider_section = "anthropic" not in loaded and any(
+                isinstance(section, dict)
+                and any(key in section for key in ("context_limits", "pricing", "encodings"))
+                for section in loaded.values()
+            )
             if (
                 "context_limits" not in anthropic_config
                 and "pricing" not in anthropic_config
+                and not other_provider_section
             ):
                 # Valid JSON object, but none of the keys we consume. Previously
                 # this was a SILENT no-op: the unknown-model warning tells the

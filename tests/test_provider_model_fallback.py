@@ -271,6 +271,26 @@ class TestAnthropicConfigLoading:
         assert loaded["context_limits"]["qwen3.8"] == 262144
         assert "NO EFFECT" not in caplog.text
 
+    def test_other_provider_namespaced_env_var_does_not_warn(self, caplog):
+        """``{"openai": {"context_limits": ...}}`` is the documented shape for the
+        OpenAI loader. The Anthropic loader consumes nothing from it, which is
+        correct, so it must not claim the config had no effect."""
+        cfg = '{"openai": {"context_limits": {"gpt-x": 400000}}}'
+        with patch.dict(os.environ, {"HEADROOM_MODEL_LIMITS": cfg}):
+            with caplog.at_level(logging.WARNING, logger="headroom.providers.anthropic"):
+                loaded = anthropic_load_config()
+        assert loaded == {"context_limits": {}, "pricing": {}}
+        assert "NO EFFECT" not in caplog.text
+
+    def test_anthropic_section_without_known_keys_still_warns(self, caplog):
+        """An explicit ``anthropic`` section that carries none of the consumed
+        keys is the same silent no-op as the flat shape, so it warns."""
+        cfg = '{"anthropic": {"qwen3.8": 262144}}'
+        with patch.dict(os.environ, {"HEADROOM_MODEL_LIMITS": cfg}):
+            with caplog.at_level(logging.WARNING, logger="headroom.providers.anthropic"):
+                anthropic_load_config()
+        assert "NO EFFECT" in caplog.text
+
     def test_non_object_config_file_falls_back_to_defaults(self):
         """A models.json whose top level is not an object must not crash."""
         with tempfile.TemporaryDirectory() as tmpdir:

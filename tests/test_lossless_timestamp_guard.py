@@ -70,9 +70,7 @@ def test_env_kill_switch_disables_all_folds(monkeypatch: pytest.MonkeyPatch) -> 
 
 def test_kill_switch_is_read_live_not_cached_at_import() -> None:
     """The proxy hot-syncs runtime env; a cached flag would ignore it."""
-    grep = "\n".join(
-        f"src/a.py:{i}:    x = {i}" for i in range(40)
-    )
+    grep = "\n".join(f"src/a.py:{i}:    x = {i}" for i in range(40))
     prior = os.environ.pop("HEADROOM_LOSSLESS_COMPACTION", None)
     try:
         assert compact_lossless(grep, "search") != grep
