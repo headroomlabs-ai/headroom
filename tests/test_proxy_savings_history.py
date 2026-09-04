@@ -125,7 +125,7 @@ def test_savings_tracker_sanitizes_legacy_state_and_applies_retention(tmp_path):
     )
     snapshot = tracker.snapshot()
 
-    assert snapshot["schema_version"] == 5
+    assert snapshot["schema_version"] == 6
     assert snapshot["lifetime"] == {
         "requests": 0,
         "tokens_saved": 30,
@@ -1103,7 +1103,7 @@ def test_stats_history_persists_across_restarts_and_stats_stays_compatible(tmp_p
         history = client.get("/stats-history")
         assert history.status_code == 200
         history_data = history.json()
-        assert history_data["schema_version"] == 5
+        assert history_data["schema_version"] == 6
         assert history_data["storage_path"] == str(savings_path)
         assert history_data["lifetime"]["tokens_saved"] == 40
         assert history_data["lifetime"]["total_input_tokens"] == 120
@@ -1548,7 +1548,7 @@ def test_v3_state_without_cache_fields_loads_clean_and_saves_v4(tmp_path):
         timestamp="2026-07-02T00:00:00Z",
     )
     persisted = json.loads(path.read_text(encoding="utf-8"))
-    assert persisted["schema_version"] == 5
+    assert persisted["schema_version"] == 6
     assert persisted["lifetime"]["cache_read_tokens"] == 5
     assert persisted["lifetime"]["tokens_saved"] == 42181
 

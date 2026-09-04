@@ -257,7 +257,7 @@ def test_funnel_attributes_savings_from_context_and_stats_exposes_them(tmp_path,
         assert stats["persistent_savings"]["projects_limit"] == DEFAULT_MAX_PROJECTS
 
         history = client.get("/stats-history").json()
-        assert history["schema_version"] == 5
+        assert history["schema_version"] == 6
         assert history["projects"]["ctx-project"]["requests"] == 1
 
 

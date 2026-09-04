@@ -218,6 +218,7 @@ def test_dashboard_per_project_setup_url_uses_current_origin() -> None:
 
         page.goto("http://127.0.0.1:8788/dashboard", wait_until="load")
         page.get_by_role("button", name="Lifetime", exact=True).click()
+        expect(page.get_by_text("Per-Project Savings")).to_be_visible()
         expect(
             page.get_by_text(
                 "ANTHROPIC_BASE_URL: http://127.0.0.1:8788/p/<project-name>", exact=True
@@ -231,6 +232,7 @@ def test_dashboard_per_project_setup_url_uses_current_origin() -> None:
 
         page.goto("http://headroom.local:9393/dashboard", wait_until="load")
         page.get_by_role("button", name="Lifetime", exact=True).click()
+        expect(page.get_by_text("Per-Project Savings")).to_be_visible()
         expect(
             page.get_by_text(
                 "ANTHROPIC_BASE_URL: http://headroom.local:9393/p/<project-name>", exact=True

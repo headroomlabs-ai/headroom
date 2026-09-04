@@ -860,6 +860,14 @@ class WasteSignals:
         }
 
 
+# Canonical names consumed by durable metrics. Keep this derived from the
+# request-level WasteSignals representation so the two views cannot drift.
+WASTE_SIGNAL_KEYS = tuple(WasteSignals().to_dict())
+
+# Persisted versions before the JSON signal was renamed can still be read.
+WASTE_SIGNAL_ALIASES = {"json_noise": "json_bloat"}
+
+
 @dataclass
 class CachePrefixMetrics:
     """Detailed cache prefix metrics for debugging cache misses.

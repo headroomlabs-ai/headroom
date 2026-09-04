@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 HEADROOM_SAVINGS_PATH_ENV_VAR = _paths.HEADROOM_SAVINGS_PATH_ENV
 DEFAULT_SAVINGS_DIR = ".headroom"
 DEFAULT_SAVINGS_FILE = "proxy_savings.json"
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 DEFAULT_MAX_HISTORY_POINTS = 5000
 DEFAULT_MAX_PROJECTS = 50
 DEFAULT_MAX_HISTORY_AGE_DAYS = 365
@@ -672,6 +672,9 @@ class SavingsTracker:
         self._needs_schema_save = False
         self._state = self._load_state()
         self._persistent_metrics = PersistentMetricsState(self._state.pop("lifetime_metrics", None))
+        if self._needs_schema_save and not self._stateless:
+            with self._lock:
+                self._save_locked()
 
     @property
     def storage_path(self) -> str:

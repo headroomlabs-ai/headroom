@@ -62,12 +62,38 @@ def test_savings_tracker_migrates_v4_lifetime_to_v5_metrics_and_preserves_legacy
 
     tracker.flush()
     saved = json.loads(path.read_text(encoding="utf-8"))
-    assert saved["schema_version"] == 5
+    assert saved["schema_version"] == 6
     assert saved["lifetime"] == legacy_state["lifetime"]
     assert saved["display_session"]["requests"] == 2
     assert saved["projects"]["keep-me"]["requests"] == 1
     assert saved["lifetime_metrics"]["models"]["other"]["input_tokens"] == 80
     assert isinstance(saved["lifetime_metrics"]["persistence"]["last_saved_at"], str)
+
+
+def test_savings_tracker_rewrites_v5_waste_signal_aliases_at_startup(tmp_path):
+    path = tmp_path / "proxy_savings.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 5,
+                "lifetime_metrics": {"waste_signals": {"json_noise": 10, "other": 7}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    tracker = SavingsTracker(path=str(path))
+
+    assert tracker.lifetime_response()["waste_signals"] == {
+        "json_bloat": 10,
+        "unknown": 7,
+    }
+    persisted = json.loads(path.read_text(encoding="utf-8"))
+    assert persisted["schema_version"] == 6
+    assert persisted["lifetime_metrics"]["waste_signals"] == {
+        "json_bloat": 10,
+        "unknown": 7,
+    }
 
 
 def test_lifetime_response_reports_stateless_mode_without_writing(tmp_path):

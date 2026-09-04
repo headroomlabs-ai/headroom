@@ -8,6 +8,8 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any
 
+from headroom.config import WASTE_SIGNAL_ALIASES, WASTE_SIGNAL_KEYS
+
 SCHEMA_VERSION = 5
 MAX_PROVIDER_VALUES = 32
 MAX_STACK_VALUES = 64
@@ -16,18 +18,6 @@ MAX_EXPOSED_MODELS = 100
 MAX_LABEL_LENGTH = 128
 
 KNOWN_MISS_REASONS = frozenset({"ttl_expiry", "prefix_change", "unknown"})
-KNOWN_WASTE_SIGNALS = frozenset(
-    {
-        "json_noise",
-        "html_noise",
-        "base64",
-        "whitespace",
-        "dynamic_date",
-        "repetition",
-        "reread",
-        "reread_compressed",
-    }
-)
 
 
 def utc_now() -> datetime:
@@ -62,6 +52,13 @@ def _label(value: Any) -> str:
         return "other"
     value = value.strip()
     return value[:MAX_LABEL_LENGTH] if value else "other"
+
+
+def _normalize_waste_signal_name(name: object) -> str:
+    if not isinstance(name, str):
+        return "unknown"
+    normalized = WASTE_SIGNAL_ALIASES.get(name, name)
+    return normalized if normalized in WASTE_SIGNAL_KEYS else "unknown"
 
 
 def _model_entry(raw: Any = None) -> dict[str, Any]:
@@ -174,9 +171,7 @@ class PersistentMetricsState:
         raw_cost = _dict_or_empty(source.get("cost"))
         for key in ("input_usd", "compression_savings_usd", "cache_savings_usd"):
             result["cost"][key] = round(_coerce_float(raw_cost.get(key)), 6)
-        result["waste_signals"] = self._normalize_enum_map(
-            source.get("waste_signals"), KNOWN_WASTE_SIGNALS
-        )
+        result["waste_signals"] = self._normalize_waste_signal_map(source.get("waste_signals"))
 
         raw_models = _dict_or_empty(source.get("models"))
         raw_tracked = _dict_or_empty(raw_models.get("tracked"))
@@ -211,6 +206,16 @@ class PersistentMetricsState:
         for key, value in raw.items():
             label = key if isinstance(key, str) and key in allowed else "unknown"
             result[label] = result.get(label, 0) + _coerce_int(value)
+        return result
+
+    @staticmethod
+    def _normalize_waste_signal_map(raw: Any) -> dict[str, int]:
+        result: dict[str, int] = {}
+        if not isinstance(raw, dict):
+            return result
+        for key, value in raw.items():
+            bucket = _normalize_waste_signal_name(key)
+            result[bucket] = result.get(bucket, 0) + _coerce_int(value)
         return result
 
     @staticmethod
@@ -366,7 +371,7 @@ class PersistentMetricsState:
 
         if isinstance(waste_signals, dict):
             for name, token_count in waste_signals.items():
-                bucket = name if isinstance(name, str) and name in KNOWN_WASTE_SIGNALS else "other"
+                bucket = _normalize_waste_signal_name(name)
                 self._state["waste_signals"][bucket] = self._state["waste_signals"].get(
                     bucket, 0
                 ) + _coerce_int(token_count)
