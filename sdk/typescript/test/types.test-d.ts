@@ -173,7 +173,7 @@ describe("HeadroomClientInterface", () => {
 
   it("compress accepts messages and optional options", () => {
     expectTypeOf<HeadroomClientInterface["compress"]>().parameters.toEqualTypeOf<
-      [OpenAIMessage[], ({ model?: string } | undefined)?]
+      [OpenAIMessage[], ({ model?: string; tokenBudget?: number } | undefined)?]
     >();
   });
 });

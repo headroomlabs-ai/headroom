@@ -73,7 +73,7 @@ export interface CompressOptions {
 
 export interface CompressResult {
   /** Compressed messages in the same format as input. */
-  messages: any[];
+  messages: OpenAIMessage[];
   tokensBefore: number;
   tokensAfter: number;
   tokensSaved: number;
