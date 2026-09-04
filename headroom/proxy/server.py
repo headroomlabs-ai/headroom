@@ -2624,11 +2624,18 @@ def read_proxy_token(headers: Mapping[str, str]) -> str | None:
     expected to be lowercase (Starlette's ``Headers`` is case-insensitive; the
     WebSocket middleware lowercases the raw ASGI pairs itself).
     """
+    raw = headers.get("x-headroom-proxy-token")
+    if raw is not None:
+        return str(raw) or None
+
+    # A provider credential can legitimately occupy Authorization (for example,
+    # an OAuth/subscription client). Prefer the explicit proxy header whenever
+    # it is present so that the upstream credential is not mistaken for the
+    # proxy credential.
     auth = str(headers.get("authorization") or "")
     if auth.lower().startswith("bearer "):
         return auth[7:].strip() or None
-    raw = headers.get("x-headroom-proxy-token")
-    return str(raw) if raw else None
+    return None
 
 
 class WebSocketAuthMiddleware:
