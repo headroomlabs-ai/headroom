@@ -382,3 +382,47 @@ def test_status_reports_every_registered_tool(monkeypatch):
     assert {"difft", "scc", "ast-grep"} <= names
     for r in rows:
         assert r["state"] in ("on-path", "cached", "missing", "unsupported-platform")
+
+
+# -------- HEADROOM_BINARIES_ALLOW_UNVERIFIED (security: fail closed) ------- #
+
+
+def _write(tmp_path, data: bytes):
+    p = tmp_path / "asset.bin"
+    p.write_bytes(data)
+    return p
+
+
+@pytest.mark.parametrize("value", ["0", "false", "no", "off", "", "  "])
+def test_allow_unverified_non_affirmative_still_verifies(monkeypatch, tmp_path, value):
+    # A security bypass must fail CLOSED: only an explicit affirmative disables
+    # verification. Setting the var to "0"/"false" (the natural way to say "keep
+    # verifying") previously passed a bare presence check and silently skipped
+    # sha256 verification of the downloaded binary.
+    monkeypatch.setenv("HEADROOM_BINARIES_ALLOW_UNVERIFIED", value)
+    path = _write(tmp_path, b"payload")
+    with pytest.raises(binaries.Sha256Mismatch):
+        binaries._verify_sha256(path, "deadbeef" * 8)  # wrong pin
+
+
+def test_allow_unverified_unset_still_verifies(monkeypatch, tmp_path):
+    monkeypatch.delenv("HEADROOM_BINARIES_ALLOW_UNVERIFIED", raising=False)
+    path = _write(tmp_path, b"payload")
+    with pytest.raises(binaries.Sha256Mismatch):
+        binaries._verify_sha256(path, "deadbeef" * 8)
+
+
+@pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "on"])
+def test_allow_unverified_affirmative_skips_verification(monkeypatch, tmp_path, value):
+    monkeypatch.setenv("HEADROOM_BINARIES_ALLOW_UNVERIFIED", value)
+    path = _write(tmp_path, b"payload")
+    # Wrong pin, but an explicit affirmative bypass returns without raising.
+    binaries._verify_sha256(path, "deadbeef" * 8)
+
+
+def test_verify_download_bytes_zero_still_verifies(monkeypatch):
+    # Same fail-closed contract on the in-memory installer path.
+    monkeypatch.setenv("HEADROOM_BINARIES_ALLOW_UNVERIFIED", "0")
+    monkeypatch.setattr(binaries, "sha256_for_url", lambda _url: "deadbeef" * 8)
+    with pytest.raises(binaries.Sha256Mismatch):
+        binaries.verify_download_bytes(b"payload", url="https://x/y", name="y")
