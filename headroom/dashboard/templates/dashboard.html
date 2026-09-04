@@ -19,6 +19,308 @@
         })();
     </script>
     <script>
+        const HEADROOM_DEFAULT_LOCALE = 'en';
+        const HEADROOM_LOCALE_STORAGE_KEY = 'headroom-locale';
+        const HEADROOM_SUPPORTED_LOCALES = ['en', 'zh-CN'];
+        const HEADROOM_I18N = {
+            'zh-CN': {
+                'Headroom Dashboard': 'Headroom 仪表盘',
+                'Dashboard language': '仪表盘语言',
+                'Settings': '设置',
+                'Session': '本次会话',
+                'Historical': '历史',
+                'Anon Telemetry': '匿名遥测',
+                'Status': '状态',
+                'Healthy': '健康',
+                'Error': '错误',
+                'Updated': '更新于',
+                'Live Feed': '实时流',
+                'Proxy $ Saved': '代理节省金额',
+                'Token Savings': 'Token 节省',
+                'Output Tokens Saved': '输出 Token 节省',
+                'Headroom Overhead': 'Headroom 开销',
+                'Savings': '节省',
+                'Savings Breakdown': '节省明细',
+                'Prefix Cache Discount': '前缀缓存折扣',
+                'Provider-native caching': '提供商原生缓存',
+                'Headroom Contribution This Window': '本窗口 Headroom 贡献',
+                'Tokens Saved': '节省 Token',
+                'Cache Reads': '缓存读取',
+                'Saved by Headroom': '由 Headroom 节省',
+                'Prefix Cache Impact': '前缀缓存影响',
+                'Cache Writes': '缓存写入',
+                'Requests': '请求',
+                'Input Tokens': '输入 Token',
+                'Output Tokens': '输出 Token',
+                'Before': '之前',
+                'After': '之后',
+                'Provider': '提供商',
+                'Model': '模型',
+                'Latency': '延迟',
+                'Overhead': '开销',
+                'Total': '总计',
+                'Average': '平均',
+                'Minimum': '最小',
+                'Maximum': '最大',
+                'Compression': '压缩',
+                'Cache': '缓存',
+                'Memory': '记忆',
+                'Recent Requests': '最近请求',
+                'Request': '请求',
+                'Response': '响应',
+                'Method': '方法',
+                'Path': '路径',
+                'Duration': '耗时',
+                'Toggle light/dark mode': '切换明暗主题',
+                'Anonymous aggregate telemetry is enabled. Disable with HEADROOM_TELEMETRY=off or --no-telemetry.': '匿名聚合遥测已启用。可通过 HEADROOM_TELEMETRY=off 或 --no-telemetry 关闭。',
+                'Of compressible tokens attempted': '占已尝试压缩 Token 的比例',
+                'Of whole pre-compression request (attempted-tokens metric unavailable)': '占压缩前完整请求的比例（attempted-tokens 指标不可用）',
+                'No TTL bucket data': '暂无 TTL 桶数据',
+                'Balanced': '均衡',
+                '1h leaning': '偏向 1 小时',
+                '5m leaning': '偏向 5 分钟',
+                'Agent Usage': 'Agent 使用情况',
+                'Agent usage appears after Cursor, Claude, Codex, or another client sends traffic through this proxy.': '当 Cursor、Claude、Codex 或其他客户端通过此代理发送流量后，会显示 Agent 使用情况。',
+                'Active Days': '活跃天数',
+                'Actual cost (with Headroom)': '实际成本（使用 Headroom）',
+                'After Compression (sent)': '压缩后（已发送）',
+                'Anthropic Subscription Window': 'Anthropic 订阅窗口',
+                'Average / month': '月均',
+                'Average Saved / Day': '日均节省',
+                'Average Saved / Week': '周均节省',
+                'Based on persisted daily buckets': '基于已持久化的每日桶',
+                'Based on persisted weekly buckets': '基于已持久化的每周桶',
+                'Before Compression': '压缩前',
+                'Before and after token usage by detected client': '按检测到的客户端统计压缩前后 Token 使用量',
+                'Bucket Mix': '桶占比',
+                'Cache Busts': '缓存失效',
+                'Cache Efficiency': '缓存效率',
+                'Compressed Tokens': '压缩后 Token',
+                'Compression (p50 / p95)': '压缩（p50 / p95）',
+                'Compression vs Cache': '压缩与缓存',
+                'Cost with Headroom': '使用 Headroom 的成本',
+                'Coverage:': '覆盖率：',
+                'Credits': '额度',
+                'Cumulative proxy compression savings': '代理压缩累计节省',
+                'Current 5m (active p50):': '当前 5 分钟（active p50）：',
+                'Daily Savings': '每日节省',
+                'Daily rollups will appear after persisted history spans at least one checkpoint.': '持久化历史至少包含一个检查点后，会显示每日汇总。',
+                'Documentation': '文档',
+                'Durable local savings history from': '持久化本地节省历史来自',
+                'Efficiency': '效率',
+                'Enable HEADROOM_LOG_MESSAGES=true to see content': '设置 HEADROOM_LOG_MESSAGES=true 可查看内容',
+                'Enable the output shaper (HEADROOM_OUTPUT_SHAPER=1) and run': '启用输出整形器（HEADROOM_OUTPUT_SHAPER=1）并运行',
+                'Exact tokens saved per model': '每个模型精确节省的 Token',
+                'Expected cost (without Headroom)': '预期成本（不使用 Headroom）',
+                'Expected cost without Headroom': '不使用 Headroom 的预期成本',
+                'Export CSV': '导出 CSV',
+                'Export JSON': '导出 JSON',
+                'Extra Usage (Overage)': '额外用量（超额）',
+                'Failed Requests': '失败请求',
+                'Forward (p50 / p95)': '转发（p50 / p95）',
+                'Forwarded to Anthropic': '已转发到 Anthropic',
+                'Generation (p50 / p95)': '生成（p50 / p95）',
+                'GitHub Copilot Quota': 'GitHub Copilot 配额',
+                'Historical Proxy Compression': '历史代理压缩',
+                'Historical Savings Trend': '历史节省趋势',
+                'Historical Summary': '历史摘要',
+                'Historical data is written locally after proxy requests save tokens. Keep using Headroom and this view will fill in automatically across restarts.': '代理请求节省 Token 后，历史数据会写入本地。继续使用 Headroom，此视图会在重启后自动补全。',
+                'Historical trend data will appear after more saved checkpoints in this granularity.': '此粒度下保存更多检查点后，会显示历史趋势数据。',
+                'Hit Rate': '命中率',
+                'Input': '输入',
+                'Input (wall / active p50)': '输入（wall / active p50）',
+                'Last 10 &mdash; click row to expand': '最近 10 条 &mdash; 点击行展开',
+                'Last Active': '最后活跃',
+                'Latest total': '最新总计',
+                'Lifetime Compression Savings': '生命周期压缩节省',
+                'Lifetime Tokens Saved': '生命周期节省 Token',
+                'Lifetime totals — attributed requests only': '生命周期总计 — 仅归因请求',
+                'Lost to Cache Busts': '因缓存失效损失',
+                'Message Transformations': '消息转换',
+                'Month start': '月初',
+                'Monthly Reset': '月度重置',
+                'Monthly Savings': '每月节省',
+                'Monthly rollups will appear after persisted history spans multiple months.': '持久化历史跨越多个月后，会显示月度汇总。',
+                'Net': '净值',
+                'No per-project data yet.': '暂无项目级数据。',
+                'No persisted savings history yet': '暂无持久化节省历史',
+                'No requests yet': '暂无请求',
+                'No requests yet. Start using the proxy to see activity here.': '暂无请求。开始使用代理后，这里会显示活动。',
+                'No waste signals detected yet. Data appears after requests are processed.': '尚未检测到浪费信号。请求处理后会显示数据。',
+                'Observed TTL Buckets': '观测到的 TTL 桶',
+                'Observed write-token split': '观测到的写入 Token 分布',
+                'OpenAI Codex Rate-Limit Window': 'OpenAI Codex 速率限制窗口',
+                'Optimization Time': '优化时间',
+                'Original Tokens': '原始 Token',
+                'Output': '输出',
+                'Output Tokens': '输出 Token',
+                'Overhead Range': '开销范围',
+                'Pay-as-you-go credits balance': '按量付费额度余额',
+                'Per-Model Breakdown': '按模型明细',
+                'Per-Model Token Savings': '按模型节省 Token',
+                'Per-Project Savings': '按项目节省',
+                'Per-Provider Breakdown': '按提供商明细',
+                'Per-model attribution appears for checkpoints recorded after upgrading.': '升级后记录的检查点会显示按模型归因。',
+                'Performance': '性能',
+                'Pipeline Breakdown': '流水线明细',
+                'Prefix Freeze Net': '前缀冻结净收益',
+                'Press': '按',
+                'Primary': '主要',
+                'Project': '项目',
+                'Provider-reported cache write mix': '提供商报告的缓存写入占比',
+                'Providers': '提供商',
+                'Proxy': '代理',
+                'Proxy Removed': '代理移除',
+                'Proxy compression only': '仅代理压缩',
+                'Raw vs Submitted': '原始与提交对比',
+                'Reads (discounted)': '读取（已折扣）',
+                'Recent Historical Checkpoints': '最近历史检查点',
+                'Reduction': '减少',
+                'Resets in': '重置倒计时',
+                'Retention': '保留',
+                'Saved': '已节省',
+                'Saved $': '节省金额',
+                'Saved by Compression': '压缩节省',
+                'Savings %': '节省比例',
+                'Savings Over Time': '节省趋势',
+                'Savings as fraction of all input tokens including frozen prefix': '节省量占全部输入 Token 的比例（包含冻结前缀）',
+                'Secondary': '次要',
+                'Selected points': '已选点数',
+                'Selected series': '已选序列',
+                'Sent': '已发送',
+                'Share': '占比',
+                'Showing': '显示',
+                'TTFB (upstream)': 'TTFB（上游）',
+                'TTFB Range': 'TTFB 范围',
+                'TTL 1h': 'TTL 1 小时',
+                'Throughput': '吞吐量',
+                'Time': '时间',
+                'Token Usage': 'Token 使用量',
+                'Token flow': 'Token 流向',
+                'Tokens Removed': '移除 Token',
+                'Tokens Sent': '发送 Token',
+                'Transforms Applied': '已应用转换',
+                'Trend data will appear after multiple requests.': '多次请求后会显示趋势数据。',
+                'Uncached': '未缓存',
+                'Unlimited': '无限制',
+                'Waste Detected': '检测到浪费',
+                'Weekly Savings': '每周节省',
+                'Weekly rollups will appear after persisted history spans multiple days.': '持久化历史跨越多天后，会显示周度汇总。',
+                'Waiting for saved requests': '等待已节省的请求',
+                'What Headroom Removed': 'Headroom 移除了什么',
+                'Writes': '写入',
+                'to refresh': '刷新',
+                'to start measuring.': '开始测量。',
+                'with cache data': '包含缓存数据',
+                'saved minus bust losses': '节省量减去失效损失',
+                'tokens removed before send': '发送前移除的 Token',
+                'new message': '条新消息',
+                's avg': '秒平均',
+                '· target': '· 目标',
+                '· 95% CI': '· 95% 置信区间',
+                '⚠ Anomalies Detected': '⚠ 检测到异常',
+            },
+        };
+        const HEADROOM_I18N_PATTERNS = {
+            'zh-CN': [
+                [/(\d[\d,]*) requests processed\b/g, '已处理 $1 个请求'],
+                [/(\d[\d,]*) requests\b/g, '$1 个请求'],
+                [/(\d[\d,]*) recorded checkpoints\b/g, '$1 个已记录检查点'],
+                [/(\d[\d,]*) (daily|weekly|monthly) points\b/g, '$1 个$2数据点'],
+                [/(\d[\d,]*) tokens saved\b/g, '节省 $1 Token'],
+                [/(\d[\d,]*) tokens\b/g, '$1 Token'],
+                [/(\d[\d,]*) cumulative\b/g, '累计 $1'],
+                [/(\d[\d,]*) msgs\b/g, '$1 条消息'],
+                [/(\d[\d,]*) new messages\b/g, '$1 条新消息'],
+                [/(\d[\d,]*) new message\b/g, '$1 条新消息'],
+                [/(\d+(?:\.\d+)?)% saved\b/g, '节省 $1%'],
+                [/Showing (\d[\d,]*) (daily|weekly|monthly) points\b/g, '显示 $1 个$2数据点'],
+                [/Coverage: (.+)$/g, '覆盖率：$1'],
+                [/Last 10 — click row to expand/g, '最近 10 条 — 点击行展开'],
+                [/Of total wire:/g, '占总传输：'],
+                [/Net savings: \$/g, '净节省：$'],
+                [/Resets in /g, '重置倒计时 '],
+                [/Forwarded to Anthropic/g, '已转发到 Anthropic'],
+                [/Daily/g, '每日'],
+                [/Weekly/g, '每周'],
+                [/Monthly/g, '每月'],
+                [/daily/g, '每日'],
+                [/weekly/g, '每周'],
+                [/monthly/g, '每月'],
+            ],
+        };
+
+        function getHeadroomLocale() {
+            const saved = localStorage.getItem(HEADROOM_LOCALE_STORAGE_KEY);
+            return HEADROOM_SUPPORTED_LOCALES.includes(saved) ? saved : HEADROOM_DEFAULT_LOCALE;
+        }
+
+        function translateHeadroomText(text, locale = getHeadroomLocale()) {
+            if (!text) return text;
+            const trimmed = text.trim();
+            const dictionary = HEADROOM_I18N[locale] || {};
+            const translated = dictionary[trimmed];
+            if (translated) return text.replace(trimmed, translated);
+
+            let result = text;
+            for (const [pattern, replacement] of HEADROOM_I18N_PATTERNS[locale] || []) {
+                result = result.replace(pattern, replacement);
+            }
+            return result;
+        }
+
+        function applyHeadroomTranslations(root = document.body) {
+            const locale = getHeadroomLocale();
+            document.documentElement.lang = locale;
+            document.title = translateHeadroomText('Headroom Dashboard', locale);
+
+            if (!root) return;
+
+            const walker = document.createTreeWalker(
+                root,
+                NodeFilter.SHOW_TEXT,
+                {
+                    acceptNode(node) {
+                        if (!node.nodeValue || !node.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
+                        const parent = node.parentElement;
+                        if (!parent || ['SCRIPT', 'STYLE', 'CODE', 'PRE', 'SVG'].includes(parent.tagName)) {
+                            return NodeFilter.FILTER_REJECT;
+                        }
+                        return NodeFilter.FILTER_ACCEPT;
+                    },
+                },
+            );
+
+            const nodes = [];
+            while (walker.nextNode()) nodes.push(walker.currentNode);
+            for (const node of nodes) {
+                const current = node.nodeValue;
+                const source = node.__headroomI18nLastValue === current
+                    ? node.__headroomI18nSource
+                    : current;
+                node.__headroomI18nSource = source;
+                const translated = translateHeadroomText(source, locale);
+                node.__headroomI18nLastValue = translated;
+                if (translated !== current) node.nodeValue = translated;
+            }
+
+            for (const attribute of ['title', 'aria-label']) {
+                for (const element of root.querySelectorAll(`[${attribute}]`)) {
+                    const sourceAttribute = `data-headroom-i18n-${attribute}`;
+                    const source = element.getAttribute(sourceAttribute) || element.getAttribute(attribute);
+                    element.setAttribute(sourceAttribute, source);
+                    element.setAttribute(attribute, translateHeadroomText(source, locale));
+                }
+            }
+        }
+
+        function setHeadroomLocale(locale) {
+            if (!HEADROOM_SUPPORTED_LOCALES.includes(locale)) return;
+            localStorage.setItem(HEADROOM_LOCALE_STORAGE_KEY, locale);
+            applyHeadroomTranslations();
+        }
+    </script>
+    <script>
         tailwind.config = {
             darkMode: 'class',
             theme: {
@@ -158,7 +460,7 @@
                 <span class="flex items-center gap-1.5">
                     <span class="w-2 h-2 rounded-full pulse-live"
                           :class="healthy ? 'bg-emerald-400' : 'bg-red-400'"></span>
-                    <span class="text-sm" x-text="healthy ? 'Healthy' : 'Error'"></span>
+                    <span class="text-sm" x-text="t(healthy ? 'Healthy' : 'Error')"></span>
                 </span>
             </div>
             <div class="text-xs text-gray-500">
@@ -169,6 +471,13 @@
                title="Settings">
                 &#9881; Settings
             </a>
+            <select class="px-2 py-1.5 text-sm rounded-md border border-border bg-surface text-gray-400 hover:text-gray-200 transition-colors"
+                    :value="locale"
+                    @change="setLocale($event.target.value)"
+                    title="Dashboard language">
+                <option value="en">English</option>
+                <option value="zh-CN">中文</option>
+            </select>
             <button onclick="toggleTheme()" id="theme-toggle"
                     class="px-3 py-1.5 text-sm rounded-md border border-border bg-surface text-gray-400 hover:text-gray-200 transition-colors"
                     title="Toggle light/dark mode">
@@ -1982,6 +2291,7 @@
                 requestHistory: [],
                 savingsHistory: [],
                 expandedRows: {},
+                locale: getHeadroomLocale(),
                 pollInterval: null,
                 statsPollMs: 5000,
                 lifetimePollMs: 30000,
@@ -2001,6 +2311,7 @@
 
                 async init() {
                     await this.fetchStats();
+                    this.$nextTick(() => applyHeadroomTranslations());
 
                     this.pollInterval = setInterval(() => {
                         this.pollDashboard();
@@ -2031,6 +2342,15 @@
                     }
                 },
 
+                setLocale(locale) {
+                    this.locale = locale;
+                    setHeadroomLocale(locale);
+                },
+
+                t(text) {
+                    return translateHeadroomText(text, this.locale);
+                },
+
                 async setViewMode(mode) {
                     this.viewMode = mode;
                     if (mode === 'lifetime') {
@@ -2039,6 +2359,7 @@
                     if (mode === 'history') {
                         await this.fetchHistoryStats();
                     }
+                    this.$nextTick(() => applyHeadroomTranslations());
                 },
 
                 async toggleFeed() {
@@ -2076,6 +2397,7 @@
                         if (this.savingsHistory.length > 30) this.savingsHistory.shift();
 
                         this.lastUpdate = new Date().toLocaleTimeString();
+                        this.$nextTick(() => applyHeadroomTranslations());
                     } catch (e) {
                         console.error('Failed to fetch stats:', e);
                         this.healthy = false;
@@ -2099,6 +2421,7 @@
                         if (response.ok) {
                             this.historyStats = await response.json();
                             this.lastHistoryFetchMs = Date.now();
+                            this.$nextTick(() => applyHeadroomTranslations());
                         }
                     } catch (e) {
                         console.error('Failed to fetch history stats:', e);
@@ -2666,14 +2989,14 @@
                     const mix = this.stats.prefix_cache?.totals?.observed_ttl_mix || {};
                     const oneHour = mix['1h_pct'] || 0;
                     const fiveMinute = mix['5m_pct'] || 0;
-                    if (oneHour === fiveMinute) return 'Balanced';
-                    return oneHour > fiveMinute ? '1h leaning' : '5m leaning';
+                    if (oneHour === fiveMinute) return this.t('Balanced');
+                    return this.t(oneHour > fiveMinute ? '1h leaning' : '5m leaning');
                 },
 
                 get observedTtlWindowLabel() {
                     const mix = this.stats.prefix_cache?.totals?.observed_ttl_mix || {};
                     const active = mix.active_buckets || [];
-                    if (!active.length) return 'No TTL bucket data';
+                    if (!active.length) return this.t('No TTL bucket data');
                     return active.length === 1 ? active[0] + ' only' : active.join(' / ');
                 },
 
