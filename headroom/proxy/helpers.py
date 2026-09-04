@@ -2997,6 +2997,25 @@ def claude_code_tool_search_inactive(
     return not any(marker in beta for marker in _TOOL_SEARCH_BETA_MARKERS)
 
 
+def claude_code_tool_search_active(
+    *,
+    client: str | None,
+    tools: Any,
+    anthropic_beta: str | None,
+) -> bool:
+    """Return whether Claude Code sent an active Tool Search protocol marker."""
+    if client != "claude-code" or not isinstance(tools, list) or not tools:
+        return False
+    if any(
+        isinstance(tool, dict)
+        and str(tool.get("type", "")).startswith(_TOOL_SEARCH_TOOL_TYPE_PREFIX)
+        for tool in tools
+    ):
+        return True
+    beta = (anthropic_beta or "").lower()
+    return any(marker in beta for marker in _TOOL_SEARCH_BETA_MARKERS)
+
+
 def format_tool_search_disabled_hint(tools: list[Any]) -> str:
     """Build the one-time, actionable hint for issue #746.
 

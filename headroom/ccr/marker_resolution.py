@@ -1,4 +1,4 @@
-"""Inline resolution of ``<<ccr:...>>`` markers on the response path.
+"""Inline resolution of CCR markers on the response path.
 
 Normal CCR resolution relies on the ``headroom_retrieve`` tool: a marker is
 redeemed when the model calls the tool back. That path assumes there's a
@@ -27,27 +27,33 @@ from ..cache.compression_store import (
 
 logger = logging.getLogger(__name__)
 
-# Matches the opaque-blob marker form `<<ccr:HASH,KIND,SIZE>>` (and the
-# row-offload form `<<ccr:HASH N_rows_offloaded>>`) emitted by SmartCrusher.
+# Matches the opaque-blob and row-offload forms emitted by SmartCrusher, plus
+# bracketed markers emitted by the text, config, read, log, and Kompress paths.
 # HASH is 12-24 hex chars; see headroom/ccr/tool_injection.py for the same
-# constant used on the injection side.
-_MARKER_RE = re.compile(r"<<ccr:([a-f0-9]{12,24})[^>]*>>")
+# ownership boundary used on the injection side.
+_MARKER_RE = re.compile(
+    r"<<ccr:([a-f0-9]{12,24})[^>]*>>"
+    r"|\[[^\]]*?Retrieve (?:more|original): hash=([a-f0-9]{12,24})[^\]]*\]",
+    re.IGNORECASE,
+)
 
 
 def resolve_markers_in_text(text: str, *, store: CompressionStore | None = None) -> str:
-    """Replace every ``<<ccr:HASH,...>>`` marker in ``text`` with its original content.
+    """Replace supported CCR markers in ``text`` with their original content.
 
     A miss (expired/evicted/unknown hash) can't be reported back to the
     model on this path — there's no tool-call round-trip — so the marker is
     left in place with the miss reason appended rather than raising.
     """
-    if "<<ccr:" not in text:
+    if not (
+        "<<ccr:" in text or "Retrieve more: hash=" in text or "Retrieve original: hash=" in text
+    ):
         return text
 
     resolved_store = store or get_compression_store()
 
     def _replace(match: re.Match[str]) -> str:
-        hash_key = match.group(1)
+        hash_key = (match.group(1) or match.group(2)).lower()
         entry = resolved_store.retrieve(hash_key)
         if entry is not None:
             original = entry.original_content
@@ -63,7 +69,7 @@ def resolve_markers_in_text(text: str, *, store: CompressionStore | None = None)
 
 
 def resolve_markers_in_response(response: Any, *, store: CompressionStore | None = None) -> Any:
-    """Recursively resolve ``<<ccr:...>>`` markers in every string field of a payload.
+    """Recursively resolve CCR markers in every string field of a payload.
 
     Walks the full response structure rather than picking out
     provider-specific fields (``content`` blocks, ``message.content``,

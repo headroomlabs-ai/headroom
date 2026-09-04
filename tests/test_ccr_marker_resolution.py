@@ -34,9 +34,19 @@ def test_resolve_markers_in_text_no_marker_is_noop():
     assert resolve_markers_in_text("plain text, no markers here") == "plain text, no markers here"
 
 
-def test_resolve_markers_in_text_replaces_hit():
+@pytest.mark.parametrize(
+    "marker_template",
+    [
+        "<<ccr:{hash},string,23.6KB>>",
+        "[100 items compressed to 10. Retrieve more: hash={hash}]",
+        "[Read content stale. Retrieve original: hash={hash}]",
+    ],
+)
+@pytest.mark.parametrize("uppercase", [False, True])
+def test_resolve_markers_in_text_replaces_all_supported_hits(marker_template: str, uppercase: bool):
     hash_key = _store_entry("the original uncompressed content")
-    text = f"before <<ccr:{hash_key},string,23.6KB>> after"
+    marker_hash = hash_key.upper() if uppercase else hash_key
+    text = f"before {marker_template.format(hash=marker_hash)} after"
 
     resolved = resolve_markers_in_text(text)
 
@@ -68,8 +78,18 @@ def test_resolve_markers_in_text_json_array_original_content():
     assert json.loads(resolved) == [1, 2, 3]
 
 
-def test_resolve_markers_in_text_miss_leaves_marker_with_reason():
-    text = "<<ccr:deadbeefdeadbeef,string,1KB>>"
+@pytest.mark.parametrize(
+    "marker_template",
+    [
+        "<<ccr:{hash},string,1KB>>",
+        "[100 items compressed to 10. Retrieve more: hash={hash}]",
+        "[Read content stale. Retrieve original: hash={hash}]",
+    ],
+)
+def test_resolve_markers_in_text_miss_leaves_all_supported_markers_with_reason(
+    marker_template: str,
+):
+    text = marker_template.format(hash="deadbeefdeadbeef")
 
     resolved = resolve_markers_in_text(text)
 

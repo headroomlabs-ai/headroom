@@ -19,6 +19,7 @@ from headroom.cli.wrap import (
     _normalize_tool_search_mode,
 )
 from headroom.proxy.helpers import (
+    claude_code_tool_search_active,
     claude_code_tool_search_inactive,
     format_tool_search_disabled_hint,
     reset_tool_search_hint_state,
@@ -141,6 +142,30 @@ def test_inactive_false_when_no_tools() -> None:
     assert not claude_code_tool_search_inactive(
         client="claude-code", tools=None, anthropic_beta=None
     )
+
+
+def test_active_requires_explicit_tool_search_protocol_marker() -> None:
+    assert claude_code_tool_search_active(
+        client="claude-code",
+        tools=[*_TOOLS, {"type": "tool_search_tool_regex_20251119"}],
+        anthropic_beta=None,
+    )
+    assert claude_code_tool_search_active(
+        client="claude-code",
+        tools=_TOOLS,
+        anthropic_beta="advanced-tool-use-2025-11-20",
+    )
+    assert not claude_code_tool_search_active(
+        client="claude-code",
+        tools=[{"name": "WaitForMcpServers"}],
+        anthropic_beta=None,
+    )
+
+
+def test_active_marker_boundary_value_zero_does_not_use_tool_name() -> None:
+    tools = [{"name": "WaitForMcpServers"}]
+    assert not claude_code_tool_search_active(client="claude-code", tools=tools, anthropic_beta="")
+    assert claude_code_tool_search_inactive(client="claude-code", tools=tools, anthropic_beta="")
 
 
 # ---------------------------------------------------------------------------
