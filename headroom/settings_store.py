@@ -1,9 +1,11 @@
 """File-backed store for a curated subset of Headroom's runtime knobs (mostly ``HEADROOM_*``,
 
 The dashboard settings GUI persists these knobs to ``settings.json`` in the
-workspace dir and this module applies them to ``os.environ`` at CLI startup
-with ``os.environ.setdefault`` — so an explicit shell export always wins over
-the stored file. Precedence: ``export > settings.json > code default``.
+workspace dir and this module applies them to ``os.environ`` at CLI startup —
+the stored value wins over a shell export (``os.environ[...] = value``), so the
+GUI is authoritative. Precedence: ``CLI arg > settings.json > export > code
+default``. The exception is ``manifest_managed`` knobs, whose env is owned by the
+install manifest: there we ``setdefault`` so the export/manifest keeps priority.
 
 Deliberately dependency-light (stdlib + ``headroom.paths`` only, no FastAPI or
 proxy imports) so the early CLI apply hook — which must run
@@ -55,14 +57,67 @@ class SettingField:
     manifest_managed: bool = False
     minimum: float | None = None
     maximum: float | None = None
-    tier: str = "advanced"  # "basic" | "advanced" - Settings vs Advanced tab placement
+    tier: str = "advanced"  # "basic" | "advanced" — Normal vs Advanced within a page
+
+    @property
+    def page(self) -> str:
+        """Sidebar nav category, derived from ``group`` via ``_GROUP_TO_PAGE``."""
+        return _GROUP_TO_PAGE.get(self.group, "General")
+
+    @property
+    def live(self) -> bool:
+        """True when the knob applies via ``runtime_env`` with no restart."""
+        return self.page == "Output Shaping"
 
 
+# Sidebar nav order for the settings GUI. Each ``group`` maps to exactly one
+# page; several groups share a page (e.g. Limits + Budget). This tuple is the
+# single source of truth for page order — the UI renders pages in this sequence.
+PAGES: tuple[str, ...] = (
+    "General",
+    "Output Shaping",
+    "Compression",
+    "CCR & Caching",
+    "Limits & Budget",
+    "Networking & Security",
+    "Endpoints",
+    "Memory",
+    "Observability",
+)
+
+# Each field's ``group`` (its in-page sub-section header) maps to one nav page.
+_GROUP_TO_PAGE: dict[str, str] = {
+    "Backend": "General",
+    "Extensions": "General",
+    "Output Shaping": "Output Shaping",
+    "Compression": "Compression",
+    "CCR": "CCR & Caching",
+    "Limits": "Limits & Budget",
+    "Budget": "Limits & Budget",
+    "Networking": "Networking & Security",
+    "Timeouts": "Networking & Security",
+    "Endpoints": "Endpoints",
+    "Memory": "Memory",
+    "Logging": "Observability",
+    "Observability": "Observability",
+}
 # Curated registry. Env formats verified against each knob's Click option in
 # headroom/cli/proxy.py (bools serialize to "1"/"0", which Click's BOOL type and
 # the body-resolved HEADROOM_CODE_AWARE_ENABLED reader both accept).
 SETTINGS: tuple[SettingField, ...] = (
     # --- Compression ---
+    SettingField(
+        "HEADROOM_MODE",
+        "mode",
+        "Proxy mode",
+        "Compression",
+        "enum",
+        default="cache",
+        choices=("token", "cache"),
+        help="Proxy posture: token prioritizes compression (history may be rewritten for max "
+        "savings); cache prioritizes provider prefix-cache stability (prior turns frozen).",
+        tier="basic",
+    ),
     SettingField(
         "HEADROOM_SAVINGS_PROFILE",
         "savings_profile",
@@ -130,7 +185,7 @@ SETTINGS: tuple[SettingField, ...] = (
         "HEADROOM_NO_CCR",
         "no_ccr",
         "Disable CCR",
-        "Compression",
+        "CCR",
         "bool",
         default=False,
         help="Disable CCR entirely (no markers, no injected retrieve tool).",
@@ -281,6 +336,67 @@ SETTINGS: tuple[SettingField, ...] = (
         help="Path for the message log file.",
         tier="basic",
     ),
+    # --- Observability (metrics / tracing / telemetry; restart-required) -----
+    SettingField(
+        "HEADROOM_OTEL_METRICS_ENABLED",
+        "otel_metrics_enabled",
+        "OpenTelemetry metrics",
+        "Observability",
+        "bool",
+        default=False,
+        help="Export OpenTelemetry metrics (requires the [otel] extra).",
+        tier="basic",
+    ),
+    SettingField(
+        "HEADROOM_OTEL_METRICS_ENDPOINT",
+        "otel_metrics_endpoint",
+        "OTel metrics endpoint",
+        "Observability",
+        "str",
+        default=None,
+        help="OTLP metrics endpoint URL (e.g. http://localhost:4318/v1/metrics).",
+        tier="advanced",
+    ),
+    SettingField(
+        "HEADROOM_OTEL_SERVICE_NAME",
+        "otel_service_name",
+        "OTel service name",
+        "Observability",
+        "str",
+        default=None,
+        help="service.name resource attribute for exported telemetry.",
+        tier="advanced",
+    ),
+    SettingField(
+        "HEADROOM_LANGFUSE_ENABLED",
+        "langfuse_enabled",
+        "Langfuse tracing",
+        "Observability",
+        "bool",
+        default=False,
+        help="Send LLM traces to Langfuse (LANGFUSE_* keys stay env-only).",
+        tier="basic",
+    ),
+    SettingField(
+        "HEADROOM_TELEMETRY",
+        "telemetry",
+        "Anonymous usage telemetry",
+        "Observability",
+        "optional-bool",
+        default=None,
+        help="Opt in/out of the anonymous usage beacon. Unset = off (opt-in).",
+        tier="basic",
+    ),
+    SettingField(
+        "HEADROOM_PERIODIC_TOIN_STATS",
+        "periodic_toin_stats",
+        "Periodic TOIN stats",
+        "Observability",
+        "bool",
+        default=True,
+        help="Log periodic tokens-out/-in efficiency stats.",
+        tier="advanced",
+    ),
     # --- Networking (upstream connection pool tuning) ---
     SettingField(
         "HEADROOM_MAX_CONNECTIONS",
@@ -340,7 +456,7 @@ SETTINGS: tuple[SettingField, ...] = (
         "HEADROOM_NO_CCR_PROACTIVE_EXPANSION",
         "no_ccr_proactive_expansion",
         "Disable CCR proactive expansion",
-        "Compression",
+        "CCR",
         "bool",
         default=False,
         help="Disable proactive expansion of previously compressed content.",
@@ -725,6 +841,387 @@ SETTINGS: tuple[SettingField, ...] = (
         help="JSON object of extra headers merged into (and overriding) forwarded OpenAI requests.",
         tier="advanced",
     ),
+    # --- Additional curated knobs -------------------------------------------
+    # Each reuses an existing ``group`` (so it renders on that group's page);
+    # env formats verified against each knob's own reader. All restart-required
+    # (non-live). See docs/environment-variables.md for the full inventory.
+    # Compression page
+    SettingField(
+        "HEADROOM_KOMPRESS_BACKEND",
+        "kompress_backend",
+        "Kompress engine backend",
+        "Compression",
+        "enum",
+        default="auto",
+        choices=("auto", "onnx", "onnx_cpu", "onnx_coreml", "pytorch", "pytorch_mps"),
+        help="Kompress ML backend. auto tries ONNX CPU first, then PyTorch.",
+        tier="advanced",
+    ),
+    SettingField(
+        "HEADROOM_DEDUPE",
+        "dedupe",
+        "Cross-turn dedup",
+        "Compression",
+        "bool",
+        default=False,
+        help="Deduplicate content repeated across turns (the original stays in context).",
+        tier="advanced",
+    ),
+    SettingField(
+        "HEADROOM_TOOL_SEARCH",
+        "tool_search",
+        "Tool-search injection",
+        "Compression",
+        "bool",
+        default=False,
+        help="Replace a large tool list with a single search tool to cut tool-schema tokens.",
+        tier="advanced",
+    ),
+    SettingField(
+        "HEADROOM_COLD_RECOMPACT",
+        "cold_recompact",
+        "Cold-prefix recompaction",
+        "Compression",
+        "bool",
+        default=False,
+        help="Recompact the whole history when the provider prompt cache has lapsed. Fires only "
+        "on a confirmed-cold turn, so there is no warm cache to bust.",
+        tier="advanced",
+    ),
+    SettingField(
+        "HEADROOM_NET_COST_POLICY",
+        "net_cost_policy",
+        "Net-cost frozen-floor unlock",
+        "Compression",
+        "bool",
+        default=False,
+        help="Allow compression to rewrite messages already inside the provider's cached prefix "
+        "when the token saving beats the cache-rewrite penalty. Without it, savings stop growing "
+        "once the prefix goes warm.",
+        tier="advanced",
+    ),
+    # CCR & Caching page
+    SettingField(
+        "HEADROOM_CCR_BACKEND",
+        "ccr_backend",
+        "CCR storage backend",
+        "CCR",
+        "enum",
+        default="sqlite",
+        choices=("sqlite", "redis", "memory"),
+        help="Where CCR-retrievable compressed content lives. redis enables cross-worker sharing.",
+        tier="advanced",
+    ),
+    SettingField(
+        "HEADROOM_REDIS_URL",
+        "redis_url",
+        "Redis URL",
+        "CCR",
+        "str",
+        default=None,
+        help="Redis connection URL, used when the CCR backend is redis (e.g. redis://localhost:6379/0).",
+        tier="advanced",
+    ),
+    SettingField(
+        "HEADROOM_CCR_TTL_SECONDS",
+        "ccr_ttl_seconds",
+        "CCR TTL (s)",
+        "CCR",
+        "int",
+        default=None,
+        minimum=0,
+        help="Seconds compressed content stays retrievable. Default: 1800 (30 min).",
+        tier="advanced",
+    ),
+    # Networking & Security page
+    SettingField(
+        "HEADROOM_STATELESS",
+        "stateless",
+        "Stateless mode",
+        "Networking",
+        "bool",
+        default=False,
+        help="Disable all filesystem writes (savings, logs) — run purely in-memory.",
+        tier="advanced",
+    ),
+    SettingField(
+        "HEADROOM_OFFLINE",
+        "offline",
+        "Offline mode",
+        "Networking",
+        "bool",
+        default=False,
+        help="Air-gap / no-egress master switch — disables update checks, model downloads, etc.",
+        tier="advanced",
+    ),
+    SettingField(
+        "HEADROOM_TLS_STRICT",
+        "tls_strict",
+        "Strict TLS verification",
+        "Networking",
+        "bool",
+        default=True,
+        help="OpenSSL 3.2+ strict X.509 verification. Turn off behind a corporate TLS-inspection proxy.",
+        tier="advanced",
+    ),
+    SettingField(
+        "HEADROOM_CORS_ORIGINS",
+        "cors_origins",
+        "Allowed CORS origins",
+        "Networking",
+        "csv-list",
+        default=None,
+        help="Comma-separated allowed CORS origins for dashboard/API access.",
+        tier="advanced",
+    ),
+    SettingField(
+        "HEADROOM_WS_ORIGINS",
+        "ws_origins",
+        "Allowed WebSocket origins",
+        "Networking",
+        "csv-list",
+        default=None,
+        help="Comma-separated allowed WebSocket origins. Falls back to the CORS origins when unset.",
+        tier="advanced",
+    ),
+    # Endpoints page (additional upstream base URLs)
+    SettingField(
+        "VERTEX_TARGET_API_URL",
+        "vertex_base_url",
+        "Vertex AI base URL",
+        "Endpoints",
+        "str",
+        default=None,
+        help="Custom Vertex AI regional API URL for publisher endpoints.",
+        tier="advanced",
+    ),
+    SettingField(
+        "BEDROCK_TARGET_API_URL",
+        "bedrock_base_url",
+        "Bedrock base URL",
+        "Endpoints",
+        "str",
+        default=None,
+        help="Custom AWS Bedrock InvokeModel API URL (gateway/LocalStack; not re-signed for real AWS SigV4).",
+        tier="advanced",
+    ),
+    SettingField(
+        "GEMINI_TARGET_API_URL",
+        "gemini_base_url",
+        "Gemini base URL",
+        "Endpoints",
+        "str",
+        default=None,
+        help="Custom Gemini API URL for passthrough endpoints.",
+        tier="advanced",
+    ),
+    SettingField(
+        "CLOUDCODE_TARGET_API_URL",
+        "cloudcode_base_url",
+        "Cloud Code base URL",
+        "Endpoints",
+        "str",
+        default=None,
+        help="Custom Cloud Code Assist API URL for compatibility endpoints.",
+        tier="advanced",
+    ),
+    # Memory page (Qdrant vector store for the qdrant-neo4j backend)
+    SettingField(
+        "HEADROOM_QDRANT_URL",
+        "qdrant_url",
+        "Qdrant URL",
+        "Memory",
+        "str",
+        default=None,
+        help="Full Qdrant URL (e.g. https://xyz.cloud.qdrant.io:6333). Overrides host/port.",
+        tier="advanced",
+    ),
+    SettingField(
+        "HEADROOM_QDRANT_HOST",
+        "qdrant_host",
+        "Qdrant host",
+        "Memory",
+        "str",
+        default=None,
+        help="Qdrant hostname for the qdrant-neo4j backend. Default: localhost.",
+        tier="advanced",
+    ),
+    SettingField(
+        "HEADROOM_QDRANT_PORT",
+        "qdrant_port",
+        "Qdrant port",
+        "Memory",
+        "int",
+        default=None,
+        minimum=1,
+        maximum=65535,
+        help="Qdrant HTTP port for the qdrant-neo4j backend. Default: 6333.",
+        tier="advanced",
+    ),
+    SettingField(
+        "HEADROOM_QDRANT_API_KEY",
+        "qdrant_api_key",
+        "Qdrant API key",
+        "Memory",
+        "str",
+        default=None,
+        secret=True,
+        help="API key for hosted Qdrant (e.g. Qdrant Cloud).",
+        tier="advanced",
+    ),
+    # --- CLI-arg toggles (env-backed; restart-required) ---------------------
+    # These mirror `headroom proxy` flags that resolve from an env var, so the
+    # settings.json -> setdefault path reaches them.
+    # Compression page
+    SettingField(
+        "HEADROOM_OPTIMIZE",
+        "optimize",
+        "Optimization enabled",
+        "Compression",
+        "bool",
+        default=True,
+        help="Master switch. Off = passthrough mode (no compression/optimization); mirrors --no-optimize.",
+        tier="basic",
+    ),
+    # Compression page (tool_result interception is a startup-read transform, so
+    # it must NOT sit on the Output Shaping page, whose fields are auto-live).
+    SettingField(
+        "HEADROOM_INTERCEPT_ENABLED",
+        "intercept_enabled",
+        "Tool-result interception",
+        "Compression",
+        "bool",
+        default=False,
+        help=(
+            "Enable ast-grep tool_result interceptors (Read outliner, etc.); mirrors "
+            "--intercept-tool-results. Rollout-gated: also needs "
+            "HEADROOM_ROLLOUT_CHANNEL=canary (or higher), else it stays off."
+        ),
+        tier="advanced",
+    ),
+    # CCR & Caching page
+    SettingField(
+        "HEADROOM_CACHE_ENABLED",
+        "cache_enabled",
+        "Semantic cache enabled",
+        "CCR",
+        "bool",
+        default=True,
+        help="Semantic response cache. Off mirrors --no-cache.",
+        tier="basic",
+    ),
+    # Limits & Budget page
+    SettingField(
+        "HEADROOM_RATE_LIMIT_ENABLED",
+        "rate_limit_enabled",
+        "Rate limiting enabled",
+        "Limits",
+        "bool",
+        default=True,
+        help="Enforce RPM/TPM limits. Off mirrors --no-rate-limit.",
+        tier="basic",
+    ),
+    # Memory page (out-of-process embedding server sidecar)
+    SettingField(
+        "HEADROOM_EMBEDDING_SERVER",
+        "embedding_server",
+        "Embedding server sidecar",
+        "Memory",
+        "bool",
+        default=False,
+        help="Run a shared out-of-process embedder across workers (saves ~600 MB RSS); mirrors --embedding-server.",
+        tier="advanced",
+    ),
+    SettingField(
+        "HEADROOM_EMBEDDING_SERVER_SOCKET",
+        "embedding_server_socket",
+        "Embedding server socket",
+        "Memory",
+        "str",
+        default=None,
+        help="Unix socket path for the embedding sidecar. Default: /tmp/headroom-embed-<port>.sock.",
+        tier="advanced",
+    ),
+    # --- Output Shaping (live: applied via runtime_env, no restart) ----------
+    # These mirror headroom/proxy/runtime_env.py RUNTIME_ENV_KNOBS. A save
+    # persists to settings.json AND hot-reloads through set_overrides(), so it
+    # takes effect on the next request. Unset means "adaptive default", so the
+    # boolean knobs are optional-bool (unset is distinct from an explicit off).
+    SettingField(
+        "HEADROOM_OUTPUT_SHAPER",
+        "output_shaper",
+        "Output shaping",
+        "Output Shaping",
+        "optional-bool",
+        default=None,
+        help="Master switch for output-token shaping. Unset = adaptive default.",
+        tier="basic",
+    ),
+    SettingField(
+        "HEADROOM_VERBOSITY_LEVEL",
+        "verbosity_level",
+        "Verbosity level",
+        "Output Shaping",
+        "int",
+        default=None,
+        minimum=0,
+        maximum=4,
+        help="Verbosity steering level 0-4. Unset = learned/default.",
+        tier="basic",
+    ),
+    SettingField(
+        "HEADROOM_EFFORT_ROUTER",
+        "effort_router",
+        "Effort router",
+        "Output Shaping",
+        "optional-bool",
+        default=None,
+        help="Lower effort on mechanical tool-result continuations. Unset = adaptive.",
+        tier="basic",
+    ),
+    SettingField(
+        "HEADROOM_MECHANICAL_EFFORT",
+        "mechanical_effort",
+        "Mechanical effort",
+        "Output Shaping",
+        "str",
+        default=None,
+        help="Effort value used on mechanical continuations (e.g. low, medium, high).",
+        tier="advanced",
+    ),
+    SettingField(
+        "HEADROOM_VERBOSITY_AUTOTUNE",
+        "verbosity_autotune",
+        "Verbosity autotune",
+        "Output Shaping",
+        "optional-bool",
+        default=None,
+        help="Use the AIMD verbosity controller state. Unset = adaptive.",
+        tier="advanced",
+    ),
+    SettingField(
+        "HEADROOM_OUTPUT_HOLDOUT",
+        "output_holdout",
+        "Output holdout fraction",
+        "Output Shaping",
+        "float",
+        default=None,
+        minimum=0.0,
+        maximum=1.0,
+        help="Fraction of conversations held out for A/B measurement (0-1).",
+        tier="advanced",
+    ),
+    SettingField(
+        "HEADROOM_INTERCEPT_READ_MIN_CHARS",
+        "intercept_read_min_chars",
+        "Read-rewrite min chars",
+        "Output Shaping",
+        "int",
+        default=None,
+        minimum=0,
+        help="Minimum tool-output chars before the ast-grep read rewrite.",
+        tier="advanced",
+    ),
 )
 
 _BY_KEY: dict[str, SettingField] = {f.key: f for f in SETTINGS}
@@ -955,27 +1452,58 @@ def save(values: dict[str, Any]) -> None:
 
 
 def apply_to_environ(values: dict[str, Any]) -> None:
-    """``setdefault`` each stored value into ``os.environ`` (explicit export wins)."""
+    """Apply each stored value into ``os.environ``.
+
+    settings.json is the highest-priority source below an explicit CLI arg, so a
+    stored value *overrides* a shell-exported env var. ``manifest_managed`` knobs
+    are the exception: the install manifest (docker/service) owns their env, so
+    there we ``setdefault`` and let the exported value win.
+
+    Live knobs are skipped: the proxy seeds them into the ``runtime_env``
+    override store at startup instead.
+    """
     for key, value in values.items():
         field = _BY_KEY.get(key)
-        if field is None or value is None:
+        if field is None or value is None or field.live:
             continue
-        os.environ.setdefault(field.env, _serialize(field, value))
+        if field.manifest_managed:
+            os.environ.setdefault(field.env, _serialize(field, value))
+        else:
+            os.environ[field.env] = _serialize(field, value)
 
 
 def effective_values(stored: dict[str, Any] | None = None) -> dict[str, Any]:
-    """The value actually active now for each knob: default ← file ← environ."""
+    """The value actually active now for each knob.
+
+    settings.json is the highest-priority source, so for a normal knob the file
+    wins over the environment: default ← environ ← file. ``manifest_managed``
+    knobs are the exception — the install manifest (env) owns them, so there the
+    environment wins: default ← file ← environ.
+    """
     if stored is None:
         stored = load()
     result: dict[str, Any] = {}
     for field in SETTINGS:
-        value = stored[field.key] if field.key in stored else field.default
+        env_val: Any = None
         env_raw = os.environ.get(field.env)
         if env_raw is not None and env_raw != "":
             try:
-                value = _coerce(field, env_raw)
+                env_val = _coerce(field, env_raw)
             except (ValueError, TypeError):
-                pass  # unparseable env: keep the file/default value
+                env_val = None  # unparseable env: ignore it
+        has_file = field.key in stored
+        if field.manifest_managed:
+            # Install manifest (env) wins over the stored file.
+            value = stored[field.key] if has_file else field.default
+            if env_val is not None:
+                value = env_val
+        else:
+            # settings.json wins over the environment.
+            value = field.default
+            if env_val is not None:
+                value = env_val
+            if has_file:
+                value = stored[field.key]
         result[field.key] = value
     return result
 
@@ -997,8 +1525,10 @@ def stored_values(mask_secrets: bool = True) -> dict[str, Any]:
 def to_schema() -> dict[str, Any]:
     """Registry + grouped fields + effective values for the UI. Secrets masked.
 
-    All curated knobs are startup-captured, so every key is restart-required;
-    ``needs_restart_keys`` lists them for the UI's "restart to apply" banner.
+    Each field carries ``page`` (sidebar nav category) and ``group`` (in-page
+    sub-section header); ``pages`` lists the populated pages in nav order.
+    ``live`` knobs apply via ``runtime_env`` with no restart, so only non-live
+    keys land in ``needs_restart_keys`` for the UI's "restart to apply" banner.
     """
     stored = load()
     effective = effective_values(stored)
@@ -1010,6 +1540,7 @@ def to_schema() -> dict[str, Any]:
                 "env": field.env,
                 "label": field.label,
                 "group": field.group,
+                "page": field.page,
                 "type": field.type,
                 "choices": list(field.choices),
                 "default": field.default,
@@ -1019,7 +1550,12 @@ def to_schema() -> dict[str, Any]:
                 "minimum": field.minimum,
                 "maximum": field.maximum,
                 "tier": field.tier,
-                "env_override": bool(os.environ.get(field.env)),
+                "live": field.live,
+                # settings.json wins over the environment, so an env var only
+                # *overrides* (locks) a knob when the install manifest owns it.
+                # ``env_present`` is purely informational for the UI.
+                "env_override": bool(field.manifest_managed and os.environ.get(field.env)),
+                "env_present": bool(os.environ.get(field.env)),
                 "value": _mask(field, effective.get(field.key)),
                 "stored": _mask(field, stored.get(field.key)),
             }
@@ -1028,9 +1564,58 @@ def to_schema() -> dict[str, Any]:
     for field in SETTINGS:
         if field.group not in groups:
             groups.append(field.group)
+    populated = {field.page for field in SETTINGS}
+    pages = [page for page in PAGES if page in populated]
     return {
+        "pages": pages,
         "groups": groups,
         "fields": fields,
         "values": {f["key"]: f["value"] for f in fields},
-        "needs_restart_keys": [field.key for field in SETTINGS],
+        "needs_restart_keys": [field.key for field in SETTINGS if not field.live],
     }
+
+
+def live_keys(keys: list[str]) -> list[str]:
+    """Subset of ``keys`` whose registry field applies live (no restart)."""
+    return [key for key in keys if (f := _BY_KEY.get(key)) is not None and f.live]
+
+
+def coerce_env_value(key: str, raw: str | None) -> Any:
+    """Coerce a raw env string to registry ``key``'s typed value (for display).
+
+    Returns ``None`` when ``raw`` is unset/empty, or the key is unknown or the
+    value unparseable. Lets the ``/settings/schema`` handler reflect a live
+    ``runtime_env`` override as the field's typed value without importing the
+    proxy into this dependency-light module.
+    """
+    if raw is None or raw == "":
+        return None
+    field = _BY_KEY.get(key)
+    if field is None:
+        return None
+    try:
+        return _coerce(field, raw)
+    except (ValueError, TypeError):
+        return None
+
+
+def runtime_overrides(keys: list[str], values: dict[str, Any]) -> dict[str, str]:
+    """Map live registry ``keys`` to ``{env: serialized}`` for a hot-reload push.
+
+    ``values`` is a coerced stored dict (e.g. from :func:`load`). Non-live or
+    unknown keys, and keys absent from ``values``, are skipped — so the result
+    is exactly what ``runtime_env.set_overrides`` should apply after a save.
+    """
+    out: dict[str, str] = {}
+    for key in keys:
+        field = _BY_KEY.get(key)
+        if field is None or not field.live or key not in values:
+            continue
+        out[field.env] = _serialize(field, values[key])
+    return out
+
+
+def env_for(key: str) -> str | None:
+    """Return the ``HEADROOM_*`` env var name for a registry ``key`` (or None)."""
+    field = _BY_KEY.get(key)
+    return field.env if field is not None else None

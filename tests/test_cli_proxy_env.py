@@ -25,6 +25,21 @@ def runner():
     return CliRunner()
 
 
+@pytest.fixture(autouse=True)
+def _isolate_settings_store(tmp_path, monkeypatch):
+    """Point the settings store at an empty tmp workspace.
+
+    The CLI's startup apply hook reads ``~/.headroom/settings.json`` and, under
+    the settings-wins precedence, its stored values override env vars. These
+    tests assert env-var handling in isolation, so pin the workspace to an empty
+    tmp dir (``load()`` -> ``{}``) rather than a developer's real settings file.
+    """
+    from headroom import paths
+
+    monkeypatch.setenv(paths.HEADROOM_WORKSPACE_DIR_ENV, str(tmp_path))
+    monkeypatch.delenv(paths.HEADROOM_SETTINGS_PATH_ENV, raising=False)
+
+
 class _FakeProxyProcess:
     returncode = None
 

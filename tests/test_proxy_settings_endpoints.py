@@ -285,3 +285,103 @@ class TestSettingsPageRoute:
         resp = client.get("/dashboard/settings")
         assert resp.status_code == 200, resp.text
         assert "<" in resp.text  # rendered HTML page
+
+
+class TestPagesAndLiveKnobs:
+    def test_schema_exposes_pages_and_per_field_page_live(self, client):
+        body = client.get("/settings/schema").json()
+        assert body["pages"][0] == "General"
+        assert "Output Shaping" in body["pages"]
+        by_key = {f["key"]: f for f in body["fields"]}
+        assert by_key["output_shaper"]["page"] == "Output Shaping"
+        assert by_key["output_shaper"]["live"] is True
+        assert by_key["target_ratio"]["live"] is False
+
+    def test_schema_reflects_live_runtime_env_override(self, client):
+        from headroom.proxy import runtime_env
+
+        runtime_env.clear_overrides()
+        try:
+            client.post("/admin/runtime-env", json={"HEADROOM_VERBOSITY_LEVEL": "3"})
+            body = client.get("/settings/schema").json()
+            verbosity = next(f for f in body["fields"] if f["key"] == "verbosity_level")
+            assert verbosity["value"] == 3
+        finally:
+            runtime_env.clear_overrides()
+
+    def test_post_settings_applies_live_knob_without_restart(self, client, workspace):
+        from headroom.proxy import runtime_env
+
+        runtime_env.clear_overrides()
+        try:
+            resp = client.post("/settings", json={"values": {"verbosity_level": 2}})
+            assert resp.status_code == 200, resp.text
+            body = resp.json()
+            assert body["live_keys"] == ["verbosity_level"]
+            assert body["needs_restart"] is False
+            # Persisted AND pushed to the live override store.
+            assert settings_store.load()["verbosity_level"] == 2
+            assert runtime_env.getenv("HEADROOM_VERBOSITY_LEVEL") == "2"
+        finally:
+            runtime_env.clear_overrides()
+
+    def test_post_settings_mixed_live_and_restart(self, client, workspace):
+        from headroom.proxy import runtime_env
+
+        runtime_env.clear_overrides()
+        try:
+            resp = client.post(
+                "/settings", json={"values": {"verbosity_level": 1, "target_ratio": 0.3}}
+            )
+            assert resp.status_code == 200, resp.text
+            body = resp.json()
+            assert body["live_keys"] == ["verbosity_level"]
+            # A non-live change is still pending, so a restart is required.
+            assert body["needs_restart"] is True
+            assert set(body["changed_keys"]) == {"verbosity_level", "target_ratio"}
+        finally:
+            runtime_env.clear_overrides()
+
+    def test_unsetting_live_knob_clears_override(self, client, workspace, monkeypatch):
+        from headroom.proxy import runtime_env
+
+        monkeypatch.delenv("HEADROOM_OUTPUT_SHAPER", raising=False)
+        runtime_env.clear_overrides()
+        try:
+            client.post("/settings", json={"values": {"output_shaper": True}})
+            assert runtime_env.getenv("HEADROOM_OUTPUT_SHAPER") == "1"
+            # Reset to "Default (unset)" -> the override must be dropped, not left stale.
+            resp = client.post("/settings", json={"values": {"output_shaper": None}})
+            assert resp.status_code == 200, resp.text
+            body = resp.json()
+            assert body["live_keys"] == ["output_shaper"]
+            assert body["needs_restart"] is False
+            assert runtime_env.getenv("HEADROOM_OUTPUT_SHAPER") is None
+            schema = client.get("/settings/schema").json()
+            field = next(f for f in schema["fields"] if f["key"] == "output_shaper")
+            assert field["value"] is None
+        finally:
+            runtime_env.clear_overrides()
+
+    def test_persisted_live_knob_editable_after_restart(self, workspace, monkeypatch):
+        """A restarted proxy seeds persisted live knobs as overrides, not env vars,
+        so they stay active yet remain GUI-editable (not env-locked)."""
+        import os
+
+        from headroom.proxy import runtime_env
+
+        monkeypatch.delenv("HEADROOM_OUTPUT_SHAPER", raising=False)
+        runtime_env.clear_overrides()
+        try:
+            settings_store.save({"output_shaper": True})
+            # Fresh app construction models a proxy restart (create_app seeds overrides).
+            fresh = TestClient(
+                _make_app(), base_url="http://127.0.0.1", client=("127.0.0.1", 12345)
+            )
+            schema = fresh.get("/settings/schema").json()
+            field = next(f for f in schema["fields"] if f["key"] == "output_shaper")
+            assert field["value"] is True  # persisted value is active
+            assert field["env_override"] is False  # not env-locked → still editable
+            assert "HEADROOM_OUTPUT_SHAPER" not in os.environ
+        finally:
+            runtime_env.clear_overrides()

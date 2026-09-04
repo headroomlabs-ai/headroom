@@ -1320,9 +1320,12 @@ def proxy(
         cloudcode_api_url=provider_api_overrides.cloudcode,
         vertex_api_url=provider_api_overrides.vertex,
         mode=effective_mode,
-        optimize=not no_optimize,
-        cache_enabled=not no_cache,
-        rate_limit_enabled=not no_rate_limit,
+        # CLI flag disables; else honor the env toggle (settings.json path).
+        # When the env var is unset _get_env_bool returns the True default, so
+        # behavior is identical to the historic `not no_<flag>`.
+        optimize=not no_optimize and _get_env_bool("HEADROOM_OPTIMIZE", True),
+        cache_enabled=not no_cache and _get_env_bool("HEADROOM_CACHE_ENABLED", True),
+        rate_limit_enabled=not no_rate_limit and _get_env_bool("HEADROOM_RATE_LIMIT_ENABLED", True),
         rate_limit_requests_per_minute=rpm if rpm is not None else 60,
         rate_limit_tokens_per_minute=tpm if tpm is not None else 100_000,
         compress_user_messages=_get_env_bool("HEADROOM_COMPRESS_USER_MESSAGES", False),

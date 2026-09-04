@@ -2740,12 +2740,23 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
     # Defensive re-apply of file-backed settings for embedded/non-CLI callers
     # that construct the app without going through the `headroom` CLI entrypoint
-    # (which already applies them before Click parsing). setdefault keeps
-    # explicit env exports authoritative; fail-open so it never blocks startup.
+    # (which already applies them before Click parsing). settings.json wins over
+    # a shell-exported env var here — highest priority below an explicit CLI arg;
+    # manifest_managed knobs keep the export. Fail-open so it never blocks startup.
     try:
         from headroom import settings_store
 
-        settings_store.apply_to_environ(settings_store.load())
+        stored = settings_store.load()
+        settings_store.apply_to_environ(stored)
+        # Live (Output Shaping) knobs are intentionally NOT written to os.environ
+        # (that would env-lock them in the GUI). Seed them into the hot-reload
+        # override store so persisted values stay active after a restart yet
+        # remain editable. The override wins over os.environ, so the stored
+        # value takes precedence over a shell export, matching settings-first.
+        _live_seed = settings_store.runtime_overrides(
+            settings_store.live_keys(list(stored)), stored
+        )
+        runtime_env.set_overrides(_live_seed)
     except Exception:  # noqa: BLE001 — settings load must never break startup
         pass
 
@@ -3899,6 +3910,15 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             schema["supervised"] = mode != "foreground"
         except Exception:  # noqa: BLE001 — schema must render even if detection fails
             schema["supervised"] = False
+        # Live (runtime_env) knobs apply without a restart, so their true current
+        # value is the hot-reload override — not the launch-time environ the store
+        # read. Reflect that so the form shows what is actually active right now.
+        for field_schema in schema["fields"]:
+            if field_schema.get("live"):
+                field_schema["value"] = settings_store.coerce_env_value(
+                    field_schema["key"], runtime_env.getenv(field_schema["env"])
+                )
+        schema["values"] = {f["key"]: f["value"] for f in schema["fields"]}
         return JSONResponse(status_code=200, content=schema)
 
     @app.get("/settings", dependencies=[Depends(_require_loopback_or_trusted_dashboard_client)])
@@ -3945,6 +3965,20 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             )
         after = settings_store.load()
         changed_keys = sorted(k for k in set(before) | set(after) if before.get(k) != after.get(k))
+        # Live (Output Shaping) knobs hot-reload with no restart: push their new
+        # values to the runtime-env override store so they take effect on the
+        # next request. Every other knob is startup-captured and needs a restart.
+        live_changed = settings_store.live_keys(changed_keys)
+        if live_changed:
+            runtime_env.set_overrides(settings_store.runtime_overrides(live_changed, after))
+            # A live knob cleared to its default is absent from `after`; drop its
+            # override so the reader falls back to the adaptive default right away.
+            for key in live_changed:
+                if key not in after:
+                    env = settings_store.env_for(key)
+                    if env:
+                        runtime_env.clear_override(env)
+        restart_changed = [k for k in changed_keys if k not in live_changed]
         record_admin_action(
             request=request,
             action="settings_update",
@@ -3953,7 +3987,12 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         )
         return JSONResponse(
             status_code=200,
-            content={"ok": True, "needs_restart": bool(changed_keys), "changed_keys": changed_keys},
+            content={
+                "ok": True,
+                "needs_restart": bool(restart_changed),
+                "changed_keys": changed_keys,
+                "live_keys": live_changed,
+            },
         )
 
     @app.post(

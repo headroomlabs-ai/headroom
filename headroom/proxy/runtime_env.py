@@ -105,7 +105,7 @@ def getenv(name: str, default: str | None = None) -> str | None:
     return os.environ.get(name, default)
 
 
-def set_overrides(values: dict[str, object]) -> dict[str, str]:
+def set_overrides(values: Mapping[str, object]) -> dict[str, str]:
     """Apply hot-reload overrides for known knobs. Returns what was applied.
 
     Unknown keys and non-string values are ignored (the endpoint is loopback-only
@@ -126,6 +126,17 @@ def clear_overrides() -> None:
     """Drop all overrides (used by tests and to reset state)."""
     with _lock:
         _overrides.clear()
+
+
+def clear_override(name: str) -> bool:
+    """Drop a single override so ``getenv`` falls back to the environment.
+
+    Returns True if an override was present. Used when a live knob is unset in
+    the settings GUI: removing the override (rather than pushing ``""``) lets
+    the reader see the value as genuinely absent again.
+    """
+    with _lock:
+        return _overrides.pop(name, None) is not None
 
 
 def explicit_env(environ: Mapping[str, str] | None = None) -> dict[str, str]:
