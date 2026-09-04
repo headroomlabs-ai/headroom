@@ -17,6 +17,7 @@ Supported Languages (Tier 1):
 
 Supported Languages (Tier 2):
 - Go, Rust, Java, C, C++
+- Bash (validated and preserved losslessly)
 
 Compression Strategy:
 1. Parse code into AST using tree-sitter
@@ -273,7 +274,7 @@ def _get_parser(language: str) -> Any:
         except Exception as e:
             raise ValueError(
                 f"Language '{language}' is not supported by tree-sitter. "
-                f"Supported: python, javascript, typescript, go, rust, java, c, cpp, csharp, php. "
+                f"Supported: python, javascript, typescript, go, rust, java, c, cpp, csharp, php, bash. "
                 f"Error: {e}"
             ) from e
 
@@ -330,6 +331,8 @@ class CodeLanguage(Enum):
     PERL = "perl"
     CSHARP = "csharp"
     PHP = "php"
+    BASH = "bash"
+    SHELL = "bash"  # Alias: tree-sitter-language-pack exposes the Bash grammar.
     UNKNOWN = "unknown"
 
 
@@ -358,6 +361,10 @@ _LANGUAGE_ALIASES: dict[str, CodeLanguage] = {
     "php5": CodeLanguage.PHP,
     "php7": CodeLanguage.PHP,
     "php8": CodeLanguage.PHP,
+    "shell": CodeLanguage.BASH,
+    "sh": CodeLanguage.BASH,
+    "zsh": CodeLanguage.BASH,
+    "shellscript": CodeLanguage.BASH,
 }
 
 
@@ -589,6 +596,34 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
         detection_hints=("<?php", "function ", "namespace ", "->", "$this"),
         class_body_node_types=frozenset({"declaration_list"}),
     ),
+    CodeLanguage.BASH: LangConfig(
+        # Shell control-flow nodes are opaque: their `then`/`fi`, `do`/`done`,
+        # and `case` delimiters are anonymous grammar tokens.  The generic
+        # extractor must not descend into them and re-emit only their commands,
+        # which would silently corrupt otherwise valid shell code.
+        import_nodes=frozenset(),
+        function_nodes=frozenset(),
+        class_nodes=frozenset(),
+        type_nodes=frozenset(),
+        body_node_types=frozenset(),
+        decorator_node=None,
+        comment_prefix="#",
+        uses_colon_after_signature=False,
+        detection_hints=("#!/bin/bash", "#!/usr/bin/env bash", " then", " fi", " esac"),
+        opaque_node_types=frozenset(
+            {
+                "if_statement",
+                "for_statement",
+                "while_statement",
+                "until_statement",
+                "case_statement",
+                "select_statement",
+                "function_definition",
+                "subshell",
+                "compound_statement",
+            }
+        ),
+    ),
 }
 
 
@@ -803,6 +838,18 @@ _LANGUAGE_PREFILTER: dict[CodeLanguage, list[re.Pattern[str]]] = {
             re.MULTILINE,
         ),
         re.compile(r"\$this->|->\w+\s*\(", re.MULTILINE),
+    ],
+    CodeLanguage.BASH: [
+        re.compile(r"^\s*#!.*\b(?:bash|sh|zsh)\b", re.MULTILINE),
+        re.compile(
+            r"^\s*(?:if|then|elif|else|fi|for|while|until|do|done|case|esac|select)\b",
+            re.MULTILINE,
+        ),
+        re.compile(
+            r"^\s*(?:export|source|shopt|declare|local|alias|set|readonly|typeset)\b",
+            re.MULTILINE,
+        ),
+        re.compile(r"\[\[.*\]\]|\$\{[^}]+\}|\$\([^)]+\)", re.MULTILINE),
     ],
 }
 
@@ -1347,6 +1394,24 @@ class CodeAwareCompressor(Transform):
                 language=detected_lang,
                 language_confidence=confidence,
                 syntax_valid=True,
+            )
+
+        # Bash control-flow is recognized and parsed for validation, but is not
+        # rewritten yet.  Its grammar uses anonymous delimiters (`then`, `fi`,
+        # `do`, `done`, `esac`) that a generic AST reassembler cannot safely
+        # preserve.  Returning the validated source keeps shell scripts
+        # byte-for-byte intact instead of sending them to lossy Kompress.
+        if detected_lang == CodeLanguage.BASH:
+            syntax_valid = self._verify_syntax(code, detected_lang)
+            return CodeCompressionResult(
+                compressed=code,
+                original=code,
+                original_tokens=original_tokens,
+                compressed_tokens=original_tokens,
+                compression_ratio=1.0,
+                language=detected_lang,
+                language_confidence=confidence,
+                syntax_valid=syntax_valid,
             )
 
         # Parse and compress
