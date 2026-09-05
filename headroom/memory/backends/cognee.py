@@ -63,7 +63,10 @@ Deletion contract (split by search type):
       finds none left); otherwise they raise
       ``CogneeDeletionUnverifiedError`` — delete tombstones the content and
       keeps the registry row for retry; update refuses before mutating
-      anything. This backend never reports a deletion it cannot stand behind.
+      anything. Discovery is non-mutating (a partial match deletes nothing)
+      and completed removals are recorded in a durable ``hard_deleted``
+      ledger, so a failed or interrupted attempt is always retryable. This
+      backend never reports a deletion it cannot stand behind.
 
 Known limitations (cognee v1.x):
     - cognee has no per-item update API. ``update_memory`` updates the durable
@@ -383,6 +386,16 @@ class _CogneeMetadataStore:
                             )
                             """
                         )
+                        conn.execute(
+                            """
+                            CREATE TABLE IF NOT EXISTS hard_deleted (
+                                dataset TEXT NOT NULL,
+                                content_hash TEXT NOT NULL,
+                                created_at TEXT,
+                                PRIMARY KEY (dataset, content_hash)
+                            )
+                            """
+                        )
                         conn.commit()
                     finally:
                         conn.close()
@@ -545,6 +558,61 @@ class _CogneeMetadataStore:
             conn.executemany(
                 "INSERT OR IGNORE INTO tombstones (user_id, content, created_at) VALUES (?, ?, ?)",
                 [(user_id, content, now_iso) for content in tombstone_contents],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    # -- hard-delete ledger ---------------------------------------------------
+    # Records content hashes this store has PROVABLY hard-deleted from a
+    # cognee dataset. "Absence of a matching data item" is deliberately not
+    # proof of removal (chunk-registered rows hash differently from their
+    # source), so without this ledger a hard delete that got interrupted
+    # after removing some items could never be re-proven on retry — the
+    # already-removed hashes would look identical to never-stored ones.
+
+    def get_hard_deleted(self, dataset: str, content_hashes: set[str]) -> set[str]:
+        """Return the subset of hashes already provably hard-deleted."""
+        if not content_hashes:
+            return set()
+        conn = self._connect()
+        try:
+            placeholders = ",".join("?" for _ in content_hashes)
+            rows = conn.execute(
+                f"SELECT content_hash FROM hard_deleted "
+                f"WHERE dataset = ? AND content_hash IN ({placeholders})",
+                (dataset, *content_hashes),
+            ).fetchall()
+        finally:
+            conn.close()
+        return {row[0] for row in rows}
+
+    def record_hard_deleted(self, dataset: str, content_hashes: set[str]) -> None:
+        """Durably record hashes whose data items were deleted from cognee."""
+        if not content_hashes:
+            return
+        now_iso = _utcnow().isoformat()
+        conn = self._connect()
+        try:
+            conn.executemany(
+                "INSERT OR IGNORE INTO hard_deleted (dataset, content_hash, created_at) "
+                "VALUES (?, ?, ?)",
+                [(dataset, h, now_iso) for h in content_hashes],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def clear_hard_deleted(self, dataset: str, content_hashes: set[str]) -> None:
+        """Forget ledger entries for content that was re-added to cognee."""
+        if not content_hashes:
+            return
+        conn = self._connect()
+        try:
+            placeholders = ",".join("?" for _ in content_hashes)
+            conn.execute(
+                f"DELETE FROM hard_deleted WHERE dataset = ? AND content_hash IN ({placeholders})",
+                (dataset, *content_hashes),
             )
             conn.commit()
         finally:
@@ -775,8 +843,19 @@ class CogneeBackend:
             valid_from=now,
         )
         # clear_tombstone: re-saving previously deleted content is an
-        # explicit request to make it live again.
+        # explicit request to make it live again. The hard-delete ledger is
+        # cleared for the re-added contents too — they exist in cognee again,
+        # so an old "provably removed" record must not vouch for them.
         await asyncio.to_thread(self._store.upsert_memory, memory, clear_tombstone=True)
+        await asyncio.to_thread(
+            self._store.clear_hard_deleted,
+            self._config.dataset_name,
+            {
+                self._content_hash(item)
+                for item in [content, *(facts or [])]
+                if isinstance(item, str) and item
+            },
+        )
         logger.info("Saved memory %s to cognee dataset %s", memory.id, self._config.dataset_name)
         return memory
 
@@ -988,23 +1067,53 @@ class CogneeBackend:
         """
         return self._config.search_type.strip().upper() == "CHUNKS"
 
+    @staticmethod
+    def _content_hash(content: str) -> str:
+        """cognee's data-item content hash (MD5 of the text)."""
+        return hashlib.md5(content.encode("utf-8"), usedforsecurity=False).hexdigest()
+
+    async def _list_matching_items(
+        self, datasets_api: Any, wanted: set[str]
+    ) -> list[tuple[Any, Any, set[str]]]:
+        """List (dataset_id, data_id, matching_hashes) without mutating anything."""
+        found: list[tuple[Any, Any, set[str]]] = []
+        for dataset in await datasets_api.list_datasets() or []:
+            if getattr(dataset, "name", None) != self._config.dataset_name:
+                continue
+            for data_item in await datasets_api.list_data(dataset.id) or []:
+                item_hashes = {
+                    getattr(data_item, "content_hash", None),
+                    getattr(data_item, "raw_content_hash", None),
+                }
+                overlap = {h for h in wanted if h in item_hashes}
+                if overlap:
+                    found.append((dataset.id, data_item.id, overlap))
+        return found
+
     async def _try_hard_delete(self, contents: list[str]) -> bool:
         """Hard-delete data items from cognee's stores; report whether proven.
 
-        cognee identifies text data items by an MD5 content hash. This maps
-        each content to its hash and removes matching items via
-        ``cognee.datasets.list_datasets`` / ``list_data`` / ``delete_data``
-        (which also removes related graph nodes/edges).
+        cognee identifies text data items by an MD5 content hash. Removal is
+        PROVEN only when every content's hash is accounted for. Three phases,
+        so a failure at any point leaves the operation retryable:
 
-        Returns True only when removal is PROVEN: every content matched at
-        least one stored data item, every matching item was deleted, and a
-        verification re-list finds no matching item left. "Nothing matched"
-        is NOT proof — content registered from a search result (a chunk, or
-        text cognee normalized) hashes differently from its source item, so
-        absence of a match cannot distinguish "already removed" from "stored
-        under different text". Failures are logged, never raised; callers
-        decide whether an unproven removal is acceptable (``CHUNKS``
-        tombstone enforcement) or must fail closed (synthesized modes).
+        1. Discovery (NON-MUTATING): map every requested hash to its stored
+           data items. Hashes this store already provably deleted (durable
+           ``hard_deleted`` ledger) count as done. If any remaining hash has
+           no matching item, return False WITHOUT deleting anything —
+           "nothing matched" is not proof (a chunk-registered row hashes
+           differently from its source item), and deleting the matched
+           subset first would make the unmatched remainder permanently
+           unprovable on retry.
+        2. Deletion: per hash, delete all its items, then durably record the
+           hash in the ledger — so an interruption between items never
+           strands an already-removed hash as unprovable.
+        3. Verification: re-list; no matching item may remain. On failure the
+           just-recorded ledger entries are cleared.
+
+        Failures are logged, never raised; callers decide whether an unproven
+        removal is acceptable (``CHUNKS`` tombstone enforcement) or must fail
+        closed (synthesized modes).
         """
         try:
             await self._ensure_initialized()
@@ -1019,51 +1128,56 @@ class CogneeBackend:
         if datasets_api is None or not hasattr(datasets_api, "list_datasets"):
             return False
 
+        dataset_name = self._config.dataset_name
         try:
-            hashes = {
-                hashlib.md5(content.encode("utf-8"), usedforsecurity=False).hexdigest()
-                for content in contents
-            }
+            hashes = {self._content_hash(content) for content in contents}
+            already_deleted = await asyncio.to_thread(
+                self._store.get_hard_deleted, dataset_name, hashes
+            )
+            remaining = hashes - already_deleted
+            if not remaining:
+                return True
+
+            # Phase 1 — discovery, non-mutating.
+            found = await self._list_matching_items(datasets_api, remaining)
             matched: set[str] = set()
-            for dataset in await datasets_api.list_datasets() or []:
-                if getattr(dataset, "name", None) != self._config.dataset_name:
-                    continue
-                for data_item in await datasets_api.list_data(dataset.id) or []:
-                    item_hashes = {
-                        getattr(data_item, "content_hash", None),
-                        getattr(data_item, "raw_content_hash", None),
-                    }
-                    overlap = {h for h in hashes if h in item_hashes}
-                    if overlap:
-                        await datasets_api.delete_data(dataset_id=dataset.id, data_id=data_item.id)
-                        matched |= overlap
-                        logger.info(
-                            "Hard-deleted cognee data item %s from dataset %s",
-                            data_item.id,
-                            self._config.dataset_name,
-                        )
-            if matched != hashes:
+            for _, _, overlap in found:
+                matched |= overlap
+            if matched != remaining:
                 logger.info(
-                    "Hard delete unproven: %d of %d contents had no matching cognee data item",
-                    len(hashes - matched),
+                    "Hard delete unproven: %d of %d contents have no matching "
+                    "cognee data item; nothing was deleted",
+                    len(remaining - matched),
                     len(hashes),
                 )
                 return False
-            # Verification pass: nothing matching may remain.
-            for dataset in await datasets_api.list_datasets() or []:
-                if getattr(dataset, "name", None) != self._config.dataset_name:
-                    continue
-                for data_item in await datasets_api.list_data(dataset.id) or []:
-                    item_hashes = {
-                        getattr(data_item, "content_hash", None),
-                        getattr(data_item, "raw_content_hash", None),
-                    }
-                    if item_hashes & hashes:
-                        logger.warning(
-                            "Hard delete unproven: data item %s still matches after deletion",
-                            data_item.id,
-                        )
-                        return False
+
+            # Phase 2 — delete per hash, recording each completed hash durably.
+            items_by_hash: dict[str, list[tuple[Any, Any]]] = {}
+            for dataset_id, data_id, overlap in found:
+                for h in overlap:
+                    items_by_hash.setdefault(h, []).append((dataset_id, data_id))
+            deleted_ids: set[Any] = set()
+            recorded: set[str] = set()
+            for h, items in items_by_hash.items():
+                for dataset_id, data_id in items:
+                    if data_id in deleted_ids:
+                        continue
+                    await datasets_api.delete_data(dataset_id=dataset_id, data_id=data_id)
+                    deleted_ids.add(data_id)
+                    logger.info(
+                        "Hard-deleted cognee data item %s from dataset %s",
+                        data_id,
+                        dataset_name,
+                    )
+                await asyncio.to_thread(self._store.record_hard_deleted, dataset_name, {h})
+                recorded.add(h)
+
+            # Phase 3 — verification: nothing matching may remain.
+            if await self._list_matching_items(datasets_api, remaining):
+                logger.warning("Hard delete unproven: matching data items remain after deletion")
+                await asyncio.to_thread(self._store.clear_hard_deleted, dataset_name, recorded)
+                return False
             return True
         except Exception:
             logger.warning(
@@ -1174,6 +1288,13 @@ class CogneeBackend:
         # Row rewritten in place (same id) + old content tombstoned, in one
         # transaction against the shared durable store.
         await asyncio.to_thread(self._store.apply_update, updated, old_contents)
+        # The new content exists in cognee again; a stale ledger record for
+        # identical past content must not vouch for its removal.
+        await asyncio.to_thread(
+            self._store.clear_hard_deleted,
+            self._config.dataset_name,
+            {self._content_hash(new_content)},
+        )
         if self._tombstones_fully_enforce():
             # Best-effort reclaim; under non-CHUNKS the old data was already
             # verifiably removed before any mutation.

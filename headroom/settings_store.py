@@ -620,6 +620,21 @@ SETTINGS: tuple[SettingField, ...] = (
     ),
     # --- Memory ---
     SettingField(
+        "HEADROOM_MEMORY_BACKEND",
+        "memory_backend",
+        "Memory backend",
+        "Memory",
+        "enum",
+        default="local",
+        choices=("local", "qdrant-neo4j", "cognee"),
+        help=(
+            "Memory backend. local: embedded SQLite (default). qdrant-neo4j: "
+            "Qdrant + Neo4j via mem0 ([memory-stack] extra). cognee: "
+            "knowledge-graph engine ([cognee] extra, HEADROOM_COGNEE_* env vars)."
+        ),
+        tier="advanced",
+    ),
+    SettingField(
         "HEADROOM_MEMORY_DB_PATH",
         "memory_db_path",
         "Memory DB path",
