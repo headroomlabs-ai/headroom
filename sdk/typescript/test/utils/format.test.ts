@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { vercelToOpenAI, openAIToVercel } from "../../src/utils/format.js";
+import { vercelToOpenAI, openAIToVercel, anthropicToOpenAI } from "../../src/utils/format.js";
 import type { OpenAIMessage } from "../../src/types.js";
 
 describe("vercelToOpenAI", () => {
@@ -266,6 +266,106 @@ describe("vercelToOpenAI", () => {
     expect(result[2].tool_calls).toHaveLength(1);
     expect(result[3].role).toBe("tool");
     expect(result[4].role).toBe("assistant");
+  });
+});
+
+describe("anthropicToOpenAI", () => {
+  it("converts image-only user message to a content-parts array (not dropped)", () => {
+    const result = anthropicToOpenAI([
+      {
+        role: "user",
+        content: [
+          {
+            type: "image",
+            source: { type: "base64", media_type: "image/png", data: "AAAA" },
+          },
+        ],
+      },
+    ]);
+    expect(result).toHaveLength(1);
+    expect(result[0]).toEqual({
+      role: "user",
+      content: [
+        {
+          type: "image_url",
+          image_url: { url: "data:image/png;base64,AAAA" },
+        },
+      ],
+    });
+  });
+
+  it("converts a url-sourced image as a passthrough url", () => {
+    const result = anthropicToOpenAI([
+      {
+        role: "user",
+        content: [
+          { type: "image", source: { type: "url", url: "https://example.com/cat.png" } },
+        ],
+      },
+    ]);
+    expect(result[0].content).toEqual([
+      { type: "image_url", image_url: { url: "https://example.com/cat.png" } },
+    ]);
+  });
+
+  it("preserves order of text + image blocks", () => {
+    const result = anthropicToOpenAI([
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "what is this?" },
+          {
+            type: "image",
+            source: { type: "base64", media_type: "image/jpeg", data: "BBBB" },
+          },
+        ],
+      },
+    ]);
+    expect(result[0].content).toEqual([
+      { type: "text", text: "what is this?" },
+      { type: "image_url", image_url: { url: "data:image/jpeg;base64,BBBB" } },
+    ]);
+  });
+
+  it("leaves text-only user messages as a flat string (backward compat)", () => {
+    const result = anthropicToOpenAI([
+      { role: "user", content: [{ type: "text", text: "hello" }] },
+    ]);
+    expect(result).toEqual([{ role: "user", content: "hello" }]);
+  });
+
+  it("emits a separate tool message alongside an image in the same user turn", () => {
+    const result = anthropicToOpenAI([
+      {
+        role: "user",
+        content: [
+          {
+            type: "image",
+            source: { type: "base64", media_type: "image/png", data: "CCCC" },
+          },
+          { type: "tool_result", tool_use_id: "tu_1", content: "ok" },
+        ],
+      },
+    ]);
+    expect(result).toHaveLength(2);
+    expect(result[0]).toEqual({
+      role: "user",
+      content: [
+        { type: "image_url", image_url: { url: "data:image/png;base64,CCCC" } },
+      ],
+    });
+    expect(result[1]).toEqual({
+      role: "tool",
+      content: "ok",
+      tool_call_id: "tu_1",
+    });
+  });
+
+  it("drops an unconvertible lone image block (no usable url) rather than pushing a broken part", () => {
+    const result = anthropicToOpenAI([
+      { role: "user", content: [{ type: "image", source: { type: "unknown" } }] },
+    ]);
+    expect(result).toEqual([]);
   });
 });
 
