@@ -1364,6 +1364,30 @@ class CodeAwareCompressor(Transform):
                 syntax_valid=True,
             )
 
+        # Bash control-flow is recognized and parsed for validation, but is not
+        # rewritten yet.  Its grammar uses anonymous delimiters (`then`, `fi`,
+        # `do`, `done`, `esac`) that a generic AST reassembler cannot safely
+        # preserve.  Returning the validated source keeps shell scripts
+        # byte-for-byte intact instead of sending them to lossy Kompress.
+        if detected_lang == CodeLanguage.BASH:
+            # Validate only when a parser exists.  Without tree-sitter there is
+            # nothing to validate against, and the source is returned unchanged
+            # either way — report it as valid rather than as broken, matching
+            # the tree-sitter-unavailable return below.
+            syntax_valid = (
+                self._verify_syntax(code, detected_lang) if _check_tree_sitter_available() else True
+            )
+            return CodeCompressionResult(
+                compressed=code,
+                original=code,
+                original_tokens=original_tokens,
+                compressed_tokens=original_tokens,
+                compression_ratio=1.0,
+                language=detected_lang,
+                language_confidence=confidence,
+                syntax_valid=syntax_valid,
+            )
+
         # Check if tree-sitter is available
         if not _check_tree_sitter_available():
             logger.warning("tree-sitter not available. Install with: pip install headroom-ai[code]")
@@ -1394,24 +1418,6 @@ class CodeAwareCompressor(Transform):
                 language=detected_lang,
                 language_confidence=confidence,
                 syntax_valid=True,
-            )
-
-        # Bash control-flow is recognized and parsed for validation, but is not
-        # rewritten yet.  Its grammar uses anonymous delimiters (`then`, `fi`,
-        # `do`, `done`, `esac`) that a generic AST reassembler cannot safely
-        # preserve.  Returning the validated source keeps shell scripts
-        # byte-for-byte intact instead of sending them to lossy Kompress.
-        if detected_lang == CodeLanguage.BASH:
-            syntax_valid = self._verify_syntax(code, detected_lang)
-            return CodeCompressionResult(
-                compressed=code,
-                original=code,
-                original_tokens=original_tokens,
-                compressed_tokens=original_tokens,
-                compression_ratio=1.0,
-                language=detected_lang,
-                language_confidence=confidence,
-                syntax_valid=syntax_valid,
             )
 
         # Parse and compress
