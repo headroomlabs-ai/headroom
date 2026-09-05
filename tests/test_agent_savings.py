@@ -85,7 +85,6 @@ def test_coding_persona_compresses_recent_delta_and_stays_visible() -> None:
     assert env["HEADROOM_LOSSLESS_THEN_LOSSY"] == "1"
     assert env["HEADROOM_PROTECT_READS"] == "1"
     assert env["HEADROOM_CODE_AWARE_ENABLED"] == "1"
-    assert env["HEADROOM_EFFORT_ROUTER"] == "0"
     assert env["HEADROOM_LOSSLESS"] == "0"  # lossy enabled (CCR keeps it recoverable)
     assert env["HEADROOM_MIN_CHARS_FOR_BLOCK"] == "25"
 

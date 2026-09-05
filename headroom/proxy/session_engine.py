@@ -152,6 +152,7 @@ def finalize_turn(
     prev_returned: list[dict[str, Any]] | None,
     *,
     count_tokens: Callable[[list[dict[str, Any]]], int] | None = None,
+    confirmed_frozen_count: int | None = None,
 ) -> TurnFinal:
     """Replay last turn's exact forwarded/returned prefix over pipeline drift.
 
@@ -159,11 +160,25 @@ def finalize_turn(
     shape, non-inflation), so calling this is always safe: when replay is not
     provably correct it returns the pipeline's own output unchanged.
 
+    ``confirmed_frozen_count`` is forwarded to ``overlay_cached_prefix`` as
+    the unconditional-replay floor: positions the provider has confirmed
+    cached are always replayed byte-identical, while beyond the floor the
+    size bound decides between drift repair (a shrinking replay) and letting
+    a fresh improvement through (an inflating one). Callers with no
+    provider-confirmed count pass None and keep the fully size-bounded
+    behavior.
+
     ``count_tokens`` is invoked only when the overlay actually replaced
     bytes — the pipeline's own token count is still accurate otherwise. A
     failing hook falls back to "no recount" rather than failing the turn.
     """
-    final = overlay_cached_prefix(result_messages, original_messages, prev_original, prev_returned)
+    final = overlay_cached_prefix(
+        result_messages,
+        original_messages,
+        prev_original,
+        prev_returned,
+        confirmed_frozen_count=confirmed_frozen_count,
+    )
     replayed = final != result_messages
     tokens: int | None = None
     if replayed and count_tokens is not None:

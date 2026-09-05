@@ -39,7 +39,7 @@ System messages are never dropped. They contain critical instructions, persona d
 
 ### Turn protection
 
-The last N user/assistant turns are always preserved, ensuring the model has immediate conversational context. By default, the last 2 turns are protected.
+The last N messages are always preserved, ensuring the model has immediate conversational context. The one-function `compress()` API exposes this as `CompressConfig.protect_recent`, which defaults to `4` messages (roughly the last 2 user/assistant turns) -- see `headroom/compress.py:110-112`.
 
 ## Configuration
 
@@ -74,9 +74,17 @@ response = client.chat.completions.create(
     model="gpt-4o",
     messages=messages,
     headroom_output_buffer_tokens=8000,  # More room for long responses
-    headroom_keep_turns=5,               # Protect last 5 turns
 )
 ```
+
+`HeadroomClient.chat.completions.create()` also accepts a `headroom_keep_turns`
+parameter, but as of this package version it is accepted and threaded through
+the wrapper methods without being forwarded into the transform pipeline (see
+`headroom/client.py` -- `TransformPipeline.apply()`'s accepted kwargs, listed
+in its docstring, don't include a turns/keep-turns option). Passing it does
+not raise an error, but it currently has no effect; use `compress()`'s
+`protect_recent` (see [Turn protection](#turn-protection) above) if you need
+this control today.
 </Tab>
 </Tabs>
 

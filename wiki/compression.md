@@ -99,7 +99,7 @@ config = UniversalCompressorConfig(
 | Option | Default | Description |
 |--------|---------|-------------|
 | `use_magika` | `True` | Use ML-based content detection |
-| `use_llmlingua` | `True` | Use LLMLingua for compression |
+| `use_kompress` | `True` | Use Kompress for content compression (`use_llmlingua` was retired; passing it raises `TypeError`) |
 | `compression_ratio_target` | `0.3` | Target ratio (0.3 = keep 30%) |
 | `min_content_length` | `100` | Minimum chars to compress |
 | `use_entropy_preservation` | `True` | Preserve high-entropy tokens |
@@ -362,7 +362,7 @@ from headroom.compression import UniversalCompressor, UniversalCompressorConfig
 config = UniversalCompressorConfig(
     compression_ratio_target=0.25,  # Keep 25%
     use_magika=True,
-    use_llmlingua=True,
+    use_kompress=True,
     ccr_enabled=True,
 )
 

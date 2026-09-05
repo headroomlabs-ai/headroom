@@ -2,6 +2,17 @@
 
 This page is the authoritative reference for the **Python Headroom CLI** exposed by the `headroom` console script.
 
+> **Audit note (2026-09-02):** `headroom --help` on this branch lists 30 top-level
+> commands; this page documents 15 of them and omits `agent-savings`,
+> `audit-reads`, `capture`, `copilot-auth`, `dashboard`, `deploy`, `diff`,
+> `doctor`, `init`, `loc`, `output-savings`, `recover`, `rollout`, `savings`,
+> `sg`, `tools`, and `update` entirely. The `headroom proxy` and
+> `headroom install apply` option tables below are similarly stale — `proxy
+> --help` alone now runs to ~90 options vs. the ~30 documented here. Treat the
+> command list and captured `--help` blocks in this file as historical
+> snapshots, not current reference; verify against `headroom <cmd> --help`
+> before relying on any option in this file. See the audit report for detail.
+
 ## Global behavior
 
 ### Entry points
@@ -55,22 +66,47 @@ Usage: headroom [OPTIONS] COMMAND [ARGS]...
       headroom proxy              Start the optimization proxy
       headroom memory list        List stored memories
       headroom memory stats       Show memory statistics
+      headroom update             Update Headroom to the latest release
 
 Options:
   -v, --version  Show the version and exit.
   -?, --help     Show this message and exit.
 
 Commands:
-  evals   Memory evaluation commands.
-  install Install and manage persistent Headroom deployments.
-  learn   Learn from past tool call failures to prevent future ones.
-  mcp     MCP server for Claude Code integration.
-  memory  Manage memories stored in Headroom.
-  perf    Analyze proxy performance from logs.
-  proxy   Start the optimization proxy server.
-  unwrap  Undo durable Headroom wrapping for supported tools.
-  wrap    Wrap CLI tools to run through Headroom.
+  agent-savings   Render or verify Codex/Claude/Cursor token-savings...
+  audit-reads     Audit Read-tool traffic for compression opportunities.
+  capture         Capture and compare network traffic for Headroom...
+  copilot-auth    Manage Headroom's GitHub Copilot OAuth token.
+  dashboard       Open the Headroom savings dashboard in your browser.
+  deploy          Deploy a turnkey local Headroom proxy and configure...
+  diff            Run difftastic (structural diff).
+  doctor          Check that the Headroom proxy and client routing are...
+  evals           Evaluation commands (memory, compression robustness,...
+  init            Install durable Headroom integrations for supported...
+  inspect         Show original vs compressed content for recent proxy...
+  install         Install and manage persistent Headroom deployments.
+  learn           Learn from past tool call failures to prevent future ones.
+  loc             Run scc (fast lines-of-code / repo-shape probe).
+  mcp             MCP server for Claude Code integration.
+  memory          Manage memories stored in Headroom.
+  output-savings  Show estimated/measured output-token reduction from the...
+  perf            Analyze proxy performance from logs.
+  proxy           Start the optimization proxy server.
+  recover         Recover agent state left in a temporary Headroom home.
+  rollout         Inspect runtime feature-rollout policy (not package...
+  savings         Show durable compression savings over time.
+  sg              Run ast-grep (AST-aware structural search/replace).
+  tools           Manage bundled CLI tool binaries (ast-grep, difft, scc).
+  unwrap          Undo durable Headroom wrapping for supported tools.
+  update          Update Headroom to the latest release.
+  wrap            Wrap CLI tools to run through Headroom.
 ```
+
+Captured from `headroom --help` on this branch, 2026-09-02 (`headroom/cli/main.py`,
+per-command modules under `headroom/cli/`). None of `agent-savings`,
+`audit-reads`, `capture`, `copilot-auth`, `dashboard`, `deploy`, `diff`,
+`doctor`, `init`, `loc`, `output-savings`, `recover`, `rollout`, `savings`,
+`sg`, `tools`, or `update` is documented elsewhere in this file.
 
 ### Top-level command help snapshots
 

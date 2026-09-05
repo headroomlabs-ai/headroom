@@ -217,9 +217,9 @@ from fastapi.testclient import TestClient  # noqa: E402
 from headroom.proxy.server import ProxyConfig, create_app  # noqa: E402
 
 
-def _make_proxy_client() -> TestClient:
+def _make_proxy_client(*, optimize: bool = True) -> TestClient:
     config = ProxyConfig(
-        optimize=True,
+        optimize=optimize,
         mode="token",
         cache_enabled=False,
         rate_limit_enabled=False,
@@ -318,3 +318,79 @@ class TestAnthropicHandlerReportsL1Transform:
         assert "anthropic:tool_schema_compaction" in transforms_header, (
             f"expected L1 label in x-headroom-transforms, got: {transforms_header!r}"
         )
+
+
+@pytest.mark.parametrize(
+    ("optimize", "headers", "should_compact"),
+    [
+        pytest.param(False, {}, False, id="no-optimize"),
+        pytest.param(True, {"x-headroom-bypass": "true"}, False, id="bypass"),
+        pytest.param(True, {"x-headroom-mode": "passthrough"}, False, id="passthrough"),
+        pytest.param(True, {}, True, id="optimization-enabled"),
+    ],
+)
+def test_handler_auxiliary_compaction_respects_optimization_decision(
+    monkeypatch: pytest.MonkeyPatch,
+    optimize: bool,
+    headers: dict[str, str],
+    should_compact: bool,
+) -> None:
+    """Opt-in tool/system passes must also honor the request's disable controls."""
+    import copy
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    import headroom.proxy.tool_schema_compaction as tool_compaction
+
+    monkeypatch.setenv("HEADROOM_TOOL_DESC_MAX_CHARS", "20")
+    monkeypatch.setenv("HEADROOM_SYSTEM_COMPACT", "1")
+    monkeypatch.setattr(tool_compaction, "_TOOL_DESC_MAX_CHARS", None)
+    router = SimpleNamespace(compress=Mock(return_value=SimpleNamespace(compressed="short system")))
+    monkeypatch.setattr(
+        "headroom.transforms.compression_units.find_content_router", lambda _: router
+    )
+    payload = _make_anthropic_payload_with_tools()
+    payload["system"] = _make_anthropic_payload_with_long_system()["system"]
+    captured = []
+
+    with _make_proxy_client(optimize=optimize) as client:
+        proxy = client.app.state.proxy
+        proxy.anthropic_pipeline.apply = lambda **kwargs: SimpleNamespace(
+            messages=kwargs["messages"],
+            transforms_applied=[],
+            timing={},
+            tokens_before=10,
+            tokens_after=10,
+            waste_signals=None,
+        )
+
+        async def capture(method, url, headers, body, stream=False, **kwargs):
+            captured.append(copy.deepcopy(body))
+            return _ok_response("msg_compaction_controls")
+
+        proxy._retry_request = capture
+        response = client.post("/v1/messages", headers=headers, json=payload)
+        assert response.status_code == 200, response.text
+        summary = client.get("/stats").json()["summary"]
+
+    forwarded = captured[0]
+    transforms = response.headers.get("x-headroom-transforms", "")
+    labels = (
+        "anthropic:tool_schema_compaction",
+        "anthropic:tool_desc_compaction",
+        "anthropic:system_prompt_compaction",
+    )
+    if should_compact:
+        assert "title" not in forwarded["tools"][0]["input_schema"]
+        assert len(forwarded["tools"][0]["description"]) < len(payload["tools"][0]["description"])
+        assert forwarded["system"][0]["text"] == "short system"
+        assert all(label in transforms for label in labels)
+        router.compress.assert_called_once()
+        assert summary["compression"]["total_tokens_removed"] > 0
+    else:
+        assert forwarded["tools"] == payload["tools"]
+        assert forwarded["system"] == payload["system"]
+        assert all(label not in transforms for label in labels)
+        router.compress.assert_not_called()
+        assert summary["compression"]["requests_compressed"] == 0
+        assert summary["compression"]["total_tokens_removed"] == 0

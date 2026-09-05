@@ -441,7 +441,7 @@ def test_force_kompress_apply_uses_lightweight_detection(
     monkeypatch.setattr(
         router,
         "compress",
-        lambda content, context="", bias=1.0: RouterCompressionResult(
+        lambda content, context="", bias=1.0, precomputed_detection=None: RouterCompressionResult(
             # CCR marker -> the original was stored and is retrievable, so the
             # #1307 reversibility gate accepts this lossy KOMPRESS tool result.
             compressed="compressed <<ccr:tool>>",
@@ -923,7 +923,7 @@ def _make_router_with_mock_compress(monkeypatch: pytest.MonkeyPatch) -> ContentR
     ``[compressed]`` payload at ratio 0.5 (passes the < min_ratio check)."""
     router = ContentRouter(ContentRouterConfig())
 
-    def fake_compress(content, context: str = "", bias: float = 1.0):
+    def fake_compress(content, context: str = "", bias: float = 1.0, precomputed_detection=None):
         return SimpleNamespace(
             compressed=content[: len(content) // 2] + "[compressed]",
             compression_ratio=0.5,
@@ -1237,7 +1237,7 @@ def _churn_router(monkeypatch: pytest.MonkeyPatch, ratio: float) -> ContentRoute
     cfg = ContentRouterConfig(min_ratio_relaxed=0.85, min_ratio_aggressive=0.65)
     router = ContentRouter(cfg)
 
-    def fake_compress(content, context: str = "", bias: float = 1.0):
+    def fake_compress(content, context: str = "", bias: float = 1.0, precomputed_detection=None):
         return SimpleNamespace(
             # CCR marker keeps the compression recoverable so the #1307
             # tool-reversibility guard preserves it instead of restoring original.
@@ -1376,7 +1376,7 @@ def test_model_not_ready_passthrough_is_not_frozen(
     monkeypatch.setattr(
         router,
         "compress",
-        lambda c, context="", bias=1.0: SimpleNamespace(
+        lambda c, context="", bias=1.0, precomputed_detection=None: SimpleNamespace(
             compressed=c, compression_ratio=1.0, strategy_used=CompressionStrategy.TEXT
         ),
     )
@@ -1402,7 +1402,7 @@ def test_model_not_ready_passthrough_is_not_frozen(
     monkeypatch.setattr(
         router,
         "compress",
-        lambda c, context="", bias=1.0: SimpleNamespace(
+        lambda c, context="", bias=1.0, precomputed_detection=None: SimpleNamespace(
             compressed="[C]"
             + c[:20]
             + " <<ccr:t>>",  # recoverable marker so #1307 tool-reversibility guard keeps the compression
@@ -1515,7 +1515,7 @@ def test_block_model_not_ready_passthrough_is_not_frozen(
     monkeypatch.setattr(
         router,
         "compress",
-        lambda c, context="", bias=1.0: SimpleNamespace(
+        lambda c, context="", bias=1.0, precomputed_detection=None: SimpleNamespace(
             compressed=c, compression_ratio=1.0, strategy_used=CompressionStrategy.TEXT
         ),
     )
@@ -1530,7 +1530,7 @@ def test_block_model_not_ready_passthrough_is_not_frozen(
     monkeypatch.setattr(
         router,
         "compress",
-        lambda c, context="", bias=1.0: SimpleNamespace(
+        lambda c, context="", bias=1.0, precomputed_detection=None: SimpleNamespace(
             compressed="[C]"
             + c[:20]
             + " <<ccr:t>>",  # recoverable marker so #1307 tool-reversibility guard keeps the compression

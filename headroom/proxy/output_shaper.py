@@ -30,13 +30,11 @@ Safety rules (each prevents a concrete failure mode):
 Turn classification is purely structural (block types, roles, ``is_error``
 flags) — no content regexes or keyword patterns.
 
-The same two levers exist for the OpenAI Responses format (Codex et al.):
-:func:`classify_responses_turn` reads the ``input`` item list,
+The same lever exists for the OpenAI Responses format (Codex et al.):
 :func:`apply_responses_verbosity_steering` appends the byte-stable steering
 block to the tail of the ``instructions`` string, and
-:func:`route_responses_effort` lowers an explicitly-present
-``reasoning.effort`` on mechanical continuations. :func:`shape_responses_request`
-is the Responses-format counterpart of :func:`shape_request`.
+:func:`shape_responses_request` is the Responses-format counterpart of
+:func:`shape_request`.
 """
 
 from __future__ import annotations
@@ -47,16 +45,6 @@ from dataclasses import dataclass
 from typing import Any
 
 from headroom.proxy import runtime_env
-from headroom.proxy.output_effort_policy import (
-    EFFORT_RANK as _EFFORT_RANK,
-)
-from headroom.proxy.output_effort_policy import (
-    LEGACY_THINKING_FLOOR,
-    can_create_openai_text_verbosity,
-    clamp_legacy_thinking_budget,
-    lower_effort_value,
-    lower_text_verbosity_value,
-)
 from headroom.proxy.output_steering import (
     apply_openai_chat_verbosity_steering,
     apply_openai_responses_verbosity_steering,
@@ -69,11 +57,11 @@ from headroom.proxy.output_turn_policy import (
     classify_openai_responses_input,
     classify_turn,
 )
+from headroom.rollout import FeatureDecisionReason
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
-    "LEGACY_THINKING_FLOOR",
     "OutputShaperSettings",
     "ShapeResult",
     "TurnKind",
@@ -83,9 +71,6 @@ __all__ = [
     "classify_openai_responses_input",
     "classify_turn",
     "resolve_verbosity_level",
-    "route_effort",
-    "route_openai_reasoning_effort",
-    "route_openai_text_verbosity",
     "shape_openai_chat_request",
     "shape_openai_responses_request",
     "shape_request",
@@ -100,12 +85,18 @@ class OutputShaperSettings:
     """Output-shaping settings with rollout enablement injected by the proxy."""
 
     enabled: bool = False
-    verbosity_level: int = 2
-    effort_router_enabled: bool = True
-    mechanical_effort: str = "low"
+    verbosity_level: int = 3
+    # False in ``mode="cache"``. Steering is the one lever that writes into the
+    # provider prefix-cache key (it appends to the system-prompt tail, and on a
+    # body with no system field it creates one); effort routing and the
+    # thinking budget sit outside the key and stay on. See
+    # :func:`steering_allowed_for`.
+    steering_enabled: bool = True
 
     @classmethod
-    def from_env(cls, *, enabled: bool | None = None) -> OutputShaperSettings:
+    def from_env(
+        cls, *, enabled: bool | None = None, steering_enabled: bool = True
+    ) -> OutputShaperSettings:
         """Resolve tuning; running proxies always inject the resolved gate.
 
         ``None`` preserves the helper's direct-call compatibility for SDK/tests,
@@ -119,24 +110,68 @@ class OutputShaperSettings:
                 "yes",
             )
         try:
-            level = int(runtime_env.getenv("HEADROOM_VERBOSITY_LEVEL", "2"))
+            level = int(runtime_env.getenv("HEADROOM_VERBOSITY_LEVEL", "3"))
         except ValueError:
             level = 2
         level = max(0, min(4, level))
-        router = runtime_env.getenv("HEADROOM_EFFORT_ROUTER", "1").lower() not in (
-            "0",
-            "false",
-            "no",
-        )
-        mech = runtime_env.getenv("HEADROOM_MECHANICAL_EFFORT", "low")
-        if mech not in _EFFORT_RANK:
-            mech = "low"
         return cls(
             enabled=enabled,
             verbosity_level=level,
-            effort_router_enabled=router,
-            mechanical_effort=mech,
+            steering_enabled=steering_enabled,
         )
+
+
+def shaper_enabled_for(config: Any) -> bool | None:
+    """Resolve the output-shaper gate for a proxy config.
+
+    Output shaping is deliberately independent of input compression — an
+    operator can run ``optimize=False`` and still want terser responses, and
+    the WS/Responses shaper tests pin that combination. So ``optimize`` does
+    not veto shaping outright. What it vetoes is shaping that nobody asked
+    for.
+
+    Since the feature defaults on, ``optimize=False`` plus *no* explicit
+    request means an operator who turned every transform off would silently
+    start getting a steering block appended to their system-prompt tail — and
+    on a request carrying no ``system`` field at all, would have one created.
+    That breaks the byte-faithful forwarding invariant. So in that one
+    combination the default loses:
+
+    * enabled explicitly (``HEADROOM_OUTPUT_SHAPER=1``, ``HEADROOM_FEATURES``)
+      → shape, whatever ``optimize`` says;
+    * enabled only by default, with ``optimize=False`` → do not shape;
+    * enabled only by default, with ``optimize=True`` → shape.
+
+    Returns ``None`` when there is no rollout snapshot to consult, which
+    preserves :meth:`OutputShaperSettings.from_env`'s env-var fallback for the
+    SDK and test callers that construct a config without one.
+    """
+    rollout = getattr(config, "rollout", None)
+    if rollout is None:
+        return None
+    try:
+        decision = rollout.decision("proxy_output_shaper")
+    except (KeyError, AttributeError):
+        return None
+    if not decision.enabled:
+        return False
+    if getattr(config, "optimize", True):
+        return True
+    return decision.reason is not FeatureDecisionReason.DEFAULT
+
+
+def steering_allowed_for(config: Any) -> bool:
+    """False when the proxy is in prefix-freezing cache mode.
+
+    ``mode="cache"`` freezes prior turns specifically to keep the provider's
+    prefix-cache key byte-stable (see ``ProxyConfig.mode``). Verbosity steering
+    writes into that key, so running it there trades a large, certain cache
+    cost for a small, uncertain output saving — the wrong side of a roughly
+    60x margin on a long context. Effort routing and the thinking budget are
+    unaffected: they ride request parameters outside the cache key, so they
+    keep saving in cache mode.
+    """
+    return getattr(config, "mode", None) != "cache"
 
 
 def resolve_verbosity_level(settings: OutputShaperSettings) -> tuple[int, str]:
@@ -151,6 +186,13 @@ def resolve_verbosity_level(settings: OutputShaperSettings) -> tuple[int, str]:
     Returns ``(level, source)``. Kept separate from :func:`shape_request` so the
     body-mutating core stays a pure function of an explicit level.
     """
+    if not settings.steering_enabled:
+        # Level 0 is the documented "no steering" value, so this disables the
+        # only cache-key-mutating lever while leaving effort routing on. It
+        # deliberately outranks the manual override below: a level set in the
+        # environment must not reintroduce a prefix mutation the mode exists
+        # to prevent.
+        return 0, "cache_mode"
     if runtime_env.getenv("HEADROOM_VERBOSITY_LEVEL"):
         return settings.verbosity_level, "env"
 
@@ -201,93 +243,6 @@ class ShapeResult:
             self.labels = []
 
 
-def route_effort(
-    body: dict[str, Any],
-    kind: TurnKind,
-    settings: OutputShaperSettings,
-) -> list[str]:
-    """Lower thinking/effort spend on mechanical continuations.
-
-    Returns labels for each mutation made (empty list = untouched).
-    """
-    if kind is not TurnKind.MECHANICAL_CONTINUATION:
-        return []
-
-    labels: list[str] = []
-
-    # Modern lever: output_config.effort. Only lower a value the client
-    # explicitly sent — presence proves the target model accepts the param.
-    output_config = body.get("output_config")
-    if isinstance(output_config, dict):
-        effort = output_config.get("effort")
-        lowered = lower_effort_value(effort, settings.mechanical_effort)
-        if lowered is not None:
-            output_config["effort"] = lowered
-            labels.append(f"output_shaper:effort:{effort}->{lowered}")
-
-    # Legacy lever: clamp thinking.budget_tokens on models still using the
-    # enabled/budget_tokens form. The type field itself is never touched.
-    thinking = body.get("thinking")
-    if isinstance(thinking, dict):
-        budget = thinking.get("budget_tokens")
-        clamped = clamp_legacy_thinking_budget(
-            thinking_type=thinking.get("type"),
-            budget_tokens=budget,
-            floor=LEGACY_THINKING_FLOOR,
-        )
-        if clamped is not None:
-            thinking["budget_tokens"] = clamped
-            labels.append(f"output_shaper:thinking_budget:{budget}->{clamped}")
-
-    return labels
-
-
-def route_openai_reasoning_effort(
-    body: dict[str, Any],
-    kind: TurnKind,
-    settings: OutputShaperSettings,
-) -> list[str]:
-    """Lower explicitly-present OpenAI reasoning effort on mechanical turns."""
-    if kind is not TurnKind.MECHANICAL_CONTINUATION:
-        return []
-
-    reasoning = body.get("reasoning")
-    if not isinstance(reasoning, dict):
-        return []
-    effort = reasoning.get("effort")
-    target = settings.mechanical_effort
-    lowered = lower_effort_value(effort, target)
-    if lowered is not None:
-        reasoning["effort"] = lowered
-        return [f"output_shaper:reasoning_effort:{effort}->{lowered}"]
-    return []
-
-
-def route_openai_text_verbosity(body: dict[str, Any]) -> list[str]:
-    """Set or lower OpenAI ``text.verbosity`` conservatively."""
-    text_config = body.get("text")
-    can_create = can_create_openai_text_verbosity(body.get("model"))
-    if text_config is None:
-        if not can_create:
-            return []
-        body["text"] = {"verbosity": "low"}
-        return ["output_shaper:text_verbosity:unset->low"]
-    if not isinstance(text_config, dict):
-        return []
-
-    verbosity = text_config.get("verbosity")
-    if verbosity is None:
-        if not can_create:
-            return []
-        text_config["verbosity"] = "low"
-        return ["output_shaper:text_verbosity:unset->low"]
-    lowered = lower_text_verbosity_value(verbosity)
-    if lowered is not None:
-        text_config["verbosity"] = lowered
-        return [f"output_shaper:text_verbosity:{verbosity}->{lowered}"]
-    return []
-
-
 def shape_openai_responses_request(
     body: dict[str, Any],
     settings: OutputShaperSettings | None = None,
@@ -306,19 +261,6 @@ def shape_openai_responses_request(
     if level > 0 and apply_openai_responses_verbosity_steering(body, level):
         result.changed = True
         result.labels.append(f"output_shaper:verbosity:L{level}")
-
-    kind = classify_openai_responses_input(body.get("input"))
-    if settings.effort_router_enabled:
-        labels = route_openai_reasoning_effort(body, kind, settings)
-        if labels:
-            result.changed = True
-            result.labels.extend(labels)
-            logger.debug("OpenAIOutputShaper: turn=%s mutations=%s", kind.value, labels)
-
-    labels = route_openai_text_verbosity(body)
-    if labels:
-        result.changed = True
-        result.labels.extend(labels)
 
     return result
 
@@ -347,14 +289,6 @@ def shape_request(
         result.changed = True
         result.labels.append(f"output_shaper:verbosity:L{level}")
 
-    if settings.effort_router_enabled:
-        kind = classify_turn(body.get("messages", []))
-        labels = route_effort(body, kind, settings)
-        if labels:
-            result.changed = True
-            result.labels.extend(labels)
-        logger.debug("OutputShaper: turn=%s mutations=%s", kind.value, labels)
-
     return result
 
 
@@ -367,10 +301,7 @@ def shape_openai_chat_request(
 
     The chat counterpart of :func:`shape_request`. Chat carries the system
     prompt as a ``role: "system"`` message, so verbosity steering uses the
-    chat-specific injector. Effort routing is intentionally not applied here:
-    the ``route_effort`` levers write Anthropic-shaped config and there is no
-    portable chat/completions equivalent, so only the verbosity steering lever
-    (the one that reduces output tokens) runs on this path.
+    chat-specific injector.
     """
     if settings is None:
         settings = OutputShaperSettings.from_env()
@@ -391,10 +322,6 @@ def shape_openai_chat_request(
 # ---------------------------------------------------------------------------
 # OpenAI Responses format (Codex, /v1/responses HTTP + WebSocket)
 # ---------------------------------------------------------------------------
-
-# Responses ``reasoning.effort`` uses "minimal" as its floor (Anthropic's
-# ``output_config.effort`` does not), so it gets its own rank table.
-_RESPONSES_EFFORT_RANK = {"minimal": 0, "low": 1, "medium": 2, "high": 3, "xhigh": 4}
 
 # Trailing ``input`` item types that represent tool output coming back to the
 # model — the Responses counterpart of an Anthropic ``tool_result`` block.
@@ -498,36 +425,6 @@ def apply_responses_verbosity_steering(body: dict[str, Any], level: int) -> bool
     return apply_openai_responses_verbosity_steering(body, level)
 
 
-def route_responses_effort(
-    body: dict[str, Any],
-    kind: TurnKind,
-    settings: OutputShaperSettings,
-) -> list[str]:
-    """Lower ``reasoning.effort`` on mechanical continuations.
-
-    Only lowers a value the client explicitly sent — presence proves the
-    target model accepts the parameter. Never injects ``reasoning`` where
-    absent, and never touches new asks or error continuations.
-    """
-    if kind is not TurnKind.MECHANICAL_CONTINUATION:
-        return []
-
-    reasoning = body.get("reasoning")
-    if not isinstance(reasoning, dict):
-        return []
-    effort = reasoning.get("effort")
-    target = settings.mechanical_effort
-    if (
-        isinstance(effort, str)
-        and effort in _RESPONSES_EFFORT_RANK
-        and target in _RESPONSES_EFFORT_RANK
-        and _RESPONSES_EFFORT_RANK[effort] > _RESPONSES_EFFORT_RANK[target]
-    ):
-        reasoning["effort"] = target
-        return [f"output_shaper:effort:{effort}->{target}"]
-    return []
-
-
 def shape_responses_request(
     body: dict[str, Any],
     settings: OutputShaperSettings | None = None,
@@ -550,13 +447,5 @@ def shape_responses_request(
     if level > 0 and apply_responses_verbosity_steering(body, level):
         result.changed = True
         result.labels.append(f"output_shaper:verbosity:L{level}")
-
-    if settings.effort_router_enabled:
-        kind = classify_responses_turn(body.get("input"))
-        labels = route_responses_effort(body, kind, settings)
-        if labels:
-            result.changed = True
-            result.labels.extend(labels)
-        logger.debug("OutputShaper(responses): turn=%s mutations=%s", kind.value, labels)
 
     return result

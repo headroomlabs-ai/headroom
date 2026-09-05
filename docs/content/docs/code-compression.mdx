@@ -28,7 +28,6 @@ Naive truncation breaks code. Cutting a function in half leaves invalid syntax t
 - Class definitions
 - Type annotations
 - Decorators
-- Error handlers (`try`/`except`, `try`/`catch`)
 
 **Compressed:**
 - Function bodies (implementations)
@@ -38,9 +37,11 @@ Naive truncation breaks code. Cutting a function in half leaves invalid syntax t
 ## Example
 
 ```python
-from headroom.transforms import CodeAwareCompressor
+from headroom.transforms import CodeAwareCompressor, CodeCompressorConfig
 
-compressor = CodeAwareCompressor()
+# min_tokens_for_compression defaults to 100; a snippet this small needs an
+# explicit override or it passes through unmodified (see "Skip small content" below).
+compressor = CodeAwareCompressor(CodeCompressorConfig(min_tokens_for_compression=10))
 
 code = '''
 import os
@@ -65,11 +66,11 @@ print(result.compressed)
 # def process_items(items: List[str]) -> List[str]:
 #     """Process a list of items."""
 #     results = []
-#     for item in items:
-#     # ... (5 lines compressed)
+#     # [6 lines omitted]
 #     pass
+# # [32 tokens compressed. Retrieve more: hash=<cache_key>. Expires in 5m.]
 
-print(f"Compression: {result.compression_ratio:.0%}")  # ~55%
+print(f"Compression: {result.compression_ratio:.0%}")  # ~57%
 print(f"Syntax valid: {result.syntax_valid}")  # True
 ```
 
@@ -82,7 +83,6 @@ config = CodeCompressorConfig(
     preserve_imports=True,              # Always keep imports
     preserve_signatures=True,           # Always keep function signatures
     preserve_type_annotations=True,     # Keep type hints
-    preserve_error_handlers=True,       # Keep try/except blocks
     preserve_decorators=True,           # Keep decorators
     docstring_mode=DocstringMode.FIRST_LINE,  # FULL, FIRST_LINE, REMOVE
     target_compression_rate=0.2,        # Keep 20% of tokens
@@ -103,7 +103,6 @@ result = compressor.compress(code)
 | `preserve_imports` | `True` | Keep all import statements |
 | `preserve_signatures` | `True` | Keep function/method signatures |
 | `preserve_type_annotations` | `True` | Keep type hints |
-| `preserve_error_handlers` | `True` | Keep try/except blocks |
 | `preserve_decorators` | `True` | Keep decorators |
 | `docstring_mode` | `FIRST_LINE` | How to handle docstrings: `FULL`, `FIRST_LINE`, `REMOVE` |
 | `target_compression_rate` | `0.2` | Fraction of tokens to keep (0.2 = keep 20%) |
@@ -169,6 +168,6 @@ unload_tree_sitter()
 | Memory | ~50MB (tree-sitter parsers) |
 | Syntax validity | Guaranteed |
 
-<Callout type="info" title="Automatic routing">
-  When you use the Headroom proxy or call `compress()`, source code is automatically detected and routed to CodeAwareCompressor. Direct usage gives you control over compression settings per language.
+<Callout type="info" title="Routing differs between the proxy and the library API">
+  ContentRouter always *detects* source code automatically, but whether it routes that code to CodeAwareCompressor depends on the entry point. `headroom proxy` enables code-aware routing by default (`HEADROOM_CODE_AWARE_ENABLED` defaults to on; disable with `--no-code-aware` or `HEADROOM_CODE_AWARE_ENABLED=0`). The one-function `compress()` API and `HeadroomClient`, however, build `ContentRouterConfig` with its own default, `enable_code_aware=False` -- there, detected code falls back to Kompress unless you construct your own pipeline with `ContentRouterConfig(enable_code_aware=True)`. Direct usage of `CodeAwareCompressor`, as shown on this page, is unaffected either way. See [How Compression Works](/docs/how-compression-works#content-type-detection).
 </Callout>

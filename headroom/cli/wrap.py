@@ -6079,7 +6079,7 @@ def vscode_claude(
             click.echo("  Keep this command running. Press Ctrl+C to stop the proxy.")
             click.echo("  Authentication and the selected Claude model are preserved.")
             click.echo("  Undo later with: headroom unwrap vscode-claude")
-            click.echo("  Guide: https://headroom-docs.vercel.app/docs/vscode-claude-code")
+            click.echo("  Guide: https://docs.headroomlabs.ai/docs/vscode-claude-code")
             return
         click.echo(f"  Add these values under 'env' in {target_settings}:")
         click.echo(f'  "ANTHROPIC_BASE_URL": "{proxy_url}",')

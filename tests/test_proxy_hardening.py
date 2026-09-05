@@ -65,6 +65,19 @@ class TestInboundAuthToken:
             resp = c.get("/stats", headers={"X-Headroom-Proxy-Token": "s3cr3t-token"})
             assert resp.status_code != 401
 
+    def test_token_set_accepts_custom_header_with_upstream_oauth(self):
+        """The upstream OAuth bearer must not override the proxy credential."""
+        app = _make_app(proxy_token="s3cr3t-token")
+        with TestClient(app, base_url="http://testserver", client=NONLOOPBACK) as c:
+            resp = c.get(
+                "/stats",
+                headers={
+                    "Authorization": "Bearer oauth-subscription-token",
+                    "X-Headroom-Proxy-Token": "s3cr3t-token",
+                },
+            )
+            assert resp.status_code != 401
+
     def test_token_set_rejects_wrong_token(self):
         app = _make_app(proxy_token="s3cr3t-token")
         with TestClient(app, base_url="http://testserver", client=NONLOOPBACK) as c:
@@ -170,6 +183,24 @@ class TestWebSocketAuthMiddleware:
         mw = WebSocketAuthMiddleware(downstream, proxy_token="s3cr3t-token")
 
         sent = await _drive(mw, _ws_scope(headers=[("x-headroom-proxy-token", "s3cr3t-token")]))
+
+        assert downstream.called is True
+        assert not _closed_with_policy_violation(sent)
+
+    async def test_accepts_custom_header_with_upstream_oauth(self):
+        """The upstream OAuth bearer must not override the proxy credential."""
+        downstream = _SpyApp()
+        mw = WebSocketAuthMiddleware(downstream, proxy_token="s3cr3t-token")
+
+        sent = await _drive(
+            mw,
+            _ws_scope(
+                headers=[
+                    ("authorization", "Bearer oauth-subscription-token"),
+                    ("x-headroom-proxy-token", "s3cr3t-token"),
+                ]
+            ),
+        )
 
         assert downstream.called is True
         assert not _closed_with_policy_violation(sent)

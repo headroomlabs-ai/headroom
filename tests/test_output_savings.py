@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from headroom.proxy.output_savings import (
     BaselineModel,
     SavingsLedger,
@@ -573,3 +575,137 @@ class TestFlushDurability:
         loop_thread = threading.get_ident()
         assert saved_on_threads, "flush never ran"
         assert all(t != loop_thread for t in saved_on_threads)
+
+
+class TestModelledTier:
+    """The fallback for a deployment with no counterfactual of its own.
+
+    The factor table ships EMPTY: open-source Headroom applies steering but
+    does not claim a savings figure it has not measured. Factors arrive either
+    from a holdout (which outranks this tier entirely) or from an extension
+    calling ``register_modelled_factors``. These tests therefore register their
+    own factors and restore the table afterwards -- they exercise the
+    arithmetic, which is permanent, not the numbers, which are not.
+    """
+
+    @staticmethod
+    @pytest.fixture
+    def factors():
+        """Install factors for level 3, then restore the real table."""
+        from headroom.proxy.output_savings import (
+            MODELLED_REDUCTION,
+            register_modelled_factors,
+        )
+
+        saved = dict(MODELLED_REDUCTION)
+        register_modelled_factors(3, 0.20, 0.40)
+        try:
+            yield (0.20, 0.40)
+        finally:
+            MODELLED_REDUCTION.clear()
+            MODELLED_REDUCTION.update(saved)
+
+    @staticmethod
+    def _ledger_with(observed_total: int, n: int):
+        from headroom.proxy.output_savings import SavingsLedger, stratum_key
+
+        ledger = SavingsLedger()
+        key = stratum_key(
+            turn_kind="new_user_ask", input_tokens=1000, model="claude-sonnet-5", has_tools=False
+        )
+        for _ in range(n):
+            ledger.record("treatment", key, observed_total // n)
+        return ledger
+
+    def test_ships_empty_so_an_unmeasured_deployment_claims_nothing(self):
+        """No factors by default -> no modelled estimate, at any level.
+
+        The dash this produces is the point: it is the correct rendering of
+        "not measured". A built-in constant would be a number nobody measured
+        on this deployment's traffic, which is the failure mode the tiering
+        exists to prevent.
+        """
+        from headroom.proxy.output_savings import MODELLED_REDUCTION
+
+        assert MODELLED_REDUCTION == {}
+        led = self._ledger_with(5_000, 5)
+        assert all(led.estimate_from_model(lv) is None for lv in (1, 2, 3, 4))
+
+    def test_registering_factors_enables_the_tier(self, factors):
+        assert self._ledger_with(5_000, 5).estimate_from_model(3) is not None
+
+    def test_nonsense_factors_are_rejected_at_registration(self):
+        """r=0 and r=1 break the r/(1-r) inversion; catch it at the door."""
+        from headroom.proxy.output_savings import register_modelled_factors
+
+        for bad in ((0.0, 0.4), (1.0, 1.0), (-0.1, 0.4), (0.5, 1.2)):
+            with pytest.raises(ValueError):
+                register_modelled_factors(3, *bad)
+        with pytest.raises(ValueError, match="exceeds optimistic"):
+            register_modelled_factors(3, 0.5, 0.2)
+
+    def test_saving_inverts_the_reduction_rather_than_scaling_by_it(self, factors):
+        """Observed output is POST-shaping, so saved is observed*r/(1-r).
+
+        The naive observed*r understates the saving. This is the single
+        arithmetic mistake the tier can make, so it is pinned.
+
+        r is read from the table rather than hardcoded: the factors are
+        re-measured whenever the steering text changes, and a test that
+        snapshots them fails on every remeasure while testing nothing about
+        the arithmetic it exists to protect.
+        """
+        from headroom.proxy.output_savings import MODELLED_REDUCTION
+
+        ledger = self._ledger_with(10_000, 10)
+        est = ledger.estimate_from_model(3)
+        assert est is not None
+        r = MODELLED_REDUCTION[3][0]
+        assert 0 < r < 1, "a reduction factor outside (0,1) makes the inversion nonsense"
+        assert est.tokens_saved == pytest.approx(10_000 * r / (1 - r), rel=1e-6)
+        assert est.tokens_saved > 10_000 * r, "naive scaling would understate"
+        # baseline = what the unshaped run would have emitted
+        assert est.baseline_tokens == pytest.approx(10_000 + est.tokens_saved, rel=1e-6)
+
+    def test_kind_is_modelled_so_the_ui_can_refuse_to_call_it_a_ci(self, factors):
+        est = self._ledger_with(5_000, 5).estimate_from_model(3)
+        assert est is not None and est.kind == "modelled"
+
+    def test_band_is_the_two_provider_spread(self, factors):
+        from headroom.proxy.output_savings import MODELLED_REDUCTION
+
+        low, high = MODELLED_REDUCTION[3]
+        est = self._ledger_with(5_000, 5).estimate_from_model(3)
+        assert est is not None
+        assert est.ci_low_pct == pytest.approx(low * 100)
+        assert est.ci_high_pct == pytest.approx(high * 100)
+        assert low <= high, "conservative end must not exceed the optimistic one"
+        assert est.pct == est.ci_low_pct, "headline uses the conservative end"
+
+    def test_unbenchmarked_level_yields_nothing_rather_than_a_guess(self):
+        assert self._ledger_with(5_000, 5).estimate_from_model(1) is None
+
+    def test_no_traffic_yields_nothing(self):
+        from headroom.proxy.output_savings import SavingsLedger
+
+        assert SavingsLedger().estimate_from_model(3) is None
+
+    def test_a_real_baseline_supersedes_the_model(self):
+        """The modelled tier is last resort; a learned baseline outranks it."""
+        from headroom.proxy.output_savings import BaselineModel, SavingsLedger, stratum_key
+
+        key = stratum_key(
+            turn_kind="new_user_ask", input_tokens=1000, model="claude-sonnet-5", has_tools=False
+        )
+        baseline = BaselineModel()
+        for _ in range(50):
+            baseline.observe(key, 2000)
+        ledger = SavingsLedger(baseline=baseline)
+        for _ in range(10):
+            ledger.record("treatment", key, 1000)
+        assert ledger.best_estimate(3).kind == "estimated"
+
+    def test_without_a_level_behaviour_is_unchanged(self):
+        """Existing callers that pass no level must not silently gain a number."""
+        est = self._ledger_with(5_000, 5).best_estimate()
+        assert est.kind == "estimated" and est.n_requests == 0

@@ -32,12 +32,12 @@ response = litellm.completion(model="bedrock/claude-sonnet", messages=[...])
 response = litellm.completion(model="azure/gpt-4o", messages=[...])
 ```
 
-The callback compresses messages in LiteLLM's `pre_call_hook` before they reach the provider.
+The callback compresses messages in LiteLLM's `async_pre_call_hook` before they reach the provider.
 
 ## How it works
 
 1. You call `litellm.completion()` with your messages
-2. `HeadroomCallback.pre_call_hook` compresses the messages
+2. `HeadroomCallback.async_pre_call_hook` compresses the messages
 3. LiteLLM sends the compressed messages to the provider
 4. The response comes back unchanged
 
@@ -99,9 +99,11 @@ Response headers include `x-headroom-compressed: true` and `x-headroom-tokens-sa
 
 The options above run Headroom **in** the LiteLLM process. If instead LiteLLM runs as its own proxy and you want it to call Headroom over the network — the guardrail deployment — point it at [`POST /v1/compress`](/docs/proxy#post-v1compress). LiteLLM swaps `messages` for the compressed result and forwards to the provider.
 
-Two things this deployment needs:
+Two things this deployment needs — the proxy extras, and the proxy itself running with remote access opted in:
 
 ```bash
+pip install "headroom-ai[proxy]"
+
 # Headroom is loopback-only by default and answers remote callers with 404.
 HEADROOM_COMPRESS_ALLOW_REMOTE=1 headroom proxy
 ```

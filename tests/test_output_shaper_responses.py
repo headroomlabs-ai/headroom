@@ -19,7 +19,6 @@ from headroom.proxy.output_shaper import (
     TurnKind,
     apply_responses_verbosity_steering,
     classify_responses_turn,
-    route_responses_effort,
     shape_responses_request,
     steering_text,
 )
@@ -178,54 +177,6 @@ class TestResponsesVerbositySteering:
 
 
 # ---------------------------------------------------------------------------
-# route_responses_effort
-# ---------------------------------------------------------------------------
-
-
-class TestRouteResponsesEffort:
-    def test_lowers_high_to_low_on_mechanical(self):
-        body = {"reasoning": {"effort": "high", "summary": "auto"}}
-        labels = route_responses_effort(body, TurnKind.MECHANICAL_CONTINUATION, ENABLED)
-        assert body["reasoning"]["effort"] == "low"
-        assert labels == ["output_shaper:effort:high->low"]
-        assert body["reasoning"]["summary"] == "auto"  # only effort is touched
-
-    def test_never_raises_effort(self):
-        body = {"reasoning": {"effort": "minimal"}}
-        labels = route_responses_effort(body, TurnKind.MECHANICAL_CONTINUATION, ENABLED)
-        assert body["reasoning"]["effort"] == "minimal"
-        assert labels == []
-
-    def test_never_injects_reasoning(self):
-        body: dict[str, Any] = {"model": "gpt-5.5"}
-        labels = route_responses_effort(body, TurnKind.MECHANICAL_CONTINUATION, ENABLED)
-        assert "reasoning" not in body
-        assert labels == []
-
-    def test_new_ask_keeps_full_effort(self):
-        body = {"reasoning": {"effort": "high"}}
-        assert route_responses_effort(body, TurnKind.NEW_USER_ASK, ENABLED) == []
-        assert body["reasoning"]["effort"] == "high"
-
-    def test_error_continuation_keeps_full_effort(self):
-        body = {"reasoning": {"effort": "high"}}
-        assert route_responses_effort(body, TurnKind.ERROR_CONTINUATION, ENABLED) == []
-        assert body["reasoning"]["effort"] == "high"
-
-    def test_unknown_effort_value_untouched(self):
-        body = {"reasoning": {"effort": "turbo"}}
-        assert route_responses_effort(body, TurnKind.MECHANICAL_CONTINUATION, ENABLED) == []
-        assert body["reasoning"]["effort"] == "turbo"
-
-    def test_respects_mechanical_effort_setting(self):
-        settings = OutputShaperSettings(enabled=True, mechanical_effort="medium")
-        body = {"reasoning": {"effort": "high"}}
-        labels = route_responses_effort(body, TurnKind.MECHANICAL_CONTINUATION, settings)
-        assert body["reasoning"]["effort"] == "medium"
-        assert labels == ["output_shaper:effort:high->medium"]
-
-
-# ---------------------------------------------------------------------------
 # shape_responses_request
 # ---------------------------------------------------------------------------
 
@@ -247,13 +198,12 @@ class TestShapeResponsesRequest:
         assert result.changed is False
         assert body == _mechanical_body()
 
-    def test_enabled_applies_both_levers(self):
+    def test_enabled_applies_steering(self):
         body = _mechanical_body()
         result = shape_responses_request(body, OutputShaperSettings(enabled=True))
         assert result.changed is True
-        assert "output_shaper:verbosity:L2" in (result.labels or [])
-        assert "output_shaper:effort:high->low" in (result.labels or [])
-        assert body["reasoning"]["effort"] == "low"
+        assert "output_shaper:verbosity:L3" in (result.labels or [])
+        assert body["reasoning"]["effort"] == "high", "reasoning.effort is left alone now"
         assert body["instructions"].startswith("You are Codex.")
 
     def test_level_override_wins(self):
@@ -267,7 +217,7 @@ class TestShapeResponsesRequest:
         result = shape_responses_request(body, OutputShaperSettings(enabled=True))
         assert result.changed is True
         assert body["reasoning"]["effort"] == "high"
-        assert result.labels == ["output_shaper:verbosity:L2"]
+        assert result.labels == ["output_shaper:verbosity:L3"]
 
 
 # ---------------------------------------------------------------------------
@@ -315,8 +265,7 @@ class TestShapeHandlerHelper:
         labels, mutated = _shape_openai_responses_payload(body, model="gpt-5.5", request_id="t2")
         assert mutated is True
         assert any(label.startswith("output_shaper:stratum:") for label in labels)
-        assert "output_shaper:effort:high->low" in labels
-        assert body["reasoning"]["effort"] == "low"
+        assert body["reasoning"]["effort"] == "high", "reasoning.effort is left alone now"
 
     def test_full_holdout_labels_without_mutation(self, monkeypatch):
         monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")

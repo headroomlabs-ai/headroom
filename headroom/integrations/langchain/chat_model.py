@@ -49,7 +49,7 @@ try:
         ToolMessage,
     )
     from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult  # noqa: F401
-    from langchain_core.runnables import RunnableLambda
+    from langchain_core.runnables import RunnableBinding, RunnableLambda
     from pydantic import ConfigDict, Field, PrivateAttr
 
     LANGCHAIN_AVAILABLE = True
@@ -60,6 +60,7 @@ except ImportError:
     ConfigDict = lambda **kwargs: {}  # type: ignore[assignment,misc]  # noqa: E731
     Field = lambda **kwargs: None  # type: ignore[assignment]  # noqa: E731
     PrivateAttr = lambda **kwargs: None  # type: ignore[assignment]  # noqa: E731
+    RunnableBinding = ()  # type: ignore[misc,assignment]
 
 from headroom import HeadroomConfig, HeadroomMode
 from headroom.providers import OpenAIProvider
@@ -375,6 +376,31 @@ class HeadroomChatModel(BaseChatModel):
 
         return optimized_messages, metrics
 
+    @staticmethod
+    def _unwrap_binding(model: Any) -> tuple[Any, dict[str, Any]]:
+        """Split a ``RunnableBinding`` into its model and the kwargs bound to it.
+
+        ``bind_tools()`` and ``bind()`` return a ``RunnableBinding`` that holds the
+        extra kwargs and only applies them through the public Runnable interface
+        (``invoke``/``stream``). Attribute access proxies straight through to
+        ``.bound``, so calling the private ``_generate`` on the binding reaches the
+        underlying model with the bound kwargs silently dropped — a model wrapped
+        after ``bind_tools`` would emit no tool calls at all.
+
+        Returns the innermost model plus the accumulated kwargs, so callers can
+        pass them explicitly.
+        """
+        bound_kwargs: dict[str, Any] = {}
+        if not RunnableBinding:
+            return model, bound_kwargs
+        # isinstance, not hasattr: a Mock answers hasattr("bound") truthfully
+        # and would be unwrapped into one of its own auto-created children.
+        while isinstance(model, RunnableBinding):
+            # Outer bindings win over inner ones, matching Runnable semantics.
+            bound_kwargs = {**(model.kwargs or {}), **bound_kwargs}
+            model = model.bound
+        return model, bound_kwargs
+
     def _generate(
         self,
         messages: list[BaseMessage],
@@ -394,12 +420,14 @@ class HeadroomChatModel(BaseChatModel):
             f"({metrics.savings_percent:.1f}% saved)"
         )
 
-        # Call wrapped model with optimized messages
-        result: ChatResult = self.wrapped_model._generate(
+        # Call wrapped model with optimized messages. Bound kwargs (tools,
+        # tool_choice, response_format) must be re-applied explicitly.
+        target, bound_kwargs = self._unwrap_binding(self.wrapped_model)
+        result: ChatResult = target._generate(
             optimized_messages,
             stop=stop,
             run_manager=run_manager,
-            **kwargs,
+            **{**bound_kwargs, **kwargs},
         )
 
         return result
@@ -421,7 +449,9 @@ class HeadroomChatModel(BaseChatModel):
         )
 
         # Stream from wrapped model
-        yield from self.wrapped_model._stream(
+        target, bound_kwargs = self._unwrap_binding(self.wrapped_model)
+        kwargs = {**bound_kwargs, **kwargs}
+        yield from target._stream(
             optimized_messages,
             stop=stop,
             run_manager=run_manager,
@@ -455,18 +485,20 @@ class HeadroomChatModel(BaseChatModel):
         # with streaming=False. This avoids mutating shared state across an
         # await, which would race with concurrent ainvoke() calls on the
         # same HeadroomChatModel instance. (GitHub #1285, review feedback)
-        model_to_call = self.wrapped_model
-        if getattr(self.wrapped_model, "streaming", False):
+        model_to_call, bound_kwargs = self._unwrap_binding(self.wrapped_model)
+        kwargs = {**bound_kwargs, **kwargs}
+        if getattr(model_to_call, "streaming", False):
+            unbound = model_to_call
             try:
-                model_to_call = self.wrapped_model.model_copy(update={"streaming": False})
+                model_to_call = unbound.model_copy(update={"streaming": False})
             except Exception:
                 # model_copy not available (non-pydantic model) — try shallow copy
-                model_to_call = copy.copy(self.wrapped_model)
+                model_to_call = copy.copy(unbound)
                 try:
                     model_to_call.streaming = False
                 except Exception:
                     # Cannot override streaming — fall through with original model
-                    model_to_call = self.wrapped_model
+                    model_to_call = unbound
 
         # Call the (possibly copied) model's async generate
         result: ChatResult = await model_to_call._agenerate(
@@ -501,7 +533,9 @@ class HeadroomChatModel(BaseChatModel):
         )
 
         # Async stream from wrapped model
-        async for chunk in self.wrapped_model._astream(
+        target, bound_kwargs = self._unwrap_binding(self.wrapped_model)
+        kwargs = {**bound_kwargs, **kwargs}
+        async for chunk in target._astream(
             optimized_messages,
             stop=stop,
             run_manager=run_manager,

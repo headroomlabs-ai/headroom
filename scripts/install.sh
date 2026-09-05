@@ -1607,7 +1607,7 @@ Installed wrapper:
 Next steps:
   1. Restart your shell or run: export PATH="${INSTALL_DIR}:\$PATH"
   2. Try: headroom proxy
-  3. Docs: https://github.com/chopratejas/headroom/blob/main/docs/docker-install.md
+  3. Docs: https://docs.headroomlabs.ai/docs/docker-install
 EOF
 }
 

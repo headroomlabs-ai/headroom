@@ -1,8 +1,8 @@
 """Information-preserving compaction for EXCLUDED tool output.
 
-Excluded tools (Read/Grep/Glob/Write/Edit) are protected from *lossy*
-compression for accuracy. This feature still compacts them by detected shape,
-using only reversible / data-preserving transforms:
+Excluded tools (Grep/Glob/Write/Edit) are protected from *lossy* compression for
+accuracy. This feature still compacts them by detected shape, using only
+reversible / data-preserving transforms:
 
 * SEARCH (grep)  -> ripgrep --heading fold   [byte-lossless]
 * LOG            -> ANSI strip + run-collapse [byte-lossless modulo ANSI color]
@@ -10,6 +10,11 @@ using only reversible / data-preserving transforms:
 
 Source code and glob path-lists match nothing -> untouched. Always on
 (information-preserving, so it needs no feature gate) in every path.
+
+File-READ tools (`Read`/`read`, Copilot's `view`) are the exception: they are in
+DEFAULT_VERBATIM_EXCLUDE_TOOLS and skip the fold entirely, because their bytes
+come back to us as the model's `Edit(old_string=...)` anchor and must therefore
+be byte-faithful, not merely recoverable.
 """
 
 from __future__ import annotations
@@ -106,14 +111,21 @@ def test_pipeline_folds_grep_and_recovers(tokenizer):
     assert search_unheading(out) == GREP
 
 
-def test_pipeline_compacts_log_read(tokenizer):
-    out, transforms = _run(LOG, "read", tokenizer)
+# The two shape tests below drive `grep`, not `read`. A file-read tool is now
+# short-circuited before the fold ever runs (see the byte-faithfulness tests
+# further down), so `read` would prove nothing about the fold. `grep` is
+# excluded-but-foldable: its output is search results the agent greps again,
+# never a string it re-emits as an Edit anchor.
+
+
+def test_pipeline_compacts_log_from_excluded_tool(tokenizer):
+    out, transforms = _run(LOG, "grep", tokenizer)
     assert "router:excluded:lossless_log" in transforms
     assert expand_runs(out) == strip_ansi(LOG)
 
 
-def test_pipeline_minifies_json_read(tokenizer):
-    out, transforms = _run(JSON, "read", tokenizer)
+def test_pipeline_minifies_json_from_excluded_tool(tokenizer):
+    out, transforms = _run(JSON, "grep", tokenizer)
     assert "router:excluded:lossless_json" in transforms
     assert json.loads(out) == json.loads(JSON)  # data-lossless (same object)
 
@@ -121,6 +133,92 @@ def test_pipeline_minifies_json_read(tokenizer):
 def test_pipeline_leaves_source_read_untouched(tokenizer):
     out, _ = _run(CODE, "read", tokenizer)
     assert out == CODE
+
+
+# --- file reads must be BYTE-faithful, not merely recoverable ----------------
+#
+# Regression for the read-then-Edit miss: `Read`/`read` were excluded from LOSSY
+# compression but not from the excluded-tool lossless fold, so a read of a
+# pretty-printed JSON file came back json-min'd. That fold is data-lossless and
+# the proxy can invert it -- but the inverse runs on OUR side, while the copy
+# that has to match on disk is typed by the MODEL from the bytes it was shown.
+# It built `Edit(old_string=...)` out of minified JSON, the file on disk was
+# still pretty-printed, the edit missed, and the retry turn cost more than the
+# ~480 tokens the fold saved. Copilot's equivalent `view` was already protected;
+# `Read` was the asymmetry.
+
+
+def _run_anthropic(content: str, tool: str, tokenizer):
+    """Claude Code's own wire shape: tool_use / tool_result content blocks.
+
+    Gated by a *separate* guard from the OpenAI chat path (`_run`), so the
+    byte-exact rule has to be asserted on both or one wire keeps folding.
+    """
+    router = ContentRouter(ContentRouterConfig())
+    messages = [
+        {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "t1", "name": tool, "input": {}}],
+        },
+        {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "t1", "content": content}],
+        },
+    ]
+    result = router.apply(messages, tokenizer, compress_user_messages=True)
+    return result.messages[1]["content"][0]["content"], result.transforms_applied
+
+
+@pytest.mark.parametrize("shape", [_run, _run_anthropic], ids=["openai_chat", "anthropic_blocks"])
+@pytest.mark.parametrize("tool", ["Read", "read", "view"])
+@pytest.mark.parametrize("body", [JSON, LOG, GREP], ids=["json", "log", "grep"])
+def test_file_read_result_is_byte_exact(shape, tool, body, tokenizer):
+    out, transforms = shape(body, tool, tokenizer)
+    assert out == body, f"{tool} result was rewritten; the model's Edit anchor would miss"
+    assert "router:excluded:tool" in transforms
+    assert not any(t.startswith("router:excluded:lossless") for t in transforms)
+
+
+def test_read_json_edit_anchor_survives(tokenizer):
+    """The exact failure this protects: an Edit anchor copied out of a Read.
+
+    `old_string` is a verbatim slice of the pretty-printed file. Before the fix
+    the model saw minified JSON, so the anchor it could construct was not a
+    substring of the file on disk and `Edit` missed.
+    """
+    anchor = '  "users": [\n    {\n      "id": 0,'
+    assert anchor in JSON  # the anchor is real on disk
+    shown, _ = _run(JSON, "Read", tokenizer)
+    assert anchor in shown
+
+
+def test_read_is_still_cross_turn_deduped(tokenizer):
+    """The deliberate line between the two protection sets — hold it.
+
+    Read is byte-exact against the FOLD, not blanket-verbatim. The one-line
+    alternative (adding Read to DEFAULT_VERBATIM_EXCLUDE_TOOLS, next to `view`)
+    would also switch off cross-turn dedup, which is worth ~66% of the tokens on
+    a file read three times — the largest Read-side saving there is, and unlike
+    the fold it does not destroy the bytes: keep-earliest guarantees the first,
+    unrewritten copy is still in the window for the model to copy its anchor
+    from. If someone later "simplifies" the two sets into one, this fails.
+    """
+    config = ContentRouterConfig()
+    config.enable_cross_turn_dedup = True
+    router = ContentRouter(config)
+    messages = []
+    for k in range(3):
+        messages.append(
+            {
+                "role": "assistant",
+                "tool_calls": [{"id": f"c{k}", "function": {"name": "Read", "arguments": "{}"}}],
+            }
+        )
+        messages.append({"role": "tool", "tool_call_id": f"c{k}", "content": CODE})
+    result = router.apply(messages, tokenizer, compress_user_messages=True)
+    outs = [m["content"] for m in result.messages if m.get("role") == "tool"]
+    assert outs[0] == CODE  # keep-earliest: the anchor copy is never rewritten
+    assert len(outs[2]) < len(CODE)  # …and the later repeats still fold to pointers
 
 
 # --- pluggable lossless provider seam ---------------------------------------
@@ -148,6 +246,31 @@ def test_registered_provider_is_authoritative():
     # Authoritative on None too: provider says "leave it" → no built-in fallback.
     set_lossless_provider(lambda content: None)
     assert _compact(GREP) is None
+
+
+def test_byte_exact_read_gate_runs_before_the_provider_seam(tokenizer):
+    """The read gate is OSS's own guarantee, not something a provider can opt out of.
+
+    An external provider is contractually only "information-preserving" (see
+    transforms/lossless_provider.py) — that admits json-min, which is exactly the
+    rewrite that misses the Edit. And the seam hands over `content` with no tool
+    name, so a provider *cannot* recognise a read and protect it itself. So the
+    gate sits in front of the seam: a read is never offered to a provider at all.
+    Every other excluded tool still reaches it, unchanged — the seam's reach
+    narrows for file reads only.
+    """
+    seen: list[str] = []
+    set_lossless_provider(lambda content: (seen.append(content), None)[1])
+
+    for tool in ("Read", "read"):
+        seen.clear()
+        _run(GREP, tool, tokenizer)
+        assert seen == [], f"{tool} content was handed to the provider"
+
+    for tool in ("Grep", "grep", "Glob", "Write", "Edit"):
+        seen.clear()
+        _run(GREP, tool, tokenizer)
+        assert seen, f"provider lost reach for {tool}"
 
 
 def test_provider_exception_falls_back_to_builtin():

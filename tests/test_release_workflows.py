@@ -931,7 +931,7 @@ def test_glibc_compat_shim_present_in_headroom_py() -> None:
     """STRUCTURAL INVARIANT: the headroom-py crate ships a glibc-2.38
     compatibility shim that defines weak `__isoc23_*` aliases.
 
-    Issue #355 (https://github.com/chopratejas/headroom/issues/355) —
+    Issue #355 (https://github.com/headroomlabs-ai/headroom/issues/355) —
     the published wheel's `_core.so` references `__isoc23_strtoll`
     (glibc 2.38+) because we statically link prebuilt ONNX Runtime
     artifacts compiled with gcc 14. Users with libc < 2.38 (Ubuntu

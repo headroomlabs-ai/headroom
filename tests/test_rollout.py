@@ -190,14 +190,15 @@ def test_live_legacy_reresolution_preserves_channel_and_named_kill_switch() -> N
             "HEADROOM_DISABLE_FEATURES": "proxy_output_shaper",
         }
     ).with_legacy_env({"HEADROOM_OUTPUT_SHAPER": "1"})
-    blocked = resolve_rollout({}).with_legacy_env({"HEADROOM_OUTPUT_SHAPER": "1"})
+    # ``proxy_output_shaper`` is STABLE and default-on, so it can no longer
+    # show a legacy alias being refused by the channel gate. ``read_maturation``
+    # is still BETA, so it carries that half of the assertion.
+    blocked = resolve_rollout({}).with_legacy_env({"HEADROOM_READ_MATURATION": "1"})
 
     assert enabled.decision("proxy_output_shaper").reason is FeatureDecisionReason.LEGACY_ALIAS
     assert disabled_again.decision("proxy_output_shaper").reason is FeatureDecisionReason.DISABLED
     assert killed.decision("proxy_output_shaper").reason is FeatureDecisionReason.DISABLED
-    assert (
-        blocked.decision("proxy_output_shaper").reason is FeatureDecisionReason.BLOCKED_BY_CHANNEL
-    )
+    assert blocked.decision("read_maturation").reason is FeatureDecisionReason.BLOCKED_BY_CHANNEL
     assert enabled.snapshot_digest != eligible.snapshot_digest
 
 

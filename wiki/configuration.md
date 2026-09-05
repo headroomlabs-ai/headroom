@@ -177,11 +177,14 @@ config = SmartCrusherConfig(
     max_items_after_crush=15,
     # Minimum tokens before applying compression
     min_tokens_to_crush=200,
-    # Relevance scoring tier: "bm25" (fast) or "embedding" (accurate)
-    relevance_tier="bm25",
-    # Always keep items with these field values
-    preserve_fields=["error", "warning", "failure"],
+    # Guarantee rows matching these patterns survive compression verbatim
+    # (requires audit_safe=True; matched against each row's canonical JSON)
+    audit_safe=True,
+    protected_patterns=["error", "warning", "failure"],
 )
+# Error items and statistical anomalies (>2 std from mean) are always kept
+# automatically. Relevance-scoring tier ("bm25"/"embedding"/"hybrid") is a
+# separate `relevance_config` argument to SmartCrusher(), not a field here.
 ```
 
 ## Cache Aligner Configuration
@@ -189,13 +192,18 @@ config = SmartCrusherConfig(
 Control prefix stabilization:
 
 ```python
-from headroom.transforms import CacheAlignerConfig
+from headroom import CacheAlignerConfig
 
 config = CacheAlignerConfig(
-    # Enable/disable cache alignment
+    # Enable/disable cache alignment (disabled by default: prefix-stability
+    # gains are marginal in practice -- see headroom/config.py:61)
     enabled=True,
-    # Patterns to extract from system prompt
-    dynamic_patterns=[
+    # Legacy pattern list (only used when use_dynamic_detector=False;
+    # the field is `date_patterns`, not `dynamic_patterns`). Default mode
+    # (use_dynamic_detector=True) auto-detects dates, UUIDs, tokens, etc.
+    # via detection_tiers instead -- see headroom/config.py:68-79.
+    use_dynamic_detector=False,
+    date_patterns=[
         r"Today is \w+ \d+, \d{4}",
         r"Current time: .*",
     ],
