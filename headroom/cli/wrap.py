@@ -1697,36 +1697,34 @@ def _ensure_claude_wrap_selfheal_hook(settings_path: Path) -> None:
     with a SessionStart hook that runs the hidden ``wrap selfheal`` command.
     SessionStart ONLY (never PreToolUse): the self-heal must not run per Bash
     call mid-session, where a transient probe blip could clear a live session.
-    Idempotent — an existing entry carrying the marker is not duplicated.
+    Idempotent — an existing entry carrying the marker is not duplicated; if its
+    command drifted (hand edit, moved headroom binary) it is rewritten in place.
     """
     payload = _read_settings_for_write(settings_path)
     hooks = dict(payload.get("hooks") or {}) if isinstance(payload.get("hooks"), dict) else {}
     entries = (
         list(hooks.get("SessionStart") or []) if isinstance(hooks.get("SessionStart"), list) else []
     )
-    already = any(
-        isinstance(entry, dict)
-        and isinstance(entry.get("hooks"), list)
-        and any(
-            isinstance(item, dict) and _WRAP_SELFHEAL_HOOK_MARKER in str(item.get("command", ""))
-            for item in entry["hooks"]
-        )
+    command = _wrap_selfheal_hook_command()
+    marked = [
+        item
         for entry in entries
-    )
-    if already:
-        return
-    entries.append(
-        {
-            "matcher": "startup|resume",
-            "hooks": [
-                {
-                    "type": "command",
-                    "command": _wrap_selfheal_hook_command(),
-                    "timeout": 10,
-                }
-            ],
-        }
-    )
+        if isinstance(entry, dict) and isinstance(entry.get("hooks"), list)
+        for item in entry["hooks"]
+        if isinstance(item, dict) and _WRAP_SELFHEAL_HOOK_MARKER in str(item.get("command", ""))
+    ]
+    if marked:
+        if all(item.get("command") == command for item in marked):
+            return
+        for item in marked:
+            item["command"] = command
+    else:
+        entries.append(
+            {
+                "matcher": "startup|resume",
+                "hooks": [{"type": "command", "command": command, "timeout": 10}],
+            }
+        )
     hooks["SessionStart"] = entries
     payload["hooks"] = hooks
     settings_path.parent.mkdir(parents=True, exist_ok=True)

@@ -212,6 +212,7 @@ benchmark_results/
 
 # Headroom specific
 .headroom/
+.claude/.headroom_wrap_*.json
 headroom.db
 headroom_*.db
 *.jsonl
