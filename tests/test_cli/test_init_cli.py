@@ -452,6 +452,48 @@ def test_ensure_claude_hooks_rewrites_existing_entries(monkeypatch, tmp_path: Pa
     assert session_entries[-1]["hooks"][0]["command"].endswith("--marker headroom-init-claude")
 
 
+def test_ensure_claude_hooks_timeout_exceeds_cold_start_wait(monkeypatch, tmp_path: Path) -> None:
+    """The external hook timeout must stay above the internal wait_ready(45s)
+    call _ensure_profile_running makes after a cold start (#3417), or the host
+    kills the hook before a first-ever proxy start can ever report ready."""
+    init_cli, _ = _load_init_module(monkeypatch)
+    settings_path = tmp_path / "settings.json"
+    monkeypatch.setattr(init_cli, "_hook_command", lambda *parts: "headroom init hook ensure")
+
+    init_cli._ensure_claude_hooks(settings_path, "init-local-demo", 9001)
+
+    payload = json.loads(settings_path.read_text(encoding="utf-8"))
+    for event in ("SessionStart", "PreToolUse"):
+        timeout = payload["hooks"][event][-1]["hooks"][0]["timeout"]
+        assert timeout > 45
+
+
+def test_ensure_copilot_hooks_timeout_exceeds_cold_start_wait(
+    monkeypatch, tmp_path: Path
+) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    config_path = tmp_path / "copilot.json"
+    monkeypatch.setattr(init_cli, "_hook_command", lambda *parts: "headroom init hook ensure")
+
+    init_cli._ensure_copilot_hooks(config_path, "init-user")
+
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    for event in ("SessionStart", "PreToolUse"):
+        assert payload["hooks"][event][-1]["timeout"] > 45
+
+
+def test_ensure_codex_hooks_timeout_exceeds_cold_start_wait(monkeypatch, tmp_path: Path) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    path = tmp_path / "hooks.json"
+    monkeypatch.setattr(init_cli, "_hook_command", lambda *parts: "headroom init hook ensure")
+
+    init_cli._ensure_codex_hooks(path, "init-user")
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    for event in ("SessionStart", "PreToolUse"):
+        assert payload["hooks"][event][-1]["hooks"][0]["timeout"] > 45
+
+
 def test_ensure_copilot_hooks_replaces_existing_marker(monkeypatch, tmp_path: Path) -> None:
     init_cli, _ = _load_init_module(monkeypatch)
     config_path = tmp_path / "copilot.json"

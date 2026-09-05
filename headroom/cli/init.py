@@ -63,6 +63,12 @@ _SUPPORTED_TARGETS = ("claude", "copilot", "codex", "openclaw")
 _LOCAL_TARGETS = {"claude", "codex"}
 _GLOBAL_TARGETS = {"claude", "copilot", "codex", "openclaw"}
 _STARTUP_READY_TIMEOUT_SECONDS = 15
+# External kill timeout Claude/Copilot/Codex apply to the `headroom init hook
+# ensure` command itself. Must stay above the internal wait_ready(45s) call in
+# _ensure_profile_running for a cold start (measured 15.9-36.9s in #3417) --
+# otherwise the host kills the hook before a first-ever proxy start can ever
+# report ready, and every session is permanently cold.
+_HOOK_ENSURE_TIMEOUT_SECONDS = 60
 _TOML_TABLE_HEADER_RE = re.compile(r"^[ \t]*(?:\[\[[^\]\r\n]+\]\]|\[[^\]\r\n]+\])[ \t]*(?:#.*)?$")
 _TOML_FEATURES_NAME_RE = r"(?:features|\"features\"|'features')"
 _TOML_CODEX_HOOKS_NAME_RE = r"(?:codex_hooks|\"codex_hooks\"|'codex_hooks')"
@@ -221,7 +227,7 @@ def _ensure_claude_hooks(path: Path, profile: str, port: int) -> None:
                     {
                         "type": "command",
                         "command": f"{command} --marker {_CLAUDE_HOOK_MARKER}",
-                        "timeout": 15,
+                        "timeout": _HOOK_ENSURE_TIMEOUT_SECONDS,
                     }
                 ],
             }
@@ -245,7 +251,14 @@ def _ensure_copilot_hooks(path: Path, profile: str) -> None:
                 isinstance(entry, dict) and _COPILOT_HOOK_MARKER in str(entry.get("command", ""))
             )
         ]
-        retained.append({"type": "command", "command": command, "cwd": ".", "timeout": 15})
+        retained.append(
+            {
+                "type": "command",
+                "command": command,
+                "cwd": ".",
+                "timeout": _HOOK_ENSURE_TIMEOUT_SECONDS,
+            }
+        )
         hooks[event] = retained
     payload["hooks"] = hooks
     _write_json(path, payload)
@@ -524,7 +537,13 @@ def _ensure_codex_hooks(path: Path, profile: str) -> None:
         retained.append(
             {
                 "matcher": matcher,
-                "hooks": [{"type": "command", "command": command, "timeout": 15}],
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": command,
+                        "timeout": _HOOK_ENSURE_TIMEOUT_SECONDS,
+                    }
+                ],
             }
         )
         hooks[event] = retained
