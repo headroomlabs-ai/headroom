@@ -58,7 +58,6 @@ DEFAULT_PORT = 8787
 # - Input tokens: $0.75 per 1M un-cached prompt tokens
 # - Text output tokens: $3.75 per 1M candidate tokens
 # Source: Google Cloud Vertex AI Pricing documentation (Introductory rates through Dec 31, 2026)
-# Note: $0.075 / 1M is the context caching read rate, not standard input pricing.
 INPUT_PRICE_PER_M = 0.75
 OUTPUT_PRICE_PER_M = 3.75
 

@@ -1,1 +1,1 @@
-"""Vertex AI Gemini 3.7 Flash Agent Benchmark with Headroom."""
+"""Vertex AI Gemini Agent Benchmark with Headroom."""
