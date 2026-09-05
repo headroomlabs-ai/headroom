@@ -617,7 +617,10 @@ def main() -> int:
         help="Path to save output JSON",
     )
     parser.add_argument(
-        "--social", action="store_true", default=True, help="Print social post text"
+        "--social",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Print social post text",
     )
     args = parser.parse_args()
 

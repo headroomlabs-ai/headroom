@@ -40,7 +40,7 @@ Pricing basis: Google Cloud Vertex AI introductory standard rates through 2026-1
 * **Prompt Tokens Saved**: **85,656 tokens** (**76.7% net reduction**, 111,687 down to 26,031)
 * **Total Inference Cost**: **$0.0941 down to $0.0285** (**69.7% cost savings** at standard Vertex rates)
 * **Average Latency**: **8.9s down to 5.7s** (**+3.2s faster roundtrip** due to reduced prompt prefill load)
-* **Relative Quality Retention**: **100.0%** (zero degradation; Headroom matched baseline extraction of all root causes, database connection pool exhaustion, CVE bypass logic, fraud outliers, and architectural contracts)
+* **Relative Quality Retention**: **100.0%** (zero degradation; Headroom matched baseline extraction of all root causes, database connection pool exhaustion, JWT `alg: none` auth bypass, fraud outliers, and architectural contracts)
 
 ---
 
@@ -89,7 +89,7 @@ export GCP_PROJECT_ID=$(gcloud config get-value project)
 Install required dependencies:
 
 ```bash
-pip install "headroom-ai[proxy,vertex]" google-genai tabulate rich
+pip install "headroom-ai[proxy]" google-genai
 ```
 
 ### 2. Execute Benchmark
@@ -109,7 +109,7 @@ python examples/vertex_gemini_benchmark/benchmark.py --model gemini-3.8-flash
 --port            Headroom local proxy port (default: 8787)
 --thinking-budget Thinking token budget in tokens (default: 0 = standard inference)
 --output-json     Output file for JSON metrics (default: examples/vertex_gemini_benchmark/results.json)
---social          Print formatted social media proof point summary
+--social / --no-social  Print formatted social media proof point summary (default: on)
 ```
 
 ---
