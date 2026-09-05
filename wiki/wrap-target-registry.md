@@ -82,10 +82,8 @@ Design rules, in the order they were decided:
   passthrough consults a precomputed host→rules index instead of scanning all targets
   per request.
 
-Every field is described by a descriptor carrying an *effect class* — `data`,
-`launch_env`, `upstream`, `mode`, `proxy_route`, `proxy_rewrite` — so validation output
-says what changing the field actually does. A test pins descriptor parity with the
-dataclass (names and round-trip types).
+Every configurable field has a coercer that validates its JSON shape. A test pins
+coercer parity with the dataclass (names and round-trip types).
 
 ## Validation and staleness
 
@@ -103,7 +101,7 @@ dataclass (names and round-trip types).
 
 A shared proxy supports concurrent wrapped clients (per-PID markers in
 `~/.headroom/clients/<port>/`; the proxy is only stopped when the last client exits),
-and savings attribution stays separate via `agent_type` and the `/p/<project>` prefix.
+and savings attribution stays separate via the target name and the `/p/<project>` prefix.
 Two settings are proxy-wide and fixed at boot, which constrains layouts:
 
 - **Mode.** One proxy runs one mode. A token-mode target joining a cache-mode proxy is
