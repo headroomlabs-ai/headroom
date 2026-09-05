@@ -56,6 +56,16 @@
             --ttl-card-bg: linear-gradient(180deg, rgba(34,211,238,0.10), rgba(12,16,22,0.88));
         }
         body { background: var(--bg); }
+        /* Accessibility: visible keyboard focus on every operable element (WCAG 2.4.7 / 2.4.11) */
+        :focus-visible { outline: 2px solid #22d3ee; outline-offset: 2px; border-radius: 4px; }
+        html:not(.dark) :focus-visible { outline-color: #0e7490; }
+        [role="button"]:focus-visible { outline-offset: -2px; }
+        .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
+        @media (prefers-reduced-motion: reduce) {
+            .pulse-live { animation: none; }
+            #feed-container { scroll-behavior: auto; }
+            .transition-colors, .transition-opacity, [x-transition] { transition: none !important; }
+        }
         .sparkline { stroke: #22d3ee; stroke-width: 1.5; fill: none; }
         .sparkline-area { fill: url(#sparkline-gradient); }
         .trend-line { stroke: #22d3ee; stroke-width: 2; fill: none; }
@@ -113,17 +123,17 @@
         </div>
         <div class="flex flex-col gap-3 md:flex-row md:items-center md:gap-6">
             <div class="inline-flex rounded-lg border border-border bg-surface p-1">
-                    <button class="px-3 py-1.5 text-sm rounded-md transition-colors"
+                    <button type="button" :aria-pressed="viewMode === 'session'" class="px-3 py-1.5 text-sm rounded-md transition-colors"
                             :class="viewMode === 'session' ? 'bg-accent text-black' : 'text-gray-400 hover:text-gray-200'"
                             @click="setViewMode('session')">
                         Session
                     </button>
-                    <button class="px-3 py-1.5 text-sm rounded-md transition-colors"
+                    <button type="button" :aria-pressed="viewMode === 'lifetime'" class="px-3 py-1.5 text-sm rounded-md transition-colors"
                             :class="viewMode === 'lifetime' ? 'bg-accent text-black' : 'text-gray-400 hover:text-gray-200'"
                             @click="setViewMode('lifetime')">
                         Lifetime
                     </button>
-                    <button class="px-3 py-1.5 text-sm rounded-md transition-colors"
+                    <button type="button" :aria-pressed="viewMode === 'history'" class="px-3 py-1.5 text-sm rounded-md transition-colors"
                         :class="viewMode === 'history' ? 'bg-accent text-black' : 'text-gray-400 hover:text-gray-200'"
                         @click="setViewMode('history')">
                     Historical
@@ -132,7 +142,7 @@
             <template x-if="stats.anon_telemetry_shipping">
                 <div class="inline-flex items-center gap-1.5 rounded-full border border-amber-500/40 bg-amber-500/10 px-2.5 py-1"
                      title="Anonymous aggregate telemetry is enabled. Disable with HEADROOM_TELEMETRY=off or --no-telemetry.">
-                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor"
+                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"
                          class="w-3 h-3 text-amber-400 shrink-0">
                         <path fill-rule="evenodd"
                               d="M6.701 2.25c.577-1 2.02-1 2.598 0l5.196 9a1.5 1.5 0 0 1-1.299 2.25H2.804a1.5 1.5 0 0 1-1.3-2.25l5.197-9ZM8 4a.75.75 0 0 1 .75.75v3a.75.75 0 0 1-1.5 0v-3A.75.75 0 0 1 8 4Zm0 8a1 1 0 1 0 0-2 1 1 0 0 0 0 2Z"
@@ -155,8 +165,8 @@
             </template>
             <div class="flex items-center gap-2">
                 <span class="text-xs text-gray-500">Status</span>
-                <span class="flex items-center gap-1.5">
-                    <span class="w-2 h-2 rounded-full pulse-live"
+                <span class="flex items-center gap-1.5" role="status" aria-live="polite">
+                    <span class="w-2 h-2 rounded-full pulse-live" aria-hidden="true"
                           :class="healthy ? 'bg-emerald-400' : 'bg-red-400'"></span>
                     <span class="text-sm" x-text="healthy ? 'Healthy' : 'Error'"></span>
                 </span>
@@ -169,18 +179,19 @@
                title="Settings">
                 &#9881; Settings
             </a>
-            <button onclick="toggleTheme()" id="theme-toggle"
+            <button type="button" onclick="toggleTheme()" id="theme-toggle"
                     class="px-3 py-1.5 text-sm rounded-md border border-border bg-surface text-gray-400 hover:text-gray-200 transition-colors"
-                    title="Toggle light/dark mode">
-                <svg class="w-4 h-4 dark:hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    title="Toggle light/dark mode" aria-label="Toggle light or dark mode">
+                <svg class="w-4 h-4 dark:hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z"/>
                 </svg>
-                <svg class="w-4 h-4 hidden dark:block" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <svg class="w-4 h-4 hidden dark:block" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z"/>
                 </svg>
             </button>
-            <button x-show="log_full_messages" id="feed-toggle"
+            <button type="button" x-show="log_full_messages" id="feed-toggle"
                     class="px-3 py-1.5 text-sm rounded-md border border-border bg-surface text-gray-300 hover:text-white transition-colors"
+                    :aria-expanded="feedOpen" aria-controls="feed-drawer"
                     @click="toggleFeed()"
                     :class="feedOpen ? 'bg-accent text-black' : ''">
                 Live Feed
@@ -227,7 +238,8 @@
                             <span x-text="'Of total wire: ' + (stats.tokens?.savings_percent || 0).toFixed(2) + '%'" title="Savings as fraction of all input tokens including frozen prefix"></span>
                         </div>
                         <div class="mt-2 h-8">
-                            <svg class="w-full h-full" viewBox="0 0 100 32" preserveAspectRatio="none">
+                            <svg class="w-full h-full" viewBox="0 0 100 32" preserveAspectRatio="none" role="img"
+                                 :aria-label="'Savings trend sparkline, ' + (stats.savings_history || []).length + ' recent samples; latest ' + (stats.tokens?.savings_percent || 0).toFixed(1) + ' percent'">
                                 <defs>
                                     <linearGradient id="sparkline-gradient" x1="0%" y1="0%" x2="0%" y2="100%">
                                         <stop offset="0%" style="stop-color:#22d3ee;stop-opacity:0.3"/>
@@ -487,7 +499,8 @@
                         </div>
                         <template x-if="(stats.savings_history || []).length >= 2">
                             <div class="h-32">
-                                <svg class="w-full h-full" viewBox="0 0 200 64" preserveAspectRatio="none">
+                                <svg class="w-full h-full" viewBox="0 0 200 64" preserveAspectRatio="none" role="img"
+                                     :aria-label="'Savings trend chart, ' + (stats.savings_history || []).length + ' samples; ' + formatNumber(stats.tokens?.saved || 0) + ' tokens saved in total'">
                                     <defs>
                                         <linearGradient id="trend-gradient" x1="0%" y1="0%" x2="0%" y2="100%">
                                             <stop offset="0%" style="stop-color:#22d3ee;stop-opacity:0.2"/>
@@ -1032,11 +1045,16 @@
                             <div class="divide-y divide-border">
                                 <template x-for="req in (stats.recent_requests || [])" :key="req.request_id">
                                     <div>
-                                        <div class="cursor-pointer" @click="toggleExpanded(req.request_id)">
+                                        <div class="cursor-pointer" role="button" tabindex="0"
+                                             :aria-expanded="!!expandedRows[req.request_id]"
+                                             :aria-label="'Request at ' + formatTime(req.timestamp) + ', ' + truncateModel(req.model) + ', ' + req.savings_percent.toFixed(0) + ' percent saved. Toggle details'"
+                                             @click="toggleExpanded(req.request_id)"
+                                             @keydown.enter.prevent="toggleExpanded(req.request_id)"
+                                             @keydown.space.prevent="toggleExpanded(req.request_id)">
                                             <div class="grid hover:bg-border/30 transition-colors"
                                                  style="grid-template-columns: 2rem 12fr 22fr 15fr 12fr 10fr 14fr">
                                                 <div class="px-2 py-3 text-gray-500 flex items-center justify-center">
-                                                    <span x-text="expandedRows[req.request_id] ? '-' : '+'"></span>
+                                                    <span aria-hidden="true" x-text="expandedRows[req.request_id] ? '-' : '+'"></span>
                                                 </div>
                                                 <div class="px-4 py-3 font-mono text-gray-400 truncate" x-text="formatTime(req.timestamp)"></div>
                                                 <div class="px-4 py-3 min-w-0">
@@ -1738,7 +1756,8 @@
                                      x-text="'Showing ' + formatNumber(historySelectedPointCount) + ' ' + historySelectedSeriesLabel.toLowerCase() + ' points'"></div>
                                 <template x-if="historicalTrend.length >= 2">
                                     <div class="h-48">
-                                        <svg class="w-full h-full" viewBox="0 0 200 64" preserveAspectRatio="none">
+                                        <svg class="w-full h-full" viewBox="0 0 200 64" preserveAspectRatio="none" role="img"
+                                             aria-label="Historical savings chart. The per-model table below this chart lists the same values.">
                                             <defs>
                                                 <linearGradient id="history-trend-gradient" x1="0%" y1="0%" x2="0%" y2="100%">
                                                     <stop offset="0%" style="stop-color:#22d3ee;stop-opacity:0.2"/>
@@ -1774,7 +1793,8 @@
                                 <div class="flex flex-wrap gap-3 mt-3"
                                      x-show="historyChartMode === 'tokens' && historyGranularity !== 'history' && historyModelChartSeries.length > 0">
                                     <template x-for="(series, index) in historyModelChartSeries" :key="series.model">
-                                        <button class="flex items-center gap-1.5 text-xs transition-opacity cursor-pointer"
+                                        <button type="button" :aria-pressed="historySelectedModel === series.model"
+                                                class="flex items-center gap-1.5 text-xs transition-opacity cursor-pointer"
                                                 :class="historyActiveModel && historyActiveModel !== series.model
                                                     ? 'text-gray-600 opacity-50'
                                                     : 'text-gray-400 hover:text-gray-200'"
@@ -1829,6 +1849,10 @@
                                                 <template x-for="row in historyModelBreakdown" :key="row.model">
                                                     <tr class="border-t border-border text-gray-300 cursor-pointer transition-colors"
                                                         :class="historySelectedModel === row.model ? 'bg-card-alt' : 'hover-bg-surface'"
+                                                        tabindex="0" role="button"
+                                                        :aria-pressed="historySelectedModel === row.model"
+                                                        @keydown.enter.prevent="toggleHistoryModel(row.model)"
+                                                        @keydown.space.prevent="toggleHistoryModel(row.model)"
                                                         @click="toggleHistoryModel(row.model)"
                                                         :title="historySelectedModel === row.model
                                                             ? 'Show all models'
@@ -1924,6 +1948,8 @@
          x-transition:leave-start="translate-x-0"
          x-transition:leave-end="translate-x-full"
          @click.away="feedOpen = false"
+         @keydown.escape.window="if (feedOpen) closeFeed()"
+         id="feed-drawer" role="dialog" aria-label="Message Transformations live feed"
          class="fixed top-0 right-0 h-full w-[520px] bg-surface border-l border-border z-50 flex flex-col"
          style="display: none;">
 
@@ -1933,19 +1959,20 @@
                 <span class="text-sm font-medium text-gray-200">Message Transformations</span>
                 <span class="text-xs text-gray-500 font-mono" x-text="transformations.length + ' msgs'"></span>
             </div>
-            <button @click="feedOpen = false" class="text-gray-500 hover:text-gray-200 transition-colors p-1">
-                <svg xmlns="http://www.w3.org/2000/svg" class="w-5 h-5" viewBox="0 0 16 16" fill="currentColor">
+            <button type="button" id="feed-close" @click="closeFeed()" aria-label="Close live feed"
+                    class="text-gray-500 hover:text-gray-200 transition-colors p-1">
+                <svg xmlns="http://www.w3.org/2000/svg" class="w-5 h-5" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
                     <path d="M2.146 2.854a.5.5 0 1 1 .708-.708L8 7.293l5.146-5.147a.5.5 0 0 1 .708.708L8.707 8l5.147 5.146a.5.5 0 0 1-.708.708L8 8.707l-5.146 5.147a.5.5 0 0 1-.708-.708L7.293 8 2.146 2.854z"/>
                 </svg>
             </button>
         </div>
 
         <!-- New messages indicator -->
-        <div x-show="feedScrolled_ && feedNewCount > 0"
+        <button type="button" x-show="feedScrolled_ && feedNewCount > 0"
              @click="scrollToFeedTop()"
              class="absolute top-16 right-4 px-3 py-2 bg-accent text-black text-sm rounded-lg shadow-lg cursor-pointer z-50 font-medium">
             <span x-text="feedNewCount"></span> new message<span x-show="feedNewCount > 1">s</span>
-        </div>
+        </button>
 
         <!-- Drawer Content (virtual scroll container) -->
         <div class="flex-1 overflow-y-auto" id="feed-container"
@@ -2042,10 +2069,18 @@
                 },
 
                 async toggleFeed() {
-                    this.feedOpen = !this.feedOpen;
                     if (this.feedOpen) {
-                        await this.fetchTransformations();
+                        this.closeFeed();
+                        return;
                     }
+                    this.feedOpen = true;
+                    this.$nextTick(() => document.getElementById('feed-close')?.focus());
+                    await this.fetchTransformations();
+                },
+
+                closeFeed() {
+                    this.feedOpen = false;
+                    this.$nextTick(() => document.getElementById('feed-toggle')?.focus());
                 },
 
                 formatVersion(value) {

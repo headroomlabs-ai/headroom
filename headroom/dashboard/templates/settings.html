@@ -26,6 +26,10 @@
         .field-help { color: var(--muted); }
         input, select { background: var(--surface); border: 1px solid var(--border); }
         input:disabled, select:disabled { opacity: .55; cursor: not-allowed; }
+        /* Accessibility: visible keyboard focus on every operable element (WCAG 2.4.7 / 2.4.11) */
+        :focus-visible { outline: 2px solid #22d3ee; outline-offset: 2px; border-radius: 4px; }
+        html:not(.dark) :focus-visible { outline-color: #0e7490; }
+        @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
     </style>
 </head>
 <body class="text-gray-800 dark:text-gray-100 min-h-screen" x-data="settingsPage()" x-init="init()">
