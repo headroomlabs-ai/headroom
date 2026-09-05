@@ -468,9 +468,7 @@ def test_ensure_claude_hooks_timeout_exceeds_cold_start_wait(monkeypatch, tmp_pa
         assert timeout > 45
 
 
-def test_ensure_copilot_hooks_timeout_exceeds_cold_start_wait(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_ensure_copilot_hooks_timeout_exceeds_cold_start_wait(monkeypatch, tmp_path: Path) -> None:
     init_cli, _ = _load_init_module(monkeypatch)
     config_path = tmp_path / "copilot.json"
     monkeypatch.setattr(init_cli, "_hook_command", lambda *parts: "headroom init hook ensure")
