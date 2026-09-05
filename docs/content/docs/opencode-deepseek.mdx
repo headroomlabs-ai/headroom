@@ -3,7 +3,9 @@ title: OpenCode + DeepSeek
 description: Configure OpenCode to route DeepSeek traffic through the Headroom proxy for compression, output shaping, and savings visibility.
 ---
 
-Save 20-60% on DeepSeek API costs with Headroom's context compression proxy.
+Cut DeepSeek API costs with Headroom's context compression proxy: tool outputs,
+logs, and search results are compressed before they reach the model, and
+responses can be shaped to be more concise.
 
 ## How it works
 
@@ -22,9 +24,9 @@ concise. DeepSeek's API is OpenAI-compatible — one flag and you're running.
 ## 1. Install Headroom
 
 ```bash
-pip install headroom-ai
+pip install "headroom-ai[proxy]"
 # or via uv:
-uv tool install headroom-ai
+uv tool install "headroom-ai[proxy]"
 ```
 
 You get SmartCrusher (structural compression), the proxy, output shaping, and
@@ -71,7 +73,7 @@ curl -s http://127.0.0.1:8787/v1/models \
 Output shaping makes the model's responses shorter — fewer tokens, lower cost:
 
 ```bash
-HEADROOM_ROLLOUT_CHANNEL=beta HEADROOM_OUTPUT_SHAPER=1 HEADROOM_VERBOSITY_LEVEL=2 \
+HEADROOM_OUTPUT_SHAPER=1 HEADROOM_VERBOSITY_LEVEL=2 \
 headroom proxy --port 8787 --openai-api-url https://api.deepseek.com/v1
 ```
 
@@ -225,8 +227,8 @@ shaper is active immediately — the numbers just need calibration.
 - **Claude or GPT models** — this setup uses DeepSeek exclusively
 - **`headroom wrap`** — do not use it; it overrides the config
 - **Deprecated model names** — `deepseek-chat` and `deepseek-reasoner` are
-  compatibility aliases that will be deprecated on 2026-07-24; use
-  `deepseek-v4-pro` and `deepseek-v4-flash` instead
+  compatibility aliases slated for removal; use `deepseek-v4-pro` and
+  `deepseek-v4-flash` instead
 - **Kompress (ML compression)** — requires extra dependencies; SmartCrusher
   handles the majority of use cases
 - **Any code changes** — headroom ships full DeepSeek support natively

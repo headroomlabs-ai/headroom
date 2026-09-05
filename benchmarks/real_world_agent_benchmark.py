@@ -12,6 +12,15 @@ We measure:
 - Answer quality (does compression hurt agent performance?)
 
 This is NOT synthetic data - these are actual output formats from production MCP servers.
+
+DETERMINISM
+-----------
+The generators below draw heavily on ``random``. Until a seed was added, every
+run produced different tool output, so any figure published from this harness
+could not be reproduced by anyone, including us. ``DEFAULT_SEED`` and
+``seed_everything()`` fix that: seed once before generating scenarios and the
+corpus is byte-identical across runs and machines. Any number quoted from this
+file must name the seed that produced it.
 """
 
 import hashlib
@@ -37,6 +46,17 @@ try:
     HEADROOM_AVAILABLE = True
 except ImportError:
     HEADROOM_AVAILABLE = False
+
+
+#: Seed for the scenario generators. Published figures must cite this value;
+#: changing it changes every number this harness reports.
+DEFAULT_SEED = 20260902
+
+
+def seed_everything(seed: int = DEFAULT_SEED) -> int:
+    """Make scenario generation reproducible. Call BEFORE building scenarios."""
+    random.seed(seed)
+    return seed
 
 
 # =============================================================================
@@ -613,7 +633,7 @@ def run_agent_scenario(
     )
 
 
-def run_full_benchmark(api_key: str = None) -> dict:
+def run_full_benchmark(api_key: str = None, seed: int = DEFAULT_SEED) -> dict:
     """Run complete benchmark comparing baseline vs Headroom."""
 
     if api_key is None:
@@ -640,6 +660,8 @@ def run_full_benchmark(api_key: str = None) -> dict:
         store_url=f"sqlite:///{db_path}",
         default_mode="optimize",
     )
+
+    seed_everything(seed)
 
     scenarios = [
         create_sre_debugging_scenario(),

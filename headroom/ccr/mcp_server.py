@@ -776,7 +776,7 @@ class HeadroomMCPServer:
             result["proxy"] = proxy_status
             result["warning"] = proxy_status["warning"]
 
-        return [TextContent(type="text", text=json.dumps(result, indent=2))]
+        return [TextContent(type="text", text=json.dumps(result, indent=2, ensure_ascii=False))]
 
     def _record_savings(self, result: dict[str, Any]) -> None:
         """Append a durable savings event for a completed compression."""
@@ -841,7 +841,7 @@ class HeadroomMCPServer:
             json.dumps(result, ensure_ascii=False, default=str),
         )
 
-        return [TextContent(type="text", text=json.dumps(result, indent=2))]
+        return [TextContent(type="text", text=json.dumps(result, indent=2, ensure_ascii=False))]
 
     async def _handle_stats(self) -> list[TextContent]:
         """Handle headroom_stats tool call."""
@@ -906,7 +906,7 @@ class HeadroomMCPServer:
                     stats["proxy"] = proxy_status
                     stats["warning"] = proxy_status["warning"]
 
-        return [TextContent(type="text", text=json.dumps(stats, indent=2))]
+        return [TextContent(type="text", text=json.dumps(stats, indent=2, ensure_ascii=False))]
 
     async def _fetch_full_proxy_stats(self) -> dict[str, Any] | None:
         """Fetch full stats from the proxy (includes summary)."""

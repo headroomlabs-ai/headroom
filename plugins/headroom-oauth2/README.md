@@ -1,7 +1,7 @@
 # headroom-oauth2
 
 Generic **OAuth2 client-credentials** upstream-auth extension for the
-[Headroom](https://github.com/chopratejas/headroom) proxy.
+[Headroom](https://github.com/headroomlabs-ai/headroom) proxy.
 
 When Headroom routes to an OpenAI-compatible backend that is protected by an
 OAuth2 client-credentials flow (enterprise AI gateways, Azure AD / Entra, Okta,

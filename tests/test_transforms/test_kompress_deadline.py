@@ -21,7 +21,7 @@ def test_compress_bails_at_deadline_keeping_tail_verbatim(monkeypatch):
     monkeypatch.setattr(kc, "_load_kompress", lambda *a, **k: (object(), object(), "onnx"))
     monkeypatch.setenv("HEADROOM_COMPRESSION_DEADLINE_MS", "20000")
 
-    comp = kc.KompressCompressor()
+    comp = kc.KompressCompressor(kc.KompressConfig(min_input_words=10))
     monkeypatch.setattr(comp, "_should_batch_single_content", lambda *a, **k: False)
 
     content = " ".join(f"w{i}" for i in range(1000))
@@ -67,7 +67,7 @@ def test_compress_partial_run_keeps_processed_head_plus_verbatim_tail(monkeypatc
     monkeypatch.setattr(kc, "_model_device_type", lambda *a, **k: "cpu")
     monkeypatch.setenv("HEADROOM_COMPRESSION_DEADLINE_MS", "20000")
 
-    comp = kc.KompressCompressor()
+    comp = kc.KompressCompressor(kc.KompressConfig(min_input_words=10))
     comp.config.chunk_words = 10  # 20 words -> 2 chunks
     monkeypatch.setattr(comp, "_should_batch_single_content", lambda *a, **k: False)
 

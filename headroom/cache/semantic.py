@@ -160,8 +160,18 @@ class SemanticCache:
                     self._hits += 1
                     return entry
 
-        # Try semantic similarity if we have embedding function
-        if self._embedding_fn:
+        # Try semantic similarity if we have embedding function.
+        #
+        # Only for a NON-EMPTY query: the query is the last user message, and in
+        # agent/tool traffic the overwhelming majority of turns are tool_result
+        # continuations whose extracted query is "" (no text block). Embedding
+        # matching on "" makes every such turn ~identical to every other (a real
+        # sentence embedder maps "" to a fixed non-zero vector), so an empty
+        # query would false-hit and serve one conversation's response to an
+        # unrelated one — precisely the cross-context collision the messages_hash
+        # key is chosen to avoid. An empty query may still hit via the exact
+        # messages_hash above, which is context-complete and safe.
+        if self._embedding_fn and query.strip():
             query_embedding = self._embedding_fn(query)
             best_match, best_similarity = self._find_similar(query_embedding)
 
@@ -208,9 +218,13 @@ class SemanticCache:
         while key not in self._cache and len(self._cache) >= self.config.max_entries:
             self._evict_oldest()
 
-        # Generate embedding if available
+        # Generate embedding if available — but never for an empty/blank query.
+        # A stored empty-query entry with an embedding would be a false-match
+        # target for the semantic get() path; leaving its embedding empty makes
+        # _find_similar skip it (it ignores entries with no embedding), so an
+        # empty-query entry is reachable only by its exact messages_hash.
         embedding: list[float] = []
-        if self._embedding_fn:
+        if self._embedding_fn and query.strip():
             embedding = self._embedding_fn(query)
 
         now = time.time()

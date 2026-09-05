@@ -216,6 +216,52 @@ def mcp_uninstall() -> None:
         click.echo("Headroom MCP is not configured. Nothing to uninstall.")
 
 
+@mcp.command("reconcile")
+@click.option("--adopt", is_flag=True, help="Replace only the Serena entry with Headroom's spec.")
+def mcp_reconcile(adopt: bool) -> None:
+    """Inspect or explicitly reconcile a user-managed Serena MCP entry."""
+    from headroom.mcp_registry import (
+        CLAUDE_SERENA_CONTEXT,
+        ClaudeConfigMutationError,
+        ClaudeRegistrar,
+        RegisterStatus,
+        build_serena_spec,
+    )
+    from headroom.mcp_registry.ledger import (
+        LedgerMutationError,
+        record_install,
+        validate_ledger_for_mutation,
+    )
+
+    registrar = ClaudeRegistrar()
+    if not registrar.detect():
+        raise click.ClickException("claude is not detected")
+    recommended = build_serena_spec(CLAUDE_SERENA_CONTEXT)
+    observed = registrar.get_server("serena")
+
+    if adopt:
+        try:
+            registrar.validate_configs_for_mutation()
+            validate_ledger_for_mutation()
+        except (ClaudeConfigMutationError, LedgerMutationError) as exc:
+            raise click.ClickException(str(exc)) from exc
+    if adopt:
+        result = registrar.register_server(recommended, force=True)
+        if result.status not in (RegisterStatus.REGISTERED, RegisterStatus.ALREADY):
+            raise click.ClickException(result.detail or "could not adopt Serena configuration")
+        record_install("claude", recommended)
+        click.echo(
+            "Adopted Headroom's Serena configuration for Claude; unrelated config preserved."
+        )
+        return
+
+    click.echo("Serena reconciliation for Claude")
+    click.echo(f"  observed: {'absent' if observed is None else 'present'}")
+    click.echo(f"  recommendation: {recommended.command} {' '.join(recommended.args)}")
+    if observed is not None and observed != recommended:
+        click.echo("  action: use --adopt to replace it")
+
+
 @mcp.command("status")
 def mcp_status() -> None:
     """Check Headroom MCP configuration status.

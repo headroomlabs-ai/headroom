@@ -26,6 +26,10 @@ from .base import MCPRegistrar, RegisterResult, RegisterStatus, ServerSpec
 logger = logging.getLogger(__name__)
 
 
+class ClaudeConfigMutationError(ValueError):
+    """Raised when a Claude config cannot be safely changed."""
+
+
 class ClaudeRegistrar(MCPRegistrar):
     """Register MCP servers with Claude Code."""
 
@@ -83,6 +87,34 @@ class ClaudeRegistrar(MCPRegistrar):
             if entry is not None:
                 return entry
         return None
+
+    def validate_configs_for_mutation(self) -> None:
+        """Validate every Claude config root before an explicit mutation."""
+        seen: set[Path] = set()
+        for config_path in (self._modern_config, self._legacy_config):
+            if config_path in seen or not config_path.exists():
+                continue
+            seen.add(config_path)
+            try:
+                raw = config_path.read_text(encoding="utf-8")
+            except OSError as exc:
+                raise ClaudeConfigMutationError(
+                    f"could not read Claude config {config_path}: {exc}"
+                ) from exc
+            try:
+                config = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise ClaudeConfigMutationError(
+                    f"Claude config {config_path} is not valid JSON; refusing to mutate"
+                ) from exc
+            if not isinstance(config, dict):
+                raise ClaudeConfigMutationError(
+                    f"Claude config {config_path} must contain a JSON object"
+                )
+            if "mcpServers" in config and not isinstance(config["mcpServers"], dict):
+                raise ClaudeConfigMutationError(
+                    f"Claude config {config_path} has a non-object mcpServers; refusing to mutate"
+                )
 
     def register_server(self, spec: ServerSpec, *, force: bool = False) -> RegisterResult:
         existing = self.get_server(spec.name)

@@ -225,6 +225,7 @@ def learn(
     total_projects = 0
     total_failures = 0
     total_recommendations = 0
+    total_analysis_failures = 0
     matched_projects = 0
     available_projects: list[tuple[str, Path]] = []
 
@@ -299,6 +300,12 @@ def learn(
                 f"Failures: {result_data.total_failures} ({result_data.failure_rate:.1%})"
             )
 
+            analysis_error = getattr(result_data, "analysis_error", None)
+            if analysis_error:
+                total_analysis_failures += 1
+                click.echo(f"  Analysis failed: {analysis_error}", err=True)
+                continue
+
             if result_data.failure_rate == 0 and not result_data.recommendations:
                 click.echo("  No failures or patterns found.")
                 continue
@@ -349,6 +356,9 @@ def learn(
             f"Total: {total_projects} projects, {total_failures} failures, "
             f"{total_recommendations} recommendations"
         )
+
+    if total_analysis_failures:
+        raise SystemExit(1)
 
 
 def _make_llm_judge(model: str) -> Any:

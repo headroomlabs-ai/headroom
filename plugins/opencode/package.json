@@ -1,6 +1,6 @@
 {
   "name": "headroom-opencode",
-  "version": "0.36.5",
+  "version": "0.37.0",
   "description": "Headroom proxy integration plugin for OpenCode - routes LLM traffic through the Headroom proxy for token compression",
   "type": "module",
   "main": "./dist/index.js",

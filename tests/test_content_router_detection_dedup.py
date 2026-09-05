@@ -6,6 +6,12 @@ identical content: once for (default-off) debug logging, then again inside
 per-message cost, so ``compress`` now runs it once and threads the result into
 ``_determine_strategy``.  These tests pin the call count at one and prove the
 threaded result routes identically to the recomputed one.
+
+The same content was *also* detected a second time one level up: ``apply``'s
+routing loop runs ``_detect_content`` on every message for its code-protection
+checks, then ``compress`` (called in the cache-miss pass) detected the identical
+bytes again.  ``apply`` now threads its detection into ``compress`` via
+``precomputed_detection`` so a cache-miss message is detected once, not twice.
 """
 
 from __future__ import annotations
@@ -94,3 +100,67 @@ def test_determine_strategy_threaded_matches_recomputed(
     threaded = router._determine_strategy("payload", mixed=mixed, detection=detection)
 
     assert threaded is recomputed
+
+
+def test_apply_runs_detection_once_per_cache_miss_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # apply()'s routing loop detects each message once (for code protection),
+    # then the cache-miss pass calls compress() on the same bytes. Before the
+    # thread-through that was 2 native detections per cache-miss message; now
+    # apply hands its detection to compress, so it must be exactly 1.
+    from headroom.providers import OpenAIProvider
+    from headroom.tokenizer import Tokenizer
+
+    router = ContentRouter(
+        ContentRouterConfig(min_section_tokens=10, prefer_code_aware_for_code=False)
+    )
+    calls = _count_detects(monkeypatch, DetectionResult(ContentType.PLAIN_TEXT, 1.0, {}))
+    monkeypatch.setattr(content_router_module, "is_mixed_content", lambda content: False)
+    # Isolate detection from the downstream compressor.
+    monkeypatch.setattr(
+        router,
+        "_compress_pure",
+        lambda *a, **k: RouterCompressionResult(
+            compressed="x", original="x", strategy_used=CompressionStrategy.TEXT
+        ),
+    )
+    tokenizer = Tokenizer(OpenAIProvider().get_token_counter("gpt-4o"), "gpt-4o")
+
+    big = "a log line with plenty of tokens to clear the min threshold\n" * 200
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "get_logs", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "c1", "content": big},
+    ]
+
+    router.apply(messages, tokenizer)
+
+    assert calls["n"] == 1
+
+
+def test_compress_precomputed_detection_matches_recomputed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Passing a precomputed detection into compress() must produce the same
+    # result as letting it detect internally — the reuse changes cost, not output.
+    router = ContentRouter(ContentRouterConfig(prefer_code_aware_for_code=False))
+    detection = DetectionResult(ContentType.PLAIN_TEXT, 1.0, {})
+    monkeypatch.setattr(content_router_module, "is_mixed_content", lambda content: False)
+    monkeypatch.setattr(content_router_module, "_detect_content", lambda content: detection)
+
+    payload = "a representative plain-text blob that is comfortably non-empty " * 20
+    recomputed = router.compress(payload)
+    threaded = router.compress(payload, precomputed_detection=detection)
+
+    assert threaded.strategy_used == recomputed.strategy_used
+    assert threaded.compressed == recomputed.compressed

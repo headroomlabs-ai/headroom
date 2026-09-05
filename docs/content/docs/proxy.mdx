@@ -22,7 +22,19 @@ headroom proxy \
   --budget 100.0
 ```
 
-Telemetry is **local-only and off by default**. `HEADROOM_TELEMETRY=on` (or `--telemetry`) turns on in-process usage stats that power your own `/stats`, `/metrics`, and dashboard — **nothing is sent to Headroom Labs**. (The anonymous aggregate beacon that older versions shipped has been removed from the code.)
+Two independent telemetry switches exist. `HEADROOM_TELEMETRY=on` (or `--telemetry`) turns on **local-only** in-process usage stats that power your own `/stats`, `/metrics`, and dashboard — off by default, and nothing under this switch leaves the machine.
+
+Separately, an **anonymous usage beacon is on by default** (opt-out). Once a session goes idle it POSTs a small summary of how compression behaved to a Headroom Labs collector.
+
+**Why it exists.** Compression quality is the product. The beacon tells us when a release changes it — a ratio that regresses, a content type that starts getting skipped, a provider path that begins failing — across real workloads rather than only our own test corpus. That is the whole purpose; there is no other use.
+
+**What it sends.** Counters and identifiers, never free text. The collector applies an allowlist server-side and drops everything else before storage ([`deploy/beacon/worker.js`](https://github.com/headroomlabs-ai/headroom/blob/main/deploy/beacon/worker.js)): token totals, compression ratios and rates, skip reasons, source and provider names, model ids, failure counts and status codes, and a routing summary. Alongside those, seven resource attributes: service name and version, install id, install mode, stack, OS type and CPU architecture. A typical event is about 2KB.
+
+**What it never sends.** Your prompts, your completions, your code, file paths, file contents, environment variables, or anything else derived from request or response bodies. None of these are on the allowlist, so even if a future client sent one the collector would discard it.
+
+The install id is a random UUID generated on first run and stored in your config directory. It is deliberately not derived from hostname, MAC address, or any hardware property — delete the file and you get a new one.
+
+Disable it with `HEADROOM_BEACON=off`, the `DO_NOT_TRACK=1` convention, or `--offline` (which also disables update checks and license reporting).
 
 ## CLI options
 
@@ -96,11 +108,11 @@ headroom proxy --mode cache
 | Profile | Target savings | Mode | Notes |
 |---------|----------------|------|-------|
 | `coding` | emergent (~50%) | `cache` | **Default.** Delta-only compression at ~0 prefix-cache busts; never lossy-compresses file reads. |
-| `balanced` | ~70% | `token` | Moderate compression with structural compaction. Also the fallback for an unknown profile name. |
+| `balanced` | ~70% | `token` | Moderate compression with structural compaction. |
 | `agent-90` | ~90% | `token` | Aggressive; pins a `0.10` keep-ratio and forces Kompress. |
 | `general` | emergent (~60%) | `token` | Non-coding workloads. |
 
-An unrecognized `HEADROOM_SAVINGS_PROFILE` value logs a warning and falls back to `balanced` — the proxy never fails to start over a bad profile name. See `headroom/agent_savings.py` for each profile's full set of knobs.
+An unrecognized `HEADROOM_SAVINGS_PROFILE` value logs a warning and falls back to `coding` (the same default an unset variable resolves to) — the proxy never fails to start over a bad profile name. `balanced` is used only as a last-resort fallback when the runtime has no `coding` entry at all (old-runtime/new-client version skew). See `headroom/agent_savings.py` for each profile's full set of knobs.
 
 Because the default `coding` profile uses **cache** mode (and the proxy's own default mode is also `cache`), Headroom runs in cache mode out of the box. Mode precedence: an explicit `--mode` wins, otherwise `HEADROOM_MODE` (which a profile seeds), otherwise the `cache` default. To run token mode, pass `--mode token` or choose a token-mode profile:
 
@@ -122,13 +134,13 @@ HEADROOM_SAVINGS_PROFILE=agent-90 headroom proxy --port 8787
 | `--no-learn` | `false` | Explicitly disable traffic learning |
 | `--min-evidence` | `5` | Minimum observations before a learned pattern is persisted |
 | `--codex-wire-debug` | `false` | Write local Codex wire snapshots and matching proxy log traces |
-| `--compress-passthrough` | `false` | Also compress custom proxy paths that fall through to the catch-all handler (OpenAI Responses-shaped bodies, path ends in `/responses`). Also `HEADROOM_COMPRESS_PASSTHROUGH=1` |
+| `HEADROOM_COMPRESS_PASSTHROUGH` | `0` | Also compress custom proxy paths that fall through to the catch-all handler (OpenAI Responses-shaped bodies, path ends in `/responses`). No `--compress-passthrough` flag on `headroom proxy`; the direct module entry point (`python -m headroom.proxy.server`) does accept one |
 
 ```bash
 headroom proxy --memory
 headroom proxy --learn --min-evidence 3
 headroom proxy --codex-wire-debug
-headroom proxy --compress-passthrough
+HEADROOM_COMPRESS_PASSTHROUGH=1 headroom proxy
 ```
 
 <Callout type="info" title="LLMLingua removed from the proxy CLI">
@@ -153,7 +165,7 @@ HEADROOM_SAVINGS_PROFILE=agent-90 headroom proxy
 | `balanced` | 70% | `token` | No | General-purpose moderate compression |
 | `general` | ~60% (emergent) | `token` | No | Non-coding chat, little code in context |
 
-**`coding` (default)** — Optimizes for coding-agent workloads with Anthropic. Uses **cache mode** (`proxy_mode="cache"`): compresses only the newest delta in each turn so the provider's prefix-cache is never busted. User messages are compressed, system prompts preserved (hottest cache). Protects the 2 most recent turns verbatim. Lossless-first with lossy fallback; tool search and cross-turn dedup enabled. This is the profile that `headroom wrap` uses.
+**`coding` (default)** — Optimizes for coding-agent workloads with Anthropic. Uses **cache mode** (`proxy_mode="cache"`): compresses only the newest delta in each turn so the provider's prefix-cache is never busted. User messages are compressed, system prompts preserved (hottest cache). `protect_recent` is `0` — in cache mode the delta already *is* the newest turn, so a turn-count guard would suppress the only thing cache mode compresses; byte-exact fidelity instead comes from `protect_reads=True` (file reads are never lossy-compressed). Lossless-first with lossy fallback; tool search and cross-turn dedup enabled. This is the profile that `headroom wrap` uses.
 
 **`agent-90`** — Forces ML-based (Kompress) compression with a 10% keep-ratio, ignoring the lossless path. Compresses both user and system messages. Designed for non-coding or cost-sensitive workloads where maximum compression is the goal.
 
@@ -212,7 +224,7 @@ Fine-grained control over what gets compressed and how hard. Most users pick a [
 | `--mode` / `HEADROOM_MODE` | `cache` | `cache` compresses only the newest delta (prefix-cache safe); `token` maximizes removal. |
 | `--target-ratio` / `HEADROOM_TARGET_RATIO` | unset | Keep-ratio for ML text compression; lower = more aggressive (e.g. `0.10`). |
 | `HEADROOM_MIN_TOKENS` | `500` | Minimum block size before a tool output is compressed. |
-| `--compress-user-messages` / `HEADROOM_COMPRESS_USER_MESSAGES` | `false` | Compress content inside user-role messages (tool results live there). The `coding` profile turns this on. |
+| `HEADROOM_COMPRESS_USER_MESSAGES` | `false` | Compress content inside user-role messages (tool results live there). The `coding` profile turns this on. No `--compress-user-messages` flag on `headroom proxy`; the direct module entry point (`python -m headroom.proxy.server`) does accept one. |
 | `HEADROOM_COMPRESS_SYSTEM_MESSAGES` | unset | Compress system prompts. Off by default to keep the hottest cache prefix stable. |
 | `HEADROOM_PROTECT_RECENT` | profile | Never compress the N most recent turns. |
 | `--protect-tool-results` / `HEADROOM_PROTECT_TOOL_RESULTS` | empty | Comma-separated tool names whose output is never lossy-compressed. |
@@ -227,7 +239,7 @@ Kompress is the ModernBERT/ONNX compressor that ContentRouter falls back to for 
 |---|---|---|
 | `--disable-kompress` / `HEADROOM_DISABLE_KOMPRESS` | `false` | Turn off ML compression; keep the structural compressors. |
 | `--disable-kompress-anthropic` / `--disable-kompress-openai` | inherit | Per-provider override. |
-| `--force-kompress-all` / `HEADROOM_FORCE_KOMPRESS_ALL` | `false` | Route *all* content through Kompress, bypassing per-type selection. |
+| `HEADROOM_FORCE_KOMPRESS_ALL` | `false` | Route *all* content through Kompress, bypassing per-type selection. No `--force-kompress-all` flag on `headroom proxy`; the direct module entry point (`python -m headroom.proxy.server`) does accept one. |
 | `HEADROOM_KOMPRESS_ENDPOINT` | none | Offload ML compression to a remote `/compress` endpoint (e.g. a Modal deployment) instead of running the model locally. |
 | `HEADROOM_KOMPRESS_ENDPOINT_TOKEN` | none | Bearer token for the remote endpoint. |
 | `HEADROOM_KOMPRESS_BACKEND` | `auto` | Compute backend: `auto`, `onnx_cpu`, `onnx_coreml`, `pytorch`, `pytorch_mps`. |
@@ -740,11 +752,13 @@ headroom proxy
 ```bash
 pip install gunicorn
 
-gunicorn headroom.proxy.server:app \
+gunicorn "headroom.proxy.server:create_app()" \
   --workers 4 \
   --bind 0.0.0.0:8787 \
   --worker-class uvicorn.workers.UvicornWorker
 ```
+
+`headroom.proxy.server` has no module-level `app` object — it exposes a `create_app(config: ProxyConfig | None = None) -> FastAPI` factory, so gunicorn's import string must call it.
 
 ### Docker
 

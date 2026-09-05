@@ -36,7 +36,8 @@ import os
 import sys
 import threading
 import time
-from collections.abc import Callable
+from collections import OrderedDict
+from collections.abc import Callable, Mapping
 from dataclasses import fields, is_dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -128,6 +129,8 @@ from headroom.proxy.cost import (
     merge_cost_stats,  # noqa: F401
 )
 from headroom.proxy.helpers import (
+    COMPRESSION_CACHE_MAX_ENTRIES,
+    COMPRESSION_CACHE_TTL_SECONDS,
     COMPRESSION_TIMEOUT_SECONDS,  # noqa: F401
     EAGER_PRELOAD_TIMEOUT_SECONDS,
     MAX_COMPRESSION_CACHE_SESSIONS,  # noqa: F401
@@ -473,6 +476,16 @@ logging.basicConfig(
 logger = logging.getLogger("headroom.proxy")
 
 
+def _code_syntax_breaker_status() -> dict[str, Any]:
+    """Per-language AST-compression breaker state, or {} if unavailable."""
+    try:
+        from headroom.transforms.code_compressor import syntax_breaker_status
+
+        return syntax_breaker_status()
+    except Exception:  # pragma: no cover - defensive; stats must not fail
+        return {}
+
+
 class _SuppressCancelledErrorFilter(logging.Filter):
     """Hide expected uvicorn CancelledError tracebacks during shutdown."""
 
@@ -651,7 +664,8 @@ def _provider_httpx_client_options(
         "timeout": httpx.Timeout(
             connect=config.connect_timeout_seconds,
             read=config.request_timeout_seconds,
-            write=config.request_timeout_seconds,
+            # Not request_timeout_seconds: see ProxyConfig.write_timeout_seconds.
+            write=config.write_timeout_seconds,
             pool=config.connect_timeout_seconds,
         ),
         "limits": httpx.Limits(
@@ -1028,7 +1042,14 @@ class HeadroomProxy(
         # `CompressionCache` instances have their own internal lock guarding
         # `_cache`/`_stable_hashes`/`_first_seen` against concurrent
         # async-dispatched requests for the same session.
-        self._compression_caches: dict[str, CompressionCache] = {}
+        # Ordered by last access: `_get_compression_cache` moves a session to
+        # the end on every hit, so capacity eviction drops the idlest sessions
+        # — whose provider prefix cache has lapsed anyway — never a busy
+        # long-lived one. `_compression_cache_last_seen` drives the idle-TTL
+        # sweep in `_maybe_cleanup_compression_caches`.
+        self._compression_caches: OrderedDict[str, CompressionCache] = OrderedDict()
+        self._compression_cache_last_seen: dict[str, float] = {}
+        self._compression_caches_last_cleanup: float = time.time()
         self._compression_caches_lock = threading.RLock()
 
         self.logger = (
@@ -1586,6 +1607,67 @@ class HeadroomProxy(
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self._background_compression_executor, fn)
 
+    # How often the lazy TTL sweep in `_get_compression_cache` may run.
+    _COMPRESSION_CACHE_CLEANUP_INTERVAL_SECONDS = 60.0
+
+    def _maybe_cleanup_compression_caches(self, now: float) -> None:
+        """Evict per-session compression caches idle past their TTL.
+
+        Caller must hold `_compression_caches_lock`. Piggybacked on
+        `_get_compression_cache` (the same lazy-sweep pattern as
+        `PrefixCacheTrackerRegistry._maybe_cleanup`) so no background task is
+        needed: any traffic at all keeps memory tracking the active-session
+        window, and a fully idle process has no memory pressure worth a timer.
+
+        A session idle longer than `COMPRESSION_CACHE_TTL_SECONDS` has
+        outlived the provider prompt cache its entries protect — the default
+        exceeds Anthropic's 1h extended breakpoint, the longest provider TTL
+        served — so evicting it cannot bust anything: the provider already
+        forgot the prefix. If the session does return, the cost is one
+        cache-write turn (fail-open), which it was going to pay regardless.
+        The TTL must never be set below the prefix tracker's session TTL:
+        after the tracker expires, this cache's byte-identical swap is the
+        only remaining protection for a still-live provider prefix.
+        """
+        if now - self._compression_caches_last_cleanup < (
+            self._COMPRESSION_CACHE_CLEANUP_INTERVAL_SECONDS
+        ):
+            return
+        self._compression_caches_last_cleanup = now
+        # Skip sessions with a turn in flight (session_turn_lock held): popping
+        # one would hand its retry a FRESH cache with a NEW lock — straggler
+        # and retry then run unserialized against the same tracker, and the
+        # retry's empty cache recompresses previously-returned content into
+        # different bytes. An in-flight session is by definition not idle; it
+        # will be swept on a later pass once genuinely quiet.
+        expired = [
+            sid
+            for sid, seen in self._compression_cache_last_seen.items()
+            if now - seen > COMPRESSION_CACHE_TTL_SECONDS
+            and (cache := self._compression_caches.get(sid)) is not None
+            and not cache.session_turn_lock.locked()
+        ]
+        for sid in expired:
+            self._compression_caches.pop(sid, None)
+            self._compression_cache_last_seen.pop(sid, None)
+        if expired:
+            logger.info(
+                "Evicted %d compression caches idle > %.0fs (%d sessions remain)",
+                len(expired),
+                COMPRESSION_CACHE_TTL_SECONDS,
+                len(self._compression_caches),
+            )
+
+    def _peek_compression_cache(self, session_id: str) -> CompressionCache | None:
+        """Return the session's cache if one exists — no create, no LRU bump.
+
+        For lookup paths that must not leave a footprint or distort access
+        recency (e.g. /v1/usage taking the session turn lock): an unknown
+        session answers None instead of allocating an empty cache.
+        """
+        with self._compression_caches_lock:
+            return self._compression_caches.get(session_id)
+
     def _get_compression_cache(self, session_id: str) -> CompressionCache:
         """Get or create a CompressionCache for a session.
 
@@ -1594,27 +1676,55 @@ class HeadroomProxy(
         for the same conversation) must return the **same** instance,
         otherwise the per-session cache state splits and the two halves
         diverge across requests.
+
+        Every access refreshes both the LRU position and the idle-TTL clock,
+        so eviction — capacity or TTL — only ever hits sessions that have
+        gone quiet. Losing one costs at most a single cache-write turn
+        upstream; it never fails a request.
         """
         with self._compression_caches_lock:
-            if session_id not in self._compression_caches:
+            now = time.time()
+            self._maybe_cleanup_compression_caches(now)
+            cache = self._compression_caches.get(session_id)
+            if cache is None:
                 from headroom.cache.compression_cache import CompressionCache
 
-                # Evict oldest caches if at capacity
+                # Evict the least-recently-used quarter at capacity. The
+                # OrderedDict is maintained in access order, so the front is
+                # always the idlest session — never a busy long-lived one.
+                # Sessions with a turn in flight (session_turn_lock held) are
+                # skipped: popping one splits its lock across two cache
+                # instances and desyncs the straggler from its retry (see the
+                # TTL sweep's comment). If every candidate is mid-turn, no
+                # eviction happens this round — briefly exceeding the cap is
+                # cheaper than a guaranteed prefix bust.
                 if len(self._compression_caches) >= MAX_COMPRESSION_CACHE_SESSIONS:
-                    # Remove oldest quarter to amortize cleanup cost
-                    oldest_keys = list(self._compression_caches.keys())[
-                        : MAX_COMPRESSION_CACHE_SESSIONS // 4
-                    ]
-                    for key in oldest_keys:
-                        del self._compression_caches[key]
-                    logger.info(
-                        "Evicted %d compression caches (exceeded %d max sessions)",
-                        len(oldest_keys),
-                        MAX_COMPRESSION_CACHE_SESSIONS,
+                    evict_count = min(
+                        max(1, MAX_COMPRESSION_CACHE_SESSIONS // 4),
+                        len(self._compression_caches),
                     )
+                    evictable = [
+                        sid
+                        for sid, c in self._compression_caches.items()
+                        if not c.session_turn_lock.locked()
+                    ][:evict_count]
+                    for sid in evictable:
+                        del self._compression_caches[sid]
+                        self._compression_cache_last_seen.pop(sid, None)
+                    if evictable:
+                        logger.info(
+                            "Evicted %d least-recently-used compression caches "
+                            "(exceeded %d max sessions)",
+                            len(evictable),
+                            MAX_COMPRESSION_CACHE_SESSIONS,
+                        )
 
-                self._compression_caches[session_id] = CompressionCache()
-            return self._compression_caches[session_id]
+                cache = CompressionCache(max_entries=COMPRESSION_CACHE_MAX_ENTRIES)
+                self._compression_caches[session_id] = cache
+            else:
+                self._compression_caches.move_to_end(session_id)
+            self._compression_cache_last_seen[session_id] = now
+            return cache
 
     def _setup_code_aware(self, config: ProxyConfig, transforms: list) -> str:
         """Set up code-aware compression if enabled.
@@ -2512,6 +2622,99 @@ _is_known_websocket_callback_failure = is_known_websocket_callback_failure
 _tool_schema_saved_from_tags = tool_schema_saved_from_tags
 
 
+def read_proxy_token(headers: Mapping[str, str]) -> str | None:
+    """Return the caller-supplied proxy token from request headers, or ``None``.
+
+    Shared by the HTTP security gate and :class:`WebSocketAuthMiddleware` so the
+    two transports cannot drift on what counts as a credential. Header names are
+    expected to be lowercase (Starlette's ``Headers`` is case-insensitive; the
+    WebSocket middleware lowercases the raw ASGI pairs itself).
+    """
+    raw = headers.get("x-headroom-proxy-token")
+    if raw is not None:
+        return str(raw) or None
+
+    # A provider credential can legitimately occupy Authorization (for example,
+    # an OAuth/subscription client). Prefer the explicit proxy header whenever
+    # it is present so that the upstream credential is not mistaken for the
+    # proxy credential.
+    auth = str(headers.get("authorization") or "")
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip() or None
+    return None
+
+
+class WebSocketAuthMiddleware:
+    """Enforce ``HEADROOM_PROXY_TOKEN`` on WebSocket handshakes.
+
+    The HTTP security gate is registered with ``@app.middleware("http")``, which
+    is a Starlette ``BaseHTTPMiddleware`` — and that class hands any scope whose
+    type is not ``http`` straight to the wrapped app. WebSocket connections
+    therefore never reached the gate, so every ``app.websocket(...)`` route
+    accepted unauthenticated callers even with a token configured. Those routes
+    are not incidental: ``/v1/responses`` and ``/v1/live`` relay to the upstream
+    provider using the operator's own credentials, and they are registered
+    unconditionally. ``/v1/responses`` exists on both transports, so the POST was
+    authenticated while the upgrade on the very same path was not.
+
+    Written as a raw ASGI middleware rather than folded into the gate because
+    that is the only layer that sees the ``websocket`` scope at all.
+
+    Loopback callers are exempt, matching the HTTP gate exactly (same trust
+    boundary as the admin/debug routes). Credentials are read from headers only:
+    the handshake carries them fine for the programmatic clients these routes
+    serve, and accepting a token from the query string would put it in access
+    logs and browser history.
+    """
+
+    def __init__(self, app: Any, *, proxy_token: str | None = None) -> None:
+        self.app = app
+        self.proxy_token = proxy_token
+        # Pre-encoded for constant-time comparison, mirroring the HTTP gate:
+        # compare_digest on str raises TypeError for non-ASCII input, which
+        # would turn a rejected handshake into a 500.
+        self.token_bytes = proxy_token.encode("utf-8") if proxy_token else b""
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] != "websocket" or not self.proxy_token:
+            await self.app(scope, receive, send)
+            return
+
+        client = scope.get("client")
+        client_host = client[0] if client else None
+        if is_loopback_host(client_host):
+            await self.app(scope, receive, send)
+            return
+
+        # Starlette's own Headers rather than a hand-built dict: on a repeated
+        # header it returns the FIRST occurrence, which is what the HTTP gate
+        # sees. Building a dict here instead took the LAST one, so the two
+        # transports disagreed about which `Authorization` counted — exactly the
+        # drift the shared reader below exists to prevent.
+        from starlette.datastructures import Headers
+
+        provided = read_proxy_token(Headers(scope=scope))
+        if provided is not None and hmac.compare_digest(
+            provided.encode("utf-8", "replace"), self.token_bytes
+        ):
+            await self.app(scope, receive, send)
+            return
+
+        logger.warning(
+            "event=proxy_auth_rejected transport=websocket path=%s client=%s reason=%s",
+            scope.get("path"),
+            client_host,
+            "missing_token" if provided is None else "bad_token",
+        )
+        # Receive the handshake before refusing it: ASGI servers send
+        # ``websocket.connect`` and wait for the application to answer, and
+        # answering with ``websocket.close`` *before* an accept is what refuses
+        # the upgrade on the wire instead of accepting and then dropping it.
+        message = await receive()
+        if message["type"] == "websocket.connect":
+            await send({"type": "websocket.close", "code": 1008})
+
+
 class WebSocketProjectPrefixMiddleware:
     """Normalize project-prefixed WebSocket paths before route matching."""
 
@@ -3357,10 +3560,12 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         )
         return response
 
-    # ── Security gate (registered last → runs outermost) ──────────────────
-    # Three concerns, kept together because they all wrap every inbound
+    # ── Security gate (outermost of the HTTP middlewares) ─────────────────
+    # Three concerns, kept together because they all wrap every inbound HTTP
     # request: optional inbound auth on the data plane, response security
     # headers, and an audit trail for state-mutating admin endpoints.
+    # WebSocket handshakes are covered separately — see the
+    # WebSocketAuthMiddleware registration just below this block.
     _proxy_token = config.proxy_token or os.environ.get("HEADROOM_PROXY_TOKEN") or None
     # Pre-encode once for constant-time comparison (compare_digest on str raises
     # TypeError for non-ASCII input, which would turn a 401 into a 500).
@@ -3390,12 +3595,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             "Strict-Transport-Security", "max-age=31536000; includeSubDomains"
         )
 
-    def _extract_proxy_token(headers) -> str | None:
-        auth = str(headers.get("authorization") or "")
-        if auth.lower().startswith("bearer "):
-            return auth[7:].strip() or None
-        raw = headers.get("x-headroom-proxy-token")
-        return str(raw) if raw else None
+    # Delegates so the HTTP gate and WebSocketAuthMiddleware read a credential
+    # by exactly one rule; they guard the same token on two transports.
+    _extract_proxy_token = read_proxy_token
 
     @app.middleware("http")
     async def _security_gate(request, call_next):
@@ -3437,12 +3639,22 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             logger.debug("admin audit emission failed", exc_info=True)
         return response
 
+    # The gate above is http-only (BaseHTTPMiddleware ignores every other
+    # scope), so the same token rule is applied to the `websocket` scope here.
+    # Added after it, which makes it the outermost layer — an unauthenticated
+    # handshake is refused before any project-prefix or routing work happens.
+    app.add_middleware(WebSocketAuthMiddleware, proxy_token=_proxy_token)
+
     # Third-party proxy extensions (Enterprise, custom plugins). Discovered via
     # the `headroom.proxy_extension` entry-point group, but **opt-in only**:
     # only names listed in config.proxy_extensions (CLI: --proxy-extension,
     # env: HEADROOM_PROXY_EXTENSIONS) actually get installed. Discovery alone
     # never runs third-party code. An extension that raises from its install()
-    # is a deliberate fail-closed signal and aborts startup.
+    # disables *itself*: `install_all` logs it, prints a SKIPPED line to stderr
+    # and the proxy keeps serving without that extension (extensions.py:169-183).
+    # One bad plugin must not brick the proxy. Note the consequence: a plugin
+    # whose licence gate raises is absent, not fatal — the feature fails closed,
+    # the process does not.
     from headroom.proxy.extensions import install_all as _install_extensions
 
     _install_extensions(app, config, enabled=getattr(config, "proxy_extensions", None))
@@ -3657,6 +3869,12 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
     # check_dir=False keeps a missing assets directory from aborting proxy
     # startup: the dashboard JS 404s, but proxying itself still works.
+    @app.get("/dashboard/static", include_in_schema=False)
+    @app.get("/dashboard/static/", include_in_schema=False)
+    async def dashboard_static_directory():
+        """Keep the static directory boundary out of upstream passthrough."""
+        return PlainTextResponse("Not Found", status_code=404)
+
     app.mount(
         "/dashboard/static",
         StaticFiles(directory=STATIC_DIR, check_dir=False),
@@ -3664,6 +3882,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     )
 
     @app.get("/dashboard", response_class=HTMLResponse)
+    @app.get("/dashboard/", response_class=HTMLResponse, include_in_schema=False)
     async def dashboard():
         """Serve the Headroom dashboard UI."""
         return get_dashboard_html()
@@ -4103,12 +4322,34 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         output_reduction: dict[str, Any] = {"available": False}
         try:
             from headroom.proxy.output_savings import get_recorder
+            from headroom.proxy.output_shaper import (
+                OutputShaperSettings,
+                resolve_verbosity_level,
+                shaper_enabled_for,
+            )
 
-            _oest = get_recorder().estimate()
+            # The active steering level enables the modelled fallback, which is
+            # what a deployment with no holdout and no learned baseline has --
+            # i.e. every fresh install, since `learn --verbosity` needs history
+            # that predates the shaper.
+            _olevel: int | None = None
+            try:
+                _osettings = OutputShaperSettings.from_env(
+                    enabled=shaper_enabled_for(getattr(proxy, "config", None))
+                )
+                if _osettings.enabled:
+                    _olevel = resolve_verbosity_level(_osettings)[0]
+            except Exception:  # pragma: no cover - defensive
+                _olevel = None
+
+            _oest = get_recorder().estimate(_olevel)
             if _oest.n_requests > 0:
                 output_reduction = {
                     "available": True,
-                    "method": _oest.kind,  # "measured" | "estimated"
+                    "method": _oest.kind,  # "measured" | "estimated" | "modelled"
+                    # A modelled band is the spread between the two benchmarked
+                    # models, not a sampling CI. The UI must not call it one.
+                    "band_is_ci": _oest.kind != "modelled",
                     "tokens_saved": round(_oest.tokens_saved),
                     "baseline_tokens": round(_oest.baseline_tokens),
                     "reduction_percent": round(_oest.pct, 1),
@@ -4119,9 +4360,14 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         except Exception:  # pragma: no cover - defensive
             pass
 
+        # Model-routing section: populated only when an extension registered a
+        # routing-stats provider (headroom.proxy.routing_stats); None otherwise.
+        from headroom.proxy.routing_stats import get_routing_stats
+
         return {
             "summary": summary,
             "agent_usage": agent_usage,
+            "routing": get_routing_stats(),
             "savings": {
                 "total_tokens": total_tokens_all_layers,
                 "per_project": persistent_savings.get("projects", {}),
@@ -4150,9 +4396,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                         **output_reduction,
                         "description": (
                             "OUTPUT tokens the model didn't emit because the shaper "
-                            "steered verbosity / routed effort down. Counterfactual — "
-                            "shown as an estimate (vs a learned baseline) or measured "
-                            "(A/B holdout), always with a confidence band."
+                            "steered verbosity down. Counterfactual — measured "
+                            "(A/B holdout), estimated (vs a learned baseline), or "
+                            "modelled (a benchmark factor, when this deployment has "
+                            "produced neither). Always labelled with which."
                         ),
                     },
                     "tool_search": {
@@ -4379,6 +4626,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "ccr_retrievals": compression_stats.get("total_retrievals", 0),
             },
             "compression_cache": compression_cache_stats,
+            # Per-language AST compression pauses. Empty on a healthy install;
+            # non-empty is the explanation for a savings drop in one language.
+            "code_syntax_breaker": _code_syntax_breaker_status(),
             # Always False: the anonymous telemetry beacon was removed, so no
             # telemetry is ever shipped externally (local collection only).
             "anon_telemetry_shipping": False,
@@ -5189,6 +5439,13 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     async def compress_messages(request: Request):
         return await proxy.handle_compress(request)
 
+    # Sidecar-mode usage relay: same exposure policy as /v1/compress — the two
+    # form one contract (compress returns the bytes, usage reports what the
+    # provider said about them), so they must be reachable from the same place.
+    @app.post("/v1/usage", dependencies=_compress_dependencies)
+    async def compress_usage(request: Request):
+        return await proxy.handle_compress_usage(request)
+
     register_provider_routes(app, proxy)
 
     return app
@@ -5250,6 +5507,11 @@ def _proxy_config_from_env() -> ProxyConfig:
         anthropic_buffered_request_timeout_seconds=_get_env_int(
             "HEADROOM_ANTHROPIC_BUFFERED_REQUEST_TIMEOUT_SECONDS",
             600,
+            min_value=1,
+        ),
+        write_timeout_seconds=_get_env_int(
+            "HEADROOM_WRITE_TIMEOUT_SECONDS",
+            150,
             min_value=1,
         ),
         buffered_ccr_grace_seconds=_get_env_float(
@@ -6000,6 +6262,13 @@ if __name__ == "__main__":
         anthropic_buffered_request_timeout_seconds=_get_env_int(
             "HEADROOM_ANTHROPIC_BUFFERED_REQUEST_TIMEOUT_SECONDS",
             args.anthropic_buffered_request_timeout_seconds,
+            min_value=1,
+        ),
+        # Env-only here, like connect/request: this parser exposes no timeout
+        # flag but the buffered one.
+        write_timeout_seconds=_get_env_int(
+            "HEADROOM_WRITE_TIMEOUT_SECONDS",
+            150,
             min_value=1,
         ),
         vertex_api_url=_get_env_str("VERTEX_TARGET_API_URL", args.vertex_api_url),

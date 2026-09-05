@@ -9,13 +9,13 @@
     "source": "github",
     "id": "1129940957"
   },
-  "version": "0.36.5",
+  "version": "0.37.0",
   "packages": [
     {
       "registryType": "pypi",
       "registryBaseUrl": "https://pypi.org",
       "identifier": "headroom-ai",
-      "version": "0.36.5",
+      "version": "0.37.0",
       "runtimeHint": "uvx",
       "runtimeArguments": [
         {

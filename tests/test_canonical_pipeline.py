@@ -246,7 +246,10 @@ def test_discover_pipeline_extensions_handles_load_and_init_failures(monkeypatch
         lambda group: entries if group == pipeline_module.ENTRY_POINT_GROUP else [],
     )
 
-    discovered = pipeline_module.discover_pipeline_extensions()
+    # Discovery is opt-in since the contract gained ``body`` (it can now
+    # rewrite max_tokens/effort on live traffic), so name them explicitly.
+    # The isolation behaviour under test is unchanged.
+    discovered = pipeline_module.discover_pipeline_extensions(["*"])
 
     assert len(discovered) == 2
     assert hasattr(discovered[0], "on_pipeline_event")

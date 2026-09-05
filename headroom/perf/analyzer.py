@@ -11,6 +11,7 @@ Anthropic), not the full input price.  This prevents overstating dollar savings.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 from dataclasses import asdict, dataclass, field
@@ -497,6 +498,29 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
     return report
 
 
+def _as_number(value: object, cast: type) -> int | float:
+    """Coerce a self-reported savings figure, or 0 if it is not a number.
+
+    `savings=` is base64 JSON written by whatever plugin recorded it, and
+    `decode()` validates only that each item is a dict -- so a source can put a
+    string like "lots" in `tokens`. An isinstance check does not save you here:
+    `str` passes it and `int("lots")` then raises, which took down the WHOLE
+    report rather than skipping one bad row. A report must not be crashable by
+    the data it reports on.
+    """
+    try:
+        out = cast(value)  # type: ignore[call-arg]
+    except (TypeError, ValueError, OverflowError):
+        return cast(0)  # type: ignore[call-arg,no-any-return]
+    # Finiteness only, matching what the WRITE side enforces (see MAX_STAGE_MS in
+    # savings_attribution): inf/nan survive a float() cast and render as "inf",
+    # which is not a measurement. A merely large finite value is left alone --
+    # capping it here would invent a limit the recording side does not have.
+    if isinstance(out, float) and not math.isfinite(out):
+        return cast(0)  # type: ignore[call-arg,no-any-return]
+    return out  # type: ignore[no-any-return]
+
+
 def format_report(report: PerfReport) -> str:
     """Format a PerfReport into a human-readable string."""
     lines: list[str] = []
@@ -761,6 +785,49 @@ def format_report(report: PerfReport) -> str:
                 "— this table sees only engines that emit a Transform line, counts "
                 "per stage, and does not check whether the mutation shipped"
             )
+        lines.append("")
+
+    # Savings attributed to a named source (extensions, plugins, hooks).
+    #
+    # The PERF line has carried this all along in `savings=` and the parser has
+    # decoded it into `savings_breakdown` since it was added -- but nothing ever
+    # RENDERED it, so an operator reading this report could not see that a paid
+    # extension had contributed anything at all.
+    #
+    # USD is reported next to tokens rather than folded into the headline because
+    # the two are different quantities and one source cannot produce both. A
+    # router that sends the SAME tokens to a cheaper model saves dollars and
+    # exactly zero tokens; every token-savings channel in the proxy would record
+    # it as nothing. Showing `$` beside a `0 tokens` row is the honest rendering
+    # of that, and collapsing them into one number would be an invented saving.
+    by_source: dict[tuple[str, bool], dict[str, float]] = {}
+    for record in report.perf_records:
+        for item in getattr(record, "savings_breakdown", ()) or ():
+            source = str(item.get("source") or "other")
+            realized = bool(item.get("realized", True))
+            row = by_source.setdefault((source, realized), {"events": 0, "tokens": 0, "usd": 0.0})
+            row["events"] += 1
+            row["tokens"] += max(0, _as_number(item.get("tokens"), int))
+            row["usd"] += _as_number(item.get("usd"), float)
+    if by_source:
+        lines.append("Savings by Source")
+        lines.append("-" * 40)
+        for (source, realized), row in sorted(
+            by_source.items(), key=lambda kv: (-kv[1]["usd"], -kv[1]["tokens"])
+        ):
+            usd = f"  ${row['usd']:,.2f}" if row["usd"] else ""
+            # "projected" is not a hedge: an unrealized row is a saving the
+            # source computed against a baseline that did not run, so it cannot
+            # be reconciled against the bill the way a realized one can.
+            tag = "" if realized else "  (projected)"
+            lines.append(
+                f"  {source}: {int(row['events']):,} events, "
+                f"{int(row['tokens']):,} tokens{usd}{tag}"
+            )
+        lines.append(
+            "  Sources self-report. A row with 0 tokens and a $ figure changed the "
+            "MODEL, not the payload — no tokens were removed."
+        )
         lines.append("")
 
     # Router routing breakdown

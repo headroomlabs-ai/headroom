@@ -303,7 +303,12 @@ class TestCompressEndpointCompression:
             transforms_summary={"test_transform": 1},
             markers_inserted=[],
         )
-        run_compression = AsyncMock(return_value=result)
+        # The executor callable returns the 5-tuple contract of
+        # _run_stateless/_run_session_turn:
+        # (result, final_messages, tokens_before, tokens_after, session_info).
+        run_compression = AsyncMock(
+            return_value=(result, result.messages, result.tokens_before, result.tokens_after, None)
+        )
         record_outcome = AsyncMock()
         monkeypatch.setattr(proxy, "_run_compression_in_executor", run_compression)
         monkeypatch.setattr(proxy, "_record_request_outcome", record_outcome)
@@ -349,7 +354,16 @@ class TestCompressEndpointCompression:
         monkeypatch.setattr(
             proxy,
             "_run_compression_in_executor",
-            AsyncMock(return_value=result),
+            # Same 5-tuple contract as _run_stateless (see above).
+            AsyncMock(
+                return_value=(
+                    result,
+                    result.messages,
+                    result.tokens_before,
+                    result.tokens_after,
+                    None,
+                )
+            ),
         )
         monkeypatch.setattr(proxy, "_record_request_outcome", AsyncMock())
 

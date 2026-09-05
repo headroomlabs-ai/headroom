@@ -1,13 +1,17 @@
 ---
 title: SmartCrusher
-description: Statistical JSON and array compression that keeps important items and drops the rest, achieving 70-90% token reduction.
+description: Statistical JSON and array compression that keeps important items and drops the rest.
 ---
 
-SmartCrusher is Headroom's compressor for JSON tool outputs. It analyzes arrays statistically, keeps the important items (errors, anomalies, relevant matches), and drops the rest. This is the compressor that fires automatically when ContentRouter detects JSON arrays.
+SmartCrusher is Headroom's compressor for JSON tool outputs. This is the compressor that fires automatically when ContentRouter detects JSON arrays.
+
+<Callout type="info" title="Lossless-first, not keep/drop-first">
+  By default SmartCrusher tries a **lossless** compaction first: if the array is cleanly tabular (a consistent set of keys across items), it re-encodes every item into a compact `csv-schema` form and keeps it *if that saves at least 30% of the bytes* -- no items are dropped, they're just represented more compactly. Only when that lossless fold doesn't clear the 30% bar (or the array isn't cleanly tabular) does SmartCrusher fall back to the scored keep/drop behavior described below. See `headroom/transforms/smart_crusher.py:415-419`. Set `with_compaction=False` on `SmartCrusher(...)` to force the pre-lossless keep/drop-only path (this is also what Headroom's retention-property tests use).
+</Callout>
 
 ## How It Works
 
-SmartCrusher doesn't blindly truncate arrays. It scores each item across five dimensions:
+When the lossy keep/drop path runs, SmartCrusher doesn't blindly truncate arrays -- it scores each item across five dimensions:
 
 1. **First/Last items** -- Context for pagination and recency
 2. **Error items** -- 100% preservation of error states (never dropped)
@@ -15,7 +19,7 @@ SmartCrusher doesn't blindly truncate arrays. It scores each item across five di
 4. **Relevant items** -- Matches to the user's query via BM25/embeddings
 5. **Change points** -- Significant transitions in data
 
-The result: a 1,000-item array becomes ~50 items with all the information the LLM actually needs.
+On that path, the target size is `max_items_after_crush` (15 by default): a 1,000-item array becomes ~15 items with all the information the LLM actually needs (measured: a 1,000-item array with `with_compaction=False` compressed to 16 items).
 
 ## What Gets Preserved
 
@@ -53,15 +57,18 @@ console.log(`Tokens saved: ${result.tokensSaved}`);
 </Tab>
 <Tab value="Python">
 ```python
+import json
 from headroom import SmartCrusher
 
 crusher = SmartCrusher()
 
-# Before: 1000 search results (45,000 tokens)
-tool_output = {"results": ["...1000 items..."]}
+# crush() takes a JSON string, not a dict
+tool_output = json.dumps({"results": ["...1000 items..."]})
 
-# After: ~50 important items (4,500 tokens) -- 90% reduction
-compressed = crusher.crush(tool_output, query="user's question")
+# Returns a CrushResult; the compressed JSON string is `.compressed`
+result = crusher.crush(tool_output, query="user's question")
+print(result.compressed)
+print(result.strategy)  # e.g. "lossless:table(...)" or "smart_sample(1000->15)"
 ```
 </Tab>
 </Tabs>
@@ -89,7 +96,7 @@ from headroom import SmartCrusher, SmartCrusherConfig
 
 config = SmartCrusherConfig(
     min_tokens_to_crush=200,      # Only compress if > 200 tokens
-    max_items_after_crush=15,     # Keep at most 15 items
+    max_items_after_crush=15,     # Keep at most 15 items (lossy path only)
     first_fraction=0.3,           # Keep first 30% of items
     last_fraction=0.15,           # Keep last 15% of items
     variance_threshold=2.0,       # Statistical variance threshold
@@ -97,7 +104,7 @@ config = SmartCrusherConfig(
 )
 
 crusher = SmartCrusher(config)
-compressed = crusher.crush(tool_output, query="find payment failures")
+result = crusher.crush(tool_output, query="find payment failures")
 ```
 </Tab>
 </Tabs>
@@ -135,11 +142,11 @@ Consider a tool that returns 1,000 search results:
     ]
 }
 
-# After SmartCrusher: 4,500 tokens (90% reduction)
-# Kept: first 3, last 2, the error at id=998, statistical sample
+# After SmartCrusher's lossy keep/drop path (with_compaction=False):
+# ~15-16 items kept -- first items, last items, and the error at id=998
 ```
 
-The LLM sees the structure, the error, and a representative sample -- everything it needs to answer "find errors in the last 24 hours" without wading through 1,000 identical success responses.
+The LLM sees the structure, the error, and a representative sample -- everything it needs to answer "find errors in the last 24 hours" without wading through 1,000 identical success responses. Note this specific shape (mostly-identical items, one error) is also exactly what the lossless table fold favors (see the callout above), so with default settings this array is more likely to be re-encoded compactly with every item still present than reduced to ~15 items -- the numbers above illustrate the scored keep/drop path, not a guarantee of which path a given array takes.
 
 <Callout type="info" title="Automatic routing">
   You don't need to call SmartCrusher directly. The ContentRouter detects JSON arrays and routes them to SmartCrusher automatically. Direct usage is available when you want fine-grained control over the configuration.

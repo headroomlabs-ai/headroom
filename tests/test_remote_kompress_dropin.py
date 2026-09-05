@@ -111,6 +111,9 @@ def _compressor(monkeypatch, *, enable_ccr: bool, payload: dict):
     c = RemoteKompressCompressor("https://ml.example.invalid")
     c._client = _FakeClient(payload)  # type: ignore[assignment]
     c.config.enable_ccr = enable_ccr
+    # The 60-word fixtures below sit under the production word floor
+    # (min_input_words=64); drop it to the clamp so the seam under test runs.
+    c.config.min_input_words = 10
     return c
 
 

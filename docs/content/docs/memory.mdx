@@ -86,7 +86,11 @@ response = client2.chat.completions.create(
 
 ## Memory Categories
 
-Each memory carries a free-form `category` string -- pass any label you like. These are the conventional categories Headroom uses for organization and retrieval:
+There is no dedicated `category` field on `Memory` or parameter on `add()`
+(`headroom/memory/models.py`, `headroom/memory/core.py`) -- store a
+free-form category string in the `metadata` dict instead, e.g.
+`metadata={"category": "fact"}`. These are the conventional category values
+used in Headroom's own examples for organization and retrieval:
 
 | Category | Description | Examples |
 |----------|-------------|----------|
@@ -122,9 +126,10 @@ all_memories = client.memory.get_all()
 client.memory.clear()
 
 # Get stats
+# `stats()` currently returns only {"total": N} -- there is no
+# per-category breakdown (`headroom/memory/wrapper.py:342-348`).
 stats = client.memory.stats()
 print(f"Total memories: {stats['total']}")
-print(f"By category: {stats['categories']}")
 ```
 
 ## Temporal Versioning
@@ -137,10 +142,12 @@ from headroom.memory import HierarchicalMemory, MemoryFilter
 memory = await HierarchicalMemory.create()
 
 # Original fact
+# `category` is a convention, not a keyword argument -- `add()` has no
+# `category` param (`headroom/memory/core.py`); store it in `metadata`.
 orig = await memory.add(
     content="User works at Google",
     user_id="alice",
-    category="fact",
+    metadata={"category": "fact"},
 )
 
 # User changes jobs -- supersede the old memory

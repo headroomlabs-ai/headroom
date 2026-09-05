@@ -52,9 +52,14 @@ ANTHROPIC_BASE_URL=http://localhost:8787 claude
 ### With HeadroomClient
 
 ```python
-from headroom import HeadroomClient
+from headroom import HeadroomClient, OpenAIProvider
+from openai import OpenAI
 
-client = HeadroomClient(provider="openai")
+client = HeadroomClient(
+    original_client=OpenAI(),
+    provider=OpenAIProvider(),
+    default_mode="optimize",
+)
 
 response = client.chat.completions.create(
     model="gpt-4o",
@@ -115,6 +120,12 @@ The compressor adapts its strategy per provider:
 |---|---|---|
 | 1,032 tokens (4 tiles) | 258 tokens (1 tile) | 75% |
 
+Unlike the OpenAI and Anthropic figures above (computed from the formulas in
+`headroom/image/tile_optimizer.py` and verified to match this page's numbers
+exactly), Headroom has no Gemini token-counting formula in the codebase --
+these figures describe Google's publicly documented tile pricing, not
+something this repo computes or tests.
+
 ## Configuration
 
 ```python
@@ -140,11 +151,10 @@ headroom proxy
 
 | Metric | Value |
 |---|---|
-| Router inference | ~10ms (CPU), ~2ms (GPU) |
-| Image resize | ~5-20ms |
-| First request | +2-3s (model download, cached after) |
-| Router accuracy | 93.7% |
-| Model size | ~128MB |
+| Image resize | ~5-20ms (measured ~9ms median for a 1024px -> 512px PIL/LANCZOS resize) |
+| First request | Model download, cached after (duration depends on network) |
+| Router accuracy | 93.7% (fine-tuned MiniLM classifier, 1,157 training examples -- see `headroom/image/trained_router.py`) |
+| Model size | ~100MB (PyTorch MiniLM router) or ~32MB (ONNX INT8 router, preferred in production) |
 | GPU memory (SigLIP) | ~400MB |
 
 <Callout type="info" title="Automatic with the proxy">

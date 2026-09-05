@@ -123,6 +123,12 @@ class CompressionCache:
         # `RLock` (not `Lock`) so future code can call locked methods from
         # inside another locked method without self-deadlock.
         self._lock = threading.RLock()
+        # Serializes one sidecar-mode compress turn per session (pre-work,
+        # pipeline, post-work run as one block on an executor thread). The
+        # sidecar contract is sequential turns per conversation; this lock
+        # keeps a contract-violating concurrent pair from interleaving and
+        # tearing the tracker's prev-original/prev-returned snapshots.
+        self.session_turn_lock = threading.Lock()
         self._cache: OrderedDict[str, _CacheEntry] = OrderedDict()
         # `_stable_hashes` is CONTENT-KEYED, not positional. It records "we
         # have seen this content before and it is known not to compress

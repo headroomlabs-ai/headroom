@@ -170,6 +170,49 @@ def test_search_detection_uses_match_ratio() -> None:
     assert _try_detect_search("\n\n") is None
 
 
+def test_search_detection_rejects_datetime_prefixed_user_message() -> None:
+    """Regression: wrap-copilot ate one-line interactive prompts (2026-08-23).
+
+    Copilot CLI prepends ``<current_datetime>…</current_datetime>`` to every
+    interactive user turn. The ISO-8601 ``T09:57:59`` matched the grep
+    ``file:line:`` pattern, so a datetime + one-line prompt classified as
+    SEARCH_RESULTS (1 match / 2 lines = 50% ≥ 30%) and the SearchCompressor
+    deleted the prompt line — the model received only the timestamp.
+    """
+    incident = (
+        "<current_datetime>2026-08-23T09:57:59.792+02:00</current_datetime>\n"
+        "\n"
+        "Please update the PR desc and check .overlay/ for hints."
+    )
+    assert _try_detect_search(incident) is None
+    assert detect_content_type(incident).content_type is not ContentType.SEARCH_RESULTS
+
+
+def test_search_detection_requires_two_matching_lines() -> None:
+    """A single coincidental ``word:digits:`` line must not classify prose."""
+    assert _try_detect_search("src/foo.py:12:def foo():") is None
+    assert (
+        _try_detect_search(
+            "Meeting at 09:30:00 tomorrow.\nBring the reports.\nDo not forget coffee."
+        )
+        is None
+    )
+    # Two genuine grep lines still classify.
+    two = "src/foo.py:12:def foo():\nsrc/bar.py:34:    foo()"
+    result = _try_detect_search(two)
+    assert result is not None
+    assert result.content_type is ContentType.SEARCH_RESULTS
+
+
+def test_search_detection_rejects_tag_like_and_key_value_prefixes() -> None:
+    """Markup / key=value lines are not file paths even with ``:\\d+:`` inside."""
+    assert (
+        _try_detect_search('<log time="10:00:00">started</log>\n<log time="10:00:01">stopped</log>')
+        is None
+    )
+    assert _try_detect_search("timeout=30:12:retried\ntimeout=31:12:retried") is None
+
+
 def test_log_detection_prefers_build_output_patterns() -> None:
     log_output = "\n".join(
         [

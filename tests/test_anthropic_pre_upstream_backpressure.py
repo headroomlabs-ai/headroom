@@ -1094,3 +1094,74 @@ def test_response_cache_keys_on_lookup_messages_not_mutated():
     assert cache.set_messages == cache.get_messages
     # And specifically the raw lookup messages, not the scanner's rewrite.
     assert cache.set_messages == [{"role": "user", "content": "hello"}]
+
+
+# --------------------------------------------------------------------------- #
+# Backpressure must not bust the provider prompt cache: the compression        #
+# pipeline is skipped under saturation, but the previously-forwarded          #
+# (compressed) prefix must still be replayed byte-identical. Forwarding raw   #
+# originals would mismatch the bytes the provider cached — busting every      #
+# gated session's prefix exactly when the proxy is busiest.                   #
+# --------------------------------------------------------------------------- #
+
+
+def test_backpressure_passthrough_replays_cached_prefix(stage_log_capture):
+    prev_original = [{"role": "user", "content": "ORIGINAL " * 6000}]
+    prev_forwarded = [{"role": "user", "content": "[compressed-form]"}]
+
+    async def _run() -> None:
+        sem = asyncio.Semaphore(1)
+        await sem.acquire()  # saturate: the request's acquire will time out
+        handler = _DummyAnthropicHandler(anthropic_pre_upstream_sem=sem)
+        handler.config.optimize = True
+        handler.config.anthropic_pre_upstream_acquire_timeout_seconds = 0.01
+        handler.anthropic_pipeline = SimpleNamespace(apply=MagicMock())
+
+        tracker = SimpleNamespace(
+            _cached_token_count=0,
+            get_frozen_message_count=lambda: 0,
+            get_last_original_messages=lambda: copy.deepcopy(prev_original),
+            get_last_forwarded_messages=lambda: copy.deepcopy(prev_forwarded),
+            update_from_response=lambda *a, **k: None,
+            record_request=lambda *a, **k: None,
+        )
+        handler.session_tracker_store = SimpleNamespace(
+            compute_session_id=lambda *a, **k: "sess-1",
+            get_or_create=lambda *a, **k: tracker,
+            resolve_tracker=lambda *a, **k: tracker,
+        )
+
+        forwarded_bodies: list[dict] = []
+        orig_retry = handler._retry_request
+
+        async def _capturing_retry(method, url, headers, body, **kw):
+            forwarded_bodies.append(copy.deepcopy(body))
+            return await orig_retry(method, url, headers, body, **kw)
+
+        handler._retry_request = _capturing_retry
+
+        req = _build_request(
+            {
+                "model": "claude-3-5-sonnet-latest",
+                "messages": copy.deepcopy(prev_original)
+                + [{"role": "user", "content": "next turn"}],
+            },
+            {"authorization": "Bearer sk-ant-api-test"},
+        )
+        try:
+            response = await handler.handle_anthropic_messages(req)
+            assert response.status_code == 200
+            # Saturation must still skip the CPU-bound pipeline...
+            assert not handler.anthropic_pipeline.apply.called
+        finally:
+            sem.release()
+
+        assert forwarded_bodies, "request never reached upstream"
+        sent = forwarded_bodies[-1]["messages"]
+        # ...but the forwarded prefix must be last turn's exact bytes, not the
+        # raw original (which the provider never cached).
+        assert sent[0]["content"] == "[compressed-form]"
+        assert sent[-1]["content"] == "next turn"
+
+    with _tokenizer_patch():
+        anyio.run(_run)

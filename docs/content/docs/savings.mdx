@@ -1,6 +1,6 @@
 ---
 title: Savings Tracking
-description: Durable, over-time compression savings — cost avoided plus Today / Last 7 days / All time and per-model / per-client breakdowns via `headroom savings`.
+description: Durable, over-time compression savings — cost avoided plus Today / Last 7 days / Last 30 days and per-model / per-client breakdowns via `headroom savings`.
 ---
 
 `headroom savings` shows how much Headroom has saved you over time — cost avoided, token counts, and breakdowns by model and client. Unlike `headroom_stats` (a single in-memory session snapshot), it reads a **durable ledger** that survives proxy and agent restarts.
@@ -10,7 +10,7 @@ description: Durable, over-time compression savings — cost avoided plus Today 
 ```bash
 headroom savings            # human-readable summary
 headroom savings --json     # machine-readable report
-headroom savings --days 30  # restrict the lookback/retention window
+headroom savings --days 7   # restrict the lookback window (1-30, default 30)
 headroom savings --reset    # delete the ledger and start fresh
 ```
 
@@ -19,7 +19,7 @@ headroom savings --reset    # delete the ledger and start fresh
 ```text
 Today       ███████████░░░░░  67.9%  saved 19,000 / 28,000 tokens  $0.0850
 Last 7 days ███████████░░░░░  67.1%  saved 47,000 / 70,000 tokens  $0.2250
-All time    ██████████░░░░░░  65.0%  saved 78,000 / 120,000 tokens  $0.2680
+Last 30 days ██████████░░░░░░  65.0%  saved 78,000 / 120,000 tokens  $0.2680
 
 Cost avoided per model:
   claude-opus-4-8          $0.1750
@@ -38,7 +38,7 @@ Every compression appends one line to an **append-only, file-locked event ledger
 
 - **Durable** — the ledger is on disk, so totals survive proxy and agent restarts.
 - **Accurate under concurrency** — Headroom's MCP server runs as multiple processes (the main agent plus each subagent), and the proxy is a separate process. An append-only, locked log lets every writer contribute without the lost-update races a single shared mutable file would suffer.
-- **Self-pruning** — events older than the retention window (365 days by default) are dropped on read, and the file is compacted once it grows large.
+- **Self-pruning** — events older than the retention window (30 days, which is also the hard maximum for `--days`) are dropped on read, and the file is compacted once it grows large.
 
 Both compression paths feed the same ledger:
 
@@ -47,7 +47,7 @@ Both compression paths feed the same ledger:
 
 ### Cost basis
 
-Cost avoided is the dollar value of the saved **input** tokens. Headroom uses [litellm](https://headroom-docs.vercel.app/docs/litellm) list pricing where the model is known (proxy traffic). MCP-tool compressions don't know the agent's upstream model, so they record `model="unknown"` and fall back to a blended per-token rate rather than reporting `$0`.
+Cost avoided is the dollar value of the saved **input** tokens. Headroom uses [litellm](https://docs.headroomlabs.ai/docs/litellm) list pricing where the model is known (proxy traffic). MCP-tool compressions don't know the agent's upstream model, so they record `model="unknown"` and fall back to a blended per-token rate rather than reporting `$0`.
 
 ## Configuration
 

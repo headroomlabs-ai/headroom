@@ -515,6 +515,19 @@ def dashboard(port: int, no_open: bool) -> None:
     ),
 )
 @click.option(
+    "--write-timeout-seconds",
+    type=click.IntRange(min=1),
+    default=None,
+    envvar="HEADROOM_WRITE_TIMEOUT_SECONDS",
+    help=(
+        "Seconds the upstream send may take before it is abandoned (default: 150). "
+        "On HTTP/1.1 this bounds the whole request body, so raise it if you push "
+        "large bodies over a slow link. Lower it to fail over a dead pooled "
+        "connection faster; --connect-timeout-seconds only guards a fresh connect. "
+        "Env: HEADROOM_WRITE_TIMEOUT_SECONDS."
+    ),
+)
+@click.option(
     "--anthropic-buffered-request-timeout-seconds",
     type=click.IntRange(min=1),
     default=None,
@@ -1103,6 +1116,7 @@ def proxy(
     retry_max_delay_ms: int | None,
     request_timeout_seconds: int | None,
     connect_timeout_seconds: int | None,
+    write_timeout_seconds: int | None,
     anthropic_buffered_request_timeout_seconds: int | None,
     anthropic_pre_upstream_concurrency: int | None,
     anthropic_pre_upstream_acquire_timeout_seconds: float | None,
@@ -1462,6 +1476,7 @@ def proxy(
         connect_timeout_seconds=connect_timeout_seconds
         if connect_timeout_seconds is not None
         else 10,
+        write_timeout_seconds=write_timeout_seconds if write_timeout_seconds is not None else 150,
         anthropic_buffered_request_timeout_seconds=(
             anthropic_buffered_request_timeout_seconds
             if anthropic_buffered_request_timeout_seconds is not None

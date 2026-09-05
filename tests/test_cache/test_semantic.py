@@ -208,6 +208,36 @@ class TestSemanticCache:
         entry = cache.get("What time is it?")
         assert entry is None
 
+    def test_empty_query_never_semantic_matches(self):
+        """An empty extracted query must not trigger cross-context false hits.
+
+        The query is the last user message; in agent/tool traffic most turns are
+        tool_result continuations whose extracted query is "". A real embedder
+        maps "" to a fixed non-zero vector, so without a guard every empty-query
+        turn would be ~identical to every other and serve one conversation's
+        response to an unrelated one. An empty query may only ever hit via the
+        exact messages_hash (which is context-complete).
+        """
+
+        def const_embedding(text: str) -> list[float]:
+            # Realistic: a non-zero, identical vector for every input (incl. "").
+            return [0.5, 0.5, 0.5]
+
+        config = SemanticCacheConfig(similarity_threshold=0.9)
+        cache = SemanticCache(config, embedding_fn=const_embedding)
+
+        # Conversation A: an empty-query turn (unique full-context hash).
+        cache.put("", "response-A", messages_hash="ctxA")
+
+        # Conversation B: a different empty-query turn — must NOT get A's answer.
+        assert cache.get("", messages_hash="ctxB") is None
+        # Its own exact hash still works.
+        assert cache.get("", messages_hash="ctxA").response == "response-A"
+
+        # A whitespace-only query is treated the same as empty.
+        cache.put("   \n\t", "response-C", messages_hash="ctxC")
+        assert cache.get("   ", messages_hash="ctxD") is None
+
 
 class TestSemanticCacheLayer:
     """Test SemanticCacheLayer functionality."""

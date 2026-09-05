@@ -5,12 +5,10 @@ that reduces retrieved documents based on relevance scoring while preserving
 the most important information.
 
 Example:
-    from langchain.retrievers import ContextualCompressionRetriever
-    from langchain_community.vectorstores import Chroma
+    from langchain_classic.retrievers import ContextualCompressionRetriever
     from headroom.integrations import HeadroomDocumentCompressor
 
-    # Create vector store retriever
-    vectorstore = Chroma.from_documents(documents, embeddings)
+    # Any retriever will do
     base_retriever = vectorstore.as_retriever(search_kwargs={"k": 50})
 
     # Wrap with Headroom compression
@@ -52,21 +50,33 @@ else:
         from langchain_core.callbacks import Callbacks
         from langchain_core.documents import Document
 
-        # BaseDocumentCompressor location varies by langchain version
+        # BaseDocumentCompressor location varies by langchain version.
+        # langchain-core 1.x: langchain_core.documents.compressor (singular)
+        # older langchain-core: langchain_core.documents.compressors
+        # umbrella package:    langchain.retrievers.document_compressors
+        # The order matters: resolving the real base class is what makes
+        # HeadroomDocumentCompressor acceptable to ContextualCompressionRetriever,
+        # which validates base_compressor against it. Falling through to the stub
+        # below produces a compressor LangChain silently rejects.
         try:
-            from langchain.retrievers.document_compressors import BaseDocumentCompressor
+            from langchain_core.documents.compressor import BaseDocumentCompressor
         except ImportError:
             try:
                 from langchain_core.documents.compressors import BaseDocumentCompressor
             except ImportError:
-                # Fallback: create a minimal base class
-                class BaseDocumentCompressor:
-                    """Minimal base class for document compression."""
+                try:
+                    from langchain.retrievers.document_compressors import (
+                        BaseDocumentCompressor,
+                    )
+                except ImportError:
+                    # Fallback: create a minimal base class
+                    class BaseDocumentCompressor:  # type: ignore[no-redef]
+                        """Minimal base class for document compression."""
 
-                    def compress_documents(
-                        self, documents: Sequence[Any], query: str, callbacks: Any = None
-                    ) -> Sequence[Any]:
-                        raise NotImplementedError
+                        def compress_documents(
+                            self, documents: Sequence[Any], query: str, callbacks: Any = None
+                        ) -> Sequence[Any]:
+                            raise NotImplementedError
 
         LANGCHAIN_AVAILABLE = True
     except ImportError:
@@ -109,7 +119,7 @@ class HeadroomDocumentCompressor(BaseDocumentCompressor):
     Works with LangChain's ContextualCompressionRetriever pattern.
 
     Example:
-        from langchain.retrievers import ContextualCompressionRetriever
+        from langchain_classic.retrievers import ContextualCompressionRetriever
         from headroom.integrations import HeadroomDocumentCompressor
 
         compressor = HeadroomDocumentCompressor(

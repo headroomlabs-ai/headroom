@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from urllib.parse import urlsplit
+
+import pytest
+
 from headroom.providers.registry import DEFAULT_VERTEX_API_URL
 from headroom.providers.vertex import (
     VERTEX_ANTHROPIC_PROVIDER_NAME,
@@ -70,4 +74,55 @@ def test_vertex_target_for_location_derives_regional_hosts_from_default_target()
 def test_vertex_target_for_location_honors_explicit_gateway() -> None:
     assert vertex_target_for_location("https://vertex-gateway.internal", "europe-west1") == (
         "https://vertex-gateway.internal"
+    )
+
+
+_VERTEX_PUBLIC_ENDPOINT = "https://aiplatform.googleapis.com"
+
+
+@pytest.mark.parametrize(
+    "region",
+    ["us-central1", "europe-west4", "asia-northeast1", "me-central1", "us-east5"],
+)
+def test_vertex_target_for_location_accepts_real_regions(region: str) -> None:
+    assert vertex_target_for_location(DEFAULT_VERTEX_API_URL, region) == (
+        f"https://{region}-aiplatform.googleapis.com"
+    )
+
+
+@pytest.mark.parametrize(
+    "malicious",
+    [
+        "169.254.169.254#",  # fragment delimiter -> cloud metadata IP (the reported PoC)
+        "127.0.0.1:44919#",  # host:port + fragment
+        "169.254.169.254/latest/meta-data/iam#",  # path injection
+        "169.254.169.254:80",  # port injection
+        "evil.example",  # dotted host
+        "foo@evil.example",  # userinfo delimiter
+        "us_central1",  # underscore (not a region)
+        "US-CENTRAL1",  # uppercase
+        "-leading",  # leading hyphen
+        "trailing-",  # trailing hyphen
+        "a--b",  # empty hyphen group
+    ],
+)
+def test_vertex_target_for_location_rejects_ssrf_payloads(malicious: str) -> None:
+    """A non-region ``location`` must never carry an attacker-chosen host into
+    the interpolated Vertex hostname (CWE-918). It falls back to the public
+    endpoint, and the parsed host is always the legitimate Vertex host — never
+    a metadata IP, loopback, or injected authority.
+    """
+    target = vertex_target_for_location(DEFAULT_VERTEX_API_URL, malicious)
+    assert target == _VERTEX_PUBLIC_ENDPOINT
+    parsed = urlsplit(target)
+    assert parsed.hostname == "aiplatform.googleapis.com"
+    assert parsed.port is None
+
+
+def test_vertex_target_for_location_ssrf_fallback_only_on_default_target() -> None:
+    """A validated non-region value still cannot override an explicitly
+    configured gateway (that path returns the operator's target verbatim and
+    is not user-derived)."""
+    assert vertex_target_for_location("https://gw.internal", "169.254.169.254#") == (
+        "https://gw.internal"
     )

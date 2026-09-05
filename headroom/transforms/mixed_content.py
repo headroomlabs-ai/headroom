@@ -19,6 +19,13 @@ class ContentSection:
     start_line: int = 0
     end_line: int = 0
     is_code_fence: bool = False
+    # Never merged into a neighbor by the post-pass coalescer. Set on
+    # tag-protection placeholder lines (merging would drag prose into their
+    # compression exemption) and on bracket-balanced-but-invalid-JSON blocks
+    # (kept standalone so a short prose banner meets the compressors' size
+    # floors on its own instead of riding a larger merged section into a
+    # lossy pass).
+    atomic: bool = False
 
 
 _CODE_FENCE_PATTERN = re.compile(r"^```(\w*)\s*$", re.MULTILINE)
@@ -82,15 +89,42 @@ def _has_valid_json_block_with_text(content: str) -> bool:
     return False
 
 
-def split_into_sections(content: str) -> list[ContentSection]:
-    """Parse mixed content into typed sections."""
+def split_into_sections(content: str, *, isolate: tuple[str, ...] = ()) -> list[ContentSection]:
+    """Parse mixed content into typed sections.
+
+    ``isolate`` lists substrings (the router's tag-protection placeholders)
+    whose lines must each become their OWN section: the router exempts any
+    section carrying a placeholder from compression, so a placeholder that
+    shares a section with ordinary prose would drag that prose into verbatim
+    passthrough. Historically placeholders self-isolated by accident — a
+    ``{{HEADROOM_TAG_N}}`` line bracket-balances, so the pre-validation
+    splitter typed it JSON_ARRAY; now that JSON typing is validated, the
+    isolation must be explicit.
+    """
     sections: list[ContentSection] = []
     lines = content.split("\n")
+
+    def _carries_isolate(text: str) -> bool:
+        return any(marker in text for marker in isolate)
+
     scan_cache: dict[tuple[int, bool, bool], tuple[int, int, bool, bool]] | None = None
 
     i = 0
     while i < len(lines):
         line = lines[i]
+
+        if isolate and _carries_isolate(line):
+            sections.append(
+                ContentSection(
+                    content=line,
+                    content_type=ContentType.PLAIN_TEXT,
+                    start_line=i,
+                    end_line=i,
+                    atomic=True,
+                )
+            )
+            i += 1
+            continue
 
         if match := _CODE_FENCE_PATTERN.match(line):
             language = match.group(1) or "unknown"
@@ -121,13 +155,35 @@ def split_into_sections(content: str) -> list[ContentSection]:
                 # First scan that ran to the end without balancing: from here on
                 # every later candidate would re-walk the same tail.
                 scan_cache = {}
-            if json_content:
+            if json_content is not None:
+                # Bracket balance alone is not JSON: prose like a harness
+                # sanitizer banner ("[harness: ... you.]") balances on one
+                # line and used to be typed JSON_ARRAY here, sending it into
+                # the structured compressors (and, via their fallback chain,
+                # into lossy text compression). Validate before typing — the
+                # mixed-content GATE (_has_valid_json_block_with_text) has
+                # always validated; the splitter must agree with it.
+                try:
+                    json.loads(json_content)
+                    valid_json = True
+                except (TypeError, ValueError):
+                    valid_json = False
+                # Either way the block keeps its own section with the same
+                # line span the JSON_ARRAY typing always gave it. For the
+                # invalid case that standalone-ness is load-bearing: a short
+                # prose banner must meet the text compressors' size floors
+                # on its own, not merged into surrounding prose whose
+                # combined size clears them (atomic=True keeps the
+                # coalescer's hands off).
                 sections.append(
                     ContentSection(
                         content=json_content,
-                        content_type=ContentType.JSON_ARRAY,
+                        content_type=(
+                            ContentType.JSON_ARRAY if valid_json else ContentType.PLAIN_TEXT
+                        ),
                         start_line=i,
                         end_line=end_i,
+                        atomic=not valid_json,
                     )
                 )
                 i = end_i + 1
@@ -159,6 +215,7 @@ def split_into_sections(content: str) -> list[ContentSection]:
                 _CODE_FENCE_PATTERN.match(next_line)
                 or next_line.strip().startswith(("[", "{"))
                 or _SEARCH_RESULT_PATTERN.match(next_line)
+                or (isolate and _carries_isolate(next_line))
             ):
                 break
             text_lines.append(next_line)
@@ -175,7 +232,41 @@ def split_into_sections(content: str) -> list[ContentSection]:
                 )
             )
 
-    return sections
+    return _coalesce_adjacent_plain_text(sections)
+
+
+def _coalesce_adjacent_plain_text(sections: list[ContentSection]) -> list[ContentSection]:
+    """Merge line-contiguous PLAIN_TEXT neighbors back into one section.
+
+    The text accumulator stops at every ``[``/``{``/search-shaped line so the
+    main loop can retry it as a candidate; when a candidate never balances it
+    becomes the start of a NEW text section. Left split, each fragment would
+    be rejoined by the router's ``"\\n\\n"`` reassembly, turning the prose's
+    original single newlines into doubles. Merging contiguous fragments with
+    ``"\\n"`` keeps the original bytes of uncompressed prose.
+
+    ``atomic`` sections (placeholder lines, balanced-but-invalid JSON blocks)
+    are never merged, in either direction — their standalone-ness carries
+    meaning (compression exemption, per-block size floors).
+    """
+    merged: list[ContentSection] = []
+    for section in sections:
+        prev = merged[-1] if merged else None
+        if (
+            prev is not None
+            and prev.content_type is ContentType.PLAIN_TEXT
+            and section.content_type is ContentType.PLAIN_TEXT
+            and not prev.is_code_fence
+            and not section.is_code_fence
+            and not prev.atomic
+            and not section.atomic
+            and section.start_line == prev.end_line + 1
+        ):
+            prev.content = f"{prev.content}\n{section.content}"
+            prev.end_line = section.end_line
+            continue
+        merged.append(section)
+    return merged
 
 
 def _scan_line(line: str, in_string: bool, escaped: bool) -> tuple[int, int, bool, bool]:

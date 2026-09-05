@@ -150,7 +150,7 @@ config.smart_crusher.min_tokens_to_crush = 100  # Default is 200
 
 **Where the savings show up**: Look at the **Prefix Cache Impact** panel and the **Compression vs Cache** tile on the dashboard — these reflect cache-read savings rather than per-request compression. The headline "Tokens Saved" tile only counts compression, so in cache mode it understates the real benefit.
 
-**To get 0.27.0-style compression numbers back**: run the proxy in token mode, which prioritizes visible compression:
+**To get 0.27.0-style compression numbers back**: run the proxy in token mode, which prioritizes visible compression. Use this to compare or diagnose, not as a permanent setting — `cache` is the default because prefix-cache stability is usually worth more on a real agent workload than a larger headline compression number:
 
 ```bash
 # Per run
@@ -244,18 +244,21 @@ See [Server-managed settings platform availability](https://code.claude.com/docs
 config = HeadroomConfig()
 config.smart_crusher.max_items_after_crush = 50  # Default: 15
 
-# 2. Skip compression for specific tools
-response = client.chat.completions.create(
-    model="gpt-4o",
-    messages=messages,
-    headroom_tool_profiles={
-        "important_tool": {"skip_compression": True},
-    },
-)
-
-# 3. Disable SmartCrusher entirely
+# 2. Disable SmartCrusher entirely
 config.smart_crusher.enabled = False
 ```
+
+<Callout type="warning" title="headroom_tool_profiles has no effect in 0.37.0">
+  `client.chat.completions.create(..., headroom_tool_profiles={...})` is
+  accepted but not currently wired through `TransformPipeline.apply()` --
+  the kwarg is documented in the pipeline's own docstring but never read
+  in its body (`headroom/transforms/pipeline.py`), so passing it changes
+  nothing. There is also no `skip_compression` key on the per-tool
+  compression profile (`CompressionProfile` in `headroom/config.py` only
+  has `bias`, `min_k`, `max_k`) -- passing a plain dict there would raise
+  `AttributeError` if a code path did consume it. Use options 1 and 2
+  above instead.
+</Callout>
 
 ## High Latency
 
@@ -286,7 +289,9 @@ config.smart_crusher.min_tokens_to_crush = 500
 
 # 3. Disable transforms you don't need
 config.cache_aligner.enabled = False
-config.rolling_window.enabled = False
+# Note: the old rolling-window "drop messages from history" stage was
+# retired (Phase B PR-B1); `HeadroomConfig` has no `rolling_window` field
+# any more (`headroom/config.py`), so there is nothing left to disable there.
 ```
 
 ## Installation Issues
@@ -535,7 +540,7 @@ plan = client.chat.completions.simulate(
 )
 
 print(f"Tokens: {plan.tokens_before} -> {plan.tokens_after}")
-print(f"Transforms: {plan.transforms_applied}")
+print(f"Transforms: {plan.transforms}")
 print(f"Waste signals: {plan.waste_signals}")
 
 import json
@@ -545,13 +550,16 @@ print(json.dumps(plan.messages_optimized, indent=2))
 ### Test Transforms Directly
 
 ```python
-from headroom import SmartCrusher, Tokenizer
+from headroom import SmartCrusher, Tokenizer, OpenAIProvider
 from headroom.config import SmartCrusherConfig
 import json
 
 config = SmartCrusherConfig()
 crusher = SmartCrusher(config)
-tokenizer = Tokenizer()
+# Tokenizer wraps a provider-specific TokenCounter -- it takes no
+# zero-argument form (headroom/tokenizer.py).
+provider = OpenAIProvider()
+tokenizer = Tokenizer(provider.get_token_counter("gpt-4o"), "gpt-4o")
 
 messages = [
     {

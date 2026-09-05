@@ -10,6 +10,7 @@ from urllib import error as urllib_error
 import pytest
 
 from headroom import copilot_auth
+from headroom.proxy import ssl_context
 
 
 def test_device_authorization_uses_form_encoded_request(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1615,3 +1616,36 @@ def test_exchange_token_sync_returns_payload_on_success(monkeypatch: pytest.Monk
     )
 
     assert result == payload
+
+
+def test_exchange_token_sync_uses_configured_corporate_tls_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Copilot refresh must use the same corporate trust config as upstream I/O."""
+    payload = {"token": "copilot-api", "expires_at": int(time.time()) + 3600}
+    tls_context = object()
+    captured: dict[str, object] = {}
+
+    class FakeResponse:
+        def read(self) -> bytes:
+            return json.dumps(payload).encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+    def fake_urlopen(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        captured.update(kwargs)
+        return FakeResponse()
+
+    monkeypatch.setattr(ssl_context, "build_urlopen_context", lambda: tls_context)
+    monkeypatch.setattr(copilot_auth.urllib_request, "urlopen", fake_urlopen)
+
+    result = copilot_auth.CopilotTokenProvider._exchange_token_sync(
+        {"Authorization": "Bearer gho_test"}  # noqa: S105
+    )
+
+    assert result == payload
+    assert captured["context"] is tls_context

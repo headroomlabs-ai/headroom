@@ -200,7 +200,11 @@ class RemoteKompressCompressor:
         whole deployment while the proxy kept reporting success.
         """
         n_words = len(content.split())
-        if n_words < _MIN_WORDS:
+        # Same floor contract as the in-process compressor: lossy
+        # word-dropping below config.min_input_words is a net loss (the
+        # retrieval marker alone is ~20 words) and garbles short
+        # instruction-like blocks. _MIN_WORDS stays the hard clamp.
+        if n_words < max(_MIN_WORDS, self.config.min_input_words):
             return self._passthrough(content, n_words)
 
         try:
@@ -255,7 +259,7 @@ class RemoteKompressCompressor:
                 source_lines = ccr_source.count("\n") + 1
                 line_word = "line" if source_lines == 1 else "lines"
                 result.compressed += (
-                    f"\n[{result.original_tokens} items compressed to "
+                    f"\n[{result.original_tokens} words compressed to "
                     f"{result.compressed_tokens} (from {source_lines} source {line_word})."
                     f" Retrieve more: hash={cache_key}]"
                 )

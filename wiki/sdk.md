@@ -107,7 +107,8 @@ response = client.messages.create(
 ### Google
 
 ```python
-from headroom import HeadroomClient, GoogleProvider
+from headroom import HeadroomClient
+from headroom.providers import GoogleProvider
 import google.generativeai as genai
 
 client = HeadroomClient(

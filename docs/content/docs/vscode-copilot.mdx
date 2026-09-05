@@ -103,17 +103,18 @@ Chat Completions API. Headroom proxies both routes. Do not treat a model's
 `unsupported_api_for_model` response from `/chat/completions` as a proxy failure;
 VS Code uses the endpoint supported by that model.
 
-Live verification on July 31, 2026 confirmed the account catalog and a successful
-HTTP 200 response through Headroom's `/responses` route for each of these exact
-model IDs:
+Live verification on August 27, 2026 confirmed successful responses through
+Headroom's `/responses` route for each of these requested model IDs:
 
 - `gpt-5.5`
 - `gpt-5.6-luna`
 - `gpt-5.6-sol`
 - `gpt-5.6-terra`
 
-Each response retained the requested model ID. Model availability remains subject
-to the signed-in user's Copilot plan and organization policy.
+Headroom retained each requested model alias. GitHub may identify the resolved
+snapshot in response metadata (for example, a request for `gpt-5.5` returned
+`gpt-5.5-2026-04-23`). Model availability remains subject to the signed-in user's
+Copilot plan and organization policy.
 
 The proxy supports the native Copilot OpenAI-compatible request paths used by
 GPT and Claude models. Headroom's upstream auth hook replaces local client auth

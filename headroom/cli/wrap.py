@@ -32,11 +32,11 @@ import subprocess
 import sys
 import time
 import urllib.parse
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from functools import wraps
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, NamedTuple, cast
 
 from headroom._subprocess import pid_alive, run
 
@@ -1192,6 +1192,235 @@ def _wrap_marker_path(settings_path: Path) -> Path:
     return settings_path.parent / ".headroom_wrap_marker.json"
 
 
+def _wrap_owners_path(settings_path: Path) -> Path:
+    """Sidecar recording which live wrap sessions own each settings env key.
+
+    Separate from ``.headroom_wrap_marker.json`` on purpose: that marker
+    describes a single writer and is consumed by doctor, unwrap and the
+    staleness checks. Concurrency ownership is additive state, so it lives in
+    its own file rather than changing a shape those readers depend on.
+    """
+    return settings_path.parent / ".headroom_wrap_owners.json"
+
+
+def _wrap_settings_lock(settings_path: Path) -> Any:
+    """Serialize settings read-modify-write across concurrent wrap sessions.
+
+    Writing the proxy URL into ``settings.local.json`` is a read-modify-write,
+    and several ``headroom wrap`` sessions in one project run it concurrently.
+    The write itself is atomic, so the file never tears -- but without this the
+    updates are still lost against each other (#3205).
+    """
+    from contextlib import nullcontext
+
+    lock_path = settings_path.parent / ".headroom_wrap_settings.lock"
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_file = open(lock_path, "a+b")  # noqa: SIM115
+    except OSError:
+        # Matches _proxy_start_lock: a workspace that cannot hold lock state is
+        # degraded, not unusable.
+        return nullcontext()
+    return _locked_file(lock_file)
+
+
+@contextmanager
+def _locked_file(lock_file: Any) -> Any:
+    """Hold an exclusive OS lock on an already-open file for the block.
+
+    Shared by ``_proxy_start_lock`` and ``_wrap_settings_lock`` -- the two
+    differ only in which file they lock, and an OS-lock dance duplicated per
+    call site is one place for the platform branches to drift apart.
+    """
+    with lock_file:
+        if sys.platform == "win32":
+            import msvcrt
+
+            # msvcrt.locking operates on bytes from the current file position.
+            lock_file.seek(0)
+            if lock_file.read(1) == b"":
+                lock_file.seek(0)
+                lock_file.write(b"0")
+                lock_file.flush()
+            lock_file.seek(0)
+            # LK_LOCK has implementation-dependent retry limits, and a holder
+            # may legitimately take longer than that (a proxy loading ML
+            # components), so use the non-blocking primitive in a loop.
+            while True:
+                try:
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    time.sleep(0.05)
+            try:
+                yield
+            finally:
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _read_wrap_owners(settings_path: Path) -> dict[str, Any]:
+    try:
+        rec = json.loads(_read_text(_wrap_owners_path(settings_path)))
+    except (OSError, ValueError):
+        return {}
+    return rec if isinstance(rec, dict) else {}
+
+
+def _write_wrap_owners(settings_path: Path, owners: dict[str, Any]) -> None:
+    target = _wrap_owners_path(settings_path)
+    try:
+        if not owners:
+            target.unlink(missing_ok=True)
+            return
+        _write_text(target, json.dumps(owners, indent=2) + "\n")
+    except OSError:
+        pass
+
+
+def _live_holders(entry: Any, *, dead_ports: frozenset[int] = frozenset()) -> list[dict[str, Any]]:
+    """Holders in *entry* whose process is still provably alive.
+
+    Reuses the same conservative liveness the proxy-client markers use: a PID
+    that is gone, or that is now provably a different process, is dropped. Any
+    uncertainty keeps the holder, because dropping a live owner is what causes
+    a running session to be unrouted.
+
+    ``dead_ports`` additionally drops holders whose proxy port the caller has
+    *proven* dead. A wrapper process outlives its proxy after a hard reboot or
+    SIGKILL of the proxy alone, and such a holder routes nothing; left in place
+    it would block the #2221 self-heal from clearing a base_url that now points
+    at nothing.
+    """
+    if not isinstance(entry, dict):
+        return []
+    holders = entry.get("holders")
+    if not isinstance(holders, list):
+        return []
+    live: list[dict[str, Any]] = []
+    for holder in holders:
+        if not isinstance(holder, dict):
+            continue
+        pid = holder.get("pid")
+        if not isinstance(pid, int) or not _pid_alive(pid):
+            continue
+        if _identity_mismatch(holder.get("start_src"), holder.get("start_time"), pid):
+            continue
+        port = holder.get("port")
+        if isinstance(port, int) and port in dead_ports:
+            continue
+        live.append(holder)
+    return live
+
+
+def _self_holder(port: int | None) -> dict[str, Any]:
+    ident = _proc_identity(os.getpid())
+    return {
+        "pid": os.getpid(),
+        "start_src": ident[0] if ident else None,
+        "start_time": ident[1] if ident else None,
+        "port": port,
+    }
+
+
+def _claim_wrap_key(
+    settings_path: Path,
+    key: str,
+    current_value: str | None,
+    *,
+    port: int | None = None,
+) -> None:
+    """Register this process as an owner of *key*, recording the true original.
+
+    The first live owner records ``original``; later owners inherit it and are
+    flagged ``inherited`` so their exit knows the value they happened to
+    observe was not the pre-wrap one. Without that, a second wrap session
+    captures the *first session's* proxy URL as the value to restore, and puts
+    a dead proxy back into the file on exit (#3205).
+    """
+    owners = _read_wrap_owners(settings_path)
+    entry = owners.get(key)
+    live = _live_holders(entry)
+    inherited = bool(live) and isinstance(entry, dict) and "original" in entry
+    original = entry.get("original") if inherited and isinstance(entry, dict) else current_value
+    me = _self_holder(port)
+    me["inherited"] = inherited
+    live = [h for h in live if h.get("pid") != me["pid"]]
+    live.append(me)
+    owners[key] = {"original": original, "holders": live}
+    _write_wrap_owners(settings_path, owners)
+
+
+class _KeyRelease(NamedTuple):
+    """Outcome of dropping this process's claim on a settings env key."""
+
+    should_restore: bool
+    original: str | None
+    trust_caller: bool
+    survivor: dict[str, Any] | None
+
+
+def _release_wrap_key(
+    settings_path: Path,
+    key: str,
+    *,
+    force: bool = False,
+    dead_ports: frozenset[int] = frozenset(),
+) -> _KeyRelease:
+    """Drop this process's claim on *key*.
+
+    ``should_restore`` is False while another live wrap session still owns the
+    key -- restoring then silently unroutes a running session. ``force`` is for
+    ``unwrap``, where the user is explicitly asking for their settings back:
+    every claim is dropped and the restore happens regardless.
+
+    ``trust_caller`` says whether the caller's remembered ``previous`` is its
+    own first-hand observation of the pre-wrap value. True when there is no
+    owner record at all (unwrap of a pre-upgrade session, and the legacy
+    callers that pass the value directly), and when this process founded the
+    record. False for an inheriting holder -- it remembers the *first
+    session's* proxy URL, so honouring it writes a dead proxy back, the exact
+    bug #3205 is about -- and false for a caller with no claim of its own,
+    whose marker-derived value is second-hand where the record is not.
+
+    ``survivor`` is a still-live holder the caller can re-point the
+    single-slot wrap marker at, so an exiting session does not take the
+    surviving one's #2221 self-heal record with it.
+    """
+    owners = _read_wrap_owners(settings_path)
+    entry = owners.get(key)
+    if not isinstance(entry, dict):
+        return _KeyRelease(True, None, True, None)
+    me = os.getpid()
+    remaining = [h for h in _live_holders(entry, dead_ports=dead_ports) if h.get("pid") != me]
+    original = entry.get("original")
+    # Look this process's own claim up in the raw holder list, never the
+    # liveness-filtered one: the caller is by definition running, and its claim
+    # is what says whether the value it remembers is first-hand.
+    raw = entry.get("holders")
+    mine = (
+        next((h for h in raw if isinstance(h, dict) and h.get("pid") == me), None)
+        if isinstance(raw, list)
+        else None
+    )
+    trust_caller = mine is not None and not mine.get("inherited")
+    if remaining and not force:
+        owners[key] = {"original": original, "holders": remaining}
+        _write_wrap_owners(settings_path, owners)
+        return _KeyRelease(False, original, trust_caller, remaining[0])
+    owners.pop(key, None)
+    _write_wrap_owners(settings_path, owners)
+    return _KeyRelease(True, original, trust_caller, None)
+
+
 def _write_wrap_marker(settings_path: Path, *, port: int, key: str, previous: str | None) -> None:
     """Best-effort record of which (pid, port, key) wrote the base_url entry.
 
@@ -1210,6 +1439,53 @@ def _write_wrap_marker(settings_path: Path, *, port: int, key: str, previous: st
             "previous": previous,
         }
         _write_text(_wrap_marker_path(settings_path), json.dumps(payload))
+    except OSError:
+        pass
+
+
+def _rehome_wrap_marker(
+    settings_path: Path,
+    *,
+    key: str,
+    survivor: dict[str, Any] | None,
+    original: str | None,
+) -> None:
+    """Hand this session's wrap marker to a session that is still running.
+
+    The marker has one slot and the last writer wins it. When that writer exits
+    while a sibling still owns the key, leaving the marker describes a dead
+    process, and deleting it strips the survivor of the #2221 dead-proxy
+    self-heal record. Rewrite it to describe the survivor instead, carrying the
+    owner record's ``original`` as the value to restore -- the marker's own
+    ``previous`` may be an earlier session's proxy URL (#3205).
+
+    Only ever touches a marker this process wrote; a sibling's marker is
+    already accurate.
+    """
+    marker_path = _wrap_marker_path(settings_path)
+    marker = _read_wrap_marker(settings_path)
+    if marker is None or marker.get("key") != key or marker.get("pid") != os.getpid():
+        return
+    port = survivor.get("port") if survivor is not None else None
+    try:
+        if survivor is None or not isinstance(port, int):
+            # No survivor to hand it to, or one whose port we never recorded:
+            # a marker without a usable port is worse than none.
+            marker_path.unlink(missing_ok=True)
+            return
+        _write_text(
+            marker_path,
+            json.dumps(
+                {
+                    "pid": survivor.get("pid"),
+                    "start_src": survivor.get("start_src"),
+                    "start_time": survivor.get("start_time"),
+                    "port": port,
+                    "key": key,
+                    "previous": original,
+                }
+            ),
+        )
     except OSError:
         pass
 
@@ -1337,7 +1613,15 @@ def _check_and_clear_dead_wrap_marker(settings_path: Path, *, key: str) -> str |
         f"running (issue #2221); restoring prior value",
         err=True,
     )
-    _restore_claude_wrap_base_url(previous, settings_path=settings_path, _key_override=key)
+    _restore_claude_wrap_base_url(
+        previous,
+        settings_path=settings_path,
+        _key_override=key,
+        # The wrapper process can outlive its proxy (the proxy alone was
+        # SIGKILLed). Its ownership claim would otherwise veto this restore and
+        # leave the base_url pointing at a port proven dead just above (#3205).
+        dead_ports=frozenset({port}) if isinstance(port, int) else frozenset(),
+    )
     return previous
 
 
@@ -1503,16 +1787,21 @@ def _write_claude_wrap_base_url(
     detected and self-healed (issue #1768).
     """
     path = settings_path or (Path.cwd() / ".claude" / "settings.local.json")
-    payload = _read_settings_for_write(path)
-    env_map = dict(payload.get("env") or {}) if isinstance(payload.get("env"), dict) else {}
     key = _claude_wrap_base_url_env_key(foundry_mode=foundry_mode, vertex_mode=vertex_mode)
-    previous = env_map.get(key)
-    env_map[key] = proxy_url
-    payload["env"] = env_map
     path.parent.mkdir(parents=True, exist_ok=True)
-    _write_text(path, json.dumps(payload, indent=2) + "\n")
-    if port is not None:
-        _write_wrap_marker(path, port=port, key=key, previous=previous)
+    with _wrap_settings_lock(path):
+        payload = _read_settings_for_write(path)
+        env_map = dict(payload.get("env") or {}) if isinstance(payload.get("env"), dict) else {}
+        previous = env_map.get(key)
+        # Claim before writing, so the recorded original is the value that was
+        # there before *any* wrap session touched it -- not the previous
+        # session's proxy URL (#3205).
+        _claim_wrap_key(path, key, previous, port=port)
+        env_map[key] = proxy_url
+        payload["env"] = env_map
+        _write_text(path, json.dumps(payload, indent=2) + "\n")
+        if port is not None:
+            _write_wrap_marker(path, port=port, key=key, previous=previous)
     return previous
 
 
@@ -1525,13 +1814,15 @@ def _write_claude_wrap_tool_search(value: str, *, settings_path: Path | None = N
     process, and is restored transactionally when the wrap session exits.
     """
     path = settings_path or (Path.cwd() / ".claude" / "settings.local.json")
-    payload = _read_settings_for_write(path)
-    env_map = dict(payload.get("env") or {}) if isinstance(payload.get("env"), dict) else {}
-    previous = env_map.get(_TOOL_SEARCH_ENV)
-    env_map[_TOOL_SEARCH_ENV] = value
-    payload["env"] = env_map
     path.parent.mkdir(parents=True, exist_ok=True)
-    _write_text(path, json.dumps(payload, indent=2) + "\n")
+    with _wrap_settings_lock(path):
+        payload = _read_settings_for_write(path)
+        env_map = dict(payload.get("env") or {}) if isinstance(payload.get("env"), dict) else {}
+        previous = env_map.get(_TOOL_SEARCH_ENV)
+        _claim_wrap_key(path, _TOOL_SEARCH_ENV, previous)
+        env_map[_TOOL_SEARCH_ENV] = value
+        payload["env"] = env_map
+        _write_text(path, json.dumps(payload, indent=2) + "\n")
     return previous
 
 
@@ -1553,6 +1844,8 @@ def _restore_claude_wrap_base_url(
     vertex_mode: bool = False,
     settings_path: Path | None = None,
     _key_override: str | None = None,
+    force: bool = False,
+    dead_ports: frozenset[int] = frozenset(),
 ) -> None:
     """Restore (or remove) the env key written by _write_claude_wrap_base_url.
 
@@ -1561,40 +1854,63 @@ def _restore_claude_wrap_base_url(
     ``previous`` is None the key is removed; when it has a value it is
     restored — preserving any URL the project already had set. Also clears
     this key's sidecar wrap marker, if any (issue #1768).
+
+    Concurrency (#3205): while another live wrap session still owns the key,
+    this is a no-op — restoring underneath a running session unroutes it. Set
+    ``force`` when the user has explicitly asked for their settings back
+    (``unwrap``), and ``dead_ports`` to name proxy ports already proven dead so
+    holders that outlived their proxy stop counting as live.
     """
     path = settings_path or (Path.cwd() / ".claude" / "settings.local.json")
     key = _key_override or _claude_wrap_base_url_env_key(
         foundry_mode=foundry_mode, vertex_mode=vertex_mode
     )
-    if not path.exists():
-        _clear_wrap_marker(path, key=key)
-        return
-    try:
-        payload = json.loads(_read_text(path))
-    except (OSError, json.JSONDecodeError):
-        return
-    if not isinstance(payload, dict):
-        return
-    env_map = payload.get("env")
-    if not isinstance(env_map, dict):
-        return
-    if previous is None:
-        if key not in env_map:
+    with _wrap_settings_lock(path):
+        # Another live wrap session in this project may still be using the key.
+        # Restoring underneath it silently unroutes a running session -- traffic
+        # bypasses the proxy with no error anywhere (#3205).
+        release = _release_wrap_key(path, key, force=force, dead_ports=dead_ports)
+        if not release.should_restore:
+            # The value stays, but this session's marker must not linger
+            # describing a process that is gone: hand the slot to a survivor.
+            _rehome_wrap_marker(path, key=key, survivor=release.survivor, original=release.original)
+            return
+        # The owner record holds the value from before *any* wrap session wrote.
+        # Prefer the caller's own value only when the caller observed it
+        # first-hand; a session that started second remembers the first
+        # session's (now dead) proxy URL, and so does the marker an unwrap or a
+        # self-heal reads it from.
+        restore_to = previous if release.trust_caller else release.original
+
+        if not path.exists():
             _clear_wrap_marker(path, key=key)
             return
-        del env_map[key]
-        if env_map:
-            payload["env"] = env_map
+        try:
+            payload = json.loads(_read_text(path))
+        except (OSError, json.JSONDecodeError):
+            return
+        if not isinstance(payload, dict):
+            return
+        env_map = payload.get("env")
+        if not isinstance(env_map, dict):
+            return
+        if restore_to is None:
+            if key not in env_map:
+                _clear_wrap_marker(path, key=key)
+                return
+            del env_map[key]
+            if env_map:
+                payload["env"] = env_map
+            else:
+                payload.pop("env", None)
         else:
-            payload.pop("env", None)
-    else:
-        env_map[key] = previous
-        payload["env"] = env_map
-    if payload:
-        _write_text(path, json.dumps(payload, indent=2) + "\n")
-    else:
-        path.unlink(missing_ok=True)
-    _clear_wrap_marker(path, key=key)
+            env_map[key] = restore_to
+            payload["env"] = env_map
+        if payload:
+            _write_text(path, json.dumps(payload, indent=2) + "\n")
+        else:
+            path.unlink(missing_ok=True)
+        _clear_wrap_marker(path, key=key)
 
 
 def _setup_headroom_mcp(
@@ -2018,17 +2334,18 @@ def _setup_serena_mcp(
 
     spec = build_serena_spec(context)
     result = registrar.register_server(spec, force=force)
+    owned_drift = (
+        result.status == RegisterStatus.MISMATCH
+        and not force
+        and headroom_installed_matching(registrar.name, registrar.get_server("serena"))
+    )
 
     # Migrate a stale Headroom-installed entry. register_server won't overwrite
     # a differing spec without force, so an older Headroom Serena entry would
     # otherwise persist across re-wraps. Force-update it only when the ledger
     # proves Headroom installed the entry that's currently on disk — never a
     # user-managed Serena.
-    if (
-        result.status == RegisterStatus.MISMATCH
-        and not force
-        and headroom_installed_matching(registrar.name, registrar.get_server("serena"))
-    ):
+    if result.status == RegisterStatus.MISMATCH and not force and owned_drift:
         result = registrar.register_server(spec, force=True)
         if result.status == RegisterStatus.REGISTERED:
             click.echo("  Serena MCP: migrated previously-installed entry to current spec")
@@ -2041,7 +2358,13 @@ def _setup_serena_mcp(
         result,
         label="Serena MCP",
         verbose=verbose,
-        overwrite_hint="update or remove the existing serena MCP entry, then rerun headroom wrap",
+        overwrite_hint=(
+            "run headroom wrap again"
+            if owned_drift
+            else "run headroom mcp reconcile --adopt"
+            if registrar.name == "claude"
+            else "update or remove the existing serena MCP entry, then rerun headroom wrap"
+        ),
         restart_hint=f"restart {registrar.display_name} if it was already running",
     )
     if line is not None:
@@ -3297,6 +3620,27 @@ def _kill_proxy_by_pid(pid: int, port: int) -> bool:
     Sends SIGTERM first, falls back to SIGKILL after 5 seconds.
     Returns True if the port is free afterwards, False otherwise.
     """
+    if sys.platform == "win32":
+        # ``os.kill(..., SIGTERM)`` only targets one Windows process.  The
+        # native proxy launcher can own a serving child, so terminating the
+        # reported PID alone may leave that child bound to the port.  Walk the
+        # verified Headroom process tree, matching the existing Serena cleanup
+        # strategy used elsewhere in this module.
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+        except Exception:
+            pass
+        for _ in range(50):
+            time.sleep(0.1)
+            if not _check_proxy(port):
+                return True
+        return False
+
     try:
         os.kill(pid, signal.SIGTERM)
     except PermissionError:
@@ -3618,6 +3962,20 @@ def _copilot_model_from_args(copilot_args: tuple[str, ...], env: dict[str, str])
 def _copilot_default_wire_api_for_model(model: str | None) -> str:
     """Return the default OpenAI-compatible wire API for a Copilot model."""
     return _copilot_default_wire_api_for_model_impl(model)
+
+
+def _build_copilot_native_launch_env(
+    *, port: int, environ: dict[str, str], project: str | None
+) -> tuple[dict[str, str], list[str]]:
+    from headroom.providers.copilot.wrap import build_native_launch_env
+
+    return build_native_launch_env(port=port, environ=environ, project=project)
+
+
+def _native_api_url_supported(*, environ: Mapping[str, str] | None = None) -> bool | None:
+    from headroom.providers.copilot.wrap import native_api_url_supported
+
+    return native_api_url_supported(environ=environ)
 
 
 def _should_use_copilot_oauth(
@@ -4097,39 +4455,8 @@ def _proxy_start_lock(port: int) -> Any:
         # environment.
         yield
         return
-    with lock_file:
-        if sys.platform == "win32":
-            import msvcrt
-
-            # msvcrt.locking operates on bytes from the current file position.
-            lock_file.seek(0)
-            if lock_file.read(1) == b"":
-                lock_file.seek(0)
-                lock_file.write(b"0")
-                lock_file.flush()
-            lock_file.seek(0)
-            # LK_LOCK has implementation-dependent retry limits. A proxy may
-            # legitimately take longer than that to load ML components, so
-            # use the non-blocking primitive in a loop instead.
-            while True:
-                try:
-                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
-                    break
-                except OSError:
-                    time.sleep(0.05)
-            try:
-                yield
-            finally:
-                lock_file.seek(0)
-                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
-        else:
-            import fcntl
-
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    with _locked_file(lock_file):
+        yield
 
 
 @wraps(_ensure_proxy_unlocked)
@@ -4295,6 +4622,19 @@ def _make_cleanup(proxy_proc_holder: list, port: int | list[int] = 8787) -> Any:
             if _other_clients_exist():
                 # Other clients still using the proxy — leave it running.
                 return
+            # Snapshot the serving PID before terminating the launcher.  On
+            # Windows the detached serving child can briefly make /health
+            # unavailable while the launcher exits, causing the later safety
+            # probe to classify our own listener as "unidentified" and leave
+            # it orphaned.  We still verify it through Headroom's health
+            # payload before trusting the PID.
+            serving_pid: int | None = None
+            if sys.platform == "win32" and _check_proxy(p):
+                running_config = _query_proxy_config(p)
+                try:
+                    serving_pid = int(running_config["pid"]) if running_config else None
+                except (KeyError, TypeError, ValueError):
+                    serving_pid = None
             if proc.poll() is None:
                 proc.terminate()
                 try:
@@ -4308,6 +4648,8 @@ def _make_cleanup(proxy_proc_holder: list, port: int | list[int] = 8787) -> Any:
             # Ctrl+C from the last wrapper must still stop the listener.
             if sys.platform == "win32" and _check_proxy(p):
                 stop_status = _stop_local_proxy_for_unwrap(p)
+                if stop_status == "unidentified" and serving_pid is not None:
+                    stop_status = "stopped" if _kill_proxy_by_pid(serving_pid, p) else "failed"
                 if stop_status not in {"stopped", "not_running"}:
                     click.echo(
                         f"  Warning: proxy on port {p} remained running "
@@ -4321,6 +4663,20 @@ def _ignore_child_sigint(signum: int | None = None, frame: Any = None) -> None:
     """Keep the wrapper alive when Ctrl-C is intended for the child CLI."""
 
     return None
+
+
+def _exit_on_signal(signum: int | None = None, frame: Any = None) -> None:
+    """Unwind on SIGTERM/SIGHUP so the ``finally`` block actually runs.
+
+    Registering ``cleanup`` itself as the handler did not achieve what its call
+    site documented. A Python signal handler that returns normally does not
+    unwind the stack -- under PEP 475 the interrupted ``waitpid`` is simply
+    retried -- so the ``finally`` that restores ``settings.local.json`` never
+    ran, while the handler had already terminated the proxy underneath a child
+    that was still alive. Raising SystemExit reverses that: the settings are
+    restored and cleanup runs exactly once, from ``finally`` (#3205).
+    """
+    raise SystemExit(128 + int(signum or 0))
 
 
 def _launch_tool(
@@ -4340,6 +4696,7 @@ def _launch_tool(
     anyllm_provider: str | None = None,
     region: str | None = None,
     openai_api_url: str | None = None,
+    anthropic_api_url: str | None = None,
     copilot_api_token: str | None = None,
     copilot_refresh_oauth_token: str | None = None,
     copilot_api_token_expires_at: float | None = None,
@@ -4354,7 +4711,7 @@ def _launch_tool(
     port_holder: list[int] = [port]
     cleanup = _make_cleanup(proxy_holder, port_holder)
     signal.signal(signal.SIGINT, _ignore_child_sigint)
-    signal.signal(signal.SIGTERM, cleanup)
+    signal.signal(signal.SIGTERM, _exit_on_signal)
 
     try:
         click.echo()
@@ -4376,6 +4733,7 @@ def _launch_tool(
             anyllm_provider=anyllm_provider,
             region=region,
             openai_api_url=openai_api_url,
+            anthropic_api_url=anthropic_api_url,
             copilot_api_token=copilot_api_token,
             copilot_refresh_oauth_token=copilot_refresh_oauth_token,
             copilot_api_token_expires_at=copilot_api_token_expires_at,
@@ -4386,7 +4744,7 @@ def _launch_tool(
         port_holder[0] = actual_port
         _push_runtime_env(actual_port, no_proxy)
 
-        # If port fell back, update env URLs to point at the actual port
+        # If port fell back, update environment URLs to point at the actual port.
         if actual_port != port:
             for k, v in dict(env).items():
                 env[k] = v.replace(f"127.0.0.1:{port}", f"127.0.0.1:{actual_port}")
@@ -4826,11 +5184,11 @@ def claude(
     )
     cleanup = _make_cleanup(proxy_holder, port_holder)
     signal.signal(signal.SIGINT, _ignore_child_sigint)
-    signal.signal(signal.SIGTERM, cleanup)
+    signal.signal(signal.SIGTERM, _exit_on_signal)
     if hasattr(signal, "SIGHUP"):
         # Terminal close / tmux kill-session sends SIGHUP, not SIGTERM — without
         # this, the finally block's base_url restore never runs (issue #1768).
-        signal.signal(signal.SIGHUP, cleanup)
+        signal.signal(signal.SIGHUP, _exit_on_signal)
 
     # Memory sync BEFORE proxy startup — sync headroom DB ↔ Claude's files
     if memory:
@@ -4932,11 +5290,11 @@ def claude(
             click.echo("  Skipping MCP retrieve tool (--no-mcp)")
 
         # Coding-task compressor: Serena (retires any legacy tokensave entry).
-        from headroom.mcp_registry import ClaudeRegistrar
+        from headroom.mcp_registry import CLAUDE_SERENA_CONTEXT, ClaudeRegistrar
 
         _setup_coding_compressor(
             ClaudeRegistrar(),
-            serena_context="claude-code",
+            serena_context=CLAUDE_SERENA_CONTEXT,
             serena=serena,
             no_serena=no_serena,
             no_tokensave=no_tokensave,
@@ -5215,6 +5573,10 @@ def unwrap_claude(
             foundry_mode=_foundry,
             vertex_mode=_vertex,
             settings_path=_unwrap_settings_path,
+            # unwrap is the user asking for their settings back, so it drops
+            # every wrap session's claim rather than deferring to a live
+            # sibling and silently doing nothing (#3205).
+            force=True,
         )
 
     # Issue #2238: unwrap restores settings.local.json, but a proxy URL that was
@@ -5297,6 +5659,14 @@ def _require_copilot_subscription_resolution() -> CopilotSubscriptionTokenResolu
     ),
 )
 @click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
+@click.option(
+    "--native",
+    is_flag=True,
+    help=(
+        "Route Copilot's own GitHub-authenticated API through Headroom instead of "
+        "the single-model BYOK override. Keeps native model aliases and /model switching."
+    ),
+)
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
 @click.argument("copilot_args", nargs=-1, type=click.UNPROCESSED)
 def copilot(
@@ -5309,6 +5679,7 @@ def copilot(
     wire_api: str | None,
     subscription: bool,
     memory: bool,
+    native: bool,
     verbose: bool,
     copilot_args: tuple[str, ...],
 ) -> None:
@@ -5343,6 +5714,7 @@ def copilot(
         )
         raise SystemExit(1)
 
+    explicit_subscription = subscription
     effective_backend = backend or os.environ.get("HEADROOM_BACKEND")
     if _check_proxy(port):
         running_backend = _detect_running_proxy_backend(port)
@@ -5352,6 +5724,17 @@ def copilot(
                 f"Stop it or rerun with --backend {running_backend}."
             )
         effective_backend = running_backend or effective_backend
+
+    if native:
+        subscription = True
+        if provider_type == "anthropic":
+            raise click.ClickException(
+                "--native does not use the BYOK provider override; drop --provider-type anthropic."
+            )
+        if wire_api is not None:
+            raise click.ClickException(
+                "--native selects the wire per request; drop the BYOK-only --wire-api option."
+            )
 
     effective_provider_type = _resolve_copilot_provider_type(effective_backend, provider_type)
     if subscription:
@@ -5380,12 +5763,22 @@ def copilot(
     copilot_api_token_expires_at: float | None = None
     client_bearer: str | None = None
     subscription_resolution: CopilotSubscriptionTokenResolution | None = None
-    if _should_use_copilot_oauth(
+    anthropic_api_url: str | None = None
+    use_copilot_oauth = _should_use_copilot_oauth(
         backend=effective_backend,
         provider_type=provider_type,
         env=env,
         force_subscription=subscription,
-    ):
+    )
+    # Without a provider key, the old implicit OAuth lane still configured
+    # Copilot as a one-model BYOK client. Native aliases (and runtime /model
+    # switches) were then forwarded literally and rejected by GitHub (#1910).
+    # Explicit --subscription remains on its existing fixed-wire behavior;
+    # implicit GitHub OAuth uses Copilot's own routing automatically.
+    if use_copilot_oauth and not explicit_subscription:
+        native = True
+
+    if use_copilot_oauth:
         if subscription:
             subscription_resolution = _require_copilot_subscription_resolution()
             client_bearer = subscription_resolution.token
@@ -5398,7 +5791,35 @@ def copilot(
                 "GITHUB_COPILOT_TOKEN / GITHUB_COPILOT_GITHUB_TOKEN."
             )
 
-        selected_model = _copilot_model_from_args(copilot_args, env)
+        if native:
+            openai_api_url = (
+                subscription_resolution.api_url
+                if subscription_resolution is not None
+                else resolve_copilot_api_url(client_bearer)
+            )
+            env, env_vars_display = _build_copilot_native_launch_env(
+                port=port,
+                environ=env,
+                project=_project_name_from_cwd(),
+            )
+            env["GITHUB_COPILOT_API_URL"] = openai_api_url
+            env["OPENAI_TARGET_API_URL"] = openai_api_url
+            env["ANTHROPIC_TARGET_API_URL"] = openai_api_url
+            anthropic_api_url = openai_api_url
+            copilot_proxy_token = client_bearer
+            if subscription_resolution is not None:
+                copilot_refresh_oauth_token = subscription_resolution.refresh_oauth_token
+                copilot_api_token_expires_at = subscription_resolution.api_token_expires_at
+            support = _native_api_url_supported(environ=os.environ)
+            if support is False:
+                raise click.ClickException(
+                    "This Copilot CLI build does not reference COPILOT_API_URL; refusing "
+                    "a native launch that could silently bypass Headroom."
+                )
+            if support is None and verbose:
+                click.echo("  Note: could not verify this Copilot CLI's COPILOT_API_URL support.")
+        else:
+            selected_model = _copilot_model_from_args(copilot_args, env)
 
         # ``--model auto`` is a Copilot-internal routing token that the BYOK
         # API rejects with ``400 The requested model is not supported``.  In
@@ -5406,7 +5827,7 @@ def copilot(
         # Copilot's own native auto-selection works fine — we just need to
         # strip the ``--model auto`` flag before launch so Copilot doesn't
         # forward it to the provider endpoint.
-        if _is_auto_model(selected_model):
+        if not native and _is_auto_model(selected_model):
             copilot_args = _strip_auto_model_args(copilot_args)
             selected_model = None
             click.echo(
@@ -5415,57 +5836,58 @@ def copilot(
                 "automatic model selection."
             )
 
-        env_wire_api = env.get("COPILOT_PROVIDER_WIRE_API")
-        effective_wire_api = wire_api or (
-            env_wire_api
-            if env_wire_api in {"completions", "responses"}
-            else _copilot_default_wire_api_for_model(selected_model)
-        )
-        env["COPILOT_PROVIDER_TYPE"] = "openai"
-        # Per-project savings: the Copilot CLI cannot send custom headers, so
-        # the project rides as a /p/<name> base-URL prefix the proxy strips.
-        env["COPILOT_PROVIDER_BASE_URL"] = _with_project_prefix(
-            f"http://127.0.0.1:{port}/v1", _project_name_from_cwd()
-        )
-        env["COPILOT_PROVIDER_WIRE_API"] = effective_wire_api
-        env["COPILOT_PROVIDER_BEARER_TOKEN"] = client_bearer
-        env["GITHUB_COPILOT_USE_TOKEN_EXCHANGE"] = "false"
-        env.pop("COPILOT_PROVIDER_API_KEY", None)
-        # Hand the exact token we resolved (and, for --subscription, validated
-        # against GitHub) to the proxy explicitly via copilot_proxy_token below.
-        # The proxy pins it as GITHUB_COPILOT_API_TOKEN, so upstream auth is
-        # deterministic instead of the proxy re-running unvalidated discovery
-        # (read_cached_oauth_token returns the *first* candidate, which may not
-        # be the one the wrapper approved → environment-dependent 401s). Passing
-        # it as a launch argument — rather than mutating this process's global
-        # os.environ — keeps the token off shared state and out of unrelated
-        # code paths.
-        copilot_proxy_token = client_bearer
-        if subscription_resolution is not None:
-            copilot_refresh_oauth_token = subscription_resolution.refresh_oauth_token
-            copilot_api_token_expires_at = subscription_resolution.api_token_expires_at
-        env_vars_display = [
-            "COPILOT_PROVIDER_TYPE=openai",
-            f"COPILOT_PROVIDER_BASE_URL={env['COPILOT_PROVIDER_BASE_URL']}",
-            f"COPILOT_PROVIDER_WIRE_API={effective_wire_api}",
-            (
-                "COPILOT_AUTH_MODE=github-subscription-experimental"
-                if subscription
-                else "COPILOT_AUTH_MODE=github-oauth"
-            ),
-        ]
-        # Non-subscription OAuth keeps upstream's generic-host policy from
-        # #610. Subscription mode can use the endpoint returned by the Copilot
-        # token exchange, which is how Business accounts advertise their API
-        # host without requiring users to configure it manually.
-        openai_api_url = (
-            subscription_resolution.api_url
-            if subscription_resolution is not None
-            else resolve_copilot_api_url(client_bearer)
-        )
-        env["GITHUB_COPILOT_API_URL"] = openai_api_url
-        env["OPENAI_TARGET_API_URL"] = openai_api_url
-        env_vars_display.append(f"COPILOT_PROVIDER_API_URL={openai_api_url}")
+        if not native:
+            env_wire_api = env.get("COPILOT_PROVIDER_WIRE_API")
+            effective_wire_api = wire_api or (
+                env_wire_api
+                if env_wire_api in {"completions", "responses"}
+                else _copilot_default_wire_api_for_model(selected_model)
+            )
+            env["COPILOT_PROVIDER_TYPE"] = "openai"
+            # Per-project savings: the Copilot CLI cannot send custom headers, so
+            # the project rides as a /p/<name> base-URL prefix the proxy strips.
+            env["COPILOT_PROVIDER_BASE_URL"] = _with_project_prefix(
+                f"http://127.0.0.1:{port}/v1", _project_name_from_cwd()
+            )
+            env["COPILOT_PROVIDER_WIRE_API"] = effective_wire_api
+            env["COPILOT_PROVIDER_BEARER_TOKEN"] = client_bearer
+            env["GITHUB_COPILOT_USE_TOKEN_EXCHANGE"] = "false"
+            env.pop("COPILOT_PROVIDER_API_KEY", None)
+            # Hand the exact token we resolved (and, for --subscription, validated
+            # against GitHub) to the proxy explicitly via copilot_proxy_token below.
+            # The proxy pins it as GITHUB_COPILOT_API_TOKEN, so upstream auth is
+            # deterministic instead of the proxy re-running unvalidated discovery
+            # (read_cached_oauth_token returns the *first* candidate, which may not
+            # be the one the wrapper approved → environment-dependent 401s). Passing
+            # it as a launch argument — rather than mutating this process's global
+            # os.environ — keeps the token off shared state and out of unrelated
+            # code paths.
+            copilot_proxy_token = client_bearer
+            if subscription_resolution is not None:
+                copilot_refresh_oauth_token = subscription_resolution.refresh_oauth_token
+                copilot_api_token_expires_at = subscription_resolution.api_token_expires_at
+            env_vars_display = [
+                "COPILOT_PROVIDER_TYPE=openai",
+                f"COPILOT_PROVIDER_BASE_URL={env['COPILOT_PROVIDER_BASE_URL']}",
+                f"COPILOT_PROVIDER_WIRE_API={effective_wire_api}",
+                (
+                    "COPILOT_AUTH_MODE=github-subscription-experimental"
+                    if subscription
+                    else "COPILOT_AUTH_MODE=github-oauth"
+                ),
+            ]
+            # Non-subscription OAuth keeps upstream's generic-host policy from
+            # #610. Subscription mode can use the endpoint returned by the Copilot
+            # token exchange, which is how Business accounts advertise their API
+            # host without requiring users to configure it manually.
+            openai_api_url = (
+                subscription_resolution.api_url
+                if subscription_resolution is not None
+                else resolve_copilot_api_url(client_bearer)
+            )
+            env["GITHUB_COPILOT_API_URL"] = openai_api_url
+            env["OPENAI_TARGET_API_URL"] = openai_api_url
+            env_vars_display.append(f"COPILOT_PROVIDER_API_URL={openai_api_url}")
     else:
         env, env_vars_display = _build_copilot_launch_env(
             port=port,
@@ -5488,7 +5910,7 @@ def copilot(
             )
             raise SystemExit(1)
 
-    if not subscription and not _copilot_model_configured(copilot_args, env):
+    if not subscription and not native and not _copilot_model_configured(copilot_args, env):
         # Distinguish between "--model auto" (wrong model for BYOK) and
         # genuinely missing model (no --model flag at all).
         raw_model = _copilot_model_from_args(copilot_args, env)
@@ -5525,6 +5947,7 @@ def copilot(
         anyllm_provider=anyllm_provider,
         region=region,
         openai_api_url=openai_api_url,
+        anthropic_api_url=anthropic_api_url,
         copilot_api_token=copilot_proxy_token,
         copilot_refresh_oauth_token=copilot_refresh_oauth_token,
         copilot_api_token_expires_at=copilot_api_token_expires_at,
@@ -5656,7 +6079,7 @@ def vscode_claude(
             click.echo("  Keep this command running. Press Ctrl+C to stop the proxy.")
             click.echo("  Authentication and the selected Claude model are preserved.")
             click.echo("  Undo later with: headroom unwrap vscode-claude")
-            click.echo("  Guide: https://headroom-docs.vercel.app/docs/vscode-claude-code")
+            click.echo("  Guide: https://docs.headroomlabs.ai/docs/vscode-claude-code")
             return
         click.echo(f"  Add these values under 'env' in {target_settings}:")
         click.echo(f'  "ANTHROPIC_BASE_URL": "{proxy_url}",')
@@ -6295,9 +6718,10 @@ def kimi(
     """Launch Kimi CLI through Headroom proxy.
 
     \b
-    Sets KIMI_BASE_URL to route Kimi's OpenAI-compatible /chat/completions
-    traffic through Headroom. Kimi's own OAuth bearer is forwarded upstream,
-    so no extra login is required — run `kimi` once to authenticate first.
+    Sets KIMI_CODE_BASE_URL for managed Kimi Code and KIMI_BASE_URL for legacy
+    kimi-cli to route OpenAI-compatible /chat/completions traffic through
+    Headroom. Managed Kimi Code needs one `/login` after the proxy URL changes
+    so its OAuth slot matches that URL; legacy kimi-cli keeps its existing login.
 
     \b
     Examples:
@@ -6315,9 +6739,20 @@ def kimi(
         click.echo("Install Kimi CLI: https://github.com/MoonshotAI/kimi-cli")
         raise SystemExit(1)
 
-    env, env_vars_display = _build_kimi_launch_env(
-        port, os.environ, project=_project_name_from_cwd()
-    )
+    project = _project_name_from_cwd()
+    env, env_vars_display = _build_kimi_launch_env(port, os.environ, project=project)
+
+    def configure_kimi_launch(
+        actual_port: int,
+        current_args: tuple,
+        current_env: dict[str, str],
+        current_display: list[str],
+    ) -> tuple[tuple, dict[str, str], list[str]]:
+        del current_display
+        updated_env, updated_display = _build_kimi_launch_env(
+            actual_port, current_env, project=project
+        )
+        return current_args, updated_env, updated_display
 
     _launch_tool(
         binary=kimi_bin,
@@ -6332,6 +6767,7 @@ def kimi(
         agent_type="kimi",
         code_graph=code_graph,
         openai_api_url=kimi_api_url,
+        configure_launch=configure_kimi_launch,
     )
 
 

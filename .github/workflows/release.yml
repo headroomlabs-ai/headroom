@@ -134,12 +134,12 @@ jobs:
           fetch-depth: 0
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
       - name: Set up Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: "20"
 
@@ -269,7 +269,7 @@ jobs:
           fetch-depth: 0
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
@@ -524,7 +524,7 @@ jobs:
       # is on PATH as `python` for the smoke step below.
       - name: Set up Python (Windows host)
         if: matrix.image == '' && runner.os == 'Windows'
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python }}
 
@@ -805,7 +805,7 @@ jobs:
           fetch-depth: 0
 
       - name: Set up Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: "20"
           registry-url: ${{ env.NPM_REGISTRY_URL }}
@@ -897,7 +897,7 @@ jobs:
           printf 'scope=%s\n' "$scope" >> "$GITHUB_OUTPUT"
 
       - name: Set up Node.js for GitHub Package Registry
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: "20"
           registry-url: ${{ env.GITHUB_PACKAGES_REGISTRY_URL }}

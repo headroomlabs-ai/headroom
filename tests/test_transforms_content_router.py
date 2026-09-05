@@ -441,7 +441,7 @@ def test_force_kompress_apply_uses_lightweight_detection(
     monkeypatch.setattr(
         router,
         "compress",
-        lambda content, context="", bias=1.0: RouterCompressionResult(
+        lambda content, context="", bias=1.0, precomputed_detection=None: RouterCompressionResult(
             # CCR marker -> the original was stored and is retrievable, so the
             # #1307 reversibility gate accepts this lossy KOMPRESS tool result.
             compressed="compressed <<ccr:tool>>",
@@ -517,7 +517,7 @@ def test_content_router_mixed_pure_apply_and_toin(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(
         content_router_module,
         "split_into_sections",
-        lambda content: [
+        lambda content, isolate=(): [
             SimpleNamespace(
                 content="print('x')",
                 content_type=ContentType.SOURCE_CODE,
@@ -923,7 +923,7 @@ def _make_router_with_mock_compress(monkeypatch: pytest.MonkeyPatch) -> ContentR
     ``[compressed]`` payload at ratio 0.5 (passes the < min_ratio check)."""
     router = ContentRouter(ContentRouterConfig())
 
-    def fake_compress(content, context: str = "", bias: float = 1.0):
+    def fake_compress(content, context: str = "", bias: float = 1.0, precomputed_detection=None):
         return SimpleNamespace(
             compressed=content[: len(content) // 2] + "[compressed]",
             compression_ratio=0.5,
@@ -1237,7 +1237,7 @@ def _churn_router(monkeypatch: pytest.MonkeyPatch, ratio: float) -> ContentRoute
     cfg = ContentRouterConfig(min_ratio_relaxed=0.85, min_ratio_aggressive=0.65)
     router = ContentRouter(cfg)
 
-    def fake_compress(content, context: str = "", bias: float = 1.0):
+    def fake_compress(content, context: str = "", bias: float = 1.0, precomputed_detection=None):
         return SimpleNamespace(
             # CCR marker keeps the compression recoverable so the #1307
             # tool-reversibility guard preserves it instead of restoring original.
@@ -1376,7 +1376,7 @@ def test_model_not_ready_passthrough_is_not_frozen(
     monkeypatch.setattr(
         router,
         "compress",
-        lambda c, context="", bias=1.0: SimpleNamespace(
+        lambda c, context="", bias=1.0, precomputed_detection=None: SimpleNamespace(
             compressed=c, compression_ratio=1.0, strategy_used=CompressionStrategy.TEXT
         ),
     )
@@ -1402,7 +1402,7 @@ def test_model_not_ready_passthrough_is_not_frozen(
     monkeypatch.setattr(
         router,
         "compress",
-        lambda c, context="", bias=1.0: SimpleNamespace(
+        lambda c, context="", bias=1.0, precomputed_detection=None: SimpleNamespace(
             compressed="[C]"
             + c[:20]
             + " <<ccr:t>>",  # recoverable marker so #1307 tool-reversibility guard keeps the compression
@@ -1515,7 +1515,7 @@ def test_block_model_not_ready_passthrough_is_not_frozen(
     monkeypatch.setattr(
         router,
         "compress",
-        lambda c, context="", bias=1.0: SimpleNamespace(
+        lambda c, context="", bias=1.0, precomputed_detection=None: SimpleNamespace(
             compressed=c, compression_ratio=1.0, strategy_used=CompressionStrategy.TEXT
         ),
     )
@@ -1530,7 +1530,7 @@ def test_block_model_not_ready_passthrough_is_not_frozen(
     monkeypatch.setattr(
         router,
         "compress",
-        lambda c, context="", bias=1.0: SimpleNamespace(
+        lambda c, context="", bias=1.0, precomputed_detection=None: SimpleNamespace(
             compressed="[C]"
             + c[:20]
             + " <<ccr:t>>",  # recoverable marker so #1307 tool-reversibility guard keeps the compression
@@ -1785,3 +1785,23 @@ def test_detect_content_overrides_html_misroute_for_grep_and_logs(
         "</section></main></body></html>"
     )
     assert _detect_content(html).content_type is ContentType.HTML
+
+
+def test_datetime_prefixed_user_prompt_survives_router() -> None:
+    """Regression (2026-08-23): interactive wrap-copilot prompts were deleted.
+
+    Copilot CLI prepends ``<current_datetime>…</current_datetime>`` to every
+    interactive user turn; the ISO timestamp matched the grep ``file:line:``
+    detector, the one-line prompt classified as SEARCH_RESULTS, and
+    SearchCompressor kept only the datetime line — the model received no
+    request and answered "How can I help you today?". The router must never
+    route this shape to the search line-filter and must keep the prose.
+    """
+    prompt = (
+        "<current_datetime>2026-08-23T09:57:59.792+02:00</current_datetime>\n"
+        "\n"
+        "Please update the PR desc and check .overlay/ for hints."
+    )
+    result = ContentRouter().compress(prompt)
+    assert result.strategy_used is not CompressionStrategy.SEARCH
+    assert "Please update the PR desc" in result.compressed

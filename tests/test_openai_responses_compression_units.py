@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
 import threading
 from types import MethodType, SimpleNamespace
+
+import pytest
 
 from headroom.proxy.handlers import openai as openai_handler
 from headroom.proxy.handlers.openai import OpenAIHandlerMixin
@@ -822,6 +825,44 @@ def test_openai_responses_adapter_losslessly_folds_excluded_grep_output_content_
     assert folded_list[1]["image_url"] == "https://example.com/img.png"
     assert folded_list[2]["type"] == "refusal"
     assert folded_list[2]["refusal"] == "I cannot process this request"
+
+
+@pytest.mark.parametrize("tool", ["read", "Read"])
+@pytest.mark.parametrize("as_content_part", [False, True], ids=["plain", "content_part"])
+def test_openai_responses_adapter_never_folds_a_file_read(tool, as_content_part):
+    """A file read stays byte-exact on the Responses wire too.
+
+    This is the Codex wire, where `read` genuinely returns raw file bytes rather
+    than Claude Code's `cat -n` rendering — so it is the shape where folding a
+    read really does destroy the `Edit(old_string=…)` anchor the model is about
+    to type. See DEFAULT_BYTE_EXACT_EXCLUDE_TOOLS. The grep folds above must keep
+    working; only reads opt out.
+    """
+    router = ContentRouter()
+    handler = _handler_with_router(router)
+    # Pretty-printed JSON: json-min is the fold that used to eat this.
+    file_bytes = json.dumps(
+        {"deps": [{"name": f"pkg{i}", "version": "1.0.0"} for i in range(40)]}, indent=2
+    )
+    output = [{"type": "output_text", "text": file_bytes}] if as_content_part else file_bytes
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            {"type": "function_call", "call_id": "call_1", "name": tool, "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": output},
+        ],
+    }
+
+    new_payload, _modified, _saved, transforms, _units, _chain, _attempted = (
+        handler._compress_openai_responses_live_text_units_with_router(
+            payload,
+            model="gpt-5",
+            request_id=f"req_read_verbatim_{tool}_{as_content_part}",
+        )
+    )
+
+    assert "router:excluded:lossless" not in transforms
+    assert new_payload["input"][1]["output"] == output
 
 
 def test_openai_responses_adapter_excludes_tool_case_insensitively_with_debug(monkeypatch):

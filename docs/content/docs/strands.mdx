@@ -108,6 +108,8 @@ The model wrapper uses the full Headroom pipeline (CacheAligner, ContentRouter).
 
 ## Structured output
 
+`structured_output()` is an async generator (it delegates to the wrapped model's own `structured_output()`), so it must be consumed with `async for`:
+
 ```python
 from pydantic import BaseModel
 
@@ -116,7 +118,8 @@ class Analysis(BaseModel):
     root_cause: str
     recommendation: str
 
-result = optimized.structured_output(Analysis, messages)
+async for event in optimized.structured_output(Analysis, messages):
+    result = event
 ```
 
 ## Metrics

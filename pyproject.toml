@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "headroom-ai"
-version = "0.36.5"
+version = "0.37.0"
 description = "The Context Optimization Layer for LLM Applications - Cut costs by 50-90%"
 readme = "README.md"
 license = "Apache-2.0"
@@ -219,6 +219,14 @@ langchain = [
     "langchain-core>=1.3.3,<4.0",
     "langchain-openai>=1.1.14,<2.0",
 ]
+# LangGraph integration (headroom.integrations.langchain.langgraph)
+# LangGraph ships its own langchain-core pin, so this only adds langgraph itself
+# on top of the langchain extra.
+langgraph = [
+    "langchain-core>=1.3.3,<4.0",
+    "langchain-openai>=1.1.14,<2.0",
+    "langgraph>=1.0,<2.0",
+]
 # Agno agent framework integration
 agno = [
     "agno>=1.0.0",
@@ -338,17 +346,18 @@ sandbox = [
 
 [project.scripts]
 headroom = "headroom.cli:main"
+headroom-cache-ttl = "headroom.cache.ttl_estimator:main"
 
 [project.urls]
-Homepage = "https://headroom-docs.vercel.app"
-Documentation = "https://headroom-docs.vercel.app/docs"
-Repository = "https://github.com/chopratejas/headroom"
-Issues = "https://github.com/chopratejas/headroom/issues"
-Changelog = "https://github.com/chopratejas/headroom/blob/main/CHANGELOG.md"
+Homepage = "https://docs.headroomlabs.ai"
+Documentation = "https://docs.headroomlabs.ai/docs"
+Repository = "https://github.com/headroomlabs-ai/headroom"
+Issues = "https://github.com/headroomlabs-ai/headroom/issues"
+Changelog = "https://github.com/headroomlabs-ai/headroom/blob/main/CHANGELOG.md"
 # llms.txt convention (llmstxt.org) — point AI agents / LLM crawlers
 # at the auto-generated docs index so they can resolve install paths
 # and entry points without a follow-up fetch.
-"AI / LLM Index" = "https://headroom-docs.vercel.app/llms.txt"
+"AI / LLM Index" = "https://docs.headroomlabs.ai/llms.txt"
 
 # Maturin builds a single wheel containing both the Python source under
 # `headroom/` AND the compiled Rust extension `headroom/_core.so` (cdylib

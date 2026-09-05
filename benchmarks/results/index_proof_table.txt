@@ -1,0 +1,32 @@
+Native content detection requires ONNX Runtime 1.24+; using pure-Python detection for this process.
+seed=20260902  model=gpt-5.6  tokenizer=TiktokenCounter
+
+=== default (protect_recent=4) ===
+Scenario                           Before      After   Savings
+--------------------------------------------------------------
+Code search (100 results)          17,199     13,597       21%
+SRE incident debugging             55,957     24,340       57%
+Codebase exploration               58,801     33,895       42%
+GitHub issue triage                46,067     32,429       30%
+--------------------------------------------------------------
+TOTAL                             178,024    104,261       41%
+
+=== full corpus (protect_recent=0) ===
+Scenario                           Before      After   Savings
+--------------------------------------------------------------
+Code search (100 results)          17,199     13,597       21%
+SRE incident debugging             55,957     24,340       57%
+Codebase exploration               58,801     33,895       42%
+GitHub issue triage                46,067     32,429       30%
+--------------------------------------------------------------
+TOTAL                             178,024    104,261       41%
+
+
+Markdown for docs/content/docs/index.mdx (full-corpus config, which must be stated on the page):
+
+| Scenario | Before | After | Savings |
+|---|---|---|---|
+| Code search (100 results) | 17,199 | 13,597 | **21%** |
+| SRE incident debugging | 55,957 | 24,340 | **57%** |
+| Codebase exploration | 58,801 | 33,895 | **42%** |
+| GitHub issue triage | 46,067 | 32,429 | **30%** |

@@ -920,7 +920,7 @@ def sample_messages_with_tools():
     ]
 
 
-# --- Anthropic tool_result content blocks (chopratejas/headroom#813) ---
+# --- Anthropic tool_result content blocks (headroomlabs-ai/headroom#813) ---
 
 
 @pytest.fixture

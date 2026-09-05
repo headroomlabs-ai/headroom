@@ -156,7 +156,8 @@ const result = {
   tokensBefore: 45000,
   tokensAfter: 4500,
   tokensSaved: 40500,
-  compressionRatio: 0.9,
+  // compressionRatio is tokensAfter / tokensBefore, so savings is 1 - ratio.
+  compressionRatio: 0.1,
   transformsApplied: ['smart_crusher', 'cache_aligner'],
   messages: [],
   ccrHashes: [],
@@ -166,7 +167,7 @@ const result = {
 console.log(`Tokens before: ${result.tokensBefore}`);
 console.log(`Tokens after:  ${result.tokensAfter}`);
 console.log(`Tokens saved:  ${result.tokensSaved}`);
-console.log(`Compression:   ${(result.compressionRatio * 100).toFixed(0)}%`);
+console.log(`Compression:   ${((1 - result.compressionRatio) * 100).toFixed(0)}%`);
 console.log(`Transforms:    ${result.transformsApplied.join(', ')}`);
 ```
 
@@ -236,11 +237,14 @@ The biggest savings come from tool outputs -- search results, database rows, log
 
 | Content type | Compressor | Typical savings |
 |---|---|---|
-| JSON arrays | SmartCrusher | 70--90% |
-| Source code | CodeCompressor | 40--70% |
-| Build/test logs | LogCompressor | 80--95% |
-| Search results | SearchCompressor | 60--80% |
-| Plain text | Kompress | 30--50% |
+| JSON arrays | SmartCrusher | varies with array size and redundancy |
+| Source code | CodeCompressor | opt-in; disabled by default |
+| Build/test logs | LogCompressor | varies with log verbosity |
+| Search results | SearchCompressor | varies with result set size |
+| Plain text | Kompress | varies with redundancy |
+
+Savings depend heavily on how repetitive the content is -- see
+[Benchmarks](/docs/benchmarks) for measured numbers on real workloads.
 
 ## Next steps
 

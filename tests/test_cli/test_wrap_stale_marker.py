@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import signal
 from pathlib import Path
+
+import pytest
 
 from headroom.cli import doctor as doctor_cli
 from headroom.cli import wrap as wrap_cli
@@ -49,4 +52,19 @@ def test_claude_command_registers_sighup_next_to_sigterm() -> None:
 
     src = inspect.getsource(wrap_cli.claude.callback)
     assert 'hasattr(signal, "SIGHUP")' in src
-    assert "signal.signal(signal.SIGHUP, cleanup)" in src
+    assert "signal.signal(signal.SIGHUP, _exit_on_signal)" in src
+    assert "signal.signal(signal.SIGTERM, _exit_on_signal)" in src
+
+
+def test_signal_handler_unwinds_so_the_restore_can_run() -> None:
+    """Registering `cleanup` directly never achieved what #1768 wanted.
+
+    A Python signal handler that returns normally does not unwind the stack --
+    under PEP 475 the interrupted `waitpid` is simply retried -- so the finally
+    block that restores settings.local.json never ran, while the handler had
+    already torn the proxy down under a live child. The handler must raise.
+    """
+    with pytest.raises(SystemExit) as excinfo:
+        wrap_cli._exit_on_signal(signal.SIGHUP, None)
+
+    assert excinfo.value.code == 128 + signal.SIGHUP
