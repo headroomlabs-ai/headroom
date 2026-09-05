@@ -285,20 +285,20 @@ class TestDescriptorParity:
         # Round-trip bob's own values through the coercers: output must equal
         # the dataclass values, pinning types (tuples, EnvVar) not just names.
         bob = wr.WRAP_TARGETS["bob"]
-        assert wr._TARGET_FIELDS["binaries"].coerce(list(bob.binaries)) == bob.binaries
+        assert wr._TARGET_FIELDS["binaries"](list(bob.binaries)) == bob.binaries
         assert (
-            wr._TARGET_FIELDS["env_vars"].coerce(
+            wr._TARGET_FIELDS["env_vars"](
                 [{"key": v.key, "style": v.style, "display": v.display} for v in bob.env_vars]
             )
             == bob.env_vars
         )
         assert (
-            wr._TARGET_FIELDS["origin_passthrough_strip_json_keys"].coerce(
+            wr._TARGET_FIELDS["origin_passthrough_strip_json_keys"](
                 [list(pair) for pair in bob.origin_passthrough_strip_json_keys]
             )
             == bob.origin_passthrough_strip_json_keys
         )
-        assert wr._TARGET_FIELDS["default_mode"].coerce(bob.default_mode) == bob.default_mode
+        assert wr._TARGET_FIELDS["default_mode"](bob.default_mode) == bob.default_mode
 
 
 class TestProxyReuseWarnings:
@@ -380,7 +380,7 @@ class TestCliSurface:
         write_config(config_dir, {"version": 1, "targets": {"bob": {"default_mode": "cache"}}})
         result = CliRunner().invoke(wrap, ["targets"])
         assert result.exit_code == 0, result.output
-        assert "overridden: default_mode (mode)" in result.output
+        assert "overridden: default_mode" in result.output
         assert "default_mode=cache" in result.output
 
     def test_targets_command_fails_on_bad_entry(self, config_dir):

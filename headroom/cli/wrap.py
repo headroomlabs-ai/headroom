@@ -8205,9 +8205,9 @@ def _make_registry_command(target: WrapTarget) -> click.Command:
         verbose: bool,
         prepare_only: bool,
         tool_args: tuple,
-        backend: str | None = None,
-        anyllm_provider: str | None = None,
-        region: str | None = None,
+        backend: str | None,
+        anyllm_provider: str | None,
+        region: str | None,
     ) -> None:
         if prepare_only:
             return
@@ -8246,11 +8246,11 @@ def _make_registry_command(target: WrapTarget) -> click.Command:
             env=env,
             port=port,
             no_proxy=no_proxy,
-            tool_label=run_target.tool_label,
+            tool_label=run_target.name.upper(),
             env_vars_display=env_vars_display,
             learn=learn,
             memory=memory,
-            agent_type=run_target.agent_type,
+            agent_type=run_target.name,
             code_graph=code_graph,
             backend=backend,
             anyllm_provider=anyllm_provider,
@@ -8270,18 +8270,13 @@ def _make_registry_command(target: WrapTarget) -> click.Command:
         ),
         click.option("--prepare-only", is_flag=True, hidden=True),
         click.option("--verbose", "-v", is_flag=True, help="Verbose output"),
-    ]
-    if target.backend_options:
-        decorators += [
-            click.option("--region", default=None, help="Cloud region for Vertex/Bedrock backends"),
-            click.option("--anyllm-provider", default=None, help="Provider for any-llm backend"),
-            click.option(
-                "--backend",
-                default=None,
-                help="API backend for the proxy: 'anthropic' (default), 'litellm-openai', etc.",
-            ),
-        ]
-    decorators += [
+        click.option("--region", default=None, help="Cloud region for Vertex/Bedrock backends"),
+        click.option("--anyllm-provider", default=None, help="Provider for any-llm backend"),
+        click.option(
+            "--backend",
+            default=None,
+            help="API backend for the proxy: 'anthropic' (default), 'litellm-openai', etc.",
+        ),
         click.option("--memory", is_flag=True, help="Enable persistent cross-session memory"),
         click.option("--learn", is_flag=True, help="Enable live traffic learning"),
         click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)"),

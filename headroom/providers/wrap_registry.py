@@ -50,6 +50,7 @@ are accepted only as overrides of built-in targets. Validate with
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import logging
@@ -114,8 +115,6 @@ class WrapTarget:
     # Upstream defaults handed to the proxy at startup.
     openai_api_url: str | None = None
     anthropic_api_url: str | None = None
-    # Whether the generated command exposes --backend/--anyllm-provider/--region.
-    backend_options: bool = True
     # Nonstandard chat-completions paths the tool posts to. Each is registered
     # as a proxy route delegating to ``handle_openai_chat`` (see
     # ``route_specs.OPENAI_HANDLER_ROUTES``) so the traffic is compressed
@@ -145,14 +144,6 @@ class WrapTarget:
     # invocation args (`headroom wrap bob -- ...`). Prepended, not appended,
     # so per-invocation args win under the usual last-flag-wins CLI rule.
     default_args: tuple[str, ...] = ()
-    agent_type: str = ""
-    tool_label: str = ""
-
-    def __post_init__(self) -> None:
-        if not self.agent_type:
-            object.__setattr__(self, "agent_type", self.name)
-        if not self.tool_label:
-            object.__setattr__(self, "tool_label", self.name.upper())
 
 
 def build_launch_env(
@@ -312,16 +303,11 @@ def get_wrap_target(name: str) -> WrapTarget:
 
 WRAP_TARGETS_CONFIG_VERSION = 1
 
-# Effect classes label what changing a field actually does, so validation
-# output (``headroom wrap targets``, doctor) can say more than "value set":
-#   data         — display/launch metadata, no cross-cutting behavior
-#   launch_env   — changes the environment handed to the launched tool
-#   launch_args  — CLI args prepended to every launch of the tool
-#   upstream     — changes where the proxy sends traffic
-#   mode         — changes the proxy mode a fresh proxy boots with
-#   proxy_route  — adds compressed-chat routes to the proxy's route table
-#   proxy_rewrite— changes passthrough forwarding / response rewriting
-_BEHAVIOR_CROSSING_EFFECTS = frozenset({"proxy_route", "proxy_rewrite"})
+# Fields that change proxy routing/rewriting; accepted only as overrides of
+# built-in targets, never on config-defined new ones.
+_NEW_TARGET_FORBIDDEN = frozenset(
+    {"extra_chat_routes", "origin_passthrough_prefixes", "origin_passthrough_strip_json_keys"}
+)
 
 
 def _coerce_str(value: object) -> str:
@@ -411,37 +397,22 @@ def _coerce_mode(value: object) -> str:
     return decision.normalized
 
 
-@dataclass(frozen=True, slots=True)
-class TargetField:
-    """Descriptor for one configurable :class:`WrapTarget` field."""
-
-    name: str
-    effect: str
-    coerce: Callable[[object], object]
-
-
-# One descriptor per WrapTarget field except ``name`` (the JSON key). A test
+# One coercer per WrapTarget field except ``name`` (the JSON key). A test
 # pins parity with the dataclass so a field added there cannot silently
 # become unconfigurable — or configurable without validation.
-_TARGET_FIELDS: dict[str, TargetField] = {
-    f.name: f
-    for f in (
-        TargetField("binaries", "data", _coerce_nonempty_str_tuple),
-        TargetField("install_hint", "data", _coerce_str),
-        TargetField("env_vars", "launch_env", _coerce_env_vars),
-        TargetField("help_text", "data", _coerce_str),
-        TargetField("project_prefix", "launch_env", _coerce_bool),
-        TargetField("openai_api_url", "upstream", _coerce_opt_str),
-        TargetField("anthropic_api_url", "upstream", _coerce_opt_str),
-        TargetField("backend_options", "data", _coerce_bool),
-        TargetField("extra_chat_routes", "proxy_route", _coerce_route_tuple),
-        TargetField("origin_passthrough_prefixes", "proxy_rewrite", _coerce_route_tuple),
-        TargetField("origin_passthrough_strip_json_keys", "proxy_rewrite", _coerce_strip_keys),
-        TargetField("default_mode", "mode", _coerce_mode),
-        TargetField("default_args", "launch_args", _coerce_args_tuple),
-        TargetField("agent_type", "data", _coerce_str),
-        TargetField("tool_label", "data", _coerce_str),
-    )
+_TARGET_FIELDS: dict[str, Callable[[object], object]] = {
+    "binaries": _coerce_nonempty_str_tuple,
+    "install_hint": _coerce_str,
+    "env_vars": _coerce_env_vars,
+    "help_text": _coerce_str,
+    "project_prefix": _coerce_bool,
+    "openai_api_url": _coerce_opt_str,
+    "anthropic_api_url": _coerce_opt_str,
+    "extra_chat_routes": _coerce_route_tuple,
+    "origin_passthrough_prefixes": _coerce_route_tuple,
+    "origin_passthrough_strip_json_keys": _coerce_strip_keys,
+    "default_mode": _coerce_mode,
+    "default_args": _coerce_args_tuple,
 }
 
 _NEW_TARGET_REQUIRED = ("binaries", "install_hint", "env_vars")
@@ -453,7 +424,7 @@ class TargetOutcome:
 
     name: str
     action: str  # "overridden" | "added" | "skipped"
-    fields: tuple[str, ...] = ()  # fields applied (with effect class in report)
+    fields: tuple[str, ...] = ()  # fields applied
     errors: tuple[str, ...] = ()
 
 
@@ -482,18 +453,18 @@ def _validate_target_section(
     errors: list[str] = []
     coerced: dict[str, object] = {}
     for key, raw in section.items():
-        descriptor = _TARGET_FIELDS.get(key)
-        if descriptor is None:
+        coerce = _TARGET_FIELDS.get(key)
+        if coerce is None:
             errors.append(f"unknown field {key!r}")
             continue
-        if base is None and descriptor.effect in _BEHAVIOR_CROSSING_EFFECTS:
+        if base is None and key in _NEW_TARGET_FORBIDDEN:
             errors.append(
                 f"{key!r} affects proxy routing and is only allowed when "
                 "overriding a built-in target, not on new targets"
             )
             continue
         try:
-            coerced[key] = descriptor.coerce(raw)
+            coerced[key] = coerce(raw)
         except (ValueError, TypeError) as exc:
             # TypeError covers JSON shapes a coercer did not anticipate (e.g.
             # a list where a string belongs); fail-open must hold regardless.
@@ -507,36 +478,26 @@ def _validate_target_section(
     if errors:
         return base, TargetOutcome(name, "skipped", errors=tuple(errors))
     if base is not None:
-        applied = tuple(f"{k} ({_TARGET_FIELDS[k].effect})" for k in coerced)
-        # Values are validated per-field by the descriptor coercers above;
-        # mypy cannot see through the dict[str, object] to the field types.
+        # Values are validated per-field by the coercers above; mypy cannot
+        # see through the dict[str, object] to the field types.
         return (
             dataclass_replace(base, **coerced),  # type: ignore[arg-type]
-            TargetOutcome(name, "overridden", applied),
+            TargetOutcome(name, "overridden", tuple(coerced)),
         )
     coerced.setdefault(
         "help_text", f"Launch {name} through Headroom proxy.\n(defined in wrap_targets.json)"
     )
     target = WrapTarget(name=name, **coerced)  # type: ignore[arg-type]
-    applied = tuple(f"{k} ({_TARGET_FIELDS[k].effect})" for k in coerced)
-    return target, TargetOutcome(name, "added", applied)
+    return target, TargetOutcome(name, "added", tuple(coerced))
 
 
-@dataclass(frozen=True, slots=True)
-class _Resolution:
-    targets: dict[str, WrapTarget]
-    status: OverlayStatus
-
-
-_RESOLUTION: _Resolution | None = None
-
-
-def _resolve() -> _Resolution:
-    """Merge code defaults with wrap_targets.json (read-if-exists, fail-open)."""
+@functools.cache
+def _resolve() -> tuple[dict[str, WrapTarget], OverlayStatus]:
+    """Merge code defaults with wrap_targets.json (read-if-exists, fail-open); cached."""
     path = _paths.wrap_targets_config_path()
     # Stat guard: the no-config common case does no parsing and no copying.
     if not path.exists():
-        return _Resolution(WRAP_TARGETS, OverlayStatus(str(path), False, None, (), ()))
+        return WRAP_TARGETS, OverlayStatus(str(path), False, None, (), ())
 
     warnings: list[str] = []
     outcomes: list[TargetOutcome] = []
@@ -562,10 +523,7 @@ def _resolve() -> _Resolution:
         # Fail-open: the whole file is rejected loudly; built-ins stay intact.
         warnings.append(f"{path}: {exc}")
         logger.warning("wrap_targets config ignored: %s: %s", path, exc)
-        return _Resolution(
-            WRAP_TARGETS,
-            OverlayStatus(str(path), True, fingerprint, tuple(warnings), ()),
-        )
+        return WRAP_TARGETS, OverlayStatus(str(path), True, fingerprint, tuple(warnings), ())
 
     resolved = dict(WRAP_TARGETS)
     for name, entry in section.items():
@@ -578,24 +536,17 @@ def _resolve() -> _Resolution:
             )
         elif target is not None:
             resolved[name] = target
-    return _Resolution(
-        resolved, OverlayStatus(str(path), True, fingerprint, tuple(warnings), tuple(outcomes))
-    )
+    return resolved, OverlayStatus(str(path), True, fingerprint, tuple(warnings), tuple(outcomes))
 
 
 def resolved_wrap_targets() -> dict[str, WrapTarget]:
     """Effective registry: code defaults + wrap_targets.json overlay, cached."""
-    global _RESOLUTION
-    if _RESOLUTION is None:
-        _RESOLUTION = _resolve()
-    return _RESOLUTION.targets
+    return _resolve()[0]
 
 
 def wrap_targets_overlay_status() -> OverlayStatus:
     """Resolution report for validation front doors (wrap targets, doctor)."""
-    resolved_wrap_targets()
-    assert _RESOLUTION is not None
-    return _RESOLUTION.status
+    return _resolve()[1]
 
 
 def wrap_targets_config_fingerprint() -> str | None:
@@ -618,9 +569,8 @@ def current_wrap_targets_file_fingerprint() -> str | None:
 
 def _reset_wrap_targets_cache() -> None:
     """Testing hook: drop the cached resolution (and derived origin index)."""
-    global _RESOLUTION, _ORIGIN_INDEX
-    _RESOLUTION = None
-    _ORIGIN_INDEX = None
+    _resolve.cache_clear()
+    _origin_index.cache_clear()
 
 
 # ---------------------------------------------------------------------------
@@ -634,34 +584,27 @@ class _OriginRules:
     strip_keys: tuple[tuple[str, str], ...]
 
 
-_ORIGIN_INDEX: dict[tuple[str, str], _OriginRules] | None = None
-
-
+@functools.cache
 def _origin_index() -> dict[tuple[str, str], _OriginRules]:
     """(scheme, netloc) -> passthrough rules, built once per process."""
-    global _ORIGIN_INDEX
-    if _ORIGIN_INDEX is None:
-        from urllib.parse import urlsplit
+    from urllib.parse import urlsplit
 
-        index: dict[tuple[str, str], _OriginRules] = {}
-        for target in resolved_wrap_targets().values():
-            if not target.openai_api_url:
-                continue
-            if not (
-                target.origin_passthrough_prefixes or target.origin_passthrough_strip_json_keys
-            ):
-                continue
-            declared = urlsplit(target.openai_api_url)
-            host = (declared.scheme, declared.netloc)
-            existing = index.get(host)
-            prefixes = target.origin_passthrough_prefixes
-            strip_keys = target.origin_passthrough_strip_json_keys
-            if existing is not None:
-                prefixes = existing.prefixes + prefixes
-                strip_keys = existing.strip_keys + strip_keys
-            index[host] = _OriginRules(prefixes, strip_keys)
-        _ORIGIN_INDEX = index
-    return _ORIGIN_INDEX
+    index: dict[tuple[str, str], _OriginRules] = {}
+    for target in resolved_wrap_targets().values():
+        if not target.openai_api_url:
+            continue
+        if not (target.origin_passthrough_prefixes or target.origin_passthrough_strip_json_keys):
+            continue
+        declared = urlsplit(target.openai_api_url)
+        host = (declared.scheme, declared.netloc)
+        existing = index.get(host)
+        prefixes = target.origin_passthrough_prefixes
+        strip_keys = target.origin_passthrough_strip_json_keys
+        if existing is not None:
+            prefixes = existing.prefixes + prefixes
+            strip_keys = existing.strip_keys + strip_keys
+        index[host] = _OriginRules(prefixes, strip_keys)
+    return index
 
 
 def resolve_origin_passthrough_url(base_url: str | None, path: str) -> str | None:
