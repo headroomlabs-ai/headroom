@@ -99,6 +99,7 @@ class WarmupRegistry:
     code_aware: WarmupSlot = field(default_factory=WarmupSlot)
     tree_sitter: WarmupSlot = field(default_factory=WarmupSlot)
     smart_crusher: WarmupSlot = field(default_factory=WarmupSlot)
+    image: WarmupSlot = field(default_factory=WarmupSlot)
     memory_backend: WarmupSlot = field(default_factory=WarmupSlot)
     memory_embedder: WarmupSlot = field(default_factory=WarmupSlot)
 
@@ -139,6 +140,7 @@ class WarmupRegistry:
             "code_aware": self.code_aware.to_dict(),
             "tree_sitter": self.tree_sitter.to_dict(),
             "smart_crusher": self.smart_crusher.to_dict(),
+            "image": self.image.to_dict(),
             "memory_backend": self.memory_backend.to_dict(),
             "memory_embedder": self.memory_embedder.to_dict(),
         }

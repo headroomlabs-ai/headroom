@@ -1519,6 +1519,19 @@ _image_compressor_available: bool | None = None
 _image_compressor_instance: Any = None
 
 
+def image_optimizer_disabled() -> bool:
+    """Whether the image optimizer is turned off via env var.
+
+    ``HEADROOM_DISABLE_IMAGE_OPTIMIZER`` lets an operator disable the image
+    optimization stack without a code change or rebuild. Mirrors the truthy
+    set used by the proxy's other boolean env vars.
+    """
+    val = os.environ.get("HEADROOM_DISABLE_IMAGE_OPTIMIZER")
+    if val is None:
+        return False
+    return val.lower() in ("true", "1", "yes", "on")
+
+
 def _get_image_compressor():
     """Return the process-wide image compressor, or None if unavailable.
 
@@ -1531,6 +1544,8 @@ def _get_image_compressor():
     fresh object per request.
     """
     global _image_compressor_available, _image_compressor_instance
+    if image_optimizer_disabled():
+        return None
     if _image_compressor_available is False:
         return None
     if _image_compressor_instance is not None:
