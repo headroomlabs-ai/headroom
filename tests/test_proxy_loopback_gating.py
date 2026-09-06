@@ -112,7 +112,9 @@ def test_toin_pattern_detail_whitelists_learned_payload(monkeypatch: pytest.Monk
             }
 
     monkeypatch.setattr("headroom.proxy.server.get_toin", lambda: FakeTOIN())
-    response = _loopback_client().get("/v1/toin/pattern/unknown")
+    # The detail endpoint addresses a pattern by its tool-signature hash (the
+    # third "auth|model|hash" component), not a prefix of the composite key.
+    response = _loopback_client().get("/v1/toin/pattern/abc123")
 
     assert response.status_code == 200
     assert response.json() == {
@@ -123,6 +125,58 @@ def test_toin_pattern_detail_whitelists_learned_payload(monkeypatch: pytest.Monk
         "skip_recommended": False,
         "optimal_max_items": 20,
     }
+
+
+def test_toin_patterns_hash_identifies_signature_not_composite_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Two patterns sharing auth_mode and model_family but with distinct tool
+    # signatures. Truncating the whole "auth|model|hash" key reported the same
+    # "unknown|unkn" identifier for both; the identifier must be the signature
+    # component so the two remain addressable.
+    class FakeTOIN:
+        def export_patterns(self):
+            return {
+                "patterns": {
+                    "unknown|unknown|aaaa1111bbbb": {"sample_size": 10},
+                    "unknown|unknown|cccc2222dddd": {"sample_size": 5},
+                }
+            }
+
+    monkeypatch.setattr("headroom.proxy.server.get_toin", lambda: FakeTOIN())
+    body = _loopback_client().get("/v1/toin/patterns").json()
+
+    hashes = [entry["hash"] for entry in body]
+    assert hashes == ["aaaa1111bbbb", "cccc2222dddd"]  # sorted by sample_size
+    assert len(set(hashes)) == 2, "distinct patterns must not share an identifier"
+
+
+def test_toin_pattern_hash_round_trips_to_detail(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The identifier from /v1/toin/patterns must resolve to the *same* pattern
+    # at /v1/toin/pattern/{hash}, not an arbitrary first-iterated one.
+    class FakeTOIN:
+        def export_patterns(self):
+            return {
+                "patterns": {
+                    "unknown|unknown|aaaa1111bbbb": {
+                        "sample_size": 10,
+                        "total_compressions": 8,
+                    },
+                    "unknown|unknown|cccc2222dddd": {
+                        "sample_size": 5,
+                        "total_compressions": 3,
+                    },
+                }
+            }
+
+    monkeypatch.setattr("headroom.proxy.server.get_toin", lambda: FakeTOIN())
+    client = _loopback_client()
+
+    listed = client.get("/v1/toin/patterns").json()
+    second = next(e for e in listed if e["hash"] == "cccc2222dddd")
+    detail = client.get(f"/v1/toin/pattern/{second['hash']}").json()
+
+    assert detail["compressions"] == 3  # the second pattern, not the first
 
 
 # Mutating routes reachable from loopback. `require_loopback` cannot stop a

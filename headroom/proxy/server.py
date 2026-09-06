@@ -184,7 +184,7 @@ from headroom.subscription.tracker import (
 )
 from headroom.telemetry import get_telemetry_collector
 from headroom.telemetry.beacon import is_telemetry_enabled
-from headroom.telemetry.toin import get_toin
+from headroom.telemetry.toin import get_toin, pattern_key_sig_hash
 from headroom.transforms import (
     CacheAligner,
     CodeAwareCompressor,
@@ -5219,7 +5219,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
             patterns_list.append(
                 {
-                    "hash": sig_hash[:12],
+                    # `sig_hash` here is the full "auth|model|hash" aggregation
+                    # key; the identifier must be the tool-signature component,
+                    # not a prefix of the whole key (which collides across every
+                    # pattern sharing an auth mode and model family).
+                    "hash": pattern_key_sig_hash(sig_hash)[:12],
                     "compressions": total_compressions,
                     "retrievals": total_retrievals,
                     "retrieval_rate": f"{retrieval_rate:.1%}",
@@ -5255,9 +5259,13 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         exported = toin.export_patterns()
         patterns_data = exported.get("patterns", {})
 
-        # Search for pattern with matching hash prefix
+        # Search for the pattern whose tool-signature hash matches the prefix.
+        # Match on the signature component of the composite key so the
+        # identifier from /v1/toin/patterns round-trips here; matching the whole
+        # "auth|model|hash" key would resolve an "unknown" prefix to an
+        # arbitrary pattern.
         for sig_hash, pattern_dict in patterns_data.items():
-            if sig_hash.startswith(hash_prefix):
+            if pattern_key_sig_hash(sig_hash).startswith(hash_prefix):
                 # Keep this response aligned with /v1/toin/patterns while
                 # excluding query text, field semantics, and other internal
                 # learning state from the detail endpoint.
