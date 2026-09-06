@@ -206,7 +206,9 @@ class CCRToolInjector:
             #
             # Standard format: [N <type> compressed to M. Retrieve more: hash=xxx]
             # Matches items, lines, matches, or any other type
-            re.compile(r"\[(\d+) \w+ compressed to (\d+)\. Retrieve more: hash=([a-f0-9]{24})\]"),
+            re.compile(
+                r"\[(\d+) \w+ compressed to (\d+)(?: \([^)]+\))?\.(?: Original content preserved\.)? Retrieve more: hash=([a-f0-9]{24})\]"
+            ),
             # Legacy format without "to M" or "Retrieve more:" (old TextCompressor)
             re.compile(r"\[(\d+) \w+ compressed\. hash=([a-f0-9]{24})\]"),
             # Generic fallback: any bracket compression marker with hash (exactly 24 chars)

@@ -1310,6 +1310,7 @@ def ccr_retrieval_marker(
     return (
         f"\n[{n_words} words compressed to {compressed_count}"
         f" (from {source_lines} source {line_word})."
+        " Original content preserved."
         f" Retrieve more: hash={cache_key}]"
     )
 
