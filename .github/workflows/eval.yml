@@ -9,6 +9,9 @@ on:
       - 'headroom/transforms/**'
       - 'headroom/evals/**'
       - 'headroom/compress.py'
+      - 'crates/**'          # Rust compressors are compiled into headroom._core
+      - 'Cargo.toml'         # and exercised by the eval smoke test (SmartCrusher
+      - 'Cargo.lock'         # import in the smoke-test job); Rust-only PRs currently skip it
 
 jobs:
   # Fast smoke test on PRs touching compression code (~$0.05, ~2 min)
