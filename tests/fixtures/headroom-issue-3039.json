@@ -1,0 +1,3 @@
+{
+  "body": "## Reproduction\n\n```console\n$ env -i HOME=\"$HOME\" PATH=/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin /bin/sh -c 'headroom init hook ensure'\n/bin/sh: headroom: command not found\n```\n"
+}

@@ -53,3 +53,27 @@ def test_plugin_metadata_points_to_upstream_repo() -> None:
     assert claude["author"]["url"] == expected_repo
     assert claude["homepage"] == expected_repo
     assert claude["repository"] == expected_repo
+
+
+def test_plugin_hooks_share_anchored_launcher_and_rootless_tail() -> None:
+    hooks = _load_json("plugins/headroom-agent-hooks/hooks/hooks.json")
+    assert isinstance(hooks, dict)
+    commands = [
+        entry["hooks"][0]["command"] for entries in hooks["hooks"].values() for entry in entries
+    ]
+    expected = (
+        'sh -c \'[ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && launcher="${CLAUDE_PLUGIN_ROOT}/bin/headroom-hook.sh" && '
+        '[ -r "$launcher" ] && exec sh "$launcher"; '
+        "exec headroom init hook ensure'"
+    )
+    assert commands == [expected, expected]
+    assert hooks["hooks"]["SessionStart"][0]["matcher"] == "startup|resume"
+    assert hooks["hooks"]["PreToolUse"][0]["matcher"] == "Bash|PowerShell"
+    assert all(
+        entry["hooks"][0]["timeout"] == 15
+        for entries in hooks["hooks"].values()
+        for entry in entries
+    )
+    launcher = REPO_ROOT / "plugins/headroom-agent-hooks/bin/headroom-hook.sh"
+    assert launcher.is_file()
+    assert b"\r" not in launcher.read_bytes()
