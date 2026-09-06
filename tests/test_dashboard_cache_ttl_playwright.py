@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 from pathlib import Path
@@ -36,6 +37,7 @@ def _sample_stats() -> dict:
             "input": 245_000,
             "output": 88_000,
             "saved": 143_000,
+            "proxy_compression_saved": 91_000,
             "total_before_compression": 388_000,
             "savings_percent": 36.86,
         },
@@ -172,8 +174,8 @@ def _fulfill_static_asset(route, path: str) -> bool:  # type: ignore[no-untyped-
     return True
 
 
-def _install_dashboard_routes(page: Page) -> None:
-    stats = _sample_stats()
+def _install_dashboard_routes(page: Page, stats: dict | None = None) -> None:
+    stats = copy.deepcopy(stats) if stats is not None else _sample_stats()
     history = _sample_history()
     lifetime = {"projects": {}}
     health = {"status": "healthy", "version": "0.3.0"}
@@ -245,8 +247,8 @@ def test_dashboard_per_project_setup_url_uses_current_origin() -> None:
         browser.close()
 
 
-def test_dashboard_renders_observed_ttl_metrics_and_can_capture_screenshot() -> None:
-    artifact_dir = os.environ.get("HEADROOM_PLAYWRIGHT_ARTIFACT_DIR")
+def test_dashboard_renders_observed_ttl_metrics_and_can_capture_screenshot(tmp_path: Path) -> None:
+    configured_artifact_dir = os.environ.get("HEADROOM_PLAYWRIGHT_ARTIFACT_DIR", "").strip()
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch()
@@ -259,15 +261,56 @@ def test_dashboard_renders_observed_ttl_metrics_and_can_capture_screenshot() -> 
         expect(page.get_by_test_id("ttl-bucket-headline")).to_have_text("1h leaning")
         expect(page.get_by_test_id("ttl-bucket-mix-1h-pct")).to_have_text("1h 56.0%")
         expect(page.get_by_test_id("ttl-bucket-mix-5m-pct")).to_have_text("5m 44.0%")
-        expect(page.get_by_test_id("ttl-bucket-1h-value")).to_have_text("235.0k")
-        expect(page.get_by_test_id("ttl-bucket-5m-value")).to_have_text("185.0k")
+        expect(page.get_by_test_id("ttl-bucket-mix-1h-total")).to_have_text("235.0k")
+        expect(page.get_by_test_id("ttl-bucket-mix-5m-total")).to_have_text("185.0k")
+        expect(page.get_by_test_id("ttl-bucket-1h-requests")).to_have_text("24")
+        expect(page.get_by_test_id("ttl-bucket-5m-requests")).to_have_text("18")
         expect(page.get_by_text("TTL 1h 56.0% / 5m 44.0%")).to_be_visible()
 
         screenshot_path = (
-            Path(artifact_dir) / "dashboard-cache-ttl-main.png"
-            if artifact_dir
-            else Path.cwd() / "dashboard-cache-ttl-main.png"
+            Path(configured_artifact_dir) / "dashboard-cache-ttl-main.png"
+            if configured_artifact_dir
+            else tmp_path / "dashboard-cache-ttl-main.png"
         )
         screenshot_path.parent.mkdir(parents=True, exist_ok=True)
         page.screenshot(path=str(screenshot_path), full_page=True)
+        browser.close()
+
+
+def test_dashboard_renders_ttl_request_counts_when_token_totals_are_zero() -> None:
+    stats = _sample_stats()
+    buckets = stats["prefix_cache"]["totals"]["observed_ttl_buckets"]
+    buckets["5m"]["tokens"] = 0
+    buckets["1h"]["tokens"] = 0
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch()
+        page = browser.new_page(viewport={"width": 1440, "height": 1400})
+        _install_dashboard_routes(page, stats)
+        page.goto("http://headroom.local/dashboard", wait_until="load")
+
+        ttl_metrics = page.get_by_test_id("ttl-metrics")
+        expect(ttl_metrics).to_be_visible()
+        expect(ttl_metrics.get_by_test_id("ttl-bucket-mix-1h-total")).to_have_text("235.0k")
+        expect(ttl_metrics.get_by_test_id("ttl-bucket-mix-5m-total")).to_have_text("185.0k")
+        expect(ttl_metrics.get_by_test_id("ttl-bucket-1h-requests")).to_have_text("24")
+        expect(ttl_metrics.get_by_test_id("ttl-bucket-5m-requests")).to_have_text("18")
+
+        browser.close()
+
+
+def test_dashboard_hides_ttl_metrics_when_request_counts_are_zero() -> None:
+    stats = _sample_stats()
+    buckets = stats["prefix_cache"]["totals"]["observed_ttl_buckets"]
+    for bucket in buckets.values():
+        bucket["requests"] = 0
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch()
+        page = browser.new_page(viewport={"width": 1440, "height": 1400})
+        _install_dashboard_routes(page, stats)
+        page.goto("http://headroom.local/dashboard", wait_until="load")
+
+        expect(page.get_by_test_id("ttl-metrics")).to_have_count(0)
+
         browser.close()
