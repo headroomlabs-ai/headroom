@@ -1056,17 +1056,35 @@ your responses, not to drive new actions."""
         if provider == "anthropic":
             content = response.get("content", [])
             if isinstance(content, list):
-                return [block for block in content if block.get("type") == "tool_use"]
+                return [
+                    block
+                    for block in content
+                    if isinstance(block, dict) and block.get("type") == "tool_use"
+                ]
             return []
 
         elif provider == "openai":
-            # Chat Completions format: choices[0].message.tool_calls
-            choices = response.get("choices", [])
-            if choices:
-                message = choices[0].get("message", {})
-                tc_list = list(message.get("tool_calls", []) or [])
-                if tc_list:
-                    return tc_list
+            # Chat Completions format: choices[0].message.tool_calls. Guard the
+            # first choice for dict-ness the way the sibling
+            # CCRResponseHandler._extract_assistant_message already does: an
+            # OpenAI-compatible gateway can send `choices: [null]` on a
+            # content-filtered / usage-only response, and this runs from
+            # has_memory_tool_calls, which is called outside the try that wraps
+            # the rest of memory handling — so an unguarded `choices[0].get` here
+            # would surface AttributeError to the request handler.
+            choices = response.get("choices")
+            first = choices[0] if isinstance(choices, list) and choices else None
+            if isinstance(first, dict):
+                message = first.get("message")
+                if isinstance(message, dict):
+                    # Filter to dict entries: a null / string element inside
+                    # tool_calls (which downstream immediately calls `.get` on)
+                    # would otherwise still crash detection.
+                    tc_list = [
+                        tc for tc in (message.get("tool_calls") or []) if isinstance(tc, dict)
+                    ]
+                    if tc_list:
+                        return tc_list
 
             # Responses API format: output[] with type=function_call
             output = response.get("output", [])
