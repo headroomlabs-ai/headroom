@@ -1,0 +1,28 @@
+---
+title: Agent Hooks
+description: Auto-start a durable headroom deployment when Claude Code or Copilot CLI sessions begin, via the bundled agent-hooks plugin.
+---
+
+The bundled [`plugins/headroom-agent-hooks`](https://github.com/chopratejas/headroom/tree/main/plugins/headroom-agent-hooks) plugin exposes lightweight startup hooks for **Claude Code** and **GitHub Copilot CLI**. It ensures a matching durable `headroom init` deployment exists and starts it if needed — so agents never begin work against a dead proxy.
+
+## What the hooks do
+
+Each hook runs one hidden helper:
+
+```bash
+headroom init hook ensure
+```
+
+It checks for a matching durable `headroom init` deployment and starts it if needed. The plugin registers it at two moments (15s timeout each):
+
+| Hook | Matcher | Effect |
+|------|---------|--------|
+| `SessionStart` | `startup\|resume` | deployment is ready before the first turn |
+| `PreToolUse` | `Bash\|PowerShell` | shell tools always hit a live proxy |
+
+## Install
+
+- **Claude Code**: the plugin ships a `.claude-plugin/plugin.json` manifest — install it as a Claude Code plugin from the headroom repository.
+- **GitHub Copilot CLI**: a matching `.github/plugin/plugin.json` manifest is included for Copilot's plugin mechanism.
+
+Both paths use the same `hooks/hooks.json` definitions, so behavior is identical.
