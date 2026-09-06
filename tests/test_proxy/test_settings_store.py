@@ -61,6 +61,24 @@ class TestRoundTrip:
         assert leftovers == []
         assert paths.settings_path().exists()
 
+    def test_anthropic_auto_continue_settings_round_trip(self, workspace, monkeypatch):
+        _clear_env(monkeypatch)
+        settings_store.save(
+            {
+                "anthropic_auto_continue": True,
+                "anthropic_auto_continue_max_wait_seconds": "900",
+            }
+        )
+
+        loaded = settings_store.load()
+        assert loaded == {
+            "anthropic_auto_continue": True,
+            "anthropic_auto_continue_max_wait_seconds": 900.0,
+        }
+        settings_store.apply_to_environ(loaded)
+        assert os.environ["HEADROOM_ANTHROPIC_AUTO_CONTINUE"] == "1"
+        assert os.environ["HEADROOM_ANTHROPIC_AUTO_CONTINUE_MAX_WAIT_SECONDS"] == "900.0"
+
 
 class TestValidation:
     def test_validate_accepts_env_aliases(self, workspace):

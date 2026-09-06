@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import datetime as dt
 import json
 import logging
+import re
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -31,6 +33,106 @@ from headroom.proxy.stream_output_tokens import estimate_output_tokens
 from headroom.proxy.thinking_tokens import ThinkingTokens, extract_thinking_tokens
 
 logger = logging.getLogger("headroom.proxy")
+
+_ANTHROPIC_LIMIT_STATUSES = frozenset({401, 402, 429})
+_ANTHROPIC_ISO_RESET_RE = re.compile(
+    r"wait until (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)",
+    re.IGNORECASE,
+)
+_ANTHROPIC_NAMED_RESET_RE = re.compile(
+    r"will reset on\s+([A-Za-z]+)\s+(\d{1,2})\s+at\s+"
+    r"(\d{1,2}):(\d{2})\s+(AM|PM)\s*\(UTC([+-]?\d{1,2})\)",
+    re.IGNORECASE,
+)
+_MONTHS = {
+    name: number
+    for number, name in enumerate(
+        ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"),
+        start=1,
+    )
+}
+
+
+def _anthropic_limit_reset(
+    status_code: int,
+    error_content: bytes,
+    *,
+    now: dt.datetime | None = None,
+) -> tuple[float, str] | None:
+    """Return a future Anthropic usage-limit reset as ``(seconds, display)``.
+
+    Besides Anthropic's nested 429 payload, some compatible gateways use
+    401/402, a string-valued ``error``, and a named date with a UTC offset.
+    Authentication/billing failures are not retried unless their message also
+    carries both an explicit rate-limit signal and a supported reset phrase.
+    """
+    if status_code not in _ANTHROPIC_LIMIT_STATUSES:
+        return None
+    try:
+        payload = json.loads(error_content.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    error = payload.get("error")
+    if isinstance(error, dict):
+        message = error.get("message", "")
+    elif isinstance(error, str):
+        message = error
+    else:
+        message = payload.get("message", "")
+    if not isinstance(message, str):
+        return None
+    lowered = message.lower()
+    if not ("usage limit reached" in lowered or "rate limit" in lowered):
+        return None
+
+    current = now or dt.datetime.now(dt.timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=dt.timezone.utc)
+    current = current.astimezone(dt.timezone.utc)
+
+    iso_match = _ANTHROPIC_ISO_RESET_RE.search(message)
+    if iso_match:
+        display = iso_match.group(1)
+        normalized = display[:-1] + "+00:00" if display.endswith(("Z", "z")) else display
+        try:
+            reset = dt.datetime.fromisoformat(normalized)
+        except ValueError:
+            return None
+        if reset.tzinfo is None:
+            reset = reset.replace(tzinfo=dt.timezone.utc)
+    else:
+        named_match = _ANTHROPIC_NAMED_RESET_RE.search(message)
+        if named_match is None:
+            return None
+        month_name, day, hour, minute, meridiem, offset = named_match.groups()
+        month = _MONTHS.get(month_name[:3].lower())
+        offset_hours = int(offset)
+        if month is None or not -23 <= offset_hours <= 23:
+            return None
+        hour_value = int(hour) % 12 + (12 if meridiem.upper() == "PM" else 0)
+        try:
+            reset = dt.datetime(
+                current.year,
+                month,
+                int(day),
+                hour_value,
+                int(minute),
+                tzinfo=dt.timezone(dt.timedelta(hours=offset_hours)),
+            )
+        except ValueError:
+            return None
+        if reset.astimezone(dt.timezone.utc) < current - dt.timedelta(days=30):
+            try:
+                reset = reset.replace(year=current.year + 1)
+            except ValueError:
+                return None
+        display = reset.isoformat()
+
+    seconds = (reset.astimezone(dt.timezone.utc) - current).total_seconds()
+    return (seconds, display) if seconds > 0 else None
 
 
 def _thinking_for_stream(payload: object) -> ThinkingTokens:
@@ -1440,6 +1542,8 @@ class StreamingMixin:
 
         get_codex_rate_limit_state().update_from_headers(dict(upstream_response.headers))
 
+        limit_reset: tuple[float, str] | None = None
+        error_content = b""
         if upstream_response.status_code >= 400:
             logger.warning(
                 "[%s] Forwarding upstream streaming error status=%s url=%s",
@@ -1498,32 +1602,57 @@ class StreamingMixin:
                     status_code=upstream_response.status_code,
                 )
 
-            stream_state["total_bytes"] = len(error_content)
-            await self._finalize_stream_response(
-                body=body,
-                provider=provider,
-                outcome_provider=outcome_provider,
-                model=model,
-                request_id=request_id,
-                original_tokens=original_tokens,
-                optimized_tokens=optimized_tokens,
-                tokens_saved=tokens_saved,
-                transforms_applied=transforms_applied,
-                optimization_latency=optimization_latency,
-                stream_state=stream_state,
-                start_time=start_time,
-                tags=tags,
-                pipeline_timing=pipeline_timing,
-                prefix_tracker=prefix_tracker,
-                original_messages=original_messages,
-                client=client,
-                waste_signals=waste_signals,
+            limit_reset = (
+                _anthropic_limit_reset(upstream_response.status_code, error_content)
+                if provider == "anthropic" and self.config.anthropic_auto_continue_enabled
+                else None
             )
-            self._cleanup_mid_turn_stream(session_key)
-            return Response(
-                content=error_content,
-                status_code=upstream_response.status_code,
-                headers=response_headers,
+            if (
+                limit_reset is not None
+                and limit_reset[0] > self.config.anthropic_auto_continue_max_wait_seconds
+            ):
+                logger.warning(
+                    "[%s] Anthropic usage-limit reset is %.1fs away, above the "
+                    "configured auto-continue ceiling of %.1fs; forwarding status %s",
+                    request_id,
+                    limit_reset[0],
+                    self.config.anthropic_auto_continue_max_wait_seconds,
+                    upstream_response.status_code,
+                )
+                limit_reset = None
+            if limit_reset is None:
+                stream_state["total_bytes"] = len(error_content)
+                await self._finalize_stream_response(
+                    body=body,
+                    provider=provider,
+                    outcome_provider=outcome_provider,
+                    model=model,
+                    request_id=request_id,
+                    original_tokens=original_tokens,
+                    optimized_tokens=optimized_tokens,
+                    tokens_saved=tokens_saved,
+                    transforms_applied=transforms_applied,
+                    optimization_latency=optimization_latency,
+                    stream_state=stream_state,
+                    start_time=start_time,
+                    tags=tags,
+                    pipeline_timing=pipeline_timing,
+                    prefix_tracker=prefix_tracker,
+                    original_messages=original_messages,
+                    client=client,
+                    waste_signals=waste_signals,
+                )
+                self._cleanup_mid_turn_stream(session_key)
+                return Response(
+                    content=error_content,
+                    status_code=upstream_response.status_code,
+                    headers=response_headers,
+                )
+            logger.info(
+                "[%s] Auto-continuing after Anthropic usage limit: waiting %.1fs until %s",
+                request_id,
+                limit_reset[0],
+                limit_reset[1],
             )
 
         # Forward upstream rate-limit headers to the client. We pass both the
@@ -1805,22 +1934,210 @@ class StreamingMixin:
                     yield f"event: headroom_pending_messages\ndata: {pending_event}\n\n".encode()
 
         async def _release_upstream_stream() -> None:
-            # Guarantee the upstream HTTP/2 stream is released even when the
-            # body generator above is never iterated — the client disconnected
-            # before Starlette started sending the response body (routine when a
-            # harness like Claude Code cancels or supersedes an in-flight turn),
-            # so ``generate()`` never entered its own ``aclosing`` and nothing
-            # else closes ``upstream_response``. Each such request otherwise
-            # leaks one open h2 stream; they accumulate on the pooled upstream
-            # connection until it reaches SETTINGS_MAX_CONCURRENT_STREAMS (100)
-            # and no new stream can open ("Max outbound streams is 100, 100
-            # open"), and the proxy goes unhealthy until restart (#2797).
-            # Starlette runs a response's ``background`` task after the body
-            # finishes *and* after an early client disconnect, so this fires in
-            # both cases. ``aclose()`` is idempotent, so on the normal path —
-            # where the generator already closed the stream — this is a no-op.
+            # Guarantee the active upstream HTTP/2 stream is released even when
+            # Starlette stops body iteration after a client disconnect. The
+            # auto-continue path rebinds ``upstream_response`` to its retry, so
+            # this closes whichever response is active when cleanup runs.
             with contextlib.suppress(Exception):
                 await upstream_response.aclose()
+
+        if limit_reset is not None:
+            sleep_seconds, reset_display = limit_reset
+            wait_attempt_finalized = False
+
+            async def finalize_wait_attempt() -> None:
+                """Account for a wait/retry that never reaches the normal stream finalizer."""
+                nonlocal wait_attempt_finalized
+                if wait_attempt_finalized:
+                    return
+                wait_attempt_finalized = True
+                stream_state["total_bytes"] = len(error_content)
+                await self._finalize_stream_response(
+                    body=body,
+                    provider=provider,
+                    outcome_provider=outcome_provider,
+                    model=model,
+                    request_id=request_id,
+                    original_tokens=original_tokens,
+                    optimized_tokens=optimized_tokens,
+                    tokens_saved=tokens_saved,
+                    transforms_applied=transforms_applied,
+                    optimization_latency=optimization_latency,
+                    stream_state=stream_state,
+                    start_time=start_time,
+                    tags=tags,
+                    pipeline_timing=pipeline_timing,
+                    prefix_tracker=prefix_tracker,
+                    original_messages=original_messages,
+                    client=client,
+                    waste_signals=waste_signals,
+                )
+
+            async def auto_continue_wrapper():
+                """Keep the client informed, retry once, then splice the real SSE stream."""
+                nonlocal upstream_response
+                retry_stream_started = False
+                try:
+                    message_start = {
+                        "type": "message_start",
+                        "message": {
+                            "id": "msg_headroom_wait",
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [],
+                            "model": model,
+                            "stop_reason": None,
+                            "stop_sequence": None,
+                            "usage": {"input_tokens": 0, "output_tokens": 0},
+                        },
+                    }
+                    block_start = {
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": {"type": "text", "text": ""},
+                    }
+                    wait_text = (
+                        "\n\n⏳ **Headroom**: Anthropic usage limit reached. "
+                        f"Auto-continuing in {sleep_seconds:.0f} seconds at {reset_display}...\n\n"
+                    )
+                    wait_delta = {
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {"type": "text_delta", "text": wait_text},
+                    }
+                    yield f"event: message_start\ndata: {json.dumps(message_start)}\n\n".encode()
+                    yield f"event: content_block_start\ndata: {json.dumps(block_start)}\n\n".encode()
+                    yield f"event: content_block_delta\ndata: {json.dumps(wait_delta)}\n\n".encode()
+
+                    remaining = sleep_seconds + 5.0
+                    while remaining > 0:
+                        yield b": headroom-keepalive\n\n"
+                        step = min(15.0, remaining)
+                        await asyncio.sleep(step)
+                        remaining -= step
+
+                    assert self.http_client is not None
+                    retry_request = self.http_client.build_request(
+                        "POST",
+                        url,
+                        content=outbound_bytes,
+                        headers=outbound_headers,
+                    )
+                    try:
+                        retry_response = await self.http_client.send(retry_request, stream=True)
+                    except (Exception, asyncio.CancelledError) as exc:
+                        if isinstance(exc, asyncio.CancelledError):
+                            raise
+                        logger.error(
+                            "[%s] Anthropic auto-continue retry failed: %s", request_id, exc
+                        )
+                        await finalize_wait_attempt()
+                        error_text = (
+                            "\n\n❌ Headroom could not reconnect after the usage-limit wait."
+                        )
+                        error_delta = {
+                            "type": "content_block_delta",
+                            "index": 0,
+                            "delta": {"type": "text_delta", "text": error_text},
+                        }
+                        yield f"event: content_block_delta\ndata: {json.dumps(error_delta)}\n\n".encode()
+                        yield b'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n'
+                        yield b'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":0}}\n\n'
+                        yield b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+                        return
+
+                    upstream_response = retry_response
+                    if retry_response.status_code >= 400:
+                        await retry_response.aread()
+                        await retry_response.aclose()
+                        logger.error(
+                            "[%s] Anthropic auto-continue retry returned status %s",
+                            request_id,
+                            retry_response.status_code,
+                        )
+                        await finalize_wait_attempt()
+                        error_text = (
+                            "\n\n❌ Headroom retried after the usage-limit wait, but "
+                            f"upstream returned status {retry_response.status_code}."
+                        )
+                        error_delta = {
+                            "type": "content_block_delta",
+                            "index": 0,
+                            "delta": {"type": "text_delta", "text": error_text},
+                        }
+                        yield f"event: content_block_delta\ndata: {json.dumps(error_delta)}\n\n".encode()
+                        yield b'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n'
+                        yield b'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":0}}\n\n'
+                        yield b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+                        return
+
+                    buffer = bytearray()
+                    first_block_seen = False
+                    shift_indexes = False
+
+                    def shift_index(match: re.Match[str]) -> str:
+                        return f'"index":{int(match.group(1)) + 1}'
+
+                    retry_stream_started = True
+                    async for chunk in generate():
+                        buffer.extend(chunk)
+                        while b"\n\n" in buffer:
+                            event_bytes, buffer = buffer.split(b"\n\n", 1)
+                            try:
+                                event_text = event_bytes.decode("utf-8")
+                            except UnicodeDecodeError:
+                                # Unknown/invalid upstream events are not safe to
+                                # rewrite; preserve their bytes exactly.
+                                yield bytes(event_bytes) + b"\n\n"
+                                continue
+                            if event_text.startswith("event: message_start"):
+                                continue
+                            if event_text.startswith("event: content_block_start"):
+                                if not first_block_seen:
+                                    first_block_seen = True
+                                    if (
+                                        '"type":"text"' in event_text
+                                        or '"type": "text"' in event_text
+                                    ):
+                                        continue
+                                    yield b'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n'
+                                    shift_indexes = True
+                                if shift_indexes:
+                                    event_text = re.sub(
+                                        r'"index"\s*:\s*(\d+)',
+                                        shift_index,
+                                        event_text,
+                                    )
+                                    yield f"{event_text}\n\n".encode()
+                                    continue
+                            if shift_indexes and event_text.startswith(
+                                ("event: content_block_delta", "event: content_block_stop")
+                            ):
+                                event_text = re.sub(
+                                    r'"index"\s*:\s*(\d+)',
+                                    shift_index,
+                                    event_text,
+                                )
+                                yield f"{event_text}\n\n".encode()
+                                continue
+                            yield bytes(event_bytes) + b"\n\n"
+                    if buffer:
+                        # Preserve an upstream tail even when it omits the final
+                        # SSE separator instead of silently truncating it.
+                        yield bytes(buffer)
+                except asyncio.CancelledError:
+                    if not retry_stream_started:
+                        await asyncio.shield(finalize_wait_attempt())
+                    raise
+                finally:
+                    self._cleanup_mid_turn_stream(session_key)
+
+            return StreamingResponse(
+                auto_continue_wrapper(),
+                media_type="text/event-stream",
+                headers=forwarded_headers,
+                background=BackgroundTask(_release_upstream_stream),
+            )
 
         return StreamingResponse(
             generate(),

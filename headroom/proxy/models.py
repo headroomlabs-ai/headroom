@@ -326,6 +326,11 @@ class ProxyConfig:
     retry_max_attempts: int = 3
     retry_base_delay_ms: int = 1000
     retry_max_delay_ms: int = 30000
+    # Holding an SSE request open until an Anthropic usage window resets is an
+    # explicit operator choice. The bounded ceiling prevents malformed or
+    # untrusted compatible-gateway dates from pinning a connection indefinitely.
+    anthropic_auto_continue_enabled: bool = False
+    anthropic_auto_continue_max_wait_seconds: float = 18_300.0
 
     # Prefix freeze
     prefix_freeze_enabled: bool = True
@@ -557,6 +562,8 @@ class ProxyConfig:
             raise ValueError("worker_processes must be >= 1")
         if self.retry_enabled and self.retry_max_attempts < 1:
             raise ValueError("retry_max_attempts must be >= 1 when retry_enabled=True")
+        if self.anthropic_auto_continue_max_wait_seconds <= 0:
+            raise ValueError("anthropic_auto_continue_max_wait_seconds must be > 0")
         # A 0 (or negative) requests-per-minute limit divides by zero in the
         # token-bucket wait computation (rate_limit_policy.consume_from_bucket),
         # 500-ing every request. The CLI already guards this with IntRange(min=1);

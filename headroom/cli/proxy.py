@@ -464,6 +464,26 @@ def dashboard(port: int, no_open: bool) -> None:
     ),
 )
 @click.option(
+    "--anthropic-auto-continue/--no-anthropic-auto-continue",
+    default=False,
+    envvar="HEADROOM_ANTHROPIC_AUTO_CONTINUE",
+    help=(
+        "Opt in to holding an Anthropic SSE request until an explicit usage-limit reset, "
+        "then retrying once. Env: HEADROOM_ANTHROPIC_AUTO_CONTINUE."
+    ),
+)
+@click.option(
+    "--anthropic-auto-continue-max-wait-seconds",
+    type=click.FloatRange(min=1, max=86400),
+    default=18_300.0,
+    show_default=True,
+    envvar="HEADROOM_ANTHROPIC_AUTO_CONTINUE_MAX_WAIT_SECONDS",
+    help=(
+        "Maximum reset wait accepted by Anthropic auto-continue (1–86400 seconds). "
+        "Longer limits pass through unchanged."
+    ),
+)
+@click.option(
     "--retry-max-attempts",
     type=click.IntRange(min=1, max=10),
     default=None,
@@ -1050,6 +1070,8 @@ def proxy(
     compressor: tuple[str, ...],
     no_subscription_tracking: bool,
     subscription_poll_interval: int | None,
+    anthropic_auto_continue: bool,
+    anthropic_auto_continue_max_wait_seconds: float,
     retry_max_attempts: int | None,
     retry_base_delay_ms: int | None,
     retry_max_delay_ms: int | None,
@@ -1381,6 +1403,8 @@ def proxy(
         subscription_poll_interval_s=(
             subscription_poll_interval if subscription_poll_interval is not None else 300
         ),
+        anthropic_auto_continue_enabled=anthropic_auto_continue,
+        anthropic_auto_continue_max_wait_seconds=anthropic_auto_continue_max_wait_seconds,
         retry_max_attempts=retry_max_attempts if retry_max_attempts is not None else 3,
         retry_base_delay_ms=retry_base_delay_ms if retry_base_delay_ms is not None else 1000,
         retry_max_delay_ms=retry_max_delay_ms if retry_max_delay_ms is not None else 30000,
