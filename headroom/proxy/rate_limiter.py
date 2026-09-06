@@ -8,14 +8,11 @@ Extracted from server.py for maintainability.
 from __future__ import annotations
 
 import asyncio
-import logging
 import time
-from collections import defaultdict
+from collections import OrderedDict
 
 from headroom.proxy.models import RateLimitState
-from headroom.proxy.rate_limit_policy import consume_from_bucket, refilled_tokens, stale_bucket_keys
-
-logger = logging.getLogger("headroom.proxy")
+from headroom.proxy.rate_limit_policy import consume_from_bucket, refilled_tokens
 
 # Maximum rate limiter buckets (prevents DoS via spoofed API keys)
 MAX_RATE_LIMITER_BUCKETS = 1000
@@ -32,28 +29,38 @@ class TokenBucketRateLimiter:
         self.requests_per_minute = requests_per_minute
         self.tokens_per_minute = tokens_per_minute
 
-        # Per-key buckets (key = API key or IP)
-        self._request_buckets: dict[str, RateLimitState] = defaultdict(
-            lambda: RateLimitState(tokens=requests_per_minute, last_update=time.time())
-        )
-        self._token_buckets: dict[str, RateLimitState] = defaultdict(
-            lambda: RateLimitState(tokens=tokens_per_minute, last_update=time.time())
-        )
+        # Per-key buckets (key = API key or IP). A shared LRU keeps request and
+        # token state on the same bounded lifecycle without scanning all keys.
+        self._request_buckets: dict[str, RateLimitState] = {}
+        self._token_buckets: dict[str, RateLimitState] = {}
+        self._bucket_lru: OrderedDict[str, None] = OrderedDict()
         self._lock = asyncio.Lock()
 
-    async def _cleanup_stale_buckets(self) -> None:
-        """Remove buckets that haven't been used in the last 10 minutes."""
-        now = time.time()
-        stale_keys = stale_bucket_keys(
-            {k: v.last_update for k, v in self._request_buckets.items()},
-            now=now,
-            stale_after_seconds=600,
-        )
-        for k in stale_keys:
-            del self._request_buckets[k]
-            self._token_buckets.pop(k, None)
-        if stale_keys:
-            logger.debug(f"Cleaned up {len(stale_keys)} stale rate limiter buckets")
+    def _touch_bucket(self, key: str) -> None:
+        """Mark a bucket active, evicting the least-recently-used key at capacity."""
+        if key in self._bucket_lru:
+            self._bucket_lru.move_to_end(key)
+            return
+
+        if len(self._bucket_lru) >= MAX_RATE_LIMITER_BUCKETS:
+            evicted_key, _ = self._bucket_lru.popitem(last=False)
+            self._request_buckets.pop(evicted_key, None)
+            self._token_buckets.pop(evicted_key, None)
+        self._bucket_lru[key] = None
+
+    def _request_bucket(self, key: str) -> RateLimitState:
+        state = self._request_buckets.get(key)
+        if state is None:
+            state = RateLimitState(tokens=self.requests_per_minute, last_update=time.time())
+            self._request_buckets[key] = state
+        return state
+
+    def _token_bucket(self, key: str) -> RateLimitState:
+        state = self._token_buckets.get(key)
+        if state is None:
+            state = RateLimitState(tokens=self.tokens_per_minute, last_update=time.time())
+            self._token_buckets[key] = state
+        return state
 
     def _refill(self, state: RateLimitState, rate_per_minute: float) -> float:
         """Refill bucket based on elapsed time."""
@@ -70,10 +77,8 @@ class TokenBucketRateLimiter:
     async def check_request(self, key: str = "default") -> tuple[bool, float]:
         """Check if request is allowed. Returns (allowed, wait_seconds)."""
         async with self._lock:
-            # Prevent unbounded bucket growth from spoofed keys
-            if len(self._request_buckets) > MAX_RATE_LIMITER_BUCKETS:
-                await self._cleanup_stale_buckets()
-            state = self._request_buckets[key]
+            self._touch_bucket(key)
+            state = self._request_bucket(key)
             available = self._refill(state, self.requests_per_minute)
 
             allowed, state.tokens, wait_seconds = consume_from_bucket(
@@ -86,7 +91,8 @@ class TokenBucketRateLimiter:
     async def check_tokens(self, key: str, token_count: int) -> tuple[bool, float]:
         """Check if token usage is allowed."""
         async with self._lock:
-            state = self._token_buckets[key]
+            self._touch_bucket(key)
+            state = self._token_bucket(key)
             available = self._refill(state, self.tokens_per_minute)
 
             allowed, state.tokens, wait_seconds = consume_from_bucket(
@@ -102,5 +108,5 @@ class TokenBucketRateLimiter:
             return {
                 "requests_per_minute": self.requests_per_minute,
                 "tokens_per_minute": self.tokens_per_minute,
-                "active_keys": len(self._request_buckets),
+                "active_keys": len(self._bucket_lru),
             }
