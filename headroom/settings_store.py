@@ -485,6 +485,17 @@ SETTINGS: tuple[SettingField, ...] = (
         tier="basic",
     ),
     SettingField(
+        "HEADROOM_DETACHED_PROFILE",
+        "detached_profile",
+        "Detached-mode profile",
+        "Backend",
+        "enum",
+        default="lenient",
+        choices=("strict", "lenient", "silent"),
+        help="Capability policy when local state is unavailable or disabled.",
+        tier="advanced",
+    ),
+    SettingField(
         "HEADROOM_ANYLLM_PROVIDER",
         "anyllm_provider",
         "any-llm provider",

@@ -743,7 +743,10 @@ def verify_cursor_wrap(base_env: dict[str, str], project_dir: Path) -> None:
         errors="replace",
     )
     try:
-        output = wait_for_output(proc, "Press Ctrl+C to stop the proxy.", timeout=30)
+        # _start_proxy waits up to 45s before surfacing proxy log context. Keep
+        # this parent-process wait longer so slow container startup is not
+        # mistaken for a Cursor wrap failure.
+        output = wait_for_output(proc, "Press Ctrl+C to stop the proxy.", timeout=75)
         # Cursor setup lines embed the /p/<name> per-project prefix.
         cursor_prefix = f"/p/{quote(project_dir.name, safe='')}"
         assert_true(

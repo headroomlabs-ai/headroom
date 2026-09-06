@@ -333,6 +333,7 @@ headroom proxy --learn --min-evidence 3
 | `HEADROOM_BUDGET` | Daily budget limit in USD | -- |
 | `HEADROOM_TELEMETRY` | Set to `on` for **local-only** usage stats (powers your own `/stats` and dashboard; nothing is sent externally) | `off` |
 | `HEADROOM_STATELESS` | Set to `true` to disable filesystem writes | `false` |
+| `HEADROOM_DETACHED_PROFILE` | Detached-mode capability policy: `strict`, `lenient`, or `silent` | `lenient` |
 | `HEADROOM_MODEL_LIMITS` | Custom model config (JSON string or file path) | -- |
 | `HEADROOM_LOSSLESS_COMPACTION` | Set to `0` to disable the byte-reversible lossless folds (grep heading, log run-collapse, diff/config folds) while leaving the rest of the compression pipeline active. Read per request, so the proxy's `/admin/runtime-env` hot-sync applies without a restart. | `1` |
 | `HEADROOM_BASE_URL` | Base URL of the Headroom proxy (TypeScript SDK) | `http://localhost:8787` |
@@ -486,6 +487,11 @@ See the **[Filesystem Contract](/docs/filesystem-contract)**
 page for the full bucket table, plugin-author guidance, and the Docker
 naming overlap note (`HEADROOM_WORKSPACE` is *not* the same as
 `HEADROOM_WORKSPACE_DIR`).
+
+For deployments where the workspace root is intentionally unavailable or
+read-only, see [Detached Mode](/docs/detached-mode). It exposes the exact
+capability matrix through `/capabilities`, `/health`, `/stats`, and
+`headroom_feature_enabled` Prometheus gauges.
 
 ## Custom Model Configuration
 

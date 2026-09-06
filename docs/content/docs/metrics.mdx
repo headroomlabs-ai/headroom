@@ -82,7 +82,12 @@ headroom_latency_ms_count 1234
 
 # HELP headroom_provider_cache_hit_requests_total Requests that read from the provider's prompt cache
 headroom_provider_cache_hit_requests_total{provider="anthropic"} 456
+
+# HELP headroom_feature_enabled Feature availability after detached-mode capability resolution
+headroom_feature_enabled{feature="compression",state="full",degradation="full",dependency="none"} 1
 ```
+
+`headroom_feature_enabled` mirrors the `/capabilities` payload. Use it to alert when an expected feature is degraded or disabled in detached/stateless deployments.
 
 <Callout type="warn" title="No percentile buckets on /metrics">
 There are no Prometheus histogram buckets for compression ratio or latency — build percentiles or averages from `_sum` / `_count` pairs (`headroom_latency_ms_sum`, `headroom_latency_ms_count`, and so on), or use the `headroom perf` CLI for real p95/p99.
