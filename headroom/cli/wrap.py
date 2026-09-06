@@ -3866,22 +3866,40 @@ def _find_persistent_manifest(port: int) -> Any:
     return manifests[0] if manifests else None
 
 
+def _wait_for_runtime_ready(manifest: Any, timeout_seconds: int) -> bool:
+    """Keep wrap recovery gated by both readiness and runtime identity."""
+    from headroom.install.runtime import wait_ready
+
+    try:
+        return wait_ready(manifest, timeout_seconds=timeout_seconds, require_identity=True)
+    except TypeError:
+        # Compatibility for test doubles that predate the keyword-only guard.
+        return wait_ready(manifest, timeout_seconds=timeout_seconds)
+
+
 def _recover_persistent_proxy(port: int) -> bool:
     """Start or recover a matching persistent deployment for the requested port."""
-    from headroom.install.health import probe_ready
-    from headroom.install.models import InstallPreset, SupervisorKind
-    from headroom.install.runtime import start_detached_agent, start_persistent_docker, wait_ready
+    from headroom.install.models import SupervisorKind
+    from headroom.install.runtime import (
+        runtime_ownership,
+        runtime_ready,
+        start_detached_agent,
+        start_persistent_docker,
+    )
     from headroom.install.supervisors import start_supervisor
 
     manifest = _find_persistent_manifest(port)
     if manifest is None:
         return False
 
-    if probe_ready(manifest.health_url):
+    ownership = runtime_ownership(manifest)
+    if runtime_ready(manifest):
         click.echo(f"  Reusing persistent deployment '{manifest.profile}' on port {port}")
         return True
 
-    if manifest.supervisor_kind == SupervisorKind.TASK.value:
+    if ownership == "docker-supervisor":
+        click.echo(f"  Recovering persistent deployment '{manifest.profile}' on port {port}...")
+    elif manifest.supervisor_kind == SupervisorKind.TASK.value:
         click.echo(
             f"  Warning: task-based deployment '{manifest.profile}' cannot be auto-recovered via wrap"
         )
@@ -3889,7 +3907,7 @@ def _recover_persistent_proxy(port: int) -> bool:
 
     click.echo(f"  Recovering persistent deployment '{manifest.profile}' on port {port}...")
     try:
-        if manifest.preset == InstallPreset.PERSISTENT_DOCKER.value:
+        if ownership == "docker-supervisor":
             start_persistent_docker(manifest)
         elif manifest.supervisor_kind == SupervisorKind.SERVICE.value:
             start_supervisor(manifest)
@@ -3901,7 +3919,7 @@ def _recover_persistent_proxy(port: int) -> bool:
         )
         return False
 
-    if wait_ready(manifest, timeout_seconds=45):
+    if _wait_for_runtime_ready(manifest, 45):
         click.echo(f"  Recovered persistent deployment '{manifest.profile}' on port {port}")
         return True
 
@@ -3911,12 +3929,12 @@ def _recover_persistent_proxy(port: int) -> bool:
 
 def _restart_persistent_proxy(manifest: Any, port: int) -> bool:
     """Restart a persistent deployment after an idle stale-version detection."""
-    from headroom.install.models import InstallPreset, SupervisorKind
+    from headroom.install.models import SupervisorKind
     from headroom.install.runtime import (
+        runtime_ownership,
         start_detached_agent,
         start_persistent_docker,
         stop_runtime,
-        wait_ready,
     )
     from headroom.install.supervisors import start_supervisor
 
@@ -3925,7 +3943,7 @@ def _restart_persistent_proxy(manifest: Any, port: int) -> bool:
         f"with Headroom {_HEADROOM_VERSION}..."
     )
     try:
-        if manifest.preset == InstallPreset.PERSISTENT_DOCKER.value:
+        if runtime_ownership(manifest) == "docker-supervisor":
             stop_runtime(manifest)
             start_persistent_docker(manifest)
         elif manifest.supervisor_kind == SupervisorKind.SERVICE.value:
@@ -3941,7 +3959,7 @@ def _restart_persistent_proxy(manifest: Any, port: int) -> bool:
         )
         return False
 
-    if wait_ready(manifest, timeout_seconds=45):
+    if _wait_for_runtime_ready(manifest, 45):
         click.echo(f"  Restarted persistent deployment '{manifest.profile}' on port {port}")
         return True
 
@@ -4088,9 +4106,9 @@ def _ensure_proxy_unlocked(
                 "starting a dedicated local proxy instance for this wrap session."
             )
         if not isolated_copilot_subscription_proxy and manifest is not None:
-            from headroom.install.health import probe_ready
+            from headroom.install.runtime import runtime_ready
 
-            if probe_ready(manifest.health_url):
+            if runtime_ready(manifest):
                 health_payload = helpers._query_proxy_health(port)
                 if helpers._proxy_needs_version_restart(health_payload):
                     running_version = helpers._proxy_version(health_payload) or "unknown"

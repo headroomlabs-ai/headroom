@@ -9,9 +9,11 @@ from headroom.install.models import ArtifactRecord, DeploymentManifest, ManagedM
 from headroom.install.state import (
     ManifestError,
     delete_manifest,
+    delete_recovery_manifest,
     list_manifests,
     load_manifest,
     save_manifest,
+    save_recovery_manifest,
 )
 
 
@@ -70,6 +72,22 @@ def test_save_manifest_writes_atomically(monkeypatch, tmp_path: Path) -> None:
     assert sorted(p.name for p in profile_dir.iterdir()) == ["manifest.json"]
     # And the persisted manifest still round-trips.
     assert load_manifest("default") is not None
+
+
+def test_recovery_manifest_preserves_mutations_and_artifacts(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    manifest = _manifest()
+
+    save_recovery_manifest(manifest)
+
+    recovery = tmp_path / ".headroom" / "deploy" / "default.recovery.json"
+    assert recovery.exists()
+    payload = json.loads(recovery.read_text(encoding="utf-8"))
+    assert payload["mutations"][0]["kind"] == "shell-block"
+    assert payload["artifacts"][0]["kind"] == "script"
+    assert load_manifest("default") is None
+    delete_recovery_manifest("default")
+    assert not recovery.exists()
 
 
 def test_list_manifests_ignores_invalid_payloads(monkeypatch, tmp_path: Path) -> None:
@@ -154,3 +172,15 @@ def test_delete_manifest_removes_profile_root(monkeypatch, tmp_path: Path) -> No
 
     assert load_manifest("default") is None
     assert not extra_file.parent.exists()
+
+
+def test_delete_manifest_propagates_removal_failure(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    root = tmp_path / ".headroom" / "deploy" / "default"
+    root.mkdir(parents=True)
+    monkeypatch.setattr(
+        "headroom.install.state.shutil.rmtree", lambda path: (_ for _ in ()).throw(OSError("busy"))
+    )
+
+    with pytest.raises(OSError, match="busy"):
+        delete_manifest("default")

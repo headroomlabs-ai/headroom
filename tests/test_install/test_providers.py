@@ -432,6 +432,65 @@ def test_apply_mutations_runs_openclaw_for_user_scope(monkeypatch, tmp_path: Pat
     assert [mutation.kind for mutation in mutations] == ["openclaw-wrap"]
 
 
+def test_provider_mutation_failure_reverts_prior_returned_record(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import headroom.providers.install_registry as registry
+
+    manifest = _manifest(tmp_path)
+    manifest.targets = ["first", "second"]
+    first = ManagedMutation(target="first", kind="first")
+    reverted: list[ManagedMutation] = []
+
+    def apply_first(current):
+        return first
+
+    def fail_second(current):
+        raise RuntimeError("second mutation failed")
+
+    def revert(mutation, current):
+        reverted.append(mutation)
+
+    monkeypatch.setattr(
+        registry,
+        "_PROVIDER_SCOPE_HANDLERS",
+        {"first": (apply_first, revert), "second": (fail_second, revert)},
+    )
+
+    with pytest.raises(RuntimeError, match="second mutation failed"):
+        registry.apply_provider_scope_mutations(manifest)
+    assert reverted == [first]
+
+
+def test_provider_rollback_failure_preserves_unreverted_records(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import headroom.providers.install_registry as registry
+
+    manifest = _manifest(tmp_path)
+    manifest.targets = ["first", "second"]
+    first = ManagedMutation(target="first", kind="first")
+
+    def apply_first(current):
+        return first
+
+    def fail_second(current):
+        raise RuntimeError("second mutation failed")
+
+    def fail_revert(mutation, current):
+        raise RuntimeError("rollback unavailable")
+
+    monkeypatch.setattr(
+        registry,
+        "_PROVIDER_SCOPE_HANDLERS",
+        {"first": (apply_first, fail_revert), "second": (fail_second, fail_revert)},
+    )
+
+    with pytest.raises(RuntimeError, match="rollback unavailable"):
+        registry.apply_provider_scope_mutations(manifest)
+    assert manifest.mutations == [first]
+
+
 def test_claude_build_install_env_returns_proxy_base_url() -> None:
     # Arrange / Act
     env = build_claude_install_env(port=5566, backend="ignored")

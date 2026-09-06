@@ -64,11 +64,15 @@ def _apply_unix_env_scope(manifest: DeploymentManifest) -> list[ManagedMutation]
     else:
         targets = unix_system_env_targets()
     mutations: list[ManagedMutation] = []
-    for path in targets:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        merged = _merge_marker_block(path, block, _ENV_PATTERN, _ENV_MARKER_START)
-        fsutil.write_text(path, merged)
-        mutations.append(ManagedMutation(target="env", kind="shell-block", path=str(path)))
+    try:
+        for path in targets:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            merged = _merge_marker_block(path, block, _ENV_PATTERN, _ENV_MARKER_START)
+            fsutil.write_text(path, merged)
+            mutations.append(ManagedMutation(target="env", kind="shell-block", path=str(path)))
+    except Exception:
+        _remove_unix_env_scope(mutations)
+        raise
     return mutations
 
 
@@ -89,37 +93,41 @@ def _apply_windows_env_scope(manifest: DeploymentManifest) -> list[ManagedMutati
     scope_name = "Machine" if manifest.scope == ConfigScope.SYSTEM.value else "User"
     merged = _unix_scope_values(manifest)
     mutations: list[ManagedMutation] = []
-    for name, value in merged.items():
-        previous = run(
-            [
+    try:
+        for name, value in merged.items():
+            previous = run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-Command",
+                    f"$value = [Environment]::GetEnvironmentVariable({_powershell_literal(name)},{_powershell_literal(scope_name)}); "
+                    "if ($null -eq $value) { '__HEADROOM_UNSET__' } else { $value }",
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+            command = [
                 "powershell",
                 "-NoProfile",
                 "-Command",
-                f"$value = [Environment]::GetEnvironmentVariable({_powershell_literal(name)},{_powershell_literal(scope_name)}); "
-                "if ($null -eq $value) { '__HEADROOM_UNSET__' } else { $value }",
-            ],
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout.strip()
-        command = [
-            "powershell",
-            "-NoProfile",
-            "-Command",
-            f"[Environment]::SetEnvironmentVariable({_powershell_literal(name)},{_powershell_literal(value)},{_powershell_literal(scope_name)})",
-        ]
-        subprocess.run(command, check=True)
-        mutations.append(
-            ManagedMutation(
-                target="env",
-                kind="windows-env",
-                data={
-                    "name": name,
-                    "scope": scope_name,
-                    "previous": None if previous == "__HEADROOM_UNSET__" else previous,
-                },
+                f"[Environment]::SetEnvironmentVariable({_powershell_literal(name)},{_powershell_literal(value)},{_powershell_literal(scope_name)})",
+            ]
+            subprocess.run(command, check=True)
+            mutations.append(
+                ManagedMutation(
+                    target="env",
+                    kind="windows-env",
+                    data={
+                        "name": name,
+                        "scope": scope_name,
+                        "previous": None if previous == "__HEADROOM_UNSET__" else previous,
+                    },
+                )
             )
-        )
+    except Exception:
+        _remove_windows_env_scope(mutations)
+        raise
     return mutations
 
 
@@ -151,15 +159,26 @@ def apply_mutations(manifest: DeploymentManifest) -> list[ManagedMutation]:
     """Apply provider/user/system configuration for a deployment."""
 
     mutations: list[ManagedMutation] = []
-    if manifest.scope in {ConfigScope.USER.value, ConfigScope.SYSTEM.value}:
-        if os.name == "nt":
-            mutations.extend(_apply_windows_env_scope(manifest))
-        else:
-            mutations.extend(_apply_unix_env_scope(manifest))
+    manifest.mutations = mutations
+    try:
+        if manifest.scope in {ConfigScope.USER.value, ConfigScope.SYSTEM.value}:
+            if os.name == "nt":
+                mutations.extend(_apply_windows_env_scope(manifest))
+            else:
+                mutations.extend(_apply_unix_env_scope(manifest))
         mutations.extend(apply_provider_scope_mutations(manifest))
         return mutations
-
-    return [*mutations, *apply_provider_scope_mutations(manifest)]
+    except Exception as exc:
+        if mutations:
+            try:
+                revert_mutations(manifest)
+            except Exception as rollback_exc:
+                raise RuntimeError(
+                    f"mutation application failed: {exc}; rollback failed: {rollback_exc}"
+                ) from exc
+            else:
+                manifest.mutations = []
+        raise
 
 
 def revert_mutations(manifest: DeploymentManifest) -> None:
