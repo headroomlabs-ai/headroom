@@ -18,7 +18,7 @@
     "typecheck": "node node_modules/@typescript/native/bin/tsc --noEmit"
   },
   "dependencies": {
-    "headroom-ai": "^0.22.3"
+    "headroom-ai": "^0.37.0"
   },
   "peerDependencies": {
     "openclaw": "*"
