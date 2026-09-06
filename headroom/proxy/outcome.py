@@ -435,9 +435,10 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
          (skipped when logger is None, i.e. ``--no-request-logging``)
       4. structured PERF log line — consumed by ``headroom perf``
 
-    A failure outcome (``status_code >= 500``, e.g. a 529 surfaced after retry
-    exhaustion) short-circuits before effects 1-4: it records a failed request
-    and returns, so an upstream failure cannot feed the success stats.
+    A rejected outcome (``status_code >= 400``, e.g. a 429 rate limit or a 529
+    surfaced after retry exhaustion) short-circuits before effects 1-4: it
+    records the request under the counter that names what happened and returns,
+    so a turn the provider never billed cannot feed the success stats.
 
     Takes the handler as a free argument rather than ``self`` so this
     function is callable from:
@@ -491,14 +492,29 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     #    beacon must never add latency to, or take down, the request path.
     record_outcome(outcome)
 
-    # Upstream failure (>= 500, e.g. a 529 Overloaded surfaced after retry
-    # exhaustion) must not feed the savings/cost/log success stats; that would
-    # let a failed request inflate the save-rate. Record it as failed and stop,
-    # mirroring the pre-passthrough behaviour where an exhausted 5xx raised and
-    # was counted via record_failed. 4xx stay on the normal funnel: they are
-    # client errors the proxy still served.
-    if outcome.status_code >= 500:
-        await handler.metrics.record_failed(provider=outcome.provider)
+    # A rejected turn must not feed the savings/cost/log success stats; that
+    # would let a request the provider never billed inflate the save-rate.
+    # Record it under the counter that names what happened, and stop.
+    #
+    # This covers 4xx as well as 5xx. A 4xx is an error the PROXY served but the
+    # PROVIDER did not: nothing was generated, so nothing was billed, so
+    # compression on that turn saved exactly nothing. Counting it anyway is not a
+    # rounding error — measured on a real session where 143 of 300 turns came
+    # back 429 ("Usage credits are required for fast mode"), 46.5% of the
+    # headline `total_saved` was compression on turns Anthropic rejected, and
+    # `requests.rate_limited` still read 0 because only Headroom's own limiter
+    # ever incremented it. The 60M `tokens.input` and the $8.90 compression
+    # savings shown against a $2.26 measured spend came from the same place.
+    #
+    # 429 goes to record_rate_limited rather than record_failed: an upstream rate
+    # limit is the one 4xx a user is expected to act on (back off, raise a cap),
+    # and folding it into a generic failure count hides exactly that. Both
+    # counters are already exported and neither feeds savings.
+    if outcome.status_code >= 400:
+        if outcome.status_code == 429:
+            await handler.metrics.record_rate_limited(provider=outcome.provider)
+        else:
+            await handler.metrics.record_failed(provider=outcome.provider)
         return
 
     # Outcome stage: hand the meter's reading to any pipeline extension that
