@@ -93,6 +93,35 @@ class TestBudgetManager:
         assert report.merged >= 1
         assert report.kept <= 2
 
+    def test_merge_groups_transitively_like_pairwise_scan(self, manager: MemoryBudgetManager):
+        """The precomputed word-set scan must merge exactly the pairs the
+        original per-pair Jaccard scan did: high-overlap entries collapse to
+        the highest-importance representative, distinct entries survive."""
+        shared = "alpha beta gamma delta epsilon zeta eta theta iota kappa"
+        entries = [
+            _make_entry(shared, importance=0.3),
+            _make_entry(shared, importance=0.9),  # highest -> kept representative
+            _make_entry(shared, importance=0.5),
+            _make_entry("wholly unrelated content about something else", importance=0.6),
+        ]
+        merged = manager._merge_similar(list(entries))
+
+        # Three identical-content entries collapse to one; the unrelated one stays.
+        assert len(merged) == 2
+        kept_shared = [m for m in merged if m.content == shared]
+        assert len(kept_shared) == 1
+        # The surviving representative is the highest-importance of the group.
+        assert kept_shared[0].importance == 0.9
+
+    def test_text_similarity_matches_explicit_jaccard(self, manager: MemoryBudgetManager):
+        a = "the quick brown fox jumps"
+        b = "the quick brown dog runs"
+        wa, wb = set(a.split()), set(b.split())
+        expected = len(wa & wb) / len(wa | wb)
+        assert manager._text_similarity(a, b) == pytest.approx(expected)
+        # Empty side yields 0.0, not a ZeroDivisionError.
+        assert manager._text_similarity("", "anything") == 0.0
+
     def test_very_old_pruned(self, manager: MemoryBudgetManager):
         """Test that very old, low-importance memories get pruned by decay."""
         entries = [

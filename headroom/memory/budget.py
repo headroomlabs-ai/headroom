@@ -25,6 +25,19 @@ from headroom.memory.writers.base import MemoryEntry, _estimate_tokens
 logger = logging.getLogger(__name__)
 
 
+def _jaccard(words_a: set[str], words_b: set[str]) -> float:
+    """Jaccard similarity between two word sets.
+
+    Operates on already-tokenized sets so callers scanning many pairs can
+    tokenize each document once instead of per comparison.
+    """
+    if not words_a or not words_b:
+        return 0.0
+    intersection = len(words_a & words_b)
+    union = len(words_a) + len(words_b) - intersection
+    return intersection / union
+
+
 @dataclass
 class BudgetConfig:
     """Configuration for memory budget management."""
@@ -240,6 +253,13 @@ class MemoryBudgetManager:
         if len(memories) <= 1:
             return memories
 
+        # Precompute each memory's word set once. The pairwise scan below is
+        # O(n^2); recomputing set(content.lower().split()) inside every
+        # _text_similarity call re-tokenized the same content O(n) times. With
+        # the sets cached, each pair is a plain set intersection/union.
+        word_sets = [set(m.content.lower().split()) for m in memories]
+        threshold = self._config.similarity_merge_threshold
+
         merged: list[MemoryEntry] = []
         used: set[int] = set()
 
@@ -247,16 +267,15 @@ class MemoryBudgetManager:
             if i in used:
                 continue
 
+            words_i = word_sets[i]
+
             # Find similar memories
             group = [m1]
-            for j, m2 in enumerate(memories[i + 1 :], start=i + 1):
+            for j in range(i + 1, len(memories)):
                 if j in used:
                     continue
-                if (
-                    self._text_similarity(m1.content, m2.content)
-                    > self._config.similarity_merge_threshold
-                ):
-                    group.append(m2)
+                if _jaccard(words_i, word_sets[j]) > threshold:
+                    group.append(memories[j])
                     used.add(j)
 
             if len(group) == 1:
@@ -276,10 +295,4 @@ class MemoryBudgetManager:
     @staticmethod
     def _text_similarity(a: str, b: str) -> float:
         """Simple Jaccard similarity on word sets."""
-        words_a = set(a.lower().split())
-        words_b = set(b.lower().split())
-        if not words_a or not words_b:
-            return 0.0
-        intersection = words_a & words_b
-        union = words_a | words_b
-        return len(intersection) / len(union)
+        return _jaccard(set(a.lower().split()), set(b.lower().split()))
