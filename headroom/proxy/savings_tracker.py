@@ -329,6 +329,61 @@ def _estimate_cache_savings_usd(model: str, cache_read_tokens: int) -> float:
         return 0.0
 
 
+# When litellm has no explicit cache-read price for a model, approximate it as
+# this fraction of the input rate. Anthropic prices cache reads at 0.1x input;
+# OpenAI and Gemini land between 0.1x and 0.25x -- 0.1x is the conservative end.
+TOOL_SCHEMA_CACHE_READ_FRACTION = 0.1
+
+
+def _estimate_tool_schema_savings_usd(model: str, tokens_saved: int) -> float:
+    """Estimate tool-schema deferral savings in USD from withheld schema tokens.
+
+    Deferred schemas are byte-stable prompt-prefix content, which caching
+    providers bill at the cache-read discount on every turn after the first --
+    so the cost a deferred token actually avoids is the cache-READ rate, not
+    the full input rate. Pricing the layer at the input rate (as message
+    compression correctly is) overstates it roughly 10x, enough to push a
+    blended $/token savings figure past the input list price of every model in
+    the mix -- a rate no real saving can reach, since a saved input token can
+    never be worth more than what sending it would have cost. First-turn cache
+    writes bill at a small premium (1.25x input on Anthropic), so the
+    cache-read rate is a conservative floor rather than an exact figure.
+
+    Mirrors ``_estimate_cache_savings_usd``'s handling otherwise: an
+    unavailable litellm falls back to the fraction of
+    ``DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN``, a model without a cache-read
+    price falls back to the fraction of its input rate, and a legitimately
+    free model prices as 0.0.
+    """
+    litellm = _get_litellm_module()
+    if tokens_saved <= 0:
+        return 0.0
+    if litellm is None:
+        return (
+            float(tokens_saved)
+            * TOOL_SCHEMA_CACHE_READ_FRACTION
+            * float(DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
+        )
+    try:
+        resolved = _resolve_litellm_model(model)
+        info = litellm.model_cost.get(resolved, {})
+        cache_read_cost = info.get("cache_read_input_token_cost")
+        if cache_read_cost is not None:
+            return float(tokens_saved) * float(cache_read_cost)
+        input_cost_per_token = info.get("input_cost_per_token")
+        # Distinguish "price unknown" (missing key -> fall back) from a model
+        # that is legitimately free -- same rule as the other estimators here.
+        if input_cost_per_token is None:
+            raise RuntimeError("input cost unavailable")
+        return float(tokens_saved) * TOOL_SCHEMA_CACHE_READ_FRACTION * float(input_cost_per_token)
+    except Exception:
+        return (
+            float(tokens_saved)
+            * TOOL_SCHEMA_CACHE_READ_FRACTION
+            * float(DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
+        )
+
+
 def estimate_request_savings_usd(
     model: str,
     *,
@@ -348,7 +403,7 @@ def estimate_request_savings_usd(
         "compression": _estimate_compression_savings_usd(
             model, max(_coerce_int(compression_tokens_saved), 0)
         ),
-        "tool_schema": _estimate_compression_savings_usd(
+        "tool_schema": _estimate_tool_schema_savings_usd(
             model, max(_coerce_int(tool_schema_tokens_saved), 0)
         ),
         "output_shaping": _estimate_output_savings_usd(
