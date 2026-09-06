@@ -71,8 +71,15 @@ def classify_auth_signals(signals: AuthSignals) -> AuthMode:
             return AuthMode.SUBSCRIPTION
 
     auth = signals.authorization
-    if auth.startswith("Bearer "):
-        token = auth[len("Bearer ") :]
+    # The auth-scheme token ("Bearer") is case-insensitive per RFC 7235 §2.1,
+    # so a client sending `Authorization: bearer sk-...` must classify the same
+    # as `Bearer`. A case-sensitive `startswith("Bearer ")` sent such a request
+    # to the `elif auth:` (OAUTH) fallthrough, misclassifying a PAYG API key —
+    # which mis-routes compression policy and mislabels cost/TOIN auth_mode.
+    # Only the scheme is case-folded; the credential itself stays case-sensitive.
+    scheme, sep, credentials = auth.partition(" ")
+    if sep and scheme.lower() == "bearer":
+        token = credentials
         if token.startswith("sk-ant-oat"):
             return AuthMode.OAUTH
         if token.startswith("sk-ant-api") or token.startswith("sk-"):
