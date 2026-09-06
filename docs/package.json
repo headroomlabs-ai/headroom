@@ -30,7 +30,7 @@
 		"tailwind-merge": "^3.5.0"
 	},
 	"devDependencies": {
-		"@ai-sdk/openai": "^3.0.51",
+		"@ai-sdk/openai": "^4.0.46",
 		"@anthropic-ai/sdk": "^0.111.0",
 		"@tailwindcss/postcss": "^4.3.2",
 		"@types/mdx": "^2.0.14",
