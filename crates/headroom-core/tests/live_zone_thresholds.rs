@@ -1,8 +1,9 @@
 //! PR-B4 byte-threshold gate — integration tests.
 //!
 //! The dispatcher must skip compression entirely for blocks whose
-//! content is below the per-content-type byte threshold (1 KiB for
-//! JSON arrays). PR-B4 spec, `REALIGNMENT/04-phase-B-live-zone.md`.
+//! content is below the per-content-type byte threshold (512 B for
+//! JSON arrays — asserted below). PR-B4 spec,
+//! `REALIGNMENT/04-phase-B-live-zone.md`.
 
 use headroom_core::transforms::live_zone::DEFAULT_MODEL;
 use headroom_core::transforms::{
@@ -88,7 +89,7 @@ fn below_threshold_no_compression_attempted() {
 
 #[test]
 fn above_threshold_compression_attempted() {
-    // 10 KB of homogeneous JSON dicts — comfortably above the 1 KiB
+    // 10 KB of homogeneous JSON dicts — comfortably above the 512 B
     // JsonArray threshold and SmartCrusher's bread-and-butter shape,
     // so the dispatcher SHOULD route through `dispatch_compressor`.
     // Either `Compressed` (SmartCrusher shrunk it — the typical

@@ -10,26 +10,26 @@ use url::Url;
 
 /// Compression mode policy for the `/v1/messages` endpoint.
 ///
-/// Drives whether `compress_anthropic_request` does any work. PR-A1
-/// (Phase A lockdown) wires the flag in but both modes currently
-/// passthrough — `live_zone` parses-but-warns until Phase B PR-B2
-/// fills in the live-zone-only block dispatcher.
+/// Drives whether `compress_anthropic_request` does any work. `off` is
+/// byte-faithful passthrough; `live_zone` routes the request through
+/// the headroom-core live-zone dispatcher, which compresses only the
+/// live-zone blocks (latest user message, latest tool/function/shell/
+/// patch outputs) via the per-content-type compressor table.
 ///
 /// We do NOT add an `icm` mode (the deleted code path) or a
 /// `passthrough` alias for `off` — those names are misleading. The
 /// only legal values are `off` (compression disabled) and `live_zone`
-/// (compress only the live-zone blocks; not yet implemented).
+/// (compress only the live-zone blocks).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[clap(rename_all = "snake_case")]
 pub enum CompressionMode {
     /// Compression disabled. Body forwards byte-equal to upstream.
-    /// This is the default; Phase B will switch the default to
-    /// `live_zone` once that mode is implemented.
+    /// This is the default.
     Off,
     /// Compress only live-zone blocks (latest user message,
-    /// latest tool/function/shell/patch outputs). NOT YET IMPLEMENTED:
-    /// in PR-A1 this falls through to passthrough behaviour with a
-    /// loud warning. Phase B PR-B2 wires in the actual dispatcher.
+    /// latest tool/function/shell/patch outputs) via the
+    /// headroom-core live-zone dispatcher's per-content-type
+    /// compressors.
     LiveZone,
 }
 
@@ -122,39 +122,35 @@ impl CacheControlAutoFrozen {
     }
 }
 
-/// Phase F PR-F2.1 c3/6: feature flag for the per-auth-mode
+/// Phase F PR-F2.1: feature flag for the per-auth-mode
 /// `CompressionPolicy` enforcement.
 ///
-/// `disabled` (default until c6/6): the proxy still classifies
-/// `auth_mode` and derives a `CompressionPolicy` for telemetry, but
-/// every dispatcher and transform behaves as if the mode were `Payg`
-/// — bit-for-bit current behaviour.
+/// `enabled` (default, from c5/5 onward): the policy struct's
+/// per-mode values take effect. For Subscription specifically, the
+/// cache aligner is skipped and the dispatcher gates on
+/// `policy.live_zone_compression_enabled()` (a no-op in F2.1 since
+/// that helper currently always returns `true`, but kept as a hook
+/// so F2.2 can flip without touching call sites).
 ///
-/// `enabled`: the policy struct's per-mode values take effect. For
-/// Subscription specifically, the cache aligner is skipped and the
-/// dispatcher gates on `policy.live_zone_compression_enabled()` (a
-/// no-op in F2.1 since that helper currently always returns `true`,
-/// but kept as a hook so F2.2 can flip without touching call sites).
-///
-/// Why a flag at all: F2.1 lands behind a default-disabled gate so
-/// commits 4 and 5 of the PR don't ship behaviour change to default
-/// users. Operators can flip this on for dogfooding before commit 6
-/// flips the default. Rollback: flip the env var back to `disabled`
-/// — instant if config is hot-reloaded, redeploy otherwise.
+/// `disabled`: the proxy still classifies `auth_mode` and derives a
+/// `CompressionPolicy` for telemetry, but every dispatcher and
+/// transform behaves as if the mode were `Payg` — bit-for-bit the
+/// pre-F2.1 behaviour. Operators can flip back to this for rollback
+/// if F2.1 surfaces a subscription regression — instant if config is
+/// hot-reloaded, redeploy otherwise.
 ///
 /// Source priority: CLI flag →
 /// `HEADROOM_PROXY_AUTH_MODE_POLICY_ENFORCEMENT` env var →
-/// default (`disabled`).
+/// default (`enabled`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[clap(rename_all = "snake_case")]
 pub enum AuthModePolicyEnforcement {
     /// Per-mode policy IS enforced. Subscription users see no
     /// cache_aligner; the dispatcher reads
-    /// `policy.live_zone_compression_enabled()`.
+    /// `policy.live_zone_compression_enabled()`. Default.
     Enabled,
     /// Per-mode policy IS NOT enforced. Every mode runs the PAYG
-    /// pipeline, identical to pre-F2.1 behaviour. Default in F2.1
-    /// commits 1–5 so the feature is dogfood-only until c6/6.
+    /// pipeline, identical to pre-F2.1 behaviour. Rollback opt-out.
     Disabled,
 }
 
@@ -340,11 +336,9 @@ pub struct CliArgs {
     /// Compression mode policy for `/v1/messages`.
     ///
     /// `off` (default): byte-faithful passthrough on every request.
-    /// `live_zone`: PR-B2 wired the dispatcher; PR-B2's per-type
-    /// compressors are no-ops, so the body still round-trips
-    /// byte-equal until PR-B3+ (which fills the per-type table).
-    /// The flag exists so the default can flip in one config
-    /// change once `live_zone` is the safer choice on real traffic.
+    /// `live_zone`: routes the request through the headroom-core
+    /// live-zone dispatcher, which compresses eligible live-zone
+    /// blocks via its per-content-type compressor table.
     ///
     /// Source priority: CLI flag → `HEADROOM_PROXY_COMPRESSION_MODE`
     /// env var → default (`off`).
@@ -637,19 +631,19 @@ pub struct Config {
     /// Inherits `max_body_bytes` when not overridden. Bodies larger
     /// than this still forward, just unchanged.
     pub compression_max_body_bytes: u64,
-    /// Policy mode for compression on `/v1/messages`. PR-A1 lockdown:
-    /// both `Off` and `LiveZone` result in byte-faithful passthrough;
-    /// `LiveZone` additionally emits a `tracing::warn!` per request
-    /// because the dispatcher isn't implemented yet (Phase B PR-B2
-    /// fills this in).
+    /// Policy mode for compression on `/v1/messages`. `Off` is
+    /// byte-faithful passthrough; `LiveZone` routes the request
+    /// through the headroom-core live-zone dispatcher, which
+    /// compresses eligible live-zone blocks via its per-content-type
+    /// compressor table.
     pub compression_mode: CompressionMode,
     /// Whether the live-zone dispatcher derives `frozen_message_count`
     /// automatically from customer `cache_control` markers. PR-A4
     /// adds the derivation function (`compute_frozen_count`); Phase
     /// B's dispatcher consumes the resolved value here.
     pub cache_control_auto_frozen: CacheControlAutoFrozen,
-    /// Phase F PR-F2.1 c3/6: gate per-auth-mode `CompressionPolicy`
-    /// enforcement. `Disabled` until c6/6 flips the default.
+    /// Phase F PR-F2.1: gate per-auth-mode `CompressionPolicy`
+    /// enforcement. `Enabled` by default (from c5/5 onward).
     pub auth_mode_policy_enforcement: AuthModePolicyEnforcement,
     /// Whether to strip internal `x-headroom-*` headers from
     /// upstream-bound requests. PR-A5 default-on guard against
