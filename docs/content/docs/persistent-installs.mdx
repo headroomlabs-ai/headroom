@@ -107,6 +107,14 @@ Provider scope is intentionally conservative. The current direct adapters are:
 
 For Copilot, Aider, Cursor, and broader env-driven setups, prefer `--scope user` or `--scope system`.
 
+`headroom install` puts Copilot on the CLI's native lane by default: the manifest sets only
+`COPILOT_API_URL`, so the CLI keeps its model picker and Auto mode and the proxy
+forwards the developer's own Copilot token to GitHub. The proxy recognizes Copilot
+credentials on its OpenAI and Anthropic routes, so the shared proxy's targets stay
+on the stock hosts for other tools. The single-model BYOK lane is used only when
+`COPILOT_PROVIDER_API_KEY` is present at install time or the backend is a
+translated one (any-llm, LiteLLM).
+
 ## Provider selection
 
 | Option | Meaning |

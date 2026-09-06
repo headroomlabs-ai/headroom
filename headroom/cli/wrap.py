@@ -72,6 +72,12 @@ from headroom.copilot_auth import (
     resolve_copilot_api_url,
     resolve_subscription_bearer_token_details,
 )
+from headroom.copilot_auth import (
+    USE_ADVERTISED_HOST_ENV as _USE_ADVERTISED_HOST_ENV,
+)
+from headroom.copilot_auth import (
+    advertised_host_is_normalized as _advertised_host_is_normalized,
+)
 from headroom.providers.aider import build_launch_env as _build_aider_launch_env
 from headroom.providers.claude import (
     REMOTE_CONTROL_BASE_URL_ENV,
@@ -100,6 +106,9 @@ from headroom.providers.copilot import (
     build_launch_env as _build_copilot_launch_env,
 )
 from headroom.providers.copilot import (
+    check_copilot_url_setting as _check_copilot_url_setting,
+)
+from headroom.providers.copilot import (
     configure_vscode_proxy_settings,
     remove_vscode_proxy_settings,
     vscode_proxy_url,
@@ -113,6 +122,9 @@ from headroom.providers.copilot import (
 )
 from headroom.providers.copilot import (
     detect_running_proxy_backend as _copilot_detect_running_proxy_backend,
+)
+from headroom.providers.copilot import (
+    ensure_loopback_no_proxy as _ensure_loopback_no_proxy,
 )
 from headroom.providers.copilot import (
     is_auto_model as _is_auto_model,
@@ -3972,10 +3984,31 @@ def _build_copilot_native_launch_env(
     return build_native_launch_env(port=port, environ=environ, project=project)
 
 
-def _native_api_url_supported(*, environ: Mapping[str, str] | None = None) -> bool | None:
+def _native_api_url_supported(
+    *, environ: Mapping[str, str] | None = None, copilot_bin: str | None = None
+) -> bool | None:
     from headroom.providers.copilot.wrap import native_api_url_supported
 
-    return native_api_url_supported(environ=environ)
+    return native_api_url_supported(environ=environ, copilot_bin=copilot_bin)
+
+
+def _echo_copilot_host_notice(resolution: CopilotSubscriptionTokenResolution | None) -> None:
+    """Tell the user when GitHub advertised a per-plan host Headroom is not using.
+
+    Business and Enterprise tokens come with ``api.business.`` /
+    ``api.enterprise.githubcopilot.com``; Headroom routes to the generic host by
+    default (see ``copilot_auth._SEGMENTED_PLAN_HOSTS``). Networks that use
+    GitHub's subscription-based routing block the generic host, and that
+    failure surfaces only as connection errors inside the agent, so say it here.
+    """
+    advertised = getattr(resolution, "advertised_api_url", None)
+    if resolution is None or not _advertised_host_is_normalized(advertised):
+        return
+    click.echo(
+        f"  Note: GitHub advertised {advertised} for this account; Headroom routes via "
+        f"{resolution.api_url}. If your network uses subscription-based routing, set "
+        f"{_USE_ADVERTISED_HOST_ENV}=1 or GITHUB_COPILOT_API_URL={advertised}."
+    )
 
 
 def _should_use_copilot_oauth(
@@ -5806,11 +5839,16 @@ def copilot(
             env["OPENAI_TARGET_API_URL"] = openai_api_url
             env["ANTHROPIC_TARGET_API_URL"] = openai_api_url
             anthropic_api_url = openai_api_url
+            # The CLI ranks its `copilotUrl` setting above COPILOT_API_URL; a
+            # pre-existing pin would make this launch look routed while every
+            # request bypassed the proxy.
+            _check_copilot_url_setting(env["COPILOT_API_URL"], environ=os.environ)
+            _echo_copilot_host_notice(subscription_resolution)
             copilot_proxy_token = client_bearer
             if subscription_resolution is not None:
                 copilot_refresh_oauth_token = subscription_resolution.refresh_oauth_token
                 copilot_api_token_expires_at = subscription_resolution.api_token_expires_at
-            support = _native_api_url_supported(environ=os.environ)
+            support = _native_api_url_supported(environ=os.environ, copilot_bin=copilot_bin)
             if support is False:
                 raise click.ClickException(
                     "This Copilot CLI build does not reference COPILOT_API_URL; refusing "
@@ -5853,6 +5891,11 @@ def copilot(
             env["COPILOT_PROVIDER_BEARER_TOKEN"] = client_bearer
             env["GITHUB_COPILOT_USE_TOKEN_EXCHANGE"] = "false"
             env.pop("COPILOT_PROVIDER_API_KEY", None)
+            # Chat goes through COPILOT_PROVIDER_BASE_URL here; a durable
+            # install's COPILOT_API_URL would send the CLI's ancillary CAPI
+            # calls to a proxy that may not be running.
+            env.pop("COPILOT_API_URL", None)
+            _ensure_loopback_no_proxy(env)
             # Hand the exact token we resolved (and, for --subscription, validated
             # against GitHub) to the proxy explicitly via copilot_proxy_token below.
             # The proxy pins it as GITHUB_COPILOT_API_TOKEN, so upstream auth is
@@ -5888,6 +5931,7 @@ def copilot(
             env["GITHUB_COPILOT_API_URL"] = openai_api_url
             env["OPENAI_TARGET_API_URL"] = openai_api_url
             env_vars_display.append(f"COPILOT_PROVIDER_API_URL={openai_api_url}")
+            _echo_copilot_host_notice(subscription_resolution)
     else:
         env, env_vars_display = _build_copilot_launch_env(
             port=port,
@@ -5985,6 +6029,7 @@ def vscode_copilot(
     model selected in VS Code. It does not edit Codex settings.
     """
     resolution = _require_copilot_subscription_resolution()
+    _echo_copilot_host_notice(resolution)
     target_settings = settings_file or vscode_settings_path()
 
     def _print_setup(actual_port: int) -> None:

@@ -9,6 +9,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Request, WebSocket
 from fastapi.responses import Response
 
+from headroom.copilot_auth import copilot_bearer_upstream as _copilot_bearer_upstream
 from headroom.providers.cloudcode import normalize_cloudcode_passthrough_path
 from headroom.providers.codex.endpoints import codex_backend_url
 from headroom.providers.codex.headers import drop_header
@@ -273,6 +274,16 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
             return await proxy.handle_anthropic_messages(
                 request, upstream_base_url=custom_base.rstrip("/")
             )
+        # Claude models on Copilot travel this route with GitHub's bearer token.
+        # On a shared proxy whose Anthropic target is the stock host that token
+        # cannot succeed; hand the handler the Copilot base the same way a
+        # per-request override would, so auth, `/v1` handling and provider
+        # labelling all follow the existing Copilot path.
+        copilot_base = _copilot_bearer_upstream(dict(request.headers), proxy.ANTHROPIC_API_URL)
+        if copilot_base is not None:
+            return await proxy.handle_anthropic_messages(
+                request, upstream_base_url=copilot_base, copilot_redirect=True
+            )
         return await proxy.handle_anthropic_messages(request)
 
     @app.post("/anthropic/v1/messages")
@@ -468,6 +479,14 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
             VERTEX_STREAM_RAW_PREDICT.name,
         )
 
+    def _model_metadata_target(request: Request, provider_name: str) -> str:
+        target = _api_target(proxy, provider_name)
+        if provider_name == "openai":
+            # Same rule as the unprefixed `/models` passthrough: a Copilot
+            # credential against the stock OpenAI target belongs at Copilot.
+            return _copilot_bearer_upstream(dict(request.headers), target) or target
+        return target
+
     @app.get("/v1/models")
     async def list_models(request: Request):
         provider_name = proxy.provider_runtime.model_metadata_provider(dict(request.headers))
@@ -475,7 +494,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
             proxy,
             request,
             endpoint=MODEL_METADATA_LIST_ENDPOINT,
-            provider_api_base_url=_api_target(proxy, provider_name),
+            provider_api_base_url=_model_metadata_target(request, provider_name),
             provider_name=provider_name,
         )
 
@@ -486,7 +505,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
             proxy,
             request,
             endpoint=model_metadata_get_endpoint(model_id),
-            provider_api_base_url=_api_target(proxy, provider_name),
+            provider_api_base_url=_model_metadata_target(request, provider_name),
             provider_name=provider_name,
         )
 
