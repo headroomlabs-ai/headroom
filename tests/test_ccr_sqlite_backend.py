@@ -14,10 +14,14 @@ import time
 import pytest
 
 from headroom.cache.backends.sqlite import SQLiteBackend
-from headroom.cache.compression_store import CompressionEntry, CompressionStore
+from headroom.cache.compression_store import (
+    CompressionEntry,
+    CompressionStore,
+    format_retrieval_miss_detail,
+)
 
 
-def make_entry(hash_key: str = "h1", content: str = "x" * 600, ttl: int = 1800) -> CompressionEntry:
+def make_entry(hash_key: str = "h1", content: str = "x" * 600, ttl: int = 3600) -> CompressionEntry:
     return CompressionEntry(
         hash=hash_key,
         original_content=content,
@@ -49,7 +53,7 @@ class TestSQLiteBackend:
         assert got is not None
         assert got.original_content == entry.original_content
         assert got.tool_name == "Read"
-        assert got.ttl == 1800
+        assert got.ttl == 3600
 
         assert b.exists("h1")
         assert b.count() == 1
@@ -187,6 +191,30 @@ class TestMultiWorkerSafety:
         assert not reopened.exists("old")  # swept at open
         assert reopened.exists("fresh")
 
+    def test_backend_purge_leaves_no_reason_and_the_miss_says_so(self, db_path):
+        """A restart loses the removal reason, and the miss text must admit it.
+
+        CompressionStore's tombstone ring is process-local, and the sweep above
+        runs inside the *backend*: by the time a restarted process asks about
+        the hash, the row is gone and nothing recorded why. Reporting the bare
+        "never stored by this store" there would be a lie — the entry was
+        stored, and it expired. The miss has to name both possibilities.
+        """
+        first = CompressionStore(backend=SQLiteBackend(db_path))
+        expired = make_entry(ttl=1)
+        expired.created_at = time.time() - 10
+        first._backend.set("h1", expired)
+        del first  # the tombstone ring does not outlive the process
+
+        # Restart: a fresh backend sweeps "h1" on open, into a fresh store.
+        restarted = CompressionStore(backend=SQLiteBackend(db_path))
+        status = restarted.get_entry_status("h1")
+
+        assert status["status"] == "missing"
+        detail = format_retrieval_miss_detail(status)
+        assert "Entry not found" in detail
+        assert "expired/evicted with no reason recorded" in detail
+
     @pytest.mark.skipif(os.name != "posix", reason="POSIX permissions")
     def test_database_file_is_private(self, db_path):
         SQLiteBackend(db_path)
@@ -199,9 +227,9 @@ class TestDefaults:
         """CCRConfig, CompressionEntry, and CompressionStore must agree."""
         from headroom.config import CCRConfig
 
-        assert CCRConfig().store_ttl_seconds == 1800
-        assert CompressionEntry.__dataclass_fields__["ttl"].default == 1800
-        assert CompressionStore()._default_ttl == 1800
+        assert CCRConfig().store_ttl_seconds == 3600
+        assert CompressionEntry.__dataclass_fields__["ttl"].default == 3600
+        assert CompressionStore()._default_ttl == 3600
 
     def test_default_backend_is_sqlite(self, monkeypatch, tmp_path):
         from headroom.cache.compression_store import _create_default_ccr_backend

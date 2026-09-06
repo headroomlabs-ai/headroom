@@ -15,6 +15,7 @@ import pytest
 
 from headroom.cache.compression_store import (
     CompressionStore,
+    format_retrieval_miss_detail,
     get_compression_store,
     reset_compression_store,
 )
@@ -88,6 +89,98 @@ class TestCompressionStore:
         assert not store.exists(hash_key)
         entry = store.retrieve(hash_key)
         assert entry is None
+
+    def test_retrieval_restarts_idle_window(self):
+        """#2604: an entry in active use must not expire under the agent."""
+        store = CompressionStore(default_ttl=1)
+
+        hash_key = store.store(original="[1,2,3]", compressed="[1]", ttl=1)
+
+        # Touch it every 0.6s across a span well past the 1s TTL.
+        for _ in range(4):
+            time.sleep(0.6)
+            assert store.retrieve(hash_key) is not None
+
+        # Then leave it idle: the window is idle-based, so it still expires.
+        time.sleep(1.1)
+        assert store.retrieve(hash_key) is None
+
+    def test_max_lifetime_ceiling_caps_a_hot_entry(self):
+        """Repeated access cannot keep an entry alive forever."""
+        store = CompressionStore(default_ttl=100, default_max_lifetime=1)
+
+        hash_key = store.store(original="[1,2,3]", compressed="[1]")
+        assert store.retrieve(hash_key) is not None
+
+        time.sleep(1.1)
+        assert store.retrieve(hash_key) is None
+        status = store.get_entry_status(hash_key)
+        assert status["status"] == "expired_and_purged"
+        assert status["expiry_reason"] == "max_lifetime"
+
+    def test_eviction_prefers_cold_entries_over_old_ones(self):
+        """Eviction is keyed on last access, not creation (#2604)."""
+        store = CompressionStore(max_entries=3)
+
+        oldest = store.store(original="a" * 40, compressed="a")
+        cold = store.store(original="b" * 40, compressed="b")
+
+        # Keep the oldest entry hot, then force an eviction.
+        assert store.retrieve(oldest) is not None
+        store.store(original="c" * 40, compressed="c")
+        store.store(original="d" * 40, compressed="d")
+
+        assert store.exists(oldest)
+        assert not store.exists(cold)
+
+    def test_miss_reason_distinguishes_eviction_from_expiry(self):
+        store = CompressionStore(max_entries=2)
+        evicted = store.store(original="a" * 40, compressed="a")
+        store.store(original="b" * 40, compressed="b")
+        store.store(original="c" * 40, compressed="c")
+
+        assert store.retrieve(evicted) is None
+        status = store.get_entry_status(evicted)
+        assert status["status"] == "evicted"
+        assert "evicted for capacity" in format_retrieval_miss_detail(status)
+
+        never_stored = store.get_entry_status("deadbeefdeadbeef")
+        assert never_stored["status"] == "missing"
+        assert "Entry not found" in format_retrieval_miss_detail(never_stored)
+
+    def test_get_metadata_purge_still_reports_expiry(self):
+        """The proxy metadata path must not erase the miss reason (#2604).
+
+        `get_metadata()` runs on the marker-refresh path before any retrieve,
+        so if it purged silently the user got "Entry not found" for an entry
+        that had simply expired.
+        """
+        store = CompressionStore(default_ttl=1)
+
+        hash_key = store.store(original="[1,2,3]", compressed="[1]", ttl=1)
+        time.sleep(1.1)
+
+        assert store.get_metadata(hash_key) is None
+
+        status = store.get_entry_status(hash_key)
+        assert status["status"] == "expired_and_purged"
+        assert status["expiry_reason"] == "idle"
+        assert "Entry expired and was purged" in format_retrieval_miss_detail(status)
+        assert "idle TTL" in format_retrieval_miss_detail(status)
+
+    def test_get_metadata_purge_reports_max_lifetime(self):
+        """Metadata purge keeps the max-lifetime reason distinct from idle TTL."""
+        store = CompressionStore(default_ttl=100, default_max_lifetime=1)
+
+        hash_key = store.store(original="[1,2,3]", compressed="[1]")
+        time.sleep(1.1)
+
+        assert store.get_metadata(hash_key) is None
+
+        status = store.get_entry_status(hash_key)
+        assert status["status"] == "expired_and_purged"
+        assert status["expiry_reason"] == "max_lifetime"
+        assert "max lifetime" in format_retrieval_miss_detail(status)
 
     def test_eviction_at_capacity(self):
         """Oldest entries evicted when at capacity."""
@@ -214,7 +307,7 @@ class TestCCRConfig:
         config = CCRConfig()
         assert config.enabled is True
         assert config.store_max_entries == 1000
-        assert config.store_ttl_seconds == 1800  # session-scale (was 300)
+        assert config.store_ttl_seconds == 3600  # session-scale idle TTL (was 1800)
         assert config.inject_retrieval_marker is True
         assert config.feedback_enabled is True
         assert config.min_items_to_cache == 20

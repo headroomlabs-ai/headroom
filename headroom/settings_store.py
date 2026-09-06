@@ -151,6 +151,24 @@ SETTINGS: tuple[SettingField, ...] = (
         ),
         tier="advanced",
     ),
+    SettingField(
+        "HEADROOM_CCR_TTL_SECONDS",
+        "ccr_ttl_seconds",
+        "CCR idle TTL (seconds)",
+        "Compression",
+        "int",
+        # Mirrors DEFAULT_CCR_TTL_SECONDS / DEFAULT_CCR_MAX_LIFETIME_MULTIPLIER
+        # in headroom.cache.compression_store — inlined because this module
+        # stays import-light for the early CLI apply hook.
+        default=3600,
+        minimum=1,
+        help=(
+            "How long a compressed entry may sit untouched before it expires. "
+            "The window restarts on every retrieval, so entries in active use "
+            "survive long sessions. Absolute ceiling is 8x this value."
+        ),
+        tier="advanced",
+    ),
     # --- Limits ---
     SettingField(
         "HEADROOM_RPM",

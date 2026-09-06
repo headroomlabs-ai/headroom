@@ -66,7 +66,7 @@ CCR keeps compression reversible. The compressed digest can stay compact while t
 The pieces that matter here are:
 
 - `headroom_retrieve` for on-demand recovery of stored originals
-- `HEADROOM_CCR_TTL_SECONDS` for sizing the local store lifetime
+- `HEADROOM_CCR_TTL_SECONDS` for sizing the local store's idle window (restarted on every retrieval)
 - `compression_strategy` as the authoritative discriminator on stored CCR entries
 
 For routing decisions, the same rule in plain terms is: headroom_retrieve recovers originals, HEADROOM_CCR_TTL_SECONDS sizes the local lifetime, compression_strategy identifies the producing path, and shape inference is not the routing authority.
