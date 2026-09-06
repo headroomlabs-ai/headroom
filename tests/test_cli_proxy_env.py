@@ -1400,6 +1400,7 @@ class TestSettingsFileToEnv:
                 ["proxy"],
                 env={
                     "HEADROOM_WORKSPACE_DIR": str(tmp_path),
+                    "HEADROOM_SETTINGS_PATH": None,
                     # Ensure nothing ambient shadows the file-applied values.
                     "HEADROOM_PORT": None,
                     "HEADROOM_CODE_AWARE_ENABLED": None,
@@ -1424,6 +1425,7 @@ class TestSettingsFileToEnv:
                 ["proxy"],
                 env={
                     "HEADROOM_WORKSPACE_DIR": str(tmp_path),
+                    "HEADROOM_SETTINGS_PATH": None,
                     "HEADROOM_PORT": "7777",
                 },
                 catch_exceptions=False,

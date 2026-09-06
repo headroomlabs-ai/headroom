@@ -39,11 +39,15 @@ def _skip_proxy_dependency_gate_unless_exercised(
 
 
 @pytest.fixture(autouse=True)
-def _scrub_developer_headroom_env(monkeypatch):
+def _scrub_developer_headroom_env(monkeypatch, tmp_path):
     for key in list(os.environ):
         if key.startswith("HEADROOM_"):
             monkeypatch.delenv(key, raising=False)
     monkeypatch.delenv("ANTHROPIC_CUSTOM_HEADERS", raising=False)
+    # Clearing HEADROOM_* alone leaves file-backed settings active. Give every
+    # test its own store so proxy/CLI startup cannot load developer settings and
+    # saves cannot rewrite them. Tests of path precedence can override this.
+    monkeypatch.setenv("HEADROOM_SETTINGS_PATH", str(tmp_path / "headroom-settings.json"))
 
 
 # The scrub above deletes every HEADROOM_* var — which includes HEADROOM_BEACON,
