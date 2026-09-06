@@ -3525,6 +3525,18 @@ class OpenAIHandlerMixin:
                     detail=f"Rate limited. Retry after {wait_seconds:.1f}s",
                 )
 
+        # Enforce the same proxy-wide spend budget as the Anthropic handler.
+        # Cost records are provider-independent, so skipping this preflight
+        # would let OpenAI traffic continue spending after the configured cap.
+        cost_tracker = getattr(self, "cost_tracker", None)
+        if cost_tracker:
+            allowed, _ = cost_tracker.check_budget()
+            if not allowed:
+                raise HTTPException(
+                    status_code=429,
+                    detail=cost_tracker.budget_denial_detail(),
+                )
+
         # Snapshot cache-key fields ONCE here (pre-upstream), reused verbatim
         # at the cache.set site below — re-reading body at set risks a mutated
         # body (e.g. tools reassigned) and a key mismatch (#327). OpenAI's
@@ -5624,6 +5636,17 @@ class OpenAIHandlerMixin:
                     detail=f"Rate limited. Retry after {wait_seconds:.1f}s",
                 )
 
+        # Budget enforcement must run before token counting/compression and,
+        # critically, before dispatching the Responses request upstream.
+        cost_tracker = getattr(self, "cost_tracker", None)
+        if cost_tracker:
+            allowed, _ = cost_tracker.check_budget()
+            if not allowed:
+                raise HTTPException(
+                    status_code=429,
+                    detail=cost_tracker.budget_denial_detail(),
+                )
+
         # Token counting on converted messages (offloaded off the event loop — GH #1701)
         tokenizer, original_tokens = await self._count_tokens_offloaded(model, messages)
 
@@ -6705,6 +6728,13 @@ class OpenAIHandlerMixin:
         session_handle: WSSessionHandle | None = None
         termination_cause: TerminationCause = "unknown"
 
+        def _budget_denial_detail() -> str | None:
+            cost_tracker = getattr(self, "cost_tracker", None)
+            if cost_tracker is None:
+                return None
+            allowed, _ = cost_tracker.check_budget()
+            return None if allowed else cost_tracker.budget_denial_detail()
+
         # Forward client headers to upstream, adding required OpenAI-Beta header
         ws_headers = dict(websocket.headers)
         _ws_url_obj = getattr(websocket, "url", None)
@@ -6721,6 +6751,16 @@ class OpenAIHandlerMixin:
                 _header_get(ws_headers, "origin"),
             )
             await websocket.close(code=1008, reason="origin not allowed")
+            return
+        budget_denial = _budget_denial_detail()
+        if budget_denial is not None:
+            logger.info(
+                "event=websocket_budget_rejected request_id=%s session_id=%s path=%s",
+                request_id,
+                session_id,
+                _ws_path,
+            )
+            await websocket.close(code=1008, reason=budget_denial[:123])
             return
         # WS sessions bypass the HTTP middleware that stamps X-Client: codex on
         # the Responses endpoint, so apply the same path-based stamp here before
@@ -7883,6 +7923,20 @@ class OpenAIHandlerMixin:
                 },
             )
 
+            # Re-check after the first frame wait: another request may have
+            # exhausted the shared budget while this socket was idle or while
+            # its upstream handshake was being established.
+            budget_denial = _budget_denial_detail()
+            if budget_denial is not None:
+                logger.info(
+                    "event=websocket_budget_rejected request_id=%s session_id=%s path=%s frame=1",
+                    request_id,
+                    session_id,
+                    _ws_path,
+                )
+                await websocket.close(code=1008, reason=budget_denial[:123])
+                return
+
             if ws_connected:
                 async with upstream:
                     await upstream.send(_strip_codex_lite_metadata(first_msg_raw))
@@ -8253,6 +8307,21 @@ class OpenAIHandlerMixin:
                                     isinstance(_inbound_frame_body, dict)
                                     and _inbound_frame_body.get("type") == "response.create"
                                 ):
+                                    budget_denial = _budget_denial_detail()
+                                    if budget_denial is not None:
+                                        logger.info(
+                                            "event=websocket_budget_rejected "
+                                            "request_id=%s session_id=%s path=%s frame=%d",
+                                            request_id,
+                                            session_id,
+                                            _ws_path,
+                                            client_frame_index,
+                                        )
+                                        await websocket.close(
+                                            code=1008,
+                                            reason=budget_denial[:123],
+                                        )
+                                        return
                                     ws_response_create_frames += 1
                                     inbound_response = _inbound_frame_body.get(
                                         "response", _inbound_frame_body

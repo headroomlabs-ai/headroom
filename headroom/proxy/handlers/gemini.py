@@ -404,6 +404,17 @@ class GeminiHandlerMixin:
                     detail=f"Rate limited. Retry after {wait_seconds:.1f}s",
                 )
 
+        # Cost tracking is shared across providers; enforce its configured
+        # budget before any Gemini generation request reaches the upstream.
+        cost_tracker = getattr(self, "cost_tracker", None)
+        if cost_tracker:
+            allowed, _ = cost_tracker.check_budget()
+            if not allowed:
+                raise HTTPException(
+                    status_code=429,
+                    detail=cost_tracker.budget_denial_detail(),
+                )
+
         # Convert Gemini format to messages for optimization
         system_instruction = body.get("systemInstruction")
         messages, preserved_indices = self._gemini_contents_to_messages(
@@ -1173,6 +1184,7 @@ class GeminiHandlerMixin:
         model: str,
     ) -> StreamingResponse | JSONResponse:
         """Handle Gemini streaming endpoint /v1beta/models/{model}:streamGenerateContent."""
+        from fastapi import HTTPException
         from fastapi.responses import JSONResponse
 
         from headroom.proxy.helpers import _read_request_json
@@ -1215,6 +1227,15 @@ class GeminiHandlerMixin:
             stripped_count=_pre_strip_count_gem_stream,
             request_id=request_id,
         )
+
+        cost_tracker = getattr(self, "cost_tracker", None)
+        if cost_tracker:
+            allowed, _ = cost_tracker.check_budget()
+            if not allowed:
+                raise HTTPException(
+                    status_code=429,
+                    detail=cost_tracker.budget_denial_detail(),
+                )
 
         # Token counting (offloaded off the event loop — GH #1701). Reuse the
         # shared _dict_parts coercion and keep only str text values: count_text
