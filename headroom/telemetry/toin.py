@@ -60,6 +60,7 @@ detection).
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import logging
@@ -432,6 +433,10 @@ class ToolIntelligenceNetwork:
     Thread-safe for concurrent access.
     """
 
+    # Bounded re-snapshot passes when a mutation races a backend write; leftovers
+    # stay dirty and the next record_* trigger retries, so this only caps I/O.
+    _SAVE_PASSES = 2
+
     # ── Deprecation warning de-dupe (PR-B5) ───────────────────────────────
     # `get_recommendation` is retired as a per-request mutator. We emit
     # `DeprecationWarning` once per process; if every call warned, busy
@@ -482,6 +487,10 @@ class ToolIntelligenceNetwork:
         # Tracking
         self._last_save_time = time.time()
         self._dirty = False
+        # Bumped alongside every _dirty=True so save() can tell whether new
+        # data landed while its snapshot was being written (all mutators hold
+        # the lock, so the counter needs no lock of its own).
+        self._mutations = 0
 
         # Load existing data from backend
         if self._backend is not None:
@@ -708,6 +717,7 @@ class ToolIntelligenceNetwork:
             pattern.last_updated = time.time()
             pattern.confidence = self._calculate_confidence(pattern)
             self._dirty = True
+            self._mutations += 1
             self._prune_patterns_locked()
 
         # Auto-save if needed (outside lock)
@@ -1015,6 +1025,7 @@ class ToolIntelligenceNetwork:
 
             pattern.last_updated = time.time()
             self._dirty = True
+            self._mutations += 1
             self._prune_patterns_locked()
 
         self._maybe_auto_save()
@@ -1319,6 +1330,7 @@ class ToolIntelligenceNetwork:
 
             self._prune_patterns_locked()
             self._dirty = True
+            self._mutations += 1
 
     def _merge_patterns(self, existing: ToolPattern, imported: ToolPattern) -> None:
         """Merge imported pattern into existing."""
@@ -1506,39 +1518,47 @@ class ToolIntelligenceNetwork:
     def save(self) -> None:
         """Save TOIN data via the storage backend.
 
-        HIGH FIX: Serialize under lock but write outside lock to prevent
-        blocking other threads during slow file I/O.
+        Snapshot under lock, write outside it, so slow file I/O never blocks
+        record_* callers. The snapshot is a deep copy — to_dict() nests live
+        containers, and dumping those unlocked would race concurrent mutators.
+        A mutation landing mid-write bumps _mutations past the snapshot's
+        count; finalize then leaves _dirty armed and one bounded re-snapshot
+        pass persists the newer state, so nothing recorded is left unwritten.
         """
         if self._backend is None:
             return
 
-        # Step 1: Serialize under lock (fast in-memory operation)
-        with self._lock:
-            data = self.export_patterns()
-
-        # Step 2: Write outside lock (slow I/O operation)
-        try:
-            self._backend.save(data)
-
-            # Step 3: Update state under lock (fast)
+        for _pass in range(self._SAVE_PASSES):
             with self._lock:
-                self._dirty = False
-                self._last_save_time = time.time()
+                data = copy.deepcopy(self.export_patterns())
+                expected_mutations = self._mutations
 
-        except Exception as e:
-            # Surface storage failures structured so log aggregators can
-            # alert on `event=toin_save_failed` without false positives
-            # from generic exception lines. Per project memory
-            # `feedback_no_silent_fallbacks.md`: never swallow.
-            logger.warning(
-                "TOIN storage save failed",
-                extra={
-                    "event": "toin_save_failed",
-                    "backend": type(self._backend).__name__,
-                    "error_type": type(e).__name__,
-                    "error": str(e),
-                },
-            )
+            try:
+                self._backend.save(data)
+            except Exception as e:
+                # Surface storage failures structured so log aggregators can
+                # alert on `event=toin_save_failed` without false positives
+                # from generic exception lines. Per project memory
+                # `feedback_no_silent_fallbacks.md`: never swallow.
+                logger.warning(
+                    "TOIN storage save failed",
+                    extra={
+                        "event": "toin_save_failed",
+                        "backend": type(self._backend).__name__,
+                        "error_type": type(e).__name__,
+                        "error": str(e),
+                    },
+                )
+                return
+
+            with self._lock:
+                if self._mutations == expected_mutations:
+                    self._dirty = False
+                    self._last_save_time = time.time()
+                    return
+                # Newer data landed during the write — loop to include it.
+                # On pass exhaustion the dirty flag stays armed and the next
+                # record_* trigger retries from a fresh snapshot.
 
     def _load_from_backend(self) -> None:
         """Load TOIN data from the storage backend."""
@@ -1572,23 +1592,27 @@ class ToolIntelligenceNetwork:
     def _maybe_auto_save(self) -> None:
         """Auto-save if enough time has passed.
 
-        HIGH FIX: Check conditions under lock to prevent race where another
-        thread modifies _dirty or _last_save_time between check and save.
-        The save() method already acquires the lock, and we use RLock so
-        it's safe to hold the lock when calling save().
+        Eligibility is checked under lock, then save() runs outside it —
+        holding the RLock across backend.save() made every concurrent
+        record_* call block for the whole disk write, defeating save()'s
+        snapshot-under / write-outside design. Two threads passing the same
+        interval boundary may both save; each converges via save()'s
+        mutation counter, so this costs a duplicate write at worst.
         """
         if self._backend is None or not self._config.auto_save_interval:
             return
 
-        # Check under lock to prevent race conditions
+        # Eligibility check stays under lock so a concurrent save cannot
+        # flip _dirty/_last_save_time between our check and our write.
         with self._lock:
             if not self._dirty:
                 return
 
             elapsed = time.time() - self._last_save_time
-            if elapsed >= self._config.auto_save_interval:
-                # save() uses the same RLock, so this is safe
-                self.save()
+            if elapsed < self._config.auto_save_interval:
+                return
+
+        self.save()
 
     def clear(self) -> None:
         """Clear all TOIN data. Mainly for testing."""

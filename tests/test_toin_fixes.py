@@ -11,7 +11,10 @@ This file tests all the fixes made to the TOIN implementation:
 """
 
 import json
+import logging
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -690,3 +693,162 @@ class TestIntegration:
         if pattern:
             # Strategy should be tracked
             assert pattern.total_retrievals >= 1
+
+
+class TestAutoSaveLockScope:
+    """The periodic auto-save must not hold the instance lock across the write."""
+
+    def test_auto_save_writes_outside_the_instance_lock(self):
+        class _LockProbeBackend:
+            """Records whether the TOIN lock is free while save() performs I/O.
+
+            The probe runs on a second thread — a same-thread acquire can't
+            detect an RLock held reentrantly by the caller.
+            """
+
+            def __init__(self, lock: threading.RLock):
+                self._lock = lock
+                self.lock_free_during_write: bool | None = None
+
+            def save(self, data: dict) -> None:
+                def probe():
+                    self.lock_free_during_write = self._lock.acquire(blocking=False)
+                    # An RLock may only be released by its owning thread.
+                    if self.lock_free_during_write:
+                        self._lock.release()
+
+                t = threading.Thread(target=probe)
+                t.start()
+                t.join(timeout=5)
+
+        toin = ToolIntelligenceNetwork(TOINConfig(auto_save_interval=600))
+        backend = _LockProbeBackend(toin._lock)
+        toin._backend = backend
+        toin._dirty = True
+        toin._last_save_time = time.time() - 2 * toin._config.auto_save_interval
+
+        toin._maybe_auto_save()
+
+        assert backend.lock_free_during_write is True
+
+    def test_mutation_during_write_is_persisted_by_the_next_pass(self):
+        writes: list[dict] = []
+        first_write_started = threading.Event()
+        release_first_write = threading.Event()
+
+        class _BlockingBackend:
+            """Blocks the first write so a commit can race the snapshot."""
+
+            def save(self, data: dict) -> None:
+                writes.append(data)
+                if len(writes) == 1:
+                    first_write_started.set()
+                    release_first_write.wait(timeout=5)
+
+        toin = ToolIntelligenceNetwork(TOINConfig(auto_save_interval=600))
+        toin._backend = _BlockingBackend()
+        toin._dirty = True
+        toin._last_save_time = time.time() - 2 * toin._config.auto_save_interval
+
+        saver = threading.Thread(target=toin._maybe_auto_save)
+        saver.start()
+        assert first_write_started.wait(timeout=5)
+
+        # Commit while the first snapshot is mid-write. The interval flip keeps
+        # record_compression's own trailing auto-save from racing this test.
+        items = [{"id": i, "score": 100 - i} for i in range(20)]
+        signature = ToolSignature.from_items(items)
+        toin._config.auto_save_interval = 0
+        toin.record_compression(
+            tool_signature=signature,
+            original_count=20,
+            compressed_count=10,
+            original_tokens=2000,
+            compressed_tokens=1000,
+            strategy="smart_sample",
+            items=items,
+        )
+        assert toin._dirty is True
+
+        release_first_write.set()
+        saver.join(timeout=5)
+
+        # The convergence pass rewrote the snapshot including the late commit.
+        assert len(writes) == 2
+        assert any(signature.structure_hash in key for key in writes[1]["patterns"])
+        assert toin._dirty is False
+
+    def test_save_failure_keeps_dirty_state_for_retry(self):
+        class _Capture(logging.Handler):
+            def __init__(self):
+                super().__init__()
+                self.records: list[logging.LogRecord] = []
+
+            def emit(self, record: logging.LogRecord) -> None:
+                self.records.append(record)
+
+        class _FailingBackend:
+            def save(self, data: dict) -> None:
+                raise OSError("disk full")
+
+        toin = ToolIntelligenceNetwork(TOINConfig(auto_save_interval=600))
+        toin._backend = _FailingBackend()
+        toin._dirty = True
+        toin._last_save_time = time.time() - 2 * toin._config.auto_save_interval
+        before = toin._last_save_time
+
+        logger = logging.getLogger("headroom.telemetry.toin")
+        capture = _Capture()
+        logger.addHandler(capture)
+        try:
+            toin._maybe_auto_save()
+        finally:
+            logger.removeHandler(capture)
+
+        # Failed write must not advance the save clock — the next record_*
+        # trigger should retry from a fresh snapshot.
+        assert toin._dirty is True
+        assert toin._last_save_time == before
+        assert any(
+            record.levelno == logging.WARNING
+            and getattr(record, "event", None) == "toin_save_failed"
+            for record in capture.records
+        )
+
+    def test_mutations_on_every_pass_exhaust_and_stay_dirty(self):
+        writes: list[dict] = []
+
+        toin = ToolIntelligenceNetwork(TOINConfig(auto_save_interval=600))
+
+        class _MutatingBackend:
+            """Commits a new pattern during every write, racing each pass."""
+
+            def save(self, data: dict) -> None:
+                writes.append(data)
+                saved_interval = toin._config.auto_save_interval
+                # Silence the trailing auto-save inside the nested commit.
+                toin._config.auto_save_interval = 0
+                try:
+                    items = [{"id": len(writes), "score": 1}]
+                    toin.record_compression(
+                        tool_signature=ToolSignature.from_items(items),
+                        original_count=1,
+                        compressed_count=1,
+                        original_tokens=10,
+                        compressed_tokens=5,
+                        strategy="smart_sample",
+                        items=items,
+                    )
+                finally:
+                    toin._config.auto_save_interval = saved_interval
+
+        toin._backend = _MutatingBackend()
+        toin._dirty = True
+        toin._last_save_time = time.time() - 2 * 600
+
+        toin._maybe_auto_save()
+
+        # Both bounded passes wrote; neither could finalize because every pass
+        # was invalidated mid-write. Dirty stays armed for the next trigger.
+        assert len(writes) == toin._SAVE_PASSES
+        assert toin._dirty is True
