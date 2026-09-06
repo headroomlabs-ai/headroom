@@ -70,7 +70,7 @@
     "build": "tsup",
     "test": "vitest run",
     "test:watch": "vitest",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "node node_modules/@typescript/native/bin/tsc --noEmit"
   },
   "peerDependencies": {
     "@ai-sdk/provider": ">=1.0.0",
@@ -93,6 +93,8 @@
     }
   },
   "devDependencies": {
+    "@typescript/native": "npm:typescript@^7.0.2",
+    "@types/node": "^26.1.1",
     "@ai-sdk/anthropic": "^3.0.64",
     "@ai-sdk/openai": "^3.0.48",
     "@ai-sdk/provider": "^1.0.0",
@@ -101,7 +103,7 @@
     "dotenv": "^17.3.1",
     "openai": "^4.80.0",
     "tsup": "^8.0.0",
-    "typescript": "^5.5.0",
+    "typescript": "^6.0.3",
     "vitest": "^4.1.5"
   },
   "overrides": {
