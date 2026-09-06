@@ -510,6 +510,7 @@ export class HeadroomClient implements HeadroomClientInterface {
       ...options.headers,
     };
     if (this.apiKey) {
+      headers["X-Headroom-Proxy-Token"] = this.apiKey;
       // Don't override provider auth headers
       if (!headers["Authorization"] && !headers["x-api-key"]) {
         headers["Authorization"] = `Bearer ${this.apiKey}`;
