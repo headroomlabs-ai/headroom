@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 from abc import ABC, abstractmethod
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -109,6 +110,122 @@ def _build_section(recommendations: list[Recommendation]) -> str:
 
 # Matches the "*~N tokens/session saved*" annotation emitted by _build_section.
 _TOKENS_ANNOTATION_PATTERN = re.compile(r"\*~([\d,]+) tokens/session saved\*\n?")
+_PATTERN_ID_PATTERN = re.compile(r"<!--\s*headroom:pattern-id:([^\s>]+)\s*-->\s*$")
+
+
+def _merge_markdown_items(
+    new_content: str,
+    prior_content: str,
+    active_item_ids: frozenset[str] | None = None,
+) -> str | None:
+    """Merge simple markdown bullets, preferring new text for stable IDs.
+
+    ``active_item_ids`` is the producing learner's authoritative set of ids
+    that are still alive — it must include the items that this batch omitted
+    only because of ranking or top-N capping, otherwise still-active advice
+    is deleted. When it is supplied, a prior item is carried forward only
+    while its `headroom:pattern-id` is in the set, so an expired or
+    tombstoned item is genuinely removed instead of being pinned forever.
+    Prior items with no id predate id tagging: a still-active one is
+    re-emitted by the current run with an id and collapses into that line by
+    visible text, so dropping the untagged leftovers removes only items the
+    learner no longer considers active.
+
+    Passing ``None`` means the producer exposes no lifecycle signal, and the
+    merge degrades to a plain union of new and prior items.
+    """
+
+    def _items(content: str) -> list[tuple[str | None, str, str]] | None:
+        lines = [line.strip() for line in content.splitlines() if line.strip()]
+        if any(not line.startswith("- ") for line in lines):
+            return None
+        items: list[tuple[str | None, str, str]] = []
+        for line in lines:
+            id_match = _PATTERN_ID_PATTERN.search(line)
+            pattern_id = id_match.group(1) if id_match else None
+            visible = _PATTERN_ID_PATTERN.sub("", line).strip().casefold()
+            items.append((pattern_id, visible, line))
+        return items
+
+    new_items = _items(new_content)
+    prior_items = _items(prior_content)
+    if new_items is None or prior_items is None:
+        return None
+
+    if active_item_ids is not None:
+        prior_items = [
+            item for item in prior_items if item[0] is not None and item[0] in active_item_ids
+        ]
+
+    merged: list[str] = []
+    seen_ids: set[str] = set()
+    seen_content: set[str] = set()
+    for pattern_id, visible, line in (*new_items, *prior_items):
+        if (pattern_id is not None and pattern_id in seen_ids) or visible in seen_content:
+            continue
+        if pattern_id is not None:
+            seen_ids.add(pattern_id)
+        seen_content.add(visible)
+        merged.append(line)
+    return "\n".join(merged)
+
+
+def _authoritative_item_ids(
+    recommendations: list[Recommendation],
+) -> frozenset[str] | None:
+    """Union every lifecycle signal the current run carries, or None.
+
+    A section the new run did not re-emit cannot be judged by its own
+    recommendation — that recommendation is exactly what is missing. The
+    sets the run *does* carry stand in for it: a producer publishes one set
+    per run covering all of its live items, so an id absent from every set
+    in the run is one no producer still claims. Returns ``None`` when no
+    recommendation carries a signal, which keeps the historical
+    carry-everything behaviour for runs that cannot speak to lifecycle.
+    """
+    signals = [r.active_item_ids for r in recommendations if r.active_item_ids is not None]
+    if not signals:
+        return None
+    return frozenset().union(*signals)
+
+
+def _prune_carried_section(
+    content: str,
+    active_item_ids: frozenset[str],
+) -> str | None:
+    """Drop expired id-tagged bullets from a section the new run did not re-emit.
+
+    This is the deletion path for a heading whose last item expired: the
+    producer stops emitting the section entirely, so the same-section merge
+    never runs and the heading would otherwise be carried forward forever.
+
+    Only bullets carrying a `headroom:pattern-id` are removable — they come
+    from a lifecycle-tracked producer, so their absence from
+    ``active_item_ids`` means that producer dropped them. Untagged bullets
+    are kept: unlike the same-section merge, where a still-active legacy
+    item is re-emitted with an id by the same run and collapses by visible
+    text, nothing in this path would bring an untagged bullet back, so
+    deleting it would discard content on no evidence.
+
+    Returns the pruned content, or ``None`` when the section carries no
+    tagged bullets at all and is therefore not a tracked section to prune.
+    """
+    lines = [line.strip() for line in content.splitlines() if line.strip()]
+    if not lines or any(not line.startswith("- ") for line in lines):
+        return None
+    kept: list[str] = []
+    saw_tracked_item = False
+    for line in lines:
+        id_match = _PATTERN_ID_PATTERN.search(line)
+        if id_match is None:
+            kept.append(line)
+            continue
+        saw_tracked_item = True
+        if id_match.group(1) in active_item_ids:
+            kept.append(line)
+    if not saw_tracked_item:
+        return None
+    return "\n".join(kept)
 
 
 def extract_marker_block(file_content: str) -> str | None:
@@ -170,15 +287,52 @@ def _merge_recommendations(
     whose headings do not reappear in the new run are carried forward so
     a re-run doesn't silently drop accumulated learnings. To fully rebuild
     the block, delete it manually and re-run.
+
+    Recommendations that opt into ``preserve_prior_items`` are merged at the
+    item level instead, bounded by their ``active_item_ids`` lifecycle signal
+    so prior items can still expire out of the file.
+
+    That signal also reaches the carried-forward sections. A category whose
+    last item expires stops producing a recommendation at all, so its
+    heading never enters the same-section merge; without pruning the carry
+    path too, those bullets would be pinned in the file forever. Sections
+    holding no id-tagged items are carried untouched, as before.
     """
     if not file_path.exists():
         return new_recommendations
     prior = _parse_prior_recommendations(_read_text_tolerant(file_path))
     if not prior:
         return new_recommendations
-    new_sections = {r.section for r in new_recommendations}
-    carried = [p for p in prior if p.section not in new_sections]
-    return list(new_recommendations) + carried
+    prior_by_section = {r.section: r for r in prior}
+    merged_new: list[Recommendation] = []
+    for recommendation in new_recommendations:
+        prior_recommendation = prior_by_section.get(recommendation.section)
+        if recommendation.preserve_prior_items and prior_recommendation is not None:
+            merged_content = _merge_markdown_items(
+                recommendation.content,
+                prior_recommendation.content,
+                recommendation.active_item_ids,
+            )
+            if merged_content is not None:
+                recommendation = replace(recommendation, content=merged_content)
+        merged_new.append(recommendation)
+
+    new_sections = {r.section for r in merged_new}
+    run_active_item_ids = _authoritative_item_ids(merged_new)
+    carried: list[Recommendation] = []
+    for prior_recommendation in prior:
+        if prior_recommendation.section in new_sections:
+            continue
+        if run_active_item_ids is not None:
+            pruned = _prune_carried_section(prior_recommendation.content, run_active_item_ids)
+            if pruned is not None:
+                if not pruned:
+                    # Every tracked item under this heading is gone; the
+                    # heading goes with them rather than outliving them.
+                    continue
+                prior_recommendation = replace(prior_recommendation, content=pruned)
+        carried.append(prior_recommendation)
+    return merged_new + carried
 
 
 def _merge_into_file(file_path: Path, new_recommendations: list[Recommendation]) -> str:
