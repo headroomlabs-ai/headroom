@@ -38,7 +38,8 @@ from functools import wraps
 from pathlib import Path
 from typing import Any, NamedTuple, cast
 
-from headroom._subprocess import pid_alive, run
+from headroom._subprocess import identity_mismatch as _shared_identity_mismatch
+from headroom._subprocess import pid_alive, proc_identity, run
 
 # Fix Windows cp1252 encoding — box-drawing characters require UTF-8
 if sys.platform == "win32" and hasattr(sys.stdout, "buffer"):
@@ -653,7 +654,16 @@ def _start_proxy(
     (see ``_find_available_port``).
     """
 
-    cmd = [sys.executable, "-m", "headroom.cli", "proxy", "--port", str(port)]
+    cmd = [
+        sys.executable,
+        "-m",
+        "headroom.cli",
+        "proxy",
+        "--port",
+        str(port),
+        "--workers",
+        "1",
+    ]
 
     # Forward HEADROOM_MODE env var so the proxy respects the user's mode choice
     headroom_mode = os.environ.get("HEADROOM_MODE")
@@ -702,6 +712,10 @@ def _start_proxy(
     # Ensure proxy subprocess uses UTF-8 (Windows defaults to cp1252)
     proxy_env = os.environ.copy()
     _scrub_copilot_proxy_seed_env(proxy_env)
+    # A wrap-owned proxy must be a single authoritative process so its orphan
+    # watchdog can observe all activity before deciding to self-terminate.
+    proxy_env.pop("HEADROOM_WORKERS", None)
+    proxy_env.pop("HEADROOM_PROXY_CONFIG_JSON", None)
     proxy_env["PYTHONIOENCODING"] = "utf-8"
     # `python -m headroom.cli` prepends the launch cwd to sys.path, so running
     # `wrap` from a directory that contains a `headroom/` folder (most commonly a
@@ -720,6 +734,12 @@ def _start_proxy(
     if agent_type != "unknown":
         proxy_env["HEADROOM_AGENT_TYPE"] = agent_type
         proxy_env.setdefault("HEADROOM_STACK", f"wrap_{agent_type}")
+    # Mark the proxy as wrap-spawned so its orphan watchdog (proxy side) stops
+    # it once no live wrap clients remain. Standalone `headroom proxy` and
+    # persistent installs never get this flag and never self-exit. The proxy
+    # is detached (setsid / breakaway flags), so without this a crashed or
+    # killed wrapper leaks the proxy forever and later wraps silently reuse it.
+    proxy_env["HEADROOM_WRAP_OWNED"] = "1"
     savings_profile = _wrap_agent_savings_profile(agent_type)
     if savings_profile is not None:
         apply_agent_savings_env_defaults(proxy_env, savings_profile)
@@ -4484,31 +4504,13 @@ def _client_marker_path(port: int) -> Path:
 
 
 def _proc_identity(pid: int) -> tuple[str, float] | None:
-    """Best-effort ``(source, start_time)`` identity for a PID.
+    """Module-level alias of :func:`headroom._subprocess.proc_identity`.
 
-    Used to defeat PID reuse: a marker is only trusted while the live PID is
-    *the same process* that wrote it. Returns ``None`` when start time can't be
-    determined (e.g. macOS without psutil), in which case callers fall back to
-    existence-only liveness — no regression, just no reuse protection there.
-
-    The ``source`` tag ("psutil" vs "proc") guards against comparing values in
-    different units; we only compare like-for-like.
+    Kept as a function (not an assignment) so tests can monkeypatch
+    ``wrap._proc_identity`` and have ``_identity_mismatch`` pick the patch up
+    through the module-global lookup below.
     """
-    try:
-        import psutil  # type: ignore[import-untyped]  # optional dependency; portable when present
-
-        return ("psutil", psutil.Process(pid).create_time())
-    except Exception:
-        pass
-    # Linux fallback: field 22 of /proc/<pid>/stat is starttime in clock ticks
-    # since boot — a stable per-process value. `comm` (field 2) may contain
-    # spaces/parens, so split after the final ')'.
-    try:
-        with open(f"/proc/{pid}/stat", "rb") as fh:
-            fields = fh.read().rpartition(b")")[2].split()
-        return ("proc", float(fields[19]))
-    except (OSError, IndexError, ValueError):
-        return None
+    return proc_identity(pid)
 
 
 def _register_proxy_client(port: int) -> None:
@@ -4545,21 +4547,9 @@ def _pid_alive(pid: int) -> bool:
 
 
 def _identity_mismatch(src: Any, recorded: Any, pid: int) -> bool:
-    """True only if ``pid``'s current identity *provably* differs from the
-    recorded ``(src, recorded)`` identity (i.e. the PID was recycled).
-
-    Conservative by design: any uncertainty (unknown/legacy identity, unknown
-    start time, mismatched source) returns ``False`` — never claim a mismatch
-    without proof, since the caller uses this to decide whether to trust or
-    discard state tied to a live PID.
-    """
-    if not isinstance(src, str) or not isinstance(recorded, int | float):
-        return False  # legacy / identity-less record — can't tell
-    ident = _proc_identity(pid)
-    if ident is None or ident[0] != src:
-        return False  # can't compare like-for-like — don't claim mismatch
-    # Start times are stable per process; >1s apart means a different process.
-    return abs(ident[1] - float(recorded)) > 1.0
+    """Delegate to the shared comparison, resolving the identity probe through
+    this module so monkeypatched ``_proc_identity`` keeps working in tests."""
+    return _shared_identity_mismatch(src, recorded, pid, identity_fn=_proc_identity)
 
 
 def _marker_pid_reused(marker: Path, pid: int) -> bool:
@@ -4569,6 +4559,8 @@ def _marker_pid_reused(marker: Path, pid: int) -> bool:
     try:
         rec = json.loads(_read_text(marker))
     except (OSError, ValueError):
+        return False
+    if not isinstance(rec, dict):
         return False
     return _identity_mismatch(rec.get("start_src"), rec.get("start_time"), pid)
 
@@ -4600,61 +4592,21 @@ def _live_proxy_clients(port: int, *, exclude_self: bool = True) -> list[int]:
 
 
 def _make_cleanup(proxy_proc_holder: list, port: int | list[int] = 8787) -> Any:
-    """Create a cleanup function that terminates the proxy on exit.
-
-    Only kills the proxy when no other live headroom-wrapped clients remain,
-    tracked via per-PID marker files in ``paths.proxy_clients_dir(port)``.
+    """Create marker cleanup for a successfully launched wrap session.
 
     ``port`` can be an ``int`` or a ``list[int]``.  When a port fallback occurs
     (``_ensure_proxy`` ups the port because the requested one is busy), the
     caller can update ``port[0]`` in-place and the closure picks it up.
-    """
 
-    def _other_clients_exist() -> bool:
-        p = port[0] if isinstance(port, list) else port
-        return len(_live_proxy_clients(p, exclude_self=True)) > 0
+    Normal wrapper exit only unregisters its marker. The wrap-owned proxy's
+    watchdog owns final shutdown so active markerless HTTP or WebSocket traffic
+    receives a full grace period. Startup rollback and explicit stop commands
+    retain direct process termination.
+    """
 
     def cleanup(signum: int | None = None, frame: Any = None) -> None:
         p = port[0] if isinstance(port, list) else port
         _unregister_proxy_client(p)
-        proc = proxy_proc_holder[0] if proxy_proc_holder else None
-        if proc:
-            if _other_clients_exist():
-                # Other clients still using the proxy — leave it running.
-                return
-            # Snapshot the serving PID before terminating the launcher.  On
-            # Windows the detached serving child can briefly make /health
-            # unavailable while the launcher exits, causing the later safety
-            # probe to classify our own listener as "unidentified" and leave
-            # it orphaned.  We still verify it through Headroom's health
-            # payload before trusting the PID.
-            serving_pid: int | None = None
-            if sys.platform == "win32" and _check_proxy(p):
-                running_config = _query_proxy_config(p)
-                try:
-                    serving_pid = int(running_config["pid"]) if running_config else None
-                except (KeyError, TypeError, ValueError):
-                    serving_pid = None
-            if proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-            # On Windows the proxy launcher can exit while its detached
-            # serving child remains alive (the native runtime uses a child
-            # process).  The detachment is intentional so an ungraceful
-            # terminal close cannot disrupt other wrappers, but a graceful
-            # Ctrl+C from the last wrapper must still stop the listener.
-            if sys.platform == "win32" and _check_proxy(p):
-                stop_status = _stop_local_proxy_for_unwrap(p)
-                if stop_status == "unidentified" and serving_pid is not None:
-                    stop_status = "stopped" if _kill_proxy_by_pid(serving_pid, p) else "failed"
-                if stop_status not in {"stopped", "not_running"}:
-                    click.echo(
-                        f"  Warning: proxy on port {p} remained running "
-                        f"after shutdown ({stop_status})."
-                    )
 
     return cleanup
 
@@ -7839,6 +7791,7 @@ def opencode(
         ),
     )
 
+    launch_started = False
     try:
         # If the proxy fell back to a different port, move our marker so
         # cleanup tracking stays accurate and update MCP config.
@@ -7867,24 +7820,35 @@ def opencode(
 
         # Proxy already started by _ensure_proxy above; tell _launch_tool to
         # skip duplicate startup.
-        _launch_tool(
-            binary=opencode_bin,
-            args=opencode_args,
-            env=env,
-            port=actual_port,
-            no_proxy=True,
-            tool_label="OPENCODE",
-            env_vars_display=env_vars_display,
-            learn=learn,
-            memory=memory,
-            agent_type="opencode",
-            code_graph=code_graph,
-            backend=backend,
-            anyllm_provider=anyllm_provider,
-            region=region,
-        )
+        launch_started = True
+        try:
+            _launch_tool(
+                binary=opencode_bin,
+                args=opencode_args,
+                env=env,
+                port=actual_port,
+                no_proxy=True,
+                tool_label="OPENCODE",
+                env_vars_display=env_vars_display,
+                learn=learn,
+                memory=memory,
+                agent_type="opencode",
+                code_graph=code_graph,
+                backend=backend,
+                anyllm_provider=anyllm_provider,
+                region=region,
+            )
+        except SystemExit as exc:
+            # _launch_tool raises plain SystemExit after a child exits, but
+            # chains pre-launch failures as the cause.
+            if exc.__cause__ is not None:
+                launch_started = False
+            raise
+        except BaseException:
+            launch_started = False
+            raise
     finally:
-        if _opencode_proxy and _opencode_proxy.poll() is None:
+        if not launch_started and _opencode_proxy and _opencode_proxy.poll() is None:
             _other = _live_proxy_clients(actual_port, exclude_self=True)
             if not _other:
                 _opencode_proxy.terminate()

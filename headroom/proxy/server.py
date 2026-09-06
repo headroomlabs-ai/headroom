@@ -160,6 +160,11 @@ from headroom.proxy.modes import (
     is_token_mode,
     normalize_proxy_mode,
 )
+from headroom.proxy.orphan_watchdog import (
+    orphan_grace_seconds,
+    orphan_watchdog_enabled,
+    orphan_watchdog_loop,
+)
 from headroom.proxy.probe_recorder import probe_recorder_from_env
 from headroom.proxy.project_context import (
     classify_project,
@@ -1211,6 +1216,8 @@ class HeadroomProxy(
         # Request counter for IDs
         self._request_counter = 0
         self._request_counter_lock = asyncio.Lock()
+        self._active_requests = 0
+        self._activity_generation = 0
 
         # CCR tool injectors (one per provider)
         self.anthropic_tool_injector = CCRToolInjector(
@@ -2202,6 +2209,16 @@ class HeadroomProxy(
             self._request_counter += 1
             return f"hr_{int(time.time())}_{self._request_counter:06d}"
 
+    @property
+    def active_request_count(self) -> int:
+        """Number of active HTTP and WebSocket ASGI scopes."""
+        return self._active_requests
+
+    @property
+    def activity_generation(self) -> int:
+        """Monotonic generation advanced at request entry and completion."""
+        return self._activity_generation
+
     def _extract_tags(self, headers: dict) -> dict[str, str]:
         """Backwards-compat wrapper around :func:`extract_tags`.
 
@@ -2725,6 +2742,27 @@ class WebSocketProjectPrefixMiddleware:
         await self.app(scope, receive, send)
 
 
+class ActivityMiddleware:
+    """Track HTTP and WebSocket scopes through their complete ASGI lifetime."""
+
+    def __init__(self, app: Any, *, proxy: HeadroomProxy) -> None:
+        self.app = app
+        self.proxy = proxy
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] not in {"http", "websocket"}:
+            await self.app(scope, receive, send)
+            return
+
+        self.proxy._active_requests += 1
+        self.proxy._activity_generation += 1
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            self.proxy._active_requests -= 1
+            self.proxy._activity_generation += 1
+
+
 def create_app(config: ProxyConfig | None = None) -> FastAPI:
     """Create FastAPI application."""
     if not FASTAPI_AVAILABLE:
@@ -2868,6 +2906,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         app.state.startup_error = None
         app.state.periodic_toin_stats_task = None
         app.state.periodic_malloc_trim_task = None
+        app.state.orphan_watchdog_task = None
 
         try:
             try:
@@ -2883,6 +2922,17 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 if config.periodic_malloc_trim_enabled:
                     app.state.periodic_malloc_trim_task = asyncio.create_task(
                         trim_periodically(config.malloc_trim_interval_seconds)
+                    )
+                # Only wrap-spawned proxies carry the env marker; standalone
+                # `headroom proxy` and persistent installs never self-exit.
+                # Multi-worker runs (HEADROOM_PROXY_CONFIG_JSON is set before
+                # forking workers) are excluded: WS sessions are per-worker,
+                # so no single worker can observe "zero active sessions", and
+                # wrap never requests multiple workers anyway.
+                if orphan_watchdog_enabled() and _MULTI_WORKER_CONFIG_ENV not in os.environ:
+                    app.state.orphan_watchdog_task = asyncio.create_task(
+                        orphan_watchdog_loop(proxy, grace_seconds=orphan_grace_seconds()),
+                        name="headroom-orphan-watchdog",
                     )
                 if proxy.usage_reporter:
                     await proxy.usage_reporter.start(proxy)
@@ -2952,6 +3002,16 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     timeout=3.0,
                 )
                 app.state.periodic_malloc_trim_task = None
+
+            orphan_watchdog_task = app.state.orphan_watchdog_task
+            if orphan_watchdog_task is not None:
+                orphan_watchdog_task.cancel()
+                await _timed(
+                    asyncio.gather(orphan_watchdog_task, return_exceptions=True),
+                    label="orphan_watchdog.stop",
+                    timeout=3.0,
+                )
+                app.state.orphan_watchdog_task = None
 
             if _cc_reconciler is not None:
                 await _timed(_cc_reconciler.stop(), label="cc_reconciler.stop", timeout=3.0)
@@ -5441,6 +5501,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         return await proxy.handle_compress_usage(request)
 
     register_provider_routes(app, proxy)
+    # Register last so this raw ASGI middleware is outermost and covers the
+    # complete response body, including responses produced by other middleware.
+    app.add_middleware(ActivityMiddleware, proxy=proxy)
 
     return app
 

@@ -533,6 +533,62 @@ class _FakeProxyProc:
         self.killed = True
 
 
+def test_start_proxy_strips_ambient_worker_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("HEADROOM_WORKERS", "4")
+    monkeypatch.setenv("HEADROOM_PROXY_CONFIG_JSON", '{"port": 9999}')
+    monkeypatch.setenv("CLAUDE_CODE_USE_VERTEX", "1")
+    captured: dict[str, object] = {}
+    proc = _FakeProxyProc()
+
+    def fake_popen(command: list[str], **kwargs: object) -> _FakeProxyProc:
+        captured["command"] = command
+        captured["env"] = kwargs["env"]
+        return proc
+
+    monkeypatch.setattr(wrap_mod.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(wrap_mod, "_check_proxy", lambda port: True)
+    monkeypatch.setattr(wrap_mod, "_get_log_path", lambda: tmp_path / "proxy.log")
+    monkeypatch.setattr(
+        wrap_mod,
+        "_get_proxy_stdio_log_path",
+        lambda: tmp_path / "proxy-stdio.log",
+    )
+    monkeypatch.setattr(wrap_mod.time, "sleep", lambda seconds: None)
+
+    assert wrap_mod._start_proxy(8787) is proc
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert "HEADROOM_WORKERS" not in env
+    assert "HEADROOM_PROXY_CONFIG_JSON" not in env
+    assert env["HEADROOM_HTTP2"] == "false"
+    assert captured["command"][-2:] == ["--workers", "1"]
+
+
+def test_start_proxy_timeout_kills_failed_new_process(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    proc = _FakeProxyProc()
+    monkeypatch.setattr(wrap_mod.subprocess, "Popen", lambda *args, **kwargs: proc)
+    monkeypatch.setattr(wrap_mod, "_check_proxy", lambda port: False)
+    monkeypatch.setattr(wrap_mod, "_get_log_path", lambda: tmp_path / "proxy.log")
+    monkeypatch.setattr(
+        wrap_mod,
+        "_get_proxy_stdio_log_path",
+        lambda: tmp_path / "proxy-stdio.log",
+    )
+    monkeypatch.setattr(wrap_mod, "_resolve_wrap_proxy_timeout_seconds", lambda: 1)
+    monkeypatch.setattr(wrap_mod.time, "sleep", lambda seconds: None)
+
+    with pytest.raises(RuntimeError, match="failed to start"):
+        wrap_mod._start_proxy(8787)
+
+    assert proc.killed is True
+
+
 class TestProxyClientRefCounting:
     """Proxy lifecycle is reference-counted via marker files, not pgrep."""
 
@@ -560,22 +616,21 @@ class TestProxyClientRefCounting:
         marker.write_text(json.dumps(rec))
         return marker
 
-    def test_cleanup_terminates_proxy_when_only_self_registered(self, clients_dir: Path) -> None:
-        """The owner alone → no other clients → proxy is terminated on exit."""
+    def test_cleanup_unregisters_marker_without_terminating_proxy(self, clients_dir: Path) -> None:
+        """Normal exit transfers final shutdown ownership to the watchdog."""
         wrap_mod._register_proxy_client(self.PORT)
         proc = _FakeProxyProc()
         cleanup = wrap_mod._make_cleanup([proc], self.PORT)
 
         cleanup()
 
-        assert proc.terminated is True
-        # Our own marker is removed before we count.
+        assert proc.terminated is False
         assert wrap_mod._live_proxy_clients(self.PORT, exclude_self=False) == []
 
-    def test_cleanup_stops_detached_windows_serving_child(
+    def test_cleanup_leaves_detached_windows_serving_child_to_watchdog(
         self, clients_dir: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Ctrl+C must stop the listener even when its launcher already exited."""
+        """Windows cleanup follows the same marker-only ownership transfer."""
         wrap_mod._register_proxy_client(self.PORT)
         proc = _FakeProxyProc()
         proc.poll = lambda: 0  # type: ignore[method-assign]
@@ -592,7 +647,7 @@ class TestProxyClientRefCounting:
         wrap_mod._make_cleanup([proc], self.PORT)()
 
         assert not proc.terminated
-        assert stopped == [self.PORT]
+        assert stopped == []
 
     def test_kill_proxy_uses_taskkill_tree_on_windows(
         self, monkeypatch: pytest.MonkeyPatch
@@ -617,10 +672,10 @@ class TestProxyClientRefCounting:
             )
         ]
 
-    def test_cleanup_uses_pre_shutdown_pid_when_health_probe_races(
+    def test_cleanup_does_not_probe_or_kill_windows_serving_child(
         self, clients_dir: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A transient post-terminate /health miss must not orphan the listener."""
+        """The watchdog, not wrapper cleanup, owns normal listener shutdown."""
         wrap_mod._register_proxy_client(self.PORT)
         proc = _FakeProxyProc()
         killed: list[tuple[int, int]] = []
@@ -636,8 +691,8 @@ class TestProxyClientRefCounting:
 
         wrap_mod._make_cleanup([proc], self.PORT)()
 
-        assert proc.terminated
-        assert killed == [(456, self.PORT)]
+        assert not proc.terminated
+        assert killed == []
 
     def test_cleanup_leaves_proxy_running_when_other_client_alive(self, clients_dir: Path) -> None:
         """A second live client (here: the test's parent) keeps the proxy up."""
@@ -664,6 +719,23 @@ class TestProxyClientRefCounting:
 
         assert dead_pid not in live
         assert not marker.exists()
+
+    def test_dead_client_marker_unlink_failure_is_tolerated(
+        self,
+        clients_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        dead_pid = 358784
+        marker = self._write_marker(clients_dir, dead_pid)
+        monkeypatch.setattr(wrap_mod, "_pid_alive", lambda pid: pid != dead_pid)
+
+        def fail_unlink(*args: object, **kwargs: object) -> None:
+            raise OSError("read-only")
+
+        monkeypatch.setattr(Path, "unlink", fail_unlink)
+
+        assert wrap_mod._live_proxy_clients(self.PORT, exclude_self=True) == []
+        assert marker.exists()
 
     def test_reused_pid_with_mismatched_identity_is_pruned(
         self, clients_dir: Path, monkeypatch: pytest.MonkeyPatch
@@ -719,6 +791,13 @@ class TestProxyClientRefCounting:
 
         assert wrap_mod._live_proxy_clients(self.PORT, exclude_self=True) == []
 
+    def test_non_dict_marker_is_tolerated(self, clients_dir: Path) -> None:
+        live_pid = os.getppid()
+        marker = self._write_marker(clients_dir, live_pid)
+        marker.write_text("[]", encoding="utf-8")
+
+        assert wrap_mod._live_proxy_clients(self.PORT, exclude_self=True) == [live_pid]
+
     def test_cleanup_does_not_shell_out_to_pgrep(
         self, clients_dir: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -739,7 +818,7 @@ class TestProxyClientRefCounting:
         cleanup = wrap_mod._make_cleanup([proc], self.PORT)
         cleanup()  # must not raise
 
-        assert proc.terminated is True
+        assert proc.terminated is False
 
     def test_register_then_unregister_is_idempotent(self, clients_dir: Path) -> None:
         """Register adds exactly our marker; unregister removes it; re-call is safe."""
