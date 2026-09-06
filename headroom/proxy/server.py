@@ -171,7 +171,7 @@ from headroom.proxy.rate_limiter import TokenBucketRateLimiter  # noqa: F401
 from headroom.proxy.request_logger import RequestLogger  # noqa: F401
 from headroom.proxy.savings_tracker import LITELLM_AVAILABLE
 from headroom.proxy.semantic_cache import SemanticCache  # noqa: F401
-from headroom.proxy.ssl_context import build_httpx_verify
+from headroom.proxy.ssl_context import build_httpx_verify, find_system_proxy
 from headroom.proxy.tool_schema_savings_policy import tool_schema_saved_from_tags
 from headroom.proxy.warmup import WarmupRegistry
 from headroom.proxy.ws_session_registry import WebSocketSessionRegistry
@@ -675,9 +675,10 @@ def _provider_httpx_client_options(
         ),
         "verify": verify,
     }
-    if config.http_proxy:
-        client_kwargs["proxy"] = config.http_proxy
-    return config.http2 and not config.http_proxy, client_kwargs
+    proxy = config.http_proxy or find_system_proxy()
+    if proxy:
+        client_kwargs["proxy"] = proxy
+    return config.http2 and not proxy, client_kwargs
 
 
 # Recognized built-in compressor names → the `ContentRouterConfig` `enable_*`

@@ -370,7 +370,10 @@ class TestProviderHttpClientOptions:
         from headroom.proxy.models import ProxyConfig
         from headroom.proxy.server import _provider_httpx_client_options
 
-        http2, kwargs = _provider_httpx_client_options(ProxyConfig(http2=True), verify=True)
+        # Pin out system/env proxy detection so this doesn't flake on machines
+        # or CI runners that have HTTPS_PROXY or a macOS system proxy set.
+        with patch("headroom.proxy.server.find_system_proxy", return_value=None):
+            http2, kwargs = _provider_httpx_client_options(ProxyConfig(http2=True), verify=True)
 
         assert http2 is True
         assert "proxy" not in kwargs
@@ -385,4 +388,34 @@ class TestProviderHttpClientOptions:
         )
 
         assert http2 is False
+        assert kwargs["proxy"] == "http://proxy.local:8080"
+
+    def test_falls_back_to_system_proxy_when_unset(self):
+        """No explicit HEADROOM_HTTP_PROXY: fall back to the detected
+        corporate/macOS system proxy instead of going proxy-less."""
+        from headroom.proxy.models import ProxyConfig
+        from headroom.proxy.server import _provider_httpx_client_options
+
+        with patch(
+            "headroom.proxy.server.find_system_proxy",
+            return_value="http://system-proxy.local:3128",
+        ):
+            http2, kwargs = _provider_httpx_client_options(ProxyConfig(http2=True), verify=True)
+
+        assert http2 is False
+        assert kwargs["proxy"] == "http://system-proxy.local:3128"
+
+    def test_explicit_http_proxy_takes_priority_over_system_proxy(self):
+        from headroom.proxy.models import ProxyConfig
+        from headroom.proxy.server import _provider_httpx_client_options
+
+        with patch(
+            "headroom.proxy.server.find_system_proxy",
+            return_value="http://system-proxy.local:3128",
+        ):
+            http2, kwargs = _provider_httpx_client_options(
+                ProxyConfig(http2=True, http_proxy="http://proxy.local:8080"),
+                verify=True,
+            )
+
         assert kwargs["proxy"] == "http://proxy.local:8080"

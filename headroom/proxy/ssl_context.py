@@ -34,6 +34,8 @@ from __future__ import annotations
 import logging
 import os
 import ssl
+import urllib.parse
+import urllib.request
 from typing import Any, cast
 
 logger = logging.getLogger("headroom.proxy")
@@ -252,3 +254,46 @@ def apply_global_tls_relaxation() -> bool:
     _u3ssl.create_urllib3_context = _relaxed_create_urllib3_context  # type: ignore[assignment]
     logger.info("event=ssl_x509_strict_disabled reason=urllib3_global_patch")
     return True
+
+
+_ENV_PROXY_VARS = ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy")
+
+
+def find_system_proxy() -> str | None:
+    """Return a proxy URL from system settings, including macOS System Preferences.
+
+    httpx trust_env=True reads HTTP_PROXY / HTTPS_PROXY env vars but not the
+    macOS System Configuration proxy (System Settings → Network → Proxies).
+    urllib.request.getproxies() reads both env vars and the system config;
+    we only use it when none of the env vars are set, so we never layer a
+    system proxy on top of explicit env-based proxy handling.
+    """
+    if any(os.environ.get(var) for var in _ENV_PROXY_VARS):
+        return None  # ponytail: trust_env already handles this path
+    proxies = urllib.request.getproxies()
+    url = proxies.get("https") or proxies.get("http")
+    if url:
+        _log_detected_system_proxy(url)
+    return url
+
+
+def _log_detected_system_proxy(url: str) -> None:
+    """Log a detected system proxy URL with any userinfo (credentials) redacted.
+
+    Tolerates malformed/hostless URLs -- a garbled PAC or system-proxy entry
+    shouldn't crash proxy startup, so falls back to logging scheme only.
+    """
+    parsed = urllib.parse.urlparse(url)
+    if not parsed.hostname:
+        logger.info("event=system_proxy_detected scheme=%s", parsed.scheme or "unknown")
+        return
+    try:
+        port = parsed.port
+    except ValueError:
+        # e.g. "http://proxy.example:notaport" -- ParseResult.port raises
+        # rather than returning None for a non-numeric port.
+        logger.info("event=system_proxy_detected host=%s", parsed.hostname)
+        return
+    netloc = parsed.hostname + (f":{port}" if port else "")
+    safe = parsed._replace(netloc=netloc)
+    logger.info("event=system_proxy_detected url=%s", safe.geturl())
