@@ -747,44 +747,62 @@ class MemoryToolAdapter:
         response: dict[str, Any],
         provider: Provider,
     ) -> list[dict[str, Any]]:
-        """Extract tool calls from response based on provider format."""
+        """Extract tool calls from response based on provider format.
+
+        Every branch reads from the untrusted upstream response, so it guards
+        the shapes an OpenAI-compatible gateway can send on a content-filtered /
+        usage-only turn: a null element inside ``choices`` / ``candidates`` /
+        ``content`` (`[null]`), or a present-but-null nested object. Without the
+        guards, ``choices[0].get`` / ``block.get`` raises AttributeError, the
+        same class the sibling ``MemoryHandler._extract_tool_calls`` and this
+        adapter's own ``_get_tool_*`` helpers already defend against.
+        """
         if provider == "anthropic":
-            content = response.get("content", [])
-            if isinstance(content, list):
-                return [block for block in content if block.get("type") == "tool_use"]
-            return []
+            return self._extract_anthropic_tool_uses(response)
 
         elif provider == "openai":
-            choices = response.get("choices", [])
-            if choices:
-                message = choices[0].get("message", {})
-                return list(message.get("tool_calls", []) or [])
-            return []
+            return self._extract_openai_tool_calls(response)
 
         elif provider == "gemini":
             # Gemini format: candidates[0].content.parts[*].functionCall
-            candidates = response.get("candidates", [])
-            if candidates:
-                content = candidates[0].get("content", {})
-                parts = content.get("parts", [])
-                return [p for p in parts if "functionCall" in p]
+            candidates = response.get("candidates")
+            first = candidates[0] if isinstance(candidates, list) and candidates else None
+            content = first.get("content") if isinstance(first, dict) else None
+            parts = content.get("parts") if isinstance(content, dict) else None
+            if isinstance(parts, list):
+                return [p for p in parts if isinstance(p, dict) and "functionCall" in p]
             return []
 
         # Generic fallback - try both formats
-        tool_calls = []
-
-        # Try Anthropic format
-        content = response.get("content", [])
-        if isinstance(content, list):
-            tool_calls.extend([block for block in content if block.get("type") == "tool_use"])
-
-        # Try OpenAI format
-        choices = response.get("choices", [])
-        if choices:
-            message = choices[0].get("message", {})
-            tool_calls.extend(list(message.get("tool_calls", []) or []))
+        tool_calls = self._extract_anthropic_tool_uses(response)
+        tool_calls.extend(self._extract_openai_tool_calls(response))
 
         return tool_calls
+
+    @staticmethod
+    def _extract_anthropic_tool_uses(response: dict[str, Any]) -> list[dict[str, Any]]:
+        """Anthropic ``content[]`` tool_use blocks, skipping non-dict elements."""
+        content = response.get("content", [])
+        if isinstance(content, list):
+            return [
+                block
+                for block in content
+                if isinstance(block, dict) and block.get("type") == "tool_use"
+            ]
+        return []
+
+    @staticmethod
+    def _extract_openai_tool_calls(response: dict[str, Any]) -> list[dict[str, Any]]:
+        """OpenAI ``choices[0].message.tool_calls``, guarding a null/non-dict choice."""
+        choices = response.get("choices")
+        first = choices[0] if isinstance(choices, list) and choices else None
+        message = first.get("message") if isinstance(first, dict) else None
+        if isinstance(message, dict):
+            # Filter to dict entries: downstream (_get_tool_name /
+            # _get_tool_input) calls `.get` on each element, so a null / string
+            # element inside tool_calls would still crash the same path.
+            return [tc for tc in (message.get("tool_calls") or []) if isinstance(tc, dict)]
+        return []
 
     def _get_tool_name(self, tool_call: dict[str, Any], provider: Provider) -> str:
         """Get the tool name from a tool call."""
