@@ -258,8 +258,10 @@ class TestAnthropicHandlerReportsL1Transform:
     ``x-headroom-transforms`` response header -- not just the helper's
     ``modified`` flag."""
 
-    def test_l1_label_reaches_response_header(self) -> None:
+    def test_l1_label_reaches_response_header(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from types import SimpleNamespace
+
+        monkeypatch.setenv("HEADROOM_TOOL_SCHEMA_COMPACTION", "1")
 
         with _make_proxy_client() as client:
             proxy = client.app.state.proxy
@@ -342,6 +344,7 @@ def test_handler_auxiliary_compaction_respects_optimization_decision(
 
     import headroom.proxy.tool_schema_compaction as tool_compaction
 
+    monkeypatch.setenv("HEADROOM_TOOL_SCHEMA_COMPACTION", "1")
     monkeypatch.setenv("HEADROOM_TOOL_DESC_MAX_CHARS", "20")
     monkeypatch.setenv("HEADROOM_SYSTEM_COMPACT", "1")
     monkeypatch.setattr(tool_compaction, "_TOOL_DESC_MAX_CHARS", None)

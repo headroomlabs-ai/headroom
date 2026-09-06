@@ -428,7 +428,10 @@ def test_issue_327_openai_handler_does_not_call_walker_functions() -> None:
     assert "apply_cached" in method_names
 
 
-def test_openai_chat_completions_compacts_tools_when_profile_enabled() -> None:
+def test_openai_chat_completions_compacts_tools_when_profile_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HEADROOM_TOOL_SCHEMA_COMPACTION", "1")
     captured = {}
     with _make_proxy_client() as client:
         proxy = client.app.state.proxy

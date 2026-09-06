@@ -270,7 +270,8 @@ def test_openai_responses_adapter_compresses_output_text_content_parts():
     assert strategy_chain == []
 
 
-def test_openai_responses_adapter_batches_small_outputs_once():
+def test_openai_responses_adapter_batches_small_outputs_once(monkeypatch):
+    monkeypatch.setenv("HEADROOM_OPENAI_RESPONSES_BATCH_COMPRESSION", "1")
     router = ContentRouter()
     calls: list[str] = []
     floor = OpenAIHandlerMixin.OPENAI_RESPONSES_ROUTER_MIN_BYTES
@@ -320,7 +321,50 @@ def test_openai_responses_adapter_batches_small_outputs_once():
     assert [item["output"] for item in new_payload["input"]] == ["x"] * 4
 
 
-def test_openai_responses_adapter_batches_small_array_parts_without_touching_images():
+def test_openai_responses_adapter_small_output_batching_is_opt_in(monkeypatch):
+    monkeypatch.delenv("HEADROOM_OPENAI_RESPONSES_BATCH_COMPRESSION", raising=False)
+    router = ContentRouter()
+
+    def compress(self, content: str, **_kwargs):  # pragma: no cover - must not run
+        raise AssertionError("batch compression should be opt-in")
+
+    router.compress = MethodType(compress, router)
+    handler = _handler_with_router(router)
+    floor = OpenAIHandlerMixin.OPENAI_RESPONSES_ROUTER_MIN_BYTES
+    outputs = [" ".join(f"unit{index}_{token}" for token in range(30)) for index in range(4)]
+    assert all(len(output.encode("utf-8")) < floor for output in outputs)
+    assert sum(len(output.encode("utf-8")) for output in outputs) >= floor
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            {
+                "type": "local_shell_call_output",
+                "call_id": f"c{index}",
+                "output": output,
+            }
+            for index, output in enumerate(outputs)
+        ],
+    }
+
+    new_payload, modified, saved, _, units_by_category, _, attempted = (
+        handler._compress_openai_responses_live_text_units_with_router(
+            payload,
+            model="gpt-5",
+            request_id="req_small_batch_default_off",
+        )
+    )
+
+    assert new_payload == payload
+    assert modified is False
+    assert saved == 0
+    assert attempted == 0
+    assert units_by_category == {"size_floor": 4}
+
+
+def test_openai_responses_adapter_batches_small_array_parts_without_touching_images(
+    monkeypatch,
+):
+    monkeypatch.setenv("HEADROOM_OPENAI_RESPONSES_BATCH_COMPRESSION", "1")
     router = ContentRouter()
     calls = {"count": 0}
 
@@ -1088,7 +1132,7 @@ def test_openai_responses_payload_routes_through_content_router_without_rust(
     assert any(t.startswith("router:openai:responses:") for t in transforms)
 
 
-def test_openai_responses_adapter_batches_small_tool_outputs_before_floor():
+def test_openai_responses_adapter_batches_small_tool_outputs_before_floor(monkeypatch):
     """Regression for #2050: many individually-small tool outputs whose combined
     size clears the floor must still reach the router.
 
@@ -1098,6 +1142,7 @@ def test_openai_responses_adapter_batches_small_tool_outputs_before_floor():
     aggregate compressible text is large. The floor must be evaluated against
     the aggregate of the extracted group, matching the batch (Anthropic) path.
     """
+    monkeypatch.setenv("HEADROOM_OPENAI_RESPONSES_BATCH_COMPRESSION", "1")
     router = ContentRouter()
     calls: list[str] = []
 

@@ -3,7 +3,8 @@
 The OpenAI-side analogue of the Anthropic path (issue #746): mark non-core
 function / MCP tools ``defer_loading: true`` and inject ``{"type": "tool_search"}``
 so OpenAI keeps their heavy parameter schemas out of the model's context until
-searched. Gated to gpt-5.4+ (older models 400 on the fields).
+searched. Explicitly opt-in via HEADROOM_OPENAI_TOOL_SEARCH or
+HEADROOM_OPENAI_TOOL_SEARCH_MODELS; older models 400 on the fields.
 """
 
 from __future__ import annotations
@@ -34,15 +35,23 @@ def _tools() -> list[dict]:
 # --- model gating ------------------------------------------------------------
 
 
+def test_model_gate_is_off_by_default(monkeypatch):
+    monkeypatch.delenv("HEADROOM_OPENAI_TOOL_SEARCH", raising=False)
+    monkeypatch.delenv("HEADROOM_OPENAI_TOOL_SEARCH_MODELS", raising=False)
+    assert _model_supports_openai_tool_search("gpt-5.5") is False
+
+
 @pytest.mark.parametrize("model", ["gpt-5.4", "gpt-5.5", "gpt-5.4-2026-02-01", "gpt-6", "gpt-6.2"])
-def test_model_supported(model):
+def test_model_supported_when_enabled(monkeypatch, model):
+    monkeypatch.setenv("HEADROOM_OPENAI_TOOL_SEARCH", "1")
     assert _model_supports_openai_tool_search(model) is True
 
 
 @pytest.mark.parametrize(
     "model", ["gpt-4o", "gpt-4.1", "gpt-5", "gpt-5.3", "o3", "", None, "claude-opus-4-8"]
 )
-def test_model_unsupported(model):
+def test_model_unsupported_when_enabled(monkeypatch, model):
+    monkeypatch.setenv("HEADROOM_OPENAI_TOOL_SEARCH", "1")
     assert _model_supports_openai_tool_search(model) is False
 
 
@@ -50,9 +59,9 @@ def test_env_override_wins_then_falls_back(monkeypatch):
     monkeypatch.setenv("HEADROOM_OPENAI_TOOL_SEARCH_MODELS", r"^my-model")
     assert _model_supports_openai_tool_search("my-model-v1") is True
     assert _model_supports_openai_tool_search("gpt-5.4") is False  # override replaces the gate
-    # a malformed regex must not crash — fall back to the version gate.
+    # a malformed regex must not crash or silently enable a rewrite.
     monkeypatch.setenv("HEADROOM_OPENAI_TOOL_SEARCH_MODELS", "[unclosed")
-    assert _model_supports_openai_tool_search("gpt-5.4") is True
+    assert _model_supports_openai_tool_search("gpt-5.4") is False
 
 
 # --- deferral behavior -------------------------------------------------------
@@ -66,7 +75,8 @@ def test_client_supported(client, supported):
     assert openai_tool_search_client_supported(client) is supported
 
 
-def test_codex_client_does_not_inject():
+def test_codex_client_does_not_inject(monkeypatch):
+    monkeypatch.setenv("HEADROOM_OPENAI_TOOL_SEARCH", "1")
     tools = _tools()
 
     out = inject_tool_search_deferral_openai(tools, "gpt-5.5", client="codex")
@@ -77,7 +87,8 @@ def test_codex_client_does_not_inject():
 
 
 @pytest.mark.parametrize("client", [None, "claude-code"])
-def test_supported_clients_still_inject(client):
+def test_supported_clients_still_inject(monkeypatch, client):
+    monkeypatch.setenv("HEADROOM_OPENAI_TOOL_SEARCH", "1")
     tools = _tools()
 
     out = inject_tool_search_deferral_openai(tools, "gpt-5.5", client=client)
@@ -87,7 +98,8 @@ def test_supported_clients_still_inject(client):
     assert any(tool.get("defer_loading") is True for tool in out)
 
 
-def test_defers_non_core_and_injects_search_tool():
+def test_defers_non_core_and_injects_search_tool(monkeypatch):
+    monkeypatch.setenv("HEADROOM_OPENAI_TOOL_SEARCH", "1")
     tools = _tools()
     out = inject_tool_search_deferral_openai(tools, "gpt-5.5")
     assert out is not tools  # new list
@@ -100,7 +112,8 @@ def test_defers_non_core_and_injects_search_tool():
         assert by_name[n].get("defer_loading") is True  # non-core deferred
 
 
-def test_terminal_reserved_namespace_stays_resident():
+def test_terminal_reserved_namespace_stays_resident(monkeypatch):
+    monkeypatch.setenv("HEADROOM_OPENAI_TOOL_SEARCH", "1")
     terminal = _fn("terminal")
     tools = [terminal] + [_fn(f"peer_{i}") for i in range(11)]
     snapshot = copy.deepcopy(tools)
@@ -114,7 +127,8 @@ def test_terminal_reserved_namespace_stays_resident():
     assert tools == snapshot
 
 
-def test_terminal_helper_remains_deferrable():
+def test_terminal_helper_remains_deferrable(monkeypatch):
+    monkeypatch.setenv("HEADROOM_OPENAI_TOOL_SEARCH", "1")
     tools = [_fn("terminal_helper")] + [_fn(f"peer_{i}") for i in range(11)]
 
     out = inject_tool_search_deferral_openai(tools, "gpt-5.6-terra")
@@ -123,7 +137,8 @@ def test_terminal_helper_remains_deferrable():
     assert helper.get("defer_loading") is True
 
 
-def test_prefixed_core_and_terminal_names_stay_resident():
+def test_prefixed_core_and_terminal_names_stay_resident(monkeypatch):
+    monkeypatch.setenv("HEADROOM_OPENAI_TOOL_SEARCH", "1")
     resident = ["_bash", "_read", "_write", "_edit", "_glob", "_grep", "_terminal"]
     noncore = ["_hub", "_todo", "_eval", "mcp__server__read", "terminal_helper"]
     tools = [_fn(name) for name in resident + noncore]
@@ -137,7 +152,8 @@ def test_prefixed_core_and_terminal_names_stay_resident():
         assert by_name[name].get("defer_loading") is True, name
 
 
-def test_defers_mcp_server():
+def test_defers_mcp_server(monkeypatch):
+    monkeypatch.setenv("HEADROOM_OPENAI_TOOL_SEARCH", "1")
     tools = [_fn(n) for n in _CORE] + [{"type": "mcp", "server_label": "sentry"}]
     tools += [_fn(f"x{i}") for i in range(8)]
     out = inject_tool_search_deferral_openai(tools, "gpt-5.5")
@@ -145,7 +161,8 @@ def test_defers_mcp_server():
     assert mcp.get("defer_loading") is True
 
 
-def test_hosted_tools_stay_resident():
+def test_hosted_tools_stay_resident(monkeypatch):
+    monkeypatch.setenv("HEADROOM_OPENAI_TOOL_SEARCH", "1")
     tools = [_fn(n) for n in _CORE] + [{"type": "web_search"}, {"type": "code_interpreter"}]
     tools += [_fn(f"x{i}") for i in range(8)]
     out = inject_tool_search_deferral_openai(tools, "gpt-5.5")
@@ -155,7 +172,8 @@ def test_hosted_tools_stay_resident():
     assert "defer_loading" not in ci
 
 
-def test_does_not_mutate_input():
+def test_does_not_mutate_input(monkeypatch):
+    monkeypatch.setenv("HEADROOM_OPENAI_TOOL_SEARCH", "1")
     tools = _tools()
     snapshot = copy.deepcopy(tools)
     inject_tool_search_deferral_openai(tools, "gpt-5.5")
@@ -165,22 +183,26 @@ def test_does_not_mutate_input():
 # --- no-op guards ------------------------------------------------------------
 
 
-def test_noop_for_unsupported_model():
+def test_noop_for_unsupported_model(monkeypatch):
+    monkeypatch.setenv("HEADROOM_OPENAI_TOOL_SEARCH", "1")
     tools = _tools()
     assert inject_tool_search_deferral_openai(tools, "gpt-4o") is tools
 
 
-def test_noop_below_min_tools():
+def test_noop_below_min_tools(monkeypatch):
+    monkeypatch.setenv("HEADROOM_OPENAI_TOOL_SEARCH", "1")
     tools = [_fn(f"x{i}") for i in range(5)]  # < 12
     assert inject_tool_search_deferral_openai(tools, "gpt-5.5") is tools
 
 
-def test_noop_when_tool_search_already_present():
+def test_noop_when_tool_search_already_present(monkeypatch):
+    monkeypatch.setenv("HEADROOM_OPENAI_TOOL_SEARCH", "1")
     tools = [{"type": "tool_search"}] + [_fn(f"x{i}") for i in range(15)]
     assert inject_tool_search_deferral_openai(tools, "gpt-5.5") is tools
 
 
-def test_noop_when_nothing_deferrable():
+def test_noop_when_nothing_deferrable(monkeypatch):
+    monkeypatch.setenv("HEADROOM_OPENAI_TOOL_SEARCH", "1")
     tools = [_fn(n) for n in _CORE * 3]  # 18 core tools, none deferrable
     assert inject_tool_search_deferral_openai(tools, "gpt-5.5") is tools
 
@@ -189,7 +211,8 @@ def test_noop_for_non_list():
     assert inject_tool_search_deferral_openai(None, "gpt-5.5") is None
 
 
-def test_resident_names_match_case_insensitively():
+def test_resident_names_match_case_insensitively(monkeypatch):
+    monkeypatch.setenv("HEADROOM_OPENAI_TOOL_SEARCH", "1")
     # The resident-name sets are lowercase; clients are not required to be. An
     # exact match deferred every tool for a PascalCase client, including its own
     # tool-search tool. Mirrors the Anthropic-side fix.
@@ -206,7 +229,8 @@ def test_resident_names_match_case_insensitively():
 # --- client-harness exclusion (GH #2660) -------------------------------------
 
 
-def test_noop_for_a_client_that_cannot_execute_the_search_tool():
+def test_noop_for_a_client_that_cannot_execute_the_search_tool(monkeypatch):
+    monkeypatch.setenv("HEADROOM_OPENAI_TOOL_SEARCH", "1")
     # GH #2660 reports opencode resolving tool calls against its own registry
     # and rejecting the injected tool as unavailable, so its tools stay resident
     # and untouched.
@@ -221,7 +245,8 @@ def test_noop_for_a_client_that_cannot_execute_the_search_tool():
     assert not any(t.get("defer_loading") for t in out)
 
 
-def test_supported_clients_keep_the_existing_deferral():
+def test_supported_clients_keep_the_existing_deferral(monkeypatch):
+    monkeypatch.setenv("HEADROOM_OPENAI_TOOL_SEARCH", "1")
     # The exclusion is per-client, not a global default flip: anything that can
     # search still gets the same payload it got before.
     tools = _tools()

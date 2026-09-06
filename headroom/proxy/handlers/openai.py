@@ -1727,6 +1727,11 @@ class OpenAIHandlerMixin:
     OPENAI_RESPONSES_ROUTER_MIN_BYTES = 512
     OPENAI_RESPONSES_OUTPUT_TYPES = _RESPONSES_OUTPUT_ITEM_TYPES
 
+    @staticmethod
+    def _openai_responses_batch_compression_enabled() -> bool:
+        value = os.environ.get("HEADROOM_OPENAI_RESPONSES_BATCH_COMPRESSION", "")
+        return value.strip().lower() in {"1", "true", "yes", "on", "enabled"}
+
     def _openai_responses_unit_cache(self) -> tuple[Any, OrderedDict[str, Any]]:
         with _OPENAI_RESPONSES_UNIT_CACHE_INIT_LOCK:
             lock = getattr(self, "_openai_responses_unit_cache_lock", None)
@@ -2475,10 +2480,14 @@ class OpenAIHandlerMixin:
                 )
             else:
                 large_unit_indexes.append(unit_idx)
-        small_batches, small_batch_skipped = build_compression_batches(
-            small_batch_entries,
-            min_batch_bytes=self.OPENAI_RESPONSES_ROUTER_MIN_BYTES,
-        )
+        if self._openai_responses_batch_compression_enabled():
+            small_batches, small_batch_skipped = build_compression_batches(
+                small_batch_entries,
+                min_batch_bytes=self.OPENAI_RESPONSES_ROUTER_MIN_BYTES,
+            )
+        else:
+            small_batches = []
+            small_batch_skipped = small_batch_entries
         cache_misses: list[tuple[int, str, RoutedCompressionUnit]] = []
         cache_miss_followers: dict[str, list[int]] = {}
         for unit_idx in large_unit_indexes:
@@ -2804,38 +2813,42 @@ class OpenAIHandlerMixin:
         transforms: list[str] = []
         reason: str | None = None
 
-        tool_compaction_started = time.perf_counter()
-        compacted_payload, tools_modified, tools_before_bytes, tools_after_bytes = (
-            _compact_openai_responses_tools(working)
-        )
-        _add_timing("compression_tool_schema_compaction", tool_compaction_started)
-        if tools_modified:
-            working = compacted_payload
-            modified = True
-            reason = None
-            transforms.append("openai:responses:tool_schema_compaction")
-            try:
-                tool_token_started = time.perf_counter()
-                tokenizer = self.openai_provider.get_token_counter(model)
-                tokens_saved += max(
-                    0,
-                    tokenizer.count_text(_json_debug_dumps(payload.get("tools")))
-                    - tokenizer.count_text(_json_debug_dumps(working.get("tools"))),
-                )
-                _add_timing("compression_tool_schema_token_count", tool_token_started)
-            except Exception:
-                pass
-            if debug_enabled:
-                _log_codex_compression_debug(
-                    "codex_tool_schema_compaction",
-                    request_id=request_id,
-                    pass_id=pass_id,
-                    model=model,
-                    modified=True,
-                    tools_bytes_before=tools_before_bytes,
-                    tools_bytes_after=tools_after_bytes,
-                    tools_bytes_saved=tools_before_bytes - tools_after_bytes,
-                )
+        from headroom.proxy.tool_schema_compaction import tool_schema_compaction_enabled
+
+        tools_modified = False
+        if tool_schema_compaction_enabled():
+            tool_compaction_started = time.perf_counter()
+            compacted_payload, tools_modified, tools_before_bytes, tools_after_bytes = (
+                _compact_openai_responses_tools(working)
+            )
+            _add_timing("compression_tool_schema_compaction", tool_compaction_started)
+            if tools_modified:
+                working = compacted_payload
+                modified = True
+                reason = None
+                transforms.append("openai:responses:tool_schema_compaction")
+                try:
+                    tool_token_started = time.perf_counter()
+                    tokenizer = self.openai_provider.get_token_counter(model)
+                    tokens_saved += max(
+                        0,
+                        tokenizer.count_text(_json_debug_dumps(payload.get("tools")))
+                        - tokenizer.count_text(_json_debug_dumps(working.get("tools"))),
+                    )
+                    _add_timing("compression_tool_schema_token_count", tool_token_started)
+                except Exception:
+                    pass
+                if debug_enabled:
+                    _log_codex_compression_debug(
+                        "codex_tool_schema_compaction",
+                        request_id=request_id,
+                        pass_id=pass_id,
+                        model=model,
+                        modified=True,
+                        tools_bytes_before=tools_before_bytes,
+                        tools_bytes_after=tools_after_bytes,
+                        tools_bytes_saved=tools_before_bytes - tools_after_bytes,
+                    )
 
         # Layer 2: Tool description truncation (opt-in via
         # HEADROOM_TOOL_DESC_MAX_CHARS).
@@ -4228,14 +4241,19 @@ class OpenAIHandlerMixin:
         tool_tokens_after_compaction = 0
         if _decision.should_compress and not _bypass and tools is not None:
             try:
-                compacted_tool_payload, tools_modified, _, _ = _compact_openai_responses_tools(
-                    {"tools": tools}
-                )
-                if tools_modified and compacted_tool_payload.get("tools") is not None:
-                    tool_tokens_before_compaction = tokenizer.count_text(_json_debug_dumps(tools))
-                    tools = compacted_tool_payload["tools"]
-                    if "openai:chat:tool_schema_compaction" not in transforms_applied:
-                        transforms_applied.append("openai:chat:tool_schema_compaction")
+                from headroom.proxy.tool_schema_compaction import tool_schema_compaction_enabled
+
+                if tool_schema_compaction_enabled():
+                    compacted_tool_payload, tools_modified, _, _ = _compact_openai_responses_tools(
+                        {"tools": tools}
+                    )
+                    if tools_modified and compacted_tool_payload.get("tools") is not None:
+                        tool_tokens_before_compaction = tokenizer.count_text(
+                            _json_debug_dumps(tools)
+                        )
+                        tools = compacted_tool_payload["tools"]
+                        if "openai:chat:tool_schema_compaction" not in transforms_applied:
+                            transforms_applied.append("openai:chat:tool_schema_compaction")
             except Exception as e:
                 logger.debug(f"[{request_id}] tool schema compaction failed: {e}")
 

@@ -194,7 +194,7 @@ impl Default for LogCompressorConfig {
             enable_ccr: true,
             min_lines_for_ccr: 50,
             min_compression_ratio_for_ccr: 0.5,
-            collapse_runtime_frames: true,
+            collapse_runtime_frames: false,
             trace_head_frames: 3,
             trace_app_frames: 5,
         }
@@ -1395,6 +1395,12 @@ mod tests {
         LogCompressor::new(LogCompressorConfig::default())
     }
 
+    fn cmp_with_collapse() -> LogCompressor {
+        let mut cfg = LogCompressorConfig::default();
+        cfg.collapse_runtime_frames = true;
+        LogCompressor::new(cfg)
+    }
+
     #[test]
     fn detects_pytest_format() {
         let c = cmp();
@@ -1756,7 +1762,7 @@ mod tests {
 
     #[test]
     fn collapse_keeps_chain_heads_and_app_frames() {
-        let c = cmp();
+        let c = cmp_with_collapse();
         let content = java_chained_trace(30); // 68 lines, way over max of 20
         let (result, stats) = c.compress(&content, 1.0);
         assert!(stats.runtime_frames_collapsed > 0);
@@ -1780,7 +1786,7 @@ mod tests {
         cfg.collapse_runtime_frames = false;
         let (result_off, _) = LogCompressor::new(cfg).compress(&content, 1.0);
         assert!(!result_off.compressed.contains("com.example.Disk.read"));
-        let (result_on, _) = cmp().compress(&content, 1.0);
+        let (result_on, _) = cmp_with_collapse().compress(&content, 1.0);
         assert!(result_on.compressed.contains("com.example.Disk.read"));
     }
 

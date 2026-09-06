@@ -137,6 +137,22 @@ _TOOL_DESC_MAX_CHARS: int | None = None
 _STRIP_SEMANTIC: bool | None = None
 
 
+def tool_schema_compaction_enabled() -> bool:
+    """Return whether Layer 1 schema annotation compaction is enabled.
+
+    This pass removes JSON Schema annotation keys such as ``$schema``,
+    ``title``, and ``examples`` from forwarded tool definitions. Although those
+    keys are non-validation metadata, removing them still changes the exact
+    request body and can affect model tool-selection context. Keep the proxy
+    behavior explicitly opt-in.
+    """
+    return os.environ.get("HEADROOM_TOOL_SCHEMA_COMPACTION", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
 def tool_desc_max_chars() -> int:
     """Return the configured max description length (cached per-process).
 

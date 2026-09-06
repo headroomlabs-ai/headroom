@@ -551,14 +551,22 @@ def test_router_maps_structured_config_to_config_strategy() -> None:
 
 
 def test_router_lazy_getter_mirrors_ccr_setting() -> None:
-    router = ContentRouter(ContentRouterConfig(lossless=True))
+    router = ContentRouter(ContentRouterConfig(lossless=True, enable_config_compressor=True))
     compressor = router._get_config_compressor()
     assert compressor is not None
     assert compressor.config.enable_ccr is False  # lossless forces markers off
 
 
+def test_router_config_compressor_default_is_opt_in(monkeypatch) -> None:
+    monkeypatch.delenv("HEADROOM_CONFIG_COMPRESSION", raising=False)
+    assert ContentRouterConfig().enable_config_compressor is False
+
+    monkeypatch.setenv("HEADROOM_CONFIG_COMPRESSION", "1")
+    assert ContentRouterConfig().enable_config_compressor is True
+
+
 def test_router_compresses_k8s_manifest_end_to_end() -> None:
-    router = ContentRouter()
+    router = ContentRouter(ContentRouterConfig(enable_config_compressor=True))
     result = router.compress(K8S_MANIFEST)
     assert result.compressed != K8S_MANIFEST or result.strategy_used in (
         CompressionStrategy.CONFIG,
@@ -571,7 +579,7 @@ def test_router_compresses_k8s_manifest_end_to_end() -> None:
 
 
 def test_router_lossless_mode_uses_lossless_config_label() -> None:
-    router = ContentRouter(ContentRouterConfig(lossless=True))
+    router = ContentRouter(ContentRouterConfig(lossless=True, enable_config_compressor=True))
     compressed, _tokens, chain = router._apply_strategy_to_content(
         K8S_MANIFEST, CompressionStrategy.CONFIG, context=""
     )

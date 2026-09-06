@@ -152,6 +152,7 @@ def test_tabular_router_dispatch_matches_direct(monkeypatch: pytest.MonkeyPatch)
 
 
 def test_config_router_dispatch_matches_direct(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HEADROOM_CONFIG_COMPRESSION", "1")
     router = _router()
     _isolate_branch(monkeypatch, router)
     context, bias = "q", 1.0

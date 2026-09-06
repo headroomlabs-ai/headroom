@@ -3489,20 +3489,21 @@ _OPENAI_TOOL_SEARCH_TYPE = "tool_search"
 _OPENAI_TOOL_SEARCH_MIN_TOOLS = 12
 _OPENAI_TOOL_SEARCH_RESIDENT_NAMES = frozenset({"terminal"})
 _OPENAI_TOOL_SEARCH_UNSUPPORTED_CLIENTS = frozenset({"codex", "opencode"})
-# gpt-5.4 is the first model with Responses tool_search (OpenAI docs). Version-
-# gated by default; overridable per deployment via a regex in
-# HEADROOM_OPENAI_TOOL_SEARCH_MODELS (matched against the model name) so new
-# model families can be enabled without a code edit + release.
+# gpt-5.4 is the first model with Responses tool_search (OpenAI docs), but
+# injecting tool_search still changes the forwarded tool list. Keep proxy-side
+# deferral explicitly opt-in: HEADROOM_OPENAI_TOOL_SEARCH=1 enables the version
+# gate, while HEADROOM_OPENAI_TOOL_SEARCH_MODELS enables only matching models.
 _OPENAI_TOOL_SEARCH_MIN_VERSION = (5, 4)
 
 
 def _model_supports_openai_tool_search(model: str | None) -> bool:
     """True when an OpenAI model supports the Responses ``tool_search`` feature.
 
-    Default gate: ``gpt-<major>.<minor>`` >= 5.4. A regex in
-    ``HEADROOM_OPENAI_TOOL_SEARCH_MODELS`` (matched against the model name) wins
-    when set; a malformed pattern falls back to the version gate rather than
-    crashing.
+    Explicit opt-in is required. ``HEADROOM_OPENAI_TOOL_SEARCH_MODELS`` is a
+    regex matched against the model name and enables only matching models.
+    Otherwise ``HEADROOM_OPENAI_TOOL_SEARCH=1`` enables the built-in
+    ``gpt-<major>.<minor>`` >= 5.4 gate. Malformed regexes fail closed instead
+    of crashing.
     """
     if not model:
         return False
@@ -3511,7 +3512,14 @@ def _model_supports_openai_tool_search(model: str | None) -> bool:
         try:
             return re.search(override, model) is not None
         except re.error:
-            pass  # malformed override → fall back to the version gate
+            return False
+    enabled = os.environ.get("HEADROOM_OPENAI_TOOL_SEARCH", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    if not enabled:
+        return False
     match = re.match(r"gpt-(\d+)(?:\.(\d+))?", model.strip().lower())
     if not match:
         return False

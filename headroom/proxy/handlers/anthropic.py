@@ -2846,12 +2846,15 @@ class AnthropicHandlerMixin:
 
             _tools_compaction_started = time.time()
             try:
-                from headroom.proxy.tool_schema_compaction import compact_tools
+                from headroom.proxy.tool_schema_compaction import (
+                    compact_tools,
+                    tool_schema_compaction_enabled,
+                )
 
                 _pre_compaction_tools = body.get("tools")
                 _tools_modified = False
                 # Auxiliary passes honor the same disable/bypass decision as messages.
-                if _decision.should_compress:
+                if _decision.should_compress and tool_schema_compaction_enabled():
                     body, _tools_modified, _tools_before_bytes, _tools_after_bytes = compact_tools(
                         body
                     )

@@ -43,11 +43,17 @@ exists only for unit testing.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, cast
 
 logger = logging.getLogger(__name__)
+
+
+def _stack_trace_runtime_frame_collapse_enabled() -> bool:
+    value = os.environ.get("HEADROOM_STACK_TRACE_COLLAPSE", "")
+    return value.strip().lower() in {"1", "true", "yes", "on", "enabled"}
 
 
 class LogFormat(Enum):
@@ -113,7 +119,9 @@ class LogCompressorConfig:
     # message/chain-head lines, the first trace_head_frames frames, and up to
     # trace_app_frames app-code frames; runtime/stdlib frames collapse into a
     # `[... N frames collapsed]` marker instead of blind tail-truncation.
-    collapse_runtime_frames: bool = True
+    collapse_runtime_frames: bool = field(
+        default_factory=_stack_trace_runtime_frame_collapse_enabled
+    )
     trace_head_frames: int = 3
     trace_app_frames: int = 5
 
