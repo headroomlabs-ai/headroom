@@ -260,6 +260,9 @@ async def test_proxy_startup_does_not_enter_cached_kompress_native_loader(monkey
             code_aware_enabled=False,
         )
     )
+    # The background warm thread (GH #2730) is allowed to preload; this test
+    # covers the *awaited* startup path only, so disable it for determinism.
+    monkeypatch.setenv("HEADROOM_KOMPRESS_BACKGROUND_WARM", "0")
     router = _router_kompress_only()
     stub = _FatalPreloadCompressor(cached=True)
     monkeypatch.setattr(router, "_get_kompress", lambda: stub)
@@ -270,5 +273,95 @@ async def test_proxy_startup_does_not_enter_cached_kompress_native_loader(monkey
     try:
         assert stub.preload_calls == []
         assert proxy.warmup.kompress.info["source_status"] == "deferred"
+        assert proxy._kompress_warm_thread is None
+    finally:
+        await proxy.shutdown()
+
+
+def _kompress_proxy(monkeypatch, stub):
+    from headroom.proxy.server import HeadroomProxy, ProxyConfig
+
+    proxy = HeadroomProxy(
+        ProxyConfig(
+            optimize=True,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+            code_aware_enabled=False,
+        )
+    )
+    router = _router_kompress_only()
+    monkeypatch.setattr(router, "_get_kompress", lambda: stub)
+    proxy.anthropic_pipeline.transforms = [router]
+    proxy.openai_pipeline.transforms = [router]
+    return proxy
+
+
+@pytest.mark.asyncio
+async def test_startup_background_warm_promotes_deferred_kompress(monkeypatch):
+    """A cached model must reach the warmup slot without any request (GH #2730)."""
+    pytest.importorskip("httpx")
+
+    stub = _StubCompressor(cached=True)
+    proxy = _kompress_proxy(monkeypatch, stub)
+
+    await proxy.startup()
+    try:
+        thread = proxy._kompress_warm_thread
+        assert thread is not None
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+        # Cache-only: the warm path must never hit the network.
+        assert stub.preload_calls == [False]
+        assert proxy.warmup.kompress.status == "loaded"
+        assert proxy.warmup.kompress.info["backend"] == "onnx"
+    finally:
+        await proxy.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_startup_background_warm_leaves_cold_cache_deferred(monkeypatch):
+    """An uncached model stays deferred and says why."""
+    pytest.importorskip("httpx")
+
+    stub = _StubCompressor(cached=False)
+    proxy = _kompress_proxy(monkeypatch, stub)
+
+    await proxy.startup()
+    try:
+        thread = proxy._kompress_warm_thread
+        assert thread is not None
+        thread.join(timeout=10)
+        assert stub.preload_calls == [False]
+        assert proxy.warmup.kompress.status == "null"
+        assert proxy.warmup.kompress.info["detail"] == "model not cached"
+    finally:
+        await proxy.shutdown()
+
+
+class _LeakyPreloadCompressor(_StubCompressor):
+    """Fails with an exception carrying a path and a token, as loaders do."""
+
+    def preload(self, *, allow_download: bool = True) -> str:
+        self.preload_calls.append(allow_download)
+        raise RuntimeError("/opt/secret-path/model.onnx token=SENTINEL-LEAK-9f3a")
+
+
+@pytest.mark.asyncio
+async def test_startup_background_warm_failure_detail_is_bounded(monkeypatch):
+    """The warm failure reason must not reach the auth-exempt health payload."""
+    pytest.importorskip("httpx")
+
+    stub = _LeakyPreloadCompressor(cached=True)
+    proxy = _kompress_proxy(monkeypatch, stub)
+
+    await proxy.startup()
+    try:
+        thread = proxy._kompress_warm_thread
+        assert thread is not None
+        thread.join(timeout=10)
+        assert stub.preload_calls == [False]
+        assert proxy.warmup.kompress.status == "null"
+        assert proxy.warmup.kompress.info["detail"] == "warm failed"
     finally:
         await proxy.shutdown()

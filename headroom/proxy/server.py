@@ -146,6 +146,14 @@ from headroom.proxy.helpers import (
     resolve_display_provider,
     retry_after_ms,
 )
+from headroom.proxy.kompress_health_detail_policy import (
+    KOMPRESS_DETAIL_LOADED,
+    KOMPRESS_DETAIL_NOT_CACHED,
+    KOMPRESS_DETAIL_NOT_INSTALLED,
+    KOMPRESS_DETAIL_WARM_FAILED,
+    KOMPRESS_DETAIL_WARMING,
+    public_detail,
+)
 from headroom.proxy.loop_callback_failure_policy import is_known_websocket_callback_failure
 from headroom.proxy.loopback_guard import is_loopback_host
 from headroom.proxy.malloc_trim import trim_periodically
@@ -1194,6 +1202,9 @@ class HeadroomProxy(
         )
         self._compression_quarantine_releases: int = 0
         self._compression_metrics_lock = threading.Lock()
+        # Daemon thread that warms the Kompress model after startup when the
+        # eager preload deferred the native load (GH #2730). None until started.
+        self._kompress_warm_thread: threading.Thread | None = None
 
         # Backend for Anthropic API (direct, LiteLLM, or any-llm)
         # Supports: "anthropic" (direct), "bedrock", "vertex", "litellm-<provider>", or "anyllm"
@@ -1816,6 +1827,71 @@ class HeadroomProxy(
 
         return eager_status, transform_statuses
 
+    def _start_kompress_background_warm(self) -> None:
+        """Warm the deferred Kompress model on a daemon thread.
+
+        The eager preload deliberately skips ``preload()`` so a native model
+        load can never block the port bind (GH #790). Without this thread the
+        warmup slot stays ``null`` and /health reports
+        ``kompress: unhealthy, backend: null`` until some request happens to
+        route to kompress (GH #2730).
+
+        ``allow_download=False`` keeps startup off the network: a cold cache
+        raises :class:`KompressModelNotCached` and the component simply stays
+        deferred, exactly as it behaves today.
+        """
+        if os.environ.get("HEADROOM_KOMPRESS_BACKGROUND_WARM", "1").strip() == "0":
+            logger.debug("Kompress background warm disabled via env")
+            return
+        if self._kompress_warm_thread is not None and self._kompress_warm_thread.is_alive():
+            return
+        compressors = _kompress_compressors(self)
+        for router in _kompress_routers(self):
+            try:
+                compressor = router._get_kompress()
+            except Exception:  # pragma: no cover - defensive
+                continue
+            if compressor is not None and all(compressor is not item for item in compressors):
+                compressors.append(compressor)
+        compressors = [c for c in compressors if hasattr(c, "preload")]
+        if not compressors:
+            return
+
+        slot = self.warmup.kompress
+
+        def _warm() -> None:
+            not_cached: tuple[type[BaseException], ...]
+            try:
+                from headroom.transforms.kompress_compressor import KompressModelNotCached
+
+                not_cached = (KompressModelNotCached,)
+            except Exception:  # pragma: no cover - ML extras absent
+                not_cached = ()
+
+            for compressor in compressors:
+                try:
+                    backend = compressor.preload(allow_download=False)
+                except not_cached:
+                    slot.info["detail"] = KOMPRESS_DETAIL_NOT_CACHED
+                    continue
+                except Exception:
+                    # The detail lands on the auth-exempt /health payload, so it
+                    # stays a bounded token; loader failures embed paths, model
+                    # ids and URLs. The real cause goes to the log only.
+                    slot.info["detail"] = KOMPRESS_DETAIL_WARM_FAILED
+                    logger.warning("Kompress background warm failed", exc_info=True)
+                    continue
+                if not backend:
+                    continue
+                slot.info.pop("detail", None)
+                slot.mark_loaded(handle=compressor, backend=backend)
+                logger.info("Kompress: model warm (backend=%s)", backend)
+                return
+
+        thread = threading.Thread(target=_warm, name="kompress-startup-warm", daemon=True)
+        self._kompress_warm_thread = thread
+        thread.start()
+
     async def startup(self):
         """Initialize async resources."""
         self._get_shutdown_event().clear()
@@ -1949,6 +2025,12 @@ class HeadroomProxy(
         # Update internal status from eager loading results
         if eager_status.get("kompress") in {"enabled", "deferred"}:
             self._kompress_status = eager_status["kompress"]
+            if self._kompress_status == "deferred":
+                # The transform IS wired into the pipeline; only the native
+                # model load was deferred so a cold cache cannot block the port
+                # bind (GH #790). Warm it in the background instead of leaving
+                # the health slot empty forever (GH #2730).
+                self._start_kompress_background_warm()
         if eager_status.get("code_aware") == "enabled":
             self._code_aware_status = "enabled"
 
@@ -1956,7 +2038,7 @@ class HeadroomProxy(
         if self._kompress_status == "enabled":
             logger.info("Kompress: ENABLED (ModernBERT token compressor)")
         elif self._kompress_status == "deferred":
-            logger.info("Kompress: DEFERRED (model loads on first request)")
+            logger.info("Kompress: DEFERRED (wired into pipeline; model loads in background)")
         elif self.config.optimize:
             logger.info("Kompress: not installed (pip install headroom-ai[ml] for ML compression)")
 
@@ -2725,6 +2807,31 @@ class WebSocketProjectPrefixMiddleware:
         await self.app(scope, receive, send)
 
 
+def _kompress_routers(proxy: HeadroomProxy) -> list[ContentRouter]:
+    """Kompress-enabled ContentRouters across both pipelines, deduped by identity."""
+    routers: list[ContentRouter] = []
+    for pipeline in (proxy.anthropic_pipeline, proxy.openai_pipeline):
+        for transform in getattr(pipeline, "transforms", ()):
+            if (
+                isinstance(transform, ContentRouter)
+                and transform.config.enable_kompress
+                and all(transform is not item for item in routers)
+            ):
+                routers.append(transform)
+    return routers
+
+
+def _kompress_compressors(proxy: HeadroomProxy) -> list[Any]:
+    """Compressor instances held by the kompress-enabled routers, deduped."""
+    compressors: list[Any] = []
+    for router in _kompress_routers(proxy):
+        for name in ("_kompress", "_kompress_remote"):
+            compressor = getattr(router, name, None)
+            if compressor is not None and all(compressor is not item for item in compressors):
+                compressors.append(compressor)
+    return compressors
+
+
 def create_app(config: ProxyConfig | None = None) -> FastAPI:
     """Create FastAPI application."""
     if not FASTAPI_AVAILABLE:
@@ -3040,30 +3147,13 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         return result
 
     def _kompress_health_routers() -> list[ContentRouter]:
-        routers: list[ContentRouter] = []
-        for pipeline in (proxy.anthropic_pipeline, proxy.openai_pipeline):
-            for transform in getattr(pipeline, "transforms", ()):
-                if (
-                    isinstance(transform, ContentRouter)
-                    and transform.config.enable_kompress
-                    and all(transform is not item for item in routers)
-                ):
-                    routers.append(transform)
-        return routers
+        return _kompress_routers(proxy)
 
     def _reconcile_kompress_health() -> bool:
-        routers = _kompress_health_routers()
-        if not routers:
+        if not _kompress_health_routers():
             return False
 
-        compressors: list[Any] = []
-        for router in routers:
-            for name in ("_kompress", "_kompress_remote"):
-                compressor = getattr(router, name, None)
-                if compressor is not None and all(compressor is not item for item in compressors):
-                    compressors.append(compressor)
-
-        for compressor in compressors:
+        for compressor in _kompress_compressors(proxy):
             try:
                 if not compressor.is_ready():
                     continue
@@ -3096,6 +3186,35 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                         handle=model, backend=backend, source_status="runtime"
                     )
         return True
+
+    def _kompress_detail() -> str:
+        """Human-readable reason behind the kompress readiness bit.
+
+        ``ready=false`` on its own is ambiguous — the model may be warming in
+        the background, missing from the local cache, or the extras may not be
+        installed at all (GH #2730).
+
+        This value is served by the auth-exempt ``/health`` and ``/readyz``, so
+        every candidate goes through :func:`public_detail` and anything outside
+        ``KOMPRESS_HEALTH_DETAILS`` collapses to ``unavailable``. That matters
+        most for ``slot.error``, which carries raw loader exception text.
+        ``/debug/warmup`` and the proxy log still hold the precise cause.
+        """
+        slot = proxy.warmup.kompress
+        if slot.status == "loaded":
+            return KOMPRESS_DETAIL_LOADED
+        detail = slot.info.get("detail")
+        if isinstance(detail, str) and detail:
+            return public_detail(detail)
+        if slot.error:
+            return public_detail(slot.error)
+        warm_thread = getattr(proxy, "_kompress_warm_thread", None)
+        if warm_thread is not None and warm_thread.is_alive():
+            return KOMPRESS_DETAIL_WARMING
+        source_status = slot.info.get("source_status")
+        if isinstance(source_status, str) and source_status:
+            return public_detail(source_status)
+        return KOMPRESS_DETAIL_NOT_INSTALLED
 
     def _health_checks() -> dict[str, dict[str, Any]]:
         kompress_enabled = _reconcile_kompress_health()
@@ -3149,6 +3268,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 ready=proxy.warmup.kompress.status == "loaded",
                 optional=True,
                 backend=proxy.warmup.kompress.info.get("backend", None),
+                detail=_kompress_detail(),
             ),
         }
 
