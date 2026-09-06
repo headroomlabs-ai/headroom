@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, ClassVar, Protocol, runtime_checkable
 
 # Tool name constant - used for matching tool calls
 CCR_TOOL_NAME = "headroom_retrieve"
@@ -178,6 +178,10 @@ class CCRToolInjector:
             messages = injector.inject_system_instructions(messages)
     """
 
+    # Depth bound for `_scan_any`. Real tool results nest a few levels;
+    # this only stops a pathological payload recursing without limit.
+    MAX_SCAN_DEPTH: ClassVar[int] = 32
+
     provider: str = "anthropic"
     inject_tool: bool = True
     inject_system_instructions: bool = True
@@ -266,15 +270,22 @@ class CCRToolInjector:
                         # Text blocks
                         if block.get("type") == "text":
                             self._scan_text(block.get("text", ""))
-                        # Tool result blocks
+                        # Tool result blocks. Walked structurally rather than
+                        # by block type: the writer side
+                        # (`DocumentCompactor::walk_string`) classifies EVERY
+                        # string in the payload tree, so it can leave a marker
+                        # under `resource.text` of an MCP `resource` block
+                        # (Slack's `text/html;profile=mcp-app`), inside a
+                        # nested container, or under any key it never had to
+                        # know the name of. Matching only `type == "text"`
+                        # here made those markers invisible to the scan, so
+                        # the retrieve tool was never injected and the model
+                        # got a marker it could not redeem — the silent-loss
+                        # class of #1006 reached through a different block
+                        # type. Over-collecting is safe: `verify_ownership`
+                        # drops every hash this proxy did not store.
                         elif block.get("type") == "tool_result":
-                            tool_content = block.get("content", "")
-                            if isinstance(tool_content, str):
-                                self._scan_text(tool_content)
-                            elif isinstance(tool_content, list):
-                                for item in tool_content:
-                                    if isinstance(item, dict) and item.get("type") == "text":
-                                        self._scan_text(item.get("text", ""))
+                            self._scan_any(block.get("content", ""))
 
             # Handle Google/Gemini format with parts
             parts = message.get("parts", [])
@@ -318,6 +329,26 @@ class CCRToolInjector:
                     hash_key = match  # Single capture group (generic pattern)
                 if hash_key and hash_key not in self._detected_hashes:
                     self._detected_hashes.append(hash_key)
+
+    def _scan_any(self, node: Any, _depth: int = 0) -> None:
+        """Recursively scan every string reachable under ``node``.
+
+        Mirrors the writer's own generality: the compactor walks the
+        payload tree without caring which key a string sits under, so the
+        scan has to as well. Depth is bounded to keep a pathological
+        (or hostile) payload from blowing the Python stack; real tool
+        results nest a few levels at most.
+        """
+        if _depth > self.MAX_SCAN_DEPTH:
+            return
+        if isinstance(node, str):
+            self._scan_text(node)
+        elif isinstance(node, dict):
+            for value in node.values():
+                self._scan_any(value, _depth + 1)
+        elif isinstance(node, list):
+            for item in node:
+                self._scan_any(item, _depth + 1)
 
     def verify_ownership(self, store: _HashOwnershipStore | None = None) -> list[str]:
         """Drop any detected hash the compression store doesn't recognize.

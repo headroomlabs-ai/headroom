@@ -795,3 +795,71 @@ class TestVerifyOwnership:
         result = injector.verify_ownership()
 
         assert result == []
+
+
+class TestScanReachesNonTextBlocks:
+    """The scan must reach every string the compactor can write a marker
+    into, not just `type: "text"` blocks.
+
+    `DocumentCompactor::walk_string` classifies EVERY string in the
+    payload tree, so a marker can land under `resource.text` of an MCP
+    `resource` block (Slack returns `text/html;profile=mcp-app`) or
+    inside an arbitrarily nested container. Scanning only text blocks
+    left those markers undetected, so `headroom_retrieve` was never
+    injected and the model got a marker it could not redeem.
+    """
+
+    MARKER = "<<ccr:d418eab1ee6e,html,13.8KB>>"
+
+    def _scan(self, tool_content):
+        injector = CCRToolInjector(provider="anthropic")
+        return injector.scan_for_markers(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_1",
+                            "content": tool_content,
+                        }
+                    ],
+                }
+            ]
+        )
+
+    def test_marker_in_text_block_still_detected(self):
+        assert self._scan([{"type": "text", "text": self.MARKER}]) == ["d418eab1ee6e"]
+
+    def test_marker_in_mcp_resource_block_is_detected(self):
+        assert self._scan(
+            [
+                {
+                    "type": "resource",
+                    "resource": {
+                        "mimeType": "text/html;profile=mcp-app",
+                        "text": self.MARKER,
+                    },
+                }
+            ]
+        ) == ["d418eab1ee6e"]
+
+    def test_marker_in_deeply_nested_container_is_detected(self):
+        assert self._scan(
+            [
+                {"type": "text", "text": "summary line"},
+                {"type": "resource", "resource": {"blob": {"rows": [{"cell": self.MARKER}]}}},
+            ]
+        ) == ["d418eab1ee6e"]
+
+    def test_string_tool_content_still_detected(self):
+        assert self._scan(self.MARKER) == ["d418eab1ee6e"]
+
+    def test_unmarked_content_detects_nothing(self):
+        assert self._scan([{"type": "resource", "resource": {"text": "no marker here"}}]) == []
+
+    def test_recursion_is_depth_bounded(self):
+        node = self.MARKER
+        for _ in range(CCRToolInjector.MAX_SCAN_DEPTH * 2):
+            node = {"nested": node}
+        assert self._scan(node) == []
