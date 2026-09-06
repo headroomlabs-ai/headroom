@@ -171,6 +171,12 @@ from headroom.proxy.rate_limiter import TokenBucketRateLimiter  # noqa: F401
 from headroom.proxy.request_logger import RequestLogger  # noqa: F401
 from headroom.proxy.savings_tracker import LITELLM_AVAILABLE
 from headroom.proxy.semantic_cache import SemanticCache  # noqa: F401
+from headroom.proxy.session_registry import (
+    ActiveSessionRegistry,
+    ClusterConfig,
+    aggregate_sessions,
+    list_active_sessions,
+)
 from headroom.proxy.ssl_context import build_httpx_verify
 from headroom.proxy.tool_schema_savings_policy import tool_schema_saved_from_tags
 from headroom.proxy.warmup import WarmupRegistry
@@ -832,6 +838,13 @@ class HeadroomProxy(
             else None
         )
         self.metrics = PrometheusMetrics(cost_tracker=self.cost_tracker, stateless=config.stateless)
+        self.active_session_registry = ActiveSessionRegistry(
+            agent_type=config.traffic_learning_agent_type
+            if config.traffic_learning_agent_type != "unknown"
+            else "proxy",
+            cluster=ClusterConfig.from_env(),
+            persistence_enabled=not config.stateless,
+        )
 
         # Cost-aware model routing (issue #1706). Disabled unless configured, so
         # the default request path is unchanged.
@@ -2033,6 +2046,13 @@ class HeadroomProxy(
         else:
             logger.info("CCR: DISABLED")
         logger.info(f"Savings history: {self.metrics.savings_tracker.storage_path}")
+        self.active_session_registry.heartbeat(self._session_metrics_snapshot())
+        logger.info(
+            "Active session: %s (cluster_enabled=%s cluster_id=%s)",
+            self.active_session_registry.session_id,
+            self.active_session_registry.cluster.enabled,
+            self.active_session_registry.cluster.cluster_id,
+        )
 
         # Reset and rebuild the quota tracker registry for this server instance.
         # reset_quota_registry() ensures a clean slate when the proxy is restarted
@@ -2124,6 +2144,7 @@ class HeadroomProxy(
 
         # Print final stats
         self._print_summary()
+        self.active_session_registry.close()
 
     def _print_summary(self):
         """Print session summary."""
@@ -2195,6 +2216,20 @@ class HeadroomProxy(
         # raises CancelledError, so generator teardown propagates exactly as
         # before. It only keeps the bookkeeping from being torn in half.
         await asyncio.shield(emit_request_outcome(self, outcome))
+
+    def _session_metrics_snapshot(self) -> dict[str, Any]:
+        """Return compact counters safe to publish in active-session manifests."""
+
+        m = self.metrics
+        return {
+            "requests": m.requests_total,
+            "tokens_saved": m.tokens_saved_total,
+            "input_tokens": m.tokens_input_total,
+            "output_tokens": m.tokens_output_total,
+            "failed_requests": m.requests_failed,
+            "cached_requests": m.requests_cached,
+            "rate_limited_requests": m.requests_rate_limited,
+        }
 
     async def _next_request_id(self) -> str:
         """Generate unique request ID."""
@@ -2847,6 +2882,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
+        session_heartbeat_task: asyncio.Task[None] | None = None
         # Hotfix-A0: Rust core deployment smoke test. Refuse to accept
         # traffic if the Rust extension is missing unless the operator
         # explicitly opted out with HEADROOM_REQUIRE_RUST_CORE=false. See
@@ -2874,6 +2910,12 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 previous_handler = _install_loop_exception_handler()
                 # Startup
                 await proxy.startup()
+                session_heartbeat_task = asyncio.create_task(
+                    proxy.active_session_registry.run_heartbeat_loop(
+                        proxy._session_metrics_snapshot
+                    ),
+                    name="headroom-active-session-heartbeat",
+                )
                 if config.periodic_toin_stats_enabled:
                     app.state.periodic_toin_stats_task = asyncio.create_task(
                         _log_toin_stats_periodically()
@@ -2955,6 +2997,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
             if _cc_reconciler is not None:
                 await _timed(_cc_reconciler.stop(), label="cc_reconciler.stop", timeout=3.0)
+            if session_heartbeat_task is not None:
+                session_heartbeat_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await session_heartbeat_task
             if _beacon_is_owner[0]:
                 _release_beacon_lock()
             if proxy.usage_reporter:
@@ -4283,6 +4329,19 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         total_tokens_all_layers = all_layers_tokens_saved
         persistent_savings = m.savings_tracker.stats_preview()
         display_session = persistent_savings.get("display_session", {})
+        current_session = proxy.active_session_registry.heartbeat(proxy._session_metrics_snapshot())
+        local_active_sessions = list_active_sessions(
+            proxy.active_session_registry.local_sessions_dir,
+            stale_after_seconds=proxy.active_session_registry.stale_after_seconds,
+            prune_stale=True,
+        )
+        cluster_active_sessions: list[dict[str, Any]] = []
+        cluster_manifest_path = proxy.active_session_registry.cluster_manifest_path
+        if proxy.active_session_registry.cluster.enabled and cluster_manifest_path is not None:
+            cluster_active_sessions = list_active_sessions(
+                cluster_manifest_path.parents[2],
+                stale_after_seconds=proxy.active_session_registry.stale_after_seconds,
+            )
         recent_request_logs = proxy.logger.get_recent(10_000) if proxy.logger else []
         recent_request_payload = _build_recent_request_payload()
 
@@ -4600,6 +4659,16 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             },
             "savings_history": m.savings_history[-100:],  # Last 100 data points
             "display_session": display_session,
+            "active_sessions": {
+                "current": current_session,
+                "local": local_active_sessions,
+                "local_summary": aggregate_sessions(local_active_sessions),
+            },
+            "cluster": {
+                **proxy.active_session_registry.cluster.snapshot(),
+                "active_sessions": cluster_active_sessions,
+                "summary": aggregate_sessions(cluster_active_sessions),
+            },
             # Whether LiteLLM is importable. Pricing (the "$ Saved" tile) is
             # derived entirely from LiteLLM's cost tables, and LiteLLM is gated
             # off on Python >=3.14 in pyproject — so when this is False the
@@ -4750,6 +4819,25 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             # _build_stats_payload bakes these in; strip for network callers.
             payload.pop("recent_requests", None)
             payload.pop("request_logs", None)
+            active_sessions = payload.get("active_sessions")
+            if isinstance(active_sessions, dict):
+                local_summary = active_sessions.get("local_summary", {})
+                if isinstance(local_summary, dict):
+                    local_summary = {
+                        key: value for key, value in local_summary.items() if key != "by_instance"
+                    }
+                payload["active_sessions"] = {"local_summary": local_summary}
+            cluster = payload.get("cluster")
+            if isinstance(cluster, dict):
+                cluster_summary = cluster.get("summary", {})
+                if isinstance(cluster_summary, dict):
+                    cluster_summary = {
+                        key: value for key, value in cluster_summary.items() if key != "by_instance"
+                    }
+                payload["cluster"] = {
+                    "enabled": bool(cluster.get("enabled", False)),
+                    "summary": cluster_summary,
+                }
         return payload
 
     @app.get("/stats-lifetime")

@@ -38,6 +38,10 @@ OPENAI_BASE_URL=http://localhost:8787/v1 your-app
 
 Anonymous aggregate telemetry is **off by default** (opt-in). Opt in with `HEADROOM_TELEMETRY=on` or `headroom proxy --telemetry`. Downstream apps can set `HEADROOM_SDK=headroom-app` to override the anonymous telemetry `sdk` label; the default remains `proxy`.
 
+Use `headroom telemetry list` to enumerate every telemetry surface and verify
+whether it includes prompt content or leaves the host. See
+[Telemetry Surfaces](telemetry.md).
+
 Operational OTEL metrics are configured separately and are **off by default**. Install `headroom-ai[proxy,otel]` and set:
 
 ```bash
@@ -59,6 +63,25 @@ LANGFUSE_BASE_URL=https://cloud.langfuse.com
 ```
 
 When configured, Headroom emits OTLP traces for the shared compression pipeline to Langfuse while continuing to expose metrics through `/metrics` and OTEL metric exporters.
+
+### Clustered mode
+
+Clustered mode mirrors per-process active-session manifests to a shared
+directory so multiple local proxies, CI runners, or service pods can be viewed
+as one logical cluster.
+
+```bash
+HEADROOM_CLUSTER_ENABLED=true
+HEADROOM_CLUSTER_ID=team-gamma
+HEADROOM_CLUSTER_DIR=/mnt/shared/headroom-cluster
+headroom proxy
+```
+
+Local manifests are always written under
+`${HEADROOM_WORKSPACE_DIR}/sessions/<session-id>/session.json`. Cluster mode
+adds a mirrored copy under
+`${HEADROOM_CLUSTER_DIR}/${HEADROOM_CLUSTER_ID}/sessions/<instance-id>/<session-id>/session.json`.
+The `/stats` payload exposes `active_sessions` and `cluster` summaries.
 
 ## Command Line Options
 

@@ -491,10 +491,16 @@ def test_stats_per_request_metadata_is_loopback_only() -> None:
     assert "recent_requests" not in payload
     assert "request_logs" not in payload
     assert "config" not in payload
+    assert set(payload["active_sessions"]) == {"local_summary"}
+    assert "by_instance" not in payload["active_sessions"]["local_summary"]
+    assert set(payload["cluster"]) == {"enabled", "summary"}
+    assert "by_instance" not in payload["cluster"]["summary"]
 
     local = _client(loopback=True).get("/stats").json()
     assert "recent_requests" in local
     assert "config" in local
+    assert "current" in local["active_sessions"]
+    assert "active_sessions" in local["cluster"]
 
 
 def test_stats_metadata_served_to_trusted_gateway_peer(
