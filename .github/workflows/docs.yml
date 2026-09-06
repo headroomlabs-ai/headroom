@@ -22,6 +22,9 @@ on:
     branches: [main]
     paths:
       - 'docs/**'
+      - 'README.md'
+      - 'SECURITY.md'
+      - 'scripts/ci/verify_documented_env_vars.py'
       - '.github/workflows/docs.yml'
   workflow_dispatch:
 
@@ -35,6 +38,13 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Verify documented environment variables
+        run: python scripts/ci/verify_documented_env_vars.py
 
       - name: Setup Node.js
         uses: actions/setup-node@v7
