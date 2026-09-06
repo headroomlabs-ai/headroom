@@ -148,6 +148,21 @@ class TestBM25Scorer:
         assert scores[0].matched_terms == ["alpha"]
         assert sorted(scores[1].matched_terms) == ["alpha", "beta"]
 
+    def test_precomputed_query_freq_matches_recomputed(self):
+        """Passing a precomputed Counter(query_tokens) into ``_bm25_score``
+        must yield identical (score, matched_terms) to letting it recompute
+        the Counter itself. ``score_batch`` relies on this to count the shared
+        context once instead of once per item."""
+        from collections import Counter
+
+        scorer = BM25Scorer()
+        doc_tokens = scorer._tokenize("alpha beta beta gamma id-9c1f2a3b4d5e")
+        query_tokens = scorer._tokenize("beta gamma id-9c1f2a3b4d5e delta")
+
+        recomputed = scorer._bm25_score(doc_tokens, query_tokens)
+        with_freq = scorer._bm25_score(doc_tokens, query_tokens, query_freq=Counter(query_tokens))
+        assert with_freq == recomputed
+
 
 class TestEmbeddingScorer:
     """Tests for embedding-based semantic scorer."""
