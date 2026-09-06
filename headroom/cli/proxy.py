@@ -777,6 +777,18 @@ def dashboard(port: int, no_open: bool) -> None:
     ),
 )
 @click.option(
+    "--memory-backend",
+    type=click.Choice(["local", "qdrant-neo4j", "cognee"], case_sensitive=False),
+    default="local",
+    show_default=True,
+    envvar="HEADROOM_MEMORY_BACKEND",
+    help=(
+        "Memory backend. local: SQLite (default). qdrant-neo4j: Qdrant + Neo4j via mem0 "
+        "(pip install 'headroom-ai[memory-stack]'). cognee: knowledge-graph engine "
+        "(pip install 'headroom-ai[cognee]'). Env: HEADROOM_MEMORY_BACKEND."
+    ),
+)
+@click.option(
     "--memory-db-path",
     default="",
     envvar="HEADROOM_MEMORY_DB_PATH",
@@ -868,6 +880,55 @@ def dashboard(port: int, no_open: bool) -> None:
     "--memory-qdrant-api-key",
     default=None,
     help=("API key for hosted Qdrant (e.g. Qdrant Cloud). Also reads HEADROOM_QDRANT_API_KEY."),
+)
+@click.option(
+    "--memory-cognee-dataset",
+    default=None,
+    help=(
+        "cognee dataset name for the cognee backend "
+        "(default: headroom_memories, also reads HEADROOM_COGNEE_DATASET)"
+    ),
+)
+@click.option(
+    "--memory-cognee-system-root",
+    default=None,
+    help=(
+        "Directory for cognee system state (databases, caches) so headroom's cognee "
+        "state stays isolated. Also reads HEADROOM_COGNEE_SYSTEM_ROOT."
+    ),
+)
+@click.option(
+    "--memory-cognee-data-root",
+    default=None,
+    help=("Directory for cognee data storage. Also reads HEADROOM_COGNEE_DATA_ROOT."),
+)
+@click.option(
+    "--memory-cognee-search-type",
+    default=None,
+    help=(
+        "cognee SearchType used for retrieval (e.g. CHUNKS, GRAPH_COMPLETION). "
+        "CHUNKS (default) is raw retrieval with no LLM synthesis. "
+        "Also reads HEADROOM_COGNEE_SEARCH_TYPE."
+    ),
+)
+@click.option(
+    "--memory-cognee-auto-cognify/--no-memory-cognee-auto-cognify",
+    default=None,
+    help=(
+        "Run cognee.cognify() after each save so new memories join the knowledge graph "
+        "(default: enabled, also reads HEADROOM_COGNEE_AUTO_COGNIFY)"
+    ),
+)
+@click.option(
+    "--memory-cognee-metadata-db",
+    default=None,
+    help=(
+        "Path to the SQLite file holding the cognee backend's durable memory "
+        "registry and delete/update tombstones. Instances sharing memories must "
+        "point at the same file. Default: headroom_cognee_meta.db under the "
+        "cognee data root (or system root, or ~/.headroom). "
+        "Also reads HEADROOM_COGNEE_METADATA_DB."
+    ),
 )
 # Traffic Learning (live pattern extraction from proxy traffic)
 @click.option(
@@ -1080,6 +1141,7 @@ def proxy(
     read_maturation_max_hold_turns: int,
     read_maturation_min_size_bytes: int,
     memory: bool,
+    memory_backend: str,
     memory_db_path: str,
     memory_storage: str,
     memory_project_root: str,
@@ -1090,6 +1152,12 @@ def proxy(
     memory_qdrant_host: str | None,
     memory_qdrant_port: int | None,
     memory_qdrant_api_key: str | None,
+    memory_cognee_dataset: str | None,
+    memory_cognee_system_root: str | None,
+    memory_cognee_data_root: str | None,
+    memory_cognee_search_type: str | None,
+    memory_cognee_auto_cognify: bool | None,
+    memory_cognee_metadata_db: str | None,
     learn: bool,
     no_learn: bool,
     min_evidence: int | None,
@@ -1307,6 +1375,24 @@ def proxy(
     if memory_qdrant_api_key is not None:
         qdrant_overrides["memory_qdrant_api_key"] = memory_qdrant_api_key
 
+    # cognee settings for the cognee backend. Same shape as the Qdrant
+    # overrides: CLI flags default to None; when omitted ProxyConfig's
+    # default_factory resolves HEADROOM_COGNEE_* env vars. Explicit CLI
+    # values win over env.
+    cognee_overrides: dict[str, Any] = {}
+    if memory_cognee_dataset is not None:
+        cognee_overrides["memory_cognee_dataset"] = memory_cognee_dataset
+    if memory_cognee_system_root is not None:
+        cognee_overrides["memory_cognee_system_root"] = memory_cognee_system_root
+    if memory_cognee_data_root is not None:
+        cognee_overrides["memory_cognee_data_root"] = memory_cognee_data_root
+    if memory_cognee_search_type is not None:
+        cognee_overrides["memory_cognee_search_type"] = memory_cognee_search_type
+    if memory_cognee_auto_cognify is not None:
+        cognee_overrides["memory_cognee_auto_cognify"] = memory_cognee_auto_cognify
+    if memory_cognee_metadata_db is not None:
+        cognee_overrides["memory_cognee_metadata_db_path"] = memory_cognee_metadata_db
+
     config = ProxyConfig(
         host=host,
         port=port,
@@ -1440,6 +1526,7 @@ def proxy(
         # --learn implies --memory (need backend for storing patterns)
         # Stateless mode disables memory (requires SQLite on disk)
         memory_enabled=False if is_stateless else (memory or (learn and not no_learn)),
+        memory_backend=cast(Literal["local", "qdrant-neo4j", "cognee"], memory_backend.lower()),
         memory_db_path=memory_db_path,
         memory_storage_mode=cast(Literal["project", "user", "global"], memory_storage.lower()),
         memory_project_root_override=memory_project_root,
@@ -1447,6 +1534,7 @@ def proxy(
         memory_inject_context=not no_memory_context,
         memory_top_k=memory_top_k,
         **qdrant_overrides,
+        **cognee_overrides,
         # Traffic Learning: only with --learn, never with --no-learn
         # Stateless mode disables learning (requires filesystem)
         traffic_learning_enabled=False if is_stateless else (learn and not no_learn),

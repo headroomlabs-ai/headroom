@@ -315,7 +315,21 @@ headroom proxy --mode cache
 # Enable memory and live learning
 headroom proxy --memory
 headroom proxy --learn --min-evidence 3
+
+# Choose the memory storage backend: local (default), qdrant-neo4j, or cognee
+headroom proxy --memory --memory-backend cognee
 ```
+
+The cognee backend requires `pip install "headroom-ai[cognee]"` and accepts
+further tuning via `--memory-cognee-dataset`, `--memory-cognee-system-root`,
+`--memory-cognee-data-root`, `--memory-cognee-search-type`,
+`--memory-cognee-auto-cognify/--no-memory-cognee-auto-cognify`, and
+`--memory-cognee-metadata-db` (each also reads the matching
+`HEADROOM_COGNEE_*` env var; the flag wins when both are set). Note that
+cognee's root-directory configuration is process-wide and immutable: the first
+cognee backend initialized in a process fixes `system-root`/`data-root` for
+every later instance in that process. See
+[Memory](/docs/memory#cognee-backend-knowledge-graph).
 
 ## Environment Variables
 
@@ -344,6 +358,13 @@ headroom proxy --learn --min-evidence 3
 | `HEADROOM_SUBSCRIPTION_STATE_PATH` | Override subscription tracker state file. Always wins when set. | derived from `${HEADROOM_WORKSPACE_DIR}` |
 | `HEADROOM_PERIODIC_TOIN_STATS` | Controls periodic TOIN stats logging in long-lived proxy workers. Set to `0`, `false`, `off`, or `no` to disable the 5-minute stats loop without disabling TOIN learning or request-time feedback. | `true` |
 | `HEADROOM_MEMORY_INJECTION_MODE` | Memory-context routing mode: `live_zone_tail` (default) or `disabled`. The legacy `system_prompt` mode was retired by PR-A2; supplying it raises. | `live_zone_tail` |
+| `HEADROOM_MEMORY_BACKEND` | Proxy memory storage backend: `local`, `qdrant-neo4j`, or `cognee`. `cognee` requires `pip install "headroom-ai[cognee]"`. Same as `--memory-backend`. See [Memory](/docs/memory#cognee-backend-knowledge-graph). | `local` |
+| `HEADROOM_COGNEE_DATASET` | cognee dataset that holds all Headroom memories (cognee backend only). | `headroom_memories` |
+| `HEADROOM_COGNEE_SYSTEM_ROOT` | Directory for cognee system state (databases, caches). Keeps Headroom's cognee state isolated from other cognee installs on the machine. | cognee's default |
+| `HEADROOM_COGNEE_DATA_ROOT` | Directory for cognee data storage. | cognee's default |
+| `HEADROOM_COGNEE_SEARCH_TYPE` | cognee `SearchType` name used for memory retrieval, e.g. `CHUNKS` (raw retrieval, no LLM synthesis) or `GRAPH_COMPLETION` (graph context; sent with `only_context=True` so no LLM answer is generated). | `CHUNKS` |
+| `HEADROOM_COGNEE_AUTO_COGNIFY` | Whether `cognee.cognify()` runs after each save so new memories join the knowledge graph. cognify is LLM-bound, so it runs in the background and never blocks a save. `true`/`false`. | `true` |
+| `HEADROOM_COGNEE_METADATA_DB` | Path to the SQLite file holding the cognee backend's durable memory registry and delete/update tombstones. Proxy workers that must share memories (and see each other's deletions) must point at the same file. Same as `--memory-cognee-metadata-db`. | `headroom_cognee_meta.db` under the cognee data root, else the system root, else `~/.headroom` |
 | `HEADROOM_PROXY_PYTHON_FORWARDER_MODE` | Python forwarder serialization mode. `byte_faithful` (default) forwards original request bytes verbatim when no transform mutated the body and re-serializes canonically only when needed — keeps Anthropic prompt-cache hit-rate intact. `legacy_json_kwarg` is an explicit operator opt-in for emergency rollback to the historical `httpx ... json=body` behavior. NOT a fallback — only flip on explicit operator decision. | `byte_faithful` |
 | `HEADROOM_STRIP_INTERNAL_HEADERS` | Python proxy: whether to strip internal `x-headroom-*` request headers (e.g. `x-headroom-bypass`, `x-headroom-mode`, `x-headroom-user-id`, `x-headroom-stack`, `x-headroom-base-url`) before every upstream forwarder call (PR-A5, fixes P5-49). `enabled` (default) stops fingerprinting / leakage. `disabled` is an explicit operator opt-in for diagnostic shadow tracing — NOT a fallback. Inbound reads of these headers (bypass gating, memory user-id resolution) are unaffected because they read `request.headers` directly. | `enabled` |
 | `HEADROOM_PROXY_STRIP_INTERNAL_HEADERS` | Rust proxy: same policy as `HEADROOM_STRIP_INTERNAL_HEADERS` but for the Rust transparent proxy. Stripping happens inside `build_forward_request_headers` so both HTTP and WebSocket upstream calls are gated by one flag. `enabled` default; `disabled` operator opt-in for diagnostic shadow tracing. Response-side `X-Headroom-*` injection (e.g. `x-headroom-tokens-saved`) is unrelated and stays. | `enabled` |

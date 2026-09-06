@@ -664,3 +664,121 @@ class TestMemoryIntegration:
             user_id="alice",
         )
         assert len(results) > 0
+
+
+# =============================================================================
+# Cognee Backend Dispatch Tests
+# =============================================================================
+
+
+class TestCogneeBackendDispatch:
+    """Memory(backend="cognee") dispatches to CogneeBackend.
+
+    CogneeBackend imports the cognee package lazily (on first save/search),
+    so dispatch can be verified without cognee installed.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _cognee_isolation(self, monkeypatch, tmp_path):
+        """Per-test tmp metadata DB + fresh process-wide cognee state.
+
+        cognee's import/config is process-wide and immutable; resetting the
+        module state simulates a fresh process per test. The metadata DB env
+        var keeps the durable registry out of ``~/.headroom``.
+        """
+        from headroom.memory.backends import cognee as cognee_backend_module
+
+        monkeypatch.setenv("HEADROOM_COGNEE_METADATA_DB", str(tmp_path / "cognee_meta.db"))
+        cognee_backend_module._reset_process_state_for_testing()
+        yield
+        cognee_backend_module._reset_process_state_for_testing()
+
+    def test_backend_type_property(self):
+        """backend_type reports 'cognee' before initialization."""
+        mem = Memory(backend="cognee")
+        assert mem.backend_type == "cognee"
+        assert mem._initialized is False
+        assert mem._backend is None
+
+    def test_repr(self):
+        """String representation includes the cognee backend name."""
+        mem = Memory(backend="cognee")
+        assert repr(mem) == "Memory(backend='cognee')"
+
+    @pytest.mark.asyncio
+    async def test_ensure_initialized_constructs_cognee_backend(self):
+        """_ensure_initialized should construct a CogneeBackend instance."""
+        from headroom.memory.backends.cognee import CogneeBackend
+
+        mem = Memory(backend="cognee")
+        await mem._ensure_initialized()
+
+        assert mem._initialized is True
+        assert isinstance(mem._backend, CogneeBackend)
+
+    @pytest.mark.asyncio
+    async def test_cognee_backend_picks_up_env(self, monkeypatch):
+        """CogneeConfig defaults resolve HEADROOM_COGNEE_* at dispatch time."""
+        monkeypatch.setenv("HEADROOM_COGNEE_DATASET", "easy_dispatch_ds")
+        monkeypatch.setenv("HEADROOM_COGNEE_AUTO_COGNIFY", "false")
+
+        mem = Memory(backend="cognee")
+        await mem._ensure_initialized()
+
+        assert mem._backend._config.dataset_name == "easy_dispatch_ds"
+        assert mem._backend._config.auto_cognify is False
+
+    @pytest.mark.asyncio
+    async def test_save_and_search_route_to_cognee(self, monkeypatch):
+        """Memory.save/search route through the cognee backend (faked module)."""
+        import sys
+        import types
+        from enum import Enum
+        from types import SimpleNamespace
+
+        calls = SimpleNamespace(add=[], cognify=[], search=[])
+        fake = types.ModuleType("cognee")
+
+        class _SearchType(str, Enum):
+            CHUNKS = "CHUNKS"
+            GRAPH_COMPLETION = "GRAPH_COMPLETION"
+
+        async def _add(data, dataset_name=None, node_set=None, **kwargs):
+            calls.add.append({"data": data, "dataset_name": dataset_name, "node_set": node_set})
+
+        async def _cognify(**kwargs):
+            calls.cognify.append(kwargs)
+
+        async def _search(**kwargs):
+            calls.search.append(kwargs)
+            return [
+                SimpleNamespace(
+                    search_result=["Alice prefers Python"],
+                    dataset_id="ds-1",
+                    dataset_name="headroom_memories",
+                )
+            ]
+
+        fake.SearchType = _SearchType
+        fake.add = _add
+        fake.cognify = _cognify
+        fake.search = _search
+        fake.config = SimpleNamespace(
+            system_root_directory=lambda path: None,
+            data_root_directory=lambda path: None,
+        )
+        monkeypatch.setitem(sys.modules, "cognee", fake)
+
+        mem = Memory(backend="cognee")
+        memory_id = await mem.save(content="Alice prefers Python", user_id="alice")
+        assert memory_id
+        assert len(calls.add) == 1
+        assert calls.add[0]["node_set"] == ["user:alice"]
+
+        results = await mem.search(query="python", user_id="alice")
+        assert len(results) == 1
+        assert isinstance(results[0], MemoryResult)
+        assert results[0].content == "Alice prefers Python"
+        assert calls.search[0]["node_name"] == ["user:alice"]
+
+        await mem.close()
