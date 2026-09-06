@@ -14,10 +14,11 @@
 	},
 	"dependencies": {
 		"@radix-ui/react-slot": "1.3.0",
+		"@vercel/analytics": "^2.0.1",
 		"class-variance-authority": "0.7.1",
 		"clsx": "2.1.1",
 		"dotted-map": "^3.1.0",
-"fumadocs-core": "16.11.5",
+		"fumadocs-core": "16.11.5",
 		"fumadocs-mdx": "15.2.0",
 		"fumadocs-twoslash": "^3.3.0",
 		"fumadocs-typescript": "^5.3.0",
