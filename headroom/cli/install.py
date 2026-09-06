@@ -829,7 +829,31 @@ def install_status(profile: str) -> None:
         config = payload.get("config")
         if not isinstance(config, dict):
             config = {}
-        click.echo(f"Backend:    {config.get('backend', manifest.backend)}")
+        # Per-protocol target overrides (#2615): `backend` is the nominal
+        # default route, but OPENAI_TARGET_API_URL-style overrides route that
+        # protocol's traffic elsewhere. When any override exists, qualify the
+        # Backend line and surface which routes are overridden so an
+        # OpenAI-only deployment doesn't read as "using Anthropic". The URL
+        # values themselves are deliberately not echoed — status output is
+        # routinely pasted into issues/chat. Without overrides the output is
+        # byte-identical to the previous format.
+        backend_value = config.get("backend", manifest.backend)
+        target_fields = (
+            ("Anthropic target:", "anthropic_api_url"),
+            ("OpenAI target:   ", "openai_api_url"),
+            ("Gemini target:   ", "gemini_api_url"),
+            ("Cloud Code target:", "cloudcode_api_url"),
+            ("Vertex target:   ", "vertex_api_url"),
+        )
+        if any(config.get(key) for _, key in target_fields):
+            click.echo(f"Backend:    {backend_value} (default for non-overridden routes)")
+            for label, key in target_fields:
+                if config.get(key):
+                    click.echo(f"{label} configured")
+                elif key in ("anthropic_api_url", "openai_api_url"):
+                    click.echo(f"{label} default")
+        else:
+            click.echo(f"Backend:    {backend_value}")
 
 
 @install.command("start")

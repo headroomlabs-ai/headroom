@@ -458,6 +458,78 @@ def test_install_status_includes_backend_from_health_probe(monkeypatch) -> None:
     assert "Backend:    anthropic" in result.output
 
 
+def test_install_status_surfaces_per_protocol_target_overrides(monkeypatch) -> None:
+    """An OpenAI-only deployment (OPENAI_TARGET_API_URL set, no Anthropic
+    override) must not present the default `anthropic` backend as the
+    effective route for its OpenAI traffic (#2615)."""
+    runner = CliRunner()
+
+    class Manifest:
+        profile = "default"
+        preset = "persistent-service"
+        runtime_kind = "python"
+        supervisor_kind = "service"
+        scope = "user"
+        port = 8787
+        backend = "anthropic"
+        health_url = "http://127.0.0.1:8787/readyz"
+
+    monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: Manifest())
+    monkeypatch.setattr("headroom.cli.install.runtime_status", lambda manifest: "running")
+    monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: True)
+    monkeypatch.setattr(
+        "headroom.cli.install.probe_json",
+        lambda url: {
+            "config": {
+                "backend": "anthropic",
+                "anthropic_api_url": None,
+                "openai_api_url": "https://openai-compatible.example/v1",
+            }
+        },
+    )
+
+    result = runner.invoke(main, ["install", "status"])
+
+    assert result.exit_code == 0, result.output
+    # The Backend line is qualified so the default value cannot be read as
+    # the effective route for the overridden protocol's traffic.
+    assert "Backend:    anthropic (default for non-overridden routes)" in result.output
+    assert "OpenAI target:    configured" in result.output
+    assert "Anthropic target: default" in result.output
+    # The target URL value must not be echoed — status output is shareable.
+    assert "openai-compatible.example" not in result.output
+
+
+def test_install_status_omits_target_lines_without_overrides(monkeypatch) -> None:
+    """With no per-protocol target overrides the status output keeps its
+    original shape — no target lines are added."""
+    runner = CliRunner()
+
+    class Manifest:
+        profile = "default"
+        preset = "persistent-service"
+        runtime_kind = "python"
+        supervisor_kind = "service"
+        scope = "user"
+        port = 8787
+        backend = "anthropic"
+        health_url = "http://127.0.0.1:8787/readyz"
+
+    monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: Manifest())
+    monkeypatch.setattr("headroom.cli.install.runtime_status", lambda manifest: "running")
+    monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: True)
+    monkeypatch.setattr(
+        "headroom.cli.install.probe_json",
+        lambda url: {"config": {"backend": "anthropic", "openai_api_url": None}},
+    )
+
+    result = runner.invoke(main, ["install", "status"])
+
+    assert result.exit_code == 0, result.output
+    assert "Backend:    anthropic" in result.output
+    assert "target:" not in result.output
+
+
 def test_install_status_survives_non_dict_config(monkeypatch) -> None:
     """A health payload whose `config` is a non-dict (e.g. a different service
     answering on the port returns config: null) must not crash the command."""
