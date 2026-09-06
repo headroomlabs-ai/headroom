@@ -329,6 +329,7 @@ headroom proxy --learn --min-evidence 3
 | `HEADROOM_MAX_CONNECTIONS` | Maximum upstream HTTP connections | `500` |
 | `HEADROOM_MAX_KEEPALIVE` | Maximum upstream keep-alive connections | `100` |
 | `HEADROOM_KEEPALIVE_EXPIRY` | Seconds an idle upstream keep-alive connection is kept open | `90` |
+| `HEADROOM_BACKGROUND_COMPRESSION_WORKERS` | Worker count for off-path background compression jobs | `1` |
 | `HEADROOM_HTTP_PROXY` | HTTP proxy URL for upstream provider requests only; HTTPS provider APIs use CONNECT | -- |
 | `HEADROOM_BUDGET` | Daily budget limit in USD | -- |
 | `HEADROOM_TELEMETRY` | Set to `on` for **local-only** usage stats (powers your own `/stats` and dashboard; nothing is sent externally) | `off` |
