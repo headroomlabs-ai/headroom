@@ -452,6 +452,19 @@ def _activate_output_shaper(port: int | None = None) -> tuple[str, int]:
         return "error", resolved_port
 
 
+# Agents whose transcript formats are supported by verbosity signal mining.
+_VERBOSITY_AGENTS = frozenset({"claude", "grok"})
+
+
+def _verbosity_session_paths(plugin_name: str, data_path: Path) -> list[Path]:
+    """Return transcript paths for verbosity mining for a given agent plugin."""
+    if plugin_name == "grok":
+        # ~/.grok/sessions/<workspace>/<session-id>/updates.jsonl
+        return sorted(data_path.glob("*/updates.jsonl"))
+    # Claude Code: flat *.jsonl under the project data dir.
+    return sorted(data_path.glob("*.jsonl"))
+
+
 def _run_verbosity(
     *,
     project: Path | None,
@@ -467,39 +480,47 @@ def _run_verbosity(
     from ..paths import ensure_workspace_dir
     from ..proxy.output_savings import BaselineModel, SavingsLedger
 
-    # Verbosity mining reads Claude Code transcripts; restrict to that plugin.
+    # Verbosity mining supports Claude Code and Grok CLI transcripts.
     if agent == "auto":
-        plugins = [p for p in auto_detect_plugins() if p.name == "claude"]
+        plugins = [p for p in auto_detect_plugins() if p.name in _VERBOSITY_AGENTS]
         if not plugins:
-            click.echo("Verbosity learning currently supports Claude Code transcripts only.")
+            click.echo(
+                "Verbosity learning currently supports Claude Code and Grok CLI "
+                "transcripts only (none detected)."
+            )
             return
-        plugin = plugins[0]
     else:
         plugin = get_plugin(agent)
-        if plugin.name != "claude":
-            click.echo("Verbosity learning currently supports Claude Code transcripts only.")
+        if plugin.name not in _VERBOSITY_AGENTS:
+            click.echo(
+                "Verbosity learning currently supports Claude Code and Grok CLI "
+                f"transcripts only (got agent={plugin.name!r})."
+            )
             return
+        plugins = [plugin]
 
-    all_projects = plugin.discover_projects()
-    if not all_projects:
-        click.echo("No Claude Code project data found.")
-        return
+    # Collect (plugin, project) targets so multi-agent auto can merge baselines.
+    targets = []
+    for plugin in plugins:
+        all_projects = plugin.discover_projects()
+        if analyze_all:
+            selected = all_projects
+        elif project:
+            resolved = project.resolve()
+            selected = [p for p in all_projects if p.project_path == resolved]
+        else:
+            cwd = Path.cwd().resolve()
+            selected = [p for p in all_projects if p.project_path == cwd]
+            if not selected:
+                for parent in cwd.parents:
+                    selected = [p for p in all_projects if p.project_path == parent]
+                    if selected:
+                        break
+        targets.extend((plugin, proj) for proj in selected)
 
-    if analyze_all:
-        targets = all_projects
-    elif project:
-        resolved = project.resolve()
-        targets = [p for p in all_projects if p.project_path == resolved]
-    else:
-        cwd = Path.cwd().resolve()
-        targets = [p for p in all_projects if p.project_path == cwd]
-        if not targets:
-            for parent in cwd.parents:
-                targets = [p for p in all_projects if p.project_path == parent]
-                if targets:
-                    break
     if not targets:
-        click.echo("No matching project. Try --all or --project <path>.")
+        names = ", ".join(p.display_name for p in plugins)
+        click.echo(f"No matching project for {names}. Try --all or --project <path>.")
         return
 
     judge = _make_llm_judge(model or "claude-sonnet-4-6") if llm_judge else None
@@ -513,8 +534,8 @@ def _run_verbosity(
     best_profile_samples = -1
     analyzed_count = 0
 
-    for proj in targets:
-        session_paths = sorted(proj.data_path.glob("*.jsonl"))
+    for plugin, proj in targets:
+        session_paths = _verbosity_session_paths(plugin.name, proj.data_path)
         if not session_paths:
             continue
         profile, baseline = analyze(session_paths, str(proj.project_path), llm_judge=judge)
@@ -526,7 +547,7 @@ def _run_verbosity(
             best_profile = profile
 
         click.echo(f"\n{'=' * 60}")
-        click.echo(f"Verbosity — {proj.name}")
+        click.echo(f"Verbosity — {proj.name} [{plugin.display_name}]")
         click.echo(f"Path: {proj.project_path}")
         click.echo(f"{'=' * 60}")
         click.echo(
