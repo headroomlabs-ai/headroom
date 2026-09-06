@@ -42,7 +42,7 @@ from headroom.install.state import ManifestError, load_manifest, save_manifest
 from headroom.install.supervisors import start_supervisor
 from headroom.providers.claude import TOOL_SEARCH_DEFAULT, TOOL_SEARCH_ENV
 from headroom.providers.claude.runtime import TOOL_SEARCH_FOUNDRY_DEFAULT
-from headroom.providers.codex.install import codex_uses_chatgpt_auth
+from headroom.providers.codex.install import build_codex_auth_config, codex_uses_chatgpt_auth
 from headroom.providers.codex.threads import retag_to_headroom
 
 from .main import main
@@ -327,6 +327,7 @@ def _ensure_codex_provider(path: Path, port: int) -> None:
         if codex_uses_chatgpt_auth(path.parent / "auth.json")
         else ""
     )
+    auth_config = build_codex_auth_config(path.parent / "auth.json")
     block = (
         f"{_CODEX_PROVIDER_MARKER_START}\n"
         'model_provider = "headroom"\n'
@@ -335,6 +336,7 @@ def _ensure_codex_provider(path: Path, port: int) -> None:
         'name = "Headroom init proxy"\n'
         f'base_url = "http://127.0.0.1:{port}/v1"\n'
         "supports_websockets = true\n"
+        f"{auth_config}"
         f"{requires_openai_auth}"
         f"{_CODEX_PROVIDER_MARKER_END}"
     )

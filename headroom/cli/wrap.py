@@ -94,7 +94,12 @@ from headroom.providers.claude import (
 )
 from headroom.providers.claude.runtime import TOOL_SEARCH_FOUNDRY_DEFAULT
 from headroom.providers.codex import build_launch_env as _build_codex_launch_env
-from headroom.providers.codex.install import codex_uses_chatgpt_auth
+from headroom.providers.codex.install import (
+    build_codex_auth_config,
+    cleanup_codex_auth_helper,
+    codex_auth_helper_is_referenced,
+    codex_uses_chatgpt_auth,
+)
 from headroom.providers.codex.threads import retag_to_headroom, retag_to_native
 from headroom.providers.copilot import (
     build_launch_env as _build_copilot_launch_env,
@@ -3091,6 +3096,7 @@ def _inject_codex_provider_config(port: int) -> str | None:
     requires_openai_auth = (
         "requires_openai_auth = true\n" if codex_uses_chatgpt_auth(config_dir / "auth.json") else ""
     )
+    auth_config = build_codex_auth_config(config_dir / "auth.json")
     # Per-project savings: Codex sends the X-Headroom-Project header only
     # when the mapped env var (HEADROOM_PROJECT, set by `headroom wrap
     # codex`) exists at Codex runtime. When a custom upstream was detected,
@@ -3106,6 +3112,7 @@ def _inject_codex_provider_config(port: int) -> str | None:
         'name = "OpenAI via Headroom proxy"\n'
         f'base_url = "http://127.0.0.1:{port}/v1"\n'
         f"supports_websockets = true\n"
+        f"{auth_config}"
         f"{requires_openai_auth}"
         # Inline table keeps the key inside this section so
         # _strip_codex_headroom_blocks removes it with the rest of the block.
@@ -3218,17 +3225,34 @@ def _restore_codex_provider_config() -> tuple[str, Path]:
     * ``"noop"``     — nothing to undo; no Headroom marker and no backup.
     """
     config_file, backup_file = _codex_config_paths()
+    helper_auth_path = config_file.parent / "auth.json"
+    helper_path = helper_auth_path.parent / ".headroom-codex-auth.py"
 
     # Case 1: pre-wrap snapshot exists — restore it exactly.
     if backup_file.exists():
+        try:
+            helper_was_preexisting = (
+                codex_auth_helper_is_referenced(
+                    _read_text(backup_file), str(helper_path.resolve())
+                ) is not False
+            )
+        except OSError:
+            # If the backup cannot be inspected, preserve the helper rather than
+            # risk deleting a file that predates this wrap.
+            helper_was_preexisting = True
         shutil.copy2(backup_file, config_file)
         backup_file.unlink()
+        if not helper_was_preexisting:
+            cleanup_codex_auth_helper(helper_auth_path)
         return "restored", config_file
 
     # Case 2: no backup, but config file exists and has markers — strip them.
     if config_file.exists():
         original = _read_text(config_file)
         if _codex_config_has_headroom_markers(original):
+            helper_was_referenced = codex_auth_helper_is_referenced(
+                original, str(helper_path.resolve())
+            )
             # Without a backup, only remove named MCP blocks when this file
             # also carries wrap-owned provider markers from a full wrap.
             remove_named_mcp = any(
@@ -3249,8 +3273,12 @@ def _restore_codex_provider_config() -> tuple[str, Path]:
                 # Nothing left but Headroom content — remove the file entirely
                 # so Codex falls back to its default config.
                 config_file.unlink()
+                if helper_was_referenced is True:
+                    cleanup_codex_auth_helper(helper_auth_path)
                 return "removed", config_file
             _write_text(config_file, cleaned)
+            if helper_was_referenced is True:
+                cleanup_codex_auth_helper(helper_auth_path)
             return "cleaned", config_file
 
     # Nothing to undo.

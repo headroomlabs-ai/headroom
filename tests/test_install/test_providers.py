@@ -682,6 +682,10 @@ def test_inject_codex_provider_config_writes_openai_base_url(
     home = tmp_path
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("USERPROFILE", str(home))
+    (home / ".codex").mkdir()
+    (home / ".codex" / "auth.json").write_text(
+        '{"OPENAI_API_KEY": "sk-test-only"}', encoding="utf-8"
+    )
 
     wrap_mod._inject_codex_provider_config(8787)
 
@@ -704,6 +708,8 @@ def test_inject_codex_provider_config_writes_openai_base_url(
     assert "requires_openai_auth" not in content, (
         f"requires_openai_auth must be absent from the injected provider block; got:\n{content}"
     )
+    assert "auth = { command =" in content
+    assert "sk-test-only" not in content
     # openai_base_url must be in the top-level block, NOT inside [model_providers.*]
     lines = content.splitlines()
     in_provider_section = False
