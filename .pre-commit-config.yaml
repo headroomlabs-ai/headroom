@@ -35,7 +35,7 @@ repos:
       - id: ruff-format
         exclude: ^experiments/
   - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.14.1
+    rev: v1.20.2
     hooks:
       - id: mypy
         args: [--ignore-missing-imports]
