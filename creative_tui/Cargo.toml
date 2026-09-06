@@ -1,0 +1,15 @@
+[package]
+name = "creative_tui"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+winit = "0.30"
+wgpu = "22"
+pollster = "0.3"
+ratatui = "0.27"
+crossterm = "0.27"
+tokio = { version = "1", features = ["full"] }
+bytemuck = { version = "1", features = ["derive"] }
