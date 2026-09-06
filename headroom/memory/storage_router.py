@@ -90,7 +90,7 @@ class ResolvedScope:
     """
 
     mode: MemoryStorageMode
-    db_path: Path
+    db_path: Path | None
     display_name: str  # human-readable label, e.g. project basename
     project_key: str | None  # stable hash, None for USER/GLOBAL
 
@@ -282,12 +282,18 @@ class BackendRouter:
         self._backends: OrderedDict[Path, LocalBackend] = OrderedDict()
         self._lock = threading.Lock()
 
-    def backend_for(self, ctx: RequestContext) -> tuple[LocalBackend, ResolvedScope]:
+    def backend_for(self, ctx: RequestContext) -> tuple[LocalBackend | None, ResolvedScope]:
         """Return the backend + scope metadata to use for this request."""
 
         scope = self._resolve_scope(ctx)
+        if scope.db_path is None:
+            return None, scope
         backend = self._get_or_create_backend(scope.db_path)
         return backend, scope
+
+    def scope_for(self, ctx: RequestContext) -> ResolvedScope:
+        """Resolve request scope without acquiring or creating a backend."""
+        return self._resolve_scope(ctx)
 
     def _resolve_scope(self, ctx: RequestContext) -> ResolvedScope:
         mode = self._config.mode
@@ -340,7 +346,7 @@ class BackendRouter:
                 )
                 return ResolvedScope(
                     mode=MemoryStorageMode.PROJECT,
-                    db_path=self._config.global_db_path,  # Unused — caller checks project_key.
+                    db_path=None,
                     display_name="unresolved (no memory)",
                     project_key=None,
                 )

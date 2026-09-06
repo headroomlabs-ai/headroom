@@ -311,6 +311,7 @@ class _MemoryContinuationHandler(_MemoryToolsOnlyHandler):
         args: dict,
         user_id: str,
         provider: str,
+        request_context=None,
     ) -> str:
         assert (name, args, user_id, provider) == (
             "memory_search",

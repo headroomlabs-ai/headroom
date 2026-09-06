@@ -101,7 +101,11 @@ class _MemoryWsHandler:
         args: dict,
         user_id: str,
         provider: str,
+        request_context=None,
     ) -> str:
+        await self._ensure_initialized()
+        if not self._backend:
+            return '{"error": "backend not ready"}'
         assert (name, args, user_id, provider) == (
             "memory_search",
             {},
@@ -1932,6 +1936,68 @@ async def test_ws_memory_frame_shape_guards_fail_open(initial_frame):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("memory_mode", "extra_headers"),
+    [
+        pytest.param("live_zone_tail", {"x-headroom-bypass": "true"}, id="bypass"),
+        pytest.param("disabled", {}, id="disabled-memory"),
+    ],
+)
+async def test_ws_memory_tool_response_passes_through_when_injection_rejected(
+    monkeypatch,
+    memory_mode,
+    extra_headers,
+):
+    monkeypatch.setenv("HEADROOM_MEMORY_INJECTION_MODE", memory_mode)
+    function_call = {
+        "type": "function_call",
+        "id": "fc-1",
+        "call_id": "call-1",
+        "name": "memory_search",
+        "arguments": "{}",
+    }
+    upstream_events = [
+        json.dumps({"type": "response.created", "response": {"id": "r-1"}}),
+        json.dumps({"type": "response.output_item.added", "item": function_call}),
+        json.dumps({"type": "response.output_item.done", "item": function_call}),
+        json.dumps(
+            {
+                "type": "response.completed",
+                "response": {"id": "r-1", "output": [function_call]},
+            }
+        ),
+    ]
+    upstream = _FakeUpstream(upstream_events)
+    fake_ws_mod = _make_fake_websockets_module(upstream)
+    initial_frame = _first_frame()
+    client_ws = _FakeWebSocket(
+        frames=[initial_frame],
+        headers={
+            "authorization": "Bearer test",
+            "x-headroom-user-id": "user-1",
+            **extra_headers,
+        },
+        hold_after_initial=True,
+    )
+    handler = _DummyOpenAIHandler()
+    handler.memory_handler = _MemoryWsHandler()
+    executed: list[tuple[str, dict, str, str]] = []
+
+    async def _execute_memory_tool(name, args, user_id, provider, request_context=None):
+        executed.append((name, args, user_id, provider))
+        return '{"memories": []}'
+
+    handler.memory_handler._execute_memory_tool = _execute_memory_tool
+
+    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    assert client_ws.sent_text == upstream_events
+    assert upstream.sent == [initial_frame]
+    assert executed == []
+
+
+@pytest.mark.asyncio
 async def test_ws_memory_enabled_non_memory_response_streams_completion():
     message_item = {
         "type": "message",
@@ -1995,7 +2061,7 @@ async def test_ws_late_memory_call_after_streamed_message_passes_through():
     handler.memory_handler = _MemoryWsHandler()
     executed: list[tuple[str, dict, str, str]] = []
 
-    async def _execute_memory_tool(name, args, user_id, provider):
+    async def _execute_memory_tool(name, args, user_id, provider, request_context=None):
         executed.append((name, args, user_id, provider))
         return '{"memories": []}'
 
@@ -2082,7 +2148,7 @@ async def test_ws_memory_continuation_normalizes_malformed_arguments():
     handler.memory_handler = _MemoryWsHandler()
     executed: list[tuple[str, dict, str, str]] = []
 
-    async def _execute_memory_tool(name, args, user_id, provider):
+    async def _execute_memory_tool(name, args, user_id, provider, request_context=None):
         executed.append((name, args, user_id, provider))
         return '{"memories": []}'
 
@@ -2205,7 +2271,7 @@ async def test_ws_memory_continuation_continues_pre_stream_and_passes_late_call(
     handler.memory_handler = _MemoryWsHandler()
     executed: list[tuple[str, dict, str, str]] = []
 
-    async def _execute_memory_tool(name, args, user_id, provider):
+    async def _execute_memory_tool(name, args, user_id, provider, request_context=None):
         executed.append((name, args, user_id, provider))
         return '{"memories": []}'
 

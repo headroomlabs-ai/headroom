@@ -2582,29 +2582,34 @@ class AnthropicHandlerMixin:
             # Traffic Learner: Extract patterns from inbound tool results
             if self.traffic_learner:
                 try:
-                    # Wire backend on first use (lazy init after memory handler is ready)
-                    if (
-                        self.traffic_learner._backend is None
-                        and self.memory_handler
-                        and self.memory_handler.initialized
-                        and self.memory_handler.backend
+                    if self.memory_handler and self.memory_handler.is_project_unresolved(
+                        memory_request_ctx
                     ):
-                        self.traffic_learner.set_backend(self.memory_handler.backend)
+                        logger.info(f"[{request_id}] Traffic learner skipped: project_unresolved")
+                    else:
+                        # Wire backend on first use (lazy init after memory handler is ready)
+                        if (
+                            self.traffic_learner._backend is None
+                            and self.memory_handler
+                            and self.memory_handler.initialized
+                            and self.memory_handler.backend
+                        ):
+                            self.traffic_learner.set_backend(self.memory_handler.backend)
 
-                    # Extract tool results from messages and learn from them
-                    tool_results = self.traffic_learner.extract_tool_results_from_messages(
-                        optimized_messages
-                    )
-                    for tr in tool_results[-5:]:  # Only recent results
-                        await self.traffic_learner.on_tool_result(
-                            tool_name=tr["tool_name"],
-                            tool_input=tr["input"],
-                            tool_output=tr["output"],
-                            is_error=tr["is_error"],
+                        # Extract tool results from messages and learn from them
+                        tool_results = self.traffic_learner.extract_tool_results_from_messages(
+                            optimized_messages
                         )
+                        for tr in tool_results[-5:]:  # Only recent results
+                            await self.traffic_learner.on_tool_result(
+                                tool_name=tr["tool_name"],
+                                tool_input=tr["input"],
+                                tool_output=tr["output"],
+                                is_error=tr["is_error"],
+                            )
 
-                    # Also extract preference signals from user messages
-                    await self.traffic_learner.on_messages(optimized_messages)
+                        # Also extract preference signals from user messages
+                        await self.traffic_learner.on_messages(optimized_messages)
                 except Exception as e:
                     logger.debug(f"[{request_id}] Traffic learner: {e}")
 
