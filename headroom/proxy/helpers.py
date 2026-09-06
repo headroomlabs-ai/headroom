@@ -1585,13 +1585,17 @@ def _setup_file_logging() -> None:
             logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
         )
         # Attach to the headroom root logger so all sub-loggers are captured.
-        # Disable propagation to root to avoid duplicate writes when
-        # wrap.py redirects stderr to the same log file.
+        # Propagation to the root logger stays enabled: root's own handler
+        # (see logging.basicConfig() in proxy/server.py) writes to
+        # stderr/stdout, while this handler writes to proxy.log — two
+        # different destinations, so nothing is duplicated in either file.
+        # Severing propagation here silently dropped every application log
+        # in containerized deployments, where stdout/stderr is the only
+        # channel the platform collects (#3087).
         headroom_logger = logging.getLogger("headroom")
         headroom_logger.setLevel(logging.INFO)
         if not any(isinstance(h, RotatingFileHandler) for h in headroom_logger.handlers):
             headroom_logger.addHandler(handler)
-        headroom_logger.propagate = False
     except OSError:
         # Non-fatal: can't write logs (read-only fs, permissions, etc.)
         pass
