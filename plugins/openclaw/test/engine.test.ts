@@ -251,3 +251,61 @@ describe("HeadroomContextEngine proxy startup helpers", () => {
     );
   });
 });
+
+describe("HeadroomContextEngine transcriptSemantics contract", () => {
+  it("declares the durable-commit transcript semantics OpenClaw requires", () => {
+    const engine = new HeadroomContextEngine();
+
+    expect(engine.info.transcriptSemantics).toEqual({
+      currentTurnFence: "before-current-turn-entry-v1",
+      turnAdvancementIdempotency: "atomic-idempotent-v1",
+    });
+  });
+
+  it("commits a new advancement key", async () => {
+    const engine = new HeadroomContextEngine();
+
+    await expect(
+      engine.commitTurn({ advancementKey: "turn-1", messages: [] }),
+    ).resolves.toEqual({ status: "committed" });
+  });
+
+  it("reports duplicate on a retried advancement key", async () => {
+    const engine = new HeadroomContextEngine();
+
+    await expect(
+      engine.commitTurn({ advancementKey: "turn-1", messages: [] }),
+    ).resolves.toEqual({ status: "committed" });
+    await expect(
+      engine.commitTurn({ advancementKey: "turn-1", messages: [] }),
+    ).resolves.toEqual({ status: "duplicate" });
+  });
+
+  it("treats distinct advancement keys independently", async () => {
+    const engine = new HeadroomContextEngine();
+
+    await expect(
+      engine.commitTurn({ advancementKey: "turn-1", messages: [] }),
+    ).resolves.toEqual({ status: "committed" });
+    await expect(
+      engine.commitTurn({ advancementKey: "turn-2", messages: [] }),
+    ).resolves.toEqual({ status: "committed" });
+  });
+
+  it("bounds tracked advancement keys so long sessions cannot grow it unbounded", async () => {
+    const engine = new HeadroomContextEngine();
+    const cap = 512;
+
+    for (let i = 0; i < cap + 1; i++) {
+      await engine.commitTurn({ advancementKey: `turn-${i}`, messages: [] });
+    }
+
+    expect((engine as { committedAdvancementKeys: Set<string> }).committedAdvancementKeys.size).toBe(
+      cap,
+    );
+    // The oldest key was evicted, so it is treated as new (committed) again rather than duplicate.
+    await expect(
+      engine.commitTurn({ advancementKey: "turn-0", messages: [] }),
+    ).resolves.toEqual({ status: "committed" });
+  });
+});
