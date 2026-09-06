@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from headroom.mcp_registry.base import RegisterStatus
+from headroom.mcp_registry.base import RegisterStatus, ServerSpec
 from headroom.mcp_registry.opencode import (
     OpencodeRegistrar,
     _diff_specs,
@@ -25,6 +25,60 @@ def _write_json(path: Path, data: dict[str, Any]) -> None:
 
 def _registrar(tmp_path: Path) -> OpencodeRegistrar:
     return OpencodeRegistrar(config_path=tmp_path / "opencode.json")
+
+
+def test_default_config_path_prefers_existing_jsonc(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression test for #1869: MCP registration must land in opencode.jsonc
+
+    when that's the file OpenCode actually reads, matching the provider-block
+    resolution in headroom.providers.opencode.config.
+    """
+    monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
+    monkeypatch.setenv("OPENCODE_HOME", str(tmp_path))
+    (tmp_path / "opencode.jsonc").write_text("{}", encoding="utf-8")
+
+    registrar = OpencodeRegistrar()
+
+    assert registrar._config_path == tmp_path / "opencode.jsonc"
+
+
+def test_register_server_merges_into_commented_jsonc(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression test for #1869 review feedback: real-world opencode.jsonc files
+
+    commonly contain ``//`` comments. register_server() must parse past them
+    and merge the mcp block in without dropping the user's existing settings,
+    instead of failing with "not valid JSON".
+    """
+    monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
+    monkeypatch.setenv("OPENCODE_HOME", str(tmp_path))
+    config_path = tmp_path / "opencode.jsonc"
+    config_path.write_text(
+        """{
+  // user's theme preference
+  "theme": "dracula",
+  "model": "anthropic/claude-sonnet-4",
+  "provider": {
+    "anthropic": {"options": {"baseURL": "https://api.example.com"}}
+  }
+}
+""",
+        encoding="utf-8",
+    )
+
+    registrar = OpencodeRegistrar()
+    spec = ServerSpec(name="headroom", command="headroom", args=("mcp",), env={})
+    result = registrar.register_server(spec)
+
+    assert result.status == RegisterStatus.REGISTERED
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    assert data["theme"] == "dracula"
+    assert data["model"] == "anthropic/claude-sonnet-4"
+    assert data["provider"]["anthropic"]["options"]["baseURL"] == "https://api.example.com"
+    assert data["mcp"]["headroom"]["command"] == ["headroom", "mcp"]
 
 
 def test_detect_when_binary_present(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
