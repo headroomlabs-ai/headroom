@@ -184,7 +184,7 @@ from headroom.subscription.tracker import (
 )
 from headroom.telemetry import get_telemetry_collector
 from headroom.telemetry.beacon import is_telemetry_enabled
-from headroom.telemetry.toin import get_toin
+from headroom.telemetry.toin import _deserialize_pattern_key, get_toin
 from headroom.transforms import (
     CacheAligner,
     CodeAwareCompressor,
@@ -5209,7 +5209,12 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
         # Convert to list and sort by sample_size
         patterns_list = []
-        for sig_hash, pattern_dict in patterns_data.items():
+        for serialized_key, pattern_dict in patterns_data.items():
+            # TOIN v2 persists the tenant/model slice as
+            # ``auth|model|signature_hash``. The public identifier is the
+            # signature component, not the first 12 characters of that
+            # composite key.
+            signature_hash = _deserialize_pattern_key(serialized_key)[2]
             sample_size = pattern_dict.get("sample_size", 0)
             total_compressions = pattern_dict.get("total_compressions", 0)
             total_retrievals = pattern_dict.get("total_retrievals", 0)
@@ -5219,7 +5224,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
             patterns_list.append(
                 {
-                    "hash": sig_hash[:12],
+                    "hash": signature_hash[:12],
                     "compressions": total_compressions,
                     "retrievals": total_retrievals,
                     "retrieval_rate": f"{retrieval_rate:.1%}",
@@ -5256,8 +5261,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         patterns_data = exported.get("patterns", {})
 
         # Search for pattern with matching hash prefix
-        for sig_hash, pattern_dict in patterns_data.items():
-            if sig_hash.startswith(hash_prefix):
+        for serialized_key, pattern_dict in patterns_data.items():
+            signature_hash = _deserialize_pattern_key(serialized_key)[2]
+            if signature_hash.startswith(hash_prefix):
                 # Keep this response aligned with /v1/toin/patterns while
                 # excluding query text, field semantics, and other internal
                 # learning state from the detail endpoint.

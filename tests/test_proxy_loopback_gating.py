@@ -112,7 +112,7 @@ def test_toin_pattern_detail_whitelists_learned_payload(monkeypatch: pytest.Monk
             }
 
     monkeypatch.setattr("headroom.proxy.server.get_toin", lambda: FakeTOIN())
-    response = _loopback_client().get("/v1/toin/pattern/unknown")
+    response = _loopback_client().get("/v1/toin/pattern/abc123")
 
     assert response.status_code == 200
     assert response.json() == {
