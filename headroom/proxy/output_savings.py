@@ -147,12 +147,23 @@ class BaselineModel:
             self.strata.setdefault(key, _Accum()).merge(acc)
         self.glob.merge(other.glob)
 
-    def lookup(self, key: str) -> tuple[float, float, int]:
+    def lookup(self, key: str, *, fall_back_to_global: bool = False) -> tuple[float, float, int]:
         """Return ``(mean, var, n)`` for *key* with hierarchical back-off.
 
-        Falls back by trimming trailing (least-specific) stratum fields, then
-        to the global mean. Back-off keeps the estimate defined for strata the
-        baseline never saw, at the cost of specificity.
+        Falls back by trimming trailing (least-specific) stratum fields, so a
+        stratum the baseline never saw is still scored against its nearest
+        observed neighbours. Returns ``(0.0, 0.0, 0)`` when even that finds
+        nothing -- callers already treat ``n == 0`` as "no evidence".
+
+        ``fall_back_to_global`` restores the old last resort of the
+        all-requests mean. It is off by default because that mean is not a
+        control for anything: the baseline is seeded once, from whatever the
+        user ran *before* installing, so every model family they adopt later
+        resolves to it. On a real ledger that meant 48% of requests -- sonnet
+        and fable turns whose replies average 43-770 tokens -- being scored
+        against one opus-derived mean of 1,083, which alone produced 74% of the
+        reported savings. Scoring a short no-tool ask against a long
+        tool-calling turn is not a synthetic control, it is a unit conversion.
         """
         acc = self.strata.get(key)
         if acc is not None and acc.n > 0:
@@ -160,11 +171,16 @@ class BaselineModel:
         parts = key.split("|")
         while len(parts) > 1:
             parts = parts[:-1]
-            prefix = "|".join(parts)
+            prefix = "|".join(parts) + "|"
+            neighbours = _Accum()
             for k, a in self.strata.items():
-                if k.startswith(prefix + "|") and a.n > 0:
-                    return a.mean, a.var, a.n
-        return self.glob.mean, self.glob.var, self.glob.n
+                if a.n > 0 and k.startswith(prefix):
+                    neighbours.merge(a)
+            if neighbours.n > 0:
+                return neighbours.mean, neighbours.var, neighbours.n
+        if fall_back_to_global:
+            return self.glob.mean, self.glob.var, self.glob.n
+        return 0.0, 0.0, 0
 
     def to_dict(self) -> dict[str, Any]:
         return {

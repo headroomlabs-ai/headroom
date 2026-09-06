@@ -180,13 +180,37 @@ class TestBaselineModel:
         assert mean == 500.0
         assert n == 1
 
-    def test_lookup_falls_back_to_global(self):
+    def test_an_unobserved_family_is_not_scored_against_the_global_mean(self):
+        # The baseline is seeded once, from what the user ran before installing.
+        # Every family adopted later lands here, and the all-requests mean is
+        # not a control for any of them.
         m = BaselineModel()
         m.observe("opus|a|s|tools", 100)
         m.observe("sonnet|b|m|notools", 300)
-        mean, _, n = m.lookup("gpt|totally|xl|tools")
+        assert m.lookup("gpt|totally|xl|tools") == (0.0, 0.0, 0)
+
+    def test_the_global_mean_remains_available_on_request(self):
+        m = BaselineModel()
+        m.observe("opus|a|s|tools", 100)
+        m.observe("sonnet|b|m|notools", 300)
+        mean, _, n = m.lookup("gpt|totally|xl|tools", fall_back_to_global=True)
         assert mean == 200.0  # global mean of 100 and 300
         assert n == 2
+
+    def test_prefix_backoff_merges_every_neighbour_not_the_first_one_hashed(self):
+        # Taking the first matching stratum in dict order made the answer
+        # depend on insertion order, so a round-tripped ledger could score the
+        # same request differently.
+        m = BaselineModel()
+        m.observe("opus|ask|l|tools", 1000)
+        m.observe("opus|ask|l|notools", 100)
+        mean, _, n = m.lookup("opus|ask|l|other")
+        assert (mean, n) == (550.0, 2)
+
+        reversed_order = BaselineModel()
+        reversed_order.observe("opus|ask|l|notools", 100)
+        reversed_order.observe("opus|ask|l|tools", 1000)
+        assert reversed_order.lookup("opus|ask|l|other") == m.lookup("opus|ask|l|other")
 
     def test_roundtrip_serialization(self):
         m = BaselineModel()
@@ -277,6 +301,28 @@ class TestEstimateFromBaseline:
 # ---------------------------------------------------------------------------
 # A/B measured estimate
 # ---------------------------------------------------------------------------
+
+
+class TestEstimateExcludesUnobservedStrata:
+    def test_requests_without_baseline_evidence_are_left_out(self):
+        ledger = SavingsLedger()
+        for _ in range(10):
+            ledger.baseline.observe("opus|ask|l|tools", 1000)
+            ledger.record("treatment", "opus|ask|l|tools", 800)
+        # A family the baseline never saw, with far shorter replies. Scoring it
+        # against the global mean would credit ~950 saved tokens per request.
+        for _ in range(40):
+            ledger.record("treatment", "sonnet|new_user_ask|m|notools", 50)
+
+        est = ledger.estimate_from_baseline()
+        assert est.n_requests == 10, "only the observed stratum is scored"
+        assert abs(est.tokens_saved - 2000) < 1e-6  # 10 * (1000 - 800)
+        assert abs(est.pct - 20.0) < 1e-6
+
+    def test_per_request_savings_are_zero_without_evidence(self):
+        ledger = SavingsLedger()
+        ledger.baseline.observe("opus|ask|l|tools", 1000)
+        assert ledger.baseline.lookup("sonnet|new_user_ask|m|notools") == (0.0, 0.0, 0)
 
 
 class TestEstimateFromHoldout:
