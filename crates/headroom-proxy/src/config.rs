@@ -579,6 +579,34 @@ pub struct CliArgs {
         default_value = "https://www.googleapis.com/auth/cloud-platform"
     )]
     pub vertex_adc_scope: String,
+
+    /// Native savings stats: record per-request savings/cost
+    /// telemetry and serve `/stats`, `/stats/timeseries`,
+    /// `/stats/events`, and `/dashboard`. When disabled, nothing is
+    /// recorded and those paths fall through to the catch-all
+    /// forwarder (i.e. they reach the upstream, matching the
+    /// pre-feature behaviour).
+    ///
+    /// Source priority: CLI flag → `HEADROOM_PROXY_STATS` env var →
+    /// default (`false`).
+    #[arg(
+        long = "stats",
+        env = "HEADROOM_PROXY_STATS",
+        default_value_t = false,
+        action = clap::ArgAction::Set,
+    )]
+    pub stats: bool,
+
+    /// Where the savings ledger persists its state. When unset, the
+    /// proxy uses `$HEADROOM_WORKSPACE_DIR/native_stats.json` when
+    /// that env var is set (how the Python proxy resolves its
+    /// workspace), else `~/.headroom/native_stats.json`; if no home
+    /// directory can be resolved, stats stay in-memory (logged).
+    ///
+    /// Source priority: CLI flag → `HEADROOM_PROXY_STATS_PATH`
+    /// env var → workspace-derived default.
+    #[arg(long = "stats-path", env = "HEADROOM_PROXY_STATS_PATH")]
+    pub stats_path: Option<std::path::PathBuf>,
 }
 
 fn parse_duration(s: &str) -> Result<Duration, String> {
@@ -692,6 +720,11 @@ pub struct Config {
     /// PR-D4: GCP ADC OAuth scope used when fetching the bearer
     /// token. Default `https://www.googleapis.com/auth/cloud-platform`.
     pub vertex_adc_scope: String,
+    /// Native savings stats: record per-request telemetry and serve
+    /// `/stats`, `/stats/timeseries`, `/stats/events`, `/dashboard`.
+    pub stats: bool,
+    /// Ledger persistence path. `None` keeps stats in-memory.
+    pub stats_path: Option<std::path::PathBuf>,
 }
 
 impl Config {
@@ -758,6 +791,8 @@ impl Config {
             bedrock_validate_eventstream_crc: args.bedrock_validate_eventstream_crc,
             vertex_region: args.vertex_region,
             vertex_adc_scope: args.vertex_adc_scope,
+            stats: args.stats,
+            stats_path: args.stats_path.or_else(default_stats_path),
         }
     }
 
@@ -816,8 +851,45 @@ impl Config {
             // only; the upstream URL is `upstream`).
             vertex_region: "us-central1".to_string(),
             vertex_adc_scope: "https://www.googleapis.com/auth/cloud-platform".to_string(),
+            // Stats on (routes mounted, recording active) but
+            // in-memory: tests never touch a real home directory.
+            stats: true,
+            stats_path: None,
         }
     }
+}
+
+/// Default persistence location for the savings ledger. Honours the
+/// same `HEADROOM_WORKSPACE_DIR` override the Python proxy uses for
+/// its workspace, falling back to `~/.headroom`. `None` (no home
+/// resolvable) keeps stats in-memory.
+fn default_stats_path() -> Option<std::path::PathBuf> {
+    if let Ok(dir) = std::env::var("HEADROOM_WORKSPACE_DIR") {
+        let dir = dir.trim();
+        if !dir.is_empty() {
+            // Tilde-expand, matching the Python proxy's
+            // `workspace_dir()` semantics (its tests pin
+            // `HEADROOM_WORKSPACE_DIR=~/custom` → `$HOME/custom`).
+            let expanded = if let Some(rest) = dir.strip_prefix("~/") {
+                match home_dir() {
+                    Some(home) => home.join(rest),
+                    None => return None,
+                }
+            } else {
+                std::path::PathBuf::from(dir)
+            };
+            return Some(expanded.join("native_stats.json"));
+        }
+    }
+    Some(home_dir()?.join(".headroom").join("native_stats.json"))
+}
+
+fn home_dir() -> Option<std::path::PathBuf> {
+    std::env::var("HOME")
+        .ok()
+        .filter(|h| !h.trim().is_empty())
+        .or_else(|| std::env::var("USERPROFILE").ok())
+        .map(std::path::PathBuf::from)
 }
 
 #[cfg(test)]
@@ -862,5 +934,23 @@ mod rollout_input_tests {
         }
         assert!(!config.enable_responses_streaming);
         assert!(!config.enable_bedrock_native);
+    }
+
+    #[test]
+    fn native_stats_require_explicit_opt_in() {
+        let base = ["headroom-proxy", "--upstream", "http://127.0.0.1:9"];
+        let default_config = Config::from_cli(CliArgs::try_parse_from(base).unwrap());
+        assert!(!default_config.stats);
+
+        let enabled = Config::from_cli(
+            CliArgs::try_parse_from([
+                "headroom-proxy",
+                "--upstream",
+                "http://127.0.0.1:9",
+                "--stats=true",
+            ])
+            .unwrap(),
+        );
+        assert!(enabled.stats);
     }
 }

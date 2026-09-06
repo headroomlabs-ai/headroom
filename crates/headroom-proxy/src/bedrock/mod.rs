@@ -54,6 +54,15 @@ pub mod invoke_streaming;
 pub mod sigv4;
 pub mod vendor;
 
+/// Compression-side numbers the Bedrock handlers hand to the savings
+/// ledger alongside the (possibly compressed) outbound body.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct CompressionStats {
+    pub tokens_before: u64,
+    pub tokens_after: u64,
+    pub transforms: Vec<String>,
+}
+
 pub use auth_mode_layer::classify_and_attach_auth_mode;
 pub use envelope::{BedrockEnvelope, EnvelopeError};
 pub use eventstream::{

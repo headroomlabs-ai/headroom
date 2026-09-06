@@ -23,9 +23,8 @@
 
 mod common;
 
-use aws_credential_types::Credentials;
 use bytes::{Bytes, BytesMut};
-use common::start_proxy_with_state;
+use common::{start_proxy_with_state, test_credentials};
 use headroom_proxy::bedrock::MessageBuilder;
 use serde_json::json;
 use url::Url;
@@ -48,16 +47,6 @@ const TEST_REGION_INVOKE_COUNT: &str = "us-test-invoke-count-1";
 const TEST_REGION_LATENCY: &str = "us-test-latency-1";
 const TEST_REGION_EVENTSTREAM: &str = "us-test-eventstream-1";
 const TEST_REGION_SCRAPE: &str = "us-test-scrape-1";
-
-fn test_credentials() -> Credentials {
-    Credentials::new(
-        "AKIAEXAMPLEAKIDFORTEST",
-        "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
-        None,
-        None,
-        "test",
-    )
-}
 
 async fn bedrock_proxy_with_region(
     upstream: &MockServer,

@@ -66,7 +66,10 @@ pub(crate) const DEFAULT_CONTEXT_WINDOW: u32 = 128_000;
 /// LiteLLM's vendored model price + context-window table. Refreshed
 /// via `scripts/refresh_model_limits.sh`. ~1.4MB; embedded into the
 /// binary so the proxy ships with no startup network dependency.
-const VENDORED_JSON: &str = include_str!("../../data/model_prices_and_context_window.json");
+// Shared with `observability::pricing`, which reads the per-token
+// cost fields of the same table — one embedded copy, two consumers.
+pub(crate) const VENDORED_JSON: &str =
+    include_str!("../../data/model_prices_and_context_window.json");
 
 /// Parsed lookup: model id → max input tokens. Built lazily on
 /// first call; subsequent calls reuse the same `HashMap`.
