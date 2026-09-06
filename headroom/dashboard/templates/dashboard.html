@@ -344,6 +344,7 @@
                                  x-text="formatNumber(row.events || 0) + ' calls · ' + (row.realized ? 'realized' : 'projected')"></div>
                         </div>
                     </template>
+
                 </div>
 
                 <!-- Performance -->
@@ -1834,15 +1835,16 @@
                                     </div>
                                 </template>
                                 <template x-if="historyModelBreakdown.length > 0">
-                                    <div class="overflow-x-auto">
-                                        <table class="w-full text-sm">
+                                    <div class="w-full overflow-hidden">
+                                        <table class="w-full table-fixed text-xs">
                                             <thead>
-                                                <tr class="text-xs text-gray-500 text-left">
-                                                    <th class="py-2 pr-4 font-medium">Model</th>
-                                                    <th class="py-2 pr-4 font-medium text-right">Tokens saved</th>
-                                                    <th class="py-2 pr-4 font-medium text-right">Cost with Headroom</th>
-                                                    <th class="py-2 pr-4 font-medium text-right">Expected cost without Headroom</th>
-                                                    <th class="py-2 font-medium text-right">Saved</th>
+                                                <tr class="text-xs text-gray-500 text-left align-bottom">
+                                                    <th class="w-1/4 py-2 pr-2 font-medium">Model</th>
+                                                    <th class="py-2 px-1 font-medium text-right leading-tight">Tokens saved</th>
+                                                    <th class="py-2 px-1 font-medium text-right leading-tight">Cost with Headroom</th>
+                                                    <th class="py-2 px-1 font-medium text-right leading-tight">Compression saved</th>
+                                                    <th class="py-2 px-1 font-medium text-right leading-tight">Cache saved</th>
+                                                    <th class="py-2 pl-1 font-medium text-right leading-tight">Total saved</th>
                                                 </tr>
                                             </thead>
                                             <tbody>
@@ -1857,13 +1859,14 @@
                                                         :title="historySelectedModel === row.model
                                                             ? 'Show all models'
                                                             : 'Show only this model in the chart'">
-                                                        <td class="py-2 pr-4 font-mono text-xs"
+                                                        <td class="py-2 pr-2 font-mono text-xs break-all"
                                                             :class="historySelectedModel === row.model ? 'underline' : ''"
                                                             x-text="truncateModel(row.model)"></td>
-                                                        <td class="py-2 pr-4 text-right tabular-nums" x-text="formatNumber(row.tokens_saved)"></td>
-                                                        <td class="py-2 pr-4 text-right tabular-nums" x-text="'$' + formatCurrency(row.input_cost_usd)"></td>
-                                                        <td class="py-2 pr-4 text-right tabular-nums" x-text="'$' + formatCurrency(row.expected_cost_usd)"></td>
-                                                        <td class="py-2 text-right tabular-nums text-accent" x-text="'$' + formatCurrency(row.savings_usd)"></td>
+                                                        <td class="py-2 px-1 text-right tabular-nums" x-text="formatNumber(row.tokens_saved)"></td>
+                                                        <td class="py-2 px-1 text-right tabular-nums" x-text="'$' + formatCurrency(row.input_cost_usd)"></td>
+                                                        <td class="py-2 px-1 text-right tabular-nums text-emerald-300" x-text="'$' + formatCurrency(row.compression_savings_usd)"></td>
+                                                        <td class="py-2 px-1 text-right tabular-nums text-cyan-400" x-text="'$' + formatCurrency(row.cache_savings_usd)"></td>
+                                                        <td class="py-2 pl-1 text-right tabular-nums text-accent" x-text="'$' + formatCurrency(row.total_savings_usd)"></td>
                                                     </tr>
                                                 </template>
                                             </tbody>
@@ -2459,18 +2462,21 @@
                             const row = totals[model] || (totals[model] = {
                                 model,
                                 tokens_saved: 0,
-                                savings_usd: 0,
+                                compression_savings_usd: 0,
+                                cache_savings_usd: 0,
                                 input_cost_usd: 0,
                             });
                             row.tokens_saved += entry.tokens_saved || 0;
-                            row.savings_usd += entry.compression_savings_usd_delta || 0;
+                            row.compression_savings_usd += entry.compression_savings_usd_delta || 0;
+                            row.cache_savings_usd += entry.cache_savings_usd_delta || 0;
                             row.input_cost_usd += entry.total_input_cost_usd_delta || 0;
                         }
                     }
                     return Object.values(totals)
                         .map(row => ({
                             ...row,
-                            expected_cost_usd: row.input_cost_usd + row.savings_usd,
+                            total_savings_usd:
+                                row.compression_savings_usd + row.cache_savings_usd,
                         }))
                         .sort((a, b) => b.tokens_saved - a.tokens_saved);
                 },
