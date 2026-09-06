@@ -194,14 +194,10 @@ function Get-SharedDockerArgs {
 function Add-TtyArgs {
     param($ArgsList)
 
+    # MCP stdio always uses a pipe for stdin. Docker only forwards stdin when
+    # explicitly given -i, regardless of whether the host console is redirected.
+    $ArgsList.Add('-i')
     if (-not [Console]::IsInputRedirected -and -not [Console]::IsOutputRedirected) {
-        $ArgsList.Add('-it')
-        return
-    }
-    if (-not [Console]::IsInputRedirected) {
-        $ArgsList.Add('-i')
-    }
-    if (-not [Console]::IsOutputRedirected) {
         $ArgsList.Add('-t')
     }
 }
