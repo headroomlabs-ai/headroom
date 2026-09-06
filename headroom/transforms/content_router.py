@@ -645,14 +645,54 @@ def _is_read_command(command: str) -> bool:
 
     Excludes writes: a redirect (``>``/``>>``), ``tee``, or heredoc (``<<``) means the
     command WRITES a file (e.g. ``cat > f <<EOF``), and a bare ``sed`` (without ``-n``)
-    is a stream edit — neither is a read.
+    is a stream edit — neither is a read. Redirects and ``tee`` are judged PER SEGMENT,
+    so a sibling write (``cat a.py && echo done > marker``) does not strip protection
+    from the read segment next to it.
+
+    CHAINED commands are scanned segment by segment: agents routinely batch a read
+    with other work (``wc -l a.py && sed -n '1,60p' a.py``, ``grep … ; head -80 b.py``),
+    and matching only the FIRST program left every such read unprotected — the file
+    content was lossy-compressed despite read protection being enabled.
     """
     if not command or not isinstance(command, str):
         return False
     # strip leading `cd <dir> && ` chains (agents prefix reads with a cd)
     c = _strip_cd_prefix(command)
-    # a write / append / tee / heredoc anywhere => not a pure read
-    if re.search(r"(^|\s)(>>?|tee\b|<<)", c):
+    # A heredoc is the one WHOLE-STRING bailout: its body can contain `;`/`&&`,
+    # which would split into bogus segments that look like reads. Redirects and
+    # `tee` are per-segment (see `_segment_is_read`) — a sibling write must not
+    # unprotect the read next to it.
+    if re.search(r"(^|\s)<<", c):
+        return False
+    return any(_segment_is_read(seg) for seg in _command_segments(c))
+
+
+# Separators that start a NEW command. A pipeline (`|`) deliberately does NOT:
+# downstream stages consume the previous stage's output, not a file, so
+# `grep -n x a.py | head -40` is derived search output (compressible), while
+# `cat a.py | head -40` is a file read (caught via the first stage).
+_CMD_SEPARATOR_RE = re.compile(r"\|\||&&|;")
+
+
+def _command_segments(command: str) -> list[str]:
+    """Split a shell string into the independently-executed commands in it.
+
+    Splits on ``;``, ``&&`` and ``||`` — never on a single ``|``. Pipelines are kept
+    whole so the segment's own writes (``cat a.py | tee b.py``) stay visible; the
+    reduction to the first stage happens in :func:`_segment_is_read`.
+    """
+    return [seg.strip() for seg in _CMD_SEPARATOR_RE.split(command) if seg.strip()]
+
+
+def _segment_is_read(c: str) -> bool:
+    """:func:`_is_read_command` for ONE command (no ``;``/``&&``/``||`` chaining)."""
+    # A redirect or `tee` in THIS segment means the segment writes a file rather than
+    # reading one (`cat a.py > copy.py`, `cat a.py | tee copy.py`). Checked on the whole
+    # segment — pipeline included — before reducing to the stage that touches the file.
+    if re.search(r"(^|\s)(>>?|tee\b)", c):
+        return False
+    c = c.split("|", 1)[0].strip()
+    if not c:
         return False
     # Parse the real program with the SAME structural parser the search-fold uses
     # (_bash_program peels sudo/env/timeout/rtk wrappers + env assignments), so
