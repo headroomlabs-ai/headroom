@@ -157,7 +157,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: ${{ env.PY_VERSION }}
