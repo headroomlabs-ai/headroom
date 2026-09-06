@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import subprocess
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -248,6 +249,8 @@ def list_release_tags(root: Path) -> list[str]:
         check=True,
         capture_output=True,
         text=True,
+        stdin=subprocess.DEVNULL,
+        timeout=10,
     )
     return [tag.strip() for tag in result.stdout.splitlines() if tag.strip()]
 
@@ -267,6 +270,8 @@ def list_release_commits(root: Path, previous_tag: str) -> list[CommitInfo]:
         check=True,
         capture_output=True,
         text=True,
+        stdin=subprocess.DEVNULL,
+        timeout=10,
     )
 
     commits: list[CommitInfo] = []
@@ -290,6 +295,8 @@ def commit_height_since(root: Path, previous_tag: str) -> str:
         check=True,
         capture_output=True,
         text=True,
+        stdin=subprocess.DEVNULL,
+        timeout=10,
     )
     return result.stdout.strip() or "0"
 
