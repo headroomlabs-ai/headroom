@@ -10,12 +10,27 @@
 //! mirroring the parity harness's "stub → Skipped" tolerance. Run it
 //! locally after `python scripts/record_kompress_trace.py` to get the
 //! real assertion.
+//!
+//! Set `HEADROOM_REQUIRE_KOMPRESS_MODEL=1` to turn every skip into a hard
+//! failure, so a cold cache can't silently pass. Any job that warms the
+//! model into the HF cache should set it.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use headroom_core::transforms::kompress::{Kompress, KompressConfig};
 use serde_json::Value;
+
+/// Skip (eprintln + return handled by caller) — unless
+/// `HEADROOM_REQUIRE_KOMPRESS_MODEL` is set, in which case the missing
+/// prerequisite is a hard failure so CI can't silently green-light a
+/// run where the parity assertions never executed.
+fn skip_or_fail(msg: &str) {
+    if std::env::var_os("HEADROOM_REQUIRE_KOMPRESS_MODEL").is_some() {
+        panic!("HEADROOM_REQUIRE_KOMPRESS_MODEL is set but: {msg}");
+    }
+    eprintln!("SKIP: {msg}");
+}
 
 fn hf_cache_file(repo_dir: &str, rel: &[&str]) -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
@@ -45,9 +60,9 @@ fn kompress_matches_python_fixtures_byte_for_byte() {
     let (tok, onnx) = match (tok, onnx) {
         (Some(t), Some(o)) => (t, o),
         _ => {
-            eprintln!(
-                "SKIP: kompress model/tokenizer not in HF cache; \
-                 run `python scripts/record_kompress_trace.py` first"
+            skip_or_fail(
+                "kompress model/tokenizer not in HF cache; \
+                 run `python scripts/record_kompress_trace.py` first",
             );
             return;
         }
@@ -56,7 +71,7 @@ fn kompress_matches_python_fixtures_byte_for_byte() {
     let fixtures_dir =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/parity/fixtures/kompress");
     if !fixtures_dir.exists() {
-        eprintln!("SKIP: fixtures dir {} missing", fixtures_dir.display());
+        skip_or_fail(&format!("fixtures dir {} missing", fixtures_dir.display()));
         return;
     }
 
@@ -118,7 +133,7 @@ fn short_input_passes_through() {
         &["onnx", "kompress-int8-wo.onnx"],
     );
     let (Some(tok), Some(onnx)) = (tok, onnx) else {
-        eprintln!("SKIP: model not cached");
+        skip_or_fail("model not cached");
         return;
     };
     let kompress = Kompress::from_files(&tok, &onnx, KompressConfig::default()).unwrap();
