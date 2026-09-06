@@ -3438,6 +3438,7 @@ class OpenAIHandlerMixin:
         # upstream-bound copy.
         from headroom.proxy.helpers import (
             _strip_internal_headers,
+            apply_keep_last_turns,
             log_outbound_headers,
             merge_extra_headers,
         )
@@ -3645,6 +3646,25 @@ class OpenAIHandlerMixin:
                 _hook_biases = self.config.hooks.compute_biases(messages, _hook_ctx)
             except Exception as e:
                 logger.debug(f"[{request_id}] Hook error: {e}")
+
+        # x-headroom-keep-last-turns: N — trim history before optimization.
+        # Consumed here (after bypass check, after _strip_internal_headers)
+        # so it never leaks upstream.  Fail-open: any malformed value is
+        # silently ignored and the full message list is used instead.
+        _klt_raw = request.headers.get("x-headroom-keep-last-turns", "").strip()
+        if _klt_raw and not _bypass:
+            try:
+                _klt = int(_klt_raw)
+                messages, _klt_dropped = apply_keep_last_turns(messages, _klt)
+                if _klt_dropped:
+                    logger.info(
+                        "[%s] keep-last-turns=%d: dropped %d leading messages",
+                        request_id,
+                        _klt,
+                        _klt_dropped,
+                    )
+            except ValueError:
+                pass  # malformed value — never break the request
 
         # Optimization
         transforms_applied = []

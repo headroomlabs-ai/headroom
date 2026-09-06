@@ -3585,3 +3585,30 @@ def inject_tool_search_deferral_openai(
     if deferred == 0:
         return tools  # nothing to defer → don't perturb the request / cache prefix
     return out
+
+
+def apply_keep_last_turns(
+    messages: list[dict[str, Any]],
+    n: int,
+) -> tuple[list[dict[str, Any]], int]:
+    """Trim ``messages`` to the last *n* conversation turns.
+
+    A "turn" is one user+assistant pair.  The trailing user message is
+    always kept regardless of *n* (it is the current request).
+
+    Returns ``(trimmed_messages, n_dropped)`` — the caller can log
+    *n_dropped* and append ``keep_last_turns:{n}:{n_dropped}_dropped``
+    to ``transforms_applied``.  When nothing is dropped (n_dropped == 0)
+    the original list is returned unchanged so callers can detect a no-op
+    with an identity check.
+
+    Invariants:
+    - n < 0 is treated as no-op (invalid, never trim).
+    - The result always contains at least one message (the final user msg).
+    """
+    if n < 0 or not messages:
+        return messages, 0
+    tail = max(0, len(messages) - 1 - n * 2)
+    if tail == 0:
+        return messages, 0
+    return messages[tail:], tail
