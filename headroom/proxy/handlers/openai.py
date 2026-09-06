@@ -379,6 +379,9 @@ def _resolve_openai_upstream_base(request_headers: dict[str, str]) -> str | None
     if raw_base_url is None:
         return None
 
+    # Preserve the full URL including path (e.g. https://nexusmmo.store/api/v1).
+    # _normalize_origin strips the path component which breaks custom upstreams
+    # that serve the API from a sub-path like /api/v1.
     normalized = _normalize_origin(raw_base_url)
     if normalized is None:
         return None
