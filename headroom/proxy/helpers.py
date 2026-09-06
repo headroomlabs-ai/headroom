@@ -3237,6 +3237,11 @@ def inject_tool_search_deferral(
 # ---------------------------------------------------------------------------
 
 _TOOL_SEARCH_RESULT_TYPE = "tool_search_tool_result"
+# A client-side tool-search result (a plain ``tool_result`` carrying
+# ``tool_reference`` blocks) that is left with no resolvable references keeps
+# this text as its content, so its paired ``tool_use`` stays valid -- dropping
+# the block outright would orphan the tool_use (which 400s on its own).
+_CLIENT_TOOL_REF_PLACEHOLDER = "[tool reference no longer available]"
 
 
 def _tool_search_reference_names(content: Any) -> list[str]:
@@ -3261,11 +3266,20 @@ def _tool_search_reference_names(content: Any) -> list[str]:
 def strip_unsupported_tool_search_blocks(messages: Any, tools: Any) -> tuple[Any, int]:
     """Drop tool-search blocks this request's ``tools`` array cannot support.
 
-    A block pair is unsupportable when the request carries no ``tool_search_tool_*``
-    tool, or when a ``tool_reference`` names a tool absent from ``tools`` — the two
-    shapes Anthropic rejects. Both the ``tool_search_tool_result`` and its paired
-    ``server_tool_use`` are removed (an orphan of either 400s on its own), and a
-    message left with no content blocks is dropped rather than sent empty.
+    A ``tool_reference`` is unsupportable when the request carries no
+    ``tool_search_tool_*`` tool, or when it names a tool absent from ``tools`` --
+    the two shapes Anthropic rejects (a deferred-but-present tool is valid, so
+    only ABSENCE is the fault). Claude Code persists references in two shapes and
+    both are handled here:
+
+    * Server-side: a ``tool_search_tool_result`` block. It and its paired
+      ``server_tool_use`` are removed (an orphan of either 400s on its own), and
+      a message left with no content blocks is dropped rather than sent empty.
+    * Client-side: a plain ``tool_result`` whose content is a list of
+      ``tool_reference`` blocks (how a custom / MCP tool search returns results).
+      Unsupportable references are dropped; if that empties the result, its
+      content becomes ``_CLIENT_TOOL_REF_PLACEHOLDER`` so the paired ``tool_use``
+      is not orphaned.
 
     Returns ``(messages, blocks_removed)``, and the ORIGINAL ``messages`` object
     when nothing was removed — callers rely on identity to skip the write-back.
@@ -3303,8 +3317,36 @@ def strip_unsupported_tool_search_blocks(messages: Any, tools: Any) -> tuple[Any
 
         drop_indexes: set[int] = set()
         orphaned_ids: set[str] = set()
+        rewrites: dict[int, Any] = {}
         for index, block in enumerate(content):
-            if not isinstance(block, dict) or block.get("type") != _TOOL_SEARCH_RESULT_TYPE:
+            if not isinstance(block, dict):
+                continue
+            block_type = block.get("type")
+            # Client-side shape: a plain tool_result carrying tool_reference
+            # blocks. Keep resolvable references (deferred-but-present included);
+            # drop the unsupportable ones. If none survive, swap the content for
+            # a placeholder so the paired tool_use is not orphaned.
+            if block_type == "tool_result" and isinstance(block.get("content"), list):
+                inner = block["content"]
+                if any(isinstance(b, dict) and b.get("type") == "tool_reference" for b in inner):
+                    kept_inner: list[Any] = []
+                    dropped = 0
+                    for b in inner:
+                        if isinstance(b, dict) and b.get("type") == "tool_reference":
+                            name = b.get("tool_name") or b.get("name")
+                            if not has_search_tool or (
+                                name is not None and str(name) not in available
+                            ):
+                                dropped += 1
+                                continue
+                        kept_inner.append(b)
+                    if dropped:
+                        new_block = dict(block)
+                        new_block["content"] = kept_inner or _CLIENT_TOOL_REF_PLACEHOLDER
+                        rewrites[index] = new_block
+                        removed += dropped
+                continue
+            if block_type != _TOOL_SEARCH_RESULT_TYPE:
                 continue
             names = _tool_search_reference_names(block.get("content"))
             if has_search_tool and all(name in available for name in names):
@@ -3323,13 +3365,17 @@ def strip_unsupported_tool_search_blocks(messages: Any, tools: Any) -> tuple[Any
             if str(block.get("id", "")) in orphaned_ids or (is_search_call and not has_search_tool):
                 drop_indexes.add(index)
 
-        if not drop_indexes:
+        if not drop_indexes and not rewrites:
             out.append(message)
             continue
 
         changed = True
         removed += len(drop_indexes)
-        kept = [block for index, block in enumerate(content) if index not in drop_indexes]
+        kept = [
+            rewrites.get(index, block)
+            for index, block in enumerate(content)
+            if index not in drop_indexes
+        ]
         if not kept:
             continue  # the whole turn was tool-search bookkeeping
         repaired = dict(message)

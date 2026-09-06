@@ -397,6 +397,7 @@ def test_core_tools_match_leading_underscore_namespace() -> None:
 # ---------------------------------------------------------------------------
 
 from headroom.proxy.helpers import (  # noqa: E402
+    _CLIENT_TOOL_REF_PLACEHOLDER,
     strip_unsupported_tool_search_blocks,
 )
 
@@ -507,6 +508,78 @@ def test_repair_strips_search_history_when_only_the_tool_is_missing() -> None:
         _poisoned_transcript(), [{"name": "AskUserQuestion", "input_schema": {}}]
     )
     assert removed == 2
+
+
+# ---------------------------------------------------------------------------
+# Client-side tool search: Claude Code (and any custom implementation) stores
+# discovered tools as tool_reference blocks inside a PLAIN tool_result, not a
+# tool_search_tool_result. Anthropic validates those references too, so a stale
+# one (e.g. an MCP server that disconnected mid-session) 400s the same way.
+# ---------------------------------------------------------------------------
+
+
+def _client_side_transcript(*referenced: str) -> list[dict]:
+    return [
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "Searching."},
+                {"type": "tool_use", "id": "toolu_cs", "name": "ToolSearch", "input": {"q": "x"}},
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_cs",
+                    "content": [
+                        {"type": "tool_reference", "tool_name": name} for name in referenced
+                    ],
+                }
+            ],
+        },
+    ]
+
+
+def test_repair_neutralizes_client_side_reference_to_absent_tool() -> None:
+    # Absent tool: drop the reference, and because it was the whole result,
+    # replace the content with a placeholder so the paired tool_use is kept
+    # (an orphaned tool_use 400s on its own).
+    messages, removed = strip_unsupported_tool_search_blocks(
+        _client_side_transcript("mcp__x__ghost"),
+        [_SEARCH_TOOL, {"name": "Read", "input_schema": {}}],
+    )
+    assert removed == 1
+    assert messages[0]["content"][1]["type"] == "tool_use"  # search call preserved
+    result = messages[1]["content"][0]
+    assert result["type"] == "tool_result"
+    assert result["content"] == _CLIENT_TOOL_REF_PLACEHOLDER
+
+
+def test_repair_keeps_client_side_reference_to_present_deferred_tool() -> None:
+    # A deferred-but-present tool is valid; keep it and return by identity.
+    transcript = _client_side_transcript("CronCreate")
+    messages, removed = strip_unsupported_tool_search_blocks(
+        transcript,
+        [_SEARCH_TOOL, {"name": "CronCreate", "input_schema": {}, "defer_loading": True}],
+    )
+    assert removed == 0
+    assert messages is transcript
+
+
+def test_repair_keeps_present_client_side_reference_and_drops_absent() -> None:
+    # Mixed result: keep the present reference, drop only the absent one.
+    messages, removed = strip_unsupported_tool_search_blocks(
+        _client_side_transcript("CronCreate", "mcp__x__ghost"),
+        [_SEARCH_TOOL, {"name": "CronCreate", "input_schema": {}, "defer_loading": True}],
+    )
+    assert removed == 1
+    refs = messages[1]["content"][0]["content"]
+    names = [
+        r["tool_name"] for r in refs if isinstance(r, dict) and r.get("type") == "tool_reference"
+    ]
+    assert names == ["CronCreate"]
 
 
 # ---------------------------------------------------------------------------
