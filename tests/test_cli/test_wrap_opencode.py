@@ -423,6 +423,154 @@ def test_wrap_opencode_prepare_only_injects_config(
     assert config["provider"]["headroom"]["options"]["baseURL"] == "http://127.0.0.1:9000/v1"
 
 
+def test_wrap_opencode_extra_model_flag_injects_config(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`--extra-model` specs are merged into the injected provider models."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    monkeypatch.delenv("HEADROOM_OPENCODE_EXTRA_MODELS", raising=False)
+    _set_test_home(monkeypatch, tmp_path)
+
+    with patch.object(wrap_mod.shutil, "which", return_value="opencode"):
+        with patch.object(wrap_mod, "_ensure_rtk_binary", return_value=Path("/tmp/rtk")):
+            result = runner.invoke(
+                main,
+                [
+                    "wrap",
+                    "opencode",
+                    "--prepare-only",
+                    "--extra-model",
+                    "deepseek-chat:DeepSeek Chat:65536",
+                    "--extra-model",
+                    "kimi-k2",
+                ],
+            )
+
+    assert result.exit_code == 0, result.output
+    config_file = tmp_path / ".config" / "opencode" / "opencode.json"
+    config = json.loads(config_file.read_text(encoding="utf-8"))
+    models = config["provider"]["headroom"]["models"]
+    assert models["deepseek-chat"]["name"] == "DeepSeek Chat"
+    assert models["deepseek-chat"]["limit"]["context"] == 65536
+    assert models["kimi-k2"]["name"] == "kimi-k2"
+    assert "claude-sonnet-4-6" in models
+
+
+def test_wrap_opencode_extra_models_env_var(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """HEADROOM_OPENCODE_EXTRA_MODELS persists extra models across wraps."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    monkeypatch.setenv("HEADROOM_OPENCODE_EXTRA_MODELS", "deepseek-chat:DeepSeek Chat:65536")
+    _set_test_home(monkeypatch, tmp_path)
+
+    with patch.object(wrap_mod.shutil, "which", return_value="opencode"):
+        with patch.object(wrap_mod, "_ensure_rtk_binary", return_value=Path("/tmp/rtk")):
+            result = runner.invoke(main, ["wrap", "opencode", "--prepare-only"])
+
+    assert result.exit_code == 0, result.output
+    config_file = tmp_path / ".config" / "opencode" / "opencode.json"
+    config = json.loads(config_file.read_text(encoding="utf-8"))
+    assert config["provider"]["headroom"]["models"]["deepseek-chat"]["limit"]["context"] == 65536
+
+
+def test_wrap_opencode_extra_model_flag_in_launch_env(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Extra models reach OPENCODE_CONFIG_CONTENT on the normal launch path."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    monkeypatch.delenv("HEADROOM_OPENCODE_EXTRA_MODELS", raising=False)
+    _set_test_home(monkeypatch, tmp_path)
+
+    captured: dict[str, object] = {}
+
+    def fake_launch_tool(**kwargs):  # noqa: ANN003
+        captured.update(kwargs)
+
+    with patch.object(wrap_mod.shutil, "which", return_value="opencode"):
+        with patch.object(wrap_mod, "_launch_tool", side_effect=fake_launch_tool):
+            with patch.object(wrap_mod, "_ensure_rtk_binary", return_value=Path("/tmp/rtk")):
+                result = runner.invoke(
+                    main,
+                    [
+                        "wrap",
+                        "opencode",
+                        "--port",
+                        "9000",
+                        "--no-mcp",
+                        "--extra-model",
+                        "deepseek-chat:DeepSeek Chat:65536",
+                    ],
+                )
+
+    assert result.exit_code == 0, result.output
+    env = captured["env"]
+    assert isinstance(env, dict)
+    config = json.loads(env["OPENCODE_CONFIG_CONTENT"])
+    models = config["provider"]["headroom"]["models"]
+    assert models["deepseek-chat"]["name"] == "DeepSeek Chat"
+    assert models["deepseek-chat"]["limit"]["context"] == 65536
+    assert "claude-sonnet-4-6" in models
+
+
+def test_wrap_opencode_extra_models_env_var_in_launch_env(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Env-sourced extra models reach OPENCODE_CONFIG_CONTENT on launch."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    monkeypatch.setenv("HEADROOM_OPENCODE_EXTRA_MODELS", "kimi-k2:Kimi K2")
+    _set_test_home(monkeypatch, tmp_path)
+
+    captured: dict[str, object] = {}
+
+    def fake_launch_tool(**kwargs):  # noqa: ANN003
+        captured.update(kwargs)
+
+    with patch.object(wrap_mod.shutil, "which", return_value="opencode"):
+        with patch.object(wrap_mod, "_launch_tool", side_effect=fake_launch_tool):
+            with patch.object(wrap_mod, "_ensure_rtk_binary", return_value=Path("/tmp/rtk")):
+                result = runner.invoke(main, ["wrap", "opencode", "--port", "9000", "--no-mcp"])
+
+    assert result.exit_code == 0, result.output
+    env = captured["env"]
+    assert isinstance(env, dict)
+    config = json.loads(env["OPENCODE_CONFIG_CONTENT"])
+    assert config["provider"]["headroom"]["models"]["kimi-k2"]["name"] == "Kimi K2"
+
+
+def test_wrap_opencode_extra_model_invalid_spec_errors(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A malformed --extra-model spec fails with a usage error, not a traceback."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    _set_test_home(monkeypatch, tmp_path)
+
+    with patch.object(wrap_mod.shutil, "which", return_value="opencode"):
+        with patch.object(wrap_mod, "_ensure_rtk_binary", return_value=Path("/tmp/rtk")):
+            result = runner.invoke(
+                main,
+                ["wrap", "opencode", "--prepare-only", "--extra-model", "bad:name:abc"],
+            )
+
+    assert result.exit_code != 0
+    assert "non-integer context window" in result.output
+
+
 def test_wrap_opencode_prepare_only_registers_serena_with_agent_context(
     runner: CliRunner,
     tmp_path: Path,

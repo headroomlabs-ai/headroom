@@ -54,13 +54,66 @@ HEADROOM_OPENCODE_MODELS: dict[str, Any] = {
 }
 
 
-def headroom_provider_entry(port: int) -> dict[str, Any]:
+# Env var holding comma-separated extra model specs (same format as the
+# `--extra-model` flag) so custom models survive re-wraps.
+HEADROOM_OPENCODE_EXTRA_MODELS_ENV = "HEADROOM_OPENCODE_EXTRA_MODELS"
+
+# Defaults for extra models when the spec omits limits.
+_EXTRA_MODEL_DEFAULT_CONTEXT = 200000
+_EXTRA_MODEL_DEFAULT_OUTPUT = 16384
+
+
+def parse_extra_model_spec(spec: str) -> tuple[str, dict[str, Any]]:
+    """Parse an ``id[:name[:context_window]]`` extra-model spec.
+
+    Returns a ``(model_id, entry)`` pair shaped like the values in
+    ``HEADROOM_OPENCODE_MODELS``. ``name`` defaults to the id and
+    ``context_window`` defaults to 200000. Raises ``ValueError`` on an
+    empty id or a non-integer context window.
+    """
+    parts = spec.split(":", 2)
+    model_id = parts[0].strip()
+    if not model_id:
+        raise ValueError(f"extra model spec has an empty model id: {spec!r}")
+    name = parts[1].strip() if len(parts) > 1 and parts[1].strip() else model_id
+    context = _EXTRA_MODEL_DEFAULT_CONTEXT
+    if len(parts) > 2 and parts[2].strip():
+        try:
+            context = int(parts[2].strip())
+        except ValueError:
+            raise ValueError(
+                f"extra model spec has a non-integer context window: {spec!r}"
+            ) from None
+        if context <= 0:
+            raise ValueError(f"extra model spec has a non-positive context window: {spec!r}")
+    return model_id, {
+        "name": name,
+        "limit": {"context": context, "output": _EXTRA_MODEL_DEFAULT_OUTPUT},
+    }
+
+
+def extra_models_from_env() -> dict[str, Any]:
+    """Parse extra models from ``HEADROOM_OPENCODE_EXTRA_MODELS`` (comma-separated)."""
+    raw = os.environ.get(HEADROOM_OPENCODE_EXTRA_MODELS_ENV, "")
+    models: dict[str, Any] = {}
+    for spec in raw.split(","):
+        spec = spec.strip()
+        if not spec:
+            continue
+        model_id, entry = parse_extra_model_spec(spec)
+        models[model_id] = entry
+    return models
+
+
+def headroom_provider_entry(
+    port: int, extra_models: dict[str, Any] | None = None
+) -> dict[str, Any]:
     """Return the `headroom` provider block pointed at the local proxy."""
     return {
         "npm": "@ai-sdk/openai-compatible",
         "name": "Headroom Proxy",
         "options": {"baseURL": f"http://127.0.0.1:{port}/v1"},
-        "models": HEADROOM_OPENCODE_MODELS,
+        "models": {**HEADROOM_OPENCODE_MODELS, **(extra_models or {})},
     }
 
 
@@ -112,9 +165,9 @@ def strip_opencode_headroom_blocks(content: str, *, remove_mcp: bool = True) -> 
     return content.strip()
 
 
-def _render_provider_block(port: int) -> str:
+def _render_provider_block(port: int, extra_models: dict[str, Any] | None = None) -> str:
     """Render a Headroom provider block as a JSON comment-wrapped snippet."""
-    provider = {"headroom": headroom_provider_entry(port)}
+    provider = {"headroom": headroom_provider_entry(port, extra_models)}
     lines = [
         _PROVIDER_MARKER_START,
         f'"provider": {json.dumps(provider, indent=2)},',
@@ -178,7 +231,7 @@ def append_headroom_plugin(config: dict[str, object]) -> bool:
     return True
 
 
-def inject_opencode_provider_config(port: int) -> None:
+def inject_opencode_provider_config(port: int, extra_models: dict[str, Any] | None = None) -> None:
     """Inject a Headroom model provider into OpenCode's config file.
 
     Safe to call multiple times — the injected block is fully replaced on
@@ -207,7 +260,7 @@ def inject_opencode_provider_config(port: int) -> None:
             data = _parse_json_loose(content)
 
         # Merge provider into the JSON data structure.
-        provider = {"headroom": headroom_provider_entry(port)}
+        provider = {"headroom": headroom_provider_entry(port, extra_models)}
         data = _inject_key_into_json(data, "provider", provider)
 
         # Write back as formatted JSON (opencode uses standard JSON with comments).
