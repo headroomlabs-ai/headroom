@@ -3598,9 +3598,16 @@ def _proxy_version(payload: dict[str, Any] | None) -> str | None:
 def _proxy_needs_version_restart(payload: dict[str, Any] | None) -> bool:
     """Return True when a running Headroom proxy uses a different package version."""
     running_version = _proxy_version(payload)
-    running_release = _normalize_release_version(running_version)
     # -dev is a display marker for source builds; compare the base release so a
-    # dev CLI still restarts a stale proxy on a real version difference.
+    # dev CLI still restarts a stale proxy on a real version difference. The
+    # suffix must be stripped from the running version too: with it intact,
+    # "0.34.0-dev" fails the release regex, normalizes to None, and the check
+    # below silently never fires for source-built proxies. The scheme is always
+    # "<base>-dev" (get_version in headroom/_version.py); any future "-rcN" or
+    # "-dev.N" style would need stripping here as well.
+    running_release = _normalize_release_version(
+        running_version.removesuffix("-dev") if running_version is not None else None
+    )
     current_release = _normalize_release_version(_HEADROOM_VERSION.removesuffix("-dev"))
     return (
         running_release is not None
