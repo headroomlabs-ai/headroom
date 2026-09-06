@@ -19,6 +19,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config = Config::from_cli(args);
 
     init_tracing(&config.log_level);
+    headroom_core::init_ort_ep();
 
     tracing::info!(
         listen = %config.listen,

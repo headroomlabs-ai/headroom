@@ -200,6 +200,7 @@ async fn oauth_body_passes_through_byte_equal() {
     let proxy = start_proxy_with(&upstream.uri(), |c| {
         c.compression = true;
         c.compression_mode = headroom_proxy::config::CompressionMode::LiveZone;
+        c.auth_mode_policy_enforcement = headroom_proxy::config::AuthModePolicyEnforcement::Enabled;
     })
     .await;
 
@@ -250,12 +251,59 @@ async fn oauth_body_passes_through_byte_equal() {
 }
 
 #[tokio::test]
+async fn oauth_body_runs_payg_pipeline_when_enforcement_disabled() {
+    let upstream = MockServer::start().await;
+    let captured = mount_anthropic_capture(&upstream).await;
+    let proxy = start_proxy_with(&upstream.uri(), |c| {
+        c.compression = true;
+        c.compression_mode = headroom_proxy::config::CompressionMode::LiveZone;
+        c.auth_mode_policy_enforcement =
+            headroom_proxy::config::AuthModePolicyEnforcement::Disabled;
+    })
+    .await;
+
+    let payload = serde_json::json!({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 32,
+        "tools": [{"name": "alpha", "description": "alpha tool"}],
+        "messages": [{"role": "user", "content": "hi"}],
+    });
+    let body = serde_json::to_vec(&payload).unwrap();
+
+    let resp = reqwest::Client::new()
+        .post(format!("{}/v1/messages", proxy.url()))
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer sk-ant-oat-fake-oauth-token")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let upstream_received = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("upstream captured a body");
+    let upstream_parsed: serde_json::Value =
+        serde_json::from_slice(&upstream_received).expect("upstream body is JSON");
+    assert_eq!(
+        upstream_parsed.pointer("/tools/0/cache_control"),
+        Some(&serde_json::json!({"type": "ephemeral"})),
+        "disabled auth-mode enforcement must run the PAYG marker path",
+    );
+
+    proxy.shutdown().await;
+}
+
+#[tokio::test]
 async fn subscription_body_passes_through_byte_equal() {
     let upstream = MockServer::start().await;
     let captured = mount_anthropic_capture(&upstream).await;
     let proxy = start_proxy_with(&upstream.uri(), |c| {
         c.compression = true;
         c.compression_mode = headroom_proxy::config::CompressionMode::LiveZone;
+        c.auth_mode_policy_enforcement = headroom_proxy::config::AuthModePolicyEnforcement::Enabled;
     })
     .await;
 

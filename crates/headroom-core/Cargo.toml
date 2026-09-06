@@ -171,9 +171,9 @@ fastembed = { version = "5", default-features = false, optional = true, features
     "ort-load-dynamic",
     "image-models",
 ] }
-# Direct dependency for Kompress inference (`ort::session::Session` /
-# `ort::value::Tensor`). Keep this pinned to the lock entry and optional so
-# `default-features = false` consumers can still build without ONNX Runtime.
+# Direct dependency for EP selection and Kompress inference. Keep this pinned
+# to the lock entry and optional so Cargo shares the fastembed/magika singleton
+# while `default-features = false` consumers build without ONNX Runtime.
 ort = { version = "=2.0.0-rc.12", default-features = false, optional = true, features = ["load-dynamic"] }
 
 [features]

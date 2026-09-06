@@ -138,6 +138,7 @@ async fn oauth_request_passes_schema_through_byte_equal() {
     let proxy = start_proxy_with(&upstream.uri(), |c| {
         c.compression = true;
         c.compression_mode = headroom_proxy::config::CompressionMode::LiveZone;
+        c.auth_mode_policy_enforcement = headroom_proxy::config::AuthModePolicyEnforcement::Enabled;
     })
     .await;
 

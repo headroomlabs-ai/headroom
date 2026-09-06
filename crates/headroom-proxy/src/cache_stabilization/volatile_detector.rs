@@ -291,17 +291,17 @@ fn scan_value_recursive(v: &Value, location: &str, out: &mut Vec<VolatileFinding
                 if out.len() >= MAX_FINDINGS_PER_REQUEST {
                     return;
                 }
-                if is_id_named_key(k) && !is_value_empty(sub) {
+                let nested = format!("{location}.{k}");
+                if is_id_named_key(k, &nested) && !is_value_empty(sub) {
                     out.push(VolatileFinding {
                         kind: VolatileKind::IdField,
-                        location: format!("{location}.{k}"),
+                        location: nested.clone(),
                         sample: truncate_sample(&value_to_sample(sub)),
                     });
                     if out.len() >= MAX_FINDINGS_PER_REQUEST {
                         return;
                     }
                 }
-                let nested = format!("{location}.{k}");
                 scan_value_recursive(sub, &nested, out);
             }
         }
@@ -410,8 +410,17 @@ fn looks_like_uuid_v4(window: &[u8]) -> bool {
 }
 
 /// Does the JSON key name match one of the conventional per-request
-/// ID needles? Case-insensitive substring match.
-fn is_id_named_key(key: &str) -> bool {
+/// ID needles? Case-insensitive substring match. The `location` path
+/// is used to filter out false-positives in schema-definition zones
+/// (e.g. `tools[].input_schema.properties.request_id` is a schema
+/// constant, not a per-request value).
+fn is_id_named_key(key: &str, location: &str) -> bool {
+    // Skip ID-field detection inside schema definitions. Tool input
+    // schemas and function parameters declare structure, not data;
+    // a `request_id` field *definition* is constant across requests.
+    if location.contains("input_schema") || location.contains("function.parameters") {
+        return false;
+    }
     let lowered = key.to_ascii_lowercase();
     ID_FIELD_NEEDLES
         .iter()
@@ -501,10 +510,11 @@ mod tests {
     }
 
     #[test]
-    fn detects_request_id_field_in_nested_object() {
-        // Tools input_schema with a nested `request_id` field whose
-        // value is a non-UUID string. The volatile-substring scan
-        // would miss this; the ID-field-name rule catches it.
+    fn does_not_detect_request_id_in_schema_definition() {
+        // Tools input_schema with `request_id` field is a schema
+        // *definition* (constant across requests), not a per-request
+        // value. Should NOT trigger the ID-field rule. This is the
+        // fix for Claude's tool schemas which always define request_id.
         let body = json!({
             "tools": [{
                 "name": "lookup",
@@ -520,16 +530,36 @@ mod tests {
             "messages": [],
         });
         let findings = detect_volatile_content(&body, ApiKind::Anthropic);
+        let id_field_findings: Vec<_> = findings
+            .iter()
+            .filter(|f| f.kind == VolatileKind::IdField)
+            .collect();
+        assert!(
+            id_field_findings.is_empty(),
+            "request_id in input_schema.properties should NOT be flagged (schema definition, not per-request); got {findings:?}",
+        );
+    }
+
+    #[test]
+    fn detects_request_id_field_in_user_data() {
+        // request_id outside a schema definition (in messages or system
+        // prompt) SHOULD be detected as volatile per-request data.
+        let body = json!({
+            "messages": [{
+                "role": "user",
+                "content": {
+                    "type": "text",
+                    "text": "Process this",
+                    "request_id": "req-2026-xyz-99999"
+                }
+            }],
+        });
+        let findings = detect_volatile_content(&body, ApiKind::Anthropic);
         let id_field = findings
             .iter()
             .find(|f| f.kind == VolatileKind::IdField)
-            .expect("expected an IdField finding");
-        assert!(
-            id_field.location.ends_with(".request_id"),
-            "location should end with .request_id, got {:?}",
-            id_field.location
-        );
-        assert!(id_field.sample.contains("req-2026-abc-12345"));
+            .expect("expected an IdField finding in user data");
+        assert!(id_field.sample.contains("req-2026-xyz-99999"));
     }
 
     #[test]
