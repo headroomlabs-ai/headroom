@@ -1023,6 +1023,50 @@ _RESPONSES_OUTPUT_ITEM_TYPES = frozenset(
 )
 
 
+_RESPONSES_EXACT_TOOL_OUTPUT_NAMES = frozenset(
+    {
+        "edit",
+        "read",
+        "write",
+    }
+)
+
+
+def _normalize_responses_tool_name(name: Any) -> str | None:
+    """Normalize OpenAI Responses function_call names for exclusion checks."""
+    if not isinstance(name, str):
+        return None
+
+    normalized = name.strip()
+    if not normalized:
+        return None
+
+    # Pi and MCP-style clients may namespace tool names as functions.read,
+    # mcp__read, etc. The exactness-sensitive bit is the final tool segment.
+    normalized = normalized.rsplit(".", 1)[-1].rsplit("__", 1)[-1].lower()
+    return normalized or None
+
+
+def _responses_tool_name_by_call_id(items: list[Any]) -> dict[str, str]:
+    """Build call_id -> normalized function_call name for Responses input items."""
+    tool_names: dict[str, str] = {}
+    for item in items:
+        if not isinstance(item, dict) or item.get("type") != "function_call":
+            continue
+
+        call_id = item.get("call_id")
+        tool_name = _normalize_responses_tool_name(item.get("name"))
+        if isinstance(call_id, str) and call_id and tool_name:
+            tool_names[call_id] = tool_name
+
+    return tool_names
+
+
+def _is_exact_responses_tool_output(tool_name: str | None) -> bool:
+    """Return true for tool outputs that must stay byte-exact for editors."""
+    return tool_name in _RESPONSES_EXACT_TOOL_OUTPUT_NAMES
+
+
 def _responses_part_text(value: Any) -> str:
     """Best-effort text from a Responses item field (string or part list)."""
     if isinstance(value, str):
@@ -2080,7 +2124,12 @@ class OpenAIHandlerMixin:
                         return True
             return False
 
-        headroom_retrieve_call_ids: set[str] = set()
+        tool_name_by_call_id = _responses_tool_name_by_call_id(items)
+        headroom_retrieve_call_ids = {
+            call_id
+            for call_id, tool_name in tool_name_by_call_id.items()
+            if tool_name == "headroom_retrieve"
+        }
         # Map each Responses tool call to its name so that outputs belonging to
         # excluded tools (HEADROOM_EXCLUDE_TOOLS) can be protected from
         # compression. The chat/Anthropic paths get this via
@@ -2101,11 +2150,6 @@ class OpenAIHandlerMixin:
                 name = unwrap_tool_call_name(name, item.get("arguments") or item.get("input"))
             if isinstance(name, str) and isinstance(call_id, str) and call_id:
                 function_name_by_call_id[call_id] = name
-            if isinstance(name, str) and (
-                name == "headroom_retrieve" or name.endswith("__headroom_retrieve")
-            ):
-                if isinstance(call_id, str) and call_id:
-                    headroom_retrieve_call_ids.add(call_id)
 
         # Resolve the effective exclude set once (None -> built-in defaults),
         # mirroring ContentRouter's policy. exclude_tools already contains both
@@ -2212,6 +2256,7 @@ class OpenAIHandlerMixin:
             item_type = item.get("type")
             if item_type in self.OPENAI_RESPONSES_OUTPUT_TYPES:
                 call_id = item.get("call_id")
+                tool_name = tool_name_by_call_id.get(call_id) if isinstance(call_id, str) else None
                 if isinstance(call_id, str) and call_id in headroom_retrieve_call_ids:
                     if debug_enabled:
                         extraction_debug.append(
@@ -2221,6 +2266,21 @@ class OpenAIHandlerMixin:
                                 "reason": "headroom_retrieve_output_protected",
                                 "item_type": item_type,
                                 "call_id": call_id,
+                                "tool_name": tool_name,
+                                "item": item,
+                            }
+                        )
+                    continue
+                if _is_exact_responses_tool_output(tool_name):
+                    if debug_enabled:
+                        extraction_debug.append(
+                            {
+                                "index": idx,
+                                "eligible": False,
+                                "reason": "exact_tool_output_protected",
+                                "item_type": item_type,
+                                "call_id": call_id,
+                                "tool_name": tool_name,
                                 "item": item,
                             }
                         )
