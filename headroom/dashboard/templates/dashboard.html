@@ -112,16 +112,23 @@
         /* Light mode: fix hardcoded dark card backgrounds */
         .bg-card-alt { background: var(--card-alt-bg); }
         .hover-bg-surface:hover { background: var(--color-surface); }
+        .rolling-provider-label, .rolling-provider-value { color: #0e7490; }
+        .rolling-compression-label, .rolling-compression-value { color: #047857; }
+        .rolling-scope-copy { color: #334155; }
+        .prefix-cache-current-label { color: #047857; }
+        html.dark .rolling-provider-label, html.dark .rolling-provider-value { color: #67e8f9; }
+        html.dark .rolling-compression-label, html.dark .rolling-compression-value { color: #6ee7b7; }
+        html.dark .rolling-scope-copy, html.dark .prefix-cache-current-label { color: #cbd5e1; }
     </style>
 </head>
 <body class="text-gray-200 min-h-screen" x-data="dashboard()" x-init="init()">
     <!-- Header -->
-    <header class="border-b border-border px-6 py-4 flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+    <header class="border-b border-border px-6 py-4 flex flex-col gap-3 md:flex-row md:flex-wrap md:items-center md:justify-between">
         <div class="flex items-center gap-4">
             <h1 class="text-xl font-semibold tracking-tight">HEADROOM</h1>
             <span class="text-xs text-gray-500 font-mono" x-text="formatVersion(version)"></span>
         </div>
-        <div class="flex flex-col gap-3 md:flex-row md:items-center md:gap-6">
+        <div class="flex min-w-0 max-w-full flex-col gap-3 md:flex-row md:flex-wrap md:items-center md:gap-6">
             <div class="inline-flex rounded-lg border border-border bg-surface p-1">
                     <button type="button" :aria-pressed="viewMode === 'session'" class="px-3 py-1.5 text-sm rounded-md transition-colors"
                             :class="viewMode === 'session' ? 'bg-accent text-black' : 'text-gray-400 hover:text-gray-200'"
@@ -520,14 +527,36 @@
                     </div>
                 </div>
 
+                <!-- Rolling display-session economics: provider and Headroom owners stay separate -->
+                <template x-if="rollingSessionActive">
+                    <div data-testid="rolling-display-session-economics" class="bg-surface rounded-lg p-4 border border-border mb-6">
+                        <div class="text-sm font-medium text-gray-300">Rolling display session economics</div>
+                        <div class="rolling-scope-copy text-xs mt-1 mb-4">Values cover the active persisted display session.</div>
+                        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                            <div data-testid="rolling-provider-cache" class="rounded-lg border border-cyan-500/20 bg-cyan-500/5 p-4">
+                                <div class="rolling-provider-label text-xs uppercase tracking-wide">Provider cache discount</div>
+                                <div class="rolling-provider-value text-2xl font-light tabular-nums mt-2"
+                                     x-text="'$' + formatCurrency(rollingSession.cache_savings_usd || 0)"></div>
+                                <div class="rolling-scope-copy text-xs mt-1">provider-observed, rolling display session</div>
+                            </div>
+                            <div data-testid="rolling-compression-savings" class="rounded-lg border border-emerald-500/20 bg-emerald-500/5 p-4">
+                                <div class="rolling-compression-label text-xs uppercase tracking-wide">Headroom compression savings</div>
+                                <div class="rolling-compression-value text-2xl font-light tabular-nums mt-2"
+                                     x-text="'$' + formatCurrency(rollingSession.compression_savings_usd || 0)"></div>
+                                <div class="rolling-scope-copy text-xs mt-1">Headroom-attributable, rolling display session</div>
+                            </div>
+                        </div>
+                    </div>
+                </template>
+
                 <!-- Prefix Cache Impact: current process plus durable cache reads after restart -->
                 <template x-if="cacheCardAvailable">
                     <div class="bg-surface rounded-lg p-4 border border-border mb-6">
-                        <div class="flex justify-between items-center mb-3">
+                        <div class="flex flex-col items-start gap-2 mb-3 sm:flex-row sm:items-center sm:justify-between">
                             <div class="text-sm font-medium text-gray-300">Prefix Cache Impact</div>
-                            <div class="text-xs text-emerald-400 font-mono"
+                            <div class="prefix-cache-current-label text-xs font-mono"
                                  x-show="cacheSessionActive"
-                                 x-text="'Net savings: $' + formatCurrency(stats.prefix_cache?.totals?.net_savings_usd || 0)"></div>
+                                 x-text="'Provider cache discount, current process: $' + formatCurrency(stats.prefix_cache?.totals?.net_savings_usd || 0)"></div>
                             <div class="text-xs text-gray-500 font-mono"
                                  x-show="!cacheSessionActive">no activity since restart</div>
                         </div>
@@ -2664,6 +2693,14 @@
 
                 get cacheSessionActive() {
                     return (this.stats.prefix_cache?.totals?.requests || 0) > 0;
+                },
+
+                get rollingSession() {
+                    return this.stats.persistent_savings?.display_session || {};
+                },
+
+                get rollingSessionActive() {
+                    return Boolean(this.rollingSession.last_activity_at);
                 },
 
                 get lifetimeCacheReadTokens() {
