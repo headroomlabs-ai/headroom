@@ -60,6 +60,23 @@ class TestMemoryEntry:
         old = MemoryEntry(content="old", importance=0.9, created_at=time.time() - 30 * 86400)
         assert recent.score > old.score
 
+    def test_score_handles_future_timestamp(self):
+        # A future created_at (clock skew, a timestamp written on another
+        # machine) drove recency = 1/(1 + age_days*0.1) to a divide-by-zero at
+        # exactly +10 days and negative past that, inverting the ranking. Age is
+        # now clamped to >= 0, so a future memory scores like a brand-new one.
+        now = time.time()
+        boom = MemoryEntry(content="future", importance=0.9, created_at=now + 10 * 86400)
+        far_future = MemoryEntry(content="far", importance=0.9, created_at=now + 30 * 86400)
+        fresh = MemoryEntry(content="fresh", importance=0.9, created_at=now)
+
+        assert boom.score > 0  # no ZeroDivisionError at exactly +10 days
+        assert far_future.score > 0  # not negative past +10 days
+        # Any future timestamp clamps to age 0, so all future memories score
+        # identically to a brand-new one (never better than a real fresh one).
+        assert far_future.score == boom.score
+        assert far_future.score >= fresh.score
+
     def test_content_hash(self):
         e1 = MemoryEntry(content="same content")
         e2 = MemoryEntry(content="same content")

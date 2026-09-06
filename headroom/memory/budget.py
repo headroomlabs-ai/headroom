@@ -140,7 +140,11 @@ class MemoryBudgetManager:
 
         result: list[MemoryEntry] = []
         for m in memories:
-            age_days = (now - m.created_at) / 86400
+            # Clamp to non-negative: a future created_at (clock skew) otherwise
+            # makes exp(-rate × negative) > 1 and inflates importance above 1.0,
+            # so a future-dated memory outranks everything. Treat it as new (no
+            # decay), matching memory_rank_policy.memory_recency_factor.
+            age_days = max(0.0, (now - m.created_at) / 86400)
             # Exponential decay: importance × e^(-rate × age)
             import math
 

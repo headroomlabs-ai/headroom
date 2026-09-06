@@ -67,6 +67,18 @@ class TestBudgetManager:
         if len(optimized) >= 2:
             assert optimized[0].content == "New memory"
 
+    def test_decay_does_not_inflate_future_timestamps(self, manager: MemoryBudgetManager):
+        # A future created_at (clock skew) made exp(-rate × negative) > 1, so the
+        # decayed importance rose above the original (and above 1.0) and the
+        # future memory outranked a fresh, genuinely-important one. Age is now
+        # clamped to >= 0, so a future memory decays like a brand-new one.
+        future = _make_entry("Future", importance=0.5, age_days=-30)  # created 30d ahead
+        decayed = manager._apply_decay([future])
+
+        assert decayed  # survives the min-importance filter
+        assert decayed[0].importance <= 0.5  # never inflated above the original
+        assert decayed[0].importance <= 1.0
+
     def test_access_count_boost(self, manager: MemoryBudgetManager):
         unused = _make_entry("Unused", importance=0.5, age_days=5, access_count=0)
         used = _make_entry("Heavily used", importance=0.5, age_days=5, access_count=10)
