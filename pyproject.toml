@@ -108,7 +108,7 @@ proxy-prod = [
 # as a transitive dependency and the existing code_compressor.py node-walk
 # logic continues to work.  See issue #1216.
 code = [
-    "tree-sitter-language-pack>=0.10.0,<1.0",
+    "tree-sitter-language-pack>=0.10.0,<2.0",
     "tree-sitter>=0.25.2,<0.27",
 ]
 # ML-based compression with Kompress (ModernBERT).
