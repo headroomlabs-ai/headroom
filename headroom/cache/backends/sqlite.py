@@ -235,6 +235,16 @@ class SQLiteBackend:
                 return 0
         return int(row[0])
 
+    def external_revision(self) -> int | None:
+        """Return a token that changes when another connection commits."""
+        with self._lock:
+            try:
+                row = self._conn.execute("PRAGMA data_version").fetchone()
+            except sqlite3.DatabaseError as e:
+                self._handle_db_error(e, "revision")
+                return None
+        return int(row[0])
+
     def keys(self) -> list[str]:
         with self._lock:
             try:

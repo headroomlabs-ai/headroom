@@ -258,10 +258,16 @@ class CompressionStore:
         # MEDIUM FIX #16: Use a min-heap for O(log n) eviction instead of O(n)
         # Heap entries are (created_at, hash_key) tuples
         self._eviction_heap: list[tuple[float, str]] = []
+        # Expiration ordering is separate so live eviction stays oldest-first.
+        self._expiration_heap: list[tuple[float, float, str]] = []
         # CRITICAL FIX: Track stale entries count to know when heap cleanup is needed
         self._stale_heap_entries = 0
+        self._stale_expiration_heap_entries = 0
         # Threshold for triggering heap rebuild (when 50% are stale)
         self._heap_rebuild_threshold = 0.5
+        external_revision = getattr(self._backend, "external_revision", None)
+        self._backend_revision_reader = external_revision if callable(external_revision) else None
+        self._backend_revision = self._read_backend_revision()
 
     @property
     def default_ttl_seconds(self) -> int:
@@ -388,6 +394,7 @@ class CompressionStore:
             tool_signature_hash=tool_signature_hash,
             compression_strategy=compression_strategy,
         )
+        expires_at = self._expiration_time(entry)
 
         # Process pending feedback BEFORE acquiring lock for eviction.
         # This ensures feedback from entries about to be evicted is captured.
@@ -424,11 +431,17 @@ class CompressionStore:
                         hash_key,
                     )
                 # Mark old heap entry as stale since we're replacing it.
-                self._stale_heap_entries += 1
+                self._mark_heap_entries_stale()
 
             self._backend.set(hash_key, entry)
             # MEDIUM FIX #16: Add to eviction heap for O(log n) eviction
             heapq.heappush(self._eviction_heap, (entry.created_at, hash_key))
+            heapq.heappush(
+                self._expiration_heap,
+                (expires_at, entry.created_at, hash_key),
+            )
+            if existing is not None:
+                self._rebuild_heap_if_needed()
 
         return hash_key
 
@@ -455,7 +468,7 @@ class CompressionStore:
             if entry.is_expired():
                 self._backend.delete(hash_key)
                 # CRITICAL FIX: Track stale heap entry
-                self._stale_heap_entries += 1
+                self._mark_heap_entries_stale()
                 return None
 
             # Track access for feedback
@@ -518,7 +531,7 @@ class CompressionStore:
 
             if entry.is_expired():
                 self._backend.delete(hash_key)
-                self._stale_heap_entries += 1
+                self._mark_heap_entries_stale()
                 return None
 
             return {
@@ -587,7 +600,7 @@ class CompressionStore:
                 if clean_expired:
                     self._backend.delete(hash_key)
                     # CRITICAL FIX: Track stale heap entry
-                    self._stale_heap_entries += 1
+                    self._mark_heap_entries_stale()
                 return False
             return True
 
@@ -623,7 +636,7 @@ class CompressionStore:
 
             if expired and clean_expired:
                 self._backend.delete(hash_key)
-                self._stale_heap_entries += 1
+                self._mark_heap_entries_stale()
 
             return status
 
@@ -675,6 +688,7 @@ class CompressionStore:
 
             # Add eviction heap memory
             bytes_used += sys.getsizeof(self._eviction_heap)
+            bytes_used += sys.getsizeof(self._expiration_heap)
 
             return ComponentStats(
                 name="compression_store",
@@ -718,24 +732,66 @@ class CompressionStore:
             self._retrieval_events.clear()
             self._pending_feedback_events.clear()
             self._eviction_heap.clear()  # MEDIUM FIX #16: Clear heap too
+            self._expiration_heap.clear()
             self._stale_heap_entries = 0  # CRITICAL FIX: Reset stale counter
+            self._stale_expiration_heap_entries = 0
 
     def _evict_if_needed(self) -> None:
-        """Evict old entries if at capacity. Must be called with lock held.
+        """Evict expired, then oldest live entries until below capacity.
 
         MEDIUM FIX #16: Use heap for O(log n) eviction instead of O(n) scan.
         CRITICAL FIX: Track and clean stale heap entries to prevent memory leak.
         """
-        # First, remove expired entries
-        self._clean_expired()
+        # Avoid the old full backend items() scan per new-key store().
+        # The expiration heap keeps cleanup proportional to expired roots.
 
-        # CRITICAL FIX: Rebuild heap if too many stale entries
-        # This prevents unbounded heap growth when entries are deleted/replaced
-        heap_size = len(self._eviction_heap)
-        if heap_size > 0:
-            stale_ratio = self._stale_heap_entries / heap_size
-            if stale_ratio >= self._heap_rebuild_threshold:
+        backend_count = self._backend.count()
+        indexed_count = max(0, len(self._eviction_heap) - self._stale_heap_entries)
+        at_capacity = backend_count >= self._max_entries
+        if at_capacity:
+            backend_revision = self._read_backend_revision()
+            backend_changed = self._backend_revision_reader is not None and (
+                backend_revision is None or backend_revision != self._backend_revision
+            )
+            if indexed_count != backend_count or backend_changed:
                 self._rebuild_heap()
+            else:
+                self._rebuild_heap_if_needed()
+            if backend_revision is not None:
+                self._backend_revision = backend_revision
+        else:
+            self._rebuild_heap_if_needed()
+
+        # Remove expired entries first without reporting successful compression.
+        while self._expiration_heap:
+            expires_at, created_at, hash_key = self._expiration_heap[0]
+            if expires_at >= time.time():
+                break
+
+            entry = self._backend.get(hash_key)
+            if entry is None and at_capacity:
+                entry = self._backend.get(hash_key)
+                if entry is None:
+                    return
+            heapq.heappop(self._expiration_heap)
+            if (
+                entry is not None
+                and entry.created_at == created_at
+                and self._expiration_time(entry) == expires_at
+            ):
+                self._backend.delete(hash_key)
+                self._stale_heap_entries += 1
+            elif self._stale_expiration_heap_entries > 0:
+                self._stale_expiration_heap_entries -= 1
+            else:
+                # Backend-side TTL purges leave the matching eviction tuple stale.
+                self._stale_heap_entries += 1
+
+            if not at_capacity or self._backend.count() < self._max_entries:
+                return
+
+        if not at_capacity:
+            return
 
         # If still at capacity, remove oldest entries using heap
         while self._backend.count() >= self._max_entries and self._eviction_heap:
@@ -746,18 +802,55 @@ class CompressionStore:
             # (entry might have been deleted or replaced)
             entry = self._backend.get(hash_key)
             if entry is not None and entry.created_at == created_at:
-                # HIGH FIX: Track eviction as "successful compression" if never retrieved
-                # This prevents state divergence between store and feedback loop
-                if self._enable_feedback and entry.retrieval_count == 0:
-                    # Entry was never retrieved = compression was successful
-                    # Notify feedback system so it knows this strategy worked
+                if not entry.is_expired() and self._enable_feedback and entry.retrieval_count == 0:
                     self._record_eviction_success(entry)
                 self._backend.delete(hash_key)
+                self._stale_expiration_heap_entries += 1
             else:
                 # CRITICAL FIX: This was a stale entry, decrement counter
                 # (we already popped it, so the stale entry is now gone)
                 if self._stale_heap_entries > 0:
                     self._stale_heap_entries -= 1
+
+    def _mark_heap_entries_stale(self) -> None:
+        """Record lazy tuples invalidated by deleting or replacing an entry."""
+        self._stale_heap_entries += 1
+        self._stale_expiration_heap_entries += 1
+
+    @staticmethod
+    def _expiration_time(entry: CompressionEntry) -> float:
+        """Return the entry expiration time, saturating numeric overflow."""
+        try:
+            return entry.created_at + float(entry.ttl)
+        except OverflowError:
+            return float("inf") if entry.ttl > 0 else float("-inf")
+
+    def _read_backend_revision(self) -> object | None:
+        """Read optional backend revision metadata without breaking stores."""
+        if self._backend_revision_reader is None:
+            return None
+        try:
+            revision: object | None = self._backend_revision_reader()
+            return revision
+        except Exception:
+            logger.debug("CCR backend revision lookup failed", exc_info=True)
+            return None
+
+    def _rebuild_heap_if_needed(self) -> None:
+        """Rebuild both indexes when either stale ratio reaches the threshold."""
+        heap_size = len(self._eviction_heap)
+        expiration_heap_size = len(self._expiration_heap)
+        stale_ratio = self._stale_heap_entries / heap_size if heap_size else 0
+        stale_expiration_ratio = (
+            self._stale_expiration_heap_entries / expiration_heap_size
+            if expiration_heap_size
+            else 0
+        )
+        if (
+            stale_ratio >= self._heap_rebuild_threshold
+            or stale_expiration_ratio >= self._heap_rebuild_threshold
+        ):
+            self._rebuild_heap()
 
     def _clean_expired(self) -> None:
         """Remove expired entries. Must be called with lock held.
@@ -767,9 +860,7 @@ class CompressionStore:
         expired_keys = [key for key, entry in self._backend.items() if entry.is_expired()]
         for key in expired_keys:
             self._backend.delete(key)
-            # CRITICAL FIX: Increment stale counter - the heap still has an entry
-            # for this key that will be stale when we try to evict
-            self._stale_heap_entries += 1
+            self._mark_heap_entries_stale()
 
     def _rebuild_heap(self) -> None:
         """Rebuild heap from current store entries. Must be called with lock held.
@@ -777,15 +868,20 @@ class CompressionStore:
         CRITICAL FIX: This removes stale heap entries that accumulate when entries
         are deleted or replaced. Without this, the heap grows unboundedly.
         """
-        # Build new heap from current store entries only
-        self._eviction_heap = [
-            (entry.created_at, hash_key) for hash_key, entry in self._backend.items()
+        # Reuse one snapshot so rebuilding never doubles backend enumeration.
+        entries = self._backend.items()
+        self._eviction_heap = [(entry.created_at, hash_key) for hash_key, entry in entries]
+        self._expiration_heap = [
+            (self._expiration_time(entry), entry.created_at, hash_key)
+            for hash_key, entry in entries
         ]
         heapq.heapify(self._eviction_heap)
+        heapq.heapify(self._expiration_heap)
         # Reset stale counter - heap is now clean
         self._stale_heap_entries = 0
+        self._stale_expiration_heap_entries = 0
         logger.debug(
-            "Rebuilt eviction heap: %d entries",
+            "Rebuilt eviction heaps: %d entries",
             len(self._eviction_heap),
         )
 
