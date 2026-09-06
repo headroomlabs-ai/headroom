@@ -25,6 +25,7 @@ def test_finally_survives_early_proxy_start_failure(
         "ANTHROPIC_VERTEX_BASE_URL",
         "ANTHROPIC_FOUNDRY_BASE_URL",
         "ANTHROPIC_FOUNDRY_RESOURCE",
+        "HEADROOM_CLAUDE_PROJECT_SETTINGS",
         "CLAUDE_CODE_USE_VERTEX",
         "CLAUDE_CODE_USE_FOUNDRY",
         "VERTEX_TARGET_API_URL",
@@ -62,9 +63,7 @@ def test_finally_survives_early_proxy_start_failure(
         ["wrap", "claude", "--no-mcp", "--no-tokensave", "--no-serena"],
     )
 
-    # The finally must complete: no UnboundLocalError masking the real failure,
-    # and both restore and cleanup ran even though the proxy failed before
-    # _wrap_settings_path was assigned inside the try.
+    # The finally must complete without masking the real failure, skip restoring settings that this run never wrote, and still clean up.
     assert not isinstance(result.exception, UnboundLocalError), result.output
-    assert state["restore_called"] is True
+    assert state["restore_called"] is False
     assert state["cleanup_called"] is True

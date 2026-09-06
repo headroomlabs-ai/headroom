@@ -313,6 +313,7 @@ _TOOL_SEARCH_ENV = TOOL_SEARCH_ENV
 _TOOL_SEARCH_DEFAULT = TOOL_SEARCH_DEFAULT
 _TOOL_SEARCH_FOUNDRY_DEFAULT = TOOL_SEARCH_FOUNDRY_DEFAULT
 _AGENT_SAVINGS_WRAP_AGENTS = {"claude", "codex", "cursor", "grok", "grok_build"}
+_CLAUDE_PROJECT_SETTINGS_ENV = "HEADROOM_CLAUDE_PROJECT_SETTINGS"
 
 # 1M context window for `wrap claude` (#1158). Claude Code only sends the
 # `context-1m` beta header — unlocking the 1M window for entitled subscription
@@ -1149,6 +1150,16 @@ def _foundry_proxy_url(proxy_url: str) -> str:
     proxy URL Claude Code receives mirrors the real Foundry URL shape.
     """
     return proxy_url.rstrip("/") + "/anthropic"
+
+
+def _claude_project_settings_enabled(project_settings: bool) -> bool:
+    """Return whether wrap claude should write project-local Claude settings."""
+    env_enabled = _env_bool_value(os.environ.get(_CLAUDE_PROJECT_SETTINGS_ENV, ""))
+    return project_settings or env_enabled
+
+
+def _claude_project_settings_skip_reason() -> str:
+    return f"use --project-settings or {_CLAUDE_PROJECT_SETTINGS_ENV}=1 to persist proxy routing"
 
 
 def _vertex_target_api_url_from_claude_env(proxy_url: str) -> str | None:
@@ -5075,6 +5086,16 @@ def wrap_selfheal(marker: str | None) -> None:
 )
 @click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
 @click.option(
+    "--project-settings",
+    "--project-settings-injection",
+    "project_settings",
+    is_flag=True,
+    help=(
+        "Write .claude/settings.local.json so daemon-spawned Claude workers inherit "
+        "Headroom routing. Env: HEADROOM_CLAUDE_PROJECT_SETTINGS=1."
+    ),
+)
+@click.option(
     "--learn", is_flag=True, help="Enable live traffic learning (patterns saved to MEMORY.md)"
 )
 @click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
@@ -5125,6 +5146,7 @@ def claude(
     no_serena: bool,
     code_graph: bool,
     no_proxy: bool,
+    project_settings: bool,
     learn: bool,
     memory: bool,
     tool_search: str | None,
@@ -5148,6 +5170,7 @@ def claude(
         headroom wrap claude --resume <id>      # Resume a session
         headroom wrap claude -- -p              # Claude in print mode
         headroom wrap claude --no-mcp           # Skip MCP retrieve tool registration
+        headroom wrap claude --project-settings # Persist proxy routing in .claude/settings.local.json
         headroom wrap claude --code-memory none # No code-memory MCP
         headroom wrap claude --1m               # Preserve the 1M context window
     """
@@ -5169,6 +5192,7 @@ def claude(
     _tool_search_not_written = object()
     _saved_tool_search: list[object | str | None] = [_tool_search_not_written]
     _settings_foundry: list[bool] = [False]
+    _wrote_project_settings: list[bool] = [False]
     port_holder: list[int] = [port]
     _settings_vertex: list[bool] = [False]
     # Bind before the try so the finally can always reference it. It is otherwise
@@ -5367,36 +5391,45 @@ def claude(
         else:
             env["ANTHROPIC_BASE_URL"] = proxy_url
 
-        # Issue #951: write to settings.json so daemon-spawned conversation
-        # workers (which read settings.json fresh rather than inheriting the
-        # daemon's environment) also route through Headroom.
+        # Project-local settings are opt-in because synced checkouts can carry
+        # stale localhost proxy URLs to machines without Headroom (#1599). When
+        # enabled, keep main's stale-marker cleanup so crashed wrap sessions do
+        # not leave .claude/settings.local.json pinned to a dead proxy.
         _settings_vertex[0] = bool(use_vertex)
         _settings_foundry[0] = bool(foundry_upstream) and not _settings_vertex[0]
-        # _wrap_settings_path is bound before the try (above) so the finally is
-        # always safe; the value is unchanged here.
-        _check_and_clear_stale_wrap_marker(
-            _wrap_settings_path,
-            key=_claude_wrap_base_url_env_key(
-                foundry_mode=_settings_foundry[0], vertex_mode=_settings_vertex[0]
-            ),
-        )
-        _saved_base_url[0] = _write_claude_wrap_base_url(
-            (
-                _foundry_proxy_url(proxy_url)
-                if _settings_foundry[0]
-                else env["ANTHROPIC_VERTEX_BASE_URL"]
-                if _settings_vertex[0]
-                else proxy_url
-            ),
-            foundry_mode=_settings_foundry[0],
-            vertex_mode=_settings_vertex[0],
-            settings_path=_wrap_settings_path,
-            port=port,
-        )
-        # Issue #2221: pair the marker just written with a reader. wrap installs
-        # no hook of its own, so a session that only ran `wrap` (never `init`)
-        # had nothing to clear a dead-proxy base_url. SessionStart-only.
-        _ensure_claude_wrap_selfheal_hook(_wrap_settings_path)
+        if _claude_project_settings_enabled(project_settings):
+            # _wrap_settings_path is bound before the try (above) so the finally is
+            # always safe; the value is unchanged here.
+            _check_and_clear_stale_wrap_marker(
+                _wrap_settings_path,
+                key=_claude_wrap_base_url_env_key(
+                    foundry_mode=_settings_foundry[0], vertex_mode=_settings_vertex[0]
+                ),
+            )
+            _saved_base_url[0] = _write_claude_wrap_base_url(
+                (
+                    _foundry_proxy_url(proxy_url)
+                    if _settings_foundry[0]
+                    else env["ANTHROPIC_VERTEX_BASE_URL"]
+                    if _settings_vertex[0]
+                    else proxy_url
+                ),
+                foundry_mode=_settings_foundry[0],
+                vertex_mode=_settings_vertex[0],
+                settings_path=_wrap_settings_path,
+                port=actual_port,
+            )
+            # Issue #2221: pair the marker just written with a reader. wrap installs
+            # no hook of its own, so a session that only ran `wrap` (never `init`)
+            # had nothing to clear a dead-proxy base_url. SessionStart-only.
+            _ensure_claude_wrap_selfheal_hook(_wrap_settings_path)
+            _wrote_project_settings[0] = True
+        elif verbose:
+            skip_reason = _claude_project_settings_skip_reason()
+            click.echo(
+                "  Skipping project-local Claude settings "
+                f"({skip_reason}); daemon-spawned workers may not inherit Headroom."
+            )
 
         # Per-project savings attribution: tag every request with the launch
         # directory's name via X-Headroom-Project (user override wins).
@@ -5405,11 +5438,12 @@ def claude(
         # Issue #746: keep Claude Code's on-demand tool loading on through the
         # proxy so tool schemas are not eagerly materialized into local context.
         _tool_search_value = _configure_tool_search_env(env, tool_search)
-        _resolved_tool_search_value = env.get(_TOOL_SEARCH_ENV, "")
-        _saved_tool_search[0] = _write_claude_wrap_tool_search(
-            _resolved_tool_search_value,
-            settings_path=_wrap_settings_path,
-        )
+        if _wrote_project_settings[0]:
+            _resolved_tool_search_value = env.get(_TOOL_SEARCH_ENV, "")
+            _saved_tool_search[0] = _write_claude_wrap_tool_search(
+                _resolved_tool_search_value,
+                settings_path=_wrap_settings_path,
+            )
         if _tool_search_value is not None:
             # Describe what the written value actually does: --tool-search
             # false/0/no/off turns deferral OFF, and the banner must say so
@@ -5460,12 +5494,13 @@ def claude(
                 cast(str | None, _saved_tool_search[0]),
                 settings_path=_wrap_settings_path,
             )
-        _restore_claude_wrap_base_url(
-            _saved_base_url[0],
-            foundry_mode=_settings_foundry[0],
-            vertex_mode=_settings_vertex[0],
-            settings_path=_wrap_settings_path,
-        )
+        if _wrote_project_settings[0]:
+            _restore_claude_wrap_base_url(
+                _saved_base_url[0],
+                foundry_mode=_settings_foundry[0],
+                vertex_mode=_settings_vertex[0],
+                settings_path=_wrap_settings_path,
+            )
         cleanup()
 
 

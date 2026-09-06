@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import click
 import pytest
+from click.testing import CliRunner
 
 from headroom.cli import wrap as wrap_cli
+from headroom.cli.main import main
 
 
 def _settings(tmp_path: Path) -> Path:
@@ -245,6 +249,122 @@ def test_write_restore_roundtrip(tmp_path: Path) -> None:
     assert "ANTHROPIC_BASE_URL" not in payload.get("env", {})
     assert payload["env"]["OTHER"] == "x"
     assert payload["model"] == "opus"
+
+
+def test_claude_project_settings_enabled_respects_flag_and_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("HEADROOM_CLAUDE_PROJECT_SETTINGS", raising=False)
+    assert wrap_cli._claude_project_settings_enabled(False) is False
+    assert wrap_cli._claude_project_settings_enabled(True) is True
+
+    monkeypatch.setenv("HEADROOM_CLAUDE_PROJECT_SETTINGS", "1")
+    assert wrap_cli._claude_project_settings_enabled(False) is True
+
+
+def test_wrap_claude_skips_project_settings_by_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = CliRunner()
+    completed = SimpleNamespace(returncode=0)
+    monkeypatch.delenv("HEADROOM_CLAUDE_PROJECT_SETTINGS", raising=False)
+
+    with runner.isolated_filesystem(temp_dir=str(tmp_path)):
+        settings_path = Path(".claude") / "settings.local.json"
+        settings_path.parent.mkdir()
+        original = {
+            "env": {
+                "ANTHROPIC_BASE_URL": "http://direct.example",
+                "KEEP": "1",
+            }
+        }
+        settings_path.write_text(json.dumps(original, indent=2) + "\n", encoding="utf-8")
+
+        with (
+            patch("headroom.cli.wrap.shutil.which", return_value="claude"),
+            patch("headroom.cli.wrap._ensure_proxy", return_value=(None, 8787)),
+            patch("headroom.cli.wrap._setup_headroom_mcp", return_value=None),
+            patch("headroom.cli.wrap._setup_coding_compressor", return_value=None),
+            patch("headroom.cli.wrap._write_claude_wrap_base_url") as write_mock,
+            patch("headroom.cli.wrap._restore_claude_wrap_base_url") as restore_mock,
+            patch("headroom.cli.wrap._ensure_claude_wrap_selfheal_hook") as selfheal_mock,
+            patch("headroom.cli.wrap.subprocess.run", return_value=completed) as run_mock,
+        ):
+            result = runner.invoke(
+                main,
+                [
+                    "wrap",
+                    "claude",
+                    "--no-mcp",
+                    "--no-tokensave",
+                    "--no-serena",
+                ],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert json.loads(settings_path.read_text(encoding="utf-8")) == original
+        write_mock.assert_not_called()
+        restore_mock.assert_not_called()
+        selfheal_mock.assert_not_called()
+        launched_env = run_mock.call_args.kwargs["env"]
+        assert launched_env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:8787"
+
+
+def test_wrap_claude_project_settings_flag_writes_and_restores(tmp_path: Path) -> None:
+    runner = CliRunner()
+    completed = SimpleNamespace(returncode=0)
+
+    with runner.isolated_filesystem(temp_dir=str(tmp_path)):
+        with (
+            patch("headroom.cli.wrap.shutil.which", return_value="claude"),
+            patch("headroom.cli.wrap._ensure_proxy", return_value=(None, 8787)),
+            patch("headroom.cli.wrap._setup_headroom_mcp", return_value=None),
+            patch("headroom.cli.wrap._setup_coding_compressor", return_value=None),
+            patch(
+                "headroom.cli.wrap._write_claude_wrap_base_url", return_value="old"
+            ) as write_mock,
+            patch("headroom.cli.wrap._restore_claude_wrap_base_url") as restore_mock,
+            patch(
+                "headroom.cli.wrap._write_claude_wrap_tool_search", return_value="old-tool-search"
+            ) as write_tool_search_mock,
+            patch("headroom.cli.wrap._restore_claude_wrap_tool_search") as restore_tool_search_mock,
+            patch("headroom.cli.wrap._ensure_claude_wrap_selfheal_hook") as selfheal_mock,
+            patch("headroom.cli.wrap.subprocess.run", return_value=completed),
+        ):
+            result = runner.invoke(
+                main,
+                [
+                    "wrap",
+                    "claude",
+                    "--project-settings",
+                    "--no-mcp",
+                    "--no-tokensave",
+                    "--no-serena",
+                ],
+            )
+
+        assert result.exit_code == 0, result.output
+        write_mock.assert_called_once()
+        write_args, write_kwargs = write_mock.call_args
+        assert write_args == ("http://127.0.0.1:8787",)
+        assert write_kwargs["foundry_mode"] is False
+        assert write_kwargs["vertex_mode"] is False
+        assert write_kwargs["port"] == 8787
+        assert write_kwargs["settings_path"].name == "settings.local.json"
+        assert write_kwargs["settings_path"].parent.name == ".claude"
+        selfheal_mock.assert_called_once_with(write_kwargs["settings_path"])
+        write_tool_search_mock.assert_called_once_with(
+            "true", settings_path=write_kwargs["settings_path"]
+        )
+        restore_tool_search_mock.assert_called_once_with(
+            "old-tool-search", settings_path=write_kwargs["settings_path"]
+        )
+        restore_mock.assert_called_once_with(
+            "old",
+            foundry_mode=False,
+            vertex_mode=False,
+            settings_path=write_kwargs["settings_path"],
+        )
 
 
 # --- stale wrap marker (issue #1768) --------------------------------------
