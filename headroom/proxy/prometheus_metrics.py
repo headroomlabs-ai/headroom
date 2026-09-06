@@ -944,6 +944,7 @@ class PrometheusMetrics:
                 # saved next to "0 tokens saved".
                 tool_search_saved=tool_search_saved,
                 provider=provider,
+                agent=client,
                 project=project,
                 cache_read_tokens=cache_read_tokens,
                 cache_write_tokens=cache_write_tokens,
