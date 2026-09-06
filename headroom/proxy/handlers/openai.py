@@ -87,6 +87,9 @@ from headroom.proxy.output_shaper import shaper_enabled_for, steering_allowed_fo
 from headroom.proxy.passthrough import (
     custom_base_passthrough_telemetry as _custom_base_passthrough_telemetry,
 )
+from headroom.proxy.passthrough import (
+    provider_label_from_model,
+)
 from headroom.proxy.project_context import (
     classify_project,
     get_current_project,
@@ -3471,7 +3474,9 @@ class OpenAIHandlerMixin:
             handler_path,
             upstream_base_url or "",
         )
-        openai_chat_outcome_provider = custom_chat_provider or "openai"
+        openai_chat_outcome_provider = (
+            custom_chat_provider or provider_label_from_model(model) or "openai"
+        )
 
         # Memory: Get user ID when memory is enabled. Reads `request.headers`
         # directly because `headers` was stripped of `x-headroom-*` for the
