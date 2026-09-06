@@ -1707,6 +1707,7 @@ all = [
     { name = "opentelemetry-sdk" },
     { name = "orjson", marker = "platform_python_implementation != 'PyPy'" },
     { name = "pillow" },
+    { name = "python-socks", extra = ["asyncio"] },
     { name = "rapidocr", marker = "python_full_version >= '3.13'" },
     { name = "rapidocr-onnxruntime", marker = "python_full_version < '3.13'" },
     { name = "scikit-learn", version = "1.7.2", source = { registry = "https://pypi.org/simple/" }, marker = "python_full_version < '3.11'" },
@@ -1831,6 +1832,7 @@ proxy = [
     { name = "onnxruntime", version = "1.26.0", source = { registry = "https://pypi.org/simple/" }, marker = "python_full_version >= '3.11'" },
     { name = "openai" },
     { name = "orjson", marker = "platform_python_implementation != 'PyPy'" },
+    { name = "python-socks", extra = ["asyncio"] },
     { name = "sqlite-vec" },
     { name = "transformers" },
     { name = "uvicorn" },
@@ -1848,6 +1850,7 @@ proxy-prod = [
     { name = "onnxruntime", version = "1.26.0", source = { registry = "https://pypi.org/simple/" }, marker = "python_full_version >= '3.11'" },
     { name = "openai" },
     { name = "orjson", marker = "platform_python_implementation != 'PyPy'" },
+    { name = "python-socks", extra = ["asyncio"] },
     { name = "sqlite-vec" },
     { name = "transformers" },
     { name = "uvicorn" },
@@ -1883,6 +1886,7 @@ sandbox = [
     { name = "opentelemetry-exporter-otlp-proto-http" },
     { name = "opentelemetry-sdk" },
     { name = "orjson", marker = "platform_python_implementation != 'PyPy'" },
+    { name = "python-socks", extra = ["asyncio"] },
     { name = "sqlite-vec" },
     { name = "starlette" },
     { name = "trafilatura" },
@@ -1990,6 +1994,7 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.21.0" },
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=4.0.0" },
+    { name = "python-socks", extras = ["asyncio"], marker = "extra == 'proxy'", specifier = ">=2.7.1" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "qdrant-client", marker = "extra == 'memory-stack'", specifier = ">=1.9.0,<2.0" },
     { name = "rapidocr", marker = "python_full_version >= '3.13' and extra == 'image'", specifier = ">=3.0,<4" },
@@ -5396,6 +5401,20 @@ source = { registry = "https://pypi.org/simple/" }
 sdist = { url = "https://files.pythonhosted.org/packages/64/7e/9b35ad8f3d9ca680f7c87a88f19612fdd8da9796c4d3b46e560ac79dcc4a/python_multipart-0.0.31.tar.gz", hash = "sha256:fc631183bb13e56db3158a4909908dfb2e23565286744e798241e63750e5d680", size = 46689, upload-time = "2026-06-04T08:27:49.014Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/5e/1e/7f7f299527a5a8ad90acd5f2f78dfa6c8495c6301a3205106ea68a84de96/python_multipart-0.0.31-py3-none-any.whl", hash = "sha256:8408153d68a9773291fc1da39a8b85a50044bddbabd2dd72e9229776b7b15e28", size = 29996, upload-time = "2026-06-04T08:27:47.804Z" },
+]
+
+[[package]]
+name = "python-socks"
+version = "3.0.0"
+source = { registry = "https://pypi.org/simple/" }
+sdist = { url = "https://files.pythonhosted.org/packages/6c/6b/bd9e15e67cf42b318970028a572750924adbe28776e8420fcdfe60838c61/python_socks-3.0.0.tar.gz", hash = "sha256:c20ddf978b5c90467bf242757a11dcd00d7c8bd339901de1839b492d5571ab7f", size = 232731, upload-time = "2026-08-11T11:17:09.464Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/eb/e7/af080d0d2d5bbc3dbdf58a805812ee45175c5c32c6673f23a5480f9785c2/python_socks-3.0.0-py3-none-any.whl", hash = "sha256:e06a421d4d7f3fc17ef2740ab6c291640364f6a362b94a1ae87a136c29bd0067", size = 49519, upload-time = "2026-08-11T11:17:07.118Z" },
+]
+
+[package.optional-dependencies]
+asyncio = [
+    { name = "async-timeout", marker = "python_full_version < '3.11'" },
 ]
 
 [[package]]
