@@ -2122,6 +2122,7 @@ class OpenAIHandlerMixin:
         effective_exclude_tools = (
             router_exclude_tools if router_exclude_tools is not None else DEFAULT_EXCLUDE_TOOLS
         )
+        protect_all_tool_outputs = "*" in effective_exclude_tools
         excluded_call_ids: set[str] = {
             call_id
             for call_id, fn_name in function_name_by_call_id.items()
@@ -2211,6 +2212,19 @@ class OpenAIHandlerMixin:
                 continue
             item_type = item.get("type")
             if item_type in self.OPENAI_RESPONSES_OUTPUT_TYPES:
+                if protect_all_tool_outputs:
+                    if debug_enabled:
+                        extraction_debug.append(
+                            {
+                                "index": idx,
+                                "eligible": False,
+                                "reason": "protect_all_tool_outputs",
+                                "item_type": item_type,
+                                "call_id": item.get("call_id"),
+                                "item": item,
+                            }
+                        )
+                    continue
                 call_id = item.get("call_id")
                 if isinstance(call_id, str) and call_id in headroom_retrieve_call_ids:
                     if debug_enabled:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import threading
 from types import MethodType, SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -177,6 +178,68 @@ def test_openai_responses_adapter_compresses_custom_tool_call_output():
     assert "router:openai:responses:custom_tool_call_output:kompress" in transforms
     assert units_by_category == {"applied": 1}
     assert strategy_chain == []
+
+
+def test_openai_responses_adapter_protects_all_orphaned_tool_outputs_verbatim(monkeypatch):
+    """The ``*`` sentinel protects outputs even without a matching call item."""
+    debug_events: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(openai_handler, "_codex_compression_debug_enabled", lambda: True)
+    monkeypatch.setattr(
+        openai_handler,
+        "_log_codex_compression_debug",
+        lambda event, **fields: debug_events.append((event, fields)),
+    )
+    router = ContentRouter()
+    router.config.exclude_tools = {"*"}
+
+    def compress(self, content: str, **_kwargs):
+        return RouterCompressionResult(
+            compressed="must not be used",
+            original=content,
+            strategy_used=CompressionStrategy.KOMPRESS,
+        )
+
+    router.compress = MethodType(compress, router)
+    handler = _handler_with_router(router)
+
+    for item_type in (
+        "function_call_output",
+        "custom_tool_call_output",
+        "local_shell_call_output",
+        "apply_patch_call_output",
+    ):
+        payload = {
+            "model": "gpt-5",
+            "input": [
+                {
+                    "type": item_type,
+                    "call_id": f"orphaned_{item_type}",
+                    "output": " ".join(f"{item_type}_{index}" for index in range(180)),
+                }
+            ],
+        }
+        original_wire = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+
+        new_payload, modified, saved, *_ = (
+            handler._compress_openai_responses_live_text_units_with_router(
+                payload,
+                model="gpt-5",
+                request_id=f"req_{item_type}",
+            )
+        )
+
+        assert modified is False
+        assert saved == 0
+        assert json.dumps(new_payload, separators=(",", ":"), ensure_ascii=False) == original_wire
+
+    extraction_events = [
+        fields for event, fields in debug_events if event == "codex_compression_extraction"
+    ]
+    assert len(extraction_events) == 4
+    assert all(
+        event["extraction"][0]["reason"] == "protect_all_tool_outputs"
+        for event in extraction_events
+    )
 
 
 def test_openai_responses_adapter_compresses_array_input_text_output():
