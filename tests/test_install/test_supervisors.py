@@ -396,15 +396,12 @@ def test_install_supervisor_darwin_windows_and_unsupported(monkeypatch, tmp_path
     )
     win_service = install_supervisor(_manifest(supervisor=SupervisorKind.SERVICE.value))
     win_task = install_supervisor(_manifest(supervisor=SupervisorKind.TASK.value))
-    assert win_service[-1].kind == "windows-service"
+    # #1866: a console process can't be an SCM service, so SERVICE is task-backed
+    # too — no more `sc.exe create`. Both presets emit startup + health tasks.
+    assert win_service[-1].kind == "windows-task"
+    assert win_service[-2].path.endswith("-startup")
     assert win_task[-2].path.endswith("-startup")
-    # Regression for #1654: the create command must be a single pre-quoted
-    # string (bypassing list2cmdline) with the inner quotes backslash-escaped
-    # and `start= auto` as a separate trailing token.
-    assert (
-        "sc.exe create headroom-default "
-        'binPath= "cmd.exe /c \\"C:\\tmp\\default\\run-headroom.cmd\\"" start= auto'
-    ) in calls
+    assert not any(isinstance(c, str) and c.startswith("sc.exe create") for c in calls)
     # #2453: tasks are registered from S4U/hidden XML via `schtasks /XML`, not
     # interactive-token flag creation. Assert the startup and health tasks are
     # each created from an XML file (the temp path varies).
@@ -526,9 +523,16 @@ def test_start_and_stop_supervisor_darwin_windows_and_none(monkeypatch) -> None:
     monkeypatch.setattr("headroom.install.supervisors.sys.platform", "win32")
     start_supervisor(_manifest(supervisor=SupervisorKind.SERVICE.value))
     stop_supervisor(_manifest(supervisor=SupervisorKind.SERVICE.value))
+    # #1866: Windows service is task-backed. start re-enables the health
+    # watchdog then runs the startup task. stop disables the watchdog, ends any
+    # in-flight health task, then ends the startup task last — so no running
+    # `ensure` can re-enable or restart the service after `stop` completes.
     assert calls == [
-        ["sc.exe", "start", "headroom-default"],
-        ["sc.exe", "stop", "headroom-default"],
+        ["schtasks", "/Change", "/TN", "headroom-default-health", "/ENABLE"],
+        ["schtasks", "/Run", "/TN", "headroom-default-startup"],
+        ["schtasks", "/Change", "/TN", "headroom-default-health", "/DISABLE"],
+        ["schtasks", "/End", "/TN", "headroom-default-health"],
+        ["schtasks", "/End", "/TN", "headroom-default-startup"],
     ]
 
 
@@ -730,9 +734,12 @@ def test_remove_supervisor_darwin_and_windows(monkeypatch, tmp_path: Path) -> No
     monkeypatch.setattr("headroom.install.supervisors.sys.platform", "win32")
     remove_supervisor(_manifest(supervisor=SupervisorKind.SERVICE.value))
     remove_supervisor(_manifest(supervisor=SupervisorKind.TASK.value))
-    assert calls == [
+    # #1866: both presets are task-backed, so removal deletes the two tasks. A
+    # best-effort `sc.exe` delete stays to clean up any legacy service.
+    windows_cleanup = [
         ["sc.exe", "stop", "headroom-default"],
         ["sc.exe", "delete", "headroom-default"],
         ["schtasks", "/Delete", "/TN", "headroom-default-startup", "/F"],
         ["schtasks", "/Delete", "/TN", "headroom-default-health", "/F"],
     ]
+    assert calls == windows_cleanup + windows_cleanup

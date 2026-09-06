@@ -418,31 +418,24 @@ def install_supervisor(manifest: DeploymentManifest) -> list[ArtifactRecord]:
         records.append(ArtifactRecord(kind="plist", path=str(plist_path)))
         return records
 
-    if _is_windows() and manifest.supervisor_kind == SupervisorKind.SERVICE.value:
-        # sc.exe's binPath= value embeds its own quotes (cmd.exe /c "<path>").
-        # Passing this as an argv list lets subprocess.list2cmdline re-quote the
-        # token and sc.exe mis-tokenizes it (issue #1654), so build the exact
-        # command line ourselves and hand subprocess a string.
-        run_cmd = windows_run_cmd_path(manifest.profile)
-        create_cmd = (
-            f"sc.exe create {manifest.service_name} "
-            f'binPath= "cmd.exe /c \\"{run_cmd}\\"" start= auto'
-        )
-        subprocess.run(create_cmd, check=True)
-        subprocess.run(
-            ["sc.exe", "failure", manifest.service_name, "reset= 0", "actions= restart/5000"],
-            check=True,
-        )
-        records.append(ArtifactRecord(kind="windows-service", path=manifest.service_name))
-        return records
-
-    if _is_windows() and manifest.supervisor_kind == SupervisorKind.TASK.value:
+    if _is_windows() and manifest.supervisor_kind in (
+        SupervisorKind.SERVICE.value,
+        SupervisorKind.TASK.value,
+    ):
+        # A plain console process (cmd.exe /c run-headroom.cmd) cannot speak the
+        # SCM protocol, so registering it with `sc.exe create` always failed at
+        # start with 1053 (issue #1866). Both SERVICE and TASK are backed by
+        # scheduled tasks instead. SERVICE launches the foreground proxy
+        # (run-headroom) at boot so it stays always-on; TASK re-ensures the proxy
+        # on boot. Both add a 5-minute health task as a watchdog. All tasks are
+        # registered from S4U/hidden XML so they never flash a console (#2453).
+        if manifest.supervisor_kind == SupervisorKind.SERVICE.value:
+            startup_cmd = str(windows_run_cmd_path(manifest.profile))
+        else:
+            startup_cmd = str(windows_ensure_cmd_path(manifest.profile))
+        health_cmd = str(windows_ensure_cmd_path(manifest.profile))
         startup_name = f"{manifest.service_name}-startup"
         health_name = f"{manifest.service_name}-health"
-        startup_cmd = str(windows_ensure_cmd_path(manifest.profile))
-        # Register from task XML (not schtasks flags) so the principal is S4U /
-        # hidden — flag-created tasks use an interactive token and flash a
-        # focus-stealing console on every run (issue #2453).
         _register_windows_task(
             startup_name,
             _windows_task_xml(
@@ -452,7 +445,7 @@ def install_supervisor(manifest: DeploymentManifest) -> list[ArtifactRecord]:
         _register_windows_task(
             health_name,
             _windows_task_xml(
-                startup_cmd, trigger_xml=_windows_health_trigger(), scope=manifest.scope
+                health_cmd, trigger_xml=_windows_health_trigger(), scope=manifest.scope
             ),
         )
         records.extend(
@@ -508,8 +501,15 @@ def start_supervisor(manifest: DeploymentManifest) -> None:
         plist_path = plist_dir / f"{label}.plist"
         _bootstrap_with_retry(domain, plist_path, action="start")
         return
-    if _is_windows() and manifest.supervisor_kind == SupervisorKind.SERVICE.value:
-        subprocess.run(["sc.exe", "start", manifest.service_name], check=True)
+    if _is_windows():
+        # Both SERVICE and TASK are task-backed on Windows (#1866). Re-enable the
+        # health watchdog (stop disables it, see stop_supervisor) before running
+        # the startup task to (re)launch the proxy now.
+        subprocess.run(
+            ["schtasks", "/Change", "/TN", f"{manifest.service_name}-health", "/ENABLE"],
+            check=True,
+        )
+        subprocess.run(["schtasks", "/Run", "/TN", f"{manifest.service_name}-startup"], check=True)
 
 
 def stop_supervisor(manifest: DeploymentManifest) -> None:
@@ -545,8 +545,20 @@ def stop_supervisor(manifest: DeploymentManifest) -> None:
                 f"launchctl bootout failed for {domain}/{label}: {detail or 'unknown error'}"
             )
         return
-    if _is_windows() and manifest.supervisor_kind == SupervisorKind.SERVICE.value:
-        subprocess.run(["sc.exe", "stop", manifest.service_name], check=True)
+    if _is_windows():
+        # Task-backed on Windows (#1866). Order matters so `stop` is durable:
+        #   1. DISABLE the health watchdog — no future 5-minute triggers.
+        #   2. End any *already running* health task — /Change only blocks future
+        #      triggers, so an in-flight `ensure` could otherwise re-enable health
+        #      and restart the proxy after we stop it (best effort: usually not
+        #      running).
+        #   3. End the startup task LAST, so a proxy a racing `ensure` just
+        #      started is still torn down.
+        # start/restart re-enable health (see start_supervisor).
+        health = f"{manifest.service_name}-health"
+        subprocess.run(["schtasks", "/Change", "/TN", health, "/DISABLE"], check=True)
+        subprocess.run(["schtasks", "/End", "/TN", health], check=False)
+        subprocess.run(["schtasks", "/End", "/TN", f"{manifest.service_name}-startup"], check=True)
 
 
 def remove_supervisor(manifest: DeploymentManifest) -> None:
@@ -620,18 +632,11 @@ def remove_supervisor(manifest: DeploymentManifest) -> None:
         return
 
     if _is_windows():
-        if manifest.supervisor_kind == SupervisorKind.SERVICE.value:
-            run(
-                ["sc.exe", "stop", manifest.service_name],
-                capture_output=True,
-                text=True,
-            )
-            run(
-                ["sc.exe", "delete", manifest.service_name],
-                capture_output=True,
-                text=True,
-            )
-            return
+        # Both SERVICE and TASK are task-backed on Windows (#1866). Best-effort
+        # delete a legacy `sc.exe`-created service too, in case this profile was
+        # applied by an older build.
+        run(["sc.exe", "stop", manifest.service_name], capture_output=True, text=True)
+        run(["sc.exe", "delete", manifest.service_name], capture_output=True, text=True)
         run(
             ["schtasks", "/Delete", "/TN", f"{manifest.service_name}-startup", "/F"],
             capture_output=True,
