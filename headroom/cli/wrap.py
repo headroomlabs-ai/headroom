@@ -7283,8 +7283,8 @@ def goose(
     """Launch Goose (Block) CLI through Headroom proxy.
 
     \b
-    Sets OPENAI_BASE_URL and ANTHROPIC_BASE_URL to route Goose's API calls
-    through Headroom.
+    Sets OPENAI_BASE_URL, ANTHROPIC_BASE_URL, and ANTHROPIC_HOST to route
+    Goose's API calls through Headroom.
 
     \b
     Uninstall: there is no ``headroom unwrap goose`` subcommand — nothing is
@@ -7306,15 +7306,19 @@ def goose(
         raise SystemExit(1)
 
     # Goose accepts OpenAI- and Anthropic-compatible providers; route both.
+    # Goose's Anthropic provider reads ANTHROPIC_HOST, not ANTHROPIC_BASE_URL;
+    # without it the provider silently bypasses the proxy for api.anthropic.com.
     env = os.environ.copy()
     openai_base = f"http://127.0.0.1:{port}/v1"
     anthropic_base = _claude_proxy_base_url(port)
     env["OPENAI_BASE_URL"] = openai_base
     env["OPENAI_API_BASE"] = openai_base
     env["ANTHROPIC_BASE_URL"] = anthropic_base
+    env["ANTHROPIC_HOST"] = anthropic_base
     env_vars_display = [
         f"OPENAI_BASE_URL={openai_base}",
         f"ANTHROPIC_BASE_URL={anthropic_base}",
+        f"ANTHROPIC_HOST={anthropic_base}",
     ]
 
     _launch_tool(
