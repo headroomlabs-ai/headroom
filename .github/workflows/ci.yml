@@ -303,6 +303,32 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: false
 
+  # Keep a small but real pytest lane on Darwin. The full four-shard suite is
+  # intentionally Linux-only for cost, but platform-gated CLI/proxy code must
+  # execute somewhere on macOS; otherwise Darwin regressions can merge green
+  # while being unreachable in every pytest job (#3065).
+  test-macos:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PY_VERSION }}
+      - name: Install package and focused test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e . pytest pytest-asyncio
+      - name: Run macOS CLI and install tests
+        run: |
+          pytest \
+            tests/test_cli \
+            tests/test_cli_*.py \
+            tests/test_install \
+            --tb=short -q
+
   test-extras:
     needs: [changes, build-wheel]
     if: needs.changes.outputs.code == 'true'
