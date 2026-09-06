@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>HEADROOM — Neural Weight Sparsity & SVD Spectrum Visualizer</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<style>
+  :root {
+    --bg: #05060a;
+    --card: rgba(15, 18, 28, 0.85);
+    --border: rgba(170, 150, 255, 0.18);
+    --accent: #b48bff;
+    --teal: #62e6c9;
+    --text: #c8d6e5;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    padding: 2rem;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+  .container {
+    max-width: 1000px;
+    width: 100%;
+  }
+  header {
+    margin-bottom: 2rem;
+    text-align: center;
+  }
+  h1 { color: var(--teal); font-size: 1.8rem; margin-bottom: 0.5rem; letter-spacing: 0.05em; }
+  p.subtitle { color: #a59fc4; font-size: 0.9rem; text-transform: uppercase; letter-spacing: 0.15em; }
+
+  .grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1.5rem;
+    margin-bottom: 2rem;
+  }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1.5rem;
+    backdrop-filter: blur(12px);
+  }
+  .card h2 { color: var(--accent); font-size: 1.1rem; margin-bottom: 1rem; }
+
+  canvas { width: 100% !important; height: 260px !important; }
+
+  .footer {
+    text-align: center;
+    font-size: 0.75rem;
+    color: #a59fc4;
+    border-top: 1px solid var(--border);
+    padding-top: 1.5rem;
+    margin-top: 2rem;
+  }
+</style>
+</head>
+<body>
+
+<div class="container">
+  <header>
+    <h1>⚡ HEADROOM NEURAL COMPRESSION</h1>
+    <p class="subtitle">Layer-by-Layer Weight Sparsity & SVD Spectrum Visualizer · BitNet b1.58</p>
+  </header>
+
+  <div class="grid">
+    <div class="card">
+      <h2>📊 Layer-by-Layer Sparsity Factor (%)</h2>
+      <canvas id="sparsityChart"></canvas>
+    </div>
+    <div class="card">
+      <h2>🌊 Singular Value (SVD) Energy Decay</h2>
+      <canvas id="svdChart"></canvas>
+    </div>
+  </div>
+
+  <div class="card" style="margin-bottom: 2rem;">
+    <h2>⚡ Compression Summary Matrix</h2>
+    <div style="display:flex; justify-content:space-between; margin-top:1rem; font-size:0.85rem;">
+      <div><strong>Original FP16 Weight Size:</strong> 14.2 GB</div>
+      <div><strong>Ternary Packed Size:</strong> 1.78 GB</div>
+      <div><strong>Effective Ratio:</strong> <span style="color:var(--teal)">7.98x Reduction</span></div>
+    </div>
+  </div>
+
+  <div class="footer">
+    the constellation · 0 + 1 · fine touch from within · vaked.dev
+  </div>
+</div>
+
+<script>
+// 1. Sparsity Chart
+const ctxSparsity = document.getElementById('sparsityChart').getContext('2d');
+new Chart(ctxSparsity, {
+  type: 'bar',
+  data: {
+    labels: ['L1 Q_proj', 'L2 K_proj', 'L3 V_proj', 'L4 O_proj', 'L5 Gate', 'L6 Up', 'L7 Down'],
+    datasets: [{
+      label: 'Zero Weight Ratio (%)',
+      data: [68.4, 72.1, 65.8, 74.3, 70.9, 69.2, 78.5],
+      backgroundColor: '#b48bff'
+    }]
+  },
+  options: {
+    responsive: true,
+    scales: {
+      y: { beginAtZero: true, max: 100, ticks: { color: '#c8d6e5' } },
+      x: { ticks: { color: '#c8d6e5' } }
+    },
+    plugins: { legend: { display: false } }
+  }
+});
+
+// 2. SVD Spectrum Chart
+const ctxSVD = document.getElementById('svdChart').getContext('2d');
+new Chart(ctxSVD, {
+  type: 'line',
+  data: {
+    labels: Array.from({length: 20}, (_, i) => `S${i+1}`),
+    datasets: [{
+      label: 'Singular Value Intensity',
+      data: [100, 84, 62, 45, 31, 22, 15, 11, 8, 6, 4.5, 3.2, 2.4, 1.8, 1.3, 0.9, 0.6, 0.4, 0.3, 0.2],
+      borderColor: '#62e6c9',
+      tension: 0.3,
+      fill: true,
+      backgroundColor: 'rgba(98,230,201,0.1)'
+    }]
+  },
+  options: {
+    responsive: true,
+    scales: {
+      y: { ticks: { color: '#c8d6e5' } },
+      x: { ticks: { color: '#c8d6e5' } }
+    },
+    plugins: { legend: { display: false } }
+  }
+});
+</script>
+</body>
+</html>

@@ -6,6 +6,7 @@ members = [
     "crates/headroom-simulators",
     "crates/headroom-py",
     "crates/headroom-parity",
+    "crates/headroom-cli",
 ]
 # headroom-py is a Python extension module — it must be built via maturin, not
 # plain cargo (the "extension-module" feature tells pyo3 not to link libpython,
