@@ -310,6 +310,30 @@ def test_proxy_log_path_default(fake_home: Path) -> None:
     assert paths.proxy_log_path() == fake_home / ".headroom" / "logs" / "proxy.log"
 
 
+def test_proxy_log_path_default_port_matches_no_port(fake_home: Path) -> None:
+    """Passing the default port explicitly must not change the filename."""
+    assert paths.proxy_log_path(port=8787) == paths.proxy_log_path()
+
+
+def test_proxy_log_path_non_default_port_is_distinct(fake_home: Path) -> None:
+    """Sibling profiles on other ports must not share the default log file.
+
+    Regression test for https://github.com/headroomlabs-ai/headroom/issues/3421:
+    multiple `install apply` profiles in one workspace all opened the same
+    proxy.log and rotated it out from under each other.
+    """
+    default_log = paths.proxy_log_path()
+    other_log = paths.proxy_log_path(port=8791)
+    assert other_log != default_log
+    assert other_log == fake_home / ".headroom" / "logs" / "proxy.8791.log"
+
+
+def test_proxy_log_path_different_ports_are_distinct_from_each_other(
+    fake_home: Path,
+) -> None:
+    assert paths.proxy_log_path(port=8791) != paths.proxy_log_path(port=8792)
+
+
 def test_debug_400_dir_default(fake_home: Path) -> None:
     assert paths.debug_400_dir() == fake_home / ".headroom" / "logs" / "debug_400"
 
@@ -365,6 +389,14 @@ def test_proxy_log_path_follows_workspace_env(
     ws = tmp_path / "state"
     clean_env.setenv(paths.HEADROOM_WORKSPACE_DIR_ENV, str(ws))
     assert paths.proxy_log_path() == ws / "logs" / "proxy.log"
+
+
+def test_proxy_log_path_with_port_follows_workspace_env(
+    fake_home: Path, clean_env: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    ws = tmp_path / "state"
+    clean_env.setenv(paths.HEADROOM_WORKSPACE_DIR_ENV, str(ws))
+    assert paths.proxy_log_path(port=8791) == ws / "logs" / "proxy.8791.log"
 
 
 def test_beacon_lock_path_follows_workspace_env(

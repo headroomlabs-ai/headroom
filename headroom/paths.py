@@ -74,6 +74,9 @@ _SYNC_STATE_FILE = "sync_state.json"
 _BRIDGE_STATE_FILE = "bridge_state.json"
 _LOGS_DIR = "logs"
 _PROXY_LOG_FILE = "proxy.log"
+# Mirrors `ProxyConfig.port`'s default (headroom/proxy/models.py). Kept as a
+# plain literal here to avoid this low-level module importing proxy code.
+_DEFAULT_PROXY_PORT = 8787
 _DEBUG_400_DIR = "debug_400"
 _CODEX_WIRE_DEBUG_DIR = "codex_wire"
 _BIN_DIR = "bin"
@@ -300,9 +303,22 @@ def log_dir() -> Path:
     return workspace_dir() / _LOGS_DIR
 
 
-def proxy_log_path() -> Path:
-    """Return the path for the proxy log file."""
+def proxy_log_path(*, port: int | None = None) -> Path:
+    """Return the path for the proxy log file.
 
+    Every proxy process shares one workspace by default (e.g. sibling
+    `install apply` profiles on different ports), so without per-port
+    scoping they all open the same file and rotate it out from under each
+    other. Passing the running proxy's `port` gives it a distinct file
+    (`proxy.<port>.log`); the default port keeps the original unsuffixed
+    name so existing tooling that reads it directly is unaffected.
+
+    Args:
+        port: The port the proxy is (or will be) listening on. Omit, or
+            pass the default port, to get the original shared filename.
+    """
+    if port is not None and port != _DEFAULT_PROXY_PORT:
+        return log_dir() / f"proxy.{port}.log"
     return log_dir() / _PROXY_LOG_FILE
 
 

@@ -1561,19 +1561,20 @@ def _headroom_log_dir() -> Path:
     return _paths.log_dir()
 
 
-def _setup_file_logging() -> None:
+def _setup_file_logging(port: int | None = None) -> None:
     """Add a RotatingFileHandler to the headroom root logger.
 
-    Writes to ~/.headroom/logs/proxy.log with automatic rotation:
+    Writes to ~/.headroom/logs/proxy.log (or, for a non-default `port`,
+    the per-port `proxy.<port>.log` — see `paths.proxy_log_path`) with
+    automatic rotation:
     - Rotates at 10 MB
     - Keeps 5 backups (~50 MB max)
     """
     from logging.handlers import RotatingFileHandler
 
     try:
-        log_dir = _headroom_log_dir()
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = log_dir / "proxy.log"
+        log_path = _paths.proxy_log_path(port=port)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
         handler = RotatingFileHandler(
             log_path,
             maxBytes=10 * 1024 * 1024,  # 10 MB
