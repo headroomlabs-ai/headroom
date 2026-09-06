@@ -778,7 +778,9 @@ def read_cached_oauth_token() -> str | None:
     return None
 
 
-def iter_oauth_token_candidates() -> list[CopilotTokenCandidate]:
+def iter_oauth_token_candidates(
+    *, include_platform_secret_stores: bool = True
+) -> list[CopilotTokenCandidate]:
     """Return reusable token candidates in safest-first discovery order."""
 
     candidates: list[CopilotTokenCandidate] = []
@@ -804,6 +806,38 @@ def iter_oauth_token_candidates() -> list[CopilotTokenCandidate]:
                 )
             )
 
+    if include_platform_secret_stores:
+        candidates.extend(_platform_secret_store_oauth_token_candidates())
+
+    candidates.extend(_read_file_oauth_token_candidates())
+
+    for env_var in _GENERIC_GITHUB_TOKEN_ENV_VARS:
+        token = os.environ.get(env_var, "").strip()
+        if token:
+            candidates.append(
+                CopilotTokenCandidate(
+                    token=token,
+                    source=f"env:{env_var}",
+                    confidence="generic-github",
+                )
+            )
+
+    gh_token = _read_gh_cli_oauth_token()
+    if gh_token:
+        candidates.append(
+            CopilotTokenCandidate(
+                token=gh_token,
+                source="gh-cli",
+                confidence="generic-github",
+            )
+        )
+
+    return _dedupe_token_candidates(candidates)
+
+
+def _platform_secret_store_oauth_token_candidates() -> list[CopilotTokenCandidate]:
+    """Return OAuth candidates from platform credential stores."""
+    candidates: list[CopilotTokenCandidate] = []
     windows_copilot_token = _read_windows_copilot_cli_oauth_token()
     if windows_copilot_token:
         candidates.append(
@@ -833,31 +867,7 @@ def iter_oauth_token_candidates() -> list[CopilotTokenCandidate]:
                 confidence="high",
             )
         )
-
-    candidates.extend(_read_file_oauth_token_candidates())
-
-    for env_var in _GENERIC_GITHUB_TOKEN_ENV_VARS:
-        token = os.environ.get(env_var, "").strip()
-        if token:
-            candidates.append(
-                CopilotTokenCandidate(
-                    token=token,
-                    source=f"env:{env_var}",
-                    confidence="generic-github",
-                )
-            )
-
-    gh_token = _read_gh_cli_oauth_token()
-    if gh_token:
-        candidates.append(
-            CopilotTokenCandidate(
-                token=gh_token,
-                source="gh-cli",
-                confidence="generic-github",
-            )
-        )
-
-    return _dedupe_token_candidates(candidates)
+    return candidates
 
 
 def _read_file_oauth_token_candidates() -> list[CopilotTokenCandidate]:
@@ -1123,9 +1133,34 @@ def resolve_subscription_bearer_token_details() -> CopilotSubscriptionTokenResol
                 api_url=_subscription_api_url_from_user_info_payload(payload),
             )
 
-    for candidate in iter_oauth_token_candidates():
+    attempted_tokens: set[str] = set()
+    resolution = _resolve_subscription_oauth_token_candidates(
+        iter_oauth_token_candidates(include_platform_secret_stores=False),
+        attempted_tokens=attempted_tokens,
+    )
+    if resolution is not None:
+        return resolution
+
+    return _resolve_subscription_oauth_token_candidates(
+        [
+            candidate
+            for candidate in _platform_secret_store_oauth_token_candidates()
+            if candidate.token not in attempted_tokens
+        ]
+    )
+
+
+def _resolve_subscription_oauth_token_candidates(
+    candidates: list[CopilotTokenCandidate],
+    *,
+    attempted_tokens: set[str] | None = None,
+) -> CopilotSubscriptionTokenResolution | None:
+    """Return the first candidate GitHub accepts for subscription APIs."""
+    for candidate in candidates:
         if not candidate.validate_for_subscription:
             continue
+        if attempted_tokens is not None:
+            attempted_tokens.add(candidate.token)
         if _is_copilot_api_token(candidate.token):
             payload = _fetch_copilot_user_info(candidate.token)
             if payload is not None:
