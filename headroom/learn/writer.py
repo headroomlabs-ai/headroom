@@ -7,9 +7,12 @@ injection mechanism for each agent system (CLAUDE.md, .cursorrules, etc.).
 from __future__ import annotations
 
 import re
+import subprocess
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 from pathlib import Path
+
+from headroom._subprocess import run
 
 from ._shared import claude_config_dir
 from .models import (
@@ -204,6 +207,79 @@ def _strip_marker_block(content: str) -> str:
     return cleaned + "\n" if cleaned else ""
 
 
+def _git(repo: Path, *argv: str) -> subprocess.CompletedProcess | None:
+    """Run a git command in ``repo``; None when git is absent or hangs."""
+    try:
+        return run(
+            ["git", *argv],
+            capture_output=True,
+            text=True,
+            cwd=repo,
+            timeout=5,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return None
+
+
+def _ensure_git_ignored(target_path: Path, dry_run: bool) -> str | None:
+    """Keep a personal context file out of git via ``.git/info/exclude``.
+
+    ``CLAUDE.local.md`` is only personal if git actually ignores it, and nothing
+    makes that true by default: git ships no rule for the name and neither does
+    Claude Code, so the file lands in the next ``git add -A`` and the machine-
+    specific absolute paths inside it reach teammates anyway -- the exact
+    outcome issue #1072 set out to prevent.
+
+    Writes to the per-clone exclude file rather than the repo's ``.gitignore``
+    because the latter is team-shared and committed: appending to it would leave
+    an unexpected diff in someone else's repo, trading one kind of pollution for
+    another. Returns a warning instead of acting when the file is already
+    tracked -- git honors no ignore rule for tracked files, so only
+    ``git rm --cached`` can fix that, and running it here would silently stage a
+    deletion in the user's repo.
+    """
+    repo = target_path.parent
+    name = target_path.name
+
+    common_dir = _git(repo, "rev-parse", "--git-common-dir")
+    if common_dir is None or common_dir.returncode != 0:
+        return None  # not a git repo, or no git on PATH: nothing to ignore
+
+    tracked = _git(repo, "ls-files", "--error-unmatch", "--", name)
+    if tracked is not None and tracked.returncode == 0:
+        return (
+            f"{target_path} is tracked in git, so learned patterns (including "
+            f"absolute paths from this machine) are committed and shared with "
+            f"your team. Run `git rm --cached {name}` to untrack it; the file "
+            f"itself stays on disk."
+        )
+
+    ignored = _git(repo, "check-ignore", "-q", "--", name)
+    if ignored is not None and ignored.returncode == 0:
+        return None  # already covered by .gitignore or a previous run
+
+    if dry_run:
+        return None
+
+    # Deliberately unanchored: a CLAUDE.local.md at any depth is personal, and
+    # anchoring would need the path relative to the repo root, which differs
+    # when the project is a subdirectory of a larger repo.
+    # git shares info/exclude across linked worktrees via the common dir.
+    exclude = Path(common_dir.stdout.strip() or ".git")
+    exclude = (repo / exclude / "info" / "exclude").resolve()
+    try:
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        prior = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
+        prefix = "" if not prior or prior.endswith("\n") else "\n"
+        exclude.write_text(
+            f"{prior}{prefix}\n# Personal `headroom learn` output, not team-shared\n{name}\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        return None  # read-only .git, exotic setup: the write is best-effort
+    return None
+
+
 # =============================================================================
 # Claude Code Writer
 # =============================================================================
@@ -248,6 +324,13 @@ class ClaudeCodeWriter(ContextWriter):
 
         if context_recs:
             target_path = self._resolve_context_path(project)
+            # Only ever auto-ignore a file whose name marks it personal: an
+            # explicit --target CLAUDE.md is a deliberate opt-in to the shared
+            # file, and ~/.claude/CLAUDE.md may sit in a dotfiles repo.
+            if target_path.name.endswith(".local.md"):
+                tracked_warning = _ensure_git_ignored(target_path, dry_run)
+                if tracked_warning:
+                    result.warnings.append(tracked_warning)
             # Migrate any stale block left in the team-shared CLAUDE.md by older
             # headroom versions into the new target, then strip it from CLAUDE.md
             # so the shared file is no longer polluted.
