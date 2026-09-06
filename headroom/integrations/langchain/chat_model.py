@@ -33,7 +33,7 @@ import json
 import logging
 from collections.abc import AsyncIterator, Iterator, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -350,7 +350,7 @@ class HeadroomChatModel(BaseChatModel):
         # Create metrics
         metrics = OptimizationMetrics(
             request_id=request_id,
-            timestamp=datetime.now(),
+            timestamp=datetime.now(timezone.utc),
             tokens_before=result.tokens_before,
             tokens_after=result.tokens_after,
             tokens_saved=result.tokens_before - result.tokens_after,
@@ -910,7 +910,7 @@ class HeadroomRunnable:
         # Track metrics
         metrics = OptimizationMetrics(
             request_id=str(uuid4()),
-            timestamp=datetime.now(),
+            timestamp=datetime.now(timezone.utc),
             tokens_before=result.tokens_before,
             tokens_after=result.tokens_after,
             tokens_saved=result.tokens_before - result.tokens_after,

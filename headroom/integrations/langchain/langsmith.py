@@ -39,7 +39,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
 
@@ -86,7 +86,7 @@ class PendingMetrics:
     tokens_saved: int
     savings_percent: float
     transforms_applied: list[str]
-    timestamp: datetime = field(default_factory=datetime.now)
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class HeadroomLangSmithCallbackHandler(BaseCallbackHandler):
