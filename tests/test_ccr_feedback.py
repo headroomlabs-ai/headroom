@@ -41,6 +41,29 @@ class TestCompressionFeedback:
         assert "test_tool" in patterns
         assert patterns["test_tool"].total_compressions == 2
 
+    def test_tool_patterns_are_lru_bounded(self):
+        """``tool_name`` is client-controlled (MCP servers expose arbitrarily
+        named tools), so the per-tool pattern map must not grow without bound on
+        the process-global feedback singleton. It is LRU-capped: past
+        ``_MAX_TRACKED_TOOLS`` the least-recently-recorded tool is evicted, while
+        a re-recorded tool is refreshed and survives."""
+        from headroom.cache.compression_feedback import _MAX_TRACKED_TOOLS
+
+        feedback = CompressionFeedback()
+        for i in range(_MAX_TRACKED_TOOLS):
+            feedback.record_compression(f"tool_{i}", 100, 10)
+        assert len(feedback._tool_patterns) == _MAX_TRACKED_TOOLS
+
+        # Refresh the oldest tool so it becomes most-recently-used.
+        feedback.record_compression("tool_0", 100, 10)
+        # A brand-new tool past the cap evicts the current LRU (tool_1), not tool_0.
+        feedback.record_compression("tool_new", 100, 10)
+
+        assert len(feedback._tool_patterns) == _MAX_TRACKED_TOOLS  # still capped
+        assert "tool_new" in feedback._tool_patterns
+        assert "tool_0" in feedback._tool_patterns  # refreshed -> survived
+        assert "tool_1" not in feedback._tool_patterns  # evicted as LRU
+
     def test_record_retrieval(self):
         """Recording retrieval events updates patterns."""
         feedback = CompressionFeedback()
