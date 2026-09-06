@@ -126,17 +126,18 @@ def make_anthropic_edit(tool_call_id: str, file_path: str) -> dict:
     }
 
 
-def make_anthropic_tool_result(tool_call_id: str, content: str) -> dict:
+def make_anthropic_tool_result(tool_call_id: str, content: str, is_error: bool = False) -> dict:
     """Create an Anthropic-format user message with a tool_result block."""
+    block: dict = {
+        "type": "tool_result",
+        "tool_use_id": tool_call_id,
+        "content": content,
+    }
+    if is_error:
+        block["is_error"] = True
     return {
         "role": "user",
-        "content": [
-            {
-                "type": "tool_result",
-                "tool_use_id": tool_call_id,
-                "content": content,
-            }
-        ],
+        "content": [block],
     }
 
 
@@ -197,6 +198,47 @@ class TestStaleDetection:
         assert "stale" in tool_result["content"].lower()
         assert "/src/app.py" in tool_result["content"]
         assert "hash=" in tool_result["content"]
+
+    def test_failed_edit_does_not_make_read_stale(self):
+        """Read(A) → Edit(A) that FAILED (is_error): file unchanged, Read stays fresh.
+
+        A failed Edit (e.g. old_string not found) does not modify the file, so
+        the earlier Read is still accurate and must not be marked stale.
+        """
+        config = ReadLifecycleConfig(enabled=True)
+        mgr = ReadLifecycleManager(config)
+
+        messages = [
+            make_anthropic_read("r1", "/src/app.py"),
+            make_anthropic_tool_result("r1", LARGE_CONTENT),
+            make_anthropic_edit("e1", "/src/app.py"),
+            make_anthropic_tool_result(
+                "e1", "Error: String to replace not found in file.", is_error=True
+            ),
+        ]
+
+        result = mgr.apply(messages)
+        assert result.reads_stale == 0
+        assert result.reads_fresh == 1
+        assert result.transforms_applied == []
+
+    def test_failed_then_successful_edit_still_makes_read_stale(self):
+        """A later SUCCESSFUL edit still marks the Read stale even if an earlier edit failed."""
+        config = ReadLifecycleConfig(enabled=True)
+        mgr = ReadLifecycleManager(config)
+
+        messages = [
+            make_anthropic_read("r1", "/src/app.py"),
+            make_anthropic_tool_result("r1", LARGE_CONTENT),
+            make_anthropic_edit("e1", "/src/app.py"),
+            make_anthropic_tool_result("e1", "Error: not found", is_error=True),
+            make_anthropic_edit("e2", "/src/app.py"),
+            make_anthropic_tool_result("e2", "edit success"),
+        ]
+
+        result = mgr.apply(messages)
+        assert result.reads_stale == 1
+        assert result.reads_fresh == 0
 
     def test_write_makes_read_stale(self):
         """Read(A) → Write(A): Read becomes stale."""

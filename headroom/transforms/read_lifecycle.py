@@ -131,7 +131,12 @@ class ReadLifecycleManager:
 
         # Phase 1: Build tool metadata and file operation index
         tool_metadata = self._build_tool_metadata(messages)
-        file_ops = self._build_file_operation_index(messages, tool_metadata)
+        # A tool call whose result reported an error did not actually run: a
+        # failed Edit/Write left the file unchanged (so it must not mark a prior
+        # Read stale), and a failed Read produced no content (so it can't
+        # supersede an earlier one). Drop those ops before classifying.
+        failed_ids = self._failed_tool_call_ids(messages)
+        file_ops = self._build_file_operation_index(messages, tool_metadata, failed_ids)
 
         # Phase 2: Classify each Read
         classifications = self._classify_reads(file_ops)
@@ -222,19 +227,52 @@ class ReadLifecycleManager:
 
         return metadata
 
+    @staticmethod
+    def _failed_tool_call_ids(messages: list[dict[str, Any]]) -> set[str]:
+        """Tool-call IDs whose result reported an error.
+
+        Uses the Anthropic ``tool_result.is_error`` flag, which Claude Code sets
+        on failed tool calls (e.g. an Edit whose ``old_string`` was not found).
+        A failed call did not change the file, so it must not drive Read
+        lifecycle decisions. OpenAI-format tool results carry no structured
+        error flag, so they are left untouched here (no behavior change there).
+        """
+        failed: set[str] = set()
+        for msg in messages:
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if (
+                    isinstance(block, dict)
+                    and block.get("type") == "tool_result"
+                    and block.get("is_error") is True
+                ):
+                    tc_id = block.get("tool_use_id", "")
+                    if tc_id:
+                        failed.add(tc_id)
+        return failed
+
     def _build_file_operation_index(
         self,
         messages: list[dict[str, Any]],
         tool_metadata: dict[str, tuple[str, str | None, int | None, int | None]],
+        failed_ids: set[str] | None = None,
     ) -> dict[str, list[FileOperation]]:
         """Build file_path → [FileOperation] index in a single pass.
 
         Groups all Read/Edit/Write operations by file_path for lifecycle analysis.
+        Tool calls in ``failed_ids`` (their result reported an error) are skipped:
+        a failed edit did not change the file and a failed read produced no
+        content, so neither should affect a Read's classification.
         """
         file_ops: dict[str, list[FileOperation]] = defaultdict(list)
+        failed_ids = failed_ids or set()
 
         for tc_id, (name, file_path, offset, limit) in tool_metadata.items():
             if not file_path:
+                continue
+            if tc_id in failed_ids:
                 continue
 
             if name in _READ_TOOL_NAMES:
