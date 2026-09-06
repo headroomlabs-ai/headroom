@@ -237,10 +237,13 @@ jobs:
           - { name: code-slim-nonroot, bake_target: runtime-code-slim-nonroot }
 
     steps:
-      # No `actions/checkout` here: the manifest job only calls
-      # `docker buildx imagetools` against the registry and runs
-      # cosign — neither needs the repo on disk. Skipping checkout
-      # saves a few seconds across 8 parallel manifest jobs.
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
       - name: Normalize image name
         id: image-name
         run: |
@@ -320,6 +323,7 @@ jobs:
 
       - name: Create multi-arch manifest
         id: manifest
+        shell: bash
         env:
           IMAGE: ${{ env.REGISTRY }}/${{ steps.image-name.outputs.image_name }}
           DIGEST_DIR: ${{ runner.temp }}/digests
@@ -327,6 +331,7 @@ jobs:
           # inline `${{ }}` so the value is never spliced into the script.
           VARIANT_NAME: ${{ matrix.variant.name }}
         run: |
+          set -o pipefail
           # Reconstruct full image references from the digest marker
           # filenames (each file is named after the bare hex digest
           # of one per-arch manifest).
@@ -359,8 +364,11 @@ jobs:
           # Empty tags array is valid (PR builds without ref-tags
           # enabled emit nothing); skip manifest creation in that case.
           tag_args=()
+          published_tags=()
           while IFS= read -r tag; do
-            [ -n "$tag" ] && tag_args+=("--tag" "$tag")
+            [ -n "$tag" ] || continue
+            tag_args+=("--tag" "$tag")
+            published_tags+=("$tag")
           done < <(jq -r '.tags[]?' <<< '${{ steps.meta.outputs.json }}')
 
           if [ "${#tag_args[@]}" -eq 0 ]; then
@@ -371,6 +379,16 @@ jobs:
           docker buildx imagetools create \
             "${tag_args[@]}" \
             "${digest_refs[@]}"
+
+          # Audit every tag this job just pushed before anything signs it. The
+          # index is only readable once it exists, so a failure here means the
+          # bad tag is live: the job stops before cosign so a corrupted index is
+          # never signed, and the audit output says what to delete and rebuild.
+          for tag in "${published_tags[@]}"; do
+            echo "Auditing published OCI index ${tag}"
+            raw_index="$(docker buildx imagetools inspect "${tag}" --raw)"
+            printf '%s' "${raw_index}" | python scripts/oci_index_audit.py --tag "${tag}"
+          done
 
           # Resolve the index manifest digest of the freshly pushed
           # multi-arch manifest so cosign can sign it directly. We
