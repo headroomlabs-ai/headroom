@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "policy_version": "1.0.0",
+  "effective_at": "2026-08-13T00:00:00Z",
+  "risk_classes": {
+    "R3": {
+      "gate_a": {
+        "required_evidence": ["candidate", "deterministic", "tier1-integrations", "benchmark"],
+        "rules": [
+          {
+            "rule_id": "all-required-evidence-passes",
+            "kind": "required_status",
+            "parameters": { "accepted_status": "pass" }
+          }
+        ],
+        "missing_data_status": "inconclusive"
+      },
+      "gate_b": {
+        "required_evidence": ["release-reachability", "final-artifact-identity", "qualification"],
+        "rules": [
+          {
+            "rule_id": "qualification-not-revoked",
+            "kind": "not_revoked",
+            "parameters": {}
+          }
+        ],
+        "missing_data_status": "inconclusive"
+      }
+    }
+  }
+}
