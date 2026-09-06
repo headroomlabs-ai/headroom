@@ -3318,6 +3318,11 @@ def _run_proxy_only_watcher(
 
     signal.signal(signal.SIGINT, _signal_shutdown)
     signal.signal(signal.SIGTERM, _signal_shutdown)
+    # Terminal close / tmux kill-session sends SIGHUP, not SIGTERM. Without
+    # this the watcher dies unhandled and the proxy it spawned is reparented
+    # to PID 1 and leaks. Mirrors the SIGHUP handling on the `claude` path.
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, _signal_shutdown)
     # Windows exposes Ctrl+Break as SIGBREAK rather than SIGINT. Test runners,
     # IDE terminals, and process supervisors commonly use Ctrl+Break to target
     # a newly created process group, so route it through the same graceful
@@ -4712,6 +4717,12 @@ def _launch_tool(
     cleanup = _make_cleanup(proxy_holder, port_holder)
     signal.signal(signal.SIGINT, _ignore_child_sigint)
     signal.signal(signal.SIGTERM, _exit_on_signal)
+    # Terminal close / tmux kill-session sends SIGHUP, not SIGTERM. Without
+    # this the wrapper dies unhandled, the `finally` below never runs, and
+    # the proxy it spawned is reparented to PID 1 and leaks. Mirrors the
+    # SIGHUP handling on the `claude` path.
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, _exit_on_signal)
 
     try:
         click.echo()
