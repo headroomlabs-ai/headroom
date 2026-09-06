@@ -81,6 +81,12 @@ class TestConvertToolChoice:
         result = _convert_tool_choice({"type": "tool", "name": "get_weather"})
         assert result == {"type": "function", "function": {"name": "get_weather"}}
 
+    def test_none_dict_not_inverted_to_auto(self):
+        # Anthropic sends {"type": "none"} to forbid tool use this turn. It must
+        # map to OpenAI's "none", not fall through to the "auto" default (which
+        # would let the model call a tool the client explicitly disallowed).
+        assert _convert_tool_choice({"type": "none"}) == "none"
+
     def test_string_passthrough(self):
         assert _convert_tool_choice("auto") == "auto"
         assert _convert_tool_choice("none") == "none"
