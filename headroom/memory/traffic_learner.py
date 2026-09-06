@@ -1275,10 +1275,16 @@ class TrafficLearner:
             # Ready to save
             del self._pattern_counts[h]
             self._saved_hashes.add(h)
-            # Trim saved hashes to prevent unbounded growth
+            # Trim saved hashes to prevent unbounded growth, and drop the evicted
+            # hash's persisted-id entry in lockstep. ``_persisted_ids`` is only
+            # ever read behind an ``h in _saved_hashes`` guard (the dedup check
+            # above), so an id for a hash no longer tracked is dead weight;
+            # without this it grew one entry per distinct persisted pattern for
+            # the whole process lifetime while ``_saved_hashes`` stayed bounded.
             if len(self._saved_hashes) > self._dedup_window:
                 # Remove oldest (arbitrary, set is unordered, but prevents growth)
-                self._saved_hashes.pop()
+                evicted = self._saved_hashes.pop()
+                self._persisted_ids.pop(evicted, None)
 
             # Persist the real accumulated count, not the dataclass default.
             pattern.evidence_count = count
@@ -1310,9 +1316,13 @@ class TrafficLearner:
                     },
                 )
                 self._patterns_saved += 1
-                # Track id so future re-sightings bump this row.
+                # Track id so future re-sightings bump this row — but only while
+                # the hash is still within the dedup window. If it was evicted
+                # from ``_saved_hashes`` between enqueue and now, recording its id
+                # would re-leak an entry that can never be read again (the dedup
+                # read at the top of ``_accumulate`` is gated on ``_saved_hashes``).
                 memory_id = getattr(memory, "id", None)
-                if memory_id is not None:
+                if memory_id is not None and pattern.content_hash in self._saved_hashes:
                     self._persisted_ids[pattern.content_hash] = memory_id
                 logger.debug(f"Traffic learner saved pattern: {pattern.content[:80]}")
 
