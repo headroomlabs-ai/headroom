@@ -20,6 +20,7 @@ from ..models import (
     ToolCall,
 )
 from ..writer import ClaudeCodeWriter, ContextWriter
+from ._paths import path_exists as _path_exists
 
 logger = logging.getLogger(__name__)
 
@@ -366,23 +367,6 @@ class ClaudeCodePlugin(LearnPlugin, ConversationScanner):
 # =============================================================================
 # Path Decode Helpers (Claude Code specific)
 # =============================================================================
-
-
-def _path_exists(path: Path) -> bool:
-    """Like ``Path.exists()`` but treats an unreadable path as absent.
-
-    ``_decode_project_path`` probes speculative candidate paths (e.g.
-    ``/home/marco/rocha`` when reconstructing ``/home/marco-rocha/...``). A
-    candidate can collide with another user's directory whose parent isn't
-    stat-able, and ``Path.exists()`` calls ``os.stat`` which then raises
-    ``PermissionError`` instead of returning ``False`` — crashing the whole
-    ``learn`` command (issue #2443). Match ``_greedy_path_decode``'s existing
-    ``OSError`` handling and treat any such error as "does not exist".
-    """
-    try:
-        return path.exists()
-    except OSError:
-        return False
 
 
 def _decode_windows_path(drive: str, parts: list[str]) -> Path | None:

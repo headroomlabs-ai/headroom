@@ -14,6 +14,7 @@ from .._shared import classify_error, is_error_content, normalize_tool_name
 from ..base import ConversationScanner, LearnPlugin
 from ..models import ErrorCategory, ProjectInfo, SessionData, ToolCall
 from ..writer import ContextWriter, GrokWriter
+from ._paths import path_exists
 
 logger = logging.getLogger(__name__)
 
@@ -76,9 +77,9 @@ class GrokPlugin(LearnPlugin, ConversationScanner):
                     project_path=project_path,
                     data_path=workspace_dir,
                     context_file=grok_md
-                    if grok_md.exists()
+                    if path_exists(grok_md)
                     else agents_md
-                    if agents_md.exists()
+                    if path_exists(agents_md)
                     else None,
                 )
             )

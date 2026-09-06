@@ -45,6 +45,7 @@ from ..models import (
     ToolCall,
 )
 from ..writer import CodexWriter, ContextWriter
+from ._paths import path_exists
 
 logger = logging.getLogger(__name__)
 
@@ -126,7 +127,7 @@ class OpenCodePlugin(LearnPlugin, ConversationScanner):
                         name=proj_name or worktree_path.name or proj_id,
                         project_path=worktree_path,
                         data_path=self._db_path.parent,
-                        context_file=agents_md if agents_md.exists() else None,
+                        context_file=agents_md if path_exists(agents_md) else None,
                     )
                 )
         finally:
