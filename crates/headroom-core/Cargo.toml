@@ -131,7 +131,7 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 # cost. Default features include the sync `Connection` API used in
 # `ccr/backends/redis.rs`; `tokio-comp` would pull `tokio` into the
 # core crate, which we do not want.
-redis = { version = "0.27", optional = true, default-features = false }
+redis = { version = "1.6", optional = true, default-features = false }
 # `http` powers the auth-mode classifier (Phase F PR-F1). The proxy
 # crate already depends on this — pulling it into core lets the
 # classifier live with the other Phase B/F policy primitives without
