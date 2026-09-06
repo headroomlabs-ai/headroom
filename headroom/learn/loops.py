@@ -117,8 +117,20 @@ def detect_loops(
     a within-conversation phenomenon; the same command in two unrelated
     sessions is not a loop). Groups meeting ``min_occurrences`` become
     ``LoopPattern`` results, sorted by measured wasted tokens descending.
+
+    A call is counted once per ``tool_call_id``. A resumed conversation can be
+    written as a fresh transcript that replays earlier turns, which presents the
+    same provider-assigned call to the scanner more than once; without this the
+    replayed turns would inflate the loop. Calls carrying no id are always
+    counted, since nothing identifies them as replays.
+
+    This makes ``tool_call_id`` uniqueness a scanner contract: an id must be
+    unique across sessions, not just within one, or two unrelated sessions look
+    like one replayed twice. Scanners that synthesize ids scope them by session
+    (see ``GeminiPlugin`` and ``OpenCodePlugin``).
     """
     groups: dict[str, list[ToolCall]] = {}
+    seen_ids: dict[str, set[str]] = {}
     for session in sessions:
         per_session: dict[str, list[ToolCall]] = {}
         for tc in session.tool_calls:
@@ -126,12 +138,24 @@ def detect_loops(
         # Merge each session's qualifying groups into the global view keyed by
         # signature so cross-session recurrence of the SAME loop accumulates.
         for sig, calls in per_session.items():
-            if len(calls) >= min_occurrences:
-                groups.setdefault(sig, []).extend(calls)
+            if len(calls) < min_occurrences:
+                continue
+            bucket = groups.setdefault(sig, [])
+            ids = seen_ids.setdefault(sig, set())
+            for call in calls:
+                if call.tool_call_id:
+                    if call.tool_call_id in ids:
+                        continue
+                    ids.add(call.tool_call_id)
+                bucket.append(call)
 
     loops: list[LoopPattern] = []
     for sig, calls in groups.items():
         count = len(calls)
+        if count < min_occurrences:
+            # The group cleared the bar before dedup and no longer does: its
+            # extra repetitions were replays of one call, not a loop.
+            continue
         is_error_loop = sum(1 for c in calls if c.is_error) >= (count / 2)
         if is_error_loop:
             # Every repetition of a failing call is waste — including the first,
