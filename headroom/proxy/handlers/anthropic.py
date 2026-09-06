@@ -2307,7 +2307,17 @@ class AnthropicHandlerMixin:
                             maturation.holding_msg_indices,
                         )
                         optimized_tokens = tokenizer.count_messages(optimized_messages)
-                        tokens_saved = max(0, original_tokens - optimized_tokens)
+                        # First-appearance accounting: the client re-sends
+                        # the raw conversation every turn, so this diff
+                        # re-books every replayed marker's removal on every
+                        # request until end of session. Subtract the
+                        # replayed share, tokenized on the same scale as
+                        # the diff; matured content books exactly once, on
+                        # the turn it matures.
+                        replay_debt = maturation_mgr.replayed_token_debt(
+                            maturation, tokenizer.count_text
+                        )
+                        tokens_saved = max(0, original_tokens - optimized_tokens - replay_debt)
                         if maturation.newly_matured:
                             transforms_applied.append(f"read_maturation:{maturation.newly_matured}")
                         logger.debug(
@@ -2315,6 +2325,7 @@ class AnthropicHandlerMixin:
                             f"holding={len(maturation.holding_msg_indices)} "
                             f"matured={maturation.newly_matured} "
                             f"replayed={maturation.replacements_applied} "
+                            f"replay_debt={replay_debt} "
                             f"bytes_saved={maturation.bytes_saved}"
                         )
                 except Exception as e:

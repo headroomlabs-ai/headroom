@@ -53,6 +53,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -100,6 +101,13 @@ class MaturationResult:
     newly_matured: int = 0
     replacements_applied: int = 0
     bytes_saved: int = 0
+    # Replays of markers recorded on EARLIER requests, as
+    # (tool_call_id, original_content, marker). A handler's plain
+    # original-vs-optimized token diff re-books these already-booked
+    # savings on every request -- feed to
+    # ReadMaturationManager.replayed_token_debt to keep the request's
+    # figure first-appearance.
+    replayed_pairs: list[tuple[str, str, str]] = field(default_factory=list)
 
 
 class ReadMaturationManager:
@@ -118,6 +126,9 @@ class ReadMaturationManager:
         self.config = config
         self.store = compression_store
         self._matured: dict[str, MaturedRead] = {}
+        # tool_call_id -> token delta of its replayed marker, tokenized
+        # once per session (content and marker are stable per tool call).
+        self._replay_token_deltas: dict[str, int] = {}
 
     # ─── Per-request entry point ────────────────────────────────────────
 
@@ -158,6 +169,36 @@ class ReadMaturationManager:
         if any_changed:
             result.messages = out
         return result
+
+    def replayed_token_debt(
+        self,
+        result: MaturationResult,
+        count_text: Callable[[str], int],
+    ) -> int:
+        """Tokens this request re-saved by replaying markers recorded on
+        EARLIER requests.
+
+        The client re-sends the raw conversation every turn, so a plain
+        original-vs-optimized token diff books a matured Read's removal
+        again on every replay until end of session; one long session
+        inflated its new-content savings rate from 31.8% to 78.15% the
+        day maturation turned on, with no new removal behind the jump.
+        Subtracting this debt makes the figure first-appearance: matured
+        content books exactly once, on the turn it matures. Newly-matured
+        replacements are not replays and stay fully booked.
+
+        ``count_text`` should be the tokenizer the handler uses for its
+        diff, so the subtraction is on the booked scale. Deltas are
+        tokenized once per tool call and cached for the session.
+        """
+        debt = 0
+        for tc_id, content, marker in result.replayed_pairs:
+            delta = self._replay_token_deltas.get(tc_id)
+            if delta is None:
+                delta = max(0, count_text(content) - count_text(marker))
+                self._replay_token_deltas[tc_id] = delta
+            debt += delta
+        return debt
 
     # ─── Internals ──────────────────────────────────────────────────────
 
@@ -272,6 +313,10 @@ class ReadMaturationManager:
                 return None, False
             result.replacements_applied += 1
             result.bytes_saved += max(0, len(content) - len(matured.marker))
+            # This Read's savings were booked by the request that matured
+            # it; report the replay so the handler can subtract it from
+            # this request's token diff (replayed_token_debt).
+            result.replayed_pairs.append((tc_id, content, matured.marker))
             return matured.marker, False
 
         size = len(content.encode("utf-8", errors="replace"))
