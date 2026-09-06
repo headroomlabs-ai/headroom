@@ -42,6 +42,7 @@
     "opencode",
     "opencode-deepseek",
     "grok-build",
+    "openclaw",
     "mcp",
     "---Configuration---",
     "configuration",
