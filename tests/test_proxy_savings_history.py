@@ -83,6 +83,7 @@ def test_savings_tracker_helpers_normalize_inputs_and_paths(tmp_path, monkeypatc
         "total_input_tokens": 0,
         "total_input_cost_usd": 0.0,
         "output_tokens_saved": 0,
+        "output_tokens": 0,
         "output_savings_usd": 0.0,
     }
     assert savings_tracker_module._normalize_history_entry({"timestamp": "bad"}) is None
@@ -148,6 +149,7 @@ def test_savings_tracker_sanitizes_legacy_state_and_applies_retention(tmp_path):
             "total_input_tokens": 0,
             "total_input_cost_usd": 0.0,
             "output_tokens_saved": 0,
+            "output_tokens": 0,
             "output_savings_usd": 0.0,
         }
     ]
@@ -1861,3 +1863,77 @@ def test_normalize_history_entry_defaults_missing_cache_fields(tmp_path):
     assert history[0]["cache_read_tokens"] == 0
     assert history[0]["cache_savings_usd"] == 0.0
     assert history[0]["total_tokens_saved"] == 40
+
+
+def test_record_request_accumulates_output_tokens_into_checkpoints(tmp_path):
+    """History checkpoints carry cumulative ACTUAL output tokens so a
+    per-bucket output-reduction rate can be diffed out of consecutive
+    checkpoints, exactly like cache_read_tokens. The cumulative must also
+    survive a reload through _normalize_history_entry."""
+    path = tmp_path / "savings.json"
+    tracker = SavingsTracker(path=path)
+    tracker.record_request(
+        model="claude-opus-5",
+        input_tokens=100,
+        tokens_saved=10,
+        output_tokens_saved=5,
+        output_tokens=200,
+    )
+    tracker.record_request(
+        model="claude-opus-5",
+        input_tokens=100,
+        tokens_saved=10,
+        output_tokens_saved=5,
+        output_tokens=300,
+    )
+
+    snapshot = tracker.snapshot()
+    assert snapshot["lifetime"]["output_tokens"] == 500
+    history = snapshot["history"]
+    assert [point["output_tokens"] for point in history[-2:]] == [200, 500]
+
+    # Reload: the normalizer must keep the field rather than strip it.
+    reloaded = SavingsTracker(path=path)
+    reloaded_history = reloaded.snapshot()["history"]
+    assert reloaded_history[-1]["output_tokens"] == 500
+
+    # Legacy entries without the key normalize to zero, not an error.
+    legacy = savings_tracker_module._normalize_history_entry(
+        {"timestamp": "2026-08-11T10:00:00Z", "total_tokens_saved": 1}
+    )
+    assert legacy is not None
+    assert legacy["output_tokens"] == 0
+
+
+def test_output_only_request_emits_checkpoint(tmp_path):
+    """A request with actual output tokens but zero savings must still emit a
+    history checkpoint: it moves lifetime["output_tokens"], and if it were the
+    final request in a window, consumers diffing checkpoints would omit those
+    actual tokens and overstate the output-reduction rate."""
+    path = tmp_path / "savings.json"
+    tracker = SavingsTracker(path=path)
+    tracker.record_request(
+        model="claude-opus-5",
+        input_tokens=100,
+        tokens_saved=10,
+        output_tokens_saved=5,
+        output_tokens=200,
+    )
+    tracker.record_request(
+        model="claude-opus-5",
+        input_tokens=100,
+        tokens_saved=0,
+        output_tokens_saved=0,
+        output_tokens=300,
+    )
+
+    history = tracker.snapshot()["history"]
+    assert len(history) == 2
+    assert history[-1]["output_tokens"] == 500
+    assert history[-1]["output_tokens_saved"] == 5
+    assert history[-1]["total_tokens_saved"] == 10
+
+    # The output-only checkpoint must survive persistence and reload.
+    reloaded_history = SavingsTracker(path=path).snapshot()["history"]
+    assert len(reloaded_history) == 2
+    assert reloaded_history[-1]["output_tokens"] == 500

@@ -951,6 +951,7 @@ class PrometheusMetrics:
                 total_input_tokens=total_input_tokens,
                 total_input_cost_usd=total_input_cost_usd,
                 output_tokens_saved=output_tokens_saved,
+                output_tokens=output_tokens,
                 estimated_savings_usd=savings_usd,
             )
 
