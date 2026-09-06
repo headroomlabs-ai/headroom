@@ -27,12 +27,14 @@ import argparse
 import asyncio
 import concurrent.futures
 import contextlib
+import gc
 import hmac
 import ipaddress
 import json
 import logging
 import math
 import os
+import platform
 import sys
 import threading
 import time
@@ -1996,17 +1998,23 @@ class HeadroomProxy(
                     handle=self.memory_handler,
                     backend=memory_status.get("backend"),
                 )
-                # Force one embed call so the ONNX graph is compiled now,
-                # not lazily during the first request. Best-effort — any
-                # failure is swallowed inside warmup_embedder.
-                self.warmup.memory_embedder.mark_loading()
-                warmed = await self.memory_handler.warmup_embedder()
-                if warmed:
-                    self.warmup.memory_embedder.mark_loaded()
-                else:
-                    # Not an error — e.g. qdrant-neo4j has no embedder slot
-                    # we can reach, or the backend simply exposes no handle.
+                skip_embedder_warmup = os.environ.get(
+                    "HEADROOM_SKIP_MEMORY_WARMUP", ""
+                ).strip().lower() in {"1", "true", "yes", "on"}
+                if skip_embedder_warmup:
                     self.warmup.memory_embedder.mark_null()
+                    logger.info(
+                        "Memory embedder warmup: SKIPPED; first memory request will load it lazily"
+                    )
+                else:
+                    # Compile the ONNX graph before the first real request.
+                    # Best-effort: warmup_embedder handles failures internally.
+                    self.warmup.memory_embedder.mark_loading()
+                    warmed = await self.memory_handler.warmup_embedder()
+                    if warmed:
+                        self.warmup.memory_embedder.mark_loaded()
+                    else:
+                        self.warmup.memory_embedder.mark_null()
             else:
                 if self.warmup.memory_backend.status != "error":
                     self.warmup.memory_backend.mark_null()
@@ -2467,6 +2475,39 @@ def _register_memory_components(proxy: HeadroomProxy, tracker: MemoryTracker) ->
     # Note: graph_store and vector_index are created per-user within the
     # LocalMemoryBackend, not as global singletons. They would need to be
     # registered when the memory system is initialized with specific backends.
+
+
+def _peak_rss_mb() -> float | None:
+    """Return the process RSS high-water mark when the platform exposes it."""
+    try:
+        import importlib
+
+        resource_module: Any = importlib.import_module("resource")
+    except ImportError:  # Windows
+        return None
+
+    peak = float(resource_module.getrusage(resource_module.RUSAGE_SELF).ru_maxrss)
+    divisor = 1024 * 1024 if platform.system() == "Darwin" else 1024
+    return round(peak / divisor, 1)
+
+
+def _gc_snapshot() -> tuple[list[dict[str, int]], list[dict[str, int | str]]]:
+    """Inspect tracked objects without triggering a stop-the-world collection."""
+    from collections import Counter
+
+    stats: list[dict[str, int]] = [
+        {
+            "generation": generation,
+            "collections": int(values["collections"]),
+            "collected": int(values["collected"]),
+        }
+        for generation, values in enumerate(gc.get_stats())
+    ]
+    counts = Counter(type(obj).__name__ for obj in gc.get_objects())
+    top_types: list[dict[str, int | str]] = [
+        {"type": name, "count": count} for name, count in counts.most_common(10)
+    ]
+    return stats, top_types
 
 
 def _request_is_loopback(request: Request) -> bool:
@@ -4906,6 +4947,43 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
         report = tracker.get_report()
         return report.to_dict()
+
+    @app.get("/debug/rss", dependencies=[Depends(_require_loopback)])
+    async def debug_rss():
+        """Return a loopback-only process and Python heap diagnostic snapshot."""
+        from ..memory.tracker import MemoryTracker
+        from ..models.ml_models import MLModelRegistry
+        from ..telemetry.toin import get_toin
+
+        tracker = MemoryTracker.get()
+        _register_memory_components(proxy, tracker)
+        report = tracker.get_report()
+        gc_stats, top_types = await asyncio.to_thread(_gc_snapshot)
+
+        request_logger = report.components.get("request_logger")
+        try:
+            toin_patterns = get_toin().get_stats().get("patterns_tracked")
+        except Exception:  # pragma: no cover - diagnostic endpoint is best-effort
+            toin_patterns = None
+
+        with proxy._compression_caches_lock:
+            compression_cache_sessions = len(proxy._compression_caches)
+
+        return {
+            "pid": os.getpid(),
+            "rss_mb": report.process.to_dict()["rss_mb"],
+            "peak_rss_mb": _peak_rss_mb(),
+            "python_version": sys.version,
+            "gc_stats": gc_stats,
+            "top_types": top_types,
+            "ml_models": MLModelRegistry.get_memory_stats(),
+            # Per-user vector indexes are not globally enumerable on current backends.
+            "hnsw_elements": None,
+            "compression_cache_sessions": compression_cache_sessions,
+            "toin_patterns": toin_patterns,
+            "request_log_count": request_logger.entry_count if request_logger else None,
+            "memory_embedder_warmed": proxy.warmup.memory_embedder.status == "loaded",
+        }
 
     @app.post(
         "/cache/clear",
