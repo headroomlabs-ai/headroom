@@ -209,8 +209,9 @@ class CCRToolInjector:
             re.compile(r"\[(\d+) \w+ compressed to (\d+)\. Retrieve more: hash=([a-f0-9]{24})\]"),
             # Legacy format without "to M" or "Retrieve more:" (old TextCompressor)
             re.compile(r"\[(\d+) \w+ compressed\. hash=([a-f0-9]{24})\]"),
-            # Generic fallback: any bracket compression marker with hash (exactly 24 chars)
-            re.compile(r"\[.*?compressed.*?hash=([a-f0-9]{24})\]", re.IGNORECASE),
+            # Generic fallback: any bracket compression marker with a 24-char
+            # hash, including markers that carry explanatory text after it.
+            re.compile(r"\[.*?compressed.*?hash=([a-f0-9]{24})[^\]]*\]", re.IGNORECASE),
             # SmartCrusher markers: the row-drop summary
             # `<<ccr:HASH N_rows_offloaded>>` and the opaque-blob form
             # `<<ccr:HASH,KIND,SIZE>>`. HASH is 12-24 hex chars, terminated by a

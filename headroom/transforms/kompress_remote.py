@@ -57,7 +57,12 @@ import logging
 
 import httpx
 
-from .kompress_compressor import KompressConfig, KompressResult, store_kompress_in_ccr
+from .kompress_compressor import (
+    KompressConfig,
+    KompressResult,
+    ccr_retrieval_marker,
+    store_kompress_in_ccr,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -256,12 +261,8 @@ class RemoteKompressCompressor:
                 result.cache_key = cache_key
                 # Report the source line span so a reader can tell content was
                 # compressed away rather than absent (#2586).
-                source_lines = ccr_source.count("\n") + 1
-                line_word = "line" if source_lines == 1 else "lines"
-                result.compressed += (
-                    f"\n[{result.original_tokens} words compressed to "
-                    f"{result.compressed_tokens} (from {source_lines} source {line_word})."
-                    f" Retrieve more: hash={cache_key}]"
+                result.compressed += ccr_retrieval_marker(
+                    result.original_tokens, result.compressed_tokens, ccr_source, cache_key
                 )
 
         return result

@@ -34,6 +34,17 @@ def test_source_line_span_marker_is_still_detected() -> None:
     assert _hashes(marker) == ["c00eb437e5e5c00eb437e5e5"]
 
 
+def test_integrity_marker_is_still_detected() -> None:
+    marker = (
+        "[122 items compressed to 27 (from 5 source lines). "
+        "Retrieve more: hash=c00eb437e5e5c00eb437e5e5. "
+        "Original content is intact; call "
+        "headroom_retrieve(hash=c00eb437e5e5c00eb437e5e5) for the full text.]"
+    )
+
+    assert _hashes(marker) == ["c00eb437e5e5c00eb437e5e5"]
+
+
 def test_has_new_ccr_markers_detects_hash_not_seen_in_previous_forward() -> None:
     old = "[100 items compressed to 10. Retrieve more: hash=abc123def456abc123def456]"
     new = "[50 items compressed to 5. Retrieve more: hash=deadbeefdeadbeefdeadbeef]"

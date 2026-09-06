@@ -164,6 +164,8 @@ def test_ccr_stores_the_pre_protection_text_not_the_placeholder(monkeypatch) -> 
     # Token count describes what was actually stored, not the placeholder.
     assert stored["tokens"] == len(ORIGINAL.split())
     assert result.cache_key == "cafebabe"
+    assert "Original content is intact" in result.compressed
+    assert "headroom_retrieve(hash=cafebabe)" in result.compressed
 
 
 def test_the_common_path_without_an_override_is_unchanged(monkeypatch) -> None:
