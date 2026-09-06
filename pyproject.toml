@@ -132,7 +132,7 @@ ml = [
 # [memory]) fail on any machine without a compiler — see #1368.
 memory = [
     "sqlite-vec>=0.1.6",
-    "sentence-transformers>=2.2.0,<6.0; sys_platform != 'darwin' or platform_machine != 'x86_64'",
+    "sentence-transformers>=2.2.0,<7.0; sys_platform != 'darwin' or platform_machine != 'x86_64'",
 ]
 # Optional HNSW vector backend. Needs a C++ toolchain to build hnswlib, so it is
 # kept out of [memory] and [all]; opt in with `pip install headroom-ai[vector]`
@@ -260,7 +260,7 @@ voice-train = [
 # Evaluation framework
 evals = [
     "datasets>=5.0.1",
-    "sentence-transformers>=2.2.0,<6.0; sys_platform != 'darwin' or platform_machine != 'x86_64'",
+    "sentence-transformers>=2.2.0,<7.0; sys_platform != 'darwin' or platform_machine != 'x86_64'",
     "numpy>=1.24.0",
     "scikit-learn>=1.3.0",
     "anthropic>=0.18.0",
