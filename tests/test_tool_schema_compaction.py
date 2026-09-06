@@ -52,6 +52,39 @@ class TestCompactToolSchemaValue:
         assert "title" in props, "property named 'title' must survive"
         assert "code" in props
 
+    def test_preserves_defs_subschema_named_like_annotation(self) -> None:
+        """A `$defs` entry named 'title' is a reusable subschema (referenced by
+        `$ref`), not an annotation, so it must survive — dropping it would leave
+        a dangling reference that breaks the schema. Annotations *inside* the
+        subschema are still dropped."""
+        schema = {
+            "type": "object",
+            "properties": {"field": {"$ref": "#/$defs/title"}},
+            "$defs": {
+                "title": {
+                    "type": "string",
+                    "title": "annotation-should-drop",
+                    "enum": ["a", "b"],
+                },
+            },
+        }
+        result = compact_tool_schema_value(schema)
+        defs = result["$defs"]
+        assert "title" in defs, "$defs subschema named 'title' must survive (ref target)"
+        # The annotation *inside* the subschema is still dropped.
+        assert "title" not in defs["title"], "annotation inside the subschema should drop"
+        assert defs["title"]["enum"] == ["a", "b"], "real constraints inside must survive"
+
+    def test_preserves_definitions_subschema_named_like_annotation(self) -> None:
+        """Same protection for the draft-07 `definitions` keyword."""
+        schema = {
+            "type": "object",
+            "properties": {"field": {"$ref": "#/definitions/example"}},
+            "definitions": {"example": {"type": "integer"}},
+        }
+        result = compact_tool_schema_value(schema)
+        assert "example" in result["definitions"], "definitions entry must survive"
+
     def test_normalises_description_whitespace(self) -> None:
         schema = {
             "name": "my_tool",

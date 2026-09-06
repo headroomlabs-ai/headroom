@@ -56,6 +56,22 @@ TOOL_SCHEMA_DROP_KEYS: frozenset[str] = frozenset(
     }
 )
 
+# JSON Schema keywords whose direct children are *names* (property names,
+# reusable-subschema names, dependency triggers), NOT schema annotations. A
+# child key under one of these must never be dropped even when it happens to
+# equal a name in TOOL_SCHEMA_DROP_KEYS: e.g. a `$defs` entry named "title" is a
+# reusable subschema (referenced by `$ref: #/$defs/title`), and dropping it
+# leaves a dangling reference that breaks the tool schema.
+TOOL_SCHEMA_NAME_CONTAINERS: frozenset[str] = frozenset(
+    {
+        "properties",
+        "$defs",
+        "definitions",
+        "patternProperties",
+        "dependentSchemas",
+    }
+)
+
 # Parameter names that are self-explanatory.  When ``description``
 # matches the name (case-insensitive prefix), it can be stripped.
 _SEMANTIC_PARAM_NAMES: frozenset[str] = frozenset(
@@ -212,9 +228,10 @@ def compact_tool_schema_value(
 ) -> Any:
     """Recursively compact a tool-schema structure.
 
-    - Drops annotation keys (``TOOL_SCHEMA_DROP_KEYS``) unless they appear
-      as property *names* inside a ``properties`` object (e.g. a field
-      literally named ``"title"`` must survive).
+    - Drops annotation keys (``TOOL_SCHEMA_DROP_KEYS``) unless they appear as
+      *names* inside a name-container keyword (``TOOL_SCHEMA_NAME_CONTAINERS``,
+      e.g. ``properties`` or ``$defs``). A field literally named ``"title"`` or
+      a ``$defs`` subschema named ``"title"`` must survive.
     - Normalises ``description`` strings by collapsing whitespace.
     """
     if isinstance(value, list):
@@ -225,9 +242,11 @@ def compact_tool_schema_value(
 
     compacted: dict[str, Any] = {}
     for key, child in value.items():
-        # Don't drop keys that are property *names* inside a JSON Schema
-        # `properties` object — only drop them when they are schema annotations.
-        if _parent_key != "properties" and key in TOOL_SCHEMA_DROP_KEYS:
+        # Don't drop keys that are *names* inside a JSON Schema name container
+        # (`properties`, `$defs`, `definitions`, ...) — a `$defs` entry named
+        # "title" is a reusable subschema referenced by `$ref`, not an
+        # annotation. Only drop these keys when they are schema annotations.
+        if _parent_key not in TOOL_SCHEMA_NAME_CONTAINERS and key in TOOL_SCHEMA_DROP_KEYS:
             continue
 
         if key == "description" and isinstance(child, str):
