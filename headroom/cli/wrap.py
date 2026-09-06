@@ -7033,7 +7033,7 @@ def grok_build(
 
 
 # =============================================================================
-# Cline (VS Code extension)
+# Cline (CLI and VS Code extension)
 # =============================================================================
 
 
@@ -7043,6 +7043,11 @@ def grok_build(
     "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
 )
 @click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
+@click.option(
+    "--openai-api-url",
+    metavar="URL",
+    help="Original OpenAI-compatible upstream URL (required for custom Cline providers)",
+)
 @click.option("--learn", is_flag=True, help="Enable live traffic learning")
 @click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
@@ -7050,17 +7055,24 @@ def grok_build(
 def cline(
     port: int,
     no_proxy: bool,
+    openai_api_url: str | None,
     learn: bool,
     memory: bool,
     verbose: bool,
     prepare_only: bool,
 ) -> None:
-    """Start Headroom proxy for use with Cline (VS Code extension).
+    """Start Headroom proxy for use with Cline CLI or the VS Code extension.
 
     \b
-    Cline is a VS Code extension that reads its API configuration from the
-    VS Code settings UI, not from environment variables. This command starts
-    the proxy and prints the Cline settings the user should configure.
+    Cline stores provider configuration itself rather than reading standard
+    OpenAI environment variables. This command starts the proxy and prints the
+    Cline CLI and VS Code settings the user should configure.
+
+    \b
+    For a custom OpenAI-compatible provider, pass its ORIGINAL base URL via
+    ``--openai-api-url``. Configure Cline's base URL to the local URL printed
+    below. Headroom then forwards Cline's existing API key to that upstream;
+    without the original URL, the proxy would route the request to OpenAI.
 
     \b
     After running this command, open Cline's settings in VS Code and configure
@@ -7074,6 +7086,7 @@ def cline(
     Examples:
         headroom wrap cline                  # Start proxy + Cline settings
         headroom wrap cline --port 9999      # Custom proxy port
+        headroom wrap cline --openai-api-url https://api.example.com/v1
     """
     if prepare_only:
         return
@@ -7081,6 +7094,13 @@ def cline(
     def _print_cline_setup(actual_port: int) -> None:
         anthropic_base = _claude_proxy_base_url(actual_port)
         openai_base = f"http://127.0.0.1:{actual_port}/v1"
+        if openai_api_url:
+            click.echo(f"  OpenAI-compatible upstream: {openai_api_url}")
+            click.echo()
+        click.echo("  Configure Cline CLI:")
+        click.echo(f"    cline auth --provider openai-native --baseurl {openai_base}")
+        click.echo("    Keep your existing API key and model configuration.")
+        click.echo()
         click.echo("  Configure Cline in VS Code:")
         click.echo("    Settings > Cline > API Provider")
         click.echo(f"    Anthropic Base URL: {anthropic_base}")
@@ -7093,6 +7113,7 @@ def cline(
         learn=learn,
         memory=memory,
         agent_type="cline",
+        openai_api_url=openai_api_url,
         print_setup_lines=_print_cline_setup,
     )
 
