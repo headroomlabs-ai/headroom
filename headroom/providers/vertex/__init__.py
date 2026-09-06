@@ -1,5 +1,15 @@
 """Google Vertex provider helpers."""
 
+from .diagnostics import (
+    HINT_HEADER,
+    annotate_backend_error_body,
+    annotate_vertex_error,
+    backend_error_hint,
+    ensure_vertex_sdk_available,
+    vertex_error_hint,
+    vertex_sdk_available,
+    with_vertex_diagnostics,
+)
 from .runtime import (
     VERTEX_ANTHROPIC_PROVIDER_NAME,
     VERTEX_COUNT_TOKENS,
@@ -17,6 +27,7 @@ from .runtime import (
 )
 
 __all__ = [
+    "HINT_HEADER",
     "VERTEX_ANTHROPIC_PROVIDER_NAME",
     "VERTEX_COUNT_TOKENS",
     "VERTEX_GENERATE_CONTENT",
@@ -25,9 +36,16 @@ __all__ = [
     "VERTEX_STREAM_GENERATE_CONTENT",
     "VERTEX_STREAM_RAW_PREDICT",
     "VertexPublisherAction",
+    "annotate_backend_error_body",
+    "annotate_vertex_error",
+    "backend_error_hint",
+    "ensure_vertex_sdk_available",
     "is_vertex_anthropic_publisher",
     "is_vertex_google_publisher",
     "vertex_anthropic_target",
+    "vertex_error_hint",
     "vertex_publisher_provider_name",
+    "vertex_sdk_available",
     "vertex_target_for_location",
+    "with_vertex_diagnostics",
 ]

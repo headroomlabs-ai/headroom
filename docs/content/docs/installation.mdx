@@ -282,8 +282,11 @@ These variables configure Headroom at runtime. Set them in your shell, `.env` fi
 | `VERTEXAI_PROJECT` | GCP project id for the Vertex AI backend (LiteLLM-specific — distinct from `GOOGLE_CLOUD_PROJECT`; set it explicitly to avoid silently billing your ADC default quota project) |
 | `VERTEXAI_LOCATION` | GCP region for the Vertex AI backend (LiteLLM-specific — distinct from `GOOGLE_CLOUD_LOCATION`) |
 
-The Vertex AI backend also requires `google-cloud-aiplatform>=1.38`, which is not
-included in any extra or Docker image — see
+The Vertex AI backend also requires `google-cloud-aiplatform>=1.38`, which ships
+in the `[vertex]` extra (`pip install "headroom-ai[proxy,vertex]"`) rather than
+`[proxy]`, since it adds roughly 175 MB and only that backend needs it. The
+proxy refuses to start if the backend is selected without it. Vertex's native
+passthrough routes need neither the extra nor the backend flag — see
 [Google Vertex AI](/docs/proxy#google-vertex-ai) for setup details.
 
 ### Proxy configuration

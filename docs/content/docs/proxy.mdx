@@ -641,16 +641,23 @@ OPENROUTER_API_KEY=sk-or-... headroom proxy --backend openrouter
 `--backend vertex_ai` delegates to [LiteLLM](https://docs.litellm.ai/docs/providers/vertex),
 which brings two requirements that are easy to miss:
 
-**1. Install the Vertex SDK.** `google-cloud-aiplatform` is not included in any
-Headroom extra (`[proxy]`, `[all]`, …) or Docker image variant, so install it
-alongside Headroom:
+**1. Install the Vertex SDK.** `google-cloud-aiplatform` ships in the dedicated
+`[vertex]` extra, kept out of `[proxy]` because it and its transitive tree add
+roughly 175 MB and only this backend needs it:
 
 ```bash
-pip install "headroom-ai[proxy]" "google-cloud-aiplatform>=1.38"
+pip install "headroom-ai[proxy,vertex]"
 ```
 
-Without it, the first Vertex request fails with
-`litellm.BadRequestError: … vertexai import failed … No module named 'vertexai'`.
+Without it the proxy **refuses to start**, naming the fix and exiting `2`:
+
+```text
+Cannot start proxy: Vertex backend selected but the Vertex SDK is missing. ...
+```
+
+This is a startup check rather than a per-request failure, because the backend
+would otherwise construct cleanly and then fail on every call with an opaque
+`litellm.BadRequestError: … No module named 'vertexai'`.
 
 **2. Set the LiteLLM project/location variables.** LiteLLM reads the GCP project
 and region from `VERTEXAI_PROJECT` / `VERTEXAI_LOCATION` — these are **not** the
@@ -702,11 +709,27 @@ mirror Vertex's native REST shape verbatim — no backend flag needed:
 ```
 
 Requests with `publisher=google` (Gemini models) go through Headroom's full
-Gemini optimization handler; `publisher=anthropic` (Claude on Vertex) routes
-through the same LiteLLM-Vertex path as `--backend vertex_ai`. Any client that
+Gemini optimization handler; `publisher=anthropic` (Claude on Vertex) is
+forwarded to Vertex directly, preserving your bearer token. Any client that
 already speaks the native Vertex REST API can simply point its endpoint at the
 proxy — this is the mechanism `headroom wrap claude` uses in
 [Vertex mode](/docs/claude-code-vertex).
+
+<Callout type="warn">
+These routes need **neither** `--backend vertex_ai` nor the `[vertex]` extra. Do
+not combine the two: with the backend flag set, Claude publisher requests are
+re-routed through LiteLLM, which derives the project, region and model from its
+own configuration and ignores the ones in your URL — a request that works
+without the flag can return a `404` for a model you never asked for.
+</Callout>
+
+### Reading Vertex errors
+
+When Vertex rejects a request with `401`, `403`, `404` or `429`, Headroom appends
+a `[headroom] hint: …` note to `error.message`, sets an `x-headroom-hint`
+response header, and logs a warning. The hint names the likely cause — expired
+ADC, a partner model not yet enabled in Model Garden, or a model that is not
+served in the requested location. Successful responses are never modified.
 
 ### Bedrock via a local gateway
 

@@ -31,6 +31,7 @@ from headroom.ccr.context_tracker import looks_like_claude_code_compact_summary
 from headroom.ccr.marker_resolution import resolve_markers_in_response
 from headroom.copilot_auth import apply_copilot_api_auth, build_copilot_upstream_url
 from headroom.pipeline import PipelineStage, summarize_routing_markers
+from headroom.providers.vertex import annotate_backend_error_body, backend_error_hint
 from headroom.proxy.auth_mode import (
     classify_auth_mode,
     classify_client,
@@ -3418,7 +3419,12 @@ class AnthropicHandlerMixin:
                         if backend_response.error:
                             return JSONResponse(
                                 status_code=backend_response.status_code,
-                                content=backend_response.body,
+                                content=annotate_backend_error_body(
+                                    backend_response.body,
+                                    backend_response.status_code,
+                                    logger=logger,
+                                    request_id=request_id,
+                                ),
                             )
 
                         # Track metrics
@@ -3570,17 +3576,30 @@ class AnthropicHandlerMixin:
 
                         return JSONResponse(
                             status_code=backend_response.status_code,
-                            content=backend_response.body,
+                            content=annotate_backend_error_body(
+                                backend_response.body,
+                                backend_response.status_code,
+                                logger=logger,
+                                request_id=request_id,
+                            ),
                         )
                 except Exception as e:
                     logger.error(f"[{request_id}] Bedrock backend error: {e}")
                     # Unit 4: release the pre-upstream semaphore on error.
                     await _finalize_pre_upstream()
+                    # A backend that never initialized (missing optional SDK, no
+                    # ADC) otherwise surfaces as an opaque provider string that
+                    # tells the user nothing about the fix.
+                    message = str(e)
+                    hint = backend_error_hint(message)
+                    if hint:
+                        logger.error(f"[{request_id}] backend setup hint: {hint}")
+                        message = f"{message}\n[headroom] hint: {hint}"
                     return JSONResponse(
                         status_code=500,
                         content={
                             "type": "error",
-                            "error": {"type": "api_error", "message": str(e)},
+                            "error": {"type": "api_error", "message": message},
                         },
                     )
 

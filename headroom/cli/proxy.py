@@ -12,6 +12,7 @@ import click
 
 from headroom import paths as _paths
 from headroom.providers.registry import (
+    BackendUnavailableError,
     resolve_api_overrides,
     resolve_api_targets,
     resolve_extra_headers,
@@ -1737,6 +1738,11 @@ Press Ctrl+C to stop.
     except KeyboardInterrupt:
         click.echo("\nShutting down...")
         raise SystemExit(130) from None
+    except BackendUnavailableError as exc:
+        # Operator misconfiguration, not a crash to debug: show the remedy, not
+        # a traceback through our startup internals.
+        click.echo(f"\nCannot start proxy: {exc}", err=True)
+        raise SystemExit(2) from None
     finally:
         if _embed_watchdog is not None:
             import asyncio as _asyncio2
