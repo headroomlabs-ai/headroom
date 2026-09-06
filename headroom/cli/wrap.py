@@ -611,18 +611,31 @@ def _find_available_port(start_port: int, max_attempts: int = 100) -> int:
     raise RuntimeError(f"No available port found in range {start_port}-{end_port - 1}")
 
 
-def _get_log_path() -> Path:
-    """Get path for proxy log file."""
+def _get_log_path(port: int | None = None) -> Path:
+    """Get path for the proxy runtime log file.
+
+    Per-port (``proxy-<port>.log``) so concurrent wrap sessions on different
+    ports do not rotate a single shared log away; the legacy ``proxy.log``
+    name is used when *port* is omitted.
+    """
     from headroom import paths as _paths
 
     log_dir = _paths.log_dir()
     log_dir.mkdir(parents=True, exist_ok=True)
-    return log_dir / "proxy.log"
+    return _paths.proxy_log_path(port)
 
 
-def _get_proxy_stdio_log_path() -> Path:
-    """Get path for dedicated proxy stdio capture."""
-    return _get_log_path().with_name("proxy-stdio.log")
+def _get_proxy_stdio_log_path(port: int | None = None) -> Path:
+    """Get path for dedicated proxy stdio capture (per-port when *port* given).
+
+    The filename comes from :func:`headroom.paths.proxy_stdio_log_path` (the
+    single source of truth) while the directory comes from :func:`_get_log_path`,
+    so a caller (or test) that redirects the log directory via that helper
+    redirects the stdio capture with it.
+    """
+    from headroom import paths as _paths
+
+    return _get_log_path(port).with_name(_paths.proxy_stdio_log_path(port).name)
 
 
 def _start_proxy(
@@ -645,9 +658,9 @@ def _start_proxy(
 ) -> subprocess.Popen:
     """Start Headroom proxy as a background subprocess.
 
-    Stdout and stderr are written to a dedicated sibling file, usually
-    `~/.headroom/logs/proxy-stdio.log`, to avoid pipe deadlock risk without
-    competing with the rotating `proxy.log` runtime log.
+    Stdout and stderr are written to a dedicated per-port sibling file,
+    `~/.headroom/logs/proxy-stdio-<port>.log`, to avoid pipe deadlock risk
+    without competing with the rotating `proxy-<port>.log` runtime log.
 
     The caller is responsible for ensuring *port* is available
     (see ``_find_available_port``).
@@ -695,8 +708,8 @@ def _start_proxy(
         cmd.extend(["--vertex-api-url", vertex_api_url])
 
     timeout_seconds = _resolve_wrap_proxy_timeout_seconds()
-    log_path = _get_log_path()
-    stdio_log_path = _get_proxy_stdio_log_path()
+    log_path = _get_log_path(port)
+    stdio_log_path = _get_proxy_stdio_log_path(port)
     stdio_log_file = open(stdio_log_path, "a", encoding="utf-8")  # noqa: SIM115
 
     # Ensure proxy subprocess uses UTF-8 (Windows defaults to cp1252)

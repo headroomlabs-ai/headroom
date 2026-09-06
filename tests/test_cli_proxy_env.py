@@ -65,7 +65,7 @@ class TestCLIWrapProxyTimeout:
 
         monkeypatch.delenv(wrap_mod._WRAP_PROXY_TIMEOUT_ENV, raising=False)
         monkeypatch.setattr(wrap_mod, "_ml_wrap_extras_detected", lambda: False)
-        monkeypatch.setattr(wrap_mod, "_get_log_path", lambda: tmp_path / "proxy.log")
+        monkeypatch.setattr(wrap_mod, "_get_log_path", lambda port=None: tmp_path / "proxy.log")
         monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: True)
         monkeypatch.setattr(wrap_mod.time, "sleep", lambda seconds: sleeps.append(seconds))
         monkeypatch.setattr(wrap_mod.subprocess, "Popen", lambda *args, **kwargs: fake_proc)
@@ -82,7 +82,7 @@ class TestCLIWrapProxyTimeout:
 
         monkeypatch.delenv(wrap_mod._WRAP_PROXY_TIMEOUT_ENV, raising=False)
         monkeypatch.setattr(wrap_mod, "_ml_wrap_extras_detected", lambda: False)
-        monkeypatch.setattr(wrap_mod, "_get_log_path", lambda: tmp_path / "proxy.log")
+        monkeypatch.setattr(wrap_mod, "_get_log_path", lambda port=None: tmp_path / "proxy.log")
         monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: True)
         monkeypatch.setattr(wrap_mod.time, "sleep", lambda _seconds: None)
 
@@ -115,7 +115,7 @@ class TestCLIWrapProxyTimeout:
         monkeypatch.setenv("GITHUB_COPILOT_API_TOKEN_EXPIRES_AT", "123")
         monkeypatch.delenv(wrap_mod._WRAP_PROXY_TIMEOUT_ENV, raising=False)
         monkeypatch.setattr(wrap_mod, "_ml_wrap_extras_detected", lambda: False)
-        monkeypatch.setattr(wrap_mod, "_get_log_path", lambda: tmp_path / "proxy.log")
+        monkeypatch.setattr(wrap_mod, "_get_log_path", lambda port=None: tmp_path / "proxy.log")
         monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: True)
         monkeypatch.setattr(wrap_mod.time, "sleep", lambda _seconds: None)
 
@@ -145,7 +145,11 @@ class TestCLIWrapProxyTimeout:
         logs: list[str] = []
 
         monkeypatch.delenv(wrap_mod._WRAP_PROXY_TIMEOUT_ENV, raising=False)
-        monkeypatch.setattr(wrap_mod, "_get_log_path", lambda: tmp_path / "proxy.log")
+        monkeypatch.setattr(
+            wrap_mod,
+            "_get_log_path",
+            lambda port=None: tmp_path / (f"proxy-{port}.log" if port is not None else "proxy.log"),
+        )
         monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: True)
         monkeypatch.setattr(wrap_mod.time, "sleep", lambda _seconds: None)
         monkeypatch.setattr(wrap_mod, "_ml_wrap_extras_detected", lambda: False)
@@ -161,9 +165,9 @@ class TestCLIWrapProxyTimeout:
 
         assert proc is fake_proc
         assert captured["kwargs"]["stdout"] is captured["kwargs"]["stderr"]
-        assert captured["kwargs"]["stdout"].name == str(tmp_path / "proxy-stdio.log")
-        assert captured["kwargs"]["stdout"].name != str(tmp_path / "proxy.log")
-        assert f"  Logs: {tmp_path / 'proxy.log'}" in logs
+        assert captured["kwargs"]["stdout"].name == str(tmp_path / "proxy-stdio-8787.log")
+        assert captured["kwargs"]["stdout"].name != str(tmp_path / "proxy-8787.log")
+        assert f"  Logs: {tmp_path / 'proxy-8787.log'}" in logs
 
     def test_env_timeout_allows_slow_start_proxy_to_succeed(self, monkeypatch, tmp_path):
         fake_proc = _FakeProxyProcess()
@@ -171,7 +175,7 @@ class TestCLIWrapProxyTimeout:
         checks = []
 
         monkeypatch.setenv(wrap_mod._WRAP_PROXY_TIMEOUT_ENV, "4")
-        monkeypatch.setattr(wrap_mod, "_get_log_path", lambda: tmp_path / "proxy.log")
+        monkeypatch.setattr(wrap_mod, "_get_log_path", lambda port=None: tmp_path / "proxy.log")
         monkeypatch.setattr(wrap_mod.time, "sleep", lambda seconds: sleeps.append(seconds))
         monkeypatch.setattr(wrap_mod.subprocess, "Popen", lambda *args, **kwargs: fake_proc)
 
@@ -196,13 +200,13 @@ class TestCLIWrapProxyTimeout:
         fake_proc.poll = lambda: fake_proc.returncode
 
         monkeypatch.setenv(wrap_mod._WRAP_PROXY_TIMEOUT_ENV, "2")
-        monkeypatch.setattr(wrap_mod, "_get_log_path", lambda: tmp_path / "proxy.log")
+        monkeypatch.setattr(wrap_mod, "_get_log_path", lambda port=None: tmp_path / "proxy.log")
         monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: False)
         monkeypatch.setattr(wrap_mod.time, "sleep", lambda _seconds: None)
         monkeypatch.setattr(wrap_mod.subprocess, "Popen", lambda *args, **kwargs: fake_proc)
 
         (tmp_path / "proxy.log").write_text("canonical runtime log output")
-        (tmp_path / "proxy-stdio.log").write_text("proxy stdio startup output")
+        (tmp_path / "proxy-stdio-8787.log").write_text("proxy stdio startup output")
 
         with pytest.raises(RuntimeError) as excinfo:
             wrap_mod._start_proxy(8787, agent_type="codex")
@@ -216,7 +220,7 @@ class TestCLIWrapProxyTimeout:
         fake_proc = _FakeProxyProcess()
 
         monkeypatch.setenv(wrap_mod._WRAP_PROXY_TIMEOUT_ENV, "2")
-        monkeypatch.setattr(wrap_mod, "_get_log_path", lambda: tmp_path / "proxy.log")
+        monkeypatch.setattr(wrap_mod, "_get_log_path", lambda port=None: tmp_path / "proxy.log")
         monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: False)
         monkeypatch.setattr(wrap_mod.time, "sleep", lambda _seconds: None)
         monkeypatch.setattr(wrap_mod.subprocess, "Popen", lambda *args, **kwargs: fake_proc)
