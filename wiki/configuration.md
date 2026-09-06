@@ -174,7 +174,6 @@ from headroom.transforms import SmartCrusherConfig
 
 config = SmartCrusherConfig(
     # Maximum items to keep after compression
-    max_items_after_crush=15,
     # Minimum tokens before applying compression
     min_tokens_to_crush=200,
     # Guarantee rows matching these patterns survive compression verbatim

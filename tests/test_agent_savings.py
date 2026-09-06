@@ -59,7 +59,6 @@ def test_agent_90_profile_exports_cross_agent_proxy_env() -> None:
     assert env["HEADROOM_TARGET_RATIO"] == "0.10"
     assert env["HEADROOM_COMPRESS_USER_MESSAGES"] == "1"
     assert env["HEADROOM_COMPRESS_SYSTEM_MESSAGES"] == "1"
-    assert env["HEADROOM_MAX_ITEMS"] == "8"
     assert env["HEADROOM_SMART_CRUSHER_COMPACTION"] == "0"
     assert env["HEADROOM_FORCE_KOMPRESS"] == "1"
     assert env["HEADROOM_ACCURACY_GUARD"] == "strict"
@@ -159,14 +158,12 @@ def test_persona_apply_profile_leaves_target_ratio_untouched() -> None:
 def test_agent_savings_env_defaults_preserve_user_overrides() -> None:
     env = {
         "HEADROOM_TARGET_RATIO": "0.25",
-        "HEADROOM_MAX_ITEMS": "12",
     }
 
     apply_agent_savings_env_defaults(env, AGENT_90_PROFILE)
 
     assert env["HEADROOM_SAVINGS_PROFILE"] == "agent-90"
     assert env["HEADROOM_TARGET_RATIO"] == "0.25"
-    assert env["HEADROOM_MAX_ITEMS"] == "12"
     assert env["HEADROOM_SMART_CRUSHER_COMPACTION"] == "0"
 
 
@@ -365,7 +362,6 @@ def test_agent_savings_config_mismatches_returns_specific_labels(monkeypatch) ->
         "protect_recent": profile.protect_recent,
         "protect_analysis_context": profile.protect_analysis_context,
         "min_tokens_to_crush": profile.min_tokens_to_compress,
-        "max_items_after_crush": profile.max_items_after_crush,
         "smart_crusher_with_compaction": profile.smart_crusher_with_compaction,
         "accuracy_guard": profile.accuracy_guard,
     }
@@ -388,7 +384,6 @@ def test_agent_savings_config_mismatches_accepts_matching_runtime_config(monkeyp
         "protect_recent": "2",
         "protect_analysis_context": True,
         "min_tokens_to_crush": "120",
-        "max_items_after_crush": "8",
         "smart_crusher_with_compaction": False,
         "accuracy_guard": "strict",
     }
@@ -406,7 +401,6 @@ def test_agent_savings_config_mismatches_reports_unparseable_values(monkeypatch)
         "protect_recent": "not-an-int",
         "protect_analysis_context": None,
         "min_tokens_to_crush": object(),
-        "max_items_after_crush": object(),
         "smart_crusher_with_compaction": None,
         "accuracy_guard": None,
     }
@@ -419,7 +413,6 @@ def test_agent_savings_config_mismatches_reports_unparseable_values(monkeypatch)
         "protect-recent",
         "protect-analysis-context",
         "min-tokens",
-        "max-items",
         "smart-crusher-compaction",
         "accuracy-guard",
     ]
@@ -436,7 +429,6 @@ def test_agent_90_profile_applies_to_proxy_config_runtime_kwargs() -> None:
     assert kwargs["protect_analysis_context"] is True
     assert kwargs["target_ratio"] == 0.10
     assert kwargs["min_tokens_to_compress"] == 120
-    assert kwargs["max_items_after_crush"] == 8
     assert kwargs["smart_crusher_with_compaction"] is False
     assert kwargs["force_kompress"] is True
     assert kwargs["read_protection_window"] == 2
@@ -460,7 +452,6 @@ def test_proxy_explicit_config_overrides_agent_90_profile() -> None:
 def test_agent_90_router_uses_ccr_sampling_not_lossless_table() -> None:
     router = ContentRouter(
         ContentRouterConfig(
-            smart_crusher_max_items_after_crush=8,
             smart_crusher_with_compaction=False,
         )
     )
@@ -468,7 +459,6 @@ def test_agent_90_router_uses_ccr_sampling_not_lossless_table() -> None:
     crusher = router._get_smart_crusher()
 
     assert crusher is not None
-    assert crusher.config.max_items_after_crush == 8
     assert crusher._with_compaction is False
 
 
@@ -516,7 +506,6 @@ def test_agent_90_router_json_tool_output_reaches_target_with_needle() -> None:
     )
     router = ContentRouter(
         ContentRouterConfig(
-            smart_crusher_max_items_after_crush=8,
             smart_crusher_with_compaction=False,
         )
     )

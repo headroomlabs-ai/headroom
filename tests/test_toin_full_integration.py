@@ -476,7 +476,6 @@ class TestTOINWithSmartCrusher:
             )
             crusher_config = SmartCrusherConfig(
                 enabled=True,
-                max_items_after_crush=10,
                 use_feedback_hints=True,
             )
             crusher = SmartCrusher(

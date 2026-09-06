@@ -205,7 +205,6 @@ class TestQueryAnchorExtraction:
             enabled=True,
             min_items_to_analyze=5,
             min_tokens_to_crush=100,
-            max_items_after_crush=10,
         )
         crusher = SmartCrusher(config)
         tokenizer = get_tokenizer()
@@ -253,7 +252,6 @@ class TestQueryAnchorExtraction:
             enabled=True,
             min_items_to_analyze=5,
             min_tokens_to_crush=100,
-            max_items_after_crush=10,
         )
         crusher = SmartCrusher(config)
         tokenizer = get_tokenizer()

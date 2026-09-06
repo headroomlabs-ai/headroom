@@ -574,7 +574,6 @@ def test_ensure_proxy_reuses_agent_proxy_with_savings_profile(monkeypatch) -> No
             "protect_recent": 2,
             "protect_analysis_context": True,
             "min_tokens_to_crush": 120,
-            "max_items_after_crush": 8,
             "smart_crusher_with_compaction": False,
             "accuracy_guard": "strict",
         },

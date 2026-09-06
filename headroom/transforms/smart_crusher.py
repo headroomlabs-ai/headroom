@@ -174,7 +174,6 @@ class SmartCrusherConfig:
     variance_threshold: float = 2.0
     uniqueness_threshold: float = 0.1
     similarity_threshold: float = 0.8
-    max_items_after_crush: int = 15
     preserve_change_points: bool = True
     factor_out_constants: bool = False
     include_summaries: bool = False
@@ -384,7 +383,6 @@ class SmartCrusher(Transform):
             "variance_threshold": cfg.variance_threshold,
             "uniqueness_threshold": cfg.uniqueness_threshold,
             "similarity_threshold": cfg.similarity_threshold,
-            "max_items_after_crush": cfg.max_items_after_crush,
             "preserve_change_points": cfg.preserve_change_points,
             "factor_out_constants": cfg.factor_out_constants,
             "include_summaries": cfg.include_summaries,

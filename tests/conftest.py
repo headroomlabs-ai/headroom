@@ -393,7 +393,6 @@ def smart_crusher_config():
         enabled=True,
         min_items_to_analyze=3,
         min_tokens_to_crush=0,  # Always crush for tests
-        max_items_after_crush=10,
     )
 
 

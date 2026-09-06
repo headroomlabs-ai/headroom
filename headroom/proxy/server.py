@@ -153,7 +153,13 @@ from headroom.proxy.memory_handler import MemoryConfig, MemoryHandler
 
 # Data models (extracted to headroom/proxy/models.py for maintainability)
 from headroom.proxy.model_router import ModelRouter, ModelRouterConfig
-from headroom.proxy.models import CacheEntry, ProxyConfig, RateLimitState, RequestLog  # noqa: F401
+from headroom.proxy.models import (  # noqa: F401
+    CacheEntry,
+    ProxyConfig,
+    RateLimitState,
+    RequestLog,
+    warn_if_max_items_configured,
+)
 from headroom.proxy.modes import (
     PROXY_MODE_CACHE,
     PROXY_MODE_TOKEN,
@@ -855,10 +861,6 @@ class HeadroomProxy(
             prefer_code_aware_for_code=_get_env_bool("HEADROOM_PREFER_CODE_AWARE_FOR_CODE", True),
             tool_profiles=config.tool_profiles,
             read_lifecycle=ReadLifecycleConfig(enabled=config.read_lifecycle),
-            smart_crusher_max_items_after_crush=cast(
-                int | None,
-                profile_kwargs.get("max_items_after_crush"),
-            ),
             smart_crusher_with_compaction=cast(
                 bool,
                 profile_kwargs.get("smart_crusher_with_compaction", True),
@@ -3336,10 +3338,6 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     "min_tokens_to_compress",
                     config.min_tokens_to_crush,
                 ),
-                "max_items_after_crush": profile_kwargs.get(
-                    "max_items_after_crush",
-                    config.max_items_after_crush,
-                ),
                 "smart_crusher_with_compaction": profile_kwargs.get(
                     "smart_crusher_with_compaction",
                     config.smart_crusher_with_compaction,
@@ -4682,9 +4680,6 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             "min_tokens_to_crush": profile_kwargs.get(
                 "min_tokens_to_compress", config.min_tokens_to_crush
             ),
-            "max_items_after_crush": profile_kwargs.get(
-                "max_items_after_crush", config.max_items_after_crush
-            ),
             "smart_crusher_with_compaction": profile_kwargs.get(
                 "smart_crusher_with_compaction",
                 config.smart_crusher_with_compaction,
@@ -5483,6 +5478,19 @@ def _proxy_config_from_env() -> ProxyConfig:
                 from headroom.rollout import RolloutSnapshot
 
                 values["rollout"] = RolloutSnapshot.from_internal_dict(rollout_value)
+            # Drop keys this build no longer has rather than discarding the whole
+            # snapshot. A worker started by a parent of a different generation
+            # (mid-upgrade, or after a field is removed) would otherwise fall all
+            # the way back to env vars and silently lose the parent's config.
+            known = {f.name for f in fields(ProxyConfig)}
+            unknown = sorted(set(values) - known)
+            if unknown:
+                logger.warning(
+                    "Ignoring unknown %s keys from the parent process: %s",
+                    _MULTI_WORKER_CONFIG_ENV,
+                    ", ".join(unknown),
+                )
+                values = {k: v for k, v in values.items() if k in known}
             return ProxyConfig(**values)
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             logger.warning(
@@ -6030,7 +6038,12 @@ if __name__ == "__main__":
     # Optimization
     parser.add_argument("--no-optimize", action="store_true", help="Disable optimization")
     parser.add_argument("--min-tokens", type=int, default=500, help="Min tokens to crush")
-    parser.add_argument("--max-items", type=int, default=50, help="Max items after crush")
+    parser.add_argument(
+        "--max-items",
+        type=int,
+        default=None,
+        help="Deprecated and ignored. Item count is derived by the adaptive sizer.",
+    )
     parser.add_argument(
         "--tool-profile",
         action="append",
@@ -6193,6 +6206,17 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    # max_items_after_crush was removed: the value never reached the crusher,
+    # and the adaptive sizer derives the item count from the content itself.
+    # The flag and env var are still accepted so existing scripts do not break.
+    if args.max_items is not None:
+        logger.warning(
+            "--max-items is deprecated and ignored. SmartCrusher derives how many "
+            "items to keep from the content itself; use a CompressionProfile bias "
+            "to lean conservative or aggressive."
+        )
+    warn_if_max_items_configured()
+
     # Environment variable defaults (HEADROOM_* prefix)
     # CLI args override env vars, env vars override ProxyConfig defaults
     env_code_aware = _get_env_bool("HEADROOM_CODE_AWARE_ENABLED", True)
@@ -6274,7 +6298,6 @@ if __name__ == "__main__":
         anyllm_provider=_get_env_str("HEADROOM_ANYLLM_PROVIDER", args.anyllm_provider),
         optimize=optimize,
         min_tokens_to_crush=_get_env_int("HEADROOM_MIN_TOKENS", args.min_tokens),
-        max_items_after_crush=_get_env_int("HEADROOM_MAX_ITEMS", args.max_items),
         smart_crusher_with_compaction=(
             _get_env_bool("HEADROOM_SMART_CRUSHER_COMPACTION", False)
             if "HEADROOM_SMART_CRUSHER_COMPACTION" in os.environ

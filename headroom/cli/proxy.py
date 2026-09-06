@@ -1133,6 +1133,7 @@ def proxy(
     ensure_proxy_dependencies()
 
     # Import here to avoid slow startup
+    from headroom.proxy.models import warn_if_max_items_configured
     from headroom.proxy.server import (
         ProxyConfig,
         _parse_csv_tools,
@@ -1140,6 +1141,8 @@ def proxy(
         _parse_tool_profiles,
         run_server,
     )
+
+    warn_if_max_items_configured()
 
     # Warn if --learn and --no-learn are both set (--no-learn wins, per docstring)
     if learn and no_learn:
@@ -1331,7 +1334,6 @@ def proxy(
         ),
         malloc_trim_interval_seconds=_get_env_int("HEADROOM_MALLOC_TRIM_INTERVAL_SECONDS", 60),
         min_tokens_to_crush=_get_env_int("HEADROOM_MIN_TOKENS", 500),
-        max_items_after_crush=_get_env_int("HEADROOM_MAX_ITEMS", 50),
         exclude_tools=_parse_exclude_tools(None) or None,
         protect_tool_results=frozenset(_parse_csv_tools(protect_tool_results))
         if protect_tool_results

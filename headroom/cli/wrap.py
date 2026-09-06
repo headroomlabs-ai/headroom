@@ -3526,7 +3526,6 @@ def _agent_savings_config_mismatches(
             "bool",
         ),
         ("HEADROOM_MIN_TOKENS", "min_tokens_to_crush", "min-tokens", "int"),
-        ("HEADROOM_MAX_ITEMS", "max_items_after_crush", "max-items", "int"),
         (
             "HEADROOM_SMART_CRUSHER_COMPACTION",
             "smart_crusher_with_compaction",

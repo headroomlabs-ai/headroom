@@ -299,13 +299,12 @@ class TestCLIProxyEnvVars:
             result = runner.invoke(
                 main,
                 ["proxy"],
-                env={"HEADROOM_MIN_TOKENS": "0", "HEADROOM_MAX_ITEMS": "0"},
+                env={"HEADROOM_MIN_TOKENS": "0"},
                 catch_exceptions=False,
             )
 
         assert result.exit_code == 0, result.output
         assert captured_config["config"].min_tokens_to_crush == 0
-        assert captured_config["config"].max_items_after_crush == 0
 
     def test_headroom_budget_from_env(self, runner):
         """HEADROOM_BUDGET env var should be passed to ProxyConfig."""

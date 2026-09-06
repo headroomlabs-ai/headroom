@@ -90,7 +90,6 @@ class MCPToolProfile:
 
     tool_name_pattern: str  # Regex pattern to match tool names
     enabled: bool = True
-    max_items: int = 20
     min_tokens_to_compress: int = 500
     preserve_error_keywords: set[str] = field(
         default_factory=lambda: {"error", "failed", "exception", "critical", "fatal"}
@@ -103,37 +102,31 @@ DEFAULT_MCP_PROFILES: list[MCPToolProfile] = [
     # Slack - preserve errors and messages matching query
     MCPToolProfile(
         tool_name_pattern=r".*slack.*",
-        max_items=25,
         preserve_error_keywords={"error", "failed", "exception", "bug", "issue", "broken"},
     ),
     # Database - preserve errors and anomalies
     MCPToolProfile(
         tool_name_pattern=r".*database.*|.*sql.*|.*query.*",
-        max_items=30,
         preserve_error_keywords={"error", "null", "failed", "exception", "violation"},
     ),
     # GitHub - preserve errors and high-priority issues
     MCPToolProfile(
         tool_name_pattern=r".*github.*|.*git.*",
-        max_items=20,
         preserve_error_keywords={"error", "bug", "critical", "urgent", "blocker"},
     ),
     # Logs - preserve ALL errors
     MCPToolProfile(
         tool_name_pattern=r".*log.*|.*trace.*",
-        max_items=40,  # Keep more for logs
         preserve_error_keywords={"error", "fatal", "critical", "exception", "failed", "panic"},
     ),
     # File system - minimal compression (paths matter)
     MCPToolProfile(
         tool_name_pattern=r".*file.*|.*fs.*|.*directory.*",
-        max_items=50,
         min_tokens_to_compress=1000,  # Higher threshold
     ),
     # Generic fallback
     MCPToolProfile(
         tool_name_pattern=r".*",
-        max_items=20,
     ),
 ]
 
@@ -254,15 +247,17 @@ class HeadroomMCPCompressor:
         # tool consumers parse and iterate. The PR4 lossless path
         # substitutes a CSV+schema STRING in place of arrays — great
         # for LLM prompts but wire-format-incompatible with consumers
-        # that expect JSON arrays. So we keep the runtime MCP wrapper
-        # on the lossy + CCR-Dropped path: the LLM sees row-level
-        # subsets inline, with the full payload retrievable via CCR
-        # cache. (Same retention semantics as Python's pre-PR4
-        # SmartCrusher behavior.)
+        # that expect JSON arrays. So the runtime MCP wrapper stays on
+        # the lossy + CCR-Dropped path, with the full payload
+        # retrievable from the CCR cache.
+        #
+        # How many items survive is decided by the adaptive sizer, which
+        # derives K from the content itself. There is no per-tool item
+        # count to set here; use CompressionProfile.bias to lean
+        # conservative or aggressive for a given tool.
         smart_config = SmartCrusherConfig(
             enabled=True,
             min_tokens_to_crush=profile.min_tokens_to_compress,
-            max_items_after_crush=profile.max_items,
         )
         # observer: MCP runs outside the proxy, so PrometheusMetrics (the
         # proxy's observer, which forwards to the beacon) never sees these
