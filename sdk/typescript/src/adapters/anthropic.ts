@@ -11,6 +11,16 @@ interface AnthropicLike {
   [key: string]: any;
 }
 
+// Anthropic image block `source` -> OpenAI image_url url string, or null if unconvertible.
+function anthropicImageUrl(source: any): string | null {
+  if (!source || typeof source !== "object") return null;
+  if (source.type === "base64" && source.media_type && source.data) {
+    return `data:${source.media_type};base64,${source.data}`;
+  }
+  if (source.type === "url" && typeof source.url === "string") return source.url;
+  return null;
+}
+
 /**
  * Convert Anthropic messages to OpenAI format for compression.
  *
@@ -29,13 +39,29 @@ function anthropicToOpenAI(messages: any[]): OpenAIMessage[] {
         const toolResults = msg.content.filter(
           (b: any) => b.type === "tool_result",
         );
-        const textBlocks = msg.content.filter((b: any) => b.type === "text");
+        const hasImages = msg.content.some((b: any) => b.type === "image");
 
-        if (textBlocks.length > 0) {
-          result.push({
-            role: "user",
-            content: textBlocks.map((b: any) => b.text).join("\n"),
-          });
+        if (hasImages) {
+          const parts = msg.content
+            .filter((b: any) => b.type === "text" || b.type === "image")
+            .map((b: any) => {
+              if (b.type === "text") return { type: "text" as const, text: b.text };
+              const url = anthropicImageUrl(b.source);
+              return url ? { type: "image_url" as const, image_url: { url } } : null;
+            })
+            .filter((p: any): p is NonNullable<typeof p> => p !== null);
+
+          if (parts.length > 0) {
+            result.push({ role: "user", content: parts });
+          }
+        } else {
+          const textBlocks = msg.content.filter((b: any) => b.type === "text");
+          if (textBlocks.length > 0) {
+            result.push({
+              role: "user",
+              content: textBlocks.map((b: any) => b.text).join("\n"),
+            });
+          }
         }
         for (const tr of toolResults) {
           result.push({

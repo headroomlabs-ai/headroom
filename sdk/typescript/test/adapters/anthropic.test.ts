@@ -190,6 +190,42 @@ describe("withHeadroom (Anthropic)", () => {
     expect(createArgs.messages.length).toBeGreaterThan(0);
   });
 
+  it("preserves image blocks instead of dropping them during compression", async () => {
+    mockFetch.mockResolvedValueOnce(mockCompressSuccess());
+
+    const mockCreate = vi.fn().mockResolvedValue({});
+    const fakeClient = { messages: { create: mockCreate } };
+
+    const wrapped = withHeadroom(fakeClient as any, {
+      baseUrl: "http://localhost:8787",
+    });
+
+    await wrapped.messages.create({
+      model: "claude-sonnet-4-5-20250929",
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "what is this?" },
+            {
+              type: "image",
+              source: { type: "base64", media_type: "image/png", data: "AAAA" },
+            },
+          ],
+        },
+      ],
+      max_tokens: 1024,
+    });
+
+    // The image must not be silently dropped from the compression request.
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.messages).toHaveLength(1);
+    expect(body.messages[0].content).toEqual([
+      { type: "text", text: "what is this?" },
+      { type: "image_url", image_url: { url: "data:image/png;base64,AAAA" } },
+    ]);
+  });
+
   it("returns original messages on compression fallback", async () => {
     // Simulate proxy unreachable
     mockFetch.mockRejectedValueOnce(new TypeError("fetch failed"));
