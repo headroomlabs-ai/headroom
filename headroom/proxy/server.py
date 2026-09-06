@@ -116,6 +116,7 @@ from headroom.proxy.auth_mode import should_stamp_codex_client
 from headroom.proxy.background_compression import BackgroundCompressor
 from headroom.proxy.budget_basis_policy import resolve_estimated_basis_policy
 from headroom.proxy.buffered_ccr_response import DEFAULT_BUFFERED_CCR_GRACE_SECONDS
+from headroom.proxy.cors import cors_origin_regex_for_config, cors_origins_for_config
 
 # =============================================================================
 # Extracted modules (re-exported for backward compatibility)
@@ -3429,21 +3430,13 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     # layer, not in ProxyConfig). Set HEADROOM_CORS_ORIGINS (comma-separated)
     # to pin an explicit allowlist for Docker or remote-dashboard deployments;
     # "*" restores the old wildcard behaviour if the operator accepts the risk.
-    _default_loopback_origin_regex = r"https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?"
-    _cors_origins_env = os.environ.get("HEADROOM_CORS_ORIGINS", "").strip()
-    if _cors_origins_env:
-        _cors_allow_origins = [o.strip() for o in _cors_origins_env.split(",") if o.strip()]
-        _cors_allow_origin_regex: str | None = None
-    else:
-        _cors_allow_origins = []
-        _cors_allow_origin_regex = _default_loopback_origin_regex
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=_cors_allow_origins,
-        allow_origin_regex=_cors_allow_origin_regex,
+        allow_origins=cors_origins_for_config(config),
+        allow_origin_regex=cors_origin_regex_for_config(config),
         allow_credentials=False,
         allow_methods=["GET", "POST"],
-        allow_headers=["Content-Type", "Authorization"],
+        allow_headers=["Content-Type", "Authorization", "X-Headroom-Project", "X-Headroom-Stack"],
     )
 
     # X-Headroom-Stack: SDK adapters (TS openai/anthropic/etc.) tag their

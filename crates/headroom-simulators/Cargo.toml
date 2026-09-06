@@ -15,6 +15,9 @@ path = "src/main.rs"
 name = "headroom_simulators"
 path = "src/lib.rs"
 
+[lints]
+workspace = true
+
 [dependencies]
 axum = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "net"] }
