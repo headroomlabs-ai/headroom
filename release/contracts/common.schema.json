@@ -1,0 +1,241 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://headroom.dev/schemas/release/v1/common.schema.json",
+  "title": "Headroom release evidence common definitions",
+  "$defs": {
+    "schemaVersion": {
+      "type": "integer",
+      "const": 1
+    },
+    "gitSha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["pass", "fail", "inconclusive", "skipped_by_policy"]
+    },
+    "decisionStatus": {
+      "type": "string",
+      "enum": ["pass", "fail", "inconclusive"]
+    },
+    "rolloutChannel": {
+      "type": "string",
+      "enum": ["stable", "beta", "canary", "dev"]
+    },
+    "riskClass": {
+      "type": "string",
+      "pattern": "^R[0-9]+$"
+    },
+    "releasePolicyVersion": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?$"
+    },
+    "nonEmptyString": {
+      "type": "string",
+      "minLength": 1
+    },
+    "artifactIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "filename", "sha256", "size_bytes"],
+      "properties": {
+        "name": { "$ref": "#/$defs/nonEmptyString" },
+        "version": { "$ref": "#/$defs/nonEmptyString" },
+        "filename": { "$ref": "#/$defs/nonEmptyString" },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "size_bytes": { "type": "integer", "minimum": 1 },
+        "media_type": { "$ref": "#/$defs/nonEmptyString" }
+      }
+    },
+    "producerIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "workflow", "run_id", "run_attempt", "commit_sha"],
+      "properties": {
+        "repository": { "type": "string", "pattern": "^[^/\\s]+/[^/\\s]+$" },
+        "workflow": { "$ref": "#/$defs/nonEmptyString" },
+        "run_id": { "type": "integer", "minimum": 1 },
+        "run_attempt": { "type": "integer", "minimum": 1 },
+        "commit_sha": { "$ref": "#/$defs/gitSha" }
+      }
+    },
+    "evidenceReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["evidence_id", "kind", "schema_version", "status", "uri", "sha256", "producer"],
+      "properties": {
+        "evidence_id": { "$ref": "#/$defs/nonEmptyString" },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "candidate_manifest",
+            "deterministic_result",
+            "integration_result",
+            "benchmark_result",
+            "gate_result",
+            "qualification_manifest",
+            "rollout_snapshot",
+            "other"
+          ]
+        },
+        "schema_version": { "type": "integer", "minimum": 1 },
+        "status": { "$ref": "#/$defs/status" },
+        "uri": { "type": "string", "format": "uri" },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "producer": { "$ref": "#/$defs/producerIdentity" }
+      }
+    },
+    "rolloutIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "policy_version",
+        "channel",
+        "registry_digest",
+        "snapshot_digest",
+        "unsafe_override",
+        "qualification_eligible"
+      ],
+      "properties": {
+        "schema_version": { "type": "integer", "minimum": 1 },
+        "policy_version": { "$ref": "#/$defs/nonEmptyString" },
+        "channel": { "$ref": "#/$defs/rolloutChannel" },
+        "registry_digest": { "$ref": "#/$defs/sha256" },
+        "snapshot_digest": { "$ref": "#/$defs/sha256" },
+        "unsafe_override": { "type": "boolean" },
+        "qualification_eligible": { "type": "boolean" },
+        "qualification_ineligible_reason": { "$ref": "#/$defs/nonEmptyString" },
+        "features": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "name",
+              "available_in",
+              "default_enabled_in",
+              "requested",
+              "disabled",
+              "enabled",
+              "decision"
+            ],
+            "properties": {
+              "name": { "$ref": "#/$defs/nonEmptyString" },
+              "available_in": { "$ref": "#/$defs/rolloutChannel" },
+              "default_enabled_in": {
+                "anyOf": [
+                  { "$ref": "#/$defs/rolloutChannel" },
+                  { "type": "null" }
+                ]
+              },
+              "requested": { "type": "boolean" },
+              "disabled": { "type": "boolean" },
+              "enabled": { "type": "boolean" },
+              "decision": {
+                "type": "string",
+                "enum": [
+                  "default",
+                  "explicit",
+                  "legacy_alias",
+                  "disabled",
+                  "blocked_by_channel",
+                  "unsafe_override",
+                  "not_requested"
+                ]
+              }
+            }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "unsafe_override": { "const": true } }, "required": ["unsafe_override"] },
+          "then": {
+            "properties": { "qualification_eligible": { "const": false } },
+            "required": ["qualification_ineligible_reason"]
+          }
+        }
+      ]
+    },
+    "environmentIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runner", "platform", "image", "resource_limits"],
+      "properties": {
+        "runner": { "$ref": "#/$defs/nonEmptyString" },
+        "platform": { "$ref": "#/$defs/nonEmptyString" },
+        "region": { "$ref": "#/$defs/nonEmptyString" },
+        "image": { "$ref": "#/$defs/nonEmptyString" },
+        "image_digest": { "$ref": "#/$defs/sha256" },
+        "resource_limits": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {
+            "type": ["string", "number", "integer", "boolean"]
+          }
+        }
+      }
+    },
+    "override": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["override_id", "scope", "reason", "approved_by", "approved_at", "expires_at"],
+      "properties": {
+        "override_id": { "$ref": "#/$defs/nonEmptyString" },
+        "scope": { "type": "string", "enum": ["gate_a", "gate_b", "evidence"] },
+        "reason": { "$ref": "#/$defs/nonEmptyString" },
+        "approved_by": { "$ref": "#/$defs/nonEmptyString" },
+        "approved_at": { "type": "string", "format": "date-time" },
+        "expires_at": { "type": "string", "format": "date-time" },
+        "ticket_uri": { "type": "string", "format": "uri" }
+      }
+    },
+    "runtimePayloadEquivalence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "method",
+        "qualified_artifact_sha256",
+        "publication_artifact_sha256",
+        "qualified_runtime_payload_sha256",
+        "publication_runtime_payload_sha256",
+        "identity_verification",
+        "verifier"
+      ],
+      "properties": {
+        "method": { "type": "string", "enum": ["exact_artifact", "runtime_payload"] },
+        "qualified_artifact_sha256": { "$ref": "#/$defs/sha256" },
+        "publication_artifact_sha256": { "$ref": "#/$defs/sha256" },
+        "qualified_runtime_payload_sha256": { "$ref": "#/$defs/sha256" },
+        "publication_runtime_payload_sha256": { "$ref": "#/$defs/sha256" },
+        "identity_verification": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "mismatches"],
+          "properties": {
+            "status": { "type": "string", "enum": ["pass", "inconclusive"] },
+            "mismatches": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/nonEmptyString" },
+              "uniqueItems": true
+            }
+          },
+          "allOf": [
+            {
+              "if": { "properties": { "status": { "const": "pass" } }, "required": ["status"] },
+              "then": { "properties": { "mismatches": { "maxItems": 0 } } },
+              "else": { "properties": { "mismatches": { "minItems": 1 } } }
+            }
+          ]
+        },
+        "verifier": { "$ref": "#/$defs/producerIdentity" }
+      }
+    }
+  }
+}

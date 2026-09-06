@@ -285,6 +285,7 @@ dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
     "pytest-asyncio>=0.21.0",
+    "jsonschema>=4.23.0,<5.0",  # Validate versioned release evidence contracts
     "ruff==0.16.3",
     "mypy>=1.0.0",
     "pre-commit>=3.0.0",

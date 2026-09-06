@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "qualification_id": "qualification-3077ac81-policy-1.0.0",
+  "created_at": "2026-08-13T06:05:00Z",
+  "candidate": {
+    "source_sha": "3077ac81e8ef3ddefebbe308ea37a4e9bb2100e6",
+    "artifact": {
+      "name": "headroom-ai",
+      "version": "0.36.0rc1",
+      "filename": "headroom_ai-0.36.0rc1-py3-none-any.whl",
+      "sha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "size_bytes": 1048576
+    },
+    "runtime_payload_sha256": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "candidate_manifest": {
+      "evidence_id": "candidate-3077ac81",
+      "kind": "candidate_manifest",
+      "schema_version": 1,
+      "status": "pass",
+      "uri": "https://github.com/headroomlabs-ai/headroom/actions/runs/123456789/artifacts/1",
+      "sha256": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "producer": {
+        "repository": "headroomlabs-ai/headroom",
+        "workflow": "candidate-artifact.yml",
+        "run_id": 123456789,
+        "run_attempt": 1,
+        "commit_sha": "3077ac81e8ef3ddefebbe308ea37a4e9bb2100e6"
+      }
+    }
+  },
+  "rollout": {
+    "schema_version": 1,
+    "policy_version": "1",
+    "channel": "stable",
+    "registry_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "snapshot_digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "unsafe_override": false,
+    "qualification_eligible": true
+  },
+  "policy_version": "1.0.0",
+  "risk_class": "R3",
+  "status": "pass",
+  "evidence": [
+    {
+      "evidence_id": "benchmark-3077ac81-regular-v1",
+      "kind": "benchmark_result",
+      "schema_version": 1,
+      "status": "pass",
+      "uri": "https://headroom-bench.example/runs/benchmark-3077ac81-regular-v1/result.json",
+      "sha256": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "producer": {
+        "repository": "headroomlabs-ai/headroom-bench",
+        "workflow": "release-benchmark.yml",
+        "run_id": 987654321,
+        "run_attempt": 1,
+        "commit_sha": "1234567890abcdef1234567890abcdef12345678"
+      }
+    }
+  ],
+  "gate_a": {
+    "evidence_id": "gate-a-3077ac81-policy-1.0.0",
+    "kind": "gate_result",
+    "schema_version": 1,
+    "status": "pass",
+    "uri": "https://github.com/headroomlabs-ai/headroom/actions/runs/123456791/artifacts/1",
+    "sha256": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+    "producer": {
+      "repository": "headroomlabs-ai/headroom",
+      "workflow": "release-policy.yml",
+      "run_id": 123456791,
+      "run_attempt": 1,
+      "commit_sha": "3077ac81e8ef3ddefebbe308ea37a4e9bb2100e6"
+    }
+  }
+}

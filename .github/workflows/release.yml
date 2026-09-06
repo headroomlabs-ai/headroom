@@ -26,6 +26,23 @@ env:
   GH_PACKAGES_SKIP: "false"
 
 on:
+  # Reusable build entry point for the non-publishing immutable candidate
+  # workflow. `candidate_mode` is a hard safety boundary: every registry and
+  # release mutation job below is disabled when it is true.
+  workflow_call:
+    inputs:
+      source_sha:
+        description: "Exact full source SHA to build"
+        required: true
+        type: string
+      candidate_mode:
+        description: "Build and smoke exact bytes without publishing"
+        required: true
+        type: boolean
+    outputs:
+      version:
+        description: "Resolved Python package version"
+        value: ${{ jobs.detect-version.outputs.version }}
   # Triggered when release-please's release PR is merged: the bot
   # tags the merge commit `vX.Y.Z` and creates a GitHub Release on
   # that tag, which fires the `release: published` event. Ordinary
@@ -90,6 +107,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          ref: ${{ inputs.source_sha || github.sha }}
 
       # When fired by release-please's release event, the tag the
       # bot just published IS the canonical version for this run —
@@ -132,6 +150,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          ref: ${{ inputs.source_sha || github.sha }}
 
       - name: Set up Python
         uses: actions/setup-python@v7
@@ -267,6 +286,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          ref: ${{ inputs.source_sha || github.sha }}
 
       - name: Set up Python
         uses: actions/setup-python@v7
@@ -765,7 +785,7 @@ jobs:
     # X2: skip on pull_request — dry-run only verifies build+smoke,
     # never publishes. The other two predicates remain (workflow_dispatch
     # dry_run, vars-level skip).
-    if: github.event_name != 'pull_request' && github.event.inputs.dry_run != 'true' && vars.PYPI_SKIP != 'true'
+    if: inputs.candidate_mode != true && github.event_name != 'pull_request' && github.event.inputs.dry_run != 'true' && vars.PYPI_SKIP != 'true'
     environment: pypi  # NOTE: environment name must be a literal; update here if the GitHub environment name changes
     runs-on: ubuntu-latest
     permissions:
@@ -793,7 +813,7 @@ jobs:
 
   publish-npm:
     needs: [detect-version, build]
-    if: github.event_name != 'pull_request' && github.event.inputs.dry_run != 'true' && vars.NPM_SKIP != 'true'
+    if: inputs.candidate_mode != true && github.event_name != 'pull_request' && github.event.inputs.dry_run != 'true' && vars.NPM_SKIP != 'true'
     runs-on: ubuntu-latest
     # Publishes to npmjs.org via NPM_TOKEN secret; no GITHUB_TOKEN
     # write permissions needed.
@@ -803,6 +823,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          ref: ${{ inputs.source_sha || github.sha }}
 
       - name: Set up Node.js
         uses: actions/setup-node@v7
@@ -880,7 +901,7 @@ jobs:
 
   publish-github-packages:
     needs: [detect-version, build]
-    if: github.event_name != 'pull_request' && github.event.inputs.dry_run != 'true' && vars.GH_PACKAGES_SKIP != 'true'
+    if: inputs.candidate_mode != true && github.event_name != 'pull_request' && github.event.inputs.dry_run != 'true' && vars.GH_PACKAGES_SKIP != 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -889,6 +910,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          ref: ${{ inputs.source_sha || github.sha }}
 
       - name: Compute GitHub Packages scope
         id: gh-scope
@@ -990,7 +1012,7 @@ jobs:
     # image's `pip install` step. Failing here ~3 minutes earlier
     # than docker-build saves the matrix's wall-clock budget.
     needs: [detect-version, smoke-import-wheels]
-    if: github.event_name != 'pull_request' && github.event.inputs.dry_run != 'true'
+    if: inputs.candidate_mode != true && github.event_name != 'pull_request' && github.event.inputs.dry_run != 'true'
     permissions:
       contents: read
       packages: write
@@ -1005,6 +1027,7 @@ jobs:
     if: >-
       ${{
         always() &&
+        inputs.candidate_mode != true &&
         github.event_name != 'pull_request' &&
         github.event.inputs.dry_run != 'true' &&
         needs.detect-version.result == 'success' &&
@@ -1021,6 +1044,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          ref: ${{ inputs.source_sha || github.sha }}
 
       - name: Download changelog artifact
         uses: actions/download-artifact@v8

@@ -1,0 +1,196 @@
+name: Immutable candidate artifact
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: "Full commit SHA reachable from authoritative main"
+        required: true
+        type: string
+
+# This entry point can only read repository contents and workflow artifacts.
+# It has no package, release, branch, or OIDC publication authority.
+permissions:
+  contents: read
+
+concurrency:
+  group: candidate-${{ inputs.source_sha }}
+  cancel-in-progress: false
+
+jobs:
+  validate-source:
+    runs-on: ubuntu-latest
+    outputs:
+      source_sha: ${{ steps.source.outputs.source_sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Validate exact authoritative main SHA
+        id: source
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          PRODUCER_SHA: ${{ github.sha }}
+          WORKFLOW_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if [ "$WORKFLOW_REF" != "refs/heads/main" ]; then
+            echo "candidate workflow must be dispatched from authoritative main" >&2
+            exit 1
+          fi
+          if [[ ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "source_sha must be a lowercase full 40-character Git SHA" >&2
+            exit 1
+          fi
+          git fetch --no-tags origin "+refs/heads/main:refs/remotes/origin/main"
+          git cat-file -e "$SOURCE_SHA^{commit}"
+          if ! git merge-base --is-ancestor "$SOURCE_SHA" refs/remotes/origin/main; then
+            echo "source_sha is not reachable from authoritative origin/main" >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$PRODUCER_SHA" refs/remotes/origin/main; then
+            echo "candidate producer is not reachable from authoritative origin/main" >&2
+            exit 1
+          fi
+          printf 'source_sha=%s\n' "$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+
+  build-and-smoke:
+    needs: validate-source
+    permissions:
+      contents: read
+    uses: ./.github/workflows/release.yml
+    with:
+      source_sha: ${{ needs.validate-source.outputs.source_sha }}
+      candidate_mode: true
+
+  emit-candidate:
+    needs: [validate-source, build-and-smoke]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      SOURCE_SHA: ${{ needs.validate-source.outputs.source_sha }}
+      VERSION: ${{ needs.build-and-smoke.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Check out exact candidate source for rollout identity
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ env.SOURCE_SHA }}
+          path: candidate-source
+
+      - uses: astral-sh/setup-uv@v7
+
+      - name: Download exact built distributions
+        uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+
+      - name: Create deterministic candidate bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$VERSION"
+          test -n "$(find dist -maxdepth 1 -type f -print -quit)"
+          uv run --extra dev python scripts/candidate_manifest.py inventory \
+            --directory dist \
+            --output candidate-runtime-payload.json
+          cp candidate-runtime-payload.json dist/
+          bundle="headroom-candidate-${SOURCE_SHA}.tar"
+          tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
+            -cf "$bundle" -C dist .
+          printf 'CANDIDATE_BUNDLE=%s\n' "$bundle" >> "$GITHUB_ENV"
+
+      - name: Resolve qualification rollout identity
+        shell: bash
+        run: uv run --project candidate-source --extra dev headroom rollout status --json > rollout-snapshot.json
+
+      - name: Emit canonical candidate manifest
+        shell: bash
+        run: |
+          uv run --extra dev python scripts/candidate_manifest.py create \
+            --artifact "$CANDIDATE_BUNDLE" \
+            --output candidate-manifest.json \
+            --source-sha "$SOURCE_SHA" \
+            --producer-sha "$GITHUB_SHA" \
+            --repository "$GITHUB_REPOSITORY" \
+            --package headroom-ai \
+            --version "$VERSION" \
+            --workflow candidate-artifact.yml \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --rollout rollout-snapshot.json \
+            --runtime-payload candidate-runtime-payload.json \
+            --media-type application/x-tar
+
+      - name: Verify manifest against exact candidate bytes
+        shell: bash
+        run: |
+          uv run --extra dev python scripts/candidate_manifest.py verify \
+            --manifest candidate-manifest.json \
+            --artifact "$CANDIDATE_BUNDLE" \
+            --runtime-payload candidate-runtime-payload.json \
+            --source-sha "$SOURCE_SHA" \
+            --producer-sha "$GITHUB_SHA" \
+            --repository "$GITHUB_REPOSITORY" \
+            --package headroom-ai \
+            --version "$VERSION" \
+            --workflow candidate-artifact.yml \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT"
+
+      - name: Upload immutable candidate and provenance
+        uses: actions/upload-artifact@v7
+        with:
+          name: candidate-${{ env.SOURCE_SHA }}
+          path: |
+            ${{ env.CANDIDATE_BUNDLE }}
+            candidate-manifest.json
+            candidate-runtime-payload.json
+            rollout-snapshot.json
+          if-no-files-found: error
+          retention-days: 90
+
+  verify-downloaded-candidate:
+    needs: [validate-source, build-and-smoke, emit-candidate]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      SOURCE_SHA: ${{ needs.validate-source.outputs.source_sha }}
+      VERSION: ${{ needs.build-and-smoke.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@v7
+
+      - name: Download retained candidate
+        uses: actions/download-artifact@v8
+        with:
+          name: candidate-${{ env.SOURCE_SHA }}
+          path: candidate/
+
+      - name: Verify independently downloaded bytes
+        shell: bash
+        run: |
+          uv run --extra dev python scripts/candidate_manifest.py verify \
+            --manifest candidate/candidate-manifest.json \
+            --artifact "candidate/headroom-candidate-${SOURCE_SHA}.tar" \
+            --runtime-payload candidate/candidate-runtime-payload.json \
+            --source-sha "$SOURCE_SHA" \
+            --producer-sha "$GITHUB_SHA" \
+            --repository "$GITHUB_REPOSITORY" \
+            --package headroom-ai \
+            --version "$VERSION" \
+            --workflow candidate-artifact.yml \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT"
