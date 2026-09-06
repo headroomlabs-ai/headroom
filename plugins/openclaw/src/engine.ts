@@ -11,20 +11,10 @@ import { compress } from "headroom-ai";
 import { ProxyManager, defaultLogger, type ProxyManagerConfig, type ProxyManagerLogger } from "./proxy-manager.js";
 import { agentToOpenAI, normalizeAgentMessages, openAIToAgent } from "./convert.js";
 
-/** Race a promise against a timeout and always release the timer. */
-function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
-  let timerId: ReturnType<typeof setTimeout> | undefined;
-  const timer = new Promise<never>((_, reject) => {
-    timerId = setTimeout(() => reject(new Error(`headroom compress() timed out after ${ms}ms`)), ms);
-  });
-  return Promise.race([promise, timer]).finally(() => {
-    if (timerId !== undefined) clearTimeout(timerId);
-  });
-}
-
 export interface HeadroomEngineConfig extends ProxyManagerConfig {
   enabled?: boolean;
   requestTimeoutMs?: number;
+  minContextChars?: number;
   circuitBreakerThreshold?: number;
   circuitBreakerCooldownMs?: number;
 }
@@ -117,20 +107,24 @@ export class HeadroomContextEngine {
       return { messages: normalizeAgentMessages(params.messages), estimatedTokens: 0 };
     }
 
-    try {
-      // Convert AgentMessage → OpenAI format
-      const openaiMessages = agentToOpenAI(params.messages);
+    const openaiMessages = agentToOpenAI(params.messages);
+    const minContextChars = this.config.minContextChars ?? 800;
+    if (minContextChars > 0 && countContextChars(openaiMessages) < minContextChars) {
+      this.logger.debug("[headroom] Context below compression threshold — using original messages");
+      return { messages: normalizeAgentMessages(params.messages), estimatedTokens: 0 };
+    }
 
+    try {
       // Compress via proxy — pass tokenBudget so RollingWindow enforces it
-      const result = await withTimeout(
-        compress(openaiMessages, {
-          model: params.model ?? "claude-sonnet-4-5",
-          baseUrl: this.proxyUrl,
-          fallback: true,
-          tokenBudget: params.tokenBudget,
-        } as any),
-        this.config.requestTimeoutMs ?? 30_000,
-      );
+      const result = await compress(openaiMessages, {
+        model: params.model ?? "claude-sonnet-4-5",
+        baseUrl: this.proxyUrl,
+        fallback: true,
+        tokenBudget: params.tokenBudget,
+        // The SDK applies this to AbortSignal.timeout(), so a timed-out call is
+        // cancelled instead of continuing in the background after fail-open.
+        timeout: this.config.requestTimeoutMs ?? 2_000,
+      } as any);
 
       if (!result.compressed || result.tokensSaved === 0) {
         this.resetCircuit();
@@ -348,4 +342,15 @@ export class HeadroomContextEngine {
       }
     }
   }
+}
+
+function countContextChars(messages: ReturnType<typeof agentToOpenAI>): number {
+  let total = 0;
+  for (const message of messages) {
+    total += message.content?.length ?? 0;
+    for (const toolCall of message.tool_calls ?? []) {
+      total += toolCall.function?.arguments?.length ?? 0;
+    }
+  }
+  return total;
 }

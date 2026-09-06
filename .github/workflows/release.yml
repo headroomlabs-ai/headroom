@@ -810,6 +810,11 @@ jobs:
           node-version: "20"
           registry-url: ${{ env.NPM_REGISTRY_URL }}
 
+      - name: Verify npm publishing authentication
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm whoami --registry "${NPM_REGISTRY_URL}"
+
       # No artifact download required: the publish steps below pack and
       # publish directly from the checked-out source tree (sdk/typescript
       # and plugins/openclaw) via `npm pack` + `npm publish`. The
@@ -825,12 +830,15 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           version="${{ needs.detect-version.outputs.npm_version }}"
+          if npm view "${NPM_SDK_PACKAGE}@${version}" version --registry "${NPM_REGISTRY_URL}" >/dev/null 2>&1; then
+            echo "${NPM_SDK_PACKAGE}@${version} is already published; continuing."
+            exit 0
+          fi
           cd sdk/typescript
           npm ci
           npm run build
           npm version "$version" --no-git-tag-version --allow-same-version
           npm publish --access public
-        continue-on-error: true
 
       - name: Publish ${{ env.NPM_OPENCLAW_PACKAGE }} to npmjs.org
         id: npm-openclaw-publish
@@ -838,6 +846,10 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           version="${{ needs.detect-version.outputs.npm_version }}"
+          if npm view "${NPM_OPENCLAW_PACKAGE}@${version}" version --registry "${NPM_REGISTRY_URL}" >/dev/null 2>&1; then
+            echo "${NPM_OPENCLAW_PACKAGE}@${version} is already published; continuing."
+            exit 0
+          fi
           cd plugins/openclaw
           npm ci
           npm run build
@@ -851,7 +863,6 @@ jobs:
           EOF
           node prepare-dist.mjs
           npm publish --access public
-        continue-on-error: true
 
       - name: Publish ${{ env.NPM_OPENCODE_PACKAGE }} to npmjs.org
         id: npm-opencode-publish
@@ -859,6 +870,10 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           version="${{ needs.detect-version.outputs.npm_version }}"
+          if npm view "${NPM_OPENCODE_PACKAGE}@${version}" version --registry "${NPM_REGISTRY_URL}" >/dev/null 2>&1; then
+            echo "${NPM_OPENCODE_PACKAGE}@${version} is already published; continuing."
+            exit 0
+          fi
           cd plugins/opencode
           npm ci
           npm run build
@@ -871,12 +886,6 @@ jobs:
           fs.writeFileSync("package.json", `${JSON.stringify(pkg, null, 2)}\n`);
           EOF
           npm publish --access public
-        continue-on-error: true
-
-      - name: npm publish notice
-        if: steps.npm-sdk-publish.outcome == 'failure' || steps.npm-openclaw-publish.outcome == 'failure' || steps.npm-opencode-publish.outcome == 'failure'
-        run: |
-          echo "::notice::One or more npm publishes failed. Set NPM_SKIP=true in repo Variables to skip npm publishes if tokens are not configured."
 
   publish-github-packages:
     needs: [detect-version, build]
