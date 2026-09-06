@@ -7672,6 +7672,25 @@ def openclaw(
 # =============================================================================
 
 
+def _resolve_opencode_binary(custom: str | None) -> tuple[str | None, str]:
+    """Resolve the OpenCode (or OpenCode-fork) executable to launch.
+
+    Several OpenCode forks (e.g. rolandcode) rename the binary but keep
+    OpenCode's config/env contract, so Headroom only needs the different command
+    name to wrap them (#1927). Precedence: the explicit ``--opencode-bin``, then
+    ``HEADROOM_OPENCODE_BIN``, then the default ``opencode``. A value that is an
+    existing file path is used as-is; otherwise it is looked up on ``PATH``.
+
+    Returns ``(resolved_path_or_None, requested_name)`` — the requested name is
+    returned too so the caller can print a useful not-found message.
+    """
+    requested = custom or os.environ.get("HEADROOM_OPENCODE_BIN") or "opencode"
+    candidate = Path(requested).expanduser()
+    if candidate.is_file():
+        return str(candidate.resolve()), requested
+    return shutil.which(requested), requested
+
+
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @_retired_context_tool_option
 @_serena_instructions_option
@@ -7699,6 +7718,17 @@ def openclaw(
 @click.option("--anyllm-provider", default=None, help="Provider for any-llm backend")
 @click.option("--region", default=None, help="Cloud region for Bedrock/Vertex")
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
+@click.option(
+    "--opencode-bin",
+    "opencode_bin_name",
+    default=None,
+    metavar="NAME_OR_PATH",
+    help=(
+        "OpenCode executable name or path to launch. Use this to wrap an "
+        "OpenCode fork with a different command name (e.g. rolandcode). "
+        "Also settable via HEADROOM_OPENCODE_BIN. Defaults to 'opencode'."
+    ),
+)
 @click.option("--prepare-only", is_flag=True, hidden=True)
 @click.argument("opencode_args", nargs=-1, type=click.UNPROCESSED)
 def opencode(
@@ -7714,6 +7744,7 @@ def opencode(
     anyllm_provider: str | None,
     region: str | None,
     verbose: bool,
+    opencode_bin_name: str | None,
     prepare_only: bool,
     opencode_args: tuple,
 ) -> None:
@@ -7733,6 +7764,7 @@ def opencode(
         headroom wrap opencode --port 9999             # Custom proxy port
         headroom wrap opencode --backend anyllm --anyllm-provider groq
         headroom wrap opencode --copilot-subscription # Use a GitHub Copilot subscription
+        headroom wrap opencode --opencode-bin rolandcode   # Wrap an OpenCode fork
     """
     subscription_resolution = None
     if copilot_subscription:
@@ -7762,10 +7794,15 @@ def opencode(
     # config without launching, so it is exempt.
     opencode_bin: str | None = None
     if not prepare_only:
-        opencode_bin = shutil.which("opencode")
+        opencode_bin, requested_bin = _resolve_opencode_binary(opencode_bin_name)
         if not opencode_bin:
-            click.echo("Error: 'opencode' not found in PATH.")
-            click.echo("Install OpenCode: https://opencode.ai")
+            click.echo(f"Error: '{requested_bin}' not found in PATH.")
+            if requested_bin == "opencode":
+                click.echo("Install OpenCode: https://opencode.ai")
+                click.echo(
+                    "For an OpenCode fork with a different command name, pass "
+                    "--opencode-bin <name> (or set HEADROOM_OPENCODE_BIN)."
+                )
             raise SystemExit(1)
 
     # Snapshot OpenCode config.json BEFORE any wrap-time mutation so
