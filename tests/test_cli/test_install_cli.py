@@ -485,6 +485,41 @@ def test_install_status_survives_non_dict_config(monkeypatch) -> None:
     assert "Backend:    anthropic" in result.output
 
 
+def test_install_status_reports_effective_memory_options(monkeypatch) -> None:
+    runner = CliRunner()
+
+    class Manifest:
+        profile = "default"
+        preset = "persistent-service"
+        runtime_kind = "python"
+        supervisor_kind = "service"
+        scope = "user"
+        port = 8787
+        backend = "anthropic"
+        health_url = "http://127.0.0.1:8787/readyz"
+        proxy_mode = None
+        memory_enabled = True
+        learn_enabled = False
+        memory_storage_mode = "global"
+        traffic_learning_min_evidence = 7
+        memory_project_root = "/tmp/scratch-project"
+
+    monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: Manifest())
+    monkeypatch.setattr("headroom.cli.install.runtime_status", lambda manifest: "running")
+    monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: True)
+    monkeypatch.setattr("headroom.cli.install.probe_json", lambda url: {"config": {}})
+
+    result = runner.invoke(main, ["install", "status"])
+
+    assert result.exit_code == 0, result.output
+    assert "Mode:       runtime default" in result.output
+    assert "Memory:     enabled" in result.output
+    assert "Learning:   disabled" in result.output
+    assert "Storage:    global" in result.output
+    assert "Min evidence: 7" in result.output
+    assert "Project root: /tmp/scratch-project" in result.output
+
+
 def test_install_restart_uses_internal_helpers(monkeypatch) -> None:
     runner = CliRunner()
     calls: list[str] = []
