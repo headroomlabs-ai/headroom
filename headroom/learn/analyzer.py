@@ -53,8 +53,22 @@ _MAX_DIGEST_TOKENS = 80_000  # Budget for the digest (leave room for prompt + ou
 # Each entry: (binary_name, model_identifier, command_prefix). The claude-cli
 # command uses stream-json output so the analyzer can detect progress and
 # enforce an idle (rather than wall-clock-only) timeout — see _call_cli_llm.
+# --include-partial-messages adds incremental "stream_event" ticks during the
+# assistant's response; without it claude only emits ~3 events total (system
+# init, one assistant message, result) — too sparse to report live progress.
 _CLI_BACKENDS: list[tuple[str, str, list[str]]] = [
-    ("claude", "claude-cli", ["claude", "-p", "--output-format", "stream-json", "--verbose"]),
+    (
+        "claude",
+        "claude-cli",
+        [
+            "claude",
+            "-p",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--include-partial-messages",
+        ],
+    ),
     ("gemini", "gemini-cli", ["gemini", "-p"]),
     ("codex", "codex-cli", ["codex", "exec", "--skip-git-repo-check"]),
 ]
@@ -71,6 +85,10 @@ _CLI_TIMEOUT = 300
 # this long. Lets us catch genuine hangs quickly while letting long-but-active
 # analyses run to completion. Override with HEADROOM_LEARN_CLI_IDLE_TIMEOUT_SECS.
 _CLI_IDLE_TIMEOUT = 60
+# Minimum time between progress-echo callbacks during claude-cli streaming —
+# the CLI can emit several partial-message events per second, but a wrapper
+# UI heartbeat only needs one update every few seconds, not a play-by-play.
+_PROGRESS_THROTTLE_SECS = 3.0
 
 
 def _resolve_windows_cli_shim(cmd: list[str]) -> list[str] | None:
@@ -166,7 +184,12 @@ class SessionAnalyzer:
     def __init__(self, model: str | None = None):
         self.model = model
 
-    def analyze(self, project: ProjectInfo, sessions: list[SessionData]) -> AnalysisResult:
+    def analyze(
+        self,
+        project: ProjectInfo,
+        sessions: list[SessionData],
+        on_progress: typing.Callable[[str], None] | None = None,
+    ) -> AnalysisResult:
         """Analyze sessions and produce recommendations via LLM."""
         all_calls = [tc for s in sessions for tc in s.tool_calls]
         failed_calls = [tc for tc in all_calls if tc.is_error]
@@ -195,7 +218,7 @@ class SessionAnalyzer:
 
         # Call LLM for analysis
         try:
-            raw = _call_llm(digest, model)
+            raw = _call_llm(digest, model, on_progress=on_progress)
             result.recommendations = _parse_llm_response(raw)
             # Weight loop guardrails above one-off rules using MEASURED waste.
             apply_loop_weighting(result.recommendations, loops)
@@ -575,7 +598,9 @@ def _failure_detail(
     return "\n".join(parts) if parts else "(no output captured)"
 
 
-def _call_cli_llm(digest: str, model: str) -> dict:
+def _call_cli_llm(
+    digest: str, model: str, on_progress: typing.Callable[[str], None] | None = None
+) -> dict:
     """Call a locally installed CLI tool as the LLM backend.
 
     Enables keyless usage for subscription-based CLI tools that handle
@@ -583,7 +608,8 @@ def _call_cli_llm(digest: str, model: str) -> dict:
     OS ``ARG_MAX`` limits and argument-injection risks.
 
     CLI invocations:
-      claude-cli → claude -p --output-format stream-json --verbose (idle-timeout)
+      claude-cli → claude -p --output-format stream-json --verbose
+                   --include-partial-messages (idle-timeout)
       gemini-cli → gemini -p (wall-clock timeout)
       codex-cli  → codex exec (wall-clock timeout)
 
@@ -593,6 +619,8 @@ def _call_cli_llm(digest: str, model: str) -> dict:
     Args:
         digest: Token-efficient session digest to analyze.
         model: CLI model identifier (e.g. ``claude-cli``).
+        on_progress: Optional callback invoked with a short progress phrase
+            while claude-cli streams (throttled). Ignored for other backends.
 
     Returns:
         Parsed JSON recommendations from the CLI tool.
@@ -614,7 +642,9 @@ def _call_cli_llm(digest: str, model: str) -> dict:
 
     if model == "claude-cli":
         idle_cap = _resolve_timeout_secs("HEADROOM_LEARN_CLI_IDLE_TIMEOUT_SECS", _CLI_IDLE_TIMEOUT)
-        return _call_claude_cli_streaming(cmd, prompt, hard_cap=hard_cap, idle_cap=idle_cap)
+        return _call_claude_cli_streaming(
+            cmd, prompt, hard_cap=hard_cap, idle_cap=idle_cap, on_progress=on_progress
+        )
 
     try:
         result = run(
@@ -665,7 +695,12 @@ def _call_cli_llm(digest: str, model: str) -> dict:
 
 
 def _call_claude_cli_streaming(
-    cmd: list[str], prompt: str, *, hard_cap: int, idle_cap: int
+    cmd: list[str],
+    prompt: str,
+    *,
+    hard_cap: int,
+    idle_cap: int,
+    on_progress: typing.Callable[[str], None] | None = None,
 ) -> dict:
     """Run claude-cli with stream-json output and an idle-timeout watchdog.
 
@@ -677,6 +712,10 @@ def _call_claude_cli_streaming(
 
     Threads (rather than ``select``) drain stdout/stderr so the watchdog works
     on Windows too, where ``select`` does not support pipe handles.
+
+    If *on_progress* is given, it is called (throttled to at most once per
+    ``_PROGRESS_THROTTLE_SECS``) with a short phrase for non-terminal events,
+    so a caller can surface liveness during the otherwise-silent analysis.
     """
 
     def _popen(cmd: list[str]) -> subprocess.Popen:
@@ -732,6 +771,7 @@ def _call_claude_cli_streaming(
 
     start = time.monotonic()
     last_activity = start
+    last_progress_at = 0.0  # 0 so the first eligible event fires immediately
     stdout_lines: list[str] = []
     stderr_lines: list[str] = []
     final_result: str | None = None
@@ -780,11 +820,22 @@ def _call_claude_cli_streaming(
         if tag == "stdout":
             stdout_lines.append(line)
             event = _parse_stream_event(line)
-            if event is not None and event.get("type") == "result":
-                # Last result event wins if multiple are emitted.
-                result_text = event.get("result")
-                if isinstance(result_text, str):
-                    final_result = result_text
+            if event is not None:
+                if event.get("type") == "result":
+                    # Last result event wins if multiple are emitted.
+                    result_text = event.get("result")
+                    if isinstance(result_text, str):
+                        final_result = result_text
+                elif on_progress is not None:
+                    now = time.monotonic()
+                    detail = _progress_detail(event, now - start)
+                    if detail is not None and now - last_progress_at >= _PROGRESS_THROTTLE_SECS:
+                        last_progress_at = now
+                        try:
+                            on_progress(detail)
+                        except Exception as exc:  # pragma: no cover — defensive, a UI
+                            # callback must never abort a successful analysis.
+                            logger.debug("on_progress callback failed: %s", exc)
         else:
             stderr_lines.append(line)
 
@@ -833,7 +884,29 @@ def _parse_stream_event(line: str) -> dict | None:
     return parsed if isinstance(parsed, dict) else None
 
 
-def _call_llm(digest: str, model: str) -> dict:
+def _progress_detail(event: dict, elapsed: float) -> str | None:
+    """Map a claude-cli stream-json event to a short progress phrase.
+
+    Returns None for event types with nothing progress-worthy to report — the
+    terminal "result" event is handled by the caller before reaching here, and
+    any other unrecognized type (including future ones) stays silent rather
+    than guessed at.
+    """
+    event_type = event.get("type")
+    if event_type == "system":
+        # subtype "init" is the session start; anything else (e.g. an
+        # API-retry notice) still deserves a heartbeat, just not "started".
+        return "session started" if event.get("subtype") == "init" else f"retrying, {elapsed:.0f}s"
+    if event_type in ("assistant", "stream_event"):
+        return f"assistant responding, {elapsed:.0f}s"
+    if event_type == "user":
+        return f"tool running, {elapsed:.0f}s"
+    return None
+
+
+def _call_llm(
+    digest: str, model: str, on_progress: typing.Callable[[str], None] | None = None
+) -> dict:
     """Call LLM with the session digest and return parsed JSON.
 
     Uses LiteLLM for provider-agnostic access. The model string determines
@@ -841,7 +914,7 @@ def _call_llm(digest: str, model: str) -> dict:
     For CLI-based models (ending in "-cli"), delegates to ``_call_cli_llm``.
     """
     if model in _CLI_MODEL_IDS:
-        return _call_cli_llm(digest, model)
+        return _call_cli_llm(digest, model, on_progress=on_progress)
 
     import litellm
 
