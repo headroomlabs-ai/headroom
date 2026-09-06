@@ -21,20 +21,24 @@ from headroom import settings_store  # noqa: E402
 from headroom.proxy.server import ProxyConfig, create_app  # noqa: E402
 
 
-def _make_app():
-    return create_app(
-        ProxyConfig(
-            optimize=False,
-            cache_enabled=False,
-            rate_limit_enabled=False,
-            cost_tracking_enabled=False,
-            log_requests=False,
-            ccr_inject_tool=False,
-            ccr_handle_responses=False,
-            ccr_context_tracking=False,
-            image_optimize=False,
-        )
-    )
+def _make_config(**overrides):
+    values = {
+        "optimize": False,
+        "cache_enabled": False,
+        "rate_limit_enabled": False,
+        "cost_tracking_enabled": False,
+        "log_requests": False,
+        "ccr_inject_tool": False,
+        "ccr_handle_responses": False,
+        "ccr_context_tracking": False,
+        "image_optimize": False,
+    }
+    values.update(overrides)
+    return ProxyConfig(**values)
+
+
+def _make_app(**overrides):
+    return create_app(_make_config(**overrides))
 
 
 @pytest.fixture
@@ -76,6 +80,28 @@ class TestSchemaAndRead:
         resp = client.get("/settings")
         assert resp.status_code == 200, resp.text
         assert resp.json() == {"target_ratio": 0.5, "savings_profile": "balanced"}
+
+    def test_schema_reports_live_config_and_seed_provenance(self, workspace, monkeypatch):
+        monkeypatch.setenv("HEADROOM_MODE", "cache")
+        monkeypatch.setenv("HEADROOM_LOSSLESS", "0")
+        app = _make_app(
+            mode="token",
+            lossless=True,
+            worker_processes=2,
+            profile_seeded_env_keys=frozenset({"HEADROOM_MODE", "HEADROOM_LOSSLESS"}),
+        )
+        client = TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345))
+
+        resp = client.get("/settings/schema")
+
+        assert resp.status_code == 200, resp.text
+        by_key = {field["key"]: field for field in resp.json()["fields"]}
+        assert by_key["mode"]["value"] == "token"
+        assert by_key["mode"]["env_override"] is False
+        assert by_key["lossless"]["value"] is True
+        assert by_key["lossless"]["runtime_override"] is True
+        assert by_key["lossless"]["env_override"] is False
+        assert by_key["workers"]["value"] == 2
 
 
 class TestEndpointsGroup:

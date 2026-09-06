@@ -3894,7 +3894,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     )
     async def settings_schema(_request: Request):
         """Registry + grouped fields + effective values for the settings form."""
-        schema = settings_store.to_schema()
+        schema = settings_store.to_schema(
+            runtime_values=_settings_runtime_values(config),
+            env_override_exclusions=config.profile_seeded_env_keys,
+        )
         # Tell the UI whether this is a supervised (docker/service) install, where
         # manifest-baked knobs (HEADROOM_PORT/HEADROOM_HOST) are owned by the
         # install manifest and must be rendered read-only. Foreground proxies
@@ -5450,7 +5453,7 @@ def _json_ready(value: Any) -> Any:
         return {field.name: _json_ready(getattr(value, field.name)) for field in fields(value)}
     if isinstance(value, dict):
         return {str(key): _json_ready(item) for key, item in value.items()}
-    if isinstance(value, list | tuple | set):
+    if isinstance(value, list | tuple | set | frozenset):
         return [_json_ready(item) for item in value]
     return value
 
@@ -5471,6 +5474,51 @@ def _proxy_config_payload(config: ProxyConfig) -> dict[str, Any]:
     return payload
 
 
+_SETTINGS_CONFIG_ALIASES: dict[str, str] = {
+    "workers": "worker_processes",
+    "rpm": "rate_limit_requests_per_minute",
+    "tpm": "rate_limit_tokens_per_minute",
+    "budget": "budget_limit_usd",
+    "log_messages": "log_full_messages",
+    "ccr_inline_resolve": "ccr_resolve_markers_inline",
+    "subscription_poll_interval": "subscription_poll_interval_s",
+    "request_timeout": "request_timeout_seconds",
+    "min_evidence": "traffic_learning_min_evidence",
+    "memory_project_root": "memory_project_root_override",
+    "anthropic_base_url": "anthropic_api_url",
+    "openai_base_url": "openai_api_url",
+    "region": "bedrock_region",
+}
+
+
+def _settings_runtime_values(config: ProxyConfig) -> dict[str, Any]:
+    """Project the live proxy config onto the curated settings registry."""
+    from headroom import settings_store
+
+    values: dict[str, Any] = {}
+    for setting in settings_store.SETTINGS:
+        attribute = _SETTINGS_CONFIG_ALIASES.get(setting.key, setting.key)
+        if not hasattr(config, attribute):
+            continue
+        value = getattr(config, attribute)
+        if isinstance(value, set | frozenset):
+            value = ",".join(sorted(value))
+        values[setting.key] = value
+
+    values.update(
+        {
+            "no_ccr": not (
+                config.ccr_inject_tool or config.ccr_inject_marker or config.ccr_handle_responses
+            ),
+            "no_ccr_proactive_expansion": not config.ccr_proactive_expansion,
+            "no_subscription_tracking": not config.subscription_tracking_enabled,
+            "no_memory_tools": not config.memory_inject_tools,
+            "no_memory_context": not config.memory_inject_context,
+        }
+    )
+    return values
+
+
 def _proxy_config_from_env() -> ProxyConfig:
     raw_config = os.environ.get(_MULTI_WORKER_CONFIG_ENV)
     if raw_config:
@@ -5483,6 +5531,8 @@ def _proxy_config_from_env() -> ProxyConfig:
                 from headroom.rollout import RolloutSnapshot
 
                 values["rollout"] = RolloutSnapshot.from_internal_dict(rollout_value)
+            if "profile_seeded_env_keys" in values:
+                values["profile_seeded_env_keys"] = frozenset(values["profile_seeded_env_keys"])
             return ProxyConfig(**values)
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             logger.warning(
@@ -5563,8 +5613,12 @@ def create_app_from_env() -> FastAPI:
     # tool-search, dedupe, read protection, …). setdefault → explicit env wins.
     from headroom.agent_savings import seed_proxy_env_defaults
 
-    seed_proxy_env_defaults()
-    return create_app(_proxy_config_from_env())
+    seeded_env_keys = seed_proxy_env_defaults()
+    config = _proxy_config_from_env()
+    config.profile_seeded_env_keys = frozenset(
+        set(config.profile_seeded_env_keys) | set(seeded_env_keys)
+    )
+    return create_app(config)
 
 
 def _get_code_aware_banner_status(config: ProxyConfig) -> str:
@@ -5631,9 +5685,12 @@ def run_server(
     # already resolved into `config` above via their inline defaults.
     from headroom.agent_savings import seed_proxy_env_defaults
 
-    seed_proxy_env_defaults()
+    seeded_env_keys = seed_proxy_env_defaults()
 
     config = config or ProxyConfig()
+    config.profile_seeded_env_keys = frozenset(
+        set(config.profile_seeded_env_keys) | set(seeded_env_keys)
+    )
     if workers < 1:
         raise ValueError("workers must be >= 1")
     config.worker_processes = workers
