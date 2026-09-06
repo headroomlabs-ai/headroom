@@ -5553,6 +5553,7 @@ def _proxy_config_from_env() -> ProxyConfig:
         model_router=ModelRouterConfig.from_env(
             os.environ.get("HEADROOM_MODEL_ROUTER_ENABLED"),
             os.environ.get("HEADROOM_MODEL_ROUTES"),
+            os.environ.get("HEADROOM_MODEL_ROUTER_LOG_ONLY"),
         ),
     )
 

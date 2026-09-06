@@ -75,9 +75,18 @@ class ModelRouterConfig:
 
     enabled: bool = False
     routes: tuple[ModelRoute, ...] = ()
+    log_only: bool = False
+    """Shadow mode: evaluate rules and log what routing *would* do, but leave the
+    model unchanged. Lets an operator validate routes against real traffic before
+    switching them on for real."""
 
     @classmethod
-    def from_env(cls, enabled_raw: str | None, routes_raw: str | None) -> ModelRouterConfig:
+    def from_env(
+        cls,
+        enabled_raw: str | None,
+        routes_raw: str | None,
+        log_only_raw: str | None = None,
+    ) -> ModelRouterConfig:
         """Build config from env-style strings, failing open to disabled.
 
         ``routes_raw`` is a JSON array of rule objects, e.g.::
@@ -85,15 +94,20 @@ class ModelRouterConfig:
             [{"name": "small->mini", "max_input_tokens": 4000,
               "require_no_tools": true, "to_model": "gpt-5.4-mini"}]
 
+        ``log_only_raw`` (``HEADROOM_MODEL_ROUTER_LOG_ONLY``) turns on shadow
+        mode: rules are evaluated and the intended route is logged, but the
+        model is left unchanged.
+
         A malformed value logs a warning and disables routing rather than
         raising, so a bad config can never take the proxy down.
         """
         enabled = _truthy(enabled_raw)
+        log_only = _truthy(log_only_raw)
         routes = _parse_routes(routes_raw)
         if enabled and not routes:
             logger.warning("model router enabled but no valid routes configured; disabling")
-            return cls(enabled=False, routes=())
-        return cls(enabled=enabled and bool(routes), routes=routes)
+            return cls(enabled=False, routes=(), log_only=log_only)
+        return cls(enabled=enabled and bool(routes), routes=routes, log_only=log_only)
 
 
 @dataclass(frozen=True)
@@ -122,6 +136,11 @@ class ModelRouter:
     def enabled(self) -> bool:
         return self._config.enabled and bool(self._config.routes)
 
+    @property
+    def log_only(self) -> bool:
+        """True when routing runs in shadow mode (decisions logged, not applied)."""
+        return self._config.log_only
+
     def select(self, *, model: str, input_tokens: int, has_tools: bool) -> ModelDecision:
         """Return the routing decision for a request.
 
@@ -135,6 +154,24 @@ class ModelRouter:
 
         for route in self._config.routes:
             if route.matches(model=model, input_tokens=input_tokens, has_tools=has_tools):
+                if self._config.log_only:
+                    # Shadow mode: record what routing WOULD do, but keep
+                    # ``routed_model == model`` so ``changed`` is False and the
+                    # handlers leave the outgoing model untouched. The reason is
+                    # what the handlers log, so the intended route is observable.
+                    reason = (
+                        f"[shadow] would route {model} -> {route.to_model} via rule "
+                        f"{route.name or route.to_model!r} "
+                        f"(input_tokens={input_tokens}, has_tools={has_tools}); "
+                        f"log_only, model unchanged"
+                    )
+                    return ModelDecision(
+                        original_model=model,
+                        routed_model=model,
+                        matched=True,
+                        reason=reason,
+                        rule_name=route.name,
+                    )
                 reason = (
                     f"matched rule {route.name or route.to_model!r}: "
                     f"{model} -> {route.to_model} "
