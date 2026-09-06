@@ -35,7 +35,7 @@ except ImportError:
     AIMessageChunk = object  # type: ignore[misc,assignment]
     ChatGenerationChunk = object  # type: ignore[misc,assignment]
 
-from headroom.providers import OpenAIProvider
+from headroom.providers.defaults import create_default_provider
 
 logger = logging.getLogger(__name__)
 
@@ -106,12 +106,12 @@ class StreamingMetricsTracker:
         Args:
             model: Model name for token counting. Default "gpt-4o".
             provider: Headroom provider for token counting. Uses
-                OpenAIProvider if not specified.
+                the provider-owned default if not specified.
         """
         _check_langchain_available()
 
         self._model = model
-        self._provider = provider or OpenAIProvider()
+        self._provider = provider or create_default_provider()
         self._content = ""
         self._chunk_count = 0
         self._start_time: datetime | None = None

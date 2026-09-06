@@ -16,6 +16,8 @@ from collections import defaultdict
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
+from headroom.providers.registry import tracks_prefix_cache_busts
+
 if TYPE_CHECKING:
     from headroom.observability import HeadroomOtelMetrics
     from headroom.proxy.cost import CostTracker
@@ -865,11 +867,11 @@ class PrometheusMetrics:
                 # bounded_model can be "other" once the cardinality cap trips, which
                 # mixes distinct models in this bust heuristic. That is acceptable:
                 # it only happens past MAX_DISTINCT_MODELS distinct models on cached
-                # anthropic traffic, the worst case is a mis-attributed bust stat,
+                # provider traffic, the worst case is a mis-attributed bust stat,
                 # and it keeps _cache_requests_by_model bounded.
                 model_req_num = self._cache_requests_by_model[bounded_model]
                 self._cache_requests_by_model[bounded_model] += 1
-                if provider == "anthropic" and model_req_num > 0:
+                if tracks_prefix_cache_busts(provider) and model_req_num > 0:
                     total_cached = cache_read_tokens + cache_write_tokens
                     if total_cached > 0 and cache_write_tokens > total_cached * 0.5:
                         pc["bust_count"] += 1

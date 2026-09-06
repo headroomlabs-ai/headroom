@@ -36,7 +36,7 @@ except ImportError:
 T = TypeVar("T")
 
 from headroom import HeadroomConfig  # noqa: E402
-from headroom.providers import OpenAIProvider  # noqa: E402
+from headroom.providers.defaults import create_default_provider  # noqa: E402
 from headroom.transforms import TransformPipeline  # noqa: E402
 
 from .providers import get_headroom_provider, get_model_name_from_strands  # noqa: E402
@@ -152,7 +152,7 @@ class HeadroomStrandsModel(Model):  # type: ignore[misc]
                             f"Auto-detected provider: {self._headroom_provider.__class__.__name__}"
                         )
                     else:
-                        self._headroom_provider = OpenAIProvider()
+                        self._headroom_provider = create_default_provider()
                     self._pipeline = TransformPipeline(
                         config=self.headroom_config,
                         provider=self._headroom_provider,
@@ -574,7 +574,7 @@ def optimize_messages(
     _check_strands_available()
 
     config = config or HeadroomConfig()
-    provider = OpenAIProvider()
+    provider = create_default_provider()
     pipeline = TransformPipeline(config=config, provider=provider)
 
     # Convert to OpenAI format (Strands uses similar format)

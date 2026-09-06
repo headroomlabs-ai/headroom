@@ -63,7 +63,8 @@ except ImportError:
     RunnableBinding = ()  # type: ignore[misc,assignment]
 
 from headroom import HeadroomConfig, HeadroomMode
-from headroom.providers import OpenAIProvider
+from headroom.providers.base import Provider
+from headroom.providers.defaults import create_default_provider
 from headroom.transforms import TransformPipeline
 
 from .providers import get_headroom_provider, get_model_name_from_langchain
@@ -228,7 +229,7 @@ class HeadroomChatModel(BaseChatModel):
                 self._provider = get_headroom_provider(self.wrapped_model)
                 logger.debug(f"Auto-detected provider: {self._provider.__class__.__name__}")
             else:
-                self._provider = OpenAIProvider()
+                self._provider = create_default_provider()
             self._pipeline = TransformPipeline(
                 config=self.headroom_config,
                 provider=self._provider,
@@ -828,14 +829,14 @@ class HeadroomRunnable:
         self.config = config or HeadroomConfig()
         self.mode = mode
         self._pipeline: TransformPipeline | None = None
-        self._provider: OpenAIProvider | None = None
+        self._provider: Provider | None = None
         self._metrics_history: list[OptimizationMetrics] = []
 
     @property
     def pipeline(self) -> TransformPipeline:
         """Lazily initialize TransformPipeline."""
         if self._pipeline is None:
-            self._provider = OpenAIProvider()
+            self._provider = create_default_provider()
             self._pipeline = TransformPipeline(
                 config=self.config,
                 provider=self._provider,
@@ -981,7 +982,7 @@ def optimize_messages(
     _check_langchain_available()
 
     config = config or HeadroomConfig()
-    provider = OpenAIProvider()
+    provider = create_default_provider()
     pipeline = TransformPipeline(config=config, provider=provider)
 
     # Convert to OpenAI format

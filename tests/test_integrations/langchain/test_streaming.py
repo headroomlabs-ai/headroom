@@ -125,7 +125,7 @@ class TestStreamingMetricsTrackerInit:
         """Initialize with default settings."""
         from headroom.integrations.langchain.streaming import StreamingMetricsTracker
 
-        with patch("headroom.integrations.langchain.streaming.OpenAIProvider"):
+        with patch("headroom.integrations.langchain.streaming.create_default_provider"):
             tracker = StreamingMetricsTracker()
 
             assert tracker._model == "gpt-4o"

@@ -13,8 +13,25 @@ from headroom.providers.registry import (
     call_client_transport,
     create_proxy_backend,
     format_backend_status,
+    format_backend_usage_section,
+    model_matches_provider,
 )
 from headroom.proxy import upstream_guard
+
+
+@pytest.mark.parametrize(
+    ("provider", "model", "expected"),
+    [
+        ("anthropic", "claude-sonnet-4-6", True),
+        ("vertex:anthropic", "claude-sonnet-4-6", True),
+        ("openai", "gpt-5.4", True),
+        ("openai", "claude-sonnet-4-6", False),
+        ("gemini", "gemini-3.1-pro", True),
+        ("bedrock", "anthropic.claude-sonnet-4-6-v1", True),
+    ],
+)
+def test_model_matches_provider(provider: str, model: str, expected: bool) -> None:
+    assert model_matches_provider(provider, model) is expected
 
 
 class DummyStorage:
@@ -211,6 +228,30 @@ def test_format_backend_status_uses_litellm_provider_metadata(
         )
         == "OPENAI via LiteLLM"
     )
+
+
+def test_format_backend_usage_section_uses_litellm_provider_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "headroom.backends.litellm.get_provider_config",
+        lambda provider: SimpleNamespace(
+            display_name=provider.upper(),
+            env_vars=("BEDROCK_PROFILE", "AWS_REGION"),
+            model_format_hint="bedrock/anthropic.claude",
+        ),
+    )
+
+    section = format_backend_usage_section(
+        backend="litellm-bedrock",
+        host="127.0.0.1",
+        port=8787,
+    )
+
+    assert "IMPORTANT for BEDROCK users" in section
+    assert "BEDROCK_PROFILE, AWS_REGION" in section
+    assert "ANTHROPIC_BASE_URL=http://127.0.0.1:8787" in section
+    assert "bedrock/anthropic.claude" in section
 
 
 def test_call_client_transport_covers_openai_and_anthropic_paths() -> None:
