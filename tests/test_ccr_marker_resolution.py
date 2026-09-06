@@ -10,6 +10,8 @@ from headroom.cache.compression_store import get_compression_store, reset_compre
 from headroom.ccr.marker_resolution import (
     resolve_markers_in_response,
     resolve_markers_in_text,
+    scrub_markers_for_client,
+    strip_internal_retrieve_calls,
 )
 
 
@@ -97,3 +99,52 @@ def test_resolve_markers_in_response_walks_nested_structure():
     assert resolved["choices"][0]["message"]["content"] == "here it is: full tool output"
     assert resolved["nested"]["list"] == ["a", "full tool output", "c"]
     assert resolved["unrelated"] == 42
+
+
+def test_client_scrubber_resolves_nested_tool_arguments():
+    hash_key = _store_entry("secret original")
+    payload = {
+        "type": "response.function_call_arguments.delta",
+        "delta": json.dumps({"content": f"<<ccr:{hash_key},text,15B>>"}),
+    }
+
+    scrubbed = scrub_markers_for_client(payload)
+
+    assert "<<ccr:" not in scrubbed["delta"]
+    assert json.loads(scrubbed["delta"])["content"] == "secret original"
+
+
+def test_client_scrubber_replaces_missing_marker_without_leaking_protocol():
+    scrubbed = scrub_markers_for_client("before <<ccr:deadbeefdeadbeef,html,6.6KB>> after")
+
+    assert "<<ccr:" not in scrubbed
+    assert scrubbed == "before [compressed content unavailable: html,6.6KB] after"
+
+
+def test_strip_internal_anthropic_retrieve_preserves_client_tool():
+    response = {
+        "content": [
+            {"type": "tool_use", "id": "ccr", "name": "headroom_retrieve", "input": {}},
+            {"type": "tool_use", "id": "client", "name": "write_file", "input": {}},
+        ],
+        "stop_reason": "tool_use",
+    }
+
+    stripped = strip_internal_retrieve_calls(response, "anthropic")
+
+    assert [block["name"] for block in stripped["content"]] == ["write_file"]
+    assert stripped["stop_reason"] == "tool_use"
+    assert len(response["content"]) == 2
+
+
+def test_strip_internal_responses_retrieve_preserves_client_function():
+    response = {
+        "output": [
+            {"type": "function_call", "call_id": "ccr", "name": "headroom_retrieve"},
+            {"type": "function_call", "call_id": "client", "name": "write_file"},
+        ]
+    }
+
+    stripped = strip_internal_retrieve_calls(response, "openai_responses")
+
+    assert [item["name"] for item in stripped["output"]] == ["write_file"]

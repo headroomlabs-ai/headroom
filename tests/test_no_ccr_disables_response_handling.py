@@ -109,6 +109,7 @@ def _upstream_stream_field(*, ccr_handle_responses: bool) -> object:
         ccr_inject_tool=False,
         ccr_inject_marker=False,
         ccr_handle_responses=ccr_handle_responses,
+        ccr_event_streaming=False,
         ccr_context_tracking=False,
         image_optimize=False,
     )

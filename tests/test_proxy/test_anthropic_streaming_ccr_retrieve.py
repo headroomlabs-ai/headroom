@@ -30,6 +30,7 @@ def _make_config() -> ProxyConfig:
         log_requests=False,
         ccr_inject_tool=True,
         ccr_handle_responses=True,
+        ccr_event_streaming=False,
         ccr_context_tracking=False,
         image_optimize=False,
     )
@@ -101,6 +102,41 @@ class _ContinuationClient:
 
     async def aclose(self) -> None:
         return None
+
+
+def test_event_level_ccr_keeps_upstream_streaming_and_wires_interceptor() -> None:
+    config = _make_config()
+    config.ccr_event_streaming = True
+
+    async def _result_stream():
+        yield b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+
+    with patch("headroom.proxy.server.AnyLLMBackend"):
+        app = create_app(config)
+        with TestClient(app) as client:
+            proxy = client.app.state.proxy
+            proxy._stream_response = AsyncMock(
+                return_value=StreamingResponse(_result_stream(), media_type="text/event-stream")
+            )
+            proxy._retry_request = AsyncMock(
+                side_effect=AssertionError("event-level path must not pre-buffer upstream")
+            )
+            response = client.post(
+                "/v1/messages",
+                headers={"x-api-key": "test-key", "anthropic-version": "2023-06-01"},
+                json={
+                    "model": "claude-sonnet-4-6",
+                    "max_tokens": 64,
+                    "stream": True,
+                    "tools": [create_ccr_tool_definition("anthropic")],
+                    "messages": [{"role": "user", "content": _buffered("use retrieval")}],
+                },
+            )
+
+    assert response.status_code == 200
+    call = proxy._stream_response.await_args
+    assert call.args[2]["stream"] is True
+    assert call.kwargs["ccr_stream_provider"] == "anthropic"
 
 
 def test_streaming_headroom_retrieve_is_intercepted_and_returned_as_sse() -> None:
@@ -257,12 +293,13 @@ def test_streaming_with_headroom_retrieve_available_but_unused_returns_sse() -> 
     proxy._stream_response.assert_not_awaited()
 
 
-def test_mixed_ccr_and_client_tool_streams_both_blocks_as_sse() -> None:
+def test_mixed_ccr_and_client_tool_suppresses_private_call_and_scrubs_markers() -> None:
     """LEGAL mixed turn (#839, #2089): headroom_retrieve emitted alongside a
     client tool. The proxy cannot synthesize the client tool_result, so it must
-    hand the turn back for the client to resolve — a 200 SSE stream preserving
-    BOTH tool_use blocks, matching the non-streaming path. It must NOT 502 and
-    must NOT issue a continuation request."""
+    hand the client-owned tool back as a 200 SSE stream. Headroom's injected
+    call is not part of the client's tool contract and markers in the remaining
+    arguments must not cross the client boundary. It must NOT 502 and must NOT
+    issue a continuation request."""
     config = _make_config()
     initial_response = _message_response(
         [
@@ -276,7 +313,7 @@ def test_mixed_ccr_and_client_tool_streams_both_blocks_as_sse() -> None:
                 "type": "tool_use",
                 "id": "toolu_client",
                 "name": "client_tool",
-                "input": {"value": 1},
+                "input": {"value": "<<ccr:deadbeefdeadbeef,text,1KB>>"},
             },
         ],
         stop_reason="tool_use",
@@ -319,22 +356,25 @@ def test_mixed_ccr_and_client_tool_streams_both_blocks_as_sse() -> None:
 
     assert resp.status_code == 200, resp.text
     assert "text/event-stream" in resp.headers["content-type"]
-    # Both tool_use blocks are preserved for the client to resolve.
-    assert "headroom_retrieve" in resp.text
+    # Preserve only the tool the client actually declared. Internal CCR syntax
+    # must not leak through its arguments.
+    assert "headroom_retrieve" not in resp.text
     assert "client_tool" in resp.text
-    assert "toolu_ccr" in resp.text
+    assert "toolu_ccr" not in resp.text
     assert "toolu_client" in resp.text
+    assert "<<ccr:" not in resp.text
+    assert "compressed content unavailable" in resp.text
     assert "Unable to safely complete streamed CCR retrieval" not in resp.text
     # No continuation is issued — the client resolves all tool calls.
     assert continuation_client.post_calls == []
 
 
-def test_unresolved_ccr_only_streams_through_as_200() -> None:
+def test_unresolved_ccr_only_fails_closed_without_private_tool_leak() -> None:
     """CCR-only turn that never resolves: the model keeps re-emitting
     headroom_retrieve so the continuation exhausts its retrieval rounds with a
-    residual marker and no accompanying client tool. Per #2089 the streaming
-    path streams the residual headroom_retrieve back as a 200 SSE so the client
-    can resolve or retry it, matching the non-streaming path."""
+    residual call and no accompanying client tool. The client never declared
+    Headroom's private tool, so the stream must fail closed instead of exposing
+    an impossible call contract."""
     config = _make_config()
     persistent_ccr = _message_response(
         [
@@ -342,7 +382,7 @@ def test_unresolved_ccr_only_streams_through_as_200() -> None:
                 "type": "tool_use",
                 "id": "toolu_ccr",
                 "name": "headroom_retrieve",
-                "input": {"hash": "deadbeef"},
+                "input": {"hash": "deadbeefdead"},
             },
         ],
         stop_reason="tool_use",
@@ -376,9 +416,10 @@ def test_unresolved_ccr_only_streams_through_as_200() -> None:
                 },
             )
 
-    assert resp.status_code == 200, resp.text
+    assert resp.status_code == 502, resp.text
     assert "text/event-stream" in resp.headers["content-type"]
-    assert "headroom_retrieve" in resp.text
+    assert "headroom_retrieve" not in resp.text
+    assert "Unable to safely complete streamed CCR retrieval" in resp.text
 
 
 @pytest.mark.asyncio

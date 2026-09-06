@@ -1965,6 +1965,61 @@ async def test_ws_memory_enabled_non_memory_response_streams_completion():
 
 
 @pytest.mark.asyncio
+async def test_ws_client_boundary_scrubs_markers_and_private_retrieve_events():
+    private_call = {
+        "type": "function_call",
+        "id": "fc-ccr",
+        "call_id": "call-ccr",
+        "name": "headroom_retrieve",
+        "arguments": '{"hash":"deadbeefdeadbeef"}',
+    }
+    message_item = {
+        "type": "message",
+        "id": "message-1",
+        "role": "assistant",
+        "content": [
+            {
+                "type": "output_text",
+                "text": "<<ccr:deadbeefdeadbeef,html,6.6KB>>",
+            }
+        ],
+    }
+    upstream_events = [
+        json.dumps({"type": "response.created", "response": {"id": "r-1"}}),
+        json.dumps({"type": "response.output_item.added", "item": private_call}),
+        json.dumps(
+            {
+                "type": "response.function_call_arguments.delta",
+                "item_id": "fc-ccr",
+                "delta": private_call["arguments"],
+            }
+        ),
+        json.dumps({"type": "response.output_item.done", "item": private_call}),
+        json.dumps({"type": "response.output_item.added", "item": message_item}),
+        json.dumps(
+            {
+                "type": "response.completed",
+                "response": {"id": "r-1", "output": [private_call, message_item]},
+            }
+        ),
+    ]
+    upstream = _FakeUpstream(upstream_events)
+    fake_ws_mod = _make_fake_websockets_module(upstream)
+    client_ws = _FakeWebSocket(frames=[_first_frame()])
+    handler = _DummyOpenAIHandler()
+
+    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    client_payload = "\n".join(client_ws.sent_text)
+    assert "headroom_retrieve" not in client_payload
+    assert "<<ccr:" not in client_payload
+    assert "compressed content unavailable: html,6.6KB" in client_payload
+    completed = json.loads(client_ws.sent_text[-1])
+    assert [item["type"] for item in completed["response"]["output"]] == ["message"]
+
+
+@pytest.mark.asyncio
 async def test_ws_late_memory_call_after_streamed_message_passes_through():
     message_item = {
         "type": "message",

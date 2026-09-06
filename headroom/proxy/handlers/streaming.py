@@ -1141,6 +1141,7 @@ class StreamingMixin:
         outcome_provider: str | None = None,
         waste_signals: dict[str, int] | None = None,
         session_key: str | None = None,
+        ccr_stream_provider: str | None = None,
     ) -> Response | StreamingResponse:
         """Stream response with metrics tracking and memory tool handling.
 
@@ -1185,6 +1186,7 @@ class StreamingMixin:
                 outcome_provider=outcome_provider,
                 waste_signals=waste_signals,
                 session_key=session_key,
+                ccr_stream_provider=ccr_stream_provider,
             )
         except (Exception, asyncio.CancelledError):
             self._cleanup_mid_turn_stream(session_key)
@@ -1215,6 +1217,7 @@ class StreamingMixin:
         outcome_provider: str | None,
         waste_signals: dict[str, int] | None,
         session_key: str,
+        ccr_stream_provider: str | None,
     ) -> Response | StreamingResponse:
         """Actual streaming implementation, guarded by _stream_response's cleanup wrapper."""
         from fastapi.responses import Response, StreamingResponse
@@ -1546,6 +1549,24 @@ class StreamingMixin:
         async def generate():
             nonlocal body, memory_enabled  # May need to modify for continuation requests
 
+            # CCR markers are an internal proxy/model protocol.  Keep one SSE
+            # event in flight so a marker split across arbitrary HTTP chunks —
+            # including inside streamed tool arguments — cannot cross the
+            # client boundary (#1877).
+            marker_egress_filter = None
+            if getattr(self.config, "ccr_inject_tool", False):
+                from headroom.ccr.egress import CCRMarkerEgressFilter
+
+                marker_egress_filter = CCRMarkerEgressFilter()
+
+            def _finish_marker_egress() -> list[bytes]:
+                nonlocal marker_egress_filter
+                if marker_egress_filter is None:
+                    return []
+                output = marker_egress_filter.finish()
+                marker_egress_filter = None
+                return output
+
             # For memory mode, we buffer the response to check for tool calls
             buffered_chunks: list[bytes] = []
             # Bytes-level mirror of the SSE stream for memory/prefix
@@ -1561,7 +1582,77 @@ class StreamingMixin:
             try:
                 async with contextlib.aclosing(upstream_response) as response:
                     sse_chunk_index = 0
-                    async for chunk in response.aiter_bytes():
+                    stream_iterator = response.aiter_bytes()
+                    if ccr_stream_provider is not None:
+                        from headroom.ccr.stream_splice import EventLevelCCRInterceptor
+
+                        ccr_response_handler = getattr(self, "ccr_response_handler", None)
+                        if ccr_response_handler is None:
+                            raise RuntimeError(
+                                "CCR stream interception requires a response handler"
+                            )
+
+                        async def _ccr_continuation(
+                            continuation_items: list[dict[str, Any]],
+                            continuation_tools: list[dict[str, Any]] | None,
+                        ) -> dict[str, Any]:
+                            continuation_body = {**body, "stream": False}
+                            if ccr_stream_provider == "anthropic":
+                                continuation_body["messages"] = continuation_items
+                            else:
+                                continuation_body["input"] = continuation_items
+                                continuation_body.pop("previous_response_id", None)
+                            if continuation_tools is not None:
+                                continuation_body["tools"] = continuation_tools
+                            continuation_headers = {
+                                key: value
+                                for key, value in headers.items()
+                                if key.lower()
+                                not in {
+                                    "content-encoding",
+                                    "transfer-encoding",
+                                    "accept-encoding",
+                                    "content-length",
+                                }
+                            }
+                            continuation_response = await self._retry_request(
+                                "POST",
+                                url,
+                                continuation_headers,
+                                continuation_body,
+                                request_id=request_id,
+                                forwarder_name="ccr_event_stream_continuation",
+                                path_for_log=url,
+                            )
+                            return continuation_response.json()
+
+                        if ccr_stream_provider == "anthropic":
+
+                            def render_response(value: dict[str, Any]) -> list[bytes]:
+                                return self._response_to_sse(value, "anthropic")
+
+                            continuation_messages = list(body.get("messages") or [])
+                        else:
+                            from headroom.proxy.handlers.openai import (
+                                _openai_responses_to_sse,
+                                _responses_input_to_items,
+                            )
+
+                            render_response = _openai_responses_to_sse
+                            continuation_messages = _responses_input_to_items(body.get("input"))
+                        interceptor = EventLevelCCRInterceptor(
+                            ccr_response_handler,
+                            provider=ccr_stream_provider,
+                            render_response=render_response,
+                        )
+                        stream_iterator = interceptor.process(
+                            stream_iterator,
+                            continuation_messages,
+                            body.get("tools"),
+                            _ccr_continuation,
+                        )
+
+                    async for chunk in stream_iterator:
                         sse_chunk_index += 1
                         # Record TTFB on first chunk
                         if stream_state["ttfb_ms"] is None:
@@ -1587,9 +1678,13 @@ class StreamingMixin:
                             tail = bytes(stream_state["sse_buffer"][-MAX_SSE_BUFFER_SIZE // 2 :])
                             stream_state["sse_buffer"] = bytearray(tail)
 
-                        # Always stream immediately — buffering breaks
-                        # real-time clients (LangGraph, LangChain, etc.)
-                        yield chunk
+                        # Preserve real-time delivery while holding at most one
+                        # incomplete SSE event for client-bound CCR scrubbing.
+                        if marker_egress_filter is None:
+                            yield chunk
+                        else:
+                            for scrubbed_chunk in marker_egress_filter.feed(chunk):
+                                yield scrubbed_chunk
 
                         if _codex_wire_debug:
                             capture_codex_wire_debug(
@@ -1646,6 +1741,9 @@ class StreamingMixin:
                                 stream_state["cache_creation_ephemeral_1h_input_tokens"] = usage[
                                     "cache_creation_ephemeral_1h_input_tokens"
                                 ]
+
+                for scrubbed_chunk in _finish_marker_egress():
+                    yield scrubbed_chunk
 
                 # Memory tool handling after stream completes
                 # Chunks were already yielded in real-time above, so we only
@@ -1731,6 +1829,8 @@ class StreamingMixin:
 
             except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
                 logger.error(f"[{request_id}] Connection error to upstream API: {e}")
+                for scrubbed_chunk in _finish_marker_egress():
+                    yield scrubbed_chunk
                 error_event = {
                     "type": "error",
                     "error": {
@@ -1742,9 +1842,17 @@ class StreamingMixin:
             except httpx.HTTPStatusError as e:
                 logger.error(f"[{request_id}] HTTP error from upstream API: {e}")
                 # Forward the upstream error response
-                yield e.response.content
+                if marker_egress_filter is None:
+                    yield e.response.content
+                else:
+                    for scrubbed_chunk in marker_egress_filter.feed(e.response.content):
+                        yield scrubbed_chunk
+                    for scrubbed_chunk in _finish_marker_egress():
+                        yield scrubbed_chunk
             except Exception as e:
                 logger.error(f"[{request_id}] Unexpected streaming error: {e}")
+                for scrubbed_chunk in _finish_marker_egress():
+                    yield scrubbed_chunk
                 error_event = {
                     "type": "error",
                     "error": {"type": "api_error", "message": str(e)},

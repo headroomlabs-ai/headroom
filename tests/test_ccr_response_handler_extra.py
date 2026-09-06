@@ -420,6 +420,7 @@ async def test_streaming_handler_process_stream_pass_through_and_ccr(
     monkeypatch.setattr(ccr_handler, "_response_to_sse", fake_response_to_sse)
 
     ccr_chunks = [
+        b"x" * 12_000,
         b'{"type":"tool_use","name":"headroom_retrieve"',
         b',"stop_reason":"tool_use"}',
         b"tail",

@@ -24,6 +24,7 @@ from .tool_calls import (
     CCRToolCall,
     extract_tool_calls,
     has_ccr_tool_calls,
+    is_ccr_tool_call,
     parse_ccr_tool_calls,
 )
 from .tool_injection import CCR_TOOL_NAME
@@ -150,7 +151,12 @@ class CCRResponseHandler:
         - ``RESIDUAL_CCR_ERROR``: headroom_retrieve remains with no accompanying
           client tool call — a genuine handling/conversion failure.
         """
-        ccr_calls, other_calls = self._parse_ccr_tool_calls(response, provider)
+        # Classification is name-based, not argument-validity-based. A model
+        # can emit a malformed ``headroom_retrieve`` call; treating it as a
+        # client tool reports "resolved" and leaks the private call (#1877).
+        raw_calls = extract_tool_calls(response, provider)
+        ccr_calls = [call for call in raw_calls if is_ccr_tool_call(call)]
+        other_calls = [call for call in raw_calls if not is_ccr_tool_call(call)]
         if not ccr_calls:
             return RESIDUAL_CCR_RESOLVED
         if other_calls:
@@ -659,12 +665,16 @@ class StreamingCCRHandler:
         Yields:
             Response chunks (possibly from continuation response).
         """
-        # Phase 1: Initial detection
-        # Buffer chunks until we can determine if there's a CCR call.
+        # Compatibility path: buffer the complete response before deciding.
         #
+        # Do not flush after an arbitrary byte threshold. A private tool call
+        # may legally follow an arbitrarily long text prefix, so doing so can
+        # expose an initial response that later requires server-side CCR
+        # continuation. Production streaming uses EventLevelCCRInterceptor;
+        # this older helper intentionally remains fully buffered and safe.
         # The end-of-stream marker is provider-specific. Anthropic signals the
         # terminal state with `stop_reason` in `message_delta`; OpenAI-compatible
-        # streams have no such field and terminate with the `[DONE]` sentinel.
+        # streams terminate with the `[DONE]` sentinel.
         end_marker = b'"stop_reason"' if self.provider == "anthropic" else b"data: [DONE]"
 
         async for chunk in stream_iterator:
@@ -685,13 +695,6 @@ class StreamingCCRHandler:
                     for buffered_chunk in self.buffer.chunks:
                         yield buffered_chunk
                     self.buffer.clear()
-
-            # If we haven't detected anything yet and buffer is large,
-            # start yielding (response is probably just text)
-            elif len(accumulated) > 10000 and not self.buffer.detected_ccr:
-                for buffered_chunk in self.buffer.chunks:
-                    yield buffered_chunk
-                self.buffer.clear()
 
         # The end marker is not guaranteed to arrive: upstream can truncate, a
         # provider can omit the sentinel, or the stream can be a shape this

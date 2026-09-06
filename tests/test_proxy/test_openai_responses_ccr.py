@@ -21,6 +21,7 @@ httpx = pytest.importorskip("httpx")
 
 from unittest.mock import AsyncMock, MagicMock, patch  # noqa: E402
 
+from fastapi.responses import StreamingResponse  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 from starlette.requests import Request  # noqa: E402
 
@@ -54,6 +55,7 @@ def _make_app():
         cache_enabled=False,
         rate_limit_enabled=False,
         cost_tracking_enabled=False,
+        ccr_event_streaming=False,
     )
     app = create_app(config)
     app.dependency_overrides[require_loopback] = lambda: None
@@ -263,6 +265,38 @@ def test_streaming_request_without_retrieve_tool_uses_normal_stream_path():
 
     assert resp.status_code == 200, resp.text
     assert stream_called["value"] is True
+
+
+def test_event_level_responses_ccr_keeps_upstream_streaming_and_wires_interceptor():
+    app = _make_app()
+    app.state.proxy.config.ccr_event_streaming = True
+
+    async def _result_stream():
+        yield b"data: [DONE]\n\n"
+
+    with TestClient(app) as client:
+        proxy = client.app.state.proxy
+        proxy._stream_response = AsyncMock(
+            return_value=StreamingResponse(_result_stream(), media_type="text/event-stream")
+        )
+        proxy._retry_request = AsyncMock(
+            side_effect=AssertionError("event-level path must not pre-buffer upstream")
+        )
+        response = client.post(
+            "/v1/responses",
+            headers={"authorization": "Bearer test-key"},
+            json={
+                "model": "gpt-5.4",
+                "stream": True,
+                "input": "retrieve",
+                "tools": [_RETRIEVE_TOOL],
+            },
+        )
+
+    assert response.status_code == 200
+    call = proxy._stream_response.await_args
+    assert call.args[2]["stream"] is True
+    assert call.kwargs["ccr_stream_provider"] == "openai_responses"
 
 
 @pytest.mark.asyncio
