@@ -573,13 +573,30 @@ def _check_rust_core() -> tuple[str, str | None]:
             return ("disabled", reason)
         # Fail loud. Print to stderr in addition to logging so operators
         # see it even if the logging handler is mis-configured.
+        #
+        # On Windows the usual cause is not a missing build but a present
+        # binary the OS refuses to load: `_core.pyd` ships unsigned, so
+        # Smart App Control / WDAC / antivirus can block it (issue #2918).
+        # "rebuild the wheel" is useless advice there, so name the real
+        # cause and point at the degraded mode instead.
+        windows_hint = ""
+        if sys.platform == "win32":
+            windows_hint = (
+                "    windows: a 'DLL load failed' or 'blocked by application control policy'\n"
+                "             error usually means Smart App Control, WDAC, or antivirus\n"
+                "             blocked the (unsigned) _core.pyd rather than the wheel being\n"
+                "             broken. Check Event Viewer > Applications and Services Logs >\n"
+                "             Microsoft > Windows > CodeIntegrity/Operational for event 3033.\n"
+            )
         msg = (
             f"FATAL: Rust extension `headroom._core` not loadable.\n"
             f"    error: {reason}\n"
+            f"{windows_hint}"
             f"    fix:   `make build-wheel && pip install --force-reinstall "
             f"target/wheels/headroom_*.whl`\n"
             f"    opt-out: set {_RUST_CORE_REQUIRED_ENV}=false to start in "
-            f"degraded Python-only mode\n"
+            f"degraded Python-only mode (proxy stays up and forwards traffic "
+            f"unoptimized)\n"
         )
         logger.error("event=rust_core_missing reason=%r action=exit_78", reason)
         print(msg, file=sys.stderr, flush=True)
@@ -2857,6 +2874,25 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         _rust_core_status, _rust_core_error = _check_rust_core()
         app.state.rust_core_status = _rust_core_status
         app.state.rust_core_error = _rust_core_error
+
+        # Degraded mode has to mean something. Every compressor reaches
+        # `headroom._core` eventually, so leaving `optimize` on while the
+        # extension is unloadable turns each request into an ImportError
+        # instead of a proxied response. Drop to the same passthrough path
+        # `--no-optimize` uses: no savings, but the client keeps working
+        # rather than getting a connection refused (issue #2918).
+        #
+        # Safe to mutate here: `HeadroomProxy` holds this exact config
+        # object, its compressors are built lazily on first use, and
+        # `proxy.startup()` has not run yet.
+        if _rust_core_status == "disabled" and config.optimize:
+            config.optimize = False
+            logger.warning(
+                "event=proxy_optimization_disabled reason=rust_core_unavailable "
+                "detail=%r mode=passthrough; traffic is forwarded unmodified, "
+                "restore `headroom._core` to re-enable compression",
+                _rust_core_error,
+            )
 
         configure_otel_metrics(OTelMetricsConfig.from_env(default_service_name="headroom-proxy"))
         configure_langfuse_tracing(
