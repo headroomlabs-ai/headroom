@@ -834,8 +834,18 @@ class HeadroomProxy(
         self.metrics = PrometheusMetrics(cost_tracker=self.cost_tracker, stateless=config.stateless)
 
         # Cost-aware model routing (issue #1706). Disabled unless configured, so
-        # the default request path is unchanged.
+        # the default request path is unchanged. Logged once at startup: routing
+        # is invisible when off (no per-request decision line is emitted), so an
+        # entrypoint that never wired the config, or a rule set that failed to
+        # parse, would otherwise show up only as an unexplained bill.
         self.model_router = ModelRouter(config.model_router)
+        if self.model_router.enabled:
+            logger.info(
+                "model router: enabled, %d rule(s)",
+                len(config.model_router.routes) if config.model_router else 0,
+            )
+        else:
+            logger.info("model router: disabled")
 
         # Initialize transforms based on routing mode.
         #
@@ -6279,6 +6289,12 @@ if __name__ == "__main__":
             _get_env_bool("HEADROOM_SMART_CRUSHER_COMPACTION", False)
             if "HEADROOM_SMART_CRUSHER_COMPACTION" in os.environ
             else None
+        ),
+        # Cost-aware model routing (#1706): env-only config, so every entrypoint
+        # that builds its own ProxyConfig has to read it (see also cli/proxy.py).
+        model_router=ModelRouterConfig.from_env(
+            os.environ.get("HEADROOM_MODEL_ROUTER_ENABLED"),
+            os.environ.get("HEADROOM_MODEL_ROUTES"),
         ),
         cache_enabled=cache_enabled,
         cache_ttl_seconds=_get_env_int("HEADROOM_CACHE_TTL", args.cache_ttl),
