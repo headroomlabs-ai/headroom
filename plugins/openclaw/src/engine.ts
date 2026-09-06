@@ -29,13 +29,23 @@ export interface HeadroomEngineConfig extends ProxyManagerConfig {
   circuitBreakerCooldownMs?: number;
 }
 
+/** Bound on tracked advancement keys so long-lived sessions can't grow this unbounded. */
+const MAX_TRACKED_ADVANCEMENT_KEYS = 512;
+
 export class HeadroomContextEngine {
   readonly info = {
     id: "headroom",
     name: "Headroom Context Compression",
     version: "0.1.0",
     ownsCompaction: true,
+    transcriptSemantics: {
+      currentTurnFence: "before-current-turn-entry-v1",
+      turnAdvancementIdempotency: "atomic-idempotent-v1",
+    },
   };
+
+  // FIFO-bounded record of committed advancement keys, for commitTurn's idempotent-retry check.
+  private committedAdvancementKeys = new Set<string>();
 
   private proxyManager: ProxyManager;
   private proxyUrl: string | null = null;
@@ -217,6 +227,30 @@ export class HeadroomContextEngine {
       compacted: true,
       reason: "Headroom applies SmartCrusher + Kompress + RollingWindow on next assemble()",
     };
+  }
+
+  /**
+   * Durable turn-advancement commit — required by OpenClaw's transcriptSemantics
+   * contract. Called only for the accepted, successful turn; failed or aborted
+   * turns never reach here. Must be an atomic, idempotent write keyed by
+   * `advancementKey` so a host retry with the same key reports "duplicate"
+   * instead of re-applying the advancement.
+   */
+  async commitTurn(params: { advancementKey: string; messages: any[] }): Promise<{
+    status: "committed" | "duplicate";
+  }> {
+    if (this.committedAdvancementKeys.has(params.advancementKey)) {
+      return { status: "duplicate" };
+    }
+
+    if (this.committedAdvancementKeys.size >= MAX_TRACKED_ADVANCEMENT_KEYS) {
+      const oldest = this.committedAdvancementKeys.values().next().value;
+      if (oldest !== undefined) {
+        this.committedAdvancementKeys.delete(oldest);
+      }
+    }
+    this.committedAdvancementKeys.add(params.advancementKey);
+    return { status: "committed" };
   }
 
   async afterTurn?(params: {
