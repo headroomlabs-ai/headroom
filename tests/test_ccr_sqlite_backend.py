@@ -107,6 +107,37 @@ class TestSQLiteBackend:
         assert got is not None
         assert got.original_content == "x" * 600
 
+    def test_missing_required_field_degrades_to_miss(self, db_path):
+        """A row that parses as JSON but is missing a required CompressionEntry
+        field (schema drift across an upgrade, a partially written row) must
+        degrade to a miss, not raise. Otherwise it crashes get() and — via
+        items(), which _clean_expired runs on every store's eviction — breaks
+        all reads, evictions, and stores for one poison row."""
+        b = SQLiteBackend(db_path)
+        b.set("good", make_entry("good"))
+        # Insert a valid-JSON blob missing required fields, plus a non-dict blob.
+        with b._lock:
+            for hash_key, blob in (
+                ("poison", '{"hash": "poison", "original_content": "x"}'),
+                ("nulljson", "null"),
+            ):
+                b._conn.execute(
+                    "INSERT OR REPLACE INTO ccr_entries "
+                    "(hash, entry_json, created_at, ttl) VALUES (?, ?, ?, ?)",
+                    (hash_key, blob, time.time(), 1800),
+                )
+            b._conn.commit()
+
+        assert b.get("poison") is None  # no TypeError
+        assert b.get("nulljson") is None
+        # items() skips the bad rows instead of raising; the good row survives.
+        items = dict(b.items())
+        assert set(items) == {"good"}
+        # A store cycle (which evicts via items()) still works with poison present.
+        store = CompressionStore(backend=b, max_entries=1000)
+        store.store(original="fresh original", compressed="c", original_item_count=1)
+        assert b.get("good") is not None
+
     def test_store_ttl_enforcement_via_compression_store(self, db_path):
         """TTL checks stay in CompressionStore; expired entries miss."""
         store = CompressionStore(backend=SQLiteBackend(db_path))
