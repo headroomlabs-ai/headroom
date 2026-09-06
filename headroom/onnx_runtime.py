@@ -78,6 +78,37 @@ _PINNED_REVISIONS: dict[str, str] = {
 }
 
 
+def _cpuset_size() -> int | None:
+    """Number of CPUs this process is actually allowed to run on.
+
+    Honors cgroup/cpuset limits via ``os.sched_getaffinity`` on Linux so the
+    ONNX thread pool is sized to the container quota rather than the host's
+    total core count. Falls back to ``os.cpu_count`` where affinity is not
+    available (Windows/macOS).
+    """
+    sched_getaffinity = getattr(os, "sched_getaffinity", None)
+    if sched_getaffinity is not None:
+        try:
+            count = len(sched_getaffinity(0))
+            if count > 0:
+                return count
+        except OSError:
+            pass
+    return os.cpu_count()
+
+
+def _env_thread_count(name: str) -> int | None:
+    """Read a positive ONNX thread-count override from the environment."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
 def _resolve_revision(repo_id: str, revision: str | None) -> str | None:
     """Resolve the HF revision to download: explicit arg wins, else the pinned
     SHA for a known repo, else ``None`` (floating ref)."""
@@ -170,6 +201,20 @@ def create_cpu_session_options(
     where disabling it degrades inference latency by orders of magnitude.
     """
     sess_options = ort.SessionOptions()
+
+    # Size the ONNX thread pools to the container's cpuset when the caller does
+    # not pass explicit values. This keeps ORT from spawning host-topology
+    # threads it then tries (and fails) to pin outside the cgroup cpuset
+    # (``pthread_setaffinity_np ... error 22``). Callers that pass explicit
+    # values (e.g. Kompress) are left untouched.
+    if intra_op_num_threads is None:
+        intra_op_num_threads = _env_thread_count("HEADROOM_ONNX_INTRA_OP_THREADS")
+        if intra_op_num_threads is None:
+            intra_op_num_threads = _cpuset_size()
+    if inter_op_num_threads is None:
+        inter_op_num_threads = _env_thread_count("HEADROOM_ONNX_INTER_OP_THREADS")
+        if inter_op_num_threads is None:
+            inter_op_num_threads = 1
 
     if intra_op_num_threads is not None:
         sess_options.intra_op_num_threads = intra_op_num_threads
