@@ -1996,6 +1996,13 @@ class HeadroomProxy(
                     handle=self.memory_handler,
                     backend=memory_status.get("backend"),
                 )
+                # Detect embedding server sidecar (Option E)
+                _embed_socket = os.environ.get("HEADROOM_EMBEDDING_SERVER_SOCKET")
+                if _embed_socket:
+                    logger.info("event=using_remote_embedding_server socket=%s", _embed_socket)
+                else:
+                    logger.info("event=using_local_embedder")
+
                 # Force one embed call so the ONNX graph is compiled now,
                 # not lazily during the first request. Best-effort — any
                 # failure is swallowed inside warmup_embedder.

@@ -1006,6 +1006,14 @@ def dashboard(port: int, no_open: bool) -> None:
     "(env: HEADROOM_EMBEDDING_SERVER_SOCKET)",
 )
 @click.option(
+    "--embedding-server-threads",
+    type=click.IntRange(min=1, max=32),
+    default=4,
+    show_default=True,
+    envvar="HEADROOM_EMBEDDING_SERVER_THREADS",
+    help="ONNX worker threads used by the embedding sidecar.",
+)
+@click.option(
     "--anthropic-extra-headers",
     default=None,
     help=(
@@ -1112,6 +1120,7 @@ def proxy(
     stateless: bool,
     embedding_server: bool,
     embedding_server_socket: str | None,
+    embedding_server_threads: int,
 ) -> None:
     """Start the optimization proxy server.
 
@@ -1700,7 +1709,10 @@ Press Ctrl+C to stop.
             # crashing the proxy at startup with ModuleNotFoundError.
             from headroom.memory.adapters.watchdog import EmbeddingServerWatchdog
 
-            wd = EmbeddingServerWatchdog(socket_path=_embed_socket)
+            wd = EmbeddingServerWatchdog(
+                socket_path=_embed_socket,
+                embed_threads=embedding_server_threads,
+            )
             await wd.start()
             ok = await wd.wait_until_healthy(timeout=30.0)
             if not ok:
