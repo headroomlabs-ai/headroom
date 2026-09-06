@@ -16,6 +16,8 @@ surfaced, were ranked no higher than a one-off rule. These tests pin:
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from headroom.learn.analyzer import SessionAnalyzer, _build_digest
 from headroom.learn.fixtures import (
     error_loop_session,
@@ -31,6 +33,8 @@ from headroom.learn.models import (
     ProjectInfo,
     Recommendation,
     RecommendationTarget,
+    SessionData,
+    ToolCall,
 )
 
 
@@ -195,3 +199,229 @@ class TestAnalyzeEndToEnd:
         # After weighting, the loop guardrail ranks first despite the LLM's order.
         assert result.recommendations[0].is_loop_guardrail is True
         assert "loop" in result.recommendations[0].section.lower()
+
+
+# =============================================================================
+# signature identity (regressions)
+# =============================================================================
+
+
+def _call(name: str, tool_call_id: str, input_data: dict, *, msg_index: int) -> ToolCall:
+    """A successful tool call with a fixed 40 KB output."""
+    output = "x" * 40_000
+    return ToolCall(
+        name=name,
+        tool_call_id=tool_call_id,
+        input_data=input_data,
+        output=output,
+        is_error=False,
+        msg_index=msg_index,
+        output_bytes=len(output),
+    )
+
+
+class TestSignatureIsIdentityNotDisplay:
+    """The loop key must be a full identity, not the truncated display summary.
+
+    ``ToolCall.input_summary`` is documented as being "for display": it cuts Bash
+    commands at 100 chars and renders any non-builtin tool as
+    ``str(input_data)[:80]``. Grouping on it makes distinct calls that share a
+    long prefix compare equal, so unrelated work is reported as one loop.
+    """
+
+    def test_distinct_custom_tool_calls_are_not_one_loop(self):
+        # Five patches to five different files under one long shared prefix.
+        prefix = "/home/user/worktrees/feature-branch-alpha/services/api/internal/handlers"
+        calls = [
+            _call(
+                "apply_patch",
+                f"call_{i}",
+                {"input": f"*** Update File: {prefix}/handler_{i}.py\n@@\n-old\n+new\n"},
+                msg_index=i,
+            )
+            for i in range(5)
+        ]
+        assert len({_canonical_signature(c) for c in calls}) == 5
+        assert detect_loops([SessionData(session_id="s", tool_calls=calls)]) == []
+
+    def test_distinct_long_bash_commands_are_not_one_loop(self):
+        # Commands diverge only after the 100-char display cutoff.
+        base = (
+            "rg --no-heading --line-number --color never "
+            "'TimeoutError|ValueError|KeyError' /srv/app/services/ingest/pipeline/"
+        )
+        calls = [
+            _call("Bash", f"call_{i}", {"command": f"{base}module_{i}/handlers.py"}, msg_index=i)
+            for i in range(4)
+        ]
+        assert len(calls[0].input_summary) < len(calls[0].input_data["command"])
+        assert len({_canonical_signature(c) for c in calls}) == 4
+        assert detect_loops([SessionData(session_id="s", tool_calls=calls)]) == []
+
+    def test_pagination_variants_of_one_long_command_still_collapse(self):
+        # The re-fetch collapse must survive the identity change: one command,
+        # growing output limits, past the 100-char display cutoff.
+        base = (
+            "rg --no-heading --line-number --color never "
+            "'TimeoutError|ValueError|KeyError' /srv/app/services/ingest/pipeline/handlers.py"
+        )
+        calls = [
+            _call("Bash", f"call_{i}", {"command": f"{base} | head -{50 * (i + 1)}"}, msg_index=i)
+            for i in range(4)
+        ]
+        assert len({_canonical_signature(c) for c in calls}) == 1
+        loops = detect_loops([SessionData(session_id="s", tool_calls=calls)])
+        assert len(loops) == 1
+        assert loops[0].count == 4
+
+
+class TestSignatureIsSizeIndependent:
+    """Detection quality must not degrade as a tool input gets larger.
+
+    The identity key is lossless, so it grows with the input. Everything derived
+    from it must stay size-independent, because the only consumer of
+    ``LoopPattern.signature`` — ``_signature_tokens`` in ``apply_loop_weighting``
+    — requires a *majority* of the signature's tokens to appear in a
+    recommendation. A signature that grows without bound pushes that threshold
+    out of reach, and a real loop silently loses its measured-waste boost.
+    """
+
+    BASE = "pytest tests/test_learn/test_loops.py -v --maxfail 1 --tb=short"
+    REC = (
+        "Avoid rerunning pytest on tests/test_learn/test_loops.py with"
+        " -v --maxfail 1 --tb=short; reuse the prior run."
+    )
+
+    def _command(self, extra_args: int) -> str:
+        tail = " ".join(f"--unrelated-opt-{i}=value-{i}" for i in range(extra_args))
+        return f"{self.BASE} {tail}".strip()
+
+    def _loop(self, extra_args: int):
+        calls = [
+            _call("Bash", f"call_b{i}", {"command": self._command(extra_args)}, msg_index=i)
+            for i in range(5)
+        ]
+        return detect_loops([SessionData(session_id="s", tool_calls=calls)])
+
+    @pytest.mark.parametrize("extra_args", [0, 20, 200, 2000])
+    def test_weighting_holds_however_long_the_input_is(self, extra_args):
+        loops = self._loop(extra_args)
+        rec = Recommendation(
+            target=RecommendationTarget.CONTEXT_FILE,
+            section="Tooling",
+            content=self.REC,
+            estimated_tokens_saved=100,
+        )
+
+        apply_loop_weighting([rec], loops)
+
+        assert rec.is_loop_guardrail is True
+        assert rec.estimated_tokens_saved == loops[0].wasted_tokens
+
+    def test_signature_size_does_not_track_input_size(self):
+        big = self._loop(500)[0].signature
+        ten_times_bigger = self._loop(5000)[0].signature
+
+        assert big == ten_times_bigger
+        assert len(big) < len(self._command(500)) // 10
+
+    def test_oversized_inputs_are_still_told_apart(self):
+        """Bounding the signature must not reintroduce the merge it was added to survive.
+
+        Identity is the *unbounded* key; only the stored signature is capped. Two
+        calls sharing a long prefix must therefore stay distinct even when their
+        bounded signatures are identical.
+        """
+        shared = "*** Update File: /repo/services/ingest/handler.py\n" + "-old\n+new\n" * 400
+        calls = [
+            _call("apply_patch", f"call_p{i}", {"input": f"{shared}# variant {i}"}, msg_index=i)
+            for i in range(5)
+        ]
+
+        assert len({_canonical_signature(c) for c in calls}) == 5
+        assert detect_loops([SessionData(session_id="s", tool_calls=calls)]) == []
+
+
+class TestGroupingInvariants:
+    """Properties that must hold for any input, not just the pinned examples."""
+
+    def _mixed_calls(self) -> list[ToolCall]:
+        return [
+            _call("Read", "call_r0", {"file_path": "/repo/a.py"}, msg_index=0),
+            _call("Read", "call_r1", {"file_path": "/repo/a.py"}, msg_index=1),
+            _call("Read", "call_r2", {"file_path": "/repo/a.py"}, msg_index=2),
+            _call("Bash", "call_b0", {"command": "rg alpha /repo"}, msg_index=3),
+            _call("Bash", "call_b1", {"command": "rg alpha /repo"}, msg_index=4),
+            _call("Bash", "call_b2", {"command": "rg alpha /repo"}, msg_index=5),
+            _call("Grep", "call_g0", {"pattern": "beta"}, msg_index=6),
+        ]
+
+    def test_detection_does_not_depend_on_call_order(self):
+        calls = self._mixed_calls()
+        shuffled = list(reversed(calls))
+
+        def summarize(cs):
+            loops = detect_loops([SessionData(session_id="s", tool_calls=cs)])
+            return sorted((lp.tool, lp.count, lp.wasted_tokens) for lp in loops)
+
+        assert summarize(shuffled) == summarize(calls)
+
+    def test_whitespace_variants_share_one_signature(self):
+        """Whitespace normalization survives the split/join implementation.
+
+        The collapse is done with ``" ".join(str.split())`` rather than a regex
+        for speed; this pins that tabs, newlines and repeated spaces still fold
+        to the same signature.
+        """
+        variants = [
+            "rg --line-number 'def handler' /repo/app.py",
+            "rg  --line-number\t'def handler'   /repo/app.py",
+            "  rg --line-number\n'def handler' /repo/app.py  ",
+        ]
+        calls = [
+            _call("Bash", f"call_w{i}", {"command": cmd}, msg_index=i)
+            for i, cmd in enumerate(variants)
+        ]
+
+        assert len({_canonical_signature(c) for c in calls}) == 1
+
+
+class TestIdentityFallsBackWhenTheSchemaIsUnknown:
+    """``_identity_input`` must render the input in full, as it documents.
+
+    ``_IDENTITY_FIELDS`` guesses which field identifies a call from the tool's
+    name. ``normalize_tool_name`` maps provider tools onto those same names
+    without normalizing their input schema, so the guess can miss every field —
+    at which point an empty identity collapses unrelated calls into one loop,
+    the exact failure this signature change exists to prevent.
+    """
+
+    def test_a_builtin_name_carrying_a_foreign_schema_stays_distinct(self):
+        # `codebase_search` / `search_text` normalize to Grep but carry `query`.
+        calls = [
+            _call("Grep", f"call_{i}", {"query": f"distinct query number {i}"}, msg_index=i)
+            for i in range(5)
+        ]
+
+        assert len({_canonical_signature(c) for c in calls}) == 5
+        assert detect_loops([SessionData(session_id="s", tool_calls=calls)]) == []
+
+    def test_a_partially_matching_schema_still_uses_the_known_field(self):
+        # `file_path` is present, so identity comes from it and the rest is
+        # ignored — the pinned builtin behaviour is unchanged.
+        calls = [
+            _call("Read", f"call_{i}", {"file_path": "/repo/a.md", "offset": i}, msg_index=i)
+            for i in range(3)
+        ]
+
+        loops = detect_loops([SessionData(session_id="s", tool_calls=calls)])
+
+        assert [lp.count for lp in loops] == [3]
+
+    @pytest.mark.parametrize("payload", [None, [], "raw string", {1: "a", "b": 2}])
+    def test_an_unexpected_input_shape_does_not_raise(self, payload):
+        # Identity is derived during a scan of files the user did not write;
+        # a malformed input must not take down `headroom learn`.
+        call = _call("Bash", "call_0", payload, msg_index=0)
+
+        assert _canonical_signature(call).startswith("bash::")
