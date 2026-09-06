@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from headroom import utils
 
@@ -77,6 +77,22 @@ def test_timestamp_marker_and_json_helpers() -> None:
     assert ts == "2026-04-23T06:00:00Z"
     assert utils.parse_timestamp(ts) == datetime(2026, 4, 23, 6, 0, 0)
     assert utils.parse_timestamp("2026-04-23T06:00:00") == datetime(2026, 4, 23, 6, 0, 0)
+
+
+def test_format_timestamp_normalizes_aware_datetimes() -> None:
+    # Shipped integrations pass datetime.now(timezone.utc) (aware). Appending a
+    # bare "Z" to an aware isoformat used to emit "...+00:00Z" — invalid ISO
+    # 8601 that datetime.fromisoformat itself rejects.
+    aware_utc = datetime(2026, 4, 23, 6, 0, 0, tzinfo=timezone.utc)
+    ts = utils.format_timestamp(aware_utc)
+    assert ts == "2026-04-23T06:00:00Z"
+    # The stored string must round-trip through a strict parser.
+    assert datetime.fromisoformat(ts.rstrip("Z")) == datetime(2026, 4, 23, 6, 0, 0)
+
+    # A non-UTC offset must be converted to UTC, not just stamped "Z" onto the
+    # local wall-clock time (which would mislabel the instant).
+    east = datetime(2026, 4, 23, 6, 0, 0, tzinfo=timezone(timedelta(hours=5)))
+    assert utils.format_timestamp(east) == "2026-04-23T01:00:00Z"
 
     marker = utils.create_marker("tool_digest", sha256="abc", count="2")
     assert marker == '<headroom:tool_digest sha256="abc" count="2">'
