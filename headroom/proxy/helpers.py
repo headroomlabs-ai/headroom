@@ -2550,7 +2550,7 @@ def apply_session_sticky_ccr_tool(
 
 
 class RequestBodyTooLarge(ValueError):
-    """A decompressed request body exceeded :data:`MAX_DECOMPRESSED_BODY_SIZE`.
+    """A raw or decompressed request body exceeded its size ceiling.
 
     Subclasses ``ValueError`` so every existing ``except ValueError`` call site
     keeps answering 400 unchanged, while giving a caller that would rather
@@ -2667,17 +2667,87 @@ def _brotli_bounded(raw: bytes) -> bytes:
     return bytes(out)
 
 
+async def _read_request_body_bounded(request: Request) -> bytes:
+    """Read the raw request body, refusing it once :data:`MAX_REQUEST_BODY_SIZE` is crossed.
+
+    The handlers gate on the ``Content-Length`` header before calling this,
+    but that header is absent on a chunked-transfer-encoding request, so a
+    client sending one walks straight past that check. ``Request.body()`` has
+    no ceiling of its own and buffers the whole thing, so this reads via
+    ``Request.stream()`` instead and checks the running total after every
+    chunk, the same "before materializing" discipline ``_inflate_bounded`` and
+    its siblings already use for the decompressed size below.
+
+    ``Request.stream()`` can only be drained once; a second call raises
+    ``RuntimeError("Stream consumed")``. Cache the bounds-checked result on
+    the request under our own attribute so a repeat call on the same request
+    (the framework re-entering a handler, a test replaying one) returns it
+    instead of re-draining the stream. This is deliberately not
+    ``request._body``, the attribute Starlette's own ``Request.body()`` uses
+    for the same purpose: that value has never passed this function's size
+    check, so trusting it here would let an earlier unbounded ``.body()``
+    call skip the very gate this function exists to enforce.
+
+    A caller with no ``.stream()`` (a lightweight test double standing in for
+    a real ``Request``) is not a network stream that can be chunk-bounded, so
+    it is read whole via ``.body()`` and checked after the fact instead.
+    """
+    cached: bytes | None = getattr(request, "_headroom_bounded_body", None)
+    if cached is not None:
+        return cached
+    stream = getattr(request, "stream", None)
+    if stream is None:
+        # ``Request.body()`` is untyped at this boundary (mirrors the
+        # ``cast(bytes, raw)`` a few functions up for the same reason), but
+        # Starlette's own implementation always returns bytes, so casting is
+        # safe. The size check right below is what actually enforces the
+        # bound; the cast only fixes the declared return type.
+        body = cast(bytes, await request.body())
+        if len(body) > MAX_REQUEST_BODY_SIZE:
+            raise RequestBodyTooLarge(
+                f"Request body exceeds {MAX_REQUEST_BODY_SIZE // (1024 * 1024)}MB"
+            )
+        request._headroom_bounded_body = body
+        return body
+    total = 0
+    chunks: list[bytes] = []
+    async for chunk in stream():
+        total += len(chunk)
+        if total > MAX_REQUEST_BODY_SIZE:
+            raise RequestBodyTooLarge(
+                f"Request body exceeds {MAX_REQUEST_BODY_SIZE // (1024 * 1024)}MB"
+            )
+        chunks.append(chunk)
+    body = b"".join(chunks)
+    request._headroom_bounded_body = body
+    return body
+
+
+def read_cached_request_body(request: Request) -> bytes | None:
+    """Return the body :func:`_read_request_body_bounded` already cached, if any.
+
+    For a caller that needs the raw bytes again after that read failed
+    partway through decoding (JSON parse, decompression) rather than during
+    the size check itself, e.g. to fail open to a verbatim forward. Calling
+    ``request.body()`` there instead re-drains an already-consumed stream and
+    raises ``RuntimeError("Stream consumed")``.
+    """
+    cached: bytes | None = getattr(request, "_headroom_bounded_body", None)
+    return cached
+
+
 async def _read_request_body_bytes(request: Request) -> bytes:
     """Read and (if needed) decompress the request body, returning raw UTF-8 bytes.
 
     Mirrors ``_read_request_json`` but returns the bytes pre-parse so
     forwarders can implement byte-faithful passthrough (PR-A3, fixes P0-2).
     Raises ``ValueError`` on any decompression failure, and the
-    :class:`RequestBodyTooLarge` subclass when the *decompressed* body would
-    exceed :data:`MAX_DECOMPRESSED_BODY_SIZE`.
+    :class:`RequestBodyTooLarge` subclass when the raw body exceeds
+    :data:`MAX_REQUEST_BODY_SIZE` or the *decompressed* body would exceed
+    :data:`MAX_DECOMPRESSED_BODY_SIZE`.
     """
     encoding = (request.headers.get("content-encoding") or "").lower().strip()
-    raw = await request.body()
+    raw = await _read_request_body_bounded(request)
 
     # Every branch below decompresses incrementally against
     # MAX_DECOMPRESSED_BODY_SIZE. RequestBodyTooLarge is re-raised ahead of the
