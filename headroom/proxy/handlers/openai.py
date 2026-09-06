@@ -11,6 +11,7 @@ import copy
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -151,6 +152,45 @@ def _response_ccr_hashes(messages: list[dict[str, Any]], markers: list[str]) -> 
         collect(marker, allow_bare_hash=True)
     collect(messages)
     return hashes
+
+
+def _parse_compress_biases(raw_biases: Any, message_count: int) -> dict[int, float]:
+    """Validate and normalize per-message biases from the compression API."""
+    if not isinstance(raw_biases, dict):
+        raise ValueError("biases must be an object mapping message indices to positive numbers")
+
+    biases: dict[int, float] = {}
+    for raw_index, raw_bias in raw_biases.items():
+        if (
+            not isinstance(raw_index, str)
+            or not raw_index.isascii()
+            or not raw_index.isdigit()
+            or (len(raw_index) > 1 and raw_index.startswith("0"))
+        ):
+            raise ValueError(f"bias key {raw_index!r} must be a canonical non-negative integer")
+
+        try:
+            index = int(raw_index)
+        except ValueError:
+            raise ValueError(
+                f"bias key {raw_index!r} must be a canonical non-negative integer"
+            ) from None
+        if index >= message_count:
+            raise ValueError(f"bias index {index} is out of range for {message_count} messages")
+        if isinstance(raw_bias, bool) or not isinstance(raw_bias, int | float):
+            raise ValueError(f"bias for message index {index} must be a finite positive number")
+
+        try:
+            bias = float(raw_bias)
+        except (OverflowError, ValueError):
+            raise ValueError(
+                f"bias for message index {index} must be a finite positive number"
+            ) from None
+        if not math.isfinite(bias) or bias <= 0:
+            raise ValueError(f"bias for message index {index} must be a finite positive number")
+        biases[index] = bias
+
+    return biases
 
 
 def _codex_ws_compression_timeout_seconds() -> float:
@@ -9595,7 +9635,7 @@ class OpenAIHandlerMixin:
         """Compress messages without calling an LLM.
 
         POST /v1/compress
-        Body: {"messages": [...], "model": "...", "config": {}}
+        Body: {"messages": [...], "model": "...", "config": {}, "biases": {}}
 
         ``config.mode`` selects the pipeline:
 
@@ -9614,6 +9654,9 @@ class OpenAIHandlerMixin:
         should set it to the number of messages the provider has already cached, so
         compression does not rewrite the prefix and bust that cache. Must be a
         non-negative integer; anything else is a 400.
+
+        ``biases`` maps canonical message indices to finite positive weights
+        consumed by the compression pipeline.
 
         Returns compressed messages + metrics.
         """
@@ -9677,6 +9720,21 @@ class OpenAIHandlerMixin:
                     "error": {
                         "type": "invalid_request",
                         "message": "Missing required field: model",
+                    }
+                },
+            )
+
+        try:
+            biases = (
+                _parse_compress_biases(body["biases"], len(messages)) if "biases" in body else {}
+            )
+        except ValueError as error:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "type": "invalid_request",
+                        "message": str(error),
                     }
                 },
             )
@@ -9866,6 +9924,8 @@ class OpenAIHandlerMixin:
                 pipeline_kwargs["protect_recent"] = int(protect_recent)
             if protect_analysis_context is not None:
                 pipeline_kwargs["protect_analysis_context"] = bool(protect_analysis_context)
+            if biases:
+                pipeline_kwargs["biases"] = biases
             if frozen_message_count is not None:
                 pipeline_kwargs["frozen_message_count"] = frozen_message_count
 

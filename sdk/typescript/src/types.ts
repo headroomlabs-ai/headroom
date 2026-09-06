@@ -83,6 +83,13 @@ export interface CompressResult {
   compressed: boolean;
 }
 
+export interface ClientCompressOptions {
+  model?: string;
+  tokenBudget?: number;
+  /** Per-message compression bias keyed by message index. */
+  biases?: Record<number, number>;
+}
+
 // --- Client ---
 
 export interface HeadroomClientOptions {
@@ -98,7 +105,7 @@ export interface HeadroomClientOptions {
 export interface HeadroomClientInterface {
   compress(
     messages: OpenAIMessage[],
-    options?: { model?: string; tokenBudget?: number },
+    options?: ClientCompressOptions,
   ): Promise<CompressResult>;
 }
 

@@ -11,6 +11,7 @@
 import type {
   OpenAIMessage,
   CompressResult,
+  ClientCompressOptions,
   HeadroomClientOptions,
   HeadroomClientInterface,
   ProxyCompressResponse,
@@ -234,7 +235,7 @@ export class HeadroomClient implements HeadroomClientInterface {
 
   async compress(
     messages: OpenAIMessage[],
-    options: { model?: string; tokenBudget?: number } = {},
+    options: ClientCompressOptions = {},
   ): Promise<CompressResult> {
     const model = options.model ?? "gpt-4o";
 
@@ -243,7 +244,12 @@ export class HeadroomClient implements HeadroomClientInterface {
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       try {
-        return await this._doCompress(messages, model, options.tokenBudget);
+        return await this._doCompress(
+          messages,
+          model,
+          options.tokenBudget,
+          options.biases,
+        );
       } catch (error) {
         lastError = error;
         if (error instanceof HeadroomAuthError) throw error;
@@ -602,10 +608,14 @@ export class HeadroomClient implements HeadroomClientInterface {
     messages: OpenAIMessage[],
     model: string,
     tokenBudget?: number,
+    biases?: Record<number, number>,
   ): Promise<CompressResult> {
     const body: Record<string, unknown> = { messages, model };
     if (tokenBudget) {
       body.token_budget = tokenBudget;
+    }
+    if (biases !== undefined) {
+      body.biases = biases;
     }
     if (this.config) {
       body.config = deepSnakeCase(this.config);
