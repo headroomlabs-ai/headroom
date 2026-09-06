@@ -17,6 +17,7 @@ from __future__ import annotations
 import contextlib
 import gc
 import hashlib
+import itertools
 import logging
 import os
 import re
@@ -85,6 +86,56 @@ def _add_kompress_must_keep_words(
     for word_idx, word in enumerate(chunk_words):
         if _KOMPRESS_MUST_KEEP_RE.search(word):
             kept_ids.add(word_idx + chunk_start)
+
+
+_TABULAR_ROW_SPLIT_RE = re.compile(r"\s{2,}")
+
+
+def _words_by_line(content: str) -> tuple[list[str], list[int]]:
+    """Split into words like content.split(), plus each word's source line index.
+
+    Reconstruction must never join words that came from different source lines
+    onto one line -- doing so can glue unrelated facts together (#3099).
+    """
+    words: list[str] = []
+    line_ids: list[int] = []
+    for line_idx, line in enumerate(content.split("\n")):
+        for word in line.split():
+            words.append(word)
+            line_ids.append(line_idx)
+    return words, line_ids
+
+
+def _join_kept_words_by_line(words: list[str], line_ids: list[int], kept_ids: set[int]) -> str:
+    """Rejoin kept words, starting a new line wherever they crossed a line boundary."""
+    parts: list[str] = []
+    prev_line: int | None = None
+    for i in sorted(kept_ids):
+        if prev_line is not None:
+            parts.append("\n" if line_ids[i] != prev_line else " ")
+        parts.append(words[i])
+        prev_line = line_ids[i]
+    return "".join(parts)
+
+
+def _tabular_protected_line_ids(content: str) -> set[int]:
+    """Flag lines in a run of >=3 consecutive lines with a consistent fixed-width
+    column count (ls -l, ps, etc.), so compression keeps each such row whole
+    instead of dropping individual fields inconsistently row to row (#3099).
+    Shares the must-keep toggle: HEADROOM_KOMPRESS_MUST_KEEP=0 disables this too.
+    """
+    if os.environ.get(_KOMPRESS_MUST_KEEP_ENV, "1") == "0":
+        return set()
+    cols_per_line = [
+        len(_TABULAR_ROW_SPLIT_RE.split(line.strip())) if line.strip() else 0
+        for line in content.split("\n")
+    ]
+    protected: set[int] = set()
+    for cols, group in itertools.groupby(enumerate(cols_per_line), key=lambda p: p[1]):
+        indices = [idx for idx, _ in group]
+        if cols >= 3 and len(indices) >= 3:
+            protected.update(indices)
+    return protected
 
 
 # ONNX artifacts are resolved against the model repo in this order, falling
@@ -1524,11 +1575,13 @@ class KompressCompressor(Transform):
             KompressResult with compressed text.
         """
         t_deadline = time.perf_counter() if _deadline_started_at is None else _deadline_started_at
-        words = content.split()
+        words, line_ids = _words_by_line(content)
         n_words = len(words)
 
         if n_words < max(10, self.config.min_input_words) or self._degraded_reason is not None:
             return self._passthrough(content, n_words)
+
+        protected_line_ids = _tabular_protected_line_ids(content)
 
         # Cooperative wall-clock budget (#1171): kompress ONNX inference is
         # O(tokens) and non-preemptible once the request's asyncio timeout fires,
@@ -1709,6 +1762,10 @@ class KompressCompressor(Transform):
                 # reconstruct from context. Disable via HEADROOM_KOMPRESS_MUST_KEEP=0.
                 _add_kompress_must_keep_words(kept_ids, chunk_words, chunk_start)
 
+            for i, line_id in enumerate(line_ids):
+                if line_id in protected_line_ids:
+                    kept_ids.add(i)
+
             if not kept_ids:
                 if inference_ms >= 1000.0:
                     logger.info(
@@ -1723,7 +1780,7 @@ class KompressCompressor(Transform):
                 return self._passthrough(content, n_words)
 
             compressed_words = [words[w] for w in sorted(kept_ids) if w < n_words]
-            compressed = " ".join(compressed_words)
+            compressed = _join_kept_words_by_line(words, line_ids, kept_ids)
             compressed_count = len(compressed_words)
             ratio = compressed_count / n_words if n_words else 1.0
 
@@ -1929,7 +1986,14 @@ class KompressCompressor(Transform):
             ]
 
         results: list[KompressResult | None] = [None] * n
-        word_lists: list[list[str]] = [c.split() for c in contents]
+        word_lists: list[list[str]] = []
+        line_id_lists: list[list[int]] = []
+        protected_line_ids_list: list[set[int]] = []
+        for c in contents:
+            words, line_ids = _words_by_line(c)
+            word_lists.append(words)
+            line_id_lists.append(line_ids)
+            protected_line_ids_list.append(_tabular_protected_line_ids(c))
 
         # Short texts short-circuit to passthrough — no model call needed.
         max_chunk_words = self.config.chunk_words
@@ -2110,14 +2174,19 @@ class KompressCompressor(Transform):
                 continue
             content = contents[text_idx]
             words = word_lists[text_idx]
+            line_ids = line_id_lists[text_idx]
             n_words = len(words)
+
+            for i, line_id in enumerate(line_ids):
+                if line_id in protected_line_ids_list[text_idx]:
+                    kept_ids.add(i)
 
             if not kept_ids:
                 results[text_idx] = self._passthrough(content, n_words)
                 continue
 
             compressed_words = [words[w] for w in sorted(kept_ids) if w < n_words]
-            compressed = " ".join(compressed_words)
+            compressed = _join_kept_words_by_line(words, line_ids, kept_ids)
             compressed_count = len(compressed_words)
             comp_ratio = compressed_count / n_words if n_words else 1.0
 
