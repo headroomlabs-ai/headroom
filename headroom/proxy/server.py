@@ -4649,6 +4649,13 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 ),
             },
             "toin": get_toin().get_stats(),
+            # Auto-learning progress. `pending_patterns` counts sub-threshold
+            # evidence so dashboards can show the learner is alive before the
+            # first pattern crosses `min_evidence` (users otherwise read the
+            # silence as "learning is broken").
+            "traffic_learner": (
+                proxy.traffic_learner.get_stats() if proxy.traffic_learner else None
+            ),
             "proxy_inbound": proxy.metrics.inbound_snapshot(),
             "cache": await proxy.cache.stats() if proxy.cache else None,
             "rate_limiter": await proxy.rate_limiter.stats() if proxy.rate_limiter else None,

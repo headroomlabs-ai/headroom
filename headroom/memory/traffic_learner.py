@@ -525,6 +525,10 @@ class TrafficLearner:
         # Hydrate persisted dedup state before workers spin up so cross-session
         # re-sightings bump existing rows instead of creating duplicates.
         await self._hydrate_persisted_state()
+        # Rehydrate sub-threshold evidence from the previous process. Without
+        # this every restart zeroed pending counts, so users with short or
+        # restart-heavy sessions could never cross min_evidence.
+        await self._load_pending_state()
         if self._save_task is None or self._save_task.done():
             self._save_task = asyncio.create_task(self._save_worker())
         if self._flush_task is None or self._flush_task.done():
@@ -569,6 +573,9 @@ class TrafficLearner:
             except Exception:
                 break
 
+        # Snapshot sub-threshold evidence so it survives the restart.
+        await self._save_pending_state()
+
         # Final flush on shutdown — bypass debounce.
         await self.flush_to_file()
 
@@ -586,6 +593,9 @@ class TrafficLearner:
                 self._flush_dirty = False
                 self._last_flush_at = time.monotonic()
                 await self.flush_to_file()
+                # Same debounce cycle also snapshots pending evidence, so a
+                # crash (vs clean stop) loses at most one debounce window.
+                await self._save_pending_state()
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -831,6 +841,7 @@ class TrafficLearner:
             "patterns_extracted": self._patterns_extracted,
             "patterns_saved": self._patterns_saved,
             "pending_patterns": len(self._pattern_counts),
+            "min_evidence": self._min_evidence,
             "history_size": len(self._tool_history),
         }
 
@@ -1380,6 +1391,82 @@ class TrafficLearner:
             # If multiple rows share the same content (legacy duplicates),
             # last-wins — we only need one id to target the bump.
             self._persisted_ids[h] = memory_id
+
+    def _pending_state_path(self) -> Path | None:
+        """Sidecar JSON next to memory.db holding sub-threshold evidence."""
+        db_path = _resolve_backend_db_path(self._backend)
+        if db_path is None:
+            return None
+        return db_path.with_name("pending_patterns.json")
+
+    async def _save_pending_state(self) -> None:
+        """Snapshot the pending accumulator so evidence survives restarts.
+
+        Best-effort: failures are logged at debug and never propagate — the
+        accumulator degrades gracefully back to per-process behavior.
+        """
+        path = self._pending_state_path()
+        if path is None:
+            return
+        entries = [
+            {
+                "category": pattern.category.value,
+                "content": pattern.content,
+                "importance": pattern.importance,
+                "count": count,
+                "entity_refs": pattern.entity_refs,
+                "metadata": pattern.metadata,
+                "content_hash": h,
+            }
+            for h, (pattern, count) in self._pattern_counts.items()
+        ]
+
+        def _write() -> None:
+            # tmp + rename so a crash mid-write can't truncate the file.
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(json.dumps({"version": 1, "patterns": entries}))
+            os.replace(tmp, path)
+
+        try:
+            await asyncio.to_thread(_write)
+        except Exception as e:
+            logger.debug("Traffic learner pending-state save failed: %s", e)
+
+    async def _load_pending_state(self) -> None:
+        """Rehydrate sub-threshold evidence saved by a previous process.
+
+        Runs after _hydrate_persisted_state so entries whose pattern crossed
+        the threshold in the meantime (hash now in _saved_hashes) are skipped;
+        their re-sightings bump the persisted row instead. Unreadable or
+        malformed files are ignored — the next snapshot overwrites them.
+        """
+        path = self._pending_state_path()
+        if path is None or not path.exists():
+            return
+        try:
+            data = json.loads(await asyncio.to_thread(path.read_text))
+        except Exception as e:
+            logger.debug("Traffic learner pending-state load failed: %s", e)
+            return
+        entries = data.get("patterns") if isinstance(data, dict) else None
+        if not isinstance(entries, list):
+            return
+        for entry in entries[: self._max_pending_patterns]:
+            try:
+                h = entry["content_hash"]
+                if not h or h in self._saved_hashes or h in self._pattern_counts:
+                    continue
+                pattern = ExtractedPattern(
+                    category=PatternCategory(entry["category"]),
+                    content=entry["content"],
+                    importance=float(entry.get("importance", 0.5)),
+                    entity_refs=list(entry.get("entity_refs", [])),
+                    metadata=dict(entry.get("metadata", {})),
+                    content_hash=h,
+                )
+                self._pattern_counts[h] = (pattern, max(1, int(entry.get("count", 1))))
+            except Exception:
+                continue
 
     async def _bump_persisted_evidence(self, memory_id: str) -> None:
         """Atomically increment a persisted row's metadata.evidence_count."""
