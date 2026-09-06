@@ -3118,7 +3118,27 @@ class AnthropicHandlerMixin:
             # and the prefix is untouched) AND the turn hooks (a hook may rewrite the
             # tools array, and repairing before it validated against a stale view).
             # Nothing past this point mutates `body["tools"]` on the outbound path.
-            from headroom.proxy.helpers import strip_unsupported_tool_search_blocks
+            from headroom.proxy.helpers import (
+                strip_unsupported_tool_search_blocks,
+                strip_unsupported_tool_search_references,
+            )
+
+            # The tools array is repaired first: it shrinks what a history
+            # tool_reference can resolve against, so the block repair below has to
+            # validate against the final view (same reason as the ORDERING note).
+            _ts_tools, _ts_refs_dropped = strip_unsupported_tool_search_references(
+                body.get("tools")
+            )
+            if _ts_refs_dropped:
+                body["tools"] = tools = _ts_tools
+                body_mutation_tracker.mark_mutated("tool_search_reference_repair")
+                transforms_applied.append(f"router:tool_search_ref_repair:{_ts_refs_dropped}refs")
+                logger.info(
+                    "[%s] Tool search: dropped %d unresolvable tool_reference "
+                    "entr(y/ies) naming a typed search tool",
+                    request_id,
+                    _ts_refs_dropped,
+                )
 
             _ts_repaired, _ts_stripped = strip_unsupported_tool_search_blocks(
                 body.get("messages"), body.get("tools")
