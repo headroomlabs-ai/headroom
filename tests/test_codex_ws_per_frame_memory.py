@@ -147,7 +147,8 @@ async def test_memory_lookup_runs_for_each_issue_artifact_frame_and_preserves_no
         [
             json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
             json.dumps({"type": "response.completed", "response": {"id": "r_1"}}),
-        ]
+        ],
+        hold_after_events=True,
     )
     first_turn, later_turn = _issue_2059_turns()
     first_input, later_input = _issue_2059_inputs()
@@ -183,7 +184,8 @@ async def test_memory_lookup_skips_input_bearing_non_create_first_frame():
         [
             json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
             json.dumps({"type": "response.completed", "response": {"id": "r_1"}}),
-        ]
+        ],
+        hold_after_events=True,
     )
     _first_input, later_input = _issue_2059_inputs()
     cancel_frame = json.dumps(
@@ -214,7 +216,8 @@ async def test_memory_lookup_skips_bypassed_frames():
         [
             json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
             json.dumps({"type": "response.completed", "response": {"id": "r_1"}}),
-        ]
+        ],
+        hold_after_events=True,
     )
     first, later = _issue_2059_turns()
     client_ws = _FakeWebSocket(
@@ -238,7 +241,8 @@ async def test_memory_lookup_keeps_legacy_direct_first_frame():
         [
             json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
             json.dumps({"type": "response.completed", "response": {"id": "r_1"}}),
-        ]
+        ],
+        hold_after_events=True,
     )
     first_input, later_input = _issue_2059_inputs()
     first = _direct_turn(first_input)
@@ -265,7 +269,8 @@ async def test_memory_lookup_skips_disabled_memory(monkeypatch):
         [
             json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
             json.dumps({"type": "response.completed", "response": {"id": "r_1"}}),
-        ]
+        ],
+        hold_after_events=True,
     )
     first, later = _issue_2059_turns()
     client_ws = _FakeWebSocket(frames=[first, later])

@@ -56,6 +56,7 @@ from headroom.copilot_auth import (
     is_copilot_api_url,
 )
 from headroom.pipeline import PipelineStage, summarize_routing_markers
+from headroom.providers.codex.project_context import CodexProjectContextResolver
 from headroom.providers.codex.responses import (
     codex_responses_http_url,
     codex_responses_websocket_url,
@@ -5508,10 +5509,6 @@ class OpenAIHandlerMixin:
         bind_scope(tags, request.scope)
         client = classify_client(headers)
 
-        # Learn from the original client payload before memory context or
-        # compression mutates it. This mirrors the Anthropic ingestion path.
-        await self._observe_openai_responses_traffic(body, request_id=request_id)
-
         # PR-A5 (P5-49): strip internal x-headroom-* from upstream-bound
         # headers AFTER `_extract_tags` reads them. Memory user-id reads
         # `request.headers` below.
@@ -5538,7 +5535,11 @@ class OpenAIHandlerMixin:
         headers = {
             key: value
             for key, value in headers.items()
-            if key.lower() != _CODEX_RESPONSES_LITE_HEADER
+            if key.lower()
+            not in {
+                _CODEX_RESPONSES_LITE_HEADER,
+                "x-codex-turn-metadata",
+            }
         }
         log_outbound_headers(
             forwarder="openai_responses",
@@ -5548,6 +5549,54 @@ class OpenAIHandlerMixin:
         headers, is_chatgpt_auth = _resolve_codex_routing_headers(headers)
         if is_chatgpt_auth:
             client = "codex"
+        codex_project = None
+        codex_project_root_override = (
+            getattr(getattr(self.memory_handler, "config", None), "project_root_override", "")
+            or getattr(self.config, "memory_project_root_override", "")
+            or None
+        )
+        if client == "codex":
+            codex_project = await CodexProjectContextResolver().resolve_async(
+                headers=dict(request.headers),
+                body=body,
+                project_root_override=codex_project_root_override,
+            )
+            tags["codex_project_context"] = codex_project.reason
+            if codex_project.project_key and classify_project(request.headers) is None:
+                set_current_project(codex_project.project_key)
+        codex_project_scope_required = client == "codex" and (
+            is_chatgpt_auth
+            or bool(request.headers.get("x-codex-turn-metadata"))
+            or "codex" in str(request.headers.get("user-agent") or "").lower()
+            or any(
+                isinstance(container, dict)
+                and isinstance(container.get("client_metadata"), dict)
+                and bool(container["client_metadata"].get("thread_id"))
+                for container in (
+                    body,
+                    body.get("response") if isinstance(body.get("response"), dict) else {},
+                )
+            )
+        )
+        codex_project_features_allowed = not codex_project_scope_required or bool(
+            codex_project
+            and (
+                codex_project.cwd is not None
+                or codex_project.source
+                in {
+                    "x-headroom-project-id",
+                    "x-headroom-cwd",
+                    "configured-project-root",
+                }
+            )
+        )
+        resolved_project_root_override = codex_project_root_override or (
+            str(codex_project.cwd) if codex_project and codex_project.cwd else None
+        )
+        # Learn from the original client payload before memory context or
+        # compression mutates it, but never without a trustworthy Codex project.
+        if codex_project_features_allowed:
+            await self._observe_openai_responses_traffic(body, request_id=request_id)
         if _ensure_chatgpt_responses_store_false(body, is_chatgpt_auth=is_chatgpt_auth):
             logger.info(f"[{request_id}] Responses: forced store=false for ChatGPT auth")
         responses_memory_tools_allowed = _allow_responses_memory_tools(is_chatgpt_auth)
@@ -5595,7 +5644,7 @@ class OpenAIHandlerMixin:
         # directly because `headers` was stripped of `x-headroom-*` (PR-A5).
         memory_user_id: str | None = None
         memory_request_ctx = None
-        if self.memory_handler:
+        if self.memory_handler and codex_project_features_allowed:
             memory_user_id = resolve_memory_identity(request)
             from headroom.memory.storage_router import (
                 RequestContext as _MemRequestContext,
@@ -5608,9 +5657,7 @@ class OpenAIHandlerMixin:
                 headers=dict(request.headers),
                 system_prompt=_extract_sys_prompt(body),
                 base_user_id=memory_user_id,
-                project_root_override=(
-                    getattr(self.memory_handler.config, "project_root_override", "") or None
-                ),
+                project_root_override=resolved_project_root_override,
             )
 
         # Rate limiting
@@ -5655,11 +5702,13 @@ class OpenAIHandlerMixin:
 
         responses_memory_decision = MemoryDecision.decide(
             headers=request.headers,
-            memory_handler=self.memory_handler,
+            memory_handler=self.memory_handler if codex_project_features_allowed else None,
             memory_user_id=memory_user_id,
             mode_name=get_memory_injection_mode(),
         )
         responses_memory_decision.apply_to_tags(tags)
+        if not codex_project_features_allowed:
+            tags["memory_skip_reason"] = "project_unresolved"
         if responses_memory_decision.inject:
             try:
                 # Memory context now routes exclusively to the live-zone tail
@@ -6015,7 +6064,9 @@ class OpenAIHandlerMixin:
         )
         buffered_stream_ccr = _should_buffer_openai_responses_stream_ccr(
             stream=stream,
-            ccr_response_handler_enabled=_ccr_response_handler_enabled,
+            ccr_response_handler_enabled=(
+                _ccr_response_handler_enabled and codex_project_features_allowed
+            ),
             tools=body.get("tools"),
             is_chatgpt_auth=is_chatgpt_auth,
         )
@@ -6814,7 +6865,11 @@ class OpenAIHandlerMixin:
         upstream_headers = {
             key: value
             for key, value in upstream_headers.items()
-            if key.lower() != _CODEX_RESPONSES_LITE_HEADER
+            if key.lower()
+            not in {
+                _CODEX_RESPONSES_LITE_HEADER,
+                "x-codex-turn-metadata",
+            }
         }
         ws_memory_tools_allowed = _allow_responses_memory_tools(is_chatgpt_auth)
         _lower_headers = {k.lower(): v for k, v in upstream_headers.items()}
@@ -7370,23 +7425,78 @@ class OpenAIHandlerMixin:
 
             memory_user_id: str | None = None
             memory_request_ctx = None
+            ws_project_resolver = CodexProjectContextResolver()
+            ws_pinned_project_cwd = None
+            ws_turn_project_key = classify_project(ws_headers)
+            ws_project_scope_required = client == "codex" and (
+                is_chatgpt_auth
+                or "codex" in str(_header_get(ws_headers, "user-agent") or "").lower()
+            )
+            ws_turn_project_features_allowed = not ws_project_scope_required
+            ws_project_root_override = (
+                getattr(
+                    getattr(self.memory_handler, "config", None),
+                    "project_root_override",
+                    "",
+                )
+                or getattr(self.config, "memory_project_root_override", "")
+                or None
+            )
             from headroom.proxy.helpers import get_memory_injection_mode, log_memory_injection
             from headroom.proxy.memory_decision import MemoryDecision
             from headroom.proxy.memory_query import MemoryQuery
 
             async def _prepare_memory_frame(frame_body: dict[str, Any], frame_raw: str) -> str:
                 nonlocal memory_user_id, memory_request_ctx
+                nonlocal ws_pinned_project_cwd, ws_turn_project_key
+                nonlocal ws_turn_project_features_allowed
+
+                resolved_project_root_override = ws_project_root_override
+                if client == "codex":
+                    resolved_project = await ws_project_resolver.resolve_async(
+                        headers=ws_headers,
+                        body=frame_body,
+                        pinned_cwd=ws_pinned_project_cwd,
+                        project_root_override=ws_project_root_override,
+                    )
+                    ws_tags["codex_project_context"] = resolved_project.reason
+                    frame_project_scope_required = (
+                        ws_project_scope_required or resolved_project.reason != "metadata_missing"
+                    )
+                    ws_turn_project_features_allowed = (
+                        not frame_project_scope_required
+                        or resolved_project.cwd is not None
+                        or resolved_project.source
+                        in {
+                            "x-headroom-project-id",
+                            "x-headroom-cwd",
+                            "configured-project-root",
+                        }
+                    )
+                    if resolved_project.cwd is not None:
+                        if ws_pinned_project_cwd is None:
+                            ws_pinned_project_cwd = resolved_project.cwd
+                        resolved_project_root_override = str(resolved_project.cwd)
+                    ws_turn_project_key = classify_project(ws_headers) or (
+                        resolved_project.project_key if ws_turn_project_features_allowed else None
+                    )
 
                 memory_user_id_candidate = (
-                    resolve_memory_identity(websocket) if self.memory_handler else None
+                resolve_memory_identity(websocket)
+                if self.memory_handler and ws_turn_project_features_allowed
+                else None
                 )
                 memory_decision = MemoryDecision.decide(
                     headers=ws_headers,
-                    memory_handler=self.memory_handler,
+                    memory_handler=(
+                        self.memory_handler if ws_turn_project_features_allowed else None
+                    ),
                     memory_user_id=memory_user_id_candidate,
                     mode_name=get_memory_injection_mode(),
                 )
                 memory_decision.apply_to_tags(ws_tags)
+                if not ws_turn_project_features_allowed:
+                    ws_tags["memory_skip_reason"] = "project_unresolved"
                 if not memory_decision.inject:
                     return frame_raw
 
@@ -7408,9 +7518,7 @@ class OpenAIHandlerMixin:
                         headers=dict(ws_headers),
                         system_prompt=str(ws_response_body.get("instructions") or ""),
                         base_user_id=memory_user_id,
-                        project_root_override=(
-                            getattr(self.memory_handler.config, "project_root_override", "") or None
-                        ),
+                        project_root_override=resolved_project_root_override,
                     )
 
                     # Debug: log what Codex sends so we can see the full tool list
@@ -8535,6 +8643,7 @@ class OpenAIHandlerMixin:
                                     else 0,
                                     tags=ws_tags,
                                     client=client,
+                                    project=ws_turn_project_key,
                                 )
                             )
 
@@ -9139,6 +9248,7 @@ class OpenAIHandlerMixin:
                         transforms_applied=tuple(transforms_applied),
                         tags=ws_session_tags,
                         client=client,
+                        project=ws_turn_project_key,
                         request_messages=ws_messages_for_log
                         if getattr(self.config, "log_full_messages", False)
                         else None,
