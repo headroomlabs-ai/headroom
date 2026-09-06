@@ -221,6 +221,30 @@ def test_wrap_selfheal_hook_install_is_idempotent(tmp_path: Path) -> None:
     assert len(marked) == 1
 
 
+def test_wrap_selfheal_hook_repairs_stale_command(tmp_path: Path) -> None:
+    """A marker-bearing entry whose command drifted (hand edit, moved binary) is rewritten."""
+    path = _settings(tmp_path)
+    path.parent.mkdir(parents=True)
+    stale = f"claude wrap selfheal --marker {_HOOK_MARKER}"
+    path.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "SessionStart": [
+                        {"matcher": "startup|resume", "hooks": [{"command": stale, "timeout": 10}]}
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    wrap_cli._ensure_claude_wrap_selfheal_hook(path)
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    commands = [h["command"] for e in payload["hooks"]["SessionStart"] for h in e["hooks"]]
+    assert commands == [wrap_cli._wrap_selfheal_hook_command()]
+
+
 def test_wrap_selfheal_hook_preserves_existing_hooks(tmp_path: Path) -> None:
     path = _settings(tmp_path)
     path.parent.mkdir(parents=True)

@@ -10448,7 +10448,14 @@ class OpenAIHandlerMixin:
             clean_model_id = sanitize_anthropic_model_id(unquote(raw_model_id))
             if clean_model_id != unquote(raw_model_id):
                 path = "/v1/models/" + quote(clean_model_id, safe="")
-        url = build_copilot_upstream_url(base_url, path)
+        from headroom.providers.wrap_registry import resolve_origin_passthrough_url
+
+        # Wrap targets that build full gateway paths themselves (e.g. IBM Bob's
+        # /inference/v1/model/info, /admin/v1/profile) declare origin
+        # passthrough prefixes; joining those paths onto the base URL's own
+        # path would double or misroot the upstream URL.
+        origin_passthrough_url = resolve_origin_passthrough_url(base_url, path)
+        url = origin_passthrough_url or build_copilot_upstream_url(base_url, path)
 
         # Preserve query string parameters
         if request.url.query:
@@ -10594,6 +10601,18 @@ class OpenAIHandlerMixin:
         # Remove compression headers since httpx already decompressed the response
         response_headers = _sanitize_forwarded_response_headers(response.headers)
         response_content = response.content
+
+        if origin_passthrough_url is not None and response.status_code == 200:
+            from headroom.providers.wrap_registry import strip_origin_passthrough_response_keys
+
+            # E.g. Bob's /admin/v1/profile carries region_domain, which bob
+            # 2.0.1 uses to rewrite its gateway host away from the proxy while
+            # keeping the proxied port — strip declared keys so the tool keeps
+            # routing through the configured gateway URL.
+            filtered = strip_origin_passthrough_response_keys(base_url, path, response_content)
+            if filtered is not None:
+                response_content = filtered
+                response_headers["content-type"] = "application/json"
 
         if provider == "anthropic" and endpoint_name == "models":
             from headroom.providers.anthropic import sanitize_anthropic_model_metadata

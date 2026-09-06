@@ -104,18 +104,23 @@ def _invoke_wrap_claude(
     monkeypatch.setattr(wrap_mod, "detect_claude_code_version", lambda *_a, **_k: (2, 1, 196))
     monkeypatch.setattr(wrap_mod.subprocess, "run", fake_run)
 
-    result = runner.invoke(
-        main,
-        [
-            "wrap",
-            "claude",
-            "--no-mcp",
-            "--no-tokensave",
-            "--no-serena",
-            *extra_args,
-        ],
-        env=env,
-    )
+    # Isolate cwd: the wrap flow writes .claude/settings.local.json (selfheal
+    # hook, stale-marker check) relative to cwd, and with shutil.which patched
+    # above a run from the repo root would poison the real repo settings with a
+    # "/usr/bin/claude wrap selfheal" hook.
+    with runner.isolated_filesystem():
+        result = runner.invoke(
+            main,
+            [
+                "wrap",
+                "claude",
+                "--no-mcp",
+                "--no-tokensave",
+                "--no-serena",
+                *extra_args,
+            ],
+            env=env,
+        )
 
     assert result.exit_code == 0, result.output
     return captured, result.output
