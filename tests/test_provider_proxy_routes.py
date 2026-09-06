@@ -1261,6 +1261,11 @@ def test_anthropic_model_metadata_strips_ansi_model_ids() -> None:
                         {"id": "claude-sonnet-4-5[1m]", "object": "model"},
                     ],
                 },
+                headers={
+                    "etag": '"stale"',
+                    "last-modified": "Thu, 01 Jan 1970 00:00:00 GMT",
+                    "cache-control": "max-age=60",
+                },
             )
 
         async def aclose(self) -> None:
@@ -1272,6 +1277,9 @@ def test_anthropic_model_metadata_strips_ansi_model_ids() -> None:
         response = client.get("/v1/models", headers={"x-api-key": "sk-ant-test"})
 
     assert response.status_code == 200
+    assert response.headers.get("etag") is None
+    assert response.headers.get("last-modified") is None
+    assert response.headers.get("cache-control") is None
     assert response.json()["data"] == [
         {"id": "claude-opus-4-8", "object": "model"},
         {"id": "claude-sonnet-4-5", "object": "model"},
@@ -1307,6 +1315,57 @@ def test_anthropic_model_detail_path_strips_ansi_model_id() -> None:
     assert fake_http_client.calls == [
         ("GET", "https://api.anthropic.test/v1/models/claude-opus-4-8")
     ]
+
+
+def test_issue_3312_grok_model_metadata() -> None:
+    fixture = {
+        "model": "grok-4.6",
+        "context_length": 500000,
+    }
+
+    class FakeAsyncClient:
+        async def request(self, method, url, **kwargs):  # type: ignore[no-untyped-def]
+            return httpx.Response(
+                200,
+                json={
+                    "object": "list",
+                    "data": [
+                        {
+                            "id": fixture["model"],
+                            "object": "model",
+                            "context_length": fixture["context_length"],
+                        }
+                    ],
+                },
+            )
+
+        async def aclose(self) -> None:
+            return None
+
+    app = create_app(
+        ProxyConfig(
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            anthropic_api_url="https://api.anthropic.test",
+            openai_api_url="https://api.x.ai",
+            gemini_api_url="https://api.gemini.test",
+            cloudcode_api_url="https://cloudcode.test",
+            vertex_api_url="https://vertex.test",
+        )
+    )
+    with TestClient(app) as client:
+        client.app.state.proxy.http_client = FakeAsyncClient()
+        response = client.get("/v1/models", headers={"authorization": "Bearer sk-xai-test"})
+
+    entry = response.json()["data"][0]
+    assert response.status_code == 200
+    assert entry == {
+        "id": "grok-4.6",
+        "object": "model",
+        "context_length": 500000,
+        "context_window": 500000,
+    }
 
 
 def test_anthropic_messages_strips_ansi_model_id_before_upstream() -> None:
