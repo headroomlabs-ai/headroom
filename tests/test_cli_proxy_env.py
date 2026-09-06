@@ -960,6 +960,89 @@ class TestCLICompressionOnlyFlags:
         assert cfg.ccr_inject_tool is False
 
 
+class TestCLINoCcrResponseHandlingFlag:
+    """--no-ccr-response-handling / HEADROOM_NO_CCR_RESPONSE_HANDLING must flip
+    ccr_handle_responses, independent of --no-ccr (issue #3082).
+
+    Before this flag existed, ccr_handle_responses had no CLI/env wiring at
+    all — a client that offers the headroom_retrieve tool itself (e.g. the
+    bundled OpenCode plugin) always took the buffered-stream path with no
+    supported opt-out, even with --no-ccr set.
+    """
+
+    def test_ccr_handle_responses_defaults_on(self, runner):
+        """Without the flag, ccr_handle_responses stays enabled (no behavior change)."""
+        captured_config = {}
+
+        def mock_run_server(config, **kwargs):
+            captured_config["config"] = config
+
+        with patch("headroom.proxy.server.run_server", mock_run_server):
+            result = runner.invoke(main, ["proxy"], catch_exceptions=False)
+
+        assert result.exit_code == 0, result.output
+        assert captured_config["config"].ccr_handle_responses is True
+
+    def test_no_ccr_response_handling_flag(self, runner):
+        """--no-ccr-response-handling disables ccr_handle_responses only."""
+        captured_config = {}
+
+        def mock_run_server(config, **kwargs):
+            captured_config["config"] = config
+
+        with patch("headroom.proxy.server.run_server", mock_run_server):
+            result = runner.invoke(
+                main, ["proxy", "--no-ccr-response-handling"], catch_exceptions=False
+            )
+
+        assert result.exit_code == 0, result.output
+        cfg = captured_config["config"]
+        assert cfg.ccr_handle_responses is False
+        # Unrelated CCR knobs stay on: this flag is independent of --no-ccr.
+        assert cfg.ccr_inject_tool is True
+        assert cfg.ccr_inject_marker is True
+
+    def test_no_ccr_response_handling_from_env(self, runner):
+        """HEADROOM_NO_CCR_RESPONSE_HANDLING env var disables ccr_handle_responses."""
+        captured_config = {}
+
+        def mock_run_server(config, **kwargs):
+            captured_config["config"] = config
+
+        with patch("headroom.proxy.server.run_server", mock_run_server):
+            result = runner.invoke(
+                main,
+                ["proxy"],
+                env={"HEADROOM_NO_CCR_RESPONSE_HANDLING": "1"},
+                catch_exceptions=False,
+            )
+
+        assert result.exit_code == 0, result.output
+        assert captured_config["config"].ccr_handle_responses is False
+
+    def test_no_ccr_response_handling_combines_with_no_ccr(self, runner):
+        """--no-ccr-response-handling composes with --no-ccr instead of being
+        implied by it: both can be set together for a fully unbuffered,
+        no-retrieval-path configuration."""
+        captured_config = {}
+
+        def mock_run_server(config, **kwargs):
+            captured_config["config"] = config
+
+        with patch("headroom.proxy.server.run_server", mock_run_server):
+            result = runner.invoke(
+                main,
+                ["proxy", "--no-ccr", "--no-ccr-response-handling"],
+                catch_exceptions=False,
+            )
+
+        assert result.exit_code == 0, result.output
+        cfg = captured_config["config"]
+        assert cfg.ccr_inject_tool is False
+        assert cfg.ccr_inject_marker is False
+        assert cfg.ccr_handle_responses is False
+
+
 class TestNoCcrMarkerCompressors:
     """Verify --no-ccr actually suppresses <<ccr:...>> markers
     from every compressor, not just SmartCrusher (#1022)."""
