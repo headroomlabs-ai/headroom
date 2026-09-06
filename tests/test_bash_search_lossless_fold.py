@@ -263,3 +263,59 @@ def test_search_file_fold_still_wins_for_many_matches_one_file() -> None:
     out = compact_lossless(grep, "search")
     assert len(out) < len(grep)
     assert search_unheading(out) == grep
+
+
+# --- rg --heading directory fold: factor a shared dir across FILE headers ---
+from headroom.transforms.lossless_compaction import (  # noqa: E402
+    search_file_heading_dir,
+    search_file_heading_undir,
+)
+
+
+def test_heading_dir_fold_factors_directory_across_rg_headings() -> None:
+    # rg --heading output: each file is a bare path header followed by
+    # ``line:content`` rows. Files under one directory repeat the dir on every
+    # header; the fold factors it to a single ``dir/`` line, losslessly.
+    rg = (
+        "src/auth/login.py\n12:def login()\n15:    return token\n"
+        "src/auth/session.py\n8:def session()\n"
+        "src/auth/logout.py\n3:def logout()\n"
+    )
+    folded = search_file_heading_dir(rg)
+    assert len(folded) < len(rg)
+    assert folded.startswith("src/auth/\n")  # dir factored to a header line
+    assert "src/auth/login.py" not in folded  # basenames left bare beneath it
+    assert search_file_heading_undir(folded) == rg  # exact byte round-trip
+    # And through the self-verifying dispatcher:
+    assert compact_lossless(rg, "search") == folded
+
+
+def test_heading_dir_fold_survives_blank_group_separators() -> None:
+    # ripgrep separates file groups with a blank line; the dir must persist
+    # across the blank so all files under one directory still fold.
+    rg = "a/b/one.rs\n1:x\n\na/b/two.rs\n2:y\n\na/b/three.rs\n3:z\n"
+    folded = search_file_heading_dir(rg)
+    assert len(folded) < len(rg)
+    assert search_file_heading_undir(folded) == rg
+
+
+def test_heading_dir_fold_is_lossless_or_passes_through_messy_input() -> None:
+    # A mix of dir'd and top-level (no-dir) headers is ambiguous to reverse, so
+    # compact_lossless must fall back to a candidate that round-trips exactly
+    # (never corrupt). Losslessness is the invariant, not that it always folds.
+    messy = "src/a/x.py\n1:hit\ntop_level.py\n2:hit\nsrc/a/y.py\n3:hit\n"
+    out = compact_lossless(messy, "search")
+    assert len(out) <= len(messy)
+    assert (
+        search_file_heading_undir(out) == messy
+        or search_dir_unheading(out) == messy
+        or search_unheading(out) == messy
+        or out == messy
+    )
+
+
+def test_grep_row_input_is_untouched_by_heading_dir_fold() -> None:
+    # grep path:line:content rows are NOT rg --heading form, so the heading-dir
+    # fold leaves them for search_heading / search_dir_heading (no interference).
+    grep = "src/a/f1.py:1:x\nsrc/a/f2.py:2:y\n"
+    assert search_file_heading_dir(grep) == grep

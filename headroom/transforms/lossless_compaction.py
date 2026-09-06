@@ -28,6 +28,8 @@ __all__ = [
     "search_unheading",
     "search_dir_heading",
     "search_dir_unheading",
+    "search_file_heading_dir",
+    "search_file_heading_undir",
     "diff_strip_index",
     "compact_lossless",
 ]
@@ -369,6 +371,116 @@ def search_dir_unheading(text: str) -> str:
     return _join(out, had_trailing)
 
 
+def search_file_heading_dir(text: str) -> str:
+    """Factor a shared parent directory across consecutive rg --heading headings.
+
+    ripgrep's default output (and :func:`search_heading`'s output) groups matches
+    under a bare file-path *header* line followed by ``line:content`` data rows::
+
+        src/auth/login.py
+        12:def login()
+        src/auth/session.py
+        8:def session()
+
+    Consecutive headers that share a parent directory repeat it on every header.
+    Factor it to a directory line (ending in ``/``) once, leaving the basenames::
+
+        src/auth/
+        login.py
+        12:def login()
+        session.py
+        8:def session()
+
+    A *header* is a non-data line immediately followed by a ``line:content`` data
+    row (the same notion :func:`search_heading` / :func:`search_unheading` use);
+    data rows keep the active directory so grouped files under one dir all fold.
+    Complements :func:`search_dir_heading` (which factors a directory across
+    ``path:line:content`` grep rows); this factors it across heading-form file
+    headers. Reversed exactly by :func:`search_file_heading_undir`;
+    ``compact_lossless`` verifies the round-trip.
+    """
+    lines, had_trailing = _split_keep_trailing(text)
+    if not lines:
+        return text
+    out: list[str] = []
+    current_dir: str | None = None
+    n = len(lines)
+    for i, line in enumerate(lines):
+        is_data = bool(_HEADING_ROW_RE.match(line))
+        next_is_data = i + 1 < n and bool(_HEADING_ROW_RE.match(lines[i + 1]))
+        if not is_data and next_is_data and "/" in line and not line.endswith("/"):
+            cut = line.rindex("/") + 1
+            dir_part, base = line[:cut], line[cut:]
+            if base:
+                if dir_part != current_dir:
+                    out.append(dir_part)
+                    current_dir = dir_part
+                out.append(base)
+                continue
+        # Data rows and blank separators belong to the group and keep the active
+        # dir (rg separates file groups under one dir with a blank line); any
+        # other line (a header with no dir, or passthrough content) ends it.
+        if not is_data and line != "":
+            current_dir = None
+        out.append(line)
+    return _join(out, had_trailing)
+
+
+def search_file_heading_undir(text: str) -> str:
+    """Exact inverse of :func:`search_file_heading_dir`.
+
+    A produced *directory header* is a line ending in ``/`` (not a data row)
+    whose next line is a basename header (no ``/``, not a data row, itself
+    followed by a data row); it is consumed and re-prefixed onto the basename
+    headers beneath it until a non-data, non-basename line clears the grouping.
+    """
+    lines, had_trailing = _split_keep_trailing(text)
+    if not lines:
+        return text
+    out: list[str] = []
+    current_dir: str | None = None
+    n = len(lines)
+    i = 0
+    while i < n:
+        line = lines[i]
+        is_data = bool(_HEADING_ROW_RE.match(line))
+        next_line = lines[i + 1] if i + 1 < n else None
+        next_is_data = next_line is not None and bool(_HEADING_ROW_RE.match(next_line))
+        # A basename header under an active dir: re-prefix it (keep the dir so
+        # sibling files under the same directory all get it).
+        if (
+            current_dir is not None
+            and not is_data
+            and line != ""
+            and "/" not in line
+            and next_is_data
+        ):
+            out.append(current_dir + line)
+            i += 1
+            continue
+        # A directory header we produced: ``dir/`` immediately above a basename
+        # header (non-data, no '/', itself followed by a data row). Consume it.
+        if (
+            line.endswith("/")
+            and not is_data
+            and next_line is not None
+            and next_line != ""
+            and "/" not in next_line
+            and not _HEADING_ROW_RE.match(next_line)
+            and i + 2 < n
+            and _HEADING_ROW_RE.match(lines[i + 2])
+        ):
+            current_dir = line
+            i += 1
+            continue
+        # Data rows and blank separators keep the active dir; anything else clears it.
+        if not is_data and line != "":
+            current_dir = None
+        out.append(line)
+        i += 1
+    return _join(out, had_trailing)
+
+
 def diff_strip_index(text: str) -> str:
     """Drop ``index <sha>..<sha>`` lines from a unified diff (still applies)."""
     lines, had_trailing = _split_keep_trailing(text)
@@ -493,14 +605,17 @@ def compact_lossless(content: str, kind: str) -> str:
             return candidate if _smaller(candidate, content) else content
 
         if kind == "search":
-            # Two independent folds; keep the smaller that round-trips exactly.
-            # search_heading factors a repeated FILE (many matches in one file);
-            # search_dir_heading factors a repeated DIRECTORY (one match each
-            # across many files in a dir — the grep -rn case the file fold misses).
+            # Independent folds; keep the smallest that round-trips exactly.
+            #  * search_heading factors a repeated FILE (many matches in one file).
+            #  * search_dir_heading factors a repeated DIRECTORY across
+            #    ``path:line:content`` grep rows (the grep -rn case).
+            #  * search_file_heading_dir factors a repeated DIRECTORY across
+            #    rg --heading FILE headers (already grouped file:line:content).
             best = content
             for candidate, inverse in (
                 (search_heading(content), search_unheading),
                 (search_dir_heading(content), search_dir_unheading),
+                (search_file_heading_dir(content), search_file_heading_undir),
             ):
                 if inverse(candidate) == content and _smaller(candidate, best):
                     best = candidate
