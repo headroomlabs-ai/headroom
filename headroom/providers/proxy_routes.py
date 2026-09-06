@@ -39,6 +39,9 @@ from headroom.providers.proxy_targets import (
     api_target as _api_target,
 )
 from headroom.providers.proxy_targets import (
+    openai_compatible_base_url as _openai_compatible_base_url,
+)
+from headroom.providers.proxy_targets import (
     select_passthrough_base_url as _select_passthrough_base_url,
 )
 from headroom.providers.proxy_targets import (
@@ -470,23 +473,35 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
 
     @app.get("/v1/models")
     async def list_models(request: Request):
-        provider_name = proxy.provider_runtime.model_metadata_provider(dict(request.headers))
+        headers = dict(request.headers)
+        provider_name = proxy.provider_runtime.model_metadata_provider(headers)
+        base_url = (
+            _openai_compatible_base_url(proxy, headers)
+            if provider_name == "openai"
+            else _api_target(proxy, provider_name)
+        )
         return await handle_model_metadata_endpoint(
             proxy,
             request,
             endpoint=MODEL_METADATA_LIST_ENDPOINT,
-            provider_api_base_url=_api_target(proxy, provider_name),
+            provider_api_base_url=base_url,
             provider_name=provider_name,
         )
 
     @app.get("/v1/models/{model_id}")
     async def get_model(request: Request, model_id: str):
-        provider_name = proxy.provider_runtime.model_metadata_provider(dict(request.headers))
+        headers = dict(request.headers)
+        provider_name = proxy.provider_runtime.model_metadata_provider(headers)
+        base_url = (
+            _openai_compatible_base_url(proxy, headers)
+            if provider_name == "openai"
+            else _api_target(proxy, provider_name)
+        )
         return await handle_model_metadata_endpoint(
             proxy,
             request,
             endpoint=model_metadata_get_endpoint(model_id),
-            provider_api_base_url=_api_target(proxy, provider_name),
+            provider_api_base_url=base_url,
             provider_name=provider_name,
         )
 

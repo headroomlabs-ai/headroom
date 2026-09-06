@@ -401,7 +401,7 @@ class _ZdrResponsesHandler(_DummyOpenAIHandler):
         )
 
 
-def _build_request(body: dict, headers: dict[str, str]) -> Request:
+def _build_request(body: dict, headers: dict[str, str], path: str = "/v1/responses") -> Request:
     payload = json.dumps(body).encode("utf-8")
 
     async def receive():
@@ -413,8 +413,8 @@ def _build_request(body: dict, headers: dict[str, str]) -> Request:
         "http_version": "1.1",
         "method": "POST",
         "scheme": "https",
-        "path": "/v1/responses",
-        "raw_path": b"/v1/responses",
+        "path": path,
+        "raw_path": path.encode("utf-8"),
         "query_string": b"",
         "headers": [
             (key.lower().encode("utf-8"), value.encode("utf-8")) for key, value in headers.items()

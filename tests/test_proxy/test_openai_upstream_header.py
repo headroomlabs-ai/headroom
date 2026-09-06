@@ -10,6 +10,11 @@ These tests pin the resolution contract:
 - header present  → its value wins
 - header absent   → configured ``OPENAI_API_URL`` fallback
 - header empty or whitespace-only → fallback (no blanking)
+- Grok CLI wire signals → ``api.x.ai``, but only while the OpenAI target is
+  still the default (a configured gateway is never bypassed)
+
+The chat/responses call sites are covered end to end in
+``tests/test_grok_shared_proxy_call_sites.py``.
 """
 
 from __future__ import annotations
@@ -97,3 +102,67 @@ def test_header_with_subpath_preserves_path() -> None:
     # Trailing slash is normalized away, not doubled.
     trailing = _FakeRequest({"x-headroom-base-url": "https://gateway.example/api/v1/"})
     assert proxy._resolve_openai_upstream(trailing) == "https://gateway.example/api/v1"
+
+
+def test_grok_cli_routes_to_xai_when_process_default_is_openai() -> None:
+    """Shared proxy started by Claude/Codex keeps OPENAI_API_URL=api.openai.com.
+
+    Grok CLI cannot stamp x-headroom-base-url; wire signals must still route
+    chat completions to api.x.ai so xAI session tokens are not sent to OpenAI.
+    """
+    proxy = _stub_proxy("https://api.openai.com")
+    request = _FakeRequest(
+        {
+            "authorization": "Bearer redacted",
+            "x-xai-token-auth": "xai-grok-cli",
+            "user-agent": "grok-pager/0.2.117 grok-shell/0.2.117 (macos; aarch64)",
+        }
+    )
+
+    assert proxy._resolve_openai_upstream(request) == "https://api.x.ai"
+
+
+def test_grok_cli_ua_alone_routes_to_xai() -> None:
+    proxy = _stub_proxy("https://api.openai.com")
+    request = _FakeRequest({"user-agent": "grok-shell/0.2.112 (macos; aarch64)"})
+
+    assert proxy._resolve_openai_upstream(request) == "https://api.x.ai"
+
+
+def test_custom_base_url_still_wins_over_grok_signals() -> None:
+    """Explicit x-headroom-base-url remains highest priority (gateway override)."""
+    proxy = _stub_proxy("https://api.openai.com")
+    request = _FakeRequest(
+        {
+            "x-headroom-base-url": "https://gateway.example",
+            "x-xai-token-auth": "xai-grok-cli",
+            "user-agent": "grok-shell/0.2.112",
+        }
+    )
+
+    assert proxy._resolve_openai_upstream(request) == "https://gateway.example"
+
+
+def test_non_grok_clients_keep_process_openai_default() -> None:
+    proxy = _stub_proxy("https://api.openai.com")
+    request = _FakeRequest(
+        {
+            "authorization": "Bearer sk-test",
+            "user-agent": "codex-tui/0.146.0",
+        }
+    )
+
+    assert proxy._resolve_openai_upstream(request) == "https://api.openai.com"
+
+
+def test_grok_signals_do_not_override_a_configured_gateway() -> None:
+    """Grok routing is a fallback for the default target, not an override."""
+    proxy = _stub_proxy("https://gateway.internal")
+    request = _FakeRequest(
+        {
+            "x-xai-token-auth": "xai-grok-cli",
+            "user-agent": "grok-shell/0.2.117",
+        }
+    )
+
+    assert proxy._resolve_openai_upstream(request) == "https://gateway.internal"
