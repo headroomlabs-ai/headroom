@@ -1066,7 +1066,13 @@ class AnthropicHandlerMixin:
                 sanitize_anthropic_model_id(raw_model) if isinstance(raw_model, str) else raw_model
             )
             body_model = body.get("model")
-            if isinstance(body_model, str) and model != body_model:
+            # Only inject model for LiteLLM-backed requests: native Vertex passthrough
+            # preserves the rawPredict wire format, where the model only exists in the URL.
+            if (isinstance(body_model, str) and model != body_model) or (
+                body_model is None
+                and model_override is not None
+                and self.anthropic_backend is not None
+            ):
                 body["model"] = model
                 body_mutation_tracker.mark_mutated("sanitize_model_id")
             messages = body.get("messages", [])
