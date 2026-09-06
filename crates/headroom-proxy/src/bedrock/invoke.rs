@@ -65,7 +65,7 @@ use crate::proxy::AppState;
 // would risk drift from the middleware's resolution + WARN log.
 use headroom_core::auth_mode::AuthMode;
 
-use crate::bedrock::vendor::is_anthropic_model_id;
+use crate::bedrock::vendor::{is_anthropic_model_id, is_safe_model_id};
 
 /// RAII guard that observes the `bedrock_invoke_latency_seconds`
 /// histogram on drop. Created at handler entry; observed when the
@@ -172,6 +172,25 @@ pub async fn handle_invoke(
         body_bytes = body.len(),
         "bedrock invoke route received request"
     );
+
+    // Security: validate model_id to prevent path traversal attacks.
+    // Axum's Path<String> extractor URL-decodes the path segment, so
+    // %2F becomes / in model_id. Without this check, an attacker could
+    // craft a model_id like ../../admin to redirect the upstream request
+    // to an arbitrary path on the AWS Bedrock endpoint.
+    if !is_safe_model_id(&model_id) {
+        tracing::warn!(
+            event = "bedrock_model_id_invalid",
+            request_id = %request_id,
+            model_id = %model_id,
+            "bedrock invoke: model_id contains path traversal characters; rejecting"
+        );
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "bedrock_model_id_invalid",
+            "model_id contains invalid path traversal characters",
+        );
+    }
 
     let is_anthropic = is_anthropic_model_id(&model_id);
     let outbound_body: Bytes = if is_anthropic {
