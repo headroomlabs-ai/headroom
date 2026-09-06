@@ -13,6 +13,7 @@ WIRE_DEBUG_SECRET_KEYS = (
     "x-api-key",
     "openai-api-key",
     "anthropic-api-key",
+    "x-oai-attestation",
     "access_token",
     "refresh_token",
     "id_token",

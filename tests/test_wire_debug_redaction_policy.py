@@ -43,3 +43,17 @@ def test_wire_debug_key_matching_normalizes_dashes_and_case() -> None:
     assert should_redact_key("Anthropic-API-Key")
     assert should_redact_key("custom-refresh-token")
     assert not should_redact_key("token_count")
+
+
+def test_wire_debug_redacts_codex_attestation_header() -> None:
+    redacted = redact_for_wire_debug(
+        {
+            "x-oai-attestation": "signed-attestation",
+            "x-codex-window-id": "window-id",
+        }
+    )
+
+    assert redacted == {
+        "x-oai-attestation": WIRE_DEBUG_REDACTED,
+        "x-codex-window-id": "window-id",
+    }
