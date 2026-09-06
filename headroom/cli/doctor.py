@@ -25,6 +25,7 @@ import click
 
 from headroom._version import format_version_label, normalize_release_version
 from headroom.install.health import probe_json
+from headroom.install.models import DeploymentManifest
 from headroom.install.paths import claude_settings_path, codex_config_path
 from headroom.install.state import list_manifests
 from headroom.paths import savings_path
@@ -47,6 +48,8 @@ PASS = "pass"
 WARN = "warn"
 FAIL = "fail"
 SKIP = "skip"
+
+DEFAULT_PROXY_PORT = 8787
 
 _LOOPBACK_URL_RE = re.compile(r"https?://(?:127\.0\.0\.1|localhost):(\d+)")
 _CODEX_BASE_URL_RE = re.compile(r'base_url\s*=\s*"https?://(?:127\.0\.0\.1|localhost):(\d+)')
@@ -683,17 +686,56 @@ def _render(checks: list[CheckResult], port: int, installed: str) -> None:
         console.print("\n[green bold]all checks passed[/green bold]")
 
 
+def resolve_probe_port(
+    requested: int | None,
+    manifests: Sequence[DeploymentManifest],
+) -> int:
+    """Resolve the port `doctor` should probe.
+
+    Precedence: an explicit ``--port`` (or ``HEADROOM_PORT``) wins, then the
+    port a managed deployment recorded, then the built-in default.
+
+    The manifest tier matters because ``headroom deploy --port N`` writes N
+    into the deployment's own environment, not into the shell `doctor` later
+    runs in. Without it a healthy non-default deployment is reported as
+    unreachable, and the remediation hints point at the wrong port.
+
+    A deployment is only consulted when it is unambiguous: the ``default``
+    profile, or a lone profile under another name. With several named profiles
+    and no explicit request there is no non-arbitrary choice, so the built-in
+    default is used and the per-deployment section reports each one instead.
+
+    Args:
+        requested: Port supplied on the command line or via the environment.
+        manifests: Deployment manifests to consider.
+
+    Returns:
+        The port to probe.
+    """
+    if requested is not None:
+        return requested
+    default_profile = next((m for m in manifests if m.profile == "default"), None)
+    if default_profile is not None:
+        return default_profile.port
+    if len(manifests) == 1:
+        return manifests[0].port
+    return DEFAULT_PROXY_PORT
+
+
 @main.command()
 @click.option(
     "--port",
     "-p",
-    default=8787,
+    default=None,
     type=click.IntRange(1, 65535),
     envvar="HEADROOM_PORT",
-    help="Proxy port to check (default: 8787, env: HEADROOM_PORT)",
+    help=(
+        "Proxy port to check (env: HEADROOM_PORT). Defaults to the port of a "
+        f"single managed deployment, else {DEFAULT_PROXY_PORT}."
+    ),
 )
 @click.option("--json", "emit_json", is_flag=True, help="Emit JSON instead of formatted output.")
-def doctor(port: int, emit_json: bool) -> None:
+def doctor(port: int | None, emit_json: bool) -> None:
     """Check that the Headroom proxy and client routing are working.
 
     \b
@@ -702,6 +744,8 @@ def doctor(port: int, emit_json: bool) -> None:
         1  warnings only (working, but not optimally wired)
         2  at least one failure (proxy down / deployment down)
     """
+    manifests = list_manifests()
+    port = resolve_probe_port(port, manifests)
     base_url = f"http://127.0.0.1:{port}"
     livez = probe_json(f"{base_url}/livez")
     stats = probe_json(f"{base_url}/stats", timeout=5.0) if livez else None
@@ -742,7 +786,7 @@ def doctor(port: int, emit_json: bool) -> None:
     desktop_check = check_claude_desktop(claude_desktop_config_dir())
     if desktop_check is not None:
         checks.append(desktop_check)
-    deployments = check_deployments(list_manifests())
+    deployments = check_deployments(manifests)
     if deployments is not None:
         checks.append(deployments)
 

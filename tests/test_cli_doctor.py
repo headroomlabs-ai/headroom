@@ -10,6 +10,7 @@ from click.testing import CliRunner
 
 import headroom.cli.doctor as doctor_mod
 from headroom.cli.doctor import (
+    DEFAULT_PROXY_PORT,
     FAIL,
     PASS,
     SKIP,
@@ -24,6 +25,7 @@ from headroom.cli.doctor import (
     check_savings,
     check_shell_env,
     check_version_drift,
+    resolve_probe_port,
 )
 from headroom.cli.main import main
 from headroom.providers.claude.runtime import remote_control_gate_message
@@ -683,6 +685,7 @@ class TestBudget:
 class _FakeManifest:
     profile: str
     health_url: str
+    port: int = 8787
 
 
 class TestDeployments:
@@ -699,6 +702,33 @@ class TestDeployments:
         result = check_deployments(manifests, probe=lambda url: None)
         assert result is not None and result.status == FAIL
         assert "prod" in result.summary
+
+
+class TestResolveProbePort:
+    def test_explicit_port_wins_over_deployment(self):
+        manifests = [_FakeManifest("default", "", port=8789)]
+        assert resolve_probe_port(9000, manifests) == 9000
+
+    def test_default_profile_deployment_port_is_preferred(self):
+        manifests = [
+            _FakeManifest("prod", "", port=9999),
+            _FakeManifest("default", "", port=8789),
+        ]
+        assert resolve_probe_port(None, manifests) == 8789
+
+    def test_single_non_default_deployment_is_used(self):
+        assert resolve_probe_port(None, [_FakeManifest("prod", "", port=9999)]) == 9999
+
+    def test_builtin_default_without_deployments(self):
+        assert resolve_probe_port(None, []) == DEFAULT_PROXY_PORT
+
+    def test_ambiguous_named_deployments_fall_back_to_the_default(self):
+        """Several named profiles and no request: any pick would be arbitrary."""
+        manifests = [
+            _FakeManifest("prod", "", port=9998),
+            _FakeManifest("staging", "", port=9999),
+        ]
+        assert resolve_probe_port(None, manifests) == DEFAULT_PROXY_PORT
 
 
 class TestDoctorCommand:
@@ -813,6 +843,24 @@ class TestDoctorCommand:
         monkeypatch.setattr(doctor_mod, "probe_json", recording_probe)
         runner.invoke(main, ["doctor"], env={"HEADROOM_PORT": "9999"})
         assert "http://127.0.0.1:9999/livez" in seen
+
+    def test_deployment_port_probed_when_shell_has_no_override(self, runner, isolated, monkeypatch):
+        """`headroom deploy --port N` only sets HEADROOM_PORT inside the deployment."""
+        seen: list[str] = []
+
+        def recording_probe(url, timeout=2.0):
+            seen.append(url)
+            return None
+
+        monkeypatch.setattr(
+            doctor_mod,
+            "list_manifests",
+            lambda: [_FakeManifest("default", "http://127.0.0.1:8789/readyz", port=8789)],
+        )
+        monkeypatch.setattr(doctor_mod, "probe_json", recording_probe)
+        runner.invoke(main, ["doctor"])
+        assert "http://127.0.0.1:8789/livez" in seen
+        assert not any("127.0.0.1:8787" in url for url in seen)
 
 
 class TestCostTrackerBudgetKeys:
