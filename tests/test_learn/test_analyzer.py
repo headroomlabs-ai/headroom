@@ -409,6 +409,40 @@ class TestLLMResponseParser:
         recs = _parse_llm_response(raw)
         assert recs == []
 
+    def test_handles_null_rule_lists_and_fields(self):
+        # The model controls this JSON. A present-but-null rules list or a null
+        # section/content must be treated like an absent value, not crash the
+        # iteration / `.strip()`.
+        assert _parse_llm_response({"context_file_rules": None, "memory_file_rules": None}) == []
+        assert (
+            _parse_llm_response({"context_file_rules": [{"section": None, "content": "x"}]}) == []
+        )
+        assert _parse_llm_response({"memory_file_rules": [{"section": "s", "content": None}]}) == []
+
+        # A truthy non-string section/content (number, list, object) is also
+        # model-controlled and must not crash `.strip()`; it is dropped like null.
+        assert _parse_llm_response({"context_file_rules": [{"section": 123, "content": "x"}]}) == []
+        assert _parse_llm_response({"context_file_rules": [{"section": "s", "content": 123}]}) == []
+        assert (
+            _parse_llm_response({"memory_file_rules": [{"section": ["s"], "content": "x"}]}) == []
+        )
+        assert (
+            _parse_llm_response({"memory_file_rules": [{"section": "s", "content": {"a": 1}}]})
+            == []
+        )
+
+        # A valid rule alongside the null shapes is still parsed.
+        recs = _parse_llm_response(
+            {
+                "context_file_rules": [
+                    None,
+                    {"section": "Large Files", "content": "use offset", "evidence_count": 3},
+                ]
+            }
+        )
+        assert [r.section for r in recs] == ["Large Files"]
+        assert recs[0].evidence_count == 3
+
 
 # =============================================================================
 # Full Analyzer Integration Tests (mocked LLM)
@@ -640,6 +674,19 @@ class TestStripFencedJson:
     def test_invalid_json_raises(self):
         with pytest.raises(json.JSONDecodeError):
             _strip_fenced_json("not json at all")
+
+    def test_non_object_json_raises(self):
+        # A model may return valid JSON that is not an object (a bare array,
+        # string, number, ...). The contract is to raise JSONDecodeError so
+        # callers do not receive a non-dict and crash on `.get`.
+        for raw in ("[1, 2, 3]", '["a", "b"]', '[{"a": 1}, {"b": 2}]', '"a string"', "42", "true"):
+            with pytest.raises(json.JSONDecodeError):
+                _strip_fenced_json(raw)
+
+    def test_array_wrapping_a_single_object_is_extracted(self):
+        # The lenient first-{ .. last-} slice still recovers a single object a
+        # model wrapped in an array; only genuinely object-less JSON raises.
+        assert _strip_fenced_json('[{"key": "value"}]') == {"key": "value"}
 
     def test_prose_preamble_before_fence(self):
         # Models sometimes add a preamble before the fence despite being told
