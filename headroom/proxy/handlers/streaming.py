@@ -1533,13 +1533,18 @@ class StreamingMixin:
         # session/weekly display would stop updating on the streaming path.
         # We also forward the ``request-id`` family: clients such as Claude Code
         # record it per transcript turn, and downstream usage/cost tools dedup by
-        # message id + request id. The buffered (non-streaming) path already
-        # forwards every upstream header, so this keeps the two paths symmetric.
+        # message id + request id. ``x-litellm-key-*`` carries the per-key
+        # spend/budget envelope a LiteLLM virtual key reports per request;
+        # downstream status widgets read it from the streaming response the
+        # same way they already do from the buffered path. The buffered
+        # (non-streaming) path already forwards every upstream header, so
+        # this keeps the two paths symmetric.
         forwarded_headers = {
             k: v
             for k, v in upstream_response.headers.items()
             if "ratelimit" in k.lower()
             or k.lower().startswith("x-codex")
+            or k.lower().startswith("x-litellm-key-")
             or k.lower() in ("request-id", "anthropic-request-id", "x-request-id")
         }
 
