@@ -342,6 +342,11 @@ class HuggingFaceTokenizer(BaseTokenizer):
                     add_generation_prompt=True,
                     return_dict=False,
                 )
+                # Recent transformers return a BatchEncoding (dict-like with
+                # input_ids/attention_mask) here; len() of it is the key count
+                # (2), not the token count.
+                if hasattr(formatted, "keys") and "input_ids" in formatted:
+                    return len(formatted["input_ids"])
                 return len(formatted)
             except Exception:
                 # Fall back to base implementation
