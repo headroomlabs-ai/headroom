@@ -361,13 +361,13 @@ class TestSetupFileLogging:
         """_setup_file_logging should not raise on OSError."""
         from headroom.proxy.helpers import _setup_file_logging
 
-        # Monkey-patch _headroom_log_dir to return a path that will cause OSError
-        def _bad_log_dir():
-            return Path("/nonexistent/deeply/nested/path/that/cannot/exist/___test___")
+        # Monkey-patch proxy_log_path to return a path that will cause OSError
+        def _bad_log_path(*, port: int | None = None) -> Path:
+            return Path("/nonexistent/deeply/nested/path/that/cannot/exist/___test___/proxy.log")
 
         import headroom.proxy.helpers as helpers_mod
 
-        monkeypatch.setattr(helpers_mod, "_headroom_log_dir", _bad_log_dir)
+        monkeypatch.setattr(helpers_mod._paths, "proxy_log_path", _bad_log_path)
         # Should not raise
         _setup_file_logging()
 

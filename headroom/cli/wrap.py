@@ -611,13 +611,18 @@ def _find_available_port(start_port: int, max_attempts: int = 100) -> int:
     raise RuntimeError(f"No available port found in range {start_port}-{end_port - 1}")
 
 
-def _get_log_path() -> Path:
-    """Get path for proxy log file."""
+def _get_log_path(port: int | None = None) -> Path:
+    """Get path for proxy log file.
+
+    Delegates the filename to `paths.proxy_log_path` so this stays in sync
+    with what the proxy subprocess (started with `--port port`) actually
+    writes to — see `_setup_file_logging` in `headroom.proxy.helpers`.
+    """
     from headroom import paths as _paths
 
-    log_dir = _paths.log_dir()
-    log_dir.mkdir(parents=True, exist_ok=True)
-    return log_dir / "proxy.log"
+    log_path = _paths.proxy_log_path(port=port)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    return log_path
 
 
 def _get_proxy_stdio_log_path() -> Path:
@@ -695,7 +700,7 @@ def _start_proxy(
         cmd.extend(["--vertex-api-url", vertex_api_url])
 
     timeout_seconds = _resolve_wrap_proxy_timeout_seconds()
-    log_path = _get_log_path()
+    log_path = _get_log_path(port)
     stdio_log_path = _get_proxy_stdio_log_path()
     stdio_log_file = open(stdio_log_path, "a", encoding="utf-8")  # noqa: SIM115
 
