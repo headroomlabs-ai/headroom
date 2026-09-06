@@ -59,7 +59,7 @@ export const HeadroomPlugin: Plugin = async (input, options = {}) => {
   const pluginOptions = options as HeadroomOpenCodePluginOptions;
   const proxyUrl = resolveProxyUrl(pluginOptions);
   const projectPath = input.worktree || input.directory;
-  const project = pluginOptions.project ?? projectPath;
+  const project = pluginOptions.project ?? input.project.id;
   const retrieveTool = createHeadroomRetrieveTool({ proxyBaseUrl: proxyUrl });
   const uninstallTransport = installHeadroomTransport({
     proxyUrl,

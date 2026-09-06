@@ -9,6 +9,8 @@ import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  acknowledgeNativeToolExecution,
+  enforceNativeToolExecution,
   evaluateNativeToolPolicy,
   installHeadroomTransport,
   isAllowedToolPolicyUrl,
@@ -94,6 +96,49 @@ function proxyServer(pathPrefix: string = "/v1"): Promise<{
 }
 
 describe("Headroom OpenCode transport", () => {
+  it("binds an independent task ID when the host provides one", async () => {
+    installHeadroomTransport({
+      proxyUrl: "http://127.0.0.1:8787",
+      toolPolicy: { rules: [] },
+    });
+    const args = { command: "echo safe" };
+    const execution = {
+      sessionID: "session-task",
+      taskID: "task-42",
+      callID: "call-7",
+    };
+
+    const preflight = await enforceNativeToolExecution(
+      "bash",
+      args,
+      process.cwd(),
+      execution,
+    );
+
+    expect(preflight?.decision.binding).toMatchObject({
+      taskID: "task-42",
+      callID: "call-7",
+    });
+    expect(() =>
+      acknowledgeNativeToolExecution(
+        preflight!,
+        "bash",
+        args,
+        process.cwd(),
+        execution,
+      ),
+    ).not.toThrow();
+    expect(() =>
+      acknowledgeNativeToolExecution(
+        preflight!,
+        "bash",
+        args,
+        process.cwd(),
+        { ...execution, taskID: "different-task" },
+      ),
+    ).toThrow(/did not match the bound preflight decision/);
+  });
+
   it.each(conformanceCases)("matches shared policy conformance: $name", ({ policy, request, expected }) => {
     const decision = evaluateNativeToolPolicy(
       policy,

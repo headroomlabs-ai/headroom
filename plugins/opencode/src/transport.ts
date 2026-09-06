@@ -1068,10 +1068,12 @@ function evaluatePolicy(
   }
   const hasDynamicShellExecution =
     input.scope === "shell" &&
-    policy.rules.some(
-      (rule) =>
-        rule.action !== "allow" && (rule.scope === "shell" || rule.scope === "tool_call"),
-    ) &&
+    (policy.defaultAction === "deny" ||
+      policy.rules.some(
+        (rule) =>
+          rule.action !== "allow" &&
+          (rule.scope === "shell" || rule.scope === "tool_call"),
+      )) &&
     /(?:\\[A-Za-z0-9]|\$(?:\{|[A-Za-z_('" ])|`|%[^%\r\n]+%|(?:^|[\s;&|])%[A-Za-z]|![A-Za-z_][A-Za-z0-9_]*!|\b(?:eval|exec|source|invoke-expression|iex|get-command|call|if|then|else|elif|fi|for|while|until|do|done|case|esac|select|function|coproc)\b|[<>]\s*\(|(?:^|[;&|]\s*)&\s*\(|[{}])/i.test(
       input.resource,
     );
@@ -1246,7 +1248,7 @@ export async function enforceNativeToolExecution(
   toolName: string,
   args: Record<string, unknown>,
   cwd?: string,
-  execution?: { sessionID: string; callID: string },
+  execution?: { sessionID: string; callID: string; taskID?: string },
 ): Promise<HeadroomToolPolicyPreflight | undefined> {
   await refreshHeadroomToolPolicy();
   const state = getState();
@@ -1256,7 +1258,7 @@ export async function enforceNativeToolExecution(
         caller: "opencode" as const,
         adapter: "tool.execute.before" as const,
         sessionID: execution.sessionID,
-        taskID: execution.callID,
+        taskID: execution.taskID ?? execution.callID,
         callID: execution.callID,
         toolName,
         cwd,
@@ -1276,7 +1278,7 @@ export function acknowledgeNativeToolExecution(
   toolName: string,
   args: Record<string, unknown>,
   cwd: string | undefined,
-  execution: { sessionID: string; callID: string },
+  execution: { sessionID: string; callID: string; taskID?: string },
 ): HeadroomToolPolicyAcknowledgement {
   const binding = preflight.decision.binding;
   const canonicalArgsHash = hashPolicyResource(stableJson(args));
@@ -1287,7 +1289,7 @@ export function acknowledgeNativeToolExecution(
     binding.adapter !== "tool.execute.before" ||
     binding.sessionID !== execution.sessionID ||
     binding.callID !== execution.callID ||
-    binding.taskID !== execution.callID ||
+    binding.taskID !== (execution.taskID ?? execution.callID) ||
     binding.toolName !== toolName ||
     binding.cwd !== cwd ||
     binding.canonicalArgsHash !== canonicalArgsHash
