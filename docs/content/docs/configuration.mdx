@@ -35,7 +35,7 @@ These modes apply to SDK usage via `HeadroomClient(default_mode=...)` or per-req
 
 ## SDK Configuration
 
-<Tabs groupId="lang" items={['TypeScript', 'Python']}>
+<Tabs groupId="lang" items={['TypeScript', 'Python', 'Go']}>
 <Tab value="TypeScript">
 ```ts twoslash
 import { HeadroomClient } from 'headroom-ai';
@@ -82,13 +82,42 @@ client = HeadroomClient(
 )
 ```
 </Tab>
+<Tab value="Go">
+```go
+import (
+    "time"
+    "github.com/headroomlabs-ai/headroom/sdk/golang"
+)
+
+// Reads HEADROOM_BASE_URL / HEADROOM_API_KEY from env automatically.
+client := headroom.NewClient()
+
+// Or configure explicitly:
+explicit := headroom.NewClient(
+    headroom.WithBaseURL("http://localhost:8787"),
+    headroom.WithAPIKey("your-api-key"),
+    headroom.WithTimeout(30*time.Second),
+    headroom.WithRetries(2),
+    headroom.WithFallback(true),
+    headroom.WithDefaultMode(headroom.ModeOptimize),
+    headroom.WithConfig(&headroom.Config{
+        ModelContextLimits: map[string]int{
+            "gpt-4o":      128000,
+            "gpt-4o-mini": 128000,
+        },
+        CacheOptimizer: &headroom.CacheOptimizerConfig{Enabled: headroom.Bool(true)},
+    }),
+)
+_ = explicit
+```
+</Tab>
 </Tabs>
 
 ## Per-Request Overrides
 
 Override configuration for individual requests:
 
-<Tabs groupId="lang" items={['TypeScript', 'Python']}>
+<Tabs groupId="lang" items={['TypeScript', 'Python', 'Go']}>
 <Tab value="TypeScript">
 ```ts twoslash
 import { compress } from 'headroom-ai';
@@ -120,6 +149,22 @@ response = client.chat.completions.create(
         "important_tool": {"skip_compression": True}
     },
 )
+```
+</Tab>
+<Tab value="Go">
+```go
+out, err := client.ChatCompletionsCreate(ctx, map[string]any{
+    "model":    "gpt-4o",
+    "messages": messages,
+}, &headroom.HeadroomParams{
+    Mode:               headroom.ModeAudit,
+    OutputBufferTokens: 8000,
+    KeepTurns:          5,
+    ToolProfiles: map[string]map[string]any{
+        "important_tool": {"skip_compression": true},
+    },
+})
+_ = out; _ = err
 ```
 </Tab>
 </Tabs>

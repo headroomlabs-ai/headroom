@@ -224,6 +224,41 @@ const result = await compress(messages, {
 node -e "const h = require('headroom-ai'); console.log('headroom-ai loaded')"
 ```
 
+## Go
+
+The Go SDK lives at `github.com/headroomlabs-ai/headroom/sdk/golang` and requires **Go 1.23+**.
+
+```bash
+go get github.com/headroomlabs-ai/headroom/sdk/golang
+```
+
+<Callout type="info" title="The Go SDK needs a running proxy">
+Like the TypeScript SDK, the Go SDK is a thin HTTP client that talks to the Headroom proxy. Start it first:
+
+```bash
+pip install "headroom-ai[proxy]"
+headroom proxy --port 8787
+```
+
+Then use it:
+
+```go
+import (
+    "context"
+    headroom "github.com/headroomlabs-ai/headroom/sdk/golang"
+)
+
+client := headroom.NewClient(headroom.WithBaseURL("http://localhost:8787"))
+res, _ := client.Compress(context.Background(), messages, headroom.CompressOptions{Model: "gpt-4o"})
+```
+</Callout>
+
+### Verify the install
+
+```bash
+go run -v github.com/headroomlabs-ai/headroom/sdk/golang@latest 2>&1 | head -1
+```
+
 ## Docker
 
 Pre-built images are published to GitHub Container Registry on every release.
@@ -296,11 +331,11 @@ included in any extra or Docker image — see
 | `HEADROOM_TELEMETRY` | `off` | Set to `on` for local-only usage stats (nothing is sent externally) |
 | `HEADROOM_REQUEST_TIMEOUT` | `300` | Request timeout in seconds |
 
-### TypeScript SDK
+### TypeScript / Go SDKs
 
 | Variable | Default | Description |
 |---|---|---|
-| `HEADROOM_BASE_URL` | `http://localhost:8787` | Proxy URL for the TypeScript SDK |
+| `HEADROOM_BASE_URL` | `http://localhost:8787` | Proxy URL for the TypeScript and Go SDKs |
 | `HEADROOM_API_KEY` | _(none)_ | API key if the proxy requires auth |
 
 ## Troubleshooting

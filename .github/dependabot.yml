@@ -60,6 +60,15 @@ updates:
           - "minor"
           - "patch"
 
+  # Go SDK module updates
+  - package-ecosystem: gomod
+    directory: "/sdk/golang"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "deps"
+    open-pull-requests-limit: 5
+
   # npm dependency updates (TS SDK, plugins, docs site)
   - package-ecosystem: npm
     directories:

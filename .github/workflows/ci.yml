@@ -43,6 +43,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       code: ${{ steps.filter.outputs.code }}
+      go-sdk: ${{ steps.filter.outputs.go-sdk }}
       native: ${{ steps.filter.outputs.native }}
       dashboard: ${{ steps.filter.outputs.dashboard }}
       packaging: ${{ steps.filter.outputs.packaging }}
@@ -63,6 +64,9 @@ jobs:
               - 'tests/**'
               - 'scripts/**'
               - '.github/workflows/**'
+            go-sdk:
+              - 'sdk/golang/**'
+              - '.github/workflows/ci.yml'
             # native = anything that can change the compiled wrapper, the native
             # install flow, or the docker image (drives the scarce macOS/Windows
             # runners + docker E2E). A pure-Python logic change hits none of these.
@@ -437,6 +441,23 @@ jobs:
       - uses: wagoid/commitlint-github-action@v6
         with:
           configFile: .commitlintrc.json
+
+  test-go-sdk:
+    needs: changes
+    if: needs.changes.outputs.go-sdk == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: sdk/golang
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: sdk/golang/go.mod
+          cache-dependency-path: sdk/golang/go.mod
+      - run: go test ./...
+      - run: go vet ./...
 
   build:
     needs: changes
